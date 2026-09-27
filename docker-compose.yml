@@ -30,7 +30,7 @@ services:
       retries: 10
 
   ollama:
-    image: ollama/ollama:0.3.14
+    image: ollama/ollama:0.34.4
     # Invoked via bash rather than as ["/entrypoint.sh"] so the script does not
     # need its executable bit. That bit is not reliably preserved when the
     # project is distributed as a zip (Finder compress, cloud storage, or a
