@@ -50,8 +50,11 @@ fidelity for an older corpus.
 If the target machine has no embedding model at all, export with
 `include_models: true`. That bundles `@@EMBED_MODEL@@` and `@@LLM_MODEL@@` as
 Ollama's own manifest and blob files, taking the package from kilobytes to
-roughly 2.3 GB. On import a model already present is left alone; a missing one is
-installed from the package and checked before the collection is built.
+roughly 2.3 GB. On import a model already present is left alone, provided its
+files match their checksums; a missing one is installed from the package and
+checked before the collection is built. If the embedding model is present but
+damaged, the import fails with `MODEL_INTEGRITY_FAILED`: restore or re-pull it,
+then import again.
 
 Without bundled models, importing into a machine that lacks the embedding model
 fails with `EMBEDDING_MODEL_MISSING` — a different error from a mismatch, because

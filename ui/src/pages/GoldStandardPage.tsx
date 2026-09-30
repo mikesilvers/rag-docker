@@ -7,7 +7,12 @@ export default function GoldStandardPage() {
   const [sampleSize, setSampleSize] = useState(20)
   const [session, setSession] = useState<Session | null>(null)
   const [sessionId, setSessionId] = useState('')
+  const [sessionLookup, setSessionLookup] = useState('')
+  const [allowHistorical, setAllowHistorical] = useState(false)
   const [loading, setLoading] = useState(false)
+  const [exportPending, setExportPending] = useState(false)
+  const exportPendingRef = useRef(false)
+  const activeSessionRef = useRef('')
   const [error, setError] = useState('')
   const [filename, setFilename] = useState('')
   const [saveResult, setSaveResult] = useState('')
@@ -26,26 +31,50 @@ export default function GoldStandardPage() {
 
   useEffect(() => {
     if (!sessionId) return
+    let active = true
     pollRef.current = setInterval(async () => {
       try {
         const s = await api.getSession(sessionId)
+        if (!active || activeSessionRef.current !== sessionId) return
         setSession(s)
         if (s.status !== 'generating') {
           clearInterval(pollRef.current!)
         }
       } catch { /* ignore */ }
     }, 2000)
-    return () => { if (pollRef.current) clearInterval(pollRef.current) }
+    return () => { active = false; if (pollRef.current) clearInterval(pollRef.current) }
   }, [sessionId])
 
+  useEffect(() => {
+    setAllowHistorical(false)
+  }, [sessionId, session?.stale, session?.orphaned, session?.stale_at, session?.orphaned_at])
+
+  async function loadSession() {
+    const id = sessionLookup.trim()
+    if (!id || exportPendingRef.current) return
+    activeSessionRef.current = ''
+    setSessionId(''); setSession(null); setAllowHistorical(false); setFilename(''); setEditingPair(null)
+    setError(''); setSaveResult(''); setLoading(true)
+    try {
+      const loaded = await api.getSession(id)
+      activeSessionRef.current = loaded.session_id
+      setSessionId(loaded.session_id); setSession(loaded); setAllowHistorical(false)
+      setFilename('')
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally { setLoading(false) }
+  }
+
   async function generate() {
-    if (session && !confirm('This will start a new session and replace the current one. Any unsaved pairs will be lost. Continue?')) return
+    if (session && !confirm('Start a new session? You can inspect this retained session again using its session ID.')) return
     setError('')
     setLoading(true)
     setSaveResult('')
     try {
       const res = await api.generateGoldStandard({ collection, sample_size: sampleSize })
+      activeSessionRef.current = res.session_id
       setSessionId(res.session_id)
+      setSessionLookup(res.session_id)
       setSession(null)
       const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15)
       setFilename(`${collection}_${ts}.json`)
@@ -78,14 +107,15 @@ export default function GoldStandardPage() {
   }
 
   async function saveExport() {
-    if (!sessionId) return
+    if (!sessionId || exportPendingRef.current || loading) return
+    exportPendingRef.current = true; setExportPending(true); setError(''); setSaveResult('')
     try {
-      const res = await api.saveSession({ session_id: sessionId, filename: filename || undefined })
-      setSaveResult(`${res.pairs_saved} pairs exported, ${res.pairs_excluded} excluded.`)
+      const res = await api.saveSession({ session_id: sessionId, filename: filename || undefined, allow_historical: allowHistorical })
+      setSaveResult(`${res.pairs_saved} pairs exported, ${res.pairs_excluded} excluded.${res.historical ? " Historical data; not a current collection baseline." : ""}`)
       window.open(api.downloadUrl(res.filename), '_blank')
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
-    }
+    } finally { exportPendingRef.current = false; setExportPending(false) }
   }
 
   function openEdit(pair: GoldPair) {
@@ -109,7 +139,8 @@ export default function GoldStandardPage() {
   const edited = session?.pairs.filter(p => p.status === 'edited').length ?? 0
   const rejected = session?.pairs.filter(p => p.status === 'rejected').length ?? 0
   const pending = session?.pairs.filter(p => p.status === 'pending').length ?? 0
-  const canExport = approved + edited > 0
+  const historical = Boolean(session?.stale || session?.orphaned)
+  const canExport = approved + edited > 0 && (!historical || allowHistorical)
 
   return (
     <div className="max-w-4xl mx-auto">
@@ -128,7 +159,7 @@ export default function GoldStandardPage() {
             <label className="block text-xs text-gray-600 mb-1">Sample Size (1–100)</label>
             <input type="number" min={1} max={100} value={sampleSize} onChange={e => setSampleSize(+e.target.value)} className="border rounded px-3 py-2 text-sm w-24" />
           </div>
-          <button onClick={generate} disabled={loading} className="bg-blue-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-blue-700">
+          <button onClick={generate} disabled={loading || exportPending} className="bg-blue-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-blue-700">
             Generate Pairs
           </button>
         </div>
@@ -143,7 +174,25 @@ export default function GoldStandardPage() {
         )}
       </div>
 
+      <div className="bg-white border rounded p-4 mb-6">
+        <label htmlFor="retained-session" className="block text-sm font-semibold mb-2">Inspect a retained session</label>
+        <div className="flex gap-3">
+          <input id="retained-session" disabled={exportPending} value={sessionLookup} onChange={e => setSessionLookup(e.target.value)} placeholder="Session ID" className="border rounded px-3 py-2 text-sm flex-1" />
+          <button onClick={loadSession} disabled={loading || exportPending || !sessionLookup.trim()} className="border rounded px-3 py-2 text-sm disabled:opacity-50">Load / refresh session</button>
+        </div>
+        {session && <p className="text-xs text-gray-500 mt-2">Session {session.session_id} · Collection {session.collection}</p>}
+      </div>
+
       {error && <p className="text-red-600 text-sm mb-4">{error}</p>}
+      {session && historical && (
+        <div role="alert" className="border border-amber-300 bg-amber-50 rounded p-4 mb-6">
+          <h2 className="font-semibold">Historical evaluation data</h2>
+          <p className="text-sm">These retained pairs are not a current collection baseline. Review them as historical data.</p>
+          {session.stale && <p className="text-sm mt-2">Stale: {session.stale_reason || 'No reason was recorded.'} {session.stale_at && <span>Recorded {session.stale_at}</span>}</p>}
+          {session.orphaned && <p className="text-sm mt-2">Orphaned: {session.orphaned_reason || 'No reason was recorded.'} {session.orphaned_at && <span>Recorded {session.orphaned_at}</span>}</p>}
+        </div>
+      )}
+
 
       {session && session.pairs.length > 0 && (
         <div className="bg-white border rounded p-4 mb-6">
@@ -182,10 +231,15 @@ export default function GoldStandardPage() {
       {session && session.pairs.length > 0 && (
         <div className="bg-white border rounded p-4">
           <h2 className="font-semibold mb-3">Phase 3 — Export</h2>
+          {historical && <label className="flex gap-2 items-start text-sm mb-3">
+            <input type="checkbox" checked={allowHistorical} onChange={e => setAllowHistorical(e.target.checked)} />
+            <span>I want to export historical pairs. The RAGAS file does not carry these validity warnings and must not be treated as a current baseline.</span>
+          </label>}
+
           <div className="flex gap-3 items-center">
             <input value={filename} onChange={e => setFilename(e.target.value)} placeholder="filename.json" className="border rounded px-3 py-2 text-sm flex-1" />
-            <button onClick={saveExport} disabled={!canExport} className="bg-green-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-green-700">
-              Export Approved
+            <button onClick={saveExport} disabled={!canExport || exportPending || loading} className="bg-green-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-green-700">
+              {exportPending ? "Exporting…" : historical ? "Export Historical Approved" : "Export Approved"}
             </button>
           </div>
           {saveResult && <p className="text-sm text-green-600 mt-2">{saveResult}</p>}

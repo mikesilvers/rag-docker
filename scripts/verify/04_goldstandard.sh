@@ -12,8 +12,12 @@ C="${PREFIX}Gold"
 
 section "§10.3 Gold Standard"
 
+# Selection needs the backend but no LLM work; include it even in slow-skip runs.
+bash ./09_sampling.sh
+check "UUID sampling acceptance" $?
+
 if [ "$SKIP_SLOW" = "1" ]; then
-  skip "§10.3 entirely" "every check needs LLM generation"
+  skip "LLM generation/review/export" "set RAG_SKIP_SLOW=0 to include them"
   summary; exit $?
 fi
 

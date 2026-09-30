@@ -14,6 +14,7 @@ from models.schemas import (
     SaveRequest,
     SaveResponse,
     SessionResponse,
+    SessionValidity,
 )
 from services import goldstandard as gs
 from services import weaviate_client as wc
@@ -56,6 +57,7 @@ async def get_session(session_id: str):
         pairs=pairs,
         collection=session.get("collection", ""),
         errors=session.get("errors", []),
+        **SessionValidity.model_validate(session).model_dump(),
     )
 
 
@@ -81,7 +83,10 @@ async def regenerate(body: RegenerateRequest):
 
 @router.post("/save", response_model=SaveResponse)
 async def save(body: SaveRequest):
-    result = await gs.save_session(body.session_id, body.filename)
+    try:
+        result = await gs.save_session(body.session_id, body.filename, body.allow_historical)
+    except gs.GoldStandardError as exc:
+        return api_error(exc.status, exc.code, exc.message)
     if result is None:
         return api_error(404, "SESSION_NOT_FOUND", f"Session '{body.session_id}' not found.")
     return SaveResponse(**result)

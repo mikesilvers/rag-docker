@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import random
 import sys
 import zipfile
 
@@ -31,8 +32,13 @@ PARAGRAPHS = [
 ONE_LINER = PARAGRAPHS[0]
 
 
-def _pdf(paragraphs: list[str]) -> bytes:
-    """A minimal single-page PDF. Hand-built to avoid a writer dependency."""
+def _pdf(paragraphs: list[str], padding: int = 0) -> bytes:
+    """A minimal single-page PDF. Hand-built to avoid a writer dependency.
+
+    `padding` adds an unreferenced stream object of that many bytes. No page
+    points at it, so parsers skip it: the file is large on the wire but carries
+    only the text above, which keeps an upload-size test fast to ingest.
+    """
     lines: list[str] = []
     for para in paragraphs:
         cur = ""
@@ -59,6 +65,12 @@ def _pdf(paragraphs: list[str]) -> bytes:
         b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
     ]
+    if padding:
+        # Seeded so the fixture is byte-identical on every run. Random bytes
+        # rather than zeros so nothing on the path can compress it away.
+        filler = random.Random(21).randbytes(padding)
+        objects.append(b"<< /Length " + str(padding).encode() + b" >>\nstream\n"
+                       + filler + b"\nendstream")
     out = bytearray(b"%PDF-1.4\n")
     offsets = []
     for number, body in enumerate(objects, 1):
@@ -119,6 +131,9 @@ def write(target: pathlib.Path) -> None:
     (target / "tiny.txt").write_text("Short.\n\nAlso short.\n\n" + ONE_LINER + "\n")
     # Right extension, unparseable content — one bad file must not fail a batch.
     (target / "broken.pdf").write_bytes(b"%PDF-1.4\nnot a real pdf body\n%%EOF\n")
+    # Over nginx's 1 MB default request-body limit, which once rejected every
+    # real-world PDF with a 413 before the API saw it. See issue #21.
+    (target / "large.pdf").write_bytes(_pdf(PARAGRAPHS, padding=3 * 1024 * 1024))
     # Unsupported types, which must be reported rather than dropped in silence.
     (target / "notes.xyz").write_text("unsupported\n")
     (target / "notes.rtf").write_text("also unsupported\n")

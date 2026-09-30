@@ -3,9 +3,14 @@
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
-[ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
+# Regenerate when the newest fixture is missing, so a directory left by an
+# older run does not hide a check behind a missing file.
+[ -f "$FIX/large.pdf" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
+# Run the independent text-storage window acceptance without model work.
+bash ./08_overlap.sh
+check "bounded overlap text-storage acceptance" $?
 C="${PREFIX}Ingest"
 
 # Uploads a set of files and echoes the finished job document to a file.
@@ -56,6 +61,36 @@ python3 -c "
 import json,sys; d=json.load(open('/tmp/vfy_job.json'))
 sys.exit(0 if all('unsupported type' in s for s in d.get('skipped',[])) else 1)"
 check "each skip names the unsupported extension" $?
+
+# ── upload size limit at the proxy ───────────────────────────────────────────
+# nginx refuses request bodies over `client_max_body_size` (default 1 MB) with
+# a 413 before the API sees them, so every real-world PDF failed through the
+# UI while the few-KB fixtures here all passed. These go through $API, which is
+# the proxy, on purpose. See issue #21.
+size=$(python3 -c "import os;print(os.path.getsize('$FIX/large.pdf'))")
+[ "$size" -gt 1048576 ]
+check "the large fixture is over nginx's 1 MB default" $? "$size bytes"
+
+drop_collection "$C"; make_collection "$C"
+if ingest "$C" fixed 300 50 "$FIX/large.pdf"; then
+  read -r status completed chunks <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], d['chunks_stored'])")"
+else
+  status="rejected"; completed=0; chunks=0
+fi
+[ "$status" = completed ] && [ "$completed" = 1 ] && [ "$chunks" -gt 0 ]
+check "an upload over 1 MB is accepted through the proxy and ingests" $? \
+  "status=$status completed=$completed chunks=$chunks"
+
+# Just over the 512 MB limit. A sparse file, so nothing is written to disk, and
+# nginx answers from the Content-Length header without reading the body.
+big_dir=$(mktemp -d)
+python3 -c "open('$big_dir/oversize.txt','wb').truncate(513*1024*1024)"
+code=$(curl -s -o /dev/null -m 120 -w '%{http_code}' -X POST "$API/ingest/upload" \
+  -F "collection=$C" -F "strategy=fixed" -F "files=@$big_dir/oversize.txt")
+rm -rf "$big_dir"
+check_eq "an upload over the 512 MB limit is refused with 413" "$code" "413"
 
 # ── every chunking strategy against a PDF ────────────────────────────────────
 for strategy in fixed overlap language context_aware semantic; do

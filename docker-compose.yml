@@ -75,7 +75,7 @@ services:
       OLLAMA_MODELS_DIR: /ollama
       # Shown by /health and compared against the memory Docker actually
       # provides. Raise this if you allocate more to Docker Desktop.
-      RECOMMENDED_MEMORY_GB: 10
+      RECOMMENDED_MEMORY_GB: 12
     volumes:
       - ingest_uploads:/app/uploads
       # Retained source documents; grows with the corpus.
@@ -109,7 +109,8 @@ services:
   proxy:
     image: nginx:1.29-alpine
     ports:
-      - "8080:80"
+      # This unauthenticated workbench is local to the host by default.
+      - "127.0.0.1:8080:80"
     volumes:
       - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
     networks: [rag-internal]

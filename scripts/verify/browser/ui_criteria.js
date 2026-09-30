@@ -36,6 +36,56 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.ctx.close();
   }
 
+  // ── owned historical UI fixtures (no persistent backend state) ────────────
+  r.section('retained-session UI boundaries');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    const suffix = require('crypto').randomBytes(4).toString('hex');
+    const emptyId = 'gs_' + suffix, currentId = 'gs_' + require('crypto').randomBytes(4).toString('hex');
+    const missingId = 'gs_' + require('crypto').randomBytes(4).toString('hex');
+    const common = { collection: 'OwnedHistoricalBrowserFixture', status: 'completed', pairs_total: 0, pairs_completed: 0, pairs: [] };
+    let exports = 0;
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/goldstandard/session/' + emptyId) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...common, session_id: emptyId, stale: true, stale_reason: 'Synthetic empty history', stale_at: '2026-09-28T00:00:00+00:00', orphaned: true, orphaned_reason: 'Synthetic deleted fixture', orphaned_at: '2026-09-28T00:01:00+00:00' }) });
+      }
+      if (path === '/api/goldstandard/session/' + currentId) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...common, session_id: currentId, pairs_total: 1, pairs_completed: 1, pairs: [{ pair_id: 'fixture', question: 'Owned synthetic question', answer: 'Inert', contexts: ['Inert'], ground_truth: 'Inert', source_file: 'inert.txt', chunk_index: 0, status: 'approved' }] }) });
+      }
+      if (path === '/api/goldstandard/session/' + missingId) {
+        return request.respond({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: { code: 'SESSION_NOT_FOUND', message: 'Unknown fixture session.' } }) });
+      }
+      if (path === '/api/goldstandard/save') {
+        exports++; await sleep(500);
+        return request.respond({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: { message: 'Synthetic export failure.' } }) });
+      }
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/goldstandard', { waitUntil: 'networkidle2' });
+      async function load(id) {
+        await s.page.evaluate(value => { const input = document.getElementById('retained-session'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, value); input.dispatchEvent(new Event('input', { bubbles: true })); }, id);
+        await sleep(100); await clickByText(s.page, 'Load / refresh session'); await sleep(200);
+      }
+      await load(emptyId);
+      const empty = await bodyText(s.page);
+      r.check('empty historical session keeps stale/orphaned reasons and timestamps visible', /Historical evaluation data/.test(empty) && /Synthetic empty history/.test(empty) && /Synthetic deleted fixture/.test(empty) && /2026-09-28T00:00/.test(empty));
+      r.check('empty historical session has no pair-dependent export button', await s.page.evaluate(() => ![...document.querySelectorAll('button')].some(b => /Export.*Approved/.test(b.textContent))));
+      await load(currentId);
+      r.check('legacy current fixture remains exportable without warning', await s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Export Approved'); return b && !b.disabled && !document.querySelector('[role=alert]'); }));
+      await s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Export Approved'); b.click(); b.click(); });
+      await sleep(100);
+      r.check('an export in flight indicates progress and is disabled', await s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Exporting…'); return b && b.disabled; }));
+      await sleep(700);
+      r.check('duplicate clicks issue one export and failure clears pending state', exports===1 && await s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Export Approved'); return b && !b.disabled && document.body.innerText.includes('Synthetic export failure.'); }));
+      await load(missingId);
+      r.check('a failed retained lookup clears prior pairs and export controls', /Unknown fixture session/.test(await bodyText(s.page)) && await s.page.evaluate(() => ![...document.querySelectorAll('button')].some(b=>/Export.*Approved/.test(b.textContent)) && !document.body.innerText.includes('Owned synthetic question')));
+      r.check('historical UI fixtures cause no React page errors', !s.errors.some(error=>error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); } // All synthetic responses/context owned here.
+  }
+
   // ── role gating ────────────────────────────────────────────────────────────
   r.section('§10.4 role gating');
   {
@@ -121,6 +171,37 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
       r.check('a wrong name sends no DELETE',
               s.api.filter(x => x.method === 'DELETE').length === before);
     }
+    await s.ctx.close();
+  }
+
+  // ── upload size limit ──────────────────────────────────────────────────────
+  // The Import page refuses a selection over the proxy's limit before sending.
+  // The file is sparse: it reports 513 MB but occupies no disk, and the check
+  // must stop it before the browser ever reads it. See issue #21.
+  r.section('upload size limit');
+  {
+    const fs = require('fs');
+    const big = '/tmp/vfy-oversize-upload.txt';
+    fs.closeSync(fs.openSync(big, 'w'));
+    fs.truncateSync(big, 513 * 1024 * 1024);
+    const s = await session(browser, BASE, 'developer');
+    await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+    const hint = await bodyText(s.page);
+    r.check('the drop zone states the upload limit', hint.includes('up to 512 MB per upload'));
+    const input = await s.page.$('#file-input');
+    await input.uploadFile(big);
+    await sleep(500);
+    const posts = () => s.api.filter(x => x.method === 'POST' && x.url.includes('/ingest/upload')).length;
+    const before = posts();
+    const clicked = await clickByText(s.page, 'Start Ingest');
+    await sleep(900);
+    const text = await bodyText(s.page);
+    r.check('an oversize selection is refused with the limit named',
+            clicked && text.includes('one upload can be at most 512 MB'),
+            clicked ? text.slice(0, 160) : 'Start Ingest button not found');
+    r.check('an oversize selection sends no upload', posts() === before);
+    r.check('no console errors on the import page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
+    fs.unlinkSync(big);
     await s.ctx.close();
   }
 

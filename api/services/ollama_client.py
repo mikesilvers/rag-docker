@@ -35,6 +35,14 @@ async def chat(system: str, user: str) -> str:
         return resp.json()["message"]["content"]
 
 
+async def list_models() -> set[str]:
+    """Full names (`name:tag`) of the models Ollama reports."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(f"{_BASE}/api/tags")
+        resp.raise_for_status()
+        return {m["name"] for m in resp.json().get("models", [])}
+
+
 async def check_health() -> dict:
     start = time.monotonic()
     try:

@@ -17,9 +17,12 @@ model that produced the vectors.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import re
+import tempfile
 import logging
-import shutil
 from pathlib import Path
 
 from config import settings
@@ -29,6 +32,9 @@ _log = logging.getLogger(__name__)
 REGISTRY = "registry.ollama.ai"
 NAMESPACE = "library"
 DEFAULT_TAG = "latest"
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_READ_SIZE = 1024 * 1024
 
 
 def _root() -> Path:
@@ -38,17 +44,21 @@ def _root() -> Path:
 def split_ref(model: str) -> tuple[str, str]:
     """'phi3.5' -> ('phi3.5', 'latest'); 'phi3.5:3.8b' -> ('phi3.5', '3.8b')."""
     name, _, tag = model.partition(":")
-    return name, (tag or DEFAULT_TAG)
+    tag = tag or DEFAULT_TAG
+    if not _COMPONENT.fullmatch(name) or not _COMPONENT.fullmatch(tag):
+        raise ValueError("Model name and tag must be simple path components")
+    return name, tag
 
 
 def manifest_path(model: str) -> Path:
     name, tag = split_ref(model)
-    return _root() / "manifests" / REGISTRY / NAMESPACE / name / tag
+    return _contained(_root(), "manifests", REGISTRY, NAMESPACE, name, tag)
 
 
 def blob_path(digest: str) -> Path:
     # Manifests write 'sha256:<hex>'; the filename on disk is 'sha256-<hex>'.
-    return _root() / "blobs" / digest.replace(":", "-")
+    _validate_digest(digest)
+    return _contained(_root(), "blobs", digest.replace(":", "-"))
 
 
 def store_available() -> bool:
@@ -56,29 +66,92 @@ def store_available() -> bool:
     return _root().is_dir()
 
 
-def is_installed(model: str) -> bool:
-    """A model counts as installed only if every blob it names is present."""
-    mp = manifest_path(model)
-    if not mp.is_file():
-        return False
+def _contained(root: Path, *parts: str) -> Path:
+    """Reject symlinks and paths outside the configured store/package root."""
+    root = root.resolve()
+    path = root.joinpath(*parts)
+    if not path.resolve().is_relative_to(root):
+        raise ValueError("Model path leaves its storage root")
+    current = root
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"Model storage path is a symlink: {current.name}")
+    return path
+
+
+def _validate_digest(digest) -> None:
+    if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+        raise ValueError("Model blob digest must be sha256 followed by 64 lowercase hex digits")
+
+
+def _digests(manifest: dict) -> list[str]:
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("config"), dict):
+        raise ValueError("Model manifest must contain a config object")
+    layers = manifest.get("layers")
+    if not isinstance(layers, list) or any(not isinstance(layer, dict) for layer in layers):
+        raise ValueError("Model manifest layers must be an array of objects")
+    digests = [manifest["config"].get("digest"), *(layer.get("digest") for layer in layers)]
+    for digest in digests:
+        _validate_digest(digest)
+    return list(dict.fromkeys(digests))
+
+
+def _check_blob(path: Path, digest: str) -> None:
+    if not path.is_file() or path.is_symlink():
+        raise FileNotFoundError(f"Model blob is not a regular file: {path.name}")
+    actual = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(_READ_SIZE):
+            actual.update(chunk)
+    if actual.hexdigest() != digest.split(":", 1)[1]:
+        raise ValueError(f"Model blob bytes disagree with {digest}; restore the content before importing")
+
+
+def supports_name(model: str) -> bool:
+    """Whether the model has a path in this store layout.
+
+    Namespaced names (`user/model`, `hf.co/org/model`) don't: they can still be
+    pulled and served by Ollama, but they can't be checked or installed here.
+    """
     try:
-        for digest in _digests(json.loads(mp.read_text())):
-            if not blob_path(digest).is_file():
-                return False
-    except (OSError, ValueError, KeyError):
+        split_ref(model)
+    except ValueError:
         return False
     return True
 
 
-def _digests(manifest: dict) -> list[str]:
-    digests = []
-    config = manifest.get("config") or {}
-    if config.get("digest"):
-        digests.append(config["digest"])
-    for layer in manifest.get("layers") or []:
-        if layer.get("digest"):
-            digests.append(layer["digest"])
-    return digests
+def installed_state(model: str) -> str:
+    """'present', 'absent' or 'corrupt'.
+
+    'corrupt' means a manifest exists but a referenced blob is missing or its
+    bytes disagree with its address. Import treats that as its own outcome:
+    telling the user to pull a model they already have would send them the
+    wrong way.
+    """
+    split_ref(model)  # a name with no path here is the caller's to handle (supports_name)
+    try:
+        mp = manifest_path(model)
+    except ValueError:
+        # A path that leaves the store or passes through a symlink is not a
+        # model this store can vouch for.
+        return "corrupt"
+    if not mp.is_file():
+        return "absent"
+    try:
+        for digest in _digests(json.loads(mp.read_text())):
+            _check_blob(blob_path(digest), digest)
+    except (OSError, ValueError):
+        return "corrupt"
+    return "present"
+
+
+def is_installed(model: str) -> bool:
+    """A model is installed only if its referenced bytes match their addresses."""
+    try:
+        return installed_state(model) == "present"
+    except (OSError, ValueError):
+        return False
 
 
 def export_model(model: str, dest: Path) -> list[tuple[str, Path]]:
@@ -110,38 +183,74 @@ def bundled_models(pkg: Path) -> list[str]:
     return sorted(p.name for p in d.iterdir() if p.is_dir() and (p / "manifest.json").is_file())
 
 
-def install_model(pkg: Path, model: str) -> None:
-    """Copy a bundled model into the live store, blobs before the manifest.
+def _publish(path: Path, write, *, replace: bool = True) -> None:
+    """Write a unique private temporary file and publish only verified bytes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, filename = tempfile.mkstemp(prefix=path.name + ".", suffix=".partial", dir=path.parent)
+    tmp = Path(filename)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            write(output)
+            output.flush()
+            os.fsync(output.fileno())
+        if replace:
+            tmp.replace(path)
+        else:
+            try:
+                os.link(tmp, path)  # An independent installer may have won; never overwrite its blob.
+            except FileExistsError:
+                pass               # The caller verifies the winning content before publishing a manifest.
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        tmp.unlink(missing_ok=True)
 
-    Order matters: the manifest is what makes Ollama consider the model
-    present, so writing it last means an interrupted install leaves unreferenced
-    blobs rather than a model that cannot be served.
+
+def install_model(pkg: Path, model: str) -> None:
+    """Verify all referenced bytes before publishing the captured manifest.
+
+    Existing content is checked and reused unchanged. A corrupt existing blob
+    is refused rather than replacing shared content behind other model names.
+    An interrupted install can leave valid unreferenced blobs, never a newly
+    published manifest whose bytes were not checked.
     """
-    name, tag = split_ref(model)
-    src = pkg / "models" / name
-    src_manifest = src / "manifest.json"
+    name, _ = split_ref(model)
+    src = _contained(pkg, "models", name)
+    src_manifest = _contained(src, "manifest.json")
     if not src_manifest.is_file():
         raise FileNotFoundError(f"Package does not bundle '{model}'")
-    manifest = json.loads(src_manifest.read_text())
+    manifest_bytes = src_manifest.read_bytes()
+    digests = _digests(json.loads(manifest_bytes))
+    destination = manifest_path(model)
+    references = []
+    for digest in digests:
+        source = _contained(src, "blobs", digest.replace(":", "-"))
+        target = blob_path(digest)
+        _check_blob(source, digest)
+        if target.exists():
+            _check_blob(target, digest)
+        references.append((digest, source, target))
 
-    blobs_dir = _root() / "blobs"
-    blobs_dir.mkdir(parents=True, exist_ok=True)
-    for digest in _digests(manifest):
-        filename = digest.replace(":", "-")
-        target = blobs_dir / filename
-        if target.is_file():
-            continue                      # content-addressed: identical by name
-        source = src / "blobs" / filename
-        if not source.is_file():
-            raise FileNotFoundError(
-                f"Bundled model '{model}' is missing blob {digest}")
-        tmp = target.with_name(filename + ".partial")
-        shutil.copyfile(source, tmp)
-        tmp.replace(target)
+    for digest, source, target in references:
+        if target.exists():
+            _check_blob(target, digest)
+            continue
+        def copy_verified(output, source=source, digest=digest):
+            actual = hashlib.sha256()
+            with source.open("rb") as data:
+                while chunk := data.read(_READ_SIZE):
+                    actual.update(chunk)
+                    output.write(chunk)
+            if actual.hexdigest() != digest.split(":", 1)[1]:
+                raise ValueError(f"Bundled blob changed or disagrees with {digest}")
+        _publish(target, copy_verified, replace=False)
 
-    dest_manifest = manifest_path(model)
-    dest_manifest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest_manifest.with_name(tag + ".partial")
-    shutil.copyfile(src_manifest, tmp)
-    tmp.replace(dest_manifest)
+    # Recheck reused files after writes too; manifest data itself is the exact
+    # snapshot whose grammar and references were preflighted, not a reread.
+    for digest, _, target in references:
+        _check_blob(blob_path(digest), digest)
+    _publish(destination, lambda output: output.write(manifest_bytes))
     _log.info("Installed model %r from package", model)

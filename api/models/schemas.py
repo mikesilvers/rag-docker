@@ -1,21 +1,67 @@
 from __future__ import annotations
-from typing import Any, Optional
-from pydantic import BaseModel, field_validator, model_validator
+from typing import Any, Optional, Annotated, Literal
+from pydantic import BaseModel, Field, BeforeValidator, field_validator, model_validator
+
+
+def _numeric(value):
+    if isinstance(value, bool):
+        raise ValueError("A numeric setting cannot be a boolean")
+    return value
+
+
+IndexType = Literal["hnsw", "flat"]
+DistanceMetric = Literal["cosine", "dot", "l2-squared"]
+RetrievalMode = Literal["hnsw", "flat", "hybrid", "semantic"]
+ResponseFormat = Literal["end_user", "engineer"]
+ChunkingStrategy = Literal["fixed", "overlap", "language", "context_aware", "semantic"]
+PositiveSize = Annotated[int, BeforeValidator(_numeric), Field(ge=1)]
+NonnegativeSize = Annotated[int, BeforeValidator(_numeric), Field(ge=0)]
+# Chunk bounds (#53): at least 50 characters, so a size-driven strategy can't
+# be asked for one-character chunks; at most 6,000, about the 1,500 tokens the
+# embedding model reads. `semantic` splits by similarity and ignores
+# chunk_size, so these don't bound its chunks. They apply to settings being
+# saved or used; a saved configuration from before them is still served and
+# exported as it is.
+ChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=50, le=6000)]
+MinChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=0, le=6000)]
+UnitInterval = Annotated[float, BeforeValidator(_numeric), Field(ge=0, le=1, allow_inf_nan=False)]
+TopK = Annotated[int, BeforeValidator(_numeric), Field(ge=1, le=50)]
+SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=16, le=512)]
 
 
 # ── Collections ──────────────────────────────────────────────────────────────
 
 class HnswConfig(BaseModel):
-    efConstruction: int = 128
-    maxConnections: int = 64
-    ef: int = 64
+    efConstruction: Annotated[int, BeforeValidator(_numeric), Field(ge=64, le=512)] = 128
+    maxConnections: Annotated[int, BeforeValidator(_numeric), Field(ge=16, le=128)] = 64
+    ef: SearchEf = 64
 
 
 class CreateCollectionRequest(BaseModel):
     name: str
-    index_type: str = "hnsw"
-    distance_metric: str = "cosine"
+    index_type: IndexType = "hnsw"
+    distance_metric: DistanceMetric = "cosine"
     hnsw_config: HnswConfig = HnswConfig()
+
+
+class StoredHnswConfig(BaseModel):
+    # Existing SDK/server settings may exceed the workbench's new-request UI
+    # ranges. Preserve them during import/rebuild without accepting booleans,
+    # zero/negative sizes or unsupported index/distance names.
+    efConstruction: PositiveSize = 128
+    maxConnections: PositiveSize = 64
+    ef: Annotated[int, BeforeValidator(_numeric), Field(ge=-1)] = 64
+
+    @field_validator("ef")
+    @classmethod
+    def _nonzero_ef(cls, value):
+        if value == 0:
+            raise ValueError("Stored ef must be -1 (dynamic) or positive")
+        return value
+
+
+class StoredCollectionRequest(CreateCollectionRequest):
+    hnsw_config: StoredHnswConfig = StoredHnswConfig()
 
 
 class CollectionInfo(BaseModel):
@@ -53,11 +99,17 @@ class JobStatusResponse(BaseModel):
 
 
 class IngestConfig(BaseModel):
-    chunking_strategy: str = "overlap"
-    chunk_size: int = 1000
-    chunk_overlap: int = 200
-    similarity_threshold: Optional[float] = None
-    min_chunk_size: int = 100
+    chunking_strategy: ChunkingStrategy = "overlap"
+    chunk_size: ChunkSize = 1000
+    chunk_overlap: NonnegativeSize = 200
+    similarity_threshold: Optional[UnitInterval] = None
+    min_chunk_size: MinChunkSize = 100
+
+    @model_validator(mode="after")
+    def _relationships(self):
+        if self.chunking_strategy in ("overlap", "language") and self.chunk_overlap >= self.chunk_size:
+            raise ValueError("chunk_overlap must be smaller than chunk_size for overlap/language")
+        return self
 
 
 class IngestConfigResponse(BaseModel):
@@ -74,43 +126,11 @@ class IngestConfigResponse(BaseModel):
 
 class SaveRetrievalConfigBody(BaseModel):
     collection: str
-    retrieval_mode: str = "hnsw"
-    top_k: int = 5
-    alpha: float = 0.75
-    ef: Optional[int] = None
-    response_format: str = "end_user"
-
-    @field_validator("retrieval_mode")
-    @classmethod
-    def _mode(cls, v: str) -> str:
-        # "semantic" routes to Weaviate near_text in rag_pipeline.run_query;
-        # it is offered on the Retrieval page, so the stored config must accept it.
-        allowed = ("hnsw", "flat", "hybrid", "semantic")
-        if v not in allowed:
-            raise ValueError(f"retrieval_mode must be one of {allowed}, got {v!r}")
-        return v
-
-    @field_validator("response_format")
-    @classmethod
-    def _fmt(cls, v: str) -> str:
-        allowed = ("end_user", "engineer")
-        if v not in allowed:
-            raise ValueError(f"response_format must be one of {allowed}, got {v!r}")
-        return v
-
-    @field_validator("top_k")
-    @classmethod
-    def _top_k(cls, v: int) -> int:
-        if not 1 <= v <= 50:
-            raise ValueError("top_k must be between 1 and 50")
-        return v
-
-    @field_validator("alpha")
-    @classmethod
-    def _alpha(cls, v: float) -> float:
-        if not 0.0 <= v <= 1.0:
-            raise ValueError("alpha must be between 0 and 1")
-        return v
+    retrieval_mode: RetrievalMode = "hnsw"
+    top_k: TopK = 5
+    alpha: UnitInterval = 0.75
+    ef: Optional[SearchEf] = None
+    response_format: ResponseFormat = "end_user"
 
 
 class RetrievalConfigResponse(BaseModel):
@@ -219,18 +239,17 @@ CHUNKING_STRATEGIES = ("fixed", "overlap", "language", "context_aware", "semanti
 
 
 class _ChunkingFields(BaseModel):
-    chunking_strategy: Optional[str] = None
-    chunk_size: Optional[int] = None
-    chunk_overlap: Optional[int] = None
-    similarity_threshold: Optional[float] = None
-    min_chunk_size: Optional[int] = None
+    chunking_strategy: Optional[ChunkingStrategy] = None
+    chunk_size: Optional[ChunkSize] = None
+    chunk_overlap: Optional[NonnegativeSize] = None
+    similarity_threshold: Optional[UnitInterval] = None
+    min_chunk_size: Optional[MinChunkSize] = None
 
-    @field_validator("chunking_strategy")
-    @classmethod
-    def _strategy(cls, v):
-        if v is not None and v not in CHUNKING_STRATEGIES:
-            raise ValueError(f"chunking_strategy must be one of {CHUNKING_STRATEGIES}, got {v!r}")
-        return v
+    @model_validator(mode="after")
+    def _relationships(self):
+        IngestConfig(**{name: getattr(self, name) for name in IngestConfig.model_fields
+                        if getattr(self, name) is not None})
+        return self
 
     def has_chunking(self) -> bool:
         return any(getattr(self, f) is not None for f in
@@ -260,23 +279,8 @@ class ReembedRequest(_ChunkingFields):
 
 class ReindexRequest(BaseModel):
     collection: str
-    index_type: Optional[str] = None
-    distance_metric: Optional[str] = None
-
-    @field_validator("index_type")
-    @classmethod
-    def _index(cls, v):
-        if v is not None and v not in ("hnsw", "flat"):
-            raise ValueError(f"index_type must be 'hnsw' or 'flat', got {v!r}")
-        return v
-
-    @field_validator("distance_metric")
-    @classmethod
-    def _distance(cls, v):
-        allowed = ("cosine", "dot", "l2-squared")
-        if v is not None and v not in allowed:
-            raise ValueError(f"distance_metric must be one of {allowed}, got {v!r}")
-        return v
+    index_type: Optional[IndexType] = None
+    distance_metric: Optional[DistanceMetric] = None
 
 
 class TuneStartResponse(BaseModel):
@@ -314,11 +318,11 @@ class TuneOptionsResponse(BaseModel):
 class QueryRequest(BaseModel):
     question: str
     collection: str
-    retrieval_mode: str = "hnsw"
-    top_k: int = 5
-    alpha: float = 0.75
+    retrieval_mode: RetrievalMode = "hnsw"
+    top_k: TopK = 5
+    alpha: UnitInterval = 0.75
     include_citations: bool = False
-    response_format: str = "end_user"
+    response_format: ResponseFormat = "end_user"
 
 
 class Citation(BaseModel):
@@ -343,6 +347,20 @@ class GenerateRequest(BaseModel):
     sample_size: int = 20
     seed: Optional[int] = None
 
+    @field_validator("sample_size", "seed", mode="before")
+    @classmethod
+    def _numeric(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("Sampling settings cannot be booleans")
+        return value
+
+    @field_validator("sample_size")
+    @classmethod
+    def _sample_size(cls, value):
+        if not 1 <= value <= 100:
+            raise ValueError("sample_size must be between 1 and 100")
+        return value
+
 
 class GenerateResponse(BaseModel):
     session_id: str
@@ -366,7 +384,16 @@ class GoldPair(BaseModel):
     status: str
 
 
-class SessionResponse(BaseModel):
+class SessionValidity(BaseModel):
+    stale: bool = False
+    stale_reason: Optional[str] = None
+    stale_at: Optional[str] = None
+    orphaned: bool = False
+    orphaned_reason: Optional[str] = None
+    orphaned_at: Optional[str] = None
+
+
+class SessionResponse(SessionValidity):
     session_id: str
     status: str
     pairs_total: int
@@ -421,6 +448,14 @@ class RegenerateRequest(BaseModel):
 class SaveRequest(BaseModel):
     session_id: str
     filename: Optional[str] = None
+    allow_historical: bool = False
+
+    @field_validator("allow_historical", mode="before")
+    @classmethod
+    def _explicit_opt_in(cls, value):
+        if not isinstance(value, bool):
+            raise ValueError("allow_historical must be a boolean")
+        return value
 
 
 class SaveResponse(BaseModel):
@@ -428,6 +463,8 @@ class SaveResponse(BaseModel):
     pairs_saved: int
     pairs_excluded: int
     download_url: str
+    historical: bool = False
+    session_validity: SessionValidity = SessionValidity()
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────

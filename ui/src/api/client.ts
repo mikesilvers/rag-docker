@@ -1,5 +1,20 @@
 const BASE = '/api'
 
+// The proxy's request-body limit: `client_max_body_size` in proxy/nginx.conf.
+// It covers a whole request, so a multi-file upload counts every file. Kept
+// here only so the Import page can warn before sending; nginx enforces it.
+// Change both together.
+export const MAX_UPLOAD_MB = 512
+export const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+// Errors the proxy answers itself, before the API sees the request. Those
+// arrive as nginx's HTML error pages, not the API's JSON error shape.
+const PROXY_ERRORS: Record<number, string> = {
+  413: `The upload is larger than the ${MAX_UPLOAD_MB} MB limit. Split it into smaller batches.`,
+  502: 'The API is not responding. It may still be starting; try again in a minute.',
+  504: 'The API took too long to respond.',
+}
+
 async function request<T>(method: string, path: string, body?: unknown, isFormData = false): Promise<T> {
   const headers: Record<string, string> = isFormData ? {} : { 'Content-Type': 'application/json' }
   const res = await fetch(`${BASE}${path}`, {
@@ -7,8 +22,15 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
     headers,
     body: isFormData ? (body as FormData) : body !== undefined ? JSON.stringify(body) : undefined,
   })
-  const data = await res.json()
-  if (!res.ok) throw new Error(data?.error?.message ?? `HTTP ${res.status}`)
+  // Read as text first: calling res.json() on an nginx error page threw a
+  // JSON syntax error, which is what the user saw instead of the real problem.
+  const text = await res.text()
+  let data: any = null
+  try { data = text ? JSON.parse(text) : null } catch { /* not JSON; handled below */ }
+  if (!res.ok) {
+    throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
+  }
+  if (data === null && text) throw new Error('The server sent a response the UI could not read.')
   return data as T
 }
 
@@ -30,10 +52,10 @@ export const api = {
   query: (body: QueryBody) => request<QueryResult>('POST', '/query', body),
 
   generateGoldStandard: (body: GenerateBody) => request<GenerateResult>('POST', '/goldstandard/generate', body),
-  getSession: (sessionId: string) => request<Session>('GET', `/goldstandard/session/${sessionId}`),
-  patchPair: (sessionId: string, pairId: string, body: PatchPairBody) => request<GoldPair>('PATCH', `/goldstandard/session/${sessionId}/pair/${pairId}`, body),
+  getSession: (sessionId: string) => request<Session>('GET', `/goldstandard/session/${encodeURIComponent(sessionId)}`),
+  patchPair: (sessionId: string, pairId: string, body: PatchPairBody) => request<GoldPair>('PATCH', `/goldstandard/session/${encodeURIComponent(sessionId)}/pair/${encodeURIComponent(pairId)}`, body),
   regeneratePair: (body: { session_id: string; pair_id: string }) => request<GoldPair>('POST', '/goldstandard/regenerate', body),
-  saveSession: (body: { session_id: string; filename?: string }) => request<SaveResult>('POST', '/goldstandard/save', body),
+  saveSession: (body: { session_id: string; filename?: string; allow_historical?: boolean }) => request<SaveResult>('POST', '/goldstandard/save', body),
   downloadUrl: (filename: string) => `${BASE}/goldstandard/download/${filename}`,
 
   // Transfer
@@ -88,12 +110,16 @@ export interface GenerateResult { session_id: string; status: string; pairs_tota
 export interface GoldPair {
   pair_id: string; question: string; answer: string; contexts: string[]; ground_truth: string; source_file: string; chunk_index: number; status: string
 }
-export interface Session {
+export interface SessionValidity {
+  stale?: boolean; stale_reason?: string | null; stale_at?: string | null
+  orphaned?: boolean; orphaned_reason?: string | null; orphaned_at?: string | null
+}
+export interface Session extends SessionValidity {
   session_id: string; status: string; pairs_total: number; pairs_attempted?: number
   pairs_completed: number; pairs_failed?: number; pairs: GoldPair[]; collection: string; errors?: string[]
 }
 export interface PatchPairBody { status: string; question?: string; answer?: string; ground_truth?: string }
-export interface SaveResult { filename: string; pairs_saved: number; pairs_excluded: number; download_url: string }
+export interface SaveResult { filename: string; pairs_saved: number; pairs_excluded: number; download_url: string; historical?: boolean; session_validity?: SessionValidity }
 export interface LatencyStats { p50: number; p95: number; p99: number }
 export interface LatencyRecord {
   timestamp: string

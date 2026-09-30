@@ -270,7 +270,7 @@ Annotations: `readOnlyHint: false`, `destructiveHint: false`,
 | Field | Type | Required | Default |
 |---|---|---|---|
 | `collection` | string | yes | — |
-| `sample_size` | integer 1–200 | no | `20` |
+| `sample_size` | integer 1–100 | no | `20` |
 | `seed` | integer | no | — |
 
 MUST return the `session_id` **immediately** without polling (confirmed

@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     ollama_models_dir: str = "/ollama"
     # Reported by /health and compared against the memory Docker actually
     # provides. Raise it in docker-compose.yml; no rebuild required.
-    recommended_memory_gb: float = 10.0
+    recommended_memory_gb: float = 12.0
 
     class Config:
         env_file = ".env"

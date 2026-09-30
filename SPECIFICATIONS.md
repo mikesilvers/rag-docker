@@ -91,7 +91,7 @@ services:
       OLLAMA_MODELS_DIR: /ollama
       # Reported by /health and compared against the memory Docker actually
       # provides. Raise it if you allocate more to Docker Desktop; no rebuild.
-      RECOMMENDED_MEMORY_GB: 10
+      RECOMMENDED_MEMORY_GB: 12
     volumes:
       - ingest_uploads:/app/uploads
       # Retained source documents; grows with the corpus.
@@ -122,7 +122,8 @@ services:
   proxy:
     image: nginx:1.27-alpine
     ports:
-      - "8080:80"
+      # Local unauthenticated workbench: host loopback only.
+      - "127.0.0.1:8080:80"
     volumes:
       - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
     networks: [rag-internal]
@@ -219,8 +220,8 @@ GET /health
   "resources": {
     "memory": {
       "status": "ok",
-      "allocated_gb": 9.7,
-      "recommended_minimum_gb": 10.0
+      "allocated_gb": 11.67,
+      "recommended_minimum_gb": 12.0
     }
   }
 }
@@ -240,12 +241,12 @@ hung connect cannot stall past the container healthcheck's own 5 s limit.
 | Field | Meaning |
 |---|---|
 | `allocated_gb` | `MemTotal` from `/proc/meminfo`, which on Docker Desktop is the VM's total memory |
-| `recommended_minimum_gb` | From `RECOMMENDED_MEMORY_GB` (default 10) |
+| `recommended_minimum_gb` | From `RECOMMENDED_MEMORY_GB` (default 12) |
 | `status` | `ok`, `below_recommended`, or `unknown` if `/proc/meminfo` is unreadable |
 | `note` | Present only when below recommended; states what to change |
 
 The guest always sees slightly less than the figure configured in Docker Desktop
-— 10240 MiB configured reads as 9.7 GB, roughly 5% lost to VM overhead — so the
+— 12288 MiB configured reads as 11.7 GB, roughly 5% lost to VM overhead — so the
 comparison allows a 5% margin. Without it a correctly sized allocation would
 report itself as too small.
 
@@ -306,6 +307,11 @@ Creates a new Weaviate collection.
 `distance_metric`: `"cosine"` (default), `"dot"`, `"l2-squared"`. This is a **collection-level** setting — it cannot be changed after creation.  
 `hnsw_config` is ignored when `index_type` is `"flat"`. All HNSW field names use camelCase to match the Weaviate v4 client API.
 
+Invalid index/distance values or HNSW settings receive **422 before backend
+lookup or creation**. HNSW numeric bounds are §4.3: `efConstruction` 64–512,
+`maxConnections` 16–128 and `ef` 16–512. Defaults remain 128/64/64; flat indexes
+ignore valid HNSW settings.
+
 **Response 201:**
 ```json
 { "name": "Documents", "status": "created" }
@@ -349,6 +355,8 @@ Content-Type: multipart/form-data
 
 Accepts one or more files. For ZIP uploads, extracts and processes all supported files within the archive. For folder-equivalent uploads (multiple files in one request), processes all submitted files.
 
+**Size limit:** one request may be at most **512 MB**, all files together. The proxy enforces this (`client_max_body_size` in `proxy/nginx.conf`) and answers an oversize request itself with **HTTP 413**, an nginx HTML page rather than the API's JSON error shape, before the API sees it. The proxy streams accepted uploads to the API without buffering them, and the API writes each file to disk in blocks rather than holding it in memory. The Import page refuses a selection over the limit before sending it.
+
 **Form fields:**
 
 | Field | Type | Required | Description |
@@ -360,6 +368,24 @@ Accepts one or more files. For ZIP uploads, extracts and processes all supported
 | `chunk_overlap` | int | No | Default: 200 (characters). Ignored by `semantic` and `context_aware`. |
 | `similarity_threshold` | float | No | Default: 0.85. Used by `semantic` only. Range: 0.0–1.0. |
 | `min_chunk_size` | int | No | Default: 100 (characters). Chunks smaller than this are merged with adjacent chunk. |
+
+Direct upload, saved ingest configuration and optional tuning chunking settings
+share validation. `chunk_size` must be an integer from 50 to 6000, and
+`min_chunk_size` an integer from 0 to 6000 (§8); overlap must be a nonnegative
+integer. For `overlap`/`language`, overlap must be
+smaller than chunk size. Minimum size is a merge preference and may exceed the
+split target; for example, fixed size 60/minimum 100 preserves the existing
+acceptance case by merging small chunks.
+`similarity_threshold` is finite and in 0.0–1.0, or `null` where saved/optional
+configuration permits it (the effective semantic default is 0.85). Boolean
+values are not numeric settings. Strategies must be one of the documented five.
+Ignored overlap settings remain ignored for fixed/context-aware/semantic; the
+context-aware fallback uses language splitting with zero overlap.
+
+Invalid multipart settings return **422 `INVALID_SETTINGS` before collection
+lookup, upload staging or job creation**. Invalid JSON settings return 422 `INVALID_PARAMETER` with
+sanitized field errors in `error.detail`. Raw input/error-context values are omitted from validation replies
+so non-finite input also produces a serializable 422. Defaults remain unchanged.
 
 **Response 202 (accepted, async):**
 ```json
@@ -476,9 +502,18 @@ POST /query
 | `collection` | string | required | Weaviate collection to query |
 | `retrieval_mode` | string | `"hnsw"` | One of: `"hnsw"`, `"flat"`, `"hybrid"`, `"semantic"` |
 | `top_k` | int | 5 | Number of chunks to retrieve |
+
 | `alpha` | float | 0.75 | Hybrid mode only: 0.0 = pure BM25, 1.0 = pure vector |
 | `include_citations` | bool | false | Whether to return source document citations |
 | `response_format` | string | `"end_user"` | `"end_user"` (plain language) or `"engineer"` (verbose, with chunk details) |
+
+Direct query and saved retrieval settings share enums and bounds: retrieval mode
+is `hnsw`, `flat`, `hybrid` or `semantic`; response format is `end_user` or
+`engineer`; `top_k` is an integer 1–50; `alpha` is finite and in 0.0–1.0.
+Invalid settings receive 422 before collection lookup, retrieval or LLM work.
+Internal collection creation, ingestion, chunking and query entry points also
+validate their supported settings before starting backend/model/staging work;
+unknown values do not silently select a default implementation.
 
 Note: distance metric is a collection-level property set at creation, not a per-query parameter.
 
@@ -568,7 +603,7 @@ carries the settings it was tuned with.
 | `top_k` | integer, 1–50 |
 | `alpha` | float, 0.0–1.0 |
 | `response_format` | one of `end_user`, `engineer` |
-| `ef` | integer or `null` |
+| `ef` | integer 16–512 or `null`; see §4.3 |
 
 **Response 201:** the saved configuration, with `is_default: false`.
 
@@ -595,7 +630,11 @@ Samples chunks from a collection and generates Q&A pairs.
 }
 ```
 
-`seed`: optional integer for reproducible sampling. If null, random sampling.
+`sample_size`: integer from 1 through 100 (default 20). `seed`: optional integer; null selects with a fresh random nonce. Booleans, non-integral and non-finite values are rejected with 422 before collection lookup, session persistence or generation. Existing integral numeric coercion is retained.
+
+Sampling scans all chunk UUIDs using the SDK iterator without vectors or text properties, then fetches text/metadata only for the at-most100 selected UUIDs. Returned rows retain rank order; a winner deleted between passes is omitted. Each canonical UUID is ranked by SHA-256 of a versioned domain, the seed (or random nonce), and UUID bytes; UUID order breaks hash ties. The best requested candidates are retained in a bounded heap and returned in rank order. A fixed seed and unchanged UUID population produce the same selected UUIDs and order regardless of backend iteration order. Different seeds can select the same subset, especially when all available objects are selected. This contract concerns selection, not deterministic model answers. Concurrent collection mutation is not a snapshot and can change the candidate population.
+
+The iterator caches 100 objects and selection retains at most `sample_size` candidate payloads; the complete corpus is scanned once. Full scans can take longer than fetching an initial prefix. Payload size is inherited from stored chunks; this is a candidate-count bound, not a byte-size limit.
 
 **Response 202 (accepted, async):**
 ```json
@@ -638,6 +677,8 @@ GET /goldstandard/session/{session_id}
   ]
 }
 ```
+
+Every session response also carries `collection`, `stale`, `orphaned`, and each flag's nullable `_reason` and `_at` metadata. Flags default to false and metadata to null for legacy sessions. Stale means the retained pairs no longer describe current chunks; orphaned means the collection is gone. These warnings do not delete or remap historical pairs.
 
 `status` (session): `"generating"`, `"completed"`, `"failed"`.  
 `status` (pair): `"pending"`, `"approved"`, `"edited"`, `"rejected"`.
@@ -713,11 +754,15 @@ POST /goldstandard/save
 
 Saves reviewed pairs as a RAGAS-compatible JSON file. Only `approved` and `edited` pairs are included. `rejected` and `pending` pairs are excluded.
 
+Stale/orphaned sessions return **409 `HISTORICAL_SESSION`** before writing unless the caller explicitly supplies boolean `allow_historical: true` (default false; numeric/string substitutes are rejected). This permits historical inspection/export, not use as a current collection baseline. `historical` and `session_validity` in the response report the captured validity decision. The exported RAGAS array retains its four standard fields and does not embed validity warnings; consumers must retain the session metadata separately. This request-time check does not add persistence locking or a transactional snapshot; those are separate work.
+
+
 **Request body:**
 ```json
 {
   "session_id": "gs_abc123",
-  "filename": null
+  "filename": null,
+  "allow_historical": false
 }
 ```
 
@@ -731,7 +776,12 @@ Saves reviewed pairs as a RAGAS-compatible JSON file. Only `approved` and `edite
   "filename": "Documents_20260910_143022.json",
   "pairs_saved": 17,
   "pairs_excluded": 3,
-  "download_url": "/api/goldstandard/download/Documents_20260910_143022.json"
+  "download_url": "/api/goldstandard/download/Documents_20260910_143022.json",
+  "historical": false,
+  "session_validity": {
+    "stale": false, "stale_reason": null, "stale_at": null,
+    "orphaned": false, "orphaned_reason": null, "orphaned_at": null
+  }
 }
 ```
 
@@ -836,11 +886,13 @@ Standard error codes:
 | `JOB_NOT_FOUND` | 404 | Ingest job ID not found |
 | `SERVICE_UNAVAILABLE` | 503 | Weaviate or Ollama unreachable |
 | `INVALID_PARAMETER` | 422 | Request parameter out of range or invalid |
+| `INVALID_SETTINGS` | 422 | Multipart chunking settings invalid before ingest work |
 | `SESSION_NOT_FOUND` | 404 | Gold standard session ID not found |
 | `CONFIRMATION_REQUIRED` | 400 | Destructive operation called without `?confirm=true` |
 | `FILE_NOT_FOUND` | 404 | Requested download file does not exist |
 | `PAIR_NOT_FOUND` | 404 | pair_id not found within the given session |
 | `SESSION_BUSY` | 409 | Operation not allowed while session is still generating |
+| `HISTORICAL_SESSION` | 409 | Explicit historical export choice required for stale/orphaned session |
 
 ---
 
@@ -1205,9 +1257,25 @@ For ZIP uploads: extract to temp directory, process all files with supported ext
 - Behavior: splits on character count with no intentional overlap. Sentence boundaries not respected.
 
 #### Fixed Size with Overlap (`overlap`)
-- Splitter: `CharacterTextSplitter`
+- Splitter: explicit character windows, independent of paragraph/word separators
 - Parameters: `chunk_size`, `chunk_overlap`, `min_chunk_size`
-- Behavior: each chunk shares `chunk_overlap` characters with the next chunk.
+- Per-file pre-merge output limits: at most 10,000 windows and 10,000,000 total window characters, including repeated overlap. Count and total payload are computed before allocating windows. Excess fails that file with a clear ingest-job error; other files can continue. These are candidate/payload character bounds, not parser or encoded-byte limits. The optional final-tail merge does not relax the pre-allocation limits.
+- Behavior: consecutive windows share exactly `chunk_overlap` characters. Nonblank
+  text is covered in order, including internal and boundary whitespace; blank-only
+  input yields no chunks. Python character counts, rather than encoded byte counts,
+  determine window sizes. Long tokens and single-newline parser text remain bounded.
+- Window size must be positive, `0 <= chunk_overlap < chunk_size`, and
+  `min_chunk_size >= 0`; impossible size/overlap values are rejected.
+- The final undersized window is merged by appending only its new suffix, removing
+  duplicated overlap without adding a separator. All other windows are at most
+  `chunk_size`; the final output is at most
+  `chunk_size + max(0, min(chunk_size, min_chunk_size - 1) - chunk_overlap)`
+  characters. With defaults
+  (size 1000, overlap 200, minimum 100), every chunk is at most 1000 characters. A whole
+  document shorter than the minimum remains one short chunk; no text is fabricated.
+  Minimum size applies to the final-window merge preference. A minimum above the
+  target does not combine every full window; the final output is still bounded by
+  at most two windows minus their overlap.
 
 #### Language-Based (`language`)
 - Splitter: `RecursiveCharacterTextSplitter`
@@ -1227,7 +1295,13 @@ For ZIP uploads: extract to temp directory, process all files with supported ext
 
 ### 5.3 Minimum Chunk Enforcement
 
-After splitting, any chunk with character count below `min_chunk_size` is merged into the preceding chunk. If it is the first chunk, it is merged into the following chunk. All size parameters throughout the pipeline are in characters.
+Overlap uses the final-window policy and size bound in §5.2. Other strategies
+use a shared merge pass: a chunk below `min_chunk_size` is appended to its
+predecessor with a space when a predecessor exists. A short initial chunk can
+remain short. That shared pass can extend a preceding chunk beyond `chunk_size`;
+context-aware tables and semantic chunks also have no hard size cap. Those
+algorithms are outside the overlap size guarantee. All size parameters throughout
+the pipeline are in characters.
 
 ### 5.4 Embedding and Storage
 
@@ -1487,6 +1561,8 @@ not part of the saved retrieval configuration.
 
 ### 7.7 Gold Standard Page
 
+A retained session can be loaded/refreshed by its session ID, including when its collection no longer exists. Its collection and ID remain visible. Stale/orphaned sessions show reasons and recorded timestamps above review/export; missing legacy metadata has clear defaults. Loading or receiving new validity metadata resets the historical-export checkbox. A new lookup clears the previous session and export controls before fetching, including when the lookup fails. Export shows a disabled progress state while its request is pending, and duplicate clicks cannot start another request.
+
 **Route:** `/goldstandard`  
 **Roles:** Engineer, Developer
 
@@ -1509,6 +1585,7 @@ not part of the saved retrieval configuration.
 
 **Phase 3 — Export:**
 - "Export Approved" button (disabled until at least 1 approved or edited pair exists).
+- Historical sessions use "Export Historical Approved" and additionally require an explicit checkbox acknowledging that the file omits validity warnings and is not a current baseline. The backend independently enforces the choice.
 - Filename field: pre-filled with `{collection}_{timestamp}`, editable.
 - Calls `POST /goldstandard/save` → on success, triggers download of the resulting JSON file.
 - Export summary shown: `17 pairs exported, 3 excluded (rejected/pending)`.
@@ -1582,13 +1659,17 @@ page renders as one undifferentiated block.
 
 ## 8. Configuration Defaults and Constraints
 
+The table gives API request bounds; narrower UI sliders are presentation choices. Internal import/rebuild preserves positive stored HNSW construction/connections settings and stored `ef=-1` (dynamic) or positive values beyond new-request limits. Index/distance enums and numeric type validation still apply; no clamping or migration is performed.
+
+The `chunk_size` and `min_chunk_size` bounds apply whenever chunk settings are saved (`POST /ingest/config`) or used (`POST /ingest/upload`, `POST /tune/rechunk`, `POST /tune/reembed`). A saved or imported configuration from before the bounds is still returned by `GET /ingest/config/{collection}` and exported as it is, never clamped; saving it again, or using its values, requires them to be within the bounds.
+
 | Parameter | Default | Min | Max | Notes |
 |---|---|---|---|---|
-| `chunk_size` | 1000 | 200 | 16000 | In characters |
-| `chunk_overlap` | 200 | 0 | 2000 | In characters; must be < `chunk_size` |
+| `chunk_size` | 1000 | 50 | 6000 | Characters. The minimum stops a flood of tiny chunks; the maximum keeps a chunk within what the embedding model reads (about 1,500 tokens), so nothing is silently truncated |
+| `chunk_overlap` | 200 | 0 | Strategy-dependent | Repeated characters between adjacent chunks; must be less than `chunk_size` for overlap/language, ignored by other strategies |
 | `similarity_threshold` | 0.85 | 0.0 | 1.0 | Semantic chunking only |
-| `min_chunk_size` | 100 | 40 | 2000 | In characters; must be < `chunk_size` |
-| `top_k` | 5 | 1 | 20 | |
+| `min_chunk_size` | 100 | 0 | 6000 | Soft merge preference in characters; may exceed the split target |
+| `top_k` | 5 | 1 | 50 | API bounds |
 | `alpha` | 0.75 | 0.0 | 1.0 | Hybrid mode only |
 | `ef` | 64 | 16 | 512 | HNSW query param |
 | `efConstruction` | 128 | 64 | 512 | HNSW build param |
@@ -1733,6 +1814,11 @@ now lives once, in `api/services/ingest_config.py`.
 
 ### 10.1 Ingest
 
+- [x] Invalid ingest/saved settings are rejected before staging, jobs or configuration writes; valid defaults and fixed size/minimum preferences are retained.
+      *`test_settings_validation.py` checks mocked work boundaries and persistence; `07_settings.sh` runs real HTTP rejection, unchanged-config and valid round-trip checks on an owned collection. Full affected ingest verification passes 18 checks.*
+- [x] `chunk_size` is bounded to 50–6000 and `min_chunk_size` to 0–6000 wherever chunk settings are saved or used; a saved configuration from before the bounds is still returned and exported unchanged, and must be within them to be saved again or used for tuning (#53).
+      *`test_settings_validation.py` saves and reads back both edges, rejects 49, 6001 and a minimum of 6001 without changing the saved configuration, and checks a saved 16000/8000 configuration is returned and exported unclamped but refused by save, rechunk and reembed. `07_settings.sh` checks both edges and their neighbours against the live stack.*
+
 - [x] Single file upload (all six types) completes without error and stores chunks in Weaviate.
       *One file of each type. `.md` failed — `unstructured[pdf,docx,csv]` omitted
       the `md` extra, so Markdown ingestion had never worked. **Fixed**: added the
@@ -1751,8 +1837,23 @@ now lives once, in `api/services/ingest_config.py`.
 - [x] On parser failure for one file, other files in the batch continue processing.
       *A corrupt PDF with two good files gave `partial`, 2 completed, 1 failed,
       and the parser error recorded against the offending filename.*
+- [x] An upload over 1 MB is accepted through the proxy and ingests; one over 512 MB is refused with 413.
+      *nginx's default 1 MB body limit rejected every real-world PDF with a 413
+      before the API saw it, and the few-KB fixtures could not catch it (issue
+      #21). **Fixed**: `client_max_body_size 512m` with request buffering off,
+      uploads written to disk in blocks, and a 3 MB `large.pdf` fixture, which
+      is accepted and completes. A 2.7 MB random-text upload that got 413 before
+      the fix returned 202 and stored 3,048 chunks before the run was stopped;
+      ingest embeds about one chunk per second, so that file takes over an hour.
+      A 513 MB sparse file gets 413.*
+
+- [x] Overlap windows recover all nonblank parsed text with exact repeated overlap and the documented tail bound; output exceeding per-file budgets fails before storage.
+      *19 controlled runtime groups plus one five-source documentation group pass. Suite08, called by suite02, passes eight real parser/window/text-storage checks with vectorization disabled. Focused production ingest plus the nested check passes19 checks in1m19s. Optional production-model checks are separate; two prior attempts failed embedding timeouts covered by PR61.*
 
 ### 10.2 Query
+
+- [x] Invalid query enums, bounds and non-finite values return a serializable 422 before retrieval or model work.
+      *Controlled tests assert no backend/model calls; `07_settings.sh` exercises real HTTP errors. The full valid-query suite passes nine checks.*
 
 - [x] A question against an ingested collection returns a non-empty answer.
 - [x] All four retrieval modes return results without error.
@@ -1767,6 +1868,9 @@ now lives once, in `api/services/ingest_config.py`.
 - [x] Latency fields (`retrieval_latency_ms`, `llm_latency_ms`) are present and non-zero in all responses.
 
 ### 10.3 Gold Standard
+
+- [x] Retained stale/orphaned session warnings reach the live API and browser, with reasons/timestamps and legacy defaults. Historical export requires explicit choice, keeps RAGAS compatibility and preserves the original session.
+      *Six controlled service/runtime groups plus one twelve-source documentation group cover validity/export and rebuild failure boundaries. Registered real backend/in-process HTTP checks cover actual stale/orphan markers, strict choices, missing sessions, empty history, compatible exports and a failed destructive cutover; browser fixtures cover empty history, failed lookup and duplicate export requests. An actual browser against the built UI and isolated real API shows legacy defaults, warning reasons/timestamps, reset consent after actual deletion, empty historical warnings and explicit four-field RAGAS download. Suite10 is called by05/all.sh; full suite is recorded separately.*
 
 - [x] Generate call returns `sample_size` pairs (or fewer if collection has fewer chunks).
       *Originally failed: sessions routinely lost pairs because the model returns
@@ -1815,6 +1919,9 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 `pairs_failed`. Failures whose exception carried an empty string were recorded as
 `''`; the type name is now always included.
 
+- [x] Seeded selection reaches the complete UUID population, preserves rank order across backend iteration orders, and retrieves payloads only for selected IDs.
+      *19 controlled runtime groups plus one nine-source documentation group cover geometry-independent selection, API validation, missing winners and parked MCP function limits. Suite09, called by04, exercises160 owned synthetic SDK objects across pages; supplied vectors avoid model calls. Its registered live HTTP cases reject invalid generation settings before a missing collection can be queried. This is selection evidence, not deterministic LLM output.*
+
 ### 10.4 Web UI
 
 - [x] Role selection persists across page navigation within same browser session.
@@ -1829,6 +1936,10 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Delete collection requires typed confirmation before calling API.
       *Confirm button starts disabled and stays disabled for a wrong name; no
       DELETE is sent until the collection name is typed exactly.*
+- [x] The Import page states the 512 MB upload limit and refuses a larger selection without sending it.
+      *A 513 MB sparse file: the page names the limit and no `POST /ingest/upload`
+      is made. A 413 or other proxy error page is shown as a readable message
+      instead of a JSON parse error (issue #21).*
 
 ### 10.5 Infrastructure
 
@@ -1842,9 +1953,11 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] `collection_registry.json` and `ingest_configs/` persist across restarts; `GET /collections` reflects correct `created_at` after restart.
       *`created_at`, index type and distance metric all preserved.*
 - [x] `GET /ingest/config` returns `is_default: true` for a collection with no saved config; `is_default: false` after saving one.
-- [x] All inter-service traffic stays on the internal Docker network; only port 80 is exposed to the host.
-      *Exactly one host binding: `0.0.0.0:8080->80/tcp` on the proxy. api and
+- [x] All inter-service traffic stays on the internal Docker network; only the proxy's container port 80 is published on host loopback.
+      *Exactly one host binding: `127.0.0.1:8080->80/tcp` on the proxy. api and
       weaviate publish nothing; ollama and ui expose container ports only.*
+- [x] Docker Engine is 28.0.0 or newer; older engines are outside the supported localhost-isolation profile. The infrastructure suite checks the daemon version.
+- [x] Resolved Compose configuration and live Docker bindings contain exactly one published TCP port, on the proxy at host address `127.0.0.1`, targeting container port 80. A missing or all-interface host address fails verification. A different free host port preserves loopback and matches `RAG_EXPECTED_PROXY_PORT` (default `8080`); verified at `18080` on a disposable deployment.
 
 ---
 
@@ -1859,12 +1972,12 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 | Requirement | Value | Why |
 |---|---|---|
 | Hardware | Apple Silicon (arm64) | All images resolve arm64 natively; torch is installed from the CPU index, which publishes linux/aarch64 wheels |
-| Docker Desktop | installed and running | The only host dependency. No Python, Node or compiler is required |
-| **Docker memory** | **10 GB minimum** | phi3.5 is ~6 GB resident. Below this it is evicted and reloaded between calls and generation times out with `httpx.ReadTimeout` |
+| Docker Desktop | installed and running, Engine 28.0.0+ | The only host dependency. No Python, Node or compiler is required |
+| **Docker memory** | **12 GB, plus 2 GB swap** | phi3.5 is ~6 GB resident. At 10 GB, full verification runs still hit Ollama timeouts under memory pressure; below that the model is evicted and reloaded between calls and generation times out with `httpx.ReadTimeout`. Swap absorbs short spikes. Leave macOS at least 4 GB: on a 16 GB Mac, 12 GB is the practical ceiling |
 | Docker disk | 20 GB minimum, 32 GB recommended | ~6.5 GB images + ~2.5 GB model weights + build cache |
-| Free host port | 8080 | `proxy` publishes `8080:80` |
+| Free host port | 8080 | `proxy` publishes `127.0.0.1:8080:80` |
 
-Memory is set in **Docker Desktop → Settings → Resources → Memory**, not in
+Memory and swap are set in **Docker Desktop → Settings → Resources**, not in
 `docker-compose.yml`; a compose `mem_limit` caps a container and cannot raise the
 VM ceiling. `/health` reports the allocated figure against
 `RECOMMENDED_MEMORY_GB` (§3.1.1) so a misconfigured host is visible rather than

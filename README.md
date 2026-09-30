@@ -14,10 +14,12 @@ A self-contained, Dockerized Retrieval-Augmented Generation (RAG) platform. Uplo
 
 ## Prerequisites
 
-- **Docker Desktop** (or Docker Engine + Compose v2) — [install](https://docs.docker.com/get-docker/)
-- **10 GB RAM allocated to Docker** (Docker Desktop → Settings → Resources → Memory). phi3.5 alone is ~6 GB resident; below 10 GB it is repeatedly evicted and reloaded and queries time out. Allocate more if you have it — `/health` reports what Docker actually has against this recommendation
+- **Docker Desktop with Engine 28.0.0 or newer** (or Docker Engine 28.0.0+ with Compose v2) — [install](https://docs.docker.com/get-docker/)
+- **12 GB RAM and 2 GB swap allocated to Docker** (Docker Desktop → Settings → Resources → Memory and Swap). phi3.5 alone is ~6 GB resident; at 10 GB, full verification runs still hit Ollama timeouts under memory pressure, and below that the model is repeatedly evicted and reloaded and queries time out. Swap turns a short spike into a slowdown instead of a failure. Leave macOS at least 4 GB: on a 16 GB Mac, 12 GB is the practical ceiling. `/health` reports what Docker actually has against this recommendation
 - **20 GB disk minimum allocated to Docker, 32 GB recommended** — see [Storage requirements](#storage-requirements) below. Check your current limit before building — a small virtual disk (8 GB or so) cannot hold this stack, and the build fails partway through with a confusing error.
-- Port **8080** free on the host — `docker-compose.yml` publishes the proxy as `8080:80`
+- Port **8080** free on the host — `docker-compose.yml` publishes the proxy as `127.0.0.1:8080:80`, bound to host loopback on supported engines
+
+Check the daemon version with `docker version --format '{{.Server.Version}}'`. Docker documents that engines older than 28.0.0 allow same-network hosts to reach localhost-published ports; upgrade the engine before using this unauthenticated workbench. See [Docker port publishing](https://docs.docker.com/engine/network/port-publishing/#publishing-ports). This default assumes Docker's standard bridge/NAT configuration; custom direct-routing settings are outside this local profile.
 
 No API keys, no cloud accounts, no Python or Node installs required on your machine.
 
@@ -163,8 +165,8 @@ provides against the recommended minimum:
   "resources": {
     "memory": {
       "status": "ok",
-      "allocated_gb": 9.7,
-      "recommended_minimum_gb": 10.0
+      "allocated_gb": 11.67,
+      "recommended_minimum_gb": 12.0
     }
   }
 }
@@ -174,7 +176,7 @@ provides against the recommended minimum:
 
 `allocated_gb` reads `MemTotal` inside the container, which on Docker Desktop is
 the VM's total memory. It reads a little **below** the figure configured in
-Docker Desktop — 10240 MiB configured shows as 9.7 GB, about 5% lost to VM
+Docker Desktop — 12288 MiB configured shows as 11.7 GB, about 5% lost to VM
 overhead — so the comparison allows a 5% margin rather than flagging a correctly
 sized allocation as too small.
 
@@ -234,9 +236,18 @@ All API settings are environment variables in `docker-compose.yml`:
 | `WEAVIATE_HOST` | `weaviate` | Weaviate hostname (internal) |
 | `OLLAMA_HOST` | `ollama` | Ollama hostname (internal) |
 | `UPLOAD_DIR` | `/app/uploads` | Container path for uploads and session data |
-| `RECOMMENDED_MEMORY_GB` | `10` | Memory recommendation reported by `/health`. Raise it if you allocate more to Docker; no rebuild needed |
+| `RECOMMENDED_MEMORY_GB` | `12` | Memory recommendation reported by `/health`. Raise it if you allocate more to Docker; no rebuild needed |
 
 To swap the LLM (e.g. to `llama3.2`), update `LLM_MODEL` in `docker-compose.yml` and add the model name to `ollama/entrypoint.sh`.
+
+**Upload size limit.** One upload (all files in it together, or one ZIP) can be at most **512 MB**. The proxy enforces it with `client_max_body_size` in `proxy/nginx.conf`. To change it, edit that value and `MAX_UPLOAD_MB` in `ui/src/api/client.ts` (the Import page uses it to warn before sending), then rebuild the UI and recreate the proxy:
+
+```bash
+docker compose build ui
+docker compose up -d --force-recreate ui proxy
+```
+
+`--force-recreate` matters for the proxy. `nginx.conf` is mounted as a single file, and most editors save by replacing the file, so a running container keeps reading the old copy until it is recreated.
 
 ## Data persistence
 
@@ -354,6 +365,10 @@ be readable, the format understood, every digest must match, and the embedding
 model must be the one this instance runs. Chunk UUIDs are preserved, so
 gold-standard sessions keep pointing at the right chunks after the move.
 
+Evaluation-session metadata is also validated before importing models or
+changing a collection. Invalid session JSON, identities or schemas fail the
+import with `PACKAGE_CORRUPT`, naming the sidecar; they are not silently skipped.
+
 ### Carrying the models too
 
 By default a package assumes the target machine already runs the same embedding
@@ -369,8 +384,10 @@ curl -X POST http://localhost:8080/api/export \
 
 That takes the package from roughly 80 KB to ~2.3 GB, because it carries the
 embedding model and the LLM as Ollama's own manifest and blob files. On import,
-a model already present is left alone; a missing one is installed from the
-package and verified before the collection is built. The models are
+a model already present is left alone, provided its files match their checksums;
+a missing one is installed from the package and verified before the collection
+is built. If the embedding model is present but damaged, the import fails
+`MODEL_INTEGRITY_FAILED`: restore or re-pull it, then import again. The models are
 content-addressed, so what lands on the target is byte-identical to what produced
 the vectors.
 
@@ -508,9 +525,9 @@ so it does not depend on its own executable bit.
 | Requirement | Value |
 |---|---|
 | Hardware | Apple Silicon (arm64) |
-| Docker Desktop | installed and running |
+| Docker Desktop | installed and running, Engine 28.0.0+ |
 | Docker disk | 20 GB minimum, 32 GB recommended |
-| Docker memory | 10 GB minimum (phi3.5 is ~6 GB resident) |
+| Docker memory | 12 GB, plus 2 GB swap (phi3.5 is ~6 GB resident) |
 | Free host port | 8080 |
 | Network | ~8–10 GB downloaded on first run |
 
@@ -563,9 +580,9 @@ bash install-offline.sh
 
 `install-offline.sh` loads the images, restores the model weights into the
 project's volume, and runs `docker compose up -d --no-build`. Nothing is pulled
-and nothing is compiled. The target needs only Docker Desktop, running.
+and nothing is compiled. The target needs only Docker Desktop, running with Engine 28.0.0 or newer.
 
-**Requirements on the target:** Apple Silicon, Docker Desktop, ~12 GB of Docker
+**Requirements on the target:** Apple Silicon, Docker Desktop with Engine 28.0.0+, ~12 GB of Docker
 disk, ~10 GB of free space on the host filesystem for the archive plus its
 extraction, and port 8080 free. No Python, Node, compiler or network needed.
 
@@ -627,7 +644,10 @@ If this fails after Docker restarts, Docker's internal networking is broken — 
 
 **Ollama health check is stuck after images are pulled** — The model download phase (`ollama pull phi3.5` etc.) is in progress. Run `docker compose logs -f ollama` to watch. If the internet drops mid-download, the entrypoint script detects the stall via a 2-hour per-attempt timeout, kills the hung pull, and retries automatically up to 5 times. Ollama resumes partial downloads so retries pick up where they left off.
 
-**Port 8080 already in use** — The proxy publishes on host port 8080 (`docker-compose.yml`, the `proxy` service: `"8080:80"`). Change the host side to any free port, for example `"9090:80"`, then access the UI at `http://localhost:9090`. Only the number to the left of the colon may change — nginx listens on 80 inside the container.
+**Port 8080 already in use** — The proxy publishes on host loopback port 8080 (`docker-compose.yml`, the `proxy` service: `"127.0.0.1:8080:80"`). Change the middle number to any free port, for example `"127.0.0.1:9090:80"`, then access the UI at `http://localhost:9090`. Keep the `127.0.0.1` host address and container port 80.
+
+**Sharing with your office** — The default binding is now local to the Docker host. An existing installation accessed from another computer will stop accepting those connections after its proxy is recreated. This workbench currently has no API authentication; authenticated LAN access with TLS is tracked in issue #26 and is not yet provided. Keep the loopback binding for the current local setup.
+**Upload fails with "larger than the 512 MB limit" or HTTP 413** — The upload is over the proxy's limit (see [Configuration](#configuration)). The limit covers the whole request, so split a large batch into several uploads, or raise the limit. Before issue #21 the proxy used nginx's 1 MB default, so a 413 on an ordinary PDF means the proxy is running an old `nginx.conf`: run `docker compose up -d --force-recreate proxy`.
 
 **Build fails with `ERROR: Could not install packages due to an OSError: [Errno 28] No space left on device`** — Docker's virtual disk is full, not your host disk — the two are reported separately, and `df -h` on the host will look fine. A virtual disk of 8 GB or so cannot hold ~6.5 GB of images plus build cache, so the build runs out of room partway through `pip install`. Check the real numbers with:
 
@@ -662,7 +682,7 @@ This discards ingested documents; re-ingest after it comes back up. The `ollama_
 docker compose exec <service> sh -c 'command -v curl wget'
 ```
 
-**Queries time out, or `httpx.ReadTimeout` appears in the api log** — Almost always memory. phi3.5 is ~6 GB resident, so on a Docker allocation below 10 GB the model is evicted and reloaded between calls and generation never completes. Note the Ollama healthcheck cannot detect this: it runs `ollama list`, which succeeds while generation is wedged.
+**Queries time out, or `httpx.ReadTimeout` appears in the api log** — Almost always memory. phi3.5 is ~6 GB resident, so on a Docker allocation below the recommended 12 GB the model can be evicted and reloaded between calls and generation never completes. Note the Ollama healthcheck cannot detect this: it runs `ollama list`, which succeeds while generation is wedged.
 
 Check what Docker actually has, and what is loaded:
 

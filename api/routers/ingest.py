@@ -4,10 +4,10 @@ import json
 import re
 from pathlib import Path
 from fastapi import APIRouter, Form, UploadFile, File
-from pydantic import BaseModel
+from pydantic import ValidationError
 
 from config import settings
-from models.schemas import IngestConfigResponse, IngestUploadResponse, JobStatusResponse
+from models.schemas import IngestConfig, IngestConfigResponse, IngestUploadResponse, JobStatusResponse
 from services import ingest_config
 from services import ingest_pipeline
 from services import weaviate_client as wc
@@ -15,13 +15,8 @@ from utils import api_error
 
 router = APIRouter(prefix="/ingest")
 
-class SaveIngestConfigBody(BaseModel):
+class SaveIngestConfigBody(IngestConfig):
     collection: str
-    chunking_strategy: str = "overlap"
-    chunk_size: int = 1000
-    chunk_overlap: int = 200
-    similarity_threshold: float | None = None
-    min_chunk_size: int = 100
 
 
 @router.post("/upload", response_model=IngestUploadResponse, status_code=202)
@@ -34,6 +29,13 @@ async def ingest_upload(
     min_chunk_size: int = Form(100),
     files: list[UploadFile] = File(...),
 ):
+    try:
+        IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
+                     chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
+                     min_chunk_size=min_chunk_size)
+    except ValidationError as exc:
+        return api_error(422, "INVALID_SETTINGS", "Invalid chunking settings.",
+                         detail={"errors": exc.errors(include_context=False, include_input=False)})
     if not await wc.collection_exists(collection):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
 

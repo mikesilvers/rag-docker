@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from config import settings
+from models.schemas import IngestConfig
 from services.chunker import chunk as do_chunk
 from services import sources
 from services import weaviate_client as wc
@@ -24,6 +25,11 @@ _log = logging.getLogger(__name__)
 
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
+
+
+def _save_upload(src, dest: Path) -> None:
+    with dest.open("wb") as fh:
+        shutil.copyfileobj(src, fh, length=1024 * 1024)
 
 
 def _parse_file(path: Path) -> tuple[str, list[Any]]:
@@ -142,6 +148,12 @@ async def start_ingest_job(
     similarity_threshold: float,
     min_chunk_size: int,
 ) -> str:
+    config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
+                          chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
+                          min_chunk_size=min_chunk_size)
+    strategy, chunk_size, chunk_overlap, min_chunk_size = (
+        config.chunking_strategy, config.chunk_size, config.chunk_overlap, config.min_chunk_size)
+    similarity_threshold = config.similarity_threshold if config.similarity_threshold is not None else 0.85
     job_id = str(uuid.uuid4())[:8]
 
     tmp_dir = Path(tempfile.mkdtemp(dir=settings.upload_dir))
@@ -158,8 +170,11 @@ async def start_ingest_job(
             if not safe_name:
                 continue
             dest = tmp_dir / safe_name
-            content = await upload.read()
-            dest.write_bytes(content)
+            # Copy in blocks rather than `await upload.read()`, which held the
+            # whole file in memory. Uploads can now reach 512 MB (issue #21),
+            # and this container already runs close to its memory budget. The
+            # copy blocks, so it runs off the event loop.
+            await asyncio.to_thread(_save_upload, upload.file, dest)
 
             if safe_name.lower().endswith(".zip"):
                 resolved_tmp = tmp_dir.resolve()

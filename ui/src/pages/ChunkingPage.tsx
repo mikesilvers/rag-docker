@@ -70,7 +70,7 @@ export default function ChunkingPage() {
           <div className="grid grid-cols-2 gap-4 mb-4">
             <div>
               <label className="block text-xs text-gray-600 mb-1">Chunk Size: {config.chunk_size}</label>
-              <input type="range" min={200} max={16000} step={100} value={config.chunk_size} onChange={e => setConfig({ ...config, chunk_size: +e.target.value })} className="w-full" />
+              <input type="range" min={50} max={6000} step={50} value={config.chunk_size} onChange={e => setConfig({ ...config, chunk_size: +e.target.value })} className="w-full" />
             </div>
             {showOverlap && (
               <div>
@@ -80,7 +80,7 @@ export default function ChunkingPage() {
             )}
             <div>
               <label className="block text-xs text-gray-600 mb-1">Min Chunk Size: {config.min_chunk_size}</label>
-              <input type="range" min={40} max={2000} step={10} value={config.min_chunk_size} onChange={e => setConfig({ ...config, min_chunk_size: +e.target.value })} className="w-full" />
+              <input type="range" min={0} max={6000} step={10} value={config.min_chunk_size} onChange={e => setConfig({ ...config, min_chunk_size: +e.target.value })} className="w-full" />
             </div>
             {showSimilarity && (
               <div>

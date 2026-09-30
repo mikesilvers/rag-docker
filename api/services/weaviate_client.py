@@ -2,12 +2,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 
 import weaviate
 from weaviate.classes.config import Configure, Property, DataType, VectorDistances
-from weaviate.classes.query import MetadataQuery
+from weaviate.classes.query import MetadataQuery, Filter
 
 from config import settings
+from models.schemas import CreateCollectionRequest, StoredCollectionRequest
 from services import ingest_config
 from services import retrieval_config
 from services import sources
@@ -85,9 +87,15 @@ def _create_collection_sync(
     index_type: str,
     distance_metric: str,
     hnsw_config: dict,
+    *,
+    preserve_hnsw: bool = False,
 ) -> None:
+    schema = StoredCollectionRequest if preserve_hnsw else CreateCollectionRequest
+    validated = schema(name=name, index_type=index_type,
+                                        distance_metric=distance_metric, hnsw_config=hnsw_config)
+    hnsw_config = validated.hnsw_config.model_dump()
     client = get_client()
-    dist = DISTANCE_MAP.get(distance_metric, VectorDistances.COSINE)
+    dist = DISTANCE_MAP[validated.distance_metric]
 
     if index_type == "flat":
         vector_index = Configure.VectorIndex.flat(distance_metric=dist)
@@ -272,14 +280,35 @@ async def get_collection_config(name: str) -> dict:
     return await asyncio.to_thread(_collection_config_sync, name)
 
 
+# Just after a collection is created under a name that was dropped moments
+# earlier, Weaviate can reject writes with "could not find index for class ...
+# It might have been deleted in the meantime" until the new index is loaded.
+# The verify suite hit this when it recreated a collection between checks (#95).
+_INDEX_NOT_READY = "could not find index"
+_INSERT_ATTEMPTS = 3
+_INSERT_RETRY_DELAY = 1.0
+
+
 def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
     client = get_client()
     coll = client.collections.get(collection_name)
-    with coll.batch.dynamic() as batch:
-        for chunk in chunks:
-            batch.add_object(properties=chunk)
-        if batch.number_errors > 0:
-            raise RuntimeError(f"{batch.number_errors} batch error(s) inserting into '{collection_name}'")
+    pending = list(chunks)
+    for attempt in range(1, _INSERT_ATTEMPTS + 1):
+        with coll.batch.dynamic() as batch:
+            for chunk in pending:
+                batch.add_object(properties=chunk)
+        # Read failures only after the batch has flushed on exit. Checking
+        # inside the block missed them, so a job could report 'completed'
+        # with nothing stored.
+        failed = coll.batch.failed_objects
+        if not failed:
+            return
+        if attempt < _INSERT_ATTEMPTS and all(_INDEX_NOT_READY in f.message for f in failed):
+            pending = [f.object_.properties for f in failed]
+            time.sleep(_INSERT_RETRY_DELAY)
+            continue
+        raise RuntimeError(
+            f"{len(failed)} batch error(s) inserting into '{collection_name}': {failed[0].message}")
 
 
 async def insert_chunks(collection_name: str, chunks: list[dict]) -> None:
@@ -373,22 +402,27 @@ async def hybrid_query(
     return await asyncio.to_thread(_hybrid_query_sync, collection_name, query, alpha, top_k)
 
 
-def _sample_chunks_sync(collection_name: str, limit: int) -> list[dict]:
+def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = None) -> list[dict]:
+    from models.schemas import GenerateRequest
+    from services.chunk_sampling import select_chunk_ids
+    request = GenerateRequest(collection=collection_name, sample_size=limit, seed=seed)
     client = get_client()
     coll = client.collections.get(collection_name)
-    result = coll.query.fetch_objects(
-        limit=limit,
-        return_properties=["content", "source_file", "chunk_index"],
-    )
-    return [
-        {
-            "content": obj.properties.get("content", ""),
-            "source_file": obj.properties.get("source_file", ""),
-            "chunk_index": obj.properties.get("chunk_index", 0),
-        }
-        for obj in result.objects
-    ]
+    objects = coll.iterator(include_vector=False, return_properties=[], cache_size=100)
+    identities = select_chunk_ids(objects, request.sample_size, request.seed)
+    if not identities:
+        return []
+    payloads = coll.query.fetch_objects(
+        filters=Filter.by_id().contains_any(identities), limit=len(identities),
+        include_vector=False, return_properties=["content", "source_file", "chunk_index"],
+    ).objects
+    by_id = {str(obj.uuid): obj.properties for obj in payloads}
+    # Concurrent deletion can remove a winner between the UUID and payload passes.
+    return [{"object_id": identity, "content": by_id[identity].get("content", ""),
+             "source_file": by_id[identity].get("source_file", ""),
+             "chunk_index": by_id[identity].get("chunk_index", 0)}
+            for identity in identities if identity in by_id]
 
 
-async def sample_chunks(collection_name: str, limit: int) -> list[dict]:
-    return await asyncio.to_thread(_sample_chunks_sync, collection_name, limit)
+async def sample_chunks(collection_name: str, limit: int, seed: int | None = None) -> list[dict]:
+    return await asyncio.to_thread(_sample_chunks_sync, collection_name, limit, seed)

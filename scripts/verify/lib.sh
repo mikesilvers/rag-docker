@@ -12,6 +12,9 @@
 
 set -uo pipefail
 
+# One verify run at a time; see lock.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/lock.sh"
+
 API="${RAG_API:-http://localhost:8080/api}"
 # Collections and packages created by the suites all carry this prefix so
 # cleanup can find them without guessing.

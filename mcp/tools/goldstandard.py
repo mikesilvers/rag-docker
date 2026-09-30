@@ -25,8 +25,10 @@ async def rag_generate_goldstandard(
     sample_size: int = 20,
     seed: int | None = None,
 ) -> dict:
-    if not 1 <= sample_size <= 200:
-        raise ToolError("sample_size must be between 1 and 200.")
+    if isinstance(sample_size, bool) or not isinstance(sample_size, int) or not 1 <= sample_size <= 100:
+        raise ToolError("sample_size must be an integer between 1 and 100.")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise ToolError("seed must be an integer or null.")
     body: dict = {"collection": collection, "sample_size": sample_size}
     if seed is not None:
         body["seed"] = seed

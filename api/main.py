@@ -2,6 +2,8 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from utils import api_error
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -44,6 +46,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="RAG API", lifespan=lifespan)
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error(request, exc):
+    # Invalid settings can include non-finite JSON numbers. Echoing their raw
+    # values in a JSONResponse would raise a serialization error instead of 422.
+    errors = [{key: value for key, value in error.items() if key not in ("input", "ctx")}
+              for error in exc.errors()]
+    return api_error(422, "INVALID_PARAMETER", "Request parameters are invalid.", detail=errors)
 
 app.add_middleware(
     CORSMiddleware,

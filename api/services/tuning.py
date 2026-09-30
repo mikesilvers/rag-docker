@@ -6,8 +6,10 @@ or vector width changes and Weaviate cannot alter either in place.
 **Safety.** Each rebuild is staged: the new chunks are built into a temporary
 collection first, and the live one is replaced only once that succeeds. Weaviate
 has no rename (see `importer.py`), so the final step copies vectors out of the
-staging collection rather than re-embedding — one embedding pass, not two. A
-failure at any point leaves the original collection untouched.
+staging collection rather than re-embedding — one embedding pass, not two.
+Preparation failures leave the original collection untouched. A failure after
+replacement begins can leave it missing or partial. Identity-changing operations
+flag retained evaluations before replacement; any failed cutover flags them too.
 
 **Gold standard.** Anything that changes chunk identity marks every session for
 the collection `stale`, with a reason and a timestamp. Sessions are never
@@ -126,12 +128,13 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
 # ── Rebuilding ────────────────────────────────────────────────────────────────
 
 def _rebuild(collection: str, properties: list[dict], index_type: str | None,
-             distance_metric: str | None, progress) -> int:
+             distance_metric: str | None, progress, before_replace=None) -> int:
     """Stage the new chunks, then swap them into place.
 
     Weaviate embeds during the staging insert. The final insert reuses those
     vectors verbatim, so the corpus is embedded once rather than twice.
     """
+    cutover_started = False
     config = wc._collection_config_sync(collection)
     new_index = index_type or config["index_type"]
     new_distance = distance_metric or config["distance_metric"]
@@ -139,7 +142,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
 
     staging = f"{collection}__tuning_{uuid.uuid4().hex[:8]}"
     client = wc.get_client()
-    wc._create_collection_sync(staging, new_index, new_distance, hnsw)
+    wc._create_collection_sync(staging, new_index, new_distance, hnsw, preserve_hnsw=True)
     try:
         wc._insert_chunks_sync(staging, properties)
         staged = [
@@ -154,10 +157,15 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
         if progress:
             progress(len(staged))
 
-        # Past this point the original is replaced. Everything that could fail
-        # has already run against the staging collection.
+        # Past this point the original is replaced. Preparation has succeeded,
+        # but deletion, creation or final writes can still fail.
+        # Persist the warning before deletion, so a failed replacement cannot
+        # leave retained pairs claiming to be a current baseline.
+        if before_replace:
+            before_replace()
+        cutover_started = True
         client.collections.delete(collection)
-        wc._create_collection_sync(collection, new_index, new_distance, hnsw)
+        wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True)
         target = client.collections.get(collection)
         with target.batch.dynamic() as batch:
             for record in staged:
@@ -167,6 +175,10 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
                 raise RuntimeError(
                     f"{batch.number_errors} error(s) writing the rebuilt collection")
         return len(staged)
+    except Exception:
+        if cutover_started:
+            goldstandard.mark_stale(collection, "collection replacement failed after cutover began; retained pairs require historical review")
+        raise
     finally:
         try:
             client.collections.delete(staging)
@@ -227,7 +239,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
         job["chunks_total"] = len(properties)
         written = _rebuild(collection, properties,
                            params.get("index_type"), params.get("distance_metric"),
-                           progress)
+                           progress, before_replace=(lambda: goldstandard.mark_stale(collection, reason)) if reason else None)
 
         notes = []
         if reason:
