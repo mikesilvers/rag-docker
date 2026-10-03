@@ -1466,6 +1466,16 @@ Visible on all pages post-role-selection. Contents vary by role:
 
 The collection selection is shared with the Retrieval Config page, because retrieval settings are stored per collection and must follow the selection.
 
+Loads and saves belong to the collection selection generation that started
+them. Changing the selection (including leaving and returning to the same
+collection) invalidates pending responses for the prior selection. A stale
+save may finish persisting its original collection, but must not change the
+active settings, loading/error state, or invalidate the new collection's load.
+Within the current generation, only the latest initiated save may publish; a
+successful current save supersedes a pending older load for that collection.
+After the selected collection's load resolves, the next Q&A request uses its
+settings, regardless of when a prior collection's save completes.
+
 **Response format** sent to API:
 - End User role → `response_format: "end_user"`
 - Engineer and Developer → `response_format: "engineer"`

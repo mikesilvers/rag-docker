@@ -14,6 +14,8 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
   const browser = await launch();
   const r = makeReporter();
 
+  await require('./query_config').runQueryConfigTests(browser, BASE, r);
+
   // ── role persistence ───────────────────────────────────────────────────────
   r.section('§10.4 role selection');
   {

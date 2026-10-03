@@ -43,7 +43,7 @@ function fromResponse(r: RetrievalConfig): QueryConfig {
 }
 
 export function QueryConfigProvider({ children }: { children: ReactNode }) {
-  const [collection, setCollection] = useState('')
+  const [collection, setCollectionState] = useState('')
   const [config, setConfigState] = useState<QueryConfig>(DEFAULT_CONFIG)
   const [isDefault, setIsDefault] = useState(true)
   const [loading, setLoading] = useState(false)
@@ -52,8 +52,20 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
   // the user has already navigated away from must not overwrite the current
   // one. Every load carries a ticket; only the latest ticket may apply.
   const requestId = useRef(0)
+  const selectedCollection = useRef('')
+  const saveId = useRef(0)
+
+  const setCollection = useCallback((name: string) => {
+    if (name === selectedCollection.current) return
+    selectedCollection.current = name
+    // Invalidate immediately, before the next effect runs. A -> B -> A is
+    // also a new generation even though the collection name matches again.
+    requestId.current++
+    setCollectionState(name)
+  }, [])
 
   useEffect(() => {
+    const ticket = ++requestId.current
     if (!collection) {
       setConfigState(DEFAULT_CONFIG)
       setIsDefault(true)
@@ -61,7 +73,6 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
       setLoading(false)
       return
     }
-    const ticket = ++requestId.current
     setLoading(true)
     setError('')
     api
@@ -81,12 +92,23 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
         setError(e instanceof Error ? e.message : String(e))
         setLoading(false)
       })
+    return () => { requestId.current++ }
   }, [collection])
 
   const saveConfig = useCallback(
     async (next: QueryConfig) => {
       if (!collection) throw new Error('Select a collection before saving retrieval settings.')
+      const ticket = requestId.current
+      const saveTicket = ++saveId.current
       const saved = await api.saveRetrievalConfig({ collection, ...next })
+      // A save belongs to the selection generation that started it. An old
+      // save must not publish into another collection or cancel its load.
+      // Of concurrent saves, only the latest started may publish.
+      if (
+        collection !== selectedCollection.current ||
+        ticket !== requestId.current ||
+        saveTicket !== saveId.current
+      ) return
       // A completed save supersedes any load still in flight for this
       // collection, which would otherwise land afterwards with stale values.
       requestId.current++

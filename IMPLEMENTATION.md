@@ -7758,7 +7758,7 @@ function fromResponse(r: RetrievalConfig): QueryConfig {
 }
 
 export function QueryConfigProvider({ children }: { children: ReactNode }) {
-  const [collection, setCollection] = useState('')
+  const [collection, setCollectionState] = useState('')
   const [config, setConfigState] = useState<QueryConfig>(DEFAULT_CONFIG)
   const [isDefault, setIsDefault] = useState(true)
   const [loading, setLoading] = useState(false)
@@ -7767,8 +7767,20 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
   // the user has already navigated away from must not overwrite the current
   // one. Every load carries a ticket; only the latest ticket may apply.
   const requestId = useRef(0)
+  const selectedCollection = useRef('')
+  const saveId = useRef(0)
+
+  const setCollection = useCallback((name: string) => {
+    if (name === selectedCollection.current) return
+    selectedCollection.current = name
+    // Invalidate immediately, before the next effect runs. A -> B -> A is
+    // also a new generation even though the collection name matches again.
+    requestId.current++
+    setCollectionState(name)
+  }, [])
 
   useEffect(() => {
+    const ticket = ++requestId.current
     if (!collection) {
       setConfigState(DEFAULT_CONFIG)
       setIsDefault(true)
@@ -7776,7 +7788,6 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
       setLoading(false)
       return
     }
-    const ticket = ++requestId.current
     setLoading(true)
     setError('')
     api
@@ -7796,12 +7807,23 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
         setError(e instanceof Error ? e.message : String(e))
         setLoading(false)
       })
+    return () => { requestId.current++ }
   }, [collection])
 
   const saveConfig = useCallback(
     async (next: QueryConfig) => {
       if (!collection) throw new Error('Select a collection before saving retrieval settings.')
+      const ticket = requestId.current
+      const saveTicket = ++saveId.current
       const saved = await api.saveRetrievalConfig({ collection, ...next })
+      // A save belongs to the selection generation that started it. An old
+      // save must not publish into another collection or cancel its load.
+      // Of concurrent saves, only the latest started may publish.
+      if (
+        collection !== selectedCollection.current ||
+        ticket !== requestId.current ||
+        saveTicket !== saveId.current
+      ) return
       // A completed save supersedes any load still in flight for this
       // collection, which would otherwise land afterwards with stale values.
       requestId.current++
@@ -9985,6 +10007,28 @@ Run `python3 scripts/tests/test_loopback_verification.py` from the repository ro
 The concurrency HTTP check uses supplied-vector ingestion fixtures while keeping the upload handler, parser, chunker, worker, source retention and actual backend writes real. Its reindex source check pauses under the writer guard; the upload remains queued until final copy verification. Recovery is separately forced to fail at final creation and verified through an independent API lifespan. These cases do not claim generative model quality.
 
 Tuning normalizes the backend first-character alias for active jobs and ownership, while preserving the caller-spelled identity for source/config/session sidecars. All tuning operations register positive staging ownership before creation and retain recovery before cutover. Explicit deletion of an exact positively owned recovery collection retires its matching journal and metadata snapshots; unrelated or invalid journals remain. Startup alone does not discard retained snapshots merely because a backend collection is missing. Interrupted explicit cleanup remains durable and is resumed at startup.
+
+## Deferred query configuration browser checks
+
+`browser/query_config.js` runs against the real UI with all API calls stubbed
+before startup. It explicitly holds and releases responses to cover a delayed
+A save arriving before/after B's load, B's failed load, an A→B→A selection,
+concurrent saves in both response orders, and save failure. Every case checks
+the actual next Q&A request payload. These fixtures are included in `06_ui.sh`
+through `ui_criteria.js`, and can also run without a backend or model:
+
+```bash
+# Start the UI separately: cd ui && npm ci && npm run dev -- --host 127.0.0.1
+# With puppeteer-core available to Node and a local Chromium installation:
+RAG_UI_BASE=http://127.0.0.1:3000 \
+RAG_CHROMIUM_PATH=/path/to/chromium \
+node scripts/verify/browser/query_config.js
+```
+
+The standalone runner uses the existing browser verification dependency
+`puppeteer-core` (also available in the verification browser image); set
+`NODE_PATH` if it is installed outside normal Node module resolution. This
+isolated fixture run does not replace the required full live-stack suite.
 ````
 
 ### scripts/verify/all.sh
@@ -12684,6 +12728,196 @@ const clickByText = (page, text) => page.evaluate(t => {
 module.exports = { sleep, makeReporter, launch, session, bodyText, setValue, clickByText };
 ```
 
+### scripts/verify/browser/query_config.js
+
+```javascript
+// Deferred responses exercise the real provider, Retrieval page, and Q&A page.
+// All API calls are intercepted before application startup; no backend is used.
+const assert = require('node:assert/strict');
+const { makeReporter, setValue, clickByText } = require('./lib');
+
+const A = { collection: 'FixtureA', retrieval_mode: 'hybrid', top_k: 11, alpha: 0.25, ef: null, response_format: 'engineer', is_default: false };
+const B = { ...A, collection: 'FixtureB', retrieval_mode: 'semantic', top_k: 23, alpha: 0.6 };
+const DEFAULT = { ...B, retrieval_mode: 'hnsw', top_k: 5, alpha: 0.75, is_default: true };
+
+async function fixture(browser, base) {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.evaluateOnNewDocument((a, b) => {
+    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
+    const realFetch = window.fetch.bind(window);
+    const requests = [];
+    window.queryConfigFixture = { requests };
+    window.fetch = (input, init = {}) => {
+      const path = new URL(input, location.href).pathname;
+      if (!path.startsWith('/api/')) return realFetch(input, init);
+      const method = init.method || 'GET';
+      const body = init.body ? JSON.parse(init.body) : null;
+      const entry = { path, method, body, done: false };
+      requests.push(entry);
+      const response = data => new Response(JSON.stringify(data), { status: 200 });
+      if (path === '/api/collections') {
+        entry.done = true;
+        return Promise.resolve(response({ collections: [a, b].map(c => ({ name: c.collection, object_count: 1, index_type: 'hnsw', distance_metric: 'cosine' })) }));
+      }
+      if (path === '/api/retrieval/config/FixtureA' && requests.filter(r => r.path === path).length === 1) {
+        entry.done = true;
+        return Promise.resolve(response(a));
+      }
+      if (path === '/api/query') {
+        entry.done = true;
+        return Promise.resolve(response({ answer: 'Fixture answer', citations: [], retrieval_latency_ms: 1, llm_latency_ms: 1 }));
+      }
+      if (path.startsWith('/api/retrieval/config')) {
+        return new Promise(resolve => { entry.resolve = (data, status) => { entry.done = true; resolve(new Response(JSON.stringify(data), { status })); }; });
+      }
+      return Promise.reject(new Error('Unexpected fixture API call: ' + method + ' ' + path));
+    };
+  }, A, B);
+  await page.goto(base + '/retrieval', { waitUntil: 'domcontentloaded' });
+  await page.waitForFunction(() => document.body.innerText.includes('Top-K Results: 11') && !document.body.innerText.includes('Loading saved settings'));
+  return { ctx, page, errors };
+}
+
+async function pending(page, path, method = 'GET', count = 1) {
+  await page.waitForFunction((p, m, n) => window.queryConfigFixture.requests.filter(r => r.path === p && r.method === m && !r.done).length >= n, {}, path, method, count);
+}
+
+async function release(page, path, data, { method = 'GET', status = 200, last = false } = {}) {
+  await pending(page, path, method);
+  await page.evaluate(async (p, m, d, s, latest) => {
+    const waiting = window.queryConfigFixture.requests.filter(r => r.path === p && r.method === m && !r.done);
+    (latest ? waiting[waiting.length - 1] : waiting[0]).resolve(d, s);
+    // Drain fetch/text microtasks and React's committed effects without sleeps.
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  }, path, method, data, status, last);
+}
+
+async function save(page) {
+  assert.equal(await clickByText(page, 'Save for this collection'), true);
+  await pending(page, '/api/retrieval/config', 'POST');
+}
+
+async function select(page, name) {
+  await page.select('select', name);
+  await pending(page, '/api/retrieval/config/' + name);
+}
+
+async function assertSettings(page, config) {
+  assert.deepEqual(await page.evaluate(() => ({
+    collection: document.querySelector('select').value,
+    top_k: Number(document.querySelector('input[type=range]').value),
+    retrieval_mode: document.querySelector('input[name=mode]:checked').value,
+    loading: document.body.innerText.includes('Loading saved settings'),
+  })), { collection: config.collection, top_k: config.top_k, retrieval_mode: config.retrieval_mode, loading: false });
+}
+
+async function assertQuery(page, config) {
+  assert.equal(await clickByText(page, 'Q&A'), true);
+  await page.waitForSelector('textarea');
+  await setValue(page, '() => document.querySelector("textarea")', 'Which settings are active?');
+  assert.equal(await clickByText(page, 'Ask'), true);
+  await page.waitForFunction(() => window.queryConfigFixture.requests.some(r => r.path === '/api/query'));
+  const body = await page.evaluate(() => window.queryConfigFixture.requests.find(r => r.path === '/api/query').body);
+  assert.deepEqual(body, {
+    question: 'Which settings are active?', collection: config.collection,
+    retrieval_mode: config.retrieval_mode, top_k: config.top_k, alpha: config.alpha,
+    include_citations: false, response_format: 'engineer',
+  });
+}
+
+async function runQueryConfigTests(browser, base, reporter) {
+  reporter.section('collection-bound query configuration (deferred API fixtures)');
+  const cases = [];
+  for (const saveFirst of [true, false]) {
+    cases.push([`A save ${saveFirst ? 'before' : 'after'} B load preserves B settings and next query`, async page => {
+      await save(page);
+      await select(page, B.collection);
+      if (saveFirst) {
+        await release(page, '/api/retrieval/config', A, { method: 'POST' });
+        assert.equal(await page.evaluate(() => document.body.innerText.includes('Loading saved settings')), true);
+      }
+      await release(page, '/api/retrieval/config/' + B.collection, B);
+      if (!saveFirst) await release(page, '/api/retrieval/config', A, { method: 'POST' });
+      await assertSettings(page, B);
+      await assertQuery(page, B);
+    }]);
+  }
+  cases.push(['B load failure remains authoritative after stale A save', async page => {
+    await save(page);
+    await select(page, B.collection);
+    await release(page, '/api/retrieval/config/' + B.collection, { error: { message: 'Fixture B unavailable' } }, { status: 500 });
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    assert.equal(await page.evaluate(() => document.body.innerText.includes('Fixture B unavailable') && document.body.innerText.includes('showing defaults')), true);
+    await assertSettings(page, DEFAULT);
+    await assertQuery(page, DEFAULT);
+  }]);
+  cases.push(['A -> B -> A does not revive the first A save or stale B load', async page => {
+    await save(page);
+    await select(page, B.collection);
+    await select(page, A.collection);
+    const current = { ...A, retrieval_mode: 'semantic', top_k: 31, alpha: 0.9 };
+    await release(page, '/api/retrieval/config/' + A.collection, current);
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    await release(page, '/api/retrieval/config/' + B.collection, B);
+    await assertSettings(page, current);
+    await assertQuery(page, current);
+  }]);
+  for (const latestFirst of [true, false]) {
+    cases.push([`concurrent saves keep latest submitted values (${latestFirst ? 'latest' : 'oldest'} response first)`, async page => {
+      await save(page);
+      await setValue(page, '() => document.querySelector("input[type=range]")', '17');
+      await save(page);
+      await pending(page, '/api/retrieval/config', 'POST', 2);
+      const current = { ...A, top_k: 17 };
+      const bodies = await page.evaluate(() => window.queryConfigFixture.requests.filter(r => r.method === 'POST').map(r => r.body.top_k));
+      assert.deepEqual(bodies, [11, 17]);
+      await release(page, '/api/retrieval/config', latestFirst ? current : A, { method: 'POST', last: latestFirst });
+      await release(page, '/api/retrieval/config', latestFirst ? A : current, { method: 'POST' });
+      await assertSettings(page, current);
+      await assertQuery(page, current);
+    }]);
+  }
+  cases.push(['current save failure still reaches the caller and preserves saved settings', async page => {
+    await save(page);
+    await release(page, '/api/retrieval/config', { error: { message: 'Fixture save failed' } }, { method: 'POST', status: 500 });
+    assert.equal(await page.evaluate(() => document.body.innerText.includes('Fixture save failed')), true);
+    await assertSettings(page, A);
+    await assertQuery(page, A);
+  }]);
+  for (const [name, test] of cases) {
+    let s;
+    try {
+      s = await fixture(browser, base);
+      await test(s.page);
+      assert.deepEqual(s.errors, []);
+      reporter.check(name, true);
+    } catch (error) {
+      reporter.check(name, false, error.stack || error.message);
+    } finally {
+      if (s) await s.ctx.close();
+    }
+  }
+}
+
+module.exports = { runQueryConfigTests };
+
+if (require.main === module) {
+  (async () => {
+    const browser = await require('puppeteer-core').launch({
+      executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser',
+      headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    });
+    const reporter = makeReporter();
+    try { await runQueryConfigTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
+    finally { await browser.close(); }
+    process.exitCode = reporter.summary() ? 0 : 1;
+  })().catch(error => { console.error(error); process.exitCode = 2; });
+}
+```
+
 ### scripts/verify/browser/ui_criteria.js
 
 ```javascript
@@ -12702,6 +12936,8 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
 (async () => {
   const browser = await launch();
   const r = makeReporter();
+
+  await require('./query_config').runQueryConfigTests(browser, BASE, r);
 
   // ── role persistence ───────────────────────────────────────────────────────
   r.section('§10.4 role selection');

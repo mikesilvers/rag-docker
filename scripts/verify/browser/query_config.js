@@ -1,0 +1,185 @@
+// Deferred responses exercise the real provider, Retrieval page, and Q&A page.
+// All API calls are intercepted before application startup; no backend is used.
+const assert = require('node:assert/strict');
+const { makeReporter, setValue, clickByText } = require('./lib');
+
+const A = { collection: 'FixtureA', retrieval_mode: 'hybrid', top_k: 11, alpha: 0.25, ef: null, response_format: 'engineer', is_default: false };
+const B = { ...A, collection: 'FixtureB', retrieval_mode: 'semantic', top_k: 23, alpha: 0.6 };
+const DEFAULT = { ...B, retrieval_mode: 'hnsw', top_k: 5, alpha: 0.75, is_default: true };
+
+async function fixture(browser, base) {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.evaluateOnNewDocument((a, b) => {
+    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
+    const realFetch = window.fetch.bind(window);
+    const requests = [];
+    window.queryConfigFixture = { requests };
+    window.fetch = (input, init = {}) => {
+      const path = new URL(input, location.href).pathname;
+      if (!path.startsWith('/api/')) return realFetch(input, init);
+      const method = init.method || 'GET';
+      const body = init.body ? JSON.parse(init.body) : null;
+      const entry = { path, method, body, done: false };
+      requests.push(entry);
+      const response = data => new Response(JSON.stringify(data), { status: 200 });
+      if (path === '/api/collections') {
+        entry.done = true;
+        return Promise.resolve(response({ collections: [a, b].map(c => ({ name: c.collection, object_count: 1, index_type: 'hnsw', distance_metric: 'cosine' })) }));
+      }
+      if (path === '/api/retrieval/config/FixtureA' && requests.filter(r => r.path === path).length === 1) {
+        entry.done = true;
+        return Promise.resolve(response(a));
+      }
+      if (path === '/api/query') {
+        entry.done = true;
+        return Promise.resolve(response({ answer: 'Fixture answer', citations: [], retrieval_latency_ms: 1, llm_latency_ms: 1 }));
+      }
+      if (path.startsWith('/api/retrieval/config')) {
+        return new Promise(resolve => { entry.resolve = (data, status) => { entry.done = true; resolve(new Response(JSON.stringify(data), { status })); }; });
+      }
+      return Promise.reject(new Error('Unexpected fixture API call: ' + method + ' ' + path));
+    };
+  }, A, B);
+  await page.goto(base + '/retrieval', { waitUntil: 'domcontentloaded' });
+  await page.waitForFunction(() => document.body.innerText.includes('Top-K Results: 11') && !document.body.innerText.includes('Loading saved settings'));
+  return { ctx, page, errors };
+}
+
+async function pending(page, path, method = 'GET', count = 1) {
+  await page.waitForFunction((p, m, n) => window.queryConfigFixture.requests.filter(r => r.path === p && r.method === m && !r.done).length >= n, {}, path, method, count);
+}
+
+async function release(page, path, data, { method = 'GET', status = 200, last = false } = {}) {
+  await pending(page, path, method);
+  await page.evaluate(async (p, m, d, s, latest) => {
+    const waiting = window.queryConfigFixture.requests.filter(r => r.path === p && r.method === m && !r.done);
+    (latest ? waiting[waiting.length - 1] : waiting[0]).resolve(d, s);
+    // Drain fetch/text microtasks and React's committed effects without sleeps.
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  }, path, method, data, status, last);
+}
+
+async function save(page) {
+  assert.equal(await clickByText(page, 'Save for this collection'), true);
+  await pending(page, '/api/retrieval/config', 'POST');
+}
+
+async function select(page, name) {
+  await page.select('select', name);
+  await pending(page, '/api/retrieval/config/' + name);
+}
+
+async function assertSettings(page, config) {
+  assert.deepEqual(await page.evaluate(() => ({
+    collection: document.querySelector('select').value,
+    top_k: Number(document.querySelector('input[type=range]').value),
+    retrieval_mode: document.querySelector('input[name=mode]:checked').value,
+    loading: document.body.innerText.includes('Loading saved settings'),
+  })), { collection: config.collection, top_k: config.top_k, retrieval_mode: config.retrieval_mode, loading: false });
+}
+
+async function assertQuery(page, config) {
+  assert.equal(await clickByText(page, 'Q&A'), true);
+  await page.waitForSelector('textarea');
+  await setValue(page, '() => document.querySelector("textarea")', 'Which settings are active?');
+  assert.equal(await clickByText(page, 'Ask'), true);
+  await page.waitForFunction(() => window.queryConfigFixture.requests.some(r => r.path === '/api/query'));
+  const body = await page.evaluate(() => window.queryConfigFixture.requests.find(r => r.path === '/api/query').body);
+  assert.deepEqual(body, {
+    question: 'Which settings are active?', collection: config.collection,
+    retrieval_mode: config.retrieval_mode, top_k: config.top_k, alpha: config.alpha,
+    include_citations: false, response_format: 'engineer',
+  });
+}
+
+async function runQueryConfigTests(browser, base, reporter) {
+  reporter.section('collection-bound query configuration (deferred API fixtures)');
+  const cases = [];
+  for (const saveFirst of [true, false]) {
+    cases.push([`A save ${saveFirst ? 'before' : 'after'} B load preserves B settings and next query`, async page => {
+      await save(page);
+      await select(page, B.collection);
+      if (saveFirst) {
+        await release(page, '/api/retrieval/config', A, { method: 'POST' });
+        assert.equal(await page.evaluate(() => document.body.innerText.includes('Loading saved settings')), true);
+      }
+      await release(page, '/api/retrieval/config/' + B.collection, B);
+      if (!saveFirst) await release(page, '/api/retrieval/config', A, { method: 'POST' });
+      await assertSettings(page, B);
+      await assertQuery(page, B);
+    }]);
+  }
+  cases.push(['B load failure remains authoritative after stale A save', async page => {
+    await save(page);
+    await select(page, B.collection);
+    await release(page, '/api/retrieval/config/' + B.collection, { error: { message: 'Fixture B unavailable' } }, { status: 500 });
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    assert.equal(await page.evaluate(() => document.body.innerText.includes('Fixture B unavailable') && document.body.innerText.includes('showing defaults')), true);
+    await assertSettings(page, DEFAULT);
+    await assertQuery(page, DEFAULT);
+  }]);
+  cases.push(['A -> B -> A does not revive the first A save or stale B load', async page => {
+    await save(page);
+    await select(page, B.collection);
+    await select(page, A.collection);
+    const current = { ...A, retrieval_mode: 'semantic', top_k: 31, alpha: 0.9 };
+    await release(page, '/api/retrieval/config/' + A.collection, current);
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    await release(page, '/api/retrieval/config/' + B.collection, B);
+    await assertSettings(page, current);
+    await assertQuery(page, current);
+  }]);
+  for (const latestFirst of [true, false]) {
+    cases.push([`concurrent saves keep latest submitted values (${latestFirst ? 'latest' : 'oldest'} response first)`, async page => {
+      await save(page);
+      await setValue(page, '() => document.querySelector("input[type=range]")', '17');
+      await save(page);
+      await pending(page, '/api/retrieval/config', 'POST', 2);
+      const current = { ...A, top_k: 17 };
+      const bodies = await page.evaluate(() => window.queryConfigFixture.requests.filter(r => r.method === 'POST').map(r => r.body.top_k));
+      assert.deepEqual(bodies, [11, 17]);
+      await release(page, '/api/retrieval/config', latestFirst ? current : A, { method: 'POST', last: latestFirst });
+      await release(page, '/api/retrieval/config', latestFirst ? A : current, { method: 'POST' });
+      await assertSettings(page, current);
+      await assertQuery(page, current);
+    }]);
+  }
+  cases.push(['current save failure still reaches the caller and preserves saved settings', async page => {
+    await save(page);
+    await release(page, '/api/retrieval/config', { error: { message: 'Fixture save failed' } }, { method: 'POST', status: 500 });
+    assert.equal(await page.evaluate(() => document.body.innerText.includes('Fixture save failed')), true);
+    await assertSettings(page, A);
+    await assertQuery(page, A);
+  }]);
+  for (const [name, test] of cases) {
+    let s;
+    try {
+      s = await fixture(browser, base);
+      await test(s.page);
+      assert.deepEqual(s.errors, []);
+      reporter.check(name, true);
+    } catch (error) {
+      reporter.check(name, false, error.stack || error.message);
+    } finally {
+      if (s) await s.ctx.close();
+    }
+  }
+}
+
+module.exports = { runQueryConfigTests };
+
+if (require.main === module) {
+  (async () => {
+    const browser = await require('puppeteer-core').launch({
+      executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser',
+      headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    });
+    const reporter = makeReporter();
+    try { await runQueryConfigTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
+    finally { await browser.close(); }
+    process.exitCode = reporter.summary() ? 0 : 1;
+  })().catch(error => { console.error(error); process.exitCode = 2; });
+}
