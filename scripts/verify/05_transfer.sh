@@ -16,6 +16,8 @@ section "Export, import and tuning"
 
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_session_import.py)
 check "evaluation import and generated-session regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_source_index_boundary.py)
+check "retained-source index boundary regressions" $?
 python3 "$REPO_ROOT/scripts/tests/test_session_implementation.py"
 check "embedded session/import verification sources match" $?
 

@@ -443,6 +443,35 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict, progress) -> int:
     return written
 
 
+def _validate_package_sources(pkg: Path, manifest: dict) -> None:
+    """Check untrusted retained-source identities before any live mutation."""
+    source_dir = pkg / "sources"
+    if not source_dir.exists():
+        if manifest.get("fidelity") == "with-sources":
+            raise PackageError("PACKAGE_CORRUPT", "Retained sources are missing.",
+                               {"file": "sources/index.json"})
+        return
+    index_path = source_dir / sources.INDEX_NAME
+    try:
+        if source_dir.is_symlink() or not source_dir.is_dir():
+            raise ValueError("Retained source directory is not a regular directory")
+        if (not index_path.exists() and not index_path.is_symlink()
+                and manifest.get("fidelity") != "with-sources"):
+            return
+        if index_path.is_symlink() or not index_path.is_file():
+            raise ValueError("Retained source index is missing or is not a regular file")
+        index = sources.validate_index(json.loads(index_path.read_text()))
+        for digest in index["documents"]:
+            blob = source_dir / digest
+            if blob.is_symlink() or not blob.is_file():
+                raise ValueError("Retained source blob is missing or is not a regular file")
+            if packager.sha256_file(blob) != digest:
+                raise ValueError("Retained source blob does not match its identity")
+    except (OSError, ValueError, TypeError) as exc:
+        raise PackageError("PACKAGE_CORRUPT", "Invalid retained source metadata.",
+                           {"file": "sources/index.json"}) from exc
+
+
 def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
     """Preflight every evaluation sidecar before touching live state.
 
@@ -579,6 +608,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         archive = packager.exports_dir() / Path(filename).name
         pkg, manifest = packager.open_package(archive, work)        # checks 1, 2
         packager.verify_digests(pkg, manifest)                      # check 3
+        _validate_package_sources(pkg, manifest)
         _check_embedding(manifest)                                  # check 4
 
         original = manifest["collection"]["name"]

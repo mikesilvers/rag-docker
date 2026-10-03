@@ -63,6 +63,13 @@ proportional to the corpus rather than to upload count, and it makes "have we
 seen this document?" answerable. The cost is that the original upload filename is
 no longer the storage key, which `index.json` exists to solve.
 
+An imported source index MUST name blobs only by lowercase SHA-256 digest.
+Import validates the index and its regular content-addressed files before
+model installation, collection mutation, or sidecar restoration; a mismatch is
+`PACKAGE_CORRUPT`. Export and re-chunking refuse invalid identities or linked
+blobs at their read boundaries, so source metadata cannot select an arbitrary
+filesystem path. Existing valid indexes keep their original fidelity.
+
 Retention MUST NOT change chunking, embedding, or any existing response shape.
 
 ### 2.3 Deletion
@@ -653,7 +660,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 |---|---|
 | `PACKAGE_UNREADABLE` | missing or not a readable archive |
 | `PACKAGE_FORMAT_UNSUPPORTED` | `package_format` newer than this instance |
-| `PACKAGE_CORRUPT` | digest mismatch or invalid evaluation-session metadata (check 4a); names the file |
+| `PACKAGE_CORRUPT` | digest mismatch or invalid evaluation-session/source metadata (check 4a); names the file |
 | `EMBEDDING_MISMATCH` | model or dimensions differ; names both |
 | `EMBEDDING_MODEL_MISSING` | target lacks the embedding model and the package does not bundle it |
 | `MODEL_INTEGRITY_FAILED` | the embedding model is installed but a file is missing or doesn't match its checksum; names the model |
@@ -711,6 +718,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E25 | With the embedding endpoint unavailable, reindex changes the physical index while preserving exact UUIDs/properties/vectors; completed jobs leave retained evaluation sessions unchanged; same-process ingestion is serialized, incompatible vectorizers are refused, and uncertain cutover retains durable recovery |
 | E26 | Importing when the installed embedding model's files don't match their checksums fails `MODEL_INTEGRITY_FAILED`, leaves the model's files untouched and says to restore or re-pull it |
 | E27 | With a namespaced `LLM_MODEL` (`user/model`), an import of a package without bundled models succeeds and notes the model |
+| E28 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths |
 
 ---
 

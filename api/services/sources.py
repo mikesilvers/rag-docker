@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +24,35 @@ log = logging.getLogger(__name__)
 
 INDEX_NAME = "index.json"
 INDEX_VERSION = 1
+_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def validate_index(index: dict) -> dict:
+    """Refuse source identities that could address anything but a stored blob."""
+    if not isinstance(index, dict) or not isinstance(index.get("documents"), dict):
+        raise ValueError("Invalid retained source index")
+    for digest, entry in index["documents"].items():
+        if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+            raise ValueError("Invalid retained source digest")
+        if not isinstance(entry, dict):
+            raise ValueError("Invalid retained source entry")
+        names = entry.get("filenames")
+        if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+            raise ValueError("Invalid retained source filenames")
+    return index
+
+
+def blob_path(collection: str, digest: str) -> Path:
+    """Return a retained blob path only when it cannot escape its collection."""
+    if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+        raise ValueError("Invalid retained source digest")
+    directory = collection_dir(collection)
+    if directory.is_symlink():
+        raise ValueError("Retained source directory is a link")
+    blob = directory / digest
+    if blob.is_symlink():
+        raise ValueError("Retained source blob is a link")
+    return blob
 
 
 def _root() -> Path:
@@ -39,6 +69,8 @@ def _index_path(collection: str) -> Path:
 
 def load_index(collection: str) -> dict:
     p = _index_path(collection)
+    if p.is_symlink():
+        raise ValueError("Retained source index is a link")
     if not p.exists():
         return {"version": INDEX_VERSION, "documents": {}}
     try:
@@ -46,9 +78,11 @@ def load_index(collection: str) -> dict:
     except (OSError, ValueError):
         log.warning("Unreadable source index for %r; treating as empty", collection)
         return {"version": INDEX_VERSION, "documents": {}}
+    if not isinstance(data, dict):
+        raise ValueError("Invalid retained source index")
     data.setdefault("version", INDEX_VERSION)
     data.setdefault("documents", {})
-    return data
+    return validate_index(data)
 
 
 def _save_index(collection: str, index: dict) -> None:

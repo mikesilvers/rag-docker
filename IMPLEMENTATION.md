@@ -1181,6 +1181,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1191,6 +1192,35 @@ log = logging.getLogger(__name__)
 
 INDEX_NAME = "index.json"
 INDEX_VERSION = 1
+_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def validate_index(index: dict) -> dict:
+    """Refuse source identities that could address anything but a stored blob."""
+    if not isinstance(index, dict) or not isinstance(index.get("documents"), dict):
+        raise ValueError("Invalid retained source index")
+    for digest, entry in index["documents"].items():
+        if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+            raise ValueError("Invalid retained source digest")
+        if not isinstance(entry, dict):
+            raise ValueError("Invalid retained source entry")
+        names = entry.get("filenames")
+        if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+            raise ValueError("Invalid retained source filenames")
+    return index
+
+
+def blob_path(collection: str, digest: str) -> Path:
+    """Return a retained blob path only when it cannot escape its collection."""
+    if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+        raise ValueError("Invalid retained source digest")
+    directory = collection_dir(collection)
+    if directory.is_symlink():
+        raise ValueError("Retained source directory is a link")
+    blob = directory / digest
+    if blob.is_symlink():
+        raise ValueError("Retained source blob is a link")
+    return blob
 
 
 def _root() -> Path:
@@ -1207,6 +1237,8 @@ def _index_path(collection: str) -> Path:
 
 def load_index(collection: str) -> dict:
     p = _index_path(collection)
+    if p.is_symlink():
+        raise ValueError("Retained source index is a link")
     if not p.exists():
         return {"version": INDEX_VERSION, "documents": {}}
     try:
@@ -1214,9 +1246,11 @@ def load_index(collection: str) -> dict:
     except (OSError, ValueError):
         log.warning("Unreadable source index for %r; treating as empty", collection)
         return {"version": INDEX_VERSION, "documents": {}}
+    if not isinstance(data, dict):
+        raise ValueError("Invalid retained source index")
     data.setdefault("version", INDEX_VERSION)
     data.setdefault("documents", {})
-    return data
+    return validate_index(data)
 
 
 def _save_index(collection: str, index: dict) -> None:
@@ -4172,9 +4206,8 @@ def build(
         source_document_count = len(index["documents"])
         if fidelity == "with-sources":
             b.add_json("sources/index.json", index)
-            src_dir = sources.collection_dir(collection)
             for digest in index["documents"]:
-                blob = src_dir / digest
+                blob = sources.blob_path(collection, digest)
                 if not blob.exists():
                     warnings.append(f"retained source {digest[:12]} is missing on disk")
                     continue
@@ -5009,6 +5042,35 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict, progress) -> int:
     return written
 
 
+def _validate_package_sources(pkg: Path, manifest: dict) -> None:
+    """Check untrusted retained-source identities before any live mutation."""
+    source_dir = pkg / "sources"
+    if not source_dir.exists():
+        if manifest.get("fidelity") == "with-sources":
+            raise PackageError("PACKAGE_CORRUPT", "Retained sources are missing.",
+                               {"file": "sources/index.json"})
+        return
+    index_path = source_dir / sources.INDEX_NAME
+    try:
+        if source_dir.is_symlink() or not source_dir.is_dir():
+            raise ValueError("Retained source directory is not a regular directory")
+        if (not index_path.exists() and not index_path.is_symlink()
+                and manifest.get("fidelity") != "with-sources"):
+            return
+        if index_path.is_symlink() or not index_path.is_file():
+            raise ValueError("Retained source index is missing or is not a regular file")
+        index = sources.validate_index(json.loads(index_path.read_text()))
+        for digest in index["documents"]:
+            blob = source_dir / digest
+            if blob.is_symlink() or not blob.is_file():
+                raise ValueError("Retained source blob is missing or is not a regular file")
+            if packager.sha256_file(blob) != digest:
+                raise ValueError("Retained source blob does not match its identity")
+    except (OSError, ValueError, TypeError) as exc:
+        raise PackageError("PACKAGE_CORRUPT", "Invalid retained source metadata.",
+                           {"file": "sources/index.json"}) from exc
+
+
 def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
     """Preflight every evaluation sidecar before touching live state.
 
@@ -5145,6 +5207,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         archive = packager.exports_dir() / Path(filename).name
         pkg, manifest = packager.open_package(archive, work)        # checks 1, 2
         packager.verify_digests(pkg, manifest)                      # check 3
+        _validate_package_sources(pkg, manifest)
         _check_embedding(manifest)                                  # check 4
 
         original = manifest["collection"]["name"]
@@ -5676,13 +5739,12 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             "fidelity 'chunks-only'.",
             {"collection": collection})
 
-    src_dir = sources.collection_dir(collection)
     out: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
     work = Path(tempfile.mkdtemp(prefix="rechunk-", dir=settings.upload_dir))
     try:
         for digest, entry in sorted(documents.items()):
-            blob = src_dir / digest
+            blob = sources.blob_path(collection, digest)
             if not blob.is_file():
                 raise PackageError(
                     "SOURCES_REQUIRED",
@@ -9803,7 +9865,7 @@ Exits non-zero if any check fails.
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
 
-`05_transfer.sh` registers both controlled regressions and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename.
+`05_transfer.sh` registers both controlled regressions and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -9887,8 +9949,9 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23, E26 and E27; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E28; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
+| `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
 | `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
@@ -11757,6 +11820,8 @@ section "Export, import and tuning"
 
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_session_import.py)
 check "evaluation import and generated-session regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_source_index_boundary.py)
+check "retained-source index boundary regressions" $?
 python3 "$REPO_ROOT/scripts/tests/test_session_implementation.py"
 check "embedded session/import verification sources match" $?
 
@@ -15167,4 +15232,119 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaises(ValueError):ns['owned_name']('','owned')
 
 if __name__=='__main__':unittest.main()
+```
+
+### scripts/tests/test_source_index_boundary.py
+
+```python
+"""Untrusted retained-source identities never select filesystem paths."""
+import hashlib
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api"))
+
+from config import settings
+from services import importer, packager, sources
+from services.packager import PackageError
+
+
+class SourceIndexBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.source_patch = patch.object(settings, "sources_dir", str(self.root / "retained"))
+        self.source_patch.start()
+        self.addCleanup(self.source_patch.stop)
+        self.package = self.root / "package"
+        (self.package / "sources").mkdir(parents=True)
+        self.outside = self.root / "outside.txt"
+        self.outside.write_text("controlled outside sentinel")
+
+    def index(self, digest):
+        return {"version": 1, "documents": {
+            digest: {"filenames": ["document.txt"], "size": 10}}}
+
+    def test_valid_content_addressed_source_round_trips(self):
+        content = b"retained source"
+        digest = hashlib.sha256(content).hexdigest()
+        (self.package / "sources" / digest).write_bytes(content)
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+        retained = sources.collection_dir("Valid")
+        retained.mkdir(parents=True)
+        (retained / digest).write_bytes(content)
+        (retained / "index.json").write_text(json.dumps(self.index(digest)))
+        self.assertEqual(sources.load_index("Valid")["documents"].keys(), {digest})
+        self.assertEqual(sources.blob_path("Valid", digest).read_bytes(), content)
+
+    def test_import_rejects_paths_before_restoring_sources(self):
+        for key in (str(self.outside), "../outside.txt", "a/b", "index.json"):
+            with self.subTest(key=key):
+                (self.package / "sources" / "index.json").write_text(json.dumps(self.index(key)))
+                with self.assertRaises(PackageError) as raised:
+                    importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+                self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
+                self.assertFalse(sources.collection_dir("Imported").exists())
+
+    def test_import_job_rejects_index_before_backend_or_model_work(self):
+        (self.package / "sources" / "index.json").write_text(
+            json.dumps(self.index(str(self.outside))))
+        check_embedding = Mock()
+        ensure_models = Mock()
+        backend = Mock()
+        job = {"status": "queued"}
+        with patch.object(settings, "upload_dir", str(self.root)), \
+             patch.object(importer, "_jobs", {"owned": job}), \
+             patch.object(importer, "_active", {"owned.tar.gz"}), \
+             patch.object(importer.packager, "exports_dir", return_value=self.root), \
+             patch.object(importer.packager, "open_package", return_value=(
+                 self.package, {"fidelity": "with-sources"})), \
+             patch.object(importer.packager, "verify_digests"), \
+             patch.object(importer, "_check_embedding", check_embedding), \
+             patch.object(importer, "_ensure_models", ensure_models), \
+             patch.object(importer.wc, "get_client", backend):
+            importer._run("owned", "owned.tar.gz", "replace")
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["error_code"], "PACKAGE_CORRUPT")
+        check_embedding.assert_not_called()
+        ensure_models.assert_not_called()
+        backend.assert_not_called()
+
+    def test_export_rejects_outside_identity_and_link(self):
+        retained = sources.collection_dir("Imported")
+        retained.mkdir(parents=True)
+        (retained / "index.json").write_text(json.dumps(self.index(str(self.outside))))
+        with self.assertRaises(ValueError):
+            sources.load_index("Imported")
+        digest = hashlib.sha256(self.outside.read_bytes()).hexdigest()
+        (retained / digest).symlink_to(self.outside)
+        (retained / "index.json").write_text(json.dumps(self.index(digest)))
+        with self.assertRaises(ValueError):
+            sources.blob_path("Imported", digest)
+        (retained / "index.json").unlink()
+        (retained / "index.json").symlink_to(self.outside)
+        with self.assertRaises(ValueError):
+            sources.load_index("Imported")
+        (retained / "index.json").unlink()
+        (retained / "index.json").write_text(json.dumps(self.index(digest)))
+        with patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager, "read_chunks", return_value=iter(())), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={}), \
+             patch.object(packager, "_ingest_config", return_value=None), \
+             patch.object(packager.retrieval_config, "resolve", return_value=({}, True)), \
+             patch.object(packager, "_goldstandard_sessions", return_value=[]):
+            with self.assertRaises(ValueError):
+                packager.build("Imported")
+        self.assertFalse(list(self.root.glob("*.tar.gz")))
+
+
+if __name__ == "__main__":
+    unittest.main()
 ```

@@ -285,9 +285,8 @@ def build(
         source_document_count = len(index["documents"])
         if fidelity == "with-sources":
             b.add_json("sources/index.json", index)
-            src_dir = sources.collection_dir(collection)
             for digest in index["documents"]:
-                blob = src_dir / digest
+                blob = sources.blob_path(collection, digest)
                 if not blob.exists():
                     warnings.append(f"retained source {digest[:12]} is missing on disk")
                     continue
