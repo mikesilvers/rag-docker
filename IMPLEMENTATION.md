@@ -1310,6 +1310,7 @@ import re
 from pathlib import Path
 
 from config import settings
+from services import settings_store
 
 log = logging.getLogger(__name__)
 
@@ -1329,8 +1330,9 @@ _DIR: Path | None = None
 def _dir() -> Path:
     global _DIR
     if _DIR is None:
-        _DIR = Path(settings.upload_dir) / "ingest_configs"
-        _DIR.mkdir(parents=True, exist_ok=True)
+        directory = Path(settings.upload_dir) / "ingest_configs"
+        directory.mkdir(parents=True, exist_ok=True)
+        _DIR = directory
     return _DIR
 
 
@@ -1367,11 +1369,7 @@ def resolve(collection: str) -> tuple[dict, bool]:
 def save(config: dict) -> dict:
     collection = config["collection"]
     p = _path(collection)
-    # Written via a temp file in the same directory so a crash cannot leave a
-    # half-written config behind.
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(config, indent=2, sort_keys=True))
-    tmp.replace(p)
+    settings_store.publish(p, config)
     return config
 
 
@@ -1407,6 +1405,7 @@ import re
 from pathlib import Path
 
 from config import settings
+from services import settings_store
 
 log = logging.getLogger(__name__)
 
@@ -1427,8 +1426,9 @@ _DIR: Path | None = None
 def _dir() -> Path:
     global _DIR
     if _DIR is None:
-        _DIR = Path(settings.upload_dir) / "retrieval_configs"
-        _DIR.mkdir(parents=True, exist_ok=True)
+        directory = Path(settings.upload_dir) / "retrieval_configs"
+        directory.mkdir(parents=True, exist_ok=True)
+        _DIR = directory
     return _DIR
 
 
@@ -1467,9 +1467,7 @@ def resolve(collection: str) -> tuple[dict, bool]:
 def save(config: dict) -> dict:
     collection = config["collection"]
     p = _path(collection)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(config, indent=2, sort_keys=True))
-    tmp.replace(p)
+    settings_store.publish(p, config)
     return config
 
 
@@ -9799,6 +9797,20 @@ bash scripts/verify/all.sh 02 04              # only the named suites
 
 Exits non-zero if any check fails.
 
+## Settings publication regressions
+
+With API dependencies installed, run
+`python3 scripts/tests/test_settings_persistence.py` for deterministic ingest and
+retrieval save contention, unique temporary paths, first-save directory races,
+and failed serialization/create/write/close/replace preservation. The test also
+checks affected embedded sources against `IMPLEMENTATION.md`. It uses disposable
+directories and does not connect to Weaviate or Ollama.
+
+`07_settings.sh` runs the controlled persistence cases inside the API container
+after verifying that `RAG_API` selects that Compose stack, then runs its live HTTP
+validation and round-trip checks. This coverage complements the required full
+verification run; it does not establish full-stack acceptance by itself.
+
 ## Focused import validation regressions
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
@@ -13817,7 +13829,12 @@ if __name__ == '__main__':
 # Settings validation through the running API; the helper owns its collection.
 set -uo pipefail
 cd "$(dirname "$0")" && . ./lib.sh
+proxy_bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
+python3 ./compose_target.py "$API" "$proxy_bindings" || exit 2
 require_stack
+section "Concurrent settings publication and failed-write preservation"
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - SettingsPersistenceTests < scripts/tests/test_settings_persistence.py)
+check "controlled retrieval/ingest concurrency and publication failures" $?
 section "Settings validation before work"
 RAG_API="$API" python3 ./settings_validation.py
 check "live settings validation and owned-fixture cleanup" $?
@@ -15167,4 +15184,253 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaises(ValueError):ns['owned_name']('','owned')
 
 if __name__=='__main__':unittest.main()
+```
+
+### api/services/settings_store.py
+
+```python
+"""Atomic settings publication shared by ingest and retrieval saves."""
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+import tempfile
+import threading
+
+log = logging.getLogger(__name__)
+
+# Saves are short filesystem transactions dispatched to API worker threads.
+# One lock also covers collection names that map to the same sanitized path.
+_write_lock = threading.Lock()
+
+
+def publish(path: Path, config: dict) -> None:
+    """Publish this request's complete value, preserving the old file on failure.
+
+    Serialize the whole transaction within this API process. Exclusive temporary
+    names ensure even independent processes cannot rename each other's payloads.
+    A later successful save may supersede this value after atomic replacement.
+    """
+    with _write_lock:
+        payload = json.dumps(config, indent=2, sort_keys=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=path.parent,
+                prefix=f".{path.name}.", suffix=".tmp", delete=False,
+            ) as output:
+                temporary = Path(output.name)
+                output.write(payload)
+            temporary.replace(path)
+            temporary = None
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    log.warning("Could not remove settings temporary file %s", temporary)
+```
+
+### scripts/tests/test_settings_persistence.py
+
+```python
+"""Deterministic settings publication regressions; no backend or model calls."""
+import json
+import os
+import sys
+import tempfile
+import threading
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
+from config import settings
+from services import ingest_config, retrieval_config, settings_store
+
+SERVICES = (ingest_config, retrieval_config)
+
+
+class SettingsPersistenceTests(unittest.TestCase):
+    @contextmanager
+    def fixture(self, service):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(settings, 'upload_dir', directory), \
+             patch.object(service, '_DIR', None):
+            yield Path(directory)
+
+    def values(self, service):
+        field = 'chunk_size' if service is ingest_config else 'top_k'
+        return [{**service.DEFAULTS, 'collection': 'ConcurrentSettings', field: value}
+                for value in ((1000, 1100, 1200) if service is ingest_config else (5, 7, 9))]
+
+    def test_contending_saves_publish_their_own_complete_values(self):
+        for service in SERVICES:
+            with self.subTest(service=service.__name__), self.fixture(service):
+                old, first, second = self.values(service)
+                service.save(old)
+                reached_replace = threading.Event()
+                second_attempt = threading.Event()
+                release_first = threading.Event()
+                lock = threading.Lock()
+                request = threading.local()
+                publications = []
+                replace = Path.replace
+
+                class ObservedLock:
+                    def __enter__(self):
+                        if request.value == second:
+                            second_attempt.set()
+                        lock.acquire()
+
+                    def __exit__(self, *args):
+                        lock.release()
+
+                def controlled_replace(temporary, destination):
+                    if request.value == first:
+                        reached_replace.set()
+                        if not release_first.wait(5):
+                            raise TimeoutError('first publication was not released')
+                    payload = json.loads(temporary.read_text())
+                    self.assertEqual(payload, request.value)
+                    result = replace(temporary, destination)
+                    self.assertEqual(service.load(old['collection']), request.value)
+                    publications.append((temporary, payload))
+                    return result
+
+                def save(value):
+                    request.value = value
+                    return service.save(value)
+
+                with patch.object(settings_store, '_write_lock', ObservedLock()), \
+                     patch.object(Path, 'replace', controlled_replace), \
+                     ThreadPoolExecutor(max_workers=2) as pool:
+                    a = pool.submit(save, first)
+                    try:
+                        self.assertTrue(reached_replace.wait(5))
+                        b = pool.submit(save, second)
+                        self.assertTrue(second_attempt.wait(5))
+                        self.assertFalse(b.done())
+                        self.assertEqual(service.load(old['collection']), old)
+                        self.assertEqual(len(list(service._dir().glob('*.tmp'))), 1)
+                    finally:
+                        release_first.set()
+                    self.assertEqual(a.result(timeout=5), first)
+                    self.assertEqual(b.result(timeout=5), second)
+                self.assertEqual([value for _, value in publications], [first, second])
+                self.assertEqual(len({path for path, _ in publications}), 2)
+                self.assertTrue(all(path.parent == service._dir() for path, _ in publications))
+                self.assertEqual(service.resolve(old['collection']), (second, False))
+                self.assertEqual(list(service._dir().glob('*.tmp')), [])
+
+    def test_first_saves_wait_for_their_directory_to_exist(self):
+        for service in SERVICES:
+            with self.subTest(service=service.__name__), self.fixture(service):
+                _, first, second = self.values(service)
+                reached_mkdir = threading.Event()
+                release_first = threading.Event()
+                mkdir = Path.mkdir
+                request = threading.local()
+
+                def controlled_mkdir(path, *args, **kwargs):
+                    if request.value == first:
+                        reached_mkdir.set()
+                        if not release_first.wait(5):
+                            raise TimeoutError('directory creation was not released')
+                    return mkdir(path, *args, **kwargs)
+
+                def save(value):
+                    request.value = value
+                    return service.save(value)
+
+                with patch.object(Path, 'mkdir', controlled_mkdir), ThreadPoolExecutor(max_workers=2) as pool:
+                    a = pool.submit(save, first)
+                    try:
+                        self.assertTrue(reached_mkdir.wait(5))
+                        b = pool.submit(save, second)
+                        self.assertEqual(b.result(timeout=5), second)
+                        self.assertEqual(service.load(first['collection']), second)
+                    finally:
+                        release_first.set()
+                    self.assertEqual(a.result(timeout=5), first)
+                self.assertEqual(service.load(first['collection']), first)
+
+    def assert_failure_preserves_old_value(self, service, fault, exception):
+        with self.fixture(service):
+            old, attempted, _ = self.values(service)
+            service.save(old)
+            previous_bytes = service._path(old['collection']).read_bytes()
+            with fault, self.assertRaises(exception):
+                service.save(attempted)
+            self.assertEqual(service._path(old['collection']).read_bytes(), previous_bytes)
+            self.assertEqual(service.resolve(old['collection']), (old, False))
+            self.assertEqual(list(service._dir().glob('*.tmp')), [])
+            self.assertEqual(service.save(attempted), attempted)
+            self.assertEqual(service.load(old['collection']), attempted)
+
+    def test_temporary_creation_failure_preserves_old_value_and_allows_retry(self):
+        for service in SERVICES:
+            with self.subTest(service=service.__name__):
+                self.assert_failure_preserves_old_value(service,
+                    patch.object(settings_store.tempfile, 'NamedTemporaryFile', side_effect=PermissionError('injected create fault')),
+                    PermissionError)
+
+    def test_partial_write_and_close_failure_preserve_old_value_and_clean_up(self):
+        create = tempfile.NamedTemporaryFile
+        for service in SERVICES:
+            for stage in ('write', 'close'):
+                with self.subTest(service=service.__name__, stage=stage):
+                    @contextmanager
+                    def failing_file(*args, **kwargs):
+                        with create(*args, **kwargs) as output:
+                            if stage == 'write':
+                                def partial_write(payload):
+                                    output.file.write(payload[:10])
+                                    raise OSError('injected partial write fault')
+                                with patch.object(output, 'write', partial_write):
+                                    yield output
+                            else:
+                                yield output
+                                raise OSError('injected close fault')
+                    self.assert_failure_preserves_old_value(service,
+                        patch.object(settings_store.tempfile, 'NamedTemporaryFile', failing_file), OSError)
+
+    def test_replacement_failure_preserves_old_value_and_cleans_up(self):
+        for service in SERVICES:
+            with self.subTest(service=service.__name__):
+                self.assert_failure_preserves_old_value(service,
+                    patch.object(Path, 'replace', side_effect=OSError('injected replace fault')), OSError)
+
+    def test_serialization_failure_preserves_old_value(self):
+        for service in SERVICES:
+            with self.subTest(service=service.__name__), self.fixture(service):
+                old, _, _ = self.values(service)
+                service.save(old)
+                with self.assertRaises(TypeError):
+                    service.save({**old, 'unserializable': object()})
+                self.assertEqual(service.load(old['collection']), old)
+                self.assertEqual(list(service._dir().glob('*.tmp')), [])
+
+
+class ImplementationTests(unittest.TestCase):
+    def test_embedded_sources_match_runtime(self):
+        root = Path(__file__).resolve().parents[2]
+        text = (root / 'IMPLEMENTATION.md').read_text()
+        for name in ('api/services/settings_store.py', 'api/services/ingest_config.py',
+                     'api/services/retrieval_config.py', 'scripts/verify/07_settings.sh',
+                     'scripts/verify/README.md', 'scripts/tests/test_settings_persistence.py'):
+            with self.subTest(file=name):
+                fence = '````' if name.endswith('.md') else '```'
+                language = 'markdown' if name.endswith('.md') else 'bash' if name.endswith('.sh') else 'python'
+                header = f'### {name}\n\n{fence}{language}\n'
+                start = text.index(header) + len(header)
+                end = text.index('\n' + fence + '\n', start)
+                self.assertEqual(text[start:end], (root / name).read_text().rstrip('\n'))
+
+
+if __name__ == '__main__':
+    unittest.main()
 ```

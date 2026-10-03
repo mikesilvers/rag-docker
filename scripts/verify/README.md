@@ -13,6 +13,20 @@ bash scripts/verify/all.sh 02 04              # only the named suites
 
 Exits non-zero if any check fails.
 
+## Settings publication regressions
+
+With API dependencies installed, run
+`python3 scripts/tests/test_settings_persistence.py` for deterministic ingest and
+retrieval save contention, unique temporary paths, first-save directory races,
+and failed serialization/create/write/close/replace preservation. The test also
+checks affected embedded sources against `IMPLEMENTATION.md`. It uses disposable
+directories and does not connect to Weaviate or Ollama.
+
+`07_settings.sh` runs the controlled persistence cases inside the API container
+after verifying that `RAG_API` selects that Compose stack, then runs its live HTTP
+validation and round-trip checks. This coverage complements the required full
+verification run; it does not establish full-stack acceptance by itself.
+
 ## Focused import validation regressions
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.

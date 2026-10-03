@@ -475,6 +475,14 @@ Saves (upserts) a default chunking configuration for a collection. Creates the c
 
 Config is persisted to `{UPLOAD_DIR}/ingest_configs/{collection}.json` so it survives restarts. The `{collection}` segment in all file paths is the collection name with spaces replaced by underscores and non-alphanumeric characters removed, to ensure safe filenames.
 
+Ingest and retrieval settings saves serialize publication across the API process's
+worker threads. Each save writes its own exclusively created temporary file in
+the destination directory and atomically replaces the saved configuration. A 201
+acknowledges that request's complete value was published; a later successful save
+may supersede it. Serialization, temporary write/close or replacement failure
+does not acknowledge success and leaves the last valid configuration readable.
+Failed saves clean up their own temporary file when filesystem permissions allow.
+
 ---
 
 #### 3.1.4 Query (RAG)
@@ -610,8 +618,8 @@ carries the settings it was tuned with.
 **Response 201:** the saved configuration, with `is_default: false`.
 
 Config is persisted to `{UPLOAD_DIR}/retrieval_configs/{collection}.json`, written
-atomically (temp file then replace) so an interrupted write cannot leave a
-half-written config. Deleting a collection deletes its retrieval config.
+atomically with the same unique-temporary-file and serialized-publication contract
+as ingest settings above. Deleting a collection deletes its retrieval config.
 
 ---
 
@@ -1736,6 +1744,7 @@ rag-docker/
 │   │   ├── rag_pipeline.py      # Reformulate → retrieve → synthesize
 │   │   ├── sources.py           # Retained original documents (content-addressed)
 │   │   ├── retrieval_config.py  # Per-collection retrieval settings (atomic JSON)
+│   │   ├── settings_store.py    # Shared serialized settings publication
 │   │   ├── packager.py          # Package format: naming, digests, manifest, reader
 │   │   ├── exporter.py          # Export job lifecycle and the per-collection guard
 │   │   ├── importer.py          # Import job: validation order, conflicts, atomicity
@@ -1820,6 +1829,8 @@ now lives once, in `api/services/ingest_config.py`.
 
 - [x] Invalid ingest/saved settings are rejected before staging, jobs or configuration writes; valid defaults and fixed size/minimum preferences are retained.
       *`test_settings_validation.py` checks mocked work boundaries and persistence; `07_settings.sh` runs real HTTP rejection, unchanged-config and valid round-trip checks on an owned collection. Full affected ingest verification passes 18 checks.*
+- [x] Concurrent ingest/retrieval settings saves publish their own complete values; failed publication preserves the previous valid configuration (#141).
+      *`test_settings_persistence.py` controls worker contention and first-save directory creation with events, observes each publication and unique temporary path, and injects serialization, creation, partial-write, close and replacement failures for both services. Suite 07 registers these controlled tests alongside live HTTP validation and round trips; full-stack verification is recorded separately.*
 - [x] `chunk_size` is bounded to 50–6000 and `min_chunk_size` to 0–6000 wherever chunk settings are saved or used; a saved configuration from before the bounds is still returned and exported unchanged, and must be within them to be saved again or used for tuning (#53).
       *`test_settings_validation.py` saves and reads back both edges, rejects 49, 6001 and a minimum of 6001 without changing the saved configuration, and checks a saved 16000/8000 configuration is returned and exported unclamped but refused by save, rechunk and reembed. `07_settings.sh` checks both edges and their neighbours against the live stack.*
 
