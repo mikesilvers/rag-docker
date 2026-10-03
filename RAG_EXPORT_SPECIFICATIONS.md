@@ -102,7 +102,7 @@ carry the corpus's parameters.
 | `retrieval_mode` | enum `hnsw`\|`flat`\|`hybrid`\|`semantic` | `hnsw` |
 | `top_k` | integer 1–50 | `5` |
 | `alpha` | number 0–1 | `0.75` |
-| `ef` | integer, optional | — |
+| `ef` | integer 16–512, optional | — |
 | `response_format` | enum `end_user`\|`engineer` | `end_user` |
 
 ### 3.2 Endpoints
@@ -238,7 +238,11 @@ One JSON object per line:
 ## 5. The Retrieval Script
 
 `retrieve.py` is generated at export from `manifest.json` and
-`retrieval_config.json`.
+`retrieval_config.json`. Saved settings MUST satisfy the same typed contract as
+`POST /retrieval/config` before export. Invalid saved settings fail the export
+without publishing a package; they are not copied into executable syntax.
+All generated Python defaults and package metadata MUST be encoded Python
+literals, and substitution MUST NOT interpret tokens inside inserted data.
 
 ### 5.1 Requirements
 
@@ -325,7 +329,17 @@ Checks run in this order and stop at the first failure:
 | 3 | Every `files` digest matches | `PACKAGE_CORRUPT`, naming the file |
 | 4 | **Embedding model and dimensions match this instance** | `EMBEDDING_MISMATCH` — refuse |
 | 4a | Every evaluation sidecar has a valid session schema, generated session ID, matching collection and unique identity within the package; its resolved storage destination is contained | `PACKAGE_CORRUPT`, naming the sidecar |
+| 4b | Optional retrieval settings are a JSON object satisfying the API save schema, normalized with its defaults and numeric conversion | `PACKAGE_CORRUPT`, naming `retrieval_config.json` |
 | 5 | Collection name collision | resolved per `on_conflict` |
+
+Check 4b runs before model installation, collection creation/replacement, recovery
+ownership, or sidecar publication. Keep its normalized snapshot for restoration;
+do not reread unvalidated settings after building the collection. Rebind the
+collection to the actual import target. Missing fields retain API defaults,
+valid historical `ef` values are preserved, and unknown fields are ignored as
+on API saves. A missing settings file remains supported. Invalid JSON, non-object
+settings, invalid enum values, booleans in numeric fields, out-of-range values,
+and non-finite alpha are refusals in every conflict mode.
 
 Check 4a runs before bundled-model installation, collection creation/deletion,
 or restoring any sidecar. All sessions MUST be preflighted together, including
@@ -711,6 +725,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E25 | With the embedding endpoint unavailable, reindex changes the physical index while preserving exact UUIDs/properties/vectors; completed jobs leave retained evaluation sessions unchanged; same-process ingestion is serialized, incompatible vectorizers are refused, and uncertain cutover retains durable recovery |
 | E26 | Importing when the installed embedding model's files don't match their checksums fails `MODEL_INTEGRITY_FAILED`, leaves the model's files untouched and says to restore or re-pull it |
 | E27 | With a namespaced `LLM_MODEL` (`user/model`), an import of a package without bundled models succeeds and notes the model |
+| E28 | Digest-valid malformed retrieval settings are refused before live mutation in all conflict modes; valid historical settings round-trip and generated script defaults/metadata remain encoded typed literals |
 
 ---
 

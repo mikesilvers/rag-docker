@@ -17,6 +17,7 @@ import re
 from pathlib import Path
 
 from config import settings
+from models.schemas import SaveRetrievalConfigBody
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +73,18 @@ def resolve(collection: str) -> tuple[dict, bool]:
     merged = {"collection": collection, **DEFAULTS, **saved}
     merged["collection"] = collection
     return merged, False
+
+
+def validate(config: dict, collection: str) -> dict:
+    """Apply the API save contract, binding settings to the actual collection.
+
+    Older packages may omit defaulted fields or carry an obsolete collection
+    name. Extra fields are ignored just as they are for API saves.
+    """
+    if not isinstance(config, dict):
+        raise ValueError("Retrieval settings must be an object")
+    return SaveRetrievalConfigBody.model_validate(
+        {**config, "collection": collection}).model_dump()
 
 
 def save(config: dict) -> dict:

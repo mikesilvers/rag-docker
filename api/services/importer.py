@@ -481,9 +481,24 @@ def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
     return sessions
 
 
+def _read_retrieval_config(pkg: Path, original: str) -> dict | None:
+    """Validate once before live mutation; restore this normalized snapshot."""
+    path = pkg / "retrieval_config.json"
+    if not path.exists():
+        return None
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("Retrieval settings must be a regular file")
+        return retrieval_config.validate(json.loads(path.read_text()), original)
+    except (OSError, ValueError) as exc:
+        raise PackageError("PACKAGE_CORRUPT", "Invalid retrieval settings.",
+                           {"file": "retrieval_config.json"}) from exc
+
+
 def _restore_sidecars(target: str, pkg: Path, original: str,
                       validated_sessions: list[dict],
-                      restored_sessions: list[dict] | None = None) -> list[str]:
+                      restored_sessions: list[dict] | None = None,
+                      validated_retrieval: dict | None = None) -> list[str]:
     """Sources, configs and gold-standard sessions. Returns notes for the job."""
     notes: list[str] = []
 
@@ -503,10 +518,8 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
         out.mkdir(parents=True, exist_ok=True)
         (out / f"{_safe_file(target)}.json").write_text(json.dumps(data, indent=2, sort_keys=True))
 
-    retrieval_cfg = pkg / "retrieval_config.json"
-    if retrieval_cfg.is_file():
-        data = json.loads(retrieval_cfg.read_text())
-        data["collection"] = target
+    if validated_retrieval is not None:
+        data = {**validated_retrieval, "collection": target}
         try:
             retrieval_config.save(data)
         except Exception as exc:                      # noqa: BLE001
@@ -594,6 +607,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                                {"name": original})
 
         validated_sessions = _read_goldstandard_sessions(pkg, original)
+        validated_retrieval = _read_retrieval_config(pkg, original)
 
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
@@ -638,7 +652,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             marked = None
             job.setdefault("restored_sessions", [])
             notes = model_notes + replace_notes + _restore_sidecars(
-                target, pkg, original, validated_sessions, job["restored_sessions"])
+                target, pkg, original, validated_sessions, job["restored_sessions"],
+                validated_retrieval)
 
             if staged and temp_collection:
                 try:

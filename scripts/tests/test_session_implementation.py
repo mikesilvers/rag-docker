@@ -12,7 +12,11 @@ class SessionImplementationTests(unittest.TestCase):
                                       ('api/services/importer.py', '```', 'python'),
                                       ('api/services/packager.py', '```', 'python'),
                                       ('scripts/verify/README.md', '````', 'markdown'),
-                                      ('scripts/verify/05_transfer.sh', '```', 'bash')]:
+                                      ('scripts/verify/05_transfer.sh', '```', 'bash'),
+                                      ('api/services/retrieval_config.py', '```', 'python'),
+                                      ('api/templates/retrieve.py.tmpl', '```', 'python'),
+                                      ('scripts/tests/test_retrieval_import.py', '```', 'python'),
+                                      ('scripts/verify/retrieval_settings.py', '```', 'python')]:
             with self.subTest(path=name):
                 header = '### ' + name + '\n\n' + fence + language + '\n'
                 start = implementation.index(header) + len(header)

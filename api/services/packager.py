@@ -156,12 +156,27 @@ def _resolve_includes(text: str, depth: int = 0) -> str:
 
 def _render(template: str, values: dict[str, str]) -> str:
     text = _resolve_includes((_TEMPLATE_DIR / template).read_text())
-    for key, value in values.items():
-        text = text.replace(f"@@{key}@@", str(value))
-    left = re.findall(r"@@[A-Z_0-9]+(?::[a-z_0-9]+)?@@", text)
-    if left:
-        raise RuntimeError(f"{template}: unsubstituted placeholders {sorted(set(left))}")
-    return text
+    # Substitute only original template tokens. Inserted data can itself contain
+    # token-shaped text and must never be interpreted as another substitution.
+    def substitute(match):
+        key = match.group()[2:-2]
+        if key not in values:
+            raise RuntimeError(f"{template}: unsubstituted placeholder {match.group()}")
+        return str(values[key])
+    return re.sub(r"@@[A-Z_0-9]+(?::[a-z_0-9]+)?@@", substitute, text)
+
+
+def _render_retrieve(collection: str, cfg: dict, metadata: dict) -> str:
+    """Only validated, encoded Python literals may cross into script source."""
+    cfg = retrieval_config.validate(cfg, collection)
+    return _render("retrieve.py.tmpl", {
+        "PACKAGE_METADATA": repr(metadata),
+        "COLLECTION_NAME": repr(collection),
+        "RETRIEVAL_MODE": repr(cfg["retrieval_mode"]),
+        "TOP_K": repr(cfg["top_k"]),
+        "ALPHA": repr(cfg["alpha"]),
+        "RESPONSE_FORMAT": repr(cfg["response_format"]),
+    })
 
 
 def render_help(embed_dimensions: int | str) -> str:
@@ -272,6 +287,7 @@ def build(
             b.add_json("ingest_config.json", ingest_cfg)
 
         retrieval_cfg, is_default = retrieval_config.resolve(collection)
+        retrieval_cfg = retrieval_config.validate(retrieval_cfg, collection)
         has_saved_retrieval = not is_default
         b.add_json("retrieval_config.json", retrieval_cfg)
 
@@ -385,17 +401,12 @@ def build(
             contents_extra += "retrieve.py             a standalone query script for this collection\n"
 
         if has_saved_retrieval:
-            (stage / "retrieve.py").write_text(_render("retrieve.py.tmpl", {
-                "COLLECTION_NAME": collection,
-                "PACKAGE_FILENAME": filename,
-                "ID8": id8,
-                "CREATED_AT": created_at,
-                "EMBED_MODEL": settings.embed_model,
-                "EMBED_DIMENSIONS": dimensions if dimensions is not None else "unknown",
-                "RETRIEVAL_MODE": retrieval_cfg["retrieval_mode"],
-                "TOP_K": retrieval_cfg["top_k"],
-                "ALPHA": retrieval_cfg["alpha"],
-                "RESPONSE_FORMAT": retrieval_cfg["response_format"],
+            (stage / "retrieve.py").write_text(_render_retrieve(collection, retrieval_cfg, {
+                "package_filename": filename,
+                "id8": id8,
+                "created_at": created_at,
+                "embed_model": settings.embed_model,
+                "embed_dimensions": dimensions,
             }))
             (stage / "retrieve.py").chmod(0o755)
 
