@@ -23,7 +23,7 @@ class LifecycleTests(unittest.TestCase):
             def insert(properties,uuid=None,vector=None):
                 if uuid is None:raise RuntimeError('connection refused 127.0.0.1:1')
                 created[name].append(dict(id=uuid,properties=properties,vector=vector))
-            return SimpleNamespace(data=SimpleNamespace(insert=insert),aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=len(created[name]))))
+            return SimpleNamespace(config=SimpleNamespace(get=lambda:SimpleNamespace(name=name)),data=SimpleNamespace(insert=insert),aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=len(created[name]))))
         client=SimpleNamespace(collections=SimpleNamespace(get=collection,exists=lambda name:ns["wc"].collection_writes.canonical(name) in created,delete=delete),close=lambda:closed.append(threading.get_ident()))
         protected={'protected':{'session_id':'gs_11111111'}}
         with patch.object(ns['tempfile'],'TemporaryDirectory',OwnedTemp),patch.object(ns['wc'],'get_client',return_value=client),patch.object(ns['wc'],'_create_collection_sync',side_effect=create),patch.object(ns['tuning'],'_existing_records',side_effect=lambda name:list(created[ns["wc"].collection_writes.canonical(name)])),patch.object(ns['gs'],'_sessions',protected),patch.object(ns['gs'],'store_session',side_effect=OSError('Owned session failure')):
@@ -31,6 +31,23 @@ class LifecycleTests(unittest.TestCase):
             self.assertIs(ns['gs']._sessions,protected)
         self.assertFalse(created);self.assertEqual(len(closed),1);self.assertTrue(all(identity!=loop_thread for _,identity in calls));self.assertNotEqual(closed[0],loop_thread)
         self.assertTrue(all(not Path(directory).exists() for directory in temps))
+    def test_deletion_verifier_uses_actual_handler_with_owned_backend_and_sidecars(self):
+        from services import ingest_config,retrieval_config
+        backend={};checks=[];created=[]
+        canonical=ns['wc'].collection_writes.canonical
+        def create(name,*args,**kwargs):backend[canonical(name)]=0;created.append(canonical(name))
+        def collection(name):
+            name=canonical(name)
+            def insert(**kwargs):backend[name]+=1
+            return SimpleNamespace(config=SimpleNamespace(get=lambda:SimpleNamespace(name=name)),data=SimpleNamespace(insert=insert),aggregate=SimpleNamespace(over_all=lambda **kwargs:SimpleNamespace(total_count=backend[name])))
+        client=SimpleNamespace(collections=SimpleNamespace(get=collection,exists=lambda name:canonical(name) in backend,delete=lambda name:backend.pop(canonical(name))))
+        def check(condition,label):self.assertTrue(condition,label);checks.append(label)
+        async def run(directory):
+            async with ns['httpx'].AsyncClient(transport=ns['httpx'].ASGITransport(app=ns['app']),base_url='http://owned') as api:
+                await ns['collection_deletion_checks'](api,client,'OwnedVerifier',directory,check)
+        with tempfile.TemporaryDirectory() as directory,patch.object(ns['settings'],'upload_dir',directory),patch.object(ns['settings'],'sources_dir',str(Path(directory)/'sources')),patch.object(ns['gs'],'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None),patch.object(ns['wc'],'get_client',return_value=client),patch.object(ns['wc'],'_create_collection_sync',side_effect=create):
+            asyncio.run(run(directory))
+        self.assertEqual(len(checks),10);self.assertEqual(set(backend),{'OwnedVerifierAliasDeleteNeighbor','OwnedVerifierCanonicalDeleteNeighbor'});self.assertEqual(len(created),4)
     def test_client_failure_still_cleans_temporary_directory(self):
         original_temp=tempfile.TemporaryDirectory;temps=[]
         def create(*args,**kwargs):result=original_temp(*args,**kwargs);temps.append(result.name);return result

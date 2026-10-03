@@ -166,18 +166,32 @@ async def additional_vectorizer_and_import_checks(api,client,name,temp,created,j
     check(staging in removed and not await asyncio.to_thread(client.collections.exists,staging),'startup removes the exact positively owned interrupted import scratch')
     check(await asyncio.to_thread(lambda:not records()),'startup completes and removes the owned import scratch journal')
 
-async def caller_sidecar_and_legacy_tuning_checks(api,client,name,temp,created,check):
+async def collection_deletion_checks(api,client,name,temp,check):
     from services import sources,ingest_config,retrieval_config
-    caller=(name+'CallerDelete');caller=caller[:1].lower()+caller[1:];sid='gs_'+uuid.uuid4().hex[:8]
-    await asyncio.to_thread(wc._create_collection_sync,caller,'hnsw','cosine',{})
-    await asyncio.to_thread(client.collections.get(caller).data.insert,properties={'content':'Owned alias deletion'},vector=[.125]*768)
-    await asyncio.to_thread(sources.store,caller,'owned.txt',b'Owned caller original')
-    await asyncio.to_thread(ingest_config.save,{'collection':caller});await asyncio.to_thread(retrieval_config.save,{'collection':caller})
-    await asyncio.to_thread(gs.store_session,{'session_id':sid,'collection':caller,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
-    check(await asyncio.to_thread(lambda:sources.collection_dir(caller).is_dir() and (Path(temp)/'ingest_configs'/(caller+'.json')).is_file()),'actual caller-spelled source/config sidecars exist before deletion')
-    response=await api.delete('/collections/'+caller)
-    check(response.status_code==200 and not await asyncio.to_thread(client.collections.exists,caller),'caller-spelled HTTP deletion removes the canonical backend collection')
-    check(await asyncio.to_thread(lambda:not sources.collection_dir(caller).exists() and not (Path(temp)/'ingest_configs'/(caller+'.json')).exists() and not (Path(temp)/'retrieval_configs'/(caller+'.json')).exists() and gs.get_session(sid)['orphaned']),'caller source/config paths are cleaned and matching evaluation is orphaned')
+    # Exercise both aliases on the Linux volume, with separate physical paths.
+    for use_alias in (True,False):
+        canonical=name+('AliasDelete' if use_alias else 'CanonicalDelete')
+        caller=canonical[:1].lower()+canonical[1:] if use_alias else canonical
+        neighbor=canonical+'Neighbor'
+        for collection in (canonical,neighbor):
+            await asyncio.to_thread(wc._create_collection_sync,collection,'hnsw','cosine',{})
+            await asyncio.to_thread(client.collections.get(collection).data.insert,properties={'content':'Owned deletion fixture'},vector=[.125]*768)
+        identities={spelling:'gs_'+uuid.uuid4().hex[:8] for spelling in dict.fromkeys((canonical,caller,neighbor))}
+        for spelling,sid in identities.items():
+            await asyncio.to_thread(sources.store,spelling,'owned.txt',b'Owned deletion original')
+            await asyncio.to_thread(ingest_config.save,{'collection':spelling})
+            await asyncio.to_thread(retrieval_config.save,{'collection':spelling})
+            await asyncio.to_thread(gs.store_session,{'session_id':sid,'collection':spelling,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        response=await api.delete('/collections/'+caller)
+        check(response.status_code==200 and response.json()['objects_deleted']==1 and not await asyncio.to_thread(client.collections.exists,canonical),'HTTP deletion removes canonical backend collection via '+caller)
+        for spelling in dict.fromkeys((canonical,caller)):
+            check(await asyncio.to_thread(lambda:not sources.collection_dir(spelling).exists() and not (Path(temp)/'ingest_configs'/(spelling+'.json')).exists() and not (Path(temp)/'retrieval_configs'/(spelling+'.json')).exists()),'deletion cleans exact source/ingest/retrieval spelling '+spelling)
+            check(await asyncio.to_thread(lambda:gs.get_session(identities[spelling])['orphaned'] and json.loads(gs._session_path(identities[spelling]).read_text())['orphaned']),'deletion persists orphan status for '+spelling)
+        check(await asyncio.to_thread(lambda:client.collections.exists(neighbor) and sources.collection_dir(neighbor).is_dir() and ingest_config.load(neighbor) is not None and retrieval_config.load(neighbor) is not None and not gs.get_session(identities[neighbor]).get('orphaned',False)),'deletion preserves unrelated collection sidecars and current session')
+
+
+async def caller_sidecar_and_legacy_tuning_checks(api,client,name,temp,created,check):
+    await collection_deletion_checks(api,client,name,temp,check)
     before=await asyncio.to_thread(tuning._existing_records,name)
     child="from services import tuning,weaviate_client as w; import os; original=w._create_collection_sync; w._create_collection_sync=lambda *a,**k:(original(*a,**k),os._exit(17)); tuning._jobs['owned']={'status':'queued','chunks_written':0}; tuning._run('owned',"+repr(name)+",'reembed',{'index_type':'hnsw','distance_metric':'cosine'})"
     result=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',child],env={**os.environ,'UPLOAD_DIR':temp,'SOURCES_DIR':str(Path(temp)/'sources')},text=True,capture_output=True,timeout=30)
@@ -205,7 +219,7 @@ async def main():
         client=await asyncio.to_thread(wc.get_client)
         with patch.object(settings,'upload_dir',temp), patch.object(settings,'sources_dir',str(Path(temp)/'sources')), \
              patch.object(settings,'ollama_host','127.0.0.1'), patch.object(settings,'ollama_port',1), \
-             patch.object(gs,'_sessions',{}),patch.object(wc,'_create_collection_sync',side_effect=record_create):
+             patch.object(gs,'_sessions',{}),patch.object(wc.ingest_config,'_DIR',None),patch.object(wc.retrieval_config,'_DIR',None),patch.object(wc,'_create_collection_sync',side_effect=record_create):
             def check(condition,label):
                 nonlocal checks
                 assert condition,label; checks+=1; print('PASS '+label,flush=True)

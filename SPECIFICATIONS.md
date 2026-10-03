@@ -332,7 +332,7 @@ Deletes a collection and all its objects. Requires `confirm=true` query paramete
 { "name": "Documents", "status": "deleted", "objects_removed": 1842 }
 ```
 
-Also removes the entry from `{UPLOAD_DIR}/collection_registry.json` and deletes `{UPLOAD_DIR}/ingest_configs/{collection}.json` if it exists.
+Before deletion, resolves the backend's canonical collection name. After successful backend deletion, removes retained source documents and ingest/retrieval configurations for that canonical name and the accepted caller spelling, when different. Only first-character aliases match; distinct collection names are not case-folded or swept. Matching canonical and caller-spelled evaluation sessions are preserved and durably marked orphaned. Deleting an original collection preserves distinct retained recovery copies; explicitly deleting a retained recovery collection retires only its matching ownership journal and snapshots.
 
 **Response 404** if the collection does not exist:
 ```json

@@ -65,6 +65,7 @@ class Batch:
 class Collection:
     def __init__(self, name, fault=None):
         self.name = name
+        self.config = SimpleNamespace(get=lambda: SimpleNamespace(name=self.name, vectorizer=None))
         self.rows = {}
         self.fault = fault
         self.batch = Batch(self)

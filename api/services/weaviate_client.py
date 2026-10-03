@@ -147,21 +147,30 @@ async def collection_exists(name: str) -> bool:
 def _delete_collection_sync(name: str) -> int:
     client = get_client()
     coll = client.collections.get(name)
+    canonical_name = coll.config.get().name
     count = coll.aggregate.over_all(total_count=True).total_count
-    client.collections.delete(name)
-    collection_recovery.retire_deleted(collection_writes.canonical(name), client)
+    client.collections.delete(canonical_name)
+    collection_recovery.retire_deleted(canonical_name, client)
     # Retained originals must go with the collection. The sources volume is
     # surfaced nowhere in the UI, so a leak here would be invisible.
-    sources.delete(name)
-    retrieval_config.delete(name)
-    ingest_config.delete(name)
+    # Older writers saved sidecars under the accepted caller spelling. Only
+    # include that spelling when it is the same first-character backend alias;
+    # case-folding the whole name could delete another collection's data.
+    spellings = [canonical_name]
+    if name != canonical_name and collection_writes.canonical(name) == canonical_name:
+        spellings.append(name)
+    for spelling in spellings:
+        sources.delete(spelling)
+        retrieval_config.delete(spelling)
+        ingest_config.delete(spelling)
     # Gold-standard sessions are kept and flagged, never deleted (spec §8 rule 4):
     # they are evaluation work the user may still want, and the pairs stay
     # readable even with the collection gone. Imported here rather than at module
     # level because goldstandard imports this module.
     from services import goldstandard
-    goldstandard.mark_orphaned(
-        name, f"collection '{name}' was deleted")
+    for spelling in spellings:
+        goldstandard.mark_orphaned(
+            spelling, f"collection '{canonical_name}' was deleted")
     return count or 0
 
 

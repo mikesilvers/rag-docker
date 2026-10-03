@@ -2112,21 +2112,30 @@ async def collection_exists(name: str) -> bool:
 def _delete_collection_sync(name: str) -> int:
     client = get_client()
     coll = client.collections.get(name)
+    canonical_name = coll.config.get().name
     count = coll.aggregate.over_all(total_count=True).total_count
-    client.collections.delete(name)
-    collection_recovery.retire_deleted(collection_writes.canonical(name), client)
+    client.collections.delete(canonical_name)
+    collection_recovery.retire_deleted(canonical_name, client)
     # Retained originals must go with the collection. The sources volume is
     # surfaced nowhere in the UI, so a leak here would be invisible.
-    sources.delete(name)
-    retrieval_config.delete(name)
-    ingest_config.delete(name)
+    # Older writers saved sidecars under the accepted caller spelling. Only
+    # include that spelling when it is the same first-character backend alias;
+    # case-folding the whole name could delete another collection's data.
+    spellings = [canonical_name]
+    if name != canonical_name and collection_writes.canonical(name) == canonical_name:
+        spellings.append(name)
+    for spelling in spellings:
+        sources.delete(spelling)
+        retrieval_config.delete(spelling)
+        ingest_config.delete(spelling)
     # Gold-standard sessions are kept and flagged, never deleted (spec §8 rule 4):
     # they are evaluation work the user may still want, and the pairs stay
     # readable even with the collection gone. Imported here rather than at module
     # level because goldstandard imports this module.
     from services import goldstandard
-    goldstandard.mark_orphaned(
-        name, f"collection '{name}' was deleted")
+    for spelling in spellings:
+        goldstandard.mark_orphaned(
+            spelling, f"collection '{canonical_name}' was deleted")
     return count or 0
 
 
@@ -9985,6 +9994,8 @@ Run `python3 scripts/tests/test_loopback_verification.py` from the repository ro
 The concurrency HTTP check uses supplied-vector ingestion fixtures while keeping the upload handler, parser, chunker, worker, source retention and actual backend writes real. Its reindex source check pauses under the writer guard; the upload remains queued until final copy verification. Recovery is separately forced to fail at final creation and verified through an independent API lifespan. These cases do not claim generative model quality.
 
 Tuning normalizes the backend first-character alias for active jobs and ownership, while preserving the caller-spelled identity for source/config/session sidecars. All tuning operations register positive staging ownership before creation and retain recovery before cutover. Explicit deletion of an exact positively owned recovery collection retires its matching journal and metadata snapshots; unrelated or invalid journals remain. Startup alone does not discard retained snapshots merely because a backend collection is missing. Interrupted explicit cleanup remains durable and is resumed at startup.
+
+Issue #140 deletion coverage exercises canonical and accepted lowercase-alias HTTP deletion, both source/config sidecar spellings, durable orphan flags for both session spellings, and unrelated collection preservation. Controlled writer cases also cover backend deletion failure and retained recovery behavior; the controlled verifier invokes the actual deletion handler without a live backend.
 ````
 
 ### scripts/verify/all.sh
@@ -14763,18 +14774,32 @@ async def additional_vectorizer_and_import_checks(api,client,name,temp,created,j
     check(staging in removed and not await asyncio.to_thread(client.collections.exists,staging),'startup removes the exact positively owned interrupted import scratch')
     check(await asyncio.to_thread(lambda:not records()),'startup completes and removes the owned import scratch journal')
 
-async def caller_sidecar_and_legacy_tuning_checks(api,client,name,temp,created,check):
+async def collection_deletion_checks(api,client,name,temp,check):
     from services import sources,ingest_config,retrieval_config
-    caller=(name+'CallerDelete');caller=caller[:1].lower()+caller[1:];sid='gs_'+uuid.uuid4().hex[:8]
-    await asyncio.to_thread(wc._create_collection_sync,caller,'hnsw','cosine',{})
-    await asyncio.to_thread(client.collections.get(caller).data.insert,properties={'content':'Owned alias deletion'},vector=[.125]*768)
-    await asyncio.to_thread(sources.store,caller,'owned.txt',b'Owned caller original')
-    await asyncio.to_thread(ingest_config.save,{'collection':caller});await asyncio.to_thread(retrieval_config.save,{'collection':caller})
-    await asyncio.to_thread(gs.store_session,{'session_id':sid,'collection':caller,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
-    check(await asyncio.to_thread(lambda:sources.collection_dir(caller).is_dir() and (Path(temp)/'ingest_configs'/(caller+'.json')).is_file()),'actual caller-spelled source/config sidecars exist before deletion')
-    response=await api.delete('/collections/'+caller)
-    check(response.status_code==200 and not await asyncio.to_thread(client.collections.exists,caller),'caller-spelled HTTP deletion removes the canonical backend collection')
-    check(await asyncio.to_thread(lambda:not sources.collection_dir(caller).exists() and not (Path(temp)/'ingest_configs'/(caller+'.json')).exists() and not (Path(temp)/'retrieval_configs'/(caller+'.json')).exists() and gs.get_session(sid)['orphaned']),'caller source/config paths are cleaned and matching evaluation is orphaned')
+    # Exercise both aliases on the Linux volume, with separate physical paths.
+    for use_alias in (True,False):
+        canonical=name+('AliasDelete' if use_alias else 'CanonicalDelete')
+        caller=canonical[:1].lower()+canonical[1:] if use_alias else canonical
+        neighbor=canonical+'Neighbor'
+        for collection in (canonical,neighbor):
+            await asyncio.to_thread(wc._create_collection_sync,collection,'hnsw','cosine',{})
+            await asyncio.to_thread(client.collections.get(collection).data.insert,properties={'content':'Owned deletion fixture'},vector=[.125]*768)
+        identities={spelling:'gs_'+uuid.uuid4().hex[:8] for spelling in dict.fromkeys((canonical,caller,neighbor))}
+        for spelling,sid in identities.items():
+            await asyncio.to_thread(sources.store,spelling,'owned.txt',b'Owned deletion original')
+            await asyncio.to_thread(ingest_config.save,{'collection':spelling})
+            await asyncio.to_thread(retrieval_config.save,{'collection':spelling})
+            await asyncio.to_thread(gs.store_session,{'session_id':sid,'collection':spelling,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        response=await api.delete('/collections/'+caller)
+        check(response.status_code==200 and response.json()['objects_deleted']==1 and not await asyncio.to_thread(client.collections.exists,canonical),'HTTP deletion removes canonical backend collection via '+caller)
+        for spelling in dict.fromkeys((canonical,caller)):
+            check(await asyncio.to_thread(lambda:not sources.collection_dir(spelling).exists() and not (Path(temp)/'ingest_configs'/(spelling+'.json')).exists() and not (Path(temp)/'retrieval_configs'/(spelling+'.json')).exists()),'deletion cleans exact source/ingest/retrieval spelling '+spelling)
+            check(await asyncio.to_thread(lambda:gs.get_session(identities[spelling])['orphaned'] and json.loads(gs._session_path(identities[spelling]).read_text())['orphaned']),'deletion persists orphan status for '+spelling)
+        check(await asyncio.to_thread(lambda:client.collections.exists(neighbor) and sources.collection_dir(neighbor).is_dir() and ingest_config.load(neighbor) is not None and retrieval_config.load(neighbor) is not None and not gs.get_session(identities[neighbor]).get('orphaned',False)),'deletion preserves unrelated collection sidecars and current session')
+
+
+async def caller_sidecar_and_legacy_tuning_checks(api,client,name,temp,created,check):
+    await collection_deletion_checks(api,client,name,temp,check)
     before=await asyncio.to_thread(tuning._existing_records,name)
     child="from services import tuning,weaviate_client as w; import os; original=w._create_collection_sync; w._create_collection_sync=lambda *a,**k:(original(*a,**k),os._exit(17)); tuning._jobs['owned']={'status':'queued','chunks_written':0}; tuning._run('owned',"+repr(name)+",'reembed',{'index_type':'hnsw','distance_metric':'cosine'})"
     result=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',child],env={**os.environ,'UPLOAD_DIR':temp,'SOURCES_DIR':str(Path(temp)/'sources')},text=True,capture_output=True,timeout=30)
@@ -14802,7 +14827,7 @@ async def main():
         client=await asyncio.to_thread(wc.get_client)
         with patch.object(settings,'upload_dir',temp), patch.object(settings,'sources_dir',str(Path(temp)/'sources')), \
              patch.object(settings,'ollama_host','127.0.0.1'), patch.object(settings,'ollama_port',1), \
-             patch.object(gs,'_sessions',{}),patch.object(wc,'_create_collection_sync',side_effect=record_create):
+             patch.object(gs,'_sessions',{}),patch.object(wc.ingest_config,'_DIR',None),patch.object(wc.retrieval_config,'_DIR',None),patch.object(wc,'_create_collection_sync',side_effect=record_create):
             def check(condition,label):
                 nonlocal checks
                 assert condition,label; checks+=1; print('PASS '+label,flush=True)
@@ -15060,15 +15085,15 @@ class DeletedRecoveryTests(unittest.TestCase):
         from unittest.mock import patch
         from types import SimpleNamespace
         from config import settings
-        from services import collection_recovery as recovery,weaviate_client as wc,goldstandard as gs
+        from services import collection_recovery as recovery,weaviate_client as wc,goldstandard as gs,ingest_config,retrieval_config
         self.recovery,self.wc=recovery,wc
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup);self.root=Path(temp.name);stack=ExitStack();self.addCleanup(stack.close)
-        for change in [patch.object(settings,'upload_dir',temp.name),patch.object(settings,'sources_dir',str(self.root/'sources')),patch.object(gs,'_sessions',{})]:stack.enter_context(change)
+        for change in [patch.object(settings,'upload_dir',temp.name),patch.object(settings,'sources_dir',str(self.root/'sources')),patch.object(gs,'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None)]:stack.enter_context(change)
         self.backend={'OwnedRecovery'}
         class Collections:
             def exists(inner,name):return writes.canonical(name) in self.backend
             def delete(inner,name):self.backend.remove(writes.canonical(name))
-            def get(inner,name):return SimpleNamespace(aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=3)))
+            def get(inner,name):return SimpleNamespace(config=SimpleNamespace(get=lambda:SimpleNamespace(name=writes.canonical(name))),aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=3)))
         self.client=SimpleNamespace(collections=Collections());stack.enter_context(patch.object(wc,'get_client',return_value=self.client))
         self.owner=recovery.begin('OwnedRecovery','tune',self.client);self.backend.add(self.owner['staging']);recovery.retain(self.owner)
     def test_explicit_alias_delete_retires_only_matching_recovery_snapshots(self):
@@ -15086,6 +15111,46 @@ class DeletedRecoveryTests(unittest.TestCase):
         self.wc._delete_collection_sync(caller)
         self.assertFalse(sources.collection_dir(caller).exists());self.assertFalse((self.root/'ingest_configs'/(caller+'.json')).exists());self.assertFalse((self.root/'retrieval_configs'/(caller+'.json')).exists())
         self.assertTrue(gs.get_session(session['session_id'])['orphaned']);self.assertIn(self.owner['staging'],self.backend)
+    def test_alias_delete_cleans_both_spellings_and_preserves_distinct_collection(self):
+        import json
+        from unittest.mock import patch,call
+        from services import sources,ingest_config,retrieval_config,goldstandard as gs
+        canonical,caller,neighbor='OwnedRecovery','ownedRecovery','Ownedrecovery'
+        self.backend.add(neighbor)
+        identities={canonical:'gs_14000001',caller:'gs_14000002',neighbor:'gs_14000003'}
+        for spelling,sid in identities.items():
+            sources.store(spelling,'inert.txt',b'Owned original')
+            ingest_config.save({'collection':spelling});retrieval_config.save({'collection':spelling})
+            gs.store_session({'session_id':sid,'collection':spelling,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        # Exact calls prove both paths even on a case-insensitive host volume.
+        with patch.object(sources,'delete',wraps=sources.delete) as originals,patch.object(ingest_config,'delete',wraps=ingest_config.delete) as ingest,patch.object(retrieval_config,'delete',wraps=retrieval_config.delete) as retrieval:
+            self.assertEqual(self.wc._delete_collection_sync(caller),3)
+            for cleanup in (originals,ingest,retrieval):self.assertEqual(cleanup.call_args_list,[call(canonical),call(caller)])
+        self.assertNotIn(canonical,self.backend);self.assertIn(neighbor,self.backend)
+        for spelling in (canonical,caller):
+            self.assertFalse(sources.collection_dir(spelling).exists());self.assertIsNone(ingest_config.load(spelling));self.assertIsNone(retrieval_config.load(spelling))
+            session=gs.get_session(identities[spelling]);self.assertTrue(session['orphaned']);self.assertEqual(session['pairs'],[])
+            self.assertTrue(json.loads(gs._session_path(identities[spelling]).read_text())['orphaned'])
+        self.assertTrue(sources.collection_dir(neighbor).exists());self.assertIsNotNone(ingest_config.load(neighbor));self.assertIsNotNone(retrieval_config.load(neighbor));self.assertFalse(gs.get_session(identities[neighbor]).get('orphaned',False))
+        self.assertIn(self.owner['staging'],self.backend);self.assertTrue((self.recovery._root()/self.owner['operation_id']).is_dir())
+    def test_canonical_delete_cleans_once_and_orphans_canonical_session(self):
+        from unittest.mock import patch,call
+        from services import sources,ingest_config,retrieval_config,goldstandard as gs
+        name='OwnedRecovery';sid='gs_14000004'
+        sources.store(name,'owned.txt',b'Original');ingest_config.save({'collection':name});retrieval_config.save({'collection':name})
+        gs.store_session({'session_id':sid,'collection':name,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        with patch.object(sources,'delete',wraps=sources.delete) as cleanup:
+            self.assertEqual(self.wc._delete_collection_sync(name),3);self.assertEqual(cleanup.call_args_list,[call(name)])
+        self.assertTrue(gs.get_session(sid)['orphaned']);self.assertFalse(sources.collection_dir(name).exists());self.assertIsNone(ingest_config.load(name));self.assertIsNone(retrieval_config.load(name))
+    def test_failed_backend_delete_preserves_sidecars_and_current_session(self):
+        from unittest.mock import patch
+        from services import sources,ingest_config,retrieval_config,goldstandard as gs
+        name='OwnedRecovery';sid='gs_14000005'
+        sources.store(name,'owned.txt',b'Original');ingest_config.save({'collection':name});retrieval_config.save({'collection':name})
+        gs.store_session({'session_id':sid,'collection':name,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        with patch.object(self.client.collections,'delete',side_effect=OSError('Owned delete failure')):
+            with self.assertRaisesRegex(OSError,'Owned delete failure'):self.wc._delete_collection_sync('ownedRecovery')
+        self.assertTrue(sources.collection_dir(name).exists());self.assertIsNotNone(ingest_config.load(name));self.assertIsNotNone(retrieval_config.load(name));self.assertFalse(gs.get_session(sid).get('orphaned',False));self.assertIn(name,self.backend)
     def test_deleting_original_preserves_distinct_retained_recovery(self):
         self.wc._delete_collection_sync('OwnedRecovery');self.assertIn(self.owner['staging'],self.backend)
         self.assertTrue((self.recovery._root()/self.owner['operation_id']).is_dir())
@@ -15133,7 +15198,7 @@ class LifecycleTests(unittest.TestCase):
             def insert(properties,uuid=None,vector=None):
                 if uuid is None:raise RuntimeError('connection refused 127.0.0.1:1')
                 created[name].append(dict(id=uuid,properties=properties,vector=vector))
-            return SimpleNamespace(data=SimpleNamespace(insert=insert),aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=len(created[name]))))
+            return SimpleNamespace(config=SimpleNamespace(get=lambda:SimpleNamespace(name=name)),data=SimpleNamespace(insert=insert),aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=len(created[name]))))
         client=SimpleNamespace(collections=SimpleNamespace(get=collection,exists=lambda name:ns["wc"].collection_writes.canonical(name) in created,delete=delete),close=lambda:closed.append(threading.get_ident()))
         protected={'protected':{'session_id':'gs_11111111'}}
         with patch.object(ns['tempfile'],'TemporaryDirectory',OwnedTemp),patch.object(ns['wc'],'get_client',return_value=client),patch.object(ns['wc'],'_create_collection_sync',side_effect=create),patch.object(ns['tuning'],'_existing_records',side_effect=lambda name:list(created[ns["wc"].collection_writes.canonical(name)])),patch.object(ns['gs'],'_sessions',protected),patch.object(ns['gs'],'store_session',side_effect=OSError('Owned session failure')):
@@ -15141,6 +15206,23 @@ class LifecycleTests(unittest.TestCase):
             self.assertIs(ns['gs']._sessions,protected)
         self.assertFalse(created);self.assertEqual(len(closed),1);self.assertTrue(all(identity!=loop_thread for _,identity in calls));self.assertNotEqual(closed[0],loop_thread)
         self.assertTrue(all(not Path(directory).exists() for directory in temps))
+    def test_deletion_verifier_uses_actual_handler_with_owned_backend_and_sidecars(self):
+        from services import ingest_config,retrieval_config
+        backend={};checks=[];created=[]
+        canonical=ns['wc'].collection_writes.canonical
+        def create(name,*args,**kwargs):backend[canonical(name)]=0;created.append(canonical(name))
+        def collection(name):
+            name=canonical(name)
+            def insert(**kwargs):backend[name]+=1
+            return SimpleNamespace(config=SimpleNamespace(get=lambda:SimpleNamespace(name=name)),data=SimpleNamespace(insert=insert),aggregate=SimpleNamespace(over_all=lambda **kwargs:SimpleNamespace(total_count=backend[name])))
+        client=SimpleNamespace(collections=SimpleNamespace(get=collection,exists=lambda name:canonical(name) in backend,delete=lambda name:backend.pop(canonical(name))))
+        def check(condition,label):self.assertTrue(condition,label);checks.append(label)
+        async def run(directory):
+            async with ns['httpx'].AsyncClient(transport=ns['httpx'].ASGITransport(app=ns['app']),base_url='http://owned') as api:
+                await ns['collection_deletion_checks'](api,client,'OwnedVerifier',directory,check)
+        with tempfile.TemporaryDirectory() as directory,patch.object(ns['settings'],'upload_dir',directory),patch.object(ns['settings'],'sources_dir',str(Path(directory)/'sources')),patch.object(ns['gs'],'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None),patch.object(ns['wc'],'get_client',return_value=client),patch.object(ns['wc'],'_create_collection_sync',side_effect=create):
+            asyncio.run(run(directory))
+        self.assertEqual(len(checks),10);self.assertEqual(set(backend),{'OwnedVerifierAliasDeleteNeighbor','OwnedVerifierCanonicalDeleteNeighbor'});self.assertEqual(len(created),4)
     def test_client_failure_still_cleans_temporary_directory(self):
         original_temp=tempfile.TemporaryDirectory;temps=[]
         def create(*args,**kwargs):result=original_temp(*args,**kwargs);temps.append(result.name);return result

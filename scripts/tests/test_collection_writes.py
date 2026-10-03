@@ -127,15 +127,15 @@ class DeletedRecoveryTests(unittest.TestCase):
         from unittest.mock import patch
         from types import SimpleNamespace
         from config import settings
-        from services import collection_recovery as recovery,weaviate_client as wc,goldstandard as gs
+        from services import collection_recovery as recovery,weaviate_client as wc,goldstandard as gs,ingest_config,retrieval_config
         self.recovery,self.wc=recovery,wc
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup);self.root=Path(temp.name);stack=ExitStack();self.addCleanup(stack.close)
-        for change in [patch.object(settings,'upload_dir',temp.name),patch.object(settings,'sources_dir',str(self.root/'sources')),patch.object(gs,'_sessions',{})]:stack.enter_context(change)
+        for change in [patch.object(settings,'upload_dir',temp.name),patch.object(settings,'sources_dir',str(self.root/'sources')),patch.object(gs,'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None)]:stack.enter_context(change)
         self.backend={'OwnedRecovery'}
         class Collections:
             def exists(inner,name):return writes.canonical(name) in self.backend
             def delete(inner,name):self.backend.remove(writes.canonical(name))
-            def get(inner,name):return SimpleNamespace(aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=3)))
+            def get(inner,name):return SimpleNamespace(config=SimpleNamespace(get=lambda:SimpleNamespace(name=writes.canonical(name))),aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=3)))
         self.client=SimpleNamespace(collections=Collections());stack.enter_context(patch.object(wc,'get_client',return_value=self.client))
         self.owner=recovery.begin('OwnedRecovery','tune',self.client);self.backend.add(self.owner['staging']);recovery.retain(self.owner)
     def test_explicit_alias_delete_retires_only_matching_recovery_snapshots(self):
@@ -153,6 +153,46 @@ class DeletedRecoveryTests(unittest.TestCase):
         self.wc._delete_collection_sync(caller)
         self.assertFalse(sources.collection_dir(caller).exists());self.assertFalse((self.root/'ingest_configs'/(caller+'.json')).exists());self.assertFalse((self.root/'retrieval_configs'/(caller+'.json')).exists())
         self.assertTrue(gs.get_session(session['session_id'])['orphaned']);self.assertIn(self.owner['staging'],self.backend)
+    def test_alias_delete_cleans_both_spellings_and_preserves_distinct_collection(self):
+        import json
+        from unittest.mock import patch,call
+        from services import sources,ingest_config,retrieval_config,goldstandard as gs
+        canonical,caller,neighbor='OwnedRecovery','ownedRecovery','Ownedrecovery'
+        self.backend.add(neighbor)
+        identities={canonical:'gs_14000001',caller:'gs_14000002',neighbor:'gs_14000003'}
+        for spelling,sid in identities.items():
+            sources.store(spelling,'inert.txt',b'Owned original')
+            ingest_config.save({'collection':spelling});retrieval_config.save({'collection':spelling})
+            gs.store_session({'session_id':sid,'collection':spelling,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        # Exact calls prove both paths even on a case-insensitive host volume.
+        with patch.object(sources,'delete',wraps=sources.delete) as originals,patch.object(ingest_config,'delete',wraps=ingest_config.delete) as ingest,patch.object(retrieval_config,'delete',wraps=retrieval_config.delete) as retrieval:
+            self.assertEqual(self.wc._delete_collection_sync(caller),3)
+            for cleanup in (originals,ingest,retrieval):self.assertEqual(cleanup.call_args_list,[call(canonical),call(caller)])
+        self.assertNotIn(canonical,self.backend);self.assertIn(neighbor,self.backend)
+        for spelling in (canonical,caller):
+            self.assertFalse(sources.collection_dir(spelling).exists());self.assertIsNone(ingest_config.load(spelling));self.assertIsNone(retrieval_config.load(spelling))
+            session=gs.get_session(identities[spelling]);self.assertTrue(session['orphaned']);self.assertEqual(session['pairs'],[])
+            self.assertTrue(json.loads(gs._session_path(identities[spelling]).read_text())['orphaned'])
+        self.assertTrue(sources.collection_dir(neighbor).exists());self.assertIsNotNone(ingest_config.load(neighbor));self.assertIsNotNone(retrieval_config.load(neighbor));self.assertFalse(gs.get_session(identities[neighbor]).get('orphaned',False))
+        self.assertIn(self.owner['staging'],self.backend);self.assertTrue((self.recovery._root()/self.owner['operation_id']).is_dir())
+    def test_canonical_delete_cleans_once_and_orphans_canonical_session(self):
+        from unittest.mock import patch,call
+        from services import sources,ingest_config,retrieval_config,goldstandard as gs
+        name='OwnedRecovery';sid='gs_14000004'
+        sources.store(name,'owned.txt',b'Original');ingest_config.save({'collection':name});retrieval_config.save({'collection':name})
+        gs.store_session({'session_id':sid,'collection':name,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        with patch.object(sources,'delete',wraps=sources.delete) as cleanup:
+            self.assertEqual(self.wc._delete_collection_sync(name),3);self.assertEqual(cleanup.call_args_list,[call(name)])
+        self.assertTrue(gs.get_session(sid)['orphaned']);self.assertFalse(sources.collection_dir(name).exists());self.assertIsNone(ingest_config.load(name));self.assertIsNone(retrieval_config.load(name))
+    def test_failed_backend_delete_preserves_sidecars_and_current_session(self):
+        from unittest.mock import patch
+        from services import sources,ingest_config,retrieval_config,goldstandard as gs
+        name='OwnedRecovery';sid='gs_14000005'
+        sources.store(name,'owned.txt',b'Original');ingest_config.save({'collection':name});retrieval_config.save({'collection':name})
+        gs.store_session({'session_id':sid,'collection':name,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        with patch.object(self.client.collections,'delete',side_effect=OSError('Owned delete failure')):
+            with self.assertRaisesRegex(OSError,'Owned delete failure'):self.wc._delete_collection_sync('ownedRecovery')
+        self.assertTrue(sources.collection_dir(name).exists());self.assertIsNotNone(ingest_config.load(name));self.assertIsNotNone(retrieval_config.load(name));self.assertFalse(gs.get_session(sid).get('orphaned',False));self.assertIn(name,self.backend)
     def test_deleting_original_preserves_distinct_retained_recovery(self):
         self.wc._delete_collection_sync('OwnedRecovery');self.assertIn(self.owner['staging'],self.backend)
         self.assertTrue((self.recovery._root()/self.owner['operation_id']).is_dir())
