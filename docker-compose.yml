@@ -107,7 +107,7 @@ services:
       api: { condition: service_healthy }
 
   proxy:
-    image: nginx:1.29-alpine
+    image: nginx:1.31-alpine
     ports:
       # This unauthenticated workbench is local to the host by default.
       - "127.0.0.1:8080:80"
