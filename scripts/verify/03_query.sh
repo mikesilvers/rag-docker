@@ -4,6 +4,8 @@ cd "$(dirname "$0")" && . ./lib.sh
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 [ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
 require_stack
+bash ./11_retrieval.sh
+check "effective retrieval controls acceptance suite" $?
 C="${PREFIX}Query"
 
 section "§10.2 Query"
@@ -19,7 +21,7 @@ ask() {  # ask <mode> <format> <citations> -> writes /tmp/vfy_ans.json
 }
 
 if [ "$SKIP_SLOW" = "1" ]; then
-  skip "§10.2 entirely" "every check needs an LLM call"
+  skip "LLM query assertions" "set RAG_SKIP_SLOW=0 to include model calls"
   summary; exit $?
 fi
 
@@ -65,8 +67,9 @@ sys.exit(0 if 'error' not in d and d.get('chunks_retrieved',0) > 0 and d.get('an
 done
 
 # ── end_user is shorter than engineer ────────────────────────────────────────
-# The prompts instruct plain language but never brevity, so a single pair is
-# noise. Compare across trials and require a clear majority.
+# The end_user prompt asks for a short answer (#109), but a CPU model still
+# varies answer to answer, so a single pair is noise. Compare the mean length
+# across trials.
 trials="${RAG_FORMAT_TRIALS:-3}"
 eu_total=0; en_total=0; eu_wins=0
 for _ in $(seq 1 "$trials"); do

@@ -15,7 +15,8 @@ SYNTHESIS_END_USER_SYSTEM = (
     "You are a helpful assistant. Answer the user's question using only the provided context. "
     "If the context does not contain enough information to answer the question, say so clearly. "
     "Do not use any knowledge outside the provided context. "
-    "Write in plain, clear language for a non-technical reader."
+    "Write in plain, clear language for a non-technical reader. "
+    "Keep the answer short: a few sentences, without technical detail."
 )
 
 SYNTHESIS_ENGINEER_SYSTEM = (

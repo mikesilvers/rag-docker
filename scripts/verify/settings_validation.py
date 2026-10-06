@@ -21,7 +21,11 @@ def request(path, body=None, method=None, raw=None, content_type='application/js
         with urllib.request.urlopen(req, timeout=60) as response:
             return response.status, json.load(response)
     except urllib.error.HTTPError as response:
-        return response.code, json.load(response)
+        body = response.read()
+        try:
+            return response.code, json.loads(body)
+        except ValueError:  # a server error page that isn't JSON
+            return response.code, body.decode(errors='replace')[:200]
 
 
 def expect(path, body, code):
@@ -108,6 +112,28 @@ try:
     assert status == 200
     assert next(c for c in current['collections'] if c['name'] == collection)['object_count'] == 0
     print('PASS invalid multipart settings leave the collection empty', flush=True)
+
+    # #141: concurrent saves through the live routes. Every save must be
+    # acknowledged, and the persisted value must be one acknowledged response,
+    # complete and unmixed (no request publishes another request's temp file).
+    from concurrent.futures import ThreadPoolExecutor
+    rounds, width = 15, 12
+    for route, make in (('/ingest/config', lambda r, i: {'collection': collection, 'chunking_strategy': 'fixed',
+                                                         'chunk_size': 100 + 20 * r + i, 'min_chunk_size': i}),
+                        ('/retrieval/config', lambda r, i: {'collection': collection, 'retrieval_mode': 'hybrid',
+                                                            'top_k': i + 1, 'alpha': r / 20, 'ef': 16 + 16 * i,
+                                                            'response_format': 'engineer'})):
+        for r in range(rounds):
+            bodies = [make(r, i) for i in range(width)]
+            with ThreadPoolExecutor(max_workers=width) as pool:
+                results = list(pool.map(lambda body: request(route, body), bodies))
+            failed = [(status, result) for status, result in results if status != 201]
+            assert not failed, (route, r, failed[:3])
+            acknowledged = [result for _, result in results]
+            status, persisted = request(route + '/' + collection)
+            assert status == 200, persisted
+            assert persisted in acknowledged, (route, r, persisted)
+    print('PASS concurrent saves are all acknowledged and publish one complete acknowledged value (ingest and retrieval)', flush=True)
 finally:
     if created:
         status, result = request('/collections/' + collection + '?confirm=true', method='DELETE')

@@ -7,7 +7,8 @@ can record how it is meant to be queried.
 
 Kept in a service rather than in the router because the exporter needs
 programmatic access: an export package ships a retrieval script carrying these
-parameters.
+parameters. An integer ef outside the save bounds, stored before PR #108, is
+inactive; export and import clear it to null rather than refuse it.
 """
 from __future__ import annotations
 
@@ -17,6 +18,8 @@ import re
 from pathlib import Path
 
 from config import settings
+from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN, SaveRetrievalConfigBody
+from services import settings_store
 
 log = logging.getLogger(__name__)
 
@@ -37,8 +40,9 @@ _DIR: Path | None = None
 def _dir() -> Path:
     global _DIR
     if _DIR is None:
-        _DIR = Path(settings.upload_dir) / "retrieval_configs"
-        _DIR.mkdir(parents=True, exist_ok=True)
+        directory = Path(settings.upload_dir) / "retrieval_configs"
+        directory.mkdir(parents=True, exist_ok=True)
+        _DIR = directory
     return _DIR
 
 
@@ -74,12 +78,36 @@ def resolve(collection: str) -> tuple[dict, bool]:
     return merged, False
 
 
+def normalize(config: dict, collection: str) -> tuple[dict, int | None]:
+    """validate(), also clearing a legacy ef; returns (settings, cleared ef or None).
+
+    A legacy ef is an integer outside the save bounds, which the API accepted
+    before PR #108. ef is inactive, so it becomes null; any other invalid value,
+    including a boolean, fractional or string ef, is still refused.
+    """
+    if not isinstance(config, dict):
+        raise ValueError("Retrieval settings must be an object")
+    ef = config.get("ef")
+    cleared = None
+    if type(ef) is int and not SEARCH_EF_MIN <= ef <= SEARCH_EF_MAX:
+        cleared, config = ef, {**config, "ef": None}
+    return SaveRetrievalConfigBody.model_validate(
+        {**config, "collection": collection}).model_dump(), cleared
+
+
+def validate(config: dict, collection: str) -> dict:
+    """Apply the API save contract, binding settings to the actual collection.
+
+    Older packages may omit defaulted fields or carry an obsolete collection
+    name. Extra fields are ignored just as they are for API saves.
+    """
+    return normalize(config, collection)[0]
+
+
 def save(config: dict) -> dict:
     collection = config["collection"]
     p = _path(collection)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(config, indent=2, sort_keys=True))
-    tmp.replace(p)
+    settings_store.publish(p, config)
     return config
 
 

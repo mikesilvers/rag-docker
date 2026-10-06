@@ -11,11 +11,19 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
-sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2]/'api')))
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2]/'api'))
 from fastapi.testclient import TestClient
 from main import app
 from models.schemas import GenerateRequest
 from services import chunk_sampling as sample, goldstandard as gs, weaviate_client as wc
+
+NEEDS_REPOSITORY = 'needs the whole repository mounted (see scripts/verify/README.md)'
+
+
+def repository_root():
+    parents = Path(__file__).resolve().parents
+    root = parents[2] if len(parents) > 2 else None
+    return root if root is not None and (root / 'IMPLEMENTATION.md').is_file() else None
 
 
 def objects(count=20):
@@ -153,19 +161,19 @@ class GenerationTests(unittest.IsolatedAsyncioTestCase):
     async def test_seed_reaches_sampler_actual_size_drives_generation(self):
         chosen=[{'object_id':identity,'content':'Synthetic','source_file':'inert.txt','chunk_index':0} for identity in sample.select_chunk_ids(objects(3),20,7)]
         with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=chosen)) as sampler, \
-             patch.object(gs,'_save_session',new=AsyncMock()) as save, \
+             patch.object(gs,'_store_generated_session',side_effect=lambda session:{**session,'session_id':'gs_460abcdf'}) as save, \
              patch.object(gs,'_run_generation',new=AsyncMock()) as generate:
             result=await gs.start_generation('Inert',20,7)
             await asyncio.sleep(0)
             sampler.assert_awaited_once_with('Inert',limit=20,seed=7)
             self.assertEqual(result['pairs_total'],3)
-            self.assertEqual(gs._sessions[result['session_id']]['pairs_total'],3)
-            save.assert_awaited_once()
+            self.assertEqual(save.call_args.args[0]['pairs_total'],3)
+            save.assert_called_once()
             generate.assert_awaited_once_with(result['session_id'],chosen)
 
     async def test_invalid_settings_and_selection_failure_prevent_session_and_model_work(self):
         with patch.object(gs.wc,'sample_chunks',new=AsyncMock(side_effect=ValueError('bad identity'))) as sampler, \
-             patch.object(gs,'_save_session',new=AsyncMock()) as save, \
+             patch.object(gs,'_store_generated_session') as save, \
              patch.object(gs,'_run_generation',new=AsyncMock()) as generate:
             for limit,seed in ((0,7),(101,7),(3,True),(3,float('inf'))):
                 with self.subTest(settings=(limit,seed)), self.assertRaises(ValueError):
@@ -174,7 +182,7 @@ class GenerationTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await gs.start_generation('Inert',3,7)
             self.assertEqual(gs._sessions,{})
-            save.assert_not_awaited(); generate.assert_not_called()
+            save.assert_not_called(); generate.assert_not_called()
 
 
 class RequestTests(unittest.TestCase):
@@ -205,7 +213,8 @@ class RequestTests(unittest.TestCase):
 
 class VerificationBoundaryTests(unittest.TestCase):
     def test_failed_backend_creation_still_cleans_owned_custom_prefix(self):
-        root=Path(__file__).resolve().parents[2];exists=False;names=[]
+        root=repository_root();exists=False;names=[]
+        if root is None:self.skipTest(NEEDS_REPOSITORY)
         def create(name,*args):
             nonlocal exists
             names.append(name);exists=True
@@ -225,7 +234,8 @@ class VerificationBoundaryTests(unittest.TestCase):
             self.assertFalse(exists)
 
     def test_parked_mcp_function_validates_before_api_call(self):
-        root=Path(__file__).resolve().parents[2]
+        root=repository_root()
+        if root is None:self.skipTest(NEEDS_REPOSITORY)
         source=ast.parse((root/'mcp/tools/goldstandard.py').read_text())
         function=next(node for node in source.body if isinstance(node,ast.AsyncFunctionDef) and node.name=='rag_generate_goldstandard')
         function.decorator_list=[]
@@ -242,7 +252,8 @@ class VerificationBoundaryTests(unittest.TestCase):
 
 class ImplementationTests(unittest.TestCase):
     def test_changed_embedded_sources_match_runtime(self):
-        root=Path(__file__).resolve().parents[2]
+        root=repository_root()
+        if root is None:self.skipTest(NEEDS_REPOSITORY)
         text=(root/'IMPLEMENTATION.md').read_text()
         names=('api/main.py','api/models/schemas.py','api/services/weaviate_client.py',
                'api/services/goldstandard.py','api/services/chunk_sampling.py',

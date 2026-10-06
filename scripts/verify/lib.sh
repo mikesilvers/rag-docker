@@ -57,17 +57,32 @@ skip() {
 # `expr` is python indexing against the parsed document, e.g. ['status']
 jfield() { python3 -c "import json,sys; d=json.load(sys.stdin); print(d$1)" 2>/dev/null; }
 
-api_get()  { curl -s -m 120 "$API$1"; }
-api_code() { curl -s -o /dev/null -m 120 -w '%{http_code}' "$@"; }
-api_post() { curl -s -m 600 -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
-api_post_code() { curl -s -o /dev/null -m 600 -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
+# Every helper below that reaches the API first checks that this suite's verify
+# lock is still held by it or an ancestor (#184). A suite orphaned by a run that
+# died after it passed lock.sh stops at its next helper call, before any
+# request, instead of acting on a later run's verify project. The suite ends
+# even when the helper runs inside $(...) or a pipeline, and its EXIT trap
+# still runs. Not re-checked: direct curl and `docker compose exec` calls in the
+# suites, and the Python helpers, which end on their own timeouts (up to 900 s).
+_rag_require_lock_owner() {
+  _rag_lock_owner_ok && return 0
+  _rag_lock_leftover
+  # In a subshell, exit alone would end only the subshell.
+  [ "${BASHPID:-}" = "$$" ] || kill -TERM "$$" 2>/dev/null
+  exit 3
+}
+
+api_get()  { _rag_require_lock_owner; curl -s -m 120 "$API$1"; }
+api_code() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -w '%{http_code}' "$@"; }
+api_post() { _rag_require_lock_owner; curl -s -m 600 -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
+api_post_code() { _rag_require_lock_owner; curl -s -o /dev/null -m 600 -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
 
 require_stack() {
   local code
   code=$(api_code "$API/health")
   if [ "$code" != "200" ]; then
     printf '\n  Cannot reach a healthy API at %s (HTTP %s).\n' "$API" "$code"
-    printf '  Start the stack first:  docker compose up -d\n\n'
+    printf '  Start the verify project first:  bash scripts/verify/stack.sh up\n\n'
     exit 2
   fi
 }
@@ -77,6 +92,7 @@ require_stack() {
 wait_for_job() {
   local path="$1" limit="${2:-600}" waited=0 status=""
   while [ "$waited" -lt "$limit" ]; do
+    _rag_require_lock_owner
     status=$(api_get "$path" | jfield "['status']")
     case "$status" in
       completed|failed|partial|cancelled) printf '%s' "$status"; return 0 ;;
@@ -90,7 +106,7 @@ make_collection() {
   api_post "/collections" "{\"name\":\"$1\",\"index_type\":\"${2:-hnsw}\",\"distance_metric\":\"${3:-cosine}\",\"hnsw_config\":{\"efConstruction\":128,\"maxConnections\":64,\"ef\":64}}" >/dev/null
 }
 
-drop_collection() { curl -s -o /dev/null -m 120 -X DELETE "$API/collections/$1?confirm=true"; }
+drop_collection() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -X DELETE "$API/collections/$1?confirm=true"; }
 
 # Remove every collection and package this run created.
 cleanup_prefixed() {
@@ -100,7 +116,7 @@ import json,sys
 for c in json.load(sys.stdin)['collections']:
     if c['name'].startswith('$PREFIX'): print(c['name'])" 2>/dev/null)
   for n in $names; do drop_collection "$n"; done
-  rm -f "${REPO_ROOT:-.}"/exports/ragpkg-"$(echo "$PREFIX" | tr '[:upper:]' '[:lower:]')"*.tar.gz 2>/dev/null || true
+  rm -f "${RAG_EXPORTS_DIR:-${REPO_ROOT:-.}/exports}"/ragpkg-"$(echo "$PREFIX" | tr '[:upper:]' '[:lower:]')"*.tar.gz 2>/dev/null || true
 }
 
 summary() {
@@ -112,3 +128,117 @@ summary() {
   fi
   return 0
 }
+
+# ── the live stack is off limits (#152) ──────────────────────────────────────
+# Verification runs on the disposable `rag-verify` project that
+# scripts/verify/stack.sh brings up, never on the live `rag-docker` stack that
+# holds real data. A target is live when the compose project these scripts
+# would act on is rag-docker, or when RAG_API uses the live port 8080.
+
+# Prints why the current target is the live stack, or nothing.
+live_target_reason() {
+  local project="${COMPOSE_PROJECT_NAME:-}" root port
+  if [ -z "$project" ]; then
+    # What compose would use: COMPOSE_PROJECT_NAME from the checkout's .env
+    # (optionally after `export `; the last one wins; quotes removed), else
+    # a `name:` in the compose file, else the folder name (#154).
+    root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+    project=$(sed -n 's/^\(export[[:space:]]\{1,\}\)\{0,1\}COMPOSE_PROJECT_NAME=//p' "$root/.env" 2>/dev/null | tail -1 \
+      | sed -e 's/^"\(.*\)"$/\1/' -e t -e "s/^'\(.*\)'\$/\1/")
+    [ -n "$project" ] || project=$(sed -n 's/^name:[[:space:]]*["'"'"']\{0,1\}\([^"'"'"'[:space:]]*\).*/\1/p' "$root/docker-compose.yml" 2>/dev/null | head -1)
+    [ -n "$project" ] || project=$(basename "$root")
+  fi
+  # Lowercased, everything outside [a-z0-9_-] dropped, and leading `-` and
+  # `_` stripped, as compose normalises a name.
+  project=$(printf '%s' "$project" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-' | sed 's/^[-_]*//')
+  port=$(python3 -c '
+import sys
+from urllib.parse import urlsplit
+url = urlsplit(sys.argv[1])
+try:
+    port = url.port
+except ValueError:
+    port = None
+print(port if port is not None else (443 if url.scheme == "https" else 80))' "$API" 2>/dev/null)
+  if [ "$project" = "rag-docker" ]; then
+    printf 'the compose project is rag-docker, the live rag-docker stack'
+  elif [ "$port" = "8080" ]; then
+    printf 'RAG_API (%s) uses port 8080, the live rag-docker stack' "$API"
+  fi
+}
+
+# Refuses a live target unless RAG_VERIFY_LIVE=1, which only warns.
+live_guard() {
+  local reason
+  reason=$(live_target_reason)
+  [ -n "$reason" ] || return 0
+  if [ "${RAG_VERIFY_LIVE:-0}" = "1" ]; then
+    printf '\n  WARNING: RAG_VERIFY_LIVE=1, so this run targets the live rag-docker stack:\n  %s.\n\n' "$reason" >&2
+    return 0
+  fi
+  printf '\n  Refusing to verify against the live rag-docker stack: %s.\n' "$reason" >&2
+  printf '  Run it on the disposable verify project:  bash scripts/verify/stack.sh run\n' >&2
+  printf '  (RAG_VERIFY_LIVE=1 overrides this; see scripts/verify/README.md.)\n\n' >&2
+  exit 2
+}
+
+# Prints why a restart must not run here, or nothing. Restarts never reach the
+# live project, whatever RAG_VERIFY_LIVE says.
+restart_refusal_reason() {
+  local project
+  project=$(printf '%s' "${COMPOSE_PROJECT_NAME:-}" | tr '[:upper:]' '[:lower:]')
+  if [ -z "$project" ]; then
+    printf 'COMPOSE_PROJECT_NAME is not set, so a restart could reach the live rag-docker stack; run it through scripts/verify/stack.sh'
+  elif [ "$project" = "rag-docker" ]; then
+    printf 'restarts never run against the live rag-docker project (#152)'
+  fi
+}
+
+# Default for RAG_RESTART_LIMIT_S (#130): Weaviate's start_period in
+# docker-compose.yml plus 60s for `down` and the api's own start.
+RESTART_LIMIT_DEFAULT_S=240
+
+# Prints the restart limit in seconds, or, with status 1, why the value of
+# RAG_RESTART_LIMIT_S is refused. Empty means unset.
+restart_limit() {
+  local value="${RAG_RESTART_LIMIT_S:-$RESTART_LIMIT_DEFAULT_S}"
+  case "$value" in
+    ''|*[!0-9]*) ;;
+    *) if [ "$((10#$value))" -gt 0 ]; then printf '%s' "$((10#$value))"; return 0; fi ;;
+  esac
+  printf "RAG_RESTART_LIMIT_S must be a positive whole number of seconds, not '%s'" "$value"
+  return 1
+}
+
+# wait_healthy_timed <started-epoch> <cap-seconds>: polls /health every 2s.
+# Prints the whole seconds since <started> once it returns 200, or nothing
+# once <cap> seconds have passed.
+wait_healthy_timed() {
+  local started="$1" cap="$2" code now
+  while :; do
+    code=$(api_code "$API/health")
+    now=$(python3 -c "import time;print(int(time.time()-$started))")
+    if [ "$code" = "200" ]; then printf '%s' "$now"; return 0; fi
+    [ "$now" -lt "$cap" ] || return 0
+    sleep 2
+  done
+}
+
+# restart_timing_check <limit> <elapsed, or empty if never healthy>: the
+# restart timing result, with the measured time on a pass and on a fail.
+restart_timing_check() {
+  local limit="$1" elapsed="$2"
+  if [ -n "$elapsed" ] && [ "$elapsed" -le "$limit" ]; then
+    check "restart reaches healthy within ${limit}s (took ${elapsed}s)" 0
+  elif [ -n "$elapsed" ]; then
+    check "restart reaches healthy within ${limit}s" 1 "took ${elapsed}s"
+  else
+    check "restart reaches healthy within ${limit}s" 1 "not healthy after $((limit * 2))s"
+  fi
+}
+
+# Suites (NN_*.sh) are guarded as soon as they source this file. Other scripts
+# that borrow these helpers are not suites and are left alone.
+case "$(basename "$0")" in
+  [0-9][0-9]_*.sh) live_guard ;;
+esac

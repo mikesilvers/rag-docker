@@ -63,6 +63,19 @@ proportional to the corpus rather than to upload count, and it makes "have we
 seen this document?" answerable. The cost is that the original upload filename is
 no longer the storage key, which `index.json` exists to solve.
 
+An imported source index MUST name blobs only by lowercase SHA-256 digest.
+Import validates the index and its regular content-addressed files before
+model installation, collection mutation, or sidecar restoration; a mismatch is
+`PACKAGE_CORRUPT`. Export and re-chunking refuse invalid identities or linked
+blobs at their read boundaries, so source metadata cannot select an arbitrary
+filesystem path. If an indexed blob is missing on disk, export warns and omits
+that entry from the shipped index; the package remains importable with its
+available sources and chunks. Existing valid indexes keep their original fidelity.
+An invalid on-disk index makes tuning options return a typed 409
+`SOURCE_INDEX_INVALID`; re-embedding from stored chunks and re-indexing do not
+need to read retained sources. A failed retention write after chunk storage does
+not misreport the ingested file as failed.
+
 Retention MUST NOT change chunking, embedding, or any existing response shape.
 
 ### 2.3 Deletion
@@ -102,7 +115,7 @@ carry the corpus's parameters.
 | `retrieval_mode` | enum `hnsw`\|`flat`\|`hybrid`\|`semantic` | `hnsw` |
 | `top_k` | integer 1–50 | `5` |
 | `alpha` | number 0–1 | `0.75` |
-| `ef` | integer, optional | — |
+| `ef` | integer 16–512, optional; legacy and inactive: stored and exported in `retrieval_config.json`, but neither query execution nor the exported `retrieve.py` applies it. An integer outside 16–512, which the API stored before PR #108, is exported and imported as `null`, with an export warning or an import note | — |
 | `response_format` | enum `end_user`\|`engineer` | `end_user` |
 
 ### 3.2 Endpoints
@@ -238,7 +251,15 @@ One JSON object per line:
 ## 5. The Retrieval Script
 
 `retrieve.py` is generated at export from `manifest.json` and
-`retrieval_config.json`.
+`retrieval_config.json`. Saved settings MUST satisfy the same typed contract as
+`POST /retrieval/config` before export, checked before any chunk is read. Invalid
+saved settings fail the export without publishing a package; they are not copied
+into executable syntax. The job error names each failing field and says to open
+the Retrieval page, save the collection's settings and export again. A legacy
+out-of-range integer `ef` (§3.1) is not a failure: it is exported as `null` with a
+warning.
+All generated Python defaults and package metadata MUST be encoded Python
+literals, and substitution MUST NOT interpret tokens inside inserted data.
 
 ### 5.1 Requirements
 
@@ -258,8 +279,9 @@ python retrieve.py --timeout 900 "..."
    Defaults: collection and parameters from the package; `--api-url` defaults to
    `http://localhost:8080/api`; `--timeout` defaults to 600 seconds, because
    generation runs on CPU and a single answer was measured at 236 s.
-4. **Records its provenance** — the source manifest's `id8` and `created_at` in a
-   header comment, so a script separated from its package can still be traced.
+4. **Records its provenance** — the source manifest's `id8` and `created_at` in the
+   script's `PACKAGE_METADATA` literal, beside `package_filename`, `embed_model` and
+   `embed_dimensions`, so a script separated from its package can still be traced.
 5. **Exit codes:** `0` success, `2` bad usage, `3` API unreachable, `4` collection
    absent, `5` API returned an error.
 
@@ -323,21 +345,38 @@ Checks run in this order and stop at the first failure:
 | 1 | File exists and is a readable `.tar.gz` | `PACKAGE_UNREADABLE` |
 | 2 | `manifest.json` present, `package_format` understood | `PACKAGE_FORMAT_UNSUPPORTED` |
 | 3 | Every `files` digest matches | `PACKAGE_CORRUPT`, naming the file |
+| 3a | Retained-source index names only valid digest identities and matching regular blobs | `PACKAGE_CORRUPT`, naming `sources/index.json` |
 | 4 | **Embedding model and dimensions match this instance** | `EMBEDDING_MISMATCH` — refuse |
-| 4a | Every evaluation sidecar has a valid session schema, generated session ID, matching collection and unique identity within the package; its resolved storage destination is contained | `PACKAGE_CORRUPT`, naming the sidecar |
+| 4a | Every evaluation sidecar has a valid session schema, generated session ID, matching collection and unique identity within the package; the local session storage directory is a regular directory inside the upload directory | `PACKAGE_CORRUPT`, naming the sidecar |
+| 4b | Optional retrieval settings are a JSON object satisfying the API save schema, normalized with its defaults and numeric conversion | `PACKAGE_CORRUPT`, naming `retrieval_config.json` |
 | 5 | Collection name collision | resolved per `on_conflict` |
+
+Check 3a runs before embedding-model checks and all live mutation. Check 4b runs before model installation, collection creation/replacement, recovery
+ownership, or sidecar publication. Keep its normalized snapshot for restoration;
+do not reread unvalidated settings after building the collection. Rebind the
+collection to the actual import target. Missing fields retain API defaults,
+valid historical `ef` values are preserved, and unknown fields are ignored as
+on API saves. A legacy integer `ef` outside 16–512 (§3.1) is restored as `null`,
+and the completed job notes it. A missing settings file remains supported.
+Invalid JSON, non-object settings, invalid enum values, booleans in numeric fields
+(including `ef`), other out-of-range values, and non-finite alpha are refusals in
+every conflict mode.
 
 Check 4a runs before bundled-model installation, collection creation/deletion,
 or restoring any sidecar. All sessions MUST be preflighted together, including
 later files, and the validated snapshots used for restoration. Invalid JSON or
 metadata is a refusal, not a skipped session. Session IDs use the locally
-generated `gs_[0-9a-f]{8}` grammar; malformed IDs are never rewritten. The
+generated `gs_[0-9a-f]{8}` grammar; malformed IDs are refused, never rewritten.
+A well-formed ID that is already used locally is kept as import provenance and
+the restored session gets a new local ID (`SPECIFICATIONS.md` §3.1.5). The
 persistence boundary also enforces resolved-path containment and refuses
 redirected storage directories and non-regular destinations. Archive extraction
 accepts only regular files and directories, so special members cannot block a
 later metadata read. Existing review work remains unchanged on validation
 failure, including `replace`. Optional legacy progress fields retain their
-existing defaults, and historical validity metadata is preserved.
+existing defaults, and historical validity metadata is preserved. A restored
+session's `persistence_error` is removed: a write failure on the source system
+says nothing about this instance's storage.
 
 Startup loading, collection flagging and export use the same session-record
 validation. Invalid legacy files (including filename/identity mismatch) remain
@@ -455,9 +494,20 @@ imported twice — a numeric suffix is appended (`..._2`, `..._3`).
 
 ### 6.5 Atomicity
 
-A failure part-way MUST leave no partial collection, and MUST NOT destroy the
-collection it was importing over. `replace` therefore deletes only after the
-incoming package has been proven to insert cleanly.
+A failed new-target build MUST remove its partial collection. `replace` MUST
+retain a verified recovery copy before deleting the original. There is no atomic
+swap: a final create or write failure can leave the original name unavailable,
+and the error MUST identify the retained incoming data.
+
+All writers MUST check the supported completed-batch failure list after context
+exit, then confirm the persisted UUID set, properties and vectors. Duplicate IDs,
+partial acceptance and manifest count mismatches MUST fail. Supplied vectors are
+compared by their float32 encoding; generated vectors must be finite and nonempty.
+`chunks_written` and ingest stored counts represent confirmed objects, not enqueue
+attempts. Verification MUST stream records with disk-backed UUID/property/vector
+fingerprints rather than retain a full decoded corpus in memory. Failed ingestion
+MUST remove only UUIDs generated by that attempt; cleanup failure MUST preserve
+the original error and explicitly report that accepted chunks may remain.
 
 **Correction — "promote" is not available.** An earlier revision required
 building into a temporary collection and renaming it on success. **Weaviate has
@@ -470,7 +520,7 @@ whether anything is at risk:
 |---|---|
 | `abort` | Fails before any build if the name is taken, so the build target is always new. Built directly; deleted on failure. |
 | `rename` | The target name is new by construction. Built directly; deleted on failure. |
-| `replace` | Built into `<name>__importing_<id8>` first. Only once that succeeds is the existing collection deleted and the real one built. |
+| `replace` | Built into `<name>__importing_<operation-id>` first. Only once that succeeds is the existing collection deleted and the real one built. |
 
 `replace` therefore performs **two insert passes**. That is the cost of a
 non-destructive replace in a database that cannot rename, and it is paid only
@@ -490,18 +540,36 @@ first request, which is what makes this safe.
 
 | Left behind by | Detected at startup by | Action |
 |---|---|---|
-| `replace` staging (`<name>__importing_<id8>`) | the name marker | delete; it is internal and would otherwise appear in the collection list as if it were real |
-| a tuning rebuild (`<name>__tuning_<id8>`) | the name marker | delete |
-| `abort`/`rename` partial target | an in-progress marker file recording the expected chunk count | delete **only if** the collection's actual count differs from the expected one |
-| an extraction workspace (`import-*`, `rechunk-*` under `UPLOAD_DIR`) | the directory name prefix | delete; twelve of these were found holding 152 MB after kill testing, and a `with-models` package leaves 2.3 GB behind each time |
+| Owned import/tuning scratch | a valid durable `collection_operations/<operation-id>.json` record with state `scratch` | delete the recorded scratch collection and its copied sidecars |
+| Verified recovery | a durable record with state `recovery`, written before deleting the target | preserve the collection and all sidecars; log its identity and metadata snapshot directory |
+| Successful/intentional cleanup interrupted by I/O failure | durable `cleanup` phase, written before deletion | retry only that authorized backend/sidecar/metadata cleanup until complete |
+| Unowned marker-like name or unreadable ownership | insufficient ownership evidence | preserve; a substring or age is never deletion authority |
+| New-target partial import | a small version-4 marker bound by SHA-256 to a compact SQLite expectation snapshot, and by a random instance token to the schema description (`rag-import:<token>`) the import gives the collection it creates | only for the collection carrying the marker's token: verify the full stored records and delete a proven mismatch. A collection without the token was created later under that name: keep it and retire the marker. Preserve on unreadable/legacy metadata or backend read failure. A version-3 marker carries no token and never deletes: in state `building` it is kept and logged; in state `cleanup` its cleanup is finished |
+| Orphaned expectation snapshot | a `<32 hex>.sqlite3` file in the markers folder that no marker names | delete it; if any marker cannot be parsed, delete none |
+| Extraction workspace (`import-*`, `rechunk-*` under `UPLOAD_DIR`) | the directory name prefix | delete the abandoned workspace; recovery sidecars are stored outside it |
 
-The count comparison is required, not an optimisation. A marker that outlives a
-*successful* import — a failed unlink, a full disk — must never cost the user a
-complete collection.
+Recovery ownership is atomic and flushed before the destructive step. Cleanup
+intent is also durable, so a failure after backend deletion does not leave a
+phantom recovery record. Import markers are bounded metadata; expected identities
+and SHA-256 fingerprints live in a separate integrity-bound SQLite snapshot, and
+startup comparisons stream through a temporary index with a 1 MiB cache. Corrupt,
+legacy or oversized metadata is preserved without authorizing backend deletion. Original
+source bytes and ingest/retrieval configs are copied under the recovery collection
+name; evaluation JSON is copied to the operation's metadata snapshot directory
+without overwriting live session identity. An imported recovery also retains its
+manifest and collection config. The error detail includes `recovered_as` and
+`sidecar_snapshots`, the snapshot directory relative to `UPLOAD_DIR`
+(`collection_operations/<operation-id>`); the absolute path appears only in the
+server log. A recovery record remains preserved even if its backend
+collection is later missing, since its sidecars may still be useful.
 
-Both sweeps MUST log what they removed and say that the package is still in
-`./exports` and can simply be imported again. Nothing here is unrecoverable:
-import never modifies or deletes the package it read.
+The owner can export the named recovery collection, inspect its metadata snapshots,
+and intentionally recover or discard it. Automatic startup cleanup never discards
+recovery data. For an intentional full discard in the API container, load the
+identified operation record and call `collection_recovery.discard(record,
+weaviate_client.get_client())`; this removes that recorded collection, its copied
+sidecars and ownership metadata. Do not discard a record until its data is no
+longer needed. Import never modifies or deletes the original package in `./exports`.
 
 ---
 
@@ -526,6 +594,8 @@ rather than silently ignoring one of them.
 
 ### 7.3 Gold-standard invalidation
 
+Invalidation covers both supported first-character collection aliases without changing stored session provenance.
+
 Any operation that changes chunk identity — re-chunking, or re-embedding that
 rebuilds the collection — MUST mark every gold-standard session for that
 collection `stale`, recording why and when. Sessions are not deleted and are not
@@ -537,12 +607,34 @@ For identity-changing rebuilds, persist the flag after preparation succeeds but 
 Changing only the index type or distance metric does **not** change chunk
 identity, and MUST NOT mark sessions stale.
 
+A successfully verified index/distance change preserves exact UUIDs, properties
+and vectors, and MUST NOT mark sessions stale. Single-process application writers
+share the collection guard through snapshot, replacement and final verification;
+external backend writers remain outside it and an observed change is refused.
+A stored vectorizer mismatch with the complete recreation configuration is refused before
+staging, including unknown module options and property name/type/vectorization flags.
+Complete replace-import workers hold the same target guard through conflict check,
+cutover and sidecar restoration; their staging ownership is persisted before creation.
+Staging-creation failures immediately discard only positively owned scratch. Verified staging and pre-cutover sidecars must survive an uncertain
+cutover under durable recovery ownership. A failed delete that leaves exact
+
 **Sessions are cached in memory as well as on disk.** Anything that writes a
 session file directly, without going through the gold-standard service, will be
 silently undone: the cache still holds the previous version and the next
 flagging pass writes it back over the file. Import hit exactly this — a restored
 session reverted to the orphaned state of the collection it replaced. Every
 writer MUST go through the service.
+
+### 7.4 Failed rebuilds
+
+Before deleting the original, tuning MUST verify the staged rebuild and durably
+retain its source/config/evaluation sidecars. Final-create, batch and verification
+failures MUST report the recovery collection and preserve it across restart,
+including chunks-only data. Cleanup may delete scratch while the original remains
+safe, or delete recovery only after final persisted-record verification succeeds
+or when a step fails before the original is deleted. If marking gold-standard
+sessions stale fails at that point, the job fails `TUNE_FAILED`, says so and that
+the original collection is unchanged, and the retained copy is discarded.
 
 ---
 
@@ -608,13 +700,13 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 |---|---|
 | `PACKAGE_UNREADABLE` | missing or not a readable archive |
 | `PACKAGE_FORMAT_UNSUPPORTED` | `package_format` newer than this instance |
-| `PACKAGE_CORRUPT` | digest mismatch or invalid evaluation-session metadata (check 4a); names the file |
+| `PACKAGE_CORRUPT` | digest mismatch, invalid retained sources (check 3a), or invalid evaluation-session metadata (check 4a); names the file |
 | `EMBEDDING_MISMATCH` | model or dimensions differ; names both |
 | `EMBEDDING_MODEL_MISSING` | target lacks the embedding model and the package does not bundle it |
 | `MODEL_INTEGRITY_FAILED` | the embedding model is installed but a file is missing or doesn't match its checksum; names the model |
 | `COLLECTION_EXISTS` | collision with `on_conflict=abort` |
 | `COLLECTION_NOT_FOUND` | export requested for a collection that does not exist |
-| `SOURCES_REQUIRED` | tuning needs `with-sources`; package is `chunks-only` |
+| `SOURCES_REQUIRED` | tuning needs retained originals covering every stored source file unambiguously; missing or ambiguous coverage is refused before staging |
 | `EXPORT_IN_PROGRESS` | concurrent export of the same collection |
 | `IMPORT_IN_PROGRESS` | concurrent import of the same package file |
 | `TUNE_IN_PROGRESS` | concurrent tuning of the same collection |
@@ -651,19 +743,24 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E10 | `retrieve.py` exits 3 with one sentence when the stack is down |
 | E11 | Import into a clean instance reproduces chunk count and answers equivalently |
 | E12 | Import refuses `EMBEDDING_MISMATCH` when the target uses a different embedding model |
+| E30 | Export refuses `EMBEDDING_MISMATCH` before streaming/bundling when the stored collection model is unknown, named-vector, or differs from the configured model; vectors are never relabeled from current environment settings |
 | E13 | A truncated package fails `PACKAGE_CORRUPT` naming the file |
 | E14 | `on_conflict=abort` fails; `rename` imports under a new name; `replace` succeeds |
-| E15 | An import that fails part-way leaves no partial or temporary collection |
+| E15 | Failed new-target builds remove partial collections; failed destructive replacement retains and names verified recovery data and sidecars |
 | E16 | Re-chunking marks the collection's gold-standard sessions `stale` |
-| E17 | Re-chunking a `chunks-only` collection fails `SOURCES_REQUIRED` |
+| E17 | Re-chunking a `chunks-only` or partially retained collection fails `SOURCES_REQUIRED` before staging; re-embed with new chunking parameters uses the same coverage guard |
 | E18 | `replace` reports the number of orphaned sessions |
 | E19 | Package `README.md` states the collection name, fidelity and encryption warning |
 | E20 | `docker compose up -d` still starts five services, with `./exports` mounted |
 | E21 | Importing a `with-models` package into an instance lacking the embedding model installs it and it appears in `ollama list` |
 | E22 | Importing a package without bundled models into such an instance fails `EMBEDDING_MODEL_MISSING` |
 | E23 | A digest-valid package with malformed evaluation metadata fails `PACKAGE_CORRUPT` before model installation, collection mutation or sidecar restoration; existing review work remains unchanged |
+| E24 | Export, edit original, rename-import twice: all three session identities retain independent review/export state and reported import provenance |
+| E25 | With the embedding endpoint unavailable, reindex changes the physical index while preserving exact UUIDs/properties/vectors; completed jobs leave retained evaluation sessions unchanged; same-process ingestion is serialized, incompatible vectorizers are refused, and uncertain cutover retains durable recovery |
 | E26 | Importing when the installed embedding model's files don't match their checksums fails `MODEL_INTEGRITY_FAILED`, leaves the model's files untouched and says to restore or re-pull it |
 | E27 | With a namespaced `LLM_MODEL` (`user/model`), an import of a package without bundled models succeeds and notes the model |
+| E28 | Digest-valid malformed retrieval settings are refused before live mutation in all conflict modes; valid historical settings round-trip, a legacy out-of-range integer `ef` imports as `null` with a note, and generated script defaults/metadata remain encoded typed literals. On export, a saved legacy out-of-range integer `ef` is written to the package as `null` with a warning and the saved settings are left alone; other invalid saved settings fail the export before any chunk is read, with an error naming the failing fields and the Retrieval page, and no package is published |
+| E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths |
 
 ---
 

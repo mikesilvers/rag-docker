@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
-from pydantic import BaseModel, Field, BeforeValidator, field_validator, model_validator
+from pydantic import BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator
 
 
 def _numeric(value):
@@ -26,7 +26,9 @@ ChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=50, le=6000)]
 MinChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=0, le=6000)]
 UnitInterval = Annotated[float, BeforeValidator(_numeric), Field(ge=0, le=1, allow_inf_nan=False)]
 TopK = Annotated[int, BeforeValidator(_numeric), Field(ge=1, le=50)]
-SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=16, le=512)]
+SEARCH_EF_MIN, SEARCH_EF_MAX = 16, 512
+SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=SEARCH_EF_MIN, le=SEARCH_EF_MAX)]
+OVERLAP_RULE = "chunk_overlap must be smaller than chunk_size for overlap/language"
 
 
 # ── Collections ──────────────────────────────────────────────────────────────
@@ -70,6 +72,7 @@ class CollectionInfo(BaseModel):
     index_type: str
     distance_metric: str
     created_at: Optional[str]
+    hnsw_config: Optional[dict[str, int]] = None
 
 
 class CollectionsResponse(BaseModel):
@@ -108,7 +111,7 @@ class IngestConfig(BaseModel):
     @model_validator(mode="after")
     def _relationships(self):
         if self.chunking_strategy in ("overlap", "language") and self.chunk_overlap >= self.chunk_size:
-            raise ValueError("chunk_overlap must be smaller than chunk_size for overlap/language")
+            raise ValueError(OVERLAP_RULE)
         return self
 
 
@@ -124,6 +127,9 @@ class IngestConfigResponse(BaseModel):
 
 # ── Retrieval config ──────────────────────────────────────────────────────────
 
+# These bounds apply to saves. A saved or packaged ef that is an integer outside
+# SEARCH_EF_MIN-SEARCH_EF_MAX was stored before PR #108 and is inactive, so
+# export and import clear it to null (retrieval_config.normalize), not refuse it.
 class SaveRetrievalConfigBody(BaseModel):
     collection: str
     retrieval_mode: RetrievalMode = "hnsw"
@@ -199,6 +205,12 @@ class ImportStartResponse(BaseModel):
     filename: str
 
 
+class ImportedSessionMapping(BaseModel):
+    source_session_id: str
+    session_id: str
+    collection: str
+
+
 class ImportJobStatusResponse(BaseModel):
     job_id: str
     status: str
@@ -212,6 +224,7 @@ class ImportJobStatusResponse(BaseModel):
     fidelity: Optional[str]
     renamed: bool
     notes: list[str]
+    restored_sessions: list[ImportedSessionMapping] = Field(default_factory=list)
     error: Optional[str]
     error_code: Optional[str]
     error_detail: Optional[dict]
@@ -235,9 +248,6 @@ class PackageListResponse(BaseModel):
 
 # ── Tuning ────────────────────────────────────────────────────────────────────
 
-CHUNKING_STRATEGIES = ("fixed", "overlap", "language", "context_aware", "semantic")
-
-
 class _ChunkingFields(BaseModel):
     chunking_strategy: Optional[ChunkingStrategy] = None
     chunk_size: Optional[ChunkSize] = None
@@ -247,8 +257,13 @@ class _ChunkingFields(BaseModel):
 
     @model_validator(mode="after")
     def _relationships(self):
-        IngestConfig(**{name: getattr(self, name) for name in IngestConfig.model_fields
-                        if getattr(self, name) is not None})
+        # Fields are already checked, so only the overlap rule can fail here.
+        # A plain ValueError keeps the nested model's input out of the error.
+        try:
+            IngestConfig(**{name: getattr(self, name) for name in IngestConfig.model_fields
+                            if getattr(self, name) is not None})
+        except ValidationError:
+            raise ValueError(OVERLAP_RULE) from None
         return self
 
     def has_chunking(self) -> bool:
@@ -393,6 +408,12 @@ class SessionValidity(BaseModel):
     orphaned_at: Optional[str] = None
 
 
+class SessionImportProvenance(BaseModel):
+    session_id: str
+    collection: str
+    imported_at: str
+
+
 class SessionResponse(SessionValidity):
     session_id: str
     status: str
@@ -405,6 +426,7 @@ class SessionResponse(SessionValidity):
     pairs: list[GoldPair]
     collection: str
     errors: list[str] = []
+    imported_from: SessionImportProvenance | None = None
 
 
 class PatchPairRequest(BaseModel):

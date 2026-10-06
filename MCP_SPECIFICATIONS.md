@@ -158,8 +158,9 @@ Notes:
   that the fallback branch was unnamed. That was wrong: the Retrieval Config page
   has always offered it as "Semantic", and `POST /retrieval/config` accepts it.)
 - **`response_format` selects the synthesis prompt**, not just formatting:
-  `end_user` asks for plain language for a non-technical reader; `engineer` asks
-  for technical detail plus an explicit confidence level (high/medium/low). The
+  `end_user` asks for a short answer in plain language for a non-technical
+  reader; `engineer` asks for technical detail plus an explicit confidence level
+  (high/medium/low). The
   default here matches the API's own default rather than overriding it. A caller
   that wants confidence signalling should pass `engineer` — worth considering as
   the default, since the consumer of this tool is a program, but that is a

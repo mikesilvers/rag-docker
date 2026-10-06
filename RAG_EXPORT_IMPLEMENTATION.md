@@ -713,6 +713,17 @@ Two fixes, both at startup, where nothing can be mid-operation:
    marker file written before the build records the expected chunk count; at
    startup a collection is deleted only when its actual count differs.
 
+> **Note, 2026-10-03 (#126):** both fixes above have since been replaced, and the
+> rest of this section is history. Since #61, names never authorize deletion:
+> `sweep_staging()` removes only a staging collection named by a valid ownership
+> record in `UPLOAD_DIR/collection_operations/` in state `scratch` or `cleanup`,
+> and keeps retained recovery. The import marker is bound to a hash-checked SQLite
+> snapshot of the expected records, and startup compares records, not counts.
+> Since #126 the marker (version 4) also carries an instance token that the import
+> writes into the collection's schema description; startup deletes only the
+> collection carrying that token, and removes expectation snapshots no marker
+> names. The current rules are in `RAG_EXPORT_SPECIFICATIONS.md` §6.5.1.
+
 The count comparison was verified in both directions, because the failure mode
 matters more than the success: a marker left over from a *successful* import
 (expected 720, actual 720) left the collection untouched, while a marker claiming

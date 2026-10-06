@@ -15,15 +15,17 @@ documentation improvements are all welcome.
 
 1. Fork the repository and create a branch from `develop`.
 2. Bring the stack up and make your change (see [Quick start](README.md#quick-start)).
-3. Run the verification suite against the live stack:
+3. Run the verification suite. It runs on a disposable verify project, never
+   on your own stack: `stack.sh` builds your branch as compose project
+   `rag-verify` on port 8081, with its own empty volumes, runs the suite and
+   removes the project again.
 
    ```bash
-   docker compose up -d
-   bash scripts/verify/all.sh                  # everything, ~20 min
-   RAG_SKIP_SLOW=1 bash scripts/verify/all.sh  # skip LLM work, ~3 min
+   bash scripts/verify/stack.sh run                  # everything, ~20 min plus start-up
+   RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run  # skip LLM work, ~8 min, start-up included
    ```
 
-   The suite exits non-zero on the first failure. See
+   The suite exits non-zero if any check fails. See
    [scripts/verify/README.md](scripts/verify/README.md) for details.
 4. If you change dependencies, follow
    [Dependency management](README.md#dependency-management) and commit the

@@ -7,8 +7,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api')))
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
 from services import chunker, ingest_pipeline
+
+NEEDS_REPOSITORY = 'needs the whole repository mounted (see scripts/verify/README.md)'
+
+
+def repository_root():
+    parents = Path(__file__).resolve().parents
+    root = parents[2] if len(parents) > 2 else None
+    return root if root is not None and (root / 'IMPLEMENTATION.md').is_file() else None
 
 
 def recover(chunks, overlap):
@@ -112,7 +120,8 @@ class OverlapTests(unittest.TestCase):
             finally:ingest_pipeline._jobs.pop(job_id,None)
 
     def test_live_helper_rejects_empty_parser_output_instead_of_vacuous_success(self):
-        root=Path(__file__).resolve().parents[2]
+        root=repository_root()
+        if root is None:self.skipTest(NEEDS_REPOSITORY)
         with patch.dict(os.environ,{'RAG_OVERLAP_REAL_EMBEDDING':'0'}), \
              patch.object(ingest_pipeline,'_parse_file',return_value=('',[])), \
              patch.object(ingest_pipeline.wc,'_collection_exists_sync',return_value=False), \
@@ -156,7 +165,8 @@ class OverlapTests(unittest.TestCase):
 
 class ImplementationTests(unittest.TestCase):
     def test_embedded_changed_sources_match_runtime(self):
-        root = Path(__file__).resolve().parents[2]
+        root = repository_root()
+        if root is None: self.skipTest(NEEDS_REPOSITORY)
         text = (root / 'IMPLEMENTATION.md').read_text()
         for name,fence,language in [('api/services/chunker.py','```','python'),
                                      ('scripts/verify/overlap_chunks.py','```','python'),

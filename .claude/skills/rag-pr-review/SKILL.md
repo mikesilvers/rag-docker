@@ -23,7 +23,7 @@ Every check, security included, runs at the PR's turn, against the `develop` of 
 
 ## Procedure
 
-Run these steps for each PR. Process PRs one at a time through step 8, because testing and the build check need the single local Docker stack to themselves.
+Run these steps for each PR. Process PRs one at a time through step 8, because testing and the build check need the single verify project ("The verify project" in `reference.md`) to themselves. No step ever builds, starts, stops or recreates the live `rag-docker` stack.
 
 Keep a history as you go, one line per step with a UTC time (claimed, dispatched with model, each result, go-ahead, build start and end). It goes into the recap.
 
@@ -115,46 +115,64 @@ Use the Agent tool with `subagent_type: general-purpose` and the chosen `model`.
 
 > You are the {coding|security|testing} reviewer for rag-docker PR #N. Invoke the `rag-pr-review-{coding|security|tests}` skill with the Skill tool and follow it exactly. If the Skill tool can't find it, read `{skills}/rag-pr-review-{…}/SKILL.md` and `{skills}/rag-pr-review/reference.md` in full and follow them exactly. Wherever the skills say `.claude/skills/`, use `{skills}/`.
 > Reviewed SHA: {sha}. Evaluated commit: {evaluated-sha}, the reviewed SHA merged with `develop` at {develop-sha7}. Source-of-truth issue(s): #{n}{; Part of — deferred: …}. Context bundle: {path}. Worktree (reviewed SHA): {path}/worktree. Merged worktree (evaluated commit): {path}/merged. Cross-repository PR: {true|false}. Your model: {model}.
-> Write your findings file and return the result block, both as defined in `reference.md`. Post nothing on GitHub, apply no labels, and never change git config.{ For coding and security on a cross-repository PR: Run no command on the PR's files, not even `py_compile`, `bash -n` or `node --check`. Read them only.}
+> Write your findings file and return the result block, both as defined in `reference.md`. Post nothing on GitHub, apply no labels, and never change git config.{ For coding and security on a cross-repository PR: Run no command on the PR's files, not even `py_compile`, `bash -n` or `node --check`. Read them only.}{ For testing: Wait for long runs as the tests skill's "Waiting for long runs" says: never end your turn while a run is in progress, and never rely on a notification, monitor or watcher to resume you.}
 
 - Dispatch **coding** and **security** together, in the background.
 - Dispatch **testing** after them:
   - **Same-repository PR:** as soon as the other two are dispatched.
   - **Cross-repository PR:** only after security returns with no High findings, *and* the user confirms that code from this outside contributor may be built and run on this machine. Record the answer as the `rag-pr-review/go-ahead` status, with the develop SHA in its description (see `reference.md`). If security found a High, or the user declines, testing is not run: record `Tests: not run (<reason>)`.
 - As each specialist returns, check that its findings file exists and matches its result block, then update its status.
+- **A testing reviewer that returns without a result block** (it says it is waiting for a run to finish) has stalled: it won't resume on its own. Check its run the way the tests skill's "Waiting for long runs" does: `kill -0` on the process id in `<bundle>/verify-all.pid` (or, without that file, whether `/tmp/rag-verify.lock` exists and its `pid` is alive), and the end of `<bundle>/verify-all.log`. While the run is still going, wait for it the same way, with foreground calls, and check again. Once it has ended, send the reviewer a message to read the log and **finish every remaining step of its skill**: score the failures, write the findings file, tear the verify project down as "The verify project" says, and return its result block.
 
 ### 8. Build and run check
 
-Do this yourself, after **all** specialists have returned. It proves the evaluated commit builds from clean and the whole stack comes up.
+Do this yourself, after **all** specialists have returned. It proves the evaluated commit builds from clean and the whole stack comes up. It runs on the verify project, never on the live `rag-docker` stack.
 
 It runs code, so the same rule as testing applies: for a cross-repository PR, only after security has no High findings and the user has said yes. If it can't run, record `Build: not run (<reason>)`.
 
-Run from the merged worktree. First reset it to the evaluated commit (`git -C <bundle>/merged checkout -- . && git -C <bundle>/merged clean -fdq -e node_modules`), because the testing reviewer may have left test edits there. Always pass `-p rag-docker` (or `export COMPOSE_PROJECT_NAME=rag-docker`): without it, compose names the project after the folder (`merged`) and starts a second stack that fights the first for port 8080, with empty volumes.
+First reset the merged worktree to the evaluated commit (`git -C <bundle>/merged checkout -- . && git -C <bundle>/merged clean -fdq -e node_modules`), because the testing reviewer may have left test edits there.
+
+The whole check runs as **one script that holds the verify lock** from before `up` until after `down`, so no other verify run can remove the project under the smoke checks (#154). `stack.sh` sees that the lock is already held (`RAG_VERIFY_LOCK_HELD`) and neither takes nor releases it. Write the script to the bundle:
 
 ```bash
-cd <bundle>/merged
-docker compose -p rag-docker config -q                   # compose file is valid
-docker compose -p rag-docker build --pull                # every image builds from this commit
-docker compose -p rag-docker up -d --force-recreate      # the whole stack starts
-```
-
-Then wait up to 15 minutes, until every service with a healthcheck reports `healthy` and none has exited. Check with `docker compose -p rag-docker ps -a --format '{{.Service}} {{.State}} {{.Health}}'`.
-
-Then run the smoke checks through the proxy. **Retry each for up to 60 seconds**: services without a healthcheck (`ui`, `proxy`) take a moment to accept connections, and the first request can return 502.
-
-```bash
+cat > <bundle>/build-check.sh <<'EOF'
+set -u
+main=$(git worktree list --porcelain | awk 'NR==1 {print $2}')
+# The trusted harness: the main checkout's must be develop's ("The verify project" in reference.md).
+git -C "$main" fetch -q origin develop || { echo "STOP: could not fetch develop"; exit 1; }
+git -C "$main" diff --quiet origin/develop -- scripts/verify/stack.sh scripts/verify/lock.sh docker-compose.verify.yml docker-compose.yml || { echo "STOP: the harness isn't develop's"; exit 1; }
+# Held until this script exits; exits 3 if another verify run holds it.
+. "$main/scripts/verify/lock.sh"
 smoke() { for i in $(seq 1 60); do c=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$1"); [ "$c" = 200 ] && { echo "200 after ${i}s"; return 0; }; sleep 1; done; echo "$c: no 200 in 60 s"; return 1; }
-smoke http://localhost:8080/api/health
-smoke http://localhost:8080/
-curl -s http://localhost:8080/api/health | python3 -c 'import json,sys; print(json.load(sys.stdin))'
+rc=0
+if bash "$main/scripts/verify/stack.sh" up --checkout <bundle>/merged --pull; then
+  smoke http://localhost:8081/api/health || rc=1
+  smoke http://localhost:8081/ || rc=1
+  curl -s http://localhost:8081/api/health | python3 -c 'import json,sys; print(json.load(sys.stdin))' || rc=1
+else
+  echo "stack.sh up failed"; rc=1
+fi
+bash "$main/scripts/verify/stack.sh" down || rc=1
+exit "$rc"
+EOF
 ```
 
-The health response must report Weaviate, the LLM and the embedding model as ok.
+Run it in the background and wait for it as "Waiting for long runs" in `.claude/skills/rag-pr-review-tests/SKILL.md` says, with this script's log and pid file in place of `verify-all.*`:
 
-- **Passed:** the config is valid, every image builds, every service is healthy within the timeout, and every smoke check returns 200 within its retry window.
-- **FAILED:** anything else. Keep the failing step, its last 30 lines of output, and `docker compose -p rag-docker logs <service> --tail 50` for any unhealthy service, for the recap.
+```bash
+(bash <bundle>/build-check.sh; echo "build-check exit=$?") > <bundle>/build-check.log 2>&1 & echo $! > <bundle>/build-check.pid
+```
 
-Either way, afterwards restore the stack to `develop` as "Restoring the stack" in `reference.md` describes, and confirm it's healthy with the same smoke checks.
+Then read the finished log:
+
+- **`STOP:` then `build-check exit=1`, with no `stack.sh` output:** the harness isn't `develop`'s, or `develop` couldn't be fetched. Nothing was built or started. Stop the evaluation, run nothing more, and tell the user.
+- **`Another verify run …` then `build-check exit=3`:** another verify run holds the lock, so the check didn't start. Wait for that run to end, then run the script again.
+- **Anything else** is the check's result. `stack.sh up` checks the resolved compose configuration (a refusal is FAILED, with the message it prints), builds every image from the merged worktree (`--pull`), starts the whole project and waits up to 15 minutes for every service with a healthcheck to report healthy (with one retry, #130), and confirms `/api/health` answers on the verify port. On a failed start it prints the last 50 log lines of each service that isn't up. The smoke checks go through the verify project's proxy on port 8081 and **retry for up to 60 seconds** each: services without a healthcheck (`ui`, `proxy`) take a moment to accept connections, and the first request can return 502. The health response must report Weaviate, the LLM and the embedding model as ok.
+
+- **Passed:** the configuration is accepted, every image builds, every service is healthy within the timeout, every smoke check returns 200 within its retry window, and `down` printed `verify project rag-verify removed`.
+- **FAILED:** anything else. Keep the failing step, its last 30 lines of output, and the logs of any unhealthy service, for the recap.
+
+Either way, the script has already torn the verify project down: confirm it as "The verify project" in `reference.md` describes. If `down` reported anything left, follow "If the teardown fails" there.
 
 ### 9. Finish the evaluation
 
@@ -178,7 +196,7 @@ Either way, afterwards restore the stack to `develop` as "Restoring the stack" i
    | not run / not concluded | `error` |
 
    Then set the overall `rag-pr-review` status to `success` for READY TO MERGE or `failure` for NOT READY, with `-f target_url=<recap review URL>`.
-5. **Clean up,** only if the restore's mount check passed ("Restoring the stack" in `reference.md`): remove both worktrees with `git worktree remove --force <bundle>/worktree` and `git worktree remove --force <bundle>/merged`. The evaluated commit was never on a branch, so git discards it in time. If the restore failed, the stack is stopped and the worktrees stay.
+5. **Clean up,** only once the verify project's teardown has succeeded ("The verify project" in `reference.md`): remove both worktrees with `git worktree remove --force <bundle>/worktree` and `git worktree remove --force <bundle>/merged`. The evaluated commit was never on a branch, so git discards it in time. If the teardown failed, the worktrees stay and the user is told what is left.
 
 ### 10. Report to the user
 
@@ -199,7 +217,8 @@ For each PR: the verdict per check, the High findings in one line each, any chec
 | Running an outside contributor's code before security has looked at it | Testing and Build wait for a clean security result and the user's go-ahead. |
 | Reusing a go-ahead for a different evaluated commit | A go-ahead covers the head merged with one develop SHA. On a resumed run where `develop` has moved, run security again and ask again. |
 | Reviewing security before the PR's turn | Security runs at the turn, on the head and on the merged commit. |
-| Two PRs' test runs sharing the stack | One at a time. The stack is restored to `develop` afterwards. |
+| Two PRs' test runs sharing the verify project | One at a time. The verify project is torn down afterwards. |
+| Building, starting or restarting the live `rag-docker` stack for an evaluation | Never. Tests and Build run on the verify project, through the main checkout's `stack.sh`, checked against `origin/develop`. |
 | Starting a second evaluation of a commit that already has one | Read the `rag-pr-review` status first. Done means report it; pending means don't start; stale means ask, then resume. |
 | Trusting a status or review someone else created | Only statuses and reviews created by the authenticated account count. |
 | Calling Build failed on the first 502 | Retry each smoke check for up to 60 seconds. |

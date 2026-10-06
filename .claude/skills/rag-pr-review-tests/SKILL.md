@@ -11,7 +11,7 @@ You are a senior test engineer who knows rag-docker. You decide whether the PR's
 
 ## Where tests live in this project
 
-The project prefers **integration tests against the live stack** (see `scripts/verify/README.md` for why):
+The project prefers **integration tests against a running stack: the verify project** (see `scripts/verify/README.md` for why, and "The verify project" in `reference.md`):
 
 | Kind | Location | Runs with |
 |---|---|---|
@@ -27,12 +27,33 @@ A PR that adds tests elsewhere, or in another style, gets a Medium noting the pr
 2. **Map them to tests.** For each T, find the test in the PR or in the existing suites that exercises it, and cite `file:line`. A T with no test is a gap.
 3. **Write the missing tests** in the merged worktree (`merged/`), in the project's style. Tests for a bug fix must fail on the base and pass on the PR head.
 4. **Run.** Only when the PR is same-repository, or the coordinator has confirmed the user's go-ahead. Run everything on the **evaluated commit**, in the merged worktree (`merged/`, see `reference.md`): that's the PR as it would merge into the current `develop`. Never build or run the PR's head as it stands.
-   - Build every image and restart the whole stack from the merged worktree: `docker compose -p rag-docker build` then `docker compose -p rag-docker up -d --force-recreate`. Unchanged images come from the cache, and the stack then runs exactly the evaluated commit, not a mix with an older `develop`. Before any command in the merged worktree, run `export COMPOSE_PROJECT_NAME=rag-docker`. From that folder, compose would otherwise start a second stack named `merged`, with empty volumes, that fights the first for port 8080. The verify scripts need it too: `06_ui.sh` finds the stack's network with `docker compose ps`.
-   - Run the suites for the changed areas, then `bash scripts/verify/all.sh`. Use the full run when the PR touches ingest, query, gold standard or Ollama; `RAG_SKIP_SLOW=1` is enough otherwise. Add `RAG_ALLOW_RESTART=1` when the issue concerns restart behaviour.
-   - For a bug fix, run the new tests on the base as well, to show they fail there. The base is `develop` at the develop SHA the coordinator gave you: `git worktree add --detach <bundle>/base <develop-sha>`, build and start the stack from it as above. Restore the stack (below) before you remove that worktree.
+   - Run on the **verify project**, never on the live `rag-docker` stack, with the main checkout's `stack.sh` after checking it against `origin/develop` ("The verify project" in `reference.md`): `bash <main>/scripts/verify/stack.sh run --checkout <bundle>/merged [suites]`. Each run builds every image from that checkout (unchanged images come from the cache), starts it on fresh, empty volumes, runs that checkout's `all.sh` (only the named suites, if you name any) and tears the project down. Never run `docker compose` without `-p rag-verify`, and never with `-p rag-docker`.
+   - Run the suites for the changed areas (for example `stack.sh run --checkout <bundle>/merged 02 04`), then the whole of `all.sh`. Use the full run when the PR touches ingest, query, gold standard or Ollama; `RAG_SKIP_SLOW=1` is enough otherwise. Add `RAG_ALLOW_RESTART=1` when the issue concerns restart behaviour; on the verify project, restarts are harmless.
+   - For a bug fix, run the new tests on the base as well, to show they fail there. The base is `develop` at the develop SHA the coordinator gave you: `git worktree add --detach <bundle>/base <develop-sha>`, then `stack.sh run --checkout <bundle>/base [suites]`. Every run starts on fresh volumes, so the base never runs on state the PR's code wrote (#78). **Cost per evaluation:** each base run adds one build and start of the verify project and one teardown to the suite's own time (about 19 minutes full, 8 minutes with `RAG_SKIP_SLOW=1`). Measured for #152 with cached images: about 40 seconds to start, including the sha256 check of the model copy (the first `up` on a machine also copies the models, about 20 seconds more), and about 5 seconds to tear down.
    - A check that fails may be re-run once; see "Flaky failures" below.
-   - **Always** restore the stack to `develop` afterwards, as "Restoring the stack" in `reference.md` describes, and confirm every service is healthy. Only then remove a `base/` worktree you created. Never remove `worktree/` or `merged/`: the coordinator's build check runs from `merged/` after you, and the coordinator removes both.
+   - Wait for long runs as "Waiting for long runs" below says.
+   - The PR's own changes to the harness (`scripts/verify/stack.sh`, `scripts/verify/lock.sh`, `docker-compose.verify.yml`) don't run here: list each as a consideration with the result `➖ not testable in the evaluation (trusted harness)`. The maintainer may run the PR's copy after review.
+   - `stack.sh run` always tears the verify project down. Confirm it as "The verify project" in `reference.md` says. Only then remove a `base/` worktree you created. Never remove `worktree/` or `merged/`: the coordinator's build check runs from `merged/` after you, and the coordinator removes both.
 5. **Loop.** Follow the review loop in `reference.md` until every T is covered and has been run.
+
+## Waiting for long runs
+
+A full `all.sh` takes 10–25 minutes, longer than one tool call may run. **Never end your turn while a run is in progress**, and never rely on a notification, monitor or watcher to resume you: when your turn ends, nothing is guaranteed to wake you, and the evaluation stalls.
+
+1. Start the run in the background, with its output going to a file in the bundle and its process id saved next to it:
+
+   ```bash
+   (bash <main>/scripts/verify/stack.sh run --checkout <bundle>/merged; echo "stack.sh exit=$?") > <bundle>/verify-all.log 2>&1 & echo $! > <bundle>/verify-all.pid
+   ```
+
+2. Wait with foreground Bash calls, each with an explicit `timeout` of 540000 (9 minutes; the default of 2 minutes is too short). Each call loops until the run's process has exited or the time is nearly up:
+
+   ```bash
+   P=$(cat <bundle>/verify-all.pid); for i in $(seq 1 16); do kill -0 "$P" 2>/dev/null || { echo ended; break; }; sleep 30; done; tail -3 <bundle>/verify-all.log
+   ```
+
+   If it didn't print `ended`, make the same call again. Never check for the run by process name: `pgrep -f "bash all.sh"` doesn't match `bash scripts/verify/all.sh`, and would report a running suite as finished.
+3. Read the finished log yourself (`tail`, `grep`). `all.sh`'s part ends with `All suites passed.` or `At least one suite failed.`, then `stack.sh` reports the teardown (`verify project rag-verify removed`), and the log ends with `stack.sh exit=<code>`. A log without them means the run died, which is a failure to report, not a pass, and only `exit=0` is a passing run. Then carry on with the remaining steps.
 
 ## Severity guidance
 
@@ -45,7 +66,8 @@ A PR that adds tests elsewhere, or in another style, gets a Medium noting the pr
 Some checks fail for reasons outside the PR: the LLM runs on CPU and its replies vary, and a busy stack can drop a request. One evaluation per commit means a failure can't be retried later, so decide every failure within this run. **Never set a failure aside as "out of scope" or "unrelated":** score it by the steps below.
 
 **1. Is the check outside the PR?** It is only when the PR changes none of these:
-- the check's own lines, and in its suite file anything else it depends on: the file's helpers (for example `ingest()` in `02_ingest.sh`), its setup, and every check or suite that runs before it in the same run and could leave state it reads. Only a change confined to other checks' own assertions doesn't count;
+- the check's own lines, and its suite: the suite file's helpers (for example `ingest()` in `02_ingest.sh`) and setup, and every script or helper the suite runs, in whatever file it lives (for example `02_ingest.sh` runs `08_overlap.sh` and `overlap_chunks.py`, `04_goldstandard.sh` runs `09_sampling.sh` and `chunk_sampling.py`, `05_transfer.sh` runs `validate_package.py`, `10_validity.sh`, `session_validity.py`, `scripts/tests/test_session_import.py` and `test_session_implementation.py`, and `07_settings.sh` runs `settings_validation.py`; check the suite file for any others);
+- anything that runs before the check in the same run and could leave state it reads, in any suite. An earlier check's assertion counts too when it has side effects (it creates, changes or deletes something). Only a change confined to other checks' side-effect-free assertions doesn't count;
 - its code path: the request it makes and the code that serves it;
 - anything that every check depends on: `docker-compose*.yml`, any `Dockerfile`, dependency files (`api/requirements*`, `ui/package*.json`), `proxy/nginx.conf`, `ollama/entrypoint.sh`, API startup and settings (`api/main.py`, `api/config.py`), and the shared verify files (`scripts/verify/lib.sh`, `lock.sh`, `all.sh`, `fixtures.py`);
 - anything that runs in the background and competes with the check for Ollama or Weaviate.
@@ -89,7 +111,7 @@ Don't push to the PR branch or create branches. Put the tests in your recap sect
 |---|---|---|
 | 02_ingest | 17 passed, 1 failed | 18 passed |
 
-Stack restored to `develop`: yes (all services healthy)
+Verify project torn down: yes (nothing labelled rag-verify left)
 ```
 
 Write `findings-tests.json` per `reference.md`, with the sections above appended to your recap section, then return the result block. If you weren't allowed to run code, return `verdict: NOT RUN` and still write the coverage mapping. Post nothing on GitHub and apply no labels: the coordinator posts one recap at the end.

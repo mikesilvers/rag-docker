@@ -14,6 +14,8 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
   const browser = await launch();
   const r = makeReporter();
 
+  await require('./query_config').runQueryConfigTests(browser, BASE, r);
+
   // ── role persistence ───────────────────────────────────────────────────────
   r.section('§10.4 role selection');
   {
@@ -136,6 +138,102 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.ctx.close();
   }
 
+  // ── owned retrieval HTTP fixtures; no backend writes/model calls ───────────
+  r.section('effective retrieval UI boundaries');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    const name = 'OwnedRetrievalBrowserFixture';
+    const row = { name, object_count: 10, index_type: 'hnsw', distance_metric: 'cosine', hnsw_config: { ef: 72, efConstruction: 160, maxConnections: 32 } };
+    let lists = 0, failRefresh = false;
+    const saves = [];
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/collections') {
+        lists++;
+        return request.respond({ status: lists === 1 || failRefresh ? 500 : 200, contentType: 'application/json', body: JSON.stringify(lists === 1 || failRefresh ? { error: { message: 'Synthetic index read failure.' } } : { collections: [row] }) });
+      }
+      if (path === '/api/retrieval/config/' + name) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collection: name, retrieval_mode: 'flat', top_k: 5, alpha: 0.25, ef: 96, response_format: 'engineer', is_default: false }) });
+      }
+      if (path === '/api/retrieval/config' && request.method() === 'POST') {
+        const body = JSON.parse(request.postData()); saves.push(body);
+        return request.respond({ status: 201, contentType: 'application/json', body: JSON.stringify({ ...body, is_default: false }) });
+      }
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/retrieval', { waitUntil: 'networkidle2' }); await sleep(300);
+      r.check('initial metadata failure displays its read warning', /Could not read the current physical index/.test(await bodyText(s.page)));
+      r.check('initial metadata failure settles the pending read instead of leaving it stuck', !/Reading index details…/.test(await bodyText(s.page)) && /Index details are unavailable for this collection\./.test(await bodyText(s.page)));
+      await clickByText(s.page, 'Refresh index details'); await sleep(500);
+      const refreshed = await bodyText(s.page);
+      r.check('successful refresh reports backend settings and clears initial warning', /ef: 72/.test(refreshed) && /efConstruction: 160/.test(refreshed) && /maxConnections: 32/.test(refreshed) && !/Could not read/.test(refreshed));
+      r.check('three query methods replace inactive build controls and show legacy ef warning', await s.page.evaluate(() => document.querySelectorAll('input[name=mode]').length === 3 && document.querySelectorAll('input[type=range]').length === 1 && document.querySelector('input[value=hnsw]').checked && document.body.innerText.includes('legacy saved ef override (96) is inactive')));
+      for (const limit of [1, 50]) {
+        await s.page.evaluate(value => { const input = document.querySelector('input[type=range]'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, String(value)); input.dispatchEvent(new Event('input', { bubbles: true })); }, limit);
+        await sleep(100); await clickByText(s.page, 'Save for this collection'); await sleep(300);
+        r.check('Top-K ' + limit + ' is selected and sent when saving', saves.at(-1)?.top_k === limit && (await bodyText(s.page)).includes('Top-K Results: ' + limit));
+      }
+      r.check('saving normalizes legacy vector alias and clears inactive ef without changing observed index', saves.length === 2 && saves.every(save => save.retrieval_mode === 'hnsw' && save.ef === null) && /ef: 72/.test(await bodyText(s.page)));
+      failRefresh = true;
+      await clickByText(s.page, 'Refresh index details'); await sleep(300);
+      r.check('failed refresh keeps prior physical details with an explicit warning', /displayed details are from the prior read/.test(await bodyText(s.page)) && /ef: 72/.test(await bodyText(s.page)));
+      r.check('retrieval fixture causes no React page errors', !s.errors.some(error => error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); }
+  }
+  for (const lateFailure of [false, true]) {
+    const s = await session(browser, BASE, 'engineer');
+    let initial, count = 0;
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      if (new URL(request.url()).pathname === '/api/collections') {
+        count++;
+        if (count === 1) { initial = request; return; }
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: [{ name: 'OwnedLatestIndexFixture', object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', hnsw_config: { ef: 191, efConstruction: 170, maxConnections: 40 } }] }) });
+      }
+      if (new URL(request.url()).pathname.startsWith('/api/retrieval/config/')) return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collection: 'OwnedLatestIndexFixture', retrieval_mode: 'hnsw', top_k: 5, alpha: 0.75, ef: null, response_format: 'engineer', is_default: true }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/retrieval', { waitUntil: 'domcontentloaded' }); await sleep(300);
+      if (!initial) throw new Error('Initial metadata request was not observed');
+      if (!lateFailure) {
+        const pending = await bodyText(s.page);
+        r.check('pending initial read says it is reading, not that details are unavailable', pending.includes('Reading index details…') && !/Index details are unavailable/.test(pending));
+      }
+      await clickByText(s.page, 'Refresh index details'); await sleep(300);
+      const freshVisible = /ef: 191/.test(await bodyText(s.page));
+      await initial.respond({ status: lateFailure ? 500 : 200, contentType: 'application/json', body: JSON.stringify(lateFailure ? { error: { message: 'Synthetic obsolete failure.' } } : { collections: [{ name: 'OwnedLatestIndexFixture', object_count: 0, index_type: 'flat', distance_metric: 'dot', hnsw_config: null }] }) });
+      await sleep(300);
+      const after = await bodyText(s.page);
+      r.check('late initial ' + (lateFailure ? 'failure' : 'success') + ' cannot replace refreshed index state', freshVisible && /ef: 191/.test(after) && !/Could not read|Synthetic obsolete failure/.test(after));
+    } finally { await s.ctx.close(); }
+  }
+
+  // ── Q&A page shares the accurate query-method label ─────────────────────
+  r.section('Q&A accurate method label');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    const name = 'OwnedQaLabelFixture';
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/collections') {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: [{ name, object_count: 4, index_type: 'flat', distance_metric: 'cosine', hnsw_config: null }] }) });
+      }
+      if (path === '/api/retrieval/config/' + name) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collection: name, retrieval_mode: 'flat', top_k: 5, alpha: 0.75, ef: null, response_format: 'engineer', is_default: false }) });
+      }
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(700);
+      const labels = await s.page.evaluate(() => [...document.querySelectorAll('select[disabled] option')].map(o => o.textContent));
+      r.check('Q&A shows the same "Vector — existing index" label for a saved flat alias', labels.includes('Vector — existing index') && !labels.includes('flat'), JSON.stringify(labels));
+    } finally { await s.ctx.close(); }
+  }
+
   // ── delete confirmation ────────────────────────────────────────────────────
   r.section('§10.4 delete confirmation');
   {
@@ -229,6 +327,112 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     }
     r.check('no console errors on the health page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
     await s.ctx.close();
+  }
+
+  // ── owned session-recovery diagnostic HTTP fixtures ───────────────────────
+  r.section('session recovery diagnostics');
+  for (const failure of [false, true]) {
+    const s = await session(browser, BASE, 'engineer');
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      if (new URL(request.url()).pathname === '/api/goldstandard/diagnostics') {
+        return request.respond({ status: failure ? 503 : 200, contentType: 'application/json', body: JSON.stringify(failure ? { error: { message: 'Synthetic diagnostic read failure' } } : { issues: [{ filename: 'gs_ownedfixture.json', code: 'SESSION_READ_FAILED', message: 'Owned unreadable snapshot preserved.' }] }) });
+      }
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/health', { waitUntil: 'networkidle2' }); await sleep(500);
+      const text = await bodyText(s.page);
+      if (failure) {
+        r.check('diagnostic refresh failure is visible', /Session recovery diagnostics could not be refreshed/.test(text));
+      } else {
+        r.check('retained-session recovery warning is visible on Health', /Evaluation session recovery needs attention/.test(text));
+        r.check('recovery warning exposes filename, code and preservation message', /gs_ownedfixture.json/.test(text) && /SESSION_READ_FAILED/.test(text) && /Owned unreadable snapshot preserved/.test(text));
+      }
+      r.check('diagnostic ' + (failure ? 'failure' : 'warning') + ' does not cause React page errors', !s.errors.some(error => error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); }
+  }
+
+  // Controlled refresh timing exercises visible pending, failure and ordering.
+  {
+    const s = await session(browser, BASE, 'engineer');
+    await s.page.evaluateOnNewDocument(() => {
+      const original = window.setInterval;
+      window.setInterval = (fn, delay, ...args) => {
+        if (delay === 30000) { window.__ownedHealthRefresh = fn; return 45001; }
+        return original(fn, delay, ...args);
+      };
+    });
+    const pending = [];
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      if (new URL(request.url()).pathname === '/api/goldstandard/diagnostics') pending.push(request);
+      else request.continue();
+    });
+    const next = async () => {
+      for (let i = 0; i < 100 && !pending.length; i++) await sleep(50);
+      if (!pending.length) throw new Error('Owned diagnostic refresh did not arrive');
+      return pending.shift();
+    };
+    const respond = (request, filename, status = 200) => request.respond({ status, contentType: 'application/json', body: JSON.stringify(status === 200 ? { issues: [{ filename, code: 'SESSION_READ_FAILED', message: 'Owned retained result.' }] } : { error: { message: 'Owned refresh failure' } }) });
+    const refresh = () => s.page.evaluate(() => window.__ownedHealthRefresh());
+    try {
+      await s.page.goto(BASE + '/health', { waitUntil: 'domcontentloaded' });
+      const initial = await next(); await sleep(150);
+      r.check('initial diagnostic pending state is visible', /Refreshing session recovery diagnostics/.test(await bodyText(s.page)));
+      await respond(initial, 'gs_previousfixture.json'); await sleep(250);
+      await refresh(); const failed = await next(); await sleep(100);
+      let text = await bodyText(s.page);
+      r.check('pending refresh labels retained diagnostics as previous results', /Previous evaluation session recovery results/.test(text) && /gs_previousfixture.json/.test(text));
+      await respond(failed, '', 503); await sleep(250); text = await bodyText(s.page);
+      r.check('failed refresh removes old current-issue claims and clears pending state', /could not be refreshed/.test(text) && !/gs_previousfixture.json|Refreshing session recovery diagnostics/.test(text));
+      await refresh(); const recovered = await next(); await respond(recovered, 'gs_currentfixture.json'); await sleep(250); text = await bodyText(s.page);
+      r.check('successful refresh clears the error and pending indicators', /gs_currentfixture.json/.test(text) && !/could not be refreshed|Refreshing session recovery diagnostics/.test(text));
+      await refresh(); const older = await next(); await refresh(); const newer = await next();
+      await respond(newer, 'gs_latestfixture.json'); await sleep(200);
+      await respond(older, '', 503); await sleep(250); text = await bodyText(s.page);
+      r.check('late failed response cannot overwrite newer diagnostic success', /gs_latestfixture.json/.test(text) && !/could not be refreshed/.test(text));
+      await refresh(); const olderSuccess = await next(); await refresh(); const newerSuccess = await next();
+      await respond(newerSuccess, 'gs_finalfixture.json'); await sleep(150);
+      await respond(olderSuccess, 'gs_stalefixture.json'); await sleep(250); text = await bodyText(s.page);
+      r.check('late successful response cannot replace newer diagnostic results', /gs_finalfixture.json/.test(text) && !/gs_stalefixture.json/.test(text));
+      r.check('refresh error and timing fixtures do not cause React page errors', !s.errors.some(error => error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); }
+  }
+
+  // Imported identities are exposed through the existing visible job notes.
+  r.section('imported session lookup IDs');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    const filename = 'ragpkg-owned-session.tar.gz';
+    const sourceId = 'gs_460abcde', localId = 'gs_460abcdf';
+    const submissions = [];
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      let body;
+      if (path === '/api/packages') body = { packages: [{ filename, size_bytes: 100, collection: 'OwnedOriginal', chunk_count: 1, fidelity: 'chunks-only', created_at: '2026-09-28T00:00:00Z', readable: true }] };
+      else if (path === '/api/import' && request.method() === 'POST') {
+        submissions.push(JSON.parse(request.postData()));
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: 'owned-identity-job', status: 'queued', filename }) });
+      } else if (path === '/api/import/job/owned-identity-job') body = { job_id: 'owned-identity-job', status: 'completed', filename, on_conflict: 'rename', collection: 'OwnedImported', original_collection: 'OwnedOriginal', chunks_written: 1, fidelity: 'chunks-only', renamed: true, notes: ["evaluation session '" + sourceId + "' restored as local '" + localId + "' for 'OwnedImported'"], restored_sessions: [{ source_session_id: sourceId, session_id: localId, collection: 'OwnedImported' }], error: null, error_code: null, error_detail: null };
+      if (body) return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' }); await sleep(250);
+      await s.page.evaluate(value => {
+        const selector = [...document.querySelectorAll('select')].find(el => [...el.options].some(option => option.value === value));
+        Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(selector, value);
+        selector.dispatchEvent(new Event('change', { bubbles: true }));
+        document.querySelector('input[name="conflict"][value="rename"]').click();
+      }, filename);
+      await s.page.evaluate(() => [...document.querySelectorAll('button')].find(button => button.textContent.trim() === 'Import').click()); await sleep(600);
+      const text = await bodyText(s.page);
+      r.check('rename import submits selected package and explicit policy', submissions.length === 1 && submissions[0].filename === filename && submissions[0].on_conflict === 'rename');
+      r.check('completed import displays original and allocated session IDs for lookup', text.includes(sourceId) && text.includes(localId) && text.includes('OwnedImported'));
+      r.check('import identity notes do not cause React page errors', !s.errors.some(error => error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); }
   }
 
   // ── transfer help page ─────────────────────────────────────────────────────

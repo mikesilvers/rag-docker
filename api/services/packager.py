@@ -19,7 +19,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from pydantic import ValidationError
+
 from config import settings
+from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import goldstandard
 from services import ingest_config
 from services import model_bundle
@@ -156,12 +159,27 @@ def _resolve_includes(text: str, depth: int = 0) -> str:
 
 def _render(template: str, values: dict[str, str]) -> str:
     text = _resolve_includes((_TEMPLATE_DIR / template).read_text())
-    for key, value in values.items():
-        text = text.replace(f"@@{key}@@", str(value))
-    left = re.findall(r"@@[A-Z_0-9]+(?::[a-z_0-9]+)?@@", text)
-    if left:
-        raise RuntimeError(f"{template}: unsubstituted placeholders {sorted(set(left))}")
-    return text
+    # Substitute only original template tokens. Inserted data can itself contain
+    # token-shaped text and must never be interpreted as another substitution.
+    def substitute(match):
+        key = match.group()[2:-2]
+        if key not in values:
+            raise RuntimeError(f"{template}: unsubstituted placeholder {match.group()}")
+        return str(values[key])
+    return re.sub(r"@@[A-Z_0-9]+(?::[a-z_0-9]+)?@@", substitute, text)
+
+
+def _render_retrieve(collection: str, cfg: dict, metadata: dict) -> str:
+    """Only validated, encoded Python literals may cross into script source."""
+    cfg = retrieval_config.validate(cfg, collection)
+    return _render("retrieve.py.tmpl", {
+        "PACKAGE_METADATA": repr(metadata),
+        "COLLECTION_NAME": repr(collection),
+        "RETRIEVAL_MODE": repr(cfg["retrieval_mode"]),
+        "TOP_K": repr(cfg["top_k"]),
+        "ALPHA": repr(cfg["alpha"]),
+        "RESPONSE_FORMAT": repr(cfg["response_format"]),
+    })
 
 
 def render_help(embed_dimensions: int | str) -> str:
@@ -175,6 +193,34 @@ def render_help(embed_dimensions: int | str) -> str:
         "EMBED_DIMENSIONS": embed_dimensions,
         "LLM_MODEL": settings.llm_model,
     })
+
+
+def _export_retrieval_settings(collection: str, warnings: list[str]) -> tuple[dict, bool]:
+    """The settings to package, and whether they are defaults.
+
+    Runs before any chunk is read, so bad settings fail the export early with
+    a next step instead of a raw validation message. A legacy ef is cleared
+    with a warning; the saved file itself is left alone.
+    """
+    try:
+        cfg, is_default = retrieval_config.resolve(collection)
+        cfg, cleared = retrieval_config.normalize(cfg, collection)
+    except TypeError as exc:          # resolve(): the saved JSON is not an object
+        problems, cause = "the settings file is not a JSON object", exc
+    except ValidationError as exc:
+        problems = "; ".join(f"{'.'.join(map(str, error['loc']))}: {error['msg']}"
+                             for error in exc.errors())
+        cause = exc
+    else:
+        if cleared is not None:
+            warnings.append(f"saved retrieval setting ef={cleared} is outside "
+                            f"{SEARCH_EF_MIN}-{SEARCH_EF_MAX} and was exported as null; ef is "
+                            "no longer used. Save this collection's settings on the Retrieval "
+                            "page to clear it.")
+        return cfg, is_default
+    raise ValueError(f"Saved retrieval settings for '{collection}' are invalid: {problems}. "
+                     "Open the Retrieval page, save this collection's settings, then "
+                     "export again.") from cause
 
 
 def _ingest_config(collection: str) -> dict | None:
@@ -237,6 +283,22 @@ def build(
     try:
         b = _Builder(stage)
 
+        # Settings first: a bad config fails before any chunk is streamed.
+        retrieval_cfg, is_default = _export_retrieval_settings(collection, warnings)
+
+        collection_cfg = wc._collection_config_sync(collection)
+        stored_model = collection_cfg.get("embedding_model")
+        if not isinstance(stored_model, str) or not stored_model or stored_model != settings.embed_model:
+            raise PackageError(
+                "EMBEDDING_MISMATCH",
+                f"Collection '{collection}' has embedding model {stored_model!r}, "
+                f"but this instance is configured for {settings.embed_model!r}. "
+                "Export cannot attribute its stored vectors to the configured model. "
+                "Re-embed the collection with the configured model before exporting; "
+                "unknown or named-vector configurations are not supported.",
+                {"collection": collection, "stored_model": stored_model,
+                 "configured_model": settings.embed_model})
+
         # 1. chunks.jsonl — streamed, one line at a time.
         chunk_count = 0
         dimensions: int | None = None
@@ -264,14 +326,13 @@ def build(
             progress(chunk_count)
 
         # 2. collection.json
-        b.add_json("collection.json", wc._collection_config_sync(collection))
+        b.add_json("collection.json", collection_cfg)
 
         # 3. configs
         ingest_cfg = _ingest_config(collection)
         if ingest_cfg is not None:
             b.add_json("ingest_config.json", ingest_cfg)
 
-        retrieval_cfg, is_default = retrieval_config.resolve(collection)
         has_saved_retrieval = not is_default
         b.add_json("retrieval_config.json", retrieval_cfg)
 
@@ -281,16 +342,19 @@ def build(
 
         # 5. sources, when they exist
         index = sources.load_index(collection)
-        fidelity = "with-sources" if index["documents"] else "chunks-only"
-        source_document_count = len(index["documents"])
+        shipped = {}
+        for digest, entry in index["documents"].items():
+            blob = sources.blob_path(collection, digest)
+            if not blob.exists():
+                warnings.append(f"retained source {digest[:12]} is missing on disk")
+                continue
+            shipped[digest] = entry
+        fidelity = "with-sources" if shipped else "chunks-only"
+        source_document_count = len(shipped)
         if fidelity == "with-sources":
-            b.add_json("sources/index.json", index)
-            src_dir = sources.collection_dir(collection)
-            for digest in index["documents"]:
-                blob = src_dir / digest
-                if not blob.exists():
-                    warnings.append(f"retained source {digest[:12]} is missing on disk")
-                    continue
+            b.add_json("sources/index.json", {**index, "documents": shipped})
+            for digest in shipped:
+                blob = sources.blob_path(collection, digest)
                 b.add(f"sources/{digest}", lambda p, s=blob: shutil.copyfile(s, p))
 
         # 5b. bundled models, resolved through each model's manifest
@@ -385,17 +449,12 @@ def build(
             contents_extra += "retrieve.py             a standalone query script for this collection\n"
 
         if has_saved_retrieval:
-            (stage / "retrieve.py").write_text(_render("retrieve.py.tmpl", {
-                "COLLECTION_NAME": collection,
-                "PACKAGE_FILENAME": filename,
-                "ID8": id8,
-                "CREATED_AT": created_at,
-                "EMBED_MODEL": settings.embed_model,
-                "EMBED_DIMENSIONS": dimensions if dimensions is not None else "unknown",
-                "RETRIEVAL_MODE": retrieval_cfg["retrieval_mode"],
-                "TOP_K": retrieval_cfg["top_k"],
-                "ALPHA": retrieval_cfg["alpha"],
-                "RESPONSE_FORMAT": retrieval_cfg["response_format"],
+            (stage / "retrieve.py").write_text(_render_retrieve(collection, retrieval_cfg, {
+                "package_filename": filename,
+                "id8": id8,
+                "created_at": created_at,
+                "embed_model": settings.embed_model,
+                "embed_dimensions": dimensions,
             }))
             (stage / "retrieve.py").chmod(0o755)
 

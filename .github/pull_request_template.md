@@ -4,8 +4,8 @@
 
 ## Verification
 
-- [ ] `bash scripts/verify/all.sh` passed (full run)
-- [ ] `RAG_SKIP_SLOW=1 bash scripts/verify/all.sh` passed (if a full run wasn't possible, say why)
+- [ ] `bash scripts/verify/stack.sh run` passed (full run, on the disposable verify project)
+- [ ] `RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run` passed (if a full run wasn't possible, say why)
 - [ ] Docs (`README.md` or specs) updated if behaviour changed
 - [ ] Lock files regenerated if dependencies changed
 

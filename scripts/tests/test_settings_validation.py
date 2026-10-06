@@ -1,5 +1,7 @@
 """Direct/saved settings reject invalid inputs before model/backend work."""
+import ast
 import asyncio
+import inspect
 import json
 import os
 import sys
@@ -7,15 +9,27 @@ import tempfile
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, MagicMock, patch
-sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api')))
+api_dir = os.environ.get('RAG_TEST_API_DIR')
+sys.path.insert(0, api_dir or str(Path(__file__).resolve().parents[2] / 'api'))
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from pydantic.fields import FieldInfo
 from config import settings
 from main import app
 from models.schemas import CreateCollectionRequest, HnswConfig, IngestConfig, QueryRequest, RechunkRequest, ReembedRequest, SaveRetrievalConfigBody
 from routers import collections, ingest, tuning as tuning_router, query, retrieval_config as retrieval_router
 from services import weaviate_client as wc, chunker, rag_pipeline, ingest_config, retrieval_config, ingest_pipeline, packager
+
+OVERLAP_RULE = 'chunk_overlap must be smaller than chunk_size for overlap/language'
+NEEDS_REPOSITORY = 'needs the whole repository mounted (see scripts/verify/README.md)'
+
+
+def repository_root():
+    parents = Path(__file__).resolve().parents
+    root = parents[2] if len(parents) > 2 else None
+    return root if root is not None and (root / 'IMPLEMENTATION.md').is_file() else None
 
 
 class SettingsTests(unittest.TestCase):
@@ -80,6 +94,35 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(response.status_code, 422, response.text)
             self.exists.assert_not_called(); self.ingest_job.assert_not_called()
             self.assertEqual(list(Path(self.temp).iterdir()), [])
+
+    def test_multipart_non_numeric_settings_are_invalid_settings(self):
+        # #108: these used to fail form parsing first, as INVALID_PARAMETER.
+        for update in ({'chunk_size': 'abc'}, {'chunk_size': '1.5'}, {'chunk_overlap': 'abc'},
+                       {'min_chunk_size': 'abc'}, {'similarity_threshold': 'abc'}):
+            with self.subTest(update=update):
+                self.exists.reset_mock(); self.ingest_job.reset_mock()
+                response = self.client.post('/ingest/upload', data={'collection': 'ReviewSettings', **update}, files={'files': ('source.txt', b'inert synthetic text')})
+                self.assertEqual(response.status_code, 422, response.text)
+                self.assertEqual(response.json()['error']['code'], 'INVALID_SETTINGS')
+                self.exists.assert_not_called(); self.ingest_job.assert_not_called()
+                self.assertEqual(list(Path(self.temp).iterdir()), [])
+
+    def test_valid_multipart_values_reach_job_as_numbers(self):
+        data = {'collection': 'ReviewSettings', 'chunk_size': '800', 'chunk_overlap': '100', 'similarity_threshold': '0.5', 'min_chunk_size': '50'}
+        response = self.client.post('/ingest/upload', data=data, files={'files': ('source.txt', b'inert synthetic text')})
+        self.assertEqual(response.status_code, 202, response.text)
+        kwargs = self.ingest_job.call_args.kwargs
+        self.assertEqual([(kwargs[k], type(kwargs[k])) for k in ('chunk_size', 'chunk_overlap', 'similarity_threshold', 'min_chunk_size')],
+                         [(800, int), (100, int), (0.5, float), (50, int)])
+
+    def test_tuning_relationship_reply_is_the_fixed_message(self):
+        for route in ('/tune/rechunk', '/tune/reembed'):
+            with self.subTest(route=route):
+                response = self.client.post(route, json={'collection': 'ReviewSettings', 'chunk_size': 100, 'chunk_overlap': 500})
+                self.assertEqual(response.status_code, 422, response.text)
+                self.assertEqual(response.json()['error']['code'], 'INVALID_PARAMETER')
+                self.assertEqual(response.json()['error']['detail'], [{'type': 'value_error', 'loc': ['body'], 'msg': 'Value error, ' + OVERLAP_RULE}])
+                self.tune_job.assert_not_called()
 
     def test_nonfinite_json_is_a_serializable_422(self):
         for token in ('NaN', 'Infinity', '-Infinity'):
@@ -193,6 +236,17 @@ class InternalBoundaryTests(unittest.TestCase):
                 with self.assertRaises(ValidationError): wc._create_collection_sync('ReviewSettings', index, distance, config)
                 client.assert_not_called()
 
+    def test_tuning_relationship_error_is_a_plain_value_error(self):
+        # #108: a nested ValidationError carried the inner model's input and text.
+        for model in (RechunkRequest, ReembedRequest):
+            with self.subTest(model=model.__name__):
+                with self.assertRaises(ValidationError) as caught: model(collection='ReviewSettings', chunk_size=100, chunk_overlap=500)
+                errors = caught.exception.errors()
+                self.assertEqual(len(errors), 1)
+                self.assertEqual(errors[0]['input']['collection'], 'ReviewSettings')
+                self.assertIs(type(errors[0]['ctx']['error']), ValueError)
+                self.assertEqual(str(errors[0]['ctx']['error']), OVERLAP_RULE)
+
     def test_stored_hnsw_settings_are_preserved_while_new_requests_remain_strict(self):
         legacy={'efConstruction':1000,'maxConnections':256,'ef':-1}
         with self.assertRaises(ValidationError):
@@ -219,18 +273,23 @@ class InternalBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.object(wc,'_create_collection_sync') as create:
             pkg=Path(directory);(pkg/'collection.json').write_text(json.dumps({'hnsw_config':legacy}))
             importer._create_from_package('ReviewStored',pkg)
-            create.assert_called_once_with('ReviewStored','hnsw','cosine',legacy,preserve_hnsw=True)
+            create.assert_called_once_with('ReviewStored','hnsw','cosine',legacy,preserve_hnsw=True,description=None)
 
     def test_rebuild_preserves_stored_hnsw_for_staging_and_replacement(self):
         from services import tuning
         legacy={'efConstruction':1000,'maxConnections':256,'ef':-1}
         config={'index_type':'hnsw','distance_metric':'cosine','hnsw_config':legacy}
         client=MagicMock();client.collections.get.return_value.iterator.return_value=[]
+        client.collections.get.return_value.aggregate.over_all.return_value.total_count=0
         client.collections.get.return_value.batch.dynamic.return_value.__enter__.return_value.number_errors=0
         with patch.object(wc,'_collection_config_sync',return_value=config), \
              patch.object(wc,'get_client',return_value=client), \
              patch.object(wc,'_create_collection_sync') as create, \
-             patch.object(wc,'_insert_chunks_sync'):
+             patch.object(wc,'_insert_chunks_sync'), \
+             patch.object(tuning.collection_recovery,'begin',return_value={'staging':'ReviewStored__test','state':'scratch','operation_id':'test'}), \
+             patch.object(tuning.collection_recovery,'retain'), \
+             patch.object(tuning.collection_recovery,'discard'), \
+             patch.object(tuning.batch_write,'insert',return_value=0):
             self.assertEqual(tuning._rebuild('ReviewStored',[],None,None,None),0)
             self.assertEqual(create.call_count,2)
             for call in create.call_args_list:
@@ -262,9 +321,112 @@ class InternalBoundaryTests(unittest.TestCase):
             chat.assert_not_called()
 
 
+class ApiPathFallbackTests(unittest.TestCase):
+    # #135: the repository fallback was computed even with RAG_TEST_API_DIR set.
+    def api_path_setup(self, source):
+        tree = ast.parse(source)
+        start = next(i for i, node in enumerate(tree.body) if 'RAG_TEST_API_DIR' in ast.get_source_segment(source, node))
+        for end in range(start, len(tree.body)):
+            node = tree.body[end]
+            if isinstance(node, ast.Expr) and ast.get_source_segment(source, node.value.func) == 'sys.path.insert':
+                return ast.Module(body=tree.body[start:end + 1], type_ignores=[])
+        self.fail('no sys.path.insert after RAG_TEST_API_DIR')
+
+    def test_fallback_is_only_computed_when_the_variable_is_unset(self):
+        root = repository_root()
+        if root is None: self.skipTest(NEEDS_REPOSITORY)
+        def evaluated(*args): raise AssertionError('fallback evaluated')
+        cases = (('set', {'RAG_TEST_API_DIR': '/synthetic/api'}, evaluated, ['/synthetic/api']),
+                 ('empty', {'RAG_TEST_API_DIR': ''}, Path, ['/synthetic/repo/api']),
+                 ('unset', {}, Path, ['/synthetic/repo/api']))
+        for name in ('scripts/verify/reindex_verifier_cases.py', 'scripts/tests/test_retrieval_controls.py'):
+            setup = compile(self.api_path_setup((root / name).read_text()), name, 'exec')
+            for case, environ, path, expected in cases:
+                with self.subTest(file=name, case=case):
+                    namespace = {'os': SimpleNamespace(environ=environ), 'sys': SimpleNamespace(path=[]),
+                                 'Path': path, '__file__': '/synthetic/repo/scripts/x/file.py'}
+                    exec(setup, namespace)
+                    self.assertEqual(namespace['sys'].path, expected)
+
+    # #155: the remaining defaults were computed even with their variable set.
+    def test_listed_defaults_are_lazy(self):
+        root = repository_root()
+        if root is None: self.skipTest(NEEDS_REPOSITORY)
+        def evaluated(*args): raise AssertionError('fallback evaluated')
+        api, repo = '/synthetic/repo/api', '/synthetic/repo/scripts/x/'
+        rows = (('scripts/tests/test_overlap_chunks.py', 'RAG_TEST_API_DIR', 1, False, api),
+                ('scripts/tests/test_insert_chunks.py', 'RAG_TEST_API_DIR', 1, False, api),
+                ('scripts/tests/test_model_bundle.py', 'RAG_TEST_API_DIR', 2, False, api),
+                ('scripts/tests/test_session_validity.py', 'RAG_TEST_API_DIR', 1, False, api),
+                ('scripts/tests/test_chunk_sampling.py', 'RAG_TEST_API_DIR', 1, False, api),
+                ('scripts/tests/test_batch_recovery.py', 'RAG_TEST_API_DIR', 1, False, api),
+                ('scripts/tests/test_collection_writes.py', 'RAG_TEST_API_DIR', 1, True, api),
+                ('scripts/verify/reindex_cases.py', 'RAG_TEST_API_DIR', 1, True, api),
+                ('scripts/verify/session_identity_cases.py', 'RAG_TEST_API_DIR', 1, True, api),
+                ('scripts/verify/session_persistence_cases.py', 'RAG_TEST_API_DIR', 3, True, api),
+                ('scripts/verify/reindex_verifier_cases.py', 'RAG_REINDEX_VERIFIER_SOURCE', 1, False, repo + 'reindex.py'),
+                ('scripts/verify/reindex_verifier_cases.py', 'RAG_VERIFIER_LIB', 1, False, repo + 'lib.sh'))
+        for name, variable, occurrences, guarded, unset in rows:
+            source = (root / name).read_text()
+            tree = ast.parse(source)
+            def reads(node):
+                return (isinstance(node, ast.Call) and ast.get_source_segment(source, node.func) == 'os.environ.get'
+                        and node.args and isinstance(node.args[0], ast.Constant) and node.args[0].value == variable)
+            calls = [node for node in ast.walk(tree) if reads(node)]
+            lazy = [node for node in ast.walk(tree) if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or)
+                    and reads(node.values[0]) and len(node.values[0].args) == 1]
+            with self.subTest(file=name, variable=variable):
+                self.assertEqual(len(calls), occurrences)
+                self.assertEqual(len(lazy), occurrences, 'os.environ.get(name, fallback) computes the fallback')
+            # Only the repository's own fallback expression runs, against fake os/Path.
+            for expression in lazy:
+                code = compile(ast.fix_missing_locations(ast.Expression(body=expression)), name, 'eval')
+                cases = [('set', {variable: '/synthetic/value'}, evaluated, '/synthetic/value'),
+                         ('empty', {variable: ''}, Path, unset), ('unset', {}, Path, unset)]
+                if guarded: cases.append(('stdin', {}, Path, '/app'))
+                for case, environ, path, expected in cases:
+                    with self.subTest(file=name, variable=variable, line=expression.lineno, case=case):
+                        script = '<stdin>' if case == 'stdin' else repo + 'file.py'
+                        reference = SimpleNamespace(with_name=evaluated) if path is evaluated else Path(repo + 'reindex.py')
+                        namespace = {'os': SimpleNamespace(environ=environ), 'Path': path, '__file__': script, 'source': reference}
+                        self.assertEqual(eval(code, namespace), expected)
+
+    def test_no_environment_default_is_computed(self):
+        root = repository_root()
+        if root is None: self.skipTest(NEEDS_REPOSITORY)
+        for path in sorted([*(root / 'scripts/tests').glob('*.py'), *(root / 'scripts/verify').glob('*.py')]):
+            source = path.read_text()
+            for node in ast.walk(ast.parse(source)):
+                if isinstance(node, ast.Call) and ast.get_source_segment(source, node.func) == 'os.environ.get' and len(node.args) > 1:
+                    with self.subTest(file=str(path.relative_to(root)), line=node.lineno):
+                        self.assertIsInstance(node.args[1], ast.Constant, ast.get_source_segment(source, node))
+
+
+class SpecificationTests(unittest.TestCase):
+    def test_upload_form_fields_match_the_route(self):
+        # #135: the spec named the strategy field chunking_strategy and required it.
+        root = repository_root()
+        if root is None: self.skipTest(NEEDS_REPOSITORY)
+        lines = (root / 'SPECIFICATIONS.md').read_text().splitlines()
+        start = lines.index('**Form fields:**', lines.index('POST /ingest/upload'))
+        documented = {}
+        for line in lines[start + 1:]:
+            if documented and not line.startswith('|'): break
+            if line.startswith('| `'):
+                cells = [cell.strip() for cell in line.strip('|').split('|')]
+                documented[cells[0].strip('`')] = {'Yes': True, 'No': False}[cells[2]]
+        route = {name: parameter.default.is_required()
+                 for name, parameter in inspect.signature(ingest.ingest_upload).parameters.items()
+                 if isinstance(parameter.default, FieldInfo)}
+        self.assertEqual(documented, route)
+
+
 class ImplementationTests(unittest.TestCase):
     def test_embedded_changed_sources_match_runtime(self):
-        root = Path(__file__).resolve().parents[2]
+        parents = Path(__file__).resolve().parents
+        root = parents[2] if len(parents) > 2 else None
+        if root is None or not (root / 'IMPLEMENTATION.md').is_file():
+            self.skipTest('needs the whole repository mounted (see scripts/verify/README.md)')
         text = (root / 'IMPLEMENTATION.md').read_text()
         names = ['api/models/schemas.py', 'api/main.py', 'api/routers/ingest.py',
                  'api/services/chunker.py', 'api/services/ingest_pipeline.py',

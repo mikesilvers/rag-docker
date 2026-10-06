@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from services import collection_writes
 from config import settings
 from models.schemas import IngestConfig
 from services.chunker import chunk as do_chunk
@@ -59,6 +60,7 @@ def _parse_file(path: Path) -> tuple[str, list[Any]]:
     return text, elements
 
 
+@collection_writes.serialized("collection")
 def _process_job_sync(
     job_id: str,
     file_paths: list[Path],
@@ -117,7 +119,7 @@ def _process_job_sync(
                         path.read_bytes(),
                         mimetypes.guess_type(path.name)[0],
                     )
-                except OSError as exc:
+                except (OSError, ValueError) as exc:
                     # Retention failing must not fail an otherwise good ingest;
                     # the chunks are already stored. It does cost this
                     # collection its full-fidelity export, so it is logged loudly.

@@ -76,8 +76,11 @@ async def tune_options(collection: str):
     """What this collection can be tuned with, given its fidelity."""
     if not await wc.collection_exists(collection):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
-    has_sources = await asyncio.to_thread(sources.has_sources, collection)
-    stats = await asyncio.to_thread(sources.stats, collection)
+    try:
+        has_sources = await asyncio.to_thread(sources.has_sources, collection)
+        stats = await asyncio.to_thread(sources.stats, collection)
+    except ValueError:
+        return api_error(409, "SOURCE_INDEX_INVALID", "Retained source index is invalid.")
     return TuneOptionsResponse(
         collection=collection,
         fidelity="with-sources" if has_sources else "chunks-only",

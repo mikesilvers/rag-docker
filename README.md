@@ -134,10 +134,11 @@ Navigate to **Retrieval** to choose a retrieval mode and top-K value for a colle
 
 | Mode | Description |
 |---|---|
-| `hnsw` | Approximate nearest-neighbor — fast, recommended default |
-| `flat` | Exact KNN — slower at scale but perfectly accurate |
-| `hybrid` | BM25 keyword + vector; tune the alpha slider |
-| `semantic` | Pure meaning-based via Weaviate's text2vec-ollama |
+| Vector — existing index | Similarity search using the collection's physical index |
+| Hybrid | BM25 keyword + vector; tune the alpha slider |
+| Semantic | Pure meaning-based via Weaviate's text2vec-ollama |
+
+The API accepts `hnsw` and `flat` as aliases for Vector; selecting either does not change the collection's physical index. Exact KNN requires a collection created with a Flat index.
 
 ### 4. Ask questions
 
@@ -364,6 +365,8 @@ The package is validated before anything touches the database: the archive must
 be readable, the format understood, every digest must match, and the embedding
 model must be the one this instance runs. Chunk UUIDs are preserved, so
 gold-standard sessions keep pointing at the right chunks after the move.
+Retained-source indexes and blobs are validated before the embedding check;
+invalid source metadata fails with `PACKAGE_CORRUPT` before any live mutation.
 
 Evaluation-session metadata is also validated before importing models or
 changing a collection. Invalid session JSON, identities or schemas fail the
@@ -428,15 +431,18 @@ replacing a collection marks its sessions `orphaned` and reports how many.
 ## Verifying a change
 
 ```bash
-docker compose up -d
-bash scripts/verify/all.sh                  # everything, ~20 min
-RAG_SKIP_SLOW=1 bash scripts/verify/all.sh  # skip LLM work, ~3 min
+bash scripts/verify/stack.sh run                  # everything, ~20 min plus start-up
+RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run  # skip LLM work, ~8 min, start-up included
 ```
 
-Runs the acceptance criteria in this project's specifications against the live
-stack — ingest, retrieval, gold standard, export/import, tuning, and the UI in a
-real headless browser. Exits non-zero on the first failure, so it can gate a
-commit.
+Runs the acceptance criteria in this project's specifications — ingest,
+retrieval, gold standard, export/import, tuning, and the UI in a real headless
+browser — on a disposable verify project: the checkout is built as compose
+project `rag-verify` on port 8081, with its own empty volumes, and removed after
+the run. `stack.sh` doesn't build, start or stop your own stack, and only
+reads its model volume, to copy the models. That guards against accidents,
+not hostile code: a branch's scripts run on your host with full access to
+Docker. Exits non-zero if any check fails, so it can gate a commit.
 
 These are integration tests on purpose. Every defect this project has produced
 was invisible to a unit test of the same function: a parser dependency missing
@@ -644,6 +650,8 @@ If this fails after Docker restarts, Docker's internal networking is broken — 
 
 **Ollama health check is stuck after images are pulled** — The model download phase (`ollama pull phi3.5` etc.) is in progress. Run `docker compose logs -f ollama` to watch. If the internet drops mid-download, the entrypoint script detects the stall via a 2-hour per-attempt timeout, kills the hung pull, and retries automatically up to 5 times. Ollama resumes partial downloads so retries pick up where they left off.
 
+**LLM answers are garbage or time out** — Answers come back in mixed scripts or as fragments of unrelated instructions, run to thousands of characters, or time out, while `/api/health` still reports the LLM as ok. Ollama's model runner has degraded; it does not recover on its own. Restart it with `docker compose restart ollama`. `scripts/verify/all.sh` checks for this before its LLM suites and stops with the same advice.
+
 **Port 8080 already in use** — The proxy publishes on host loopback port 8080 (`docker-compose.yml`, the `proxy` service: `"127.0.0.1:8080:80"`). Change the middle number to any free port, for example `"127.0.0.1:9090:80"`, then access the UI at `http://localhost:9090`. Keep the `127.0.0.1` host address and container port 80.
 
 **Sharing with your office** — The default binding is now local to the Docker host. An existing installation accessed from another computer will stop accepting those connections after its proxy is recreated. This workbench currently has no API authentication; authenticated LAN access with TLS is tracked in issue #26 and is not yet provided. Keep the loopback binding for the current local setup.
@@ -675,6 +683,8 @@ docker compose up -d
 ```
 
 This discards ingested documents; re-ingest after it comes back up. The `ollama_models` volume is untouched, so models are not re-downloaded.
+
+**`docker compose up -d` fails with `dependency failed to start: container rag-docker-weaviate-1 is unhealthy`** — Weaviate's start-up grows with the collection deletes in its Raft log since its last snapshot: each one costs a short wait before `/v1/.well-known/ready` answers. `docker-compose.yml` has Weaviate snapshot that log often (`RAFT_SNAPSHOT_THRESHOLD`, `RAFT_SNAPSHOT_INTERVAL`), so starts are usually quick. The slow ones are the first start after upgrading a volume that has no snapshot yet, which can take over two and a half minutes, and a start right after many collections were deleted. The health check allows 180 seconds for that (`start_period` in `docker-compose.yml`) before failures count, so this should be rare. If `up` still gives up, the api, ui and proxy are left stopped, but Weaviate keeps starting. Wait until `docker compose ps` shows weaviate as healthy, then run `docker compose up -d` again; it starts the rest.
 
 **A healthcheck never passes and the service sits in `health: starting` forever** — Check that the probe binary exists in that image. The `ollama` image ships only the `ollama` binary and the `weaviate` image has busybox `wget` but no `curl`, so `curl`-based healthchecks can never succeed there. Only the `api` image installs `curl`. Verify with:
 

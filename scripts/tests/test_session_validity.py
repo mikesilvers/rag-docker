@@ -8,10 +8,18 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR',str(Path(__file__).resolve().parents[2]/'api')))
+sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2]/'api'))
 from config import settings
 from models.schemas import SessionResponse
 from services import goldstandard as gs
+
+NEEDS_REPOSITORY = 'needs the whole repository mounted (see scripts/verify/README.md)'
+
+
+def repository_root():
+    parents = Path(__file__).resolve().parents
+    root = parents[2] if len(parents) > 2 else None
+    return root if root is not None and (root / 'IMPLEMENTATION.md').is_file() else None
 
 
 def session():
@@ -35,12 +43,39 @@ class ValidityServiceTests(unittest.TestCase):
         self.assertFalse(response.stale);self.assertFalse(response.orphaned)
         self.assertEqual(gs.mark_stale('ValidityFixture','Synthetic rechunk'),1)
         self.assertEqual(gs.mark_orphaned('ValidityFixture','Synthetic deletion'),1)
-        expected=copy.deepcopy(self.data);gs._sessions={};gs.load_sessions_from_disk()
+        expected=gs.get_session(self.data['session_id']);gs._sessions={};gs.load_sessions_from_disk()
         self.assertEqual(gs.get_session(self.data['session_id']),expected)
+
+    def test_tuning_invalidates_both_backend_aliases_without_remapping(self):
+        from services import tuning
+        for caller in ('ValidityFixture', 'validityFixture'):
+            for operation in ('reembed', 'rechunk'):
+                with self.subTest(caller=caller, operation=operation):
+                    for sid, name in (('gs_11111111', 'ValidityFixture'), ('gs_22222222', 'validityFixture'), ('gs_33333333', 'Validityfixture')):
+                        data = session()
+                        data.update(session_id=sid, collection=name)
+                        gs.store_session(data)
+                    job = {}
+                    def rebuild(*args, **kwargs):
+                        kwargs['before_replace']()
+                        return 1
+                    with patch.dict(tuning._jobs, {'alias': job}), patch.object(tuning.sources, 'has_sources', return_value=True), patch.object(tuning, '_chunks_from_sources', return_value=[{'content': 'Inert'}]), patch.object(tuning, '_existing_chunks', return_value=[{'content': 'Inert'}]), patch.object(tuning, '_rebuild', side_effect=rebuild):
+                        tuning._run('alias', caller, operation, {'chunking': {} if operation == 'rechunk' else None})
+                    self.assertEqual(job['status'], 'completed')
+                    gs._sessions = {}
+                    gs.load_sessions_from_disk()
+                    for sid, name in (('gs_11111111', 'ValidityFixture'), ('gs_22222222', 'validityFixture')):
+                        current = gs.get_session(sid)
+                        self.assertEqual(current['collection'], name)
+                        self.assertTrue(current['stale'])
+                        with self.assertRaises(gs.GoldStandardError):
+                            asyncio.run(gs.save_session(sid, 'current.json'))
+                    self.assertFalse(gs.get_session('gs_33333333').get('stale', False))
 
     def test_historical_guard_rejects_before_export_writes(self):
         for flags in ({'stale':True},{'orphaned':True},{'stale':True,'orphaned':True}):
             self.data.pop('stale',None);self.data.pop('orphaned',None);self.data.update(flags)
+            gs.store_session(self.data)
             before=copy.deepcopy(self.data)
             with patch.object(gs,'_save_export_sync') as write:
                 with self.assertRaises(gs.GoldStandardError) as error:
@@ -51,6 +86,7 @@ class ValidityServiceTests(unittest.TestCase):
 
     def test_explicit_service_export_reports_metadata_without_mutating_history(self):
         self.data.update(stale=True,stale_reason='Synthetic stale',stale_at='2026-09-28T00:00:00+00:00')
+        gs.store_session(self.data)
         before=copy.deepcopy(self.data)
         result=asyncio.run(gs.save_session(self.data['session_id'],'historical.json',True))
         self.assertTrue(result['historical']);self.assertEqual((result['pairs_saved'],result['pairs_excluded']),(2,2))
@@ -71,15 +107,15 @@ class ValidityServiceTests(unittest.TestCase):
         from unittest.mock import MagicMock
         for failure in ('stage','delete','create','write'):
             self.data.pop('stale',None);self.data.pop('stale_reason',None);self.data.pop('stale_at',None)
+            gs.store_session(self.data)
             client=MagicMock();stage=MagicMock();target=MagicMock()
             obj=SimpleNamespace(uuid='00000000-0000-0000-0000-000000000001',vector={'default':[0.1]},properties={'content':'Inert'})
             stage.iterator.return_value=[obj];stage.aggregate.over_all.return_value=SimpleNamespace(total_count=1)
+            ownership={'staging':'ValidityFixture__test','state':'scratch','operation_id':'test'}
             client.collections.get.side_effect=lambda name:target if name=='ValidityFixture' else stage
-            batch=target.batch.dynamic.return_value.__enter__.return_value;batch.number_errors=0
-            if failure=='write':batch.add_object.side_effect=RuntimeError('write fault')
             def delete(name):
                 if name=='ValidityFixture':
-                    self.assertTrue(self.data['stale'])
+                    self.assertTrue(gs.get_session(self.data['session_id'])['stale'])
                     with self.assertRaises(gs.GoldStandardError):asyncio.run(gs.save_session(self.data['session_id'],'guard.json'))
                     if failure=='delete':raise RuntimeError('delete fault')
             client.collections.delete.side_effect=delete
@@ -89,17 +125,22 @@ class ValidityServiceTests(unittest.TestCase):
             with patch.object(tuning.wc,'get_client',return_value=client), \
                  patch.object(tuning.wc,'_collection_config_sync',return_value={'index_type':'hnsw','distance_metric':'cosine','hnsw_config':{}}), \
                  patch.object(tuning.wc,'_create_collection_sync',side_effect=create), \
-                 patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert):
+                 patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert), \
+                 patch.object(tuning.collection_recovery,'begin',return_value=ownership), \
+                 patch.object(tuning.collection_recovery,'retain',side_effect=lambda owner:owner.update(state='recovery')), \
+                 patch.object(tuning.collection_recovery,'discard'), \
+                 patch.object(tuning.batch_write,'insert',side_effect=RuntimeError('write fault') if failure=='write' else None):
                 with self.assertRaises(Exception):tuning._rebuild('ValidityFixture',[{'content':'Inert'}],None,None,None,before_replace=lambda:gs.mark_stale('ValidityFixture','Synthetic replacement'))
-            self.assertEqual(bool(self.data.get('stale')),failure!='stage')
-            if failure!='stage':self.assertTrue(self.data['stale_at'])
+            current=gs.get_session(self.data['session_id'])
+            self.assertEqual(bool(current.get('stale')),failure!='stage')
+            if failure!='stage':self.assertTrue(current['stale_at'])
 
     def test_successful_identity_preserving_reindex_keeps_validity_semantics(self):
         from services import tuning
         job={'status':'queued'}
         with patch.dict(tuning._jobs,{'synthetic':job}), \
              patch.object(tuning.sources,'has_sources',return_value=False), \
-             patch.object(tuning,'_existing_chunks',return_value=[{'content':'Inert'}]), \
+             patch.object(tuning,'_existing_records',return_value=[{'id':'00000000-0000-0000-0000-000000000001','vector':[0.1],'properties':{'content':'Inert'}}]), \
              patch.object(tuning,'_rebuild',return_value=1) as rebuild, \
              patch.object(gs,'mark_stale') as mark:
             tuning._run('synthetic','ValidityFixture','reindex',{})
@@ -109,7 +150,9 @@ class ValidityServiceTests(unittest.TestCase):
 
 class ImplementationTests(unittest.TestCase):
     def test_changed_embedded_sources_match_runtime(self):
-        root=Path(__file__).resolve().parents[2];text=(root/'IMPLEMENTATION.md').read_text()
+        root=repository_root()
+        if root is None:self.skipTest(NEEDS_REPOSITORY)
+        text=(root/'IMPLEMENTATION.md').read_text()
         for name in ('api/main.py','api/models/schemas.py','api/routers/goldstandard.py',
                      'api/services/goldstandard.py','api/services/tuning.py','ui/src/api/client.ts','ui/src/pages/GoldStandardPage.tsx','scripts/verify/session_validity.py','scripts/verify/10_validity.sh','scripts/verify/05_transfer.sh','scripts/verify/README.md','scripts/verify/browser/ui_criteria.js'):
             language='typescript' if name.endswith(('.ts','.tsx')) else 'javascript' if name.endswith('.js') else 'bash' if name.endswith('.sh') else 'markdown' if name.endswith('.md') else 'python'

@@ -23,16 +23,18 @@ class SaveIngestConfigBody(IngestConfig):
 async def ingest_upload(
     collection: str = Form(...),
     strategy: str = Form("overlap"),
-    chunk_size: int = Form(1000),
-    chunk_overlap: int = Form(200),
-    similarity_threshold: float = Form(0.85),
-    min_chunk_size: int = Form(100),
+    # Strings, so IngestConfig parses them and a non-numeric value is
+    # INVALID_SETTINGS like any other invalid setting, not a form error.
+    chunk_size: str = Form("1000"),
+    chunk_overlap: str = Form("200"),
+    similarity_threshold: str = Form("0.85"),
+    min_chunk_size: str = Form("100"),
     files: list[UploadFile] = File(...),
 ):
     try:
-        IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
-                     chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
-                     min_chunk_size=min_chunk_size)
+        config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
+                              chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
+                              min_chunk_size=min_chunk_size)
     except ValidationError as exc:
         return api_error(422, "INVALID_SETTINGS", "Invalid chunking settings.",
                          detail={"errors": exc.errors(include_context=False, include_input=False)})
@@ -43,11 +45,11 @@ async def ingest_upload(
         job_id = await ingest_pipeline.start_ingest_job(
             files=files,
             collection=collection,
-            strategy=strategy,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            similarity_threshold=similarity_threshold,
-            min_chunk_size=min_chunk_size,
+            strategy=config.chunking_strategy,
+            chunk_size=config.chunk_size,
+            chunk_overlap=config.chunk_overlap,
+            similarity_threshold=config.similarity_threshold,
+            min_chunk_size=config.min_chunk_size,
         )
     except ValueError as exc:
         return api_error(400, "NO_SUPPORTED_FILES", str(exc))

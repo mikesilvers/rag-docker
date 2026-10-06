@@ -6,10 +6,11 @@ or vector width changes and Weaviate cannot alter either in place.
 **Safety.** Each rebuild is staged: the new chunks are built into a temporary
 collection first, and the live one is replaced only once that succeeds. Weaviate
 has no rename (see `importer.py`), so the final step copies vectors out of the
-staging collection rather than re-embedding — one embedding pass, not two.
-Preparation failures leave the original collection untouched. A failure after
-replacement begins can leave it missing or partial. Identity-changing operations
-flag retained evaluations before replacement; any failed cutover flags them too.
+staging collection rather than re-embedding — one embedding pass, not two. A
+failure before replacement leaves the original untouched. After replacement
+starts, a verified recovery copy and its sidecars survive failure and restart.
+Identity-changing operations flag retained evaluations before replacement;
+failed reindex cutovers flag them when exact identity cannot be verified.
 
 **Gold standard.** Anything that changes chunk identity marks every session for
 the collection `stale`, with a reason and a timestamp. Sessions are never
@@ -18,7 +19,9 @@ deleted and never remapped (spec §7.3).
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
+import math
 import mimetypes
 import shutil
 import tempfile
@@ -27,10 +30,12 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from services import collection_writes
 from config import settings
 from services import goldstandard
 from services import sources
 from services import weaviate_client as wc
+from services import batch_write, collection_recovery
 from services.chunker import chunk as do_chunk
 from services.ingest_pipeline import _parse_file
 from services.packager import PackageError
@@ -54,6 +59,55 @@ def _existing_chunks(collection: str) -> list[dict]:
     return [dict(o.properties or {}) for o in col.iterator()]
 
 
+def _existing_records(collection: str) -> list[dict]:
+    """Read the supported single-vector corpus without regenerating identity."""
+    return list(_iter_existing_records(collection))
+
+
+def _iter_existing_records(collection: str):
+    seen = set()
+    col = wc.get_client().collections.get(collection)
+    for obj in col.iterator(include_vector=True):
+        identity = str(obj.uuid)
+        vector = obj.vector
+        if isinstance(vector, dict):
+            if set(vector) != {"default"}:
+                raise RuntimeError("Reindex requires the collection's single default vector")
+            vector = vector["default"]
+        if (not isinstance(vector, list) or not vector
+                or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                       or not math.isfinite(value) for value in vector)):
+            raise RuntimeError(f"Reindex cannot preserve the stored vector for {identity}")
+        if identity in seen:
+            raise RuntimeError(f"Reindex received duplicate stored UUID {identity}")
+        seen.add(identity)
+        yield {"id": identity, "vector": copy.deepcopy(vector),
+               "properties": copy.deepcopy(dict(obj.properties or {}))}
+
+
+def _write_records(collection: str, records: list[dict]) -> None:
+    """Supply exact records, drain the batch, then compare backend readback."""
+    col = wc.get_client().collections.get(collection)
+    with col.batch.dynamic() as batch:
+        for record in records:
+            batch.add_object(properties=copy.deepcopy(record["properties"]),
+                             uuid=record["id"], vector=copy.deepcopy(record["vector"]))
+    if batch.number_errors:
+        raise RuntimeError(f"{batch.number_errors} error(s) copying reindex records")
+    _verify_records(collection, records)
+
+
+def _verify_records(collection: str, records: list[dict]) -> None:
+    expected = {record["id"]: record for record in records}
+    seen = set()
+    for record in _iter_existing_records(collection):
+        if record != expected.get(record["id"]):
+            raise RuntimeError("Reindex backend readback changed UUIDs, properties or vectors")
+        seen.add(record["id"])
+    if seen != expected.keys():
+        raise RuntimeError("Reindex backend readback changed UUIDs, properties or vectors")
+
+
 def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                          chunk_overlap: int, similarity_threshold: float,
                          min_chunk_size: int) -> list[dict]:
@@ -74,13 +128,32 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             "fidelity 'chunks-only'.",
             {"collection": collection})
 
-    src_dir = sources.collection_dir(collection)
+    # A chunks-only import or a failed retention can leave a mixed corpus.
+    # Any retained file is insufficient: replacing from that subset loses the
+    # other chunks and successful cutover discards their recovery copy.
+    by_filename: dict[str, list[str]] = {}
+    for digest, entry in documents.items():
+        for filename in entry["filenames"]:
+            by_filename.setdefault(filename, []).append(digest)
+    uncovered = set()
+    for obj in wc.get_client().collections.get(collection).iterator():
+        filename = (obj.properties or {}).get("source_file")
+        if not isinstance(filename, str) or len(by_filename.get(filename, [])) != 1:
+            uncovered.add(filename if isinstance(filename, str) and filename else "<unknown>")
+    if uncovered:
+        raise PackageError(
+            "SOURCES_REQUIRED",
+            "Cannot change chunk boundaries: some stored chunks have missing or "
+            "ambiguous retained originals. Re-embed without chunking parameters "
+            "or re-index to preserve the existing chunks.",
+            {"collection": collection, "uncovered_source_files": sorted(uncovered)})
+
     out: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
     work = Path(tempfile.mkdtemp(prefix="rechunk-", dir=settings.upload_dir))
     try:
         for digest, entry in sorted(documents.items()):
-            blob = src_dir / digest
+            blob = sources.blob_path(collection, digest)
             if not blob.is_file():
                 raise PackageError(
                     "SOURCES_REQUIRED",
@@ -127,74 +200,116 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
 
 # ── Rebuilding ────────────────────────────────────────────────────────────────
 
+@collection_writes.serialized("collection")
 def _rebuild(collection: str, properties: list[dict], index_type: str | None,
-             distance_metric: str | None, progress, before_replace=None) -> int:
-    """Stage the new chunks, then swap them into place.
-
-    Weaviate embeds during the staging insert. The final insert reuses those
-    vectors verbatim, so the corpus is embedded once rather than twice.
-    """
-    cutover_started = False
+             distance_metric: str | None, progress, *, records: list[dict] | None = None,
+             source_collection: str | None = None, before_replace=None) -> int:
+    """Stage and verify, then replace the live collection under its writer guard."""
+    source_collection = source_collection or collection
+    collection = collection_writes.canonical(collection)
+    if records is not None:
+        wc._validate_reindex_vectorizer_sync(collection)
     config = wc._collection_config_sync(collection)
     new_index = index_type or config["index_type"]
     new_distance = distance_metric or config["distance_metric"]
     hnsw = config.get("hnsw_config") or {}
-
-    staging = f"{collection}__tuning_{uuid.uuid4().hex[:8]}"
     client = wc.get_client()
-    wc._create_collection_sync(staging, new_index, new_distance, hnsw, preserve_hnsw=True)
+    ownership = collection_recovery.begin(collection, "tune", client)
+    staging = ownership["staging"]
+    cutover_started = False
+    completed = False
+    original_intact = False
     try:
-        wc._insert_chunks_sync(staging, properties)
-        staged = [
-            {"id": str(o.uuid),
-             "vector": (o.vector or {}).get("default"),
-             "properties": dict(o.properties or {})}
-            for o in client.collections.get(staging).iterator(include_vector=True)
-        ]
-        if len(staged) != len(properties):
-            raise RuntimeError(
-                f"staged {len(staged)} chunks but expected {len(properties)}")
-        if progress:
-            progress(len(staged))
-
-        # Past this point the original is replaced. Preparation has succeeded,
-        # but deletion, creation or final writes can still fail.
-        # Persist the warning before deletion, so a failed replacement cannot
-        # leave retained pairs claiming to be a current baseline.
+        wc._create_collection_sync(staging, new_index, new_distance, hnsw, preserve_hnsw=True)
+        if records is not None:
+            _write_records(staging, records)
+            # The guard covers application writers; independently connected
+            # backend writers are detected by comparing the source again.
+            _verify_records(collection, records)
+        else:
+            wc._insert_chunks_sync(staging, properties)
+            staged_count = client.collections.get(staging).aggregate.over_all(total_count=True).total_count
+            if staged_count != len(properties):
+                raise RuntimeError(f"staged {staged_count} chunks but expected {len(properties)}")
+        if source_collection != collection:
+            collection_recovery.retain(ownership, source_collection=source_collection)
+        else:
+            collection_recovery.retain(ownership)
         if before_replace:
             before_replace()
         cutover_started = True
         client.collections.delete(collection)
         wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True)
-        target = client.collections.get(collection)
-        with target.batch.dynamic() as batch:
-            for record in staged:
-                batch.add_object(properties=record["properties"],
-                                 uuid=record["id"], vector=record["vector"])
-            if batch.number_errors > 0:
-                raise RuntimeError(
-                    f"{batch.number_errors} error(s) writing the rebuilt collection")
-        return len(staged)
-    except Exception:
-        if cutover_started:
-            goldstandard.mark_stale(collection, "collection replacement failed after cutover began; retained pairs require historical review")
+        if records is not None:
+            _write_records(collection, records)
+            written = len(records)
+        else:
+            def staged():
+                return (
+                    {"id": str(obj.uuid), "vector": (obj.vector or {}).get("default"),
+                     "properties": dict(obj.properties or {})}
+                    for obj in client.collections.get(staging).iterator(include_vector=True)
+                )
+            written = batch_write.insert(client.collections.get(collection), staged,
+                                         expected_count=len(properties))
+        if progress:
+            progress(written)
+        completed = True
+        return written
+    except Exception as exc:
+        if records is not None and cutover_started:
+            try:
+                _verify_records(collection, records)
+                original_intact = wc._collection_config_sync(collection) == config
+            except Exception:
+                original_intact = False
+            if not original_intact:
+                try:
+                    goldstandard.mark_stale(source_collection, "reindex replacement failed after cutover began; exact record preservation was not verified")
+                except Exception:
+                    _log.exception("Could not mark evaluation historical after failed reindex")
+        elif cutover_started:
+            try:
+                goldstandard.mark_stale(source_collection, "collection replacement failed after cutover began; retained pairs require historical review")
+            except Exception:
+                _log.exception("Could not mark evaluation historical after failed rebuild")
+        if cutover_started and not original_intact and ownership["state"] == "recovery":
+            raise PackageError(
+                "TUNE_FAILED", f"{type(exc).__name__}: {exc}. Verified data is retained as '{staging}'.",
+                {"recovered_as": staging,
+                 "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}) from exc
+        if not cutover_started and ownership["state"] == "recovery":
+            # Only before_replace runs between retain and cutover. The original
+            # was never deleted, so the copy is discarded below.
+            raise PackageError(
+                "TUNE_FAILED", f"{type(exc).__name__}: {exc}. Gold-standard sessions could not be "
+                "marked stale before replacement, so the original collection is unchanged.") from exc
         raise
     finally:
-        try:
-            client.collections.delete(staging)
-        except Exception:                             # noqa: BLE001
-            _log.exception("Could not remove staging collection %r", staging)
+        # Before cutover the original is intact, so a retained copy is not needed.
+        if completed or original_intact or not cutover_started or ownership["state"] == "scratch":
+            try:
+                collection_recovery.discard(ownership, client)
+            except Exception:
+                _log.exception("Could not remove owned staging collection %r", staging)
 
 
-def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
+@collection_writes.serialized("collection")
+def _run(job_id: str, collection: str, operation: str, params: dict, *, source_collection: str | None = None) -> None:
+    source_collection = source_collection or collection
+    collection = collection_writes.canonical(collection)
     job = _jobs[job_id]
+    job["collection"] = collection
     job["status"] = "running"
 
     def progress(n: int) -> None:
         job["chunks_written"] = n
 
     try:
-        has_sources = sources.has_sources(collection)
+        needs_sources = operation == "rechunk" or (
+            operation == "reembed" and params.get("chunking") is not None)
+        has_sources = sources.has_sources(source_collection) if needs_sources else False
+        records = None
 
         if operation == "rechunk":
             if not has_sources:
@@ -205,7 +320,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
                     "Re-embedding from the stored chunk text is available, but "
                     "chunk boundaries cannot change.",
                     {"collection": collection})
-            properties = _chunks_from_sources(collection, **params["chunking"])
+            properties = _chunks_from_sources(source_collection, **params["chunking"])
             reason = "the collection was re-chunked, so its chunks no longer match these pairs"
 
         elif operation == "reembed":
@@ -220,7 +335,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
                         "boundaries cannot change; this request also asked for new "
                         "chunking parameters. Send one or the other.",
                         {"collection": collection})
-                properties = _chunks_from_sources(collection, **params["chunking"])
+                properties = _chunks_from_sources(source_collection, **params["chunking"])
                 reason = "the collection was re-chunked and re-embedded"
             elif has_sources:
                 properties = _existing_chunks(collection)
@@ -231,24 +346,31 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
                           "so its vectors changed")
 
         elif operation == "reindex":
-            properties = _existing_chunks(collection)
-            reason = None            # chunk identity is unchanged
+            records = _existing_records(collection)
+            properties = [record["properties"] for record in records]
+            reason = None            # exact UUID/vector/property copy is verified
         else:
             raise PackageError("TUNE_UNSUPPORTED", f"Unknown operation '{operation}'.")
 
         job["chunks_total"] = len(properties)
-        written = _rebuild(collection, properties,
-                           params.get("index_type"), params.get("distance_metric"),
-                           progress, before_replace=(lambda: goldstandard.mark_stale(collection, reason)) if reason else None)
+        stale_count = 0
+
+        def mark_before_replace() -> None:
+            nonlocal stale_count
+            stale_count = goldstandard.mark_stale(source_collection, reason)
+
+        written = _rebuild(
+            collection, properties, params.get("index_type"), params.get("distance_metric"),
+            progress, records=records, source_collection=source_collection,
+            before_replace=mark_before_replace if reason else None)
 
         notes = []
         if reason:
-            stale = goldstandard.mark_stale(collection, reason)
-            if stale:
-                notes.append(f"{stale} gold-standard session(s) marked stale")
+            if stale_count:
+                notes.append(f"{stale_count} gold-standard session(s) marked stale")
         else:
-            notes.append("chunk identity unchanged, so gold-standard sessions "
-                         "were left alone")
+            notes.append("UUIDs, properties and vectors verified unchanged after reindex; "
+                         "gold-standard sessions were left alone")
 
         job.update(status="completed", chunks_written=written, notes=notes)
 
@@ -265,6 +387,8 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
 
 
 async def start_tune_job(collection: str, operation: str, params: dict) -> str:
+    source_collection = collection
+    collection = collection_writes.canonical(collection)
     job_id = str(uuid.uuid4())[:8]
     with _lock:
         if collection in _active:
@@ -283,5 +407,5 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
         "error_code": None,
         "error_detail": None,
     }
-    asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params))
+    asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params, source_collection=source_collection))
     return job_id

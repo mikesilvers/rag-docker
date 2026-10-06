@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -28,11 +29,14 @@ async def generate(body: GenerateRequest):
     if not await wc.collection_exists(body.collection):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
 
-    result = await gs.start_generation(
-        collection=body.collection,
-        sample_size=body.sample_size,
-        seed=body.seed,
-    )
+    try:
+        result = await gs.start_generation(
+            collection=body.collection,
+            sample_size=body.sample_size,
+            seed=body.seed,
+        )
+    except gs.GoldStandardError as exc:
+        return api_error(exc.status, exc.code, exc.message)
     return GenerateResponse(**result)
 
 
@@ -57,6 +61,7 @@ async def get_session(session_id: str):
         pairs=pairs,
         collection=session.get("collection", ""),
         errors=session.get("errors", []),
+        imported_from=session.get("imported_from"),
         **SessionValidity.model_validate(session).model_dump(),
     )
 
@@ -64,7 +69,10 @@ async def get_session(session_id: str):
 @router.patch("/session/{session_id}/pair/{pair_id}", response_model=GoldPair)
 async def patch_pair(session_id: str, pair_id: str, body: PatchPairRequest):
     updates = body.model_dump(exclude_none=True)
-    pair = await gs.update_pair(session_id, pair_id, updates)
+    try:
+        pair = await gs.update_pair(session_id, pair_id, updates)
+    except gs.GoldStandardError as exc:
+        return api_error(exc.status, exc.code, exc.message)
     if pair is None:
         return api_error(404, "PAIR_NOT_FOUND", f"Pair '{pair_id}' not found in session '{session_id}'.")
     return GoldPair(**pair)
@@ -105,3 +113,8 @@ async def download(filename: str):
         media_type="application/json",
         filename=filename,
     )
+
+
+@router.get("/diagnostics")
+async def diagnostics():
+    return {"issues": await asyncio.to_thread(gs.session_diagnostics)}

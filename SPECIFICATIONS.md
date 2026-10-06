@@ -273,11 +273,20 @@ Returns all Weaviate collections with stats. `created_at` is tracked by the API 
       "object_count": 1842,
       "index_type": "hnsw",
       "distance_metric": "cosine",
+      "hnsw_config": {
+        "ef": 64,
+        "efConstruction": 128,
+        "maxConnections": 64
+      },
       "created_at": "2026-09-10T14:23:00Z"
     }
   ]
 }
 ```
+
+`index_type`: `"hnsw"`, `"flat"`, `"dynamic"`, or `"unknown"` when the collection has no recognized vector index configuration (for example, named vectors).  
+`distance_metric`: `"cosine"`, `"dot"`, `"l2-squared"`, or `"unknown"` when the distance is unavailable or isn't one of these three.  
+`hnsw_config`: the actual HNSW settings `{ef, efConstruction, maxConnections}` when `index_type` is `"hnsw"`; `null` otherwise.
 
 `created_at` is `null` for any collection that exists in Weaviate but has no entry in `collection_registry.json` (e.g. created outside this system).
 
@@ -332,7 +341,7 @@ Deletes a collection and all its objects. Requires `confirm=true` query paramete
 { "name": "Documents", "status": "deleted", "objects_removed": 1842 }
 ```
 
-Also removes the entry from `{UPLOAD_DIR}/collection_registry.json` and deletes `{UPLOAD_DIR}/ingest_configs/{collection}.json` if it exists.
+Before deletion, resolves the backend's canonical collection name. After successful backend deletion, removes retained source documents and ingest/retrieval configurations for both the canonical name and its lowercase-first-character alias, regardless of the spelling used in the request. Only that first-character alias matches; distinct collection names are not case-folded or swept. Matching sessions for both spellings are preserved and durably marked orphaned. Also removes both spellings from `collection_registry.json`. Import-replace reports the number of retained sessions across both spellings. Deleting an original collection preserves distinct retained recovery copies; explicitly deleting a retained recovery collection retires only its matching ownership journal and snapshots.
 
 **Response 404** if the collection does not exist:
 ```json
@@ -363,7 +372,7 @@ Accepts one or more files. For ZIP uploads, extracts and processes all supported
 |---|---|---|---|
 | `files` | file[] | Yes | One or more files (PDF, DOCX, TXT, MD, CSV, JSON) or a single ZIP |
 | `collection` | string | Yes | Target Weaviate collection name |
-| `chunking_strategy` | string | Yes | One of: `fixed`, `overlap`, `semantic`, `context_aware`, `language` |
+| `strategy` | string | No | Default: `overlap`. One of: `fixed`, `overlap`, `semantic`, `context_aware`, `language` |
 | `chunk_size` | int | No | Default: 1000 (characters). All size parameters are in characters, not tokens. |
 | `chunk_overlap` | int | No | Default: 200 (characters). Ignored by `semantic` and `context_aware`. |
 | `similarity_threshold` | float | No | Default: 0.85. Used by `semantic` only. Range: 0.0–1.0. |
@@ -382,8 +391,8 @@ values are not numeric settings. Strategies must be one of the documented five.
 Ignored overlap settings remain ignored for fixed/context-aware/semantic; the
 context-aware fallback uses language splitting with zero overlap.
 
-Invalid multipart settings return **422 `INVALID_SETTINGS` before collection
-lookup, upload staging or job creation**. Invalid JSON settings return 422 `INVALID_PARAMETER` with
+Invalid multipart settings, including values that aren't numbers, return **422
+`INVALID_SETTINGS` before collection lookup, upload staging or job creation**. Invalid JSON settings return 422 `INVALID_PARAMETER` with
 sanitized field errors in `error.detail`. Raw input/error-context values are omitted from validation replies
 so non-finite input also produces a serializable 422. Defaults remain unchanged.
 
@@ -475,6 +484,14 @@ Saves (upserts) a default chunking configuration for a collection. Creates the c
 
 Config is persisted to `{UPLOAD_DIR}/ingest_configs/{collection}.json` so it survives restarts. The `{collection}` segment in all file paths is the collection name with spaces replaced by underscores and non-alphanumeric characters removed, to ensure safe filenames.
 
+Ingest and retrieval settings saves serialize publication across the API process's
+worker threads. Each save writes its own exclusively created temporary file in
+the destination directory and atomically replaces the saved configuration. A 201
+acknowledges that request's complete value was published; a later successful save
+may supersede it. Serialization, temporary write/close or replacement failure
+does not acknowledge success and leaves the last valid configuration readable.
+Failed saves clean up their own temporary file when filesystem permissions allow. Package import publishes ingest settings through this same lock and atomic writer. Published files use mode 0600 (API owner read/write), including replacements of older files.
+
 ---
 
 #### 3.1.4 Query (RAG)
@@ -502,7 +519,6 @@ POST /query
 | `collection` | string | required | Weaviate collection to query |
 | `retrieval_mode` | string | `"hnsw"` | One of: `"hnsw"`, `"flat"`, `"hybrid"`, `"semantic"` |
 | `top_k` | int | 5 | Number of chunks to retrieve |
-
 | `alpha` | float | 0.75 | Hybrid mode only: 0.0 = pure BM25, 1.0 = pure vector |
 | `include_citations` | bool | false | Whether to return source document citations |
 | `response_format` | string | `"end_user"` | `"end_user"` (plain language) or `"engineer"` (verbose, with chunk details) |
@@ -582,6 +598,8 @@ special-case a new collection.
 system defaults (`hnsw`, `top_k: 5`, `alpha: 0.75`, `ef: null`,
 `response_format: "end_user"`).
 
+Saved `ef` is a legacy inactive field, not a query override. `GET /collections` reports actual HNSW settings as `hnsw_config` (ef, efConstruction, maxConnections), or null for a Flat, Dynamic or unrecognized index configuration. An unavailable distance metric is reported as `unknown`. Both hnsw/flat query-mode names use the existing physical index.
+
 ---
 
 ```
@@ -608,8 +626,8 @@ carries the settings it was tuned with.
 **Response 201:** the saved configuration, with `is_default: false`.
 
 Config is persisted to `{UPLOAD_DIR}/retrieval_configs/{collection}.json`, written
-atomically (temp file then replace) so an interrupted write cannot leave a
-half-written config. Deleting a collection deletes its retrieval config.
+atomically with the same unique-temporary-file and serialized-publication contract
+as ingest settings above. Deleting a collection deletes its retrieval config.
 
 ---
 
@@ -690,7 +708,13 @@ The `pairs` array contains only pairs whose generation has completed so far. Dur
 { "error": { "code": "SESSION_NOT_FOUND", "message": "Session 'gs_abc123' not found.", "detail": null } }
 ```
 
-**Session persistence:** Gold standard sessions are stored in `{UPLOAD_DIR}/goldstandard_sessions/` as individual JSON files (`{session_id}.json`). Sessions survive API container restarts. The API loads existing session files on startup into an in-memory dict.
+**Session persistence:** Gold standard sessions are stored in `{UPLOAD_DIR}/goldstandard_sessions/` as individual JSON files (`{session_id}.json`). Sessions survive API container restarts. The API loads existing session files on startup into an in-memory dict. The local deployment uses one API process. A process-wide reentrant lock serializes each session mutation, snapshot and durable write across generation, review, regeneration, import storage and history markers. Files use unique temporary names, file fsync, atomic replacement and directory fsync. Readers receive independent snapshots; no lock is held across model calls. Concurrent edits to distinct fields retain each acknowledged change; edits to the same field follow the serialized commit order. Review during generation remains supported. Session files are owner-only (mode 0600); only the API process reads them.
+
+Imported sessions keep a free source identity or receive a new local `gs_` identity when the cache or any existing session file occupies it. Import refuses a source identity that is not `gs_[0-9a-f]{8}` (`PACKAGE_CORRUPT`, export check 4a). Concurrent imports and generation starts share the same process lock for identity selection and durable publication. If identity selection at generation start cannot inspect session storage, or runs out of attempts, generation returns 503 `SESSION_WRITE_FAILED` without writing, and the diagnostic names the candidate session file being checked (or the last one tried). The original session and its newer human edits remain intact. Imported sessions retain `imported_from` (`session_id`, `collection`, `imported_at` UTC); GET session exposes that provenance. Import job `restored_sessions` maps source IDs to local lookup IDs and collections, and the UI notes display those IDs. RAGAS rows keep their four fields.
+
+Regeneration compares the target pair after the model call. If the target changed, it returns 409 `PAIR_CHANGED_DURING_REGENERATION` and preserves the acknowledged edit; updates to other pairs and validity flags are retained. A write failure before replacement returns 503 `SESSION_WRITE_FAILED`, leaving the prior cache/disk snapshot intact. A directory fsync failure after replacement returns 503 `SESSION_DURABILITY_UNCERTAIN`: cache reflects the replacement, but the caller must refresh and inspect storage before retrying. These errors are not acknowledged edits.
+
+`GET /goldstandard/diagnostics` returns `{"issues": [{"filename": "...", "code": "...", "message": "..."}]}`. Unreadable/invalid session files are preserved and reported as `SESSION_READ_FAILED`, rather than silently omitted. An unavailable or unreadable storage directory is reported as `SESSION_STORAGE_UNAVAILABLE` without aborting startup or erasing the cached last valid state. Recovery scans do not create a missing directory. Owned unpublished temporary snapshots left by interruption are preserved and reported as `SESSION_INTERRUPTED_WRITE`; the final JSON remains authoritative. A valid restored file needs API restart to reload its cache. Health displays diagnostic filenames, codes and recovery messages, plus a warning if diagnostics cannot refresh. Diagnostic issues do not change dependency health. Pending refreshes label retained results as previous; failed refreshes clear them, and responses from older refresh requests cannot overwrite newer results. Removed unreadable files or inspected temporary snapshots clear their file-read diagnostics on the next successful scan. Write failures keep their separate successful-write recovery policy; failed generation persists its original code/reason and keeps its warning through status updates and restart. A generation whose final write keeps failing ends `failed` in the process cache with the write error, ahead of disk, until a later successful write of that session saves it. File inspection occurs outside the writer lock; a scan that races a durable commit is discarded. Session marker write failures are individually reported without aborting the already completed primary delete/import/tuning operation; marker counts include only durably acknowledged updates. A stale/orphaned marker that cannot be written to its session file is saved as a pending marker in `goldstandard_sessions/pending_markers/{session_id}.json`; it is applied when the session loads at startup and to the copies in collection export packages, keeps the session's `SESSION_WRITE_FAILED` diagnostic with marker wording, and is removed by the next successful write of that session. An unreadable pending marker is preserved and reported. If the pending marker cannot be written either, the historical guard lasts only until restart. This is a single-process session-store contract, not cross-process locking, historical-export policy (#47), or a collection-wide export snapshot.
 
 ---
 
@@ -888,6 +912,9 @@ Standard error codes:
 | `INVALID_PARAMETER` | 422 | Request parameter out of range or invalid |
 | `INVALID_SETTINGS` | 422 | Multipart chunking settings invalid before ingest work |
 | `SESSION_NOT_FOUND` | 404 | Gold standard session ID not found |
+| `PAIR_CHANGED_DURING_REGENERATION` | 409 | Target changed during model generation; acknowledged edit retained |
+| `SESSION_WRITE_FAILED` | 503 | Failure before replacement; prior session snapshot unchanged |
+| `SESSION_DURABILITY_UNCERTAIN` | 503 | Replacement published but directory durability uncertain; refresh before retry |
 | `CONFIRMATION_REQUIRED` | 400 | Destructive operation called without `?confirm=true` |
 | `FILE_NOT_FOUND` | 404 | Requested download file does not exist |
 | `PAIR_NOT_FOUND` | 404 | pair_id not found within the given session |
@@ -1107,8 +1134,12 @@ ingest default.
   collection does not have. Re-embedding a `chunks-only` collection *with*
   chunking fields is refused rather than half-honoured.
 
-Each rebuild is staged into a temporary collection and swapped in only once it
-succeeds, so a failure leaves the original untouched. Vectors are copied out of
+Each rebuild is staged into a temporary collection and verified before the
+original is deleted, so a failure before replacement leaves the original
+untouched. Weaviate has no atomic swap: once replacement starts, a failure can
+leave the original name missing or partial. A verified recovery copy and its
+sidecars are then kept across restarts and named in the job error
+(`RAG_EXPORT_SPECIFICATIONS.md` §7.4). Vectors are copied out of
 the staging collection rather than regenerated, so the corpus is embedded once.
 
 Any operation that changes chunk identity marks the collection's gold-standard
@@ -1342,7 +1373,7 @@ Original question: {user_question}
 
 **System:**
 ```
-You are a helpful assistant. Answer the user's question using only the provided context. If the context does not contain enough information to answer the question, say so clearly. Do not use any knowledge outside the provided context. Write in plain, clear language for a non-technical reader.
+You are a helpful assistant. Answer the user's question using only the provided context. If the context does not contain enough information to answer the question, say so clearly. Do not use any knowledge outside the provided context. Write in plain, clear language for a non-technical reader. Keep the answer short: a few sentences, without technical detail.
 ```
 
 **User:**
@@ -1455,6 +1486,16 @@ Visible on all pages post-role-selection. Contents vary by role:
 
 The collection selection is shared with the Retrieval Config page, because retrieval settings are stored per collection and must follow the selection.
 
+Loads and saves belong to the collection selection generation that started
+them. Changing the selection (including leaving and returning to the same
+collection) invalidates pending responses for the prior selection. A stale
+save may finish persisting its original collection, but must not change the
+active settings, loading/error state, or invalidate the new collection's load.
+Within the current generation, only the latest initiated save may publish; a
+successful current save supersedes a pending older load for that collection.
+After the selected collection's load resolves, the next Q&A request uses its
+settings, regardless of when a prior collection's save completes.
+
 **Response format** sent to API:
 - End User role → `response_format: "end_user"`
 - Engineer and Developer → `response_format: "engineer"`
@@ -1524,18 +1565,13 @@ is shared by every browser, and travels with a RAG export. It is not held in
 
 | Mode | Explanation text |
 |---|---|
-| HNSW — Approximate (default) | The fastest option. Uses a smart graph to find the closest matches quickly. May very rarely miss the single best result, but works well for almost all use cases. |
-| Flat — Exact | Checks every stored chunk to find the mathematically perfect match. More accurate but slower as your collection grows. Best for collections under 10,000 chunks. |
+| Vector — existing index | Finds similar chunks using the collection's existing physical index. Selecting this query method does not switch HNSW/Flat. |
 | Hybrid | Combines keyword search with meaning-based search. Best when your questions include specific terms, names, or codes. Adjust the slider to balance between the two modes. |
 | Semantic | Pure meaning-based search. Best for conceptual questions where the exact words are less important than the idea. |
 
-- Top-K slider (1–20, default 5).
+- Top-K slider (1–50, default 5).
 - Hybrid alpha slider (visible only when Hybrid selected, range 0.0–1.0, default 0.75, labeled "Keyword ← Balance → Meaning").
-- HNSW advanced parameters accordion (Engineer role only, collapsed by default):
-  - `ef` slider (16–512)
-  - `efConstruction` slider (64–512)
-  - `maxConnections` slider (16–128)
-  - Each parameter has an explanation tooltip.
+- Read-only physical index panel shows observed index type, distance metric and actual HNSW ef/efConstruction/maxConnections. A refresh button reads current backend settings; details are labeled as last refreshed. Missing details and refresh failures are explicit. No build/query-ef sliders appear.
 - "Save for this collection" button — `POST /retrieval/config` with the full
   configuration. Disabled while no collection is selected or while settings are
   loading. On success the button shows a transient "Saved!" confirmation.
@@ -1549,15 +1585,13 @@ is shared by every browser, and travels with a RAG export. It is not held in
   "response_format": "engineer"
 }
 ```
-`ef` is sent as `null` unless `retrieval_mode` is `"hnsw"`. `alpha` is always
+`ef` is always sent as `null` from this form; a prior saved override is shown as inactive and cleared on save. `alpha` is always
 sent and is only applied by the server for `"hybrid"`. `response_format` records
 the active role at the time of saving (End User → `end_user`, Engineer and
 Developer → `engineer`) so an exported retrieval script reproduces the same
 answer style.
 
-`efConstruction` and `maxConnections` are collection build-time properties set
-when the collection is created; the sliders shown here are informational and are
-not part of the saved retrieval configuration.
+`efConstruction` and `maxConnections` are physical build settings; `ef` belongs to the physical HNSW index as well. The pinned query API does not accept a per-request ef override. Query settings do not alter the physical index. The legacy API modes `hnsw` and `flat` both use near_vector against the existing index; the UI displays a single Vector method and normalizes a saved flat alias when saving. Exact search depends on the observed physical Flat index, not a query-mode name.
 
 ### 7.7 Gold Standard Page
 
@@ -1671,7 +1705,7 @@ The `chunk_size` and `min_chunk_size` bounds apply whenever chunk settings are s
 | `min_chunk_size` | 100 | 0 | 6000 | Soft merge preference in characters; may exceed the split target |
 | `top_k` | 5 | 1 | 50 | API bounds |
 | `alpha` | 0.75 | 0.0 | 1.0 | Hybrid mode only |
-| `ef` | 64 | 16 | 512 | HNSW query param |
+| `ef` | 64 | 16 | 512 | Physical HNSW setting; saved query override inactive |
 | `efConstruction` | 128 | 64 | 512 | HNSW build param |
 | `maxConnections` | 64 | 16 | 128 | HNSW build param |
 | Gold standard `sample_size` | 20 | 1 | 100 | |
@@ -1732,6 +1766,7 @@ rag-docker/
 │   │   ├── rag_pipeline.py      # Reformulate → retrieve → synthesize
 │   │   ├── sources.py           # Retained original documents (content-addressed)
 │   │   ├── retrieval_config.py  # Per-collection retrieval settings (atomic JSON)
+│   │   ├── settings_store.py    # Shared serialized settings publication
 │   │   ├── packager.py          # Package format: naming, digests, manifest, reader
 │   │   ├── exporter.py          # Export job lifecycle and the per-collection guard
 │   │   ├── importer.py          # Import job: validation order, conflicts, atomicity
@@ -1814,8 +1849,12 @@ now lives once, in `api/services/ingest_config.py`.
 
 ### 10.1 Ingest
 
+- [x] Deleting a collection by either its canonical name or first-character alias removes both spellings' retained sources, configurations and registry entries, durably orphans both spellings' sessions, and preserves case-distinct neighbours and retained recovery copies. Import-replace notes count sessions under both spellings.
+      *`test_collection_writes.py` covers both deletion spellings and a case-distinct neighbour; `reindex.py` runs both deletion paths through the HTTP handler against owned backend and sidecar fixtures, with `reindex_verifier_cases.py` checking registration. The live backend rejects case-only neighbouring collections; Linux-volume checks still verify case-distinct sidecar/session preservation, while controlled tests cover both backend collections.*
 - [x] Invalid ingest/saved settings are rejected before staging, jobs or configuration writes; valid defaults and fixed size/minimum preferences are retained.
       *`test_settings_validation.py` checks mocked work boundaries and persistence; `07_settings.sh` runs real HTTP rejection, unchanged-config and valid round-trip checks on an owned collection. Full affected ingest verification passes 18 checks.*
+- [x] Concurrent ingest/retrieval settings saves publish their own complete values; failed publication preserves the previous valid configuration (#141).
+      *`test_settings_persistence.py` controls worker contention and first-save directory creation with events, observes each publication and unique temporary path, and injects serialization, creation, partial-write, close and replacement failures for both services. Suite 07 registers these controlled tests (including failed import publication), host-side `ImplementationTests`, and 15 rounds of 12 concurrent live saves per ingest/retrieval route; each round checks that the persisted config is one complete acknowledged response. Full-stack verification is recorded separately.*
 - [x] `chunk_size` is bounded to 50–6000 and `min_chunk_size` to 0–6000 wherever chunk settings are saved or used; a saved configuration from before the bounds is still returned and exported unchanged, and must be within them to be saved again or used for tuning (#53).
       *`test_settings_validation.py` saves and reads back both edges, rejects 49, 6001 and a minimum of 6001 without changing the saved configuration, and checks a saved 16000/8000 configuration is returned and exported unclamped but refused by save, rechunk and reembed. `07_settings.sh` checks both edges and their neighbours against the live stack.*
 
@@ -1861,11 +1900,15 @@ now lives once, in `api/services/ingest_config.py`.
 - [x] `include_citations: true` returns citation objects with source_file and score.
       *Each citation carries source_file, chunk_index, score and excerpt.*
 - [x] `response_format: "end_user"` produces shorter, plainer answers than `"engineer"` for the same question.
-      *Four paired trials: end_user shorter in 4/4, mean 652 vs 907 chars. Note
-      that "plain language" is instructed but brevity is not — it follows from
-      engineer being told to add technical detail and a confidence level, so the
-      margin is a tendency rather than a guarantee.*
+      *Four paired trials: end_user shorter in 4/4, mean 652 vs 907 chars. Brevity
+      was originally not instructed, so the margin was only a tendency, and
+      `03_query.sh`'s 3-trial mean flipped in several PR evaluations (#109). The
+      end_user prompt now asks for a short answer without technical detail, so
+      "shorter" is instructed rather than incidental.*
 - [x] Latency fields (`retrieval_latency_ms`, `llm_latency_ms`) are present and non-zero in all responses.
+
+- [x] Retrieval controls distinguish query method from the existing physical index and report actual backend HNSW settings; inactive ef/build sliders are absent.
+      *Six controlled runtime groups plus one twelve-source documentation group pass. Registered browser criteria cover Top-K 1/50 save payloads, initial/refresh failures and late initial responses. Suite 11 (called by 03/all.sh) passes seven real backend configuration/vector-query checks, controlling only model responses. Actual browser shows 72/160/32 backend settings, labels saved ef 96 inactive, clears it on save without physical changes, normalizes the flat alias, and labels Q&A Vector; zero console errors and owned fixtures removed. Full suite is recorded separately.*
 
 ### 10.3 Gold Standard
 
@@ -1902,6 +1945,24 @@ now lives once, in `api/services/ingest_config.py`.
       under a status saying otherwise. **Fixed**: a model validator requires
       `status="edited"` whenever content fields are present.*
 - [x] Sessions survive API container restart (data loaded from `{UPLOAD_DIR}/goldstandard_sessions/`).
+- [x] Export, edit original, import with rename twice: all three sessions remain independently usable for lookup/RAGAS export, and imported identities/provenance survive restart.
+      *Registered `13_identity.sh` exercises controlled collision, concurrent creation, guarded reads, and actual package/HTTP/backend/fresh-process acceptance. The exact current-head counts and full-suite result are recorded in PR #69.*
+- [x] Generation start returns 503 `SESSION_WRITE_FAILED`, writes nothing and records a diagnostic for the candidate session file when identity selection cannot inspect session storage (including a redirected storage directory) or runs out of attempts. Import refuses a source session ID that is not `gs_[0-9a-f]{8}` with `PACKAGE_CORRUPT` naming the sidecar, before restoring anything.
+      *Registered `13_identity.sh` runs 21 owned cases in `session_identity_cases.py`. Generation start: `test_reviewer_generation_identity_inspection_failure_is_session_write_failed_503`, `test_generation_allocation_failure_records_diagnostic_for_candidate` (inspection failure and exhaustion), `test_reviewer_generation_redirected_storage_root_is_session_write_failed_503` and `test_reviewer_generate_route_returns_503_session_write_failed_envelope`. Source IDs: `test_noncanonical_source_identity_is_refused_before_restoration` and `test_reviewer_preflight_refuses_near_canonical_and_unbounded_source_ids` (near misses, a 10,003-character ID, an empty string and an integer are refused; `gs_0123abcd` is accepted). The live check in `session_identity.py` imports a digest-valid package with a noncanonical source ID and expects `PACKAGE_CORRUPT` naming the sidecar, nothing restored and the original unchanged. The redirected-storage and route cases fail on the code before #148.*
+- [x] Concurrent edits survive generation, independent-field updates and restart; write faults are not acknowledged, and changed regeneration targets are rejected.
+      *Registered `12_persistence.sh` runs owned concurrency, interruption and failure-path cases plus real backend/HTTP/fresh-process checks. Exact counts and initial full-suite failures are retained in the PR; this is single-process acceptance.*
+- [x] Recovery diagnostics preserve unreadable bytes, clear removed-file warnings, retain generation failure codes, and do not hold the writer lock while reading the archive.
+      *Registered cases pause an archive read while an edit commits, inject failed pair writes and later status updates, and remove inspected fixtures. Health browser fixtures exercise pending, failed and out-of-order refreshes.*
+- [x] Secondary session marker write failures do not misreport a completed collection deletion/import/rebuild or prevent later session markers.
+      *Registered live HTTP deletion checks physical absence and registry removal under an owned marker failure; isolated import/tuning paths and two-session marker cases verify bounded continuation.*
+- [x] An interrupted import never deletes a collection it didn't create. Each import writes a version-4 marker with a 32-hex instance token and creates its target carrying that token in abort, rename and replace modes; staging and existing collections carry none. At startup the collection is deleted only when it carries the marker's token and its records don't match the expected snapshot. With no token or another import's token it is kept and the marker and snapshot are retired; with an unreadable identity, a missing or invalid version-4 token, or a version-3 marker still building, the collection and marker are both kept (#126).
+      *Registered by `05_transfer.sh`, which runs `scripts/tests/test_batch_recovery.py` in the API container: `test_every_import_mode_binds_its_target_to_the_marker_instance`, `test_import_creates_its_target_with_the_marker_identity`, `test_interrupted_import_compares_records_not_only_count`, `test_new_collection_under_unresolved_marker_name_is_kept`, `test_other_import_token_keeps_collection_and_retires_marker`, `test_unreadable_collection_identity_preserves_collection_and_marker`, `test_v4_marker_with_invalid_instance_never_deletes` and `test_marker_without_instance_identity_never_deletes`.*
+- [x] At startup, an import expectation snapshot (`<32 hex>.sqlite3`) that no marker names is removed. Snapshots named by any parseable marker, even an invalid one, other file names and symlinks are kept, and an unreadable marker stops the sweep (#126).
+      *`test_batch_recovery.py`: `test_orphaned_expectation_snapshots_are_swept_at_startup`, `test_unreadable_marker_blocks_the_orphan_snapshot_sweep` and `test_orphan_sweep_keeps_snapshots_named_by_invalid_markers_and_symlinks`.*
+- [x] When a tuning or import failure retains recovery data, the job's `sidecar_snapshots` is relative to `UPLOAD_DIR` (`collection_operations/<operation>`) wherever the recovery root resolves; the absolute path is written only to the server log (#126).
+      *`test_batch_recovery.py`: `test_job_errors_name_sidecar_snapshots_relative_to_upload_dir`, `test_absolute_sidecar_path_goes_to_the_server_log_only` (tuning and both import failure branches) and `test_sidecar_reference_does_not_depend_on_where_the_root_resolves`; `test_collection_writes.py`'s `test_replace_failure_retains_positive_recovery_and_startup_preserves_it`, run by `14_reindex.sh`.*
+- [x] When gold-standard sessions can't be marked stale before a tuning replacement, the job fails `TUNE_FAILED` saying the original collection is unchanged; the original keeps its records, the retained copy is discarded and the error carries no `recovered_as` or `sidecar_snapshots`. A failure to discard the copy is logged and finished at the next startup (#126).
+      *`test_batch_recovery.py`: `test_stale_marking_failure_before_cutover_discards_copy_and_keeps_original` and `test_stale_marking_discard_failure_is_logged_and_resumed_at_startup`.*
 - [x] Export includes only approved/edited pairs; excluded count matches rejected + pending.
       *2 approved + 1 edited saved; 1 rejected + 1 pending excluded.*
 - [x] Exported file is valid JSON and each pair matches the RAGAS schema.
@@ -1940,6 +2001,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *A 513 MB sparse file: the page names the limit and no `POST /ingest/upload`
       is made. A 413 or other proxy error page is shown as a readable message
       instead of a JSON parse error (issue #21).*
+
+- [x] Retrieval save confirmations and errors stay with their selection generation. Deferred browser cases verify stale success/failure after switching collections and preserve the newest acknowledged success when a newer save fails, in both response orders.
 
 ### 10.5 Infrastructure
 
@@ -2058,3 +2121,6 @@ A rebuild from these documents is correct when:
 - A create → ingest → query round-trip returns a non-empty answer with at least one citation.
 - `docker compose down && docker compose up -d` succeeds twice in a row.
 - The offline bundle installs on a machine with no network and reaches the same state.
+
+- [x] Reindex with embeddings unavailable preserves exact UUIDs, properties and vectors while changing the physical index; retained evaluation validity is unchanged on success.
+      *Registered `14_reindex.sh`: 24 runtime cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling cases and 44 real backend/ASGI/restart checks pass on Python3.11 (4 shell groups, 0 failures). The actual API upload remains queued through cutover; its later supplied-vector write and original exact records both survive. A refused vectorizer mismatch leaves records/config/session bytes intact, and a forced final-create failure preserves recovery through an independent API lifespan.*

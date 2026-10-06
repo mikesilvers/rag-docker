@@ -1,0 +1,29 @@
+# Overlay for the disposable verify project (#152). Used only by
+# scripts/verify/stack.sh, which runs it as compose project `rag-verify` on top
+# of the docker-compose.yml of the checkout under test, and sets the two
+# variables below. Run any other way, it refuses to resolve.
+#
+# Everything here keeps verification away from the live `rag-docker` stack:
+services:
+  proxy:
+    # Replace the base list rather than add to it (compose merges `ports`
+    # otherwise), so the live port 8080 is never published by this project.
+    ports: !override
+      - "127.0.0.1:${RAG_VERIFY_PORT:?set by scripts/verify/stack.sh}:80"
+  api:
+    # Own image tags: building with the base file's rag-docker-api:latest would
+    # move the live stack's tag to the code under test.
+    image: rag-verify-api:latest
+    volumes:
+      # Same container path as the base file's ./exports, so this entry
+      # replaces it: from the main checkout, ./exports is the live exports folder.
+      - ${RAG_EXPORTS_DIR:?set by scripts/verify/stack.sh}:/app/exports
+  ui:
+    image: rag-verify-ui:latest
+
+volumes:
+  # A copy of the live models that stack.sh keeps in step with
+  # rag-docker_ollama_models (read-only there). External, so `down -v` keeps it.
+  ollama_models:
+    external: true
+    name: rag-verify-ollama-models

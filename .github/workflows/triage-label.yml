@@ -1,0 +1,19 @@
+# Label issues opened by anyone other than the maintainer "Triage" (issue #211).
+# The maintainer removes the label to accept the issue; until then, PRs for it
+# are not evaluated.
+name: Triage new issues
+on:
+  issues:
+    types: [opened]
+permissions:
+  issues: write
+jobs:
+  label:
+    if: github.event.issue.user.login != 'mikesilvers'
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh issue edit "$NUMBER" --add-label Triage --repo "$REPO"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}

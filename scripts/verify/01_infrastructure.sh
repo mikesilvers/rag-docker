@@ -41,6 +41,15 @@ sys.exit(0 if ok else 1)
 ENDPY
 check "resolved Compose publishes only the proxy on host loopback" $?
 
+# ── cross-origin access, as SECURITY.md describes it ─────────────────────────
+# SECURITY.md says a web page open in a browser on this machine can call the
+# API, because CORS allows any origin (#25 tracks tightening it). Check that
+# this is still true, so the policy and the code can't drift apart silently:
+# when #25 changes CORS, this check and SECURITY.md change together.
+cors=$(curl -s -D - -o /dev/null -m 10 -H "Origin: http://other.example" "$API/health" \
+  | tr -d '\r' | awk -F': ' 'tolower($1)=="access-control-allow-origin"{print $2}')
+check_eq "the API allows any origin, as SECURITY.md describes (#25)" "$cors" "*"
+
 (cd "$REPO_ROOT" && python3 - <<'ENDPY'
 import json, subprocess
 ids = subprocess.check_output(['docker', 'compose', 'ps', '-q'], text=True).split()
@@ -146,14 +155,32 @@ check_eq "a recreated collection does not inherit the retrieval config" \
   "$(api_get "/retrieval/config/$C" | jfield "['is_default']")" "True"
 
 # ── persistence across a restart (opt-in: it stops the stack) ────────────────
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  restart_refusal=$(restart_refusal_reason)
+  # The limit is checked before anything restarts (#130).
+  restart_limit=$(restart_limit); restart_limit_ok=$?
+fi
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -n "$restart_refusal" ]; then
+  check "restart, persistence and timing" 1 "$restart_refusal"
+elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ "$restart_limit_ok" != 0 ]; then
+  check "restart, persistence and timing" 1 "$restart_limit"
+elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  # Save a known config here, right before the restart: the section above ends
+  # by recreating $C with no saved config, so relying on earlier state made
+  # this check fail on every run (#73).
+  api_post "/ingest/config" "{\"collection\":\"$C\",\"chunking_strategy\":\"semantic\",\"chunk_size\":800,\"chunk_overlap\":150,\"similarity_threshold\":0.9,\"min_chunk_size\":80}" >/dev/null
+  check_eq "a config saved before the restart reads back" \
+    "$(api_get "/ingest/config/$C" | jfield "['chunking_strategy']")" "semantic"
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_before.json"
   started=$(python3 -c "import time;print(time.time())")
-  (cd "$REPO_ROOT" && docker compose down >/dev/null 2>&1 && docker compose up -d >/dev/null 2>&1)
-  for _ in $(seq 1 120); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
-  elapsed=$(python3 -c "import time;print(int(time.time()-$started))")
-  [ "$elapsed" -le 120 ]
-  check "restart reaches healthy within 120s" $? "took ${elapsed}s"
+  # Name the project explicitly; restart_refusal_reason has already made sure
+  # it is set and is not the live rag-docker project.
+  project="$COMPOSE_PROJECT_NAME"
+  (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
+  # Wait up to twice the limit, so a slow restart is still timed (#130).
+  elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
+  restart_timing_check "$restart_limit" "$elapsed"
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_after.json"
   python3 -c "
 import json,sys,os
@@ -168,21 +195,123 @@ b={c['name']:c for c in json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_befor
 a={c['name']:c for c in json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_after.json'))['collections']}
 sys.exit(0 if all(b[k]['created_at']==a[k]['created_at'] for k in b if k in a) else 1)"
   check "created_at is preserved across restart" $?
+  api_get "/ingest/config/$C" > "$RAG_INFRA_TMP/vfy_cfg_after.json"
   check_eq "saved ingest config survives restart" \
-    "$(api_get "/ingest/config/$C" | jfield "['chunking_strategy']")" "semantic"
+    "$(jfield "['chunking_strategy']" < "$RAG_INFRA_TMP/vfy_cfg_after.json")" "semantic"
+  check_eq "it is still the saved config, not the default" \
+    "$(jfield "['is_default']" < "$RAG_INFRA_TMP/vfy_cfg_after.json")" "False"
 else
   skip "restart, persistence and timing" "set RAG_ALLOW_RESTART=1 to include them"
+fi
+
+# ── restart from a Raft snapshot (issue #178; opt-in: it stops the stack) ────
+# The restart above comes too early for a snapshot: few schema changes, under
+# a minute of uptime. Here Weaviate takes one, a tail of changes follows it,
+# and a down/up must restore both: collections and objects from before the
+# snapshot, a create and a delete after it.
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -z "$restart_refusal" ] && [ "$restart_limit_ok" = 0 ]; then
+  SNAP_KEEP="${C}SnapKeep"; SNAP_GONE="${C}SnapGone"; SNAP_TAIL="${C}SnapTail"
+  for n in "$SNAP_KEEP" "$SNAP_GONE" "$SNAP_TAIL"; do drop_collection "$n"; done
+  # put_objects <collection> <count>: objects with their own vectors, so no
+  # embedding call is involved.
+  put_objects() {
+    (cd "$REPO_ROOT" && docker compose exec -T api python - "$1" "$2" <<'ENDPY'
+import sys
+from weaviate.classes.data import DataObject
+from services import weaviate_client as wc
+name, count = sys.argv[1], int(sys.argv[2])
+try:
+    result = wc.get_client().collections.get(name).data.insert_many([
+        DataObject(properties={"content": f"snapshot check {i}", "chunk_index": i},
+                   vector=[(i + 1) / (j + 1) for j in range(768)])
+        for i in range(count)])
+    sys.exit(1 if result.has_errors else 0)
+finally:
+    wc.close_client()
+ENDPY
+    ) >/dev/null 2>&1
+  }
+  snapshots() { (cd "$REPO_ROOT" && docker compose exec -T weaviate ls /var/lib/weaviate/raft/snapshots) 2>/dev/null | sort; }
+  make_collection "$SNAP_KEEP"; put_objects "$SNAP_KEEP" 5; keep_ok=$?
+  make_collection "$SNAP_GONE"; put_objects "$SNAP_GONE" 3; gone_ok=$?
+  [ "$keep_ok$gone_ok" = 00 ]
+  check "objects written before the snapshot" $?
+  before_snaps=$(snapshots)
+  # 70 create/delete pairs: 140 Raft entries, over the threshold of 128.
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "${C}Churn" <<'ENDPY'
+import sys
+from services import weaviate_client as wc
+client = wc.get_client()
+try:
+    for i in range(70):
+        client.collections.create(f"{sys.argv[1]}{i}")
+        client.collections.delete(f"{sys.argv[1]}{i}")
+finally:
+    wc.close_client()
+ENDPY
+  ) >/dev/null 2>&1
+  check "140 schema changes made" $?
+  # The interval is checked every 30-60s; allow 150s.
+  new_snap=""
+  for _ in $(seq 1 30); do
+    new_snap=$(comm -13 <(printf '%s\n' "$before_snaps") <(snapshots) | grep . | tail -1)
+    [ -n "$new_snap" ] && break
+    sleep 5
+  done
+  [ -n "$new_snap" ]
+  check "Weaviate snapshots its Raft log after 140 schema changes (within 150s)" $? "no new snapshot in /var/lib/weaviate/raft/snapshots"
+  snap_index=$(printf '%s' "$new_snap" | cut -d- -f2)
+  # The tail after the snapshot: one collection created, one deleted.
+  make_collection "$SNAP_TAIL"; put_objects "$SNAP_TAIL" 4
+  check "objects written after the snapshot" $?
+  drop_collection "$SNAP_GONE"
+  started=$(python3 -c "import time;print(time.time())")
+  project="$COMPOSE_PROJECT_NAME"
+  (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
+  elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
+  [ -n "$elapsed" ]
+  check "healthy again after a restart from the snapshot" $? "not healthy after $((restart_limit * 2))s"
+  # Weaviate logs the snapshot it started from on "raft node constructed".
+  restored=$( (cd "$REPO_ROOT" && docker compose -p "$project" logs weaviate 2>/dev/null) | python3 -c "
+import json, sys
+for line in sys.stdin:
+    _, _, body = line.partition('|')
+    try:
+        d = json.loads(body)
+    except ValueError:
+        continue
+    if d.get('msg') == 'raft node constructed':
+        print(d.get('last_snapshot_index', 0))")
+  [ -n "$snap_index" ] && [ "${restored:-0}" -ge "$snap_index" ] 2>/dev/null
+  check "the restart starts from the snapshot" $? "last_snapshot_index on start: ${restored:-none}, snapshot taken at: ${snap_index:-none}"
+  api_get "/collections" | python3 -c "
+import json, sys
+a = {c['name']: c['object_count'] for c in json.load(sys.stdin)['collections']}
+ok = (a.get('$SNAP_KEEP') == 5 and a.get('$SNAP_TAIL') == 4 and '$SNAP_GONE' not in a
+      and not any(n.startswith('${C}Churn') for n in a))
+print(a if not ok else '')
+sys.exit(0 if ok else 1)" > "$RAG_INFRA_TMP/vfy_snap.txt"
+  check "collections and objects before and after the snapshot survive the restart, deletes stay deleted" $? "$(cat "$RAG_INFRA_TMP/vfy_snap.txt")"
+  for n in "$SNAP_KEEP" "$SNAP_TAIL"; do drop_collection "$n"; done
+elif [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "restart from a Raft snapshot" "set RAG_ALLOW_RESTART=1 to include it"
 fi
 
 # ── startup sweeps leave a clean instance alone ──────────────────────────────
 leftover=$( (cd "$REPO_ROOT" && docker compose exec -T api sh -c \
   'ls -d /app/uploads/import-* /app/uploads/rechunk-* 2>/dev/null | wc -l') | tr -d ' ')
 check_eq "no abandoned extraction directories" "${leftover:-0}" "0"
-staging=$(api_get "/collections" | python3 -c "
-import json,sys
-print(sum(1 for c in json.load(sys.stdin)['collections']
-          if '__importing_' in c['name'] or '__tuning_' in c['name']))")
-check_eq "no abandoned staging collections" "$staging" "0"
+staging=$( (cd "$REPO_ROOT" && docker compose exec -T api python -c '
+import json
+from services import collection_recovery as recovery, weaviate_client as wc
+try:
+    records = [json.loads(path.read_text()) for path in recovery._root().glob("*.json")]
+    print(sum(record.get("state") == "scratch" and wc.get_client().collections.exists(record["staging"])
+              for record in records))
+finally:
+    wc.close_client()
+'))
+check_eq "no abandoned owned scratch collections" "$staging" "0"
 
 drop_collection "$C"
 cleanup_prefixed

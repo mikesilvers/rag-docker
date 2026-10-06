@@ -45,7 +45,7 @@ services:
   weaviate:
     # 1.27.0 is the minimum supported by weaviate-client 4.23.1 (pinned in
     # api/requirements.txt); 1.25.x fails at connect with WeaviateStartUpError.
-    image: semitechnologies/weaviate:1.39.4
+    image: semitechnologies/weaviate:1.39.6
     environment:
       QUERY_DEFAULTS_LIMIT: 25
       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
@@ -61,16 +61,29 @@ services:
       # Pinning the name keeps the identity stable across container recreation.
       CLUSTER_HOSTNAME: 'node1'
       RAFT_BOOTSTRAP_EXPECT: 1
+      # Without a Raft snapshot, every start replays each collection delete in
+      # Weaviate's Raft log and waits ~150ms on each one (issue #178: 922
+      # deletes, ~145s). A snapshot after 128 entries, checked every 30-60s,
+      # keeps the replayed tail short.
+      RAFT_SNAPSHOT_THRESHOLD: 128
+      RAFT_SNAPSHOT_INTERVAL: 30
     volumes:
       - weaviate_data:/var/lib/weaviate
     ports: []
     networks: [rag-internal]
     healthcheck:
       # The weaviate image has no curl; busybox wget is what it ships.
+      # The first start on a volume whose Raft log has no snapshot yet (the
+      # first after upgrading to the snapshot settings above) still replays
+      # its whole history before /ready answers: up to 156s on a copy of real
+      # data, 163.5s live (issue #130). Later starts replay only the tail since
+      # the last snapshot. Without start_period, compose marks Weaviate
+      # unhealthy after ~100s and fails the api, ui and proxy behind it.
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/v1/.well-known/ready"]
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 180s
 
   ollama:
     image: ollama/ollama:0.3.14
@@ -150,8 +163,9 @@ services:
       api: { condition: service_healthy }
 
   proxy:
-    image: nginx:1.27-alpine
+    image: nginx:1.29-alpine
     ports:
+      # This unauthenticated workbench is local to the host by default.
       - "127.0.0.1:8080:80"
     volumes:
       - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
@@ -177,6 +191,40 @@ volumes:
 networks:
   rag-internal:
     driver: bridge
+```
+
+### docker-compose.verify.yml
+
+```yaml
+# Overlay for the disposable verify project (#152). Used only by
+# scripts/verify/stack.sh, which runs it as compose project `rag-verify` on top
+# of the docker-compose.yml of the checkout under test, and sets the two
+# variables below. Run any other way, it refuses to resolve.
+#
+# Everything here keeps verification away from the live `rag-docker` stack:
+services:
+  proxy:
+    # Replace the base list rather than add to it (compose merges `ports`
+    # otherwise), so the live port 8080 is never published by this project.
+    ports: !override
+      - "127.0.0.1:${RAG_VERIFY_PORT:?set by scripts/verify/stack.sh}:80"
+  api:
+    # Own image tags: building with the base file's rag-docker-api:latest would
+    # move the live stack's tag to the code under test.
+    image: rag-verify-api:latest
+    volumes:
+      # Same container path as the base file's ./exports, so this entry
+      # replaces it: from the main checkout, ./exports is the live exports folder.
+      - ${RAG_EXPORTS_DIR:?set by scripts/verify/stack.sh}:/app/exports
+  ui:
+    image: rag-verify-ui:latest
+
+volumes:
+  # A copy of the live models that stack.sh keeps in step with
+  # rag-docker_ollama_models (read-only there). External, so `down -v` keeps it.
+  ollama_models:
+    external: true
+    name: rag-verify-ollama-models
 ```
 
 ### ollama/entrypoint.sh
@@ -250,6 +298,19 @@ http {
         listen 80;
 
         location /api/ {
+            # nginx's default request-body limit is 1 MB, which rejected most
+            # real PDFs with a 413 before the API saw them (issue #21). 512 MB
+            # covers a ZIP of a firm's documents in one upload. It is the limit
+            # for the whole request, so a multi-file upload counts every file.
+            # ui/src/api/client.ts holds the same number to warn before sending;
+            # change both together.
+            client_max_body_size 512m;
+            # Stream uploads straight to the API instead of spooling each one to
+            # nginx's temp directory first. Buffering would write up to 512 MB
+            # into the container's writable layer, on Docker's often-small
+            # virtual disk, before the API even starts reading. The limit above
+            # still applies: nginx checks Content-Length up front.
+            proxy_request_buffering off;
             proxy_pass http://api/;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
@@ -616,7 +677,7 @@ settings = Settings()
 ```python
 from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
-from pydantic import BaseModel, Field, BeforeValidator, field_validator, model_validator
+from pydantic import BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator
 
 
 def _numeric(value):
@@ -642,7 +703,9 @@ ChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=50, le=6000)]
 MinChunkSize = Annotated[int, BeforeValidator(_numeric), Field(ge=0, le=6000)]
 UnitInterval = Annotated[float, BeforeValidator(_numeric), Field(ge=0, le=1, allow_inf_nan=False)]
 TopK = Annotated[int, BeforeValidator(_numeric), Field(ge=1, le=50)]
-SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=16, le=512)]
+SEARCH_EF_MIN, SEARCH_EF_MAX = 16, 512
+SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=SEARCH_EF_MIN, le=SEARCH_EF_MAX)]
+OVERLAP_RULE = "chunk_overlap must be smaller than chunk_size for overlap/language"
 
 
 # ── Collections ──────────────────────────────────────────────────────────────
@@ -686,6 +749,7 @@ class CollectionInfo(BaseModel):
     index_type: str
     distance_metric: str
     created_at: Optional[str]
+    hnsw_config: Optional[dict[str, int]] = None
 
 
 class CollectionsResponse(BaseModel):
@@ -724,7 +788,7 @@ class IngestConfig(BaseModel):
     @model_validator(mode="after")
     def _relationships(self):
         if self.chunking_strategy in ("overlap", "language") and self.chunk_overlap >= self.chunk_size:
-            raise ValueError("chunk_overlap must be smaller than chunk_size for overlap/language")
+            raise ValueError(OVERLAP_RULE)
         return self
 
 
@@ -740,6 +804,9 @@ class IngestConfigResponse(BaseModel):
 
 # ── Retrieval config ──────────────────────────────────────────────────────────
 
+# These bounds apply to saves. A saved or packaged ef that is an integer outside
+# SEARCH_EF_MIN-SEARCH_EF_MAX was stored before PR #108 and is inactive, so
+# export and import clear it to null (retrieval_config.normalize), not refuse it.
 class SaveRetrievalConfigBody(BaseModel):
     collection: str
     retrieval_mode: RetrievalMode = "hnsw"
@@ -815,6 +882,12 @@ class ImportStartResponse(BaseModel):
     filename: str
 
 
+class ImportedSessionMapping(BaseModel):
+    source_session_id: str
+    session_id: str
+    collection: str
+
+
 class ImportJobStatusResponse(BaseModel):
     job_id: str
     status: str
@@ -828,6 +901,7 @@ class ImportJobStatusResponse(BaseModel):
     fidelity: Optional[str]
     renamed: bool
     notes: list[str]
+    restored_sessions: list[ImportedSessionMapping] = Field(default_factory=list)
     error: Optional[str]
     error_code: Optional[str]
     error_detail: Optional[dict]
@@ -851,9 +925,6 @@ class PackageListResponse(BaseModel):
 
 # ── Tuning ────────────────────────────────────────────────────────────────────
 
-CHUNKING_STRATEGIES = ("fixed", "overlap", "language", "context_aware", "semantic")
-
-
 class _ChunkingFields(BaseModel):
     chunking_strategy: Optional[ChunkingStrategy] = None
     chunk_size: Optional[ChunkSize] = None
@@ -863,8 +934,13 @@ class _ChunkingFields(BaseModel):
 
     @model_validator(mode="after")
     def _relationships(self):
-        IngestConfig(**{name: getattr(self, name) for name in IngestConfig.model_fields
-                        if getattr(self, name) is not None})
+        # Fields are already checked, so only the overlap rule can fail here.
+        # A plain ValueError keeps the nested model's input out of the error.
+        try:
+            IngestConfig(**{name: getattr(self, name) for name in IngestConfig.model_fields
+                            if getattr(self, name) is not None})
+        except ValidationError:
+            raise ValueError(OVERLAP_RULE) from None
         return self
 
     def has_chunking(self) -> bool:
@@ -1009,6 +1085,12 @@ class SessionValidity(BaseModel):
     orphaned_at: Optional[str] = None
 
 
+class SessionImportProvenance(BaseModel):
+    session_id: str
+    collection: str
+    imported_at: str
+
+
 class SessionResponse(SessionValidity):
     session_id: str
     status: str
@@ -1021,6 +1103,7 @@ class SessionResponse(SessionValidity):
     pairs: list[GoldPair]
     collection: str
     errors: list[str] = []
+    imported_from: SessionImportProvenance | None = None
 
 
 class PatchPairRequest(BaseModel):
@@ -1150,6 +1233,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1160,6 +1244,35 @@ log = logging.getLogger(__name__)
 
 INDEX_NAME = "index.json"
 INDEX_VERSION = 1
+_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def validate_index(index: dict) -> dict:
+    """Refuse source identities that could address anything but a stored blob."""
+    if not isinstance(index, dict) or not isinstance(index.get("documents"), dict):
+        raise ValueError("Invalid retained source index")
+    for digest, entry in index["documents"].items():
+        if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+            raise ValueError("Invalid retained source digest")
+        if not isinstance(entry, dict):
+            raise ValueError("Invalid retained source entry")
+        names = entry.get("filenames")
+        if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+            raise ValueError("Invalid retained source filenames")
+    return index
+
+
+def blob_path(collection: str, digest: str) -> Path:
+    """Return a retained blob path only when it cannot escape its collection."""
+    if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+        raise ValueError("Invalid retained source digest")
+    directory = collection_dir(collection)
+    if directory.is_symlink():
+        raise ValueError("Retained source directory is a link")
+    blob = directory / digest
+    if blob.is_symlink():
+        raise ValueError("Retained source blob is a link")
+    return blob
 
 
 def _root() -> Path:
@@ -1176,6 +1289,8 @@ def _index_path(collection: str) -> Path:
 
 def load_index(collection: str) -> dict:
     p = _index_path(collection)
+    if p.is_symlink():
+        raise ValueError("Retained source index is a link")
     if not p.exists():
         return {"version": INDEX_VERSION, "documents": {}}
     try:
@@ -1183,9 +1298,11 @@ def load_index(collection: str) -> dict:
     except (OSError, ValueError):
         log.warning("Unreadable source index for %r; treating as empty", collection)
         return {"version": INDEX_VERSION, "documents": {}}
+    if not isinstance(data, dict):
+        raise ValueError("Invalid retained source index")
     data.setdefault("version", INDEX_VERSION)
     data.setdefault("documents", {})
-    return data
+    return validate_index(data)
 
 
 def _save_index(collection: str, index: dict) -> None:
@@ -1279,10 +1396,9 @@ import re
 from pathlib import Path
 
 from config import settings
+from services import settings_store
 
 log = logging.getLogger(__name__)
-
-CHUNKING_STRATEGIES = ("fixed", "overlap", "language", "context_aware", "semantic")
 
 DEFAULTS = {
     "chunking_strategy": "overlap",
@@ -1298,8 +1414,9 @@ _DIR: Path | None = None
 def _dir() -> Path:
     global _DIR
     if _DIR is None:
-        _DIR = Path(settings.upload_dir) / "ingest_configs"
-        _DIR.mkdir(parents=True, exist_ok=True)
+        directory = Path(settings.upload_dir) / "ingest_configs"
+        directory.mkdir(parents=True, exist_ok=True)
+        _DIR = directory
     return _DIR
 
 
@@ -1336,11 +1453,7 @@ def resolve(collection: str) -> tuple[dict, bool]:
 def save(config: dict) -> dict:
     collection = config["collection"]
     p = _path(collection)
-    # Written via a temp file in the same directory so a crash cannot leave a
-    # half-written config behind.
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(config, indent=2, sort_keys=True))
-    tmp.replace(p)
+    settings_store.publish(p, config)
     return config
 
 
@@ -1366,7 +1479,8 @@ can record how it is meant to be queried.
 
 Kept in a service rather than in the router because the exporter needs
 programmatic access: an export package ships a retrieval script carrying these
-parameters.
+parameters. An integer ef outside the save bounds, stored before PR #108, is
+inactive; export and import clear it to null rather than refuse it.
 """
 from __future__ import annotations
 
@@ -1376,6 +1490,8 @@ import re
 from pathlib import Path
 
 from config import settings
+from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN, SaveRetrievalConfigBody
+from services import settings_store
 
 log = logging.getLogger(__name__)
 
@@ -1396,8 +1512,9 @@ _DIR: Path | None = None
 def _dir() -> Path:
     global _DIR
     if _DIR is None:
-        _DIR = Path(settings.upload_dir) / "retrieval_configs"
-        _DIR.mkdir(parents=True, exist_ok=True)
+        directory = Path(settings.upload_dir) / "retrieval_configs"
+        directory.mkdir(parents=True, exist_ok=True)
+        _DIR = directory
     return _DIR
 
 
@@ -1433,18 +1550,537 @@ def resolve(collection: str) -> tuple[dict, bool]:
     return merged, False
 
 
+def normalize(config: dict, collection: str) -> tuple[dict, int | None]:
+    """validate(), also clearing a legacy ef; returns (settings, cleared ef or None).
+
+    A legacy ef is an integer outside the save bounds, which the API accepted
+    before PR #108. ef is inactive, so it becomes null; any other invalid value,
+    including a boolean, fractional or string ef, is still refused.
+    """
+    if not isinstance(config, dict):
+        raise ValueError("Retrieval settings must be an object")
+    ef = config.get("ef")
+    cleared = None
+    if type(ef) is int and not SEARCH_EF_MIN <= ef <= SEARCH_EF_MAX:
+        cleared, config = ef, {**config, "ef": None}
+    return SaveRetrievalConfigBody.model_validate(
+        {**config, "collection": collection}).model_dump(), cleared
+
+
+def validate(config: dict, collection: str) -> dict:
+    """Apply the API save contract, binding settings to the actual collection.
+
+    Older packages may omit defaulted fields or carry an obsolete collection
+    name. Extra fields are ignored just as they are for API saves.
+    """
+    return normalize(config, collection)[0]
+
+
 def save(config: dict) -> dict:
     collection = config["collection"]
     p = _path(collection)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(config, indent=2, sort_keys=True))
-    tmp.replace(p)
+    settings_store.publish(p, config)
     return config
 
 
 def delete(collection: str) -> None:
     """Remove a collection's retrieval config; called when it is deleted."""
     _path(collection).unlink(missing_ok=True)
+```
+
+### api/services/batch_write.py
+
+```python
+"""Completed-batch checks with bounded, disk-backed record expectations."""
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import math
+import sqlite3
+import struct
+import tempfile
+import uuid
+from contextlib import closing
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import quote
+
+from weaviate.classes.query import Filter
+from config import settings
+
+log = logging.getLogger(__name__)
+LOOKUP_SIZE = 100
+
+
+class BatchVerificationError(RuntimeError):
+    """A completed read proved that stored records differ from expectations."""
+
+
+class BatchCleanupError(RuntimeError):
+    def __init__(self, original: Exception, cleanup: Exception):
+        self.original = original
+        self.cleanup = cleanup
+        super().__init__(f"{type(original).__name__}: {original}; ingestion cleanup "
+                         f"could not be confirmed ({type(cleanup).__name__}: {cleanup}). "
+                         "Accepted chunks may remain; resolve cleanup before retrying.")
+
+
+def _properties(value):
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).isoformat()
+    if isinstance(value, dict):
+        return {key: _properties(item) for key, item in value.items() if item is not None}
+    if isinstance(value, list):
+        return [_properties(item) for item in value]
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
+def _record_properties(value: dict) -> dict:
+    value = dict(value)
+    if isinstance(value.get("created_at"), str):
+        value["created_at"] = datetime.fromisoformat(value["created_at"].replace("Z", "+00:00"))
+    return _properties(value)
+
+
+def _valid_vector(vector) -> bool:
+    return isinstance(vector, list) and bool(vector) and all(
+        isinstance(n, (int, float)) and not isinstance(n, bool) and math.isfinite(n)
+        for n in vector)
+
+
+def _property_digest(properties: dict) -> bytes:
+    return hashlib.sha256(json.dumps(_record_properties(properties), sort_keys=True,
+                                    separators=(",", ":"), allow_nan=False).encode()).digest()
+
+
+def _vector_digest(vector) -> bytes:
+    if not _valid_vector(vector):
+        raise ValueError("Missing or invalid vector")
+    digest = hashlib.sha256()
+    for number in vector:
+        try:
+            encoded = struct.pack("<f", number)
+        except (OverflowError, struct.error) as exc:
+            raise ValueError("Vector exceeds finite float32 storage") from exc
+        if not math.isfinite(struct.unpack("<f", encoded)[0]):
+            raise ValueError("Vector exceeds finite float32 storage")
+        digest.update(encoded)
+    return digest.digest()
+
+
+def _factory(records):
+    if callable(records):
+        return records
+    if iter(records) is records:
+        raise ValueError("A one-shot iterator needs a reusable record factory")
+    return lambda: iter(records)
+
+
+class ExpectedRecords:
+    """UUIDs and SHA-256 fingerprints on disk; no corpus vectors held in RAM.
+
+    The SQLite cache is limited to 1 MiB. Capture/preflight and writing each
+    stream records separately; transient verification state never changes a
+    durable expectation snapshot used by restart cleanup.
+    """
+    def __init__(self):
+        Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(prefix="batch-verify-", dir=settings.upload_dir)
+        self.path = Path(self.temp.name) / "expected.sqlite3"
+        self.db = sqlite3.connect(self.path)
+        self.db.execute("PRAGMA cache_size=-1024")
+        self.db.execute("PRAGMA temp_store=FILE")
+        self.db.execute("PRAGMA user_version=1")
+        self.db.execute("CREATE TABLE expected (position INTEGER PRIMARY KEY, id TEXT UNIQUE NOT NULL, "
+                        "properties BLOB NOT NULL, vector BLOB, seen INTEGER NOT NULL DEFAULT 0)")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        # Temporary index cleanup cannot turn a confirmed write into a failed
+        # ingest after its rollback boundary has already passed.
+        try:
+            self.db.close()
+            self.temp.cleanup()
+        except (OSError, sqlite3.Error):
+            log.exception("Could not remove temporary batch verification index %s", self.path)
+
+    @property
+    def count(self) -> int:
+        return self.db.execute("SELECT COUNT(*) FROM expected").fetchone()[0]
+
+    def capture(self, records, expected_count=None, *, generated_only=False):
+        if expected_count is not None and (type(expected_count) is not int or expected_count < 0):
+            raise ValueError("Declared object count must be a nonnegative integer")
+        for position, record in enumerate(_factory(records)()):
+            if generated_only and "id" in record:
+                raise ValueError("Owned ingestion cleanup requires newly generated UUIDs")
+            key = str(uuid.UUID(str(record["id"]))) if "id" in record else str(uuid.uuid4())
+            vector = _vector_digest(record["vector"]) if "vector" in record else None
+            try:
+                self.db.execute("INSERT INTO expected(position,id,properties,vector) VALUES (?,?,?,?)",
+                                (position, key, _property_digest(record["properties"]), vector))
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(f"Duplicate chunk UUID {key}") from exc
+        if expected_count is not None and self.count != expected_count:
+            raise ValueError(f"Package contains {self.count} objects but declares {expected_count}")
+        self.db.commit()
+
+    def snapshot(self, destination: Path):
+        with closing(sqlite3.connect(destination)) as target:
+            self.db.backup(target)
+
+    def load_snapshot(self, source: Path, expected_count: int):
+        with closing(sqlite3.connect("file:" + quote(str(source)) + "?mode=ro", uri=True)) as original:
+            if original.execute("PRAGMA user_version").fetchone()[0] != 1:
+                raise ValueError("Unsupported expected-record snapshot")
+            original.backup(self.db)
+        self.db.execute("PRAGMA cache_size=-1024")
+        if self.count != expected_count:
+            raise ValueError("Expected-record snapshot count mismatch")
+        for position, row in enumerate(self.db.execute(
+                "SELECT position,id,properties,vector,seen FROM expected ORDER BY position")):
+            index, key, properties, vector, seen = row
+            if (index != position or str(uuid.UUID(key)) != key
+                    or not isinstance(properties, bytes) or len(properties) != 32
+                    or (vector is not None and (not isinstance(vector, bytes) or len(vector) != 32))
+                    or seen != 0):
+                raise ValueError("Invalid expected-record snapshot entry")
+
+    def prepare(self, position, record):
+        expected = self.db.execute("SELECT id,properties,vector FROM expected WHERE position=?",
+                                   (position,)).fetchone()
+        if expected is None:
+            raise ValueError("Record stream changed after preflight")
+        key, properties, vector = expected
+        actual_id = str(uuid.UUID(str(record["id"]))) if "id" in record else key
+        actual_vector = _vector_digest(record["vector"]) if "vector" in record else None
+        if (actual_id != key or _property_digest(record["properties"]) != properties or actual_vector != vector):
+            raise ValueError("Record stream changed after preflight")
+        return {**record, "id": key}
+
+    def id_batches(self):
+        cursor = self.db.execute("SELECT id FROM expected ORDER BY position")
+        while rows := cursor.fetchmany(LOOKUP_SIZE):
+            yield [row[0] for row in rows]
+
+    def verify(self, collection, *, exact: bool) -> int:
+        self.db.execute("UPDATE expected SET seen=0")
+        vectorless_allowed = None
+
+        def stored_objects():
+            if exact:
+                yield from collection.iterator(include_vector=True)
+            else:
+                for ids in self.id_batches():
+                    yield from collection.query.fetch_objects(
+                        filters=Filter.by_id().contains_any(ids), limit=len(ids), include_vector=True).objects
+
+        for obj in stored_objects():
+            key = str(obj.uuid)
+            expected = self.db.execute("SELECT properties,vector,seen FROM expected WHERE id=?", (key,)).fetchone()
+            if expected is None:
+                if exact:
+                    raise BatchVerificationError(f"Unexpected stored object {key}")
+                continue
+            properties, vector, seen = expected
+            if seen:
+                raise BatchVerificationError(f"Duplicate stored object {key}")
+            if _property_digest(obj.properties or {}) != properties:
+                raise BatchVerificationError(f"Stored properties differ for {key}")
+            stored_vector = (obj.vector or {}).get("default")
+            if stored_vector is None and vector is None:
+                if vectorless_allowed is None:
+                    config = getattr(collection, "config", None)
+                    vectorizer = config.get().vectorizer if config is not None else None
+                    vectorless_allowed = getattr(vectorizer, "value", None) == "none"
+                if not vectorless_allowed:
+                    raise BatchVerificationError(f"Stored vector is missing or invalid for {key}")
+                actual_vector = None
+            else:
+                try:
+                    actual_vector = _vector_digest(stored_vector)
+                except ValueError as exc:
+                    raise BatchVerificationError(f"Stored vector is missing or invalid for {key}") from exc
+            if vector is not None and vector != actual_vector:
+                raise BatchVerificationError(f"Stored float32 vector differs for {key}")
+            self.db.execute("UPDATE expected SET seen=1 WHERE id=?", (key,))
+        confirmed = self.db.execute("SELECT COUNT(*) FROM expected WHERE seen=1").fetchone()[0]
+        if confirmed != self.count:
+            raise BatchVerificationError(f"Confirmed {confirmed} of {self.count} expected objects")
+        return confirmed
+
+    def rollback(self, collection):
+        for ids in self.id_batches():
+            result = collection.data.delete_many(where=Filter.by_id().contains_any(ids))
+            if result.failed:
+                raise RuntimeError(f"Could not remove {result.failed} owned ingestion object(s)")
+            remaining = collection.query.fetch_objects(filters=Filter.by_id().contains_any(ids), limit=len(ids))
+            if remaining.objects:
+                raise RuntimeError("Owned ingestion objects remain after cleanup")
+
+
+def verify(collection, records, *, exact: bool) -> int:
+    with ExpectedRecords() as expected:
+        expected.capture(records)
+        return expected.verify(collection, exact=exact)
+
+
+def insert(collection, records, *, exact: bool = True, expected_count: int | None = None,
+           cleanup_owned: bool = False) -> int:
+    """Preflight a reusable stream, flush, then compare persisted fingerprints.
+
+    Only ingestion-generated UUIDs may be rolled back individually. Import and
+    tuning own new collections and retain/remove them at their operation boundary.
+    """
+    factory = _factory(records)
+    with ExpectedRecords() as expected:
+        expected.capture(factory, expected_count, generated_only=cleanup_owned)
+        try:
+            queued = 0
+            with collection.batch.dynamic() as batch:
+                for position, record in enumerate(factory()):
+                    record = expected.prepare(position, record)
+                    batch.add_object(properties=record["properties"], uuid=record["id"], vector=record.get("vector"))
+                    queued += 1
+                if queued != expected.count:
+                    raise ValueError("Record stream changed after preflight")
+            failed = collection.batch.failed_objects
+            if failed:
+                detail = getattr(failed[0], "message", None)
+                raise RuntimeError(
+                    f"Weaviate rejected {len(failed)} batch object(s)"
+                    + (f": {detail}" if detail else ""))
+            return expected.verify(collection, exact=exact)
+        except Exception as original:
+            if cleanup_owned:
+                try:
+                    expected.rollback(collection)
+                except Exception as cleanup:
+                    raise BatchCleanupError(original, cleanup) from original
+            raise
+```
+
+### api/services/collection_recovery.py
+
+```python
+"""Durable ownership of scratch collections and retained recovery copies.
+
+Names are never cleanup authority. Only a valid record created by this service
+allows startup to remove scratch; recovery records survive until explicit
+collection deletion or successful completion of their owning operation.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import shutil
+import uuid
+from pathlib import Path
+
+from config import settings
+from services import sources
+
+log = logging.getLogger(__name__)
+_NAME = re.compile(r"[A-Z][A-Za-z0-9_]*")
+
+
+def _root() -> Path:
+    root = Path(settings.upload_dir) / "collection_operations"
+    created = not root.exists()
+    root.mkdir(parents=True, exist_ok=True)
+    if created:
+        _sync_dir(root.parent)
+    return root
+
+
+def _sync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_json(path: Path, record: dict) -> None:
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w") as output:
+        json.dump(record, output, indent=2, sort_keys=True)
+        output.flush()
+        os.fsync(output.fileno())
+    tmp.replace(path)
+    _sync_dir(path.parent)
+
+
+def _write(record: dict) -> None:
+    atomic_json(_root() / f"{record['operation_id']}.json", record)
+
+
+def begin(target: str, operation: str, client) -> dict:
+    if not _NAME.fullmatch(target) or operation not in ("import", "tune"):
+        raise ValueError("Invalid collection operation")
+    token = uuid.uuid4().hex
+    marker = "__importing_" if operation == "import" else "__tuning_"
+    staging = f"{target}{marker}{token}"
+    if client.collections.exists(staging):
+        raise RuntimeError(f"Recovery name '{staging}' is already in use")
+    record = dict(version=1, operation_id=token, operation=operation,
+                  target=target, staging=staging, state="scratch")
+    _write(record)  # Ownership is persisted before collection creation.
+    return record
+
+
+def _copy(source: Path, destination: Path) -> None:
+    if source.is_dir():
+        shutil.copytree(source, destination)
+    elif source.is_file():
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+
+
+def retain(record: dict, *, package: Path | None = None, source_collection: str | None = None) -> None:
+    """Snapshot sidecars and mark recovery durably BEFORE deleting the target."""
+    metadata = _root() / record["operation_id"]
+    metadata.mkdir()
+    target, staging = source_collection or record["target"], record["staging"]
+    upload = Path(settings.upload_dir)
+    _copy(package / "sources" if package else sources.collection_dir(target),
+          sources.collection_dir(staging))
+    for kind in ("ingest", "retrieval"):
+        origin = package / f"{kind}_config.json" if package else upload / f"{kind}_configs" / f"{target}.json"
+        _copy(origin, metadata / f"{kind}_config.json")
+        if origin.is_file():
+            config = json.loads(origin.read_text())
+            config["collection"] = staging
+            out = upload / f"{kind}_configs" / f"{staging}.json"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(config, indent=2, sort_keys=True))
+    if package:
+        _copy(package / "goldstandard", metadata / "goldstandard")
+        _copy(package / "collection.json", metadata / "collection.json")
+        _copy(package / "manifest.json", metadata / "manifest.json")
+    else:
+        sessions = upload / "goldstandard_sessions"
+        for path in sessions.glob("*.json"):
+            # Preserve unreadable state rather than guessing that it is unrelated.
+            try:
+                belongs = json.loads(path.read_text()).get("collection") == target
+            except (ValueError, OSError, AttributeError):
+                belongs = True
+            if belongs:
+                _copy(path, metadata / "goldstandard" / path.name)
+    # Sources live on a separate named volume. Flush both snapshots before the
+    # state transition; a crash before the transition leaves the original safe.
+    paths = [metadata, sources.collection_dir(staging)]
+    paths += [upload / f"{kind}_configs" / f"{staging}.json" for kind in ("ingest", "retrieval")]
+    for path in paths:
+        files = list(path.rglob("*")) if path.is_dir() else [path]
+        for item in files:
+            if item.is_file():
+                with item.open("rb") as data:
+                    os.fsync(data.fileno())
+        if path.is_dir():
+            for directory in sorted((p for p in path.rglob("*") if p.is_dir()), reverse=True):
+                _sync_dir(directory)
+            _sync_dir(path)
+        if path.exists():
+            _sync_dir(path.parent)
+    _sync_dir(upload)
+    updated = {**record, "state": "recovery"}
+    _write(updated)
+    record.update(updated)
+
+
+def sidecar_reference(record: dict) -> str:
+    """The snapshot directory relative to UPLOAD_DIR, for job error details.
+
+    Job results are served without authentication, so the absolute path stays
+    in the server log.
+    """
+    metadata = _root() / record["operation_id"]
+    log.warning("Recovery collection %r keeps sidecar snapshots in %s", record["staging"], metadata)
+    # Built, not derived with relative_to: the root needn't resolve under
+    # UPLOAD_DIR (a symlinked mount, or the reindex verifier's own root).
+    return "collection_operations/" + record["operation_id"]
+
+
+def discard(record: dict, client) -> None:
+    """Delete an owned copy after success, or scratch while the target is safe."""
+    # Persist intent before the first deletion. Startup can finish this exact
+    # authorized cleanup even if backend or filesystem cleanup is interrupted.
+    if record["state"] != "cleanup":
+        updated = {**record, "state": "cleanup"}
+        _write(updated)
+        record.update(updated)
+    name = record["staging"]
+    if client.collections.exists(name):
+        client.collections.delete(name)
+    sources.delete(name)
+    if sources.collection_dir(name).exists():
+        raise OSError(f"Could not remove recovery sources for {name}")
+    for kind in ("ingest", "retrieval"):
+        (Path(settings.upload_dir) / f"{kind}_configs" / f"{name}.json").unlink(missing_ok=True)
+    metadata = _root() / record["operation_id"]
+    if metadata.exists():
+        shutil.rmtree(metadata)
+    (_root() / f"{record['operation_id']}.json").unlink(missing_ok=True)
+    _sync_dir(_root())
+
+
+
+def _read_owned_record(path: Path) -> dict:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
+        raise ValueError("Ownership must be a regular metadata file of at most 4096 bytes")
+    record = json.loads(path.read_text())
+    token = record["operation_id"]
+    operation = record["operation"]
+    marker = "__importing_" if operation == "import" else "__tuning_"
+    if (type(record.get("version")) is not int or record["version"] != 1 or operation not in ("import", "tune")
+            or not re.fullmatch(r"[0-9a-f]{32}", token)
+            or path.name != f"{token}.json" or not _NAME.fullmatch(record["target"])
+            or record["staging"] != f"{record['target']}{marker}{token}"
+            or record["state"] not in ("scratch", "recovery", "cleanup")):
+        raise ValueError("Invalid collection ownership record")
+    return record
+
+
+def retire_deleted(name: str, client) -> None:
+    """Retire exact recovery ownership only after explicit backend deletion.
+
+    A missing backend copy at startup does not itself authorize losing retained
+    snapshots. Invalid or unrelated journals never grant cleanup authority.
+    """
+    for path in sorted(_root().glob("*.json")):
+        try:
+            record = _read_owned_record(path)
+        except Exception:
+            log.exception("Unreadable collection ownership %s; preserved", path)
+            continue
+        if record["staging"] == name and record["state"] in ("recovery", "cleanup"):
+            discard(record, client)
+
+
+def sweep(client) -> list[str]:
+    removed = []
+    for path in sorted(_root().glob("*.json")):
+        try:
+            record = _read_owned_record(path)
+            if record["state"] == "recovery":
+                log.warning("Retained recovery collection %r; sidecar snapshots: %s",
+                            record["staging"], _root() / record["operation_id"])
+                continue
+            discard(record, client)
+            removed.append(record["staging"])
+        except Exception:  # Unreadable ownership never grants deletion authority.
+            log.exception("Could not resolve collection ownership %s; preserved", path)
+    return removed
 ```
 
 ### api/services/weaviate_client.py
@@ -1460,11 +2096,13 @@ import weaviate
 from weaviate.classes.config import Configure, Property, DataType, VectorDistances
 from weaviate.classes.query import MetadataQuery, Filter
 
+from services import collection_writes, collection_recovery
 from config import settings
 from models.schemas import CreateCollectionRequest, StoredCollectionRequest
 from services import ingest_config
 from services import retrieval_config
 from services import sources
+from services import batch_write, collection_recovery
 
 log = logging.getLogger(__name__)
 
@@ -1534,6 +2172,7 @@ async def check_health() -> bool:
     return await asyncio.to_thread(_check_health_sync)
 
 
+@collection_writes.serialized("name")
 def _create_collection_sync(
     name: str,
     index_type: str,
@@ -1541,10 +2180,11 @@ def _create_collection_sync(
     hnsw_config: dict,
     *,
     preserve_hnsw: bool = False,
+    description: str | None = None,
 ) -> None:
     schema = StoredCollectionRequest if preserve_hnsw else CreateCollectionRequest
     validated = schema(name=name, index_type=index_type,
-                                        distance_metric=distance_metric, hnsw_config=hnsw_config)
+                       distance_metric=distance_metric, hnsw_config=hnsw_config)
     hnsw_config = validated.hnsw_config.model_dump()
     client = get_client()
     dist = DISTANCE_MAP[validated.distance_metric]
@@ -1567,6 +2207,8 @@ def _create_collection_sync(
 
     client.collections.create(
         name=name,
+        # Set only by import, to bind its in-progress marker to this instance.
+        description=description,
         vectorizer_config=vectorizer,
         vector_index_config=vector_index,
         properties=COLLECTION_PROPERTIES,
@@ -1592,23 +2234,33 @@ async def collection_exists(name: str) -> bool:
     return await asyncio.to_thread(_collection_exists_sync, name)
 
 
+@collection_writes.serialized("name")
 def _delete_collection_sync(name: str) -> int:
     client = get_client()
     coll = client.collections.get(name)
+    canonical_name = coll.config.get().name
     count = coll.aggregate.over_all(total_count=True).total_count
-    client.collections.delete(name)
+    client.collections.delete(canonical_name)
+    collection_recovery.retire_deleted(canonical_name, client)
     # Retained originals must go with the collection. The sources volume is
     # surfaced nowhere in the UI, so a leak here would be invisible.
-    sources.delete(name)
-    retrieval_config.delete(name)
-    ingest_config.delete(name)
+    # Older writers saved sidecars under the first-character backend alias.
+    # The caller can use either spelling, so clean both after backend deletion.
+    # Other case changes can name distinct collections and must be preserved.
+    alias = canonical_name[:1].lower() + canonical_name[1:]
+    spellings = list(dict.fromkeys((canonical_name, alias)))
+    for spelling in spellings:
+        sources.delete(spelling)
+        retrieval_config.delete(spelling)
+        ingest_config.delete(spelling)
     # Gold-standard sessions are kept and flagged, never deleted (spec §8 rule 4):
     # they are evaluation work the user may still want, and the pairs stay
     # readable even with the collection gone. Imported here rather than at module
     # level because goldstandard imports this module.
     from services import goldstandard
-    goldstandard.mark_orphaned(
-        name, f"collection '{name}' was deleted")
+    for spelling in spellings:
+        goldstandard.mark_orphaned(
+            spelling, f"collection '{canonical_name}' was deleted")
     return count or 0
 
 
@@ -1628,20 +2280,36 @@ def _get_collections_sync() -> list[dict]:
         # vector_index_config (weaviate-client 4.x dropped it from the reduced
         # config). Fetch the full per-collection config for the index details.
         vector_config = coll.config.get().vector_index_config
-        index_type = "flat" if "flat" in type(vector_config).__name__.lower() else "hnsw"
+        index_name = type(vector_config).__name__.lower()
+        hnsw_fields = tuple(
+            getattr(vector_config, field, None)
+            for field in ("ef", "ef_construction", "max_connections")
+        )
+        if "flat" in index_name:
+            index_type = "flat"
+        elif "dynamic" in index_name:
+            index_type = "dynamic"
+        elif all(value is not None for value in hnsw_fields):
+            index_type = "hnsw"
+        else:
+            index_type = "unknown"
 
-        distance_attr = getattr(vector_config, "distance_metric", VectorDistances.COSINE)
+        distance_attr = getattr(vector_config, "distance_metric", None)
         distance_str = {
             VectorDistances.COSINE: "cosine",
             VectorDistances.DOT: "dot",
             VectorDistances.L2_SQUARED: "l2-squared",
-        }.get(distance_attr, "cosine")
+        }.get(distance_attr, "unknown")
 
         result.append({
             "name": col_name,
             "object_count": count,
             "index_type": index_type,
             "distance_metric": distance_str,
+            "hnsw_config": ({"ef": hnsw_fields[0],
+                             "efConstruction": hnsw_fields[1],
+                             "maxConnections": hnsw_fields[2]}
+                            if index_type == "hnsw" else None),
         })
     return result
 
@@ -1650,29 +2318,12 @@ async def get_collections() -> list[dict]:
     return await asyncio.to_thread(_get_collections_sync)
 
 
-# Collections created mid-operation and normally removed by the operation's own
-# cleanup. A hard kill (SIGKILL, OOM, `docker compose kill`) skips that cleanup,
-# so they are swept at startup instead — nothing can legitimately be using one
-# before the application has begun serving.
-STAGING_MARKERS = ("__importing_", "__tuning_")
-
-
 def _sweep_staging_sync() -> list[str]:
-    client = get_client()
-    removed = []
-    for name in list(client.collections.list_all()):
-        if any(marker in name for marker in STAGING_MARKERS):
-            try:
-                client.collections.delete(name)
-            except Exception:                         # noqa: BLE001
-                log.exception("Could not remove abandoned staging collection %r", name)
-                continue
-            removed.append(name)
-    return removed
+    return collection_recovery.sweep(get_client())
 
 
 async def sweep_staging() -> list[str]:
-    """Remove staging collections abandoned by a previous process."""
+    """Remove positively owned scratch; preserve recovery and unowned names."""
     return await asyncio.to_thread(_sweep_staging_sync)
 
 
@@ -1697,6 +2348,13 @@ def _collection_config_sync(name: str) -> dict:
     coll = get_client().collections.get(name)
     cfg = coll.config.get()
     vi = cfg.vector_index_config
+    vectorizer = getattr(cfg, "vectorizer_config", None)
+    kind = getattr(vectorizer, "vectorizer", None)
+    model_config = getattr(vectorizer, "model", None)
+    embedding_model = (model_config.get("model")
+                       if getattr(kind, "value", kind) == "text2vec-ollama"
+                       and isinstance(model_config, dict)
+                       and not getattr(cfg, "vector_config", None) else None)
 
     index_type = "flat" if "flat" in type(vi).__name__.lower() else "hnsw"
     distance = {
@@ -1715,6 +2373,7 @@ def _collection_config_sync(name: str) -> dict:
 
     return {
         "name": name,
+        "embedding_model": embedding_model,
         "index_type": index_type,
         "distance_metric": distance,
         "hnsw_config": hnsw,
@@ -1732,35 +2391,68 @@ async def get_collection_config(name: str) -> dict:
     return await asyncio.to_thread(_collection_config_sync, name)
 
 
+def _validate_reindex_vectorizer_sync(name: str) -> None:
+    """Fail before staging if recreation would change the stored vector space."""
+    cfg = get_client().collections.get(name).config.get()
+    vectorizer = getattr(cfg, "vectorizer_config", None)
+    kind = getattr(vectorizer, "vectorizer", None)
+    model = getattr(vectorizer, "model", None)
+    expected_model = {"model": settings.embed_model,
+                      "apiEndpoint": f"http://{settings.ollama_host}:{settings.ollama_port}"}
+    compatible = (getattr(kind, "value", kind) == "text2vec-ollama"
+                  and model == expected_model
+                  and getattr(vectorizer, "vectorize_collection_name", None) is False
+                  and not getattr(cfg, "vector_config", None))
+    # Property names/types and skip/name flags also determine provider input.
+    # Refuse unknown module options and custom properties instead of copying
+    # old vectors into the fixed schema with different future insert rules.
+    expected_properties = {p.name: p._to_dict() for p in COLLECTION_PROPERTIES}
+    properties = list(getattr(cfg, "properties", None) or [])
+    compatible = compatible and len(properties) == len(expected_properties) and {p.name for p in properties} == set(expected_properties)
+    for prop in properties:
+        expected = expected_properties.get(prop.name)
+        rules = getattr(prop, "vectorizer_config", None)
+        compatible = compatible and bool(
+            expected
+            and getattr(prop.data_type, "value", prop.data_type) == expected["dataType"][0]
+            and getattr(prop, "vectorizer", None) == "text2vec-ollama"
+            and not getattr(prop, "vectorizer_configs", None)
+            and rules is not None
+            and rules.skip == expected["skip_vectorization"]
+            and rules.vectorize_property_name == expected["vectorize_property_name"]
+            and not getattr(prop, "nested_properties", None))
+    if not compatible:
+        raise ValueError("Reindex would change the collection's vectorizer configuration; "
+                         "re-embed with the configured model first")
+
+
+
 # Just after a collection is created under a name that was dropped moments
-# earlier, Weaviate can reject writes with "could not find index for class ...
-# It might have been deleted in the meantime" until the new index is loaded.
-# The verify suite hit this when it recreated a collection between checks (#95).
+# earlier, Weaviate can reject writes until the new index is loaded.
 _INDEX_NOT_READY = "could not find index"
 _INSERT_ATTEMPTS = 3
 _INSERT_RETRY_DELAY = 1.0
 
 
+@collection_writes.serialized("collection_name")
 def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
     client = get_client()
     coll = client.collections.get(collection_name)
-    pending = list(chunks)
     for attempt in range(1, _INSERT_ATTEMPTS + 1):
-        with coll.batch.dynamic() as batch:
-            for chunk in pending:
-                batch.add_object(properties=chunk)
-        # Read failures only after the batch has flushed on exit. Checking
-        # inside the block missed them, so a job could report 'completed'
-        # with nothing stored.
-        failed = coll.batch.failed_objects
-        if not failed:
-            return
-        if attempt < _INSERT_ATTEMPTS and all(_INDEX_NOT_READY in f.message for f in failed):
-            pending = [f.object_.properties for f in failed]
+        try:
+            # The writer verifies persisted records and removes only UUIDs
+            # generated by a failed attempt before a retry can begin.
+            return batch_write.insert(
+                coll, lambda: ({"properties": chunk} for chunk in chunks),
+                exact=False, cleanup_owned=True)
+        except RuntimeError as exc:
+            failed = coll.batch.failed_objects
+            if not (type(exc) is RuntimeError
+                    and str(exc).startswith("Weaviate rejected ")
+                    and attempt < _INSERT_ATTEMPTS and failed
+                    and all(_INDEX_NOT_READY in getattr(f, "message", "") for f in failed)):
+                raise
             time.sleep(_INSERT_RETRY_DELAY)
-            continue
-        raise RuntimeError(
-            f"{len(failed)} batch error(s) inserting into '{collection_name}': {failed[0].message}")
 
 
 async def insert_chunks(collection_name: str, chunks: list[dict]) -> None:
@@ -1962,6 +2654,20 @@ from langchain_text_splitters import CharacterTextSplitter, RecursiveCharacterTe
 
 MAX_OVERLAP_WINDOWS = 10_000
 MAX_OVERLAP_OUTPUT_CHARACTERS = 10_000_000
+# Every strategy's per-file limits (#111). The chunk count matches the overlap
+# window cap from #64. The ceiling is the most a chunk may hold whatever the
+# strategy or minimum-size merging does: about the 1,500 tokens the embedding
+# model reads, the same as the chunk_size maximum (#53). The floor applies to
+# strategies that don't split by size (semantic): without it a similarity
+# threshold of 1 turns "a. b. c." text into one tiny chunk per sentence.
+MAX_CHUNKS_PER_FILE = MAX_OVERLAP_WINDOWS
+MAX_CHUNK_CHARACTERS = 6000
+MIN_SEMANTIC_CHUNK_CHARACTERS = 50
+MAX_SEMANTIC_SENTENCES = 10 * MAX_CHUNKS_PER_FILE
+# The most text one file may bring to any strategy, checked before splitting
+# or embedding: the count caps alone still let a size-based splitter or the
+# embedding model spend minutes on a huge file before refusing it.
+MAX_TEXT_CHARACTERS = MAX_OVERLAP_OUTPUT_CHARACTERS
 
 _semantic_model = None
 _semantic_model_lock = threading.Lock()
@@ -1982,11 +2688,44 @@ def _enforce_min_chunk_size(chunks: list[str], min_size: int) -> list[str]:
         return chunks
     result: list[str] = []
     for chunk in chunks:
-        if len(chunk) < min_size and result:
+        # Merge a short chunk into the previous one, unless that would take the
+        # previous one over the ceiling: then it stays short rather than long.
+        if len(chunk) < min_size and result and len(result[-1]) + 1 + len(chunk) <= MAX_CHUNK_CHARACTERS:
             result[-1] = result[-1] + " " + chunk
         else:
             result.append(chunk)
     return [c for c in result if c.strip()] or chunks
+
+
+def _cap_chunk_length(chunks: list[str]) -> list[str]:
+    """Split any chunk over MAX_CHUNK_CHARACTERS, at whitespace where possible.
+
+    Walks each chunk by index rather than re-slicing the remainder, so a long
+    chunk costs time in proportion to its length.
+    """
+    capped: list[str] = []
+    for chunk in chunks:
+        start, end = 0, len(chunk)
+        while end - start > MAX_CHUNK_CHARACTERS:
+            limit = start + MAX_CHUNK_CHARACTERS
+            cut = max(chunk.rfind(ws, start + MAX_CHUNK_CHARACTERS // 2, limit + 1) for ws in (" ", "\n", "\t"))
+            cut = cut if cut > start else limit
+            piece = chunk[start:cut].rstrip()
+            if piece:
+                capped.append(piece)
+            start = cut
+            while start < end and chunk[start].isspace():
+                start += 1
+        if start < end:
+            capped.append(chunk[start:end])
+    return capped
+
+
+def _check_chunk_count(count: int, strategy: str, unit: str = "chunks") -> None:
+    if count > MAX_CHUNKS_PER_FILE:
+        raise ValueError(
+            f"{strategy} chunking exceeds the per-file limit: {count} {unit} "
+            f"(maximum {MAX_CHUNKS_PER_FILE}). Use a larger chunk size or split the file.")
 
 
 def chunk_fixed(text: str, chunk_size: int, min_chunk_size: int) -> list[str]:
@@ -2033,7 +2772,8 @@ def chunk_overlap(text: str, chunk_size: int, chunk_overlap: int, min_chunk_size
     # suffix, preserving coverage without duplicating those repeated bytes.
     # Only this last window can be undersized. A short whole document stays
     # one short chunk; minimum size is a preference, not fabricated content.
-    if len(chunks) > 1 and len(chunks[-1]) < min_chunk_size:
+    if (len(chunks) > 1 and len(chunks[-1]) < min_chunk_size
+            and len(chunks[-2]) + len(chunks[-1]) - chunk_overlap <= MAX_CHUNK_CHARACTERS):
         tail = chunks.pop()
         chunks[-1] += tail[chunk_overlap:]
     return chunks
@@ -2087,11 +2827,16 @@ def chunk_semantic(
 ) -> list[str]:
     import numpy as np
 
-    model = _get_semantic_model()
-
     raw_sentences = [s.strip() for s in text.replace("\n", " ").split(". ") if s.strip()]
     if not raw_sentences:
         return [text] if text.strip() else []
+    # Bound the embedding work before it starts: every sentence is embedded.
+    if len(raw_sentences) > MAX_SEMANTIC_SENTENCES:
+        raise ValueError(
+            f"semantic chunking exceeds the per-file limit: {len(raw_sentences)} sentences "
+            f"(maximum {MAX_SEMANTIC_SENTENCES}). Use a size-based strategy or split the file.")
+
+    model = _get_semantic_model()
 
     embeddings = model.encode(raw_sentences, convert_to_numpy=True)
 
@@ -2112,7 +2857,7 @@ def chunk_semantic(
     if current:
         chunks.append(". ".join(current) + ".")
 
-    return _enforce_min_chunk_size(chunks, min_chunk_size)
+    return _enforce_min_chunk_size(chunks, max(min_chunk_size, MIN_SEMANTIC_CHUNK_CHARACTERS))
 
 
 def chunk(
@@ -2130,20 +2875,34 @@ def chunk(
     strategy, chunk_size, chunk_overlap_size = config.chunking_strategy, config.chunk_size, config.chunk_overlap
     min_chunk_size = config.min_chunk_size
     similarity_threshold = config.similarity_threshold if config.similarity_threshold is not None else 0.85
+    text_length = len(text) if elements is None else sum(len(str(el)) for el in elements)
+    if text_length > MAX_TEXT_CHARACTERS:
+        raise ValueError(
+            f"{strategy} chunking exceeds the per-file limit: {text_length} characters "
+            f"(maximum {MAX_TEXT_CHARACTERS}). Split the file.")
+    if strategy in ("fixed", "language", "context_aware"):
+        # These split by size, so the count is known before splitting. Refuse
+        # an oversized file before the splitter allocates every chunk.
+        stride = chunk_size - (chunk_overlap_size if strategy == "language" else 0)
+        _check_chunk_count(len(text) // max(stride, 1), strategy, "pieces before minimum-size merging")
     if strategy == "fixed":
-        return chunk_fixed(text, chunk_size, min_chunk_size)
+        chunks = chunk_fixed(text, chunk_size, min_chunk_size)
     elif strategy == "overlap":
-        return chunk_overlap(text, chunk_size, chunk_overlap_size, min_chunk_size)
+        chunks = chunk_overlap(text, chunk_size, chunk_overlap_size, min_chunk_size)
     elif strategy == "language":
-        return chunk_language(text, chunk_size, chunk_overlap_size, min_chunk_size)
+        chunks = chunk_language(text, chunk_size, chunk_overlap_size, min_chunk_size)
     elif strategy == "context_aware":
         if elements is None:
-            return chunk_language(text, chunk_size, 0, min_chunk_size)
-        return chunk_context_aware(elements, chunk_size, min_chunk_size)
+            chunks = chunk_language(text, chunk_size, 0, min_chunk_size)
+        else:
+            chunks = chunk_context_aware(elements, chunk_size, min_chunk_size)
     elif strategy == "semantic":
-        return chunk_semantic(text, similarity_threshold, min_chunk_size)
+        chunks = chunk_semantic(text, similarity_threshold, min_chunk_size)
     else:
         raise ValueError(f"Unsupported chunking strategy: {strategy!r}")
+    chunks = _cap_chunk_length(chunks)
+    _check_chunk_count(len(chunks), strategy)
+    return chunks
 ```
 
 ### api/services/ingest_pipeline.py
@@ -2162,6 +2921,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from services import collection_writes
 from config import settings
 from models.schemas import IngestConfig
 from services.chunker import chunk as do_chunk
@@ -2210,6 +2970,7 @@ def _parse_file(path: Path) -> tuple[str, list[Any]]:
     return text, elements
 
 
+@collection_writes.serialized("collection")
 def _process_job_sync(
     job_id: str,
     file_paths: list[Path],
@@ -2268,7 +3029,7 @@ def _process_job_sync(
                         path.read_bytes(),
                         mimetypes.guess_type(path.name)[0],
                     )
-                except OSError as exc:
+                except (OSError, ValueError) as exc:
                     # Retention failing must not fail an otherwise good ingest;
                     # the chunks are already stored. It does cost this
                     # collection its full-fidelity export, so it is logged loudly.
@@ -2421,7 +3182,8 @@ SYNTHESIS_END_USER_SYSTEM = (
     "You are a helpful assistant. Answer the user's question using only the provided context. "
     "If the context does not contain enough information to answer the question, say so clearly. "
     "Do not use any knowledge outside the provided context. "
-    "Write in plain, clear language for a non-technical reader."
+    "Write in plain, clear language for a non-technical reader. "
+    "Keep the answer short: a few sentences, without technical detail."
 )
 
 SYNTHESIS_ENGINEER_SYSTEM = (
@@ -2555,6 +3317,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import copy
+import os
+import tempfile
+import threading
 
 import httpx
 import re
@@ -2592,7 +3358,20 @@ class GoldStandardError(Exception):
 
 _sessions: dict[str, dict] = {}
 _tasks: set[asyncio.Task] = set()
+_state_lock = threading.RLock()
+_diagnostics: dict[str, dict] = {}
+_scan_lock = threading.Lock()
+# Parse/validation results by path, keyed on (inode, mtime_ns, size); scans only.
+_scan_cache: dict[str, tuple[tuple[int, int, int], dict | None]] = {}
+_store_revision = 0
 _SESSION_ID = re.compile(r"gs_[0-9a-f]{8}")
+_PENDING_DIR = "pending_markers"
+_MARKER_FLAGS = ("stale", "orphaned")
+_PERSISTENCE_CODES = ("SESSION_WRITE_FAILED", "SESSION_DURABILITY_UNCERTAIN")
+_MARKER_MESSAGES = {
+    True: "History marker could not be saved in the session file. A pending marker keeps the session historical after restart, and current export is refused. Check local storage; the next successful write of this session saves the marker.",
+    False: "History marker could not be saved. The session is treated as historical and current export is refused only until restart. Check local storage, then edit this session to save the marker.",
+}
 
 
 def validate_session_id(session_id: str) -> None:
@@ -2620,7 +3399,10 @@ def _session_storage_root() -> Path:
 
 def _sessions_dir() -> Path:
     p = _session_storage_root()
+    created = not p.exists()
     p.mkdir(parents=True, exist_ok=True)
+    if created:
+        _sync_directory(p.parent)
     return p
 
 
@@ -2640,85 +3422,434 @@ def _session_path(session_id: str) -> Path:
     return target
 
 
+def _session_key(session_id: str) -> Path:
+    # The scan's diagnostic key form, without the storage checks that may be
+    # what failed; one key per file keeps Health's entries distinct.
+    return Path(settings.upload_dir).resolve() / "goldstandard_sessions" / f"{session_id}.json"
+
+
+def _pending_root() -> Path:
+    p = _session_storage_root() / _PENDING_DIR
+    if p.is_symlink() or (p.exists() and not p.is_dir()):
+        raise ValueError("Pending marker storage is not a regular directory.")
+    return p
+
+
+def _pending_path(session_id: str) -> Path:
+    validate_session_id(session_id)
+    root = _pending_root()
+    candidate = root / f"{session_id}.json"
+    if candidate.is_symlink() or (candidate.exists() and not candidate.is_file()):
+        raise ValueError("Pending marker destination is not a regular file.")
+    if candidate.resolve().parent != root.resolve():
+        raise ValueError("Pending marker destination is outside marker storage.")
+    return candidate
+
+
+def _load_pending(path: Path) -> dict:
+    """A pending marker holds only history flags that a session file could not take."""
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("Pending marker must be a regular file.")
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict) or data.get("session_id") != path.stem:
+        raise ValueError("Pending marker does not match its session.")
+    validate_session_id(data["session_id"])
+    allowed = {"session_id"} | {f"{flag}{suffix}" for flag in _MARKER_FLAGS for suffix in ("", "_reason", "_at")}
+    if set(data) - allowed or not any(flag in data for flag in _MARKER_FLAGS):
+        raise ValueError("Pending marker has unexpected fields.")
+    for flag in _MARKER_FLAGS:
+        if flag in data and data[flag] is not True:
+            raise ValueError("Pending marker flag must be true.")
+        for suffix in ("_reason", "_at"):
+            if not isinstance(data.get(flag + suffix), (str, type(None))):
+                raise ValueError("Pending marker metadata must be text.")
+    return data
+
+
+def _apply_pending(session: dict, pending: dict) -> bool:
+    changed = False
+    for flag in _MARKER_FLAGS:
+        if pending.get(flag) is True and session.get(flag) is not True:
+            session[flag] = True
+            session[f"{flag}_reason"] = pending.get(f"{flag}_reason")
+            session[f"{flag}_at"] = pending.get(f"{flag}_at")
+            changed = True
+    return changed
+
+
+def _record_issue(path: Path, code: str, message: str | None = None) -> None:
+    changed = _diagnostics.get(str(path), {}).get("code") != code
+    messages = {
+        "SESSION_STORAGE_UNAVAILABLE": "Session storage could not be inspected. Existing files are preserved; inspect local storage and restart after recovery.",
+        "SESSION_READ_FAILED": "Session file could not be loaded. Original bytes are preserved; restore a valid copy and restart the API.",
+        "SESSION_INTERRUPTED_WRITE": "An interrupted write left an unpublished temporary snapshot. The final JSON file remains authoritative; inspect the temporary file before removing it.",
+        "SESSION_WRITE_FAILED": "Update failed before replacement; the previous snapshot remains authoritative. Check local storage before retrying.",
+        "SESSION_DURABILITY_UNCERTAIN": "Replacement occurred but directory durability could not be confirmed. Refresh the session and inspect local storage before retrying.",
+    }
+    filename = f"{_PENDING_DIR}/{path.name}" if path.parent.name == _PENDING_DIR else path.name
+    _diagnostics[str(path)] = {"filename": filename, "code": code, "message": message or messages[code]}
+    if changed:
+        log.error("Session persistence issue %s for %s", code, path.name)
+
+
+def _sync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _replace_durably(path: Path, payload: str) -> None:
+    """Write a unique fsynced temporary file and replace `path` with it.
+
+    Returning means the replacement happened; raising means it did not. The
+    caller syncs the directory and decides what a failure means.
+    """
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                prefix="." + path.stem + "-", suffix=".tmp", delete=False) as output:
+            temporary = Path(output.name)
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                log.exception("Could not remove owned session temporary file %s", temporary.name)
+
+
 def _save_session_sync(session: dict) -> None:
-    path = _session_path(session["session_id"])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(session, indent=2))
+    """Publish one immutable snapshot under the single-process writer lock.
+
+    Before replace, errors leave both the prior disk snapshot and cache intact.
+    After replace, cache reflects disk even if directory fsync reports an
+    uncertain durability outcome. Neither failure is acknowledged as success.
+    """
+    global _store_revision
+    with _state_lock:
+        snapshot = copy.deepcopy(session)
+        try:
+            path = _session_path(snapshot["session_id"])
+            _sessions_dir()
+        except (OSError, ValueError) as exc:
+            _record_issue(Path(settings.upload_dir) / "goldstandard_sessions" / (str(snapshot["session_id"]) + ".json"), "SESSION_WRITE_FAILED")
+            raise GoldStandardError("SESSION_WRITE_FAILED", "Session directory could not be prepared. The previous snapshot is unchanged.", 503) from exc
+        replaced = False
+        try:
+            payload = json.dumps(snapshot, indent=2, allow_nan=False)
+            _replace_durably(path, payload)
+            replaced = True
+            _sessions[snapshot["session_id"]] = snapshot
+            _store_revision += 1
+            _sync_directory(path.parent)
+            # Only generation's own codes are evidence; an imported or edited
+            # value is not, and must not turn a completed write into an error.
+            error = snapshot.get("persistence_error")
+            if isinstance(error, dict) and error.get("code") in _PERSISTENCE_CODES:
+                _record_issue(path, error["code"])
+            else:
+                _diagnostics.pop(str(path), None)
+            try:
+                _discard_pending_marker(snapshot)
+            except Exception:                         # noqa: BLE001
+                log.exception("Could not remove pending history marker for %s", snapshot["session_id"])
+        except (OSError, ValueError, TypeError) as exc:
+            code = "SESSION_DURABILITY_UNCERTAIN" if replaced else "SESSION_WRITE_FAILED"
+            _record_issue(path, code)
+            message = ("Session replacement occurred but durability could not be confirmed. Refresh the session and inspect diagnostics before retrying."
+                       if replaced else "Session update could not be persisted. The previous snapshot is unchanged.")
+            raise GoldStandardError(code, message, 503) from exc
 
 
-async def _save_session(session: dict) -> None:
-    await asyncio.to_thread(_save_session_sync, session)
+def _write_pending_marker(session_id: str, fields: dict) -> bool:
+    """Keep a history flag across restart when its session file cannot take it."""
+    with _state_lock:
+        try:
+            path = _pending_path(session_id)
+            merged = {"session_id": session_id}
+            if path.exists():
+                try:
+                    merged.update(_load_pending(path))
+                except (OSError, ValueError):
+                    # Nothing readable to keep; the new marker replaces it.
+                    pass
+            merged.update(fields)
+            if not path.parent.exists():
+                path.parent.mkdir()
+                _sync_directory(path.parent.parent)
+            _replace_durably(path, json.dumps(merged, indent=2))
+            _sync_directory(path.parent)
+            return True
+        except (OSError, ValueError):
+            log.exception("Could not save pending history marker for %s", session_id)
+            return False
+
+
+def _discard_pending_marker(snapshot: dict) -> None:
+    """A successful write that carries every pending flag makes the marker obsolete."""
+    path = _pending_path(snapshot["session_id"])
+    if not path.exists():
+        return
+    try:
+        pending = _load_pending(path)
+    except (OSError, ValueError):
+        # An unreadable marker is preserved and the scan reports it.
+        return
+    if not _apply_pending(copy.deepcopy(snapshot), pending):
+        path.unlink()
+        _sync_directory(path.parent)
+
+
+def _scan_sessions() -> None:
+    """Inspect disk without blocking writers, then publish only a current scan."""
+    global _store_revision
+    with _scan_lock:
+        with _state_lock:
+            revision = _store_revision
+        storage_label = Path(settings.upload_dir) / "goldstandard_sessions"
+        loaded = {}
+        issues = {}
+        try:
+            root = _session_storage_root()
+            with os.scandir(root) as entries:
+                paths = [Path(entry.path) for entry in entries]
+        except FileNotFoundError:
+            paths = []
+        except (OSError, ValueError, RuntimeError):
+            with _state_lock:
+                if revision == _store_revision:
+                    _record_issue(storage_label, "SESSION_STORAGE_UNAVAILABLE")
+            return
+        for path in paths:
+            if re.fullmatch(r"\.gs_[0-9a-f]{8}-.+\.tmp", path.name):
+                issues[path] = ("SESSION_INTERRUPTED_WRITE", None)
+            elif path.name.endswith(".json"):
+                try:
+                    if path.is_symlink() or not path.is_file():
+                        raise ValueError("Evaluation session must be a regular file.")
+                    stat = path.stat()
+                    signature = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+                    cached = _scan_cache.get(str(path))
+                    if cached is not None and cached[0] == signature:
+                        if cached[1] is None:
+                            raise ValueError("Evaluation session is unchanged and still invalid.")
+                        data = copy.deepcopy(cached[1])
+                    else:
+                        # Only parse and validation outcomes are remembered; a
+                        # failed read is retried on the next scan.
+                        _scan_cache.pop(str(path), None)
+                        text = path.read_text()
+                        _scan_cache[str(path)] = (signature, None)
+                        data = json.loads(text)
+                        validate_session(data)
+                        _scan_cache[str(path)] = (signature, copy.deepcopy(data))
+                    if path != _session_path(data["session_id"]):
+                        raise ValueError("Evaluation session filename does not match its identity.")
+                    loaded[data["session_id"]] = data
+                    retained_error = data.get("persistence_error")
+                    if isinstance(retained_error, dict) and retained_error.get("code") in _PERSISTENCE_CODES:
+                        issues[path] = (retained_error["code"], None)
+                except (OSError, ValueError, TypeError):
+                    issues[path] = ("SESSION_READ_FAILED", None)
+        listed = {str(path) for path in paths}
+        for key in list(_scan_cache):
+            if key not in listed:
+                _scan_cache.pop(key, None)
+        pending_root = root / _PENDING_DIR
+        pending_paths = []
+        try:
+            if pending_root.is_symlink() or (pending_root.exists() and not pending_root.is_dir()):
+                raise ValueError("Pending marker storage is not a regular directory.")
+            with os.scandir(pending_root) as entries:
+                pending_paths = [Path(entry.path) for entry in entries]
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            issues[pending_root] = ("SESSION_READ_FAILED", None)
+        for path in pending_paths:
+            if not re.fullmatch(r"gs_[0-9a-f]{8}\.json", path.name):
+                continue
+            try:
+                pending = _load_pending(path)
+            except (OSError, ValueError):
+                issues[path] = ("SESSION_READ_FAILED", None)
+                continue
+            data = loaded.get(pending["session_id"])
+            # A marker whose session file is missing has nothing to apply to.
+            if data is not None and _apply_pending(data, pending):
+                issues[root / path.name] = ("SESSION_WRITE_FAILED", _MARKER_MESSAGES[True])
+        with _state_lock:
+            # A concurrent durable commit wins over an older inspection, including
+            # its cache and write-failure diagnostics. The next refresh rescans.
+            if revision != _store_revision:
+                return
+            _diagnostics.pop(str(storage_label), None)
+            present = {str(path) for path in paths + pending_paths} | {str(pending_root)}
+            for key, issue in list(_diagnostics.items()):
+                if issue["code"] in ("SESSION_READ_FAILED", "SESSION_INTERRUPTED_WRITE") and Path(key).parent in (root, pending_root) and (key not in present or Path(key) not in issues):
+                    _diagnostics.pop(key, None)
+            for sid, data in loaded.items():
+                if sid not in _sessions:
+                    _sessions[sid] = data
+                    _store_revision += 1
+            for path, (code, message) in issues.items():
+                # Preserve the independent failed-write policy at the same path.
+                if _diagnostics.get(str(path), {}).get("code") not in ("SESSION_WRITE_FAILED", "SESSION_DURABILITY_UNCERTAIN"):
+                    _record_issue(path, code, message)
+
+
+def load_sessions_from_disk() -> None:
+    _scan_sessions()
 
 
 def _sessions_on_disk() -> list[dict]:
-    """Leave invalid legacy files untouched and reported, outside the cache.
-
-    A previously accepted ID must not make post-deletion flagging raise after
-    the collection has already gone. Every disk reader uses this same boundary.
-    """
+    """Return detached, validated files for export without changing the cache."""
     try:
         paths = sorted(_session_storage_root().glob("*.json"))
     except (OSError, ValueError, RuntimeError):
         log.exception("Cannot read evaluation session storage; existing files are unchanged")
         return []
     sessions = []
-    for p in paths:
+    for path in paths:
         try:
-            if p.is_symlink() or not p.is_file():
+            if path.is_symlink() or not path.is_file():
                 raise ValueError("Evaluation session must be a regular file.")
-            data = json.loads(p.read_text())
+            data = json.loads(path.read_text())
             validate_session(data)
-            if p != _session_path(data["session_id"]):
+            if path != _session_path(data["session_id"]):
                 raise ValueError("Evaluation session filename does not match its identity.")
         except (OSError, ValueError, RuntimeError) as exc:
             # ValidationError text can include document-derived field values.
             log.warning("Skipping invalid evaluation session %s; file is unchanged (%s)",
-                        p.name, type(exc).__name__)
+                        path.name, type(exc).__name__)
             continue
+        # A package must not carry a session as current when its history
+        # marker is only pending. An unreadable marker is reported by the scan.
+        try:
+            pending = _pending_path(data["session_id"])
+            if pending.exists():
+                _apply_pending(data, _load_pending(pending))
+        except (OSError, ValueError):
+            pass
         sessions.append(data)
     return sessions
 
 
-def load_sessions_from_disk() -> None:
-    for data in _sessions_on_disk():
-        _sessions[data["session_id"]] = data
+def session_diagnostics() -> list[dict]:
+    _scan_sessions()
+    with _state_lock:
+        return copy.deepcopy([_diagnostics[key] for key in sorted(_diagnostics)])
 
 
 def sessions_for(collection: str) -> list[dict]:
-    """Every session generated against a collection, in-memory and on disk."""
-    found = {}
-    for sid, sess in list(_sessions.items()):
-        if sess.get("collection") != collection:
-            continue
-        try:
-            validate_session(sess)
-            if sid != sess["session_id"]:
-                raise ValueError("Cached evaluation identity does not match its key.")
-            _session_path(sid)
-        except (OSError, ValueError, RuntimeError) as exc:
-            log.warning("Skipping invalid cached evaluation session %s (%s)",
-                        sid, type(exc).__name__)
-            continue
-        found[sid] = sess
-    # A session written by an import may not be in memory yet.
-    for data in _sessions_on_disk():
-        if data.get("collection") == collection and data["session_id"] not in found:
-            found[data["session_id"]] = data
-            _sessions[data["session_id"]] = data
-    return list(found.values())
+    _scan_sessions()
+    with _state_lock:
+        found = []
+        for sid, session in _sessions.items():
+            if session.get("collection") != collection:
+                continue
+            try:
+                validate_session(session)
+                if sid != session.get("session_id"):
+                    raise ValueError("Cached session key does not match identity")
+                _session_path(sid)
+            except (OSError, ValueError, RuntimeError) as exc:
+                log.warning("Skipping invalid cached evaluation session %s (%s)",
+                            sid, type(exc).__name__)
+                _record_issue(_session_key(str(sid)), "SESSION_READ_FAILED")
+                continue
+            found.append(session)
+        return copy.deepcopy(found)
 
 
 def store_session(session: dict) -> None:
-    """Write a session to disk *and* into the in-memory cache.
+    """Write through the durable store so the cache cannot undo an import.
 
     Anything outside this module that writes a session file directly will be
     silently undone: the cache still holds the previous version, and the next
-    flagging pass writes that back over the file. Import learned this the hard
-    way — a restored session reverted to its pre-import orphaned state.
+    cache-based write puts that back over the file. Import learned this the
+    hard way — a restored session reverted to its pre-import orphaned state.
     """
     validate_session(session)
     _save_session_sync(session)
-    _sessions[session["session_id"]] = session
+
+
+def _identity_available(session_id: str) -> bool:
+    """Treat every existing directory entry as occupied, even unreadable bytes."""
+    if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
+        # Source identities are provenance, never local filesystem addresses.
+        return False
+    if session_id in _sessions:
+        return False
+    path = _session_storage_root() / f"{session_id}.json"
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def _allocate_identity(preferred: str | None = None, tried: list[str] | None = None) -> str:
+    # Callers hold _state_lock across allocation and durable publication.
+    if preferred is not None and _identity_available(preferred):
+        return preferred
+    for _ in range(128):
+        candidate = f"gs_{uuid.uuid4().hex[:8]}"
+        if tried is not None:
+            tried.append(candidate)
+        if _identity_available(candidate):
+            return candidate
+    raise RuntimeError("Could not allocate an unoccupied session identity")
+
+
+def _store_generated_session(session: dict) -> dict:
+    snapshot = copy.deepcopy(session)
+    with _state_lock:
+        tried: list[str] = []
+        try:
+            snapshot["session_id"] = _allocate_identity(tried=tried)
+        except (OSError, ValueError, RuntimeError) as exc:
+            # Nothing was written. Report it like the writer's own prepare
+            # failure, under the candidate being checked or the last one tried.
+            _record_issue(Path(settings.upload_dir) / "goldstandard_sessions" / (tried[-1] + ".json"), "SESSION_WRITE_FAILED")
+            raise GoldStandardError("SESSION_WRITE_FAILED", "Session storage could not be inspected to allocate an identity. No session was written.", 503) from exc
+        store_session(snapshot)
+    return copy.deepcopy(snapshot)
+
+
+def store_imported_session(session: dict, source_collection: str) -> dict:
+    """Serialize source-ID collision handling with generation and other imports."""
+    snapshot = copy.deepcopy(session)
+    # Import preflight (check 4a) has already refused noncanonical source IDs.
+    # Allocation keeps the source ID only when it is free; it stays provenance.
+    SessionResponse.model_validate(snapshot, strict=True)
+    source_id = snapshot["session_id"]
+    with _state_lock:
+        snapshot["session_id"] = _allocate_identity(source_id)
+        snapshot["imported_from"] = {
+            "session_id": source_id,
+            "collection": source_collection,
+            "imported_at": datetime.now(timezone.utc).isoformat(),
+        }
+        store_session(snapshot)
+    return copy.deepcopy(snapshot)
+
+
+def _update_session_sync(session_id: str, change):
+    with _state_lock:
+        current = _sessions.get(session_id)
+        if current is None:
+            return None
+        snapshot = copy.deepcopy(current)
+        result = change(snapshot)
+        if snapshot != current:
+            _save_session_sync(snapshot)
+        return copy.deepcopy(result)
 
 
 def _flag_sessions(collection: str, flag: str, reason: str) -> int:
@@ -2727,34 +3858,67 @@ def _flag_sessions(collection: str, flag: str, reason: str) -> int:
     Sessions are never deleted and never remapped. A remap that guesses which
     new chunk replaces an old one corrupts an evaluation baseline silently,
     which is worse than an honest flag the user can act on.
+
+    If a completed mutation cannot persist a marker to the session file, the
+    historical guard is kept in memory and in a pending marker that survives
+    restart.
     """
+    global _store_revision
+    sessions = sessions_for(collection)
     now = datetime.now(timezone.utc).isoformat()
     marked = 0
-    for session in sessions_for(collection):
-        session[flag] = True
-        session[f"{flag}_reason"] = reason
-        session[f"{flag}_at"] = now
+    for session in sessions:
+        def change(current):
+            current[flag] = True
+            current[f"{flag}_reason"] = reason
+            current[f"{flag}_at"] = now
         try:
-            _save_session_sync(session)
-        except (OSError, ValueError, RuntimeError):
-            log.exception("Could not flag gold-standard session %s", session["session_id"])
-            continue
-        marked += 1
+            _update_session_sync(session["session_id"], change)
+            marked += 1
+        except (GoldStandardError, OSError, ValueError, RuntimeError):
+            # The primary collection mutation already happened. Preserve the
+            # failed-write diagnostic. Publish the marker in the process cache
+            # even when disk still holds the prior snapshot, so a completed
+            # delete/rebuild cannot export this session as a current baseline.
+            # A pending marker carries it across restart; a later successful
+            # session write persists it and removes the pending marker.
+            with _state_lock:
+                current = _sessions.get(session["session_id"])
+                if current is not None:
+                    snapshot = copy.deepcopy(current)
+                    change(snapshot)
+                    _sessions[session["session_id"]] = snapshot
+                    _store_revision += 1
+            log.exception("Could not durably mark session %s %s", session["session_id"], flag)
+            saved = _write_pending_marker(session["session_id"],
+                                          {flag: True, f"{flag}_reason": reason, f"{flag}_at": now})
+            with _state_lock:
+                key = _session_key(session["session_id"])
+                # An uncertain-durability report keeps its own wording.
+                if _diagnostics.get(str(key), {}).get("code", "SESSION_WRITE_FAILED") == "SESSION_WRITE_FAILED":
+                    _record_issue(key, "SESSION_WRITE_FAILED", _MARKER_MESSAGES[saved])
     return marked
 
 
 def mark_stale(collection: str, reason: str) -> int:
     """Chunk identity changed, so the pairs no longer describe what is stored."""
-    return _flag_sessions(collection, "stale", reason)
+    from services.collection_writes import canonical
+    name = canonical(collection)
+    # Backend aliases address the same corpus, but retained provenance keeps
+    # the spelling supplied when a session was created or imported.
+    aliases = {name, name[:1].lower() + name[1:]}
+    return sum(_flag_sessions(alias, "stale", reason) for alias in sorted(aliases))
 
 
 def mark_orphaned(collection: str, reason: str) -> int:
-    """The collection is gone. Retained rather than deleted — see spec §8 rule 4."""
+    """The collection is gone. Retained rather than deleted — see RAG_EXPORT_SPECIFICATIONS.md §8 rule 4."""
     return _flag_sessions(collection, "orphaned", reason)
 
 
+# Published cache snapshots are immutable (see save_session), so readers take a
+# copy without waiting for the writer lock, which is held through fsync.
 def get_session(session_id: str) -> dict | None:
-    return _sessions.get(session_id)
+    return copy.deepcopy(_sessions.get(session_id))
 
 
 def _parse_gs_json(text: str) -> dict:
@@ -2843,48 +4007,86 @@ async def _generate_pair(chunk: dict) -> dict:
     }
 
 
+def _failed_generation(current: dict, exc: Exception) -> None:
+    current["status"] = "failed"
+    reason = (f"{exc.code}: {exc.message}" if isinstance(exc, GoldStandardError)
+              else f"{type(exc).__name__}: {exc}")
+    errors = current.setdefault("errors", [])
+    if reason not in errors:
+        errors.append(reason)
+    if isinstance(exc, GoldStandardError):
+        current["persistence_error"] = {"code": exc.code, "message": exc.message}
+
+
+def _publish_generation_failure(session_id: str, exc: Exception, write_error: Exception) -> None:
+    """Publish a failed status the store could not save, as marker failures do."""
+    global _store_revision
+    with _state_lock:
+        current = _sessions.get(session_id)
+        if current is None:
+            return
+        snapshot = copy.deepcopy(current)
+        _failed_generation(snapshot, exc)
+        _failed_generation(snapshot, write_error)
+        _sessions[session_id] = snapshot
+        _store_revision += 1
+
+
+async def _record_generation_failure(session_id: str, exc: Exception) -> None:
+    try:
+        await asyncio.to_thread(_update_session_sync, session_id,
+                                lambda current: _failed_generation(current, exc))
+    except Exception as write_error:
+        log.exception("Could not durably report failed generation for %s", session_id)
+        # Otherwise `generating` stays in the cache for as long as the fault
+        # lasts, and the UI polls it forever. The cache runs ahead of disk;
+        # the next successful write of this session saves the failed status.
+        # The lock can be held through fsync, so this stays off the event loop.
+        try:
+            await asyncio.to_thread(_publish_generation_failure, session_id, exc, write_error)
+        except Exception:
+            log.exception("Could not publish failed generation for %s", session_id)
+
+
 async def _run_generation(session_id: str, chunks: list[dict]) -> None:
-    session = _sessions[session_id]
     cancelled = False
+    persistence_failure = None
     try:
         for chunk in chunks:
             try:
                 pair = await _generate_pair(chunk)
-                session["pairs"].append(pair)
-                session["pairs_completed"] += 1
-                await _save_session(session)
             except asyncio.CancelledError:
                 cancelled = True
                 raise
             except Exception as exc:
-                # Some of these carry an empty str(), which produced sessions
-                # whose only record of a lost pair was an empty string.
                 reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
                 log.warning("Gold-standard pair generation failed: %s", reason, exc_info=True)
-                session["pairs_failed"] = session.get("pairs_failed", 0) + 1
-                session.setdefault("errors", []).append(reason)
-                try:
-                    await _save_session(session)
-                except Exception:
-                    pass
-            finally:
-                if not cancelled:
-                    session["pairs_attempted"] = session.get("pairs_attempted", 0) + 1
+                def failed(current):
+                    current["pairs_failed"] = current.get("pairs_failed", 0) + 1
+                    current.setdefault("errors", []).append(reason)
+                    current["pairs_attempted"] = current.get("pairs_attempted", 0) + 1
+                await asyncio.to_thread(_update_session_sync, session_id, failed)
+            else:
+                def completed(current):
+                    current["pairs"].append(pair)
+                    current["pairs_completed"] += 1
+                    current["pairs_attempted"] = current.get("pairs_attempted", 0) + 1
+                await asyncio.to_thread(_update_session_sync, session_id, completed)
+    except GoldStandardError as exc:
+        persistence_failure = exc
+        raise
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     finally:
-        if cancelled:
-            if session.get("status") == "generating":
-                session["status"] = "cancelled"
-                _save_session_sync(session)
-        else:
-            if session.get("status") == "generating":
-                if not session["pairs"] and session.get("errors"):
-                    session["status"] = "failed"
-                else:
-                    session["status"] = "completed"
-            try:
-                await _save_session(session)
-            except Exception:
-                _save_session_sync(session)
+        def finish(current):
+            if persistence_failure is not None:
+                _failed_generation(current, persistence_failure)
+                return
+            if current.get("status") == "generating":
+                current["status"] = ("cancelled" if cancelled else
+                    "failed" if not current["pairs"] and current.get("errors") else "completed")
+        await asyncio.to_thread(_update_session_sync, session_id, finish)
 
 
 async def start_generation(
@@ -2897,9 +4099,8 @@ async def start_generation(
     all_chunks = await wc.sample_chunks(collection, limit=request.sample_size, seed=request.seed)
     actual_size = len(all_chunks)
 
-    session_id = f"gs_{uuid.uuid4().hex[:8]}"
     session = {
-        "session_id": session_id,
+        "session_id": "",
         "collection": collection,
         "status": "generating",
         "pairs_total": actual_size,
@@ -2911,8 +4112,8 @@ async def start_generation(
         "pairs_failed": 0,
         "pairs": [],
     }
-    _sessions[session_id] = session
-    await _save_session(session)
+    session = await asyncio.to_thread(_store_generated_session, session)
+    session_id = session["session_id"]
 
     task = asyncio.create_task(_run_generation(session_id, all_chunks))
     _tasks.add(task)
@@ -2921,11 +4122,9 @@ async def start_generation(
         _tasks.discard(t)
         exc = t.exception() if not t.cancelled() else None
         if exc is not None:
-            s = _sessions.get(session_id)
-            if s and s.get("status") == "generating":
-                s["status"] = "failed"
-                s.setdefault("errors", []).append(str(exc))
-                _save_session_sync(s)
+            reporter = asyncio.create_task(_record_generation_failure(session_id, exc))
+            _tasks.add(reporter)
+            reporter.add_done_callback(_tasks.discard)
 
     task.add_done_callback(_on_task_done)
 
@@ -2938,19 +4137,17 @@ async def start_generation(
 
 
 async def update_pair(session_id: str, pair_id: str, updates: dict) -> dict | None:
-    session = _sessions.get(session_id)
-    if session is None:
+    def change(current):
+        for pair in current["pairs"]:
+            if pair["pair_id"] == pair_id:
+                pair.update({key: value for key, value in updates.items() if value is not None})
+                return pair
         return None
-    for pair in session["pairs"]:
-        if pair["pair_id"] == pair_id:
-            pair.update({k: v for k, v in updates.items() if v is not None})
-            await _save_session(session)
-            return pair
-    return None
+    return await asyncio.to_thread(_update_session_sync, session_id, change)
 
 
 async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
-    session = _sessions.get(session_id)
+    session = get_session(session_id)
     if session is None:
         return None
     if session.get("status") == "generating":
@@ -2981,12 +4178,21 @@ async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
                     f"The model did not return a usable question/answer pair "
                     f"({reason}). The existing pair is unchanged; try again.", 502) from exc
             new_pair["pair_id"] = pair_id
-            session["pairs"][i] = new_pair
-            await _save_session(session)
-            return new_pair
+            def replace(current):
+                for position, existing in enumerate(current["pairs"]):
+                    if existing["pair_id"] == pair_id:
+                        if existing != pair or current.get("status") == "generating":
+                            raise GoldStandardError("PAIR_CHANGED_DURING_REGENERATION",
+                                "The pair changed while regeneration was running. Its acknowledged edits are preserved; refresh before retrying.", 409)
+                        current["pairs"][position] = new_pair
+                        return new_pair
+                return None
+            return await asyncio.to_thread(_update_session_sync, session_id, replace)
     return None
 
 
+# Published cache snapshots are immutable. Export captures one stable reference
+# and never mutates or exposes it; later commits publish a different object.
 def _save_export_sync(out_path: Path, ragas: list[dict]) -> None:
     out_path.write_text(json.dumps(ragas, indent=2))
 
@@ -3070,7 +4276,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from pydantic import ValidationError
+
 from config import settings
+from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import goldstandard
 from services import ingest_config
 from services import model_bundle
@@ -3207,12 +4416,27 @@ def _resolve_includes(text: str, depth: int = 0) -> str:
 
 def _render(template: str, values: dict[str, str]) -> str:
     text = _resolve_includes((_TEMPLATE_DIR / template).read_text())
-    for key, value in values.items():
-        text = text.replace(f"@@{key}@@", str(value))
-    left = re.findall(r"@@[A-Z_0-9]+(?::[a-z_0-9]+)?@@", text)
-    if left:
-        raise RuntimeError(f"{template}: unsubstituted placeholders {sorted(set(left))}")
-    return text
+    # Substitute only original template tokens. Inserted data can itself contain
+    # token-shaped text and must never be interpreted as another substitution.
+    def substitute(match):
+        key = match.group()[2:-2]
+        if key not in values:
+            raise RuntimeError(f"{template}: unsubstituted placeholder {match.group()}")
+        return str(values[key])
+    return re.sub(r"@@[A-Z_0-9]+(?::[a-z_0-9]+)?@@", substitute, text)
+
+
+def _render_retrieve(collection: str, cfg: dict, metadata: dict) -> str:
+    """Only validated, encoded Python literals may cross into script source."""
+    cfg = retrieval_config.validate(cfg, collection)
+    return _render("retrieve.py.tmpl", {
+        "PACKAGE_METADATA": repr(metadata),
+        "COLLECTION_NAME": repr(collection),
+        "RETRIEVAL_MODE": repr(cfg["retrieval_mode"]),
+        "TOP_K": repr(cfg["top_k"]),
+        "ALPHA": repr(cfg["alpha"]),
+        "RESPONSE_FORMAT": repr(cfg["response_format"]),
+    })
 
 
 def render_help(embed_dimensions: int | str) -> str:
@@ -3226,6 +4450,34 @@ def render_help(embed_dimensions: int | str) -> str:
         "EMBED_DIMENSIONS": embed_dimensions,
         "LLM_MODEL": settings.llm_model,
     })
+
+
+def _export_retrieval_settings(collection: str, warnings: list[str]) -> tuple[dict, bool]:
+    """The settings to package, and whether they are defaults.
+
+    Runs before any chunk is read, so bad settings fail the export early with
+    a next step instead of a raw validation message. A legacy ef is cleared
+    with a warning; the saved file itself is left alone.
+    """
+    try:
+        cfg, is_default = retrieval_config.resolve(collection)
+        cfg, cleared = retrieval_config.normalize(cfg, collection)
+    except TypeError as exc:          # resolve(): the saved JSON is not an object
+        problems, cause = "the settings file is not a JSON object", exc
+    except ValidationError as exc:
+        problems = "; ".join(f"{'.'.join(map(str, error['loc']))}: {error['msg']}"
+                             for error in exc.errors())
+        cause = exc
+    else:
+        if cleared is not None:
+            warnings.append(f"saved retrieval setting ef={cleared} is outside "
+                            f"{SEARCH_EF_MIN}-{SEARCH_EF_MAX} and was exported as null; ef is "
+                            "no longer used. Save this collection's settings on the Retrieval "
+                            "page to clear it.")
+        return cfg, is_default
+    raise ValueError(f"Saved retrieval settings for '{collection}' are invalid: {problems}. "
+                     "Open the Retrieval page, save this collection's settings, then "
+                     "export again.") from cause
 
 
 def _ingest_config(collection: str) -> dict | None:
@@ -3288,6 +4540,22 @@ def build(
     try:
         b = _Builder(stage)
 
+        # Settings first: a bad config fails before any chunk is streamed.
+        retrieval_cfg, is_default = _export_retrieval_settings(collection, warnings)
+
+        collection_cfg = wc._collection_config_sync(collection)
+        stored_model = collection_cfg.get("embedding_model")
+        if not isinstance(stored_model, str) or not stored_model or stored_model != settings.embed_model:
+            raise PackageError(
+                "EMBEDDING_MISMATCH",
+                f"Collection '{collection}' has embedding model {stored_model!r}, "
+                f"but this instance is configured for {settings.embed_model!r}. "
+                "Export cannot attribute its stored vectors to the configured model. "
+                "Re-embed the collection with the configured model before exporting; "
+                "unknown or named-vector configurations are not supported.",
+                {"collection": collection, "stored_model": stored_model,
+                 "configured_model": settings.embed_model})
+
         # 1. chunks.jsonl — streamed, one line at a time.
         chunk_count = 0
         dimensions: int | None = None
@@ -3315,14 +4583,13 @@ def build(
             progress(chunk_count)
 
         # 2. collection.json
-        b.add_json("collection.json", wc._collection_config_sync(collection))
+        b.add_json("collection.json", collection_cfg)
 
         # 3. configs
         ingest_cfg = _ingest_config(collection)
         if ingest_cfg is not None:
             b.add_json("ingest_config.json", ingest_cfg)
 
-        retrieval_cfg, is_default = retrieval_config.resolve(collection)
         has_saved_retrieval = not is_default
         b.add_json("retrieval_config.json", retrieval_cfg)
 
@@ -3332,16 +4599,19 @@ def build(
 
         # 5. sources, when they exist
         index = sources.load_index(collection)
-        fidelity = "with-sources" if index["documents"] else "chunks-only"
-        source_document_count = len(index["documents"])
+        shipped = {}
+        for digest, entry in index["documents"].items():
+            blob = sources.blob_path(collection, digest)
+            if not blob.exists():
+                warnings.append(f"retained source {digest[:12]} is missing on disk")
+                continue
+            shipped[digest] = entry
+        fidelity = "with-sources" if shipped else "chunks-only"
+        source_document_count = len(shipped)
         if fidelity == "with-sources":
-            b.add_json("sources/index.json", index)
-            src_dir = sources.collection_dir(collection)
-            for digest in index["documents"]:
-                blob = src_dir / digest
-                if not blob.exists():
-                    warnings.append(f"retained source {digest[:12]} is missing on disk")
-                    continue
+            b.add_json("sources/index.json", {**index, "documents": shipped})
+            for digest in shipped:
+                blob = sources.blob_path(collection, digest)
                 b.add(f"sources/{digest}", lambda p, s=blob: shutil.copyfile(s, p))
 
         # 5b. bundled models, resolved through each model's manifest
@@ -3436,17 +4706,12 @@ def build(
             contents_extra += "retrieve.py             a standalone query script for this collection\n"
 
         if has_saved_retrieval:
-            (stage / "retrieve.py").write_text(_render("retrieve.py.tmpl", {
-                "COLLECTION_NAME": collection,
-                "PACKAGE_FILENAME": filename,
-                "ID8": id8,
-                "CREATED_AT": created_at,
-                "EMBED_MODEL": settings.embed_model,
-                "EMBED_DIMENSIONS": dimensions if dimensions is not None else "unknown",
-                "RETRIEVAL_MODE": retrieval_cfg["retrieval_mode"],
-                "TOP_K": retrieval_cfg["top_k"],
-                "ALPHA": retrieval_cfg["alpha"],
-                "RESPONSE_FORMAT": retrieval_cfg["response_format"],
+            (stage / "retrieve.py").write_text(_render_retrieve(collection, retrieval_cfg, {
+                "package_filename": filename,
+                "id8": id8,
+                "created_at": created_at,
+                "embed_model": settings.embed_model,
+                "embed_dimensions": dimensions,
             }))
             (stage / "retrieve.py").chmod(0o755)
 
@@ -3746,7 +5011,7 @@ depending on whether there is anything to protect:
 * `replace` builds into a temporary collection first, to prove the package
   inserts cleanly, and only then deletes the existing collection and builds the
   real one. That costs a second insert pass, which is the price of a
-  non-destructive replace in a database that cannot rename. If the second pass
+  staged replace with a recoverable failure path in a database that cannot rename. If the second pass
   fails, the temporary collection is *kept* and named in the error, so the data
   is recoverable rather than lost.
 """
@@ -3755,20 +5020,25 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 import tempfile
 import threading
 import uuid
 from pathlib import Path
+from contextlib import nullcontext
 
 from config import settings
+from services import settings_store
+from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import goldstandard
 from services import model_bundle
 from services import packager
 from services import retrieval_config
 from services import sources
 from services import weaviate_client as wc
+from services import batch_write, collection_recovery, collection_writes
 from services.packager import PackageError
 
 _log = logging.getLogger(__name__)
@@ -3794,7 +5064,9 @@ def get_job(job_id: str) -> dict | None:
 # staging name for the startup sweep to recognise. A SIGKILL during the insert
 # would leave a half-filled collection that looks like a real one. A marker
 # written before the build, and removed after it, lets the next start tell the
-# two apart.
+# two apart. The marker's instance token is also written into the collection's
+# schema description, so a collection created later under the same name is
+# never mistaken for the interrupted import.
 
 def _markers_dir() -> Path:
     d = Path(settings.upload_dir) / "imports_in_progress"
@@ -3806,23 +5078,77 @@ def _marker_path(collection: str) -> Path:
     return _markers_dir() / f"{_safe_file(collection)}.json"
 
 
-def _mark_started(collection: str, expected_chunks: int, job_id: str) -> None:
-    _marker_path(collection).write_text(json.dumps({
-        "collection": collection,
-        "expected_chunks": expected_chunks,
-        "job_id": job_id,
-    }, indent=2))
+def _instance_description(instance: str) -> str:
+    return f"rag-import:{instance}"
+
+
+def _read_marker(path: Path) -> tuple[dict, Path]:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
+        raise ValueError("Import ownership must be a regular metadata file of at most 4096 bytes")
+    data = json.loads(path.read_text())
+    collection, count = data["collection"], data["expected_chunks"]
+    snapshot = data["expected_snapshot"]
+    # Version 3 predates the instance identity: it is read so that its cleanup
+    # can finish and its snapshot stays named, but it never authorizes deletion.
+    if (type(data.get("version")) is not int or data["version"] not in (3, 4)
+            or not _NAME_OK.fullmatch(collection) or collection != canonical(collection)
+            or path.name != f"{collection}.json" or type(count) is not int or count < 0
+            or data["state"] not in ("building", "cleanup")
+            or (data["version"] == 4 and (type(data["instance"]) is not str
+                                          or not re.fullmatch(r"[0-9a-f]{32}", data["instance"])))
+            or not re.fullmatch(r"[0-9a-f]{32}\.sqlite3", snapshot["file"])
+            or not re.fullmatch(r"[0-9a-f]{64}", snapshot["sha256"])):
+        raise ValueError("Invalid import ownership")
+    return data, _markers_dir() / snapshot["file"]
+
+
+def _mark_started(collection: str, expected_chunks: int, job_id: str, records) -> str:
+    """Publish the marker; returns the instance token the target must carry."""
+    instance = uuid.uuid4().hex
+    snapshot = _markers_dir() / f"{uuid.uuid4().hex}.sqlite3"
+    try:
+        with batch_write.ExpectedRecords() as expected:
+            try:
+                expected.capture(records, expected_chunks)
+            except (ValueError, KeyError, TypeError) as exc:
+                raise PackageError("PACKAGE_CORRUPT", str(exc), {"file": "chunks.jsonl"}) from exc
+            expected.snapshot(snapshot)
+        with snapshot.open("rb") as data:
+            os.fsync(data.fileno())
+        collection_recovery._sync_dir(_markers_dir())
+        collection_recovery._sync_dir(Path(settings.upload_dir))
+        collection_recovery.atomic_json(_marker_path(collection), {
+            "version": 4, "collection": collection, "expected_chunks": expected_chunks,
+            "job_id": job_id, "state": "building", "instance": instance,
+            "expected_snapshot": {"file": snapshot.name, "sha256": packager.sha256_file(snapshot)},
+        })
+    except Exception:
+        try:
+            snapshot.unlink(missing_ok=True)
+        except OSError:
+            _log.exception("Could not remove unpublished expectation snapshot %s", snapshot)
+        raise
+    return instance
 
 
 def _mark_finished(collection: str) -> None:
-    _marker_path(collection).unlink(missing_ok=True)
+    marker = _marker_path(collection)
+    if not marker.exists():
+        return
+    record, snapshot = _read_marker(marker)
+    if record["state"] != "cleanup":
+        record["state"] = "cleanup"
+        collection_recovery.atomic_json(marker, record)
+    snapshot.unlink(missing_ok=True)
+    marker.unlink()
+    collection_recovery._sync_dir(_markers_dir())
 
 
 # Extraction workspaces created by an import or a re-chunk. Both remove their
 # own directory in a `finally`, which a hard kill skips -- twelve of these were
 # found holding 152 MB after the kill tests, and a with-models package would
 # leave 2.3 GB behind each time.
-_WORKDIR_PREFIXES = ("import-", "rechunk-")
+_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-")
 
 
 def sweep_stale_workdirs() -> list[str]:
@@ -3847,31 +5173,82 @@ def sweep_stale_workdirs() -> list[str]:
 def sweep_interrupted_imports() -> list[str]:
     """Remove collections left half-built by a killed import.
 
-    The expected chunk count is compared rather than trusting the marker alone:
-    a marker that outlived a *successful* import — a failed unlink, a disk
-    error — must not cost the user a complete collection.
+    Compare the expected identities, properties and vectors, not just count.
+    Only the collection instance the import created, identified by the token
+    in its schema description, can be deleted. Unreadable or legacy ownership
+    cannot authorize destructive cleanup.
     """
     removed: list[str] = []
     for marker in sorted(_markers_dir().glob("*.json")):
         try:
-            data = json.loads(marker.read_text())
+            data, snapshot = _read_marker(marker)
             collection = data["collection"]
-            expected = int(data.get("expected_chunks", -1))
-        except (OSError, ValueError, KeyError):
-            marker.unlink(missing_ok=True)
+            if data["state"] == "building" and data["version"] == 3:
+                # No instance identity: it cannot tell this import's collection
+                # from a later one under the same name, so it never deletes.
+                _log.warning("Import marker %s has no instance identity; kept, and never "
+                             "used to delete %r", marker, collection)
+                continue
+            if data["state"] == "building":
+                if snapshot.is_symlink() or not snapshot.is_file():
+                    raise ValueError("Expected-record snapshot is not a regular file")
+                if packager.sha256_file(snapshot) != data["expected_snapshot"]["sha256"]:
+                    raise ValueError("Expected-record snapshot integrity mismatch")
+                with batch_write.ExpectedRecords() as expected:
+                    expected.load_snapshot(snapshot, data["expected_chunks"])
+                    if wc._collection_exists_sync(collection):
+                        col = wc.get_client().collections.get(collection)
+                        if col.config.get().description != _instance_description(data["instance"]):
+                            # Created after the import stopped, for example while
+                            # an earlier start could not resolve this marker.
+                            _log.warning("Collection %r is not the one the interrupted import "
+                                         "created; kept, and its import marker retired", collection)
+                        else:
+                            try:
+                                expected.verify(col, exact=True)
+                            except batch_write.BatchVerificationError:
+                                wc.get_client().collections.delete(collection)
+                                removed.append(f"{collection} (persisted records did not match import)")
+            # Cleanup is an explicit durable phase: failure here never converts
+            # a verified target back into a candidate for backend deletion.
+            _mark_finished(collection)
+        except Exception:
+            _log.exception("Could not resolve import ownership %s; preserved", marker)
+            continue
+    _sweep_orphaned_snapshots()
+    return removed
+
+
+def _sweep_orphaned_snapshots() -> None:
+    """Remove expectation snapshots that no marker names.
+
+    A kill between writing the snapshot and publishing its marker, or a new
+    import overwriting a marker, leaves one behind. A marker that cannot be
+    parsed might name any of them, so then nothing is removed.
+    """
+    directory = _markers_dir()
+    referenced: set[str] = set()
+    for marker in directory.glob("*.json"):
+        try:
+            if marker.is_symlink() or not marker.is_file() or marker.stat().st_size > 4096:
+                raise ValueError("not a bounded regular file")
+            data = json.loads(marker.read_text())
+        except (OSError, ValueError):
+            _log.warning("Unreadable import marker %s; expectation snapshots preserved", marker)
+            return
+        snapshot = data.get("expected_snapshot") if isinstance(data, dict) else None
+        if isinstance(snapshot, dict) and isinstance(snapshot.get("file"), str):
+            referenced.add(snapshot["file"])
+    for path in sorted(directory.glob("*.sqlite3")):
+        if (path.name in referenced or not re.fullmatch(r"[0-9a-f]{32}\.sqlite3", path.name)
+                or path.is_symlink() or not path.is_file()):
             continue
         try:
-            if wc._collection_exists_sync(collection):
-                col = wc.get_client().collections.get(collection)
-                actual = col.aggregate.over_all(total_count=True).total_count or 0
-                if expected < 0 or actual != expected:
-                    wc.get_client().collections.delete(collection)
-                    removed.append(f"{collection} ({actual} of {expected} chunks)")
-        except Exception:                             # noqa: BLE001
-            _log.exception("Could not resolve interrupted import of %r", collection)
+            path.unlink()
+        except OSError:
+            _log.exception("Could not remove orphaned expectation snapshot %s", path)
             continue
-        marker.unlink(missing_ok=True)
-    return removed
+        _log.warning("Removed orphaned import expectation snapshot %s", path.name)
 
 
 def canonical(name: str) -> str:
@@ -4074,7 +5451,7 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
 
 # ── Building ──────────────────────────────────────────────────────────────────
 
-def _create_from_package(name: str, pkg: Path) -> None:
+def _create_from_package(name: str, pkg: Path, instance: str | None = None) -> None:
     cfg_path = pkg / "collection.json"
     cfg = json.loads(cfg_path.read_text()) if cfg_path.is_file() else {}
     wc._create_collection_sync(
@@ -4083,11 +5460,29 @@ def _create_from_package(name: str, pkg: Path) -> None:
         cfg.get("distance_metric", "cosine"),
         cfg.get("hnsw_config") or {},
         preserve_hnsw=True,
+        description=_instance_description(instance) if instance else None,
     )
 
 
-def _insert_chunks(name: str, pkg: Path, manifest: dict,
-                   progress) -> int:
+def _package_records(pkg: Path, manifest: dict):
+    expected_dims = (manifest.get("embedding") or {}).get("dimensions")
+    for record in packager.iter_chunks_file(pkg):
+        try:
+            uuid.UUID(record["id"])
+            if not isinstance(record["properties"], dict):
+                raise ValueError("Chunk properties must be an object")
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise PackageError("PACKAGE_CORRUPT", f"Invalid chunk identity or properties: {exc}",
+                               {"file": "chunks.jsonl"}) from exc
+        vector = record.get("vector")
+        if not batch_write._valid_vector(vector):
+            raise PackageError("PACKAGE_CORRUPT", f"Chunk {record.get('id')} has no valid vector.")
+        if expected_dims and len(vector) != expected_dims:
+            raise PackageError("PACKAGE_CORRUPT", f"Chunk {record.get('id')} has the wrong vector width.")
+        yield record
+
+
+def _insert_chunks(name: str, pkg: Path, manifest: dict, progress) -> int:
     """Insert every chunk with its original uuid and vector.
 
     The uuid is preserved deliberately: gold-standard sessions reference chunks
@@ -4095,35 +5490,43 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict,
     """
     client = wc.get_client()
     col = client.collections.get(name)
-    expected_dims = (manifest.get("embedding") or {}).get("dimensions")
-    written = 0
-    with col.batch.dynamic() as batch:
-        for record in packager.iter_chunks_file(pkg):
-            vector = record.get("vector")
-            if not isinstance(vector, list) or not vector:
-                raise PackageError("PACKAGE_CORRUPT",
-                                   f"Chunk {record.get('id')} has no vector.",
-                                   {"file": "chunks.jsonl", "id": record.get("id")})
-            if expected_dims and len(vector) != expected_dims:
-                raise PackageError(
-                    "PACKAGE_CORRUPT",
-                    f"Chunk {record.get('id')} has {len(vector)} dimensions but the "
-                    f"manifest declares {expected_dims}.",
-                    {"file": "chunks.jsonl", "id": record.get("id")})
-            batch.add_object(properties=record["properties"],
-                             uuid=record["id"],
-                             vector=vector)
-            written += 1
-            if progress and written % 500 == 0:
-                progress(written)
-        if batch.number_errors > 0:
-            raise PackageError(
-                "PACKAGE_CORRUPT",
-                f"Weaviate rejected {batch.number_errors} object(s) while importing.",
-                {"errors": batch.number_errors})
+    try:
+        written = batch_write.insert(col, lambda: _package_records(pkg, manifest),
+                                     expected_count=manifest["collection"]["chunk_count"])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise PackageError("PACKAGE_CORRUPT", str(exc), {"file": "chunks.jsonl"}) from exc
     if progress:
         progress(written)
     return written
+
+
+def _validate_package_sources(pkg: Path, manifest: dict) -> None:
+    """Check untrusted retained-source identities before any live mutation."""
+    source_dir = pkg / "sources"
+    if not source_dir.exists():
+        if manifest.get("fidelity") == "with-sources":
+            raise PackageError("PACKAGE_CORRUPT", "Retained sources are missing.",
+                               {"file": "sources/index.json"})
+        return
+    index_path = source_dir / sources.INDEX_NAME
+    try:
+        if source_dir.is_symlink() or not source_dir.is_dir():
+            raise ValueError("Retained source directory is not a regular directory")
+        if (not index_path.exists() and not index_path.is_symlink()
+                and manifest.get("fidelity") != "with-sources"):
+            return
+        if index_path.is_symlink() or not index_path.is_file():
+            raise ValueError("Retained source index is missing or is not a regular file")
+        index = sources.validate_index(json.loads(index_path.read_text()))
+        for digest in index["documents"]:
+            blob = source_dir / digest
+            if blob.is_symlink() or not blob.is_file():
+                raise ValueError("Retained source blob is missing or is not a regular file")
+            if packager.sha256_file(blob) != digest:
+                raise ValueError("Retained source blob does not match its identity")
+    except (OSError, ValueError, TypeError) as exc:
+        raise PackageError("PACKAGE_CORRUPT", "Invalid retained source metadata.",
+                           {"file": "sources/index.json"}) from exc
 
 
 def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
@@ -4146,14 +5549,15 @@ def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
             if path.is_symlink() or not path.is_file():
                 raise ValueError("Evaluation session must be a regular file.")
             data = json.loads(path.read_text())
+            # Source IDs must use the generated grammar. An occupied one is
+            # kept as provenance at restore, so only the guarded root is
+            # checked here, not the source ID's own file.
             goldstandard.validate_session(data)
             if canonical(data["collection"]) != canonical(original):
                 raise ValueError("Evaluation session belongs to a different collection.")
             if data["session_id"] in identities:
                 raise ValueError("Duplicate evaluation session identity.")
-            # Check the live write boundary too, before any collection/model
-            # mutation. This catches pre-existing redirected destinations.
-            goldstandard._session_path(data["session_id"])
+            goldstandard._session_storage_root()
         except (OSError, ValueError, RuntimeError) as exc:
             raise PackageError(
                 "PACKAGE_CORRUPT", "Invalid evaluation session metadata.",
@@ -4163,8 +5567,34 @@ def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
     return sessions
 
 
+def _read_retrieval_config(pkg: Path, original: str,
+                           notes: list[str] | None = None) -> dict | None:
+    """Validate once before live mutation; restore this normalized snapshot.
+
+    A legacy ef (an integer outside the save bounds, from before PR #108) is
+    cleared to null, and `notes` records it for the completed job.
+    """
+    path = pkg / "retrieval_config.json"
+    if not path.exists():
+        return None
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("Retrieval settings must be a regular file")
+        validated, cleared = retrieval_config.normalize(json.loads(path.read_text()), original)
+    except (OSError, ValueError) as exc:
+        raise PackageError("PACKAGE_CORRUPT", "Invalid retrieval settings.",
+                           {"file": "retrieval_config.json"}) from exc
+    if cleared is not None and notes is not None:
+        notes.append(f"the package's retrieval setting ef={cleared} is outside "
+                     f"{SEARCH_EF_MIN}-{SEARCH_EF_MAX} and was restored as null; "
+                     "ef is no longer used.")
+    return validated
+
+
 def _restore_sidecars(target: str, pkg: Path, original: str,
-                      validated_sessions: list[dict]) -> list[str]:
+                      validated_sessions: list[dict],
+                      restored_sessions: list[dict] | None = None,
+                      validated_retrieval: dict | None = None) -> list[str]:
     """Sources, configs and gold-standard sessions. Returns notes for the job."""
     notes: list[str] = []
 
@@ -4182,12 +5612,10 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
         data["collection"] = target
         out = Path(settings.upload_dir) / "ingest_configs"
         out.mkdir(parents=True, exist_ok=True)
-        (out / f"{_safe_file(target)}.json").write_text(json.dumps(data, indent=2, sort_keys=True))
+        settings_store.publish(out / f"{_safe_file(target)}.json", data)
 
-    retrieval_cfg = pkg / "retrieval_config.json"
-    if retrieval_cfg.is_file():
-        data = json.loads(retrieval_cfg.read_text())
-        data["collection"] = target
+    if validated_retrieval is not None:
+        data = {**validated_retrieval, "collection": target}
         try:
             retrieval_config.save(data)
         except Exception as exc:                      # noqa: BLE001
@@ -4206,10 +5634,19 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
             data.pop("orphaned", None)
             data.pop("orphaned_reason", None)
             data.pop("orphaned_at", None)
+            # A package can carry any value here, and a write failure on the
+            # source system says nothing about this one's storage.
+            data.pop("persistence_error", None)
             # Write through the service: a direct file write leaves the
             # in-memory cache holding the old version, which the next flagging
             # pass would write straight back over this one.
-            goldstandard.store_session(data)
+            saved = goldstandard.store_imported_session(data, original)
+            mapping = {"source_session_id": session["session_id"],
+                       "session_id": saved["session_id"], "collection": target}
+            if restored_sessions is not None:
+                restored_sessions.append(mapping)
+            notes.append(f"evaluation session '{mapping['source_session_id']}' "
+                         f"restored as local '{mapping['session_id']}' for '{target}'")
             restored += 1
         if restored:
             notes.append(f"{restored} gold-standard session(s) restored")
@@ -4218,17 +5655,20 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
     return notes
 
 
-def _build(target: str, pkg: Path, manifest: dict, progress) -> int:
+@collection_writes.serialized("target")
+def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | None = None) -> int:
     """Create and fill `target`. Removes it again if anything fails."""
-    _create_from_package(target, pkg)
+    _create_from_package(target, pkg, instance)
     try:
         return _insert_chunks(target, pkg, manifest, progress)
-    except Exception:
+    except Exception as original:
         # Spec §6.5: a failure part-way leaves no partial collection.
         try:
             wc.get_client().collections.delete(target)
-        except Exception:                             # noqa: BLE001
-            _log.exception("Could not remove partial collection %r", target)
+        except Exception as cleanup:
+            raise PackageError("IMPORT_FAILED", f"{type(original).__name__}: {original}; "
+                               f"partial target cleanup failed ({cleanup})",
+                               {"collection": target, "cleanup_pending": True}) from original
         raise
 
 
@@ -4242,6 +5682,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
     # _build deletes its own collection on failure, so temp_collection being
     # set is not by itself evidence that anything survived to recover.
     staged = False
+    ownership: dict | None = None
 
     def progress(n: int) -> None:
         job["chunks_written"] = n
@@ -4250,6 +5691,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         archive = packager.exports_dir() / Path(filename).name
         pkg, manifest = packager.open_package(archive, work)        # checks 1, 2
         packager.verify_digests(pkg, manifest)                      # check 3
+        _validate_package_sources(pkg, manifest)
         _check_embedding(manifest)                                  # check 4
 
         original = manifest["collection"]["name"]
@@ -4265,58 +5707,67 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                                {"name": original})
 
         validated_sessions = _read_goldstandard_sessions(pkg, original)
+        retrieval_notes: list[str] = []
+        validated_retrieval = _read_retrieval_config(pkg, original, retrieval_notes)
 
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
-        exists = wc._collection_exists_sync(target)                 # check 5
-        if exists and on_conflict == "abort":
-            raise PackageError(
-                "COLLECTION_EXISTS",
-                f"A collection named '{target}' already exists. Import with "
-                "on_conflict='rename' to keep both, or 'replace' to overwrite it.",
-                {"collection": target})
+        # Hold one target guard across conflict check, replacement, and sidecars.
+        with (collection_writes.guard(target) if on_conflict == "replace" else nullcontext()):
+            exists = wc._collection_exists_sync(target)                 # check 5
+            if exists and on_conflict == "abort":
+                raise PackageError(
+                    "COLLECTION_EXISTS",
+                    f"A collection named '{target}' already exists. Import with "
+                    "on_conflict='rename' to keep both, or 'replace' to overwrite it.",
+                    {"collection": target})
 
-        if exists and on_conflict == "rename":
-            target = _rename_target(original, id8)
+            if exists and on_conflict == "rename":
+                target = _rename_target(original, id8)
 
-        if exists and on_conflict == "replace":
-            # Prove the package inserts cleanly before destroying anything.
-            temp_collection = f"{canonical(original)}__importing_{id8}"
-            if wc._collection_exists_sync(temp_collection):
-                wc.get_client().collections.delete(temp_collection)
-            _build(temp_collection, pkg, manifest, progress)
-            staged = True
-            job["chunks_written"] = 0
-            # Counted before the delete, because the delete is what orphans them.
-            orphaned = len(goldstandard.sessions_for(target))
-            wc._delete_collection_sync(target)   # also drops its sources + config
-            if orphaned:
-                # Spec §8 rule 4: silently destroying evaluation work is worse
-                # than reporting it, and refusing the import would block a
-                # legitimate operation over data the user may not care about.
-                replace_notes.append(
-                    f"{orphaned} gold-standard session(s) from the replaced "
-                    "collection were kept and marked orphaned")
+            if exists and on_conflict == "replace":
+                # Prove the package inserts cleanly before destroying anything.
+                ownership = collection_recovery.begin(target, "import", wc.get_client())
+                temp_collection = ownership["staging"]
+                _build(temp_collection, pkg, manifest, progress)
+                job["chunks_written"] = 0
+                collection_recovery.retain(ownership, package=pkg)
+                staged = True
+                # Counted before the delete, because the delete is what orphans them.
+                orphaned = len({session["session_id"]
+                                for spelling in {target, target[:1].lower() + target[1:]}
+                                for session in goldstandard.sessions_for(spelling)})
+                wc._delete_collection_sync(target)   # also drops its sources + config
+                if orphaned:
+                    # Spec §8 rule 4: silently destroying evaluation work is worse
+                    # than reporting it, and refusing the import would block a
+                    # legitimate operation over data the user may not care about.
+                    replace_notes.append(
+                        f"{orphaned} gold-standard session(s) from the replaced "
+                        "collection were kept; inspect session recovery diagnostics "
+                        "if an orphan marker could not be persisted")
 
-        expected = manifest.get("collection", {}).get("chunk_count", -1)
-        _mark_started(target, expected, job_id)
-        marked = target
-        written = _build(target, pkg, manifest, progress)
-        _mark_finished(target)
-        marked = None
-        notes = model_notes + replace_notes + _restore_sidecars(
-            target, pkg, original, validated_sessions)
+            expected = manifest.get("collection", {}).get("chunk_count", -1)
+            instance = _mark_started(target, expected, job_id, lambda: _package_records(pkg, manifest))
+            marked = target
+            written = _build(target, pkg, manifest, progress, instance)
+            _mark_finished(target)
+            marked = None
+            job.setdefault("restored_sessions", [])
+            notes = model_notes + replace_notes + _restore_sidecars(
+                target, pkg, original, validated_sessions, job["restored_sessions"],
+                validated_retrieval) + retrieval_notes
 
-        if staged and temp_collection:
-            try:
-                wc.get_client().collections.delete(temp_collection)
-            except Exception:                         # noqa: BLE001
-                _log.exception("Could not remove staging collection %r", temp_collection)
-            staged = False
+            if staged and temp_collection:
+                try:
+                    collection_recovery.discard(ownership, wc.get_client())
+                except Exception:                         # noqa: BLE001
+                    _log.exception("Could not remove staging collection %r", temp_collection)
+                staged = False
 
-        job.update(status="completed", collection=target, original_collection=original,
-                   chunks_written=written, renamed=(target != canonical(original)),
-                   notes=notes)
+            job.update(status="completed", collection=target, original_collection=original,
+                       chunks_written=written, renamed=(target != canonical(original)),
+                       notes=notes)
 
     except PackageError as exc:
         job.update(status="failed", error_code=exc.code, error=exc.message,
@@ -4326,7 +5777,8 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             # staging collection means the data is recoverable, not lost.
             job["error"] = (exc.message + f" The imported data is available as "
                             f"'{temp_collection}'.")
-            job["error_detail"] = {**(exc.detail or {}), "recovered_as": temp_collection}
+            job["error_detail"] = {**(exc.detail or {}), "recovered_as": temp_collection,
+                                   "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}
     except Exception as exc:                          # noqa: BLE001
         _log.exception("Import of %r failed", filename)
         job.update(status="failed", error_code="IMPORT_FAILED",
@@ -4334,13 +5786,22 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         if staged and temp_collection:
             job["error"] = (job["error"] + f" The imported data is available as "
                             f"'{temp_collection}'.")
-            job["error_detail"] = {"recovered_as": temp_collection}
+            job["error_detail"] = {"recovered_as": temp_collection,
+                                   "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}
     finally:
         # A handled failure already removed the partial collection, so the
         # marker has nothing left to describe. Only a hard kill leaves one
         # behind, which is the case the startup sweep exists for.
-        if marked:
-            _mark_finished(marked)
+        if marked and not (job.get("error_detail") or {}).get("cleanup_pending"):
+            try:
+                _mark_finished(marked)
+            except Exception:
+                _log.exception("Could not finish import marker for %r; startup will retry", marked)
+        if ownership and ownership["state"] == "scratch":
+            try:
+                collection_recovery.discard(ownership, wc.get_client())
+            except Exception:
+                _log.exception("Could not remove owned scratch collection %r", ownership["staging"])
         shutil.rmtree(work, ignore_errors=True)
         with _lock:
             _active.discard(filename)
@@ -4364,6 +5825,7 @@ async def start_import_job(filename: str, on_conflict: str) -> str:
         "fidelity": None,
         "renamed": False,
         "notes": [],
+        "restored_sessions": [],
         "error": None,
         "error_code": None,
         "error_detail": None,
@@ -4644,10 +6106,11 @@ or vector width changes and Weaviate cannot alter either in place.
 **Safety.** Each rebuild is staged: the new chunks are built into a temporary
 collection first, and the live one is replaced only once that succeeds. Weaviate
 has no rename (see `importer.py`), so the final step copies vectors out of the
-staging collection rather than re-embedding — one embedding pass, not two.
-Preparation failures leave the original collection untouched. A failure after
-replacement begins can leave it missing or partial. Identity-changing operations
-flag retained evaluations before replacement; any failed cutover flags them too.
+staging collection rather than re-embedding — one embedding pass, not two. A
+failure before replacement leaves the original untouched. After replacement
+starts, a verified recovery copy and its sidecars survive failure and restart.
+Identity-changing operations flag retained evaluations before replacement;
+failed reindex cutovers flag them when exact identity cannot be verified.
 
 **Gold standard.** Anything that changes chunk identity marks every session for
 the collection `stale`, with a reason and a timestamp. Sessions are never
@@ -4656,7 +6119,9 @@ deleted and never remapped (spec §7.3).
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
+import math
 import mimetypes
 import shutil
 import tempfile
@@ -4665,10 +6130,12 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from services import collection_writes
 from config import settings
 from services import goldstandard
 from services import sources
 from services import weaviate_client as wc
+from services import batch_write, collection_recovery
 from services.chunker import chunk as do_chunk
 from services.ingest_pipeline import _parse_file
 from services.packager import PackageError
@@ -4692,6 +6159,55 @@ def _existing_chunks(collection: str) -> list[dict]:
     return [dict(o.properties or {}) for o in col.iterator()]
 
 
+def _existing_records(collection: str) -> list[dict]:
+    """Read the supported single-vector corpus without regenerating identity."""
+    return list(_iter_existing_records(collection))
+
+
+def _iter_existing_records(collection: str):
+    seen = set()
+    col = wc.get_client().collections.get(collection)
+    for obj in col.iterator(include_vector=True):
+        identity = str(obj.uuid)
+        vector = obj.vector
+        if isinstance(vector, dict):
+            if set(vector) != {"default"}:
+                raise RuntimeError("Reindex requires the collection's single default vector")
+            vector = vector["default"]
+        if (not isinstance(vector, list) or not vector
+                or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                       or not math.isfinite(value) for value in vector)):
+            raise RuntimeError(f"Reindex cannot preserve the stored vector for {identity}")
+        if identity in seen:
+            raise RuntimeError(f"Reindex received duplicate stored UUID {identity}")
+        seen.add(identity)
+        yield {"id": identity, "vector": copy.deepcopy(vector),
+               "properties": copy.deepcopy(dict(obj.properties or {}))}
+
+
+def _write_records(collection: str, records: list[dict]) -> None:
+    """Supply exact records, drain the batch, then compare backend readback."""
+    col = wc.get_client().collections.get(collection)
+    with col.batch.dynamic() as batch:
+        for record in records:
+            batch.add_object(properties=copy.deepcopy(record["properties"]),
+                             uuid=record["id"], vector=copy.deepcopy(record["vector"]))
+    if batch.number_errors:
+        raise RuntimeError(f"{batch.number_errors} error(s) copying reindex records")
+    _verify_records(collection, records)
+
+
+def _verify_records(collection: str, records: list[dict]) -> None:
+    expected = {record["id"]: record for record in records}
+    seen = set()
+    for record in _iter_existing_records(collection):
+        if record != expected.get(record["id"]):
+            raise RuntimeError("Reindex backend readback changed UUIDs, properties or vectors")
+        seen.add(record["id"])
+    if seen != expected.keys():
+        raise RuntimeError("Reindex backend readback changed UUIDs, properties or vectors")
+
+
 def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                          chunk_overlap: int, similarity_threshold: float,
                          min_chunk_size: int) -> list[dict]:
@@ -4712,13 +6228,32 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
             "fidelity 'chunks-only'.",
             {"collection": collection})
 
-    src_dir = sources.collection_dir(collection)
+    # A chunks-only import or a failed retention can leave a mixed corpus.
+    # Any retained file is insufficient: replacing from that subset loses the
+    # other chunks and successful cutover discards their recovery copy.
+    by_filename: dict[str, list[str]] = {}
+    for digest, entry in documents.items():
+        for filename in entry["filenames"]:
+            by_filename.setdefault(filename, []).append(digest)
+    uncovered = set()
+    for obj in wc.get_client().collections.get(collection).iterator():
+        filename = (obj.properties or {}).get("source_file")
+        if not isinstance(filename, str) or len(by_filename.get(filename, [])) != 1:
+            uncovered.add(filename if isinstance(filename, str) and filename else "<unknown>")
+    if uncovered:
+        raise PackageError(
+            "SOURCES_REQUIRED",
+            "Cannot change chunk boundaries: some stored chunks have missing or "
+            "ambiguous retained originals. Re-embed without chunking parameters "
+            "or re-index to preserve the existing chunks.",
+            {"collection": collection, "uncovered_source_files": sorted(uncovered)})
+
     out: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
     work = Path(tempfile.mkdtemp(prefix="rechunk-", dir=settings.upload_dir))
     try:
         for digest, entry in sorted(documents.items()):
-            blob = src_dir / digest
+            blob = sources.blob_path(collection, digest)
             if not blob.is_file():
                 raise PackageError(
                     "SOURCES_REQUIRED",
@@ -4765,74 +6300,116 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
 
 # ── Rebuilding ────────────────────────────────────────────────────────────────
 
+@collection_writes.serialized("collection")
 def _rebuild(collection: str, properties: list[dict], index_type: str | None,
-             distance_metric: str | None, progress, before_replace=None) -> int:
-    """Stage the new chunks, then swap them into place.
-
-    Weaviate embeds during the staging insert. The final insert reuses those
-    vectors verbatim, so the corpus is embedded once rather than twice.
-    """
-    cutover_started = False
+             distance_metric: str | None, progress, *, records: list[dict] | None = None,
+             source_collection: str | None = None, before_replace=None) -> int:
+    """Stage and verify, then replace the live collection under its writer guard."""
+    source_collection = source_collection or collection
+    collection = collection_writes.canonical(collection)
+    if records is not None:
+        wc._validate_reindex_vectorizer_sync(collection)
     config = wc._collection_config_sync(collection)
     new_index = index_type or config["index_type"]
     new_distance = distance_metric or config["distance_metric"]
     hnsw = config.get("hnsw_config") or {}
-
-    staging = f"{collection}__tuning_{uuid.uuid4().hex[:8]}"
     client = wc.get_client()
-    wc._create_collection_sync(staging, new_index, new_distance, hnsw, preserve_hnsw=True)
+    ownership = collection_recovery.begin(collection, "tune", client)
+    staging = ownership["staging"]
+    cutover_started = False
+    completed = False
+    original_intact = False
     try:
-        wc._insert_chunks_sync(staging, properties)
-        staged = [
-            {"id": str(o.uuid),
-             "vector": (o.vector or {}).get("default"),
-             "properties": dict(o.properties or {})}
-            for o in client.collections.get(staging).iterator(include_vector=True)
-        ]
-        if len(staged) != len(properties):
-            raise RuntimeError(
-                f"staged {len(staged)} chunks but expected {len(properties)}")
-        if progress:
-            progress(len(staged))
-
-        # Past this point the original is replaced. Preparation has succeeded,
-        # but deletion, creation or final writes can still fail.
-        # Persist the warning before deletion, so a failed replacement cannot
-        # leave retained pairs claiming to be a current baseline.
+        wc._create_collection_sync(staging, new_index, new_distance, hnsw, preserve_hnsw=True)
+        if records is not None:
+            _write_records(staging, records)
+            # The guard covers application writers; independently connected
+            # backend writers are detected by comparing the source again.
+            _verify_records(collection, records)
+        else:
+            wc._insert_chunks_sync(staging, properties)
+            staged_count = client.collections.get(staging).aggregate.over_all(total_count=True).total_count
+            if staged_count != len(properties):
+                raise RuntimeError(f"staged {staged_count} chunks but expected {len(properties)}")
+        if source_collection != collection:
+            collection_recovery.retain(ownership, source_collection=source_collection)
+        else:
+            collection_recovery.retain(ownership)
         if before_replace:
             before_replace()
         cutover_started = True
         client.collections.delete(collection)
         wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True)
-        target = client.collections.get(collection)
-        with target.batch.dynamic() as batch:
-            for record in staged:
-                batch.add_object(properties=record["properties"],
-                                 uuid=record["id"], vector=record["vector"])
-            if batch.number_errors > 0:
-                raise RuntimeError(
-                    f"{batch.number_errors} error(s) writing the rebuilt collection")
-        return len(staged)
-    except Exception:
-        if cutover_started:
-            goldstandard.mark_stale(collection, "collection replacement failed after cutover began; retained pairs require historical review")
+        if records is not None:
+            _write_records(collection, records)
+            written = len(records)
+        else:
+            def staged():
+                return (
+                    {"id": str(obj.uuid), "vector": (obj.vector or {}).get("default"),
+                     "properties": dict(obj.properties or {})}
+                    for obj in client.collections.get(staging).iterator(include_vector=True)
+                )
+            written = batch_write.insert(client.collections.get(collection), staged,
+                                         expected_count=len(properties))
+        if progress:
+            progress(written)
+        completed = True
+        return written
+    except Exception as exc:
+        if records is not None and cutover_started:
+            try:
+                _verify_records(collection, records)
+                original_intact = wc._collection_config_sync(collection) == config
+            except Exception:
+                original_intact = False
+            if not original_intact:
+                try:
+                    goldstandard.mark_stale(source_collection, "reindex replacement failed after cutover began; exact record preservation was not verified")
+                except Exception:
+                    _log.exception("Could not mark evaluation historical after failed reindex")
+        elif cutover_started:
+            try:
+                goldstandard.mark_stale(source_collection, "collection replacement failed after cutover began; retained pairs require historical review")
+            except Exception:
+                _log.exception("Could not mark evaluation historical after failed rebuild")
+        if cutover_started and not original_intact and ownership["state"] == "recovery":
+            raise PackageError(
+                "TUNE_FAILED", f"{type(exc).__name__}: {exc}. Verified data is retained as '{staging}'.",
+                {"recovered_as": staging,
+                 "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}) from exc
+        if not cutover_started and ownership["state"] == "recovery":
+            # Only before_replace runs between retain and cutover. The original
+            # was never deleted, so the copy is discarded below.
+            raise PackageError(
+                "TUNE_FAILED", f"{type(exc).__name__}: {exc}. Gold-standard sessions could not be "
+                "marked stale before replacement, so the original collection is unchanged.") from exc
         raise
     finally:
-        try:
-            client.collections.delete(staging)
-        except Exception:                             # noqa: BLE001
-            _log.exception("Could not remove staging collection %r", staging)
+        # Before cutover the original is intact, so a retained copy is not needed.
+        if completed or original_intact or not cutover_started or ownership["state"] == "scratch":
+            try:
+                collection_recovery.discard(ownership, client)
+            except Exception:
+                _log.exception("Could not remove owned staging collection %r", staging)
 
 
-def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
+@collection_writes.serialized("collection")
+def _run(job_id: str, collection: str, operation: str, params: dict, *, source_collection: str | None = None) -> None:
+    source_collection = source_collection or collection
+    collection = collection_writes.canonical(collection)
     job = _jobs[job_id]
+    job["collection"] = collection
     job["status"] = "running"
 
     def progress(n: int) -> None:
         job["chunks_written"] = n
 
     try:
-        has_sources = sources.has_sources(collection)
+        needs_sources = operation == "rechunk" or (
+            operation == "reembed" and params.get("chunking") is not None)
+        has_sources = sources.has_sources(source_collection) if needs_sources else False
+        records = None
 
         if operation == "rechunk":
             if not has_sources:
@@ -4843,7 +6420,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
                     "Re-embedding from the stored chunk text is available, but "
                     "chunk boundaries cannot change.",
                     {"collection": collection})
-            properties = _chunks_from_sources(collection, **params["chunking"])
+            properties = _chunks_from_sources(source_collection, **params["chunking"])
             reason = "the collection was re-chunked, so its chunks no longer match these pairs"
 
         elif operation == "reembed":
@@ -4858,7 +6435,7 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
                         "boundaries cannot change; this request also asked for new "
                         "chunking parameters. Send one or the other.",
                         {"collection": collection})
-                properties = _chunks_from_sources(collection, **params["chunking"])
+                properties = _chunks_from_sources(source_collection, **params["chunking"])
                 reason = "the collection was re-chunked and re-embedded"
             elif has_sources:
                 properties = _existing_chunks(collection)
@@ -4869,24 +6446,31 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
                           "so its vectors changed")
 
         elif operation == "reindex":
-            properties = _existing_chunks(collection)
-            reason = None            # chunk identity is unchanged
+            records = _existing_records(collection)
+            properties = [record["properties"] for record in records]
+            reason = None            # exact UUID/vector/property copy is verified
         else:
             raise PackageError("TUNE_UNSUPPORTED", f"Unknown operation '{operation}'.")
 
         job["chunks_total"] = len(properties)
-        written = _rebuild(collection, properties,
-                           params.get("index_type"), params.get("distance_metric"),
-                           progress, before_replace=(lambda: goldstandard.mark_stale(collection, reason)) if reason else None)
+        stale_count = 0
+
+        def mark_before_replace() -> None:
+            nonlocal stale_count
+            stale_count = goldstandard.mark_stale(source_collection, reason)
+
+        written = _rebuild(
+            collection, properties, params.get("index_type"), params.get("distance_metric"),
+            progress, records=records, source_collection=source_collection,
+            before_replace=mark_before_replace if reason else None)
 
         notes = []
         if reason:
-            stale = goldstandard.mark_stale(collection, reason)
-            if stale:
-                notes.append(f"{stale} gold-standard session(s) marked stale")
+            if stale_count:
+                notes.append(f"{stale_count} gold-standard session(s) marked stale")
         else:
-            notes.append("chunk identity unchanged, so gold-standard sessions "
-                         "were left alone")
+            notes.append("UUIDs, properties and vectors verified unchanged after reindex; "
+                         "gold-standard sessions were left alone")
 
         job.update(status="completed", chunks_written=written, notes=notes)
 
@@ -4903,6 +6487,8 @@ def _run(job_id: str, collection: str, operation: str, params: dict) -> None:
 
 
 async def start_tune_job(collection: str, operation: str, params: dict) -> str:
+    source_collection = collection
+    collection = collection_writes.canonical(collection)
     job_id = str(uuid.uuid4())[:8]
     with _lock:
         if collection in _active:
@@ -4921,7 +6507,7 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
         "error_code": None,
         "error_detail": None,
     }
-    asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params))
+    asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params, source_collection=source_collection))
     return job_id
 ```
 
@@ -5119,6 +6705,7 @@ from models.schemas import (
     CreateCollectionRequest,
 )
 from services import weaviate_client as wc
+from services.collection_writes import canonical
 from utils import api_error
 
 router = APIRouter(prefix="/collections")
@@ -5161,6 +6748,7 @@ async def list_collections():
             index_type=c["index_type"],
             distance_metric=c["distance_metric"],
             created_at=registry.get(c["name"]),
+            hnsw_config=c.get("hnsw_config"),
         )
         for c in raw
     ]
@@ -5202,7 +6790,9 @@ async def delete_collection(name: str):
 
     async with _registry_lock:
         registry = await asyncio.to_thread(_load_registry)
-        registry.pop(name, None)
+        canonical_name = canonical(name)
+        for spelling in {canonical_name, canonical_name[:1].lower() + canonical_name[1:]}:
+            registry.pop(spelling, None)
         await asyncio.to_thread(_save_registry, registry)
 
     return {"name": name, "objects_deleted": count}
@@ -5236,16 +6826,18 @@ class SaveIngestConfigBody(IngestConfig):
 async def ingest_upload(
     collection: str = Form(...),
     strategy: str = Form("overlap"),
-    chunk_size: int = Form(1000),
-    chunk_overlap: int = Form(200),
-    similarity_threshold: float = Form(0.85),
-    min_chunk_size: int = Form(100),
+    # Strings, so IngestConfig parses them and a non-numeric value is
+    # INVALID_SETTINGS like any other invalid setting, not a form error.
+    chunk_size: str = Form("1000"),
+    chunk_overlap: str = Form("200"),
+    similarity_threshold: str = Form("0.85"),
+    min_chunk_size: str = Form("100"),
     files: list[UploadFile] = File(...),
 ):
     try:
-        IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
-                     chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
-                     min_chunk_size=min_chunk_size)
+        config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
+                              chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
+                              min_chunk_size=min_chunk_size)
     except ValidationError as exc:
         return api_error(422, "INVALID_SETTINGS", "Invalid chunking settings.",
                          detail={"errors": exc.errors(include_context=False, include_input=False)})
@@ -5256,11 +6848,11 @@ async def ingest_upload(
         job_id = await ingest_pipeline.start_ingest_job(
             files=files,
             collection=collection,
-            strategy=strategy,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            similarity_threshold=similarity_threshold,
-            min_chunk_size=min_chunk_size,
+            strategy=config.chunking_strategy,
+            chunk_size=config.chunk_size,
+            chunk_overlap=config.chunk_overlap,
+            similarity_threshold=config.similarity_threshold,
+            min_chunk_size=config.min_chunk_size,
         )
     except ValueError as exc:
         return api_error(400, "NO_SUPPORTED_FILES", str(exc))
@@ -5562,8 +7154,11 @@ async def tune_options(collection: str):
     """What this collection can be tuned with, given its fidelity."""
     if not await wc.collection_exists(collection):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
-    has_sources = await asyncio.to_thread(sources.has_sources, collection)
-    stats = await asyncio.to_thread(sources.stats, collection)
+    try:
+        has_sources = await asyncio.to_thread(sources.has_sources, collection)
+        stats = await asyncio.to_thread(sources.stats, collection)
+    except ValueError:
+        return api_error(409, "SOURCE_INDEX_INVALID", "Retained source index is invalid.")
     return TuneOptionsResponse(
         collection=collection,
         fidelity="with-sources" if has_sources else "chunks-only",
@@ -5582,6 +7177,7 @@ async def tune_options(collection: str):
 
 ```python
 from __future__ import annotations
+import asyncio
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -5611,11 +7207,14 @@ async def generate(body: GenerateRequest):
     if not await wc.collection_exists(body.collection):
         return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
 
-    result = await gs.start_generation(
-        collection=body.collection,
-        sample_size=body.sample_size,
-        seed=body.seed,
-    )
+    try:
+        result = await gs.start_generation(
+            collection=body.collection,
+            sample_size=body.sample_size,
+            seed=body.seed,
+        )
+    except gs.GoldStandardError as exc:
+        return api_error(exc.status, exc.code, exc.message)
     return GenerateResponse(**result)
 
 
@@ -5640,6 +7239,7 @@ async def get_session(session_id: str):
         pairs=pairs,
         collection=session.get("collection", ""),
         errors=session.get("errors", []),
+        imported_from=session.get("imported_from"),
         **SessionValidity.model_validate(session).model_dump(),
     )
 
@@ -5647,7 +7247,10 @@ async def get_session(session_id: str):
 @router.patch("/session/{session_id}/pair/{pair_id}", response_model=GoldPair)
 async def patch_pair(session_id: str, pair_id: str, body: PatchPairRequest):
     updates = body.model_dump(exclude_none=True)
-    pair = await gs.update_pair(session_id, pair_id, updates)
+    try:
+        pair = await gs.update_pair(session_id, pair_id, updates)
+    except gs.GoldStandardError as exc:
+        return api_error(exc.status, exc.code, exc.message)
     if pair is None:
         return api_error(404, "PAIR_NOT_FOUND", f"Pair '{pair_id}' not found in session '{session_id}'.")
     return GoldPair(**pair)
@@ -5688,6 +7291,11 @@ async def download(filename: str):
         media_type="application/json",
         filename=filename,
     )
+
+
+@router.get("/diagnostics")
+async def diagnostics():
+    return {"issues": await asyncio.to_thread(gs.session_diagnostics)}
 ```
 
 ### api/routers/metrics.py
@@ -6004,12 +7612,7 @@ This package is:
 
 ```python
 #!/usr/bin/env python3
-"""Query the "@@COLLECTION_NAME@@" collection through a rag-docker API.
-
-Generated with the RAG package @@PACKAGE_FILENAME@@
-  package id : @@ID8@@
-  created    : @@CREATED_AT@@
-  embedding  : @@EMBED_MODEL@@ (@@EMBED_DIMENSIONS@@ dimensions)
+"""Query the packaged collection through a rag-docker API.
 
 The defaults below are the settings this collection was tuned with. Every one
 can be overridden with a flag. Standard library only, on purpose: this has to
@@ -6026,12 +7629,13 @@ import urllib.error
 import urllib.request
 
 # ── Baked in at export from the collection's saved retrieval settings ─────────
-COLLECTION = "@@COLLECTION_NAME@@"
+PACKAGE_METADATA = @@PACKAGE_METADATA@@
+COLLECTION = @@COLLECTION_NAME@@
 DEFAULT_API_URL = "http://localhost:8080/api"
-DEFAULT_MODE = "@@RETRIEVAL_MODE@@"
+DEFAULT_MODE = @@RETRIEVAL_MODE@@
 DEFAULT_TOP_K = @@TOP_K@@
 DEFAULT_ALPHA = @@ALPHA@@
-DEFAULT_RESPONSE_FORMAT = "@@RESPONSE_FORMAT@@"
+DEFAULT_RESPONSE_FORMAT = @@RESPONSE_FORMAT@@
 
 MODES = ("hnsw", "flat", "hybrid", "semantic")
 # Generous by default: the answer is generated by an LLM on CPU, which can take
@@ -6320,9 +7924,8 @@ async def lifespan(app: FastAPI):
     from services import weaviate_client as wc
     goldstandard.load_sessions_from_disk()
     metrics.load_from_disk()
-    # An import or tune killed part-way cannot run its own cleanup, so its
-    # staging collection would survive forever. Nothing can be using one before
-    # the app starts serving, so clearing them here is safe.
+    # Sweep only durably owned scratch. Verified recovery collections and
+    # unowned marker-like names must survive startup.
     log = logging.getLogger(__name__)
     try:
         abandoned = await wc.sweep_staging()
@@ -6390,14 +7993,14 @@ app.include_router(tuning.router)
 ### ui/Dockerfile
 
 ```dockerfile
-FROM node:20-alpine AS builder
+FROM node:26-alpine AS builder
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 COPY . .
 RUN npm run build
 
-FROM node:20-alpine
+FROM node:26-alpine
 WORKDIR /app
 RUN npm install -g serve
 COPY --from=builder /app/dist ./dist
@@ -6418,12 +8021,12 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
     "preview": "vite preview"
   },
   "dependencies": {
-    "lucide-react": "^0.441.0",
+    "lucide-react": "^1.48.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^9.0.1",
-    "react-router-dom": "^6.26.0",
-    "recharts": "^2.12.7",
+    "react-router-dom": "^7.18.4",
+    "recharts": "^3.10.1",
     "remark-gfm": "^4.0.0"
   },
   "devDependencies": {
@@ -6431,11 +8034,11 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
     "@types/react": "^18.3.5",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
-    "autoprefixer": "^10.4.20",
+    "autoprefixer": "^10.6.1",
     "postcss": "^8.4.45",
     "tailwindcss": "^3.4.11",
-    "typescript": "^5.5.4",
-    "vite": "^5.4.2"
+    "typescript": "^7.0.2",
+    "vite": "^6.4.3"
   }
 }
 ```
@@ -6722,7 +8325,7 @@ interface QueryConfigValue {
   isDefault: boolean
   loading: boolean
   error: string
-  saveConfig: (config: QueryConfig) => Promise<void>
+  saveConfig: (config: QueryConfig) => Promise<boolean>
 }
 
 const QueryConfigContext = createContext<QueryConfigValue | null>(null)
@@ -6738,7 +8341,7 @@ function fromResponse(r: RetrievalConfig): QueryConfig {
 }
 
 export function QueryConfigProvider({ children }: { children: ReactNode }) {
-  const [collection, setCollection] = useState('')
+  const [collection, setCollectionState] = useState('')
   const [config, setConfigState] = useState<QueryConfig>(DEFAULT_CONFIG)
   const [isDefault, setIsDefault] = useState(true)
   const [loading, setLoading] = useState(false)
@@ -6747,8 +8350,26 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
   // the user has already navigated away from must not overwrite the current
   // one. Every load carries a ticket; only the latest ticket may apply.
   const requestId = useRef(0)
+  const selectedCollection = useRef('')
+  const saveId = useRef(0)
+  const selectionId = useRef(0)
+  const latestFailed = useRef(false)
+  const lastSuccess = useRef<{ id: number; value: RetrievalConfig } | null>(null)
+
+  const setCollection = useCallback((name: string) => {
+    if (name === selectedCollection.current) return
+    selectedCollection.current = name
+    selectionId.current++
+    latestFailed.current = false
+    lastSuccess.current = null
+    // Invalidate immediately, before the next effect runs. A -> B -> A is
+    // also a new generation even though the collection name matches again.
+    requestId.current++
+    setCollectionState(name)
+  }, [])
 
   useEffect(() => {
+    const ticket = ++requestId.current
     if (!collection) {
       setConfigState(DEFAULT_CONFIG)
       setIsDefault(true)
@@ -6756,7 +8377,6 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
       setLoading(false)
       return
     }
-    const ticket = ++requestId.current
     setLoading(true)
     setError('')
     api
@@ -6776,19 +8396,42 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
         setError(e instanceof Error ? e.message : String(e))
         setLoading(false)
       })
+    return () => { requestId.current++ }
   }, [collection])
 
   const saveConfig = useCallback(
     async (next: QueryConfig) => {
       if (!collection) throw new Error('Select a collection before saving retrieval settings.')
-      const saved = await api.saveRetrievalConfig({ collection, ...next })
-      // A completed save supersedes any load still in flight for this
-      // collection, which would otherwise land afterwards with stale values.
-      requestId.current++
-      setConfigState(fromResponse(saved))
-      setIsDefault(saved.is_default)
-      setError('')
-      setLoading(false)
+      const selection = selectionId.current
+      const saveTicket = ++saveId.current
+      latestFailed.current = false
+      const isCurrent = () => selection === selectionId.current && collection === selectedCollection.current
+      const publish = (saved: RetrievalConfig) => {
+        // Cancel pending loads without invalidating other saves in this selection.
+        requestId.current++
+        setConfigState(fromResponse(saved))
+        setIsDefault(saved.is_default)
+        setError('')
+        setLoading(false)
+      }
+      try {
+        const saved = await api.saveRetrievalConfig({ collection, ...next })
+        if (!isCurrent()) return false
+        if (!lastSuccess.current || saveTicket > lastSuccess.current.id) {
+          lastSuccess.current = { id: saveTicket, value: saved }
+        }
+        // If the newest request failed, retain the newest acknowledged success,
+        // even when that older request's response arrives after the failure.
+        if (saveTicket === saveId.current || latestFailed.current) {
+          publish(lastSuccess.current.value)
+        }
+        return saveTicket === saveId.current
+      } catch (e: unknown) {
+        if (!isCurrent() || saveTicket !== saveId.current) return false
+        latestFailed.current = true
+        if (lastSuccess.current) publish(lastSuccess.current.value)
+        throw e
+      }
     },
     [collection],
   )
@@ -6882,12 +8525,14 @@ export const api = {
   getTransferHelp: () => request<{ topic: string; markdown: string }>('GET', '/help/transfer'),
 
   getMetrics: () => request<MetricsResult>('GET', '/metrics/latency'),
+  getSessionDiagnostics: () => request<{ issues: { filename: string; code: string; message: string }[] }>('GET', '/goldstandard/diagnostics'),
   getHealth: () => request<HealthResult>('GET', '/health'),
 }
 
 // Types
 export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
+  hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null
 }
 export interface CreateCollectionBody {
   name: string; index_type: string; distance_metric: string; hnsw_config: { efConstruction: number; maxConnections: number; ef: number }
@@ -6931,6 +8576,7 @@ export interface SessionValidity {
 export interface Session extends SessionValidity {
   session_id: string; status: string; pairs_total: number; pairs_attempted?: number
   pairs_completed: number; pairs_failed?: number; pairs: GoldPair[]; collection: string; errors?: string[]
+  imported_from?: { session_id: string; collection: string; imported_at: string } | null
 }
 export interface PatchPairBody { status: string; question?: string; answer?: string; ground_truth?: string }
 export interface SaveResult { filename: string; pairs_saved: number; pairs_excluded: number; download_url: string; historical?: boolean; session_validity?: SessionValidity }
@@ -6964,6 +8610,7 @@ export interface ImportJob {
   job_id: string; status: string; filename: string; on_conflict: string
   collection: string | null; original_collection: string | null; chunks_written: number
   fidelity: string | null; renamed: boolean; notes: string[]
+  restored_sessions?: { source_session_id: string; session_id: string; collection: string }[]
   error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
 }
 export interface PackageSummary {
@@ -7326,7 +8973,7 @@ export default function QAPage() {
         </select>
         {role !== 'end_user' && (
           <select value={config.retrieval_mode} disabled className="border rounded px-3 py-2 text-sm bg-gray-50 text-gray-500">
-            <option value={config.retrieval_mode}>{config.retrieval_mode}</option>
+            <option value={config.retrieval_mode}>{["hnsw", "flat"].includes(config.retrieval_mode) ? "Vector — existing index" : config.retrieval_mode}</option>
           </select>
         )}
       </div>
@@ -7521,12 +9168,12 @@ export default function ImportPage() {
       <div className="grid grid-cols-2 gap-4 mt-4 mb-4">
         <div>
           <label className="block text-xs text-gray-600 mb-1">Chunk Size: {chunkSize}</label>
-          <input type="range" min={50} max={6000} step={50} value={chunkSize} onChange={e => setChunkSize(+e.target.value)} className="w-full" />
+          <input type="range" min={50} max={6000} step={50} value={chunkSize} onChange={e => { const size = +e.target.value; setChunkSize(size); setChunkOverlap(o => Math.min(o, Math.max(0, size - 50))) }} className="w-full" />
         </div>
         {showOverlap && (
           <div>
             <label className="block text-xs text-gray-600 mb-1">Overlap: {chunkOverlap}</label>
-            <input type="range" min={0} max={2000} step={50} value={chunkOverlap} onChange={e => setChunkOverlap(+e.target.value)} className="w-full" />
+            <input type="range" min={0} max={Math.max(0, Math.min(2000, chunkSize - 50))} step={50} value={chunkOverlap} onChange={e => setChunkOverlap(+e.target.value)} className="w-full" />
           </div>
         )}
         <div>
@@ -7643,12 +9290,12 @@ export default function ChunkingPage() {
           <div className="grid grid-cols-2 gap-4 mb-4">
             <div>
               <label className="block text-xs text-gray-600 mb-1">Chunk Size: {config.chunk_size}</label>
-              <input type="range" min={50} max={6000} step={50} value={config.chunk_size} onChange={e => setConfig({ ...config, chunk_size: +e.target.value })} className="w-full" />
+              <input type="range" min={50} max={6000} step={50} value={config.chunk_size} onChange={e => { const size = +e.target.value; setConfig({ ...config, chunk_size: size, chunk_overlap: Math.min(config.chunk_overlap, Math.max(0, size - 50)) }) }} className="w-full" />
             </div>
             {showOverlap && (
               <div>
                 <label className="block text-xs text-gray-600 mb-1">Overlap: {config.chunk_overlap}</label>
-                <input type="range" min={0} max={2000} step={50} value={config.chunk_overlap} onChange={e => setConfig({ ...config, chunk_overlap: +e.target.value })} className="w-full" />
+                <input type="range" min={0} max={Math.max(0, Math.min(2000, config.chunk_size - 50))} step={50} value={config.chunk_overlap} onChange={e => setConfig({ ...config, chunk_overlap: +e.target.value })} className="w-full" />
               </div>
             )}
             <div>
@@ -7675,14 +9322,13 @@ export default function ChunkingPage() {
 ### ui/src/pages/RetrievalPage.tsx
 
 ```typescript
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api, CollectionInfo } from '../api/client'
 import { useRole } from '../context/RoleContext'
 import { useQueryConfig, QueryConfig } from '../context/QueryConfigContext'
 
 const MODES = [
-  { id: 'hnsw', label: 'HNSW — Approximate (default)', description: 'The fastest option. Uses a smart graph to find the closest matches quickly. May very rarely miss the single best result, but works well for almost all use cases.' },
-  { id: 'flat', label: 'Flat — Exact', description: 'Checks every stored chunk to find the mathematically perfect match. More accurate but slower as your collection grows. Best for collections under 10,000 chunks.' },
+  { id: 'hnsw', label: 'Vector — existing index', description: 'Finds similar chunks using the physical index already configured for this collection. Choosing this method does not switch between HNSW and Flat.' },
   { id: 'hybrid', label: 'Hybrid', description: 'Combines keyword search with meaning-based search. Best when your questions include specific terms, names, or codes. Adjust the slider to balance between the two modes.' },
   { id: 'semantic', label: 'Semantic', description: 'Pure meaning-based search. Best for conceptual questions where the exact words are less important than the idea.' },
 ]
@@ -7691,20 +9337,27 @@ export default function RetrievalPage() {
   const { role } = useRole()
   const { collection, setCollection, config, isDefault, loading, error, saveConfig } = useQueryConfig()
   const [collections, setCollections] = useState<CollectionInfo[]>([])
-  const [mode, setMode] = useState(config.retrieval_mode)
+  const [mode, setMode] = useState(config.retrieval_mode === 'flat' ? 'hnsw' : config.retrieval_mode)
   const [topK, setTopK] = useState(config.top_k)
   const [alpha, setAlpha] = useState(config.alpha)
-  const [ef, setEf] = useState(config.ef ?? 64)
-  const [efConstruction, setEfConstruction] = useState(128)
-  const [maxConnections, setMaxConnections] = useState(64)
+  const [indexError, setIndexError] = useState('')
+  const [indexLoading, setIndexLoading] = useState(false)
+  const [indexRead, setIndexRead] = useState(false)
   const [applied, setApplied] = useState(false)
   const [saveError, setSaveError] = useState('')
+  const indexRequest = useRef(0)
+  const saveRequest = useRef(0)
 
   useEffect(() => {
+    const ticket = ++indexRequest.current
     api.getCollections().then(r => {
+      if (ticket !== indexRequest.current) return
+      setIndexError('')
       setCollections(r.collections)
+      setIndexRead(true)
       if (!collection && r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => {})
+    }).catch(() => { if (ticket === indexRequest.current) { setIndexError('Could not read the current physical index.'); setIndexRead(true) } })
+    return () => { indexRequest.current++ }
     // Runs once; picking a default collection must not fight the user's choice.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -7714,35 +9367,55 @@ export default function RetrievalPage() {
   // the values. `applied` is deliberately not reset here: a save replaces
   // `config`, which would otherwise clear the confirmation immediately.
   useEffect(() => {
-    setMode(config.retrieval_mode)
+    setMode(config.retrieval_mode === 'flat' ? 'hnsw' : config.retrieval_mode)
     setTopK(config.top_k)
     setAlpha(config.alpha)
-    setEf(config.ef ?? 64)
   }, [config])
 
   useEffect(() => {
+    saveRequest.current++
     setApplied(false)
     setSaveError('')
+    return () => { saveRequest.current++ }
   }, [collection])
 
   async function apply() {
+    const ticket = ++saveRequest.current
+    setApplied(false)
     const next: QueryConfig = {
       retrieval_mode: mode,
       top_k: topK,
       alpha,
-      ef: mode === 'hnsw' ? ef : null,
+      ef: null, // Legacy overrides were saved but never applied to query execution.
       // The role toggle drives the answer style live; persisting it here is
       // what makes the stored config usable by an exported retrieval script.
       response_format: role === 'end_user' ? 'end_user' : 'engineer',
     }
     setSaveError('')
     try {
-      await saveConfig(next)
+      const saved = await saveConfig(next)
+      if (!saved || ticket !== saveRequest.current) return
       setApplied(true)
-      setTimeout(() => setApplied(false), 3000)
+      setTimeout(() => { if (ticket === saveRequest.current) setApplied(false) }, 3000)
     } catch (e: unknown) {
+      if (ticket !== saveRequest.current) return
       setSaveError(e instanceof Error ? e.message : String(e))
     }
+  }
+
+  const physicalIndex = collections.find(c => c.name === collection)
+
+  async function refreshIndex() {
+    const ticket = ++indexRequest.current
+    setIndexLoading(true); setIndexError('')
+    try {
+      const result = await api.getCollections()
+      if (ticket !== indexRequest.current) return
+      setCollections(result.collections)
+      if (!collection && result.collections.length > 0) setCollection(result.collections[0].name)
+    }
+    catch { if (ticket === indexRequest.current) setIndexError('Could not refresh the physical index; displayed details are from the prior read.') }
+    finally { if (ticket === indexRequest.current) { setIndexLoading(false); setIndexRead(true) } }
   }
 
   return (
@@ -7793,7 +9466,7 @@ export default function RetrievalPage() {
 
       <div className="mb-4">
         <label className="block text-xs text-gray-600 mb-1">Top-K Results: {topK}</label>
-        <input type="range" min={1} max={20} value={topK} onChange={e => setTopK(+e.target.value)} className="w-full" />
+        <input type="range" min={1} max={50} value={topK} onChange={e => setTopK(+e.target.value)} className="w-full" />
       </div>
 
       {mode === 'hybrid' && (
@@ -7805,25 +9478,17 @@ export default function RetrievalPage() {
         </div>
       )}
 
-      {mode === 'hnsw' && role === 'engineer' && (
-        <details className="mb-4 border rounded">
-          <summary className="px-3 py-2 text-sm cursor-pointer font-medium">Advanced HNSW Parameters</summary>
-          <div className="p-3 space-y-3">
-            <div>
-              <label className="block text-xs text-gray-600 mb-1">ef (query accuracy): {ef}</label>
-              <input type="range" min={16} max={512} step={8} value={ef} onChange={e => setEf(+e.target.value)} className="w-full" />
-            </div>
-            <div>
-              <label className="block text-xs text-gray-600 mb-1">efConstruction (build accuracy): {efConstruction}</label>
-              <input type="range" min={64} max={512} step={8} value={efConstruction} onChange={e => setEfConstruction(+e.target.value)} className="w-full" />
-            </div>
-            <div>
-              <label className="block text-xs text-gray-600 mb-1">maxConnections (graph density): {maxConnections}</label>
-              <input type="range" min={16} max={128} step={4} value={maxConnections} onChange={e => setMaxConnections(+e.target.value)} className="w-full" />
-            </div>
-          </div>
-        </details>
-      )}
+      <div className="mb-4 border rounded p-3 text-sm">
+        <h2 className="font-semibold mb-2">Physical index (read only)</h2>
+        {indexError && <p className="text-amber-700">{indexError}</p>}
+        {physicalIndex ? <>
+          <p>Type: {physicalIndex.index_type} · Distance: {physicalIndex.distance_metric}</p>
+          {physicalIndex.hnsw_config && <p className="mt-1">ef: {physicalIndex.hnsw_config.ef} · efConstruction: {physicalIndex.hnsw_config.efConstruction} · maxConnections: {physicalIndex.hnsw_config.maxConnections}</p>}
+          <p className="text-xs text-gray-500 mt-1">Observed when index details were last refreshed. Saved query methods do not rebuild the index.</p>
+        </> : <p>{indexRead ? 'Index details are unavailable for this collection.' : 'Reading index details…'}</p>}
+        {config.ef !== null && <p className="text-xs text-amber-700 mt-2">The legacy saved ef override ({config.ef}) is inactive. Queries use the physical index settings; saving here clears that override.</p>}
+        <button onClick={refreshIndex} disabled={indexLoading} className="mt-2 border rounded px-2 py-1 text-xs disabled:opacity-50">Refresh index details</button>
+      </div>
 
       <button
         onClick={apply}
@@ -8584,7 +10249,7 @@ export default function HelpTransferPage() {
 ### ui/src/pages/HealthPage.tsx
 
 ```typescript
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { api, HealthResult, MetricsResult } from '../api/client'
 import LatencyCharts from '../components/LatencyCharts'
 
@@ -8592,7 +10257,24 @@ export default function HealthPage() {
   const [health, setHealth] = useState<HealthResult | null>(null)
   const [metrics, setMetrics] = useState<MetricsResult | null>(null)
 
+  const [sessionIssues, setSessionIssues] = useState<{ filename: string; code: string; message: string }[]>([])
+  const [diagnosticError, setDiagnosticError] = useState(false)
+
+  const [diagnosticPending, setDiagnosticPending] = useState(true)
+  const diagnosticTicket = useRef(0)
+
   async function load() {
+    const ticket = ++diagnosticTicket.current
+    setDiagnosticPending(true)
+    api.getSessionDiagnostics().then(result => {
+      if (ticket !== diagnosticTicket.current) return
+      setSessionIssues(result.issues); setDiagnosticError(false)
+    }).catch(() => {
+      if (ticket !== diagnosticTicket.current) return
+      setSessionIssues([]); setDiagnosticError(true)
+    }).finally(() => {
+      if (ticket === diagnosticTicket.current) setDiagnosticPending(false)
+    })
     try {
       const [h, m] = await Promise.all([api.getHealth(), api.getMetrics()])
       setHealth(h)
@@ -8603,7 +10285,7 @@ export default function HealthPage() {
   useEffect(() => {
     load()
     const interval = setInterval(load, 30000)
-    return () => clearInterval(interval)
+    return () => { ++diagnosticTicket.current; clearInterval(interval) }
   }, [])
 
   function StatusBadge({ status }: { status: string }) {
@@ -8615,6 +10297,12 @@ export default function HealthPage() {
   return (
     <div className="max-w-4xl mx-auto">
       <h1 className="text-2xl font-bold mb-6">Health Dashboard</h1>
+      {diagnosticPending && <p role="status" className="text-gray-500 mb-4">Refreshing session recovery diagnostics…</p>}
+      {diagnosticError && <p role="alert" className="text-amber-700 mb-4">Session recovery diagnostics could not be refreshed.</p>}
+      {sessionIssues.length > 0 && <div role="alert" className="border border-amber-300 bg-amber-50 rounded p-4 mb-6">
+        <h2 className="font-semibold">{diagnosticPending ? "Previous evaluation session recovery results — refresh pending" : "Evaluation session recovery needs attention"}</h2>
+        {sessionIssues.map(issue => <p key={issue.filename} className="text-sm mt-2">{issue.filename}: {issue.code} — {issue.message}</p>)}
+      </div>}
       {health && (
         <div className="grid grid-cols-3 gap-4 mb-8">
           <div className="bg-white border rounded p-4">
@@ -8731,34 +10419,163 @@ print('PASS disposable model package and target removed', flush=True)
 # Verification suite
 
 Integration tests that run the acceptance criteria in `SPECIFICATIONS.md` §10
-and `RAG_EXPORT_SPECIFICATIONS.md` §13 against a live stack.
+and `RAG_EXPORT_SPECIFICATIONS.md` §13 against a running stack: the disposable
+verify project, never the live stack (#152).
 
 ```bash
-docker compose up -d          # they need the stack running
-
-bash scripts/verify/all.sh                    # everything, ~20 min
-RAG_SKIP_SLOW=1 bash scripts/verify/all.sh    # skip LLM work, ~3 min
-bash scripts/verify/all.sh 02 04              # only the named suites
+bash scripts/verify/stack.sh run                    # everything, ~20 min plus start-up
+RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run    # skip LLM work, ~8 min, start-up included
+bash scripts/verify/stack.sh run 02 04              # only the named suites
 ```
 
 Exits non-zero if any check fails.
+
+## Entry point and verify project
+
+`stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
+the stack built from a checkout. `stack.sh` never builds, starts or stops the
+live `rag-docker` stack, and only reads its model volume, to copy the models.
+That guards against accidents, not hostile code (see "What it doesn't protect
+against" below).
+
+| Command | What it does |
+|---|---|
+| `stack.sh run [--checkout DIR] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
+| `stack.sh up [--checkout DIR] [--pull]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. |
+| `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
+
+`--checkout` is the checkout to build and test; the default is the one holding
+`stack.sh`. The overlay `docker-compose.verify.yml` and `stack.sh` itself always
+come from the checkout holding `stack.sh`, so a reviewer can run a trusted copy
+against someone else's checkout.
+
+What makes it separate from the live stack:
+
+- **Its own project and port.** Compose project `rag-verify`, publishing only
+  the proxy, on `127.0.0.1:8081` (`RAG_VERIFY_PORT`; 8080 is refused). Its
+  network, containers and volumes (`rag-verify_weaviate_data`, ...) are its
+  own, and empty at every `up`.
+- **Its own images.** `rag-verify-api:latest` and `rag-verify-ui:latest`, and
+  `rag-verify-<service>:latest` for any other service that builds. The
+  configuration check refuses a build that would write any other tag, so the
+  build doesn't move the base file's `rag-docker-api` and `rag-docker-ui`
+  tags, or a third-party tag the live stack runs. `down` removes every image
+  the project built.
+- **Its own exports folder.** `${TMPDIR:-/tmp}/rag-verify-<uid>/exports`,
+  inside a folder of the user's own with mode 700 (a symlink there, or a
+  folder owned by someone else, is refused). It is passed to the suites as
+  `RAG_EXPORTS_DIR`, in place of the checkout's `./exports`.
+- **A copy of the models.** The Ollama models are copied once from the live
+  `rag-docker_ollama_models` into the volume `rag-verify-ollama-models` (about
+  2.5 GB). Every `up` checks the copy against the live store by sha256 and
+  repairs any difference. The live volume is mounted read-only, in a throwaway
+  container with no network, and only for that copy. The copy is kept by
+  `down`, so later runs don't copy again. With no live model volume, the copy
+  is skipped and the verify project's Ollama pulls the models into it, which
+  needs the internet.
+- **A configuration check.** Before anything is built, `up` reads the resolved
+  configuration (`docker compose config`) and checks it against an allow-list
+  of what the base file and the overlay need (#154). It refuses any other
+  top-level or service key (for example `volumes_from`, `network_mode`,
+  `privileged`, `cap_add`, `devices`, `pid`, `secrets`, `configs`); a build
+  with options other than a context and Dockerfile inside the checkout, or
+  whose image isn't `rag-verify-<service>`; a `rag-docker-*` image, under any
+  registry name; a network other than the project's own bridge network, or
+  joined with options; a volume that isn't the project's own or the model
+  copy; anything but the proxy published, on loopback at the verify port; a
+  mount other than a volume or a read-only bind from inside the checkout
+  (never its `exports` folder), apart from the api's own exports folder; and
+  the Docker socket. It can't see `env_file`, which compose merges into the
+  environment.
+- **Start-up.** `up` tears down anything left from an earlier run first, then
+  builds, then starts with `up --wait` (15 minutes), and tries once more if that
+  fails (Weaviate can be slow to report healthy, #130). If it still fails, it
+  prints the last log lines of each service that isn't up. `up` then leaves
+  the project running for inspection (`down` removes it); `run` removes it.
+- **No suite outlives its run (#184).** `run` starts `all.sh` in a process
+  group of its own. Whenever `run` ends, whether normally, on a failing suite,
+  or on INT or TERM (which now act at once), it first stops that whole group
+  (TERM, then KILL after 5 seconds), so nothing the suites started is left
+  running, and only then tears the project down and releases the lock. A
+  `stack.sh` killed outright (SIGKILL) can't do that. Then the verify lock
+  stops the orphaned suite instead: `lock.sh` trusts an inherited
+  `RAG_VERIFY_LOCK_HELD` only while the lock's pid is that shell or one of its
+  ancestors, and `lib.sh`'s API helpers (`api_get`, `api_post`, `api_code`,
+  `api_post_code`, `drop_collection`, `make_collection` and every
+  `wait_for_job` poll) repeat that check before each request and end the
+  suite, exit 3, when it fails. Not re-checked: direct `curl` and
+  `docker compose exec` calls in the suites, and the Python helpers, which
+  end on their own timeouts (up to 900 s).
+
+**Memory.** The verify project runs next to the live stack on the same Docker
+VM. With 12 GB allocated, both fit while one LLM is loaded; when both stacks
+answer LLM questions at once, each loads its own model (about 3 GB), so
+expect slower answers or a reload rather than a failure.
+
+**What it doesn't protect against.** The suites, and anything else a checkout
+runs on the host, have full access to Docker. The verify project keeps
+verification away from the live stack by accident, not from hostile code:
+reviewing what a branch runs is the security review's job.
+
+### The live stack is refused
+
+`all.sh` and every suite (`NN_*.sh`) refuse to run, exit 2, before any request
+or Docker command, when their target is the live stack: when the compose
+project they would act on is `rag-docker` (from `COMPOSE_PROJECT_NAME`, or
+the folder name when it's unset), or when `RAG_API` uses port 8080, which is
+also its default. `stack.sh` sets both for the verify project.
+
+`RAG_VERIFY_LIVE=1` overrides the refusal with a warning, for someone verifying
+their own deployment on purpose. The documented commands and the PR review
+never use it. Restarts never reach the live project, even with it: with
+`RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
+`04_goldstandard.sh` and `05_transfer.sh` run only when `COMPOSE_PROJECT_NAME`
+is set and isn't `rag-docker`; otherwise they fail with the reason and restart
+nothing.
+
+`python3 scripts/tests/test_verify_stack.py` checks `stack.sh`, the
+configuration check and both refusals, with Docker replaced by a stub, so it
+needs no stack.
+
+## Settings publication regressions
+
+With API dependencies installed, run
+`python3 scripts/tests/test_settings_persistence.py` for deterministic ingest and
+retrieval save contention, unique temporary paths, first-save directory races,
+and failed serialization/create/write/close/replace preservation. The test also
+checks affected embedded sources against `IMPLEMENTATION.md`. It uses disposable
+directories and does not connect to Weaviate or Ollama.
+
+`07_settings.sh` runs the controlled persistence cases inside the disposable
+verify-project API container, then runs its HTTP validation and round-trip checks. This coverage complements the required full
+verification run; it does not establish full-stack acceptance by itself.
+
+Suite 07 also runs `scripts/tests/test_settings_implementation.py` on the host
+(no API dependencies), and 15 rounds of 12 concurrent live saves per ingest and
+retrieval route. The persistence cases cover failed import-config publication.
 
 ## Focused import validation regressions
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
 
-`05_transfer.sh` registers both controlled regressions and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename.
+`05_transfer.sh` registers the four controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py` and `test_batch_recovery.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
 seams are mocked; this complements the live transfer suite and does not prove
-Weaviate/Ollama acceptance. Run it using the API image's pinned dependencies:
+Weaviate/Ollama acceptance. Run it using the API image's pinned dependencies, on
+the verify project: `bash scripts/verify/stack.sh up`, paste the `export` lines
+it prints, then
 
 ```bash
 docker compose run --rm --no-deps \
   -v "$PWD/scripts/tests:/tests:ro" -e RAG_TEST_API_DIR=/app \
   api python /tests/test_session_import.py
 ```
+
+and `bash scripts/verify/stack.sh down` when done. Without those exports,
+`docker compose run` from the main checkout starts a container in the live
+`rag-docker` project, with the live volumes mounted.
 
 Alternatively, with `uv` on the host:
 
@@ -8768,6 +10585,35 @@ uv run --no-project --python 3.11 \
   --with httpx==0.28.1 --with weaviate-client==4.23.1 \
   python scripts/tests/test_session_import.py
 ```
+
+`scripts/tests/test_retrieval_import.py` adds controlled digest-valid malformed
+retrieval package rejection before model, backend, recovery, or sidecar mutation;
+historical defaults/coercion and `ef` round trips; and generated Python literal
+regressions. Run it with the same API dependencies as the session import test.
+`05_transfer.sh` registers it and `retrieval_settings.py` (E28), which submits
+15 malformed settings imports across abort/rename/replace and verifies live
+collection counts and saved settings are unchanged. The normal rename import
+also checks all saved retrieval fields round-trip. `legacy_retrieval.py` (E28,
+#184) writes a legacy `ef` and other invalid saved settings into the API
+container, then checks through the real API that a legacy `ef` exports and
+imports as `null` with a warning or note, and that other invalid saved settings
+fail the export early with an actionable error and publish nothing. Crafted
+packages are written under a `.part` name and renamed into place, because on
+Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
+and do not replace, this live acceptance.
+
+`scripts/tests/test_settings_validation.py` checks that invalid settings are
+refused before backend, model or staging work, with every backend mocked. Its
+embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository
+(on the verify project, with the exports from `stack.sh up`, as above):
+
+```bash
+docker compose run --rm --no-deps -v "$PWD:/repo:ro" -w /repo \
+  api python scripts/tests/test_settings_validation.py
+```
+
+With only `scripts/tests` mounted (as for `test_session_import.py` above) the
+other tests still run and the embedded-source check is skipped.
 
 ## Why integration tests
 
@@ -8787,6 +10633,51 @@ the same code:
 These tests talk to the running API, the real Weaviate and the real model, and
 drive the UI in a real browser.
 
+## Batch faults and recovery across restart
+
+Run the controlled regressions with the API dependencies installed:
+
+```bash
+python -m unittest discover -s scripts/tests -p 'test_batch*.py'
+```
+
+`05_transfer.sh` runs `test_batch_recovery.py` in the API container, so `all.sh` covers it; `test_batch_implementation.py` is run by hand.
+
+`batch_recovery.py` is the fault acceptance. It uses real Weaviate, synthetic
+collections and the real embedding model. It injects final-create failures into
+the test process, retains import/tuning recovery, restarts the API, then verifies
+exact UUIDs, properties, vectors and sources. It also checks real completed-batch
+rejection/partial acceptance, ingestion UUID rollback after a post-write read fault,
+resumption of metadata cleanup after backend deletion, owned scratch cleanup and
+retention of an unowned marker-like collection. It must not run against a
+user's data stack: run it on the verify project.
+
+`05_transfer.sh` runs it when `RAG_ALLOW_RESTART=1`: prepare, `docker compose
+restart api`, check, then cleanup. It creates and deletes only the
+`${RAG_TEST_PREFIX}BatchRecovery*` collections, archive and package folder it
+records in its state file. The restart ends any job in progress on the stack.
+Cleanup always runs, even after a failed check; the phase logs stay in
+`/tmp/vfy_recovery_prepare.log`, `/tmp/vfy_recovery_check.log` and
+`/tmp/vfy_recovery_cleanup.log`. The script accepts only a prefix starting with
+`Vfy` (a guard on its destructive phases), so with any other `RAG_TEST_PREFIX`
+the suite skips these checks and says why.
+
+To run the phases by hand on a disposable stack:
+
+```bash
+bash scripts/verify/stack.sh up      # then paste the export lines it prints
+docker compose exec -T api python - prepare < scripts/verify/batch_recovery.py
+docker compose restart api
+# Wait for /api/health to report healthy before the next phase.
+docker compose exec -T api python - check < scripts/verify/batch_recovery.py
+docker compose exec -T api python - cleanup < scripts/verify/batch_recovery.py
+bash scripts/verify/stack.sh down
+```
+
+In a manual run, if interrupted, keep the recorded fixtures and run `check` after
+restarting; run `cleanup` only after inspecting the result. Recovery journal and sidecar snapshots
+live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
+
 ## Layout
 
 | File | Covers |
@@ -8794,8 +10685,8 @@ drive the UI in a real browser.
 | `all.sh` | entry point; runs the suites and aggregates |
 | `lib.sh` | shared helpers: checks, job polling, cleanup |
 | `07_settings.sh` | registered live settings validation suite; invokes the standalone helper |
-| `settings_validation.py` | standalone: `RAG_API=http://localhost:8080/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
-| `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. Tested by `scripts/tests/test_verify_lock.sh` |
+| `settings_validation.py` | standalone, on the verify project after `stack.sh up`: `RAG_API=http://localhost:8081/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
+| `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
 | `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |
@@ -8803,10 +10694,15 @@ drive the UI in a real browser.
 | `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
 | `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23, E26 and E27; live metadata and model checks, controlled regressions and source drift |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E29; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
+| `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
+| `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
+| `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
+| `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
+| `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
 | `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
 | `09_sampling.sh` | called by suite04 (and thus all.sh), including slow-skip runs; owned synthetic UUID selection without model calls |
@@ -8821,15 +10717,25 @@ It checks warning metadata, actual deletion marking and explicit historical expo
 
 | Variable | Default | Effect |
 |---|---|---|
-| `RAG_EXPECTED_PROXY_PORT` | `8080` | expected resolved/live proxy host port; use `18080` with a deliberate loopback test override |
-| `RAG_API` | `http://localhost:8080/api` | where the API is |
+| `RAG_VERIFY_PORT` | `8081` | `stack.sh`: the verify project's host port; 8080 is refused |
+| `RAG_EXPECTED_PROXY_PORT` | `8080` | expected resolved/live proxy host port; `stack.sh` sets it to the verify port |
+| `RAG_API` | `http://localhost:8080/api` | where the API is; `stack.sh` sets it to the verify project. Port 8080, the default, is refused as the live stack unless `RAG_VERIFY_LIVE=1` |
+| `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
+| `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks) |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
+| `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
 | `RAG_NETWORK` | detected | compose network for the browser container |
 
 ## Writing a check
+
+`12_persistence.sh` is called by `04_goldstandard.sh` before its slow-model skip, so `all.sh` includes durable session acceptance. It uses a unique real collection, supplied vectors, controlled model pairs, concurrent HTTP requests and a fresh API process reading the saved files. Only its owned fixtures are removed. The same registered script executes `session_persistence_cases.py` in the API image: owned filesystem/concurrency cases additionally hard-kill an owned writer at the replace boundary, pause archive inspection during a concurrent commit, retain generation failure codes and test marker-failure continuation. Native browser criteria verify pending, failed and out-of-order diagnostic refreshes using isolated HTTP responses. The in-container script rejects remote or mismatched `RAG_API` targets before health/backend execution.
+
+The in-container retrieval check first verifies that `RAG_API` selects this Compose proxy on its published loopback port; remote or mismatched deployments are refused before execution. Its disposable collections use legacy staging markers, or persisted scratch ownership when the recovery service is present, so startup can finish cleanup after an interrupted verifier. Normal exit deletes only its own fixtures. Browser criteria cover Top-K 1/50 save payloads, metadata-read failures and out-of-order refresh completion with isolated HTTP responses.
+
+`11_retrieval.sh` is called by 03/all.sh and runs `retrieval_controls.py` on owned real physical configurations/vector queries, controlling only model responses and avoiding startup sweeps.
 
 `check <name> <exit-status> [detail]` — pass `$?` straight in:
 
@@ -8850,10 +10756,12 @@ Two rules the hard way:
 
 ## Bundled-model integrity
 
-On a disposable stack with its embedding model already pulled, run:
+On the verify project (`bash scripts/verify/stack.sh up`, then paste the
+`export` lines it prints), whose model copy holds the embedding model, run:
 
 ```bash
 docker compose exec -T api python - < scripts/verify/model_integrity.py
+bash scripts/verify/stack.sh down
 ```
 
 This verifies the real model's referenced bytes, copies them into a temporary
@@ -8872,17 +10780,50 @@ python -m unittest discover -s scripts/tests -p 'test_model_bundle.py'
 ## Cleaning up
 
 Suites create collections prefixed `Vfy` (`RAG_TEST_PREFIX`) and remove them at
-the end. If a run is interrupted:
+the end. On the verify project nothing outlives the run: `stack.sh run` removes
+the whole project, volumes included, even when interrupted. If `stack.sh` itself
+was killed, remove what is left with:
 
 ```bash
-curl -s localhost:8080/api/collections | python3 -c \
-  "import json,sys;[print(c['name']) for c in json.load(sys.stdin)['collections']]" \
-  | grep '^Vfy' | xargs -I{} curl -s -X DELETE "localhost:8080/api/collections/{}?confirm=true"
+bash scripts/verify/stack.sh down
 ```
+
+`13_identity.sh` is registered by `05_transfer.sh`/`all.sh`. It checks the embedded identity sources on the host, then executes twenty-one owned cache/disk/collision/redirected-slot/noncanonical-ID-refusal/concurrent-insertion/forced-duplicate-race/generation-503 cases in the API image, then a real export/edit/rename-import-twice roundtrip with supplied vectors and synthetic evaluation pairs. It verifies returned lookup mappings, independent four-field RAGAS downloads, fresh-process retention, re-export filenames/provenance, original-package byte equality and the `PACKAGE_CORRUPT` refusal of a noncanonical source session ID. Two controlled cases verify job-poll and cleanup deadlines. Backend/file/archive operations are delegated to worker threads. Successful collection creation records exact cleanup names; a similarly named protected fixture must survive that cleanup. Jobs have a 300-second poll deadline and 30-second cleanup deadline. If a job remains active, the standalone verifier exits 2 without executor joining or deleting its retained fixture directory, reporting the job/status/path. Only its exact owned fixtures are removed; in-container checks reject remote/mismatched targets before health/backend execution. Native browser criteria verify the existing Transfer notes expose source/local session IDs.
 
 The infrastructure suite requires Docker Engine 28.0.0+ and checks both resolved Compose and live Docker bindings for a single loopback proxy publication. When deploying an alternate host port for testing, set `RAG_EXPECTED_PROXY_PORT` to that port as well as `RAG_API`. Its inspection files are kept in a private temporary directory removed on exit. The local profile assumes standard bridge/NAT routing.
 
 Run `python3 scripts/tests/test_loopback_verification.py` from the repository root for the verifier's engine-version and adverse binding regressions. These exercise the actual assertion blocks and resolved default Compose; the live infrastructure suite still requires a running stack.
+
+
+`reindex_verifier_cases.py` checks actual async failure cleanup and the parent shell cleanup predicate without a backend/model call. The registered suite transports its helper, the actual `lib.sh`, and these controlled tests into an owned temporary API directory. `test_collection_writes.py` checks waiting writers, case aliases, reentrancy, failures, independent collections and actual import/backend entry points, a paused complete replace-import cutover and sidecar restoration, positive ownership before import staging, and ordinary staging failure/recovery cleanup. The live suite refuses altered property vectorization and removes exact durably owned import scratch after an independent process exits without finally.
+
+The concurrency HTTP check uses supplied-vector ingestion fixtures while keeping the upload handler, parser, chunker, worker, source retention and actual backend writes real. Its reindex source check pauses under the writer guard; the upload remains queued until final copy verification. Recovery is separately forced to fail at final creation and verified through an independent API lifespan. These cases do not claim generative model quality.
+
+Tuning normalizes the backend first-character alias for active jobs and ownership, while preserving the caller-spelled identity for source/config/session sidecars. All tuning operations register positive staging ownership before creation and retain recovery before cutover. Explicit deletion of an exact positively owned recovery collection retires its matching journal and metadata snapshots; unrelated or invalid journals remain. Startup alone does not discard retained snapshots merely because a backend collection is missing. Interrupted explicit cleanup remains durable and is resumed at startup.
+
+Issue #140 deletion coverage exercises canonical and accepted lowercase-alias HTTP deletion, both source/config sidecar spellings, durable orphan flags for both session spellings, and unrelated collection preservation. Controlled writer cases also cover backend deletion failure and retained recovery behavior; the controlled verifier invokes the actual deletion handler without a live backend.
+
+## Deferred query configuration browser checks
+
+`browser/query_config.js` runs against the real UI with all API calls stubbed
+before startup. It explicitly holds and releases responses to cover a delayed
+A save arriving before/after B's load, B's failed load, an A→B→A selection,
+concurrent saves in both response orders, and save failure. Every case checks
+the actual next Q&A request payload. These fixtures are included in `06_ui.sh`
+through `ui_criteria.js`, and can also run without a backend or model:
+
+```bash
+# Start the UI separately: cd ui && npm ci && npm run dev -- --host 127.0.0.1
+# With puppeteer-core available to Node and a local Chromium installation:
+RAG_UI_BASE=http://127.0.0.1:3000 \
+RAG_CHROMIUM_PATH=/path/to/chromium \
+node scripts/verify/browser/query_config.js
+```
+
+The standalone runner uses the existing browser verification dependency
+`puppeteer-core` (also available in the verification browser image); set
+`NODE_PATH` if it is installed outside normal Node module resolution. This
+isolated fixture run does not replace the full verification suite (`stack.sh run`).
 ````
 
 ### scripts/verify/all.sh
@@ -8893,9 +10834,12 @@ Run `python3 scripts/tests/test_loopback_verification.py` from the repository ro
 # Run every verification suite against a running stack.
 #
 #   bash scripts/verify/all.sh              # everything (~20 min, LLM-bound)
-#   RAG_SKIP_SLOW=1 bash scripts/verify/all.sh   # skip LLM work (~3 min)
+#   RAG_SKIP_SLOW=1 bash scripts/verify/all.sh   # skip LLM work (~8 min)
 #   RAG_ALLOW_RESTART=1 bash scripts/verify/all.sh  # also restart the stack
 #   bash scripts/verify/all.sh 02 04        # only the named suites
+#
+# Normally started by scripts/verify/stack.sh run, on the disposable verify
+# project. It refuses the live rag-docker stack (#152).
 #
 # Exits non-zero if any check fails, so it can gate a commit or a release.
 #
@@ -8906,8 +10850,10 @@ Run `python3 scripts/tests/test_loopback_verification.py` from the repository ro
 set -uo pipefail
 cd "$(dirname "$0")"
 REPO_ROOT="$(cd ../.. && pwd)"
-# One run at a time: the fixtures rebuilt below are shared (#95).
-. ./lock.sh
+# One run at a time: the fixtures rebuilt below are shared (#95). lib.sh takes
+# the lock (lock.sh) and holds the live-stack guard (#152).
+. ./lib.sh
+live_guard
 
 API="${RAG_API:-http://localhost:8080/api}"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -8915,8 +10861,21 @@ FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$API/health" 2>/dev/null)
 if [ "$code" != "200" ]; then
   printf '\nNo healthy API at %s (HTTP %s).\n' "$API" "$code"
-  printf 'Start the stack first:  docker compose up -d\n\n'
+  printf 'Start the verify project first:  bash scripts/verify/stack.sh up\n\n'
   exit 2
+fi
+
+# A degraded Ollama runner keeps /health ok while every answer is garbage, and
+# then every LLM check fails for reasons unrelated to the code (#119). Ask one
+# question with a known answer first, unless LLM work is being skipped.
+if [ "${RAG_SKIP_SLOW:-0}" != "1" ]; then
+  if ! sanity=$(cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/llm_sanity.py 2>&1); then
+    printf '\nThe LLM is not giving usable answers:\n  %s\n' "$sanity"
+    printf 'Restart it and run again:  docker compose restart ollama\n'
+    printf '(with the verify environment that scripts/verify/stack.sh up prints)\n\n'
+    exit 2
+  fi
+  printf '\n%s\n' "$sanity"
 fi
 
 printf '\nBuilding fixtures in %s\n' "$FIX"
@@ -8962,6 +10921,546 @@ else
   printf '\n  At least one suite failed.\n\n'
 fi
 exit "$overall"
+```
+
+### scripts/verify/stack.sh
+
+```bash
+#!/usr/bin/env bash
+#
+# Run the verification suite on a disposable compose project, never on the
+# live stack (#152).
+#
+#   bash scripts/verify/stack.sh run [--checkout DIR] [suite ...]
+#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull]
+#   bash scripts/verify/stack.sh down
+#
+# `run` brings the verify project up, runs that checkout's all.sh against it
+# (RAG_SKIP_SLOW and RAG_ALLOW_RESTART pass through) and always tears it down,
+# exiting with all.sh's status. all.sh runs in a process group of its own, and
+# before the teardown that whole group is stopped (TERM, then KILL), so no suite
+# outlives the run that started it (#184). INT and TERM act at once. A
+# stack.sh killed outright (SIGKILL) can't do this; then lock.sh and lib.sh's
+# helpers stop the orphaned suite (see lock.sh). `up` leaves the project running and prints the
+# environment that points docker compose and the suites at it; `down` removes
+# it. --checkout picks the checkout to build and test (default: this one).
+#
+# The verify project is compose project `rag-verify` on port RAG_VERIFY_PORT
+# (default 8081; 8080 is refused), with its own empty volumes, its own image
+# tags (rag-verify-api, rag-verify-ui) and its own exports folder. The live
+# `rag-docker` stack holds real data, and nothing here builds, starts, stops or
+# writes to it. Its only contact with it: the Ollama models are copied from
+# rag-docker_ollama_models, mounted read-only in a throwaway container, into
+# the volume rag-verify-ollama-models, which is kept between runs and checked
+# by sha256 on every `up`.
+#
+# The overlay docker-compose.verify.yml and this script come from the checkout
+# that holds this script, so an evaluation can run a trusted copy against a PR's
+# checkout. Before anything is built, the resolved configuration is checked
+# against an allow-list of what docker-compose.yml and the overlay need (#154),
+# and refused otherwise: any other top-level or service key (volumes_from,
+# network_mode, privileged, secrets, ...); a build with options other than a
+# context and Dockerfile inside the checkout, or one that would write a tag
+# other than rag-verify-<service>; a rag-docker-* image under any registry
+# name; a network or volume other than the project's own (and the model copy);
+# any published port but the proxy on loopback at the verify port; a mount
+# other than a volume or a read-only bind from inside the checkout (never its
+# exports folder), apart from the api's own exports folder; the Docker socket.
+# It can't see env_file, which compose merges into the environment.
+#
+# What this does not do: the suites, and anything else the checkout runs on the
+# host, still have full access to Docker. It keeps verification away from the
+# live stack by accident, not from hostile code; that is the security review's.
+set -uo pipefail
+
+PROJECT=rag-verify
+LIVE_MODELS=rag-docker_ollama_models
+MODELS=rag-verify-ollama-models
+HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+SCRATCH="${TMPDIR:-/tmp}"
+SCRATCH="${SCRATCH%/}"
+[ -n "$SCRATCH" ] || SCRATCH=/tmp
+# A folder of this user's own, mode 700, holds the exports folder, so another
+# local user can't pre-create it or plant a symlink there (#154).
+PRIVATE="$SCRATCH/rag-verify-$(id -u)"
+EXPORTS="$PRIVATE/exports"
+
+usage() {
+  sed -n '6,8p' "${BASH_SOURCE[0]}" | sed 's/^#  //' >&2
+  exit 2
+}
+
+fail() {
+  printf '\nstack.sh: %s\n\n' "$1" >&2
+  exit 2
+}
+
+# Prints why the private folder can't be used, or nothing.
+private_problem() {
+  if [ -L "$PRIVATE" ]; then
+    printf '%s is a symlink; refusing to use it.' "$PRIVATE"
+  elif [ -e "$PRIVATE" ] && [ ! -d "$PRIVATE" ]; then
+    printf '%s exists and is not a folder; refusing to use it.' "$PRIVATE"
+  elif [ -d "$PRIVATE" ] && [ ! -O "$PRIVATE" ]; then
+    printf '%s belongs to another user; refusing to use it.' "$PRIVATE"
+  fi
+}
+
+# ── arguments, checked before any Docker command ─────────────────────────────
+[ "$#" -ge 1 ] || usage
+CMD="$1"; shift
+case "$CMD" in up|down|run) ;; *) usage ;; esac
+CHECKOUT="$HARNESS"
+PULL=""
+ARGS=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --checkout)
+      [ "$CMD" != down ] && [ "$#" -ge 2 ] || usage
+      CHECKOUT="$2"; shift 2 ;;
+    --pull)
+      [ "$CMD" = up ] || usage
+      PULL=1; shift ;;
+    -*) usage ;;
+    *)
+      [ "$CMD" = run ] || usage
+      ARGS+=("$1"); shift ;;
+  esac
+done
+
+PORT="${RAG_VERIFY_PORT:-8081}"
+case "$PORT" in
+  ''|*[!0-9]*) fail "RAG_VERIFY_PORT must be a port number, not '$PORT'." ;;
+esac
+[ "${#PORT}" -le 5 ] || fail "RAG_VERIFY_PORT must be from 1024 to 65535, not $PORT."
+PORT=$((10#$PORT))
+{ [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ]; } || fail "RAG_VERIFY_PORT must be from 1024 to 65535, not $PORT."
+[ "$PORT" -ne 8080 ] || fail "RAG_VERIFY_PORT can't be 8080: that is the live rag-docker stack's port."
+
+if [ "$CMD" != down ]; then
+  { [ -d "$CHECKOUT" ] && [ -f "$CHECKOUT/docker-compose.yml" ]; } \
+    || fail "--checkout must be a checkout of this project (a folder with docker-compose.yml): $CHECKOUT"
+  CHECKOUT="$(cd "$CHECKOUT" && pwd -P)"
+fi
+
+# The private folder, checked before any Docker command; up and run create it.
+problem=$(private_problem)
+[ -z "$problem" ] || fail "$problem"
+if [ "$CMD" != down ]; then
+  if [ -d "$PRIVATE" ]; then
+    chmod 700 "$PRIVATE" || fail "could not set $PRIVATE to mode 700."
+  else
+    mkdir -m 700 "$PRIVATE" || fail "could not create $PRIVATE."
+  fi
+fi
+
+# ── one verify run per machine ───────────────────────────────────────────────
+# Held for the whole command; the all.sh started below inherits it.
+. "$HARNESS/scripts/verify/lock.sh"
+TEARDOWN=0
+SUITE=""
+# Stops all.sh's process group: everything the suites started, including what
+# they left running in the background after all.sh ended.
+stop_suite() {
+  local i
+  [ -n "$SUITE" ] || return 0
+  kill -TERM -- "-$SUITE" 2>/dev/null
+  for i in $(seq 1 50); do
+    # Zombies count as gone: only this shell can reap all.sh itself.
+    ps -A -o pgid=,stat= 2>/dev/null | awk -v g="$SUITE" '$1 == g && $2 !~ /^Z/ {found=1} END {exit !found}' || break
+    sleep 0.1
+  done
+  kill -KILL -- "-$SUITE" 2>/dev/null
+  wait "$SUITE" 2>/dev/null
+  SUITE=""
+}
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  stop_suite
+  if [ "$TEARDOWN" = 1 ]; then
+    TEARDOWN=0
+    do_down || rc=2
+  fi
+  _rag_lock_release
+  exit "$rc"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ── the verify environment ───────────────────────────────────────────────────
+unset COMPOSE_PATH_SEPARATOR
+export COMPOSE_PROJECT_NAME="$PROJECT"
+export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$HARNESS/docker-compose.verify.yml"
+export RAG_VERIFY_PORT="$PORT"
+export RAG_API="http://localhost:$PORT/api"
+export RAG_EXPECTED_PROXY_PORT="$PORT"
+export RAG_EXPORTS_DIR="$EXPORTS"
+
+# ── down: remove everything of the verify project, except the model copy ────
+# The images the verify project built, by name. Untagged entries are left
+# out: they can't be removed by name.
+labelled_images() {
+  docker image ls --filter "label=com.docker.compose.project=$PROJECT" \
+    --format '{{.Repository}}:{{.Tag}}' | grep -v '<none>'
+}
+
+do_down() {
+  local filter="label=com.docker.compose.project=$PROJECT" ids images problem left
+  # Project name only, from a neutral folder: no compose file is needed.
+  (cd / && env -u COMPOSE_FILE docker compose -p "$PROJECT" down -v --remove-orphans) >/dev/null 2>&1
+  ids=$(docker ps -aq --filter "$filter")
+  [ -z "$ids" ] || docker rm -f $ids >/dev/null
+  ids=$(docker network ls -q --filter "$filter")
+  [ -z "$ids" ] || docker network rm $ids >/dev/null
+  ids=$(docker volume ls -q --filter "$filter" | grep -vx "$MODELS")
+  [ -z "$ids" ] || docker volume rm $ids >/dev/null
+  # Every image built for the project, whatever its service, but only by a
+  # rag-verify-* name. A labelled image under any other name is left alone
+  # and reported below.
+  images=$(labelled_images | grep '^rag-verify-')
+  [ -z "$images" ] || docker image rm $images >/dev/null
+  problem=$(private_problem)
+  if [ -n "$problem" ]; then
+    printf 'stack.sh: %s\n' "$problem" >&2
+    return 2
+  fi
+  if [ -L "$EXPORTS" ]; then
+    printf 'stack.sh: %s is a symlink; not removing it.\n' "$EXPORTS" >&2
+    return 2
+  fi
+  [ ! -d "$EXPORTS" ] || rm -rf "$EXPORTS"
+  left="$(docker ps -aq --filter "$filter")$(docker network ls -q --filter "$filter")$(docker volume ls -q --filter "$filter" | grep -vx "$MODELS")$(labelled_images)"
+  if [ -e "$EXPORTS" ] || [ -L "$EXPORTS" ]; then
+    left="$left $EXPORTS"
+  fi
+  if [ -n "$left" ]; then
+    printf 'stack.sh: the verify project was not fully removed: %s\n' "$(printf '%s' "$left" | tr '\n' ' ')" >&2
+    return 2
+  fi
+  printf 'verify project %s removed (the model copy %s is kept)\n' "$PROJECT" "$MODELS"
+}
+
+# ── the models: a copy of the live store, checked on every up ────────────────
+# The image that runs the copy is the ollama image pinned by the harness's own
+# docker-compose.yml, already on this machine, not one the checkout picks.
+seed_image() {
+  python3 - "$HARNESS/docker-compose.yml" <<'IMAGEPY'
+import sys
+inside = False
+for line in open(sys.argv[1]):
+    if line.rstrip('\n') == '  ollama:':
+        inside = True
+    elif inside and line.startswith('  ') and not line.startswith('   ') and line.strip():
+        break
+    elif inside and line.startswith('    image:'):
+        print(line.split(':', 1)[1].strip().strip('"\''))
+        sys.exit(0)
+sys.exit(1)
+IMAGEPY
+}
+
+# Runs in the throwaway container: /live is the live store (read-only), /copy
+# the verify copy. Every file is compared by sha256 and copied when missing or
+# different; files the live store doesn't have are removed.
+SYNC='set -euo pipefail
+copied=0; repaired=0; removed=0
+cd /live
+while IFS= read -r -d "" f; do
+  f="${f#./}"
+  want=$(sha256sum "/live/$f" | cut -d" " -f1)
+  case "$f" in
+    */blobs/sha256-*) [ "${f##*/sha256-}" = "$want" ] || echo "warning: live blob $f does not match its name" >&2 ;;
+  esac
+  if [ -f "/copy/$f" ] && [ ! -L "/copy/$f" ]; then
+    [ "$(sha256sum "/copy/$f" | cut -d" " -f1)" = "$want" ] && continue
+    repaired=$((repaired + 1))
+  else
+    copied=$((copied + 1))
+  fi
+  mkdir -p "/copy/$(dirname "$f")"
+  rm -rf "/copy/$f"
+  cp -p "/live/$f" "/copy/$f"
+done < <(find . -type f -print0)
+cd /copy
+while IFS= read -r -d "" f; do
+  f="${f#./}"
+  if [ ! -f "/live/$f" ] || [ -L "/live/$f" ]; then rm -f "/copy/$f"; removed=$((removed + 1)); fi
+done < <(find . \( -type f -o -type l \) -print0)
+find /copy -mindepth 1 -type d -empty -delete
+echo "models: copied=$copied repaired=$repaired removed=$removed"'
+
+do_seed() {
+  local img
+  if ! docker volume inspect "$MODELS" >/dev/null 2>&1; then
+    docker volume create --label rag-verify.models=1 "$MODELS" >/dev/null || fail "could not create the volume $MODELS."
+  fi
+  if ! docker volume inspect "$LIVE_MODELS" >/dev/null 2>&1; then
+    printf 'note: there is no %s volume to copy the models from, so the verify\n' "$LIVE_MODELS"
+    printf 'project'"'"'s ollama will pull them into %s (this needs the internet).\n' "$MODELS"
+    return 0
+  fi
+  img=$(seed_image) || fail "could not find the ollama image in $HARNESS/docker-compose.yml."
+  docker image inspect "$img" >/dev/null 2>&1 \
+    || fail "the image $img, used to copy the models, isn't on this machine; it isn't pulled for this."
+  printf 'checking the model copy %s against %s (read-only)...\n' "$MODELS" "$LIVE_MODELS"
+  docker run --rm --network none --entrypoint /bin/bash \
+    -v "$LIVE_MODELS:/live:ro" -v "$MODELS:/copy" "$img" -c "$SYNC" \
+    || fail "copying the models into $MODELS failed."
+}
+
+# ── the guard on the resolved configuration ──────────────────────────────────
+do_guard() {
+  local config rc
+  config=$(mktemp "$SCRATCH/rag-verify-config.XXXXXX") || fail "could not create a scratch file."
+  if ! docker compose -p "$PROJECT" config --format json > "$config"; then
+    rm -f "$config"
+    fail "docker compose config failed for $CHECKOUT."
+  fi
+  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" <<'GUARDPY'
+import json, os, sys
+
+checkout, exports, port, path = sys.argv[1:5]
+config = json.load(open(path))
+services = config.get('services') or {}
+volumes = config.get('volumes') or {}
+networks = config.get('networks') or {}
+real = os.path.realpath
+problems = []
+
+# An allow-list (#154): only the keys and values that docker-compose.yml and
+# the overlay resolve to. Anything else could reach the host or other
+# containers, so it is refused; a branch that needs more changes this list.
+TOP_KEYS = {'name', 'services', 'volumes', 'networks'}
+SERVICE_KEYS = {'build', 'command', 'depends_on', 'entrypoint', 'environment',
+                'healthcheck', 'image', 'networks', 'ports', 'volumes'}
+BUILD_KEYS = {'context', 'dockerfile'}
+NETWORK_KEYS = {'name', 'driver', 'ipam'}
+VOLUME_KEYS = {'name', 'external'}
+MOUNT_KEYS = {'type', 'source', 'target', 'read_only', 'bind', 'volume'}
+
+def inside(child, parent):
+    child, parent = real(child), real(parent)
+    return child == parent or child.startswith(parent.rstrip('/') + '/')
+
+def normalise(image):
+    # The same image under its registry-qualified names.
+    for prefix in ('docker.io/', 'index.docker.io/', 'registry-1.docker.io/'):
+        if image.startswith(prefix):
+            image = image[len(prefix):]
+            break
+    if image.startswith('library/'):
+        image = image[len('library/'):]
+    return image
+
+def extra(keys, allowed):
+    return ', '.join(sorted(set(keys) - allowed))
+
+# (g) top level: only these keys, and the verify project's name
+if extra(config, TOP_KEYS):
+    problems.append(f"(g) top-level keys not allowed: {extra(config, TOP_KEYS)}")
+if config.get('name') != 'rag-verify':
+    problems.append(f"(g) the project name is {config.get('name')!r}, not 'rag-verify'")
+
+# (h) service keys: only the base file's
+for svc, service in services.items():
+    if extra(service, SERVICE_KEYS):
+        problems.append(f"(h) service {svc!r} uses keys not allowed: {extra(service, SERVICE_KEYS)}")
+
+# (i) builds: only a context and a Dockerfile, both inside the checkout
+for svc, service in services.items():
+    if 'build' not in service:
+        continue
+    build = service['build']
+    if not isinstance(build, dict):
+        problems.append(f"(i) service {svc!r} has a build of an unexpected form: {build!r}")
+        continue
+    if extra(build, BUILD_KEYS):
+        problems.append(f"(i) service {svc!r} uses build keys not allowed: {extra(build, BUILD_KEYS)}")
+    context = build.get('context')
+    if not (isinstance(context, str) and os.path.isabs(context) and inside(context, checkout)):
+        problems.append(f"(i) service {svc!r} builds from {context!r}, not a folder inside the checkout")
+        continue
+    dockerfile = os.path.join(context, build.get('dockerfile') or 'Dockerfile')
+    if not inside(dockerfile, checkout):
+        problems.append(f"(i) service {svc!r} uses the Dockerfile {dockerfile!r}, outside the checkout")
+
+# (a) volumes: the project's own, or the external model copy, nothing else
+for key, volume in volumes.items():
+    volume = volume or {}
+    name = volume.get('name')
+    if key == 'ollama_models' or name == 'rag-verify-ollama-models':
+        ok = (name == 'rag-verify-ollama-models' and volume.get('external') is True
+              and not volume.get('driver_opts'))
+    else:
+        ok = (name == 'rag-verify_' + key and not volume.get('external')
+              and not volume.get('driver_opts'))
+    if not ok:
+        problems.append(f"(a) volume {key!r} resolves to {name!r}"
+                        f"{' (external)' if volume.get('external') else ''}"
+                        f"{' (driver_opts)' if volume.get('driver_opts') else ''}; "
+                        f"only rag-verify_{key} or the external rag-verify-ollama-models are allowed")
+    if extra(volume, VOLUME_KEYS):
+        problems.append(f"(a) volume {key!r} uses keys not allowed: {extra(volume, VOLUME_KEYS)}")
+for svc, service in services.items():
+    for mount in service.get('volumes') or []:
+        if mount.get('type') == 'volume' and mount.get('source') and mount['source'] not in volumes:
+            problems.append(f"(a) service {svc!r} mounts undeclared volume {mount['source']!r}")
+
+# (b) images: never the live stack's tags; a build writes only its own
+# rag-verify-<service> tag, so no tag the live stack runs can be rebuilt
+for svc, service in services.items():
+    image = normalise(service.get('image') or '')
+    if image.startswith('rag-docker-') or image.startswith('rag-docker:'):
+        problems.append(f"(b) service {svc!r} uses the live image {service.get('image')!r}")
+for svc, want in (('api', 'rag-verify-api:latest'), ('ui', 'rag-verify-ui:latest')):
+    if svc in services and services[svc].get('image') != want:
+        problems.append(f"(b) service {svc!r} must use {want}, not {services[svc].get('image')!r}")
+for svc, service in services.items():
+    if 'build' in service and svc not in ('api', 'ui') and 'image' in service \
+            and normalise(service.get('image') or '') not in (f'rag-verify-{svc}:latest', f'rag-verify-{svc}'):
+        problems.append(f"(b) service {svc!r} builds, so its image must be rag-verify-{svc}:latest "
+                        f"or unset, not {service.get('image')!r}")
+
+# (j) networks: the project's own bridge networks, joined with no options
+for key, network in networks.items():
+    network = network or {}
+    if extra(network, NETWORK_KEYS):
+        problems.append(f"(j) network {key!r} uses keys not allowed: {extra(network, NETWORK_KEYS)}")
+    if network.get('name') != 'rag-verify_' + key:
+        problems.append(f"(j) network {key!r} resolves to {network.get('name')!r}; only rag-verify_{key} is allowed")
+    if network.get('driver') not in (None, 'bridge'):
+        problems.append(f"(j) network {key!r} uses the driver {network.get('driver')!r}; only bridge is allowed")
+    if network.get('ipam'):
+        problems.append(f"(j) network {key!r} sets ipam options")
+for svc, service in services.items():
+    joined = service.get('networks') or {}
+    if isinstance(joined, list):
+        joined = {name: None for name in joined}
+    for name, options in joined.items():
+        if name not in networks:
+            problems.append(f"(j) service {svc!r} joins the undeclared network {name!r}")
+        if options:
+            problems.append(f"(j) service {svc!r} sets options on network {name!r}")
+
+# (c) exactly one published port: the proxy, on loopback, the verify port
+ports = [(svc, p) for svc, service in services.items() for p in service.get('ports') or []]
+if not (len(ports) == 1 and ports[0][0] == 'proxy'
+        and ports[0][1].get('host_ip') == '127.0.0.1'
+        and str(ports[0][1].get('published')) == port
+        and ports[0][1].get('target') == 80
+        and ports[0][1].get('protocol', 'tcp') == 'tcp'):
+    shown = ', '.join(f"{svc}:{p.get('host_ip', '')}:{p.get('published')}->{p.get('target')}/{p.get('protocol', 'tcp')}"
+                      for svc, p in ports) or 'none'
+    problems.append(f"(c) published ports must be exactly proxy:127.0.0.1:{port}->80/tcp, not {shown}")
+
+# (d) mounts: volumes and binds only, with no options; binds read-only, from
+# inside the checkout but not its exports folder; (e) never the socket
+sockets = {'/var/run/docker.sock', '/run/docker.sock'}
+checkout_exports = os.path.join(checkout, 'exports')
+for svc, service in services.items():
+    for mount in service.get('volumes') or []:
+        source, target = mount.get('source') or '', mount.get('target') or ''
+        if source in sockets or target in sockets or (source and real(source) in {real(s) for s in sockets}):
+            problems.append(f"(e) service {svc!r} mounts the Docker socket")
+            continue
+        if extra(mount, MOUNT_KEYS):
+            problems.append(f"(d) service {svc!r} mount {target!r} uses keys not allowed: {extra(mount, MOUNT_KEYS)}")
+        if mount.get('type') not in ('volume', 'bind'):
+            problems.append(f"(d) service {svc!r} mount {target!r} is of type {mount.get('type')!r}; only volume and bind are allowed")
+            continue
+        if mount.get('volume'):
+            problems.append(f"(d) service {svc!r} mount {target!r} sets volume options")
+        if set(mount.get('bind') or {}) - {'create_host_path'}:
+            problems.append(f"(d) service {svc!r} mount {target!r} sets bind options")
+        if mount.get('type') != 'bind' or (svc == 'api' and target == '/app/exports'):
+            continue  # the api's exports: rule (f)
+        if not (os.path.isabs(source) and inside(source, checkout)):
+            problems.append(f"(d) service {svc!r} binds {source!r}, outside the checkout")
+        elif inside(source, checkout_exports) or inside(checkout_exports, source):
+            problems.append(f"(d) service {svc!r} binds {source!r}, which is or holds the checkout's exports folder")
+        elif mount.get('read_only') is not True:
+            problems.append(f"(d) service {svc!r} binds {source!r} read-write; binds must be read-only")
+
+# (f) the API's exports are the verify project's own folder
+mounts = [m for m in (services.get('api', {}).get('volumes') or []) if m.get('target') == '/app/exports']
+if not (len(mounts) == 1 and mounts[0].get('type') == 'bind' and real(mounts[0].get('source') or '/') == real(exports)):
+    problems.append(f"(f) the api's /app/exports must be bound from {exports}, not "
+                    f"{[m.get('source') for m in mounts] or 'nothing'}")
+
+if problems:
+    print('The resolved compose configuration is refused:')
+    for problem in problems:
+        print('  ' + problem)
+    sys.exit(2)
+GUARDPY
+  rc=$?
+  rm -f "$config"
+  [ "$rc" -eq 0 ] || fail "the verify project's configuration is refused (see above); nothing was built or started."
+}
+
+# ── up ───────────────────────────────────────────────────────────────────────
+do_up() {
+  local i code=000 service state health
+  printf 'clearing any leftover verify project...\n'
+  do_down >/dev/null || fail "could not remove a leftover verify project."
+  mkdir -p "$EXPORTS" || fail "could not create $EXPORTS."
+  do_seed
+  do_guard
+  printf 'building the verify project from %s...\n' "$CHECKOUT"
+  docker compose -p "$PROJECT" build ${PULL:+--pull} || fail "the build failed."
+  if ! docker compose -p "$PROJECT" up -d --wait --wait-timeout 900; then
+    # Weaviate can be slow to report healthy (#130): one more try.
+    printf 'the first start failed; trying once more...\n'
+    if ! docker compose -p "$PROJECT" up -d --wait --wait-timeout 900; then
+      docker compose -p "$PROJECT" ps -a --format '{{.Service}} {{.State}} {{.Health}}' \
+        | while read -r service state health; do
+            case "$state/${health:-}" in
+              running/healthy|running/) ;;
+              *) printf '\n── %s (%s %s) ──\n' "$service" "$state" "${health:-}"
+                 docker compose -p "$PROJECT" logs --tail 50 "$service" ;;
+            esac
+          done
+      [ "$CMD" != run ] || fail "the verify project did not come up; run removes it now."
+      fail "the verify project did not come up; it is left running for inspection (stack.sh down removes it)."
+    fi
+  fi
+  for i in $(seq 1 60); do
+    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$RAG_API/health" 2>/dev/null)
+    [ "$code" = 200 ] && break
+    sleep 1
+  done
+  [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 within 60 seconds (last: $code)."
+  printf '\nThe verify project is up at http://localhost:%s. To point commands at it:\n\n' "$PORT"
+  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT; do
+    printf 'export %s=%q\n' "$var" "${!var}"
+  done
+  printf '\n'
+}
+
+case "$CMD" in
+  down)
+    do_down || exit 2 ;;
+  up)
+    do_up ;;
+  run)
+    TEARDOWN=1
+    do_up
+    rc=0
+    # In the background with job control on, all.sh leads a process group of
+    # its own (pgid $!), which stop_suite ends; and `wait`, unlike a foreground
+    # command, returns as soon as INT or TERM arrives, so the traps act at once.
+    # Its stdin is /dev/null: a background job keeps the terminal otherwise,
+    # and run from one, its first read (docker compose exec -T) would be
+    # stopped by SIGTTIN and the run would hang.
+    set -m
+    bash "$CHECKOUT/scripts/verify/all.sh" ${ARGS[@]+"${ARGS[@]}"} </dev/null &
+    SUITE=$!
+    set +m
+    wait "$SUITE" || rc=$?
+    exit "$rc" ;;
+esac
 ```
 
 ### scripts/verify/lib.sh
@@ -9026,17 +11525,32 @@ skip() {
 # `expr` is python indexing against the parsed document, e.g. ['status']
 jfield() { python3 -c "import json,sys; d=json.load(sys.stdin); print(d$1)" 2>/dev/null; }
 
-api_get()  { curl -s -m 120 "$API$1"; }
-api_code() { curl -s -o /dev/null -m 120 -w '%{http_code}' "$@"; }
-api_post() { curl -s -m 600 -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
-api_post_code() { curl -s -o /dev/null -m 600 -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
+# Every helper below that reaches the API first checks that this suite's verify
+# lock is still held by it or an ancestor (#184). A suite orphaned by a run that
+# died after it passed lock.sh stops at its next helper call, before any
+# request, instead of acting on a later run's verify project. The suite ends
+# even when the helper runs inside $(...) or a pipeline, and its EXIT trap
+# still runs. Not re-checked: direct curl and `docker compose exec` calls in the
+# suites, and the Python helpers, which end on their own timeouts (up to 900 s).
+_rag_require_lock_owner() {
+  _rag_lock_owner_ok && return 0
+  _rag_lock_leftover
+  # In a subshell, exit alone would end only the subshell.
+  [ "${BASHPID:-}" = "$$" ] || kill -TERM "$$" 2>/dev/null
+  exit 3
+}
+
+api_get()  { _rag_require_lock_owner; curl -s -m 120 "$API$1"; }
+api_code() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -w '%{http_code}' "$@"; }
+api_post() { _rag_require_lock_owner; curl -s -m 600 -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
+api_post_code() { _rag_require_lock_owner; curl -s -o /dev/null -m 600 -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
 
 require_stack() {
   local code
   code=$(api_code "$API/health")
   if [ "$code" != "200" ]; then
     printf '\n  Cannot reach a healthy API at %s (HTTP %s).\n' "$API" "$code"
-    printf '  Start the stack first:  docker compose up -d\n\n'
+    printf '  Start the verify project first:  bash scripts/verify/stack.sh up\n\n'
     exit 2
   fi
 }
@@ -9046,6 +11560,7 @@ require_stack() {
 wait_for_job() {
   local path="$1" limit="${2:-600}" waited=0 status=""
   while [ "$waited" -lt "$limit" ]; do
+    _rag_require_lock_owner
     status=$(api_get "$path" | jfield "['status']")
     case "$status" in
       completed|failed|partial|cancelled) printf '%s' "$status"; return 0 ;;
@@ -9059,7 +11574,7 @@ make_collection() {
   api_post "/collections" "{\"name\":\"$1\",\"index_type\":\"${2:-hnsw}\",\"distance_metric\":\"${3:-cosine}\",\"hnsw_config\":{\"efConstruction\":128,\"maxConnections\":64,\"ef\":64}}" >/dev/null
 }
 
-drop_collection() { curl -s -o /dev/null -m 120 -X DELETE "$API/collections/$1?confirm=true"; }
+drop_collection() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -X DELETE "$API/collections/$1?confirm=true"; }
 
 # Remove every collection and package this run created.
 cleanup_prefixed() {
@@ -9069,7 +11584,7 @@ import json,sys
 for c in json.load(sys.stdin)['collections']:
     if c['name'].startswith('$PREFIX'): print(c['name'])" 2>/dev/null)
   for n in $names; do drop_collection "$n"; done
-  rm -f "${REPO_ROOT:-.}"/exports/ragpkg-"$(echo "$PREFIX" | tr '[:upper:]' '[:lower:]')"*.tar.gz 2>/dev/null || true
+  rm -f "${RAG_EXPORTS_DIR:-${REPO_ROOT:-.}/exports}"/ragpkg-"$(echo "$PREFIX" | tr '[:upper:]' '[:lower:]')"*.tar.gz 2>/dev/null || true
 }
 
 summary() {
@@ -9081,6 +11596,120 @@ summary() {
   fi
   return 0
 }
+
+# ── the live stack is off limits (#152) ──────────────────────────────────────
+# Verification runs on the disposable `rag-verify` project that
+# scripts/verify/stack.sh brings up, never on the live `rag-docker` stack that
+# holds real data. A target is live when the compose project these scripts
+# would act on is rag-docker, or when RAG_API uses the live port 8080.
+
+# Prints why the current target is the live stack, or nothing.
+live_target_reason() {
+  local project="${COMPOSE_PROJECT_NAME:-}" root port
+  if [ -z "$project" ]; then
+    # What compose would use: COMPOSE_PROJECT_NAME from the checkout's .env
+    # (optionally after `export `; the last one wins; quotes removed), else
+    # a `name:` in the compose file, else the folder name (#154).
+    root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+    project=$(sed -n 's/^\(export[[:space:]]\{1,\}\)\{0,1\}COMPOSE_PROJECT_NAME=//p' "$root/.env" 2>/dev/null | tail -1 \
+      | sed -e 's/^"\(.*\)"$/\1/' -e t -e "s/^'\(.*\)'\$/\1/")
+    [ -n "$project" ] || project=$(sed -n 's/^name:[[:space:]]*["'"'"']\{0,1\}\([^"'"'"'[:space:]]*\).*/\1/p' "$root/docker-compose.yml" 2>/dev/null | head -1)
+    [ -n "$project" ] || project=$(basename "$root")
+  fi
+  # Lowercased, everything outside [a-z0-9_-] dropped, and leading `-` and
+  # `_` stripped, as compose normalises a name.
+  project=$(printf '%s' "$project" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-' | sed 's/^[-_]*//')
+  port=$(python3 -c '
+import sys
+from urllib.parse import urlsplit
+url = urlsplit(sys.argv[1])
+try:
+    port = url.port
+except ValueError:
+    port = None
+print(port if port is not None else (443 if url.scheme == "https" else 80))' "$API" 2>/dev/null)
+  if [ "$project" = "rag-docker" ]; then
+    printf 'the compose project is rag-docker, the live rag-docker stack'
+  elif [ "$port" = "8080" ]; then
+    printf 'RAG_API (%s) uses port 8080, the live rag-docker stack' "$API"
+  fi
+}
+
+# Refuses a live target unless RAG_VERIFY_LIVE=1, which only warns.
+live_guard() {
+  local reason
+  reason=$(live_target_reason)
+  [ -n "$reason" ] || return 0
+  if [ "${RAG_VERIFY_LIVE:-0}" = "1" ]; then
+    printf '\n  WARNING: RAG_VERIFY_LIVE=1, so this run targets the live rag-docker stack:\n  %s.\n\n' "$reason" >&2
+    return 0
+  fi
+  printf '\n  Refusing to verify against the live rag-docker stack: %s.\n' "$reason" >&2
+  printf '  Run it on the disposable verify project:  bash scripts/verify/stack.sh run\n' >&2
+  printf '  (RAG_VERIFY_LIVE=1 overrides this; see scripts/verify/README.md.)\n\n' >&2
+  exit 2
+}
+
+# Prints why a restart must not run here, or nothing. Restarts never reach the
+# live project, whatever RAG_VERIFY_LIVE says.
+restart_refusal_reason() {
+  local project
+  project=$(printf '%s' "${COMPOSE_PROJECT_NAME:-}" | tr '[:upper:]' '[:lower:]')
+  if [ -z "$project" ]; then
+    printf 'COMPOSE_PROJECT_NAME is not set, so a restart could reach the live rag-docker stack; run it through scripts/verify/stack.sh'
+  elif [ "$project" = "rag-docker" ]; then
+    printf 'restarts never run against the live rag-docker project (#152)'
+  fi
+}
+
+# Default for RAG_RESTART_LIMIT_S (#130): Weaviate's start_period in
+# docker-compose.yml plus 60s for `down` and the api's own start.
+RESTART_LIMIT_DEFAULT_S=240
+
+# Prints the restart limit in seconds, or, with status 1, why the value of
+# RAG_RESTART_LIMIT_S is refused. Empty means unset.
+restart_limit() {
+  local value="${RAG_RESTART_LIMIT_S:-$RESTART_LIMIT_DEFAULT_S}"
+  case "$value" in
+    ''|*[!0-9]*) ;;
+    *) if [ "$((10#$value))" -gt 0 ]; then printf '%s' "$((10#$value))"; return 0; fi ;;
+  esac
+  printf "RAG_RESTART_LIMIT_S must be a positive whole number of seconds, not '%s'" "$value"
+  return 1
+}
+
+# wait_healthy_timed <started-epoch> <cap-seconds>: polls /health every 2s.
+# Prints the whole seconds since <started> once it returns 200, or nothing
+# once <cap> seconds have passed.
+wait_healthy_timed() {
+  local started="$1" cap="$2" code now
+  while :; do
+    code=$(api_code "$API/health")
+    now=$(python3 -c "import time;print(int(time.time()-$started))")
+    if [ "$code" = "200" ]; then printf '%s' "$now"; return 0; fi
+    [ "$now" -lt "$cap" ] || return 0
+    sleep 2
+  done
+}
+
+# restart_timing_check <limit> <elapsed, or empty if never healthy>: the
+# restart timing result, with the measured time on a pass and on a fail.
+restart_timing_check() {
+  local limit="$1" elapsed="$2"
+  if [ -n "$elapsed" ] && [ "$elapsed" -le "$limit" ]; then
+    check "restart reaches healthy within ${limit}s (took ${elapsed}s)" 0
+  elif [ -n "$elapsed" ]; then
+    check "restart reaches healthy within ${limit}s" 1 "took ${elapsed}s"
+  else
+    check "restart reaches healthy within ${limit}s" 1 "not healthy after $((limit * 2))s"
+  fi
+}
+
+# Suites (NN_*.sh) are guarded as soon as they source this file. Other scripts
+# that borrow these helpers are not suites and are left alone.
+case "$(basename "$0")" in
+  [0-9][0-9]_*.sh) live_guard ;;
+esac
 ```
 
 ### scripts/verify/lock.sh
@@ -9096,7 +11725,13 @@ summary() {
 # other run's recreated collection (#95).
 #
 # The first script to source this holds the lock for its whole process tree:
-# it exports RAG_VERIFY_LOCK_HELD, so the suites all.sh starts don't try again.
+# it exports RAG_VERIFY_LOCK_HELD and the lock's path, RAG_VERIFY_LOCK, so the
+# suites all.sh starts don't try again. An inherited RAG_VERIFY_LOCK_HELD is
+# trusted only while the lock's pid is this shell or one of its ancestors
+# (#184). A suite orphaned by a run that died still carries the variable; it
+# exits 3 here instead of acting on a later run's verify project, and never
+# takes the dead holder's lock over. lib.sh's API helpers repeat the check
+# before every request, for a suite that was already past this point.
 #
 # The lock is a directory holding a pid file. mkdir is atomic, so only one run
 # can create it. A lock whose holder has died is taken over, but only under a
@@ -9113,6 +11748,34 @@ _rag_lock_release() {
   [ "$(cat "$RAG_VERIFY_LOCK/pid" 2>/dev/null)" = "$$" ] || return 0
   rm -f "$RAG_VERIFY_LOCK/pid"
   rmdir "$RAG_VERIFY_LOCK" 2>/dev/null || true
+}
+
+# Succeeds only when the lock's pid is this shell ($$) or an ancestor of it.
+# A missing, symlinked or pid-less lock, or a process table that can't be
+# read, counts as not ours. The pid == $$ case needs no ps, which the API
+# container lacks.
+_rag_lock_owner_ok() {
+  local lock="${RAG_VERIFY_LOCK:-/tmp/rag-verify.lock}" owner pid steps=0
+  [ ! -L "$lock" ] || return 1
+  owner=$(cat "$lock/pid" 2>/dev/null) || return 1
+  case "$owner" in ''|*[!0-9]*) return 1 ;; esac
+  pid=$$
+  while [ "$steps" -lt 64 ]; do
+    [ "$pid" = "$owner" ] && return 0
+    [ "$pid" -gt 1 ] || return 1
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    steps=$((steps + 1))
+  done
+  return 1
+}
+
+_rag_lock_leftover() {
+  local lock="${RAG_VERIFY_LOCK:-/tmp/rag-verify.lock}" owner
+  owner=$(cat "$lock/pid" 2>/dev/null | LC_ALL=C tr -cd '0-9' | cut -c1-20)
+  if [ -n "$owner" ]; then owner="its pid is $owner"; else owner="it has no pid"; fi
+  printf '\nThe verify lock %s is not held by this run or its parents (%s). This is a leftover\nof an earlier verify run, so it stops here.\n\n' \
+    "$lock" "$owner" >&2
 }
 
 _rag_lock_acquire() {
@@ -9145,7 +11808,10 @@ _rag_lock_acquire() {
     case "$holder" in
       none) ;;
       *[!0-9]*)
-        printf '\nThe verify lock %s holds %s, not a pid; remove it by hand if no run is using it.\n\n' "$lock" "$holder" >&2
+        # Shown, not trusted: printable characters other than the quote, and
+        # not much of them.
+        holder=$(printf '%s' "$holder" | LC_ALL=C tr -cd '[:print:]' | tr -d '"' | cut -c1-40)
+        printf '\nThe verify lock %s holds "%s", not a pid; remove it by hand if no run is using it.\n\n' "$lock" "$holder" >&2
         return 3 ;;
     esac
     if [ "$holder" != none ] && kill -0 "$holder" 2>/dev/null; then
@@ -9178,10 +11844,12 @@ _rag_lock_acquire() {
   return 3
 }
 
-if [ -z "${RAG_VERIFY_LOCK_HELD:-}" ]; then
+if [ -n "${RAG_VERIFY_LOCK_HELD:-}" ]; then
+  _rag_lock_owner_ok || { _rag_lock_leftover; exit 3; }
+else
   RAG_VERIFY_LOCK="${RAG_VERIFY_LOCK:-/tmp/rag-verify.lock}"
   _rag_lock_acquire "$RAG_VERIFY_LOCK" || exit 3
-  export RAG_VERIFY_LOCK_HELD=1
+  export RAG_VERIFY_LOCK RAG_VERIFY_LOCK_HELD=1
   # Released on exit, after any EXIT trap already set (bash traps replace
   # rather than chain, so keep the earlier one). A suite that sets its own
   # EXIT trap later should call _rag_lock_release in it; if it doesn't, the
@@ -9319,6 +11987,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import random
 import sys
 import zipfile
 
@@ -9339,8 +12008,13 @@ PARAGRAPHS = [
 ONE_LINER = PARAGRAPHS[0]
 
 
-def _pdf(paragraphs: list[str]) -> bytes:
-    """A minimal single-page PDF. Hand-built to avoid a writer dependency."""
+def _pdf(paragraphs: list[str], padding: int = 0) -> bytes:
+    """A minimal single-page PDF. Hand-built to avoid a writer dependency.
+
+    `padding` adds an unreferenced stream object of that many bytes. No page
+    points at it, so parsers skip it: the file is large on the wire but carries
+    only the text above, which keeps an upload-size test fast to ingest.
+    """
     lines: list[str] = []
     for para in paragraphs:
         cur = ""
@@ -9367,6 +12041,12 @@ def _pdf(paragraphs: list[str]) -> bytes:
         b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
     ]
+    if padding:
+        # Seeded so the fixture is byte-identical on every run. Random bytes
+        # rather than zeros so nothing on the path can compress it away.
+        filler = random.Random(21).randbytes(padding)
+        objects.append(b"<< /Length " + str(padding).encode() + b" >>\nstream\n"
+                       + filler + b"\nendstream")
     out = bytearray(b"%PDF-1.4\n")
     offsets = []
     for number, body in enumerate(objects, 1):
@@ -9427,6 +12107,9 @@ def write(target: pathlib.Path) -> None:
     (target / "tiny.txt").write_text("Short.\n\nAlso short.\n\n" + ONE_LINER + "\n")
     # Right extension, unparseable content — one bad file must not fail a batch.
     (target / "broken.pdf").write_bytes(b"%PDF-1.4\nnot a real pdf body\n%%EOF\n")
+    # Over nginx's 1 MB default request-body limit, which once rejected every
+    # real-world PDF with a 413 before the API saw it. See issue #21.
+    (target / "large.pdf").write_bytes(_pdf(PARAGRAPHS, padding=3 * 1024 * 1024))
     # Unsupported types, which must be reported rather than dropped in silence.
     (target / "notes.xyz").write_text("unsupported\n")
     (target / "notes.rtf").write_text("also unsupported\n")
@@ -9656,6 +12339,15 @@ sys.exit(0 if ok else 1)
 ENDPY
 check "resolved Compose publishes only the proxy on host loopback" $?
 
+# ── cross-origin access, as SECURITY.md describes it ─────────────────────────
+# SECURITY.md says a web page open in a browser on this machine can call the
+# API, because CORS allows any origin (#25 tracks tightening it). Check that
+# this is still true, so the policy and the code can't drift apart silently:
+# when #25 changes CORS, this check and SECURITY.md change together.
+cors=$(curl -s -D - -o /dev/null -m 10 -H "Origin: http://other.example" "$API/health" \
+  | tr -d '\r' | awk -F': ' 'tolower($1)=="access-control-allow-origin"{print $2}')
+check_eq "the API allows any origin, as SECURITY.md describes (#25)" "$cors" "*"
+
 (cd "$REPO_ROOT" && python3 - <<'ENDPY'
 import json, subprocess
 ids = subprocess.check_output(['docker', 'compose', 'ps', '-q'], text=True).split()
@@ -9761,14 +12453,32 @@ check_eq "a recreated collection does not inherit the retrieval config" \
   "$(api_get "/retrieval/config/$C" | jfield "['is_default']")" "True"
 
 # ── persistence across a restart (opt-in: it stops the stack) ────────────────
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  restart_refusal=$(restart_refusal_reason)
+  # The limit is checked before anything restarts (#130).
+  restart_limit=$(restart_limit); restart_limit_ok=$?
+fi
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -n "$restart_refusal" ]; then
+  check "restart, persistence and timing" 1 "$restart_refusal"
+elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ "$restart_limit_ok" != 0 ]; then
+  check "restart, persistence and timing" 1 "$restart_limit"
+elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  # Save a known config here, right before the restart: the section above ends
+  # by recreating $C with no saved config, so relying on earlier state made
+  # this check fail on every run (#73).
+  api_post "/ingest/config" "{\"collection\":\"$C\",\"chunking_strategy\":\"semantic\",\"chunk_size\":800,\"chunk_overlap\":150,\"similarity_threshold\":0.9,\"min_chunk_size\":80}" >/dev/null
+  check_eq "a config saved before the restart reads back" \
+    "$(api_get "/ingest/config/$C" | jfield "['chunking_strategy']")" "semantic"
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_before.json"
   started=$(python3 -c "import time;print(time.time())")
-  (cd "$REPO_ROOT" && docker compose down >/dev/null 2>&1 && docker compose up -d >/dev/null 2>&1)
-  for _ in $(seq 1 120); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
-  elapsed=$(python3 -c "import time;print(int(time.time()-$started))")
-  [ "$elapsed" -le 120 ]
-  check "restart reaches healthy within 120s" $? "took ${elapsed}s"
+  # Name the project explicitly; restart_refusal_reason has already made sure
+  # it is set and is not the live rag-docker project.
+  project="$COMPOSE_PROJECT_NAME"
+  (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
+  # Wait up to twice the limit, so a slow restart is still timed (#130).
+  elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
+  restart_timing_check "$restart_limit" "$elapsed"
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_after.json"
   python3 -c "
 import json,sys,os
@@ -9783,21 +12493,123 @@ b={c['name']:c for c in json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_befor
 a={c['name']:c for c in json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_after.json'))['collections']}
 sys.exit(0 if all(b[k]['created_at']==a[k]['created_at'] for k in b if k in a) else 1)"
   check "created_at is preserved across restart" $?
+  api_get "/ingest/config/$C" > "$RAG_INFRA_TMP/vfy_cfg_after.json"
   check_eq "saved ingest config survives restart" \
-    "$(api_get "/ingest/config/$C" | jfield "['chunking_strategy']")" "semantic"
+    "$(jfield "['chunking_strategy']" < "$RAG_INFRA_TMP/vfy_cfg_after.json")" "semantic"
+  check_eq "it is still the saved config, not the default" \
+    "$(jfield "['is_default']" < "$RAG_INFRA_TMP/vfy_cfg_after.json")" "False"
 else
   skip "restart, persistence and timing" "set RAG_ALLOW_RESTART=1 to include them"
+fi
+
+# ── restart from a Raft snapshot (issue #178; opt-in: it stops the stack) ────
+# The restart above comes too early for a snapshot: few schema changes, under
+# a minute of uptime. Here Weaviate takes one, a tail of changes follows it,
+# and a down/up must restore both: collections and objects from before the
+# snapshot, a create and a delete after it.
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -z "$restart_refusal" ] && [ "$restart_limit_ok" = 0 ]; then
+  SNAP_KEEP="${C}SnapKeep"; SNAP_GONE="${C}SnapGone"; SNAP_TAIL="${C}SnapTail"
+  for n in "$SNAP_KEEP" "$SNAP_GONE" "$SNAP_TAIL"; do drop_collection "$n"; done
+  # put_objects <collection> <count>: objects with their own vectors, so no
+  # embedding call is involved.
+  put_objects() {
+    (cd "$REPO_ROOT" && docker compose exec -T api python - "$1" "$2" <<'ENDPY'
+import sys
+from weaviate.classes.data import DataObject
+from services import weaviate_client as wc
+name, count = sys.argv[1], int(sys.argv[2])
+try:
+    result = wc.get_client().collections.get(name).data.insert_many([
+        DataObject(properties={"content": f"snapshot check {i}", "chunk_index": i},
+                   vector=[(i + 1) / (j + 1) for j in range(768)])
+        for i in range(count)])
+    sys.exit(1 if result.has_errors else 0)
+finally:
+    wc.close_client()
+ENDPY
+    ) >/dev/null 2>&1
+  }
+  snapshots() { (cd "$REPO_ROOT" && docker compose exec -T weaviate ls /var/lib/weaviate/raft/snapshots) 2>/dev/null | sort; }
+  make_collection "$SNAP_KEEP"; put_objects "$SNAP_KEEP" 5; keep_ok=$?
+  make_collection "$SNAP_GONE"; put_objects "$SNAP_GONE" 3; gone_ok=$?
+  [ "$keep_ok$gone_ok" = 00 ]
+  check "objects written before the snapshot" $?
+  before_snaps=$(snapshots)
+  # 70 create/delete pairs: 140 Raft entries, over the threshold of 128.
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "${C}Churn" <<'ENDPY'
+import sys
+from services import weaviate_client as wc
+client = wc.get_client()
+try:
+    for i in range(70):
+        client.collections.create(f"{sys.argv[1]}{i}")
+        client.collections.delete(f"{sys.argv[1]}{i}")
+finally:
+    wc.close_client()
+ENDPY
+  ) >/dev/null 2>&1
+  check "140 schema changes made" $?
+  # The interval is checked every 30-60s; allow 150s.
+  new_snap=""
+  for _ in $(seq 1 30); do
+    new_snap=$(comm -13 <(printf '%s\n' "$before_snaps") <(snapshots) | grep . | tail -1)
+    [ -n "$new_snap" ] && break
+    sleep 5
+  done
+  [ -n "$new_snap" ]
+  check "Weaviate snapshots its Raft log after 140 schema changes (within 150s)" $? "no new snapshot in /var/lib/weaviate/raft/snapshots"
+  snap_index=$(printf '%s' "$new_snap" | cut -d- -f2)
+  # The tail after the snapshot: one collection created, one deleted.
+  make_collection "$SNAP_TAIL"; put_objects "$SNAP_TAIL" 4
+  check "objects written after the snapshot" $?
+  drop_collection "$SNAP_GONE"
+  started=$(python3 -c "import time;print(time.time())")
+  project="$COMPOSE_PROJECT_NAME"
+  (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
+  elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
+  [ -n "$elapsed" ]
+  check "healthy again after a restart from the snapshot" $? "not healthy after $((restart_limit * 2))s"
+  # Weaviate logs the snapshot it started from on "raft node constructed".
+  restored=$( (cd "$REPO_ROOT" && docker compose -p "$project" logs weaviate 2>/dev/null) | python3 -c "
+import json, sys
+for line in sys.stdin:
+    _, _, body = line.partition('|')
+    try:
+        d = json.loads(body)
+    except ValueError:
+        continue
+    if d.get('msg') == 'raft node constructed':
+        print(d.get('last_snapshot_index', 0))")
+  [ -n "$snap_index" ] && [ "${restored:-0}" -ge "$snap_index" ] 2>/dev/null
+  check "the restart starts from the snapshot" $? "last_snapshot_index on start: ${restored:-none}, snapshot taken at: ${snap_index:-none}"
+  api_get "/collections" | python3 -c "
+import json, sys
+a = {c['name']: c['object_count'] for c in json.load(sys.stdin)['collections']}
+ok = (a.get('$SNAP_KEEP') == 5 and a.get('$SNAP_TAIL') == 4 and '$SNAP_GONE' not in a
+      and not any(n.startswith('${C}Churn') for n in a))
+print(a if not ok else '')
+sys.exit(0 if ok else 1)" > "$RAG_INFRA_TMP/vfy_snap.txt"
+  check "collections and objects before and after the snapshot survive the restart, deletes stay deleted" $? "$(cat "$RAG_INFRA_TMP/vfy_snap.txt")"
+  for n in "$SNAP_KEEP" "$SNAP_TAIL"; do drop_collection "$n"; done
+elif [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "restart from a Raft snapshot" "set RAG_ALLOW_RESTART=1 to include it"
 fi
 
 # ── startup sweeps leave a clean instance alone ──────────────────────────────
 leftover=$( (cd "$REPO_ROOT" && docker compose exec -T api sh -c \
   'ls -d /app/uploads/import-* /app/uploads/rechunk-* 2>/dev/null | wc -l') | tr -d ' ')
 check_eq "no abandoned extraction directories" "${leftover:-0}" "0"
-staging=$(api_get "/collections" | python3 -c "
-import json,sys
-print(sum(1 for c in json.load(sys.stdin)['collections']
-          if '__importing_' in c['name'] or '__tuning_' in c['name']))")
-check_eq "no abandoned staging collections" "$staging" "0"
+staging=$( (cd "$REPO_ROOT" && docker compose exec -T api python -c '
+import json
+from services import collection_recovery as recovery, weaviate_client as wc
+try:
+    records = [json.loads(path.read_text()) for path in recovery._root().glob("*.json")]
+    print(sum(record.get("state") == "scratch" and wc.get_client().collections.exists(record["staging"])
+              for record in records))
+finally:
+    wc.close_client()
+'))
+check_eq "no abandoned owned scratch collections" "$staging" "0"
 
 drop_collection "$C"
 cleanup_prefixed
@@ -9962,6 +12774,156 @@ cleanup_prefixed
 summary
 ```
 
+### scripts/verify/compose_target.py
+
+```python
+"""Refuse an in-container verifier when RAG_API selects another deployment."""
+import sys
+from urllib.parse import urlsplit
+
+def matches_local_proxy(api, bindings):
+    try:
+        url=urlsplit(api)
+        if url.scheme!='http' or url.hostname not in ('localhost','127.0.0.1','::1') or url.username or url.password or url.path.rstrip('/')!='/api' or url.query or url.fragment:
+            return False
+        port=url.port or 80
+        for binding in bindings.splitlines():
+            host, published=binding.rsplit(':',1)
+            host=host.strip('[]')
+            if int(published)!=port:continue
+            if host in ('0.0.0.0','::') or host==url.hostname or (host=='127.0.0.1' and url.hostname=='localhost'):
+                return True
+        return False
+    except (ValueError,TypeError):return False
+
+if __name__=='__main__':
+    if len(sys.argv)!=3 or not matches_local_proxy(sys.argv[1],sys.argv[2]):
+        print('This in-container check requires RAG_API to select this Compose proxy on a published loopback port. Remote or mismatched targets are unsupported; no backend check ran.',file=sys.stderr)
+        sys.exit(2)
+```
+
+### scripts/verify/11_retrieval.sh
+
+```bash
+#!/usr/bin/env bash
+# Observe physical config and execute top-K on real backend, controlling models.
+set -uo pipefail
+cd "$(dirname "$0")" && . ./lib.sh
+proxy_bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
+python3 ./compose_target.py "$API" "$proxy_bindings" || exit 2
+require_stack
+section "Physical index and effective query controls"
+(cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/retrieval_controls.py)
+check "physical index, legacy vector aliases, executed topK and config lifecycle" $?
+summary
+```
+
+### scripts/verify/retrieval_controls.py
+
+```python
+"""Real physical config and executed query limits on owned synthetic collections.
+
+Inside disposable API: python - < scripts/verify/retrieval_controls.py
+Actual SDK/backend storage and vector queries; only Ollama reformulation,
+embedding and answer calls are controlled. No startup sweep/model calls.
+"""
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import uuid
+from unittest.mock import AsyncMock,patch
+from fastapi.testclient import TestClient
+from config import settings
+from main import app
+from services import weaviate_client as wc,rag_pipeline as rag
+
+prefix=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Controls'+uuid.uuid4().hex[:10]
+collections=[]
+owners=[]
+persistent_upload=settings.upload_dir
+if importlib.util.find_spec('services.collection_recovery'):
+    from services import collection_recovery as recovery
+else:
+    recovery=None  # The pre-recovery baseline sweeps legacy staging markers.
+
+client=TestClient(app)
+with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patch.object(settings,'upload_dir',directory):
+    try:
+        for index in ('hnsw','flat'):
+            if recovery:
+                with patch.object(settings,'upload_dir',persistent_upload):
+                    owner=recovery.begin(prefix+index,'tune',wc.get_client())
+                owners.append(owner)
+                name=owner['staging']
+            else:
+                name=prefix+index+'__tuning_'+uuid.uuid4().hex
+            assert not wc._collection_exists_sync(name)
+            collections.append(name)
+            response=client.post('/collections',json={'name':name,'index_type':index,'hnsw_config':{'ef':72,'efConstruction':160,'maxConnections':32}})
+            assert response.status_code==201,response.text
+            if os.environ.get('RAG_VERIFY_INTERRUPT_AFTER_CREATE')=='1':
+                print('OWNED_INTERRUPTED_FIXTURE '+json.dumps({'name':name,'owner':owners[-1] if owners else None}),flush=True)
+                os._exit(86)  # Acceptance injection: skips finally like a hard kill.
+            coll=wc.get_client().collections.get(name)
+            for i in range(1,11):
+                coll.data.insert(uuid=uuid.UUID(int=i),properties={'content':f'Inert backend chunk{i}','source_file':'inert.txt','chunk_index':i},vector=[0.1]*768)
+            row=next(row for row in client.get('/collections').json()['collections'] if row['name']==name)
+            assert row['index_type']==index and row['distance_metric']=='cosine'
+            assert row['hnsw_config']==({'ef':72,'efConstruction':160,'maxConnections':32} if index=='hnsw' else None),row
+            print('PASS real '+index+' physical settings are observed, not query labels',flush=True)
+            for mode,limit in (('hnsw',1),('flat',50)):
+                with patch.object(rag.ollama,'chat',new=AsyncMock(return_value='Synthetic controlled answer')),patch.object(rag.ollama,'embed',new=AsyncMock(return_value=[0.1]*768)):
+                    response=client.post('/query',json={'collection':name,'question':'Inert','retrieval_mode':mode,'top_k':limit,'include_citations':True,'response_format':'engineer'})
+                assert response.status_code==200,response.text
+                body=response.json()
+                assert body['chunks_retrieved']==min(limit,10) and len(body['citations'])==min(limit,10),body
+            after=next(row for row in client.get('/collections').json()['collections'] if row['name']==name)
+            assert after['hnsw_config']==row['hnsw_config'] and after['index_type']==index
+            print('PASS legacy query aliases execute different topK limits without changing '+index+' physical config',flush=True)
+            config={'collection':name,'retrieval_mode':'hybrid','top_k':7,'alpha':0.25,'ef':96,'response_format':'engineer'}
+            assert client.post('/retrieval/config',json=config).status_code==201
+            loaded=client.get('/retrieval/config/'+name).json()
+            assert all(loaded[key]==value for key,value in config.items()),loaded
+            config['ef']=None
+            assert client.post('/retrieval/config',json=config).status_code==201
+            assert client.get('/retrieval/config/'+name).json()['ef'] is None
+            for limit in (1,50):
+                config['top_k']=limit
+                saved=client.post('/retrieval/config',json=config)
+                assert saved.status_code==201 and client.get('/retrieval/config/'+name).json()['top_k']==limit,saved.text
+            for limit in (0,51):
+                invalid=client.post('/retrieval/config',json={**config,'top_k':limit})
+                assert invalid.status_code==422,invalid.text
+            print('PASS saved method/topK boundaries/alpha/style roundtrip and inactive ef clears on '+index,flush=True)
+    finally:
+        # Every owned collection gets a deletion attempt; failures are reported
+        # together afterwards so they never hide a failure from the checks.
+        cleanup_failures=[]
+        for name in collections:
+            try:
+                if wc._collection_exists_sync(name):
+                    response=client.delete('/collections/'+name+'?confirm=true')
+                    if response.status_code!=200:
+                        cleanup_failures.append(f'{name}: {response.status_code} {response.text}')
+            except Exception as error:
+                cleanup_failures.append(f'{name}: {error!r}')
+        if cleanup_failures:
+            print('FAIL owned collection cleanup: '+'; '.join(cleanup_failures),flush=True)
+        if recovery:
+            with patch.object(settings,'upload_dir',persistent_upload):
+                for owner in owners:
+                    recovery.discard(owner,wc.get_client())
+        wc.close_client()
+        if cleanup_failures:
+            if sys.exc_info()[0] is None:  # Otherwise the original failure stays the raised error.
+                raise AssertionError('owned collection cleanup failed: '+'; '.join(cleanup_failures))
+assert all(not wc._collection_exists_sync(name) for name in collections)
+wc.close_client()
+print('PASS owned synthetic collections/config/files removed',flush=True)
+```
+
 ### scripts/verify/03_query.sh
 
 ```bash
@@ -9971,6 +12933,8 @@ cd "$(dirname "$0")" && . ./lib.sh
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 [ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
 require_stack
+bash ./11_retrieval.sh
+check "effective retrieval controls acceptance suite" $?
 C="${PREFIX}Query"
 
 section "§10.2 Query"
@@ -9986,7 +12950,7 @@ ask() {  # ask <mode> <format> <citations> -> writes /tmp/vfy_ans.json
 }
 
 if [ "$SKIP_SLOW" = "1" ]; then
-  skip "§10.2 entirely" "every check needs an LLM call"
+  skip "LLM query assertions" "set RAG_SKIP_SLOW=0 to include model calls"
   summary; exit $?
 fi
 
@@ -10032,8 +12996,9 @@ sys.exit(0 if 'error' not in d and d.get('chunks_retrieved',0) > 0 and d.get('an
 done
 
 # ── end_user is shorter than engineer ────────────────────────────────────────
-# The prompts instruct plain language but never brevity, so a single pair is
-# noise. Compare across trials and require a clear majority.
+# The end_user prompt asks for a short answer (#109), but a CPU model still
+# varies answer to answer, so a single pair is noise. Compare the mean length
+# across trials.
 trials="${RAG_FORMAT_TRIALS:-3}"
 eu_total=0; en_total=0; eu_wins=0
 for _ in $(seq 1 "$trials"); do
@@ -10049,6 +13014,121 @@ check "end_user answers are shorter than engineer on average" $? \
 drop_collection "$C"
 cleanup_prefixed
 summary
+```
+
+### scripts/verify/12_persistence.sh
+
+```bash
+#!/usr/bin/env bash
+# Durable session edits, generation interleaving and visible recovery diagnostics.
+set -uo pipefail
+cd "$(dirname "$0")" && . ./lib.sh
+bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
+python3 ./compose_target.py "$API" "$bindings" || exit 2
+require_stack
+section "Durable evaluation session updates"
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/verify/session_persistence_cases.py)
+check "owned persistence failure, concurrency and interruption regressions" $?
+(cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/session_persistence.py)
+check "concurrent HTTP edits, fresh-process reload, write failures and diagnostics" $?
+summary
+```
+
+### scripts/verify/session_persistence.py
+
+```python
+"""Owned real backend, concurrent HTTP edits and fresh-process filesystem reload.
+
+No startup sweep or model contact. Generated pairs are controlled, while the
+collection/sample reads, HTTP handlers and filesystem durability are real.
+"""
+import asyncio,copy,json,os,subprocess,sys,tempfile,uuid
+from pathlib import Path
+from unittest.mock import patch
+import httpx
+from config import settings
+from main import app
+from services import goldstandard as gs,weaviate_client as wc
+
+collection=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Persistence'+uuid.uuid4().hex[:10]
+created=False
+with tempfile.TemporaryDirectory(prefix='session-persistence-live-') as directory,patch.object(settings,'upload_dir',directory):
+    async def run():
+        global created
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-fixture') as client:
+            created=True
+            response=await client.post('/collections',json={'name':collection});assert response.status_code==201,response.text
+            coll=wc.get_client().collections.get(collection)
+            for i in range(2):coll.data.insert(properties={'content':'Owned inert chunk'+str(i),'source_file':'inert.txt','chunk_index':i},vector=[0.1]*768)
+            print('PASS unique real collection and supplied-vector chunks created',flush=True)
+            pending=asyncio.Event();release=asyncio.Event();calls=0
+            async def generated(chunk):
+                nonlocal calls
+                calls+=1
+                if calls==2:pending.set();await release.wait()
+                return {'pair_id':'p_owned'+str(calls),'question':'Original question','answer':'Original answer','contexts':[chunk['content']],'ground_truth':'Original truth','source_file':'inert.txt','chunk_index':calls-1,'status':'pending'}
+            with patch.object(gs,'_generate_pair',side_effect=generated):
+                started=await client.post('/goldstandard/generate',json={'collection':collection,'sample_size':2});assert started.status_code==202,started.text
+                sid=started.json()['session_id'];await asyncio.wait_for(pending.wait(),10)
+                tasks=list(gs._tasks)
+                responses=await asyncio.gather(*[client.patch('/goldstandard/session/'+sid+'/pair/p_owned1',json={'status':'edited',key:value}) for key,value in [('question','Acknowledged question'),('answer','Acknowledged answer'),('ground_truth','Acknowledged truth')]])
+                assert all(response.status_code==200 for response in responses),[response.text for response in responses]
+                await asyncio.to_thread(gs.mark_stale,collection,'Owned concurrent history flag')
+                release.set();await asyncio.gather(*tasks)
+            response=await client.get('/goldstandard/session/'+sid);assert response.status_code==200,response.text
+            state=gs.get_session(sid);pair=state['pairs'][0]
+            assert (pair['question'],pair['answer'],pair['ground_truth'])==('Acknowledged question','Acknowledged answer','Acknowledged truth')
+            assert len(state['pairs'])==2 and state['stale'] and state['status']=='completed'
+            print('PASS concurrent acknowledged HTTP edits and generation/history interleaving retained',flush=True)
+            code="from config import settings;from services import goldstandard as gs;import sys,json;settings.upload_dir=sys.argv[1];gs.load_sessions_from_disk();print(json.dumps(gs.get_session(sys.argv[2])))"
+            reloaded=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',code,directory,sid],capture_output=True,text=True,check=True)
+            assert json.loads(reloaded.stdout)==state,reloaded.stdout
+            print('PASS fresh API process reload retains every acknowledged update and flag',flush=True)
+            before=copy.deepcopy(state)
+            with patch.object(gs.os,'replace',side_effect=OSError('Owned pre-replace fault')):
+                failed=await client.patch('/goldstandard/session/'+sid+'/pair/p_owned1',json={'status':'edited','answer':'Rejected edit'})
+            assert failed.status_code==503 and failed.json()['error']['code']=='SESSION_WRITE_FAILED',failed.text
+            assert gs.get_session(sid)==before
+            issues=await client.get('/goldstandard/diagnostics');assert issues.status_code==200 and issues.json()['issues'][0]['code']=='SESSION_WRITE_FAILED',issues.text
+            print('PASS failed HTTP write is not acknowledged and diagnostic names failed snapshot',flush=True)
+            pending=asyncio.Event();release=asyncio.Event()
+            async def regenerate(chunk):pending.set();await release.wait();return {**before['pairs'][0],'answer':'Generated overwrite'}
+            with patch.object(gs,'_generate_pair',side_effect=regenerate):
+                task=asyncio.create_task(client.post('/goldstandard/regenerate',json={'session_id':sid,'pair_id':'p_owned1'}));await asyncio.wait_for(pending.wait(),10)
+                edit=await client.patch('/goldstandard/session/'+sid+'/pair/p_owned1',json={'status':'edited','answer':'Latest acknowledged answer'});assert edit.status_code==200,edit.text
+                release.set();conflict=await task
+            assert conflict.status_code==409 and conflict.json()['error']['code']=='PAIR_CHANGED_DURING_REGENERATION',conflict.text
+            assert gs.get_session(sid)['pairs'][0]['answer']=='Latest acknowledged answer'
+            print('PASS in-flight regeneration rejects changed target instead of losing acknowledged edit',flush=True)
+            # Marker persistence is secondary to an already completed deletion.
+            original_replace=gs.os.replace
+            def marker_fault(src,dst):
+                if Path(dst).stem==sid:raise OSError('Owned deletion marker failure')
+                return original_replace(src,dst)
+            with patch.object(gs.os,'replace',side_effect=marker_fault):
+                deleted=await client.delete('/collections/'+collection)
+            assert deleted.status_code==200 and deleted.json()['objects_deleted']==2,deleted.text
+            assert not wc._collection_exists_sync(collection)
+            from routers import collections as collection_routes
+            assert collection not in collection_routes._load_registry()
+            assert any(issue['filename']==sid+'.json' and issue['code']=='SESSION_WRITE_FAILED' for issue in gs.session_diagnostics())
+            print('PASS completed real HTTP deletion remains200 and registry removal completes despite marker persistence failure',flush=True)
+            corrupt=gs._sessions_dir()/('gs_'+uuid.uuid4().hex[:8]+'.json');corrupt.write_bytes(b'{owned incomplete snapshot')
+            response=await client.get('/goldstandard/diagnostics')
+            assert any(issue['filename']==corrupt.name and issue['code']=='SESSION_READ_FAILED' for issue in response.json()['issues']),response.text
+            assert corrupt.read_bytes()==b'{owned incomplete snapshot'
+            print('PASS real unreadable file preserved and reported through diagnostic HTTP endpoint',flush=True)
+            corrupt.unlink()
+            response=await client.get('/goldstandard/diagnostics')
+            assert not any(issue['filename']==corrupt.name for issue in response.json()['issues'])
+            print('PASS removed unreadable file clears its recovery issue while failed-write diagnostic remains',flush=True)
+    try:asyncio.run(run())
+    finally:
+        if created and wc._collection_exists_sync(collection):wc._delete_collection_sync(collection)
+        for sid in [sid for sid,s in gs._sessions.items() if s.get('collection')==collection]:gs._sessions.pop(sid,None)
+        wc.close_client()
+assert not wc._collection_exists_sync(collection);wc.close_client()
+print('PASS owned collection/session/files removed',flush=True)
 ```
 
 ### scripts/verify/09_sampling.sh
@@ -10148,6 +13228,8 @@ cd "$(dirname "$0")" && . ./lib.sh
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 [ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
 require_stack
+bash ./12_persistence.sh
+check "durable session acceptance suite" $?
 C="${PREFIX}Gold"
 
 section "§10.3 Gold Standard"
@@ -10298,7 +13380,11 @@ code=$(api_code "$API/goldstandard/download/definitely_not_here.json")
 check_eq "download of an unknown filename returns 404" "$code" "404"
 
 # ── sessions survive a restart ───────────────────────────────────────────────
-if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ] && [ -n "$restart_refusal" ]; then
+  check "sessions survive an API restart" 1 "$restart_refusal"
+elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   (cd "$(git rev-parse --show-toplevel 2>/dev/null || echo ../..)" && docker compose restart api >/dev/null 2>&1)
   for _ in $(seq 1 60); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 3; done
   api_get "/goldstandard/session/$SID" > /tmp/vfy_post.json
@@ -10334,19 +13420,30 @@ summary
 
 ```bash
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26, E27)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E29)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 [ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
 require_stack
+bash ./13_identity.sh
+check "imported evaluation identity acceptance suite" $?
+bash ./14_reindex.sh
+check "exact-record reindex acceptance suite" $?
 C="${PREFIX}Transfer"
-EXPORTS="$REPO_ROOT/exports"
+# The API's /app/exports on the host: the verify project's own folder (#152).
+EXPORTS="${RAG_EXPORTS_DIR:-$REPO_ROOT/exports}"
 
 section "Export, import and tuning"
 
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_session_import.py)
 check "evaluation import and generated-session regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_source_index_boundary.py)
+check "retained-source index boundary regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_retrieval_import.py)
+check "retrieval import and generated-script trust-boundary regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_batch_recovery.py)
+check "import and tuning recovery regressions" $?
 python3 "$REPO_ROOT/scripts/tests/test_session_implementation.py"
 check "embedded session/import verification sources match" $?
 
@@ -10388,8 +13485,15 @@ with tempfile.TemporaryDirectory() as td:
     chunks = root / "chunks.jsonl"
     chunks.write_bytes(chunks.read_bytes()[: len(chunks.read_bytes()) // 2])
     out = src.parent / (src.name.replace(".tar.gz", "") + "-corrupt.tar.gz")
-    with tarfile.open(out, "w:gz") as t:
-        t.add(root, arcname=root.name)
+    # Written under a .part name, then renamed into place: on Docker Desktop
+    # the API can read a freshly written bind-mounted file as empty (#184).
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
 ENDPY
 CORRUPT=$(python3 - "$EXPORTS/$PKG" <<'ENDPY'
 import pathlib, sys
@@ -10408,6 +13512,14 @@ sys.exit(0 if 'chunks.jsonl' in (d.get('error') or '') else 1)"
 check "the corruption error names the offending file" $?
 rm -f "$EXPORTS/$CORRUPT"
 
+# Digest-valid malformed retrieval settings must fail before every conflict path.
+python3 ./retrieval_settings.py "$API" "$C" "$EXPORTS/$PKG"
+check "invalid retrieval imports preserve live collections and settings" $?
+# Settings saved before PR #108 (#173): a legacy ef exports and imports as null
+# with a warning or note; other invalid saved settings fail the export early.
+python3 ./legacy_retrieval.py "$API" "$C" "$EXPORTS" "$REPO_ROOT"
+check "E28: legacy ef is cleared on export and import; invalid saved settings fail early" $?
+
 # ── evaluation metadata is validated before mutation (E23) ──────────────────
 # Add one evaluation sidecar to a copy of the package and re-sign the manifest,
 # so the archive is digest-valid and only the session metadata decides.
@@ -10416,7 +13528,7 @@ make_gs_pkg() {   # make_gs_pkg <session-id> <suffix>; prints the new filename
   python3 - "$EXPORTS/$PKG" "$1" "$2" "$C" <<'ENDPY'
 import hashlib, json, pathlib, sys, tarfile, tempfile
 src, sid, suffix, coll = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
-session = {"session_id": sid, "collection": coll, "status": "completed",
+session = {"session_id": 123 if sid == "__invalid_type__" else sid, "collection": coll, "status": "completed",
            "pairs_total": 1, "pairs_attempted": 1, "pairs_completed": 1, "pairs_failed": 0,
            "pairs": [{"pair_id": "p_0123abcd", "question": "Q?", "answer": "A",
                       "ground_truth": "A", "contexts": ["C"], "source_file": "policies.txt",
@@ -10434,15 +13546,22 @@ with tempfile.TemporaryDirectory() as td:
         "sha256:" + hashlib.sha256(side.read_bytes()).hexdigest()
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     out = src.parent / (src.name.replace(".tar.gz", "") + f"-{suffix}.tar.gz")
-    with tarfile.open(out, "w:gz") as t:
-        t.add(root, arcname=root.name)
+    # Written under a .part name, then renamed into place: on Docker Desktop
+    # the API can read a freshly written bind-mounted file as empty (#184).
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
     print(out.name)
 ENDPY
 }
 count_of() { api_get "/collections" | python3 -c "
 import json,sys; print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$1'][0])"; }
 
-BADGS=$(make_gs_pkg "not-a-generated-id" badgs)
+BADGS=$(make_gs_pkg "__invalid_type__" badgs)
 api_post "/import" "{\"filename\":\"$BADGS\",\"on_conflict\":\"replace\"}" > /tmp/vfy_imp.json
 ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
 wait_for_job "/import/job/$ijob" 900 >/dev/null
@@ -10454,8 +13573,8 @@ import json,sys; d=json.load(open('/tmp/vfy_gsjob.json'))
 sys.exit(0 if 'goldstandard/session.json' in json.dumps(d) else 1)"
 check "E23: the refusal names the offending sidecar" $?
 check_eq "E23: replace left the existing collection untouched" "$(count_of "$C")" "$chunks_before"
-code=$(api_code "$API/goldstandard/session/not-a-generated-id")
-check_eq "E23: no session was restored from the refused package" "$code" "404"
+check_eq "E23: no session was restored from the refused package" \
+  "$(jfield "['restored_sessions']" < /tmp/vfy_gsjob.json)" "[]"
 rm -f "$EXPORTS/$BADGS"
 
 # A refused package must change no live state at all. A replace from this
@@ -10489,8 +13608,15 @@ with tempfile.TemporaryDirectory() as td:
             "sha256:" + hashlib.sha256((gold / name).read_bytes()).hexdigest()
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     out = src.parent / (src.name.replace(".tar.gz", "") + "-mixgs.tar.gz")
-    with tarfile.open(out, "w:gz") as t:
-        t.add(root, arcname=root.name)
+    # Written under a .part name, then renamed into place: on Docker Desktop
+    # the API can read a freshly written bind-mounted file as empty (#184).
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
     print(out.name)
 ENDPY
 )
@@ -10533,6 +13659,206 @@ drop_collection "$gname"
 (cd "$REPO_ROOT" && docker compose exec -T api \
   rm -f "/app/uploads/goldstandard_sessions/$GS_SID.json") >/dev/null 2>&1 || true
 
+# ── retained-source identities never select outside files (E29, #138) ───────
+# A crafted, digest-valid package names an outside sentinel file in the API
+# container through sources/index.json. Import must refuse it before any live
+# mutation, and nothing exported afterwards may carry the sentinel's bytes.
+E29_TAG="$(python3 -c 'import uuid;print(uuid.uuid4().hex[:12])')"
+E29_SENT="/tmp/e29-sentinel-$E29_TAG"
+E29_TEXT="E29-OUTSIDE-SENTINEL-$E29_TAG"
+(cd "$REPO_ROOT" && docker compose exec -T api sh -c "printf '%s' '$E29_TEXT' > '$E29_SENT'")
+check "E29: the outside sentinel exists in the API container" $?
+make_src_pkg() {   # make_src_pkg <abs|trav|mismatch> <suffix>; prints the new filename
+  python3 - "$EXPORTS/$PKG" "$1" "$2" "$E29_SENT" <<'ENDPY'
+import hashlib, json, pathlib, sys, tarfile, tempfile
+src, mode, suffix, sent = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+sha = lambda b: hashlib.sha256(b).hexdigest()
+with tempfile.TemporaryDirectory() as td:
+    work = pathlib.Path(td)
+    with tarfile.open(src) as t:
+        t.extractall(work, filter="data")
+    root = next(p for p in work.iterdir() if p.is_dir())
+    manifest = json.loads((root / "manifest.json").read_text())
+    idx_path = root / "sources" / "index.json"
+    index = json.loads(idx_path.read_text())
+    digest, entry = next(iter(index["documents"].items()))   # the valid in-directory source
+    if mode == "abs":
+        key = sent
+    elif mode == "trav":
+        key = "../../.." + sent        # /app/sources/<collection>/../../.. is /
+    else:                              # a digest-shaped key whose blob doesn't match it
+        key = "0" * 64
+        blob = root / "sources" / key
+        blob.write_bytes(b"bytes that do not hash to the key")
+        manifest["files"]["sources/" + key] = "sha256:" + sha(blob.read_bytes())
+    index["documents"][key] = dict(entry, filenames=["leak.txt"])
+    idx_path.write_text(json.dumps(index))
+    assert "sources/index.json" in manifest["files"]
+    manifest["files"]["sources/index.json"] = "sha256:" + sha(idx_path.read_bytes())
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    out = src.parent / (src.name.replace(".tar.gz", "") + f"-{suffix}.tar.gz")
+    # Written under a .part name, then renamed into place: on Docker Desktop
+    # the API can read a freshly written bind-mounted file as empty (#184).
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
+    print(out.name)
+ENDPY
+}
+no_sentinel_in_exports() {   # exit 0 when no file or archive member in exports holds the sentinel
+  python3 - "$EXPORTS" "$E29_TEXT" <<'ENDPY'
+import pathlib, sys, tarfile
+root, needle = pathlib.Path(sys.argv[1]), sys.argv[2].encode()
+hits = []
+for p in root.rglob("*"):
+    if not p.is_file():
+        continue
+    if needle in p.read_bytes():
+        hits.append(str(p))
+    if p.name.endswith(".tar.gz"):
+        try:
+            with tarfile.open(p) as t:
+                for m in t.getmembers():
+                    f = t.extractfile(m) if m.isfile() else None
+                    if f is not None and needle in f.read():
+                        hits.append(f"{p.name}:{m.name}")
+        except tarfile.TarError:
+            pass
+print("\n".join(hits) or "no sentinel bytes in exports")
+sys.exit(1 if hits else 0)
+ENDPY
+}
+src_index_hash() {   # sha256 of the collection's retained index inside the API container
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$1" <<'ENDPY'
+import hashlib, sys
+from services import sources
+p = sources.collection_dir(sys.argv[1]) / "index.json"
+print(hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "missing")
+ENDPY
+  )
+}
+collection_names() { api_get "/collections" | python3 -c "
+import json,sys; print(' '.join(sorted(c['name'] for c in json.load(sys.stdin)['collections'])))"; }
+run_import() {   # run_import <file> <on_conflict>; leaves the job in /tmp/vfy_e29job.json
+  api_post "/import" "{\"filename\":\"$1\",\"on_conflict\":\"$2\"}" > /tmp/vfy_imp.json
+  local j; j=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
+  wait_for_job "/import/job/$j" 1800 >/dev/null
+  api_get "/import/job/$j" > /tmp/vfy_e29job.json
+}
+
+# Import → export, rename: the PR's controlled regression in one chain on the
+# live stack. If the import is (wrongly) accepted, export what it created and
+# look for the sentinel there.
+names_before=$(collection_names)
+ABSPKG=$(make_src_pkg abs srcabs)
+run_import "$ABSPKG" rename
+check_eq "E29: an absolute source-index key is refused as PACKAGE_CORRUPT" \
+  "$(jfield "['error_code']" < /tmp/vfy_e29job.json)" "PACKAGE_CORRUPT"
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_e29job.json'))
+sys.exit(0 if 'sources/index.json' in json.dumps(d) else 1)"
+check "E29: the refusal names sources/index.json" $?
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_e29job.json'))
+sys.exit(1 if '$E29_SENT' in json.dumps(d) or '$E29_TEXT' in json.dumps(d) else 0)"
+check "E29: the refusal doesn't echo the outside path or its contents" $?
+read -r e29stat e29name <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_e29job.json')); print(d['status'], d.get('collection') or '-')")"
+if [ "$e29stat" = "completed" ] && [ "$e29name" != "-" ]; then
+  api_post "/export" "{\"collection\":\"$e29name\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+  wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_e29exp.json)" 1800 >/dev/null
+fi
+check_eq "E29: a refused rename import creates no collection" "$(collection_names)" "$names_before"
+leak=$(no_sentinel_in_exports); check "E29: import → export never archives the outside sentinel" $? "$leak"
+[ "$e29stat" = "completed" ] && [ "$e29name" != "-" ] && drop_collection "$e29name"
+
+# Replace: refused before any live mutation, for every unsafe identity.
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":7,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+idx_before=$(src_index_hash "$C")
+for mode in abs trav mismatch; do
+  [ "$mode" = abs ] && P="$ABSPKG" || P=$(make_src_pkg "$mode" "src$mode")
+  run_import "$P" replace
+  check_eq "E29: replace with a $mode source identity is refused as PACKAGE_CORRUPT" \
+    "$(jfield "['error_code']" < /tmp/vfy_e29job.json)" "PACKAGE_CORRUPT"
+  check_eq "E29: ... leaves the chunk count alone ($mode)" "$(count_of "$C")" "$chunks_before"
+  check_eq "E29: ... and the live retrieval settings ($mode)" \
+    "$(api_get "/retrieval/config/$C" | jfield "['top_k']")" "7"
+  check_eq "E29: ... and the retained source index ($mode)" "$(src_index_hash "$C")" "$idx_before"
+  rm -f "$EXPORTS/$P"
+done
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+
+# The valid in-directory source still round-trips after the refusals.
+api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+e29job=$(jfield "['job_id']" < /tmp/vfy_e29exp.json)
+check_eq "E29: the collection still exports after refused imports" \
+  "$(wait_for_job "/export/job/$e29job" 1800)" "completed"
+E29PKG=$(api_get "/export/job/$e29job" | jfield "['filename']")
+python3 - "$EXPORTS/$E29PKG" <<'ENDPY'
+import hashlib, json, re, sys, tarfile
+with tarfile.open(sys.argv[1]) as t:
+    names = {m.name.split("/", 1)[1]: m for m in t.getmembers() if "/" in m.name}
+    index = json.load(t.extractfile(names["sources/index.json"]))
+    docs = index["documents"]
+    ok = bool(docs) and all(re.fullmatch(r"[0-9a-f]{64}", k) for k in docs)
+    for k in docs:
+        ok = ok and hashlib.sha256(t.extractfile(names[f"sources/{k}"]).read()).hexdigest() == k
+sys.exit(0 if ok else 1)
+ENDPY
+check "E29: its package carries the valid source under its digest, and nothing else" $?
+rm -f "$EXPORTS/$E29PKG"
+
+# Read boundaries: an unsafe index already on disk (as a pre-fix import would
+# have left it) must not let export or re-chunking read the sentinel.
+plant() {   # plant <abs|link|restore>
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$C" "$E29_SENT" "$1" <<'ENDPY'
+import hashlib, json, os, sys
+from services import sources
+d = sources.collection_dir(sys.argv[1]); sent, mode = sys.argv[2], sys.argv[3]
+idx, bak = d / "index.json", d / "index.json.e29bak"
+if mode == "restore":
+    keep = json.loads(bak.read_text())["documents"]
+    for p in d.iterdir():
+        if p.is_symlink():
+            p.unlink()
+    os.replace(bak, idx)
+    sys.exit(0)
+if not bak.exists():
+    bak.write_bytes(idx.read_bytes())
+index = json.loads(bak.read_text())
+entry = next(iter(index["documents"].values()))
+if mode == "abs":
+    key = sent
+else:
+    key = hashlib.sha256(open(sent, "rb").read()).hexdigest()
+    os.symlink(sent, d / key)
+index["documents"][key] = dict(entry, filenames=["leak.txt"])
+idx.write_text(json.dumps(index))
+ENDPY
+  )
+}
+for mode in abs link; do
+  plant "$mode"
+  check "E29: planted a $mode source entry on disk" $?
+  api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+  check_eq "E29: export refuses an on-disk $mode source entry" \
+    "$(wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_e29exp.json)" 1800)" "failed"
+  leak=$(no_sentinel_in_exports); check "E29: ... and archives no outside bytes ($mode)" $? "$leak"
+  api_post "/tune/rechunk" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
+  check_eq "E29: re-chunking refuses an on-disk $mode source entry" \
+    "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "failed"
+  check_eq "E29: ... and leaves the chunk count alone ($mode)" "$(count_of "$C")" "$chunks_before"
+  echo "    (info) GET /tune/$C with the $mode entry planted: HTTP $(api_code "$API/tune/$C")"
+  plant restore
+  check "E29: restored the collection's own source index ($mode)" $?
+done
+check_eq "E29: the restored index is the original" "$(src_index_hash "$C")" "$idx_before"
+(cd "$REPO_ROOT" && docker compose exec -T api rm -f "$E29_SENT") >/dev/null 2>&1 || true
+
 # ── conflict handling ────────────────────────────────────────────────────────
 api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"abort\"}" > /tmp/vfy_imp.json
 ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
@@ -10551,13 +13877,32 @@ check_eq "rename imports alongside the original" "$istat" "completed"
 [ "$irenamed" = "True" ] && [ "$iname" != "$C" ]
 check "the renamed collection has a new name" $? "imported as $iname"
 check_eq "every chunk is imported" "$iwritten" "$chunks_before"
+api_get "/retrieval/config/$iname" | python3 -c '
+import json,sys
+config=json.load(sys.stdin)
+expected={"retrieval_mode":"hybrid","top_k":6,"alpha":0.5,"ef":None,"response_format":"engineer"}
+sys.exit(0 if all(config[k] == v for k,v in expected.items()) and not config["is_default"] else 1)'
+check "renamed import preserves every saved retrieval setting" $?
+
+# A successful destructive replace must be exercised as well as abort/rename.
+api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"replace\"}" > /tmp/vfy_replace.json
+rjob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_replace.json'))['job_id'])")
+rstatus=$(wait_for_job "/import/job/$rjob" 1800)
+check_eq "replace completes after verified final writes" "$rstatus" "completed"
+check_eq "replace reports confirmed target objects" "$(api_get "/import/job/$rjob" | jfield "['chunks_written']")" "$chunks_before"
+api_post "/export" "{\"collection\":\"$C\"}" > /tmp/vfy_replace_exp.json
+rejob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_replace_exp.json'))['job_id'])")
+wait_for_job "/export/job/$rejob" 1800 >/dev/null
+RPKG=$(api_get "/export/job/$rejob" | jfield "['filename']")
+[ "$RPKG" != "$PKG" ]
+check "replace fidelity compares an independent re-export" $?
 
 # ── import is lossless ───────────────────────────────────────────────────────
 api_post "/export" "{\"collection\":\"$iname\"}" > /tmp/vfy_exp2.json
 ejob2=$(python3 -c "import json;print(json.load(open('/tmp/vfy_exp2.json'))['job_id'])")
 wait_for_job "/export/job/$ejob2" 1800 >/dev/null
 PKG2=$(api_get "/export/job/$ejob2" | jfield "['filename']")
-python3 - "$EXPORTS/$PKG" "$EXPORTS/$PKG2" <<'ENDPY'
+python3 - "$EXPORTS/$PKG" "$EXPORTS/$PKG2" "$EXPORTS/$RPKG" <<'ENDPY'
 import json, sys, tarfile, tempfile, pathlib
 def chunks(path):
     with tempfile.TemporaryDirectory() as td:
@@ -10566,13 +13911,15 @@ def chunks(path):
         root = next(p for p in pathlib.Path(td).iterdir() if p.is_dir())
         return {r["id"]: r for r in
                 (json.loads(l) for l in (root / "chunks.jsonl").read_text().splitlines() if l.strip())}
-a, b = chunks(sys.argv[1]), chunks(sys.argv[2])
-same = set(a) == set(b) and all(a[k]["vector"] == b[k]["vector"]
+a = chunks(sys.argv[1])
+comparisons = [chunks(path) for path in sys.argv[2:]]
+same = all(set(a) == set(b) and all(a[k]["vector"] == b[k]["vector"]
                                 and a[k]["properties"] == b[k]["properties"] for k in a)
+           for b in comparisons)
 sys.exit(0 if same else 1)
 ENDPY
-check "re-export after import is byte-identical (uuids, vectors, properties)" $?
-rm -f "$EXPORTS/$PKG2"
+check "rename and replace preserve exported uuids, vectors and properties" $?
+rm -f "$EXPORTS/$PKG2" "$EXPORTS/$RPKG"
 drop_collection "$iname"
 
 # ── models on import: damaged and namespaced (E26, E27) ──────────────────────
@@ -10738,12 +14085,275 @@ m=json.load(open('/tmp/vfy_help.json'))['markdown']
 sys.exit(0 if not re.search(r'@@[A-Z_0-9]+@@', m) else 1)"
 check "the help page has no unsubstituted placeholders" $?
 
+# ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
+RP="${PREFIX}BatchRecovery"
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "batch recovery across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+elif [ -n "$restart_refusal" ]; then
+  check "batch recovery across an API restart" 1 "$restart_refusal"
+elif ! [[ "$RP" =~ ^Vfy[A-Za-z0-9_]+$ ]]; then
+  # batch_recovery.py refuses any other prefix, as a guard on its destructive phases.
+  skip "batch recovery across an API restart" "batch_recovery.py accepts only Vfy… prefixes; RAG_TEST_PREFIX='$PREFIX' gives '$RP'"
+else
+  (cd "$REPO_ROOT" && docker compose exec -T api python - prepare --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_prepare.log 2>&1
+  check "batch faults fail truthfully and retain verified recovery" $? \
+    "$(grep -E 'Error|AssertionError' /tmp/vfy_recovery_prepare.log | tail -1)"
+  (cd "$REPO_ROOT" && docker compose restart api) >/dev/null 2>&1
+  for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+  (cd "$REPO_ROOT" && docker compose exec -T api python - check --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_check.log 2>&1
+  check "recovery survives restart; owned scratch swept, unowned names kept" $? \
+    "$(grep -E 'Error|AssertionError' /tmp/vfy_recovery_check.log | tail -1)"
+  (cd "$REPO_ROOT" && docker compose exec -T api python - cleanup --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_cleanup.log 2>&1
+  check "recovery acceptance fixtures are removed" $?
+fi
+
 rm -f "$EXPORTS/$PKG"
 drop_collection "$C"
 cleanup_prefixed
 bash ./10_validity.sh
 check "retained-session validity acceptance suite" $?
 summary
+```
+
+### scripts/verify/batch_recovery.py
+
+```python
+"""Destructive fault acceptance for a disposable stack, using only Vfy names.
+
+Run prepare in the API container, restart the API, then run check and cleanup.
+No production fault switches are added to the server.
+"""
+import argparse
+import asyncio
+import hashlib
+import json
+import re
+import sys
+import tarfile
+import uuid
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, '/app')
+from config import settings
+from services import batch_write, collection_recovery as recovery, goldstandard, importer, ollama_client, packager, sources, tuning, weaviate_client as wc
+
+
+def require(condition, message):
+    if not condition:
+        raise AssertionError(message)
+    print('PASS ' + message)
+
+
+def write_import_package(package, name, rows, dimensions):
+    """Write the replace-import fixture into an existing directory; return its manifest."""
+    (package / 'chunks.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    (package / 'collection.json').write_text('{}')
+    source_dir = package / 'sources'
+    source_dir.mkdir()
+    # Retained sources as an export ships them: digest-named blobs and their index.
+    blob = b'synthetic imported source'
+    digest = hashlib.sha256(blob).hexdigest()
+    (source_dir / digest).write_bytes(blob)
+    seen = '2026-09-27T00:00:00Z'
+    (source_dir / sources.INDEX_NAME).write_text(json.dumps({'version': sources.INDEX_VERSION, 'documents': {
+        digest: {'filenames': ['synthetic.txt'], 'size': len(blob), 'media_type': 'text/plain',
+                 'first_seen': seen, 'last_seen': seen}}}, indent=2, sort_keys=True))
+    manifest = {'package_format': 1, 'collection': {'name': name, 'chunk_count': len(rows)},
+                'embedding': {'model': settings.embed_model, 'dimensions': dimensions},
+                'fidelity': 'with-sources', 'files': {str(p.relative_to(package)): 'sha256:' + packager.sha256_file(p)
+                    for p in package.rglob('*') if p.is_file()}}
+    (package / 'manifest.json').write_text(json.dumps(manifest))
+    return manifest
+
+
+def prepare(prefix, state_path):
+    require(not state_path.exists(), 'no previous acceptance state is overwritten')
+    client = wc.get_client()
+    require(not any(name.startswith(prefix) for name in client.collections.list_all()), 'disposable names are unused')
+    vector = asyncio.run(ollama_client.embed('synthetic recovery acceptance text'))
+    rows = [dict(id=str(uuid.uuid4()), properties={'content': f'synthetic chunk {i}',
+            'source_file': 'synthetic.txt', 'chunk_index': i, 'created_at': '2026-09-27T00:00:00Z'}, vector=vector)
+            for i in range(2)]
+    state = {'prefix': prefix, 'recoveries': [], 'names': [], 'archives': []}
+    state_path.write_text(json.dumps(state))
+
+    def save():
+        state_path.write_text(json.dumps(state, indent=2, default=lambda value: value.isoformat()))
+
+    def collection(suffix):
+        name = prefix + suffix
+        state['names'].append(name)
+        save()
+        wc._create_collection_sync(name, 'hnsw', 'cosine', {})
+        batch_write.insert(client.collections.get(name), rows)
+        return name
+
+    rejected = collection('Reject')
+    col = client.collections.get(rejected)
+    invalid = [{**row, 'id': str(uuid.uuid4()), 'properties': {**row['properties'], 'chunk_index': 'not an integer'}} for row in rows]
+    invalid[1]['properties'] = dict(rows[1]['properties'])
+    try:
+        batch_write.insert(col, invalid, exact=False)
+    except RuntimeError:
+        require(bool(col.batch.failed_objects), 'real completed batch rejection is reported')
+        stored_ids = {str(obj.uuid) for obj in col.iterator()}
+        require(invalid[0]['id'] not in stored_ids and invalid[1]['id'] in stored_ids,
+                'real partial acceptance still fails the batch')
+    else:
+        raise AssertionError('real invalid batch reported success')
+
+    before_attempt = list(packager.read_chunks(rejected))
+    original_fetch = col.query.fetch_objects
+    def fail_verification_read(*args, **kwargs):
+        if kwargs.get('include_vector'):
+            raise OSError('controlled post-write read fault')
+        return original_fetch(*args, **kwargs)
+    with patch.object(col.query, 'fetch_objects', side_effect=fail_verification_read):
+        try:
+            batch_write.insert(col, lambda: ({'properties': row['properties']} for row in rows),
+                               exact=False, cleanup_owned=True)
+        except OSError:
+            pass
+        else:
+            raise AssertionError('post-write read fault reported success')
+    require(batch_write.verify(col, before_attempt, exact=True) == len(before_attempt),
+            'failed ingestion removes only its generated UUIDs and preserves prior records')
+
+    def remember(name, detail):
+        record_path = next(p for p in recovery._root().glob('*.json')
+                           if json.loads(p.read_text()).get('staging') == detail['recovered_as'])
+        record = json.loads(record_path.read_text())
+        expected = list(packager.read_chunks(record['staging']))
+        require(len(expected) == 2, name + ' retains every verified record')
+        state['recoveries'].append({'record': record, 'rows': expected})
+        save()
+
+    tune_name = collection('Tune')
+    sources.store(tune_name, 'synthetic.txt', b'synthetic retained source')
+    real_create = wc._create_collection_sync
+    def fail_create(name, *args, **kwargs):
+        if name == tune_name:
+            raise RuntimeError('controlled final-create fault')
+        return real_create(name, *args, **kwargs)
+    with patch.object(wc, '_create_collection_sync', side_effect=fail_create):
+        try:
+            tuning._rebuild(tune_name, [row['properties'] for row in rows], None, None, None)
+        except packager.PackageError as exc:
+            remember('tuning', exc.detail)
+        else:
+            raise AssertionError('tuning final-create fault reported success')
+
+    import_name = collection('Import')
+    package = Path(settings.upload_dir) / (prefix + '-package')
+    package.mkdir()
+    write_import_package(package, import_name, rows, len(vector))
+    archive = packager.exports_dir() / (prefix + '-fixture.tar.gz')
+    state['archives'].append(str(archive))
+    save()
+    with tarfile.open(archive, 'w:gz') as tar:
+        tar.add(package, arcname='package')
+    def fail_import_create(name, *args, **kwargs):
+        if name == import_name:
+            raise RuntimeError('controlled final-create fault')
+        return real_create(name, *args, **kwargs)
+    importer._jobs['live-acceptance'] = {'chunks_written': 0}
+    with patch.object(wc, '_create_collection_sync', side_effect=fail_import_create):
+        importer._run('live-acceptance', archive.name, 'replace')
+    job = importer._jobs['live-acceptance']
+    require(job['status'] == 'failed' and job['chunks_written'] == 0, 'replace failure reports zero confirmed target writes')
+    remember('replace import', job['error_detail'])
+
+    cleanup_record = recovery.begin(prefix + 'Cleanup', 'tune', client)
+    wc._create_collection_sync(cleanup_record['staging'], 'hnsw', 'cosine', {})
+    recovery.retain(cleanup_record)
+    metadata = recovery._root() / cleanup_record['operation_id']
+    actual_rmtree = recovery.shutil.rmtree
+    def fail_metadata_cleanup(path, *args, **kwargs):
+        if Path(path) == metadata:
+            raise OSError('controlled metadata cleanup fault')
+        return actual_rmtree(path, *args, **kwargs)
+    with patch.object(recovery.shutil, 'rmtree', side_effect=fail_metadata_cleanup):
+        try:
+            recovery.discard(cleanup_record, client)
+        except OSError:
+            pass
+        else:
+            raise AssertionError('cleanup fault was not observed')
+    require(cleanup_record['state'] == 'cleanup' and not client.collections.exists(cleanup_record['staging']),
+            'cleanup intent survives filesystem failure after backend deletion')
+    state['cleanup_record'] = cleanup_record
+    save()
+
+    unrelated = collection('__tuning_user_data')
+    state['unrelated'] = unrelated
+    scratch = recovery.begin(prefix + 'Scratch', 'tune', client)
+    wc._create_collection_sync(scratch['staging'], 'hnsw', 'cosine', {})
+    state['scratch'] = scratch['staging']
+    save()
+    print('READY restart the API before check')
+
+
+def check(state):
+    client = wc.get_client()
+    for entry in state['recoveries']:
+        record = entry['record']
+        require(client.collections.exists(record['staging']), 'recovery survives API restart: ' + record['operation'])
+        require(batch_write.verify(client.collections.get(record['staging']), entry['rows'], exact=True) == 2,
+                'recovery UUIDs, properties and vectors match: ' + record['operation'])
+        source_dir = sources.collection_dir(record['staging'])
+        require(source_dir.is_dir() and any(source_dir.iterdir()), 'recovery sources survive: ' + record['operation'])
+        require((recovery._root() / (record['operation_id'] + '.json')).is_file(), 'recovery ownership survives: ' + record['operation'])
+    require(client.collections.exists(state['unrelated']), 'unowned marker-like collection survives restart')
+    require(not client.collections.exists(state['scratch']), 'positively owned scratch is removed at startup')
+    cleanup_record = state['cleanup_record']
+    require(not (recovery._root() / (cleanup_record['operation_id'] + '.json')).exists(),
+            'startup finishes interrupted recovery journal cleanup')
+    require(not (recovery._root() / cleanup_record['operation_id']).exists(),
+            'startup removes remaining cleanup metadata')
+
+
+def cleanup(state, state_path):
+    client = wc.get_client()
+    for entry in state['recoveries']:
+        recovery.discard(entry['record'], client)
+    for name in state['names'] + [state.get('scratch', '')]:
+        if name and client.collections.exists(name):
+            wc._delete_collection_sync(name)
+        elif name:
+            sources.delete(name)
+            wc.ingest_config.delete(name)
+            wc.retrieval_config.delete(name)
+    for archive in state['archives']:
+        Path(archive).unlink(missing_ok=True)
+    import shutil
+    shutil.rmtree(Path(settings.upload_dir) / (state['prefix'] + '-package'), ignore_errors=True)
+    state_path.unlink()
+    print('PASS disposable recovery fixtures removed')
+
+
+if __name__ == '__main__':
+    args = argparse.ArgumentParser()
+    args.add_argument('phase', choices=('prepare', 'check', 'cleanup'))
+    args.add_argument('--prefix', default='VfyBatchRecovery')
+    options = args.parse_args()
+    if not re.fullmatch(r'Vfy[A-Za-z0-9_]+', options.prefix):
+        args.error('prefix must be a safe Vfy collection prefix')
+    state_path = Path(settings.upload_dir) / (options.prefix + '-acceptance.json')
+    try:
+        if options.phase == 'prepare':
+            prepare(options.prefix, state_path)
+        elif options.phase == 'check':
+            check(json.loads(state_path.read_text()))
+        else:
+            cleanup(json.loads(state_path.read_text()), state_path)
+    finally:
+        wc.close_client()
 ```
 
 ### scripts/verify/06_ui.sh
@@ -11017,6 +14627,234 @@ const clickByText = (page, text) => page.evaluate(t => {
 module.exports = { sleep, makeReporter, launch, session, bodyText, setValue, clickByText };
 ```
 
+### scripts/verify/browser/query_config.js
+
+```javascript
+// Deferred responses exercise the real provider, Retrieval page, and Q&A page.
+// All API calls are intercepted before application startup; no backend is used.
+const assert = require('node:assert/strict');
+const { makeReporter, setValue, clickByText } = require('./lib');
+
+const A = { collection: 'FixtureA', retrieval_mode: 'hybrid', top_k: 11, alpha: 0.25, ef: null, response_format: 'engineer', is_default: false };
+const B = { ...A, collection: 'FixtureB', retrieval_mode: 'semantic', top_k: 23, alpha: 0.6 };
+const DEFAULT = { ...B, retrieval_mode: 'hnsw', top_k: 5, alpha: 0.75, is_default: true };
+
+async function fixture(browser, base) {
+  const ctx = await browser.createBrowserContext();
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.evaluateOnNewDocument((a, b) => {
+    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
+    const realFetch = window.fetch.bind(window);
+    const requests = [];
+    window.queryConfigFixture = { requests };
+    window.fetch = (input, init = {}) => {
+      const path = new URL(input, location.href).pathname;
+      if (!path.startsWith('/api/')) return realFetch(input, init);
+      const method = init.method || 'GET';
+      const body = init.body ? JSON.parse(init.body) : null;
+      const entry = { path, method, body, done: false };
+      requests.push(entry);
+      const response = data => new Response(JSON.stringify(data), { status: 200 });
+      if (path === '/api/collections') {
+        entry.done = true;
+        return Promise.resolve(response({ collections: [a, b].map(c => ({ name: c.collection, object_count: 1, index_type: 'hnsw', distance_metric: 'cosine' })) }));
+      }
+      if (path === '/api/retrieval/config/FixtureA' && requests.filter(r => r.path === path).length === 1) {
+        entry.done = true;
+        return Promise.resolve(response(a));
+      }
+      if (path === '/api/query') {
+        entry.done = true;
+        return Promise.resolve(response({ answer: 'Fixture answer', citations: [], retrieval_latency_ms: 1, llm_latency_ms: 1 }));
+      }
+      if (path.startsWith('/api/retrieval/config')) {
+        return new Promise(resolve => { entry.resolve = (data, status) => { entry.done = true; resolve(new Response(JSON.stringify(data), { status })); }; });
+      }
+      return Promise.reject(new Error('Unexpected fixture API call: ' + method + ' ' + path));
+    };
+  }, A, B);
+  await page.goto(base + '/retrieval', { waitUntil: 'domcontentloaded' });
+  await page.waitForFunction(() => document.body.innerText.includes('Top-K Results: 11') && !document.body.innerText.includes('Loading saved settings'));
+  return { ctx, page, errors };
+}
+
+async function pending(page, path, method = 'GET', count = 1) {
+  await page.waitForFunction((p, m, n) => window.queryConfigFixture.requests.filter(r => r.path === p && r.method === m && !r.done).length >= n, {}, path, method, count);
+}
+
+async function release(page, path, data, { method = 'GET', status = 200, last = false } = {}) {
+  await pending(page, path, method);
+  await page.evaluate(async (p, m, d, s, latest) => {
+    const waiting = window.queryConfigFixture.requests.filter(r => r.path === p && r.method === m && !r.done);
+    (latest ? waiting[waiting.length - 1] : waiting[0]).resolve(d, s);
+    // Drain fetch/text microtasks and React's committed effects without sleeps.
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  }, path, method, data, status, last);
+}
+
+async function save(page) {
+  assert.equal(await clickByText(page, 'Save for this collection'), true);
+  await pending(page, '/api/retrieval/config', 'POST');
+}
+
+async function select(page, name) {
+  await page.select('select', name);
+  await pending(page, '/api/retrieval/config/' + name);
+}
+
+async function assertSettings(page, config) {
+  assert.deepEqual(await page.evaluate(() => ({
+    collection: document.querySelector('select').value,
+    top_k: Number(document.querySelector('input[type=range]').value),
+    retrieval_mode: document.querySelector('input[name=mode]:checked').value,
+    loading: document.body.innerText.includes('Loading saved settings'),
+  })), { collection: config.collection, top_k: config.top_k, retrieval_mode: config.retrieval_mode, loading: false });
+}
+
+async function assertQuery(page, config) {
+  assert.equal(await clickByText(page, 'Q&A'), true);
+  await page.waitForSelector('textarea');
+  await setValue(page, '() => document.querySelector("textarea")', 'Which settings are active?');
+  assert.equal(await clickByText(page, 'Ask'), true);
+  await page.waitForFunction(() => window.queryConfigFixture.requests.some(r => r.path === '/api/query'));
+  const body = await page.evaluate(() => window.queryConfigFixture.requests.find(r => r.path === '/api/query').body);
+  assert.deepEqual(body, {
+    question: 'Which settings are active?', collection: config.collection,
+    retrieval_mode: config.retrieval_mode, top_k: config.top_k, alpha: config.alpha,
+    include_citations: false, response_format: 'engineer',
+  });
+}
+
+async function runQueryConfigTests(browser, base, reporter) {
+  reporter.section('collection-bound query configuration (deferred API fixtures)');
+  const cases = [];
+  for (const saveFirst of [true, false]) {
+    cases.push([`A save ${saveFirst ? 'before' : 'after'} B load preserves B settings and next query`, async page => {
+      await save(page);
+      await select(page, B.collection);
+      if (saveFirst) {
+        await release(page, '/api/retrieval/config', A, { method: 'POST' });
+        assert.equal(await page.evaluate(() => document.body.innerText.includes('Loading saved settings')), true);
+      }
+      await release(page, '/api/retrieval/config/' + B.collection, B);
+      if (!saveFirst) await release(page, '/api/retrieval/config', A, { method: 'POST' });
+      await assertSettings(page, B);
+      await assertQuery(page, B);
+    }]);
+  }
+  cases.push(['B load failure remains authoritative after stale A save', async page => {
+    await save(page);
+    await select(page, B.collection);
+    await release(page, '/api/retrieval/config/' + B.collection, { error: { message: 'Fixture B unavailable' } }, { status: 500 });
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    assert.equal(await page.evaluate(() => document.body.innerText.includes('Fixture B unavailable') && document.body.innerText.includes('showing defaults')), true);
+    await assertSettings(page, DEFAULT);
+    await assertQuery(page, DEFAULT);
+  }]);
+  cases.push(['A -> B -> A does not revive the first A save or stale B load', async page => {
+    await save(page);
+    await select(page, B.collection);
+    await select(page, A.collection);
+    const current = { ...A, retrieval_mode: 'semantic', top_k: 31, alpha: 0.9 };
+    await release(page, '/api/retrieval/config/' + A.collection, current);
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    await release(page, '/api/retrieval/config/' + B.collection, B);
+    await assertSettings(page, current);
+    await assertQuery(page, current);
+  }]);
+  for (const latestFirst of [true, false]) {
+    cases.push([`concurrent saves keep latest submitted values (${latestFirst ? 'latest' : 'oldest'} response first)`, async page => {
+      await save(page);
+      await setValue(page, '() => document.querySelector("input[type=range]")', '17');
+      await save(page);
+      await pending(page, '/api/retrieval/config', 'POST', 2);
+      const current = { ...A, top_k: 17 };
+      const bodies = await page.evaluate(() => window.queryConfigFixture.requests.filter(r => r.method === 'POST').map(r => r.body.top_k));
+      assert.deepEqual(bodies, [11, 17]);
+      await release(page, '/api/retrieval/config', latestFirst ? current : A, { method: 'POST', last: latestFirst });
+      await release(page, '/api/retrieval/config', latestFirst ? A : current, { method: 'POST' });
+      await assertSettings(page, current);
+      await assertQuery(page, current);
+    }]);
+  }
+  cases.push(['current save failure still reaches the caller and preserves saved settings', async page => {
+    await save(page);
+    await release(page, '/api/retrieval/config', { error: { message: 'Fixture save failed' } }, { method: 'POST', status: 500 });
+    assert.equal(await page.evaluate(() => document.body.innerText.includes('Fixture save failed')), true);
+    await assertSettings(page, A);
+    await assertQuery(page, A);
+  }]);
+  // Reviewer cases: what a stale save leaves on the newly selected collection's page.
+  cases.push(['stale A save still persists to A, and B shows no save confirmation', async page => {
+    await save(page);
+    const posted = await page.evaluate(() => window.queryConfigFixture.requests.find(r => r.method === 'POST').body.collection);
+    assert.equal(posted, A.collection, 'the save request must name the collection it was started for');
+    await select(page, B.collection);
+    await release(page, '/api/retrieval/config/' + B.collection, B);
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), false, 'B shows "Saved!" from A\'s stale save');
+    await assertSettings(page, B);
+  }]);
+  cases.push(['stale A save failure is not shown as an error on B', async page => {
+    await save(page);
+    await select(page, B.collection);
+    await release(page, '/api/retrieval/config/' + B.collection, B);
+    await release(page, '/api/retrieval/config', { error: { message: 'Fixture stale save failed' } }, { method: 'POST', status: 500 });
+    assert.equal(await page.evaluate(() => document.body.innerText.includes('Fixture stale save failed')), false, "B's page shows A's stale save failure");
+    await assertSettings(page, B);
+    await assertQuery(page, B);
+  }]);
+  for (const failureFirst of [true, false]) {
+    cases.push([`older acknowledged save survives newer failure (${failureFirst ? 'failure' : 'success'} first)`, async page => {
+      const saved = { ...A, top_k: 13 };
+      await setValue(page, '() => document.querySelector("input[type=range]")', '13');
+      await save(page);
+      await setValue(page, '() => document.querySelector("input[type=range]")', '17');
+      await save(page);
+      await pending(page, '/api/retrieval/config', 'POST', 2);
+      const fail = () => release(page, '/api/retrieval/config', { error: { message: 'Latest save failed' } }, { method: 'POST', status: 500, last: true });
+      if (failureFirst) await fail();
+      await release(page, '/api/retrieval/config', saved, { method: 'POST' });
+      if (!failureFirst) await fail();
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('Latest save failed')), true);
+      assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), false);
+      await assertSettings(page, saved);
+      await assertQuery(page, saved);
+    }]);
+  }
+  for (const [name, test] of cases) {
+    let s;
+    try {
+      s = await fixture(browser, base);
+      await test(s.page);
+      assert.deepEqual(s.errors, []);
+      reporter.check(name, true);
+    } catch (error) {
+      reporter.check(name, false, error.stack || error.message);
+    } finally {
+      if (s) await s.ctx.close();
+    }
+  }
+}
+
+module.exports = { runQueryConfigTests };
+
+if (require.main === module) {
+  (async () => {
+    const browser = await require('puppeteer-core').launch({
+      executablePath: process.env.RAG_CHROMIUM_PATH || '/usr/bin/chromium-browser',
+      headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    });
+    const reporter = makeReporter();
+    try { await runQueryConfigTests(browser, process.env.RAG_UI_BASE || 'http://127.0.0.1:3000', reporter); }
+    finally { await browser.close(); }
+    process.exitCode = reporter.summary() ? 0 : 1;
+  })().catch(error => { console.error(error); process.exitCode = 2; });
+}
+```
+
 ### scripts/verify/browser/ui_criteria.js
 
 ```javascript
@@ -11035,6 +14873,8 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
 (async () => {
   const browser = await launch();
   const r = makeReporter();
+
+  await require('./query_config').runQueryConfigTests(browser, BASE, r);
 
   // ── role persistence ───────────────────────────────────────────────────────
   r.section('§10.4 role selection');
@@ -11158,6 +14998,102 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.ctx.close();
   }
 
+  // ── owned retrieval HTTP fixtures; no backend writes/model calls ───────────
+  r.section('effective retrieval UI boundaries');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    const name = 'OwnedRetrievalBrowserFixture';
+    const row = { name, object_count: 10, index_type: 'hnsw', distance_metric: 'cosine', hnsw_config: { ef: 72, efConstruction: 160, maxConnections: 32 } };
+    let lists = 0, failRefresh = false;
+    const saves = [];
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/collections') {
+        lists++;
+        return request.respond({ status: lists === 1 || failRefresh ? 500 : 200, contentType: 'application/json', body: JSON.stringify(lists === 1 || failRefresh ? { error: { message: 'Synthetic index read failure.' } } : { collections: [row] }) });
+      }
+      if (path === '/api/retrieval/config/' + name) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collection: name, retrieval_mode: 'flat', top_k: 5, alpha: 0.25, ef: 96, response_format: 'engineer', is_default: false }) });
+      }
+      if (path === '/api/retrieval/config' && request.method() === 'POST') {
+        const body = JSON.parse(request.postData()); saves.push(body);
+        return request.respond({ status: 201, contentType: 'application/json', body: JSON.stringify({ ...body, is_default: false }) });
+      }
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/retrieval', { waitUntil: 'networkidle2' }); await sleep(300);
+      r.check('initial metadata failure displays its read warning', /Could not read the current physical index/.test(await bodyText(s.page)));
+      r.check('initial metadata failure settles the pending read instead of leaving it stuck', !/Reading index details…/.test(await bodyText(s.page)) && /Index details are unavailable for this collection\./.test(await bodyText(s.page)));
+      await clickByText(s.page, 'Refresh index details'); await sleep(500);
+      const refreshed = await bodyText(s.page);
+      r.check('successful refresh reports backend settings and clears initial warning', /ef: 72/.test(refreshed) && /efConstruction: 160/.test(refreshed) && /maxConnections: 32/.test(refreshed) && !/Could not read/.test(refreshed));
+      r.check('three query methods replace inactive build controls and show legacy ef warning', await s.page.evaluate(() => document.querySelectorAll('input[name=mode]').length === 3 && document.querySelectorAll('input[type=range]').length === 1 && document.querySelector('input[value=hnsw]').checked && document.body.innerText.includes('legacy saved ef override (96) is inactive')));
+      for (const limit of [1, 50]) {
+        await s.page.evaluate(value => { const input = document.querySelector('input[type=range]'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, String(value)); input.dispatchEvent(new Event('input', { bubbles: true })); }, limit);
+        await sleep(100); await clickByText(s.page, 'Save for this collection'); await sleep(300);
+        r.check('Top-K ' + limit + ' is selected and sent when saving', saves.at(-1)?.top_k === limit && (await bodyText(s.page)).includes('Top-K Results: ' + limit));
+      }
+      r.check('saving normalizes legacy vector alias and clears inactive ef without changing observed index', saves.length === 2 && saves.every(save => save.retrieval_mode === 'hnsw' && save.ef === null) && /ef: 72/.test(await bodyText(s.page)));
+      failRefresh = true;
+      await clickByText(s.page, 'Refresh index details'); await sleep(300);
+      r.check('failed refresh keeps prior physical details with an explicit warning', /displayed details are from the prior read/.test(await bodyText(s.page)) && /ef: 72/.test(await bodyText(s.page)));
+      r.check('retrieval fixture causes no React page errors', !s.errors.some(error => error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); }
+  }
+  for (const lateFailure of [false, true]) {
+    const s = await session(browser, BASE, 'engineer');
+    let initial, count = 0;
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      if (new URL(request.url()).pathname === '/api/collections') {
+        count++;
+        if (count === 1) { initial = request; return; }
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: [{ name: 'OwnedLatestIndexFixture', object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', hnsw_config: { ef: 191, efConstruction: 170, maxConnections: 40 } }] }) });
+      }
+      if (new URL(request.url()).pathname.startsWith('/api/retrieval/config/')) return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collection: 'OwnedLatestIndexFixture', retrieval_mode: 'hnsw', top_k: 5, alpha: 0.75, ef: null, response_format: 'engineer', is_default: true }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/retrieval', { waitUntil: 'domcontentloaded' }); await sleep(300);
+      if (!initial) throw new Error('Initial metadata request was not observed');
+      if (!lateFailure) {
+        const pending = await bodyText(s.page);
+        r.check('pending initial read says it is reading, not that details are unavailable', pending.includes('Reading index details…') && !/Index details are unavailable/.test(pending));
+      }
+      await clickByText(s.page, 'Refresh index details'); await sleep(300);
+      const freshVisible = /ef: 191/.test(await bodyText(s.page));
+      await initial.respond({ status: lateFailure ? 500 : 200, contentType: 'application/json', body: JSON.stringify(lateFailure ? { error: { message: 'Synthetic obsolete failure.' } } : { collections: [{ name: 'OwnedLatestIndexFixture', object_count: 0, index_type: 'flat', distance_metric: 'dot', hnsw_config: null }] }) });
+      await sleep(300);
+      const after = await bodyText(s.page);
+      r.check('late initial ' + (lateFailure ? 'failure' : 'success') + ' cannot replace refreshed index state', freshVisible && /ef: 191/.test(after) && !/Could not read|Synthetic obsolete failure/.test(after));
+    } finally { await s.ctx.close(); }
+  }
+
+  // ── Q&A page shares the accurate query-method label ─────────────────────
+  r.section('Q&A accurate method label');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    const name = 'OwnedQaLabelFixture';
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/collections') {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: [{ name, object_count: 4, index_type: 'flat', distance_metric: 'cosine', hnsw_config: null }] }) });
+      }
+      if (path === '/api/retrieval/config/' + name) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collection: name, retrieval_mode: 'flat', top_k: 5, alpha: 0.75, ef: null, response_format: 'engineer', is_default: false }) });
+      }
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(700);
+      const labels = await s.page.evaluate(() => [...document.querySelectorAll('select[disabled] option')].map(o => o.textContent));
+      r.check('Q&A shows the same "Vector — existing index" label for a saved flat alias', labels.includes('Vector — existing index') && !labels.includes('flat'), JSON.stringify(labels));
+    } finally { await s.ctx.close(); }
+  }
+
   // ── delete confirmation ────────────────────────────────────────────────────
   r.section('§10.4 delete confirmation');
   {
@@ -11251,6 +15187,112 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     }
     r.check('no console errors on the health page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
     await s.ctx.close();
+  }
+
+  // ── owned session-recovery diagnostic HTTP fixtures ───────────────────────
+  r.section('session recovery diagnostics');
+  for (const failure of [false, true]) {
+    const s = await session(browser, BASE, 'engineer');
+    await s.page.setRequestInterception(true);
+    s.page.on('request', async request => {
+      if (new URL(request.url()).pathname === '/api/goldstandard/diagnostics') {
+        return request.respond({ status: failure ? 503 : 200, contentType: 'application/json', body: JSON.stringify(failure ? { error: { message: 'Synthetic diagnostic read failure' } } : { issues: [{ filename: 'gs_ownedfixture.json', code: 'SESSION_READ_FAILED', message: 'Owned unreadable snapshot preserved.' }] }) });
+      }
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/health', { waitUntil: 'networkidle2' }); await sleep(500);
+      const text = await bodyText(s.page);
+      if (failure) {
+        r.check('diagnostic refresh failure is visible', /Session recovery diagnostics could not be refreshed/.test(text));
+      } else {
+        r.check('retained-session recovery warning is visible on Health', /Evaluation session recovery needs attention/.test(text));
+        r.check('recovery warning exposes filename, code and preservation message', /gs_ownedfixture.json/.test(text) && /SESSION_READ_FAILED/.test(text) && /Owned unreadable snapshot preserved/.test(text));
+      }
+      r.check('diagnostic ' + (failure ? 'failure' : 'warning') + ' does not cause React page errors', !s.errors.some(error => error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); }
+  }
+
+  // Controlled refresh timing exercises visible pending, failure and ordering.
+  {
+    const s = await session(browser, BASE, 'engineer');
+    await s.page.evaluateOnNewDocument(() => {
+      const original = window.setInterval;
+      window.setInterval = (fn, delay, ...args) => {
+        if (delay === 30000) { window.__ownedHealthRefresh = fn; return 45001; }
+        return original(fn, delay, ...args);
+      };
+    });
+    const pending = [];
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      if (new URL(request.url()).pathname === '/api/goldstandard/diagnostics') pending.push(request);
+      else request.continue();
+    });
+    const next = async () => {
+      for (let i = 0; i < 100 && !pending.length; i++) await sleep(50);
+      if (!pending.length) throw new Error('Owned diagnostic refresh did not arrive');
+      return pending.shift();
+    };
+    const respond = (request, filename, status = 200) => request.respond({ status, contentType: 'application/json', body: JSON.stringify(status === 200 ? { issues: [{ filename, code: 'SESSION_READ_FAILED', message: 'Owned retained result.' }] } : { error: { message: 'Owned refresh failure' } }) });
+    const refresh = () => s.page.evaluate(() => window.__ownedHealthRefresh());
+    try {
+      await s.page.goto(BASE + '/health', { waitUntil: 'domcontentloaded' });
+      const initial = await next(); await sleep(150);
+      r.check('initial diagnostic pending state is visible', /Refreshing session recovery diagnostics/.test(await bodyText(s.page)));
+      await respond(initial, 'gs_previousfixture.json'); await sleep(250);
+      await refresh(); const failed = await next(); await sleep(100);
+      let text = await bodyText(s.page);
+      r.check('pending refresh labels retained diagnostics as previous results', /Previous evaluation session recovery results/.test(text) && /gs_previousfixture.json/.test(text));
+      await respond(failed, '', 503); await sleep(250); text = await bodyText(s.page);
+      r.check('failed refresh removes old current-issue claims and clears pending state', /could not be refreshed/.test(text) && !/gs_previousfixture.json|Refreshing session recovery diagnostics/.test(text));
+      await refresh(); const recovered = await next(); await respond(recovered, 'gs_currentfixture.json'); await sleep(250); text = await bodyText(s.page);
+      r.check('successful refresh clears the error and pending indicators', /gs_currentfixture.json/.test(text) && !/could not be refreshed|Refreshing session recovery diagnostics/.test(text));
+      await refresh(); const older = await next(); await refresh(); const newer = await next();
+      await respond(newer, 'gs_latestfixture.json'); await sleep(200);
+      await respond(older, '', 503); await sleep(250); text = await bodyText(s.page);
+      r.check('late failed response cannot overwrite newer diagnostic success', /gs_latestfixture.json/.test(text) && !/could not be refreshed/.test(text));
+      await refresh(); const olderSuccess = await next(); await refresh(); const newerSuccess = await next();
+      await respond(newerSuccess, 'gs_finalfixture.json'); await sleep(150);
+      await respond(olderSuccess, 'gs_stalefixture.json'); await sleep(250); text = await bodyText(s.page);
+      r.check('late successful response cannot replace newer diagnostic results', /gs_finalfixture.json/.test(text) && !/gs_stalefixture.json/.test(text));
+      r.check('refresh error and timing fixtures do not cause React page errors', !s.errors.some(error => error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); }
+  }
+
+  // Imported identities are exposed through the existing visible job notes.
+  r.section('imported session lookup IDs');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    const filename = 'ragpkg-owned-session.tar.gz';
+    const sourceId = 'gs_460abcde', localId = 'gs_460abcdf';
+    const submissions = [];
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      let body;
+      if (path === '/api/packages') body = { packages: [{ filename, size_bytes: 100, collection: 'OwnedOriginal', chunk_count: 1, fidelity: 'chunks-only', created_at: '2026-09-28T00:00:00Z', readable: true }] };
+      else if (path === '/api/import' && request.method() === 'POST') {
+        submissions.push(JSON.parse(request.postData()));
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: 'owned-identity-job', status: 'queued', filename }) });
+      } else if (path === '/api/import/job/owned-identity-job') body = { job_id: 'owned-identity-job', status: 'completed', filename, on_conflict: 'rename', collection: 'OwnedImported', original_collection: 'OwnedOriginal', chunks_written: 1, fidelity: 'chunks-only', renamed: true, notes: ["evaluation session '" + sourceId + "' restored as local '" + localId + "' for 'OwnedImported'"], restored_sessions: [{ source_session_id: sourceId, session_id: localId, collection: 'OwnedImported' }], error: null, error_code: null, error_detail: null };
+      if (body) return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' }); await sleep(250);
+      await s.page.evaluate(value => {
+        const selector = [...document.querySelectorAll('select')].find(el => [...el.options].some(option => option.value === value));
+        Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(selector, value);
+        selector.dispatchEvent(new Event('change', { bubbles: true }));
+        document.querySelector('input[name="conflict"][value="rename"]').click();
+      }, filename);
+      await s.page.evaluate(() => [...document.querySelectorAll('button')].find(button => button.textContent.trim() === 'Import').click()); await sleep(600);
+      const text = await bodyText(s.page);
+      r.check('rename import submits selected package and explicit policy', submissions.length === 1 && submissions[0].filename === filename && submissions[0].on_conflict === 'rename');
+      r.check('completed import displays original and allocated session IDs for lookup', text.includes(sourceId) && text.includes(localId) && text.includes('OwnedImported'));
+      r.check('import identity notes do not cause React page errors', !s.errors.some(error => error.startsWith('pageerror:')));
+    } finally { await s.ctx.close(); }
   }
 
   // ── transfer help page ─────────────────────────────────────────────────────
@@ -11634,6 +15676,589 @@ echo "Verify the models were restored (no download should occur):"
 echo "  docker compose exec ollama ollama list"
 ```
 
+### scripts/verify/session_persistence_cases.py
+
+```python
+"""Durable acknowledged mutations and controlled failure/interleaving acceptance."""
+import asyncio,json,os,sys,tempfile,threading,unittest,subprocess,time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+from pathlib import Path
+from unittest.mock import AsyncMock,MagicMock,patch
+sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
+import httpx
+from config import settings
+from main import app
+from services import goldstandard as gs
+
+
+def fixture():
+    return {'session_id':'gs_450abcde','collection':'OwnedPersistence','status':'completed','pairs_total':2,'pairs_completed':2,'pairs':[{'pair_id':'p_'+str(i),'question':'Original','answer':'Original','contexts':['Inert'],'ground_truth':'Original','source_file':'inert.txt','chunk_index':i,'status':'pending'} for i in range(2)]}
+
+def child_env():
+    return {**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
+
+def client():
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app,raise_app_exceptions=False),base_url='http://owned-review')
+
+class PersistenceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        patches=[(settings,'upload_dir',self.tmp.name),(settings,'sources_dir',str(Path(self.tmp.name)/'sources')),(gs,'_sessions',{})]
+        if hasattr(gs,'_diagnostics'):patches.append((gs,'_diagnostics',{}))
+        if hasattr(gs,'_scan_cache'):patches.append((gs,'_scan_cache',{}))
+        for obj,key,value in patches:
+            change=patch.object(obj,key,value);change.start();self.addCleanup(change.stop)
+        self.data=fixture();gs.store_session(self.data)
+
+    def restart(self):
+        gs._sessions={};gs.load_sessions_from_disk();return gs.get_session(self.data['session_id'])
+
+    def test_parallel_acknowledged_fields_survive_restart(self):
+        data=fixture();data["pairs"]=[{**data["pairs"][0],"pair_id":"p_"+str(i)} for i in range(8)];data.update(pairs_total=8,pairs_completed=8);gs.store_session(data)
+        barrier=threading.Barrier(16)
+        def edit(i):
+            barrier.wait();return asyncio.run(gs.update_pair(self.data['session_id'],'p_'+str(i//2),{('question' if i%2==0 else 'answer'):str(i)}))
+        with ThreadPoolExecutor(max_workers=16) as pool:results=list(pool.map(edit,range(16)))
+        self.assertTrue(all(results));state=self.restart()
+        for i in range(16):self.assertEqual(state['pairs'][i//2]['question' if i%2==0 else 'answer'],str(i))
+
+    def test_slow_first_write_cannot_replace_later_acknowledged_edit(self):
+        path=gs._session_path(self.data['session_id'])
+        entered=threading.Event();calls=0
+        original_write=Path.write_text;original_replace=os.replace
+        def pause_first_write():
+            nonlocal calls
+            calls+=1
+            if calls==1:
+                entered.set();time.sleep(0.8)
+        def write_text(target,*args,**kwargs):
+            if Path(target)==path:pause_first_write()
+            return original_write(target,*args,**kwargs)
+        def replace(src,dst):
+            if Path(dst)==path:pause_first_write()
+            return original_replace(src,dst)
+        async def run():
+            with patch.object(Path,'write_text',write_text),patch.object(os,'replace',side_effect=replace):
+                first=asyncio.create_task(gs.update_pair(self.data['session_id'],'p_0',{'question':'First acknowledged'}))
+                self.assertTrue(await asyncio.to_thread(entered.wait,5))
+                second=asyncio.create_task(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Second acknowledged'}))
+                return await asyncio.gather(first,second)
+        results=asyncio.run(run())
+        self.assertEqual(len(results),2)
+        pair=self.restart()['pairs'][0]
+        self.assertEqual((pair['question'],pair['answer']),('First acknowledged','Second acknowledged'))
+
+    def test_replace_failure_leaves_previous_snapshot_and_reports_failure(self):
+        path=gs._session_path(self.data['session_id']);before=path.read_bytes()
+        with patch.object(gs.os,'replace',side_effect=OSError('Controlled replace fault')):
+            with self.assertRaises(gs.GoldStandardError) as error:asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Failed edit'}))
+        self.assertEqual(error.exception.code,'SESSION_WRITE_FAILED')
+        self.assertEqual(path.read_bytes(),before);self.assertEqual(gs.get_session(self.data['session_id']),self.data)
+        self.assertFalse(list(path.parent.glob('*.tmp')))
+        self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
+        asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Accepted edit'}));self.assertEqual(gs.session_diagnostics(),[])
+
+    def test_file_fsync_failure_leaves_old_snapshot(self):
+        path=gs._session_path(self.data['session_id']);before=path.read_bytes()
+        with patch.object(gs.os,'fsync',side_effect=OSError('Controlled file fsync')):
+            with self.assertRaises(gs.GoldStandardError):asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Not accepted'}))
+        self.assertEqual(path.read_bytes(),before);self.assertEqual(gs.get_session(self.data['session_id']),self.data)
+
+    def test_after_replace_failure_is_uncertain_and_cache_matches_disk(self):
+        with patch.object(gs,'_sync_directory',side_effect=OSError('Controlled directory fsync')):
+            with self.assertRaises(gs.GoldStandardError) as error:asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Replaced'}))
+        self.assertEqual(error.exception.code,'SESSION_DURABILITY_UNCERTAIN')
+        self.assertEqual(json.loads(gs._session_path(self.data['session_id']).read_text()),gs.get_session(self.data['session_id']))
+        self.assertEqual(gs.get_session(self.data['session_id'])['pairs'][0]['answer'],'Replaced')
+
+    def test_unreadable_and_invalid_files_are_preserved_reported(self):
+        files={'gs_450bad00.json':'{incomplete','gs_450bad01.json':'[]','gs_450bad02.json':'{"session_id":"gs_450bad02","pairs":[]}'}
+        for name,text in files.items():(gs._sessions_dir()/name).write_text(text)
+        self.assertEqual(len(gs.session_diagnostics()),3)
+        for name,text in files.items():self.assertEqual((gs._sessions_dir()/name).read_text(),text)
+        self.assertEqual(len(gs.sessions_for('OwnedPersistence')),1)
+
+    def test_no_mutable_aliases_from_storage_reads_or_exports(self):
+        self.data['pairs'][0]['answer']='Caller mutation'
+        gs.get_session(self.data['session_id'])['pairs'][0]['answer']='Reader mutation'
+        gs.sessions_for('OwnedPersistence')[0]['pairs'].clear()
+        self.assertEqual(self.restart()['pairs'][0]['answer'],'Original')
+
+    def test_generation_review_flags_interleave_without_lost_updates(self):
+        async def run():
+            pending=asyncio.Event();release=asyncio.Event()
+            initial=fixture();initial.update(status='generating',pairs_total=3);gs.store_session(initial)
+            async def pair(chunk):pending.set();await release.wait();return {**initial['pairs'][0],'pair_id':'p_generated'}
+            with patch.object(gs,'_generate_pair',side_effect=pair):
+                task=asyncio.create_task(gs._run_generation(initial['session_id'],[{'content':'Inert'}]));await pending.wait()
+                await asyncio.gather(gs.update_pair(initial['session_id'],'p_0',{'answer':'Reviewed answer'}),gs.update_pair(initial['session_id'],'p_1',{'question':'Reviewed question'}))
+                await asyncio.to_thread(gs.mark_stale,'OwnedPersistence','Controlled identity change')
+                release.set();await task
+        asyncio.run(run());state=self.restart();self.assertEqual(state['status'],'completed');self.assertEqual(len(state['pairs']),3)
+        self.assertEqual(state['pairs'][0]['answer'],'Reviewed answer');self.assertEqual(state['pairs'][1]['question'],'Reviewed question');self.assertTrue(state['stale']);self.assertEqual(state['pairs_attempted'],1)
+
+    def test_regeneration_rejects_changed_target_preserving_acknowledged_edit(self):
+        async def run():
+            pending=asyncio.Event();release=asyncio.Event()
+            async def pair(chunk):pending.set();await release.wait();return {**fixture()['pairs'][0],'answer':'Generated replacement'}
+            with patch.object(gs,'_generate_pair',side_effect=pair):
+                task=asyncio.create_task(gs.regenerate_pair(self.data['session_id'],'p_0'));await pending.wait()
+                await gs.update_pair(self.data['session_id'],'p_0',{'answer':'Acknowledged review'});release.set()
+                with self.assertRaises(gs.GoldStandardError) as error:await task
+                self.assertEqual(error.exception.code,'PAIR_CHANGED_DURING_REGENERATION')
+        asyncio.run(run());self.assertEqual(self.restart()['pairs'][0]['answer'],'Acknowledged review')
+
+    def test_regeneration_preserves_other_pair_edits_and_history_flags(self):
+        async def run():
+            pending=asyncio.Event();release=asyncio.Event()
+            async def pair(chunk):pending.set();await release.wait();return {**fixture()['pairs'][0],'answer':'Generated replacement'}
+            with patch.object(gs,'_generate_pair',side_effect=pair):
+                task=asyncio.create_task(gs.regenerate_pair(self.data['session_id'],'p_0'));await pending.wait()
+                await gs.update_pair(self.data['session_id'],'p_1',{'answer':'Other review'})
+                gs.mark_orphaned('OwnedPersistence','Controlled deletion');release.set();await task
+        asyncio.run(run());state=self.restart();self.assertTrue(state['orphaned']);self.assertEqual([p['answer'] for p in state['pairs']],['Generated replacement','Other review'])
+
+    def test_hard_killed_writer_preserves_valid_snapshot_reports_owned_temporary(self):
+        path=gs._session_path(self.data['session_id']);before=path.read_bytes();marker=Path(self.tmp.name)/'replace-boundary'
+        code="""import sys,time,asyncio
+from pathlib import Path
+from config import settings
+from services import goldstandard as gs
+settings.upload_dir=sys.argv[1]
+gs.load_sessions_from_disk()
+def stopped(src,dst):
+    Path(sys.argv[2]).write_text('ready')
+    time.sleep(30)
+gs.os.replace=stopped
+asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
+"""
+        env={**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
+        child=subprocess.Popen([sys.executable,'-c',code,self.tmp.name,str(marker)],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        try:
+            deadline=time.monotonic()+5
+            while not marker.exists() and child.poll() is None and time.monotonic()<deadline:time.sleep(0.02)
+            self.assertTrue(marker.exists(),'Owned child did not reach replace boundary')
+            child.kill();child.communicate(timeout=5)
+            self.assertEqual(path.read_bytes(),before);self.assertEqual(self.restart(),self.data)
+            issues=gs.session_diagnostics();self.assertEqual(len(issues),1);self.assertEqual(issues[0]['code'],'SESSION_INTERRUPTED_WRITE')
+            self.assertTrue(list(path.parent.glob('.gs_450abcde-*.tmp')))
+        finally:
+            if child.poll() is None:child.kill();child.communicate(timeout=5)
+
+    def test_export_keeps_captured_snapshot_while_new_edit_commits(self):
+        initial=fixture();initial['pairs'][0]['status']='approved';gs.store_session(initial)
+        started=threading.Event();release=threading.Event();original=gs._save_export_sync
+        def delayed(path,rows):
+            started.set()
+            if not release.wait(5):raise AssertionError('Owned export was not released')
+            original(path,rows)
+        async def run():
+            with patch.object(gs,'_save_export_sync',side_effect=delayed):
+                task=asyncio.create_task(gs.save_session(initial['session_id'],'snapshot.json'))
+                self.assertTrue(await asyncio.to_thread(started.wait,5))
+                try:await gs.update_pair(initial['session_id'],'p_0',{'answer':'Later acknowledged edit'})
+                finally:release.set()
+                result=await task;self.assertEqual(result['pairs_saved'],1)
+        asyncio.run(run())
+        self.assertEqual(json.loads((Path(self.tmp.name)/'snapshot.json').read_text())[0]['answer'],'Original')
+        self.assertEqual(self.restart()['pairs'][0]['answer'],'Later acknowledged edit')
+
+    def test_scan_of_missing_storage_does_not_create_directory(self):
+        with tempfile.TemporaryDirectory() as missing:
+            with patch.object(settings,'upload_dir',missing):
+                self.assertEqual(gs.session_diagnostics(),[])
+                self.assertFalse((Path(missing)/'goldstandard_sessions').exists())
+
+    def test_storage_scan_failure_reports_without_destroying_cached_state(self):
+        before=gs.get_session(self.data['session_id'])
+        with patch.object(gs.os,'scandir',side_effect=OSError('Owned storage read failure')):
+            gs.load_sessions_from_disk()
+            self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_STORAGE_UNAVAILABLE')
+        self.assertEqual(gs.get_session(self.data['session_id']),before)
+        self.assertEqual(gs.session_diagnostics(),[])
+
+    def test_model_failure_and_cancellation_status_are_persisted(self):
+        async def run():
+            initial=fixture();initial.update(status='generating',pairs=[],pairs_total=1,pairs_completed=0);gs.store_session(initial)
+            with patch.object(gs,'_generate_pair',new=AsyncMock(side_effect=ValueError('Controlled model failure'))):await gs._run_generation(initial['session_id'],[{}])
+            self.assertEqual(gs.get_session(initial['session_id'])['status'],'failed')
+            initial['status']='generating';gs.store_session(initial);pending=asyncio.Event()
+            async def wait(chunk):pending.set();await asyncio.Event().wait()
+            with patch.object(gs,'_generate_pair',side_effect=wait):
+                task=asyncio.create_task(gs._run_generation(initial['session_id'],[{}]));await pending.wait();task.cancel()
+                with self.assertRaises(asyncio.CancelledError):await task
+        asyncio.run(run());self.assertEqual(self.restart()['status'],'cancelled')
+
+    def test_removed_read_and_temporary_issues_clear_but_write_failure_remains(self):
+        root=gs._sessions_dir();bad=root/'gs_450bad00.json';temporary=root/'.gs_450abcde-owned.tmp'
+        bad.write_text('{');temporary.write_text('unpublished');self.assertEqual(len(gs.session_diagnostics()),2)
+        with patch.object(gs.os,'replace',side_effect=OSError('Owned replacement failure')):
+            with self.assertRaises(gs.GoldStandardError):asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Rejected'}))
+        bad.unlink();temporary.unlink();issues=gs.session_diagnostics()
+        self.assertEqual([issue['code'] for issue in issues],['SESSION_WRITE_FAILED'])
+
+    def test_scan_does_not_block_edit_or_publish_stale_read_failure(self):
+        path=gs._session_path(self.data['session_id']);path.write_text('{')
+        entered=threading.Event();release=threading.Event();original=Path.read_text
+        def read(p,*args,**kwargs):
+            text=original(p,*args,**kwargs)
+            if p==path:
+                entered.set()
+                if not release.wait(5):raise AssertionError('Owned scan was not released')
+            return text
+        with ThreadPoolExecutor(max_workers=2) as pool,patch.object(Path,'read_text',read):
+            scan=pool.submit(gs.session_diagnostics);self.assertTrue(entered.wait(5))
+            edit=pool.submit(lambda:asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Committed during scan'})))
+            try:self.assertEqual(edit.result(timeout=2)['answer'],'Committed during scan')
+            finally:release.set()
+            self.assertEqual(scan.result(timeout=5),[])
+        self.assertEqual(self.restart()['pairs'][0]['answer'],'Committed during scan')
+
+    def test_marker_failure_continues_other_sessions_without_primary_failure(self):
+        second=fixture();second['session_id']='gs_450abcdf';gs.store_session(second);original=gs.os.replace
+        def replace(src,dst):
+            if Path(dst).stem==self.data['session_id']:raise OSError('Owned marker failure')
+            return original(src,dst)
+        with patch.object(gs.os,'replace',side_effect=replace):
+            self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned completed deletion'),1)
+        self.assertTrue(gs.get_session(self.data['session_id'])['orphaned'])
+        self.assertNotIn('orphaned',json.loads(gs._session_path(self.data['session_id']).read_text()))
+        self.assertTrue(gs.get_session(second['session_id'])['orphaned'])
+        self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
+
+    def test_failed_orphan_marker_refuses_current_export(self):
+        with patch.object(gs,'_save_session_sync',side_effect=OSError('Owned marker write fault')):
+            self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned completed deletion'),0)
+        async def request():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as client:
+                return await client.post('/goldstandard/save',json={'session_id':self.data['session_id'],'filename':'owned-review.json'})
+        response=asyncio.run(request())
+        self.assertEqual(response.status_code,409,response.text)
+        self.assertEqual(response.json()['error']['code'],'HISTORICAL_SESSION')
+        self.assertFalse((Path(self.tmp.name)/'owned-review.json').exists())
+
+    def test_generation_commit_failure_retains_code_after_followup_status_writes(self):
+        async def run():
+            initial=fixture();initial.update(status='generating',pairs=[],pairs_total=1,pairs_completed=0);gs.store_session(initial)
+            original=gs.os.replace;calls=0
+            def replace(src,dst):
+                nonlocal calls
+                calls+=1
+                if calls==1:raise OSError('Owned first pair commit failure')
+                return original(src,dst)
+            with patch.object(gs,'_generate_pair',new=AsyncMock(return_value=fixture()['pairs'][0])),patch.object(gs.os,'replace',side_effect=replace):
+                with self.assertRaises(gs.GoldStandardError):await gs._run_generation(initial['session_id'],[{}])
+                await gs._record_generation_failure(initial['session_id'],gs.GoldStandardError('SESSION_WRITE_FAILED','Session update could not be persisted. The previous snapshot is unchanged.',503))
+        asyncio.run(run());state=self.restart();self.assertEqual(state['status'],'failed')
+        self.assertEqual(state['persistence_error']['code'],'SESSION_WRITE_FAILED');self.assertIn('SESSION_WRITE_FAILED',state['errors'][0])
+        self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
+
+    def test_generation_failure_reporter_keeps_event_loop_responsive(self):
+        async def run():
+            entered=threading.Event();release=threading.Event();original=gs._update_session_sync
+            def delayed(sid,change):
+                entered.set()
+                if not release.wait(5):raise AssertionError('Owned failure reporter was not released')
+                return original(sid,change)
+            with patch.object(gs,'_update_session_sync',side_effect=delayed):
+                task=asyncio.create_task(gs._record_generation_failure(self.data['session_id'],RuntimeError('Owned unexpected failure')))
+                self.assertTrue(await asyncio.to_thread(entered.wait,5))
+                try:await asyncio.wait_for(asyncio.sleep(0.02),0.5)
+                finally:release.set()
+                await task
+        asyncio.run(run());self.assertEqual(self.restart()['status'],'failed')
+
+    async def generate(self,pair):
+        # The real task, done-callback and reporter run; only the model and sampling are owned.
+        chunk={'content':'Inert','source_file':'inert.txt','chunk_index':0}
+        with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[chunk])),patch.object(gs,'_generate_pair',side_effect=pair),patch.object(gs,'_tasks',set()):
+            sid=(await gs.start_generation('OwnedPersistence',1,None))['session_id']
+            deadline=time.monotonic()+5
+            while gs._tasks:
+                if time.monotonic()>deadline:raise AssertionError('Owned generation did not finish')
+                await asyncio.sleep(0.01)
+        return sid
+
+    async def fetch(self,sid):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as client:
+            return await client.get('/goldstandard/session/'+sid)
+
+    def test_persistent_replace_failure_ends_generation_failed(self):
+        fault=threading.Event();original=gs.os.replace
+        def replace(src,dst):
+            if fault.is_set():raise OSError('Owned persistent replace fault')
+            return original(src,dst)
+        async def pair(chunk):fault.set();return fixture()['pairs'][0]
+        async def run():
+            with patch.object(gs.os,'replace',side_effect=replace):
+                sid=await self.generate(pair);return sid,await self.fetch(sid)
+        sid,response=asyncio.run(run());state=gs.get_session(sid)
+        self.assertEqual(state['status'],'failed')
+        self.assertTrue(any('SESSION_WRITE_FAILED' in e for e in state['errors']),state['errors'])
+        self.assertEqual(state['persistence_error']['code'],'SESSION_WRITE_FAILED')
+        self.assertEqual((response.status_code,response.json()['status']),(200,'failed'),response.text)
+        self.assertEqual(json.loads(gs._session_path(sid).read_text())['status'],'generating')
+
+    def test_directory_at_session_path_ends_generation_failed(self):
+        async def pair(chunk):
+            # The only generating session is the one this case started.
+            sid=next(key for key,value in gs._sessions.items() if value['status']=='generating')
+            path=gs._session_path(sid);path.unlink();path.mkdir()
+            return fixture()['pairs'][0]
+        async def run():
+            sid=await self.generate(pair);return sid,await self.fetch(sid)
+        sid,response=asyncio.run(run());state=gs.get_session(sid)
+        self.assertEqual(state['status'],'failed')
+        self.assertEqual((response.status_code,response.json()['status']),(200,'failed'),response.text)
+        # Untyped on develop; #127 types the same fault as SESSION_WRITE_FAILED.
+        self.assertTrue(any('not a regular file' in e or 'SESSION_WRITE_FAILED' in e for e in state['errors']),state['errors'])
+
+    def test_cancelled_generation_with_failing_final_write_ends_failed(self):
+        fault=threading.Event();original=gs.os.replace
+        def replace(src,dst):
+            if fault.is_set():raise OSError('Owned persistent replace fault')
+            return original(src,dst)
+        async def run():
+            waiting=asyncio.Event()
+            async def pair(chunk):fault.set();waiting.set();await asyncio.Event().wait()
+            async def cancel():
+                await waiting.wait()
+                for task in list(gs._tasks):task.cancel()
+            with patch.object(gs.os,'replace',side_effect=replace):
+                canceller=asyncio.create_task(cancel())
+                sid=await self.generate(pair);await canceller;return sid
+        self.assertEqual(gs.get_session(asyncio.run(run()))['status'],'failed')
+
+    def test_cache_fallback_keeps_event_loop_responsive(self):
+        initial=fixture();initial.update(session_id='gs_450abcd1',status='generating',pairs=[],pairs_total=1,pairs_completed=0);gs.store_session(initial)
+        written=threading.Event();held=threading.Event();release=threading.Event();seen=[]
+        def failing(sid,change):
+            written.set();raise gs.GoldStandardError('SESSION_WRITE_FAILED','Owned persistent write fault',503)
+        def hold():
+            with gs._state_lock:
+                held.set();seen.append(release.wait(5))
+        holder=threading.Thread(target=hold);holder.start();self.assertTrue(held.wait(5))
+        async def run():
+            with patch.object(gs,'_update_session_sync',side_effect=failing):
+                task=asyncio.create_task(gs._record_generation_failure(initial['session_id'],RuntimeError('Owned unexpected failure')))
+                try:
+                    self.assertTrue(await asyncio.to_thread(written.wait,5))
+                    # Long enough for the reporter to reach its fallback; on the loop it would block here.
+                    await asyncio.sleep(0.05)
+                finally:release.set()
+                await task
+        try:asyncio.run(run())
+        finally:release.set();holder.join(5)
+        self.assertEqual(seen,[True])
+        self.assertEqual(gs.get_session(initial['session_id'])['status'],'failed')
+
+    def test_successful_tuning_not_misreported_when_stale_marker_write_fails(self):
+        from services import tuning
+        job={'status':'queued'};jobid='owned-marker-job'
+        with patch.dict(tuning._jobs,{jobid:job}),patch.object(tuning.sources,'has_sources',return_value=False),patch.object(tuning,'_existing_chunks',return_value=[{'content':'Inert'}]),patch.object(tuning,'_rebuild',side_effect=lambda *args,**kwargs:(kwargs['before_replace'](),1)[1]) as rebuild,patch.object(gs.os,'replace',side_effect=OSError('Owned marker failure')):
+            tuning._run(jobid,'OwnedPersistence','reembed',{})
+        rebuild.assert_called_once();self.assertEqual(job['status'],'completed');self.assertEqual(job['chunks_written'],1)
+        self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
+
+
+    def test_replace_import_continues_after_marker_failure_and_reports_retention_truthfully(self):
+        from services import importer
+        job={'status':'queued'};jobid='owned-import-marker-job';pkg=Path(self.tmp.name)
+        manifest={'collection':{'name':'OwnedPersistence','chunk_count':1}}
+        client=MagicMock();client.collections.exists.side_effect=lambda name:name=='OwnedPersistence'
+        original_replace=gs.os.replace
+        def failed_marker(src,dst):
+            if Path(dst).stem==self.data['session_id']:raise OSError('Owned marker failure')
+            return original_replace(src,dst)
+        def deleted(name):
+            gs.mark_orphaned(name,'Owned completed primary replacement')
+            return 1
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(importer._jobs,{jobid:job}))
+            for obj,name,kwargs in [
+                (importer.packager,'exports_dir',{'return_value':pkg}),
+                (importer.packager,'open_package',{'return_value':(pkg,manifest)}),
+                (importer.packager,'verify_digests',{'return_value':None}),
+                (importer.packager,'sha256_file',{'return_value':'01234567'*8}),
+                (importer,'_check_embedding',{'return_value':None}),
+                (importer,'_ensure_models',{'return_value':[]}),
+                (importer,'_restore_sidecars',{'return_value':[]}),
+                (importer,'_mark_started',{'return_value':None}),
+                (importer,'_mark_finished',{'return_value':None}),
+                (importer.wc,'_collection_exists_sync',{'side_effect':lambda name:name=='OwnedPersistence'}),
+                (importer.wc,'_delete_collection_sync',{'side_effect':deleted}),
+                (importer.wc,'get_client',{'return_value':client}),
+                (gs.os,'replace',{'side_effect':failed_marker})]:
+                stack.enter_context(patch.object(obj,name,**kwargs))
+            build=stack.enter_context(patch.object(importer,'_build',return_value=1))
+            importer._run(jobid,'owned-package.tar.gz','replace')
+        self.assertEqual(build.call_count,2);self.assertEqual(job['status'],'completed')
+        self.assertIn('inspect session recovery diagnostics',job['notes'][0]);self.assertNotIn('marked orphaned',job['notes'][0])
+        self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
+
+    # #127 follow-ups.
+    def pending(self):
+        return Path(self.tmp.name)/'goldstandard_sessions'/'pending_markers'/(self.data['session_id']+'.json')
+
+    def fail_session_file_replace(self):
+        path=gs._session_path(self.data['session_id']);original=gs.os.replace
+        def replace(src,dst):
+            if Path(dst)==path:raise OSError('Owned session-file marker fault')
+            return original(src,dst)
+        return patch.object(gs.os,'replace',side_effect=replace)
+
+    def test_session_poll_does_not_block_event_loop_during_slow_commit(self):
+        async def run():
+            inside=threading.Event();real_fsync=os.fsync
+            def slow_fsync(fd):
+                inside.set();time.sleep(1.5);return real_fsync(fd)
+            with patch.object(gs.os,'fsync',side_effect=slow_fsync):
+                writer=asyncio.create_task(gs.update_pair(self.data['session_id'],'p_0',{'status':'edited','answer':'Slow commit'}))
+                self.assertTrue(await asyncio.to_thread(inside.wait,5))
+                gaps=[]
+                async def ticker():
+                    last=time.monotonic()
+                    for _ in range(30):
+                        await asyncio.sleep(0.02);now=time.monotonic();gaps.append(now-last);last=now
+                tick=asyncio.create_task(ticker());await asyncio.sleep(0.05)
+                async with client() as c:response=await c.get('/goldstandard/session/'+self.data['session_id'])
+                await tick;await writer
+            self.assertEqual(response.status_code,200)
+            self.assertLess(max(gaps),0.5,'event loop stalled %.2fs while a poll waited for the writer lock'%max(gaps))
+        asyncio.run(run())
+
+    def test_failed_marker_survives_restart_and_refuses_current_export(self):
+        first="""import sys
+from unittest.mock import patch
+from config import settings
+from services import goldstandard as gs
+settings.upload_dir=sys.argv[1]
+gs.load_sessions_from_disk()
+with patch.object(gs,'_save_session_sync',side_effect=OSError('Owned marker write fault')):
+    gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+"""
+        second="""import sys,asyncio,json,httpx
+from config import settings
+from main import app
+from services import goldstandard as gs
+settings.upload_dir=sys.argv[1]
+gs.load_sessions_from_disk()
+async def run():
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as c:
+        r=await c.post('/goldstandard/save',json={'session_id':'gs_450abcde','filename':'owned-restart.json'})
+        return r.status_code,r.json()
+print(json.dumps({'export':list(asyncio.run(run())),'diagnostics':gs.session_diagnostics()}))
+"""
+        one=subprocess.run([sys.executable,'-c',first,self.tmp.name],env=child_env(),capture_output=True,text=True,timeout=60)
+        self.assertEqual(one.returncode,0,one.stderr[-2000:])
+        two=subprocess.run([sys.executable,'-c',second,self.tmp.name],env=child_env(),capture_output=True,text=True,timeout=60)
+        self.assertEqual(two.returncode,0,two.stderr[-2000:])
+        observed=json.loads(two.stdout.strip().splitlines()[-1])
+        self.assertEqual(observed['export'][0],409,observed)
+        self.assertEqual(observed['export'][1]['error']['code'],'HISTORICAL_SESSION')
+        issues=[i for i in observed['diagnostics'] if i['filename']=='gs_450abcde.json']
+        self.assertEqual([i['code'] for i in issues],['SESSION_WRITE_FAILED'],observed['diagnostics'])
+        self.assertIn('pending marker',issues[0]['message'])
+
+    def test_failed_marker_is_applied_to_package_snapshots(self):
+        with self.fail_session_file_replace():
+            self.assertEqual(gs.mark_stale('OwnedPersistence','Owned rebuild'),0)
+        self.assertNotIn('stale',json.loads(gs._session_path(self.data['session_id']).read_text()))
+        exported=[s for s in gs._sessions_on_disk() if s['session_id']==self.data['session_id']]
+        self.assertTrue(exported[0].get('stale'));self.assertEqual(exported[0]['stale_reason'],'Owned rebuild')
+        self.assertNotIn('stale',json.loads(gs._session_path(self.data['session_id']).read_text()))
+
+    def test_next_successful_write_persists_marker_and_removes_pending_file(self):
+        with self.fail_session_file_replace():
+            gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+        self.assertTrue(self.pending().is_file())
+        asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Later edit'}))
+        self.assertTrue(json.loads(gs._session_path(self.data['session_id']).read_text())['orphaned'])
+        self.assertFalse(self.pending().exists());self.assertEqual(gs.session_diagnostics(),[])
+
+    def test_both_failed_markers_are_kept_pending(self):
+        with self.fail_session_file_replace():
+            gs.mark_stale('OwnedPersistence','Owned rebuild');gs.mark_orphaned('OwnedPersistence','Owned deletion')
+        state=self.restart();self.assertTrue(state['stale']);self.assertTrue(state['orphaned'])
+        self.assertEqual((state['stale_reason'],state['orphaned_reason']),('Owned rebuild','Owned deletion'))
+
+    def test_unreadable_pending_marker_is_preserved_and_reported(self):
+        self.pending().parent.mkdir();self.pending().write_text('{')
+        state=self.restart();self.assertFalse(state.get('orphaned'))
+        self.assertEqual([(i['filename'],i['code']) for i in gs.session_diagnostics()],[('pending_markers/gs_450abcde.json','SESSION_READ_FAILED')])
+        asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Later edit'}));self.assertEqual(self.pending().read_text(),'{')
+
+    def test_pending_marker_write_failure_keeps_guard_until_restart(self):
+        with patch.object(gs.os,'replace',side_effect=OSError('Owned storage fault')):
+            self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned completed deletion'),0)
+        self.assertFalse(self.pending().exists())
+        with self.assertRaises(gs.GoldStandardError) as error:asyncio.run(gs.save_session(self.data['session_id'],'owned.json'))
+        self.assertEqual(error.exception.code,'HISTORICAL_SESSION')
+        issue=gs.session_diagnostics()[0];self.assertEqual(issue['code'],'SESSION_WRITE_FAILED');self.assertIn('until restart',issue['message'])
+
+    def test_unknown_persistence_error_does_not_fail_writes_or_markers(self):
+        for value in ({'code':'BOGUS','message':'Owned'},'Owned text'):
+            with self.subTest(value=value):
+                data=fixture();data['persistence_error']=value;gs.store_session(data)
+                self.assertEqual(gs.session_diagnostics(),[])
+                self.assertEqual(asyncio.run(gs.update_pair(data['session_id'],'p_0',{'answer':'Edit'}))['answer'],'Edit')
+                self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned deletion'),1)
+
+    def test_import_restore_strips_persistence_error(self):
+        from services import importer
+        source=fixture();source.update(session_id='gs_450abcd9',errors=['Owned kept reason'],persistence_error={'code':'SESSION_WRITE_FAILED','message':'Owned source failure'})
+        pkg=Path(self.tmp.name)/'owned-package';pkg.mkdir();restored=[]
+        importer._restore_sidecars('OwnedPersistence',pkg,'OwnedPersistence',[source],restored)
+        stored=gs.get_session(restored[0]['session_id'])
+        self.assertNotIn('persistence_error',stored);self.assertEqual(stored['errors'],['Owned kept reason'])
+        self.assertNotIn('persistence_error',json.loads(gs._session_path(stored['session_id']).read_text()))
+        self.assertEqual(gs.session_diagnostics(),[])
+
+    def test_nonregular_session_destination_is_typed_write_failure(self):
+        path=gs._session_path(self.data['session_id']);path.unlink();path.mkdir()
+        async def run():
+            async with client() as c:
+                return await c.patch('/goldstandard/session/'+self.data['session_id']+'/pair/p_0',json={'status':'edited','answer':'Refused'})
+        response=asyncio.run(run())
+        self.assertEqual(response.status_code,503,response.text);self.assertEqual(response.json()['error']['code'],'SESSION_WRITE_FAILED')
+        self.assertEqual(gs.get_session(self.data['session_id']),self.data)
+
+    def test_cached_read_failure_uses_one_absolute_diagnostic_key(self):
+        sid='gs_450bad05';(gs._sessions_dir()/(sid+'.json')).write_text('{')
+        gs._sessions[sid]={'session_id':sid,'collection':'OwnedPersistence'}
+        self.assertEqual(len(gs.sessions_for('OwnedPersistence')),1)
+        self.assertTrue(all(Path(key).is_absolute() for key in gs._diagnostics),list(gs._diagnostics))
+        names=[i['filename'] for i in gs.session_diagnostics()]
+        self.assertEqual(names,[sid+'.json'])
+
+    def test_marker_failure_wording_differs_from_edit_failure(self):
+        with self.fail_session_file_replace():
+            with self.assertRaises(gs.GoldStandardError):asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Rejected'}))
+            self.assertIn('previous snapshot remains authoritative',gs.session_diagnostics()[0]['message'])
+            gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+        issue=gs.session_diagnostics()[0];self.assertEqual(issue['code'],'SESSION_WRITE_FAILED')
+        self.assertIn('pending marker',issue['message']);self.assertNotIn('previous snapshot remains authoritative',issue['message'])
+
+    def test_scan_cache_skips_unchanged_and_reflects_changes(self):
+        path=gs._session_path(self.data['session_id']);original=Path.read_text;reads=[]
+        def read(p,*args,**kwargs):
+            if p==path:reads.append(1)
+            return original(p,*args,**kwargs)
+        with patch.object(Path,'read_text',read):
+            gs.session_diagnostics();reads.clear()
+            gs.session_diagnostics();self.assertEqual(reads,[],'an unchanged session file was read again')
+            changed=fixture();changed['pairs'][0]['answer']='Changed';gs.store_session(changed)
+            gs._sessions={};gs.load_sessions_from_disk();self.assertEqual(len(reads),1)
+            self.assertEqual(gs.get_session(self.data['session_id'])['pairs'][0]['answer'],'Changed')
+        bad=gs._sessions_dir()/'gs_450bad00.json';bad.write_text('{')
+        self.assertEqual(len(gs.session_diagnostics()),1);bad.unlink();self.assertEqual(gs.session_diagnostics(),[])
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
+
 ### scripts/verify/07_settings.sh
 
 ```bash
@@ -11641,7 +16266,14 @@ echo "  docker compose exec ollama ollama list"
 # Settings validation through the running API; the helper owns its collection.
 set -uo pipefail
 cd "$(dirname "$0")" && . ./lib.sh
+proxy_bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
+python3 ./compose_target.py "$API" "$proxy_bindings" || exit 2
 require_stack
+section "Concurrent settings publication and failed-write preservation"
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - SettingsPersistenceTests < scripts/tests/test_settings_persistence.py)
+check "controlled retrieval/ingest concurrency and publication failures" $?
+(cd ../.. && python3 scripts/tests/test_settings_implementation.py)
+check "settings embedded implementation copies match runtime" $?
 section "Settings validation before work"
 RAG_API="$API" python3 ./settings_validation.py
 check "live settings validation and owned-fixture cleanup" $?
@@ -11674,7 +16306,11 @@ def request(path, body=None, method=None, raw=None, content_type='application/js
         with urllib.request.urlopen(req, timeout=60) as response:
             return response.status, json.load(response)
     except urllib.error.HTTPError as response:
-        return response.code, json.load(response)
+        body = response.read()
+        try:
+            return response.code, json.loads(body)
+        except ValueError:  # a server error page that isn't JSON
+            return response.code, body.decode(errors='replace')[:200]
 
 
 def expect(path, body, code):
@@ -11761,10 +16397,2539 @@ try:
     assert status == 200
     assert next(c for c in current['collections'] if c['name'] == collection)['object_count'] == 0
     print('PASS invalid multipart settings leave the collection empty', flush=True)
+
+    # #141: concurrent saves through the live routes. Every save must be
+    # acknowledged, and the persisted value must be one acknowledged response,
+    # complete and unmixed (no request publishes another request's temp file).
+    from concurrent.futures import ThreadPoolExecutor
+    rounds, width = 15, 12
+    for route, make in (('/ingest/config', lambda r, i: {'collection': collection, 'chunking_strategy': 'fixed',
+                                                         'chunk_size': 100 + 20 * r + i, 'min_chunk_size': i}),
+                        ('/retrieval/config', lambda r, i: {'collection': collection, 'retrieval_mode': 'hybrid',
+                                                            'top_k': i + 1, 'alpha': r / 20, 'ef': 16 + 16 * i,
+                                                            'response_format': 'engineer'})):
+        for r in range(rounds):
+            bodies = [make(r, i) for i in range(width)]
+            with ThreadPoolExecutor(max_workers=width) as pool:
+                results = list(pool.map(lambda body: request(route, body), bodies))
+            failed = [(status, result) for status, result in results if status != 201]
+            assert not failed, (route, r, failed[:3])
+            acknowledged = [result for _, result in results]
+            status, persisted = request(route + '/' + collection)
+            assert status == 200, persisted
+            assert persisted in acknowledged, (route, r, persisted)
+    print('PASS concurrent saves are all acknowledged and publish one complete acknowledged value (ingest and retrieval)', flush=True)
 finally:
     if created:
         status, result = request('/collections/' + collection + '?confirm=true', method='DELETE')
         assert status == 200, result
 assert collection not in names()
 print('PASS owned disposable collection removed', flush=True)
+```
+
+### scripts/verify/13_identity.sh
+
+```bash
+#!/usr/bin/env bash
+# Independent imported evaluation identities and real rename round trips.
+set -uo pipefail
+cd "$(dirname "$0")" && . ./lib.sh
+bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
+python3 ./compose_target.py "$API" "$bindings" || exit 2
+require_stack
+section "Imported evaluation session identities"
+python3 ../tests/test_session_identity.py
+check "embedded identity sources match" $?
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/verify/session_identity_cases.py)
+check "owned identity collision, preservation and allocation regressions" $?
+(cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/session_identity.py)
+check "real export/edit/import-twice lookup and RAGAS roundtrip" $?
+summary
+```
+
+### scripts/verify/session_identity_cases.py
+
+```python
+"""Owned import identity preservation; run by13_identity.sh in the API image."""
+import asyncio,copy,json,os,subprocess,sys,tempfile,threading,time,unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock,patch
+sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__!='<stdin>' else '/app'))
+from config import settings
+from services import goldstandard as gs,importer
+
+
+def fixture():
+    return {'session_id':'gs_460abcde','collection':'OwnedOriginal','status':'completed','pairs_total':1,'pairs_completed':1,'pairs':[{'pair_id':'p_owned','question':'Inert question','answer':'Original answer','contexts':['Inert context'],'ground_truth':'Inert truth','source_file':'inert.txt','chunk_index':0,'status':'approved'}]}
+
+
+class IdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        for obj,key,value in [(settings,'upload_dir',self.tmp.name),(settings,'sources_dir',str(Path(self.tmp.name)/'sources')),(gs,'_sessions',{})]:
+            change=patch.object(obj,key,value);change.start();self.addCleanup(change.stop)
+        self.original=fixture();gs.store_session(copy.deepcopy(self.original));self.path=gs._session_path(self.original['session_id'])
+
+    def test_restore_twice_preserves_newer_original_review_and_independent_exports(self):
+        package=Path(self.tmp.name)/'owned-package';gold=package/'goldstandard';gold.mkdir(parents=True)
+        (gold/(self.original['session_id']+'.json')).write_text(json.dumps(self.original))
+        asyncio.run(gs.update_pair(self.original['session_id'],'p_owned',{'answer':'Newer human review','status':'edited'}));before=self.path.read_bytes()
+        imported=[]
+        for target in ['OwnedRenamedOne','OwnedRenamedTwo']:
+            mappings=[];validated=importer._read_goldstandard_sessions(package,'OwnedOriginal')
+            notes=importer._restore_sidecars(target,package,'OwnedOriginal',validated,mappings)
+            self.assertEqual(len(mappings),1);self.assertTrue(any(mappings[0]['session_id'] in note for note in notes))
+            session=gs.get_session(mappings[0]['session_id']);imported.append(session)
+            self.assertEqual(session['imported_from']['session_id'],self.original['session_id']);self.assertEqual(session['imported_from']['collection'],'OwnedOriginal')
+        identities=[self.original['session_id']]+[s['session_id'] for s in imported];self.assertEqual(len(set(identities)),3);self.assertEqual(self.path.read_bytes(),before)
+        for i,sid in enumerate(identities):
+            result=asyncio.run(gs.save_session(sid,'owned-export'+str(i)+'.json'));rows=json.loads((Path(self.tmp.name)/result['filename']).read_text())
+            self.assertEqual(rows[0]['answer'],'Newer human review' if i==0 else 'Original answer');self.assertEqual(set(rows[0]),{'question','answer','contexts','ground_truth'})
+        gs._sessions={};gs.load_sessions_from_disk();self.assertEqual({gs.get_session(sid)['collection'] for sid in identities},{'OwnedOriginal','OwnedRenamedOne','OwnedRenamedTwo'})
+
+    def test_concurrent_imports_select_distinct_local_identities(self):
+        before=self.path.read_bytes()
+        def run(i):
+            data=fixture();data['collection']='OwnedImported'+str(i)
+            return gs.store_imported_session(data,'OwnedOriginal')['session_id']
+        with ThreadPoolExecutor(max_workers=8) as pool:identities=list(pool.map(run,range(16)))
+        self.assertEqual(len(set(identities)),16);self.assertNotIn(self.original['session_id'],identities);self.assertEqual(self.path.read_bytes(),before)
+        self.assertEqual(len(list(self.path.parent.glob('*.json'))),17)
+
+    def test_cold_cache_still_respects_existing_disk_identity(self):
+        before=self.path.read_bytes();gs._sessions={}
+        result=gs.store_imported_session(fixture(),'OwnedOriginal')
+        self.assertNotEqual(result['session_id'],self.original['session_id']);self.assertEqual(self.path.read_bytes(),before)
+
+    def test_unreadable_original_bytes_still_occupy_the_identity(self):
+        self.path.write_bytes(b'{owned retained unreadable bytes');gs._sessions={}
+        result=gs.store_imported_session(fixture(),'OwnedOriginal')
+        self.assertNotEqual(result['session_id'],self.original['session_id']);self.assertEqual(self.path.read_bytes(),b'{owned retained unreadable bytes')
+
+    def test_collision_exhaustion_is_bounded_without_overwrite(self):
+        before=self.path.read_bytes()
+        with patch.object(gs.uuid,'uuid4',return_value=SimpleNamespace(hex='460abcde'+'0'*24)) as ids:
+            with self.assertRaisesRegex(RuntimeError,'unoccupied session'):gs.store_imported_session(fixture(),'OwnedOriginal')
+        self.assertEqual(ids.call_count,128);self.assertEqual(self.path.read_bytes(),before);self.assertEqual(len(gs._sessions),1)
+
+    def test_redirected_existing_identity_is_reserved_without_following_it(self):
+        foreign=Path(self.tmp.name)/'owned-retained-neighbor';foreign.write_bytes(b'owned retained bytes')
+        self.path.unlink();self.path.symlink_to(foreign);gs._sessions={}
+        saved=gs.store_imported_session(fixture(),'OwnedOriginal')
+        self.assertNotEqual(saved['session_id'],self.original['session_id']);self.assertTrue(self.path.is_symlink())
+        self.assertEqual(foreign.read_bytes(),b'owned retained bytes')
+
+    def test_cache_readers_skip_symlinks_and_fifo_without_opening_them(self):
+        directory=gs._sessions_dir();os.mkfifo(directory/'gs_460aa001.json')
+        foreign=Path(self.tmp.name)/'owned-foreign.json';data=fixture();data['pairs'][0]['answer']='Foreign bytes'
+        foreign.write_text(json.dumps(data));(directory/'gs_460aa002.json').symlink_to(foreign)
+        code="from config import settings;from services import goldstandard as gs;import sys;settings.upload_dir=sys.argv[1];gs.load_sessions_from_disk();assert len(gs.sessions_for('OwnedOriginal'))==1;assert gs.get_session('gs_460abcde')['pairs'][0]['answer']=='Original answer'"
+        subprocess.run([sys.executable,'-c',code,self.tmp.name],env={**os.environ,'PYTHONPATH':str(Path(gs.__file__).parents[1])},check=True,timeout=5,capture_output=True)
+        self.assertTrue((directory/'gs_460aa001.json').exists());self.assertTrue((directory/'gs_460aa002.json').is_symlink());self.assertEqual(json.loads(foreign.read_text())['pairs'][0]['answer'],'Foreign bytes')
+
+    def test_free_valid_source_identity_is_retained_with_provenance(self):
+        data=fixture();data['session_id']='gs_460abcdf';data['collection']='OwnedNew'
+        result=gs.store_imported_session(data,'ExternalOriginal')
+        self.assertEqual(result['session_id'],data['session_id']);self.assertEqual(result['imported_from']['collection'],'ExternalOriginal')
+        self.assertTrue(result['imported_from']['imported_at'].endswith('+00:00'))
+
+    def test_inputs_and_returned_snapshots_do_not_alias_imported_storage(self):
+        data=fixture();before=copy.deepcopy(data);result=gs.store_imported_session(data,'OwnedOriginal')
+        result['pairs'][0]['answer']='Returned mutation';data['pairs'][0]['answer']='Caller mutation'
+        self.assertEqual(gs.get_session(result['session_id'])['pairs'][0]['answer'],'Original answer');self.assertNotIn('imported_from',before)
+
+    def test_storage_inspection_failure_never_guesses_a_free_slot(self):
+        before=self.path.read_bytes()
+        with patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure')):
+            with self.assertRaises(PermissionError):gs.store_imported_session(fixture(),'OwnedOriginal')
+        self.assertEqual(self.path.read_bytes(),before);self.assertEqual(len(gs._sessions),1)
+
+    def test_generation_start_uses_the_same_namespace_without_overwriting_collision(self):
+        before=self.path.read_bytes()
+        async def run():
+            with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()),patch.object(gs.uuid,'uuid4',side_effect=[SimpleNamespace(hex='460abcde'+'0'*24),SimpleNamespace(hex='460abcdf'+'0'*24)]):
+                result=await gs.start_generation('OwnedGeneration',1,None)
+                await asyncio.gather(*list(gs._tasks))
+            self.assertEqual(result['session_id'],'gs_460abcdf')
+        asyncio.run(run());self.assertEqual(self.path.read_bytes(),before)
+
+    def test_concurrent_generated_and_imported_sessions_share_identity_serialization(self):
+        before=self.path.read_bytes()
+        def run(i):
+            data=fixture();data['collection']='OwnedCreated'+str(i)
+            saved=(gs.store_imported_session(data,'OwnedOriginal') if i%2 else gs._store_generated_session(data))
+            return saved['session_id']
+        with ThreadPoolExecutor(max_workers=8) as pool:identities=list(pool.map(run,range(16)))
+        self.assertEqual(len(set(identities)),16);self.assertNotIn(self.original['session_id'],identities);self.assertEqual(self.path.read_bytes(),before)
+
+    def test_noncanonical_source_identity_is_refused_before_restoration(self):
+        package=Path(self.tmp.name)/'legacy-package';gold=package/'goldstandard';gold.mkdir(parents=True)
+        data=fixture();data['session_id']='legacy-review-2024';(gold/'legacy.json').write_text(json.dumps(data))
+        before=self.path.read_bytes()
+        with self.assertRaises(importer.PackageError) as caught:importer._read_goldstandard_sessions(package,'OwnedOriginal')
+        self.assertEqual((caught.exception.code,caught.exception.detail),('PACKAGE_CORRUPT',{'file':'goldstandard/legacy.json'}))
+        self.assertEqual(list(gs._sessions),[self.original['session_id']]);self.assertEqual(self.path.read_bytes(),before)
+        self.assertEqual(len(list(self.path.parent.glob('*.json'))),1)
+
+    def test_cache_iteration_serializes_with_generation_insertion(self):
+        entered=threading.Event();release=threading.Event();started=threading.Event();mutated=threading.Event()
+        class PausedCache(dict):
+            def __setitem__(cache,key,value):
+                super(PausedCache,cache).__setitem__(key,value);mutated.set()
+            def items(cache):
+                iterator=iter(super(PausedCache,cache).items())
+                entered.set();self.assertTrue(release.wait(2),'Cache fixture was not released')
+                return iterator
+        gs._sessions=PausedCache(gs._sessions)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            reading=pool.submit(gs.sessions_for,'OwnedOriginal');self.assertTrue(entered.wait(2))
+            def create():
+                started.set();return gs._store_generated_session(fixture())
+            writing=pool.submit(create);self.assertTrue(started.wait(2))
+            try:self.assertFalse(mutated.wait(.1),'Insertion bypassed the cache snapshot lock')
+            finally:release.set()
+            self.assertEqual(len(reading.result(timeout=2)),1);self.assertRegex(writing.result(timeout=2)['session_id'],r'^gs_[0-9a-f]{8}$')
+
+
+    # Reviewer-added: forced candidate collisions under real thread contention.
+    def test_reviewer_forced_duplicate_candidates_race_never_share_or_overwrite(self):
+        before=self.path.read_bytes();shared='gs_460abc01';draw=threading.Lock();counter=[0]
+        def duplicated():
+            with draw:
+                n=counter[0];counter[0]+=1
+            return SimpleNamespace(hex='%08x'%(0x46100000+n//2)+'0'*24)
+        original_save=gs._save_session_sync
+        def slow_save(session):
+            time.sleep(.02);return original_save(session)
+        def run(i):
+            data=fixture();data['collection']='OwnedRace'+str(i)
+            if i%3==0:return gs._store_generated_session(data)['session_id']
+            data['session_id']=shared if i%3==1 else self.original['session_id']
+            return gs.store_imported_session(data,'OwnedOriginal')['session_id']
+        with patch.object(gs.uuid,'uuid4',side_effect=duplicated),patch.object(gs,'_save_session_sync',side_effect=slow_save):
+            with ThreadPoolExecutor(max_workers=12) as pool:identities=list(pool.map(run,range(24)))
+        self.assertEqual(len(set(identities)),24,identities);self.assertNotIn(self.original['session_id'],identities)
+        self.assertEqual(identities.count(shared),1,'exactly one concurrent import keeps a free shared source ID')
+        self.assertEqual(self.path.read_bytes(),before);self.assertEqual(len(list(self.path.parent.glob('*.json'))),25)
+        for sid in identities:self.assertEqual(json.loads((self.path.parent/(sid+'.json')).read_text())['session_id'],sid)
+
+    def test_reviewer_replace_import_into_same_collection_keeps_newer_original(self):
+        package=Path(self.tmp.name)/'owned-replace-package';gold=package/'goldstandard';gold.mkdir(parents=True)
+        (gold/(self.original['session_id']+'.json')).write_text(json.dumps(self.original))
+        asyncio.run(gs.update_pair(self.original['session_id'],'p_owned',{'answer':'Newer human review','status':'edited'}));before=self.path.read_bytes()
+        mappings=[];validated=importer._read_goldstandard_sessions(package,'OwnedOriginal')
+        importer._restore_sidecars('OwnedOriginal',package,'OwnedOriginal',validated,mappings)
+        self.assertNotEqual(mappings[0]['session_id'],self.original['session_id']);self.assertEqual(self.path.read_bytes(),before)
+        self.assertEqual(gs.get_session(self.original['session_id'])['pairs'][0]['answer'],'Newer human review')
+
+    def test_reviewer_generation_identity_inspection_failure_is_session_write_failed_503(self):
+        before=self.path.read_bytes()
+        async def run():
+            with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()) as generate,patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure')):
+                with self.assertRaises(gs.GoldStandardError) as caught:await gs.start_generation('OwnedGeneration',1,None)
+                generate.assert_not_called()
+            return caught.exception
+        error=asyncio.run(run())
+        self.assertEqual((error.code,error.status),('SESSION_WRITE_FAILED',503));self.assertEqual(self.path.read_bytes(),before)
+
+    def test_generation_allocation_failure_records_diagnostic_for_candidate(self):
+        storage=Path(settings.upload_dir)/'goldstandard_sessions';before=self.path.read_bytes()
+        for name,changes,expected in [('inspection',[patch.object(gs.uuid,'uuid4',return_value=SimpleNamespace(hex='460abcdf'+'0'*24)),patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure'))],'gs_460abcdf.json'),
+                                      ('exhaustion',[patch.object(gs.uuid,'uuid4',return_value=SimpleNamespace(hex='460abcde'+'0'*24))],'gs_460abcde.json')]:
+            with self.subTest(case=name),patch.object(gs,'_diagnostics',{}):
+                with ExitStack() as stack:
+                    for change in changes:stack.enter_context(change)
+                    with self.assertRaises(gs.GoldStandardError) as caught:gs._store_generated_session(fixture())
+                self.assertEqual((caught.exception.code,caught.exception.status),('SESSION_WRITE_FAILED',503))
+                self.assertEqual({key:issue['code'] for key,issue in gs._diagnostics.items()},{str(storage/expected):'SESSION_WRITE_FAILED'})
+                self.assertEqual(list(gs._sessions),[self.original['session_id']]);self.assertEqual(self.path.read_bytes(),before)
+
+    # Testing reviewer (#148): the ValueError branch, the HTTP envelope and grammar boundaries.
+    def test_reviewer_generation_redirected_storage_root_is_session_write_failed_503(self):
+        storage=Path(settings.upload_dir)/'goldstandard_sessions';moved=Path(self.tmp.name)/'owned-moved-sessions'
+        storage.rename(moved);storage.symlink_to(moved);before=sorted(p.name for p in moved.iterdir())
+        with patch.object(gs,'_diagnostics',{}),patch.object(gs.uuid,'uuid4',return_value=SimpleNamespace(hex='460abc11'+'0'*24)):
+            with self.assertRaises(gs.GoldStandardError) as caught:gs._store_generated_session(fixture())
+            self.assertEqual((caught.exception.code,caught.exception.status),('SESSION_WRITE_FAILED',503))
+            self.assertIsInstance(caught.exception.__cause__,ValueError)
+            self.assertEqual({key:issue['code'] for key,issue in gs._diagnostics.items()},{str(storage/'gs_460abc11.json'):'SESSION_WRITE_FAILED'})
+        self.assertEqual(sorted(p.name for p in moved.iterdir()),before);self.assertEqual(list(gs._sessions),[self.original['session_id']])
+
+    def test_reviewer_generate_route_returns_503_session_write_failed_envelope(self):
+        from routers import goldstandard as route
+        from models.schemas import GenerateRequest
+        before=self.path.read_bytes()
+        async def run():
+            with patch.object(route.wc,'collection_exists',new=AsyncMock(return_value=True)),patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()) as generate,patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure')):
+                response=await route.generate(GenerateRequest(collection='OwnedGeneration',sample_size=1,seed=None))
+                generate.assert_not_called()
+            return response
+        response=asyncio.run(run())
+        self.assertEqual(response.status_code,503);self.assertEqual(json.loads(response.body)['error']['code'],'SESSION_WRITE_FAILED')
+        self.assertEqual(self.path.read_bytes(),before);self.assertEqual(list(gs._sessions),[self.original['session_id']])
+
+    def test_reviewer_preflight_refuses_near_canonical_and_unbounded_source_ids(self):
+        before=self.path.read_bytes()
+        for source in ['gs_460ABCDE','GS_460abcde','gs_460abcd','gs_460abcde0','gs_460abcdg',' gs_460abcde','gs_460abcde\n','gs_'+'a'*10000,'',460]:
+            with self.subTest(source=repr(source)[:40]):
+                package=Path(tempfile.mkdtemp(dir=self.tmp.name));gold=package/'goldstandard';gold.mkdir()
+                data=fixture();data['session_id']=source;(gold/'owned.json').write_text(json.dumps(data))
+                with self.assertRaises(importer.PackageError) as caught:importer._read_goldstandard_sessions(package,'OwnedOriginal')
+                self.assertEqual((caught.exception.code,caught.exception.detail),('PACKAGE_CORRUPT',{'file':'goldstandard/owned.json'}))
+        package=Path(tempfile.mkdtemp(dir=self.tmp.name));gold=package/'goldstandard';gold.mkdir()
+        data=fixture();data['session_id']='gs_0123abcd';(gold/'owned.json').write_text(json.dumps(data))
+        self.assertEqual([s['session_id'] for s in importer._read_goldstandard_sessions(package,'OwnedOriginal')],['gs_0123abcd'])
+        self.assertEqual(self.path.read_bytes(),before);self.assertEqual(len(list(self.path.parent.glob('*.json'))),1)
+
+if __name__=='__main__':unittest.main()
+```
+
+### scripts/verify/session_identity.py
+
+```python
+"""Owned real HTTP/package/backend export-edit-rename-import-twice acceptance.
+
+Pairs and vectors are synthetic; package/model metadata and import/export jobs
+are real. No generation call or startup sweep runs in this process.
+"""
+import asyncio,copy,hashlib,json,os,subprocess,sys,tarfile,tempfile,threading,uuid
+from pathlib import Path
+from unittest.mock import patch
+import httpx
+from config import settings
+from main import app
+from services import exporter,goldstandard as gs,importer,weaviate_client as wc
+
+
+def archive_session(archive, identity):
+    with tarfile.open(archive) as package:
+        member=next(m for m in package.getmembers() if m.name.endswith('/goldstandard/'+identity+'.json'))
+        return json.load(package.extractfile(member))
+
+def file_digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def legacy_archive(archive,root,identity,source_id):
+    with tempfile.TemporaryDirectory(prefix='owned-legacy-package-',dir=root) as temp:
+        work=Path(temp)
+        with tarfile.open(archive) as package:package.extractall(work,filter='data')
+        package_root=next(path for path in work.iterdir() if path.is_dir())
+        relative='goldstandard/'+identity+'.json';sidecar=package_root/relative
+        data=json.loads(sidecar.read_text());data['session_id']=source_id;sidecar.write_text(json.dumps(data))
+        manifest_path=package_root/'manifest.json';manifest=json.loads(manifest_path.read_text())
+        manifest['files'][relative]='sha256:'+file_digest(sidecar);manifest_path.write_text(json.dumps(manifest,sort_keys=True,indent=2))
+        output=archive.parent/(archive.name.removesuffix('.tar.gz')+'-legacy.tar.gz')
+        with tarfile.open(output,'w:gz') as package:package.add(package_root,arcname=package_root.name)
+        return output.name
+
+async def completed(client,path,timeout=300,expected='completed'):
+    deadline=asyncio.get_running_loop().time()+timeout;last='not observed'
+    while True:
+        remaining=deadline-asyncio.get_running_loop().time()
+        if remaining<=0:raise TimeoutError(f'Owned job {path} exceeded {timeout}s; last status={last}')
+        try:response=await asyncio.wait_for(client.get(path),remaining)
+        except asyncio.TimeoutError as exc:raise TimeoutError(f'Owned job {path} exceeded {timeout}s; last status={last}') from exc
+        assert response.status_code==200,response.text
+        job=response.json();last=job.get('status','missing')
+        if last not in ('queued','running'):
+            assert last==expected,job
+            return job
+        await asyncio.sleep(min(.1,max(0,deadline-asyncio.get_running_loop().time())))
+
+async def settle_owned_jobs(jobs,timeout=30):
+    deadline=asyncio.get_running_loop().time()+timeout
+    while True:
+        pending=[(module.__name__,jobid,(module.get_job(jobid) or {}).get('status','missing')) for module,jobid in jobs if (module.get_job(jobid) or {}).get('status') not in ('completed','failed')]
+        if not pending or asyncio.get_running_loop().time()>=deadline:return pending
+        await asyncio.sleep(min(.1,max(0,deadline-asyncio.get_running_loop().time())))
+
+async def bounded_poll_cases():
+    from types import SimpleNamespace
+    class StuckClient:
+        async def get(self,path):return SimpleNamespace(status_code=200,text='',json=lambda:{'status':'running'})
+    try:await completed(StuckClient(),'/owned/stuck-job',timeout=.01)
+    except TimeoutError as exc:assert '/owned/stuck-job' in str(exc) and 'running' in str(exc)
+    else:raise AssertionError('Stuck owned job did not meet its deadline')
+    pending=await settle_owned_jobs([(SimpleNamespace(__name__='owned',get_job=lambda identity:{'status':'queued'}),'owned-cleanup-job')],timeout=.01)
+    assert pending==[('owned','owned-cleanup-job','queued')]
+    print('PASS two controlled job-poll and cleanup deadline cases',flush=True)
+
+collection=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Identity'+uuid.uuid4().hex[:10]
+sid='gs_'+uuid.uuid4().hex[:8]
+protected_neighbor=collection+'_protected'
+neighbor_created=False
+created_names=set()
+created_lock=threading.Lock()
+original_create=wc._create_collection_sync
+def record_create(name,*args,**kwargs):
+    original_create(name,*args,**kwargs)
+    with created_lock:created_names.add(name)
+jobs=[]
+with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
+    root=Path(directory)
+    with patch.object(settings,'upload_dir',str(root/'uploads')),patch.object(settings,'sources_dir',str(root/'sources')),patch.object(settings,'exports_dir',str(root/'exports')),patch.object(gs,'_sessions',{}),patch.object(wc,'_create_collection_sync',side_effect=record_create):
+        async def run():
+            global neighbor_created
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-fixture') as client:
+                await bounded_poll_cases()
+                assert not await asyncio.to_thread(wc._collection_exists_sync,collection),'Owned name already exists'
+                assert not await asyncio.to_thread(wc._collection_exists_sync,protected_neighbor),'Protected fixture name already exists'
+                await asyncio.to_thread(original_create,protected_neighbor,'hnsw','cosine',{})
+                neighbor_created=True
+                response=await client.post('/collections',json={'name':collection});assert response.status_code==201,response.text
+                coll=await asyncio.to_thread(lambda:wc.get_client().collections.get(collection))
+                await asyncio.to_thread(coll.data.insert,properties={'content':'Owned inert evaluation context','source_file':'inert.txt','chunk_index':0},vector=[0.1]*768)
+                session={'session_id':sid,'collection':collection,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs':[{'pair_id':'p_owned','question':'Inert question','answer':'Original exported answer','contexts':['Owned inert evaluation context'],'ground_truth':'Inert truth','source_file':'inert.txt','chunk_index':0,'status':'approved'}]}
+                await asyncio.to_thread(gs.store_session,session)
+                print('PASS owned real collection, supplied-vector object and synthetic evaluation session created',flush=True)
+                start=await client.post('/export',json={'collection':collection,'include_models':False});assert start.status_code==202,start.text
+                jobs.append((exporter,start.json()['job_id']))
+                exported=await completed(client,'/export/job/'+start.json()['job_id']);archive=root/'exports'/exported['filename'];digest=await asyncio.to_thread(file_digest,archive)
+                retained=await asyncio.to_thread(archive_session,archive,sid);assert retained['pairs'][0]['answer']=='Original exported answer'
+                print('PASS actual completed export package contains the original session snapshot',flush=True)
+                edited=await client.patch('/goldstandard/session/'+sid+'/pair/p_owned',json={'status':'edited','answer':'Newer acknowledged human answer'});assert edited.status_code==200,edited.text
+                original_path=await asyncio.to_thread(gs._session_path,sid);original_bytes=await asyncio.to_thread(original_path.read_bytes)
+                print('PASS newer original human edit acknowledged through HTTP after package export',flush=True)
+                mappings=[];targets=[]
+                for _ in range(2):
+                    start=await client.post('/import',json={'filename':exported['filename'],'on_conflict':'rename'});assert start.status_code==202,start.text
+                    jobs.append((importer,start.json()['job_id']))
+                    imported=await completed(client,'/import/job/'+start.json()['job_id'])
+                    assert imported['renamed'] and len(imported['restored_sessions'])==1,imported
+                    mapping=imported['restored_sessions'][0];assert mapping['source_session_id']==sid and mapping['collection']==imported['collection']
+                    assert any(mapping['session_id'] in note for note in imported['notes']),imported
+                    mappings.append(mapping);targets.append(imported['collection'])
+                    assert await asyncio.to_thread(original_path.read_bytes)==original_bytes,'Original human edit was overwritten'
+                assert len({collection,*targets})==3 and len({sid,*[m['session_id'] for m in mappings]})==3
+                print('PASS two actual rename imports expose distinct collections and independent local session mappings without changing original bytes',flush=True)
+                for local_sid,target,expected in [(sid,collection,'Newer acknowledged human answer')]+[(m['session_id'],m['collection'],'Original exported answer') for m in mappings]:
+                    response=await client.get('/goldstandard/session/'+local_sid);assert response.status_code==200,response.text
+                    loaded=response.json();assert loaded['collection']==target and loaded['pairs'][0]['answer']==expected,loaded
+                    if local_sid!=sid:
+                        assert loaded['imported_from']['session_id']==sid and loaded['imported_from']['collection']==collection and loaded['imported_from']['imported_at']
+                    saved=await client.post('/goldstandard/save',json={'session_id':local_sid,'filename':'owned-'+local_sid+'.json'});assert saved.status_code==200,saved.text
+                    download=await client.get('/goldstandard/download/'+saved.json()['filename']);assert download.status_code==200,download.text
+                    rows=download.json();assert len(rows)==1 and rows[0]['answer']==expected and set(rows[0])=={'question','answer','contexts','ground_truth'},rows
+                print('PASS original and both reported imported IDs remain usable through HTTP lookup/provenance/save/download with exact four-field RAGAS rows',flush=True)
+                code="from config import settings;from services import goldstandard as gs;import json,sys;settings.upload_dir=sys.argv[1];gs.load_sessions_from_disk();print(json.dumps([gs.get_session(s) for s in sys.argv[2:]]))"
+                identities=[sid]+[m['session_id'] for m in mappings]
+                reload=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',code,str(root/'uploads'),*identities],text=True,capture_output=True,check=True)
+                fresh=json.loads(reload.stdout);assert [row['collection'] for row in fresh]==[collection,*targets];assert fresh[0]['pairs'][0]['answer']=='Newer acknowledged human answer';assert all(row['imported_from']['session_id']==sid for row in fresh[1:])
+                print('PASS fresh independent API process restores all three session identities, newer original review and imported provenance',flush=True)
+                start=await client.post('/export',json={'collection':targets[0],'include_models':False});assert start.status_code==202,start.text
+                jobs.append((exporter,start.json()['job_id']))
+                reexported=await completed(client,'/export/job/'+start.json()['job_id'])
+                imported_sid=mappings[0]['session_id'];retained=await asyncio.to_thread(archive_session,root/'exports'/reexported['filename'],imported_sid)
+                assert retained['session_id']==imported_sid and retained['imported_from']['session_id']==sid
+                assert await asyncio.to_thread(file_digest,archive)==digest
+                print('PASS re-export uses the allocated session filename/provenance and the original package remains byte-identical',flush=True)
+                source_id='legacy-review-2024';legacy_filename=await asyncio.to_thread(legacy_archive,archive,root,sid,source_id)
+                start=await client.post('/import',json={'filename':legacy_filename,'on_conflict':'rename'});assert start.status_code==202,start.text
+                jobs.append((importer,start.json()['job_id']));legacy=await completed(client,'/import/job/'+start.json()['job_id'],expected='failed')
+                assert legacy['error_code']=='PACKAGE_CORRUPT' and legacy['error_detail']=={'file':'goldstandard/'+sid+'.json'} and not legacy['restored_sessions'],legacy
+                assert await asyncio.to_thread(original_path.read_bytes)==original_bytes
+                print('PASS digest-valid noncanonical-ID archive is refused PACKAGE_CORRUPT naming the sidecar, restores nothing and leaves the original newer review unchanged',flush=True)
+
+
+        async def owned():
+            try:await run()
+            finally:
+                pending=await settle_owned_jobs(jobs)
+                if pending:
+                    # This standalone verifier owns these worker threads. Hard
+                    # exit prevents asyncio's executor shutdown joining a stuck
+                    # job forever, and preserves its exact fixture directory.
+                    print('FAIL owned jobs did not settle: '+repr(pending)+'; preserved fixture directory '+str(root),flush=True)
+                    os._exit(2)
+                for name in sorted(created_names):
+                    if await asyncio.to_thread(wc._collection_exists_sync,name):
+                        await asyncio.to_thread(wc._delete_collection_sync,name)
+                if neighbor_created:
+                    assert await asyncio.to_thread(wc._collection_exists_sync,protected_neighbor),'Exact cleanup deleted a similarly named protected collection'
+                    await asyncio.to_thread(wc._delete_collection_sync,protected_neighbor)
+                    print('PASS exact recorded-name cleanup leaves a similarly named collection intact until explicit fixture teardown',flush=True)
+                await asyncio.to_thread(wc.close_client)
+        asyncio.run(owned())
+assert all(not wc._collection_exists_sync(name) for name in created_names);wc.close_client()
+print('PASS only owned collections/packages/session fixtures removed',flush=True)
+```
+
+### scripts/verify/14_reindex.sh
+
+```bash
+#!/usr/bin/env bash
+# Exact-record reindex and unavailable-embedding acceptance.
+set -uo pipefail
+cd "$(dirname "$0")" && . ./lib.sh
+bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
+python3 ./compose_target.py "$API" "$bindings" || exit 2
+require_stack
+section "Exact-record reindex"
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_collection_writes.py)
+check "collection writer barrier regressions" $?
+# Transport only these three controlled sources into a temporary API directory.
+# The tests exercise the actual helper and parent cleanup function with mocks.
+(cd ../.. && python3 -c 'import sys,tarfile; t=tarfile.open(fileobj=sys.stdout.buffer,mode="w|"); [t.add("scripts/verify/"+name,arcname=name) for name in ("reindex.py","lib.sh","reindex_verifier_cases.py")]; t.close()' | docker compose exec -T api python -c 'import os,sys,tarfile,tempfile,subprocess; task=tempfile.TemporaryDirectory(prefix="owned-reindex-tests-"); tarfile.open(fileobj=sys.stdin.buffer,mode="r|*").extractall(task.name,filter="data"); result=subprocess.run([sys.executable,task.name+"/reindex_verifier_cases.py"],env={**os.environ,"RAG_TEST_API_DIR":"/app","RAG_REINDEX_VERIFIER_SOURCE":task.name+"/reindex.py","RAG_VERIFIER_LIB":task.name+"/lib.sh"}); task.cleanup(); sys.exit(result.returncode)')
+check "verifier async ownership and parent cleanup regressions" $?
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/verify/reindex_cases.py)
+check "owned reindex preservation and failure regressions" $?
+(cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/reindex.py)
+check "real reindex with embedding endpoint unavailable" $?
+summary
+```
+
+### scripts/verify/reindex_cases.py
+
+```python
+"""Controlled reindex preservation/failure cases; registered by14_reindex.sh."""
+import copy, math, os, sys, unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app'))
+from services import tuning
+validate_vectorizer = tuning.wc._validate_reindex_vectorizer_sync
+
+
+def records():
+    return [{'id': '49000000-0000-4000-8000-00000000000'+str(i),
+             'vector': [0.125, float(i), -0.25],
+             'properties': {'content': 'Owned inert '+str(i), 'chunk_index': i, 'source_file': 'owned.txt'}} for i in range(2)]
+
+
+class Batch:
+    def __init__(self, owner, name):
+        self.owner, self.name, self.number_errors, self.pending = owner, name, 0, []
+    def __enter__(self): return self
+    def add_object(self, properties, uuid=None, vector=None):
+        self.pending.append({'id': str(uuid), 'vector': copy.deepcopy(vector), 'properties': copy.deepcopy(properties)})
+        if self.owner.mutate_arguments:
+            properties['content'] = 'SDK argument mutation'; vector[0] = 999
+    def __exit__(self, *exc):
+        if self.owner.fail(self.name): self.number_errors = 1
+        else: self.owner.data[self.name] += self.pending
+        self.owner.closed.append(self.name)
+        if self.owner.corrupt(self.name) and self.owner.data[self.name]:
+            self.owner.data[self.name][0]['properties']['content'] = 'Owned readback corruption'
+        if self.owner.change_source and self.name != 'OwnedReindex':
+            self.owner.data['OwnedReindex'][0]['properties']['content'] = 'Newer independent write'
+
+
+class Collections:
+    def __init__(self, initial):
+        self.data = {'OwnedReindex': copy.deepcopy(initial)}; self.deleted = []; self.created = []; self.closed = []
+        self.fail = lambda name: False; self.corrupt = lambda name: False
+        self.change_source = self.mutate_arguments = False
+    def get(self, name):
+        def iterator(include_vector=False):
+            for record in self.data[name]:
+                yield SimpleNamespace(uuid=record['id'], properties=copy.deepcopy(record['properties']), vector={'default':copy.deepcopy(record['vector'])} if include_vector else None)
+        return SimpleNamespace(iterator=iterator, batch=SimpleNamespace(dynamic=lambda: Batch(self, name), failed_objects=[]), aggregate=SimpleNamespace(over_all=lambda **kwargs: SimpleNamespace(total_count=len(self.data[name]))))
+    def delete(self, name): self.deleted.append(name); del self.data[name]
+    def create(self, name, index, distance, hnsw, **kwargs):
+        self.created.append((name,index,distance,copy.deepcopy(hnsw))); self.data[name] = []
+
+
+class ReindexTests(unittest.TestCase):
+    def setUp(self):
+        self.original = records(); self.backend = Collections(self.original)
+        self.config = {'index_type':'hnsw','distance_metric':'cosine','hnsw_config':{'ef':64,'efConstruction':128,'maxConnections':64}}
+        self.embedding = Mock(side_effect=AssertionError('Reindex contacted embedding insertion'))
+        self.stale = Mock(return_value=1)
+        patches = [patch.object(tuning.wc,'get_client',return_value=SimpleNamespace(collections=self.backend)),
+                   patch.object(tuning.wc,'_create_collection_sync',side_effect=self.backend.create),
+                   patch.object(tuning.wc,'_collection_config_sync',return_value=self.config),
+                   patch.object(tuning.wc,'_validate_reindex_vectorizer_sync'),
+                   patch.object(tuning.wc,'_insert_chunks_sync',self.embedding),
+                   patch.object(tuning.sources,'has_sources',return_value=False),
+                   patch.object(tuning.goldstandard,'mark_stale',self.stale),
+                   patch.object(tuning,'_jobs',{}),patch.object(tuning,'_active',{'OwnedReindex'})]
+        for change in patches: change.start(); self.addCleanup(change.stop)
+        import tempfile
+        self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        def begin(collection,operation,client):return {'staging':collection+'__tuning_owned','state':'scratch','operation_id':'owned'}
+        def retain(owner, **kwargs):owner['state']='recovery'
+        def discard(owner,client):client.collections.delete(owner['staging'])
+        for change in [patch.object(tuning.collection_recovery,'begin',side_effect=begin),patch.object(tuning.collection_recovery,'retain',side_effect=retain),patch.object(tuning.collection_recovery,'discard',side_effect=discard),patch.object(tuning.collection_recovery,'_root',return_value=Path(self.temp.name))]:
+            change.start();self.addCleanup(change.stop)
+    def run_job(self, operation='reindex'):
+        tuning._jobs['owned'] = {'status':'queued','chunks_written':0,'notes':[]}
+        tuning._run('owned','OwnedReindex',operation,{'index_type':'flat','distance_metric':'dot',**({'chunking':{}} if operation=='rechunk' else {})})
+        return tuning._jobs['owned']
+    def test_reindex_changes_physical_config_and_preserves_every_record_without_embedding(self):
+        job=self.run_job(); self.assertEqual(job['status'],'completed'); self.assertEqual(job['chunks_written'],2)
+        self.assertEqual(self.backend.data['OwnedReindex'],self.original); self.embedding.assert_not_called(); self.stale.assert_not_called()
+        self.assertTrue(all(entry[1:3]==('flat','dot') for entry in self.backend.created)); self.assertIn('verified unchanged',job['notes'][0])
+        self.assertNotIn('OwnedReindex',tuning._active)
+    def test_deferred_batch_failure_is_seen_before_original_deletion(self):
+        self.backend.fail=lambda name:name!='OwnedReindex'; job=self.run_job()
+        self.assertEqual(job['status'],'failed'); self.assertNotIn('OwnedReindex',self.backend.deleted)
+        self.assertEqual(self.backend.data['OwnedReindex'],self.original); self.assertEqual(job['chunks_written'],0); self.stale.assert_not_called()
+    def test_staging_readback_mismatch_preserves_original(self):
+        self.backend.corrupt=lambda name:name!='OwnedReindex'; job=self.run_job()
+        self.assertEqual(job['status'],'failed'); self.assertNotIn('OwnedReindex',self.backend.deleted); self.stale.assert_not_called()
+    def test_observed_source_change_during_staging_is_not_overwritten(self):
+        self.backend.change_source=True; job=self.run_job(); self.assertEqual(job['status'],'failed')
+        self.assertNotIn('OwnedReindex',self.backend.deleted); self.assertEqual(self.backend.data['OwnedReindex'][0]['properties']['content'],'Newer independent write')
+    def test_final_deferred_failure_has_no_completion_claim_and_marks_retained_pairs(self):
+        self.backend.fail=lambda name:name=='OwnedReindex'; job=self.run_job()
+        self.assertEqual(job['status'],'failed'); self.assertEqual(job['chunks_written'],0); self.assertEqual(job['notes'],[])
+        self.stale.assert_called_once(); self.assertIn('cutover',self.stale.call_args.args[1])
+    def test_final_readback_mismatch_is_not_completed(self):
+        self.backend.corrupt=lambda name:name=='OwnedReindex'; job=self.run_job()
+        self.assertEqual(job['status'],'failed'); self.assertEqual(job['chunks_written'],0); self.stale.assert_called_once()
+    def test_missing_or_nonfinite_vectors_fail_before_any_creation(self):
+        for vector in [[],None,[math.nan],[math.inf],[True]]:
+            with self.subTest(vector=vector):
+                self.backend.data['OwnedReindex'][0]['vector']=vector; job=self.run_job()
+                self.assertEqual(job['status'],'failed'); self.assertEqual(self.backend.created,[]); self.assertEqual(self.backend.deleted,[])
+    def test_unsupported_named_vector_is_refused_without_guessing(self):
+        col=SimpleNamespace(iterator=lambda **kw:iter([SimpleNamespace(uuid=self.original[0]['id'],properties={},vector={'other':[1.0]})]))
+        with patch.object(tuning.wc,'get_client',return_value=SimpleNamespace(collections=SimpleNamespace(get=lambda name:col))):
+            with self.assertRaisesRegex(RuntimeError,'single default vector'): tuning._existing_records('OwnedReindex')
+    def test_duplicate_readback_id_is_refused(self):
+        self.backend.data['OwnedReindex'].append(copy.deepcopy(self.original[0])); job=self.run_job()
+        self.assertEqual(job['status'],'failed'); self.assertEqual(self.backend.created,[])
+    def test_sdk_argument_mutation_does_not_change_expected_snapshot(self):
+        self.backend.mutate_arguments=True; snapshot=tuning._existing_records('OwnedReindex'); before=copy.deepcopy(snapshot)
+        self.backend.create('OwnedCopy','flat','dot',{}); tuning._write_records('OwnedCopy',snapshot)
+        self.assertEqual(snapshot,before); self.assertEqual(self.backend.data['OwnedCopy'],self.original)
+    def test_empty_collection_reindexes_without_embedding(self):
+        self.backend.data['OwnedReindex']=[]; job=self.run_job()
+        self.assertEqual(job['status'],'completed'); self.assertEqual(job['chunks_written'],0); self.embedding.assert_not_called(); self.stale.assert_not_called()
+    def test_ingest_started_after_source_check_waits_for_final_reindex_copy(self):
+        import tempfile,threading,uuid
+        from concurrent.futures import ThreadPoolExecutor
+        from services import ingest_pipeline as ingest
+        entered=threading.Event();release=threading.Event();parsed=threading.Event();attempted=threading.Event()
+        verify=tuning._verify_records;paused=False
+        def paused_verify(name,records):
+            nonlocal paused
+            verify(name,records)
+            if name=='OwnedReindex' and not paused:
+                paused=True;entered.set();assert release.wait(3)
+        def parse(path):parsed.set();return 'Owned later upload',[]
+        def insert(name,chunks):self.backend.data[name].append({'id':str(uuid.uuid4()),'vector':[.125,0.,-.25],'properties':chunks[0]})
+        job={'status':'queued','chunks_stored':0,'files_completed':0,'files_failed':0,'files_total':1,'errors':[]}
+        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_verify_records',side_effect=paused_verify),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned later upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
+            path=Path(temp)/'owned.txt';path.write_text('Owned later upload')
+            reindex=pool.submit(self.run_job);self.assertTrue(entered.wait(2))
+            def start_ingest():
+                attempted.set();ingest._process_job_sync('owned_ingest',[path],Path(temp),'OwnedReindex','fixed',150,0,.5,40)
+            upload=pool.submit(start_ingest);self.assertTrue(attempted.wait(2));self.assertFalse(parsed.wait(.05));release.set()
+            result=reindex.result(timeout=3);upload.result(timeout=3)
+        self.assertEqual(result['status'],'completed');self.assertEqual(job['status'],'completed')
+        self.assertEqual(self.backend.data['OwnedReindex'][:2],self.original);self.assertEqual(len(self.backend.data['OwnedReindex']),3)
+    def test_reindex_snapshot_waits_for_already_running_ingest(self):
+        import tempfile,threading,uuid
+        from concurrent.futures import ThreadPoolExecutor
+        from services import ingest_pipeline as ingest
+        parsed=threading.Event();release=threading.Event();snapshot=threading.Event();attempted=threading.Event()
+        original_read=tuning._existing_records
+        def read(name):snapshot.set();return original_read(name)
+        def parse(path):parsed.set();assert release.wait(3);return 'Owned active upload',[]
+        def insert(name,chunks):self.backend.data[name].append({'id':str(uuid.uuid4()),'vector':[.125,0.,-.25],'properties':chunks[0]})
+        job={'status':'queued','chunks_stored':0,'files_completed':0,'files_failed':0,'files_total':1,'errors':[]}
+        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_existing_records',side_effect=read),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned active upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
+            path=Path(temp)/'owned.txt';path.write_text('Owned active upload')
+            upload=pool.submit(ingest._process_job_sync,'owned_ingest',[path],Path(temp),'OwnedReindex','fixed',150,0,.5,40)
+            self.assertTrue(parsed.wait(2))
+            def start_reindex():attempted.set();return self.run_job()
+            reindex=pool.submit(start_reindex);self.assertTrue(attempted.wait(2));self.assertFalse(snapshot.wait(.05));release.set()
+            upload.result(timeout=3);result=reindex.result(timeout=3)
+        self.assertEqual(result['status'],'completed');self.assertEqual(result['chunks_written'],3)
+        self.assertEqual(self.backend.data['OwnedReindex'][:2],self.original);self.assertEqual(len(self.backend.data['OwnedReindex']),3)
+    def test_foreign_vectorizer_refuses_before_staging_or_delete(self):
+        tuning.wc._validate_reindex_vectorizer_sync.side_effect=ValueError('Owned incompatible model')
+        job=self.run_job();self.assertEqual(job['status'],'failed')
+        self.assertEqual(self.backend.created,[]);self.assertEqual(self.backend.deleted,[])
+        self.assertEqual(self.backend.data['OwnedReindex'],self.original);self.stale.assert_not_called()
+    def test_vectorizer_validation_checks_model_endpoint_type_and_named_vectors(self):
+        from config import settings
+        cfg=SimpleNamespace(vectorizer_config=SimpleNamespace(vectorizer='text2vec-ollama',model={'model':settings.embed_model,'apiEndpoint':f'http://{settings.ollama_host}:{settings.ollama_port}'},vectorize_collection_name=False),vector_config=None,properties=[SimpleNamespace(name=p.name,data_type=p._to_dict()["dataType"][0],vectorizer='text2vec-ollama',vectorizer_config=SimpleNamespace(skip=False,vectorize_property_name=True),vectorizer_configs=None,nested_properties=None) for p in tuning.wc.COLLECTION_PROPERTIES])
+        client=SimpleNamespace(collections=SimpleNamespace(get=lambda name:SimpleNamespace(config=SimpleNamespace(get=lambda:cfg))))
+        with patch.object(tuning.wc,'get_client',return_value=client):
+            validate_vectorizer('Owned')
+            for attribute,value in [('model','foreign'),('apiEndpoint','http://foreign:1')]:
+                original=cfg.vectorizer_config.model[attribute];cfg.vectorizer_config.model[attribute]=value
+                with self.assertRaises(ValueError):validate_vectorizer('Owned')
+                cfg.vectorizer_config.model[attribute]=original
+            cfg.vectorizer_config.vectorizer='unsupported'
+            with self.assertRaises(ValueError):validate_vectorizer('Owned')
+            cfg.vectorizer_config.vectorizer='text2vec-ollama';cfg.vector_config={'foreign':object()}
+            with self.assertRaises(ValueError):validate_vectorizer('Owned')
+    def test_vectorizer_refuses_extra_module_options_and_changed_property_inputs(self):
+        from config import settings
+        props=[SimpleNamespace(name=p.name,data_type=p._to_dict()["dataType"][0],vectorizer='text2vec-ollama',vectorizer_config=SimpleNamespace(skip=False,vectorize_property_name=True),vectorizer_configs=None,nested_properties=None) for p in tuning.wc.COLLECTION_PROPERTIES]
+        cfg=SimpleNamespace(vectorizer_config=SimpleNamespace(vectorizer='text2vec-ollama',model={'model':settings.embed_model,'apiEndpoint':f'http://{settings.ollama_host}:{settings.ollama_port}'},vectorize_collection_name=False),vector_config=None,properties=props)
+        client=SimpleNamespace(collections=SimpleNamespace(get=lambda name:SimpleNamespace(config=SimpleNamespace(get=lambda:cfg))))
+        with patch.object(tuning.wc,'get_client',return_value=client):
+            validate_vectorizer('Owned')
+            cfg.vectorizer_config.model['source_properties']=['content']
+            with self.assertRaises(ValueError):validate_vectorizer('Owned')
+            cfg.vectorizer_config.model.pop('source_properties')
+            for field,value in [('skip',True),('vectorize_property_name',False)]:
+                rules=props[0].vectorizer_config;old=getattr(rules,field);setattr(rules,field,value)
+                with self.assertRaises(ValueError):validate_vectorizer('Owned')
+                setattr(rules,field,old)
+            for field,value in [('name','custom_text'),('data_type','int'),('vectorizer','foreign'),('vectorizer_configs',{'default':object()})]:
+                old=getattr(props[0],field);setattr(props[0],field,value)
+                with self.assertRaises(ValueError):validate_vectorizer('Owned')
+                setattr(props[0],field,old)
+            props[1]=props[0]
+            with self.assertRaises(ValueError):validate_vectorizer('Owned')
+    def test_staging_creation_failures_cleanup_owned_scratch_without_touching_original(self):
+        create=self.backend.create
+        for created_before_error in (False,True):
+            with self.subTest(created_before_error=created_before_error):
+                def fail(name,*args):
+                    if created_before_error:create(name,*args)
+                    raise RuntimeError('Owned staging create acknowledgement failure')
+                def discard(owner,client):
+                    if owner['staging'] in client.collections.data:client.collections.delete(owner['staging'])
+                with patch.object(tuning.wc,'_create_collection_sync',side_effect=fail),patch.object(tuning.collection_recovery,'discard',side_effect=discard) as cleanup:
+                    job=self.run_job()
+                self.assertEqual(job['status'],'failed');cleanup.assert_called_once()
+                self.assertEqual(set(self.backend.data),{'OwnedReindex'});self.assertEqual(self.backend.data['OwnedReindex'],self.original)
+                self.stale.assert_not_called()
+    def test_delete_refusal_with_intact_original_preserves_evaluation_validity(self):
+        delete=self.backend.delete
+        def refuse(name):
+            if name=='OwnedReindex':raise RuntimeError('Owned delete refusal')
+            delete(name)
+        with patch.object(self.backend,'delete',side_effect=refuse):job=self.run_job()
+        self.assertEqual(job['status'],'failed');self.assertEqual(self.backend.data['OwnedReindex'],self.original)
+        self.stale.assert_not_called();self.assertEqual(set(self.backend.data),{'OwnedReindex'})
+    def test_uncertain_delete_retains_recovery_and_marks_historical(self):
+        delete=self.backend.delete
+        def uncertain(name):
+            delete(name)
+            if name=='OwnedReindex':raise RuntimeError('Owned lost delete acknowledgement')
+        with patch.object(self.backend,'delete',side_effect=uncertain):job=self.run_job()
+        self.assertEqual(job['status'],'failed');self.stale.assert_called_once()
+        retained=job['error_detail']['recovered_as'];self.assertEqual(self.backend.data[retained],self.original)
+        self.assertEqual(job['chunks_written'],0)
+    def test_lowercase_alias_uses_canonical_job_and_cutover_identity(self):
+        tuning._jobs['owned']={'status':'queued','chunks_written':0,'notes':[]}
+        tuning._run('owned','ownedReindex','reindex',{'index_type':'flat','distance_metric':'dot'})
+        job=tuning._jobs['owned'];self.assertEqual(job['status'],'completed');self.assertEqual(job['collection'],'OwnedReindex')
+        self.assertEqual(self.backend.data['OwnedReindex'],self.original)
+        self.assertTrue(all(name.startswith('OwnedReindex') for name,_,_,_ in self.backend.created))
+    def test_alias_jobs_share_the_same_active_identity(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+        async def check():
+            with patch.object(tuning,'_active',set()),patch.object(tuning.asyncio,'to_thread',new=AsyncMock(return_value=None)):
+                identity=await tuning.start_tune_job('ownedReindex','reindex',{})
+                self.assertEqual(tuning._jobs[identity]['collection'],'OwnedReindex')
+                with self.assertRaises(RuntimeError):await tuning.start_tune_job('OwnedReindex','reindex',{})
+                await asyncio.sleep(0)
+        asyncio.run(check())
+    def test_rechunk_and_reembed_preserve_caller_spelled_source_identity(self):
+        for operation in ('rechunk','reembed'):
+            with self.subTest(operation=operation),patch.object(tuning.sources,'has_sources',return_value=True) as has_sources,patch.object(tuning,'_chunks_from_sources',return_value=[{'content':'Owned caller sources'}]) as read_sources,patch.object(tuning,'_existing_chunks',return_value=[{'content':'Owned caller chunks'}]),patch.object(tuning,'_rebuild',return_value=1):
+                tuning._jobs['owned']={'status':'queued','chunks_written':0,'notes':[]}
+                params={'chunking':{'strategy':'fixed','chunk_size':150,'chunk_overlap':0,'similarity_threshold':.5,'min_chunk_size':40}}
+                tuning._run('owned','ownedReindex',operation,params)
+                self.assertEqual(tuning._jobs['owned']['status'],'completed');has_sources.assert_called_once_with('ownedReindex');self.assertEqual(read_sources.call_args.args[0],'ownedReindex')
+    def test_every_tuning_operation_registers_owned_staging(self):
+        for operation in ('reindex','reembed','rechunk'):
+            with self.subTest(operation=operation),patch.object(tuning.collection_recovery,'begin',wraps=tuning.collection_recovery.begin) as begin:
+                # Existing controlled rebuild fixture executes the real rebuild;
+                # rechunk uses inert parsed properties without changing traversal.
+                with patch.object(tuning.sources,'has_sources',return_value=True),patch.object(tuning,'_chunks_from_sources',return_value=[r['properties'] for r in self.original]),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=lambda name,props:self.backend.data.__setitem__(name,__import__('copy').deepcopy(self.original))):
+                    job=self.run_job(operation)
+                begin.assert_called_once();self.assertEqual(begin.call_args.args[:2],('OwnedReindex','tune'))
+                self.assertEqual(set(self.backend.data),{'OwnedReindex'})
+    def test_reembed_retains_its_explicit_regeneration_path(self):
+        def embed(name,props):
+            self.backend.data[name]=[{'id':'49000000-0000-4000-8000-000000000100','vector':[4.,5.,6.],'properties':copy.deepcopy(props[0])},
+                                     {'id':'49000000-0000-4000-8000-000000000101','vector':[4.,5.,6.],'properties':copy.deepcopy(props[1])}]
+        self.embedding.side_effect=embed; job=self.run_job('reembed')
+        self.assertEqual(job['status'],'completed'); self.embedding.assert_called_once(); self.stale.assert_called_once()
+        self.assertNotEqual(self.backend.data['OwnedReindex'],self.original)
+
+if __name__=='__main__': unittest.main()
+```
+
+### scripts/verify/reindex.py
+
+```python
+"""Real Weaviate reindex with an unreachable embedding endpoint; owned fixtures only."""
+import asyncio, json, os, subprocess, sys, tempfile, threading, uuid
+from pathlib import Path
+from unittest.mock import patch
+import httpx
+from config import settings
+from main import app
+from services import goldstandard as gs, tuning, ingest_pipeline as ingest
+from services import weaviate_client as wc
+
+
+async def completed(client,path,timeout=300,expected_status="completed"):
+    deadline=asyncio.get_running_loop().time()+timeout;last='not observed'
+    while True:
+        remaining=deadline-asyncio.get_running_loop().time()
+        if remaining<=0:raise TimeoutError(f'Owned job {path} exceeded {timeout}s; last status={last}')
+        try:response=await asyncio.wait_for(client.get(path),remaining)
+        except asyncio.TimeoutError as exc:raise TimeoutError(f'Owned job {path} exceeded {timeout}s; last status={last}') from exc
+        assert response.status_code==200,response.text
+        job=response.json();last=job.get('status','missing')
+        if last not in ('queued','running'):
+            assert last==expected_status,job
+            return job
+        await asyncio.sleep(min(.1,max(0,deadline-asyncio.get_running_loop().time())))
+
+async def settle_owned_jobs(jobs,timeout=30):
+    deadline=asyncio.get_running_loop().time()+timeout
+    while True:
+        pending=[(module.__name__,jobid,(module.get_job(jobid) or {}).get('status','missing')) for module,jobid in jobs if (module.get_job(jobid) or {}).get('status') not in ('completed','failed')]
+        if not pending or asyncio.get_running_loop().time()>=deadline:return pending
+        await asyncio.sleep(min(.1,max(0,deadline-asyncio.get_running_loop().time())))
+
+async def bounded_poll_cases():
+    from types import SimpleNamespace
+    class StuckClient:
+        async def get(self,path):return SimpleNamespace(status_code=200,text='',json=lambda:{'status':'running'})
+    try:await completed(StuckClient(),'/owned/stuck-job',timeout=.01)
+    except TimeoutError as exc:assert '/owned/stuck-job' in str(exc) and 'running' in str(exc)
+    else:raise AssertionError('Stuck owned job did not meet its deadline')
+    pending=await settle_owned_jobs([(SimpleNamespace(__name__='owned',get_job=lambda identity:{'status':'queued'}),'owned-cleanup-job')],timeout=.01)
+    assert pending==[('owned','owned-cleanup-job','queued')]
+    print('PASS two controlled job-poll and cleanup deadline cases',flush=True)
+
+def owned_name(prefix,token):
+    # Parent suites may sweep their prefix. This standalone owner must remain
+    # outside that namespace when preserving a failed or interrupted fixture.
+    if not prefix:raise ValueError('A nonempty parent fixture prefix is required')
+    first = 'A' if not prefix.startswith('A') else 'B'
+    return first+'OwnedReindex'+token
+
+def preserve_receipt(directory,created,pending):
+    path=Path(directory)/'owned-fixtures.json'
+    with path.open('w') as output:
+        json.dump({'created_collections':list(created),'pending_jobs':pending,'fixture_directory':directory,'cleanup':'Inspect terminal writer state and delete only these exact owned names; do not prefix-sweep.'},output,indent=2)
+        output.flush();os.fsync(output.fileno())
+    return str(path)
+
+
+async def queued_ingest_checks(api,client,collection,jobs,check):
+    before=await asyncio.to_thread(tuning._existing_records,collection)
+    paused=threading.Event();release=threading.Event();original_verify=tuning._verify_records;once=False
+    def verify(target,records):
+        nonlocal once
+        original_verify(target,records)
+        if target==collection and not once:
+            once=True;paused.set()
+            if not release.wait(30):raise TimeoutError('Owned source-check pause expired')
+    # Only the embedding fixture is replaced; the HTTP upload, parser, chunker,
+    # ingest worker, source retention and actual backend writes remain real.
+    def supplied_vectors(target,chunks):
+        col=client.collections.get(target)
+        for chunk in chunks:col.data.insert(properties=chunk,uuid=str(uuid.uuid4()),vector=[.25]*len(before[0]['vector']))
+    with patch.object(tuning,'_verify_records',side_effect=verify),patch.object(wc,'_insert_chunks_sync',side_effect=supplied_vectors):
+        try:
+            response=await api.post('/tune/reindex',json={'collection':collection,'index_type':'hnsw','distance_metric':'cosine'})
+            assert response.status_code==202,response.text;reindex=response.json()['job_id'];jobs.append((tuning,reindex))
+            check(await asyncio.to_thread(paused.wait,10),'real reindex reaches protected source check before cutover')
+            uploaded=await api.post('/ingest/upload',data={'collection':collection,'strategy':'fixed','chunk_size':'150','chunk_overlap':'0','min_chunk_size':'100'},files={'files':('owned-concurrent.txt',b'Owned concurrency upload with inert public text. '*40,'text/plain')})
+            assert uploaded.status_code==202,uploaded.text;upload=uploaded.json()['job_id'];jobs.append((ingest,upload))
+            status=await api.get('/ingest/job/'+upload)
+            check(status.status_code==200 and status.json()['status']=='queued','actual ingest HTTP job remains queued while reindex holds the source guard')
+            release.set()
+            reindexed=await completed(api,'/tune/job/'+reindex)
+            ingested=await completed(api,'/ingest/job/'+upload)
+            check(reindexed['chunks_written']==len(before) and ingested['chunks_stored']>0,'reindex verifies its copy before the waiting real ingest completes')
+        finally:release.set()
+    after=await asyncio.to_thread(tuning._existing_records,collection);observed={record['id']:record for record in after}
+    check(all(observed.get(record['id'])==record for record in before) and len(after)==len(before)+ingested['chunks_stored'],'real backend retains original exact records and the post-cutover upload')
+
+
+async def retained_cutover_checks(api,client,name,temp,record_create,jobs,check):
+    collection=name+'CutoverFail';sid='gs_'+uuid.uuid4().hex[:8]
+    await asyncio.to_thread(wc._create_collection_sync,collection,'hnsw','cosine',{})
+    col=client.collections.get(collection)
+    await asyncio.to_thread(col.data.insert,properties={'content':'Owned inert recovery','source_file':'owned.txt','chunk_index':0},uuid=str(uuid.uuid4()),vector=[.125]*768)
+    before=await asyncio.to_thread(tuning._existing_records,collection)
+    session={'session_id':sid,'collection':collection[:1].lower()+collection[1:],'status':'completed','pairs_total':1,'pairs_completed':1,'pairs_attempted':1,'pairs_failed':0,'pairs':[{'pair_id':'p_owned','question':'Owned','answer':'Owned','contexts':['Owned inert recovery'],'ground_truth':'Owned','source_file':'owned.txt','chunk_index':0,'status':'approved'}]}
+    await asyncio.to_thread(gs.store_session,session);session_bytes=await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes())
+    def create(target,*args,**kwargs):
+        if target==collection:raise RuntimeError('Owned injected final-create failure after cutover')
+        record_create(target,*args,**kwargs)
+    with patch.object(wc,'_create_collection_sync',side_effect=create):
+        response=await api.post('/tune/reindex',json={'collection':collection[:1].lower()+collection[1:],'index_type':'flat','distance_metric':'dot'})
+        assert response.status_code==202,response.text;job=response.json()['job_id'];jobs.append((tuning,job))
+        result=await completed(api,'/tune/job/'+job,expected_status='failed')
+    check(result['chunks_written']==0,'post-cutover failure is not published as completion')
+    stage=result['error_detail']['recovered_as'];check(stage.startswith(collection+'__tuning_'),'failure identifies the exact operation-owned retained copy')
+    check(await asyncio.to_thread(tuning._existing_records,stage)==before,'retained backend copy preserves exact UUID/properties/vector after final create fails')
+    paths=await asyncio.to_thread(lambda:list(tuning.collection_recovery._root().glob('*.json')));assert len(paths)==1
+    owner=await asyncio.to_thread(lambda:json.loads(paths[0].read_text()))
+    check(owner['state']=='recovery' and owner['target']==collection and owner['staging']==stage,'durable recovery ownership binds the original and retained copy')
+    snapshot=Path(settings.upload_dir)/result['error_detail']['sidecar_snapshots']/'goldstandard'/(sid+'.json')
+    check(await asyncio.to_thread(snapshot.read_bytes)==session_bytes,'pre-cutover evaluation snapshot is retained byte-identically')
+    check(await asyncio.to_thread(lambda:gs.get_session(sid).get('stale')),'failed cutover marks its retained evaluation historical')
+    await asyncio.to_thread(wc._sweep_staging_sync)
+    check(await asyncio.to_thread(client.collections.exists,stage) and await asyncio.to_thread(paths[0].is_file),'actual startup sweep preserves retained recovery and its durable record')
+    child="""import asyncio,json,sys
+from services import weaviate_client as wc,goldstandard as gs,tuning
+from main import app,lifespan
+expected=json.load(sys.stdin)
+async def proof():
+    async with lifespan(app):
+        assert wc.get_client().collections.exists(sys.argv[1])
+        assert tuning._existing_records(sys.argv[1])==expected
+        assert gs.get_session(sys.argv[2])['stale']
+asyncio.run(proof())
+print('PASS independent API lifespan restores recovery, exact records and historical session')
+"""
+    env={**os.environ,'UPLOAD_DIR':temp,'SOURCES_DIR':str(Path(temp)/'sources')}
+    restarted=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',child,stage,sid],input=json.dumps(before),text=True,capture_output=True,env=env,timeout=30)
+    if restarted.returncode:print(restarted.stderr,flush=True)
+    check(restarted.returncode==0,'fresh API process restores owned recovery and exact records: '+restarted.stderr[-200:])
+    deletion=await api.delete('/collections/'+stage[:1].lower()+stage[1:])
+    check(deletion.status_code==200 and deletion.json()['objects_deleted']==len(before),'explicit lowercase-alias DELETE removes the retained backend copy')
+    check(not await asyncio.to_thread(paths[0].exists) and not await asyncio.to_thread(snapshot.parent.parent.exists),'explicit recovery deletion retires exactly its ownership journal and metadata snapshots')
+
+
+async def additional_vectorizer_and_import_checks(api,client,name,temp,created,jobs,check):
+    custom=name+'Custom'
+    def create_custom():
+        properties=[wc.Property(name=p.name,data_type=p.dataType,skip_vectorization=(p.name=='content')) for p in wc.COLLECTION_PROPERTIES]
+        client.collections.create(name=custom,vectorizer_config=wc.Configure.Vectorizer.text2vec_ollama(api_endpoint='http://127.0.0.1:1',model=settings.embed_model,vectorize_collection_name=False),properties=properties)
+        created.append(custom)
+        client.collections.get(custom).data.insert(properties={'content':'Owned custom vectorizer input'},vector=[.125]*768)
+    await asyncio.to_thread(create_custom)
+    before=await asyncio.to_thread(tuning._existing_records,custom)
+    request=await api.post('/tune/reindex',json={'collection':custom,'index_type':'flat','distance_metric':'dot'})
+    assert request.status_code==202,request.text;identity=request.json()['job_id'];jobs.append((tuning,identity))
+    refusal=await completed(api,'/tune/job/'+identity,expected_status='failed')
+    check('vectorizer configuration' in refusal['error'] and refusal['chunks_written']==0,'actual custom property vectorization is refused before staging')
+    check(await asyncio.to_thread(tuning._existing_records,custom)==before,'custom property refusal preserves real UUID/property/vector data')
+    check(await asyncio.to_thread(lambda:not list(tuning.collection_recovery._root().glob('*.json'))),'custom property refusal creates no ownership or staging')
+    # A distinct process registers actual import scratch, creates it, then exits
+    # without Python finally. Startup ownership sweep must remove exactly it.
+    parent=name+'ImportParent'
+    code="from services import collection_recovery as r,weaviate_client as w; import os; o=r.begin("+repr(parent)+",'import',w.get_client()); w._create_collection_sync(o['staging'],'hnsw','cosine',{}); print(o['staging'],flush=True); os._exit(17)"
+    env={**os.environ,'UPLOAD_DIR':temp,'SOURCES_DIR':str(Path(temp)/'sources')}
+    result=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',code],env=env,text=True,capture_output=True,timeout=30)
+    def records():return [json.loads(p.read_text()) for p in tuning.collection_recovery._root().glob('*.json') if json.loads(p.read_text()).get('target')==parent]
+    ownership=await asyncio.to_thread(records)
+    created.extend(o['staging'] for o in ownership)
+    check(result.returncode==17 and len(ownership)==1 and ownership[0]['state']=='scratch','independent import scratch writer hard-exits with durable positive ownership')
+    staging=ownership[0]['staging']
+    check(await asyncio.to_thread(client.collections.exists,staging),'hard exit leaves the exact owned import staging collection')
+    removed=await asyncio.to_thread(wc._sweep_staging_sync)
+    check(staging in removed and not await asyncio.to_thread(client.collections.exists,staging),'startup removes the exact positively owned interrupted import scratch')
+    check(await asyncio.to_thread(lambda:not records()),'startup completes and removes the owned import scratch journal')
+
+async def collection_deletion_checks(api,client,name,temp,check):
+    from services import sources,ingest_config,retrieval_config
+    from routers import collections as collection_routes
+    from weaviate.exceptions import UnexpectedStatusCodeError
+    # Exercise both aliases on the Linux volume, with separate physical paths.
+    for use_alias in (True,False):
+        canonical=name+('AliasDelete' if use_alias else 'CanonicalDelete')
+        alias=canonical[:1].lower()+canonical[1:]
+        caller=alias if use_alias else canonical
+        neighbor=canonical[:-1]+canonical[-1].upper()
+        neighbor_supported=True
+        for collection in (canonical,neighbor):
+            try:
+                await asyncio.to_thread(wc._create_collection_sync,collection,'hnsw','cosine',{})
+            except UnexpectedStatusCodeError as exc:
+                if collection != neighbor or exc.status_code != 422 or 'similar class' not in str(exc):
+                    raise
+                neighbor_supported=False
+                check(True,'backend rejects a case-only neighbor; verifying case-distinct sidecars and sessions on the Linux volume')
+                continue
+            await asyncio.to_thread(client.collections.get(collection).data.insert,properties={'content':'Owned deletion fixture'},vector=[.125]*768)
+        identities={spelling:'gs_'+uuid.uuid4().hex[:8] for spelling in (canonical,alias,neighbor)}
+        for spelling,sid in identities.items():
+            await asyncio.to_thread(sources.store,spelling,'owned.txt',b'Owned deletion original')
+            await asyncio.to_thread(ingest_config.save,{'collection':spelling})
+            await asyncio.to_thread(retrieval_config.save,{'collection':spelling})
+            await asyncio.to_thread(gs.store_session,{'session_id':sid,'collection':spelling,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        await asyncio.to_thread(collection_routes._save_registry, {canonical:'owned', alias:'owned', neighbor:'neighbor'})
+        response=await api.delete('/collections/'+caller)
+        registry=await asyncio.to_thread(collection_routes._load_registry)
+        check(registry=={neighbor:'neighbor'},'registry removes both aliases and preserves case-distinct neighbor')
+        check(response.status_code==200 and response.json()['objects_deleted']==1 and not await asyncio.to_thread(client.collections.exists,canonical),'HTTP deletion removes canonical backend collection via '+caller)
+        for spelling in (canonical,alias):
+            check(await asyncio.to_thread(lambda:not sources.collection_dir(spelling).exists() and not (Path(temp)/'ingest_configs'/(spelling+'.json')).exists() and not (Path(temp)/'retrieval_configs'/(spelling+'.json')).exists()),'deletion cleans exact source/ingest/retrieval spelling '+spelling)
+            check(await asyncio.to_thread(lambda:gs.get_session(identities[spelling])['orphaned'] and json.loads(gs._session_path(identities[spelling]).read_text())['orphaned']),'deletion persists orphan status for '+spelling)
+            check(gs.get_session(identities[spelling])['orphaned_reason']==f"collection '{canonical}' was deleted",'orphan reason names canonical collection for '+spelling)
+        check(await asyncio.to_thread(lambda:(not neighbor_supported or client.collections.exists(neighbor)) and sources.collection_dir(neighbor).is_dir() and ingest_config.load(neighbor) is not None and retrieval_config.load(neighbor) is not None and not gs.get_session(identities[neighbor]).get('orphaned',False)),'deletion preserves case-distinct sidecars and current session')
+
+
+async def caller_sidecar_and_legacy_tuning_checks(api,client,name,temp,created,check):
+    await collection_deletion_checks(api,client,name,temp,check)
+    before=await asyncio.to_thread(tuning._existing_records,name)
+    child="from services import tuning,weaviate_client as w; import os; original=w._create_collection_sync; w._create_collection_sync=lambda *a,**k:(original(*a,**k),os._exit(17)); tuning._jobs['owned']={'status':'queued','chunks_written':0}; tuning._run('owned',"+repr(name)+",'reembed',{'index_type':'hnsw','distance_metric':'cosine'})"
+    result=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',child],env={**os.environ,'UPLOAD_DIR':temp,'SOURCES_DIR':str(Path(temp)/'sources')},text=True,capture_output=True,timeout=30)
+    def owners():return [json.loads(p.read_text()) for p in tuning.collection_recovery._root().glob('*.json') if json.loads(p.read_text()).get('target')==name]
+    ownership=await asyncio.to_thread(owners);created.extend(o['staging'] for o in ownership)
+    check(result.returncode==17 and len(ownership)==1 and ownership[0]['state']=='scratch','actual reembed worker hard-exits with positive staging ownership')
+    stage=ownership[0]['staging'];check(await asyncio.to_thread(client.collections.exists,stage),'hard exit leaves exact positively owned legacy tuning staging')
+    removed=await asyncio.to_thread(wc._sweep_staging_sync)
+    check(stage in removed and not await asyncio.to_thread(client.collections.exists,stage) and await asyncio.to_thread(tuning._existing_records,name)==before and not await asyncio.to_thread(owners),'startup removes exact legacy tuning scratch while preserving original records')
+
+async def main():
+    from routers import collections as collection_routes
+    token=uuid.uuid4().hex[:8]; name=owned_name(os.environ.get('RAG_TEST_PREFIX','Vfy49'),token)
+    probe=name+'Probe'; sid='gs_'+token; job=None; jobs=[]; checks=0
+    await bounded_poll_cases()
+    for prefix in ('Vfy49','A','B'):
+        if prefix:assert not owned_name(prefix,'owned').startswith(prefix)
+    print('PASS parent cleanup namespace excludes verifier-owned names',flush=True)
+    client=None;created=[]
+    original_create=wc._create_collection_sync
+    def record_create(collection,*args,**kwargs):
+        original_create(collection,*args,**kwargs);created.append(collection)
+    temporary=await asyncio.to_thread(tempfile.TemporaryDirectory,prefix='owned-reindex-')
+    temp=temporary.name
+    try:
+        client=await asyncio.to_thread(wc.get_client)
+        with patch.object(collection_routes,'_REGISTRY_FILE',Path(temp)/'collection_registry.json'), \
+             patch.object(settings,'upload_dir',temp), patch.object(settings,'sources_dir',str(Path(temp)/'sources')), \
+             patch.object(settings,'ollama_host','127.0.0.1'), patch.object(settings,'ollama_port',1), \
+             patch.object(gs,'_sessions',{}),patch.object(wc.ingest_config,'_DIR',None),patch.object(wc.retrieval_config,'_DIR',None),patch.object(wc,'_create_collection_sync',side_effect=record_create):
+            def check(condition,label):
+                nonlocal checks
+                assert condition,label; checks+=1; print('PASS '+label,flush=True)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned') as api:
+                try:
+                    await asyncio.to_thread(wc._create_collection_sync,probe,'hnsw','cosine',{})
+                    try:
+                        await asyncio.to_thread(client.collections.get(probe).data.insert,properties={'content':'Owned endpoint refusal probe'})
+                    except Exception as exc:
+                        message=str(exc).lower()
+                        check('connect' in message and ('127.0.0.1:1' in message or 'connection refused' in message),'actual vectorization fails against the closed embedding endpoint')
+                    else: raise AssertionError('Owned embedding endpoint unexpectedly served a vector')
+                    check(await asyncio.to_thread(lambda:client.collections.get(probe).aggregate.over_all(total_count=True).total_count)==0,'failed embedding probe stores no object')
+                    alias=name[:1].lower()+name[1:]
+                    creation=await api.post('/collections',json={'name':alias,'index_type':'hnsw','distance_metric':'cosine'})
+                    check(creation.status_code==201 and creation.json()['name']==alias,'collection HTTP creation echoes a supported lowercase alias')
+                    col=client.collections.get(name)
+                    source=[]
+                    for i in range(2):
+                        identity=str(uuid.uuid4()); vector=[(i+1)/8.0]*768
+                        props={'content':'Owned inert reindex '+str(i),'source_file':'owned-inert.txt','source_type':'txt','chunk_index':i,'chunk_strategy':'fixed','chunk_size':150,'chunk_overlap':0,'created_at':'2026-09-28T00:00:00Z'}
+                        await asyncio.to_thread(col.data.insert,properties=props,uuid=identity,vector=vector)
+                        source.append(identity)
+                    before=await asyncio.to_thread(tuning._existing_records,name)
+                    check({r['id'] for r in before}==set(source),'stored explicit vectors and original UUIDs are readable with embeddings unavailable')
+                    session={'session_id':sid,'collection':name,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs_attempted':1,'pairs_failed':0,'pairs':[{'pair_id':'p_'+token,'question':'Owned question','answer':'Owned answer','ground_truth':'Owned truth','contexts':['Owned inert reindex'],'source_file':'owned-inert.txt','chunk_index':0,'status':'approved'}]}
+                    await asyncio.to_thread(gs.store_session,session); session_bytes=await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes())
+                    request=await api.post('/tune/reindex',json={'collection':alias,'index_type':'flat','distance_metric':'dot'})
+                    check(request.status_code==202,'real reindex HTTP handler queues the job with closed embedding configuration'); job=request.json()['job_id'];jobs.append((tuning,job))
+                    result=await completed(api,'/tune/job/'+job)
+                    check(result['status']=='completed' and result['collection']==name and result['chunks_written']==len(before), 'job completes only after final backend verification: '+str(result))
+                    after=await asyncio.to_thread(tuning._existing_records,name)
+                    check({r['id']:r for r in after}=={r['id']:r for r in before},'UUIDs, every property and all stored vector values match exactly after reindex')
+                    config=await asyncio.to_thread(wc._collection_config_sync,name)
+                    check(config['index_type']=='flat' and config['distance_metric']=='dot','physical index and distance change to flat/dot')
+                    check(await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes()==session_bytes and not gs.get_session(sid).get('stale')),'retained evaluation identity/content/validity are unchanged')
+                    check(any('verified unchanged' in note for note in result['notes']),'completion notes truthfully report verified identity and vector preservation')
+                    with patch.object(settings,'embed_model','owned-incompatible-model'):
+                        request=await api.post('/tune/reindex',json={'collection':name,'index_type':'hnsw','distance_metric':'cosine'})
+                        assert request.status_code==202,request.text;job=request.json()['job_id'];jobs.append((tuning,job))
+                        refused=await completed(api,'/tune/job/'+job,expected_status='failed')
+                    check('vectorizer configuration' in refused['error'] and refused['chunks_written']==0,'foreign deployed embedding model is refused before replacement')
+                    unchanged=await asyncio.to_thread(tuning._existing_records,name)
+                    config_after_refusal=await asyncio.to_thread(wc._collection_config_sync,name)
+                    check(unchanged==after and config_after_refusal==config,'refused model mismatch leaves real records and physical index unchanged')
+                    check(await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes()==session_bytes),'refused model mismatch preserves evaluation bytes')
+                    check(await asyncio.to_thread(lambda:not list(tuning.collection_recovery._root().glob('*.json'))),'successful reindex removes its exact durable ownership; refusal creates none')
+                    check(all(not item.startswith(os.environ.get('RAG_TEST_PREFIX','Vfy49')) for item in created),'all real verifier-created names remain outside the parent prefix sweep')
+                    await additional_vectorizer_and_import_checks(api,client,name,temp,created,jobs,check)
+                    await caller_sidecar_and_legacy_tuning_checks(api,client,name,temp,created,check)
+                    await queued_ingest_checks(api,client,name,jobs,check)
+                    await retained_cutover_checks(api,client,name,temp,record_create,jobs,check)
+                    check(await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes()==session_bytes),'failed secondary cutover leaves the unrelated primary evaluation unchanged')
+                finally:
+                    if jobs:
+                        pending=await settle_owned_jobs(jobs)
+                        if pending:
+                            receipt=await asyncio.to_thread(preserve_receipt,temp,created,pending)
+                            print(f'FAIL owned jobs still active: {pending}; preserving fixtures {created} and {receipt}',flush=True)
+                            # Standalone verifier: preserve active fixtures and avoid executor join.
+                            os._exit(2)
+                    for owned in reversed(created):
+                        if await asyncio.to_thread(client.collections.exists,owned): await asyncio.to_thread(client.collections.delete,owned)
+                    check(not any([await asyncio.to_thread(client.collections.exists,item) for item in created]),'cleanup removes all exact recorded verifier-owned collections')
+                    gs._sessions.pop(sid,None)
+    finally:
+        try:
+            await asyncio.to_thread(temporary.cleanup)
+        finally:
+            if client is not None:await asyncio.to_thread(client.close)
+    print(str(checks)+' real reindex checks passed',flush=True)
+
+asyncio.run(main())
+```
+
+### api/services/collection_writes.py
+
+```python
+"""Serialize collection mutations within one API process.
+
+The registry counts both owners and waiting writers. A guard spans synchronous
+worker work; callers must enter it in their executor, never across an async wait.
+"""
+from contextlib import contextmanager
+from functools import wraps
+from inspect import signature
+import threading
+
+_registry_lock = threading.Lock()
+_registry = {}
+
+
+def canonical(collection):
+    """The same first-character alias normalization used by the backend SDK."""
+    return collection[:1].upper() + collection[1:]
+
+
+@contextmanager
+def guard(collection):
+    collection = canonical(collection)
+    with _registry_lock:
+        entry = _registry.setdefault(collection, [threading.RLock(), 0])
+        entry[1] += 1
+    try:
+        with entry[0]:
+            yield
+    finally:
+        with _registry_lock:
+            entry[1] -= 1
+            if not entry[1]:
+                del _registry[collection]
+
+
+def serialized(argument):
+    def decorate(function):
+        parameters = signature(function)
+        @wraps(function)
+        def run(*args, **kwargs):
+            collection = parameters.bind(*args, **kwargs).arguments[argument]
+            with guard(collection):
+                return function(*args, **kwargs)
+        return run
+    return decorate
+```
+
+### scripts/tests/test_collection_writes.py
+
+```python
+"""Writer barriers cover complete workers, nesting and independent collections."""
+import os,sys,threading,unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__!='<stdin>' else '/app'))
+from services import collection_writes as writes
+
+class WriterTests(unittest.TestCase):
+    def test_same_collection_waits_until_complete_guard_releases(self):
+        attempted=threading.Event();entered=threading.Event()
+        def worker():
+            attempted.set()
+            with writes.guard('Owned'):entered.set()
+        with ThreadPoolExecutor() as pool:
+            with writes.guard('Owned'):
+                task=pool.submit(worker);self.assertTrue(attempted.wait(2));self.assertFalse(entered.wait(.05))
+            task.result(timeout=2);self.assertTrue(entered.is_set())
+        self.assertNotIn('Owned',writes._registry)
+    def test_reentrant_worker_and_primitive_share_one_guard(self):
+        @writes.serialized('collection')
+        def primitive(collection):
+            with writes.guard(collection):return writes._registry[collection][1]
+        with writes.guard('Owned'):self.assertEqual(primitive(collection='Owned'),3)
+        self.assertNotIn('Owned',writes._registry)
+    def test_other_collections_do_not_wait(self):
+        with ThreadPoolExecutor() as pool:
+            with writes.guard('Owned'):
+                def independent():
+                    with writes.guard('Other'):return True
+                self.assertTrue(pool.submit(independent).result(timeout=2))
+    def test_failed_worker_releases_guard(self):
+        with self.assertRaises(RuntimeError):
+            with writes.guard('Owned'):raise RuntimeError('Owned failure')
+        self.assertNotIn('Owned',writes._registry)
+    def test_backend_case_aliases_share_the_same_guard(self):
+        entered=threading.Event()
+        def worker():
+            with writes.guard('owned'):entered.set()
+        with ThreadPoolExecutor() as pool:
+            with writes.guard('Owned'):
+                task=pool.submit(worker);self.assertFalse(entered.wait(.05))
+            task.result(timeout=2);self.assertTrue(entered.is_set())
+    def test_actual_import_and_backend_mutators_wait_before_entering_their_body(self):
+        from unittest.mock import patch
+        from services import importer,weaviate_client as wc
+        operations=[(wc._create_collection_sync,('owned','hnsw','cosine',{}),wc,'get_client'),
+                    (wc._insert_chunks_sync,('owned',[]),wc,'get_client'),
+                    (wc._delete_collection_sync,('owned',),wc,'get_client'),
+                    (importer._build,('owned',Path('/inert'),{},None),importer,'_create_from_package')]
+        for operation,args,module,boundary in operations:
+            with self.subTest(operation=operation.__name__):
+                attempted=threading.Event();entered=threading.Event()
+                def boundary_call(*args,**kwargs):
+                    entered.set();raise RuntimeError('Owned stopped backend boundary')
+                def worker():attempted.set();return operation(*args)
+                with patch.object(module,boundary,side_effect=boundary_call),ThreadPoolExecutor() as pool:
+                    with writes.guard('Owned'):
+                        task=pool.submit(worker);self.assertTrue(attempted.wait(2));self.assertFalse(entered.wait(.05))
+                    with self.assertRaisesRegex(RuntimeError,'Owned stopped'):task.result(timeout=2)
+                    self.assertTrue(entered.is_set())
+                self.assertNotIn('Owned',writes._registry)
+
+class ImportCutoverTests(unittest.TestCase):
+    def execute(self,build_hook=None,restore_hook=None,delete_hook=None):
+        import tempfile,json
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        from services import importer,collection_recovery as recovery
+        from config import settings
+        task=tempfile.TemporaryDirectory();self.addCleanup(task.cleanup);root=Path(task.name)
+        pkg=root/'pkg';pkg.mkdir();(pkg/'manifest.json').write_text('{}')
+        backend={'OwnedImport'};deleted=[];observed=[]
+        class Collections:
+            def exists(self,name):return name in backend
+            def delete(self,name):deleted.append(name);backend.discard(name)
+        client=SimpleNamespace(collections=Collections())
+        job={'status':'queued','chunks_written':0};manifest={'collection':{'name':'OwnedImport','chunk_count':1}}
+        def build(name,*args):
+            backend.add(name)
+            if name!='OwnedImport':
+                records=[json.loads(p.read_text()) for p in recovery._root().glob('*.json')]
+                self.assertEqual(len(records),1);self.assertEqual(records[0]['staging'],name);self.assertEqual(records[0]['state'],'scratch');observed.append(name)
+            if build_hook:build_hook(name,backend)
+            return 1
+        def delete(name):
+            client.collections.delete(name)
+            if delete_hook:delete_hook(name)
+        stack=ExitStack();self.addCleanup(stack.close)
+        for change in [patch.object(settings,'upload_dir',str(root)),patch.object(settings,'sources_dir',str(root/'sources')),patch.object(importer,'_jobs',{'owned':job}),patch.object(importer,'_active',{'owned.zip'}),patch.object(importer.packager,'exports_dir',return_value=root),patch.object(importer.packager,'open_package',return_value=(pkg,manifest)),patch.object(importer.packager,'verify_digests'),patch.object(importer,'_check_embedding'),patch.object(importer,'_ensure_models',return_value=[]),patch.object(importer.wc,'get_client',return_value=client),patch.object(importer.wc,'_collection_exists_sync',side_effect=lambda name:name in backend),patch.object(importer.wc,'_delete_collection_sync',side_effect=delete),patch.object(importer,'_build',side_effect=build),patch.object(importer,'_mark_started'),patch.object(importer,'_mark_finished'),patch.object(importer.goldstandard,'sessions_for',return_value=[]),patch.object(importer,'_restore_sidecars',side_effect=restore_hook or (lambda *args:[]))]:stack.enter_context(change)
+        return importer,job,backend,deleted,observed,root
+    def test_replace_guard_spans_deleted_target_and_sidecar_restoration(self):
+        from concurrent.futures import ThreadPoolExecutor
+        deleted_event=threading.Event();restore_event=threading.Event();resume_delete=threading.Event();resume_restore=threading.Event();entered=threading.Event();attempted=threading.Event()
+        def delete(name):deleted_event.set();assert resume_delete.wait(3)
+        def restore(*args):restore_event.set();assert resume_restore.wait(3);return []
+        module,job,backend,deleted,observed,root=self.execute(delete_hook=delete,restore_hook=restore)
+        def writer():
+            attempted.set()
+            with writes.guard('ownedImport'):entered.set();self.assertIn('OwnedImport',backend)
+        with ThreadPoolExecutor() as pool:
+            task=pool.submit(module._run,'owned','owned.zip','replace');self.assertTrue(deleted_event.wait(2))
+            waiting=pool.submit(writer);self.assertTrue(attempted.wait(2));self.assertFalse(entered.wait(.05));resume_delete.set()
+            self.assertTrue(restore_event.wait(2));self.assertFalse(entered.wait(.05));resume_restore.set();task.result(timeout=3);waiting.result(timeout=3)
+        self.assertEqual(job['status'],'completed');self.assertEqual(backend,{'OwnedImport'});self.assertEqual(len(observed),1)
+        self.assertEqual(list((root/'collection_operations').glob('*.json')),[])
+    def test_import_staging_failure_cleans_owned_journal_and_collection(self):
+        def fail(name,backend):
+            if name!='OwnedImport':raise RuntimeError('Owned staging insertion failed')
+        module,job,backend,deleted,observed,root=self.execute(build_hook=fail)
+        module._run('owned','owned.zip','replace');self.assertEqual(job['status'],'failed');self.assertEqual(backend,{'OwnedImport'})
+        self.assertNotIn('OwnedImport',deleted);self.assertEqual(list((root/'collection_operations').glob('*.json')),[])
+    def test_replace_failure_retains_positive_recovery_and_startup_preserves_it(self):
+        from services import collection_recovery as recovery
+        def fail(name,backend):
+            if name=='OwnedImport':backend.remove(name);raise RuntimeError('Owned final insertion failed')
+        module,job,backend,deleted,observed,root=self.execute(build_hook=fail)
+        module._run('owned','owned.zip','replace');self.assertEqual(job['status'],'failed');retained=job['error_detail']['recovered_as']
+        self.assertIn(retained,backend);self.assertFalse(Path(job['error_detail']['sidecar_snapshots']).is_absolute());self.assertTrue((root/job['error_detail']['sidecar_snapshots']).is_dir())
+        self.assertEqual(recovery.sweep(module.wc.get_client()),[]);self.assertIn(retained,backend)
+
+
+class DeletedRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from contextlib import ExitStack
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        from config import settings
+        from services import collection_recovery as recovery,weaviate_client as wc,goldstandard as gs,ingest_config,retrieval_config
+        self.recovery,self.wc=recovery,wc
+        temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup);self.root=Path(temp.name);stack=ExitStack();self.addCleanup(stack.close)
+        for change in [patch.object(settings,'upload_dir',temp.name),patch.object(settings,'sources_dir',str(self.root/'sources')),patch.object(gs,'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None)]:stack.enter_context(change)
+        self.backend={'OwnedRecovery'}
+        class Collections:
+            def exists(inner,name):return writes.canonical(name) in self.backend
+            def delete(inner,name):self.backend.remove(writes.canonical(name))
+            def get(inner,name):return SimpleNamespace(config=SimpleNamespace(get=lambda:SimpleNamespace(name=writes.canonical(name))),aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=3)))
+        self.client=SimpleNamespace(collections=Collections());stack.enter_context(patch.object(wc,'get_client',return_value=self.client))
+        self.owner=recovery.begin('OwnedRecovery','tune',self.client);self.backend.add(self.owner['staging']);recovery.retain(self.owner)
+    def test_explicit_alias_delete_retires_only_matching_recovery_snapshots(self):
+        import json
+        other=self.recovery.begin('OwnedRecovery','import',self.client);self.backend.add(other['staging']);self.recovery.retain(other)
+        corrupt=self.recovery._root()/'invalid.json';corrupt.write_text(json.dumps({**self.owner,'operation_id':'invalid'}))
+        name=self.owner['staging'];self.assertEqual(self.wc._delete_collection_sync(name[:1].lower()+name[1:]),3)
+        self.assertNotIn(name,self.backend);self.assertFalse((self.recovery._root()/self.owner['operation_id']).exists());self.assertFalse((self.recovery._root()/(self.owner['operation_id']+'.json')).exists())
+        self.assertIn(other['staging'],self.backend);self.assertTrue((self.recovery._root()/other['operation_id']).is_dir());self.assertTrue(corrupt.is_file())
+    def test_caller_spelled_sidecars_and_sessions_are_cleaned_on_normal_delete(self):
+        from services import sources,ingest_config,retrieval_config,goldstandard as gs
+        caller='ownedRecovery';sources.store(caller,'inert.txt',b'Owned inert original')
+        ingest_config.save({'collection':caller});retrieval_config.save({'collection':caller})
+        session={'session_id':'gs_490abcde','collection':caller,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]};gs.store_session(session)
+        self.wc._delete_collection_sync(caller)
+        self.assertFalse(sources.collection_dir(caller).exists());self.assertFalse((self.root/'ingest_configs'/(caller+'.json')).exists());self.assertFalse((self.root/'retrieval_configs'/(caller+'.json')).exists())
+        self.assertTrue(gs.get_session(session['session_id'])['orphaned']);self.assertIn(self.owner['staging'],self.backend)
+    def test_alias_delete_cleans_both_spellings_and_preserves_distinct_collection(self):
+        import json
+        from unittest.mock import patch,call
+        from services import sources,ingest_config,retrieval_config,goldstandard as gs
+        canonical,caller,neighbor='OwnedRecovery','ownedRecovery','Ownedrecovery'
+        self.backend.add(neighbor)
+        identities={canonical:'gs_14000001',caller:'gs_14000002',neighbor:'gs_14000003'}
+        for spelling,sid in identities.items():
+            sources.store(spelling,'inert.txt',b'Owned original')
+            ingest_config.save({'collection':spelling});retrieval_config.save({'collection':spelling})
+            gs.store_session({'session_id':sid,'collection':spelling,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        # Exact calls prove both paths even on a case-insensitive host volume.
+        with patch.object(sources,'delete',wraps=sources.delete) as originals,patch.object(ingest_config,'delete',wraps=ingest_config.delete) as ingest,patch.object(retrieval_config,'delete',wraps=retrieval_config.delete) as retrieval:
+            self.assertEqual(self.wc._delete_collection_sync(caller),3)
+            for cleanup in (originals,ingest,retrieval):self.assertEqual(cleanup.call_args_list,[call(canonical),call(caller)])
+        self.assertNotIn(canonical,self.backend);self.assertIn(neighbor,self.backend)
+        for spelling in (canonical,caller):
+            self.assertFalse(sources.collection_dir(spelling).exists());self.assertIsNone(ingest_config.load(spelling));self.assertIsNone(retrieval_config.load(spelling))
+            session=gs.get_session(identities[spelling]);self.assertTrue(session['orphaned']);self.assertEqual(session['pairs'],[])
+            self.assertTrue(json.loads(gs._session_path(identities[spelling]).read_text())['orphaned'])
+        self.assertTrue(sources.collection_dir(neighbor).exists());self.assertIsNotNone(ingest_config.load(neighbor));self.assertIsNotNone(retrieval_config.load(neighbor));self.assertFalse(gs.get_session(identities[neighbor]).get('orphaned',False))
+        self.assertIn(self.owner['staging'],self.backend);self.assertTrue((self.recovery._root()/self.owner['operation_id']).is_dir())
+    def test_canonical_delete_cleans_once_and_orphans_canonical_session(self):
+        from unittest.mock import patch,call
+        from services import sources,ingest_config,retrieval_config,goldstandard as gs
+        name='OwnedRecovery';sid='gs_14000004'
+        sources.store(name,'owned.txt',b'Original');ingest_config.save({'collection':name});retrieval_config.save({'collection':name})
+        gs.store_session({'session_id':sid,'collection':name,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        with patch.object(sources,'delete',wraps=sources.delete) as cleanup:
+            self.assertEqual(self.wc._delete_collection_sync(name),3);self.assertEqual(cleanup.call_args_list,[call(name),call('ownedRecovery')])
+        self.assertTrue(gs.get_session(sid)['orphaned']);self.assertFalse(sources.collection_dir(name).exists());self.assertIsNone(ingest_config.load(name));self.assertIsNone(retrieval_config.load(name))
+    def test_canonical_delete_cleans_historical_alias_sidecars_and_sessions(self):
+        from unittest.mock import patch,call
+        from services import sources,ingest_config,retrieval_config,goldstandard as gs
+        canonical,alias,neighbor='OwnedRecovery','ownedRecovery','Ownedrecovery'
+        self.backend.add(neighbor);identities={alias:'gs_14000006',neighbor:'gs_14000007'}
+        for spelling,sid in identities.items():
+            sources.store(spelling,'owned.txt',b'Owned historical original')
+            ingest_config.save({'collection':spelling});retrieval_config.save({'collection':spelling})
+            gs.store_session({'session_id':sid,'collection':spelling,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        with patch.object(sources,'delete',wraps=sources.delete) as originals:
+            self.assertEqual(self.wc._delete_collection_sync(canonical),3)
+            self.assertEqual(originals.call_args_list,[call(canonical),call(alias)])
+        self.assertFalse(sources.collection_dir(alias).exists())
+        self.assertIsNone(ingest_config.load(alias));self.assertIsNone(retrieval_config.load(alias))
+        self.assertTrue(gs.get_session(identities[alias]).get('orphaned',False))
+        self.assertTrue(sources.collection_dir(neighbor).exists());self.assertIsNotNone(ingest_config.load(neighbor))
+        self.assertFalse(gs.get_session(identities[neighbor]).get('orphaned',False))
+    def test_failed_backend_delete_preserves_sidecars_and_current_session(self):
+        from unittest.mock import patch
+        from services import sources,ingest_config,retrieval_config,goldstandard as gs
+        name='OwnedRecovery';sid='gs_14000005'
+        sources.store(name,'owned.txt',b'Original');ingest_config.save({'collection':name});retrieval_config.save({'collection':name})
+        gs.store_session({'session_id':sid,'collection':name,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        with patch.object(self.client.collections,'delete',side_effect=OSError('Owned delete failure')):
+            with self.assertRaisesRegex(OSError,'Owned delete failure'):self.wc._delete_collection_sync('ownedRecovery')
+        self.assertTrue(sources.collection_dir(name).exists());self.assertIsNotNone(ingest_config.load(name));self.assertIsNotNone(retrieval_config.load(name));self.assertFalse(gs.get_session(sid).get('orphaned',False));self.assertIn(name,self.backend)
+    def test_http_delete_removes_both_registry_spellings_only_after_success(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from routers import collections as route
+        for caller in ('OwnedRecovery', 'ownedRecovery'):
+            for fails in (False, True):
+                registry = {'OwnedRecovery': 'canonical', 'ownedRecovery': 'alias', 'Ownedrecovery': 'neighbor'}
+                with self.subTest(caller=caller, fails=fails), \
+                     patch.object(route.wc, 'collection_exists', new=AsyncMock(return_value=True)), \
+                     patch.object(route.wc, 'delete_collection', new=AsyncMock(side_effect=OSError('owned') if fails else None, return_value=3)), \
+                     patch.object(route, '_registry_lock', asyncio.Lock()), \
+                     patch.object(route, '_load_registry', return_value=registry), \
+                     patch.object(route, '_save_registry') as save:
+                    asyncio.run(route.delete_collection(caller))
+                    if fails:
+                        save.assert_not_called()
+                        self.assertEqual(len(registry), 3)
+                    else:
+                        save.assert_called_once_with({'Ownedrecovery': 'neighbor'})
+
+    def test_alias_delete_orphan_reason_names_canonical_collection(self):
+        # #140: whichever spelling the caller used, both sessions record the canonical name.
+        import json
+        from services import goldstandard as gs
+        identities={'OwnedRecovery':'gs_14000008','ownedRecovery':'gs_14000009'}
+        for spelling,sid in identities.items():
+            gs.store_session({'session_id':sid,'collection':spelling,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
+        self.wc._delete_collection_sync('ownedRecovery')
+        for sid in identities.values():
+            self.assertEqual(gs.get_session(sid).get('orphaned_reason'),"collection 'OwnedRecovery' was deleted",'in-memory orphan reason must name the canonical collection')
+            self.assertEqual(json.loads(gs._session_path(sid).read_text()).get('orphaned_reason'),"collection 'OwnedRecovery' was deleted",'persisted orphan reason must name the canonical collection')
+    def test_deleting_original_preserves_distinct_retained_recovery(self):
+        self.wc._delete_collection_sync('OwnedRecovery');self.assertIn(self.owner['staging'],self.backend)
+        self.assertTrue((self.recovery._root()/self.owner['operation_id']).is_dir())
+    def test_missing_backend_at_startup_does_not_authorize_snapshot_loss(self):
+        self.backend.remove(self.owner['staging']);self.assertEqual(self.recovery.sweep(self.client),[])
+        self.assertTrue((self.recovery._root()/self.owner['operation_id']).is_dir())
+    def test_explicit_cleanup_failure_is_resumed_from_durable_intent(self):
+        import json
+        from unittest.mock import patch
+        with patch.object(self.recovery.shutil,'rmtree',side_effect=OSError('Owned cleanup failure')):
+            with self.assertRaises(OSError):self.wc._delete_collection_sync(self.owner['staging'])
+        journal=self.recovery._root()/(self.owner['operation_id']+'.json');self.assertEqual(json.loads(journal.read_text())['state'],'cleanup')
+        self.assertEqual(self.recovery.sweep(self.client),[self.owner['staging']]);self.assertFalse(journal.exists());self.assertFalse((self.recovery._root()/self.owner['operation_id']).exists())
+
+
+
+if __name__=='__main__':unittest.main()
+```
+
+### scripts/verify/reindex_verifier_cases.py
+
+```python
+"""Owned async lifecycle and parent-cleanup regressions; no backend/model calls."""
+import ast,asyncio,json,os,subprocess,sys,tempfile,threading,unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+api_dir=os.environ.get('RAG_TEST_API_DIR')
+sys.path.insert(0,api_dir or str(Path(__file__).resolve().parents[2]/'api'))
+# Loaded from the host script on stdin with its helper passed alongside it.
+source=Path(os.environ.get('RAG_REINDEX_VERIFIER_SOURCE') or str(Path(__file__).with_name('reindex.py')))
+tree=ast.parse(source.read_text());assert isinstance(tree.body[-1],ast.Expr);tree.body.pop()
+ns={'__file__':str(source),'__name__':'owned_verifier'};exec(compile(tree,str(source),'exec'),ns)
+
+class LifecycleTests(unittest.TestCase):
+    def test_failure_cleans_exact_collections_and_temp_off_loop_and_restores_cache(self):
+        loop_thread=threading.get_ident();calls=[];created={};closed=[];temps=[]
+        original_temp=tempfile.TemporaryDirectory
+        class OwnedTemp(original_temp):
+            def __init__(self,*args,**kwargs):calls.append(('temp_create',threading.get_ident()));super().__init__(*args,**kwargs);temps.append(self.name)
+            def cleanup(self):calls.append(('temp_cleanup',threading.get_ident()));super().cleanup()
+        def create(name,*args,**kwargs):name=ns['wc'].collection_writes.canonical(name);calls.append(('create',threading.get_ident()));created[name]=[]
+        def delete(name):name=ns['wc'].collection_writes.canonical(name);calls.append(('delete',threading.get_ident()));del created[name]
+        def collection(name):
+            name=ns['wc'].collection_writes.canonical(name)
+            def insert(properties,uuid=None,vector=None):
+                if uuid is None:raise RuntimeError('connection refused 127.0.0.1:1')
+                created[name].append(dict(id=uuid,properties=properties,vector=vector))
+            return SimpleNamespace(config=SimpleNamespace(get=lambda:SimpleNamespace(name=name)),data=SimpleNamespace(insert=insert),aggregate=SimpleNamespace(over_all=lambda **kw:SimpleNamespace(total_count=len(created[name]))))
+        client=SimpleNamespace(collections=SimpleNamespace(get=collection,exists=lambda name:ns["wc"].collection_writes.canonical(name) in created,delete=delete),close=lambda:closed.append(threading.get_ident()))
+        protected={'protected':{'session_id':'gs_11111111'}}
+        with patch.object(ns['tempfile'],'TemporaryDirectory',OwnedTemp),patch.object(ns['wc'],'get_client',return_value=client),patch.object(ns['wc'],'_create_collection_sync',side_effect=create),patch.object(ns['tuning'],'_existing_records',side_effect=lambda name:list(created[ns["wc"].collection_writes.canonical(name)])),patch.object(ns['gs'],'_sessions',protected),patch.object(ns['gs'],'store_session',side_effect=OSError('Owned session failure')):
+            with self.assertRaisesRegex(OSError,'Owned session failure'):asyncio.run(ns['main']())
+            self.assertIs(ns['gs']._sessions,protected)
+        self.assertFalse(created);self.assertEqual(len(closed),1);self.assertTrue(all(identity!=loop_thread for _,identity in calls));self.assertNotEqual(closed[0],loop_thread)
+        self.assertTrue(all(not Path(directory).exists() for directory in temps))
+    def test_deletion_verifier_uses_actual_handler_with_owned_backend_and_sidecars(self):
+        from services import ingest_config,retrieval_config
+        backend={};checks=[];created=[]
+        canonical=ns['wc'].collection_writes.canonical
+        def create(name,*args,**kwargs):backend[canonical(name)]=0;created.append(canonical(name))
+        def collection(name):
+            name=canonical(name)
+            def insert(**kwargs):backend[name]+=1
+            return SimpleNamespace(config=SimpleNamespace(get=lambda:SimpleNamespace(name=name)),data=SimpleNamespace(insert=insert),aggregate=SimpleNamespace(over_all=lambda **kwargs:SimpleNamespace(total_count=backend[name])))
+        client=SimpleNamespace(collections=SimpleNamespace(get=collection,exists=lambda name:canonical(name) in backend,delete=lambda name:backend.pop(canonical(name))))
+        def check(condition,label):self.assertTrue(condition,label);checks.append(label)
+        async def run(directory):
+            async with ns['httpx'].AsyncClient(transport=ns['httpx'].ASGITransport(app=ns['app']),base_url='http://owned') as api:
+                await ns['collection_deletion_checks'](api,client,'OwnedVerifier',directory,check)
+        from routers import collections as collections_router
+        with tempfile.TemporaryDirectory() as directory,patch.object(ns['settings'],'upload_dir',directory),patch.object(ns['settings'],'sources_dir',str(Path(directory)/'sources')),patch.object(ns['gs'],'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None),patch.object(collections_router,'_REGISTRY_FILE',None),patch.object(ns['wc'],'get_client',return_value=client),patch.object(ns['wc'],'_create_collection_sync',side_effect=create):
+            asyncio.run(run(directory))
+        self.assertEqual(len(checks),18);self.assertEqual(set(backend),{'OwnedVerifierAliasDeletE','OwnedVerifierCanonicalDeletE'});self.assertEqual(len(created),4)
+    def test_client_failure_still_cleans_temporary_directory(self):
+        original_temp=tempfile.TemporaryDirectory;temps=[]
+        def create(*args,**kwargs):result=original_temp(*args,**kwargs);temps.append(result.name);return result
+        with patch.object(ns['tempfile'],'TemporaryDirectory',side_effect=create),patch.object(ns['wc'],'get_client',side_effect=OSError('Owned client failure')):
+            with self.assertRaisesRegex(OSError,'Owned client failure'):asyncio.run(ns['main']())
+        self.assertTrue(temps);self.assertTrue(all(not Path(directory).exists() for directory in temps))
+    def test_temp_creation_failure_does_not_open_client(self):
+        with patch.object(ns['tempfile'],'TemporaryDirectory',side_effect=OSError('Owned temp failure')),patch.object(ns['wc'],'get_client') as client:
+            with self.assertRaisesRegex(OSError,'Owned temp failure'):asyncio.run(ns['main']())
+            client.assert_not_called()
+    def test_parent_cleanup_preserves_exact_owned_namespace_and_receipt(self):
+        prefix='VfyParent';owned=ns['owned_name'](prefix,'49000000');probe=owned+'Probe';parent=prefix+'Transfer'
+        with tempfile.TemporaryDirectory(prefix='owned-parent-cleanup-') as directory:
+            root=Path(directory);fixture=root/'collections.json';fixture.write_text(json.dumps({'collections':[{'name':name} for name in [owned,probe,parent]]}))
+            receipt=ns['preserve_receipt'](directory,[owned,probe],[('tuning','owned-job','running')]);data=json.loads(Path(receipt).read_text())
+            self.assertEqual(data['created_collections'],[owned,probe]);self.assertEqual(data['pending_jobs'],[['tuning','owned-job','running']])
+            lib=Path(os.environ.get('RAG_VERIFIER_LIB') or str(source.with_name('lib.sh')))
+            code='source "$1"; PREFIX="$2"; REPO_ROOT="$3"; api_get(){ cat "$4"; }; drop_collection(){ printf "%s\\n" "$1"; }; cleanup_prefixed'
+            # api_get's function arguments differ from the script's, so retain
+            # the controlled input path in a distinct variable before defining it.
+            code=code.replace('api_get(){ cat "$4"; }','owned_fixture="$4"; api_get(){ cat "$owned_fixture"; }')
+            run=subprocess.run(['bash','-c',code,'owned',str(lib),prefix,directory,str(fixture)],text=True,capture_output=True,cwd=directory)
+            self.assertEqual(run.returncode,0,run.stderr);self.assertEqual(run.stdout.splitlines(),[parent]);self.assertTrue(Path(receipt).exists())
+        with self.assertRaises(ValueError):ns['owned_name']('','owned')
+
+if __name__=='__main__':unittest.main()
+```
+
+### api/services/settings_store.py
+
+```python
+"""Atomic settings publication shared by ingest and retrieval saves."""
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+import tempfile
+import threading
+
+log = logging.getLogger(__name__)
+
+# Saves are short filesystem transactions dispatched to API worker threads.
+# One lock also covers collection names that map to the same sanitized path.
+_write_lock = threading.Lock()
+
+
+def publish(path: Path, config: dict) -> None:
+    """Publish this request's complete value, preserving the old file on failure.
+
+    Serialize the whole transaction within this API process. Exclusive temporary
+    names ensure even independent processes cannot rename each other's payloads.
+    A later successful save may supersede this value after atomic replacement.
+    """
+    with _write_lock:
+        payload = json.dumps(config, indent=2, sort_keys=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=path.parent,
+                prefix=f".{path.name}.", suffix=".tmp", delete=False,
+            ) as output:
+                temporary = Path(output.name)
+                output.write(payload)
+            temporary.replace(path)
+            temporary = None
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    log.warning("Could not remove settings temporary file %s", temporary)
+```
+
+### scripts/tests/test_settings_implementation.py
+
+```python
+"""Host-side source-copy checks; no API runtime dependencies."""
+from pathlib import Path
+import unittest
+
+class ImplementationTests(unittest.TestCase):
+    def test_embedded_sources_match_runtime(self):
+        root = Path(__file__).resolve().parents[2]
+        text = (root / 'IMPLEMENTATION.md').read_text()
+        for name in ('api/services/settings_store.py', 'api/services/ingest_config.py',
+                     'api/services/retrieval_config.py', 'scripts/verify/07_settings.sh',
+                     'scripts/verify/README.md', 'scripts/tests/test_settings_persistence.py',
+                     'scripts/verify/settings_validation.py', 'api/services/importer.py'):
+            with self.subTest(file=name):
+                fence = '````' if name.endswith('.md') else '```'
+                language = 'markdown' if name.endswith('.md') else 'bash' if name.endswith('.sh') else 'python'
+                header = f'### {name}\n\n{fence}{language}\n'
+                start = text.index(header) + len(header)
+                end = text.index('\n' + fence + '\n', start)
+                self.assertEqual(text[start:end], (root / name).read_text().rstrip('\n'))
+
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
+### scripts/tests/test_settings_persistence.py
+
+```python
+"""Deterministic settings publication regressions; no backend or model calls."""
+import json
+import os
+import sys
+import tempfile
+import threading
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
+from config import settings
+from services import ingest_config, retrieval_config, settings_store
+
+SERVICES = (ingest_config, retrieval_config)
+
+
+class SettingsPersistenceTests(unittest.TestCase):
+    @contextmanager
+    def fixture(self, service):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(settings, 'upload_dir', directory), \
+             patch.object(service, '_DIR', None):
+            yield Path(directory)
+
+    def values(self, service):
+        field = 'chunk_size' if service is ingest_config else 'top_k'
+        return [{**service.DEFAULTS, 'collection': 'ConcurrentSettings', field: value}
+                for value in ((1000, 1100, 1200) if service is ingest_config else (5, 7, 9))]
+
+    def test_import_publication_preserves_config_on_failure_and_uses_shared_lock(self):
+        from services import importer
+        with self.fixture(ingest_config) as root:
+            old, incoming, _ = self.values(ingest_config)
+            ingest_config.save(old)
+            pkg = root / 'package'
+            pkg.mkdir()
+            (pkg / 'ingest_config.json').write_text(json.dumps(incoming))
+            path = ingest_config._path(old['collection'])
+            before = path.read_bytes()
+            entered = []
+            class ObservedLock:
+                def __enter__(self):
+                    entered.append(True)
+                def __exit__(self, *args):
+                    pass
+            with patch.object(settings_store, '_write_lock', ObservedLock()), \
+                 patch.object(Path, 'replace', side_effect=OSError('owned publication failure')):
+                with self.assertRaises(OSError):
+                    importer._restore_sidecars(old['collection'], pkg, 'Original', [])
+            self.assertEqual(entered, [True])
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(list(path.parent.glob('*.tmp')), [])
+            importer._restore_sidecars(old['collection'], pkg, 'Original', [])
+            self.assertEqual(ingest_config.load(old['collection']), incoming)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_contending_saves_publish_their_own_complete_values(self):
+        for service in SERVICES:
+            with self.subTest(service=service.__name__), self.fixture(service):
+                old, first, second = self.values(service)
+                service.save(old)
+                reached_replace = threading.Event()
+                second_attempt = threading.Event()
+                release_first = threading.Event()
+                lock = threading.Lock()
+                request = threading.local()
+                publications = []
+                replace = Path.replace
+
+                class ObservedLock:
+                    def __enter__(self):
+                        if request.value == second:
+                            second_attempt.set()
+                        lock.acquire()
+
+                    def __exit__(self, *args):
+                        lock.release()
+
+                def controlled_replace(temporary, destination):
+                    if request.value == first:
+                        reached_replace.set()
+                        if not release_first.wait(5):
+                            raise TimeoutError('first publication was not released')
+                    payload = json.loads(temporary.read_text())
+                    self.assertEqual(payload, request.value)
+                    result = replace(temporary, destination)
+                    self.assertEqual(service.load(old['collection']), request.value)
+                    publications.append((temporary, payload))
+                    return result
+
+                def save(value):
+                    request.value = value
+                    return service.save(value)
+
+                with patch.object(settings_store, '_write_lock', ObservedLock()), \
+                     patch.object(Path, 'replace', controlled_replace), \
+                     ThreadPoolExecutor(max_workers=2) as pool:
+                    a = pool.submit(save, first)
+                    try:
+                        self.assertTrue(reached_replace.wait(5))
+                        b = pool.submit(save, second)
+                        self.assertTrue(second_attempt.wait(5))
+                        self.assertFalse(b.done())
+                        self.assertEqual(service.load(old['collection']), old)
+                        self.assertEqual(len(list(service._dir().glob('*.tmp'))), 1)
+                    finally:
+                        release_first.set()
+                    self.assertEqual(a.result(timeout=5), first)
+                    self.assertEqual(b.result(timeout=5), second)
+                self.assertEqual([value for _, value in publications], [first, second])
+                self.assertEqual(len({path for path, _ in publications}), 2)
+                self.assertTrue(all(path.parent == service._dir() for path, _ in publications))
+                self.assertEqual(service.resolve(old['collection']), (second, False))
+                self.assertEqual(list(service._dir().glob('*.tmp')), [])
+
+    def test_first_saves_wait_for_their_directory_to_exist(self):
+        for service in SERVICES:
+            with self.subTest(service=service.__name__), self.fixture(service):
+                _, first, second = self.values(service)
+                reached_mkdir = threading.Event()
+                release_first = threading.Event()
+                mkdir = Path.mkdir
+                request = threading.local()
+
+                def controlled_mkdir(path, *args, **kwargs):
+                    if request.value == first:
+                        reached_mkdir.set()
+                        if not release_first.wait(5):
+                            raise TimeoutError('directory creation was not released')
+                    return mkdir(path, *args, **kwargs)
+
+                def save(value):
+                    request.value = value
+                    return service.save(value)
+
+                with patch.object(Path, 'mkdir', controlled_mkdir), ThreadPoolExecutor(max_workers=2) as pool:
+                    a = pool.submit(save, first)
+                    try:
+                        self.assertTrue(reached_mkdir.wait(5))
+                        b = pool.submit(save, second)
+                        self.assertEqual(b.result(timeout=5), second)
+                        self.assertEqual(service.load(first['collection']), second)
+                    finally:
+                        release_first.set()
+                    self.assertEqual(a.result(timeout=5), first)
+                self.assertEqual(service.load(first['collection']), first)
+
+    def assert_failure_preserves_old_value(self, service, fault, exception):
+        with self.fixture(service):
+            old, attempted, _ = self.values(service)
+            service.save(old)
+            previous_bytes = service._path(old['collection']).read_bytes()
+            with fault, self.assertRaises(exception):
+                service.save(attempted)
+            self.assertEqual(service._path(old['collection']).read_bytes(), previous_bytes)
+            self.assertEqual(service.resolve(old['collection']), (old, False))
+            self.assertEqual(list(service._dir().glob('*.tmp')), [])
+            self.assertEqual(service.save(attempted), attempted)
+            self.assertEqual(service.load(old['collection']), attempted)
+
+    def test_temporary_creation_failure_preserves_old_value_and_allows_retry(self):
+        for service in SERVICES:
+            with self.subTest(service=service.__name__):
+                self.assert_failure_preserves_old_value(service,
+                    patch.object(settings_store.tempfile, 'NamedTemporaryFile', side_effect=PermissionError('injected create fault')),
+                    PermissionError)
+
+    def test_partial_write_and_close_failure_preserve_old_value_and_clean_up(self):
+        create = tempfile.NamedTemporaryFile
+        for service in SERVICES:
+            for stage in ('write', 'close'):
+                with self.subTest(service=service.__name__, stage=stage):
+                    @contextmanager
+                    def failing_file(*args, **kwargs):
+                        with create(*args, **kwargs) as output:
+                            if stage == 'write':
+                                def partial_write(payload):
+                                    output.file.write(payload[:10])
+                                    raise OSError('injected partial write fault')
+                                with patch.object(output, 'write', partial_write):
+                                    yield output
+                            else:
+                                yield output
+                                raise OSError('injected close fault')
+                    self.assert_failure_preserves_old_value(service,
+                        patch.object(settings_store.tempfile, 'NamedTemporaryFile', failing_file), OSError)
+
+    def test_replacement_failure_preserves_old_value_and_cleans_up(self):
+        for service in SERVICES:
+            with self.subTest(service=service.__name__):
+                self.assert_failure_preserves_old_value(service,
+                    patch.object(Path, 'replace', side_effect=OSError('injected replace fault')), OSError)
+
+    def test_serialization_failure_preserves_old_value(self):
+        for service in SERVICES:
+            with self.subTest(service=service.__name__), self.fixture(service):
+                old, _, _ = self.values(service)
+                service.save(old)
+                with self.assertRaises(TypeError):
+                    service.save({**old, 'unserializable': object()})
+                self.assertEqual(service.load(old['collection']), old)
+                self.assertEqual(list(service._dir().glob('*.tmp')), [])
+
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
+### scripts/tests/test_source_index_boundary.py
+
+```python
+"""Untrusted retained-source identities never select filesystem paths."""
+import asyncio
+import hashlib
+import json
+import os
+import sys
+import tarfile
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
+
+sys.path.insert(0, os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api"))
+
+from config import settings
+from services import importer, ingest_pipeline, packager, sources
+from services.packager import PackageError
+
+
+class SourceIndexBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.source_patch = patch.object(settings, "sources_dir", str(self.root / "retained"))
+        self.source_patch.start()
+        self.addCleanup(self.source_patch.stop)
+        self.package = self.root / "package"
+        (self.package / "sources").mkdir(parents=True)
+        self.outside = self.root / "outside.txt"
+        self.outside.write_text("controlled outside sentinel")
+
+    def index(self, digest):
+        return {"version": 1, "documents": {
+            digest: {"filenames": ["document.txt"], "size": 10}}}
+
+    def test_valid_content_addressed_source_round_trips(self):
+        content = b"retained source"
+        digest = hashlib.sha256(content).hexdigest()
+        (self.package / "sources" / digest).write_bytes(content)
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+        retained = sources.collection_dir("Valid")
+        retained.mkdir(parents=True)
+        (retained / digest).write_bytes(content)
+        (retained / "index.json").write_text(json.dumps(self.index(digest)))
+        self.assertEqual(sources.load_index("Valid")["documents"].keys(), {digest})
+        self.assertEqual(sources.blob_path("Valid", digest).read_bytes(), content)
+
+    def test_import_rejects_paths_before_restoring_sources(self):
+        for key in (str(self.outside), "../outside.txt", "a/b", "index.json"):
+            with self.subTest(key=key):
+                (self.package / "sources" / "index.json").write_text(json.dumps(self.index(key)))
+                with self.assertRaises(PackageError) as raised:
+                    importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+                self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
+                self.assertFalse(sources.collection_dir("Imported").exists())
+
+    def test_import_job_rejects_index_before_backend_or_model_work(self):
+        (self.package / "sources" / "index.json").write_text(
+            json.dumps(self.index(str(self.outside))))
+        check_embedding = Mock()
+        ensure_models = Mock()
+        backend = Mock()
+        job = {"status": "queued"}
+        with patch.object(settings, "upload_dir", str(self.root)), \
+             patch.object(importer, "_jobs", {"owned": job}), \
+             patch.object(importer, "_active", {"owned.tar.gz"}), \
+             patch.object(importer.packager, "exports_dir", return_value=self.root), \
+             patch.object(importer.packager, "open_package", return_value=(
+                 self.package, {"fidelity": "with-sources"})), \
+             patch.object(importer.packager, "verify_digests"), \
+             patch.object(importer, "_check_embedding", check_embedding), \
+             patch.object(importer, "_ensure_models", ensure_models), \
+             patch.object(importer.wc, "get_client", backend):
+            importer._run("owned", "owned.tar.gz", "replace")
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["error_code"], "PACKAGE_CORRUPT")
+        check_embedding.assert_not_called()
+        ensure_models.assert_not_called()
+        backend.assert_not_called()
+
+    def test_export_rejects_outside_identity_and_link(self):
+        retained = sources.collection_dir("Imported")
+        retained.mkdir(parents=True)
+        (retained / "index.json").write_text(json.dumps(self.index(str(self.outside))))
+        with self.assertRaises(ValueError):
+            sources.load_index("Imported")
+        digest = hashlib.sha256(self.outside.read_bytes()).hexdigest()
+        (retained / digest).symlink_to(self.outside)
+        (retained / "index.json").write_text(json.dumps(self.index(digest)))
+        with self.assertRaises(ValueError):
+            sources.blob_path("Imported", digest)
+        (retained / "index.json").unlink()
+        (retained / "index.json").symlink_to(self.outside)
+        with self.assertRaises(ValueError):
+            sources.load_index("Imported")
+        (retained / "index.json").unlink()
+        (retained / "index.json").write_text(json.dumps(self.index(digest)))
+        with patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager, "read_chunks", return_value=iter(())), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={"embedding_model": settings.embed_model}), \
+             patch.object(packager, "_ingest_config", return_value=None), \
+             patch.object(packager.retrieval_config, "resolve", return_value=({}, True)), \
+             patch.object(packager, "_goldstandard_sessions", return_value=[]):
+            with self.assertRaises(ValueError):
+                packager.build("Imported")
+        self.assertFalse(list(self.root.glob("*.tar.gz")))
+
+
+    def test_validate_index_rejects_malformed_shapes(self):
+        digest = "a" * 64
+        good = {"filenames": ["document.txt"]}
+        for bad in ([], {"documents": []}, {"documents": {digest: "entry"}},
+                    {"documents": {digest: {"filenames": "document.txt"}}},
+                    {"documents": {digest: {"filenames": [1]}}},
+                    {"documents": {digest.upper(): good}},
+                    {"documents": {digest + "\n": good}}):
+            with self.subTest(index=bad):
+                with self.assertRaises(ValueError):
+                    sources.validate_index(bad)
+        self.assertEqual(sources.validate_index({"documents": {digest: good}})["documents"].keys(),
+                         {digest})
+
+    def test_import_rejects_missing_or_mismatched_sources(self):
+        bare = self.root / "bare"
+        bare.mkdir()
+        importer._validate_package_sources(bare, {"fidelity": "chunks-only"})
+        with self.assertRaises(PackageError) as raised:
+            importer._validate_package_sources(bare, {"fidelity": "with-sources"})
+        self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
+        digest = hashlib.sha256(b"retained source").hexdigest()
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        for blob in (None, b"different bytes"):
+            with self.subTest(blob=blob):
+                path = self.package / "sources" / digest
+                if blob is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.write_bytes(blob)
+                with self.assertRaises(PackageError) as raised:
+                    importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+                self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
+
+    def test_blob_path_refuses_linked_collection_directory(self):
+        content = self.outside.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / digest).write_bytes(content)
+        Path(settings.sources_dir).mkdir(parents=True)
+        sources.collection_dir("Linked").symlink_to(elsewhere, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            sources.blob_path("Linked", digest)
+
+    def test_export_omits_missing_blob_from_shipped_index(self):
+        content = b"available source"
+        available = hashlib.sha256(content).hexdigest()
+        missing = hashlib.sha256(b"missing source").hexdigest()
+        retained = sources.collection_dir("Exported")
+        retained.mkdir(parents=True)
+        (retained / available).write_bytes(content)
+        (retained / "index.json").write_text(json.dumps({
+            "version": 1, "documents": {
+                available: {"filenames": ["available.txt"]},
+                missing: {"filenames": ["missing.txt"]},
+            }}))
+        with patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager, "read_chunks", return_value=iter(())), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={"embedding_model": settings.embed_model}), \
+             patch.object(packager.wc, "_meta_sync", return_value={}), \
+             patch.object(packager, "_ingest_config", return_value=None), \
+             patch.object(packager.retrieval_config, "resolve", return_value=({}, True)), \
+             patch.object(packager.retrieval_config, "validate", return_value={}), \
+             patch.object(packager, "_goldstandard_sessions", return_value=[]):
+            result = packager.build("Exported")
+        self.assertEqual(result["source_document_count"], 1)
+        self.assertTrue(any("missing on disk" in warning for warning in result["warnings"]))
+        with tarfile.open(self.root / result["filename"]) as archive:
+            names = archive.getnames()
+            index_name = next(name for name in names if name.endswith("/sources/index.json"))
+            index = json.load(archive.extractfile(index_name))
+            self.assertEqual(set(index["documents"]), {available})
+            self.assertTrue(any(name.endswith(f"/sources/{available}") for name in names))
+            self.assertFalse(any(name.endswith(f"/sources/{missing}") for name in names))
+
+    def test_tune_options_reports_invalid_index_as_typed_error(self):
+        from routers import tuning as tuning_router
+        retained = sources.collection_dir("Invalid")
+        retained.mkdir(parents=True)
+        (retained / "index.json").write_text(json.dumps(self.index("../outside.txt")))
+        with patch.object(tuning_router.wc, "collection_exists", new_callable=AsyncMock,
+                          return_value=True):
+            response = asyncio.run(tuning_router.tune_options("Invalid"))
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(json.loads(response.body)["error"]["code"], "SOURCE_INDEX_INVALID")
+
+    def test_ingest_keeps_stored_chunks_when_source_index_is_invalid(self):
+        upload = self.root / "accepted.txt"
+        upload.write_text("accepted text")
+        job_id = "source-index-retention-error"
+        job = {"status": "queued", "files_total": 1, "files_completed": 0,
+               "files_failed": 0, "chunks_stored": 0, "errors": []}
+        with patch.dict(ingest_pipeline._jobs, {job_id: job}, clear=True), \
+             patch.object(ingest_pipeline, "_parse_file", return_value=("accepted text", [])), \
+             patch.object(ingest_pipeline.wc, "_insert_chunks_sync") as insert, \
+             patch.object(ingest_pipeline.sources, "store", side_effect=ValueError("Invalid retained source index")):
+            ingest_pipeline._process_job_sync(job_id, [upload], self.root,
+                                              "Invalid", "fixed", 150, 0, 0.85, 0)
+        insert.assert_called_once()
+        self.assertEqual((job["status"], job["files_completed"], job["files_failed"],
+                          job["chunks_stored"]), ("completed", 1, 0, 1))
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+### scripts/tests/test_retrieval_import.py
+
+```python
+"""Controlled package preflight and generated-script trust-boundary regressions."""
+import ast
+import json
+import os
+import sys
+import tarfile
+import tempfile
+import unittest
+from contextlib import ExitStack
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
+from config import settings
+from models.schemas import SaveRetrievalConfigBody
+from services import importer, packager, retrieval_config
+
+
+INVALID = [None, [], 3, 'settings', {'top_k': '5; injected = True'},
+           {'retrieval_mode': 'hybrid"; injected = True #'},
+           {'response_format': 'engineer"; injected = True #'},
+           {'top_k': True}, {'top_k': 0}, {'top_k': 51}, {'top_k': 1.5},
+           {'alpha': False}, {'alpha': -0.1}, {'alpha': 1.1},
+           {'alpha': float('nan')}, {'alpha': float('inf')},
+           {'ef': True}, {'ef': '10000'}, {'ef': 64.5}]
+# Integer ef values outside 16-512 that the API stored before PR #108. ef is
+# inactive, so export and import clear them to null instead of refusing.
+LEGACY_EF = [-1, 0, 15, 513, 10000]
+EXPORT_WARNING = ('saved retrieval setting ef={} is outside 16-512 and was exported as null; '
+                  "ef is no longer used. Save this collection's settings on the Retrieval "
+                  'page to clear it.')
+IMPORT_NOTE = ("the package's retrieval setting ef={} is outside 16-512 and was restored "
+               'as null; ef is no longer used.')
+
+
+class RetrievalImportTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.pkg = self.root / 'package'
+        self.pkg.mkdir()
+        self.uploads = self.root / 'uploads'
+        self.uploads.mkdir()
+        self.exports = self.root / 'exports'
+        self.exports.mkdir()
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        for key, value in [('upload_dir', self.uploads), ('exports_dir', self.exports),
+                           ('sources_dir', self.root / 'sources')]:
+            self.stack.enter_context(patch.object(settings, key, str(value)))
+        self.stack.enter_context(patch.object(retrieval_config, '_DIR', None))
+        self.stack.enter_context(patch.dict(importer._jobs, {}, clear=True))
+        self.stack.enter_context(patch.object(importer, '_log'))
+
+    def archive(self, data):
+        (self.pkg / 'retrieval_config.json').write_text(data)
+        (self.pkg / 'chunks.jsonl').write_text('')
+        manifest = {'package_format': 1, 'collection': {'name': 'Corpus', 'chunk_count': 0},
+                    'embedding': {'model': settings.embed_model},
+                    'files': {p.name: 'sha256:' + packager.sha256_file(p)
+                              for p in self.pkg.iterdir() if p.name != 'manifest.json'}}
+        (self.pkg / 'manifest.json').write_text(json.dumps(manifest))
+        with tarfile.open(self.exports / 'fixture.tar.gz', 'w:gz') as tar:
+            tar.add(self.pkg, arcname='package')
+
+    def test_digest_valid_bad_settings_refused_before_any_live_mutation(self):
+        original = retrieval_config.validate({'top_k': 9}, 'Corpus')
+        retrieval_config.save(original)
+        saved = retrieval_config._path('Corpus')
+        before = saved.read_bytes()
+        for data in [json.dumps(value) for value in INVALID] + ['{']:
+            self.archive(data)
+            for conflict in ('abort', 'rename', 'replace'):
+                with self.subTest(data=data, conflict=conflict), ExitStack() as mocks:
+                    operations = [mocks.enter_context(patch.object(module, name)) for module, name in [
+                        (importer, '_ensure_models'), (importer, '_build'),
+                        (importer.wc, '_collection_exists_sync'), (importer.wc, '_delete_collection_sync'),
+                        (importer.wc, 'get_client'), (importer, '_restore_sidecars'),
+                        (importer, '_mark_started'), (importer.collection_recovery, 'begin')]]
+                    importer._jobs['test'] = {'status': 'queued'}
+                    importer._run('test', 'fixture.tar.gz', conflict)
+                    result = importer._jobs['test']
+                    self.assertEqual(result['status'], 'failed')
+                    self.assertEqual(result['error_code'], 'PACKAGE_CORRUPT')
+                    self.assertEqual(result['error_detail'], {'file': 'retrieval_config.json'})
+                    for operation in operations:
+                        operation.assert_not_called()
+                    self.assertEqual(saved.read_bytes(), before)
+                    self.assertFalse((self.root / 'sources').exists())
+                    self.assertFalse(list(self.uploads.glob('import-*')))
+
+    def test_valid_historical_defaults_coercion_and_ef_match_api_and_roundtrip(self):
+        for data in [{}, {'collection': 'OldName', 'top_k': '7', 'alpha': '0.5', 'ef': '64'},
+                     {'retrieval_mode': 'flat', 'top_k': 50, 'alpha': 0, 'ef': 512,
+                      'response_format': 'engineer', 'legacy_field': 'ignored'}]:
+            with self.subTest(data=data):
+                self.archive(json.dumps(data))
+                expected = SaveRetrievalConfigBody.model_validate({**data, 'collection': 'Corpus'}).model_dump()
+                with patch.object(importer, '_ensure_models', return_value=[]), \
+                     patch.object(importer.wc, '_collection_exists_sync', return_value=False), \
+                     patch.object(importer, '_build', return_value=0):
+                    importer._jobs['test'] = {'status': 'queued'}
+                    importer._run('test', 'fixture.tar.gz', 'abort')
+                self.assertEqual(importer._jobs['test']['status'], 'completed')
+                self.assertEqual(retrieval_config.load('Corpus'), expected)
+
+    def test_legacy_ef_is_normalised_and_reported(self):
+        for value in LEGACY_EF:
+            with self.subTest(ef=value):
+                cfg, cleared = retrieval_config.normalize({'ef': value, 'top_k': 7}, 'Corpus')
+                self.assertIsNone(cfg['ef'])
+                self.assertEqual(cfg['top_k'], 7)
+                self.assertEqual(cleared, value)
+        for value, kept in [(16, 16), (512, 512), (64, 64), (None, None), ('64', 64)]:
+            with self.subTest(ef=value):
+                cfg, cleared = retrieval_config.normalize({'ef': value}, 'Corpus')
+                self.assertEqual(cfg['ef'], kept)
+                self.assertIsNone(cleared)
+                self.assertEqual(retrieval_config.validate({'ef': value}, 'Corpus'), cfg)
+
+    def test_legacy_ef_import_completes_with_note(self):
+        # Every conflict mode (#184): abort into a new collection, rename beside
+        # an existing one, and replace an existing one through staging.
+        for conflict in ('abort', 'rename', 'replace'):
+            for value in LEGACY_EF:
+                with self.subTest(conflict=conflict, ef=value), ExitStack() as mocks:
+                    self.archive(json.dumps({'ef': value, 'top_k': 7}))
+                    mocks.enter_context(patch.object(importer, '_ensure_models', return_value=[]))
+                    mocks.enter_context(patch.object(importer, '_build', return_value=0))
+                    mocks.enter_context(patch.object(
+                        importer.wc, '_collection_exists_sync',
+                        side_effect=lambda name: conflict != 'abort' and name == 'Corpus'))
+                    if conflict == 'replace':
+                        mocks.enter_context(patch.object(importer.collection_recovery, 'begin',
+                                                         return_value={'staging': 'Corpus__importing_test',
+                                                                       'state': 'scratch'}))
+                        for name in ('retain', 'discard'):
+                            mocks.enter_context(patch.object(importer.collection_recovery, name))
+                        mocks.enter_context(patch.object(importer.wc, 'get_client'))
+                        mocks.enter_context(patch.object(importer.wc, '_delete_collection_sync'))
+                        mocks.enter_context(patch.object(importer.goldstandard, 'sessions_for', return_value=[]))
+                    importer._jobs['test'] = {'status': 'queued'}
+                    importer._run('test', 'fixture.tar.gz', conflict)
+                    job = importer._jobs['test']
+                    self.assertEqual(job['status'], 'completed', job)
+                    target = job['collection']
+                    if conflict == 'rename':
+                        self.assertTrue(target.startswith('Corpus_imported_'), target)
+                    else:
+                        self.assertEqual(target, 'Corpus')
+                    restored = retrieval_config.load(target)
+                    self.assertIsNone(restored['ef'])
+                    self.assertEqual(restored['top_k'], 7)
+                    self.assertEqual(job['notes'].count(IMPORT_NOTE.format(value)), 1)
+                    retrieval_config._path(target).unlink()
+
+    def test_restore_uses_preflight_snapshot_and_rebinds_renamed_collection(self):
+        self.archive(json.dumps({'top_k': '8', 'ef': 64}))
+        validated = importer._read_retrieval_config(self.pkg, 'Corpus')
+        (self.pkg / 'retrieval_config.json').write_text('{')
+        importer._restore_sidecars('Renamed', self.pkg, 'Corpus', [], validated_retrieval=validated)
+        self.assertEqual(retrieval_config.load('Renamed'), {**validated, 'collection': 'Renamed'})
+        self.assertEqual(validated['collection'], 'Corpus')
+
+    def test_absent_settings_remain_optional_and_nonregular_settings_fail(self):
+        self.assertIsNone(importer._read_retrieval_config(self.pkg, 'Corpus'))
+        (self.pkg / 'retrieval_config.json').mkdir()
+        with self.assertRaises(packager.PackageError):
+            importer._read_retrieval_config(self.pkg, 'Corpus')
+
+    def test_saved_invalid_settings_cannot_generate_script(self):
+        for data in INVALID:
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                packager._render_retrieve('Corpus', data, {})
+
+    def test_generated_script_defaults_are_literals_and_metadata_stays_data(self):
+        malicious = '\"\"\"\nraise RuntimeError("injected")\n#\\\n@@TOP_K@@'
+        cfg = {'retrieval_mode': 'hybrid', 'top_k': '8', 'alpha': '0.25',
+               'response_format': 'engineer', 'ef': 64, 'unknown': malicious}
+        source = packager._render_retrieve(malicious, cfg, {'embed_model': malicious})
+        tree = ast.parse(source)
+        literals = {node.targets[0].id: ast.literal_eval(node.value)
+                    for node in tree.body if isinstance(node, ast.Assign)}
+        self.assertEqual(literals['COLLECTION'], malicious)
+        self.assertEqual(literals['PACKAGE_METADATA'], {'embed_model': malicious})
+        self.assertEqual(literals['DEFAULT_TOP_K'], 8)
+        self.assertIs(type(literals['DEFAULT_TOP_K']), int)
+        self.assertEqual(literals['DEFAULT_ALPHA'], 0.25)
+        namespace = {'__name__': 'retrieval_import_test'}
+        exec(compile(tree, 'retrieve.py', 'exec'), namespace)
+        args = namespace['build_parser']().parse_args(['a question'])
+        self.assertEqual((args.mode, args.top_k, args.alpha, args.response_format),
+                         ('hybrid', 8, 0.25, 'engineer'))
+
+    def test_export_checks_stored_model_before_streaming_or_bundling(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        for model, kind, named in (('old-model', 'text2vec-ollama', None), (None, 'none', None), ('new-model', 'text2vec-ollama', {'named': {}})):
+            with self.subTest(model=model, kind=kind, named=named):
+                cfg = SimpleNamespace(vector_index_config=SimpleNamespace(), properties=[], vectorizer_config=SimpleNamespace(vectorizer=kind, model={'model': model}), vector_config=named)
+                backend = MagicMock()
+                backend.collections.get.return_value.config.get.return_value = cfg
+                with patch.object(settings, 'embed_model', 'new-model'), patch.object(packager.wc, 'get_client', return_value=backend), patch.object(packager, 'read_chunks') as chunks, patch.object(packager.model_bundle, 'export_model') as bundle:
+                    before = sorted(self.exports.iterdir())
+                    with self.assertRaises(packager.PackageError) as caught:
+                        packager.build('Corpus', include_models=True)
+                    self.assertEqual(caught.exception.code, 'EMBEDDING_MISMATCH')
+                    self.assertIn('Re-embed', caught.exception.message)
+                    chunks.assert_not_called()
+                    bundle.assert_not_called()
+                    self.assertEqual(sorted(self.exports.iterdir()), before)
+
+    def test_collection_schema_records_actual_model_not_process_default(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        backend = MagicMock()
+        backend.collections.get.return_value.config.get.return_value = SimpleNamespace(vector_index_config=SimpleNamespace(), properties=[], vectorizer_config=SimpleNamespace(vectorizer='text2vec-ollama', model={'model': 'stored-model'}), vector_config=None)
+        with patch.object(settings, 'embed_model', 'different-model'), patch.object(packager.wc, 'get_client', return_value=backend):
+            self.assertEqual(packager.wc._collection_config_sync('Corpus')['embedding_model'], 'stored-model')
+
+    def test_export_emits_normalized_settings_and_executable_defaults(self):
+        saved = {'collection': 'Corpus', 'top_k': '7', 'alpha': '0.5', 'ef': 64}
+        retrieval_config.save(saved)
+        with patch.object(packager, 'read_chunks', return_value=[]), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}), \
+             patch.object(packager, '_ingest_config', return_value=None), \
+             patch.object(packager, '_goldstandard_sessions', return_value=[]), \
+             patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
+             patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}):
+            result = packager.build('Corpus')
+        with tarfile.open(self.exports / result['filename']) as archive:
+            members = {Path(m.name).name: m for m in archive.getmembers() if m.isfile()}
+            cfg = json.load(archive.extractfile(members['retrieval_config.json']))
+            source = archive.extractfile(members['retrieve.py']).read().decode()
+        self.assertEqual(cfg, SaveRetrievalConfigBody.model_validate(saved).model_dump())
+        namespace = {'__name__': 'retrieval_import_test'}
+        exec(compile(source, 'retrieve.py', 'exec'), namespace)
+        self.assertEqual(namespace['DEFAULT_TOP_K'], 7)
+        self.assertEqual(namespace['DEFAULT_ALPHA'], 0.5)
+        self.assertEqual(namespace['PACKAGE_METADATA']['package_filename'], result['filename'])
+
+    def test_export_clears_legacy_ef_with_warning(self):
+        retrieval_config.save({'collection': 'Corpus', 'top_k': 7, 'ef': 10000})
+        saved = retrieval_config._path('Corpus')
+        before = saved.read_bytes()
+        with patch.object(packager, 'read_chunks', return_value=[]), \
+             patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}), \
+             patch.object(packager, '_ingest_config', return_value=None), \
+             patch.object(packager, '_goldstandard_sessions', return_value=[]), \
+             patch.object(packager.sources, 'load_index', return_value={'documents': {}}), \
+             patch.object(packager.wc, '_meta_sync', return_value={'version': 'test'}):
+            result = packager.build('Corpus')
+        with tarfile.open(self.exports / result['filename']) as archive:
+            members = {Path(m.name).name: m for m in archive.getmembers() if m.isfile()}
+            cfg = json.load(archive.extractfile(members['retrieval_config.json']))
+            manifest = json.load(archive.extractfile(members['manifest.json']))
+        self.assertIsNone(cfg['ef'])
+        self.assertEqual(cfg['top_k'], 7)
+        self.assertIn('retrieve.py', members)
+        warning = EXPORT_WARNING.format(10000)
+        self.assertEqual(result['warnings'].count(warning), 1)
+        self.assertEqual(manifest['warnings'].count(warning), 1)
+        self.assertEqual(saved.read_bytes(), before)
+
+    def test_export_rejects_invalid_stored_settings_without_publishing_package(self):
+        for value in INVALID:
+            if value is None:  # None denotes no saved file, not an invalid saved config.
+                continue
+            with self.subTest(value=value), ExitStack() as mocks:
+                chunks = mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
+                mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': settings.embed_model}))
+                mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
+                mocks.enter_context(patch.object(retrieval_config, 'load', return_value=value))
+                with self.assertRaises(ValueError) as caught:
+                    packager.build('Corpus')
+                message = str(caught.exception)
+                self.assertIn("'Corpus'", message)
+                self.assertIn('Retrieval page', message)
+                if isinstance(value, dict):
+                    self.assertIn(next(iter(value)), message)
+                else:
+                    self.assertIn('not a JSON object', message)
+                chunks.assert_not_called()
+                self.assertEqual(list(self.exports.iterdir()), [])
+
+    def test_symlinked_settings_fail_with_package_corrupt(self):
+        target = self.root / 'outside.json'
+        target.write_text('{}')
+        (self.pkg / 'retrieval_config.json').symlink_to(target)
+        with self.assertRaises(packager.PackageError) as caught:
+            importer._read_retrieval_config(self.pkg, 'Corpus')
+        self.assertEqual(caught.exception.code, 'PACKAGE_CORRUPT')
+        self.assertEqual(caught.exception.detail, {'file': 'retrieval_config.json'})
+
+    def test_render_refuses_a_template_token_without_a_value(self):
+        with self.assertRaises(RuntimeError):
+            packager._render('retrieve.py.tmpl', {'COLLECTION_NAME': repr('Corpus')})
+
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
+### scripts/verify/retrieval_settings.py
+
+```python
+"""Live transfer regression: digest-valid invalid settings cannot replace a corpus."""
+import hashlib
+import json
+from pathlib import Path
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+import uuid
+
+
+def run(api, collection, package):
+    def request(path, body=None):
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(api.rstrip('/') + path, data=data,
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return json.load(response)
+
+    def collections():
+        return sorted((c['name'], c['object_count'])
+                      for c in request('/collections')['collections'])
+
+    package = Path(package)
+    saved = request('/retrieval/config/' + collection)
+    baseline = collections()
+    marker = {**saved, 'top_k': 9 if saved['top_k'] != 9 else 10}
+    try:
+        request('/retrieval/config', marker)
+        expected = request('/retrieval/config/' + collection)
+        invalid = [[], {'top_k': '5; raise RuntimeError("injected")'},
+                   {'retrieval_mode': 'hybrid"; raise RuntimeError("injected") #'},
+                   {'alpha': 2}, {'ef': True}]
+        for value in invalid:
+            with tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                with tarfile.open(package) as archive:
+                    archive.extractall(work, filter='data')
+                root = next(p for p in work.iterdir() if p.is_dir())
+                side = root / 'retrieval_config.json'
+                side.write_text(json.dumps(value))
+                manifest_path = root / 'manifest.json'
+                manifest = json.loads(manifest_path.read_text())
+                manifest['files'][side.name] = 'sha256:' + hashlib.sha256(side.read_bytes()).hexdigest()
+                manifest_path.write_text(json.dumps(manifest))
+                # Written under a .part name, then renamed into place: on Docker
+                # Desktop the API can read a freshly written bind-mounted file
+                # as empty (#184).
+                output = package.parent / f'vfy-retrieval-{uuid.uuid4().hex[:12]}.tar.gz'
+                part = output.with_name('.' + output.name + '.part')
+                try:
+                    with tarfile.open(part, 'w:gz') as archive:
+                        archive.add(root, arcname=root.name)
+                    part.replace(output)
+                    for conflict in ('abort', 'rename', 'replace'):
+                        job_id = request('/import', {'filename': output.name,
+                                                     'on_conflict': conflict})['job_id']
+                        deadline = time.monotonic() + 120
+                        while True:
+                            job = request('/import/job/' + job_id)
+                            if job['status'] in ('failed', 'completed'):
+                                break
+                            if time.monotonic() >= deadline:
+                                raise AssertionError('Retrieval settings import timed out')
+                            time.sleep(0.2)
+                        assert job['status'] == 'failed', job
+                        assert job['error_code'] == 'PACKAGE_CORRUPT', job
+                        assert job['error_detail'] == {'file': 'retrieval_config.json'}, job
+                        assert request('/retrieval/config/' + collection) == expected
+                        assert collections() == baseline
+                finally:
+                    part.unlink(missing_ok=True)
+                    output.unlink(missing_ok=True)
+        print('15 digest-valid malformed retrieval imports rejected; live collections/settings preserved')
+    finally:
+        request('/retrieval/config', saved)
+
+
+if __name__ == '__main__':
+    run(*sys.argv[1:])
+```
+
+### scripts/verify/legacy_retrieval.py
+
+```python
+"""Live E28 acceptance for retrieval settings saved under an older contract (#173).
+
+Writes the collection's saved settings file directly in the API container, as
+an API from before PR #108 could have, then checks through the real API:
+- a legacy integer ef exports as null with a warning, and the saved file is
+  left alone;
+- a package carrying a legacy ef imports with ef null and a note;
+- other invalid saved settings fail the export before any package is
+  published, with an error naming the fields and the Retrieval page.
+The collection's saved settings are restored on exit.
+"""
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+
+WARNING = ("saved retrieval setting ef={} is outside 16-512 and was exported as null; "
+           "ef is no longer used. Save this collection's settings on the Retrieval "
+           "page to clear it.")
+NOTE = ("the package's retrieval setting ef={} is outside 16-512 and was restored "
+        "as null; ef is no longer used.")
+
+
+def run(api, collection, exports, repo_root):
+    exports = Path(exports)
+    failures = []
+
+    def request(path, body=None):
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(api.rstrip('/') + path, data=data,
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return json.load(response)
+
+    def wait(path, timeout=900):
+        deadline = time.monotonic() + timeout
+        while True:
+            job = request(path)
+            if job['status'] in ('failed', 'completed'):
+                return job
+            if time.monotonic() >= deadline:
+                raise AssertionError(f'{path} timed out: {job}')
+            time.sleep(0.5)
+
+    def write_saved(value):
+        """Bypass the save contract, as an older API's saved file would."""
+        code = ('import json, sys\n'
+                'from services import retrieval_config\n'
+                'retrieval_config._path(sys.argv[1]).write_text(sys.argv[2])\n')
+        subprocess.run(['docker', 'compose', 'exec', '-T', 'api', 'python', '-c', code,
+                        collection, json.dumps(value)], cwd=repo_root, check=True)
+
+    def expect(name, ok, detail=''):
+        print(('PASS ' if ok else 'FAIL ') + name + ('' if ok else f'  -- {detail}'))
+        if not ok:
+            failures.append(name)
+
+    def listing():
+        return sorted(p.name for p in exports.iterdir())
+
+    saved = request('/retrieval/config/' + collection)
+    renamed = None
+    try:
+        # 1. Export of a legacy ef: null in the package, a warning, file left alone.
+        legacy = {k: saved[k] for k in ('retrieval_mode', 'alpha', 'response_format')}
+        write_saved({**legacy, 'top_k': 7, 'ef': 10000})
+        loaded = request('/retrieval/config/' + collection)
+        expect('legacy ef: the Retrieval page can still load the saved settings',
+               loaded['ef'] == 10000 and loaded['top_k'] == 7, loaded)
+        job = wait('/export/job/' + request('/export', {'collection': collection,
+                                                        'include_models': False})['job_id'])
+        expect('legacy ef: export completes', job['status'] == 'completed', job)
+        package = exports / job['filename']
+        with tarfile.open(package) as archive:
+            members = {Path(m.name).name: m for m in archive.getmembers() if m.isfile()}
+            cfg = json.load(archive.extractfile(members['retrieval_config.json']))
+            manifest = json.load(archive.extractfile(members['manifest.json']))
+            script = archive.extractfile(members['retrieve.py']).read().decode()
+        warning = WARNING.format(10000)
+        expect('legacy ef: the package carries ef null and the other settings',
+               cfg['ef'] is None and cfg['top_k'] == 7, cfg)
+        expect('legacy ef: the export job warns once', job['warnings'].count(warning) == 1,
+               job['warnings'])
+        expect('legacy ef: the manifest records the warning',
+               manifest['warnings'].count(warning) == 1, manifest['warnings'])
+        expect('legacy ef: retrieve.py carries the saved top_k', 'DEFAULT_TOP_K = 7' in script,
+               [l for l in script.splitlines() if 'TOP_K =' in l])
+        after = request('/retrieval/config/' + collection)
+        expect('legacy ef: export leaves the saved settings alone', after['ef'] == 10000, after)
+
+        # 2. Import of a package with a legacy ef: restored as null, with a note.
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            with tarfile.open(package) as archive:
+                archive.extractall(work, filter='data')
+            root = next(p for p in work.iterdir() if p.is_dir())
+            side = root / 'retrieval_config.json'
+            side.write_text(json.dumps({**json.loads(side.read_text()), 'ef': 513}))
+            manifest_path = root / 'manifest.json'
+            manifest = json.loads(manifest_path.read_text())
+            manifest['files'][side.name] = 'sha256:' + hashlib.sha256(side.read_bytes()).hexdigest()
+            manifest_path.write_text(json.dumps(manifest))
+            crafted = exports / (package.name.replace('.tar.gz', '') + '-legacyef.tar.gz')
+            # Write under another name, then rename: on Docker Desktop, the API
+            # container can read a freshly written bind-mounted file as empty.
+            partial = crafted.with_name('.' + crafted.name + '.part')
+            with tarfile.open(partial, 'w:gz') as archive:
+                archive.add(root, arcname=root.name)
+            partial.replace(crafted)
+        try:
+            job = wait('/import/job/' + request('/import', {'filename': crafted.name,
+                                                            'on_conflict': 'rename'})['job_id'])
+        finally:
+            crafted.unlink(missing_ok=True)
+            package.unlink(missing_ok=True)
+        expect('legacy ef: a package with ef=513 imports', job['status'] == 'completed', job)
+        if job['status'] == 'completed':
+            renamed = job['collection']
+            expect('legacy ef: the import notes the cleared ef once',
+                   job['notes'].count(NOTE.format(513)) == 1, job['notes'])
+            restored = request('/retrieval/config/' + renamed)
+            expect('legacy ef: the imported collection has ef null and the package top_k',
+                   restored['ef'] is None and restored['top_k'] == 7
+                   and restored['is_default'] is False, restored)
+
+        # 3. Other invalid saved settings fail early, actionably, publishing nothing.
+        for value, needles in [({**legacy, 'top_k': 0, 'alpha': 2}, ['top_k', 'alpha']),
+                               ({**legacy, 'ef': True}, ['ef']),
+                               ([], ['not a JSON object'])]:
+            write_saved(value)
+            before = listing()
+            job = wait('/export/job/' + request('/export', {'collection': collection,
+                                                            'include_models': False})['job_id'])
+            error = job.get('error') or ''
+            expect(f'invalid saved settings {value!r}: export fails', job['status'] == 'failed', job)
+            expect(f'invalid saved settings {value!r}: the error is actionable',
+                   all(n in error for n in needles) and 'Retrieval page' in error
+                   and f"'{collection}'" in error, error)
+            expect(f'invalid saved settings {value!r}: no package or staging is left',
+                   listing() == before, sorted(set(listing()) ^ set(before)))
+    finally:
+        if renamed:
+            urllib.request.urlopen(urllib.request.Request(
+                api.rstrip('/') + f'/collections/{renamed}?confirm=true', method='DELETE'),
+                timeout=120).read()
+        request('/retrieval/config', saved)
+    print(f'{len(failures)} legacy/invalid retrieval settings check(s) failed')
+    return 1 if failures else 0
+
+
+if __name__ == '__main__':
+    sys.exit(run(*sys.argv[1:]))
 ```

@@ -14,9 +14,8 @@ async def lifespan(app: FastAPI):
     from services import weaviate_client as wc
     goldstandard.load_sessions_from_disk()
     metrics.load_from_disk()
-    # An import or tune killed part-way cannot run its own cleanup, so its
-    # staging collection would survive forever. Nothing can be using one before
-    # the app starts serving, so clearing them here is safe.
+    # Sweep only durably owned scratch. Verified recovery collections and
+    # unowned marker-like names must survive startup.
     log = logging.getLogger(__name__)
     try:
         abandoned = await wc.sweep_staging()

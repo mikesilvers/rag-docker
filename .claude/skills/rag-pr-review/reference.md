@@ -114,28 +114,34 @@ high_findings:
 notes: <anything the coordinator must know>
 ```
 
-## Restoring the stack
+## The verify project
 
-The stack bind-mounts files from the folder it was started in: `./exports` (export packages), `proxy/nginx.conf` and `ollama/entrypoint.sh`. So it must always end up started from a folder that stays: the main checkout. A stack started from a bundle worktree that is then removed keeps running on deleted files, and exports land in a folder nobody will see.
+An evaluation never builds, starts, stops or recreates the live `rag-docker` stack: it holds the maintainer's real data (#152). Tests and the build check run on the **verify project**: compose project `rag-verify` on port 8081 (`RAG_VERIFY_PORT`), with its own empty volumes, its own image tags (`rag-verify-api`, `rag-verify-ui`) and its own exports folder, brought up and torn down by `scripts/verify/stack.sh`. Its Ollama models are `rag-verify-ollama-models`, a copy of the live models that `stack.sh` checks by sha256 on every `up`; the live model volume is only ever mounted read-only, for that copy. `scripts/verify/README.md` describes it in full.
 
-1. **Find the main checkout:** the first `worktree` line of `git worktree list --porcelain`.
-2. **Check it:** `git fetch origin develop`. It must be on `develop`, with `git status --porcelain` empty (untracked files count: a build copies them in). If it's behind `origin/develop` and not ahead, fast-forward it (`git merge --ff-only origin/develop`). If it's ahead or has diverged, that fails this step. Never switch its branch or discard anything yourself.
-3. **Restart from it:** `docker compose -p rag-docker build`, then `docker compose -p rag-docker up -d --force-recreate --remove-orphans`, then the smoke checks: `http://localhost:8080/api/health` and `http://localhost:8080/` must each return 200 within 60 seconds of retrying (the `smoke` function in the coordinator's step 8). `--remove-orphans` stops any service the evaluated commit added that `develop` doesn't have.
-4. **Check the mounts** of every container in the project. Each bind source must be under the main checkout (Docker Desktop may prefix it with `/host_mnt`), never a bundle path:
+1. **Use the trusted harness.** Always the main checkout's `stack.sh`, pointed at the checkout under test with `--checkout <bundle>/merged` (or `<bundle>/base`), never the copy in `merged/`, which the PR controls. Before each use, check that the main checkout's harness is `develop`'s:
 
    ```bash
-   docker ps -a --filter label=com.docker.compose.project=rag-docker --format '{{.Names}}' | while read -r c; do
-     docker inspect "$c" --format '{{range .Mounts}}{{if eq .Type "bind"}}{{$.Name}} {{.Source}}{{"\n"}}{{end}}{{end}}'
-   done
+   main=$(git worktree list --porcelain | awk 'NR==1 {print $2}')
+   git -C "$main" fetch -q origin develop
+   git -C "$main" diff --quiet origin/develop -- scripts/verify/stack.sh scripts/verify/lock.sh docker-compose.verify.yml docker-compose.yml || { echo "STOP: the harness isn't develop's"; exit 1; }
    ```
 
-5. **Only then** remove worktrees, and only your own: the testing reviewer removes a `base/` worktree it created, never `worktree/` or `merged/`, which the coordinator still needs for the build check and removes itself in step 9.
+   The main checkout's `docker-compose.yml` is checked because `stack.sh` takes the image that copies the models from it; the checkout under test's own `docker-compose.yml` is still the one that gets built. A non-zero exit means the harness isn't `develop`'s: it ends that shell, so nothing after it runs. Stop the evaluation, run nothing, and tell the user.
+2. **The configuration check.** Before building anything, `stack.sh up` checks the checkout's resolved compose configuration against an allow-list of what the base file and the overlay need (#154). It refuses any other top-level or service key (such as `volumes_from`, `network_mode`, `privileged`, `secrets`); a build with options other than a context and Dockerfile inside the checkout, or one that would write a tag other than `rag-verify-<service>`; a `rag-docker-*` image under any registry name; a network or volume other than the project's own or the model copy; any published port other than the proxy on loopback at the verify port; a mount other than a volume or a read-only bind from inside the checkout (never its `exports` folder), apart from the api's own exports folder; and a Docker socket mount. Nothing is then built or started. The refusal fails the check that ran it. It can't see `env_file`, which compose merges into the environment.
+3. **Tear it down.** `stack.sh run` tears the project down itself; after `stack.sh up`, run `bash "$main/scripts/verify/stack.sh" down`. It removes the project's containers, network, volumes, images and exports folder, keeps the model copy, and prints `verify project rag-verify removed` only when nothing is left. Confirm that both of these print nothing:
 
-**If step 2, 3 or 4 fails** (the main checkout isn't a clean `develop` it can fast-forward, the build fails, or a mount points outside the main checkout), don't leave the evaluated code anywhere it could run again:
+   ```bash
+   docker ps -a --filter label=com.docker.compose.project=rag-verify --format '{{.Names}}'
+   docker volume ls --filter label=com.docker.compose.project=rag-verify --format '{{.Name}}'
+   ```
 
-1. Stop the stack: `docker compose -p rag-docker down --remove-orphans` (never `-v`: the volumes hold the data).
-2. Remove the images built from the evaluated commit: `docker image rm rag-docker-api:latest rag-docker-ui:latest`. Otherwise the next `docker compose up -d`, or `package-offline.sh`, would use them. The next `up` rebuilds them from whatever folder it runs in.
-3. Keep every bundle worktree, and tell the user the stack is stopped, why, and that it must be started again from the main checkout on `develop`.
+4. **Only then** remove worktrees, and only your own: the testing reviewer removes a `base/` worktree it created, never `worktree/` or `merged/`, which the coordinator still needs for the build check and removes itself in step 9.
+
+**If the teardown fails**, stop: keep every bundle worktree, and tell the user what is left (`stack.sh down` names it), so it can be removed by hand. Never fall back to the live stack, and never run `docker compose` without `-p rag-verify`.
+
+**What it doesn't protect against.** The suites, and any script the checkout runs on the host, still have full access to Docker, so a script could still address the live stack directly. The verify project keeps evaluations away from the live stack by accident, not from hostile code: that is the security review's job, and for a cross-repository PR, the go-ahead's.
+
+A PR's own changes to the harness (`scripts/verify/stack.sh`, `scripts/verify/lock.sh`, `docker-compose.verify.yml`) don't run in its evaluation, which uses `develop`'s. The maintainer may run the PR's copy after review.
 
 For a cross-repository PR, the evaluated code is the contributor's, and the go-ahead covered running it only for the evaluation.
 
@@ -218,7 +224,9 @@ One GitHub review with `event: COMMENT` on the reviewed commit. Never use `APPRO
 - <check> — <path:line> — <failed once, passed on re-run | failed twice, passed on `develop`>
 
 <only for a PR by `joefeser`, see "Maintainer follow-ups" below>
-**Medium and Low findings:** the maintainer will fix these in a follow-up PR after this one merges. You don't need to change anything for them. Checks listed above as flaky or environmental are for your information: they aren't follow-up work, and they aren't yours to fix.
+**Medium and Low findings:** the maintainer will fix these in a follow-up PR after this one merges. You don't need to change anything for them.
+<also, only when Tests scored a check as flaky or environmental>
+The checks listed above as flaky or environmental are for your information: they aren't follow-up work, and they aren't yours to fix.
 
 **Build and run:** config valid ✅ · images built ✅ · all services healthy ✅ (<n> min) · `/api/health` 200 ✅ · UI 200 ✅
 
@@ -254,7 +262,7 @@ To link a finished evaluation's recap, use the overall status's `target_url`, wh
 For a PR whose author is `joefeser`, only High findings go back to him. "Author" means the PR's `author.login` from the step 1 snapshot (`gh pr view --json author`), which GitHub sets and nobody can edit. Never go by commit authors, `Co-authored-by` trailers or anything written in the PR. The maintainer fixes the Medium and Low findings in a follow-up issue and PR against `develop` after his PR merges, so they never hold his PR.
 
 - The recap carries the "Medium and Low findings" line shown in the recap format, so his team doesn't also fix them. On a NOT READY recap, the line still applies: he fixes the Highs only.
-- After his PR merges, the coordinator offers the maintainer a follow-up issue listing the Mediums, and the Lows worth doing, each with its `path:line` from the recap. The follow-up is an ordinary maintainer PR, evaluated like any other.
+- After his PR merges, the coordinator offers the maintainer a follow-up issue listing the Mediums, and the Lows worth doing, each with its `path:line` from the recap. Checks scored flaky or environmental are left out: they aren't follow-up work. The follow-up is an ordinary maintainer PR, evaluated like any other.
 - Severities are graded exactly as for any other PR. The rule changes who fixes a Medium or Low, never what counts as High.
 - Conflicts with `develop` are still his to resolve.
 

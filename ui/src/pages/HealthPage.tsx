@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { api, HealthResult, MetricsResult } from '../api/client'
 import LatencyCharts from '../components/LatencyCharts'
 
@@ -6,7 +6,24 @@ export default function HealthPage() {
   const [health, setHealth] = useState<HealthResult | null>(null)
   const [metrics, setMetrics] = useState<MetricsResult | null>(null)
 
+  const [sessionIssues, setSessionIssues] = useState<{ filename: string; code: string; message: string }[]>([])
+  const [diagnosticError, setDiagnosticError] = useState(false)
+
+  const [diagnosticPending, setDiagnosticPending] = useState(true)
+  const diagnosticTicket = useRef(0)
+
   async function load() {
+    const ticket = ++diagnosticTicket.current
+    setDiagnosticPending(true)
+    api.getSessionDiagnostics().then(result => {
+      if (ticket !== diagnosticTicket.current) return
+      setSessionIssues(result.issues); setDiagnosticError(false)
+    }).catch(() => {
+      if (ticket !== diagnosticTicket.current) return
+      setSessionIssues([]); setDiagnosticError(true)
+    }).finally(() => {
+      if (ticket === diagnosticTicket.current) setDiagnosticPending(false)
+    })
     try {
       const [h, m] = await Promise.all([api.getHealth(), api.getMetrics()])
       setHealth(h)
@@ -17,7 +34,7 @@ export default function HealthPage() {
   useEffect(() => {
     load()
     const interval = setInterval(load, 30000)
-    return () => clearInterval(interval)
+    return () => { ++diagnosticTicket.current; clearInterval(interval) }
   }, [])
 
   function StatusBadge({ status }: { status: string }) {
@@ -29,6 +46,12 @@ export default function HealthPage() {
   return (
     <div className="max-w-4xl mx-auto">
       <h1 className="text-2xl font-bold mb-6">Health Dashboard</h1>
+      {diagnosticPending && <p role="status" className="text-gray-500 mb-4">Refreshing session recovery diagnostics…</p>}
+      {diagnosticError && <p role="alert" className="text-amber-700 mb-4">Session recovery diagnostics could not be refreshed.</p>}
+      {sessionIssues.length > 0 && <div role="alert" className="border border-amber-300 bg-amber-50 rounded p-4 mb-6">
+        <h2 className="font-semibold">{diagnosticPending ? "Previous evaluation session recovery results — refresh pending" : "Evaluation session recovery needs attention"}</h2>
+        {sessionIssues.map(issue => <p key={issue.filename} className="text-sm mt-2">{issue.filename}: {issue.code} — {issue.message}</p>)}
+      </div>}
       {health && (
         <div className="grid grid-cols-3 gap-4 mb-8">
           <div className="bg-white border rounded p-4">

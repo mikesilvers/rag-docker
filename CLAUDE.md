@@ -18,13 +18,33 @@ Always review a pull request with the project's `rag-pr-review` skill (`/rag-pr-
 - An issue stays open until **every** PR for it has merged. Use `Part of #N` on a PR that doesn't finish the issue, and `Closes #N` only on the PR that completes it: merging into `develop` closes the issue automatically.
 - Follow `CONTRIBUTING.md` and the PR template.
 
+## Developing a fix
+
+Every PR's work starts in a fresh agent with no earlier context, and produces three documents before any code is written. The documents are for reference and the maintainer's later review. They are never committed: they live in `dev-docs/issue-<N>/<branch>/` in the main checkout (not a worktree), which `.git/info/exclude` keeps out of git.
+
+1. **Analysis** (`analysis.md`): what the prompt and the linked issue ask for, and nothing more.
+2. **Specifications** (`specifications.md`): what the change must do, built from the analysis.
+3. **Implementation plan** (`implementation-plan.md`): how to make the change, built from the specifications.
+
+Each document goes through a review loop before the next one starts:
+
+- Review the document, revise it, and repeat. Stop after **two consecutive reviews with no changes**.
+- Every change is checked against the document's source, so that scope doesn't grow or drift: the analysis against the prompt and the issue, the specifications against the analysis, and the plan against the specifications.
+- Each document ends with a review log: one line per review, listing what changed or "no changes".
+
+Then implement the plan and carry on with the usual cycle: verification, PR and `rag-pr-review`.
+
+At any step, if something is unclear, stop and ask the maintainer. Don't guess. An agent working on an issue returns its questions to the session that started it, which asks the maintainer and passes back the answers.
+
 ## Before opening a PR
 
-Run the verification suite against the live stack. It needs `docker compose up -d` first.
+Run the verification suite on the disposable verify project, never on the live stack. `stack.sh` builds the branch as compose project `rag-verify` on port 8081, with its own empty volumes, runs the suite and tears the project down. `stack.sh` never builds, starts or stops the live `rag-docker` stack, and only reads its model volume, to copy the models (#152); that guards against accidents, not hostile code (see `scripts/verify/README.md`).
 
 ```bash
-bash scripts/verify/all.sh                  # full run, about 20 minutes
-RAG_SKIP_SLOW=1 bash scripts/verify/all.sh  # skips LLM work, about 3 minutes
+bash scripts/verify/stack.sh run                  # full run, about 20 minutes plus start-up
+RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run  # skips LLM work, about 8 minutes, start-up included
 ```
+
+`all.sh` and the suites refuse the live stack on their own. Never override that with `RAG_VERIFY_LIVE=1` for verification. See `scripts/verify/README.md`.
 
 Tier 1 (bug) fixes need the full run, with its summary pasted into the PR.

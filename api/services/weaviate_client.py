@@ -8,11 +8,13 @@ import weaviate
 from weaviate.classes.config import Configure, Property, DataType, VectorDistances
 from weaviate.classes.query import MetadataQuery, Filter
 
+from services import collection_writes, collection_recovery
 from config import settings
 from models.schemas import CreateCollectionRequest, StoredCollectionRequest
 from services import ingest_config
 from services import retrieval_config
 from services import sources
+from services import batch_write, collection_recovery
 
 log = logging.getLogger(__name__)
 
@@ -82,6 +84,7 @@ async def check_health() -> bool:
     return await asyncio.to_thread(_check_health_sync)
 
 
+@collection_writes.serialized("name")
 def _create_collection_sync(
     name: str,
     index_type: str,
@@ -89,10 +92,11 @@ def _create_collection_sync(
     hnsw_config: dict,
     *,
     preserve_hnsw: bool = False,
+    description: str | None = None,
 ) -> None:
     schema = StoredCollectionRequest if preserve_hnsw else CreateCollectionRequest
     validated = schema(name=name, index_type=index_type,
-                                        distance_metric=distance_metric, hnsw_config=hnsw_config)
+                       distance_metric=distance_metric, hnsw_config=hnsw_config)
     hnsw_config = validated.hnsw_config.model_dump()
     client = get_client()
     dist = DISTANCE_MAP[validated.distance_metric]
@@ -115,6 +119,8 @@ def _create_collection_sync(
 
     client.collections.create(
         name=name,
+        # Set only by import, to bind its in-progress marker to this instance.
+        description=description,
         vectorizer_config=vectorizer,
         vector_index_config=vector_index,
         properties=COLLECTION_PROPERTIES,
@@ -140,23 +146,33 @@ async def collection_exists(name: str) -> bool:
     return await asyncio.to_thread(_collection_exists_sync, name)
 
 
+@collection_writes.serialized("name")
 def _delete_collection_sync(name: str) -> int:
     client = get_client()
     coll = client.collections.get(name)
+    canonical_name = coll.config.get().name
     count = coll.aggregate.over_all(total_count=True).total_count
-    client.collections.delete(name)
+    client.collections.delete(canonical_name)
+    collection_recovery.retire_deleted(canonical_name, client)
     # Retained originals must go with the collection. The sources volume is
     # surfaced nowhere in the UI, so a leak here would be invisible.
-    sources.delete(name)
-    retrieval_config.delete(name)
-    ingest_config.delete(name)
+    # Older writers saved sidecars under the first-character backend alias.
+    # The caller can use either spelling, so clean both after backend deletion.
+    # Other case changes can name distinct collections and must be preserved.
+    alias = canonical_name[:1].lower() + canonical_name[1:]
+    spellings = list(dict.fromkeys((canonical_name, alias)))
+    for spelling in spellings:
+        sources.delete(spelling)
+        retrieval_config.delete(spelling)
+        ingest_config.delete(spelling)
     # Gold-standard sessions are kept and flagged, never deleted (spec §8 rule 4):
     # they are evaluation work the user may still want, and the pairs stay
     # readable even with the collection gone. Imported here rather than at module
     # level because goldstandard imports this module.
     from services import goldstandard
-    goldstandard.mark_orphaned(
-        name, f"collection '{name}' was deleted")
+    for spelling in spellings:
+        goldstandard.mark_orphaned(
+            spelling, f"collection '{canonical_name}' was deleted")
     return count or 0
 
 
@@ -176,20 +192,36 @@ def _get_collections_sync() -> list[dict]:
         # vector_index_config (weaviate-client 4.x dropped it from the reduced
         # config). Fetch the full per-collection config for the index details.
         vector_config = coll.config.get().vector_index_config
-        index_type = "flat" if "flat" in type(vector_config).__name__.lower() else "hnsw"
+        index_name = type(vector_config).__name__.lower()
+        hnsw_fields = tuple(
+            getattr(vector_config, field, None)
+            for field in ("ef", "ef_construction", "max_connections")
+        )
+        if "flat" in index_name:
+            index_type = "flat"
+        elif "dynamic" in index_name:
+            index_type = "dynamic"
+        elif all(value is not None for value in hnsw_fields):
+            index_type = "hnsw"
+        else:
+            index_type = "unknown"
 
-        distance_attr = getattr(vector_config, "distance_metric", VectorDistances.COSINE)
+        distance_attr = getattr(vector_config, "distance_metric", None)
         distance_str = {
             VectorDistances.COSINE: "cosine",
             VectorDistances.DOT: "dot",
             VectorDistances.L2_SQUARED: "l2-squared",
-        }.get(distance_attr, "cosine")
+        }.get(distance_attr, "unknown")
 
         result.append({
             "name": col_name,
             "object_count": count,
             "index_type": index_type,
             "distance_metric": distance_str,
+            "hnsw_config": ({"ef": hnsw_fields[0],
+                             "efConstruction": hnsw_fields[1],
+                             "maxConnections": hnsw_fields[2]}
+                            if index_type == "hnsw" else None),
         })
     return result
 
@@ -198,29 +230,12 @@ async def get_collections() -> list[dict]:
     return await asyncio.to_thread(_get_collections_sync)
 
 
-# Collections created mid-operation and normally removed by the operation's own
-# cleanup. A hard kill (SIGKILL, OOM, `docker compose kill`) skips that cleanup,
-# so they are swept at startup instead — nothing can legitimately be using one
-# before the application has begun serving.
-STAGING_MARKERS = ("__importing_", "__tuning_")
-
-
 def _sweep_staging_sync() -> list[str]:
-    client = get_client()
-    removed = []
-    for name in list(client.collections.list_all()):
-        if any(marker in name for marker in STAGING_MARKERS):
-            try:
-                client.collections.delete(name)
-            except Exception:                         # noqa: BLE001
-                log.exception("Could not remove abandoned staging collection %r", name)
-                continue
-            removed.append(name)
-    return removed
+    return collection_recovery.sweep(get_client())
 
 
 async def sweep_staging() -> list[str]:
-    """Remove staging collections abandoned by a previous process."""
+    """Remove positively owned scratch; preserve recovery and unowned names."""
     return await asyncio.to_thread(_sweep_staging_sync)
 
 
@@ -245,6 +260,13 @@ def _collection_config_sync(name: str) -> dict:
     coll = get_client().collections.get(name)
     cfg = coll.config.get()
     vi = cfg.vector_index_config
+    vectorizer = getattr(cfg, "vectorizer_config", None)
+    kind = getattr(vectorizer, "vectorizer", None)
+    model_config = getattr(vectorizer, "model", None)
+    embedding_model = (model_config.get("model")
+                       if getattr(kind, "value", kind) == "text2vec-ollama"
+                       and isinstance(model_config, dict)
+                       and not getattr(cfg, "vector_config", None) else None)
 
     index_type = "flat" if "flat" in type(vi).__name__.lower() else "hnsw"
     distance = {
@@ -263,6 +285,7 @@ def _collection_config_sync(name: str) -> dict:
 
     return {
         "name": name,
+        "embedding_model": embedding_model,
         "index_type": index_type,
         "distance_metric": distance,
         "hnsw_config": hnsw,
@@ -280,35 +303,68 @@ async def get_collection_config(name: str) -> dict:
     return await asyncio.to_thread(_collection_config_sync, name)
 
 
+def _validate_reindex_vectorizer_sync(name: str) -> None:
+    """Fail before staging if recreation would change the stored vector space."""
+    cfg = get_client().collections.get(name).config.get()
+    vectorizer = getattr(cfg, "vectorizer_config", None)
+    kind = getattr(vectorizer, "vectorizer", None)
+    model = getattr(vectorizer, "model", None)
+    expected_model = {"model": settings.embed_model,
+                      "apiEndpoint": f"http://{settings.ollama_host}:{settings.ollama_port}"}
+    compatible = (getattr(kind, "value", kind) == "text2vec-ollama"
+                  and model == expected_model
+                  and getattr(vectorizer, "vectorize_collection_name", None) is False
+                  and not getattr(cfg, "vector_config", None))
+    # Property names/types and skip/name flags also determine provider input.
+    # Refuse unknown module options and custom properties instead of copying
+    # old vectors into the fixed schema with different future insert rules.
+    expected_properties = {p.name: p._to_dict() for p in COLLECTION_PROPERTIES}
+    properties = list(getattr(cfg, "properties", None) or [])
+    compatible = compatible and len(properties) == len(expected_properties) and {p.name for p in properties} == set(expected_properties)
+    for prop in properties:
+        expected = expected_properties.get(prop.name)
+        rules = getattr(prop, "vectorizer_config", None)
+        compatible = compatible and bool(
+            expected
+            and getattr(prop.data_type, "value", prop.data_type) == expected["dataType"][0]
+            and getattr(prop, "vectorizer", None) == "text2vec-ollama"
+            and not getattr(prop, "vectorizer_configs", None)
+            and rules is not None
+            and rules.skip == expected["skip_vectorization"]
+            and rules.vectorize_property_name == expected["vectorize_property_name"]
+            and not getattr(prop, "nested_properties", None))
+    if not compatible:
+        raise ValueError("Reindex would change the collection's vectorizer configuration; "
+                         "re-embed with the configured model first")
+
+
+
 # Just after a collection is created under a name that was dropped moments
-# earlier, Weaviate can reject writes with "could not find index for class ...
-# It might have been deleted in the meantime" until the new index is loaded.
-# The verify suite hit this when it recreated a collection between checks (#95).
+# earlier, Weaviate can reject writes until the new index is loaded.
 _INDEX_NOT_READY = "could not find index"
 _INSERT_ATTEMPTS = 3
 _INSERT_RETRY_DELAY = 1.0
 
 
+@collection_writes.serialized("collection_name")
 def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
     client = get_client()
     coll = client.collections.get(collection_name)
-    pending = list(chunks)
     for attempt in range(1, _INSERT_ATTEMPTS + 1):
-        with coll.batch.dynamic() as batch:
-            for chunk in pending:
-                batch.add_object(properties=chunk)
-        # Read failures only after the batch has flushed on exit. Checking
-        # inside the block missed them, so a job could report 'completed'
-        # with nothing stored.
-        failed = coll.batch.failed_objects
-        if not failed:
-            return
-        if attempt < _INSERT_ATTEMPTS and all(_INDEX_NOT_READY in f.message for f in failed):
-            pending = [f.object_.properties for f in failed]
+        try:
+            # The writer verifies persisted records and removes only UUIDs
+            # generated by a failed attempt before a retry can begin.
+            return batch_write.insert(
+                coll, lambda: ({"properties": chunk} for chunk in chunks),
+                exact=False, cleanup_owned=True)
+        except RuntimeError as exc:
+            failed = coll.batch.failed_objects
+            if not (type(exc) is RuntimeError
+                    and str(exc).startswith("Weaviate rejected ")
+                    and attempt < _INSERT_ATTEMPTS and failed
+                    and all(_INDEX_NOT_READY in getattr(f, "message", "") for f in failed)):
+                raise
             time.sleep(_INSERT_RETRY_DELAY)
-            continue
-        raise RuntimeError(
-            f"{len(failed)} batch error(s) inserting into '{collection_name}': {failed[0].message}")
 
 
 async def insert_chunks(collection_name: str, chunks: list[dict]) -> None:

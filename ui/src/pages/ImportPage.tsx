@@ -146,12 +146,12 @@ export default function ImportPage() {
       <div className="grid grid-cols-2 gap-4 mt-4 mb-4">
         <div>
           <label className="block text-xs text-gray-600 mb-1">Chunk Size: {chunkSize}</label>
-          <input type="range" min={50} max={6000} step={50} value={chunkSize} onChange={e => setChunkSize(+e.target.value)} className="w-full" />
+          <input type="range" min={50} max={6000} step={50} value={chunkSize} onChange={e => { const size = +e.target.value; setChunkSize(size); setChunkOverlap(o => Math.min(o, Math.max(0, size - 50))) }} className="w-full" />
         </div>
         {showOverlap && (
           <div>
             <label className="block text-xs text-gray-600 mb-1">Overlap: {chunkOverlap}</label>
-            <input type="range" min={0} max={2000} step={50} value={chunkOverlap} onChange={e => setChunkOverlap(+e.target.value)} className="w-full" />
+            <input type="range" min={0} max={Math.max(0, Math.min(2000, chunkSize - 50))} step={50} value={chunkOverlap} onChange={e => setChunkOverlap(+e.target.value)} className="w-full" />
           </div>
         )}
         <div>

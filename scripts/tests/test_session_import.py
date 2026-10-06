@@ -47,6 +47,8 @@ class SessionImportTests(unittest.TestCase):
         (self.pkg / 'goldstandard' / name).write_text(json.dumps(data))
 
     def archive(self):
+        # Even a zero-chunk package carries the chunk stream for recovery preflight.
+        (self.pkg / 'chunks.jsonl').touch()
         files = {str(p.relative_to(self.pkg)): 'sha256:' + packager.sha256_file(p)
                  for p in self.pkg.rglob('*.json') if p.name != 'manifest.json'}
         manifest = {'package_format': 1, 'collection': {'name': 'Corpus', 'chunk_count': 0},
@@ -73,7 +75,7 @@ class SessionImportTests(unittest.TestCase):
         directory = self.root / 'uploads' / 'goldstandard_sessions'
         directory.mkdir()
         (directory / 'gs_0123abcd.json').symlink_to(outside)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(gs.GoldStandardError):
             gs.store_session(self.original)
         self.assertEqual(outside.read_text(), 'existing')
         self.assertNotIn('gs_0123abcd', gs._sessions)
@@ -144,7 +146,7 @@ class SessionImportTests(unittest.TestCase):
 
     def test_all_sessions_preflight_before_models_build_or_replacement(self):
         self.sidecar('first.json', self.original)
-        self.sidecar('second.json', session('not-a-generated-id'))
+        self.sidecar('second.json', session(123))
         manifest = {'collection': {'name': 'Corpus'}, 'embedding': {'model': settings.embed_model}}
         (self.pkg / 'manifest.json').write_text(json.dumps(manifest))
         for conflict in ('abort', 'rename', 'replace'):
@@ -173,7 +175,7 @@ class SessionImportTests(unittest.TestCase):
         saved = gs._session_path(self.original['session_id'])
         original_bytes = saved.read_bytes()
         self.sidecar('first.json', self.original)
-        self.sidecar('second.json', session('not-a-generated-id'))
+        self.sidecar('second.json', session(123))
         self.archive()
         for conflict in ('abort', 'rename', 'replace'):
             with self.subTest(conflict=conflict), ExitStack() as mocks:
@@ -199,8 +201,10 @@ class SessionImportTests(unittest.TestCase):
             importer._jobs['test'] = {'status': 'queued'}
             importer._run('test', 'fixture.tar.gz', 'abort')
         self.assertEqual(importer._jobs['test']['status'], 'completed')
-        self.assertEqual(json.loads(gs._session_path(self.original['session_id']).read_text()),
-                         self.original)
+        saved = json.loads(gs._session_path(self.original['session_id']).read_text())
+        self.assertEqual({key: saved[key] for key in self.original}, self.original)
+        self.assertEqual(saved['imported_from']['session_id'], self.original['session_id'])
+        self.assertEqual(saved['imported_from']['collection'], 'Corpus')
 
     def test_redirected_storage_root_is_refused_by_import_store_and_load(self):
         outside = self.root / 'existing-storage'
@@ -210,7 +214,7 @@ class SessionImportTests(unittest.TestCase):
         self.sidecar('session.json', self.original)
         with self.assertRaises(packager.PackageError):
             importer._read_goldstandard_sessions(self.pkg, 'Corpus')
-        with self.assertRaises(ValueError):
+        with self.assertRaises(gs.GoldStandardError):
             gs.store_session(self.original)
         with self.assertLogs(gs.log, level='WARNING'):
             gs.load_sessions_from_disk()
@@ -282,7 +286,7 @@ class SessionImportTests(unittest.TestCase):
         directory.mkdir()
         dest = directory / (self.original['session_id'] + '.json')
         os.mkfifo(dest)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(gs.GoldStandardError):
             gs.store_session(self.original)
         self.assertFalse(gs._sessions)
 

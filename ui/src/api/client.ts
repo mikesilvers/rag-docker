@@ -68,12 +68,14 @@ export const api = {
   getTransferHelp: () => request<{ topic: string; markdown: string }>('GET', '/help/transfer'),
 
   getMetrics: () => request<MetricsResult>('GET', '/metrics/latency'),
+  getSessionDiagnostics: () => request<{ issues: { filename: string; code: string; message: string }[] }>('GET', '/goldstandard/diagnostics'),
   getHealth: () => request<HealthResult>('GET', '/health'),
 }
 
 // Types
 export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
+  hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null
 }
 export interface CreateCollectionBody {
   name: string; index_type: string; distance_metric: string; hnsw_config: { efConstruction: number; maxConnections: number; ef: number }
@@ -117,6 +119,7 @@ export interface SessionValidity {
 export interface Session extends SessionValidity {
   session_id: string; status: string; pairs_total: number; pairs_attempted?: number
   pairs_completed: number; pairs_failed?: number; pairs: GoldPair[]; collection: string; errors?: string[]
+  imported_from?: { session_id: string; collection: string; imported_at: string } | null
 }
 export interface PatchPairBody { status: string; question?: string; answer?: string; ground_truth?: string }
 export interface SaveResult { filename: string; pairs_saved: number; pairs_excluded: number; download_url: string; historical?: boolean; session_validity?: SessionValidity }
@@ -150,6 +153,7 @@ export interface ImportJob {
   job_id: string; status: string; filename: string; on_conflict: string
   collection: string | null; original_collection: string | null; chunks_written: number
   fidelity: string | null; renamed: boolean; notes: string[]
+  restored_sessions?: { source_session_id: string; session_id: string; collection: string }[]
   error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
 }
 export interface PackageSummary {

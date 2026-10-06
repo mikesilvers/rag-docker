@@ -71,7 +71,7 @@ export default function QAPage() {
         </select>
         {role !== 'end_user' && (
           <select value={config.retrieval_mode} disabled className="border rounded px-3 py-2 text-sm bg-gray-50 text-gray-500">
-            <option value={config.retrieval_mode}>{config.retrieval_mode}</option>
+            <option value={config.retrieval_mode}>{["hnsw", "flat"].includes(config.retrieval_mode) ? "Vector — existing index" : config.retrieval_mode}</option>
           </select>
         )}
       </div>

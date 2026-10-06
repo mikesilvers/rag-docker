@@ -7,9 +7,17 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api')))
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
 from config import settings
 from services import model_bundle as models
+
+NEEDS_REPOSITORY = 'needs the whole repository mounted (see scripts/verify/README.md)'
+
+
+def repository_root():
+    parents = Path(__file__).resolve().parents
+    root = parents[2] if len(parents) > 2 else None
+    return root if root is not None and (root / 'IMPLEMENTATION.md').is_file() else None
 
 
 class BundleFixture(unittest.TestCase):
@@ -399,7 +407,7 @@ class InterruptedPublicationTests(BundleFixture):
             'with patch.object(settings, "ollama_models_dir", sys.argv[2]), \\\n'
             '     patch.object(os, "link", die), patch.object(Path, "replace", die):\n'
             '    models.install_model(Path(sys.argv[3]), sys.argv[4])\n')
-        api = os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api'))
+        api = os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api')
         import subprocess
         result = subprocess.run([sys.executable, '-c', script, api, str(self.store), str(self.pkg), self.model])
         self.assertEqual(result.returncode, -9)
@@ -424,7 +432,8 @@ class InterruptedPublicationTests(BundleFixture):
 
 class ImplementationTests(unittest.TestCase):
     def test_embedded_model_source_matches_runtime(self):
-        root = Path(__file__).resolve().parents[2]
+        root = repository_root()
+        if root is None: self.skipTest(NEEDS_REPOSITORY)
         text = (root / 'IMPLEMENTATION.md').read_text()
         for name, fence, language in [('api/services/model_bundle.py', '```', 'python'),
                                       ('scripts/verify/model_integrity.py', '```', 'python'),

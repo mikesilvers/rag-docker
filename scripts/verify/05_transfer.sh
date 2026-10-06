@@ -1,17 +1,28 @@
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26, E27)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E29)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 [ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
 require_stack
+bash ./13_identity.sh
+check "imported evaluation identity acceptance suite" $?
+bash ./14_reindex.sh
+check "exact-record reindex acceptance suite" $?
 C="${PREFIX}Transfer"
-EXPORTS="$REPO_ROOT/exports"
+# The API's /app/exports on the host: the verify project's own folder (#152).
+EXPORTS="${RAG_EXPORTS_DIR:-$REPO_ROOT/exports}"
 
 section "Export, import and tuning"
 
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_session_import.py)
 check "evaluation import and generated-session regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_source_index_boundary.py)
+check "retained-source index boundary regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_retrieval_import.py)
+check "retrieval import and generated-script trust-boundary regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_batch_recovery.py)
+check "import and tuning recovery regressions" $?
 python3 "$REPO_ROOT/scripts/tests/test_session_implementation.py"
 check "embedded session/import verification sources match" $?
 
@@ -53,8 +64,15 @@ with tempfile.TemporaryDirectory() as td:
     chunks = root / "chunks.jsonl"
     chunks.write_bytes(chunks.read_bytes()[: len(chunks.read_bytes()) // 2])
     out = src.parent / (src.name.replace(".tar.gz", "") + "-corrupt.tar.gz")
-    with tarfile.open(out, "w:gz") as t:
-        t.add(root, arcname=root.name)
+    # Written under a .part name, then renamed into place: on Docker Desktop
+    # the API can read a freshly written bind-mounted file as empty (#184).
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
 ENDPY
 CORRUPT=$(python3 - "$EXPORTS/$PKG" <<'ENDPY'
 import pathlib, sys
@@ -73,6 +91,14 @@ sys.exit(0 if 'chunks.jsonl' in (d.get('error') or '') else 1)"
 check "the corruption error names the offending file" $?
 rm -f "$EXPORTS/$CORRUPT"
 
+# Digest-valid malformed retrieval settings must fail before every conflict path.
+python3 ./retrieval_settings.py "$API" "$C" "$EXPORTS/$PKG"
+check "invalid retrieval imports preserve live collections and settings" $?
+# Settings saved before PR #108 (#173): a legacy ef exports and imports as null
+# with a warning or note; other invalid saved settings fail the export early.
+python3 ./legacy_retrieval.py "$API" "$C" "$EXPORTS" "$REPO_ROOT"
+check "E28: legacy ef is cleared on export and import; invalid saved settings fail early" $?
+
 # ── evaluation metadata is validated before mutation (E23) ──────────────────
 # Add one evaluation sidecar to a copy of the package and re-sign the manifest,
 # so the archive is digest-valid and only the session metadata decides.
@@ -81,7 +107,7 @@ make_gs_pkg() {   # make_gs_pkg <session-id> <suffix>; prints the new filename
   python3 - "$EXPORTS/$PKG" "$1" "$2" "$C" <<'ENDPY'
 import hashlib, json, pathlib, sys, tarfile, tempfile
 src, sid, suffix, coll = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
-session = {"session_id": sid, "collection": coll, "status": "completed",
+session = {"session_id": 123 if sid == "__invalid_type__" else sid, "collection": coll, "status": "completed",
            "pairs_total": 1, "pairs_attempted": 1, "pairs_completed": 1, "pairs_failed": 0,
            "pairs": [{"pair_id": "p_0123abcd", "question": "Q?", "answer": "A",
                       "ground_truth": "A", "contexts": ["C"], "source_file": "policies.txt",
@@ -99,15 +125,22 @@ with tempfile.TemporaryDirectory() as td:
         "sha256:" + hashlib.sha256(side.read_bytes()).hexdigest()
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     out = src.parent / (src.name.replace(".tar.gz", "") + f"-{suffix}.tar.gz")
-    with tarfile.open(out, "w:gz") as t:
-        t.add(root, arcname=root.name)
+    # Written under a .part name, then renamed into place: on Docker Desktop
+    # the API can read a freshly written bind-mounted file as empty (#184).
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
     print(out.name)
 ENDPY
 }
 count_of() { api_get "/collections" | python3 -c "
 import json,sys; print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$1'][0])"; }
 
-BADGS=$(make_gs_pkg "not-a-generated-id" badgs)
+BADGS=$(make_gs_pkg "__invalid_type__" badgs)
 api_post "/import" "{\"filename\":\"$BADGS\",\"on_conflict\":\"replace\"}" > /tmp/vfy_imp.json
 ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
 wait_for_job "/import/job/$ijob" 900 >/dev/null
@@ -119,8 +152,8 @@ import json,sys; d=json.load(open('/tmp/vfy_gsjob.json'))
 sys.exit(0 if 'goldstandard/session.json' in json.dumps(d) else 1)"
 check "E23: the refusal names the offending sidecar" $?
 check_eq "E23: replace left the existing collection untouched" "$(count_of "$C")" "$chunks_before"
-code=$(api_code "$API/goldstandard/session/not-a-generated-id")
-check_eq "E23: no session was restored from the refused package" "$code" "404"
+check_eq "E23: no session was restored from the refused package" \
+  "$(jfield "['restored_sessions']" < /tmp/vfy_gsjob.json)" "[]"
 rm -f "$EXPORTS/$BADGS"
 
 # A refused package must change no live state at all. A replace from this
@@ -154,8 +187,15 @@ with tempfile.TemporaryDirectory() as td:
             "sha256:" + hashlib.sha256((gold / name).read_bytes()).hexdigest()
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     out = src.parent / (src.name.replace(".tar.gz", "") + "-mixgs.tar.gz")
-    with tarfile.open(out, "w:gz") as t:
-        t.add(root, arcname=root.name)
+    # Written under a .part name, then renamed into place: on Docker Desktop
+    # the API can read a freshly written bind-mounted file as empty (#184).
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
     print(out.name)
 ENDPY
 )
@@ -198,6 +238,206 @@ drop_collection "$gname"
 (cd "$REPO_ROOT" && docker compose exec -T api \
   rm -f "/app/uploads/goldstandard_sessions/$GS_SID.json") >/dev/null 2>&1 || true
 
+# ── retained-source identities never select outside files (E29, #138) ───────
+# A crafted, digest-valid package names an outside sentinel file in the API
+# container through sources/index.json. Import must refuse it before any live
+# mutation, and nothing exported afterwards may carry the sentinel's bytes.
+E29_TAG="$(python3 -c 'import uuid;print(uuid.uuid4().hex[:12])')"
+E29_SENT="/tmp/e29-sentinel-$E29_TAG"
+E29_TEXT="E29-OUTSIDE-SENTINEL-$E29_TAG"
+(cd "$REPO_ROOT" && docker compose exec -T api sh -c "printf '%s' '$E29_TEXT' > '$E29_SENT'")
+check "E29: the outside sentinel exists in the API container" $?
+make_src_pkg() {   # make_src_pkg <abs|trav|mismatch> <suffix>; prints the new filename
+  python3 - "$EXPORTS/$PKG" "$1" "$2" "$E29_SENT" <<'ENDPY'
+import hashlib, json, pathlib, sys, tarfile, tempfile
+src, mode, suffix, sent = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+sha = lambda b: hashlib.sha256(b).hexdigest()
+with tempfile.TemporaryDirectory() as td:
+    work = pathlib.Path(td)
+    with tarfile.open(src) as t:
+        t.extractall(work, filter="data")
+    root = next(p for p in work.iterdir() if p.is_dir())
+    manifest = json.loads((root / "manifest.json").read_text())
+    idx_path = root / "sources" / "index.json"
+    index = json.loads(idx_path.read_text())
+    digest, entry = next(iter(index["documents"].items()))   # the valid in-directory source
+    if mode == "abs":
+        key = sent
+    elif mode == "trav":
+        key = "../../.." + sent        # /app/sources/<collection>/../../.. is /
+    else:                              # a digest-shaped key whose blob doesn't match it
+        key = "0" * 64
+        blob = root / "sources" / key
+        blob.write_bytes(b"bytes that do not hash to the key")
+        manifest["files"]["sources/" + key] = "sha256:" + sha(blob.read_bytes())
+    index["documents"][key] = dict(entry, filenames=["leak.txt"])
+    idx_path.write_text(json.dumps(index))
+    assert "sources/index.json" in manifest["files"]
+    manifest["files"]["sources/index.json"] = "sha256:" + sha(idx_path.read_bytes())
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    out = src.parent / (src.name.replace(".tar.gz", "") + f"-{suffix}.tar.gz")
+    # Written under a .part name, then renamed into place: on Docker Desktop
+    # the API can read a freshly written bind-mounted file as empty (#184).
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
+    print(out.name)
+ENDPY
+}
+no_sentinel_in_exports() {   # exit 0 when no file or archive member in exports holds the sentinel
+  python3 - "$EXPORTS" "$E29_TEXT" <<'ENDPY'
+import pathlib, sys, tarfile
+root, needle = pathlib.Path(sys.argv[1]), sys.argv[2].encode()
+hits = []
+for p in root.rglob("*"):
+    if not p.is_file():
+        continue
+    if needle in p.read_bytes():
+        hits.append(str(p))
+    if p.name.endswith(".tar.gz"):
+        try:
+            with tarfile.open(p) as t:
+                for m in t.getmembers():
+                    f = t.extractfile(m) if m.isfile() else None
+                    if f is not None and needle in f.read():
+                        hits.append(f"{p.name}:{m.name}")
+        except tarfile.TarError:
+            pass
+print("\n".join(hits) or "no sentinel bytes in exports")
+sys.exit(1 if hits else 0)
+ENDPY
+}
+src_index_hash() {   # sha256 of the collection's retained index inside the API container
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$1" <<'ENDPY'
+import hashlib, sys
+from services import sources
+p = sources.collection_dir(sys.argv[1]) / "index.json"
+print(hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "missing")
+ENDPY
+  )
+}
+collection_names() { api_get "/collections" | python3 -c "
+import json,sys; print(' '.join(sorted(c['name'] for c in json.load(sys.stdin)['collections'])))"; }
+run_import() {   # run_import <file> <on_conflict>; leaves the job in /tmp/vfy_e29job.json
+  api_post "/import" "{\"filename\":\"$1\",\"on_conflict\":\"$2\"}" > /tmp/vfy_imp.json
+  local j; j=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
+  wait_for_job "/import/job/$j" 1800 >/dev/null
+  api_get "/import/job/$j" > /tmp/vfy_e29job.json
+}
+
+# Import → export, rename: the PR's controlled regression in one chain on the
+# live stack. If the import is (wrongly) accepted, export what it created and
+# look for the sentinel there.
+names_before=$(collection_names)
+ABSPKG=$(make_src_pkg abs srcabs)
+run_import "$ABSPKG" rename
+check_eq "E29: an absolute source-index key is refused as PACKAGE_CORRUPT" \
+  "$(jfield "['error_code']" < /tmp/vfy_e29job.json)" "PACKAGE_CORRUPT"
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_e29job.json'))
+sys.exit(0 if 'sources/index.json' in json.dumps(d) else 1)"
+check "E29: the refusal names sources/index.json" $?
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_e29job.json'))
+sys.exit(1 if '$E29_SENT' in json.dumps(d) or '$E29_TEXT' in json.dumps(d) else 0)"
+check "E29: the refusal doesn't echo the outside path or its contents" $?
+read -r e29stat e29name <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_e29job.json')); print(d['status'], d.get('collection') or '-')")"
+if [ "$e29stat" = "completed" ] && [ "$e29name" != "-" ]; then
+  api_post "/export" "{\"collection\":\"$e29name\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+  wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_e29exp.json)" 1800 >/dev/null
+fi
+check_eq "E29: a refused rename import creates no collection" "$(collection_names)" "$names_before"
+leak=$(no_sentinel_in_exports); check "E29: import → export never archives the outside sentinel" $? "$leak"
+[ "$e29stat" = "completed" ] && [ "$e29name" != "-" ] && drop_collection "$e29name"
+
+# Replace: refused before any live mutation, for every unsafe identity.
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":7,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+idx_before=$(src_index_hash "$C")
+for mode in abs trav mismatch; do
+  [ "$mode" = abs ] && P="$ABSPKG" || P=$(make_src_pkg "$mode" "src$mode")
+  run_import "$P" replace
+  check_eq "E29: replace with a $mode source identity is refused as PACKAGE_CORRUPT" \
+    "$(jfield "['error_code']" < /tmp/vfy_e29job.json)" "PACKAGE_CORRUPT"
+  check_eq "E29: ... leaves the chunk count alone ($mode)" "$(count_of "$C")" "$chunks_before"
+  check_eq "E29: ... and the live retrieval settings ($mode)" \
+    "$(api_get "/retrieval/config/$C" | jfield "['top_k']")" "7"
+  check_eq "E29: ... and the retained source index ($mode)" "$(src_index_hash "$C")" "$idx_before"
+  rm -f "$EXPORTS/$P"
+done
+api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
+
+# The valid in-directory source still round-trips after the refusals.
+api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+e29job=$(jfield "['job_id']" < /tmp/vfy_e29exp.json)
+check_eq "E29: the collection still exports after refused imports" \
+  "$(wait_for_job "/export/job/$e29job" 1800)" "completed"
+E29PKG=$(api_get "/export/job/$e29job" | jfield "['filename']")
+python3 - "$EXPORTS/$E29PKG" <<'ENDPY'
+import hashlib, json, re, sys, tarfile
+with tarfile.open(sys.argv[1]) as t:
+    names = {m.name.split("/", 1)[1]: m for m in t.getmembers() if "/" in m.name}
+    index = json.load(t.extractfile(names["sources/index.json"]))
+    docs = index["documents"]
+    ok = bool(docs) and all(re.fullmatch(r"[0-9a-f]{64}", k) for k in docs)
+    for k in docs:
+        ok = ok and hashlib.sha256(t.extractfile(names[f"sources/{k}"]).read()).hexdigest() == k
+sys.exit(0 if ok else 1)
+ENDPY
+check "E29: its package carries the valid source under its digest, and nothing else" $?
+rm -f "$EXPORTS/$E29PKG"
+
+# Read boundaries: an unsafe index already on disk (as a pre-fix import would
+# have left it) must not let export or re-chunking read the sentinel.
+plant() {   # plant <abs|link|restore>
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$C" "$E29_SENT" "$1" <<'ENDPY'
+import hashlib, json, os, sys
+from services import sources
+d = sources.collection_dir(sys.argv[1]); sent, mode = sys.argv[2], sys.argv[3]
+idx, bak = d / "index.json", d / "index.json.e29bak"
+if mode == "restore":
+    keep = json.loads(bak.read_text())["documents"]
+    for p in d.iterdir():
+        if p.is_symlink():
+            p.unlink()
+    os.replace(bak, idx)
+    sys.exit(0)
+if not bak.exists():
+    bak.write_bytes(idx.read_bytes())
+index = json.loads(bak.read_text())
+entry = next(iter(index["documents"].values()))
+if mode == "abs":
+    key = sent
+else:
+    key = hashlib.sha256(open(sent, "rb").read()).hexdigest()
+    os.symlink(sent, d / key)
+index["documents"][key] = dict(entry, filenames=["leak.txt"])
+idx.write_text(json.dumps(index))
+ENDPY
+  )
+}
+for mode in abs link; do
+  plant "$mode"
+  check "E29: planted a $mode source entry on disk" $?
+  api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
+  check_eq "E29: export refuses an on-disk $mode source entry" \
+    "$(wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_e29exp.json)" 1800)" "failed"
+  leak=$(no_sentinel_in_exports); check "E29: ... and archives no outside bytes ($mode)" $? "$leak"
+  api_post "/tune/rechunk" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
+  check_eq "E29: re-chunking refuses an on-disk $mode source entry" \
+    "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "failed"
+  check_eq "E29: ... and leaves the chunk count alone ($mode)" "$(count_of "$C")" "$chunks_before"
+  echo "    (info) GET /tune/$C with the $mode entry planted: HTTP $(api_code "$API/tune/$C")"
+  plant restore
+  check "E29: restored the collection's own source index ($mode)" $?
+done
+check_eq "E29: the restored index is the original" "$(src_index_hash "$C")" "$idx_before"
+(cd "$REPO_ROOT" && docker compose exec -T api rm -f "$E29_SENT") >/dev/null 2>&1 || true
+
 # ── conflict handling ────────────────────────────────────────────────────────
 api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"abort\"}" > /tmp/vfy_imp.json
 ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_imp.json'))['job_id'])")
@@ -216,13 +456,32 @@ check_eq "rename imports alongside the original" "$istat" "completed"
 [ "$irenamed" = "True" ] && [ "$iname" != "$C" ]
 check "the renamed collection has a new name" $? "imported as $iname"
 check_eq "every chunk is imported" "$iwritten" "$chunks_before"
+api_get "/retrieval/config/$iname" | python3 -c '
+import json,sys
+config=json.load(sys.stdin)
+expected={"retrieval_mode":"hybrid","top_k":6,"alpha":0.5,"ef":None,"response_format":"engineer"}
+sys.exit(0 if all(config[k] == v for k,v in expected.items()) and not config["is_default"] else 1)'
+check "renamed import preserves every saved retrieval setting" $?
+
+# A successful destructive replace must be exercised as well as abort/rename.
+api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"replace\"}" > /tmp/vfy_replace.json
+rjob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_replace.json'))['job_id'])")
+rstatus=$(wait_for_job "/import/job/$rjob" 1800)
+check_eq "replace completes after verified final writes" "$rstatus" "completed"
+check_eq "replace reports confirmed target objects" "$(api_get "/import/job/$rjob" | jfield "['chunks_written']")" "$chunks_before"
+api_post "/export" "{\"collection\":\"$C\"}" > /tmp/vfy_replace_exp.json
+rejob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_replace_exp.json'))['job_id'])")
+wait_for_job "/export/job/$rejob" 1800 >/dev/null
+RPKG=$(api_get "/export/job/$rejob" | jfield "['filename']")
+[ "$RPKG" != "$PKG" ]
+check "replace fidelity compares an independent re-export" $?
 
 # ── import is lossless ───────────────────────────────────────────────────────
 api_post "/export" "{\"collection\":\"$iname\"}" > /tmp/vfy_exp2.json
 ejob2=$(python3 -c "import json;print(json.load(open('/tmp/vfy_exp2.json'))['job_id'])")
 wait_for_job "/export/job/$ejob2" 1800 >/dev/null
 PKG2=$(api_get "/export/job/$ejob2" | jfield "['filename']")
-python3 - "$EXPORTS/$PKG" "$EXPORTS/$PKG2" <<'ENDPY'
+python3 - "$EXPORTS/$PKG" "$EXPORTS/$PKG2" "$EXPORTS/$RPKG" <<'ENDPY'
 import json, sys, tarfile, tempfile, pathlib
 def chunks(path):
     with tempfile.TemporaryDirectory() as td:
@@ -231,13 +490,15 @@ def chunks(path):
         root = next(p for p in pathlib.Path(td).iterdir() if p.is_dir())
         return {r["id"]: r for r in
                 (json.loads(l) for l in (root / "chunks.jsonl").read_text().splitlines() if l.strip())}
-a, b = chunks(sys.argv[1]), chunks(sys.argv[2])
-same = set(a) == set(b) and all(a[k]["vector"] == b[k]["vector"]
+a = chunks(sys.argv[1])
+comparisons = [chunks(path) for path in sys.argv[2:]]
+same = all(set(a) == set(b) and all(a[k]["vector"] == b[k]["vector"]
                                 and a[k]["properties"] == b[k]["properties"] for k in a)
+           for b in comparisons)
 sys.exit(0 if same else 1)
 ENDPY
-check "re-export after import is byte-identical (uuids, vectors, properties)" $?
-rm -f "$EXPORTS/$PKG2"
+check "rename and replace preserve exported uuids, vectors and properties" $?
+rm -f "$EXPORTS/$PKG2" "$EXPORTS/$RPKG"
 drop_collection "$iname"
 
 # ── models on import: damaged and namespaced (E26, E27) ──────────────────────
@@ -402,6 +663,33 @@ import json,re,sys
 m=json.load(open('/tmp/vfy_help.json'))['markdown']
 sys.exit(0 if not re.search(r'@@[A-Z_0-9]+@@', m) else 1)"
 check "the help page has no unsubstituted placeholders" $?
+
+# ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
+RP="${PREFIX}BatchRecovery"
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "batch recovery across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+elif [ -n "$restart_refusal" ]; then
+  check "batch recovery across an API restart" 1 "$restart_refusal"
+elif ! [[ "$RP" =~ ^Vfy[A-Za-z0-9_]+$ ]]; then
+  # batch_recovery.py refuses any other prefix, as a guard on its destructive phases.
+  skip "batch recovery across an API restart" "batch_recovery.py accepts only Vfy… prefixes; RAG_TEST_PREFIX='$PREFIX' gives '$RP'"
+else
+  (cd "$REPO_ROOT" && docker compose exec -T api python - prepare --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_prepare.log 2>&1
+  check "batch faults fail truthfully and retain verified recovery" $? \
+    "$(grep -E 'Error|AssertionError' /tmp/vfy_recovery_prepare.log | tail -1)"
+  (cd "$REPO_ROOT" && docker compose restart api) >/dev/null 2>&1
+  for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+  (cd "$REPO_ROOT" && docker compose exec -T api python - check --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_check.log 2>&1
+  check "recovery survives restart; owned scratch swept, unowned names kept" $? \
+    "$(grep -E 'Error|AssertionError' /tmp/vfy_recovery_check.log | tail -1)"
+  (cd "$REPO_ROOT" && docker compose exec -T api python - cleanup --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_cleanup.log 2>&1
+  check "recovery acceptance fixtures are removed" $?
+fi
 
 rm -f "$EXPORTS/$PKG"
 drop_collection "$C"
