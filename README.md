@@ -274,7 +274,7 @@ rag-docker/
 │   ├── Dockerfile
 │   ├── .dockerignore
 │   ├── requirements.in   # Direct dependencies — edit this one
-│   ├── requirements.txt  # Generated lock — all 156 packages pinned; do not hand-edit
+│   ├── requirements.txt  # Generated lock — all packages pinned; do not hand-edit
 │   ├── main.py
 │   ├── config.py
 │   ├── utils.py
@@ -455,22 +455,13 @@ surviving a vectorizer. See `scripts/verify/README.md`.
 
 Both services pin their dependencies, so a rebuild six months from now installs the same versions as today.
 
-**Python (`api/`)** — `requirements.in` holds the direct dependencies; `requirements.txt` is the generated lock with all 156 packages pinned — those 9 plus everything they pull in — and is what the Dockerfile installs. To change a dependency:
+**Python (`api/`)** — `requirements.in` holds the direct dependencies; `requirements.txt` is the generated lock with all packages pinned — direct dependencies plus their transitive dependencies — and is what the Dockerfile installs. To change a dependency:
 
-```bash
-# 1. edit api/requirements.in, then rebuild so pip re-resolves
-docker compose build api
-
-# 2. regenerate the lock — keeps the header, drops the CPU-index packages
-docker run --rm rag-docker-api pip freeze \
-  | grep -viE '^(torch|torchvision)==' \
-  | LC_ALL=C sort > /tmp/pins.txt
-awk '/^[a-zA-Z0-9]/{exit} {print}' api/requirements.txt > /tmp/header.txt
-cat /tmp/header.txt /tmp/pins.txt > api/requirements.txt
-
-# 3. rebuild to confirm the lock installs cleanly, then commit both files
-docker compose build api
-```
+Follow the resolve-against-current-image procedure at the top of
+`api/requirements.in`: resolve changes with `pip install --dry-run --report`,
+update the sorted lock with the resolved pins, rebuild, then compare the image's
+`pip freeze` (excluding torch/torchvision) against the lock. Editing the input
+and rebuilding alone does not resolve changes because Docker installs the lock.
 
 `LC_ALL=C` keeps the ordering stable across machines, so re-locking produces a clean diff instead of a reshuffle.
 
@@ -728,3 +719,225 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/api/inges
 ```
 
 Overlap uses exact character windows, including internal whitespace-only windows, so boundaries can split words. Per-file limits are 10,000 chunks and 10 million parsed characters; overlap also caps duplicated output at 10 million characters. At default 1000/200 sizing, more than 8,000,200 characters exceeds the window limit. Split large documents or select suitable chunk settings. These limits bound ingestion work independently of the upload byte limit.
+
+## Optional backend telemetry
+
+The API includes a private OpenTelemetry SDK lifecycle (#282), disabled by
+default. This foundation does not yet instrument requests/jobs, bridge Python
+logging, or install a collector (#283–#285). Existing application logs retain
+their existing content and behavior; the policy below applies only to OTLP.
+
+To enable it, inject these variables into the **API container** using your own
+Compose override or deployment environment. Compose does not automatically pass
+host variables through. No destination or secret is supplied by this repository.
+
+| Variable | Default / accepted values |
+|---|---|
+| `RAG_OTEL_ENABLED` | `false`; exact `true` or `false` |
+| `RAG_OTEL_ENDPOINT` | Required when enabled; HTTP(S) origin, e.g. `http://collector:4318`; no userinfo, path, query or fragment |
+| `RAG_OTEL_PROTOCOL` | `http/protobuf` only; gRPC is rejected |
+| `RAG_OTEL_HEADERS_FILE` | Optional mounted UTF-8 JSON file containing `Authorization` and/or `X-Api-Key`; max 8 KiB, max 2 KiB per value |
+| `RAG_OTEL_SERVICE_NAME` | `rag-api` |
+| `RAG_OTEL_SERVICE_VERSION` | `1.1.0` |
+| `RAG_OTEL_ENVIRONMENT` | `development` |
+| `RAG_OTEL_TRACES`, `RAG_OTEL_LOGS`, `RAG_OTEL_METRICS` | Each `true`; exact booleans |
+| `RAG_OTEL_SAMPLE_RATIO` | `1.0`; finite 0–1, root-independent ratio sampling |
+| `RAG_OTEL_QUEUE_SIZE` | `256`; integer 1–4096 per trace/log queue |
+| `RAG_OTEL_BATCH_SIZE` | `64`; integer 1–512, no larger than queue |
+| `RAG_OTEL_TIMEOUT_MS` | `1000`; integer 100–10000 per transport attempt |
+| `RAG_OTEL_INTERVAL_MS` | `5000`; integer 1000–60000 for batching/metric export |
+| `RAG_OTEL_SHUTDOWN_MS` | `3000`; integer 100–30000 per lifecycle call |
+
+Service metadata is explicitly operator-selected public telemetry data: use
+non-sensitive identifiers (1–64 ASCII letters, digits, dots, underscores or
+hyphens, starting with a letter/digit). Do not put customer names or secrets in
+these fields. Headers belong in an uncommitted mounted secret file, never in
+service metadata. Credential headers require HTTPS, including loopback destinations;
+HTTP is accepted only without credentials. Header names are case-insensitive and
+duplicate names (including repeated JSON keys) are rejected. Exporter transport ignores ambient proxies/netrc and uses TLS
+verification; redirects are refused. An enabled runtime rejects a process-level
+`OTEL_SDK_DISABLED` value that the SDK recognizes as true (case-insensitive,
+ignoring surrounding whitespace), before reading secrets or creating exporters.
+Remove that setting or set it to false to enable RAG telemetry. Explicit bootstrap
+configuration mappings cannot override this process-level conflict. Disabled RAG
+telemetry remains a no-op regardless of that setting. The runtime never mutates
+the process environment. Other `OTEL_*` variables are not a supported
+configuration interface for this private runtime.
+
+Disabled mode creates no providers, workers or exporters and does not read the
+secret file. Invalid enabled configuration fails API startup with field-only
+errors. No global OTel provider or root logging handler is installed. Manual request, worker and dependency
+instrumentation uses `app.state.telemetry.tracer`, `.logger` and `.meter`, with
+`force_flush()` and `shutdown()` for lifecycle. Raw SDK providers are internal
+implementation details and are not part of the supported runtime API. This
+encapsulation is not a security boundary against Python private-state access.
+
+Before trace/log queueing and again at the final protobuf transport boundary,
+the runtime drops arbitrary text and rebuilds queued scope/resource metadata,
+context and log limits without retaining exception objects. The runtime logger
+copies supplied plain records and both wrapper layers before SDK normalization
+or exception expansion, preserving caller-owned inputs. Keyword emission is
+also supported. Approved string attributes are snapshotted before SDK delegation;
+forbidden mutable values are discarded rather than recursively copied. Callers
+must not mutate mappings during snapshot construction. Non-mapping attributes
+become empty. Every form receives fixed limits before SDK processing (16
+attributes, 128 characters); ambient log or general attribute limits cannot
+truncate approved values or cause emission errors. Wire resources contain
+only the three explicit
+service fields; scope is `rag.telemetry`. Request names use the fixed registered
+HTTP method and route template, with `rag.request` for unmatched routes. Dynamic
+path values and query strings are never recorded. Other names are finite
+`rag.*` operation/stage names and `ollama.*` / `weaviate.*` dependency names
+listed in `api/services/telemetry.py`; unknown names become `rag.operation`.
+Attributes are finite operation, outcome (ok/error/cancelled/partial), error type
+(timeout/connection/validation/internal), registered method-and-route,
+HTTP status class (1xx–5xx or unknown), method, dependency and tuning operation values. Raw exception messages,
+job/session identifiers, model names, customer names and content are excluded.
+All other attributes, span events, trace state, status descriptions, log severity
+text and arbitrary log bodies are removed. Only the fixed completion bodies
+documented below survive; other bodies become `rag.operation`.
+At most one link survives, containing only fixed-size nonzero trace/span IDs and
+a sampled flag. Trace/span IDs remain correlation fields, never authentication.
+The operational metric allowlist and finite dimensions are documented below.
+The private meter validates values before SDK aggregation; instrument-specific
+views and the final export boundary enforce its schema. Export removes arbitrary
+descriptions and exemplars and preserves only fixed declared units. Metric
+exemplar sampling is explicitly disabled, regardless of ambient exemplar settings,
+so dropped attributes never enter an exemplar reservoir. The original
+dimensionless `rag.telemetry.check` remains a one-point synthetic schema probe.
+All points in a metric are validated before admitting the record. Histograms
+require at most 31 finite, strictly increasing boundaries, consistent bucket
+totals and finite optional sum/min/max with min no greater than max. Invalid
+records cannot reserve a name or consume valid metric capacity.
+Do not pass content into instrumentation even though the exporter excludes it:
+active SDK spans may retain inputs until completion.
+
+The pinned SDK and OTLP HTTP exporter are version 1.44.0. Bounded batch queues
+drop oldest pending records under load. Each export makes one HTTP attempt;
+HTTP failures, redirects and network exceptions become fixed diagnostics with
+no endpoint, headers or response body. No retries occur. Application work never
+waits for export. Flush/shutdown wait at most the configured lifecycle deadline
+and return whether processing completed, **not** proof of collector delivery.
+A single daemon lifecycle worker per runtime continues cleanup after a timeout;
+repeated calls reuse it. Requests timeouts cannot cancel OS DNS resolution or
+force-stop a stalled system call, so a timed-out export may finish later. There
+are no additional workers per record or per repeated lifecycle call. API cleanup
+runs on both startup failure and normal shutdown. Collector provisioning and
+deployed end-to-end acceptance remain separate work.
+
+
+### Request and worker tracing (#283)
+
+Each request starts a locally sampled trace. One strictly valid version-00 W3C
+`traceparent` can supply a correlation link; duplicated, malformed, oversized,
+zero-ID and unsupported-version headers are ignored. Caller sampled flags do
+not control local sampling. Valid flag bytes span 00–ff; only the sampled bit
+is retained on the link. `tracestate` and `baggage` are ignored. Headers never
+change application identity, permissions, service metadata or response headers.
+
+Query spans cover reformulation, retrieval and synthesis. Ingest covers parsing,
+chunking, storage and source retention. Export/import, tuning and gold-standard
+generation/regeneration have operation spans and narrower stages. Explicit
+Ollama and Weaviate spans surround application-owned calls, iterator consumption
+and batch flushes. Weaviate-managed embedding remains part of its dependency
+latency; the API cannot report an internal model span for that work.
+
+At each job admission, the runtime and local parent span context are captured.
+The worker starts its child span during actual execution, including raw executor
+threads and async task/thread handoffs. This child may outlive its already-ended
+request parent; it retains the same trace ID after the 202 response. Concurrent
+jobs keep separate contexts, and thread context is restored after execution.
+Application job/session IDs are not exported. Caught and partial failures mark
+safe outcomes without changing existing responses or durable job accounting.
+
+Tracing preserves existing shutdown and cancellation behavior. Cancelling a
+waiter does not stop a running thread; that thread's span ends when its actual
+work exits. Async cancellation and existing timeouts close their spans. The API
+does not gain a worker drain, new retry or new deadline. Forced process death or
+workers surviving telemetry shutdown can lose their final spans; traces are not
+a durable execution ledger. Collector provisioning and deployed acceptance remain
+a separate story.
+
+
+### Operational metrics and correlated logs (#284)
+
+The private meter records executions independently of trace sampling or the
+traces flag. No automatic HTTP/client instrumentation is installed. Request,
+job and dependency measurements have separate denominators; nested stage spans
+do not increment these counts. Every completed execution, including failure or
+cancellation, contributes one count and one monotonic duration in seconds.
+
+| Instrument | Type / unit | Finite dimensions |
+| --- | --- | --- |
+| `rag.api.requests` | Counter / `{request}` | `http.route`, `http.method`, `http.status_class`, `rag.outcome` |
+| `rag.api.duration` | Histogram / `s` | Same as API requests |
+| `rag.api.active` | UpDownCounter / `{request}` | `http.method` |
+| `rag.dependency.calls` | Counter / `{call}` | `rag.dependency`, `rag.outcome` |
+| `rag.dependency.duration` | Histogram / `s` | Same as dependency calls |
+| `rag.dependency.errors` | Counter / `{error}` | `rag.dependency`, `error.type` |
+| `rag.job.completed` | Counter / `{job}` | `rag.operation`, `rag.outcome` |
+| `rag.job.duration` | Histogram / `s` | Same as job completions |
+| `rag.job.active` | UpDownCounter / `{job}` | `rag.operation` |
+
+Routes are the finite METHOD plus route-template strings in `ROUTES` in
+`api/services/telemetry.py`, or `unmatched`. Raw paths are never dimensions.
+Methods are GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, TRACE, CONNECT or
+`unknown`. Status classes are 1xx–5xx or `unknown` when no response start was
+observed. Outcomes are `ok`, `error` or `cancelled`; partial job results count as
+`error` and remain `partial` in logs and durable job status. HTTP 4xx/5xx count
+as errors. Dependency errors exclude cancellation; their error type is
+`timeout`, `connection`, `validation` or `internal`. Jobs cover ingest, export,
+import, tuning and evaluation generation. Dependency operations are the finite
+`ollama.*` and `weaviate.*` names in the same source registry. Iterator duration
+covers its entire consumption lifetime, including time between pulls; premature
+close is cancellation. Iterator construction captures the originating runtime,
+parent span and job token; factory execution and pulls remain lazy and rebind
+that context without leaking it across yields. An unconsumed iterator emits
+nothing. Model token usage is not available and is not invented.
+
+Histograms use explicit boundaries in seconds: 0.005, 0.01, 0.025, 0.05, 0.1,
+0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300 (plus the implicit overflow bucket).
+All valid finite series survive export regardless of the trace/log batch size.
+Malformed, duplicate or excess points reject their entire metric record before
+admission; later valid records remain eligible, including the same metric name.
+Compatible same-name records merge their distinct approved series across scopes
+and resources; repeated identities keep the first snapshot without summing.
+Later records with incompatible kinds, temporality or monotonicity are rejected.
+No valid disjoint series is truncated. SDK aggregation cannot
+allocate a series for arbitrary values under permitted keys. Job IDs, user IDs,
+collection names, filenames, prompts, raw exceptions and trace exemplars never
+become metric dimensions.
+
+Active instruments report process-local concurrency as the sum of increments
+and decrements. They start at actual scope entry and settle at scope exit.
+Cancelling a thread's waiter does not finish its running worker. A task cancelled
+before execution has no started/completed measurement. Process death resets
+active state and cannot synthesize historical completions. Existing job status
+and `/metrics/latency` contracts are unchanged.
+
+If an active-instrument SDK factory or update fails, its mutation state is
+unknown. That entire active instrument is suppressed for the runtime lifetime,
+including subsequent measurements and later wire exports. There is no retry or
+invented reset; other instruments and completion logs continue. This sacrifices
+active-instrument availability until restart, and does not reconstruct correct
+concurrency or remove previously exported backend history or in-flight exports.
+Local validation rejection does not suppress a healthy instrument.
+
+The private `SafeMeter` is a restricted finite-schema interface. It supports
+only the counter, histogram and up/down factories listed above. Unknown names
+and wrong factory/name combinations return inert instruments; gauge and
+observable factories are unsupported. It does not promise general SDK Meter
+compatibility or arbitrary custom metrics.
+
+Explicit structured completion logs use `rag.api.completed`,
+`rag.dependency.completed` or `rag.job.completed` bodies, INFO for successful
+work and WARN otherwise. Finite attributes carry outcomes and categories;
+trace/span IDs correlate with the owning scope. Each job execution generates a
+32-character random hexadecimal `rag.job_token`, inherited by its dependency
+logs and restored after execution. This token is never a durable/application
+job or session ID, metric dimension, authorization value or durable lookup key.
+Concurrent jobs receive separate tokens. With tracing disabled, operation logs
+still emit, with absent trace/span IDs. Logs can be disabled independently.
+Existing application log messages are not forwarded to OTLP: exception text,
+credentials, document content and arbitrary bodies remain excluded. Telemetry
+measurement or logger failures do not change application results.

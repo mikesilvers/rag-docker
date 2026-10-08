@@ -6,6 +6,7 @@ never overlap — they would race on the staging directory and the temporary
 archive.
 """
 from __future__ import annotations
+from services import telemetry
 
 import asyncio
 import logging
@@ -31,6 +32,7 @@ def active_job_for(collection: str) -> str | None:
         return _active.get(collection)
 
 
+@telemetry.traced("rag.export")
 def _run(job_id: str, collection: str, include_models: bool) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
@@ -41,10 +43,12 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
     try:
         result = packager.build(collection, include_models=include_models, progress=progress)
     except packager.PackageError as exc:
+        telemetry.outcome("error", exc)
         _log.warning("Export of %r refused (%s): %s", collection, exc.code, exc.message)
         job.update(status="failed", error=f"PackageError: {exc.message}",
                    error_code=exc.code, error_detail=exc.detail)
     except Exception as exc:                       # noqa: BLE001 - reported to the caller
+        telemetry.outcome("error", exc)
         _log.exception("Export of %r failed", collection)
         job["status"] = "failed"
         job["error"] = f"{type(exc).__name__}: {exc}"
@@ -99,5 +103,5 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
 
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
     # export does not stall ingest or query (spec §6.1).
-    asyncio.create_task(asyncio.to_thread(_run, job_id, collection, include_models))
+    asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, include_models))
     return job_id

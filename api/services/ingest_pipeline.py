@@ -1,4 +1,5 @@
 from __future__ import annotations
+from services import telemetry
 import asyncio
 import logging
 import mimetypes
@@ -33,6 +34,7 @@ def _save_upload(src, dest: Path) -> None:
         shutil.copyfileobj(src, fh, length=1024 * 1024)
 
 
+@telemetry.traced("rag.parse")
 def _parse_file(path: Path) -> tuple[str, list[Any]]:
     ext = path.suffix.lower()
     if ext == ".pdf":
@@ -60,6 +62,7 @@ def _parse_file(path: Path) -> tuple[str, list[Any]]:
     return text, elements
 
 
+@telemetry.traced("rag.ingest")
 @collection_writes.serialized("collection")
 def _process_job_sync(
     job_id: str,
@@ -128,6 +131,7 @@ def _process_job_sync(
                 job["chunks_stored"] += len(chunks)
                 job["files_completed"] += 1
             except Exception as exc:
+                telemetry.outcome("partial", exc)
                 job["files_failed"] += 1
                 job["errors"].append(f"{path.name}: {exc}")
     finally:
@@ -137,6 +141,7 @@ def _process_job_sync(
         job["status"] = "completed"
     elif job["files_failed"] == job["files_total"]:
         job["status"] = "failed"
+        telemetry.outcome("error")
     else:
         job["status"] = "partial"
 
@@ -223,20 +228,23 @@ async def start_ingest_job(
         "skipped": skipped,
     }
 
+    @telemetry.admitted
     def _on_done(future: asyncio.Future) -> None:
         if future.cancelled():
             return
         exc = future.exception()
         if exc is not None:
-            _log.error("ingest job %s failed: %s", job_id, exc)
-            job = _jobs.get(job_id)
-            if job and job["status"] not in ("completed", "partial", "failed"):
-                job["status"] = "failed"
-                job["errors"].append(str(exc))
+            with telemetry.span("rag.failure_report"):
+                telemetry.outcome("error", exc)
+                _log.error("ingest job %s failed: %s", job_id, exc)
+                job = _jobs.get(job_id)
+                if job and job["status"] not in ("completed", "partial", "failed"):
+                    job["status"] = "failed"
+                    job["errors"].append(str(exc))
 
     future = asyncio.get_running_loop().run_in_executor(
         None,
-        _process_job_sync,
+        telemetry.admitted(_process_job_sync),
         job_id,
         file_paths,
         tmp_dir,
