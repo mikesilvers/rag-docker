@@ -427,3 +427,20 @@ Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Pyt
 Retrieval deferred cases also cover superseded success/error notices, notice timer
 ownership, both orders of an acknowledged success and newer failure, and a
 three-save race that must not republish the same result over new edits.
+
+### Optional telemetry foundation (#282)
+
+Suite 01 runs `scripts/tests/test_telemetry.py` in the built API image with
+`--network none`; its real OTLP/protobuf receiver uses container loopback only.
+Checks cover SDK traces/logs/metrics, sentinel privacy across schema surfaces,
+configuration/no-op behavior, overload and bounded lifecycle failure. It also
+checks embedded copies with `scripts/tests/test_telemetry_implementation.py`.
+Suite 01 also runs `scripts/tests/test_tracing.py` for #283 in the same isolated
+API image. Synthetic real ASGI and service launchers exercise all five background
+job families, raw executor/task/thread propagation, correlation after 202,
+concurrent isolation, partial/handled errors, generation failure reporting,
+regeneration timeout, async cancellation and a surviving thread waiter. Tests
+cover actual Ollama client errors, iterator/batch boundaries, finite routes,
+untrusted headers, disabled/failing telemetry and sanitized OTLP links. Backend
+operations are faked; no collector setup or full deployed end-to-end claim is
+made by these offline tests.
