@@ -9,40 +9,49 @@ from fastapi.middleware.cors import CORSMiddleware
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    import logging
-    from services import goldstandard, metrics
-    from services import weaviate_client as wc
-    goldstandard.load_sessions_from_disk()
-    goldstandard.reconcile_interrupted_generations()
-    metrics.load_from_disk()
-    # Sweep only durably owned scratch. Verified recovery collections and
-    # unowned marker-like names must survive startup.
-    log = logging.getLogger(__name__)
+    import asyncio
+    from services.telemetry import bootstrap
+    runtime = bootstrap()
+    app.state.telemetry = runtime
     try:
-        abandoned = await wc.sweep_staging()
-        if abandoned:
-            log.warning("Removed %d staging collection(s) left by a previous run: %s. "
-                        "Re-import the package to try again; it is still in ./exports.",
-                        len(abandoned), ", ".join(abandoned))
-    except Exception:                                 # noqa: BLE001
-        log.exception("Startup sweep of staging collections failed")
-    try:
-        import asyncio
-        from services import importer
-        partial = await asyncio.to_thread(importer.sweep_interrupted_imports)
-        if partial:
-            log.warning("Removed %d collection(s) left half-built by an interrupted "
-                        "import: %s. Re-import the package to try again.",
-                        len(partial), ", ".join(partial))
-        stale_dirs = await asyncio.to_thread(importer.sweep_stale_workdirs)
-        if stale_dirs:
-            log.warning("Removed %d abandoned extraction directory(ies): %s",
-                        len(stale_dirs), ", ".join(stale_dirs))
-    except Exception:                                 # noqa: BLE001
-        log.exception("Startup sweep of interrupted imports failed")
-    yield
-    from services import weaviate_client as wc
-    wc.close_client()
+        import logging
+        from services import goldstandard, metrics
+        from services import weaviate_client as wc
+        goldstandard.load_sessions_from_disk()
+        goldstandard.reconcile_interrupted_generations()
+        metrics.load_from_disk()
+        # Sweep only durably owned scratch. Verified recovery collections and
+        # unowned marker-like names must survive startup.
+        log = logging.getLogger(__name__)
+        try:
+            abandoned = await wc.sweep_staging()
+            if abandoned:
+                log.warning("Removed %d staging collection(s) left by a previous run: %s. "
+                            "Re-import the package to try again; it is still in ./exports.",
+                            len(abandoned), ", ".join(abandoned))
+        except Exception:                                 # noqa: BLE001
+            log.exception("Startup sweep of staging collections failed")
+        try:
+            import asyncio
+            from services import importer
+            partial = await asyncio.to_thread(importer.sweep_interrupted_imports)
+            if partial:
+                log.warning("Removed %d collection(s) left half-built by an interrupted "
+                            "import: %s. Re-import the package to try again.",
+                            len(partial), ", ".join(partial))
+            stale_dirs = await asyncio.to_thread(importer.sweep_stale_workdirs)
+            if stale_dirs:
+                log.warning("Removed %d abandoned extraction directory(ies): %s",
+                            len(stale_dirs), ", ".join(stale_dirs))
+        except Exception:                                 # noqa: BLE001
+            log.exception("Startup sweep of interrupted imports failed")
+        yield
+    finally:
+        try:
+            from services import weaviate_client as wc
+            wc.close_client()
+        finally:
+            await asyncio.to_thread(runtime.shutdown)
 
 
 app = FastAPI(title="RAG API", lifespan=lifespan)
