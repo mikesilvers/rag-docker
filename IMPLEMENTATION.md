@@ -407,7 +407,7 @@ CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 #     docker run --rm rag-docker-api pip freeze
 #
 # Direct dependencies (the human-maintained intent) live in requirements.in.
-# To change a dependency: edit requirements.in, rebuild, re-freeze, commit both.
+# To change a dependency: follow the resolution procedure in requirements.in.
 #
 # torch and torchvision are deliberately ABSENT. They are installed from the
 # PyTorch CPU index in api/Dockerfile because the default PyPI wheel pulls in
@@ -497,6 +497,11 @@ onnx==1.22.0
 onnxruntime==1.30.0
 opencv-python==5.0.0.93
 opentelemetry-api==1.44.0
+opentelemetry-exporter-otlp-proto-common==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0
+opentelemetry-proto==1.44.0
+opentelemetry-sdk==1.44.0
+opentelemetry-semantic-conventions==0.65b0
 orjson==3.12.0
 packaging==26.3
 pandas==2.3.3
@@ -628,6 +633,10 @@ unstructured[pdf,docx,csv,md]>=0.14  # resolved: 0.27.5 -- 'md' extra pulls `mar
 langchain-text-splitters>=0.3     # resolved: 1.1.2
 sentence-transformers>=3.0        # resolved: 6.0.1
 python-multipart>=0.0.9           # resolved: 0.0.32
+
+# Private, optional OTLP HTTP/protobuf telemetry runtime (#282).
+opentelemetry-sdk==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0
 ```
 
 ### api/utils.py
@@ -1243,6 +1252,7 @@ re-ingesting the same document stores one copy and records the extra logical
 name. Storage is proportional to the corpus rather than to upload count.
 """
 from __future__ import annotations
+from services import telemetry
 
 import hashlib
 import json
@@ -1346,6 +1356,7 @@ def restore_package(package: Path, collection: str) -> None:
     shutil.copyfile(src / INDEX_NAME, dest / INDEX_NAME)
 
 
+@telemetry.traced("rag.retain")
 def store(collection: str, filename: str, data: bytes, media_type: str | None = None) -> str:
     """Retain one accepted upload. Returns its sha256."""
     digest = hashlib.sha256(data).hexdigest()
@@ -1624,6 +1635,7 @@ def delete(collection: str) -> None:
 ```python
 """Completed-batch checks with bounded, disk-backed record expectations."""
 from __future__ import annotations
+from services import telemetry
 
 import hashlib
 import json
@@ -1806,10 +1818,10 @@ class ExpectedRecords:
 
         def stored_objects():
             if exact:
-                yield from collection.iterator(include_vector=True)
+                yield from telemetry.iterate(collection.iterator, include_vector=True)
             else:
                 for ids in self.id_batches():
-                    yield from collection.query.fetch_objects(
+                    yield from telemetry.call("weaviate.query", collection.query.fetch_objects,
                         filters=Filter.by_id().contains_any(ids), limit=len(ids), include_vector=True).objects
 
         for obj in stored_objects():
@@ -1828,7 +1840,7 @@ class ExpectedRecords:
             if stored_vector is None and vector is None:
                 if vectorless_allowed is None:
                     config = getattr(collection, "config", None)
-                    vectorizer = config.get().vectorizer if config is not None else None
+                    vectorizer = telemetry.call("weaviate.config", config.get).vectorizer if config is not None else None
                     vectorless_allowed = getattr(vectorizer, "value", None) == "none"
                 if not vectorless_allowed:
                     raise BatchVerificationError(f"Stored vector is missing or invalid for {key}")
@@ -1848,10 +1860,10 @@ class ExpectedRecords:
 
     def rollback(self, collection):
         for ids in self.id_batches():
-            result = collection.data.delete_many(where=Filter.by_id().contains_any(ids))
+            result = telemetry.call("weaviate.query", collection.data.delete_many, where=Filter.by_id().contains_any(ids))
             if result.failed:
                 raise RuntimeError(f"Could not remove {result.failed} owned ingestion object(s)")
-            remaining = collection.query.fetch_objects(filters=Filter.by_id().contains_any(ids), limit=len(ids))
+            remaining = telemetry.call("weaviate.query", collection.query.fetch_objects, filters=Filter.by_id().contains_any(ids), limit=len(ids))
             if remaining.objects:
                 raise RuntimeError("Owned ingestion objects remain after cleanup")
 
@@ -1874,19 +1886,20 @@ def insert(collection, records, *, exact: bool = True, expected_count: int | Non
         expected.capture(factory, expected_count, generated_only=cleanup_owned)
         try:
             queued = 0
-            with collection.batch.dynamic() as batch:
-                for position, record in enumerate(factory()):
-                    record = expected.prepare(position, record)
-                    batch.add_object(properties=record["properties"], uuid=record["id"], vector=record.get("vector"))
-                    queued += 1
-                if queued != expected.count:
-                    raise ValueError("Record stream changed after preflight")
-            failed = collection.batch.failed_objects
-            if failed:
-                detail = getattr(failed[0], "message", None)
-                raise RuntimeError(
-                    f"Weaviate rejected {len(failed)} batch object(s)"
-                    + (f": {detail}" if detail else ""))
+            with telemetry.span("weaviate.batch"):
+                with collection.batch.dynamic() as batch:
+                    for position, record in enumerate(factory()):
+                        record = expected.prepare(position, record)
+                        batch.add_object(properties=record["properties"], uuid=record["id"], vector=record.get("vector"))
+                        queued += 1
+                    if queued != expected.count:
+                        raise ValueError("Record stream changed after preflight")
+                failed = collection.batch.failed_objects
+                if failed:
+                    detail = getattr(failed[0], "message", None)
+                    raise RuntimeError(
+                        f"Weaviate rejected {len(failed)} batch object(s)"
+                        + (f": {detail}" if detail else ""))
             return expected.verify(collection, exact=exact)
         except Exception as original:
             if cleanup_owned:
@@ -1907,6 +1920,7 @@ allows startup to remove scratch; recovery records survive until explicit
 collection deletion or successful completion of their owning operation.
 """
 from __future__ import annotations
+from services import telemetry
 
 import json
 import logging
@@ -1960,7 +1974,7 @@ def begin(target: str, operation: str, client) -> dict:
     token = uuid.uuid4().hex
     marker = "__importing_" if operation == "import" else "__tuning_"
     staging = f"{target}{marker}{token}"
-    if client.collections.exists(staging):
+    if telemetry.call("weaviate.exists", client.collections.exists, staging):
         raise RuntimeError(f"Recovery name '{staging}' is already in use")
     record = dict(version=1, operation_id=token, operation=operation,
                   target=target, staging=staging, state="scratch")
@@ -2053,17 +2067,17 @@ def _check_tuning_cutover(record: dict, client) -> None:
     """Check the owned target without deleting data based on mutable recovery."""
     from services import batch_write, goldstandard
     target, staging = record["target"], record["staging"]
-    if not client.collections.exists(staging):
+    if not telemetry.call("weaviate.exists", client.collections.exists, staging):
         log.warning("Tuning recovery %r is unavailable; target and journal preserved", staging)
         return
-    if client.collections.exists(target):
+    if telemetry.call("weaviate.exists", client.collections.exists, target):
         collection = client.collections.get(target)
-        if collection.config.get().description != cutover_description(record):
+        if telemetry.call("weaviate.config", collection.config.get).description != cutover_description(record):
             log.warning("Tuning target %r has another instance; preserved", target)
             _finish_cutover_check(record, "other-instance")
             return
         def expected():
-            for obj in client.collections.get(staging).iterator(include_vector=True):
+            for obj in telemetry.iterate(client.collections.get(staging).iterator, include_vector=True):
                 vector = obj.vector
                 if isinstance(vector, dict):
                     if set(vector) != {"default"}:
@@ -2104,8 +2118,8 @@ def discard(record: dict, client) -> None:
         _write(updated)
         record.update(updated)
     name = record["staging"]
-    if client.collections.exists(name):
-        client.collections.delete(name)
+    if telemetry.call("weaviate.exists", client.collections.exists, name):
+        telemetry.call("weaviate.delete", client.collections.delete, name)
     sources.delete(name)
     if sources.collection_dir(name).exists():
         raise OSError(f"Could not remove recovery sources for {name}")
@@ -2175,6 +2189,7 @@ def sweep(client) -> list[str]:
 
 ```python
 from __future__ import annotations
+from services import telemetry
 import asyncio
 import logging
 import threading
@@ -2224,7 +2239,7 @@ def get_client() -> weaviate.WeaviateClient:
                     _client.close()
                 except Exception:
                     pass
-            _client = weaviate.connect_to_custom(
+            _client = telemetry.call("weaviate.connect", weaviate.connect_to_custom,
                 http_host=settings.weaviate_host,
                 http_port=settings.weaviate_port,
                 http_secure=False,
@@ -2252,8 +2267,12 @@ def _check_health_sync() -> bool:
     answers "ready" while every client call fails, so health reports green
     during a total outage of Weaviate functionality.
     """
-    client = get_client()
-    return bool(client.is_ready())
+    with telemetry.span("weaviate.health"):
+        client = get_client()
+        ready = bool(client.is_ready())
+        if not ready:
+            telemetry.outcome("error")
+        return ready
 
 
 async def check_health() -> bool:
@@ -2293,7 +2312,7 @@ def _create_collection_sync(
         vectorize_collection_name=False,
     )
 
-    client.collections.create(
+    telemetry.call("weaviate.create", client.collections.create,
         name=name,
         # Set only by import, to bind its in-progress marker to this instance.
         description=description,
@@ -2315,7 +2334,7 @@ async def create_collection(
 
 
 def _collection_exists_sync(name: str) -> bool:
-    return get_client().collections.exists(name)
+    return telemetry.call("weaviate.exists", get_client().collections.exists, name)
 
 
 async def collection_exists(name: str) -> bool:
@@ -2326,9 +2345,9 @@ async def collection_exists(name: str) -> bool:
 def _delete_collection_sync(name: str) -> int:
     client = get_client()
     coll = client.collections.get(name)
-    canonical_name = coll.config.get().name
-    count = coll.aggregate.over_all(total_count=True).total_count
-    client.collections.delete(canonical_name)
+    canonical_name = telemetry.call("weaviate.config", coll.config.get).name
+    count = telemetry.call("weaviate.aggregate", coll.aggregate.over_all, total_count=True).total_count
+    telemetry.call("weaviate.delete", client.collections.delete, canonical_name)
     collection_recovery.retire_deleted(canonical_name, client)
     # Retained originals must go with the collection. The sources volume is
     # surfaced nowhere in the UI, so a leak here would be invisible.
@@ -2357,16 +2376,16 @@ async def delete_collection(name: str) -> int:
 
 def _get_collections_sync() -> list[dict]:
     client = get_client()
-    all_cols = client.collections.list_all()
+    all_cols = telemetry.call("weaviate.list", client.collections.list_all)
     result = []
     for col_name in all_cols:
         coll = client.collections.get(col_name)
-        count = coll.aggregate.over_all(total_count=True).total_count or 0
+        count = telemetry.call("weaviate.aggregate", coll.aggregate.over_all, total_count=True).total_count or 0
 
         # list_all() returns _CollectionConfigSimple, which does NOT carry
         # vector_index_config (weaviate-client 4.x dropped it from the reduced
         # config). Fetch the full per-collection config for the index details.
-        vector_config = coll.config.get().vector_index_config
+        vector_config = telemetry.call("weaviate.config", coll.config.get).vector_index_config
         index_name = type(vector_config).__name__.lower()
         hnsw_fields = tuple(
             getattr(vector_config, field, None)
@@ -2417,7 +2436,7 @@ async def sweep_staging() -> list[str]:
 def _meta_sync() -> dict:
     """Server metadata. `version` goes into the export manifest."""
     try:
-        return get_client().get_meta() or {}
+        return telemetry.call("weaviate.meta", get_client().get_meta) or {}
     except Exception:
         return {}
 
@@ -2433,7 +2452,7 @@ def _collection_config_sync(name: str) -> dict:
     recreate the collection by feeding this straight back in.
     """
     coll = get_client().collections.get(name)
-    cfg = coll.config.get()
+    cfg = telemetry.call("weaviate.config", coll.config.get)
     vi = cfg.vector_index_config
     vectorizer = getattr(cfg, "vectorizer_config", None)
     kind = getattr(vectorizer, "vectorizer", None)
@@ -2480,7 +2499,7 @@ async def get_collection_config(name: str) -> dict:
 
 def _validate_reindex_vectorizer_sync(name: str) -> None:
     """Fail before staging if recreation would change the stored vector space."""
-    cfg = get_client().collections.get(name).config.get()
+    cfg = telemetry.call("weaviate.config", get_client().collections.get(name).config.get)
     vectorizer = getattr(cfg, "vectorizer_config", None)
     kind = getattr(vectorizer, "vectorizer", None)
     model = getattr(vectorizer, "model", None)
@@ -2521,6 +2540,7 @@ _INSERT_ATTEMPTS = 3
 _INSERT_RETRY_DELAY = 1.0
 
 
+@telemetry.traced("rag.store")
 @collection_writes.serialized("collection_name")
 def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
     client = get_client()
@@ -2551,7 +2571,7 @@ def _near_vector_query_sync(
 ) -> list[dict]:
     client = get_client()
     coll = client.collections.get(collection_name)
-    result = coll.query.near_vector(
+    result = telemetry.call("weaviate.query", coll.query.near_vector,
         near_vector=vector,
         limit=top_k,
         return_metadata=MetadataQuery(distance=True),
@@ -2580,7 +2600,7 @@ def _near_text_query_sync(
 ) -> list[dict]:
     client = get_client()
     coll = client.collections.get(collection_name)
-    result = coll.query.near_text(
+    result = telemetry.call("weaviate.query", coll.query.near_text,
         query=query,
         limit=top_k,
         return_metadata=MetadataQuery(distance=True),
@@ -2609,7 +2629,7 @@ def _hybrid_query_sync(
 ) -> list[dict]:
     client = get_client()
     coll = client.collections.get(collection_name)
-    result = coll.query.hybrid(
+    result = telemetry.call("weaviate.query", coll.query.hybrid,
         query=query,
         alpha=alpha,
         limit=top_k,
@@ -2642,14 +2662,14 @@ def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = Non
     from services.chunk_sampling import select_chunk_ids
     request = GenerateRequest(collection=collection_name, sample_size=limit, seed=seed)
     client = get_client()
-    if not client.collections.exists(collection_name):
+    if not telemetry.call("weaviate.exists", client.collections.exists, collection_name):
         raise CollectionNotFoundError(collection_name)
     coll = client.collections.get(collection_name)
-    objects = coll.iterator(include_vector=False, return_properties=[], cache_size=100)
+    objects = telemetry.iterate(coll.iterator, include_vector=False, return_properties=[], cache_size=100)
     identities = select_chunk_ids(objects, request.sample_size, request.seed)
     if not identities:
         return []
-    payloads = coll.query.fetch_objects(
+    payloads = telemetry.call("weaviate.query", coll.query.fetch_objects,
         filters=Filter.by_id().contains_any(identities), limit=len(identities),
         include_vector=False, return_properties=["content", "source_file", "chunk_index"],
     ).objects
@@ -2665,6 +2685,7 @@ def _sample_chunks_sync(collection_name: str, limit: int, seed: int | None = Non
 
 ```python
 from __future__ import annotations
+from services import telemetry
 import time
 
 import httpx
@@ -2674,6 +2695,7 @@ from config import settings
 _BASE = f"http://{settings.ollama_host}:{settings.ollama_port}"
 
 
+@telemetry.traced("ollama.embed")
 async def embed(text: str) -> list[float]:
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
@@ -2684,6 +2706,7 @@ async def embed(text: str) -> list[float]:
         return resp.json()["embedding"]
 
 
+@telemetry.traced("ollama.chat")
 async def chat(system: str, user: str) -> str:
     async with httpx.AsyncClient(timeout=300.0) as client:
         resp = await client.post(
@@ -2701,6 +2724,7 @@ async def chat(system: str, user: str) -> str:
         return resp.json()["message"]["content"]
 
 
+@telemetry.traced("ollama.models")
 async def list_models() -> set[str]:
     """Full names (`name:tag`) of the models Ollama reports."""
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -2709,6 +2733,7 @@ async def list_models() -> set[str]:
         return {m["name"] for m in resp.json().get("models", [])}
 
 
+@telemetry.traced("ollama.health")
 async def check_health() -> dict:
     start = time.monotonic()
     try:
@@ -2719,11 +2744,14 @@ async def check_health() -> dict:
             models = {m["name"].split(":")[0] for m in resp.json().get("models", [])}
             llm_ok = settings.llm_model.split(":")[0] in models
             embed_ok = settings.embed_model.split(":")[0] in models
+            if not (llm_ok and embed_ok):
+                telemetry.outcome("error")
             return {
                 "llm": {"status": "ok" if llm_ok else "error", "latency_ms": latency_ms, "model": settings.llm_model},
                 "embed": {"status": "ok" if embed_ok else "error", "latency_ms": latency_ms, "model": settings.embed_model},
             }
-    except Exception:
+    except Exception as exc:
+        telemetry.outcome("error", exc)
         latency_ms = int((time.monotonic() - start) * 1000)
         return {
             "llm": {"status": "error", "latency_ms": latency_ms, "model": settings.llm_model},
@@ -2735,6 +2763,7 @@ async def check_health() -> dict:
 
 ```python
 from __future__ import annotations
+from services import telemetry
 import threading
 from typing import Any
 from models.schemas import IngestConfig
@@ -2949,6 +2978,7 @@ def chunk_semantic(
     return _enforce_min_chunk_size(chunks, max(min_chunk_size, MIN_SEMANTIC_CHUNK_CHARACTERS))
 
 
+@telemetry.traced("rag.chunk")
 def chunk(
     text: str,
     strategy: str,
@@ -2998,6 +3028,7 @@ def chunk(
 
 ```python
 from __future__ import annotations
+from services import telemetry
 import asyncio
 import logging
 import mimetypes
@@ -3032,6 +3063,7 @@ def _save_upload(src, dest: Path) -> None:
         shutil.copyfileobj(src, fh, length=1024 * 1024)
 
 
+@telemetry.traced("rag.parse")
 def _parse_file(path: Path) -> tuple[str, list[Any]]:
     ext = path.suffix.lower()
     if ext == ".pdf":
@@ -3059,6 +3091,7 @@ def _parse_file(path: Path) -> tuple[str, list[Any]]:
     return text, elements
 
 
+@telemetry.traced("rag.ingest")
 @collection_writes.serialized("collection")
 def _process_job_sync(
     job_id: str,
@@ -3127,6 +3160,7 @@ def _process_job_sync(
                 job["chunks_stored"] += len(chunks)
                 job["files_completed"] += 1
             except Exception as exc:
+                telemetry.outcome("partial", exc)
                 job["files_failed"] += 1
                 job["errors"].append(f"{path.name}: {exc}")
     finally:
@@ -3136,6 +3170,7 @@ def _process_job_sync(
         job["status"] = "completed"
     elif job["files_failed"] == job["files_total"]:
         job["status"] = "failed"
+        telemetry.outcome("error")
     else:
         job["status"] = "partial"
 
@@ -3222,20 +3257,23 @@ async def start_ingest_job(
         "skipped": skipped,
     }
 
+    @telemetry.admitted
     def _on_done(future: asyncio.Future) -> None:
         if future.cancelled():
             return
         exc = future.exception()
         if exc is not None:
-            _log.error("ingest job %s failed: %s", job_id, exc)
-            job = _jobs.get(job_id)
-            if job and job["status"] not in ("completed", "partial", "failed"):
-                job["status"] = "failed"
-                job["errors"].append(str(exc))
+            with telemetry.span("rag.failure_report"):
+                telemetry.outcome("error", exc)
+                _log.error("ingest job %s failed: %s", job_id, exc)
+                job = _jobs.get(job_id)
+                if job and job["status"] not in ("completed", "partial", "failed"):
+                    job["status"] = "failed"
+                    job["errors"].append(str(exc))
 
     future = asyncio.get_running_loop().run_in_executor(
         None,
-        _process_job_sync,
+        telemetry.admitted(_process_job_sync),
         job_id,
         file_paths,
         tmp_dir,
@@ -3255,6 +3293,7 @@ async def start_ingest_job(
 
 ```python
 from __future__ import annotations
+from services import telemetry
 import time
 
 from models.schemas import QueryRequest
@@ -3297,6 +3336,7 @@ def _build_context_engineer(chunks: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
+@telemetry.traced("rag.query")
 async def run_query(
     question: str,
     collection: str,
@@ -3311,26 +3351,29 @@ async def run_query(
                           response_format=response_format)
     retrieval_mode, top_k, alpha, response_format = (
         config.retrieval_mode, config.top_k, config.alpha, config.response_format)
-    reformulated = await ollama.chat(REFORMULATE_SYSTEM, f"Original question: {question}")
-    reformulated = reformulated.strip()
+    with telemetry.span("rag.reformulate"):
+        reformulated = await ollama.chat(REFORMULATE_SYSTEM, f"Original question: {question}")
+        reformulated = reformulated.strip()
 
     t0 = time.monotonic()
-    if retrieval_mode in ("hnsw", "flat"):
-        vector = await ollama.embed(reformulated)
-        chunks = await wc.near_vector_query(collection, vector, top_k)
-    elif retrieval_mode == "hybrid":
-        chunks = await wc.hybrid_query(collection, reformulated, alpha, top_k)
-    elif retrieval_mode == "semantic":
-        chunks = await wc.near_text_query(collection, reformulated, top_k)
+    with telemetry.span("rag.retrieval"):
+        if retrieval_mode in ("hnsw", "flat"):
+            vector = await ollama.embed(reformulated)
+            chunks = await wc.near_vector_query(collection, vector, top_k)
+        elif retrieval_mode == "hybrid":
+            chunks = await wc.hybrid_query(collection, reformulated, alpha, top_k)
+        elif retrieval_mode == "semantic":
+            chunks = await wc.near_text_query(collection, reformulated, top_k)
     retrieval_ms = int((time.monotonic() - t0) * 1000)
 
     t1 = time.monotonic()
-    if response_format == "engineer":
-        context = _build_context_engineer(chunks)
-        answer = await ollama.chat(SYNTHESIS_ENGINEER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}")
-    else:
-        context = _build_context_end_user(chunks)
-        answer = await ollama.chat(SYNTHESIS_END_USER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}")
+    with telemetry.span("rag.synthesis"):
+        if response_format == "engineer":
+            context = _build_context_engineer(chunks)
+            answer = await ollama.chat(SYNTHESIS_ENGINEER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}")
+        else:
+            context = _build_context_end_user(chunks)
+            answer = await ollama.chat(SYNTHESIS_END_USER_SYSTEM, f"Context:\n{context}\n\nQuestion: {question}")
     llm_ms = int((time.monotonic() - t1) * 1000)
 
     citations = None
@@ -3403,6 +3446,7 @@ def select_chunk_ids(objects, limit: int, seed: int | None = None) -> list[str]:
 
 ```python
 from __future__ import annotations
+from services import telemetry
 import asyncio
 import json
 import logging
@@ -4093,6 +4137,7 @@ _GENERATION_ATTEMPTS = 3
 _REGENERATION_TIMEOUT_SECONDS = 1800
 
 
+@telemetry.traced("rag.pair")
 async def _generate_pair(chunk: dict) -> dict:
     user_msg = f"Chunk:\n{chunk['content']}"
     data = None
@@ -4153,11 +4198,13 @@ def _publish_generation_failure(session_id: str, exc: Exception, write_error: Ex
         _store_revision += 1
 
 
+@telemetry.traced("rag.failure_report")
 async def _record_generation_failure(session_id: str, exc: Exception) -> None:
     try:
         await asyncio.to_thread(_update_session_sync, session_id,
                                 lambda current: _failed_generation(current, exc))
     except Exception as write_error:
+        telemetry.outcome("error", write_error)
         log.exception("Could not durably report failed generation for %s", session_id)
         # Otherwise `generating` stays in the cache for as long as the fault
         # lasts, and the UI polls it forever. The cache runs ahead of disk;
@@ -4169,6 +4216,7 @@ async def _record_generation_failure(session_id: str, exc: Exception) -> None:
             log.exception("Could not publish failed generation for %s", session_id)
 
 
+@telemetry.traced("rag.evaluation")
 async def _run_generation(session_id: str, chunks: list[dict]) -> None:
     cancelled = False
     persistence_failure = None
@@ -4180,6 +4228,7 @@ async def _run_generation(session_id: str, chunks: list[dict]) -> None:
                 cancelled = True
                 raise
             except Exception as exc:
+                telemetry.outcome("partial", exc)
                 reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
                 log.warning("Gold-standard pair generation failed: %s", reason, exc_info=True)
                 def failed(current):
@@ -4207,6 +4256,8 @@ async def _run_generation(session_id: str, chunks: list[dict]) -> None:
             if current.get("status") == "generating":
                 current["status"] = ("cancelled" if cancelled else
                     "failed" if not current["pairs"] and current.get("errors") else "completed")
+            if current.get("status") == "failed":
+                telemetry.outcome("error")
         await asyncio.to_thread(_update_session_sync, session_id, finish)
 
 
@@ -4255,14 +4306,16 @@ async def start_generation(
         _prepare_generation_sync, collection, request.sample_size, request.seed)
     session_id = session["session_id"]
 
-    task = asyncio.create_task(_run_generation(session_id, all_chunks))
+    task = asyncio.create_task(telemetry.admitted(_run_generation)(session_id, all_chunks))
     _tasks.add(task)
+
+    report_failure = telemetry.admitted(_record_generation_failure)
 
     def _on_task_done(t: asyncio.Task) -> None:
         _tasks.discard(t)
         exc = t.exception() if not t.cancelled() else None
         if exc is not None:
-            reporter = asyncio.create_task(_record_generation_failure(session_id, exc))
+            reporter = asyncio.create_task(report_failure(session_id, exc))
             _tasks.add(reporter)
             reporter.add_done_callback(_tasks.discard)
 
@@ -4286,6 +4339,7 @@ async def update_pair(session_id: str, pair_id: str, updates: dict) -> dict | No
     return await asyncio.to_thread(_update_session_sync, session_id, change)
 
 
+@telemetry.traced("rag.regenerate")
 async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
     session = get_session(session_id)
     if session is None:
@@ -4410,6 +4464,7 @@ from drifting.
 Format reference: RAG_EXPORT_SPECIFICATIONS.md §4.
 """
 from __future__ import annotations
+from services import telemetry
 
 import hashlib
 import json
@@ -4500,7 +4555,7 @@ def read_chunks(collection: str) -> Iterator[dict]:
         for name in entry.get("filenames", []):
             by_filename.setdefault(name, []).append(digest)
 
-    for obj in col.iterator(include_vector=True):
+    for obj in telemetry.iterate(col.iterator, include_vector=True):
         vector = obj.vector
         # Verified against the live stack: iterator() yields a dict keyed by
         # vector name, not a bare list. Code written for a list breaks here.
@@ -4664,6 +4719,7 @@ def _retrieve_section(has_script: bool, cfg: dict, collection: str) -> str:
             f"answer style `{cfg['response_format']}`.")
 
 
+@telemetry.traced("rag.package")
 def build(
     collection: str,
     include_models: bool = False,
@@ -4954,6 +5010,7 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
     tar.extractall(dest)
 
 
+@telemetry.traced("rag.package")
 def open_package(archive: Path, dest: Path) -> tuple[Path, dict]:
     """Checks 1 and 2 of spec §6.2: readable archive, understood format.
 
@@ -5001,6 +5058,7 @@ def open_package(archive: Path, dest: Path) -> tuple[Path, dict]:
     return pkg, manifest
 
 
+@telemetry.traced("rag.validate")
 def verify_digests(pkg: Path, manifest: dict) -> None:
     """Check 3 of spec §6.2. Names the first file that fails."""
     for rel, expected in sorted(manifest.get("files", {}).items()):
@@ -5045,6 +5103,7 @@ never overlap — they would race on the staging directory and the temporary
 archive.
 """
 from __future__ import annotations
+from services import telemetry
 
 import asyncio
 import logging
@@ -5070,6 +5129,7 @@ def active_job_for(collection: str) -> str | None:
         return _active.get(collection)
 
 
+@telemetry.traced("rag.export")
 def _run(job_id: str, collection: str, include_models: bool) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
@@ -5080,10 +5140,12 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
     try:
         result = packager.build(collection, include_models=include_models, progress=progress)
     except packager.PackageError as exc:
+        telemetry.outcome("error", exc)
         _log.warning("Export of %r refused (%s): %s", collection, exc.code, exc.message)
         job.update(status="failed", error=f"PackageError: {exc.message}",
                    error_code=exc.code, error_detail=exc.detail)
     except Exception as exc:                       # noqa: BLE001 - reported to the caller
+        telemetry.outcome("error", exc)
         _log.exception("Export of %r failed", collection)
         job["status"] = "failed"
         job["error"] = f"{type(exc).__name__}: {exc}"
@@ -5138,7 +5200,7 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
 
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
     # export does not stall ingest or query (spec §6.1).
-    asyncio.create_task(asyncio.to_thread(_run, job_id, collection, include_models))
+    asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, include_models))
     return job_id
 ```
 
@@ -5168,6 +5230,7 @@ depending on whether there is anything to protect:
   is recoverable rather than lost.
 """
 from __future__ import annotations
+from services import telemetry
 
 import asyncio
 import json
@@ -5350,7 +5413,7 @@ def sweep_interrupted_imports() -> list[str]:
                     expected.load_snapshot(snapshot, data["expected_chunks"])
                     if wc._collection_exists_sync(collection):
                         col = wc.get_client().collections.get(collection)
-                        if col.config.get().description != _instance_description(data["instance"]):
+                        if telemetry.call("weaviate.config", col.config.get).description != _instance_description(data["instance"]):
                             # Created after the import stopped, for example while
                             # an earlier start could not resolve this marker.
                             _log.warning("Collection %r is not the one the interrupted import "
@@ -5359,7 +5422,7 @@ def sweep_interrupted_imports() -> list[str]:
                             try:
                                 expected.verify(col, exact=True)
                             except batch_write.BatchVerificationError:
-                                wc.get_client().collections.delete(collection)
+                                telemetry.call("weaviate.delete", wc.get_client().collections.delete, collection)
                                 removed.append(f"{collection} (persisted records did not match import)")
             # Cleanup is an explicit durable phase: failure here never converts
             # a verified target back into a candidate for backend deletion.
@@ -5652,6 +5715,7 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict, progress) -> int:
     return written
 
 
+@telemetry.traced("rag.validate")
 def _validate_package_sources(pkg: Path, manifest: dict) -> None:
     """Check source identities after verify_digests, before any live mutation."""
     source_dir = pkg / "sources"
@@ -5807,6 +5871,7 @@ def _restore_sidecars(target: str, pkg: Path, original: str,
     return notes
 
 
+@telemetry.traced("rag.rebuild")
 @collection_writes.serialized("target")
 def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | None = None) -> int:
     """Create and fill `target`. Removes it again if anything fails."""
@@ -5816,7 +5881,7 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
     except Exception as original:
         # Spec §6.5: a failure part-way leaves no partial collection.
         try:
-            wc.get_client().collections.delete(target)
+            telemetry.call("weaviate.delete", wc.get_client().collections.delete, target)
         except Exception as cleanup:
             raise PackageError("IMPORT_FAILED", f"{type(original).__name__}: {original}; "
                                f"partial target cleanup failed ({cleanup})",
@@ -5824,6 +5889,7 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
         raise
 
 
+@telemetry.traced("rag.import")
 def _run(job_id: str, filename: str, on_conflict: str) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
@@ -5922,6 +5988,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
                        notes=notes)
 
     except PackageError as exc:
+        telemetry.outcome("error", exc)
         job.update(status="failed", error_code=exc.code, error=exc.message,
                    error_detail=exc.detail)
         if staged and temp_collection:
@@ -5932,6 +5999,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             job["error_detail"] = {**(exc.detail or {}), "recovered_as": temp_collection,
                                    "sidecar_snapshots": collection_recovery.sidecar_reference(ownership)}
     except Exception as exc:                          # noqa: BLE001
+        telemetry.outcome("error", exc)
         _log.exception("Import of %r failed", filename)
         job.update(status="failed", error_code="IMPORT_FAILED",
                    error=f"{type(exc).__name__}: {exc}")
@@ -5982,7 +6050,7 @@ async def start_import_job(filename: str, on_conflict: str) -> str:
         "error_code": None,
         "error_detail": None,
     }
-    asyncio.create_task(asyncio.to_thread(_run, job_id, filename, on_conflict))
+    asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict))
     return job_id
 ```
 
@@ -6269,6 +6337,7 @@ the collection `stale`, with a reason and a timestamp. Sessions are never
 deleted and never remapped (spec §7.3).
 """
 from __future__ import annotations
+from services import telemetry
 
 import asyncio
 import copy
@@ -6308,7 +6377,7 @@ def get_job(job_id: str) -> dict | None:
 def _existing_chunks(collection: str) -> list[dict]:
     """Stored properties, without vectors. Used when re-embedding chunk text."""
     col = wc.get_client().collections.get(collection)
-    return [dict(o.properties or {}) for o in col.iterator()]
+    return [dict(o.properties or {}) for o in telemetry.iterate(col.iterator)]
 
 
 def _existing_records(collection: str) -> list[dict]:
@@ -6319,7 +6388,7 @@ def _existing_records(collection: str) -> list[dict]:
 def _iter_existing_records(collection: str):
     seen = set()
     col = wc.get_client().collections.get(collection)
-    for obj in col.iterator(include_vector=True):
+    for obj in telemetry.iterate(col.iterator, include_vector=True):
         identity = str(obj.uuid)
         vector = obj.vector
         if isinstance(vector, dict):
@@ -6340,12 +6409,13 @@ def _iter_existing_records(collection: str):
 def _write_records(collection: str, records: list[dict]) -> None:
     """Supply exact records, drain the batch, then compare backend readback."""
     col = wc.get_client().collections.get(collection)
-    with col.batch.dynamic() as batch:
-        for record in records:
-            batch.add_object(properties=copy.deepcopy(record["properties"]),
-                             uuid=record["id"], vector=copy.deepcopy(record["vector"]))
-    if batch.number_errors:
-        raise RuntimeError(f"{batch.number_errors} error(s) copying reindex records")
+    with telemetry.span("weaviate.batch"):
+        with col.batch.dynamic() as batch:
+            for record in records:
+                batch.add_object(properties=copy.deepcopy(record["properties"]),
+                                 uuid=record["id"], vector=copy.deepcopy(record["vector"]))
+        if batch.number_errors:
+            raise RuntimeError(f"{batch.number_errors} error(s) copying reindex records")
     _verify_records(collection, records)
 
 
@@ -6376,7 +6446,7 @@ def _uncovered_source_files(collection: str, documents: dict) -> list[str]:
             by_filename.setdefault(filename, []).append(digest)
     seen: dict[str, set] = {}
     uncovered = set()
-    for obj in wc.get_client().collections.get(collection).iterator():
+    for obj in telemetry.iterate(wc.get_client().collections.get(collection).iterator):
         props = obj.properties or {}
         filename = props.get("source_file")
         if not isinstance(filename, str) or not filename:
@@ -6411,6 +6481,7 @@ def can_rechunk(collection: str) -> bool:
     return not _uncovered_source_files(collection, documents)
 
 
+@telemetry.traced("rag.chunk")
 def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                          chunk_overlap: int, similarity_threshold: float,
                          min_chunk_size: int) -> list[dict]:
@@ -6499,6 +6570,7 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
 
 # ── Rebuilding ────────────────────────────────────────────────────────────────
 
+@telemetry.traced("rag.rebuild")
 @collection_writes.serialized("collection")
 def _rebuild(collection: str, properties: list[dict], index_type: str | None,
              distance_metric: str | None, progress, *, records: list[dict] | None = None,
@@ -6527,7 +6599,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             _verify_records(collection, records)
         else:
             wc._insert_chunks_sync(staging, properties)
-            staged_count = client.collections.get(staging).aggregate.over_all(total_count=True).total_count
+            staged_count = telemetry.call("weaviate.aggregate", client.collections.get(staging).aggregate.over_all, total_count=True).total_count
             if staged_count != len(properties):
                 raise RuntimeError(f"staged {staged_count} chunks but expected {len(properties)}")
         if source_collection != collection:
@@ -6538,7 +6610,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
             before_replace()
         collection_recovery.begin_cutover(ownership)
         cutover_started = True
-        client.collections.delete(collection)
+        telemetry.call("weaviate.delete", client.collections.delete, collection)
         wc._create_collection_sync(collection, new_index, new_distance, hnsw, preserve_hnsw=True,
                                    description=collection_recovery.cutover_description(ownership))
         if records is not None:
@@ -6549,7 +6621,7 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
                 return (
                     {"id": str(obj.uuid), "vector": (obj.vector or {}).get("default"),
                      "properties": dict(obj.properties or {})}
-                    for obj in client.collections.get(staging).iterator(include_vector=True)
+                    for obj in telemetry.iterate(client.collections.get(staging).iterator, include_vector=True)
                 )
             written = batch_write.insert(client.collections.get(collection), staged,
                                          expected_count=len(properties))
@@ -6595,8 +6667,10 @@ def _rebuild(collection: str, properties: list[dict], index_type: str | None,
                 _log.exception("Could not remove owned staging collection %r", staging)
 
 
+@telemetry.traced("rag.tuning")
 @collection_writes.serialized("collection")
 def _run(job_id: str, collection: str, operation: str, params: dict, *, source_collection: str | None = None) -> None:
+    telemetry.attribute("rag.tuning_operation", operation)
     source_collection = source_collection or collection
     collection = collection_writes.canonical(collection)
     job = _jobs[job_id]
@@ -6673,9 +6747,11 @@ def _run(job_id: str, collection: str, operation: str, params: dict, *, source_c
         job.update(status="completed", chunks_written=written, notes=notes)
 
     except PackageError as exc:
+        telemetry.outcome("error", exc)
         job.update(status="failed", error_code=exc.code, error=exc.message,
                    error_detail=exc.detail)
     except Exception as exc:                          # noqa: BLE001
+        telemetry.outcome("error", exc)
         _log.exception("Tuning %r on %r failed", operation, collection)
         job.update(status="failed", error_code="TUNE_FAILED",
                    error=f"{type(exc).__name__}: {exc}")
@@ -6705,7 +6781,7 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
         "error_code": None,
         "error_detail": None,
     }
-    asyncio.create_task(asyncio.to_thread(_run, job_id, collection, operation, params, source_collection=source_collection))
+    asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, operation, params, source_collection=source_collection))
     return job_id
 ```
 
@@ -8125,40 +8201,49 @@ from fastapi.middleware.cors import CORSMiddleware
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    import logging
-    from services import goldstandard, metrics
-    from services import weaviate_client as wc
-    goldstandard.load_sessions_from_disk()
-    goldstandard.reconcile_interrupted_generations()
-    metrics.load_from_disk()
-    # Sweep only durably owned scratch. Verified recovery collections and
-    # unowned marker-like names must survive startup.
-    log = logging.getLogger(__name__)
+    import asyncio
+    from services.telemetry import bootstrap
+    runtime = bootstrap()
+    app.state.telemetry = runtime
     try:
-        abandoned = await wc.sweep_staging()
-        if abandoned:
-            log.warning("Removed %d staging collection(s) left by a previous run: %s. "
-                        "Re-import the package to try again; it is still in ./exports.",
-                        len(abandoned), ", ".join(abandoned))
-    except Exception:                                 # noqa: BLE001
-        log.exception("Startup sweep of staging collections failed")
-    try:
-        import asyncio
-        from services import importer
-        partial = await asyncio.to_thread(importer.sweep_interrupted_imports)
-        if partial:
-            log.warning("Removed %d collection(s) left half-built by an interrupted "
-                        "import: %s. Re-import the package to try again.",
-                        len(partial), ", ".join(partial))
-        stale_dirs = await asyncio.to_thread(importer.sweep_stale_workdirs)
-        if stale_dirs:
-            log.warning("Removed %d abandoned extraction directory(ies): %s",
-                        len(stale_dirs), ", ".join(stale_dirs))
-    except Exception:                                 # noqa: BLE001
-        log.exception("Startup sweep of interrupted imports failed")
-    yield
-    from services import weaviate_client as wc
-    wc.close_client()
+        import logging
+        from services import goldstandard, metrics
+        from services import weaviate_client as wc
+        goldstandard.load_sessions_from_disk()
+        goldstandard.reconcile_interrupted_generations()
+        metrics.load_from_disk()
+        # Sweep only durably owned scratch. Verified recovery collections and
+        # unowned marker-like names must survive startup.
+        log = logging.getLogger(__name__)
+        try:
+            abandoned = await wc.sweep_staging()
+            if abandoned:
+                log.warning("Removed %d staging collection(s) left by a previous run: %s. "
+                            "Re-import the package to try again; it is still in ./exports.",
+                            len(abandoned), ", ".join(abandoned))
+        except Exception:                                 # noqa: BLE001
+            log.exception("Startup sweep of staging collections failed")
+        try:
+            import asyncio
+            from services import importer
+            partial = await asyncio.to_thread(importer.sweep_interrupted_imports)
+            if partial:
+                log.warning("Removed %d collection(s) left half-built by an interrupted "
+                            "import: %s. Re-import the package to try again.",
+                            len(partial), ", ".join(partial))
+            stale_dirs = await asyncio.to_thread(importer.sweep_stale_workdirs)
+            if stale_dirs:
+                log.warning("Removed %d abandoned extraction directory(ies): %s",
+                            len(stale_dirs), ", ".join(stale_dirs))
+        except Exception:                                 # noqa: BLE001
+            log.exception("Startup sweep of interrupted imports failed")
+        yield
+    finally:
+        try:
+            from services import weaviate_client as wc
+            wc.close_client()
+        finally:
+            await asyncio.to_thread(runtime.shutdown)
 
 
 app = FastAPI(title="RAG API", lifespan=lifespan)
@@ -8172,12 +8257,15 @@ async def request_validation_error(request, exc):
               for error in exc.errors()]
     return api_error(422, "INVALID_PARAMETER", "Request parameters are invalid.", detail=errors)
 
+from services.telemetry import RequestTracing
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RequestTracing)
 
 from routers import help as help_router, health, collections, ingest, query, goldstandard, metrics, retrieval_config, transfer, tuning
 
@@ -11106,6 +11194,86 @@ Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Pyt
 Retrieval deferred cases also cover superseded success/error notices, notice timer
 ownership, both orders of an acknowledged success and newer failure, and a
 three-save race that must not republish the same result over new edits.
+
+### Optional telemetry foundation (#282)
+
+Suite 01 runs `scripts/tests/test_telemetry.py` in the built API image with
+`--network none`; its real OTLP/protobuf receiver uses container loopback only.
+Checks cover SDK traces/logs/metrics, sentinel privacy across schema surfaces,
+configuration/no-op behavior, overload and bounded lifecycle failure. It also
+checks embedded copies with `scripts/tests/test_telemetry_implementation.py`.
+Suite 01 also runs `scripts/tests/test_tracing.py` for #283 in the same isolated
+API image. Synthetic real ASGI and service launchers exercise all five background
+job families, raw executor/task/thread propagation, correlation after 202,
+concurrent isolation, partial/handled errors, generation failure reporting,
+regeneration timeout, async cancellation and a surviving thread waiter. Tests
+cover actual Ollama client errors, iterator/batch boundaries, finite routes,
+untrusted headers, disabled/failing telemetry and sanitized OTLP links. Backend
+operations are faked; no collector setup or full deployed end-to-end claim is
+made by these offline tests.
+
+
+### Operational telemetry (#284)
+
+Suite 01 also runs `scripts/tests/test_telemetry_operations.py` in the built API
+image with `--network none`. Real SDK aggregation and a container-local OTLP
+receiver check exact counts/durations/active values, repeated IDs without new
+series, preserved multiple points, fixed correlated logs, cancellation and
+sampled-out/disabled tracing. Actual ingest/export/import/tuning/evaluation
+launchers use synthetic dependencies to prove handled outcomes preserve durable
+status. No live application content, external model or hosted collector is used.
+Exporter error and malformed-wire cases check bounded failure isolation;
+collector deployment acceptance remains #285.
+
+## Optional Collector acceptance (#285)
+
+```sh
+bash scripts/verify/stack.sh run
+bash scripts/verify/stack.sh run --telemetry
+# Targeted enabled acceptance, after the same guarded disposable startup:
+bash scripts/verify/stack.sh run --telemetry 15
+```
+
+Run these serially. The default run's registered `15_telemetry` suite verifies
+the API is disabled and explicitly reports enabled capture as unexercised.
+The enabled full run uses trusted overlays, the pinned private Collector and a
+bounded private protobuf receiver using the API image. Only the proxy publishes
+a host port. Narrow guard additions allow resource/log bounds only on these two
+services; live image, network, mount and port restrictions remain enforced.
+
+The suite recreates the disposable API through a guarded `telemetry-mode`
+command under the inherited lock to compare enabled/disabled settings. It submits
+real synthetic uploads, queries and concurrent export jobs; inspects actual
+received traces/metrics/logs, parent relationships, correlation and planted
+sentinels; stops/restarts only disposable services; and tests a slow receiver.
+Capture is memory-bounded (16 MiB, 1000 batches, 1 MiB/request, 16 handlers); overflow
+fails inspection. Raw payloads are synthetic and temporary. Summary output records
+five warm-ups and 20 timed health requests plus one query/two jobs per mode,
+latency distributions, sampled container stats and shutdown timing. Health timings
+include host guard overhead; samples are observations, not performance SLOs.
+`RAG_SKIP_SLOW=1` explicitly skips model-dependent enabled acceptance and cannot
+satisfy full telemetry acceptance. No real backend account or external egress is
+needed once dependencies/images/models are available.
+
+Suite 01 always runs capture/evidence regressions and offline/installer/package
+regressions in the built API image with network disabled, in both default and
+telemetry-enabled runs. Compose-only collector checks run on the host without
+starting services. Exact inventory and embedded-source checks also remain
+mandatory in suite 01.
+
+Standalone focused checks: `python3 scripts/tests/test_collector.py` (host stdlib and Compose
+configuration only), `python scripts/tests/test_telemetry_capture.py` (locked API
+dependencies), and the existing verify-stack tests. These complement, not replace,
+both full runs.
+
+Verification telemetry assets are absolute harness-owned paths, including when
+`--checkout` selects another source tree. Their exact read-only bind identities
+are checked; this preserves harness provenance, not a hostile-code sandbox.
+Protocol, version and export budgets are fixed in the verification overlay,
+independent of ambient operator telemetry variables. Before disabled-mode counting,
+the old API, Collector queues and capture handlers terminate; a fresh Collector
+and capture process isolate the zero-traffic observation from earlier exports.
+Malformed capture shapes fail as incomplete evidence, never partial success.
 ````
 
 ### scripts/verify/all.sh
@@ -11213,7 +11381,7 @@ exit "$overall"
 # Run the verification suite on a disposable compose project, never on the
 # live stack (#152).
 #
-#   bash scripts/verify/stack.sh run [--checkout DIR] [suite ...]
+#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry] [suite ...]
 #   bash scripts/verify/stack.sh up [--checkout DIR] [--pull]
 #   bash scripts/verify/stack.sh down
 #
@@ -11291,15 +11459,26 @@ private_problem() {
 # ── arguments, checked before any Docker command ─────────────────────────────
 [ "$#" -ge 1 ] || usage
 CMD="$1"; shift
-case "$CMD" in up|down|run) ;; *) usage ;; esac
+case "$CMD" in up|down|run|telemetry-mode) ;; *) usage ;; esac
+if [ "$CMD" = telemetry-mode ]; then
+  [ "${RAG_VERIFY_LOCK_HELD:-}" = 1 ] || fail "telemetry-mode requires an inherited verification lock"
+fi
 CHECKOUT="$HARNESS"
 PULL=""
+TELEMETRY=0
+OTEL_ENABLED=true
 ARGS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --checkout)
       [ "$CMD" != down ] && [ "$#" -ge 2 ] || usage
       CHECKOUT="$2"; shift 2 ;;
+    --telemetry)
+      [ "$CMD" != down ] || usage
+      TELEMETRY=1; shift ;;
+    --disabled)
+      [ "$CMD" = telemetry-mode ] || usage
+      OTEL_ENABLED=false; shift ;;
     --pull)
       [ "$CMD" = up ] || usage
       PULL=1; shift ;;
@@ -11375,6 +11554,16 @@ trap 'exit 143' TERM
 unset COMPOSE_PATH_SEPARATOR
 export COMPOSE_PROJECT_NAME="$PROJECT"
 export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$HARNESS/docker-compose.verify.yml"
+# Ignore ambient Compose profiles; only this explicit option enables telemetry.
+unset COMPOSE_PROFILES
+export RAG_VERIFY_TELEMETRY="$TELEMETRY"
+export RAG_VERIFY_OTEL_ENABLED="$OTEL_ENABLED"
+export RAG_VERIFY_HARNESS="$HARNESS"
+export RAG_VERIFY_CHECKOUT="$CHECKOUT"
+if [ "$TELEMETRY" = 1 ]; then
+  export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.telemetry.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.telemetry.verify.yml"
+  export COMPOSE_PROFILES=telemetry
+fi
 export RAG_VERIFY_PORT="$PORT"
 export RAG_API="http://localhost:$PORT/api"
 export RAG_EXPECTED_PROXY_PORT="$PORT"
@@ -11500,7 +11689,7 @@ do_guard() {
     rm -f "$config"
     fail "docker compose config failed for $CHECKOUT."
   fi
-  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" <<'GUARDPY'
+  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" "$HARNESS" <<'GUARDPY'
 import json, os, sys
 
 checkout, exports, port, path = sys.argv[1:5]
@@ -11547,8 +11736,16 @@ if config.get('name') != 'rag-verify':
 
 # (h) service keys: only the base file's
 for svc, service in services.items():
-    if extra(service, SERVICE_KEYS):
-        problems.append(f"(h) service {svc!r} uses keys not allowed: {extra(service, SERVICE_KEYS)}")
+    allowed = SERVICE_KEYS
+    if svc in ('otel-collector', 'otel-capture'):
+        allowed = allowed | {'profiles', 'mem_limit', 'cpus', 'stop_grace_period', 'read_only', 'logging'}
+    if extra(service, allowed):
+        problems.append(f"(h) service {svc!r} uses keys not allowed: {extra(service, allowed)}")
+if {'otel-collector', 'otel-capture'} & services.keys():
+    import runpy
+    harness = sys.argv[5] if len(sys.argv) > 5 else checkout
+    guard = runpy.run_path(os.path.join(harness, 'scripts/verify/telemetry_guard.py'))
+    problems.extend(guard['check'](config, harness))
 
 # (i) builds: only a context and a Dockerfile, both inside the checkout
 for svc, service in services.items():
@@ -11658,7 +11855,10 @@ for svc, service in services.items():
             problems.append(f"(d) service {svc!r} mount {target!r} sets bind options")
         if mount.get('type') != 'bind' or (svc == 'api' and target == '/app/exports'):
             continue  # the api's exports: rule (f)
-        if not (os.path.isabs(source) and inside(source, checkout)):
+        trusted_asset = (
+            svc == 'otel-collector' and source == os.path.join(harness, 'scripts/verify', 'collector.yaml')
+            or svc == 'otel-capture' and source == os.path.join(harness, 'scripts/verify'))
+        if not (os.path.isabs(source) and (inside(source, checkout) or trusted_asset)):
             problems.append(f"(d) service {svc!r} binds {source!r}, outside the checkout")
         elif inside(source, checkout_exports) or inside(checkout_exports, source):
             problems.append(f"(d) service {svc!r} binds {source!r}, which is or holds the checkout's exports folder")
@@ -11715,13 +11915,23 @@ do_up() {
   done
   [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 within 60 seconds (last: $code)."
   printf '\nThe verify project is up at http://localhost:%s. To point commands at it:\n\n' "$PORT"
-  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT; do
+  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT RAG_VERIFY_TELEMETRY; do
     printf 'export %s=%q\n' "$var" "${!var}"
   done
+  if [ "$TELEMETRY" = 1 ]; then
+    for var in COMPOSE_PROFILES RAG_VERIFY_HARNESS RAG_VERIFY_CHECKOUT RAG_VERIFY_OTEL_ENABLED; do
+      printf 'export %s=%q\n' "$var" "${!var}"
+    done
+  fi
   printf '\n'
 }
 
 case "$CMD" in
+  telemetry-mode)
+    # Called only by a suite under the inherited lock and explicit opt-in.
+    [ "$TELEMETRY" = 1 ] || fail "telemetry-mode requires --telemetry"
+    do_guard
+    docker compose -p "$PROJECT" up -d --no-deps --no-build --pull never --wait --wait-timeout 120 api || fail "API telemetry reconfiguration failed" ;;
   down)
     do_down || exit 2 ;;
   up)
@@ -12600,6 +12810,27 @@ require_stack
 C="${PREFIX}Infra"
 
 section "§10.5 Infrastructure"
+# Synthetic loopback receiver inside an isolated container; no collector or
+# external network is needed and no request payload from the stack is captured.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_telemetry.py)
+check "OTel configuration, safe OTLP export and bounded lifecycle" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_tracing.py)
+check "OTel request, worker and dependency trace continuity" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_telemetry_operations.py)
+check "OTel operational metrics and sanitized correlated logs" $?
+# Collector evidence and packaging regressions run in both default and enabled
+# modes. Only the Compose-only class needs the host CLI; it never starts services.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_telemetry_capture.py)
+check "OTel capture evidence, identity and transition regressions" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo/scripts/tests "$(docker compose images -q api)" python -m unittest test_collector.Offline test_collector.Installer test_collector.Packager)
+check "OTel offline identity, installer and package regressions" $?
+python3 "$REPO_ROOT/scripts/tests/test_collector.py" Compose
+check "OTel Compose isolation and verification configuration" $?
+python3 "$REPO_ROOT/scripts/tests/test_service_inventory.py"
+check "exact default/telemetry infrastructure inventory policy" $?
+python3 "$REPO_ROOT/scripts/tests/test_telemetry_implementation.py"
+check "OTel embedded implementation stays synchronized" $?
+
 RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
 export RAG_INFRA_TMP
 # Also release the verify lock: this trap replaces the one lock.sh set.
@@ -12672,9 +12903,18 @@ for svc in api weaviate; do
   check_eq "$svc publishes nothing to the host" "$published" "0"
 done
 
-# ── five services, all reporting healthy where a healthcheck exists ──────────
-running=$( (cd "$REPO_ROOT" && docker compose ps --services --filter status=running) | grep -c .)
-check_eq "five services are running" "$running" "5"
+# ── exact service inventory for this guarded verification mode ──────────────
+# The default is exactly api/ollama/proxy/ui/weaviate. Only --telemetry adds
+# otel-collector and otel-capture; arbitrary five/seven services cannot pass.
+verify_service_inventory() {
+  (cd "$REPO_ROOT" && docker compose ps --services --filter status=running) > "$RAG_INFRA_TMP/vfy_running_services" || return 1
+  (cd "$REPO_ROOT" && docker compose ps --all --services) > "$RAG_INFRA_TMP/vfy_all_services" || return 1
+  python3 "$REPO_ROOT/scripts/verify/service_inventory.py" \
+    "$RAG_INFRA_TMP/vfy_compose.json" "$RAG_INFRA_TMP/vfy_running_services" "$RAG_INFRA_TMP/vfy_all_services" \
+    --mode "${RAG_VERIFY_TELEMETRY:-0}" --project "${COMPOSE_PROJECT_NAME:-}" --profiles "${COMPOSE_PROFILES:-}"
+}
+verify_service_inventory
+check "exact configured and running service inventory for verification mode" $?
 unhealthy=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Status}}') | grep -c 'unhealthy' || true)
 check_eq "no service reports unhealthy" "$unhealthy" "0"
 
@@ -12773,6 +13013,8 @@ elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   # Wait up to twice the limit, so a slow restart is still timed (#130).
   elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
   restart_timing_check "$restart_limit" "$elapsed"
+  verify_service_inventory
+  check "exact service inventory survives restart" $?
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_after.json"
   python3 -c "
 import json,sys,os
@@ -12863,6 +13105,8 @@ ENDPY
   elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
   [ -n "$elapsed" ]
   check "healthy again after a restart from the snapshot (took ${elapsed:-unknown}s)" $? "not healthy after $((restart_limit * 2))s"
+  verify_service_inventory
+  check "exact service inventory survives snapshot restart" $?
   # Weaviate logs the snapshot it started from on "raft node constructed".
   restored=$( (cd "$REPO_ROOT" && docker compose -p "$project" logs weaviate 2>/dev/null) | python3 -c "
 import json, sys
@@ -20256,4 +20500,4582 @@ if problems:
     print(f"{settings.llm_model} looks degraded ({'; '.join(problems)}): {answer[:200]!r}")
     sys.exit(1)
 print(f"{settings.llm_model} answers sensibly: {answer[:120]!r}")
+```
+
+### api/services/telemetry.py
+
+```python
+"""Private OTel lifecycle. No global providers, auto-instrumentation or log bridge.
+
+The final OTLP protobuf boundary is deliberately stricter than ordinary attribute
+redaction: arbitrary text is never a telemetry field in this foundation.
+"""
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+import json
+import math
+import os
+from pathlib import Path
+import re
+import threading
+import time
+import uuid
+from urllib.parse import urlsplit
+
+
+class TelemetryConfigError(ValueError):
+    """Messages contain field names only, never configuration values."""
+
+
+@dataclass(frozen=True)
+class Config:
+    enabled: bool = False
+    endpoint: str = field(default="", repr=False)
+    headers: dict = field(default_factory=dict, repr=False)
+    service: str = "rag-api"
+    version: str = "1.1.0"
+    environment: str = "development"
+    traces: bool = True
+    logs: bool = True
+    metrics: bool = True
+    sample_ratio: float = 1.0
+    queue_size: int = 256
+    batch_size: int = 64
+    timeout_ms: int = 1000
+    interval_ms: int = 5000
+    shutdown_ms: int = 3000
+
+    @classmethod
+    def from_env(cls, env=None):
+        env = os.environ if env is None else env
+        def value(key, default):
+            return env.get("RAG_OTEL_" + key, str(default))
+        def boolean(key, default):
+            raw = value(key, str(default).lower())
+            if raw not in ("true", "false"):
+                raise TelemetryConfigError("Invalid RAG_OTEL_" + key)
+            return raw == "true"
+        if not boolean("ENABLED", False):
+            return cls()  # No other configuration or secret file is examined.
+        # All pinned SDK providers read the real process environment, even when
+        # callers supply a separate RAG configuration mapping. Reject the
+        # conflict before creating exporters rather than mutate global state.
+        if os.environ.get("OTEL_SDK_DISABLED", "").lower().strip() == "true":
+            raise TelemetryConfigError("RAG_OTEL_ENABLED conflicts with OTEL_SDK_DISABLED")
+        def number(key, default, low, high, integer=True):
+            try:
+                raw = value(key, default)
+                parsed = int(raw) if integer else float(raw)
+                if not math.isfinite(parsed) or not low <= parsed <= high:
+                    raise ValueError
+                return parsed
+            except (ValueError, TypeError, OverflowError):
+                raise TelemetryConfigError("Invalid RAG_OTEL_" + key) from None
+        def identifier(key, default):
+            raw = value(key, default)
+            if not isinstance(raw, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}", raw):
+                raise TelemetryConfigError("Invalid RAG_OTEL_" + key)
+            return raw
+        if value("PROTOCOL", "http/protobuf") != "http/protobuf":
+            raise TelemetryConfigError("Invalid RAG_OTEL_PROTOCOL (requires http/protobuf)")
+        endpoint = value("ENDPOINT", "")
+        try:
+            url = urlsplit(endpoint)
+            valid = (url.scheme in ("http", "https") and url.hostname and url.port != 0
+                     and not url.username and not url.password and not url.query
+                     and not url.fragment and url.path in ("", "/")
+                     and not any(c.isspace() for c in endpoint))
+        except (ValueError, TypeError):
+            valid = False
+        if not valid:
+            raise TelemetryConfigError("Invalid RAG_OTEL_ENDPOINT (requires HTTP origin)")
+        headers = {}
+        secret_file = value("HEADERS_FILE", "")
+        if secret_file:
+            try:
+                with Path(secret_file).open("rb") as source:
+                    raw = source.read(8193)
+                if len(raw) > 8192:
+                    raise ValueError
+                def header_pairs(pairs):
+                    result = {}
+                    for key, val in pairs:
+                        canonical = {"authorization": "Authorization", "x-api-key": "X-Api-Key"}.get(key.lower())
+                        if canonical is None or canonical in result:
+                            raise ValueError
+                        result[canonical] = val
+                    return result
+                headers = json.loads(raw, object_pairs_hook=header_pairs)
+                if (not isinstance(headers, dict) or len(headers) > 8
+                    or any(not isinstance(k, str) or not isinstance(v, str)
+                           or not re.fullmatch(r"[A-Za-z0-9-]{1,64}", k)
+                           or k.lower() not in ("authorization", "x-api-key")
+                           or not v or len(v) > 2048 or any(ord(c) < 32 or ord(c) > 126 for c in v)
+                           for k, v in headers.items())):
+                    raise ValueError
+            except (OSError, ValueError, TypeError):
+                raise TelemetryConfigError("Invalid RAG_OTEL_HEADERS_FILE") from None
+        if headers and url.scheme != "https":
+            raise TelemetryConfigError("RAG_OTEL_HEADERS_FILE requires HTTPS RAG_OTEL_ENDPOINT")
+        queue = number("QUEUE_SIZE", 256, 1, 4096)
+        batch = number("BATCH_SIZE", 64, 1, 512)
+        if batch > queue:
+            raise TelemetryConfigError("RAG_OTEL_BATCH_SIZE exceeds RAG_OTEL_QUEUE_SIZE")
+        return cls(True, endpoint.rstrip("/"), headers,
+                   identifier("SERVICE_NAME", "rag-api"), identifier("SERVICE_VERSION", "1.1.0"),
+                   identifier("ENVIRONMENT", "development"),
+                   boolean("TRACES", True), boolean("LOGS", True), boolean("METRICS", True),
+                   number("SAMPLE_RATIO", 1, 0, 1, False), queue, batch,
+                   number("TIMEOUT_MS", 1000, 100, 10000),
+                   number("INTERVAL_MS", 5000, 1000, 60000),
+                   number("SHUTDOWN_MS", 3000, 100, 30000))
+
+
+# Finite value vocabularies prevent sensitive values hidden under approved keys.
+ENUMS = {
+    "rag.operation": frozenset(("startup", "query", "ingest", "export", "import", "tuning", "evaluation")),
+    "rag.outcome": frozenset(("ok", "error", "cancelled", "partial")),
+    "error.type": frozenset(("timeout", "connection", "validation", "internal")),
+}
+SPAN_NAMES = frozenset("rag." + v for v in ENUMS["rag.operation"])
+
+# Explicit code-owned vocabulary. Raw URL/path values never enter this schema.
+ROUTES = frozenset(('DELETE /collections/{name}', 'GET /collections', 'GET /export/job/{job_id}', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /metrics/latency', 'GET /packages', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
+ENUMS.update({"http.route": ROUTES | {"unmatched"},
+              "rag.tuning_operation": frozenset(("rechunk", "reembed", "reindex")),
+              "http.status_class": frozenset(("1xx", "2xx", "3xx", "4xx", "5xx"))})
+SPAN_NAMES |= ROUTES | frozenset(("rag.request", "rag.reformulate", "rag.retrieval", "rag.synthesis",
+    "rag.parse", "rag.chunk", "rag.store", "rag.retain", "rag.package", "rag.validate",
+    "rag.rebuild", "rag.pair", "rag.regenerate", "rag.failure_report",
+    "ollama.chat", "ollama.embed", "ollama.models", "ollama.health",
+    "weaviate.connect", "weaviate.health", "weaviate.create", "weaviate.delete",
+    "weaviate.exists", "weaviate.list", "weaviate.meta", "weaviate.config",
+    "weaviate.aggregate", "weaviate.query", "weaviate.iterate", "weaviate.batch"))
+
+# Separate finite metric schemas: correlation never enters SDK aggregation.
+JOB_NAMES = frozenset("rag." + v for v in ("ingest", "export", "import", "tuning", "evaluation"))
+DEPENDENCIES = frozenset(n for n in SPAN_NAMES if n.startswith(("ollama.", "weaviate.")))
+ENUMS.update({"http.method": frozenset(("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT", "unknown")),
+              "rag.dependency": DEPENDENCIES})
+ENUMS["http.status_class"] |= {"unknown"}
+BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300)
+_API_KEYS = ("http.route", "http.method", "http.status_class", "rag.outcome")
+_DEP_KEYS = ("rag.dependency", "rag.outcome")
+_JOB_KEYS = ("rag.operation", "rag.outcome")
+# name -> (instrument factory, unit, exact dimension keys)
+METRICS = {
+    "rag.telemetry.check": ("create_counter", "", ()),
+    "rag.api.requests": ("create_counter", "{request}", _API_KEYS),
+    "rag.api.duration": ("create_histogram", "s", _API_KEYS),
+    "rag.api.active": ("create_up_down_counter", "{request}", ("http.method",)),
+    "rag.dependency.calls": ("create_counter", "{call}", _DEP_KEYS),
+    "rag.dependency.duration": ("create_histogram", "s", _DEP_KEYS),
+    "rag.dependency.errors": ("create_counter", "{error}", ("rag.dependency", "error.type")),
+    "rag.job.completed": ("create_counter", "{job}", _JOB_KEYS),
+    "rag.job.duration": ("create_histogram", "s", _JOB_KEYS),
+    "rag.job.active": ("create_up_down_counter", "{job}", ("rag.operation",)),
+}
+METRIC_NAMES = frozenset(METRICS)
+LOG_BODIES = frozenset(("rag.api.completed", "rag.dependency.completed", "rag.job.completed"))
+
+
+def safe_attributes(attributes):
+    if not isinstance(attributes, Mapping):
+        return {}
+    result = {k: v for k, v in attributes.items()
+              if k in ENUMS and isinstance(v, str) and v in ENUMS[k]}
+    token = attributes.get("rag.job_token")
+    if isinstance(token, str) and re.fullmatch(r"[0-9a-f]{32}", token):
+        result["rag.job_token"] = token
+    return result
+
+
+def metric_values(name, key):
+    if key == "rag.outcome":
+        return ENUMS[key] - {"partial"}
+    if name.startswith("rag.job.") and key == "rag.operation":
+        return frozenset(n[4:] for n in JOB_NAMES)
+    return ENUMS[key]
+
+
+def metric_attributes(name, attributes):
+    keys = METRICS[name][2]
+    clean = {k: v for k, v in (attributes or {}).items() if k in keys}
+    # Missing/invalid approved dimensions are rejected, never allocated as a
+    # new series. Unapproved keys (including job IDs) cannot affect aggregation.
+    if clean.get("rag.outcome") == "partial":
+        clean["rag.outcome"] = "error"
+    if set(clean) != set(keys) or any(not isinstance(v, str) or v not in metric_values(name, k) for k, v in clean.items()):
+        return None
+    return clean
+
+
+def metric_series_limit(name):
+    return math.prod(len(metric_values(name, key)) for key in METRICS[name][2])
+
+
+class ActiveHealth:
+    """Bounded runtime-local loss of availability after ambiguous SDK failure."""
+    NAMES = frozenset(("rag.api.active", "rag.job.active"))
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self._suppressed = set()
+
+    def suppress(self, name):
+        with self.lock:
+            if name in self.NAMES:
+                self._suppressed.add(name)
+
+    def snapshot(self):
+        with self.lock:
+            return frozenset(self._suppressed)
+
+
+class SafeInstrument:
+    def __init__(self, name, instrument=None, health=None):
+        self.name, self.instrument = name, instrument
+        self._health = health if health is not None else ActiveHealth()
+
+    def _measure(self, method, value, attributes):
+        if self.instrument is None:
+            return False
+        try:
+            clean = metric_attributes(self.name, attributes)
+            if clean is None or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                return False
+            if METRICS[self.name][0] != "create_up_down_counter" and value < 0:
+                return False
+        except Exception:
+            return False
+        # Input rejection does not taint an instrument. Once the SDK is called,
+        # a raised error cannot tell us whether it already changed aggregation.
+        with self._health.lock:
+            if self.name in self._health.snapshot():
+                return False
+            try:
+                getattr(self.instrument, method)(value, clean)
+                return True
+            except Exception:
+                self._health.suppress(self.name)
+                return False
+
+    def add(self, amount, attributes=None, context=None):
+        return self._measure("add", amount, attributes)
+
+    def record(self, amount, attributes=None, context=None):
+        return self._measure("record", amount, attributes)
+
+
+class SafeMeter:
+    """Restricted finite-schema factories, not a general SDK Meter interface.
+
+    Unknown names or mismatched factories return inert instruments. Gauge and
+    observable factories are intentionally unsupported.
+    """
+    def __init__(self, meter, health=None):
+        self._meter = meter
+        self._health = health if health is not None else ActiveHealth()
+        self._instruments = {}
+        self._lock = threading.Lock()
+
+    def _create(self, kind, name):
+        schema = METRICS.get(name)
+        if schema is None or schema[0] != kind:
+            return SafeInstrument(name)
+        with self._lock:
+            if name not in self._instruments:
+                with self._health.lock:
+                    if name in self._health.snapshot():
+                        return SafeInstrument(name)
+                    try:
+                        instrument = getattr(self._meter, kind)(name, unit=schema[1])
+                    except Exception:
+                        self._health.suppress(name)
+                        return SafeInstrument(name)
+                    self._instruments[name] = SafeInstrument(name, instrument, self._health)
+            return self._instruments[name]
+
+    def create_counter(self, name, unit="", description="", **kwargs):
+        return self._create("create_counter", name)
+
+    def create_histogram(self, name, unit="", description="", **kwargs):
+        return self._create("create_histogram", name)
+
+    def create_up_down_counter(self, name, unit="", description="", **kwargs):
+        return self._create("create_up_down_counter", name)
+
+
+def _metric_point_attributes(name, point):
+    keys = METRICS[name][2]
+    approved = [a.key for a in point.attributes if a.key in keys]
+    if len(set(approved)) != len(approved):
+        return None
+    raw = {a.key: a.value.string_value for a in point.attributes
+           if a.value.WhichOneof("value") == "string_value"}
+    if raw.get("rag.outcome") == "partial":
+        return None
+    return metric_attributes(name, raw)
+
+
+def _valid_metric(record):
+    """Admit every point before reserving a name or allocating output.
+
+    The foundation probe has one dimensionless point. Operational instruments
+    retain all distinct permitted series; malformed records cannot consume the
+    capacity of a later valid record, even when it uses the same metric name.
+    """
+    kind = record.WhichOneof("data")
+    if record.name not in METRIC_NAMES or kind not in ("sum", "gauge", "histogram"):
+        return False
+    probe = record.name == "rag.telemetry.check"
+    factory = METRICS[record.name][0]
+    if not probe and kind != ("histogram" if factory == "create_histogram" else "sum"):
+        return False
+    data = getattr(record, kind)
+    if not 1 <= len(data.data_points) <= metric_series_limit(record.name):
+        return False
+    if kind != "gauge" and data.aggregation_temporality not in (1, 2):
+        return False
+    if not probe and kind == "sum" and data.is_monotonic != (factory == "create_counter"):
+        return False
+    seen = set()
+    for point in data.data_points:
+        clean = _metric_point_attributes(record.name, point)
+        if clean is None:
+            return False
+        identity = tuple(sorted(clean.items()))
+        if identity in seen:
+            return False
+        seen.add(identity)
+        if kind != "histogram":
+            value = point.WhichOneof("value")
+            if (value is None or not math.isfinite(getattr(point, value))
+                or (not probe and factory == "create_counter" and getattr(point, value) < 0)):
+                return False
+            continue
+        bounds, buckets = point.explicit_bounds, point.bucket_counts
+        if not (len(bounds) <= 31 and len(buckets) == len(bounds) + 1
+                and point.count >= 0 and all(n >= 0 for n in buckets)
+                and sum(buckets) == point.count
+                and all(math.isfinite(n) for n in bounds)
+                and all(a < b for a, b in zip(bounds, bounds[1:]))
+                and all(not point.HasField(f) or math.isfinite(getattr(point, f))
+                        for f in ("sum", "min", "max"))
+                and (not (point.HasField("min") and point.HasField("max"))
+                     or point.min <= point.max)):
+            return False
+        if not probe and (tuple(bounds) != BUCKETS or any(
+                point.HasField(f) and getattr(point, f) < 0 for f in ("sum", "min", "max"))):
+            return False
+    return True
+
+
+def sanitize_wire(data, signal, config, suppressed_metrics=()):
+    """Rebuild protobuf, dropping all fields not explicitly copied below."""
+    from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+    from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
+    from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import ExportMetricsServiceRequest
+    types = {"traces": (ExportTraceServiceRequest, "resource_spans", "scope_spans", "spans"),
+             "logs": (ExportLogsServiceRequest, "resource_logs", "scope_logs", "log_records"),
+             "metrics": (ExportMetricsServiceRequest, "resource_metrics", "scope_metrics", "metrics")}
+    cls, resources, scopes, records = types[signal]
+    source = cls.FromString(data)
+    output = cls()
+    resource = getattr(output, resources).add()
+    for key, val in (("service.name", config.service), ("service.version", config.version),
+                     ("deployment.environment.name", config.environment)):
+        attr = resource.resource.attributes.add(key=key)
+        attr.value.string_value = val
+    scope = getattr(resource, scopes).add()
+    scope.scope.name = "rag.telemetry"
+    def attrs(src, dst):
+        seen = set()
+        for a in src:
+            if (a.key not in seen and a.value.WhichOneof("value") == "string_value"
+                and (a.value.string_value in ENUMS.get(a.key, ())
+                     or (a.key == "rag.job_token" and re.fullmatch(r"[0-9a-f]{32}", a.value.string_value)))):
+                dst.add().CopyFrom(a)
+                seen.add(a.key)
+    count = 0
+    metric_records = {}
+    for rs in getattr(source, resources):
+        for ss in getattr(rs, scopes):
+            for record in getattr(ss, records):
+                if signal != "metrics" and count >= config.batch_size:
+                    break
+                if signal == "metrics":
+                    if record.name in suppressed_metrics or not _valid_metric(record):
+                        continue
+                    kind = record.WhichOneof("data")
+                    src_data = getattr(record, kind)
+                    metadata = (kind, getattr(src_data, "aggregation_temporality", None),
+                                getattr(src_data, "is_monotonic", None))
+                    if record.name in metric_records:
+                        dest, admitted_metadata, identities = metric_records[record.name]
+                        if metadata != admitted_metadata:
+                            continue
+                    else:
+                        dest = getattr(scope, records).add()
+                        identities = set()
+                        metric_records[record.name] = (dest, metadata, identities)
+                else:
+                    dest = getattr(scope, records).add()
+                count += 1
+                if signal == "traces":
+                    dest.name = record.name if record.name in SPAN_NAMES else "rag.operation"
+                    dest.trace_id, dest.span_id, dest.parent_span_id = record.trace_id, record.span_id, record.parent_span_id
+                    dest.start_time_unix_nano, dest.end_time_unix_nano = record.start_time_unix_nano, record.end_time_unix_nano
+                    dest.kind = record.kind
+                    dest.status.code = record.status.code
+                    attrs(record.attributes, dest.attributes)
+                    for link in record.links[:1]:
+                        if len(link.trace_id) == 16 and any(link.trace_id) and len(link.span_id) == 8 and any(link.span_id):
+                            dest.links.add(trace_id=link.trace_id, span_id=link.span_id, flags=link.flags & 1)
+                elif signal == "logs":
+                    dest.time_unix_nano, dest.observed_time_unix_nano = record.time_unix_nano, record.observed_time_unix_nano
+                    dest.trace_id, dest.span_id = record.trace_id, record.span_id
+                    dest.severity_number = record.severity_number
+                    dest.body.string_value = record.body.string_value if record.body.string_value in LOG_BODIES else "rag.operation"
+                    attrs(record.attributes, dest.attributes)
+                else:
+                    dest.name = record.name
+                    dest.unit = METRICS[record.name][1]
+                    kind = record.WhichOneof("data")
+                    src_data, dst_data = getattr(record, kind), getattr(dest, kind)
+                    if kind != "gauge":
+                        dst_data.aggregation_temporality = src_data.aggregation_temporality
+                    if kind == "sum":
+                        dst_data.is_monotonic = src_data.is_monotonic
+                    # Merge disjoint series across scopes/resources. Repeated
+                    # identities retain the first snapshot; never sum snapshots.
+                    for point in src_data.data_points:
+                        identity = tuple(sorted(_metric_point_attributes(record.name, point).items()))
+                        if identity in identities:
+                            continue
+                        identities.add(identity)
+                        dp = dst_data.data_points.add()
+                        dp.start_time_unix_nano, dp.time_unix_nano = point.start_time_unix_nano, point.time_unix_nano
+                        for key, value in _metric_point_attributes(record.name, point).items():
+                            dp.attributes.add(key=key).value.string_value = value
+                        if kind == "histogram":
+                            dp.count = point.count
+                            for field_name in ("sum", "min", "max"):
+                                if point.HasField(field_name):
+                                    setattr(dp, field_name, getattr(point, field_name))
+                            dp.bucket_counts.extend(point.bucket_counts)
+                            dp.explicit_bounds.extend(point.explicit_bounds)
+                        else:
+                            val = point.WhichOneof("value")
+                            setattr(dp, val, getattr(point, val))
+    return output.SerializeToString()
+
+
+def _session(signal, config, health=None):
+    import requests
+    class SafeSession(requests.Session):
+        def __init__(self):
+            super().__init__()
+            self.trust_env = False  # No ambient proxy, netrc, or credentials.
+        def post(self, url, data=None, **kwargs):
+            result = requests.Response()
+            result.status_code = 400  # SDK treats this as non-retryable.
+            result._content = b"telemetry export failed"
+            try:
+                payload = sanitize_wire(data, signal, config, health.snapshot() if health is not None else ())
+                # Explicit arguments override ambient OTEL_* TLS/header options.
+                self.cookies.clear()
+                self.headers.clear()
+                self.headers.update({"Content-Type": "application/x-protobuf", **config.headers})
+                with super().post(config.endpoint + "/v1/" + signal, data=payload,
+                                  timeout=config.timeout_ms / 1000, verify=True,
+                                  allow_redirects=False, stream=True) as response:
+                    if 200 <= response.status_code < 300:
+                        result.status_code = 200
+                        result._content = b""
+            except Exception:
+                # No exception text, response bodies, destination or headers in
+                # SDK diagnostics; normal application logging is untouched.
+                pass
+            return result
+    return SafeSession()
+
+
+class Runtime:
+    def __init__(self, config):
+        self.config = config
+        self._providers = []
+        self._active_health = ActiveHealth()
+        self.tracer = self.logger = self.meter = None
+        self._lock = threading.Lock()
+        self._worker = None
+        self._closed = False
+        self._shutdown_requested = threading.Event()
+        self._last_ok = True
+
+    def _run(self, shutdown):
+        ok = True
+        try:
+            for provider in self._providers:
+                try:
+                    if shutdown:
+                        provider.shutdown()
+                    else:
+                        ok = provider.force_flush(timeout_millis=self.config.shutdown_ms) is not False and ok
+                except Exception:
+                    ok = False
+        finally:
+            self._last_ok = ok
+
+    def _lifecycle(self, shutdown):
+        with self._lock:
+            if shutdown:
+                self._closed = True
+                self._shutdown_requested.set()
+            elif self._closed:
+                return False
+            if shutdown and getattr(self, "_shutdown_finished", False):
+                return self._last_ok
+            if self._worker is None:
+                def work():
+                    closing = shutdown
+                    while True:
+                        self._run(closing)
+                        with self._lock:
+                            if not closing and self._shutdown_requested.is_set():
+                                closing = True
+                                continue
+                            if closing:
+                                self._shutdown_finished = True
+                            self._worker = None
+                            return
+                self._worker = threading.Thread(target=work, name="rag-telemetry-lifecycle", daemon=True)
+                self._worker.start()
+            worker = self._worker
+        worker.join(self.config.shutdown_ms / 1000)
+        return not worker.is_alive() and self._last_ok
+
+    def force_flush(self):
+        return True if not self.config.enabled else self._lifecycle(False)
+
+    def shutdown(self):
+        return True if not self.config.enabled else self._lifecycle(True)
+
+
+def bootstrap(env=None):
+    config = Config.from_env(env)
+    runtime = Runtime(config)
+    if not config.enabled:
+        return runtime
+    from opentelemetry.metrics import NoOpMeterProvider
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider, SpanLimits
+    from opentelemetry.sdk.trace.sampling import TraceIdRatioBased
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.sdk._logs import LoggerProvider, ReadWriteLogRecord, LogRecordLimits
+    from opentelemetry._logs import LogRecord
+    from opentelemetry.context import Context
+    from opentelemetry.sdk.util.instrumentation import InstrumentationScope
+    from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+    from opentelemetry.sdk.metrics import MeterProvider, AlwaysOffExemplarFilter
+    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+    from opentelemetry.sdk.metrics.view import View, DropAggregation, ExplicitBucketHistogramAggregation
+    from opentelemetry.exporter.otlp.proto.http import Compression
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+    class SafeBatchSpans(BatchSpanProcessor):
+        def on_end(self, span):
+            from opentelemetry.sdk.trace import ReadableSpan
+            from opentelemetry.trace import Status, SpanContext
+            def clean_context(context):
+                return None if context is None else SpanContext(
+                    trace_id=context.trace_id, span_id=context.span_id,
+                    is_remote=context.is_remote, trace_flags=context.trace_flags)
+            clean = ReadableSpan(
+                name=span.name if span.name in SPAN_NAMES else "rag.operation",
+                context=clean_context(span.context), parent=clean_context(span.parent), resource=resource,
+                links=safe_links(span.links),
+                attributes=safe_attributes(span.attributes), kind=span.kind,
+                status=Status(span.status.status_code), start_time=span.start_time,
+                end_time=span.end_time, instrumentation_scope=scope)
+            super().on_end(clean)
+
+    class SafeLogger:
+        """Keep SDK normalization/exception expansion off caller-owned records."""
+        def __init__(self, logger):
+            self._logger = logger
+
+        def emit(self, record=None, *, timestamp=None, observed_timestamp=None,
+                 context=None, severity_number=None, severity_text=None, body=None,
+                 attributes=None, event_name=None, exception=None):
+            if record is not None:
+                import copy
+                target = copy.copy(record.log_record if isinstance(record, ReadWriteLogRecord) else record)
+            else:
+                target = LogRecord(timestamp=timestamp, observed_timestamp=observed_timestamp,
+                                   context=context, severity_number=severity_number,
+                                   severity_text=severity_text, body=body, attributes=attributes,
+                                   event_name=event_name, exception=exception)
+            target.attributes = safe_attributes(target.attributes)
+            # Every form must bypass SDK default wrappers, which read ambient
+            # limits before our batch processor can sanitize or repair data.
+            wrapped = ReadWriteLogRecord(log_record=target, resource=resource,
+                                         instrumentation_scope=scope, limits=log_limits)
+            return self._logger.emit(wrapped)
+
+    class SafeBatchLogs(BatchLogRecordProcessor):
+        def on_emit(self, record):
+            # Rebuild both layers: shallow copies retain caller-owned metadata
+            # and exception objects, even after the visible attributes are safe.
+            source = record.log_record
+            clean_record = LogRecord(
+                timestamp=source.timestamp, observed_timestamp=source.observed_timestamp,
+                severity_number=source.severity_number,
+                body=source.body if isinstance(source.body, str) and source.body in LOG_BODIES else "rag.operation",
+                attributes=safe_attributes(source.attributes))
+            clean_record.context = Context()
+            clean_record.trace_id = source.trace_id
+            clean_record.span_id = source.span_id
+            clean_record.trace_flags = source.trace_flags
+            clean = ReadWriteLogRecord(log_record=clean_record, resource=resource,
+                                       instrumentation_scope=scope, limits=log_limits)
+            super().on_emit(clean)
+
+    resource = Resource({"service.name": config.service, "service.version": config.version,
+                         "deployment.environment.name": config.environment})
+    scope = InstrumentationScope("rag.telemetry")
+    log_limits = LogRecordLimits(max_attributes=16, max_attribute_length=128,
+                                max_log_record_attributes=16, max_log_record_attribute_length=128)
+    internal_meter = NoOpMeterProvider()
+    def exporter(cls, signal):
+        return cls(endpoint=config.endpoint + "/v1/" + signal,
+                   headers={"Content-Type": "application/x-protobuf"},
+                   timeout=config.timeout_ms / 1000, compression=Compression.NoCompression,
+                   session=_session(signal, config, runtime._active_health), meter_provider=internal_meter)
+    batch = dict(max_queue_size=config.queue_size, max_export_batch_size=config.batch_size,
+                 schedule_delay_millis=config.interval_ms, export_timeout_millis=config.timeout_ms,
+                 meter_provider=internal_meter)
+    try:
+        if config.traces:
+            provider = TracerProvider(resource=resource, shutdown_on_exit=False, meter_provider=internal_meter,
+                                     sampler=TraceIdRatioBased(config.sample_ratio),
+                                     span_limits=SpanLimits(max_attributes=16, max_events=0, max_links=1,
+                                                            max_attribute_length=128))
+            runtime._providers.append(provider)
+            provider.add_span_processor(SafeBatchSpans(exporter(OTLPSpanExporter, "traces"), **batch))
+            runtime.tracer = provider.get_tracer("rag.telemetry")
+        if config.logs:
+            provider = LoggerProvider(resource=resource, shutdown_on_exit=False, meter_provider=internal_meter)
+            runtime._providers.append(provider)
+            provider.add_log_record_processor(SafeBatchLogs(exporter(OTLPLogExporter, "logs"), **batch))
+            runtime.logger = SafeLogger(provider.get_logger("rag.telemetry"))
+        if config.metrics:
+            reader = PeriodicExportingMetricReader(exporter(OTLPMetricExporter, "metrics"),
+                                                  export_interval_millis=config.interval_ms,
+                                                  export_timeout_millis=config.timeout_ms)
+            provider = MeterProvider(resource=resource, shutdown_on_exit=False, metric_readers=[reader],
+                                     exemplar_filter=AlwaysOffExemplarFilter(),
+                                     views=[View(instrument_name="*", aggregation=DropAggregation()),
+                                            *[View(instrument_name=name, attribute_keys=set(schema[2]),
+                                                   aggregation=ExplicitBucketHistogramAggregation(BUCKETS) if schema[0] == "create_histogram" else None)
+                                              for name, schema in METRICS.items()]])
+            runtime._providers.append(provider)
+            runtime.meter = SafeMeter(provider.get_meter("rag.telemetry"), runtime._active_health)
+    except Exception:
+        runtime.shutdown()
+        raise TelemetryConfigError("Telemetry initialization failed") from None
+    return runtime
+
+
+# App-scoped manual instrumentation. No global provider or request baggage.
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import wraps
+import inspect
+
+_runtime = ContextVar("rag_telemetry_runtime", default=None)
+_operation = ContextVar("rag_telemetry_operation", default=None)
+_job_token = ContextVar("rag_telemetry_job_token", default=None)
+
+
+class Operation:
+    """Per-execution state, independent of sampling and recording spans."""
+    def __init__(self, runtime, name, current=None):
+        self.runtime, self.current = runtime, current
+        self.category = "api" if name == "rag.request" else ("job" if name in JOB_NAMES else ("dependency" if name in DEPENDENCIES else None))
+        self.attributes = {"rag.outcome": "ok"}
+        self.started = time.monotonic()
+        self.active = None
+        self.closed = False
+        if self.category == "job":
+            self.attributes["rag.operation"] = name[4:]
+        elif self.category == "dependency":
+            self.attributes["rag.dependency"] = name
+        elif self.category == "api":
+            self.attributes.update({"http.route": "unmatched", "http.method": "unknown", "http.status_class": "unknown"})
+
+    def measure(self, name, value, attributes):
+        try:
+            if self.runtime.meter is not None:
+                kind = METRICS[name][0]
+                instrument = getattr(self.runtime.meter, kind)(name)
+                if name in self.runtime._active_health.snapshot():
+                    return False
+                if (instrument.record if kind == "create_histogram" else instrument.add)(value, attributes) is not False:
+                    return True
+        except Exception:
+            pass
+        # The facade owns suppression at SDK/factory exception boundaries.
+        # False also means local validation rejection, which must not taint it.
+        return False
+
+    def enter(self):
+        if self.category in ("api", "job"):
+            keys = METRICS["rag." + self.category + ".active"][2]
+            attributes = {key: self.attributes[key] for key in keys}
+            if self.measure("rag." + self.category + ".active", 1, attributes):
+                self.active = attributes
+
+    def finish(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self.category is None:
+            return
+        prefix = "rag." + self.category
+        if self.active is not None:
+            self.measure(prefix + ".active", -1, self.active)
+        attrs = dict(self.attributes)
+        attrs["rag.outcome"] = "error" if attrs["rag.outcome"] == "partial" else attrs["rag.outcome"]
+        count = {"api": ".requests", "job": ".completed", "dependency": ".calls"}[self.category]
+        self.measure(prefix + count, 1, attrs)
+        self.measure(prefix + ".duration", max(0, time.monotonic() - self.started), attrs)
+        if self.category == "dependency" and attrs["rag.outcome"] == "error":
+            attrs.setdefault("error.type", "internal")
+            self.measure(prefix + ".errors", 1, attrs)
+        try:
+            if self.runtime.logger is not None:
+                from opentelemetry._logs import SeverityNumber
+                from opentelemetry import context, trace
+                log_context = context.Context()
+                if self.current is not None:
+                    log_context = trace.set_span_in_context(self.current, log_context)
+                attrs = dict(self.attributes)
+                token = _job_token.get()
+                if token is not None:
+                    attrs["rag.job_token"] = token
+                self.runtime.logger.emit(body=prefix + ".completed", context=log_context,
+                    severity_number=SeverityNumber.INFO if attrs["rag.outcome"] == "ok" else SeverityNumber.WARN,
+                    attributes=safe_attributes(attrs))
+        except Exception:
+            pass
+
+
+
+def safe_links(links):
+    from opentelemetry.trace import Link, SpanContext, TraceFlags, TraceState
+    result = []
+    for link in links[:1]:
+        c = link.context
+        if c.is_valid:
+            clean = SpanContext(c.trace_id, c.span_id, c.is_remote,
+                                TraceFlags(int(c.trace_flags) & 1), TraceState())
+            result.append(Link(clean))
+    return result
+
+
+def capture():
+    runtime = _runtime.get()
+    if runtime is None or runtime.tracer is None:
+        return runtime, None
+    from opentelemetry.trace import get_current_span
+    try:
+        return runtime, get_current_span().get_span_context()
+    except Exception:
+        return runtime, None
+
+
+@contextmanager
+def bind(snapshot, *, job_token=None):
+    runtime, parent = snapshot
+    token = _runtime.set(runtime)
+    operation_token = _operation.set(None)
+    job_context = _job_token.set(job_token)
+    attached = None
+    try:
+        try:
+            if runtime is not None and runtime.tracer is not None:
+                from opentelemetry import context, trace
+                clean = context.Context()
+                if parent is not None and parent.is_valid:
+                    clean = trace.set_span_in_context(trace.NonRecordingSpan(parent), clean)
+                attached = context.attach(clean)
+        except Exception:
+            pass
+        yield
+    finally:
+        if attached is not None:
+            try:
+                context.detach(attached)
+            except Exception:
+                pass
+        _job_token.reset(job_context)
+        _operation.reset(operation_token)
+        _runtime.reset(token)
+
+
+def admitted(fn):
+    """Capture now, bind inside actual execution (including raw executors)."""
+    snapshot = capture()
+    job_token = _job_token.get()
+    if inspect.iscoroutinefunction(fn):
+        @wraps(fn)
+        async def run(*args, **kwargs):
+            with bind(snapshot, job_token=job_token):
+                return await fn(*args, **kwargs)
+    else:
+        @wraps(fn)
+        def run(*args, **kwargs):
+            with bind(snapshot, job_token=job_token):
+                return fn(*args, **kwargs)
+    return run
+
+
+def error_type(exc):
+    import httpx
+    if isinstance(exc, (TimeoutError, httpx.TimeoutException)) or isinstance(exc.__cause__, (TimeoutError, httpx.TimeoutException)):
+        return "timeout"
+    if isinstance(exc, (ConnectionError, httpx.TransportError)):
+        return "connection"
+    if isinstance(exc, ValueError):
+        return "validation"
+    return "internal"
+
+
+def attribute(key, value, target=None):
+    if key not in ENUMS or not isinstance(value, str) or value not in ENUMS[key]:
+        return
+    state = _operation.get()
+    if state is not None and (target is None or state.current is target):
+        state.attributes[key] = value
+    try:
+        if target is None:
+            runtime = _runtime.get()
+            if runtime is None or runtime.tracer is None:
+                return
+            from opentelemetry.trace import get_current_span
+            target = get_current_span()
+        target.set_attribute(key, value)
+    except Exception:
+        pass
+
+
+def outcome(value, exc=None, target=None):
+    if not isinstance(value, str) or value not in ENUMS["rag.outcome"]:
+        return
+    attribute("rag.outcome", value, target)
+    if exc is not None and value != "cancelled":
+        attribute("error.type", error_type(exc), target)
+    runtime = _runtime.get()
+    if runtime is None or runtime.tracer is None:
+        return
+    try:
+        from opentelemetry import trace
+        current = target if target is not None else trace.get_current_span()
+        if value != "ok":
+            current.set_status(trace.Status(trace.StatusCode.ERROR))
+    except Exception:
+        pass
+
+
+@contextmanager
+def span(name, *, links=(), server=False, method=None):
+    runtime = _runtime.get()
+    current = None
+    token = None
+    try:
+        if runtime is not None and runtime.tracer is not None:
+            from opentelemetry import trace, context
+            kind = trace.SpanKind.SERVER if server else (trace.SpanKind.CLIENT if name in DEPENDENCIES else trace.SpanKind.INTERNAL)
+            current = runtime.tracer.start_span(name, kind=kind, links=links,
+                                                attributes={"rag.outcome": "ok"})
+            token = context.attach(trace.set_span_in_context(current))
+    except Exception:
+        pass
+    state = Operation(runtime, name, current) if runtime is not None else None
+    state_token = _operation.set(state)
+    job_context = _job_token.set(uuid.uuid4().hex) if name in JOB_NAMES and runtime is not None else None
+    if state is not None:
+        if state.category == "api":
+            attribute("http.method", method if method in ENUMS["http.method"] else "unknown", current)
+        state.enter()
+    try:
+        yield current
+    except BaseException as exc:
+        import asyncio
+        outcome("cancelled" if isinstance(exc, (asyncio.CancelledError, GeneratorExit)) else "error", exc, current)
+        raise
+    finally:
+        try:
+            if state is not None:
+                state.finish()
+        except Exception:
+            pass
+        if job_context is not None:
+            _job_token.reset(job_context)
+        _operation.reset(state_token)
+        if token is not None:
+            try:
+                context.detach(token)
+            except Exception:
+                pass
+        if current is not None:
+            try:
+                current.end()
+            except Exception:
+                pass
+
+
+def traced(name):
+    def decorate(fn):
+        if inspect.iscoroutinefunction(fn):
+            @wraps(fn)
+            async def run(*args, **kwargs):
+                with span(name):
+                    return await fn(*args, **kwargs)
+        else:
+            @wraps(fn)
+            def run(*args, **kwargs):
+                with span(name):
+                    return fn(*args, **kwargs)
+        return run
+    return decorate
+
+
+def call(name, fn, /, *args, **kwargs):
+    with span(name):
+        return fn(*args, **kwargs)
+
+
+def iterate(fn, /, *args, **kwargs):
+    # Admission is eager, execution lazy. An unconsumed iterator starts no work.
+    return _iterate(capture(), _job_token.get(), fn, args, kwargs)
+
+
+def _iterate(snapshot, job_token, fn, args, kwargs):
+    runtime, parent = snapshot
+    current = None
+    with bind(snapshot, job_token=job_token):
+        if runtime is not None and runtime.tracer is not None:
+            try:
+                from opentelemetry import trace
+                current = runtime.tracer.start_span("weaviate.iterate", kind=trace.SpanKind.CLIENT,
+                                                    attributes={"rag.outcome": "ok"})
+            except Exception:
+                pass
+    state = Operation(runtime, "weaviate.iterate", current) if runtime is not None else None
+
+    @contextmanager
+    def activate():
+        with bind((runtime, current.get_span_context() if current is not None else parent), job_token=job_token):
+            state_context = _operation.set(state)
+            attached = None
+            try:
+                if current is not None:
+                    from opentelemetry import context, trace
+                    attached = context.attach(trace.set_span_in_context(current))
+                yield
+            finally:
+                if attached is not None:
+                    context.detach(attached)
+                _operation.reset(state_context)
+
+    try:
+        with activate():
+            iterator = iter(fn(*args, **kwargs))
+        while True:
+            with activate():
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    return
+            # Neither tracing nor operational context may escape into caller.
+            yield item
+    except BaseException as exc:
+        import asyncio
+        with activate():
+            outcome("cancelled" if isinstance(exc, (asyncio.CancelledError, GeneratorExit)) else "error", exc, current)
+        raise
+    finally:
+        with activate():
+            try:
+                if state is not None:
+                    state.finish()
+            except Exception:
+                pass
+            if current is not None:
+                try:
+                    current.end()
+                except Exception:
+                    pass
+
+
+def remote_link(headers):
+    value = None
+    for key, candidate in headers:
+        if key.lower() == b"traceparent":
+            if value is not None or len(candidate) != 55:
+                return ()
+            value = candidate
+    if value is None or not re.fullmatch(rb"00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}", value):
+        return ()
+    from opentelemetry.trace import SpanContext, TraceFlags, TraceState, Link
+    _, tid, sid, flags = value.split(b"-")
+    c = SpanContext(int(tid, 16), int(sid, 16), True, TraceFlags(int(flags, 16) & 1), TraceState())
+    return (Link(c),) if c.is_valid else ()
+
+
+class RequestTracing:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        runtime = getattr(getattr(scope.get("app"), "state", None), "telemetry", None)
+        if scope["type"] != "http" or runtime is None or not any((runtime.tracer, runtime.meter, runtime.logger)):
+            return await self.app(scope, receive, send)
+        # Always a local root. External IDs can correlate but cannot sample it.
+        with bind((runtime, None)):
+            with span("rag.request", links=remote_link(scope.get("headers", ())) if runtime.tracer is not None else (), server=True, method=scope.get("method")) as request_span:
+                request_state = _operation.get()
+                async def traced_send(message):
+                    if message["type"] == "http.response.start":
+                        # A streaming producer may have its own active scope.
+                        # Response metadata belongs to the request in all cases.
+                        state_context = _operation.set(request_state)
+                        try:
+                            status = message["status"]
+                            attribute("http.status_class", str(status // 100) + "xx", request_span)
+                            if status >= 400:
+                                outcome("error", target=request_span)
+                        finally:
+                            _operation.reset(state_context)
+                    await send(message)
+                try:
+                    await self.app(scope, receive, traced_send)
+                finally:
+                    route = getattr(scope.get("route"), "path", "")
+                    label = scope.get("method", "") + " " + route
+                    attribute("http.route", label if label in ROUTES else "unmatched", request_span)
+                    if request_span is not None:
+                        if label in ROUTES:
+                            try:
+                                request_span.update_name(label)
+                            except Exception:
+                                pass
+```
+
+### scripts/tests/test_telemetry.py
+
+```python
+"""Real SDK/loopback OTLP acceptance for #282; no external service needed."""
+import contextlib
+import http.server
+import io
+import logging
+import os
+from pathlib import Path
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api')))
+from services.telemetry import Config, Runtime, TelemetryConfigError, bootstrap, sanitize_wire, _session, safe_attributes
+from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
+from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import ExportMetricsServiceRequest
+from opentelemetry.trace import Status, StatusCode
+
+SECRET = 'SENTINEL-secret-prompt-document-/private/file.txt'
+
+@contextlib.contextmanager
+def receiver(status=200):
+    records = []
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            records.append((self.path, self.rfile.read(int(self.headers['Content-Length']))))
+            self.send_response(status)
+            self.send_header('Location', 'http://127.0.0.1:1/' + SECRET)
+            self.end_headers()
+            self.wfile.write(SECRET.encode())
+        def log_message(self, *args):
+            pass
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield {'RAG_OTEL_ENABLED': 'true', 'RAG_OTEL_ENDPOINT': f'http://127.0.0.1:{server.server_port}',
+               'RAG_OTEL_TIMEOUT_MS': '100', 'RAG_OTEL_SHUTDOWN_MS': '500'}, records
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+class TelemetryTests(unittest.TestCase):
+    def test_disabled_never_constructs_transport_or_reads_secrets(self):
+        with patch('services.telemetry._session', side_effect=AssertionError), patch('pathlib.Path.open', side_effect=AssertionError):
+            runtime = bootstrap({'RAG_OTEL_HEADERS_FILE': SECRET, 'RAG_OTEL_ENDPOINT': SECRET})
+            self.assertFalse(runtime.config.enabled)
+            self.assertEqual(runtime._providers, [])
+            self.assertTrue(runtime.force_flush())
+            self.assertTrue(runtime.shutdown())
+
+    def test_ambient_sdk_disable_conflict_fails_before_side_effects(self):
+        for ambient in ('true', 'TRUE', ' TrUe '):
+            with self.subTest(ambient=ambient), patch.dict(os.environ, {'OTEL_SDK_DISABLED':ambient}):
+                before = dict(os.environ)
+                env = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'http://localhost:4318',
+                       'RAG_OTEL_HEADERS_FILE':SECRET, 'OTEL_SDK_DISABLED':'false'}
+                with patch('services.telemetry._session', side_effect=AssertionError), patch('pathlib.Path.open', side_effect=AssertionError):
+                    for signals in ({}, {'RAG_OTEL_TRACES':'false'}, {'RAG_OTEL_LOGS':'false'}, {'RAG_OTEL_METRICS':'false'}):
+                        with self.assertRaises(TelemetryConfigError) as error:
+                            bootstrap({**env, **signals})
+                        self.assertEqual(str(error.exception), 'RAG_OTEL_ENABLED conflicts with OTEL_SDK_DISABLED')
+                        self.assertNotIn(SECRET, str(error.exception))
+                    runtime = bootstrap({**env, 'RAG_OTEL_ENABLED':'false'})
+                    self.assertFalse(runtime.config.enabled)
+                    self.assertEqual(runtime._providers, [])
+                    self.assertTrue(runtime.force_flush())
+                    self.assertTrue(runtime.shutdown())
+                self.assertEqual(dict(os.environ), before)
+
+    def test_non_disabling_process_env_exports_all_signals_despite_mapping(self):
+        for ambient in (None, 'false'):
+            with self.subTest(ambient=ambient), patch.dict(os.environ):
+                if ambient is None:
+                    os.environ.pop('OTEL_SDK_DISABLED', None)
+                else:
+                    os.environ['OTEL_SDK_DISABLED'] = ambient
+                before = dict(os.environ)
+                with receiver() as (env, records):
+                    runtime = bootstrap({**env, 'OTEL_SDK_DISABLED':'true'})
+                    try:
+                        with runtime.tracer.start_as_current_span('rag.query'):
+                            runtime.logger.emit(body='rag.operation')
+                        runtime.meter.create_counter('rag.telemetry.check').add(1)
+                        self.assertTrue(runtime.force_flush())
+                    finally:
+                        self.assertTrue(runtime.shutdown())
+                    self.assertEqual({path for path, _ in records}, {'/v1/traces', '/v1/logs', '/v1/metrics'})
+                self.assertEqual(dict(os.environ), before)
+
+    def test_supported_runtime_api_hides_raw_providers_and_retains_lifecycle(self):
+        with receiver() as (env, records), patch.dict(os.environ, {'OTEL_LOGRECORD_ATTRIBUTE_COUNT_LIMIT':SECRET}):
+            for enabled in ('false', 'true'):
+                with self.subTest(enabled=enabled):
+                    runtime = bootstrap({**env, 'RAG_OTEL_ENABLED':enabled, 'RAG_OTEL_TRACES':'false', 'RAG_OTEL_METRICS':'false'})
+                    try:
+                        with self.assertRaises(AttributeError):
+                            getattr(runtime, 'providers')
+                        for name, value in vars(runtime).items():
+                            if not name.startswith('_'):
+                                self.assertFalse(hasattr(value, 'get_logger'), name)
+                        if enabled == 'true':
+                            runtime.logger.emit(body=SECRET, attributes={'rag.outcome':'error'}, exception=RuntimeError(SECRET))
+                        else:
+                            self.assertIsNone(runtime.logger)
+                        self.assertTrue(runtime.force_flush())
+                    finally:
+                        self.assertTrue(runtime.shutdown())
+                        self.assertTrue(runtime.shutdown())
+            self.assertEqual(len(records), 1)
+            payload = records[0][1]
+            self.assertNotIn(SECRET.encode(), payload)
+            log = ExportLogsServiceRequest.FromString(payload).resource_logs[0].scope_logs[0].log_records[0]
+            self.assertEqual({a.key:a.value.string_value for a in log.attributes}, {'rag.outcome':'error'})
+
+    def test_invalid_configuration_is_value_free(self):
+        fields = {'ENABLED': '1', 'PROTOCOL': 'grpc', 'ENDPOINT': 'http://user:secret@example.com',
+                  'SERVICE_NAME': SECRET, 'SAMPLE_RATIO': 'nan', 'QUEUE_SIZE': '0', 'BATCH_SIZE': '5000',
+                  'TIMEOUT_MS': '0', 'INTERVAL_MS': '0', 'SHUTDOWN_MS': '999999', 'LOGS': 'yes'}
+        for key, value in fields.items():
+            env = {'RAG_OTEL_ENABLED': 'true', 'RAG_OTEL_ENDPOINT': 'http://localhost:4318', 'RAG_OTEL_'+key: value}
+            with self.subTest(key=key), self.assertRaises(TelemetryConfigError) as raised:
+                Config.from_env(env)
+            self.assertNotIn(SECRET, str(raised.exception))
+        for endpoint in ('http://localhost/?secret=yes', 'http://localhost/path', 'file:///tmp/a', 'http://localhost:99999'):
+            with self.assertRaises(TelemetryConfigError):
+                Config.from_env({'RAG_OTEL_ENABLED': 'true', 'RAG_OTEL_ENDPOINT': endpoint})
+
+    def test_header_file_and_repr(self):
+        with tempfile.NamedTemporaryFile(mode='w') as f:
+            f.write('{"Authorization":"'+SECRET+'"}');f.flush()
+            cfg = Config.from_env({'RAG_OTEL_ENABLED': 'true', 'RAG_OTEL_ENDPOINT': 'https://localhost:4318', 'RAG_OTEL_HEADERS_FILE': f.name})
+            self.assertEqual(cfg.headers['Authorization'], SECRET)
+            self.assertNotIn(SECRET, repr(cfg))
+        with self.assertRaises(TelemetryConfigError) as err:
+            Config.from_env({'RAG_OTEL_ENABLED': 'true', 'RAG_OTEL_ENDPOINT': 'https://localhost', 'RAG_OTEL_HEADERS_FILE': SECRET})
+        self.assertNotIn(SECRET, str(err.exception))
+
+    def test_credentials_require_https_and_unambiguous_header_identity(self):
+        for header in ('Authorization', 'authorization', 'X-Api-Key', 'x-API-key'):
+            with tempfile.NamedTemporaryFile(mode='w') as f:
+                f.write('{"'+header+'":"'+SECRET+'"}'); f.flush()
+                for origin in ('http://localhost:4318', 'http://collector.example', 'https://collector.example'):
+                    env = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':origin, 'RAG_OTEL_HEADERS_FILE':f.name}
+                    if origin.startswith('https:'):
+                        cfg = Config.from_env(env)
+                        self.assertEqual(list(cfg.headers), ['Authorization' if header.lower() == 'authorization' else 'X-Api-Key'])
+                    else:
+                        with patch('services.telemetry._session', side_effect=AssertionError), self.assertRaises(TelemetryConfigError) as error:
+                            bootstrap(env)
+                        self.assertNotIn(SECRET, str(error.exception))
+        for names in (('Authorization', 'authorization'), ('X-Api-Key', 'x-api-key'), ('Authorization', 'Authorization')):
+            with tempfile.NamedTemporaryFile(mode='w') as f:
+                f.write('{"'+names[0]+'":"first","'+names[1]+'":"'+SECRET+'"}'); f.flush()
+                with self.assertRaises(TelemetryConfigError):
+                    Config.from_env({'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost', 'RAG_OTEL_HEADERS_FILE':f.name})
+
+    def test_remote_trace_state_removed_before_queue_and_at_receiver(self):
+        from opentelemetry.trace import SpanContext, TraceFlags, TraceState, NonRecordingSpan, set_span_in_context
+        parent = SpanContext(123, 456, True, TraceFlags(1), TraceState([('secret', SECRET)]))
+        with receiver() as (env, records):
+            runtime = bootstrap({**env, 'RAG_OTEL_LOGS':'false', 'RAG_OTEL_METRICS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
+            try:
+                with runtime.tracer.start_as_current_span('rag.query', context=set_span_in_context(NonRecordingSpan(parent))) as span:
+                    child = span.get_span_context()
+                processor = runtime._providers[0]._active_span_processor._span_processors[0]._batch_processor
+                queued = processor._queue[0]
+                for clean, original in ((queued.context, child), (queued.parent, parent)):
+                    self.assertFalse(clean.trace_state)
+                    self.assertEqual((clean.trace_id, clean.span_id, clean.trace_flags, clean.is_remote),
+                                     (original.trace_id, original.span_id, original.trace_flags, original.is_remote))
+                self.assertTrue(runtime.force_flush())
+                payload = dict(records)['/v1/traces']
+                self.assertNotIn(SECRET.encode(), payload)
+                exported = ExportTraceServiceRequest.FromString(payload).resource_spans[0].scope_spans[0].spans[0]
+                self.assertEqual(int.from_bytes(exported.parent_span_id, 'big'), 456)
+                self.assertEqual(int.from_bytes(exported.trace_id, 'big'), 123)
+            finally:
+                runtime.shutdown()
+
+    def test_metric_admission_invariants_at_real_wire_boundary(self):
+        from opentelemetry.proto.metrics.v1.metrics_pb2 import Metric
+        def numeric(kind='gauge', value=7):
+            metric = Metric(name='rag.telemetry.check')
+            data = getattr(metric, kind)
+            if kind == 'sum': data.aggregation_temporality = 2
+            data.data_points.add(as_double=value)
+            return metric
+        def histogram(**changes):
+            metric = Metric(name='rag.telemetry.check')
+            metric.histogram.aggregation_temporality = 2
+            values = dict(count=3, sum=4, min=0, max=3, bucket_counts=[1,1,1], explicit_bounds=[1,2])
+            values.update(changes)
+            metric.histogram.data_points.add(**values)
+            return metric
+        invalid = [Metric(name='rag.telemetry.check'), numeric(value=float('nan')), numeric(value=float('inf'))]
+        for kind in ('gauge', 'sum', 'histogram'):
+            metric = histogram() if kind == 'histogram' else numeric(kind)
+            getattr(metric, kind).data_points.add().CopyFrom(getattr(metric, kind).data_points[0])
+            invalid.append(metric)
+            empty = Metric(name='rag.telemetry.check'); getattr(empty, kind).SetInParent(); invalid.append(empty)
+        missing = Metric(name='rag.telemetry.check'); missing.gauge.data_points.add(); invalid.append(missing)
+        bad_temporality = numeric('sum'); bad_temporality.sum.aggregation_temporality = 0; invalid.append(bad_temporality)
+        for changes in (dict(explicit_bounds=[2,1]), dict(explicit_bounds=[1,1]),
+                        dict(explicit_bounds=[1,float('inf')]), dict(explicit_bounds=[float('nan'),2]),
+                        dict(sum=float('nan')), dict(min=float('-inf')), dict(max=float('inf')),
+                        dict(min=4,max=3), dict(count=4), dict(bucket_counts=[1,2]),
+                        dict(explicit_bounds=list(range(32)),bucket_counts=[0]*33,count=0)):
+            invalid.append(histogram(**changes))
+        # Protobuf uint64 fields reject negative values before sanitizer admission.
+        for changes in (dict(count=-1), dict(bucket_counts=[-1,2,2])):
+            with self.assertRaises(ValueError): histogram(**changes)
+        with receiver() as (env, records):
+            config = Config.from_env({**env, 'RAG_OTEL_BATCH_SIZE':'1'})
+            with _session('metrics', config) as session:
+                for bad in invalid:
+                    source = ExportMetricsServiceRequest()
+                    metrics = source.resource_metrics.add().scope_metrics.add().metrics
+                    metrics.add().CopyFrom(bad); metrics.add().CopyFrom(numeric())
+                    response = session.post('', data=source.SerializeToString())
+                    self.assertEqual(response.status_code, 200)
+                    output = ExportMetricsServiceRequest.FromString(records[-1][1]).resource_metrics[0].scope_metrics[0].metrics
+                    self.assertEqual(len(output), 1)
+                    self.assertEqual(output[0].WhichOneof('data'), 'gauge')
+                    self.assertEqual(output[0].gauge.data_points[0].as_double, 7)
+                absent_statistics = histogram()
+                for field in ('sum', 'min', 'max'):
+                    absent_statistics.histogram.data_points[0].ClearField(field)
+                for good in (numeric('sum'), histogram(), absent_statistics,
+                             histogram(count=0,sum=0,min=0,max=0,bucket_counts=[0,0,0])):
+                    source = ExportMetricsServiceRequest()
+                    source.resource_metrics.add().scope_metrics.add().metrics.add().CopyFrom(good)
+                    session.post('', data=source.SerializeToString())
+                    output = ExportMetricsServiceRequest.FromString(records[-1][1]).resource_metrics[0].scope_metrics[0].metrics
+                    self.assertEqual(len(output), 1)
+                    self.assertEqual(output[0], good)
+
+    def test_real_sdk_all_signals_safe_on_receiver(self):
+        with receiver() as (env, records), patch.dict(os.environ, {'OTEL_RESOURCE_ATTRIBUTES': 'secret='+SECRET,
+                 'OTEL_SERVICE_NAME': SECRET, 'OTEL_EXPORTER_OTLP_HEADERS': 'authorization='+SECRET}):
+            runtime = bootstrap(env)
+            try:
+                with runtime.tracer.start_as_current_span(SECRET, attributes={'rag.operation': 'query', 'prompt': SECRET, 'rag.outcome': SECRET}) as span:
+                    span.add_event(SECRET, {'secret': SECRET})
+                    span.set_status(Status(StatusCode.ERROR, SECRET))
+                    runtime.logger.emit(body=SECRET, severity_text=SECRET, attributes={'rag.outcome': 'error', 'secret': SECRET})
+                counter = runtime.meter.create_counter('rag.telemetry.check', description=SECRET, unit=SECRET)
+                for n in range(200):
+                    counter.add(1, {'secret': SECRET+str(n), 'trace_id': str(n)})
+                runtime.meter.create_counter('secret.metric').add(1, {'secret': SECRET})
+                self.assertTrue(runtime.force_flush())
+            finally:
+                self.assertTrue(runtime.shutdown())
+            by_path = dict(records)
+            self.assertEqual(set(by_path), {'/v1/traces', '/v1/logs', '/v1/metrics'})
+            for body in by_path.values():
+                self.assertNotIn(SECRET.encode(), body)
+            traces = ExportTraceServiceRequest.FromString(by_path['/v1/traces'])
+            resource = {a.key: a.value.string_value for a in traces.resource_spans[0].resource.attributes}
+            self.assertEqual(resource, {'service.name':'rag-api', 'service.version':'1.1.0', 'deployment.environment.name':'development'})
+            span = traces.resource_spans[0].scope_spans[0].spans[0]
+            self.assertEqual(span.name, 'rag.operation')
+            self.assertFalse(span.events);self.assertFalse(span.links);self.assertFalse(span.status.message)
+            logs = ExportLogsServiceRequest.FromString(by_path['/v1/logs'])
+            log = logs.resource_logs[0].scope_logs[0].log_records[0]
+            self.assertEqual(log.trace_id, span.trace_id)
+            self.assertEqual(log.body.string_value, 'rag.operation')
+            metrics = ExportMetricsServiceRequest.FromString(by_path['/v1/metrics'])
+            metric = metrics.resource_metrics[0].scope_metrics[0].metrics[0]
+            self.assertEqual(metric.name, 'rag.telemetry.check')
+            self.assertEqual(len(metric.sum.data_points), 1)
+            self.assertFalse(metric.sum.data_points[0].attributes)
+            self.assertEqual(metric.sum.data_points[0].as_int, 200)
+
+    def test_exemplar_reservoir_never_receives_dropped_attributes(self):
+        from opentelemetry.sdk.metrics._internal.exemplar.exemplar_reservoir import FixedSizeExemplarReservoirABC
+        from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+        original_offer = FixedSizeExemplarReservoirABC.offer
+        original_export = OTLPMetricExporter.export
+        for ambient in (None, 'always_on'):
+            with self.subTest(ambient=ambient), patch.dict(os.environ):
+                if ambient is None:
+                    os.environ.pop('OTEL_METRICS_EXEMPLAR_FILTER', None)
+                else:
+                    os.environ['OTEL_METRICS_EXEMPLAR_FILTER'] = ambient
+                collected = []
+                def capture(exporter, metrics_data, *args, **kwargs):
+                    collected.append(metrics_data)
+                    return original_export(exporter, metrics_data, *args, **kwargs)
+                with receiver() as (env, records), patch.object(
+                        FixedSizeExemplarReservoirABC, 'offer', autospec=True, side_effect=original_offer) as offer, patch.object(
+                        OTLPMetricExporter, 'export', autospec=True, side_effect=capture):
+                    runtime = bootstrap({**env, 'RAG_OTEL_LOGS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
+                    try:
+                        counter = runtime.meter.create_counter('rag.telemetry.check')
+                        with runtime.tracer.start_as_current_span('rag.query') as span:
+                            self.assertTrue(span.get_span_context().trace_flags.sampled)
+                            counter.add(2, {'secret':SECRET})
+                        counter.add(3, {'secret':SECRET+'-outside-span'})
+                        # Before collection/serialization, nothing entered a reservoir.
+                        offer.assert_not_called()
+                        self.assertTrue(runtime.force_flush())
+                        points = [point for data in collected for resource in data.resource_metrics
+                                  for scope in resource.scope_metrics for metric in scope.metrics
+                                  for point in metric.data.data_points]
+                        self.assertTrue(points)
+                        for point in points:
+                            self.assertEqual(point.value, 5)
+                            self.assertFalse(point.attributes)
+                            self.assertFalse(point.exemplars)
+                        payload = dict(records)['/v1/metrics']
+                        self.assertNotIn(SECRET.encode(), payload)
+                        metric = ExportMetricsServiceRequest.FromString(payload).resource_metrics[0].scope_metrics[0].metrics[0]
+                        self.assertEqual(metric.sum.data_points[0].as_int, 5)
+                    finally:
+                        self.assertTrue(runtime.shutdown())
+                    offer.assert_not_called()
+
+    def test_log_queue_rebuilds_wrapper_and_exception_without_mutating_input(self):
+        from opentelemetry._logs import LogRecord, SeverityNumber
+        from opentelemetry.sdk._logs import ReadWriteLogRecord, LogRecordLimits
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.util.instrumentation import InstrumentationScope
+        from opentelemetry.context import Context
+        hostile_resource = Resource({'secret':SECRET}, schema_url=SECRET)
+        hostile_scope = InstrumentationScope(SECRET, version=SECRET, schema_url=SECRET, attributes={'secret':SECRET})
+        hostile_limits = LogRecordLimits(max_attributes=128, max_attribute_length=1024)
+        hostile_limits.private_note = SECRET
+        original = LogRecord(body=SECRET, severity_text=SECRET, event_name=SECRET,
+                             severity_number=SeverityNumber.ERROR, context=Context({'secret':SECRET}),
+                             attributes={'secret':SECRET, 'rag.outcome':'error'})
+        wrapper = ReadWriteLogRecord(log_record=original, resource=hostile_resource,
+                                     instrumentation_scope=hostile_scope, limits=hostile_limits)
+        before = dict(original.__dict__)
+        before['attributes'] = dict(original.attributes)
+        with receiver() as (env, records):
+            runtime = bootstrap({**env, 'RAG_OTEL_TRACES':'false', 'RAG_OTEL_METRICS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
+            try:
+                runtime.logger.emit(record=wrapper)
+                try:
+                    raise RuntimeError(SECRET)
+                except RuntimeError as error:
+                    exception_record = LogRecord(body=SECRET, exception=error, attributes={'rag.outcome':'error'})
+                    runtime.logger.emit(record=exception_record)
+                    self.assertIs(exception_record.exception, error)
+                    self.assertEqual(dict(exception_record.attributes), {'rag.outcome':'error'})
+                processor = runtime._providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
+                self.assertEqual(len(processor._queue), 2)
+                for queued in processor._queue:
+                    self.assertEqual(dict(queued.resource.attributes), {'service.name':'rag-api', 'service.version':'1.1.0', 'deployment.environment.name':'development'})
+                    self.assertFalse(queued.resource.schema_url)
+                    self.assertEqual(queued.instrumentation_scope.name, 'rag.telemetry')
+                    self.assertFalse(queued.instrumentation_scope.version)
+                    self.assertFalse(queued.instrumentation_scope.schema_url)
+                    self.assertFalse(queued.instrumentation_scope.attributes)
+                    self.assertIsNot(queued.limits, hostile_limits)
+                    self.assertNotIn(SECRET, repr(vars(queued.limits)))
+                    self.assertFalse(queued.log_record.context)
+                    self.assertIsNone(queued.log_record.exception)
+                    self.assertEqual(queued.log_record.body, 'rag.operation')
+                    self.assertFalse(queued.log_record.severity_text)
+                    self.assertFalse(queued.log_record.event_name)
+                    self.assertEqual(dict(queued.log_record.attributes), {'rag.outcome':'error'})
+                self.assertEqual(original.__dict__, before)
+                self.assertIs(wrapper.resource, hostile_resource)
+                self.assertIs(wrapper.instrumentation_scope, hostile_scope)
+                self.assertIs(wrapper.limits, hostile_limits)
+                self.assertEqual(hostile_limits.private_note, SECRET)
+                self.assertTrue(runtime.force_flush())
+                payload = dict(records)['/v1/logs']
+                self.assertNotIn(SECRET.encode(), payload)
+                logs = ExportLogsServiceRequest.FromString(payload).resource_logs[0].scope_logs[0].log_records
+                self.assertEqual(len(logs), 2)
+                self.assertIn(SeverityNumber.ERROR.value, [log.severity_number for log in logs])
+            finally:
+                self.assertTrue(runtime.shutdown())
+
+    def test_emit_forms_preserve_caller_inputs_with_and_without_exceptions(self):
+        from types import MappingProxyType
+        from opentelemetry._logs import LogRecord, SeverityNumber
+        from opentelemetry.sdk._logs import ReadWriteLogRecord
+        from opentelemetry.attributes import BoundedAttributes
+        from opentelemetry.context import Context
+        from opentelemetry.trace import SpanContext, NonRecordingSpan, TraceFlags, set_span_in_context
+        context = set_span_in_context(NonRecordingSpan(SpanContext(123, 456, False, TraceFlags(1))),
+                                      Context({'secret':SECRET}))
+        factories = (dict, MappingProxyType,
+                     lambda values: BoundedAttributes(maxlen=8, attributes=values, immutable=False))
+        with receiver() as (env, records):
+            runtime = bootstrap({**env, 'RAG_OTEL_TRACES':'false', 'RAG_OTEL_METRICS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
+            try:
+                processor = runtime._providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
+                for form in ('wrapper', 'plain', 'keyword'):
+                    for has_exception in (False, True):
+                        for factory in factories:
+                            with self.subTest(form=form, exception=has_exception, mapping=factory):
+                                attributes = factory({'rag.outcome':'error', 'secret':SECRET})
+                                values = dict(attributes)
+                                exception = RuntimeError(SECRET) if has_exception else None
+                                fields = dict(timestamp=123, observed_timestamp=456, context=context,
+                                              severity_number=SeverityNumber.ERROR, severity_text=SECRET,
+                                              body=SECRET, attributes=attributes, event_name=SECRET, exception=exception)
+                                source = LogRecord(**fields)
+                                wrapper = ReadWriteLogRecord(source) if form == 'wrapper' else None
+                                # Public writable records can carry any supported attribute mapping.
+                                source.attributes = attributes
+                                before = dict(source.__dict__)
+                                wrapper_before = dict(wrapper.__dict__) if wrapper else None
+                                if form == 'keyword':
+                                    runtime.logger.emit(**fields)
+                                elif form == 'wrapper':
+                                    runtime.logger.emit(record=wrapper)
+                                else:
+                                    runtime.logger.emit(source)
+                                self.assertEqual(source.__dict__, before)
+                                self.assertIs(source.attributes, attributes)
+                                self.assertEqual(dict(attributes), values)
+                                self.assertIs(source.context, context)
+                                self.assertIs(source.exception, exception)
+                                if wrapper:
+                                    self.assertEqual(wrapper.__dict__, wrapper_before)
+                                    self.assertIs(wrapper.log_record, source)
+                                queued = processor._queue[0].log_record
+                                self.assertEqual(dict(queued.attributes), {'rag.outcome':'error'})
+                                self.assertEqual((queued.trace_id, queued.span_id), (123,456))
+                                self.assertEqual((queued.timestamp, queued.observed_timestamp), (123,456))
+                                self.assertEqual(queued.severity_number, SeverityNumber.ERROR)
+                                self.assertEqual(queued.body, 'rag.operation')
+                                self.assertIsNone(queued.exception)
+                                self.assertFalse(queued.context)
+                                self.assertFalse(queued.event_name)
+                                self.assertFalse(queued.severity_text)
+                self.assertEqual(len(processor._queue), 18)
+                self.assertTrue(runtime.force_flush())
+                payload = dict(records)['/v1/logs']
+                self.assertNotIn(SECRET.encode(), payload)
+                logs = ExportLogsServiceRequest.FromString(payload).resource_logs[0].scope_logs[0].log_records
+                self.assertEqual(len(logs), 18)
+            finally:
+                self.assertTrue(runtime.shutdown())
+
+    def test_attribute_snapshot_precedes_sdk_delegation_for_all_emit_forms(self):
+        from types import MappingProxyType
+        from opentelemetry._logs import LogRecord
+        from opentelemetry.sdk._logs import ReadWriteLogRecord
+        from opentelemetry.attributes import BoundedAttributes
+        factories = (lambda values: (values, values),
+                     lambda values: (MappingProxyType(values), values),
+                     lambda values: (BoundedAttributes(maxlen=8, attributes=values, immutable=False,
+                                                       extended_attributes=True), None))
+        with receiver() as (env, records):
+            runtime = bootstrap({**env, 'RAG_OTEL_TRACES':'false', 'RAG_OTEL_METRICS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
+            try:
+                processor = runtime._providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
+                for form in ('wrapper', 'plain', 'keyword'):
+                    for has_exception in (False, True):
+                        for index, factory in enumerate(factories):
+                            with self.subTest(form=form, exception=has_exception, mapping=index):
+                                attributes, backing = factory({'rag.outcome':'error', 'secret':{'nested':[SECRET]},
+                                                               'rag.operation':['query']})
+                                if backing is None:
+                                    backing = attributes
+                                exception = RuntimeError(SECRET) if has_exception else None
+                                source = LogRecord(body=SECRET, attributes=attributes, exception=exception)
+                                wrapper = ReadWriteLogRecord(source) if form == 'wrapper' else None
+                                source.attributes = attributes
+                                real_emit = runtime.logger._logger.emit
+                                def at_sdk_boundary(record=None, **kwargs):
+                                    delegated = (record.log_record if isinstance(record, ReadWriteLogRecord) else record)
+                                    snapshot = delegated.attributes if delegated is not None else kwargs['attributes']
+                                    self.assertIsNot(snapshot, attributes)
+                                    self.assertEqual(snapshot, {'rag.outcome':'error'})
+                                    # Simulate a caller write after delegation begins, before SDK normalization.
+                                    backing['rag.outcome'] = 'ok'
+                                    backing['secret'] = {'nested':[SECRET+'-changed']}
+                                    self.assertEqual(snapshot, {'rag.outcome':'error'})
+                                    return real_emit(record, **kwargs)
+                                with patch.object(runtime.logger._logger, 'emit', side_effect=at_sdk_boundary):
+                                    if form == 'keyword':
+                                        runtime.logger.emit(body=SECRET, attributes=attributes, exception=exception)
+                                    else:
+                                        runtime.logger.emit(wrapper if wrapper else source)
+                                self.assertIs(source.attributes, attributes)
+                                self.assertIs(source.exception, exception)
+                                self.assertEqual(attributes['rag.outcome'], 'ok')
+                                self.assertNotIn('exception.message', attributes)
+                                queued = processor._queue[0].log_record
+                                self.assertEqual(dict(queued.attributes), {'rag.outcome':'error'})
+                                self.assertIsNone(queued.exception)
+                self.assertEqual(len(processor._queue), 18)
+                self.assertTrue(runtime.force_flush())
+                payload = dict(records)['/v1/logs']
+                self.assertNotIn(SECRET.encode(), payload)
+                logs = ExportLogsServiceRequest.FromString(payload).resource_logs[0].scope_logs[0].log_records
+                self.assertEqual(len(logs), 18)
+            finally:
+                self.assertTrue(runtime.shutdown())
+
+    def test_all_log_forms_ignore_ambient_attribute_limits(self):
+        from opentelemetry._logs import LogRecord
+        from opentelemetry.sdk._logs import ReadWriteLogRecord, LogRecordLimits
+        limits = LogRecordLimits(max_attributes=16, max_attribute_length=128,
+                                 max_log_record_attributes=16, max_log_record_attribute_length=128)
+        approved = {'rag.operation':'query', 'rag.outcome':'error', 'error.type':'internal'}
+        fields = ('OTEL_LOGRECORD_ATTRIBUTE_COUNT_LIMIT', 'OTEL_LOGRECORD_ATTRIBUTE_VALUE_LENGTH_LIMIT',
+                  'OTEL_ATTRIBUTE_COUNT_LIMIT', 'OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT')
+        with receiver() as (env, records):
+            for field in fields:
+                for value in (SECRET, '-1', '0', '1'):
+                    with self.subTest(field=field, value=value), patch.dict(os.environ, {field:value}):
+                        runtime = bootstrap({**env, 'RAG_OTEL_TRACES':'false', 'RAG_OTEL_METRICS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
+                        try:
+                            processor = runtime._providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
+                            for form in ('wrapper', 'plain', 'keyword'):
+                                for has_exception in (False, True):
+                                    attributes = dict(approved)
+                                    exception = RuntimeError(SECRET) if has_exception else None
+                                    source = LogRecord(body=SECRET, attributes=attributes, exception=exception)
+                                    wrapper = ReadWriteLogRecord(source, limits=limits) if form == 'wrapper' else None
+                                    source.attributes = attributes
+                                    if form == 'keyword':
+                                        runtime.logger.emit(body=SECRET, attributes=attributes, exception=exception)
+                                    else:
+                                        runtime.logger.emit(wrapper if wrapper else source)
+                                    self.assertIs(source.attributes, attributes)
+                                    self.assertEqual(attributes, approved)
+                                    queued = processor._queue[0].log_record
+                                    self.assertEqual(dict(queued.attributes), approved)
+                                    self.assertIsNone(queued.exception)
+                            self.assertEqual(len(processor._queue), 6)
+                            self.assertTrue(runtime.force_flush())
+                            payload = dict(records)['/v1/logs']
+                            self.assertNotIn(SECRET.encode(), payload)
+                            logs = ExportLogsServiceRequest.FromString(payload).resource_logs[0].scope_logs[0].log_records
+                            self.assertEqual(len(logs), 6)
+                            for log in logs:
+                                self.assertEqual({a.key:a.value.string_value for a in log.attributes}, approved)
+                            self.assertEqual(os.environ[field], value)
+                        finally:
+                            self.assertTrue(runtime.shutdown())
+
+    def test_nonmapping_attributes_are_empty_for_all_log_forms(self):
+        from opentelemetry._logs import LogRecord
+        from opentelemetry.sdk._logs import ReadWriteLogRecord
+        class HostileNonMapping:
+            def __bool__(self): raise AssertionError('truthiness must not be inspected')
+            def items(self): raise AssertionError('nonmapping items must not be called')
+        malformed = (None, False, True, 0, 1, '', SECRET, [], [SECRET], (), (SECRET,), set(), {SECRET}, HostileNonMapping())
+        with receiver() as (env, records):
+            runtime = bootstrap({**env, 'RAG_OTEL_TRACES':'false', 'RAG_OTEL_METRICS':'false',
+                                 'RAG_OTEL_INTERVAL_MS':'60000', 'RAG_OTEL_BATCH_SIZE':'128'})
+            try:
+                processor = runtime._providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
+                for form in ('wrapper', 'plain', 'keyword'):
+                    for has_exception in (False, True):
+                        for attributes in malformed:
+                            with self.subTest(form=form, exception=has_exception, type=type(attributes)):
+                                self.assertEqual(safe_attributes(attributes), {})
+                                exception = RuntimeError(SECRET) if has_exception else None
+                                source = LogRecord(body=SECRET, exception=exception)
+                                wrapper = ReadWriteLogRecord(source) if form == 'wrapper' else None
+                                source.attributes = attributes
+                                if form == 'keyword':
+                                    runtime.logger.emit(body=SECRET, attributes=attributes, exception=exception)
+                                else:
+                                    runtime.logger.emit(wrapper if wrapper else source)
+                                self.assertIs(source.attributes, attributes)
+                                self.assertIs(source.exception, exception)
+                                self.assertFalse(processor._queue[0].log_record.attributes)
+                self.assertEqual(len(processor._queue), len(malformed)*6)
+                self.assertTrue(runtime.force_flush())
+                self.assertNotIn(SECRET.encode(), dict(records)['/v1/logs'])
+            finally:
+                self.assertTrue(runtime.shutdown())
+
+    def test_adapter_preserves_body_for_processor_schema_extensions(self):
+        from opentelemetry._logs import LogRecord
+        from opentelemetry.sdk._logs import ReadWriteLogRecord
+        runtime = bootstrap({'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'http://localhost:1',
+                             'RAG_OTEL_TRACES':'false', 'RAG_OTEL_METRICS':'false'})
+        try:
+            body = 'rag.startup.completed'
+            for record in (LogRecord(body=body), ReadWriteLogRecord(LogRecord(body=body)), None):
+                with patch.object(runtime.logger._logger, 'emit') as emit:
+                    runtime.logger.emit(record, body=body)
+                    delegated = emit.call_args.args[0]
+                    self.assertIsInstance(delegated, ReadWriteLogRecord)
+                    self.assertEqual(delegated.log_record.body, body)
+        finally:
+            self.assertTrue(runtime.shutdown())
+
+    def test_caller_selected_span_scope_is_rebuilt_before_queue(self):
+        with receiver() as (env, records):
+            runtime = bootstrap({**env, 'RAG_OTEL_LOGS':'false', 'RAG_OTEL_METRICS':'false', 'RAG_OTEL_INTERVAL_MS':'60000'})
+            try:
+                tracer = runtime._providers[0].get_tracer(SECRET, instrumenting_library_version=SECRET,
+                                                       schema_url=SECRET, attributes={'secret':SECRET})
+                with tracer.start_as_current_span('rag.query') as original:
+                    pass
+                self.assertEqual(original.instrumentation_scope.name, SECRET)
+                processor = runtime._providers[0]._active_span_processor._span_processors[0]._batch_processor
+                queued = processor._queue[0]
+                self.assertEqual(queued.instrumentation_scope.name, 'rag.telemetry')
+                self.assertFalse(queued.instrumentation_scope.version)
+                self.assertFalse(queued.instrumentation_scope.schema_url)
+                self.assertFalse(queued.instrumentation_scope.attributes)
+                self.assertEqual(queued.context.trace_id, original.context.trace_id)
+                self.assertEqual(queued.context.span_id, original.context.span_id)
+                self.assertEqual(dict(original.instrumentation_scope.attributes), {'secret':SECRET})
+                self.assertTrue(runtime.force_flush())
+                self.assertNotIn(SECRET.encode(), dict(records)['/v1/traces'])
+            finally:
+                self.assertTrue(runtime.shutdown())
+
+    def test_wire_rebuilds_scope_resource_and_free_text(self):
+        source = ExportTraceServiceRequest()
+        rs = source.resource_spans.add(schema_url=SECRET)
+        rs.resource.attributes.add(key='secret').value.string_value = SECRET
+        ss = rs.scope_spans.add(schema_url=SECRET);ss.scope.name=SECRET;ss.scope.version=SECRET
+        ss.scope.attributes.add(key='secret').value.string_value=SECRET
+        span=ss.spans.add(name=SECRET, trace_state=SECRET)
+        span.status.message=SECRET
+        span.events.add(name=SECRET)
+        span.links.add(trace_state=SECRET)
+        for key in ('rag.operation','authorization','filename','prompt','exception.stacktrace'):
+            span.attributes.add(key=key).value.string_value=SECRET
+        body=sanitize_wire(source.SerializeToString(), 'traces', Config())
+        self.assertNotIn(SECRET.encode(),body)
+
+    def test_histogram_large_shape_is_dropped_not_truncated(self):
+        source=ExportMetricsServiceRequest()
+        metric=source.resource_metrics.add().scope_metrics.add().metrics.add(name='rag.telemetry.check')
+        point=metric.histogram.data_points.add(count=40, sum=40)
+        point.bucket_counts.extend([1]*40);point.explicit_bounds.extend(range(39))
+        result=ExportMetricsServiceRequest.FromString(sanitize_wire(source.SerializeToString(),'metrics',Config()))
+        self.assertFalse(result.resource_metrics[0].scope_metrics[0].metrics)
+
+    def test_bounded_queue_under_blocked_export(self):
+        from opentelemetry.sdk.trace.export import SpanExportResult
+        entered=threading.Event();release=threading.Event()
+        def blocked(*args):
+            entered.set();release.wait(2);return SpanExportResult.FAILURE
+        with patch('opentelemetry.exporter.otlp.proto.http.trace_exporter.OTLPSpanExporter.export',side_effect=blocked):
+            runtime=bootstrap({'RAG_OTEL_ENABLED':'true','RAG_OTEL_ENDPOINT':'http://localhost:1',
+                               'RAG_OTEL_LOGS':'false','RAG_OTEL_METRICS':'false','RAG_OTEL_BATCH_SIZE':'1','RAG_OTEL_QUEUE_SIZE':'4'})
+            try:
+                with runtime.tracer.start_as_current_span('rag.query'):pass
+                self.assertTrue(entered.wait(1))
+                for _ in range(20):
+                    with runtime.tracer.start_as_current_span(SECRET):pass
+                processor=runtime._providers[0]._active_span_processor._span_processors[0]._batch_processor
+                self.assertEqual(len(processor._queue),4)
+                self.assertTrue(all(s.name=='rag.operation' for s in processor._queue))
+            finally:release.set();runtime.shutdown()
+
+    def test_outage_no_retry_or_sensitive_diagnostics(self):
+        for status in (500, 429, 302):
+            with receiver(status) as (env, records):
+                stream=io.StringIO();handler=logging.StreamHandler(stream)
+                logger=logging.getLogger('opentelemetry');logger.addHandler(handler)
+                try:
+                    runtime=bootstrap({**env, 'RAG_OTEL_LOGS':'false','RAG_OTEL_METRICS':'false'})
+                    started=time.monotonic()
+                    with runtime.tracer.start_as_current_span('rag.query'):pass
+                    runtime.force_flush();runtime.shutdown()
+                    self.assertLess(time.monotonic()-started,1.5)
+                    self.assertEqual(len(records),1)
+                    self.assertNotIn(SECRET,stream.getvalue())
+                    self.assertNotIn(env['RAG_OTEL_ENDPOINT'],stream.getvalue())
+                finally:logger.removeHandler(handler)
+
+    def test_sampling_zero_and_signal_toggles(self):
+        with receiver() as (env, records):
+            runtime=bootstrap({**env,'RAG_OTEL_SAMPLE_RATIO':'0','RAG_OTEL_LOGS':'false','RAG_OTEL_METRICS':'false'})
+            with runtime.tracer.start_as_current_span('rag.query'):pass
+            self.assertIsNone(runtime.logger);self.assertIsNone(runtime.meter)
+            runtime.force_flush();runtime.shutdown();runtime.shutdown()
+            self.assertFalse(records)
+
+    def test_api_lifespan_cleans_up_on_failed_startup_and_normal_exit(self):
+        import ast
+        import asyncio
+        from contextlib import asynccontextmanager
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, Mock
+        api=Path(os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2]/'api')))
+        tree=ast.parse((api/'main.py').read_text())
+        function=next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name=='lifespan')
+        namespace={'asynccontextmanager':asynccontextmanager,'FastAPI':object}
+        exec(compile(ast.Module(body=[function],type_ignores=[]),'main.py','exec'),namespace)
+        for fail in (False, True):
+            order=[]
+            runtime=SimpleNamespace(shutdown=lambda:order.append('shutdown'))
+            gold=SimpleNamespace(load_sessions_from_disk=Mock(side_effect=RuntimeError('startup') if fail else lambda:order.append('load')),
+                                 reconcile_interrupted_generations=Mock())
+            wc=SimpleNamespace(sweep_staging=AsyncMock(return_value=[]),close_client=lambda:order.append('close'))
+            importer=SimpleNamespace(sweep_interrupted_imports=lambda:[],sweep_stale_workdirs=lambda:[])
+            service=SimpleNamespace(goldstandard=gold,metrics=SimpleNamespace(load_from_disk=Mock()),weaviate_client=wc,importer=importer)
+            modules={'services':service,'services.telemetry':SimpleNamespace(bootstrap=lambda:(order.append('bootstrap') or runtime))}
+            async def exercise():
+                async with namespace['lifespan'](SimpleNamespace(state=SimpleNamespace())):
+                    order.append('yield')
+            with patch.dict(sys.modules,modules):
+                if fail:
+                    with self.assertRaises(RuntimeError):asyncio.run(exercise())
+                else:asyncio.run(exercise())
+            self.assertEqual(order[0],'bootstrap')
+            self.assertEqual(order[-2:],['close','shutdown'])
+            self.assertEqual('yield' in order,not fail)
+
+    def test_lifecycle_deadline_single_worker_and_eventual_shutdown(self):
+        release=threading.Event()
+        class Stalled:
+            closed=0
+            def force_flush(self, **kwargs):release.wait();return True
+            def shutdown(self):self.closed+=1
+        runtime=Runtime(Config(enabled=True,shutdown_ms=100));provider=Stalled();runtime._providers=[provider]
+        try:
+            started=time.monotonic()
+            self.assertFalse(runtime.force_flush())
+            worker=runtime._worker
+            self.assertFalse(runtime.shutdown())
+            self.assertIs(worker,runtime._worker)
+            self.assertLess(time.monotonic()-started,.5)
+        finally:release.set();worker.join(1)
+        self.assertEqual(provider.closed,1)
+        self.assertTrue(runtime.shutdown())
+        self.assertEqual(provider.closed,1)
+
+if __name__ == '__main__':unittest.main()
+```
+
+### scripts/tests/test_telemetry_implementation.py
+
+```python
+"""Ensure the copyable implementation matches the tested telemetry foundation."""
+from pathlib import Path
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+FILES = [('api/main.py', 'python'), ('api/services/telemetry.py', 'python'), ('api/requirements.in', 'text'), ('api/requirements.txt', 'text'), ('scripts/tests/test_telemetry.py', 'python'), ('scripts/tests/test_telemetry_implementation.py', 'python'), ('scripts/tests/test_tracing.py', 'python'), ('scripts/tests/test_telemetry_operations.py', 'python'), ('scripts/verify/01_infrastructure.sh', 'bash'), ('scripts/verify/README.md', 'markdown'), ('api/services/batch_write.py', 'python'), ('api/services/chunker.py', 'python'), ('api/services/collection_recovery.py', 'python'), ('api/services/exporter.py', 'python'), ('api/services/goldstandard.py', 'python'), ('api/services/importer.py', 'python'), ('api/services/ingest_pipeline.py', 'python'), ('api/services/ollama_client.py', 'python'), ('api/services/packager.py', 'python'), ('api/services/rag_pipeline.py', 'python'), ('api/services/sources.py', 'python'), ('api/services/tuning.py', 'python'), ('api/services/weaviate_client.py', 'python')]
+FILES += [('scripts/verify/stack.sh', 'bash'), ('scripts/verify/service_inventory.py', 'python'), ('scripts/tests/test_service_inventory.py', 'python')]
+
+FILES += [('scripts/verify/telemetry_e2e.py', 'python'), ('scripts/verify/telemetry_guard.py', 'python'), ('scripts/collector_offline.py', 'python'), ('scripts/tests/test_collector.py', 'python'), ('scripts/tests/test_telemetry_capture.py', 'python'), ('docker-compose.telemetry.verify.yml', 'yaml'), ('package-offline.sh', 'bash')]
+
+class EmbeddedTelemetryTests(unittest.TestCase):
+    def test_normative_telemetry_dependencies_match_inputs_and_lock(self):
+        spec = (ROOT/'SPECIFICATIONS.md').read_text()
+        inputs = (ROOT/'api/requirements.in').read_text().splitlines()
+        lock = (ROOT/'api/requirements.txt').read_text().splitlines()
+        for dependency in ('opentelemetry-sdk==1.44.0', 'opentelemetry-exporter-otlp-proto-http==1.44.0'):
+            self.assertIn(dependency, spec)
+            self.assertIn(dependency, inputs)
+            self.assertIn(dependency, lock)
+
+    def test_embedded_files_match(self):
+        document = (ROOT/'IMPLEMENTATION.md').read_text()
+        for name, language in FILES:
+            with self.subTest(name=name):
+                fence = '````' if language == 'markdown' else '```'
+                # Existing dependency fences are intentionally plain text.
+                header = '### '+name+'\n\n'+fence
+                start = document.index('\n', document.index(header)+len(header))+1
+                end = document.index('\n'+fence+'\n', start)
+                self.assertEqual(document[start:end], (ROOT/name).read_text().rstrip('\n'))
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
+
+### scripts/tests/test_tracing.py
+
+```python
+"""Synthetic #283 producer/worker tests; no backend or hosted collector."""
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import contextlib
+import io
+import os
+from pathlib import Path
+import sys
+import tempfile
+import threading
+from types import SimpleNamespace as NS
+import unittest
+from unittest.mock import patch, AsyncMock
+
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api')))
+from services import telemetry as ot, exporter, importer, tuning, goldstandard as gs
+from services import ingest_pipeline as ingest, weaviate_client as wc, ollama_client as ollama
+from config import settings
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.sampling import TraceIdRatioBased
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
+from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+import httpx
+from fastapi import FastAPI
+from routers import query, ingest as ingest_router, transfer, tuning as tuning_router, goldstandard
+
+SECRET = 'SENTINEL-secret-document-path-prompt'
+
+
+class TracingTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.stack = contextlib.ExitStack()
+        for field in ('upload_dir', 'sources_dir', 'exports_dir'):
+            self.stack.enter_context(patch.object(settings, field, self.temp.name))
+        self.memory = InMemorySpanExporter()
+        self.provider = TracerProvider(sampler=TraceIdRatioBased(1), shutdown_on_exit=False)
+        self.provider.add_span_processor(SimpleSpanProcessor(self.memory))
+        self.runtime = ot.Runtime(ot.Config())
+        self.runtime.tracer = self.provider.get_tracer('test')
+        self.app = FastAPI()
+        self.app.state.telemetry = self.runtime
+        self.app.add_middleware(ot.RequestTracing)
+        for router in (query.router, ingest_router.router, transfer.router, tuning_router.router, goldstandard.router):
+            self.app.include_router(router)
+        self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url='http://test')
+
+    async def asyncTearDown(self):
+        await self.client.aclose()
+        self.provider.shutdown()
+        self.stack.close()
+        self.temp.cleanup()
+
+    def spans(self, name=None):
+        result = self.memory.get_finished_spans()
+        return [s for s in result if name is None or s.name == name or (name == 'rag.request' and s.kind == trace.SpanKind.SERVER)]
+
+    def wire(self):
+        payload = encode_spans(self.spans()).SerializeToString()
+        clean = ot.sanitize_wire(payload, 'traces', ot.Config(batch_size=512))
+        self.assertNotIn(SECRET.encode(), clean)
+        return ExportTraceServiceRequest.FromString(clean).resource_spans[0].scope_spans[0].spans
+
+    async def until(self, predicate):
+        for _ in range(1000):
+            if predicate():
+                return
+            await asyncio.sleep(.002)
+        self.fail('worker did not complete')
+
+    def lineage(self, job_name):
+        jobs = self.spans(job_name)
+        requests = {s.context.span_id: s for s in self.spans('rag.request')}
+        self.assertTrue(jobs)
+        for job in jobs:
+            self.assertIn(job.parent.span_id, requests)
+            self.assertEqual(job.context.trace_id, requests[job.parent.span_id].context.trace_id)
+        self.wire()
+
+    async def test_query_real_pipeline_and_dependency_error(self):
+        collection = NS(query=NS(near_vector=lambda **kw: NS(objects=[])))
+        fake_client = NS(collections=NS(get=lambda name: collection))
+        async def chat(*args):
+            return SECRET
+        async def embed(*args):
+            return [1.0]
+        with patch.object(wc, 'collection_exists', AsyncMock(return_value=True)), patch.object(wc, 'get_client', return_value=fake_client), patch.object(ollama, 'chat', ot.traced('ollama.chat')(chat)), patch.object(ollama, 'embed', ot.traced('ollama.embed')(embed)):
+            response = await self.client.post('/query', json={'question': SECRET, 'collection': 'Corpus', 'retrieval_mode': 'hnsw'})
+        self.assertEqual(response.status_code, 200, response.text)
+        for name in ('rag.query', 'rag.reformulate', 'rag.retrieval', 'rag.synthesis', 'weaviate.query'):
+            self.assertTrue(self.spans(name), name)
+        dep = self.spans('weaviate.query')[0]
+        self.assertGreater(dep.end_time, dep.start_time)
+        self.assertEqual(next(s.name for s in self.spans() if s.context.span_id == dep.parent.span_id), 'rag.retrieval')
+        self.wire()
+        with ot.bind((self.runtime, None)), self.assertRaises(TimeoutError):
+            ot.call('weaviate.query', lambda: (_ for _ in ()).throw(TimeoutError(SECRET)))
+        self.assertEqual(self.spans('weaviate.query')[-1].attributes['error.type'], 'timeout')
+
+    async def test_headers_routes_and_external_sampling(self):
+        tid, sid = 'a' * 32, 'b' * 16
+        good = f'00-{tid}-{sid}-00'
+        response = await self.client.get('/export/job/' + SECRET, headers={'traceparent': good, 'baggage': SECRET, 'tracestate': SECRET})
+        self.assertEqual(response.status_code, 404)
+        server = self.spans('rag.request')[-1]
+        self.assertIsNone(server.parent)
+        self.assertNotEqual(server.context.trace_id, int(tid, 16))
+        self.assertEqual(server.links[0].context.trace_id, int(tid, 16))
+        self.assertEqual(server.attributes['http.route'], 'GET /export/job/{job_id}')
+        self.assertEqual(server.attributes['http.status_class'], '4xx')
+        for headers in ({'traceparent': 'x' * 10000}, {'traceparent': good.upper()}, {'traceparent': f'00-{tid}-'+ '0'*16+'-01'}, [('traceparent', good), ('traceparent', good)], {'traceparent': good.replace('00-', 'ff-', 1)}):
+            await self.client.get('/'+SECRET, headers=headers)
+            self.assertFalse(self.spans('rag.request')[-1].links)
+            self.assertEqual(self.spans('rag.request')[-1].attributes['http.route'], 'unmatched')
+        self.wire()
+        self.runtime.tracer = TracerProvider(sampler=TraceIdRatioBased(0)).get_tracer('zero')
+        count = len(self.spans())
+        await self.client.get('/'+SECRET, headers={'traceparent': good[:-2]+'01'})
+        self.assertEqual(len(self.spans()), count)
+
+    async def test_outcome_admission_and_classification(self):
+        with ot.bind((self.runtime, None)):
+            for explicit in (False, True):
+                with ot.span('rag.query') as current:
+                    for invalid in (SECRET, None, 1, True, [], {}, ('error',)):
+                        ot.outcome(invalid, ValueError(SECRET), current if explicit else None)
+                        self.assertEqual(dict(current.attributes), {'rag.outcome': 'ok'})
+                        self.assertEqual(current.status.status_code, trace.StatusCode.UNSET)
+            for value in ('ok', 'error', 'partial', 'cancelled'):
+                with ot.span('rag.query') as current:
+                    ot.outcome(value, ValueError(SECRET))
+                result = self.spans('rag.query')[-1]
+                self.assertEqual(result.attributes['rag.outcome'], value)
+                self.assertEqual(result.attributes.get('error.type'),
+                                 'validation' if value != 'cancelled' else None)
+            for exc, category in ((TimeoutError(SECRET), 'timeout'),
+                                  (ConnectionError(SECRET), 'connection'),
+                                  (ValueError(SECRET), 'validation'),
+                                  (RuntimeError(SECRET), 'internal')):
+                with self.assertRaises(type(exc)) as caught:
+                    with ot.span('rag.query'):
+                        raise exc
+                self.assertIs(caught.exception, exc)
+                self.assertEqual(self.spans('rag.query')[-1].attributes['error.type'], category)
+        self.wire()
+
+    async def test_span_cancellation_has_no_internal_error(self):
+        with ot.bind((self.runtime, None)):
+            for exc in (asyncio.CancelledError(SECRET), GeneratorExit(SECRET)):
+                with ot.span('rag.query') as parent:
+                    with self.assertRaises(type(exc)) as caught:
+                        with ot.span('rag.retrieval'):
+                            raise exc
+                    self.assertIs(caught.exception, exc)
+                    self.assertIs(trace.get_current_span(), parent)
+                result = self.spans('rag.retrieval')[-1]
+                self.assertEqual(result.attributes['rag.outcome'], 'cancelled')
+                self.assertNotIn('error.type', result.attributes)
+        self.wire()
+
+    async def test_iterator_terminal_outcomes_and_context(self):
+        for phase in ('factory', 'iter', 'next', 'yield'):
+            for exc in (asyncio.CancelledError(SECRET), GeneratorExit(SECRET), ValueError(SECRET)):
+                with self.subTest(phase=phase, exc=type(exc).__name__):
+                    def fail():
+                        raise exc
+                    class Source:
+                        def __iter__(self):
+                            if phase == 'iter':
+                                fail()
+                            return self
+                        def __next__(self):
+                            if phase == 'next':
+                                fail()
+                            return 1
+                    factory = fail if phase == 'factory' else Source
+                    before = len(self.spans('weaviate.iterate'))
+                    with ot.bind((self.runtime, None)), ot.span('rag.export') as parent:
+                        iterator = ot.iterate(factory)
+                        with self.assertRaises(type(exc)) as caught:
+                            if phase == 'yield':
+                                self.assertEqual(next(iterator), 1)
+                                self.assertIs(trace.get_current_span(), parent)
+                                iterator.throw(exc)
+                            else:
+                                next(iterator)
+                        self.assertIs(caught.exception, exc)
+                        self.assertIs(trace.get_current_span(), parent)
+                        iterator.close()
+                    self.assertEqual(len(self.spans('weaviate.iterate')), before + 1)
+                    result = self.spans('weaviate.iterate')[-1]
+                    cancelled = isinstance(exc, (asyncio.CancelledError, GeneratorExit))
+                    self.assertEqual(result.attributes['rag.outcome'], 'cancelled' if cancelled else 'error')
+                    self.assertEqual(result.attributes.get('error.type'), None if cancelled else 'validation')
+                    self.assertEqual(result.parent.span_id, parent.get_span_context().span_id)
+        with ot.bind((self.runtime, None)), ot.span('rag.export') as parent:
+            iterator = ot.iterate(lambda: iter([1, 2]))
+            self.assertEqual(next(iterator), 1)
+            iterator.close()
+            self.assertEqual(self.spans('weaviate.iterate')[-1].attributes['rag.outcome'], 'cancelled')
+            self.assertNotIn('error.type', self.spans('weaviate.iterate')[-1].attributes)
+            self.assertIs(trace.get_current_span(), parent)
+            self.assertEqual(list(ot.iterate(lambda: iter([1, 2]))), [1, 2])
+            self.assertEqual(self.spans('weaviate.iterate')[-1].attributes['rag.outcome'], 'ok')
+            self.assertIs(trace.get_current_span(), parent)
+        self.wire()
+
+    async def test_health_covers_connection_and_readiness(self):
+        exc = ConnectionError(SECRET)
+        with patch.object(wc, '_client', None), patch.object(wc.weaviate, 'connect_to_custom', side_effect=exc), ot.bind((self.runtime, None)):
+            with self.assertRaises(ConnectionError) as caught:
+                await wc.check_health()
+        self.assertIs(caught.exception, exc)
+        health = self.spans('weaviate.health')[-1]
+        connect = self.spans('weaviate.connect')[-1]
+        self.assertEqual(connect.parent.span_id, health.context.span_id)
+        for result in (health, connect):
+            self.assertEqual(result.attributes['rag.outcome'], 'error')
+            self.assertEqual(result.attributes['error.type'], 'connection')
+        for ready in (True, False, TimeoutError(SECRET)):
+            def check():
+                if isinstance(ready, BaseException):
+                    raise ready
+                return ready
+            with patch.object(wc, 'get_client', return_value=NS(is_ready=check)), ot.bind((self.runtime, None)):
+                if isinstance(ready, BaseException):
+                    with self.assertRaises(TimeoutError) as caught:
+                        await wc.check_health()
+                    self.assertEqual(caught.exception.args, ready.args)
+                else:
+                    self.assertIs(await wc.check_health(), ready)
+            result = self.spans('weaviate.health')[-1]
+            self.assertEqual(result.attributes['rag.outcome'], 'ok' if ready is True else 'error')
+            self.assertEqual(result.attributes.get('error.type'), 'timeout' if isinstance(ready, BaseException) else None)
+        self.wire()
+
+    async def test_all_trace_flag_bytes_preserve_only_sampled_bit(self):
+        tid, sid = 'a' * 32, 'b' * 16
+        for flags in range(256):
+            value = f'00-{tid}-{sid}-{flags:02x}'
+            links = ot.remote_link([(b'traceparent', value.encode())])
+            self.assertEqual(len(links), 1)
+            self.assertEqual(int(links[0].context.trace_flags), flags & 1)
+        for flags in ('02', '03', 'fe', 'ff'):
+            await self.client.get('/' + SECRET, headers={'traceparent': f'00-{tid}-{sid}-{flags}'})
+            server = self.spans('rag.request')[-1]
+            self.assertIsNone(server.parent)
+            self.assertNotEqual(server.context.trace_id, int(tid, 16))
+            self.assertEqual(server.links[0].context.trace_id, int(tid, 16))
+            self.assertEqual(int(server.links[0].context.trace_flags), int(flags, 16) & 1)
+        for flags in ('0G', 'FF', 'g0', '0', '000', ' 1'):
+            self.assertFalse(ot.remote_link([(b'traceparent', f'00-{tid}-{sid}-{flags}'.encode())]))
+        for result in self.wire():
+            self.assertEqual(len(result.links), 1)
+            self.assertLessEqual(result.links[0].flags & 255, 1)
+        zero = TracerProvider(sampler=TraceIdRatioBased(0), shutdown_on_exit=False)
+        zero.add_span_processor(SimpleSpanProcessor(self.memory))
+        try:
+            self.runtime.tracer = zero.get_tracer('zero')
+            count = len(self.spans())
+            await self.client.get('/' + SECRET, headers={'traceparent': f'00-{tid}-{sid}-ff'})
+            self.assertEqual(len(self.spans()), count)
+        finally:
+            zero.shutdown()
+
+    async def test_rebuild_config_span_tracks_only_backend_fetch(self):
+        config_api = NS(get=lambda: None)
+        client = NS(collections=NS(get=lambda name: NS(config=config_api)))
+        hnsw = {'efConstruction': 64, 'maxConnections': 16, 'ef': 32}
+        config = NS(vector_index_config=NS(ef_construction=64, max_connections=16, ef=32,
+                                          distance_metric=wc.VectorDistances.COSINE),
+                    properties=[], vectorizer=None, vectorizer_config=None)
+        for fetch_fails in (False, True):
+            with self.subTest(fetch_fails=fetch_fails):
+                # Stop at staging creation, after the real fetch and local lookup.
+                # This covers the producer without performing collection writes.
+                failure = ValueError(SECRET) if fetch_fails else RuntimeError(SECRET)
+                before = len(self.spans('weaviate.config'))
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(patch.object(wc, 'get_client', return_value=client))
+                    fetch = stack.enter_context(patch.object(config_api, 'get',
+                        return_value=config, side_effect=failure if fetch_fails else None))
+                    stack.enter_context(patch.object(tuning.collection_recovery, 'begin',
+                        return_value={'staging': 'Scratch', 'state': 'scratch'}))
+                    stack.enter_context(patch.object(tuning.collection_recovery, 'discard'))
+                    create = stack.enter_context(patch.object(wc, '_create_collection_sync', side_effect=failure))
+                    stack.enter_context(ot.bind((self.runtime, None)))
+                    with self.assertRaises(type(failure)) as caught:
+                        tuning._rebuild('Synthetic', [], None, None, None)
+                self.assertIs(caught.exception, failure)
+                fetch.assert_called_once_with()
+                if fetch_fails:
+                    create.assert_not_called()
+                else:
+                    create.assert_called_once_with('Scratch', 'hnsw', 'cosine', hnsw, preserve_hnsw=True)
+                emitted = self.spans('weaviate.config')[before:]
+                self.assertEqual(len(emitted), 1)
+                self.assertEqual(emitted[0].kind, trace.SpanKind.CLIENT)
+                self.assertEqual(emitted[0].parent.span_id, self.spans('rag.rebuild')[-1].context.span_id)
+                self.assertEqual(emitted[0].attributes['rag.outcome'], 'error' if fetch_fails else 'ok')
+        self.wire()
+
+    async def test_export_admission_concurrency_and_after_response(self):
+        release = threading.Event()
+        entered = []
+        def build(collection, **kwargs):
+            entered.append(trace.get_current_span().get_span_context().trace_id)
+            if not release.wait(3):
+                raise TimeoutError('test synchronization')
+            ot.call('weaviate.query', lambda: None)
+            return dict(filename=SECRET, size_bytes=1, chunk_count=1, source_document_count=0,
+                        fidelity='chunks-only', models_bundled=False, retrieve_script=False, warnings=[])
+        try:
+            with patch.object(wc, 'collection_exists', AsyncMock(return_value=True)), patch.object(exporter.packager, 'build', build):
+                a = await self.client.post('/export', json={'collection':'TraceA'})
+                b = await self.client.post('/export', json={'collection':'TraceB'})
+                self.assertEqual((a.status_code,b.status_code),(202,202))
+                await self.until(lambda: len(entered)==2)
+                self.assertFalse(self.spans('rag.export'))
+                self.assertEqual(len(set(entered)),2)
+                release.set()
+                await self.until(lambda: len(self.spans('rag.export'))==2)
+        finally:
+            release.set()
+        self.lineage('rag.export')
+        request_ends = {s.context.span_id:s.end_time for s in self.spans('rag.request')}
+        self.assertTrue(all(s.end_time > request_ends[s.parent.span_id] for s in self.spans('rag.export')))
+
+    async def test_ingest_real_executor_partial_failure(self):
+        def parse(path):
+            if path.name.startswith('bad'):
+                raise ValueError(SECRET)
+            return SECRET, []
+        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(ingest,'_parse_file',ot.traced('rag.parse')(parse)), patch.object(ingest,'do_chunk',return_value=[SECRET]), patch.object(wc,'_insert_chunks_sync',side_effect=lambda *a: ot.call('weaviate.batch',lambda: None)), patch.object(ingest.sources,'store'):
+            response = await self.client.post('/ingest/upload', data={'collection':'TraceIngest'}, files=[('files',('good.txt',b'data')),('files',('bad.txt',b'data'))])
+            self.assertEqual(response.status_code,202,response.text)
+            job_id=response.json()['job_id']
+            await self.until(lambda: ingest.get_job(job_id)['status'] in ('partial','failed','completed'))
+            await self.until(lambda: bool(self.spans('rag.ingest')))
+        self.assertEqual(ingest.get_job(job_id)['status'],'partial')
+        self.assertEqual(self.spans('rag.ingest')[0].attributes['rag.outcome'],'partial')
+        self.lineage('rag.ingest')
+
+    async def test_import_and_tuning_real_launchers_handled_failure(self):
+        with patch.object(importer.packager,'open_package',side_effect=importer.PackageError('INVALID',SECRET)), patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(tuning,'_existing_chunks',side_effect=ValueError(SECRET)):
+            a=await self.client.post('/import',json={'filename':SECRET+'.tar.gz','on_conflict':'abort'})
+            b=await self.client.post('/tune/reembed',json={'collection':'TraceTune'})
+            self.assertEqual((a.status_code,b.status_code),(202,202))
+            await self.until(lambda: bool(self.spans('rag.import')) and bool(self.spans('rag.tuning')))
+        self.assertEqual(importer.get_job(a.json()['job_id'])['status'],'failed')
+        self.assertEqual(tuning.get_job(b.json()['job_id'])['status'],'failed')
+        self.lineage('rag.import'); self.lineage('rag.tuning')
+        for name in ('rag.import','rag.tuning'):
+            self.assertEqual(self.spans(name)[0].attributes['rag.outcome'],'error')
+
+    async def test_generation_real_task_and_regeneration_timeout(self):
+        session={'session_id':'synthetic','status':'generating','pairs':[], 'pairs_total':1,'pairs_completed':0,'pairs_failed':0,'pairs_attempted':0}
+        def update(sid,change):
+            return change(session)
+        ready=asyncio.Event()
+        async def model(*args):
+            await ready.wait()
+            return '{"question":"synthetic","answer":"synthetic","ground_truth":"synthetic"}'
+        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',update), patch.object(ollama,'chat',ot.traced('ollama.chat')(model)):
+            response=await self.client.post('/goldstandard/generate',json={'collection':'TraceGold','sample_size':1})
+            self.assertEqual(response.status_code,202,response.text)
+            ready.set()
+            await self.until(lambda: bool(self.spans('rag.evaluation')))
+        self.assertEqual(session['status'],'completed')
+        self.lineage('rag.evaluation')
+        pair={'pair_id':'pair','contexts':[SECRET],'source_file':SECRET,'chunk_index':0}
+        async def slow(*args):
+            await asyncio.sleep(10)
+        with patch.object(gs,'get_session',return_value={'pairs':[pair],'status':'completed'}), patch.object(gs,'_REGENERATION_TIMEOUT_SECONDS',.005), patch.object(ollama,'chat',ot.traced('ollama.chat')(slow)):
+            response=await self.client.post('/goldstandard/regenerate',json={'session_id':'session','pair_id':'pair'})
+        self.assertEqual(response.status_code,504,response.text)
+        self.assertEqual(self.spans('rag.regenerate')[-1].attributes['error.type'],'timeout')
+        self.assertTrue(any(s.attributes.get('rag.outcome')=='cancelled' for s in self.spans('rag.pair')))
+        self.wire()
+
+    async def test_thread_waiter_cancel_and_context_restore(self):
+        entered=threading.Event(); release=threading.Event()
+        @ot.traced('rag.export')
+        def work():
+            entered.set();release.wait(3)
+        with ot.bind((self.runtime,None)), ot.span('rag.request') as parent:
+            captured=ot.admitted(work)
+        task=asyncio.create_task(asyncio.to_thread(captured))
+        await self.until(entered.is_set)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):await task
+        self.assertFalse(self.spans('rag.export'))
+        release.set()
+        await self.until(lambda: bool(self.spans('rag.export')))
+        self.assertEqual(self.spans('rag.export')[0].parent.span_id,parent.get_span_context().span_id)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            await asyncio.get_running_loop().run_in_executor(pool,captured)
+            context=await asyncio.get_running_loop().run_in_executor(pool,ot.capture)
+        self.assertEqual(context,(None,None))
+
+    async def test_iterator_batch_boundaries_and_no_context_leak(self):
+        def rows():
+            yield 1
+            raise ConnectionError(SECRET)
+        with ot.bind((self.runtime,None)),ot.span('rag.export') as parent:
+            iterator=ot.iterate(rows)
+            self.assertEqual(next(iterator),1)
+            self.assertEqual(trace.get_current_span(),parent)
+            with self.assertRaises(ConnectionError):next(iterator)
+        self.assertEqual(self.spans('weaviate.iterate')[0].attributes['error.type'],'connection')
+        self.wire()
+
+    async def test_telemetry_fault_and_disabled_do_not_repeat_work(self):
+        for tracer in (None, NS(start_span=lambda *a,**k: (_ for _ in ()).throw(RuntimeError(SECRET)))):
+            self.runtime.tracer=tracer
+            calls=[]
+            with ot.bind((self.runtime,None)):
+                self.assertEqual(ot.call('weaviate.query',lambda: calls.append(1) or 7),7)
+                self.assertEqual(list(ot.iterate(lambda:iter([1,2]))),[1,2])
+            self.assertEqual(calls,[1])
+        self.assertEqual(ot.capture(),(None,None))
+
+    async def test_generation_cancellation_and_failure_reporter(self):
+        session={'session_id':'cancel-session','status':'generating','pairs':[], 'pairs_total':1,'pairs_completed':0,'pairs_failed':0,'pairs_attempted':0}
+        def update(sid,change): return change(session)
+        entered=asyncio.Event()
+        async def slow(*args):
+            entered.set()
+            await asyncio.sleep(10)
+        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',update), patch.object(ollama,'chat',ot.traced('ollama.chat')(slow)):
+            response=await self.client.post('/goldstandard/generate',json={'collection':'TraceCancel','sample_size':1})
+            self.assertEqual(response.status_code,202)
+            await entered.wait()
+            tasks=list(gs._tasks)
+            for task in tasks: task.cancel()
+            await asyncio.gather(*tasks,return_exceptions=True)
+        self.assertEqual(session['status'],'cancelled')
+        self.assertEqual(self.spans('rag.evaluation')[-1].attributes['rag.outcome'],'cancelled')
+        # Real done callback creates the failure reporter with captured origin.
+        session['status']='generating'
+        async def model(*args): return '{"question":"q","answer":"a","ground_truth":"g"}'
+        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',side_effect=gs.GoldStandardError('STORE_FAILED',SECRET,500)), patch.object(gs,'_publish_generation_failure'), patch.object(ollama,'chat',ot.traced('ollama.chat')(model)):
+            await self.client.post('/goldstandard/generate',json={'collection':'TraceFailed','sample_size':1})
+            await self.until(lambda: bool(self.spans('rag.failure_report')))
+        self.lineage('rag.failure_report')
+        self.assertEqual(self.spans('rag.failure_report')[-1].attributes['rag.outcome'],'error')
+
+    async def test_ollama_real_client_error_and_nested_asyncio_run(self):
+        class Client:
+            async def __aenter__(self): return self
+            async def __aexit__(self,*args): pass
+            async def post(self,*args,**kwargs): raise httpx.ReadTimeout(SECRET)
+            async def get(self,*args,**kwargs): raise httpx.ConnectError(SECRET)
+        with patch.object(ollama.httpx,'AsyncClient',return_value=Client()), ot.bind((self.runtime,None)), ot.span('rag.import') as parent:
+            # This is the actual importer's synchronous bridge into a fresh loop.
+            result=await asyncio.to_thread(importer._probe_dimensions)
+            self.assertIsNone(result)
+            health=await ollama.check_health()
+        self.assertEqual(health['llm']['status'],'error')
+        self.assertEqual(self.spans('ollama.embed')[-1].parent.span_id,parent.get_span_context().span_id)
+        self.assertEqual(self.spans('ollama.embed')[-1].attributes['error.type'],'timeout')
+        self.assertEqual(self.spans('ollama.health')[-1].attributes['error.type'],'connection')
+        self.wire()
+
+    async def test_streaming_request_cancellation_and_validation(self):
+        from fastapi.responses import StreamingResponse
+        entered=asyncio.Event()
+        @self.app.get('/stream')
+        async def stream():
+            async def chunks():
+                yield b'first'
+                entered.set()
+                await asyncio.sleep(10)
+            return StreamingResponse(chunks())
+        task=asyncio.create_task(self.client.get('/stream'))
+        await entered.wait()
+        self.assertFalse(self.spans('rag.request'))
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError): await task
+        self.assertEqual(self.spans('rag.request')[-1].attributes['rag.outcome'],'cancelled')
+        response=await self.client.post('/query',json={'question':SECRET})
+        self.assertEqual(response.status_code,422)
+        self.assertEqual(self.spans('rag.request')[-1].attributes['http.status_class'],'4xx')
+        self.wire()
+
+    async def test_actual_batch_failure_and_export_iterator_paths(self):
+        from services import batch_write, packager
+        class Batch:
+            number_errors=0
+            def __enter__(self): return self
+            def __exit__(self,*args):
+                self.finished=True
+            def add_object(self,**kwargs): pass
+        batch=Batch()
+        coll=NS(batch=NS(dynamic=lambda:batch,failed_objects=[NS(message=SECRET)]))
+        records=[{'id':'00000000-0000-0000-0000-000000000001','properties':{'content':SECRET},'vector':[1.0]}]
+        with ot.bind((self.runtime,None)),ot.span('rag.ingest'),self.assertRaises(RuntimeError):
+            batch_write.insert(coll,records)
+        self.assertTrue(batch.finished)
+        self.assertEqual(self.spans('weaviate.batch')[-1].attributes['rag.outcome'],'error')
+        obj=NS(uuid='00000000-0000-0000-0000-000000000001',properties={'content':SECRET,'source_file':SECRET},vector=[1.0])
+        coll=NS(iterator=lambda **kw:iter([obj]))
+        with patch.object(wc,'get_client',return_value=NS(collections=NS(get=lambda name:coll))),patch.object(packager.sources,'load_index',return_value={'documents':{}}),ot.bind((self.runtime,None)),ot.span('rag.export') as parent:
+            self.assertEqual(len(list(packager.read_chunks('Synthetic'))),1)
+            self.assertEqual(trace.get_current_span(),parent)
+        self.assertTrue(self.spans('weaviate.iterate'))
+        self.wire()
+
+    async def test_real_export_link_sanitization_both_boundaries(self):
+        from test_telemetry import receiver
+        from opentelemetry.trace import Link, SpanContext, TraceFlags, TraceState
+        with receiver() as (env,records):
+            env.update(RAG_OTEL_LOGS='false',RAG_OTEL_METRICS='false')
+            runtime=ot.bootstrap(env)
+            try:
+                context=SpanContext(1,2,True,TraceFlags(1),TraceState([('private',SECRET)]))
+                with ot.bind((runtime,None)),ot.span('rag.request',links=[Link(context,{'secret':SECRET}),Link(context)]):
+                    pass
+                self.assertTrue(runtime.force_flush())
+            finally:
+                runtime.shutdown()
+        traces=[payload for path,payload in records if path=='/v1/traces']
+        self.assertTrue(traces)
+        for payload in traces:
+            self.assertNotIn(SECRET.encode(),payload)
+            spans=ExportTraceServiceRequest.FromString(payload).resource_spans[0].scope_spans[0].spans
+            self.assertEqual(len(spans[0].links),1)
+            self.assertEqual(spans[0].links[0].trace_id,b'\x00'*15+b'\x01')
+            self.assertEqual(spans[0].links[0].trace_state,'')
+            self.assertFalse(spans[0].links[0].attributes)
+
+if __name__=='__main__':
+    unittest.main()
+```
+
+
+### scripts/tests/test_telemetry_operations.py
+
+```python
+"""Operational #284 counts/correlation using real SDKs and synthetic producers."""
+import asyncio
+import os
+from pathlib import Path
+import sys
+import threading
+from types import SimpleNamespace as NS
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR', str(Path(__file__).resolve().parents[2] / 'api')))
+from services import telemetry as ot
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+from opentelemetry.sdk.metrics.view import View, DropAggregation, ExplicitBucketHistogramAggregation
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.sampling import TraceIdRatioBased
+from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import ExportMetricsServiceRequest
+from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
+from test_telemetry import receiver, SECRET
+import httpx
+from fastapi import FastAPI
+
+
+def dimensions(point):
+    return {a.key: a.value.string_value for a in point.attributes}
+
+
+class OperationsTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.reader = InMemoryMetricReader()
+        self.provider = MeterProvider(shutdown_on_exit=False, metric_readers=[self.reader], views=[
+            View(instrument_name='*', aggregation=DropAggregation()),
+            *[View(instrument_name=n, attribute_keys=set(v[2]), aggregation=ExplicitBucketHistogramAggregation(ot.BUCKETS) if v[0]=='create_histogram' else None) for n,v in ot.METRICS.items()]])
+        self.runtime = ot.Runtime(ot.Config())
+        self.runtime.meter = ot.SafeMeter(self.provider.get_meter('test'), self.runtime._active_health)
+        self.logs = []
+        self.runtime.logger = NS(emit=lambda **kw: self.logs.append(kw))
+
+    def tearDown(self):
+        self.provider.shutdown()
+
+    def metrics(self):
+        data = self.reader.get_metrics_data()
+        return {} if data is None else {m.name: m for r in data.resource_metrics for s in r.scope_metrics for m in s.metrics}
+
+    def total(self, name, key='value'):
+        return sum(getattr(p,key) for p in self.metrics()[name].data.data_points)
+
+    async def test_exact_job_dependency_deltas_and_nested_outcomes(self):
+        # Unknown token usage is absent. Stage spans do not add job counts.
+        with ot.bind((self.runtime,None)), ot.span('rag.export'):
+            for invalid in (SECRET,None,1,True,[],{},('error',)):
+                ot.outcome(invalid,ValueError(SECRET))
+            with ot.span('rag.package'):
+                ot.call('weaviate.query', lambda: None)
+        with ot.bind((self.runtime,None)), ot.span('rag.import'):
+            try:
+                ot.call('ollama.embed', lambda: (_ for _ in ()).throw(TimeoutError(SECRET)))
+            except TimeoutError:
+                ot.outcome('error', TimeoutError(SECRET))
+        with ot.bind((self.runtime,None)), ot.span('rag.ingest'):
+            ot.outcome('partial')
+        with self.assertRaises(asyncio.CancelledError), ot.bind((self.runtime,None)), ot.span('rag.evaluation'):
+            raise asyncio.CancelledError()
+        self.assertEqual(self.total('rag.job.completed'),4)
+        self.assertEqual(self.total('rag.job.duration','count'),4)
+        self.assertEqual(self.total('rag.job.active'),0)
+        self.assertEqual(self.total('rag.dependency.calls'),2)
+        self.assertEqual(self.total('rag.dependency.errors'),1)
+        outcomes={p.attributes['rag.operation']:p.attributes['rag.outcome'] for p in self.metrics()['rag.job.completed'].data.data_points}
+        self.assertEqual(outcomes,{'export':'ok','import':'error','ingest':'error','evaluation':'cancelled'})
+        self.assertEqual(len(self.logs),6)
+        self.assertTrue(all('error.type' not in log['attributes'] for log in self.logs
+                            if log['attributes']['rag.outcome']=='cancelled'))
+        self.assertTrue(all('rag.job_token' in log['attributes'] for log in self.logs))
+        self.assertEqual(self.logs[0]['attributes']['rag.job_token'], self.logs[1]['attributes']['rag.job_token'])
+        self.assertNotIn('token.usage',self.metrics())
+
+    async def test_deterministic_monotonic_duration(self):
+        with patch.object(ot.time,'monotonic',side_effect=[10,12.5]), ot.bind((self.runtime,None)), ot.span('rag.export'):
+            pass
+        self.assertEqual(self.total('rag.job.duration','sum'),2.5)
+        self.assertEqual(self.total('rag.job.active'),0)
+
+    async def test_real_asgi_routes_failures_stream_cancel_and_unknown_methods(self):
+        app=FastAPI()
+        app.state.telemetry=self.runtime
+        app.add_middleware(ot.RequestTracing)
+        @app.get('/health')
+        async def health(): return {'ok': True}
+        @app.post('/query')
+        async def query(): raise ValueError(SECRET)
+        entered=asyncio.Event()
+        from fastapi.responses import StreamingResponse
+        @app.get('/stream')
+        async def stream():
+            async def chunks():
+                yield b'a'; entered.set(); await asyncio.sleep(60)
+            return StreamingResponse(chunks())
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app,raise_app_exceptions=False),base_url='http://test') as client:
+            self.assertEqual((await client.get('/health')).status_code,200)
+            self.assertEqual((await client.post('/query')).status_code,500)
+            self.assertEqual((await client.request('PRIVATE', '/'+SECRET)).status_code,404)
+            task=asyncio.create_task(client.get('/stream'))
+            await entered.wait()
+            self.assertEqual(self.total('rag.api.active'),1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError): await task
+        self.assertEqual(self.total('rag.api.requests'),4)
+        self.assertEqual(self.total('rag.api.duration','count'),4)
+        self.assertEqual(self.total('rag.api.active'),0)
+        points=self.metrics()['rag.api.requests'].data.data_points
+        labels=[dict(p.attributes) for p in points]
+        self.assertIn({'http.route':'POST /query','http.method':'POST','http.status_class':'unknown','rag.outcome':'error'},labels)
+        self.assertTrue(any(p['http.method']=='unknown' for p in labels))
+        self.assertTrue(any(p['rag.outcome']=='cancelled' for p in labels))
+        self.assertNotIn(SECRET,str(labels))
+
+    async def test_cardinality_before_aggregation_and_concurrent_job_tokens(self):
+        instrument=self.runtime.meter.create_counter('rag.api.requests')
+        attrs={'http.route':'GET /health','http.method':'GET','http.status_class':'2xx','rag.outcome':'ok'}
+        for n in range(1000):
+            instrument.add(1,{**attrs,'job_id':str(n),'rag.job_token':f'{n:032x}','filename':SECRET})
+            instrument.add(1,{**attrs,'http.route':SECRET+str(n)})
+        self.assertEqual(len(self.metrics()['rag.api.requests'].data.data_points),1)
+        self.assertEqual(self.total('rag.api.requests'),1000)
+        async def job():
+            with ot.span('rag.export'):
+                await asyncio.sleep(0)
+                ot.call('weaviate.query',lambda:None)
+        with ot.bind((self.runtime,None)):
+            await asyncio.gather(*(job() for _ in range(20)))
+        logs=[r for r in self.logs if r['body']=='rag.job.completed']
+        tokens={r['attributes']['rag.job_token'] for r in logs}
+        self.assertEqual(len(tokens),20)
+        self.assertEqual({r['attributes']['rag.job_token'] for r in self.logs if r['body']=='rag.dependency.completed'},tokens)
+        self.assertEqual(len(self.metrics()['rag.job.completed'].data.data_points),1)
+        self.assertIsNone(ot._job_token.get())
+        self.assertIsNone(ot._operation.get())
+
+    async def test_worker_waiter_cancellation_and_never_started_task(self):
+        entered=threading.Event();release=threading.Event()
+        @ot.traced('rag.export')
+        def worker():
+            entered.set();release.wait(3)
+        with ot.bind((self.runtime,None)):
+            captured=ot.admitted(worker)
+        task=asyncio.create_task(asyncio.to_thread(captured))
+        await asyncio.to_thread(entered.wait,2)
+        self.assertEqual(self.total('rag.job.active'),1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError): await task
+        self.assertEqual(self.total('rag.job.active'),1)
+        self.assertNotIn('rag.job.completed',self.metrics())
+        release.set()
+        for _ in range(1000):
+            if 'rag.job.completed' in self.metrics(): break
+            await asyncio.sleep(.001)
+        self.assertEqual(self.total('rag.job.completed'),1)
+        self.assertEqual(self.total('rag.job.active'),0)
+        @ot.traced('rag.evaluation')
+        async def never(): raise AssertionError('must never execute')
+        with ot.bind((self.runtime,None)):
+            task=asyncio.create_task(ot.admitted(never)())
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):await task
+        self.assertEqual(self.total('rag.job.completed'),1)
+
+    async def test_iterator_lifetime_no_context_leak_and_early_close(self):
+        def rows():
+            yield 1
+            raise ConnectionError(SECRET)
+        with ot.bind((self.runtime,None)),ot.span('rag.export'):
+            iterator=ot.iterate(rows)
+            self.assertEqual(next(iterator),1)
+            self.assertEqual(ot._operation.get().category,'job')
+            with self.assertRaises(ConnectionError):next(iterator)
+            closed=ot.iterate(lambda:iter([1,2]))
+            next(closed);closed.close()
+            ot.outcome('partial')
+        self.assertEqual(self.total('rag.dependency.calls'),2)
+        self.assertEqual(self.total('rag.dependency.errors'),1)
+        self.assertEqual(self.total('rag.job.completed'),1)
+        self.assertEqual(self.logs[-1]['attributes']['rag.outcome'],'partial')
+        self.assertEqual({r['attributes']['rag.outcome'] for r in self.logs[:-1]},{'error','cancelled'})
+
+    async def test_sampling_zero_and_sdk_faults_preserve_operation(self):
+        provider=TracerProvider(sampler=TraceIdRatioBased(0),shutdown_on_exit=False)
+        self.runtime.tracer=provider.get_tracer('test')
+        try:
+            with ot.bind((self.runtime,None)),ot.span('rag.export'):
+                pass
+            self.assertEqual(self.total('rag.job.completed'),1)
+            self.assertEqual(len(self.logs),1)
+            def fail(*args,**kwargs):raise RuntimeError(SECRET)
+            self.runtime.meter=NS(create_counter=fail,create_up_down_counter=fail,create_histogram=fail)
+            self.runtime.logger=NS(emit=fail)
+            self.runtime.tracer=NS(start_span=fail)
+            calls=[]
+            with ot.bind((self.runtime,None)):
+                self.assertEqual(ot.call('weaviate.query',lambda:calls.append(1) or 42),42)
+                self.assertEqual(list(ot.iterate(lambda:iter([1,2]))),[1,2])
+            self.assertEqual(calls,[1])
+        finally:provider.shutdown()
+
+    async def test_rebuilt_queue_preserves_operational_bodies_and_job_correlation(self):
+        with receiver() as (env,records):
+            runtime=ot.bootstrap({**env,'RAG_OTEL_METRICS':'false','RAG_OTEL_INTERVAL_MS':'60000'})
+            try:
+                with ot.bind((runtime,None)),ot.span('rag.request',server=True,method='GET') as request:
+                    with ot.span('rag.export'):
+                        ot.call('weaviate.query',lambda:None)
+                provider=next(p for p in runtime._providers if hasattr(p,'_multi_log_record_processor'))
+                processor=provider._multi_log_record_processor._log_record_processors[0]._batch_processor
+                queued=list(processor._queue)
+                self.assertEqual({r.log_record.body for r in queued},ot.LOG_BODIES)
+                jobs=[r.log_record for r in queued if r.log_record.body!='rag.api.completed']
+                self.assertEqual(len(jobs),2)
+                self.assertEqual(len({r.attributes['rag.job_token'] for r in jobs}),1)
+                for record in queued:
+                    log=record.log_record
+                    self.assertEqual(log.trace_id,request.get_span_context().trace_id)
+                    self.assertNotEqual(log.span_id,0)
+                    self.assertFalse(log.context)
+                    self.assertIsNone(log.exception)
+                    self.assertEqual(record.instrumentation_scope.name,'rag.telemetry')
+                    self.assertFalse(record.instrumentation_scope.attributes)
+                self.assertTrue(runtime.force_flush())
+                wire=ExportLogsServiceRequest.FromString(dict(records)['/v1/logs']).resource_logs[0].scope_logs[0].log_records
+                self.assertEqual({r.body.string_value for r in wire},ot.LOG_BODIES)
+                self.assertEqual(len([r for r in wire if 'rag.job_token' in dimensions(r)]),2)
+            finally:runtime.shutdown()
+
+    async def test_real_wire_all_instruments_multiple_series_and_log_correlation(self):
+        with receiver() as (env,records):
+            # Tiny trace/log batches must not truncate the set of metrics.
+            runtime=ot.bootstrap({**env,'RAG_OTEL_BATCH_SIZE':'1'})
+            try:
+                for operation in ('export','import'):
+                    with ot.bind((runtime,None)),ot.span('rag.request',server=True,method='GET'):
+                        ot.attribute('http.route','GET /health')
+                        ot.attribute('http.status_class','2xx')
+                        with ot.span('rag.'+operation):
+                            try:
+                                ot.call('weaviate.query',lambda:(_ for _ in ()).throw(TimeoutError(SECRET)))
+                            except TimeoutError: pass
+                runtime.force_flush()
+            finally:runtime.shutdown()
+        metrics=[];logs=[]
+        for path,payload in records:
+            self.assertNotIn(SECRET.encode(),payload)
+            if path=='/v1/metrics':metrics=ExportMetricsServiceRequest.FromString(payload).resource_metrics[0].scope_metrics[0].metrics
+            if path=='/v1/logs':logs.extend(ExportLogsServiceRequest.FromString(payload).resource_logs[0].scope_logs[0].log_records)
+        by_name={m.name:m for m in metrics}
+        self.assertEqual(set(by_name),set(ot.METRICS)-{'rag.telemetry.check'})
+        self.assertEqual(len(by_name['rag.job.completed'].sum.data_points),2)
+        self.assertEqual(by_name['rag.job.duration'].unit,'s')
+        for m in metrics:
+            for p in getattr(m,m.WhichOneof('data')).data_points:
+                self.assertNotIn('rag.job_token',dimensions(p));self.assertFalse(p.exemplars)
+        job_logs=[r for r in logs if r.body.string_value=='rag.job.completed']
+        self.assertEqual(len(job_logs),2)
+        for log in job_logs:
+            attrs=dimensions(log)
+            self.assertRegex(attrs['rag.job_token'],r'^[0-9a-f]{32}$')
+            self.assertEqual(len(log.trace_id),16);self.assertEqual(len(log.span_id),8)
+            children=[r for r in logs if dimensions(r).get('rag.job_token')==attrs['rag.job_token']]
+            self.assertEqual(len(children),2)
+            self.assertEqual({r.trace_id for r in children},{log.trace_id})
+
+    async def test_wire_admission_rejects_bad_records_without_consuming_names(self):
+        from opentelemetry.proto.metrics.v1.metrics_pb2 import Metric
+        def numeric():
+            metric=Metric(name='rag.job.completed')
+            metric.sum.aggregation_temporality=2;metric.sum.is_monotonic=True
+            for operation in ('export','import'):
+                point=metric.sum.data_points.add(as_int=1)
+                for k,v in {'rag.operation':operation,'rag.outcome':'ok'}.items():
+                    point.attributes.add(key=k).value.string_value=v
+            return metric
+        def histogram(**changes):
+            metric=Metric(name='rag.job.duration')
+            metric.histogram.aggregation_temporality=2
+            values=dict(count=1,sum=0.001,min=0.001,max=0.001,
+                        bucket_counts=[1]+[0]*len(ot.BUCKETS),explicit_bounds=ot.BUCKETS)
+            values.update(changes)
+            for operation in ('export','import'):
+                point=metric.histogram.data_points.add(**values)
+                for k,v in {'rag.operation':operation,'rag.outcome':'ok'}.items():
+                    point.attributes.add(key=k).value.string_value=v
+            return metric
+        invalid=[]
+        duplicate=numeric();duplicate.sum.data_points[1].CopyFrom(duplicate.sum.data_points[0]);invalid.append(duplicate)
+        missing=numeric();missing.sum.data_points[1].ClearField('as_int');invalid.append(missing)
+        for value in (float('nan'),float('inf'),-1):
+            bad=numeric();bad.sum.data_points[1].as_double=value;invalid.append(bad)
+        bad=numeric();bad.sum.data_points[1].attributes[0].value.string_value=SECRET;invalid.append(bad)
+        bad=numeric();bad.sum.data_points[1].attributes.add().CopyFrom(bad.sum.data_points[1].attributes[0]);invalid.append(bad)
+        bad=numeric();bad.sum.aggregation_temporality=0;invalid.append(bad)
+        bad=numeric();bad.sum.is_monotonic=False;invalid.append(bad)
+        for changes in (dict(sum=float('nan')),dict(min=float('-inf')),dict(max=float('inf')),
+                        dict(min=3,max=2),dict(count=2),dict(sum=-1),
+                        dict(explicit_bounds=tuple(reversed(ot.BUCKETS))),
+                        dict(explicit_bounds=[0.1]*len(ot.BUCKETS))):
+            invalid.append(histogram(**changes))
+        good_count,good_hist=numeric(),histogram()
+        # All malformed points include an initially valid series: partial
+        # admission must not reserve the name or discard later valid series.
+        with receiver() as (env,records):
+            config=ot.Config.from_env({**env,'RAG_OTEL_BATCH_SIZE':'1'})
+            with ot._session('metrics',config) as session:
+                for bad in invalid:
+                    source=ExportMetricsServiceRequest()
+                    metrics=source.resource_metrics.add().scope_metrics.add().metrics
+                    for metric in (bad,good_count,good_hist):metrics.add().CopyFrom(metric)
+                    self.assertEqual(session.post('',data=source.SerializeToString()).status_code,200)
+                    output=ExportMetricsServiceRequest.FromString(records[-1][1]).resource_metrics[0].scope_metrics[0].metrics
+                    self.assertEqual({m.name for m in output},{'rag.job.completed','rag.job.duration'})
+                    by_name={m.name:m for m in output}
+                    good_count.unit='{job}';good_hist.unit='s'
+                    self.assertEqual(by_name['rag.job.completed'],good_count)
+                    self.assertEqual(by_name['rag.job.duration'],good_hist)
+                absent=histogram()
+                for point in absent.histogram.data_points:
+                    for field in ('sum','min','max'):point.ClearField(field)
+                source=ExportMetricsServiceRequest()
+                source.resource_metrics.add().scope_metrics.add().metrics.add().CopyFrom(absent)
+                session.post('',data=source.SerializeToString())
+                exported=ExportMetricsServiceRequest.FromString(records[-1][1]).resource_metrics[0].scope_metrics[0].metrics[0]
+                self.assertEqual(len(exported.histogram.data_points),2)
+                self.assertTrue(all(not p.HasField(f) for p in exported.histogram.data_points for f in ('sum','min','max')))
+
+    async def test_wire_merges_disjoint_records_and_first_duplicate_snapshot(self):
+        from opentelemetry.proto.metrics.v1.metrics_pb2 import Metric
+        def record(name, operation, value=1):
+            m=Metric(name=name)
+            kind='histogram' if name.endswith('duration') else 'sum'
+            data=getattr(m,kind);data.aggregation_temporality=2
+            if kind=='sum':data.is_monotonic=True
+            point=data.data_points.add()
+            for key,val in {'rag.operation':operation,'rag.outcome':'ok'}.items():
+                point.attributes.add(key=key).value.string_value=val
+            if kind=='sum':point.as_int=value
+            else:
+                point.count=value;point.sum=float(value);point.min=1;point.max=1
+                point.explicit_bounds.extend(ot.BUCKETS)
+                point.bucket_counts.extend([0]*len(ot.BUCKETS)+[value])
+            return m
+        for name in ('rag.job.completed','rag.job.duration'):
+            with self.subTest(name=name):
+                source=ExportMetricsServiceRequest()
+                records=[record(name,'export'),record(name,'import'),record(name,'export',99)]
+                # Overlap does not erase a distinct sibling in that record.
+                kind=records[0].WhichOneof('data')
+                getattr(records[2],kind).data_points.add().CopyFrom(getattr(record(name,'tuning'),kind).data_points[0])
+                bad=record(name,'evaluation');getattr(bad,kind).aggregation_temporality=1
+                malformed=record(name,'ingest');getattr(malformed,kind).data_points[0].attributes[0].value.string_value=SECRET
+                for m in [malformed,*records,bad]:
+                    source.resource_metrics.add().scope_metrics.add().metrics.add().CopyFrom(m)
+                out=ExportMetricsServiceRequest.FromString(ot.sanitize_wire(source.SerializeToString(),'metrics',ot.Config(batch_size=1)))
+                metrics=out.resource_metrics[0].scope_metrics[0].metrics
+                self.assertEqual(len(metrics),1)
+                points=getattr(metrics[0],kind).data_points
+                self.assertEqual({dimensions(p)['rag.operation'] for p in points},{'export','import','tuning'})
+                self.assertTrue(all((p.count if kind=='histogram' else p.as_int)==1 for p in points))
+
+    async def test_restricted_meter_factories_never_create_unknown_or_wrong_kind(self):
+        from unittest.mock import Mock
+        raw=Mock();meter=ot.SafeMeter(raw)
+        for factory in ('create_counter','create_histogram','create_up_down_counter'):
+            instrument=getattr(meter,factory)('secret.metric')
+            self.assertFalse(instrument.add(1,{SECRET:SECRET}))
+            self.assertFalse(instrument.record(1))
+        self.assertFalse(meter.create_counter('rag.job.active').add(1,{'rag.operation':'export'}))
+        self.assertFalse(meter.create_histogram('rag.job.completed').record(1))
+        self.assertEqual(raw.mock_calls,[])
+        for method in ('create_gauge','create_observable_counter','create_observable_gauge','create_observable_up_down_counter'):
+            self.assertFalse(hasattr(meter,method))
+        self.assertTrue(meter.create_counter('rag.telemetry.check').add(1))
+        self.assertEqual(raw.create_counter.call_count,1)
+
+    async def test_active_ambiguous_failures_suppress_later_wire_without_retry(self):
+        from opentelemetry.exporter.otlp.proto.common.metrics_encoder import encode_metrics
+        # Failure may precede or follow mutation, at entry or exit; concurrent
+        # in-flight siblings must not re-establish the now-uncertain instrument.
+        import itertools
+        for category,scope,sibling_scope,other_scope in (
+                ('job','rag.export','rag.import','rag.request'),
+                ('api','rag.request','rag.request','rag.export')):
+            for failing_value,mutate in itertools.product((1,-1),(False,True)):
+                with self.subTest(category=category,failing_value=failing_value,mutate=mutate):
+                    self.tearDown();self.setUp()
+                    active_name='rag.'+category+'.active'
+                    other='api' if category=='job' else 'job'
+                    completed='rag.'+category+('.completed' if category=='job' else '.requests')
+                    health=ot.ActiveHealth();self.runtime._active_health=health
+                    meter=ot.SafeMeter(self.provider.get_meter('fault-'+str(failing_value)+str(mutate)),health)
+                    self.runtime.meter=meter
+                    instrument=meter.create_up_down_counter(active_name)
+                    original=instrument.instrument.add
+                    calls=[];armed=threading.Event();release=threading.Event()
+                    def broken(value,attrs):
+                        calls.append(value)
+                        if value==failing_value and armed.is_set():
+                            if mutate:original(value,attrs)
+                            raise RuntimeError(SECRET)
+                        original(value,attrs)
+                    instrument.instrument=NS(add=broken)
+                    def sibling():
+                        with ot.bind((self.runtime,None)),ot.span(sibling_scope):
+                            release.wait(5)
+                    worker=threading.Thread(target=sibling);worker.start()
+                    # Wait for the sibling to enter, then fail another operation.
+                    for _ in range(1000):
+                        if calls:break
+                        await asyncio.sleep(.001)
+                    self.assertEqual(calls,[1]);armed.set()
+                    with ot.bind((self.runtime,None)),ot.span(scope):pass
+                    before=len(calls);release.set();worker.join(5)
+                    self.assertFalse(worker.is_alive())
+                    with ot.bind((self.runtime,None)),ot.span(scope):pass
+                    self.assertEqual(len(calls),before)
+                    self.assertEqual(health.snapshot(),{active_name})
+                    # The independent API instrument and completions remain available.
+                    with ot.bind((self.runtime,None)),ot.span(other_scope):pass
+                    data=encode_metrics(self.reader.get_metrics_data()).SerializeToString()
+                    with receiver() as (env,records):
+                        session=ot._session('metrics',ot.Config.from_env({**env,'RAG_OTEL_TIMEOUT_MS':'1000'}),health)
+                        for _ in range(2):self.assertEqual(session.post('',data=data).status_code,200)
+                        for _,payload in records:
+                            metrics=ExportMetricsServiceRequest.FromString(payload).resource_metrics[0].scope_metrics[0].metrics
+                            names={m.name for m in metrics}
+                            self.assertNotIn(active_name,names)
+                            self.assertTrue({'rag.'+other+'.active',completed,'rag.'+category+'.duration'}<=names)
+                    self.assertTrue(any(r['body']=='rag.'+category+'.completed' for r in self.logs))
+
+    async def test_bootstrap_shares_active_suppression_with_transport(self):
+        with receiver() as (env,records):
+            runtime=ot.bootstrap({**env,'RAG_OTEL_TRACES':'false','RAG_OTEL_TIMEOUT_MS':'1000'})
+            try:
+                instrument=runtime.meter.create_up_down_counter('rag.job.active')
+                original=instrument.instrument.add
+                def mutate_then_fail(value,attrs):
+                    original(value,attrs)
+                    if value<0:raise RuntimeError(SECRET)
+                instrument.instrument=NS(add=mutate_then_fail)
+                with ot.bind((runtime,None)),ot.span('rag.export'):pass
+                self.assertEqual(runtime._active_health.snapshot(),{'rag.job.active'})
+                self.assertTrue(runtime.force_flush())
+            finally:runtime.shutdown()
+            metrics=[m for path,payload in records if path=='/v1/metrics'
+                     for r in ExportMetricsServiceRequest.FromString(payload).resource_metrics
+                     for scope in r.scope_metrics for m in scope.metrics]
+            self.assertTrue(metrics)
+            self.assertNotIn('rag.job.active',{m.name for m in metrics})
+            self.assertTrue({'rag.job.completed','rag.job.duration'}<={m.name for m in metrics})
+
+    async def test_operation_local_rejection_keeps_active_instruments_available(self):
+        from unittest.mock import Mock
+        from opentelemetry.exporter.otlp.proto.common.metrics_encoder import encode_metrics
+        for name,scope,valid in (
+                ('rag.api.active','rag.request',{'http.method':'GET'}),
+                ('rag.job.active','rag.export',{'rag.operation':'export'})):
+            operation=ot.Operation(self.runtime,scope)
+            instrument=self.runtime.meter.create_up_down_counter(name)
+            updates=Mock(wraps=instrument.instrument.add)
+            instrument.instrument=NS(add=updates)
+            key=next(iter(valid))
+            invalid=[(1,None),(1,{}),(1,[]),(1,[('unapproved','value')]),
+                     (1,object()),(1,{key:SECRET}),(1,{key:None}),
+                     (1,{key:True}),(1,{key:[]}),
+                     (True,valid),(None,valid),('1',valid),([],valid),
+                     (float('nan'),valid),(float('inf'),valid),(float('-inf'),valid)]
+            for value,attrs in invalid:
+                with self.subTest(name=name,value=repr(value),attrs=repr(attrs)):
+                    self.assertFalse(operation.measure(name,value,attrs))
+                    self.assertFalse(self.runtime._active_health.snapshot())
+                    updates.assert_not_called()
+            self.assertTrue(operation.measure(name,1,valid))
+            self.assertTrue(operation.measure(name,-1,valid))
+            self.assertEqual(updates.call_count,2)
+        data=encode_metrics(self.reader.get_metrics_data()).SerializeToString()
+        clean=ot.sanitize_wire(data,'metrics',self.runtime.config,self.runtime._active_health.snapshot())
+        metrics=ExportMetricsServiceRequest.FromString(clean).resource_metrics[0].scope_metrics[0].metrics
+        self.assertEqual({m.name for m in metrics},ot.ActiveHealth.NAMES)
+        self.assertTrue(all(len(m.sum.data_points)==1 and m.sum.data_points[0].as_int==0 for m in metrics))
+
+    async def test_active_direct_and_factory_failures_are_bounded_and_input_rejection_is_safe(self):
+        from unittest.mock import Mock
+        health=ot.ActiveHealth();raw=Mock();meter=ot.SafeMeter(raw,health)
+        active=meter.create_up_down_counter('rag.api.active')
+        self.assertFalse(active.add(float('nan'),{'http.method':'GET'}))
+        self.assertFalse(active.add(1,{'http.method':SECRET}))
+        self.assertFalse(health.snapshot())
+        raw.create_up_down_counter.return_value.add.side_effect=RuntimeError(SECRET)
+        self.assertFalse(active.add(1,{'http.method':'GET'}))
+        self.assertFalse(active.add(-1,{'http.method':'GET'}))
+        self.assertEqual(raw.create_up_down_counter.return_value.add.call_count,1)
+        raw.create_up_down_counter.side_effect=RuntimeError(SECRET)
+        self.assertFalse(meter.create_up_down_counter('rag.job.active').add(1,{'rag.operation':'export'}))
+        meter.create_up_down_counter('rag.job.active')
+        self.assertEqual(raw.create_up_down_counter.call_count,2)
+        for name in (SECRET,'rag.job.completed'):health.suppress(name)
+        self.assertEqual(health.snapshot(),ot.ActiveHealth.NAMES)
+
+    async def test_disabled_and_export_failure_preserve_results(self):
+        with patch.object(ot,'_session',side_effect=AssertionError('no exporter')):
+            disabled=ot.bootstrap({})
+            with ot.bind((disabled,None)):
+                self.assertEqual(ot.call('weaviate.query',lambda:7),7)
+        with receiver(500) as (env,records):
+            runtime=ot.bootstrap({**env,'RAG_OTEL_TRACES':'false'})
+            try:
+                with ot.bind((runtime,None)),ot.span('rag.export'):
+                    self.assertEqual(ot.call('weaviate.query',lambda:9),9)
+                runtime.force_flush()
+            finally:runtime.shutdown()
+            self.assertTrue(any(path=='/v1/logs' for path,_ in records))
+            self.assertTrue(any(path=='/v1/metrics' for path,_ in records))
+            self.assertFalse(any(path=='/v1/traces' for path,_ in records))
+
+# Reuse the exact real router/worker fixtures from #283, adding metric/log
+# assertions at the producer boundaries rather than testing decorators alone.
+import test_tracing as tracing_fixture
+
+
+class ProducerOperationsTests(unittest.IsolatedAsyncioTestCase):
+    spans = tracing_fixture.TracingTests.spans
+    wire = tracing_fixture.TracingTests.wire
+    until = tracing_fixture.TracingTests.until
+    lineage = tracing_fixture.TracingTests.lineage
+
+    async def asyncSetUp(self):
+        await tracing_fixture.TracingTests.asyncSetUp(self)
+        self.reader = InMemoryMetricReader()
+        self.metric_provider = MeterProvider(shutdown_on_exit=False, metric_readers=[self.reader])
+        self.runtime.meter = ot.SafeMeter(self.metric_provider.get_meter('producer-test'), self.runtime._active_health)
+        self.logs = []
+        self.runtime.logger = NS(emit=lambda **kw:self.logs.append(kw))
+
+    async def asyncTearDown(self):
+        self.metric_provider.shutdown()
+        await tracing_fixture.TracingTests.asyncTearDown(self)
+
+    def assert_jobs(self, expected):
+        data=self.reader.get_metrics_data()
+        metrics={m.name:m for r in data.resource_metrics for s in r.scope_metrics for m in s.metrics}
+        actual={(p.attributes['rag.operation'],p.attributes['rag.outcome']):p.value
+                for p in metrics['rag.job.completed'].data.data_points}
+        self.assertEqual(actual,expected)
+        self.assertTrue(all(p.value==0 for p in metrics['rag.job.active'].data.data_points))
+        logs=[r for r in self.logs if r['body']=='rag.job.completed']
+        self.assertEqual(len(logs),sum(expected.values()))
+        self.assertTrue(all('rag.job_token' in r['attributes'] for r in logs))
+
+    async def test_real_ingest_partial_counts_error_without_rewriting_status(self):
+        await tracing_fixture.TracingTests.test_ingest_real_executor_partial_failure(self)
+        self.assert_jobs({('ingest','error'):1})
+        self.assertEqual(next(r['attributes']['rag.outcome'] for r in self.logs if r['body']=='rag.job.completed'),'partial')
+
+    async def test_real_import_and_tuning_caught_failure(self):
+        await tracing_fixture.TracingTests.test_import_and_tuning_real_launchers_handled_failure(self)
+        self.assert_jobs({('import','error'):1,('tuning','error'):1})
+
+    async def test_real_export_success_and_isolated_tokens(self):
+        await tracing_fixture.TracingTests.test_export_admission_concurrency_and_after_response(self)
+        self.assert_jobs({('export','ok'):2})
+        self.assertEqual(len({r['attributes']['rag.job_token'] for r in self.logs if r['body']=='rag.job.completed'}),2)
+
+    async def test_real_tuning_config_metrics_count_only_remote_fetch(self):
+        await tracing_fixture.TracingTests.test_rebuild_config_span_tracks_only_backend_fetch(self)
+        data=self.reader.get_metrics_data()
+        metrics={m.name:m for r in data.resource_metrics for s in r.scope_metrics for m in s.metrics}
+        points=[p for p in metrics['rag.dependency.calls'].data.data_points
+                if p.attributes['rag.dependency']=='weaviate.config']
+        self.assertEqual({p.attributes['rag.outcome']:p.value for p in points},{'ok':1,'error':1})
+        durations=[p for p in metrics['rag.dependency.duration'].data.data_points
+                   if p.attributes['rag.dependency']=='weaviate.config']
+        self.assertEqual(sum(p.count for p in durations),2)
+        errors=[p for p in metrics['rag.dependency.errors'].data.data_points
+                if p.attributes['rag.dependency']=='weaviate.config']
+        self.assertEqual(sum(p.value for p in errors),1)
+        self.assertEqual(len([r for r in self.logs
+            if r['attributes'].get('rag.dependency')=='weaviate.config']),2)
+
+    async def test_real_iterator_terminal_cancellation_metrics(self):
+        await tracing_fixture.TracingTests.test_iterator_terminal_outcomes_and_context(self)
+        self.assert_jobs({('export','ok'):13})
+        data=self.reader.get_metrics_data()
+        metrics={m.name:m for r in data.resource_metrics for s in r.scope_metrics for m in s.metrics}
+        calls={p.attributes['rag.outcome']:p.value for p in metrics['rag.dependency.calls'].data.data_points}
+        self.assertEqual(calls,{'cancelled':9,'error':4,'ok':1})
+        self.assertEqual(sum(p.count for p in metrics['rag.dependency.duration'].data.data_points),14)
+        self.assertEqual(sum(p.value for p in metrics['rag.dependency.errors'].data.data_points),4)
+        cancelled=[r for r in self.logs if r['attributes']['rag.outcome']=='cancelled']
+        self.assertEqual(len(cancelled),9)
+        self.assertTrue(all('error.type' not in r['attributes'] for r in cancelled))
+
+    async def test_delayed_iterator_captures_admission_and_restores_consumer(self):
+        from opentelemetry import trace
+        foreign=ot.Runtime(ot.Config())
+        foreign_logs=[];foreign.logger=NS(emit=lambda **kw:foreign_logs.append(kw))
+        seen=[]
+        class Values:
+            def __iter__(inner):
+                seen.append(('iter',ot._runtime.get(),ot._job_token.get(),trace.get_current_span().get_span_context()))
+                return inner
+            def __next__(inner):
+                seen.append(('next',ot._runtime.get(),ot._job_token.get(),trace.get_current_span().get_span_context()))
+                if len([r for r in seen if r[0]=='next'])%2==0:raise StopIteration
+                return 7
+        def factory():
+            seen.append(('factory',ot._runtime.get(),ot._job_token.get(),trace.get_current_span().get_span_context()))
+            return Values()
+        for threaded in (False,True):
+            seen.clear()
+            with ot.bind((self.runtime,None)),ot.span('rag.export'):
+                parent=trace.get_current_span().get_span_context()
+                token=ot._job_token.get()
+                iterator=ot.iterate(factory)
+                untouched=ot.iterate(lambda: self.fail('unconsumed factory'))
+            before=len(self.spans('weaviate.iterate'))
+            untouched.close()
+            self.assertEqual(len(self.spans('weaviate.iterate')),before)
+            errors=[]
+            def consume():
+                try:
+                    with ot.bind((foreign,None),job_token='f'*32):
+                        previous=trace.get_current_span().get_span_context()
+                        self.assertEqual(next(iterator),7)
+                        self.assertIs(ot._runtime.get(),foreign)
+                        self.assertEqual(ot._job_token.get(),'f'*32)
+                        self.assertEqual(trace.get_current_span().get_span_context(),previous)
+                        self.assertEqual(list(iterator),[])
+                        self.assertIs(ot._runtime.get(),foreign)
+                except BaseException as exc:errors.append(exc)
+            if threaded:
+                worker=threading.Thread(target=consume);worker.start();worker.join(5)
+                self.assertFalse(worker.is_alive())
+            else:consume()
+            if errors:raise errors[0]
+            self.assertEqual(len(self.spans('weaviate.iterate')),before+1)
+            span=self.spans('weaviate.iterate')[-1]
+            self.assertEqual(span.parent.span_id,parent.span_id)
+            self.assertEqual(span.context.trace_id,parent.trace_id)
+            self.assertTrue(all(r[1] is self.runtime and r[2]==token and r[3].span_id==span.context.span_id for r in seen))
+            log=[r for r in self.logs if r['body']=='rag.dependency.completed'][-1]
+            self.assertEqual(log['attributes']['rag.job_token'],token)
+            self.assertEqual(trace.get_current_span(log['context']).get_span_context().span_id,span.context.span_id)
+        # Admission with no runtime must never borrow the consumer's runtime.
+        with ot.bind((None,None)):iterator=ot.iterate(lambda:iter([1]))
+        count=len(self.logs)
+        with ot.bind((self.runtime,None)),ot.span('rag.package'):
+            self.assertEqual(list(iterator),[1])
+        self.assertEqual(len(self.logs),count)
+        self.assertEqual(foreign_logs,[])
+
+    async def test_delayed_iterator_failure_and_close_keep_origin_outcome(self):
+        from opentelemetry import trace
+        for stage in ('factory','iter','next','close'):
+            with self.subTest(stage=stage):
+                class Values:
+                    def __iter__(inner):
+                        if stage=='iter':raise ValueError(SECRET)
+                        return inner
+                    def __next__(inner):
+                        if stage=='next':raise ValueError(SECRET)
+                        return 1
+                def factory():
+                    if stage=='factory':raise ValueError(SECRET)
+                    return Values()
+                with ot.bind((self.runtime,None)),ot.span('rag.export'):
+                    token=ot._job_token.get();parent=trace.get_current_span().get_span_context()
+                    iterator=ot.iterate(factory)
+                with ot.bind((None,None)):
+                    if stage=='close':next(iterator);iterator.close();iterator.close()
+                    else:
+                        with self.assertRaises(ValueError):next(iterator)
+                expected='cancelled' if stage=='close' else 'error'
+                span=self.spans('weaviate.iterate')[-1]
+                self.assertEqual(span.parent.span_id,parent.span_id)
+                self.assertEqual(span.attributes['rag.outcome'],expected)
+                log=self.logs[-1]
+                self.assertEqual(log['attributes']['rag.outcome'],expected)
+                self.assertEqual(log['attributes']['rag.job_token'],token)
+
+    async def test_real_evaluation_cancellation_and_failure(self):
+        await tracing_fixture.TracingTests.test_generation_cancellation_and_failure_reporter(self)
+        self.assert_jobs({('evaluation','cancelled'):1,('evaluation','error'):1})
+
+if __name__=='__main__':unittest.main()
+```
+
+
+## Optional collector integration (#285)
+
+The telemetry overlay and profile wire the API to the private pinned Collector;
+operator setup, offline identity verification and bounds are in
+`telemetry/README.md`. `scripts/collector_offline.py` checks trusted platform
+config/layer hashes and sanitizes image archives before optional offline loading.
+The default Compose file and five-image path do not enable telemetry.
+
+`15_telemetry` is explicitly registered in the verification dispatcher. Enabled
+acceptance requires `stack.sh run --telemetry`, whose trusted overlay adds a
+bounded protobuf capture service using the existing API image. Configuration
+checks, focused synthetic tests and real disposable API/collector acceptance are
+separate evidence layers. The controller reports timings and resource samples;
+no production overhead result is implied by implementation or unit tests.
+
+
+### scripts/verify/service_inventory.py
+
+```python
+"""Exact service inventory for the default and guarded telemetry verify modes."""
+import argparse
+from collections import Counter
+import json
+from pathlib import Path
+
+BASE = frozenset(('api', 'ollama', 'proxy', 'ui', 'weaviate'))
+TELEMETRY = frozenset(('otel-collector', 'otel-capture'))
+
+
+def check(config, running, all_services, mode='0', project='', profiles=''):
+    if mode not in ('0', '1'):
+        return ['unknown telemetry verification mode']
+    if mode == '1' and (project != 'rag-verify' or config.get('name') != 'rag-verify'
+                        or 'telemetry' not in profiles.split(',')):
+        return ['telemetry inventory requires the guarded rag-verify project and profile']
+    expected = BASE | (TELEMETRY if mode == '1' else frozenset())
+    problems = []
+    if set(config.get('services', {})) != expected:
+        problems.append('configured service inventory differs from the selected verification mode')
+    # Counter equality rejects replacements, unexpected services and duplicate
+    # containers rather than merely accepting any five/seven running names.
+    wanted = Counter({name: 1 for name in expected})
+    if Counter(all_services) != wanted:
+        problems.append('project service inventory has missing, duplicate or unexpected services')
+    if Counter(running) != wanted:
+        problems.append('running service inventory differs from the required exact set')
+    return problems
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('config', type=Path)
+    parser.add_argument('running', type=Path)
+    parser.add_argument('all_services', type=Path)
+    parser.add_argument('--mode', default='0')
+    parser.add_argument('--project', default='')
+    parser.add_argument('--profiles', default='')
+    args = parser.parse_args()
+    problems = check(json.loads(args.config.read_text()), args.running.read_text().splitlines(),
+                     args.all_services.read_text().splitlines(), args.mode, args.project, args.profiles)
+    for problem in problems:
+        print(problem)
+    raise SystemExit(bool(problems))
+
+
+if __name__ == '__main__':
+    main()
+```
+
+
+### scripts/tests/test_service_inventory.py
+
+```python
+"""Default/optional infrastructure inventory acceptance without Docker."""
+import importlib.util
+from pathlib import Path
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+SPEC = importlib.util.spec_from_file_location('inventory', ROOT/'scripts/verify/service_inventory.py')
+INVENTORY = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(INVENTORY)
+
+
+class InventoryTests(unittest.TestCase):
+    def fixture(self, telemetry=False):
+        names = sorted(INVENTORY.BASE | (INVENTORY.TELEMETRY if telemetry else frozenset()))
+        config = {'name':'rag-verify', 'services':{name:{} for name in names}}
+        return config,names
+
+    def test_default_exact_five(self):
+        config,names = self.fixture()
+        self.assertEqual(INVENTORY.check(config,names,names),[])
+
+    def test_guarded_telemetry_exact_seven(self):
+        config,names = self.fixture(True)
+        self.assertEqual(INVENTORY.check(config,names,names,'1','rag-verify','telemetry'),[])
+
+    def test_same_count_replacement_does_not_pass(self):
+        for mode in (False,True):
+            with self.subTest(telemetry=mode):
+                config,names = self.fixture(mode)
+                replaced = ['unexpected' if n=='api' else n for n in names]
+                self.assertTrue(INVENTORY.check(config,replaced,replaced,str(int(mode)),'rag-verify','telemetry'))
+
+    def test_missing_stopped_duplicate_or_extra_service_is_refused(self):
+        config,names = self.fixture(True)
+        for running,all_services in [(names[:-1],names),(names,names+['orphan']),
+                                     (names+['api'],names+['api']), (names[:-1],names[:-1])]:
+            with self.subTest(running=running,all_services=all_services):
+                self.assertTrue(INVENTORY.check(config,running,all_services,'1','rag-verify','telemetry'))
+
+    def test_default_cannot_silently_accept_optional_services(self):
+        config,names = self.fixture(True)
+        self.assertTrue(INVENTORY.check(config,names,names))
+
+    def test_mode_requires_project_and_profile(self):
+        config,names = self.fixture(True)
+        for mode,project,profiles in [('1','rag-docker','telemetry'),('1','rag-verify',''),('anything','rag-verify','telemetry')]:
+            with self.subTest(mode=mode,project=project,profiles=profiles):
+                self.assertTrue(INVENTORY.check(config,names,names,mode,project,profiles))
+
+    def test_unexpected_configured_service_refused_even_when_not_running(self):
+        config,names = self.fixture(True)
+        config['services']['surprise'] = {}
+        self.assertTrue(INVENTORY.check(config,names,names,'1','rag-verify','telemetry'))
+
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
+
+### scripts/verify/telemetry_e2e.py
+
+```python
+"""Host controller for real disposable API -> Collector -> protobuf capture.
+
+Uses only stdlib on the host. The private sink decodes protobuf in the API image.
+Every mutation is limited to the explicit guarded rag-verify project.
+"""
+import base64
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+import json
+import os
+from pathlib import Path
+import statistics
+import runpy
+import threading
+import subprocess
+import time
+import urllib.request
+import uuid
+
+ROOT = Path(__file__).resolve().parents[2]
+API = os.environ.get('RAG_API', '')
+SCHEMA = runpy.run_path(str(ROOT / 'api/services/telemetry.py'))
+SENTINELS = ['OTEL285_SECRET_SENTINEL', 'OTEL285_CONTENT_SENTINEL', 'OTEL285_FILENAME_SENTINEL', 'OTEL285_PATH_SENTINEL']
+
+
+def owner():
+    subprocess.run(['bash', '-c', 'source "$1/scripts/verify/lock.sh"; _rag_lock_owner_ok',
+                    'telemetry-lock', str(ROOT)], check=True, stdout=subprocess.DEVNULL)
+
+
+def compose(*args, timeout=120, capture_stderr=False):
+    owner()
+    return subprocess.check_output(['docker', 'compose', '-p', 'rag-verify', *args],
+                                   text=True, timeout=timeout, stderr=subprocess.PIPE if capture_stderr else None)
+
+
+def safe_failure(exc):
+    """Only typed numeric diagnostics; never exporter output, URLs, bodies or argv."""
+    result = {'type': type(exc).__name__[:64]}
+    if isinstance(exc, subprocess.CalledProcessError):
+        result['exit_code'] = exc.returncode
+    elif isinstance(exc, subprocess.TimeoutExpired):
+        result['timeout_seconds'] = exc.timeout
+    elif isinstance(exc, urllib.error.HTTPError):
+        result['http_status'] = exc.code
+    return result
+
+
+def stats_snapshot(collector_running):
+    result = {}
+    # Compose stats accepts one SERVICE argument (unlike docker stats).
+    # Explicit per-service calls also establish which required sample was absent.
+    for service in ('api', 'otel-collector'):
+        if service == 'otel-collector' and not collector_running:
+            result[service] = {'state': 'stopped_by_test'}
+            continue
+        raw = compose('stats', '--no-stream', '--format', 'json', service,
+                      timeout=8, capture_stderr=True)
+        if len(raw) > 8192:
+            raise ValueError('oversized resource sample')
+        try:
+            rows = json.loads(raw)
+        except json.JSONDecodeError:
+            rows = [json.loads(line) for line in raw.splitlines() if line.strip()]
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+            raise ValueError('missing or ambiguous resource sample')
+        # Docker's stats fields contain measurements. Keep only the expected
+        # numeric display fields; container names and other metadata are unnecessary.
+        fields = ('CPUPerc', 'MemUsage', 'MemPerc', 'PIDs', 'BlockIO', 'NetIO')
+        sample = {k: rows[0][k] for k in fields if k in rows[0]}
+        if not all(k in sample for k in ('CPUPerc', 'MemUsage')):
+            raise ValueError('CPU or memory resource evidence missing')
+        if any(not isinstance(v, str) or len(v) > 128 for v in sample.values()):
+            raise ValueError('malformed resource measurement')
+        result[service] = sample
+    return result
+
+
+@contextmanager
+def resource_samples(collector_running):
+    measurements, failures = [], []
+    stopped = threading.Event()
+    def sample_stats():
+        while not stopped.is_set():
+            try:
+                measurements.append({'monotonic': time.monotonic(),
+                                     'stats': stats_snapshot(collector_running)})
+            except Exception as exc:
+                failures.append(safe_failure(exc))
+                return
+            stopped.wait(5)
+    sampler = threading.Thread(target=sample_stats, daemon=True)
+    sampler.start()
+    primary = None
+    try:
+        yield measurements
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        stopped.set()
+        sampler.join(20)
+        if sampler.is_alive():
+            failures.append({'type': 'SamplerJoinTimeout', 'timeout_seconds': 20})
+        if not measurements and not failures:
+            failures.append({'type': 'NoResourceSamples'})
+        if failures:
+            detail = 'resource sampling failed: ' + json.dumps(failures[:4], sort_keys=True)
+            if primary is not None:
+                primary.add_note(detail)
+            else:
+                raise AssertionError(detail) from None
+
+
+def cleanup(actions, primary=None):
+    failures = []
+    for stage, action in actions:
+        try:
+            action()
+        except Exception as exc:
+            failures.append({'stage': stage, **safe_failure(exc)})
+    if failures:
+        detail = 'telemetry cleanup failed: ' + json.dumps(failures[:4], sort_keys=True)
+        if primary is not None:
+            primary.add_note(detail)
+        else:
+            raise AssertionError(detail) from None
+
+
+def sink(path, post=False):
+    code = ('import urllib.request; print(urllib.request.urlopen(urllib.request.Request('
+            + repr('http://127.0.0.1:4319' + path) + ',method=' + repr('POST' if post else 'GET')
+            + '),timeout=10).read().decode())')
+    value = compose('exec', '-T', 'otel-capture', 'python', '-c', code)
+    return json.loads(value) if value.strip() else None
+
+
+def request(path, body=None, headers=None, method=None):
+    owner()
+    data = json.dumps(body).encode() if body is not None else None
+    h = {'Content-Type': 'application/json', 'Authorization': 'Bearer '+SENTINELS[0],
+         'Cookie': 'session='+SENTINELS[0], **(headers or {})}
+    with urllib.request.urlopen(urllib.request.Request(API+path, data=data, headers=h, method=method),
+                                timeout=600) as response:
+        return json.load(response)
+
+
+def trace_headers():
+    remote = uuid.uuid4().hex
+    return {'traceparent': f'00-{remote}-0123456789abcdef-01'}, base64.b64encode(bytes.fromhex(remote)).decode()
+
+
+def upload(collection):
+    owner()
+    h, remote = trace_headers()
+    boundary = uuid.uuid4().hex
+    fields = {'collection': collection, 'strategy': 'fixed', 'chunk_size': '200',
+              'chunk_overlap': '20', 'min_chunk_size': '20'}
+    chunks = []
+    for name, value in fields.items():
+        chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n')
+    chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="files"; filename="{SENTINELS[2]}.txt"\r\nContent-Type: text/plain\r\n\r\nManagers approve overtime. {SENTINELS[1]}. Synthetic path /private/{SENTINELS[3]}. The policy requires approval before work.\r\n--{boundary}--\r\n')
+    data = ''.join(chunks).encode()
+    with urllib.request.urlopen(urllib.request.Request(API+'/ingest/upload', data=data,
+            headers={**h, 'Content-Type': 'multipart/form-data; boundary='+boundary,
+                     'Authorization': 'Bearer '+SENTINELS[0]}), timeout=120) as r:
+        job = json.load(r)['job_id']
+    wait_job('/ingest/job/'+job)
+    return remote
+
+
+def wait_job(path):
+    deadline = time.monotonic()+900
+    while time.monotonic() < deadline:
+        data = request(path)
+        if data['status'] in ('completed', 'failed', 'cancelled'):
+            assert data['status'] == 'completed', 'synthetic job did not complete'
+            return
+        time.sleep(0.5)
+    raise AssertionError('synthetic job exceeded 900s')
+
+
+def export(collection):
+    h, remote = trace_headers()
+    job = request('/export', {'collection': collection, 'include_models': False}, h)['job_id']
+    wait_job('/export/job/'+job)
+    return remote
+
+
+def query(collection):
+    h, remote = trace_headers()
+    result = request('/query', {'question': 'Who approves overtime? '+SENTINELS[1],
+        'collection': collection, 'retrieval_mode': 'hnsw', 'top_k': 2, 'include_citations': False}, h)
+    assert result.get('answer', '').strip(), 'synthetic query has no answer'
+    return remote
+
+
+def records(snapshot, signal):
+    resource, scope, field = {'traces': ('resource_spans', 'scope_spans', 'spans'),
+        'logs': ('resource_logs', 'scope_logs', 'log_records'),
+        'metrics': ('resource_metrics', 'scope_metrics', 'metrics')}[signal]
+    assert isinstance(snapshot, dict), 'invalid capture snapshot'
+    batches = snapshot.get('batches')
+    assert isinstance(batches, list), 'invalid capture batches'
+    result = []
+    for batch in batches:
+        assert isinstance(batch, dict), 'invalid capture batch'
+        assert batch.get('signal') in ('traces', 'logs', 'metrics'), 'invalid capture signal'
+        data = batch.get('data')
+        assert isinstance(data, dict), 'invalid capture data'
+        if batch['signal'] != signal:
+            continue
+        resources = data.get(resource, [])
+        assert isinstance(resources, list), 'invalid capture resources'
+        for res in resources:
+            assert isinstance(res, dict), 'invalid capture resource'
+            scopes = res.get(scope, [])
+            assert isinstance(scopes, list), 'invalid capture scopes'
+            for sc in scopes:
+                assert isinstance(sc, dict), 'invalid capture scope'
+                rows = sc.get(field, [])
+                assert isinstance(rows, list) and all(isinstance(row, dict) for row in rows), 'invalid capture records'
+                result.extend(rows)
+    return result
+
+
+def inspect(snapshot, requests):
+    try:
+        return inspect_records(snapshot, requests)
+    except (TypeError, AttributeError, KeyError) as exc:
+        raise AssertionError('invalid capture evidence shape') from None
+
+
+def inspect_records(snapshot, requests):
+    assert isinstance(snapshot, dict), 'invalid capture snapshot'
+    assert snapshot['overflow'] == 0, 'capture overflow: inspection incomplete'
+    wire = json.dumps(snapshot)
+    assert all(s not in wire for s in SENTINELS), 'content/credential sentinel exported'
+    spans, logs, metrics = (records(snapshot, s) for s in ('traces', 'logs', 'metrics'))
+    identities = [(span['trace_id'], span['span_id']) for span in spans]
+    assert len(set(identities)) == len(identities), 'duplicate received span identity'
+    for item in [*spans, *logs]:
+        if 'name' in item:
+            assert item['name'] in SCHEMA['SPAN_NAMES'], 'unsafe span name'
+        if 'body' in item:
+            assert item['body'].get('string_value') in SCHEMA['LOG_BODIES'], 'unsafe log body'
+        for attr in item.get('attributes', []):
+            key, value = attr['key'], attr['value'].get('string_value')
+            if key == 'rag.job_token':
+                import re
+                assert re.fullmatch('[0-9a-f]{32}', value or '')
+            else:
+                assert value in SCHEMA['ENUMS'].get(key, ()), 'unsafe trace/log attribute'
+    names = {m['name'] for m in metrics}
+    assert names <= SCHEMA['METRIC_NAMES'], 'unsafe metric name'
+    assert {'rag.api.requests', 'rag.api.duration', 'rag.dependency.calls', 'rag.job.completed'} <= names
+    for metric in metrics:
+        expected_kind = 'histogram' if SCHEMA['METRICS'][metric['name']][0] == 'create_histogram' else 'sum'
+        assert expected_kind in metric, 'metric aggregation schema mismatch'
+        assert any(metric.get(k, {}).get('data_points') for k in ('sum', 'histogram')), 'empty metric payload'
+        for kind in ('sum', 'histogram'):
+            for point in metric.get(kind, {}).get('data_points', []):
+                assert not point.get('exemplars'), 'unexpected exemplar identity'
+                assert {a['key'] for a in point.get('attributes', [])} == set(SCHEMA['METRICS'][metric['name']][2]), 'metric label schema mismatch'
+                for attr in point.get('attributes', []):
+                    assert attr['key'] in SCHEMA['METRICS'][metric['name']][2]
+                    assert attr['value'].get('string_value') in SCHEMA['metric_values'](metric['name'], attr['key'])
+    roots, job_tokens = [], []
+    for remote, operation in requests:
+        candidates = [s for s in spans if any(l.get('trace_id') == remote for l in s.get('links', []))]
+        assert len(candidates) == 1, f'expected one linked request root for {operation}'
+        root = candidates[0]
+        roots.append(root['trace_id'])
+        tree = {s['span_id']: s for s in spans if s['trace_id'] == root['trace_id']}
+        target = [s for s in tree.values() if s['name'] == operation]
+        assert target, f'missing {operation} worker/operation span'
+        for item in target:
+            seen = set()
+            node = item
+            while node['span_id'] != root['span_id']:
+                assert node['span_id'] not in seen, 'cyclic span tree'
+                seen.add(node['span_id'])
+                node = tree[node['parent_span_id']]
+            correlated = [l for l in logs if l.get('trace_id') == item['trace_id']
+                          and l.get('span_id') == item['span_id']]
+            if operation != 'rag.query':
+                job_logs = [l for l in correlated if l.get('body', {}).get('string_value') == 'rag.job.completed']
+                assert job_logs, 'missing correlated job completion'
+                tokens = {a['value']['string_value'] for l in job_logs for a in l.get('attributes', [])
+                          if a['key'] == 'rag.job_token'}
+                assert len(tokens) == 1, 'job has no stable generated correlation token'
+                token = tokens.pop()
+                job_tokens.append(token)
+                for log in logs:
+                    if log.get('trace_id') == item['trace_id']:
+                        for attr in log.get('attributes', []):
+                            if attr['key'] == 'rag.job_token':
+                                assert attr['value']['string_value'] == token, 'job context crossed trace trees'
+        dependencies = [s for s in tree.values() if s['name'].startswith(('ollama.', 'weaviate.'))]
+        assert dependencies, 'missing dependency spans'
+        for operation_span in target:
+            connected = False
+            for dependency in dependencies:
+                cursor, visited = dependency, set()
+                while cursor.get('parent_span_id') in tree and cursor['span_id'] not in visited:
+                    visited.add(cursor['span_id'])
+                    cursor = tree[cursor['parent_span_id']]
+                    if cursor['span_id'] == operation_span['span_id']:
+                        connected = True
+                        break
+            assert connected, 'dependency has no parent chain through operation/worker'
+        assert any(l.get('trace_id') == root['trace_id'] and l.get('span_id') == root['span_id']
+                   and l.get('body', {}).get('string_value') == 'rag.api.completed' for l in logs)
+    assert len(roots) == len(set(roots)), 'concurrent requests share a local trace'
+    assert len(job_tokens) == len(set(job_tokens)), 'concurrent jobs share a correlation token'
+
+
+def await_capture(expected):
+    deadline = time.monotonic()+30
+    last = None
+    while time.monotonic() < deadline:
+        data = sink('/snapshot')
+        try:
+            inspect(data, expected)
+            return data
+        except (AssertionError, KeyError) as exc:
+            last = exc
+        time.sleep(1)
+    raise AssertionError(f'capture incomplete: {last}')
+
+
+def enabled(value):
+    owner()
+    harness = os.environ['RAG_VERIFY_HARNESS']
+    args = ['bash', harness+'/scripts/verify/stack.sh', 'telemetry-mode', '--telemetry',
+            '--checkout', os.environ['RAG_VERIFY_CHECKOUT']]
+    if not value:
+        args.append('--disabled')
+    subprocess.run(args, check=True, timeout=150, stdout=subprocess.DEVNULL)
+
+
+def transition(mode):
+    enabled(mode != 'disabled')
+    if mode == 'disabled':
+        # API replacement terminates the old producer. Terminate both the old
+        # collector queues and capture handlers before opening the zero-traffic
+        # window; elapsed quiet time alone cannot prove a drained pipeline.
+        compose('stop', '-t', '10', 'otel-collector')
+        compose('restart', '-t', '10', 'otel-capture')
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                sink('/reset', True)
+                break
+            except (OSError, subprocess.SubprocessError):
+                if time.monotonic() >= deadline:
+                    raise AssertionError('capture unavailable after disabled transition') from None
+                time.sleep(0.2)
+        compose('start', 'otel-collector')
+    else:
+        time.sleep(3)
+        sink('/reset', True)
+
+
+def samples(collections):
+    for _ in range(5):
+        request('/health')
+    durations = []
+    for _ in range(20):
+        start = time.monotonic()
+        request('/health')
+        durations.append(time.monotonic()-start)
+    start = time.monotonic()
+    q = query(collections[0])
+    query_seconds = time.monotonic()-start
+    start = time.monotonic()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = list(pool.map(export, collections))
+    return {'health_samples_seconds': durations, 'health_median_seconds': statistics.median(durations),
+            'health_max_seconds': max(durations), 'query_seconds': query_seconds,
+            'two_jobs_seconds': time.monotonic()-start}, [(q, 'rag.query'), *[(x, 'rag.export') for x in jobs]]
+
+
+def main():
+    assert os.environ.get('COMPOSE_PROJECT_NAME') == 'rag-verify'
+    assert os.environ.get('RAG_VERIFY_TELEMETRY') == '1'
+    assert API.startswith('http://localhost:') and API != 'http://localhost:8080/api'
+    owner()
+    config = json.loads(compose('config', '--format', 'json'))
+    assert config['name'] == 'rag-verify'
+    for service in ('otel-collector', 'otel-capture'):
+        assert not config['services'][service].get('ports')
+        cid = compose('ps', '-q', service).strip()
+        assert cid
+        runtime = json.loads(subprocess.check_output(['docker', 'inspect', cid]))[0]
+        assert not runtime['HostConfig']['PortBindings']
+        assert runtime['Config']['Labels']['com.docker.compose.project'] == 'rag-verify'
+    actual = compose('exec', '-T', 'api', 'python', '-c',
+        'import os; assert os.environ["RAG_OTEL_ENABLED"] == "true"; assert os.environ["RAG_OTEL_ENDPOINT"] == "http://otel-collector:4318"')
+    collections = ['VfyOtel'+uuid.uuid4().hex[:12] for _ in range(2)]
+    report = {'workload': '5 warm-up +20 timed health requests,1 real query,2 concurrent export jobs per mode',
+              'limits': 'small synthetic sample; health timings include host lock checks; no production SLO claim',
+              'modes': {}}
+    primary = None
+    try:
+        for c in collections:
+            request('/collections', {'name': c, 'index_type': 'hnsw', 'distance_metric': 'cosine',
+                    'hnsw_config': {'efConstruction': 128, 'maxConnections': 64, 'ef': 64}})
+        sink('/reset', True)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            ingest = list(pool.map(upload, collections))
+        await_capture([(r, 'rag.ingest') for r in ingest])
+        for mode in ('healthy', 'disabled', 'unavailable', 'slow'):
+            transition(mode)
+            if mode == 'unavailable':
+                compose('stop', '-t', '10', 'otel-collector')
+            if mode == 'slow':
+                sink('/slow', True)
+            with resource_samples(mode != 'unavailable') as statistics_samples:
+                result, expected = samples(collections)
+            result['container_stats_samples'] = statistics_samples
+            if mode == 'healthy':
+                captured = await_capture(expected)
+                result['captured_batches'] = len(captured['batches'])
+            elif mode == 'disabled':
+                time.sleep(4)
+                assert sink('/snapshot')['requests'] == 0, 'disabled application exported telemetry'
+            report['modes'][mode] = result
+            if mode == 'unavailable':
+                compose('start', 'otel-collector')
+            if mode == 'slow':
+                sink('/healthy', True)
+        # Healthy final buffered work, bounded stop and clean fresh request trees.
+        time.sleep(12)
+        assert all(s not in json.dumps(sink('/snapshot')) for s in SENTINELS), 'outage recovery leaked sentinel'
+        sink('/reset', True)
+        remote = query(collections[0])
+        start = time.monotonic()
+        compose('stop', '-t', '10', 'api')
+        report['api_stop_seconds'] = time.monotonic()-start
+        assert report['api_stop_seconds'] < 15
+        await_capture([(remote, 'rag.query')])
+        compose('start', 'api')
+        compose('restart', '-t', '10', 'otel-collector')
+        deadline = time.monotonic()+120
+        while True:
+            try:
+                request('/health')
+                break
+            except Exception:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(1)
+        time.sleep(3)
+        sink('/reset', True)
+        _, expected = samples(collections)
+        await_capture(expected)
+        print(json.dumps(report, indent=2))
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        cleanup([('receiver', lambda: sink('/healthy', True)),
+                 ('collector', lambda: compose('start', 'otel-collector')),
+                 ('api_mode', lambda: enabled(True)),
+                 *[('collection', lambda c=c: request('/collections/'+c+'?confirm=true', method='DELETE'))
+                   for c in collections]], primary)
+
+
+if __name__ == '__main__':
+    main()
+```
+
+
+### scripts/verify/telemetry_guard.py
+
+```python
+"""Additional service-specific restrictions for the optional disposable collector."""
+import json
+from pathlib import Path
+
+KEYS = {'profiles', 'mem_limit', 'cpus', 'stop_grace_period', 'read_only', 'logging'}
+SERVICES = {'otel-collector', 'otel-capture'}
+
+
+def check(config, root):
+    problems = []
+    services = config['services']
+    pin = json.loads((Path(root) / 'telemetry/image.json').read_text())['image']
+    for name in SERVICES & services.keys():
+        svc = services[name]
+        expected_image = pin if name == 'otel-collector' else 'rag-verify-api:latest'
+        if svc.get('image') != expected_image or 'build' in svc:
+            problems.append(f'{name}: unexpected telemetry image/build')
+        if (svc.get('profiles') != ['telemetry'] or str(svc.get('mem_limit')) != '268435456'
+                or svc.get('cpus') != 0.5 or svc.get('stop_grace_period') != '10s'
+                or svc.get('read_only') is not True):
+            problems.append(f'{name}: telemetry limits differ from approved bounds')
+        if svc.get('logging') != {'driver': 'json-file', 'options': {'max-size': '5m', 'max-file': '2'}}:
+            problems.append(f'{name}: unbounded telemetry logs')
+        expected_command = (['--config=/etc/otelcol/config.yaml'] if name == 'otel-collector'
+                            else ['python', '/verify/telemetry_capture.py'])
+        if svc.get('command') != expected_command or svc.get('entrypoint') is not None:
+            problems.append(f'{name}: telemetry command differs from harness contract')
+        expected_target = '/etc/otelcol/config.yaml' if name == 'otel-collector' else '/verify'
+        expected_source = Path(root) / 'scripts/verify'
+        if name == 'otel-collector':
+            expected_source /= 'collector.yaml'
+        mounts = [m for m in svc.get('volumes', []) if m.get('type') == 'bind']
+        if (len(mounts) != 1 or mounts[0].get('target') != expected_target
+                or mounts[0].get('source') != str(expected_source)
+                or Path(mounts[0].get('source', '/')).resolve() != expected_source
+                or mounts[0].get('read_only') is not True):
+            problems.append(f'{name}: expected exact read-only harness asset')
+        if svc.get('ports') or svc.get('depends_on'):
+            problems.append(f'{name}: telemetry has published ports/dependencies')
+    for name, svc in services.items():
+        if name not in SERVICES and SERVICES & set(svc.get('depends_on') or {}):
+            problems.append(f'{name}: collector is in the application dependency chain')
+    return problems
+```
+
+
+### scripts/collector_offline.py
+
+```python
+"""Offline collector identity validation; package metadata never selects an image.
+
+The tracked pin/config-ID allow-list is the trust root. Reconstruct a minimal
+Docker archive from hash-checked config and layers before loading: untrusted OCI
+indexes, repository tags, and unrelated image records never reach docker load.
+"""
+import argparse
+import hashlib
+import io
+import json
+from pathlib import Path
+import subprocess
+import tarfile
+
+ROOT = Path(__file__).resolve().parents[1]
+PIN = json.loads((ROOT / 'telemetry/image.json').read_text())
+LIMIT = 512 * 1024 * 1024
+
+
+def sha(data):
+    return 'sha256:' + hashlib.sha256(data).hexdigest()
+
+
+def read_member(archive, name, limit=LIMIT):
+    if not isinstance(name, str) or not name:
+        raise ValueError('invalid collector member reference')
+    try:
+        member = archive.getmember(name)
+    except KeyError:
+        raise ValueError('missing collector archive member') from None
+    if not member.isfile() or member.size > limit:
+        raise ValueError('collector archive member is not a bounded regular file')
+    return archive.extractfile(member).read()
+
+
+def sanitize(source, destination, architecture):
+    try:
+        return _sanitize(source, destination, architecture)
+    except tarfile.TarError:
+        raise ValueError("invalid collector TAR archive") from None
+
+
+def _sanitize(source, destination, architecture):
+    expected = PIN['config_ids'][architecture]
+    if Path(source).stat().st_size > LIMIT:
+        raise ValueError('collector archive is oversized')
+    with tarfile.open(source, 'r:') as archive:
+        entries, total = [], 0
+        for member in archive:
+            entries.append(member)
+            total += member.size
+            if len(entries) > 40 or total > LIMIT:
+                raise ValueError('collector archive is oversized')
+        # tarfile accepts EOF without end markers and ignores bytes after them.
+        # Docker save produces an uncompressed TAR with two zero end blocks.
+        with Path(source).open('rb') as raw:
+            raw.seek(archive.offset)
+            tail = raw.read()
+        if len(tail) < 1024 or len(tail) % 512 or any(tail):
+            raise ValueError('invalid collector archive terminator/trailing bytes')
+        if len({e.name for e in entries}) != len(entries):
+            raise ValueError('duplicate collector archive members')
+        manifest = json.loads(read_member(archive, 'manifest.json', 65536))
+        if not isinstance(manifest, list) or len(manifest) != 1:
+            raise ValueError('expected exactly one collector image')
+        image = manifest[0]
+        if (not isinstance(image, dict) or not isinstance(image.get('Config'), str)
+                or not image['Config'] or not isinstance(image.get('Layers'), list)
+                or not all(isinstance(name, str) and name for name in image['Layers'])):
+            raise ValueError('invalid collector image manifest')
+        config = read_member(archive, image['Config'], 65536)
+        if sha(config) != expected:
+            raise ValueError('collector image differs from trusted platform pin')
+        parsed = json.loads(config)
+        if parsed['architecture'] != architecture or parsed['os'] != 'linux':
+            raise ValueError('collector platform mismatch')
+        diff_ids = parsed['rootfs']['diff_ids']
+        if len(image['Layers']) != len(diff_ids):
+            raise ValueError('collector layer count mismatch')
+        # Verify all bytes before producing an archive Docker will see.
+        layers = []
+        for name, digest in zip(image['Layers'], diff_ids):
+            data = read_member(archive, name)
+            if sha(data) != digest:
+                raise ValueError('collector layer differs from trusted image config')
+            layers.append(data)
+    clean = {'Config': 'config.json', 'RepoTags': None,
+             'Layers': [f'layer-{i}.tar' for i in range(len(layers))]}
+    with tarfile.open(destination, 'w') as out:
+        for name, data in [('config.json', config), ('manifest.json', json.dumps([clean]).encode()),
+                           *zip(clean['Layers'], layers)]:
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            out.addfile(info, io.BytesIO(data))
+    return expected
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('mode', choices=['package', 'prepare'])
+    parser.add_argument('folder', type=Path)
+    parser.add_argument('--output', type=Path)
+    args = parser.parse_args()
+    if args.mode == 'package':
+        inspected = json.loads(subprocess.check_output(['docker', 'image', 'inspect', PIN['image']]))[0]
+        arch = inspected['Architecture']
+        if inspected['Id'] != PIN['config_ids'].get(arch) or inspected['Os'] != 'linux':
+            raise ValueError('local collector does not match trusted platform pin')
+        target = args.folder / 'collector.tar'
+        subprocess.run(['docker', 'image', 'save', '-o', str(target), PIN['image']], check=True)
+        with target.open('rb') as stream:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        metadata = {'architecture': arch, 'archive_sha256': digest}
+        (args.folder / 'collector.json').write_text(json.dumps(metadata) + '\n')
+    else:
+        if args.output is None:
+            parser.error('--output is required for prepare')
+        architecture = subprocess.check_output(['docker', 'info', '--format', '{{.Architecture}}'], text=True).strip()
+        architecture = {'aarch64': 'arm64', 'x86_64': 'amd64'}.get(architecture, architecture)
+        if architecture not in PIN['config_ids']:
+            raise ValueError('offline collector supports linux amd64/arm64 only')
+        metadata_path = args.folder / 'collector.json'
+        if metadata_path.stat().st_size > 4096:
+            raise ValueError('collector metadata is oversized')
+        metadata = json.loads(metadata_path.read_text())
+        if not isinstance(metadata, dict):
+            raise ValueError('invalid collector metadata object')
+        target = args.folder / 'collector.tar'
+        if target.stat().st_size > LIMIT:
+            raise ValueError('collector archive is oversized')
+        with target.open('rb') as stream:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        if metadata.get('architecture') != architecture or metadata.get('archive_sha256') != digest:
+            raise ValueError('collector archive checksum/platform mismatch')
+        print(sanitize(target, args.output, architecture))
+
+
+if __name__ == '__main__':
+    main()
+```
+
+
+### scripts/tests/test_collector.py
+
+```python
+"""Focused optional collector checks. Host stdlib plus Docker Compose config only.
+No application container is started by these checks.
+"""
+import copy
+import hashlib
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tarfile
+import tempfile
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, ROOT / path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def archive(path, config, layer=b'synthetic layer', tags=None):
+    with tarfile.open(path, 'w') as tar:
+        data = {'config': config, 'layer': layer,
+                'manifest.json': json.dumps([{'Config': 'config', 'Layers': ['layer'], 'RepoTags': tags}]).encode(),
+                'index.json': b'{"untrusted":"must not pass to Docker"}'}
+        for name, body in data.items():
+            item = tarfile.TarInfo(name); item.size = len(body)
+            tar.addfile(item, io.BytesIO(body))
+
+
+class Offline(unittest.TestCase):
+    def setUp(self):
+        self.module = load('collector_offline', 'scripts/collector_offline.py')
+        self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.input = Path(self.temp.name) / 'input.tar'
+        self.output = Path(self.temp.name) / 'output.tar'
+        self.config = json.dumps({'architecture': 'arm64', 'os': 'linux',
+            'rootfs': {'diff_ids': [self.module.sha(b'synthetic layer')]}}).encode()
+        self.module.PIN = {'config_ids': {'arm64': self.module.sha(self.config)}}
+
+    def test_verified_bytes_strip_untrusted_tags_and_index(self):
+        archive(self.input, self.config, tags=['rag-docker-api:latest'])
+        expected = self.module.sanitize(self.input, self.output, 'arm64')
+        self.assertEqual(expected, self.module.sha(self.config))
+        with tarfile.open(self.output) as tar:
+            self.assertEqual(set(tar.getnames()), {'config.json', 'manifest.json', 'layer-0.tar'})
+            manifest = json.load(tar.extractfile('manifest.json'))
+            self.assertIsNone(manifest[0]['RepoTags'])
+
+    def test_layer_tampering_rejected_before_output(self):
+        archive(self.input, self.config, b'tampered')
+        with self.assertRaisesRegex(ValueError, 'layer differs'):
+            self.module.sanitize(self.input, self.output, 'arm64')
+        self.assertFalse(self.output.exists())
+
+    def test_untrusted_config_cannot_select_image(self):
+        archive(self.input, b'{}')
+        with self.assertRaisesRegex(ValueError, 'trusted platform pin'):
+            self.module.sanitize(self.input, self.output, 'arm64')
+
+    def test_wrong_platform_refused(self):
+        archive(self.input, self.config)
+        with self.assertRaises(KeyError):
+            self.module.sanitize(self.input, self.output, 'amd64')
+
+    def test_duplicate_archive_names_refused(self):
+        archive(self.input, self.config)
+        with tarfile.open(self.input, 'a') as tar:
+            data = b'[]'; item = tarfile.TarInfo('manifest.json'); item.size = len(data)
+            tar.addfile(item, io.BytesIO(data))
+        with self.assertRaisesRegex(ValueError, 'duplicate'):
+            self.module.sanitize(self.input, self.output, 'arm64')
+
+    def test_tar_terminators_and_trailing_bytes(self):
+        archive(self.input, self.config)
+        original = self.input.read_bytes()
+        with tarfile.open(self.input) as tar:
+            list(tar)
+            end = tar.offset
+        for suffix in (b'', bytes(512), bytes(1023), bytes(1024)+b'x', bytes(1024)+b'x'*512):
+            with self.subTest(length=len(suffix)):
+                self.input.write_bytes(original[:end]+suffix)
+                with self.assertRaisesRegex(ValueError, 'terminator'):
+                    self.module.sanitize(self.input,self.output,'arm64')
+                self.assertFalse(self.output.exists())
+        for padding in (1024, 2048):
+            self.input.write_bytes(original[:end]+bytes(padding))
+            self.module.sanitize(self.input,self.output,'arm64')
+            self.output.unlink()
+
+    def test_manifest_shapes_and_missing_references(self):
+        for image in (None, [], 'bad', {}, {'Config':None,'Layers':[]},
+                      {'Config':'config','Layers':None}, {'Config':'config','Layers':['']},
+                      {'Config':'config','Layers':[1]}, {'Config':'missing','Layers':[]},
+                      {'Config':'config','Layers':['missing']}):
+            with self.subTest(image=image):
+                with tarfile.open(self.input,'w') as tar:
+                    for name, data in [('manifest.json',json.dumps([image]).encode()),('config',self.config)]:
+                        item=tarfile.TarInfo(name); item.size=len(data);tar.addfile(item,io.BytesIO(data))
+                with self.assertRaises(ValueError):
+                    self.module.sanitize(self.input,self.output,'arm64')
+                self.assertFalse(self.output.exists())
+
+    def test_prepare_metadata_shapes(self):
+        for data in (None, [], 'bad', 42, True):
+            with self.subTest(data=data):
+                Path(self.temp.name,'collector.json').write_text(json.dumps(data))
+                with patch('sys.argv',['collector_offline','prepare',self.temp.name,'--output',str(self.output)]), \
+                     patch.object(self.module.subprocess,'check_output',return_value='arm64'):
+                    with self.assertRaisesRegex(ValueError,'metadata object'):
+                        self.module.main()
+                self.assertFalse(self.output.exists())
+
+
+class Installer(unittest.TestCase):
+    def test_default_and_optional_commands_and_missing_payload(self):
+        for mode in ('default', 'optional', 'missing'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                for sub in ('scripts', 'telemetry', 'offline', 'bin'):
+                    (root/sub).mkdir()
+                shutil.copy(ROOT/'install-offline.sh', root/'install-offline.sh')
+                shutil.copy(ROOT/'scripts/collector_offline.py', root/'scripts/collector_offline.py')
+                layer = b'fixture layer'
+                config = json.dumps({'architecture':'arm64', 'os':'linux',
+                    'rootfs':{'diff_ids':['sha256:'+hashlib.sha256(layer).hexdigest()]}}).encode()
+                identity = 'sha256:'+hashlib.sha256(config).hexdigest()
+                (root/'telemetry/image.json').write_text(json.dumps({'config_ids':{'arm64':identity}}))
+                (root/'offline/images.tar.gz').touch()
+                (root/'offline/ollama_models.tar.gz').touch()
+                if mode == 'optional':
+                    target = root/'offline/collector.tar'
+                    archive(target, config, layer)
+                    (root/'offline/collector.json').write_text(json.dumps({'architecture':'arm64',
+                        'archive_sha256':hashlib.sha256(target.read_bytes()).hexdigest()}))
+                stub = root/'bin/docker'
+                stub.write_text(r"""#!/usr/bin/env python3
+import json,os,sys
+with open(os.environ['TEST_LOG'],'a') as f: f.write(json.dumps(sys.argv[1:])+'\n')
+a=sys.argv[1:]
+if a[:1]==['info'] and '--format' in a: print('aarch64')
+elif a[:2]==['image','inspect']: print(os.environ['TEST_ID'])
+elif a[:2]==['compose','ps'] and '--services' in a:
+ for i in range(int(os.environ['TEST_COUNT'])): print('service'+str(i))
+""")
+                stub.chmod(0o755)
+                env = {**os.environ, 'PATH':str(root/'bin')+os.pathsep+os.environ['PATH'],
+                       'TEST_LOG':str(root/'calls'), 'TEST_ID':identity, 'TEST_COUNT':'5' if mode=='default' else '6'}
+                run = subprocess.run(['bash', str(root/'install-offline.sh'), *([] if mode=='default' else ['--telemetry'])],
+                                     env=env, text=True, capture_output=True)
+                calls = [json.loads(x) for x in (root/'calls').read_text().splitlines()]
+                if mode == 'missing':
+                    self.assertNotEqual(run.returncode,0)
+                    self.assertFalse(any(x[0]=='load' or x[:2]==['compose','up'] for x in calls))
+                    continue
+                self.assertEqual(run.returncode,0,run.stderr)
+                up = next(x for x in calls if x[:2]==['compose','up'])
+                restore = next(x for x in calls if x[:2]==['compose','run'])
+                if mode == 'optional':
+                    self.assertIn('--pull',up); self.assertIn('never',up)
+                    self.assertIn('--pull=never',restore)
+                else:
+                    self.assertEqual(up,['compose','up','-d','--no-build'])
+                    self.assertNotIn('--pull=never',restore)
+
+
+class Packager(unittest.TestCase):
+    def test_printed_install_command_matches_bundle_mode(self):
+        for telemetry in (False,True):
+            with self.subTest(telemetry=telemetry), tempfile.TemporaryDirectory() as folder:
+                root=Path(folder);(root/'bin').mkdir();(root/'scripts').mkdir()
+                shutil.copy(ROOT/'package-offline.sh',root/'package-offline.sh')
+                (root/'scripts/collector_offline.py').write_text("from pathlib import Path\nimport sys\nPath(sys.argv[2],'collector.tar').touch()\n")
+                stub=root/'bin/docker'
+                stub.write_text("""#!/usr/bin/env python3
+import sys,json,pathlib
+args=sys.argv[1:]
+if args[:2]==['compose','config']:print(json.dumps({'name':'fixture'}))
+if args[:1]==['run']:
+ for arg in args:
+  if arg.endswith(':/out'):pathlib.Path(arg[:-5],'ollama_models.tar.gz').touch()
+""")
+                stub.chmod(0o755)
+                result=subprocess.run(['bash',str(root/'package-offline.sh'),*(['--telemetry'] if telemetry else []),'bundle.tar'],
+                    env={**os.environ,'PATH':str(root/'bin')+os.pathsep+os.environ['PATH']},text=True,capture_output=True)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(result.stdout.splitlines()[-1],'  bash install-offline.sh'+(' --telemetry' if telemetry else ''))
+                with tarfile.open(root/'bundle.tar') as tar:
+                    self.assertEqual('rag-docker/offline/collector.tar' in tar.getnames(),telemetry)
+
+
+class Compose(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.env = {**os.environ, 'RAG_VERIFY_PORT': '18081', 'RAG_EXPORTS_DIR': '/tmp/collector-test-exports',
+                   'COMPOSE_PROFILES': 'telemetry', 'RAG_VERIFY_HARNESS': str(ROOT)}
+        cls.cmd = ['docker', 'compose', '-p', 'rag-verify', '-f', str(ROOT/'docker-compose.yml'),
+                   '-f', str(ROOT/'docker-compose.telemetry.yml'), '-f', str(ROOT/'docker-compose.verify.yml'),
+                   '-f', str(ROOT/'docker-compose.telemetry.verify.yml'), 'config', '--format', 'json']
+        cls.config = json.loads(subprocess.check_output(cls.cmd, env=cls.env))
+        cls.guard = re.findall(r"python3 - [^\n]*<<'GUARDPY'\n(.*?)\nGUARDPY", (ROOT/'scripts/verify/stack.sh').read_text(), re.S)[0]
+
+    def run_guard(self, config, checkout=ROOT):
+        with tempfile.NamedTemporaryFile(mode='w') as file:
+            json.dump(config, file); file.flush()
+            return subprocess.run(['python3', '-', str(checkout), self.env['RAG_EXPORTS_DIR'], '18081', file.name, str(ROOT)],
+                                  input=self.guard, text=True, capture_output=True)
+
+    def test_optional_config_passes_full_guard(self):
+        result = self.run_guard(self.config)
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        api = self.config['services']['api']['environment']
+        self.assertEqual(api['RAG_OTEL_ENABLED'], 'true')
+        self.assertEqual(api['RAG_OTEL_ENDPOINT'], 'http://otel-collector:4318')
+
+    def test_default_does_not_include_collector_or_enable_api(self):
+        value = json.loads(subprocess.check_output(['docker', 'compose', '-f', str(ROOT/'docker-compose.yml'),
+                                                    'config', '--format', 'json']))
+        self.assertEqual(len(value['services']), 5)
+        self.assertNotIn('RAG_OTEL_ENABLED', value['services']['api']['environment'])
+
+    def test_ambient_inputs_and_distinct_checkout(self):
+        hostile={k:'invalid' for k in self.config['services']['api']['environment'] if k.startswith('RAG_OTEL_')}
+        config=json.loads(subprocess.check_output(self.cmd,env={**self.env,**hostile}))
+        self.assertEqual(config,self.config)
+        with tempfile.TemporaryDirectory() as folder:
+            checkout=Path(folder)
+            for name in ('docker-compose.yml','docker-compose.telemetry.yml'):
+                shutil.copy(ROOT/name,checkout/name)
+            cmd=[str(checkout/Path(x).name) if x in (str(ROOT/'docker-compose.yml'),str(ROOT/'docker-compose.telemetry.yml')) else x for x in self.cmd]
+            value=json.loads(subprocess.check_output(cmd,env=self.env))
+            for service in ('otel-collector','otel-capture'):
+                mount=next(v for v in value['services'][service]['volumes'] if v['type']=='bind')
+                self.assertTrue(mount['source'].startswith(str(ROOT/'scripts/verify')))
+            result=self.run_guard(value,checkout)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            guard=load('guard','scripts/verify/telemetry_guard.py')
+            self.assertEqual(guard.check(value,ROOT),[])
+            for service in ('otel-collector','otel-capture'):
+                changed=copy.deepcopy(value)
+                next(v for v in changed['services'][service]['volumes'] if v['type']=='bind')['source']=str(checkout/'scripts/verify')
+                self.assertTrue(guard.check(changed,ROOT))
+
+    def test_unsafe_variants_still_refused(self):
+        mutations = [
+            lambda c: c['services']['otel-collector'].update(command=['--config=http://outside.invalid/config']),
+            lambda c: c['services']['otel-capture'].update(command=['python', '/tmp/replacement.py']),
+            lambda c: c['services']['otel-capture'].update(entrypoint=['sh']),
+            lambda c: c['services']['otel-collector'].update(ports=[{'target':4318, 'published':'4318'}]),
+            lambda c: c['services']['otel-collector'].update(mem_limit='0'),
+            lambda c: c['services']['otel-collector'].update(image='evil:latest'),
+            lambda c: c['services']['api'].update(mem_limit='268435456'),
+            lambda c: c['services']['api']['depends_on'].update({'otel-collector': {'condition':'service_started'}}),
+            lambda c: c['services']['otel-capture']['volumes'][0].update(source='/private/secret'),
+            lambda c: c['services']['otel-collector'].update(logging={'driver':'json-file'}),
+        ]
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                config = copy.deepcopy(self.config); mutate(config)
+                self.assertNotEqual(self.run_guard(config).returncode, 0)
+
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
+
+### scripts/tests/test_telemetry_capture.py
+
+```python
+"""Receiver and decoded evidence assertions, run with the locked API dependencies."""
+import base64
+import importlib.util
+import json
+import copy
+from pathlib import Path
+import threading
+import unittest
+from unittest.mock import patch
+import subprocess
+import urllib.error
+import urllib.request
+from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, ROOT / path)
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    return module
+
+
+class CaptureTests(unittest.TestCase):
+    def setUp(self):
+        self.m = load('capture', 'scripts/verify/telemetry_capture.py')
+        self.server = self.m.Server(('127.0.0.1', 0), self.m.Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True); self.thread.start()
+        self.addCleanup(self.server.server_close); self.addCleanup(self.server.shutdown)
+        self.url = 'http://127.0.0.1:'+str(self.server.server_port)
+
+    def post(self, path, data=b''):
+        return urllib.request.urlopen(urllib.request.Request(self.url+path, data=data), timeout=2)
+
+    def test_real_protobuf_decodes_and_reset_zeros_counts(self):
+        msg = ExportTraceServiceRequest()
+        msg.resource_spans.add().scope_spans.add().spans.add(name='POST /query', trace_id=b'a'*16, span_id=b'b'*8)
+        self.assertEqual(self.post('/v1/traces', msg.SerializeToString()).status, 200)
+        data = json.load(urllib.request.urlopen(self.url+'/snapshot'))
+        self.assertEqual(data['requests'], 1)
+        self.assertEqual(data['batches'][0]['data']['resource_spans'][0]['scope_spans'][0]['spans'][0]['name'], 'POST /query')
+        self.post('/reset')
+        self.assertEqual(json.load(urllib.request.urlopen(self.url+'/snapshot'))['requests'], 0)
+
+    def test_capture_overflow_is_explicit_failure(self):
+        self.m.MAX_BATCHES = 1
+        self.post('/v1/traces')
+        with self.assertRaises(urllib.error.HTTPError) as exc:
+            self.post('/v1/traces')
+        self.assertEqual(exc.exception.code, 503)
+        self.assertEqual(self.m.capture.overflow, 1)
+
+    def test_oversized_body_refused(self):
+        self.m.MAX_BODY = 8
+        with self.assertRaises(urllib.error.HTTPError) as exc:
+            self.post('/v1/traces', b'0123456789')
+        self.assertEqual(exc.exception.code, 413)
+
+
+class EvidenceTests(unittest.TestCase):
+    def fixture(self):
+        m = load('e2e', 'scripts/verify/telemetry_e2e.py')
+        def attr(key, value):
+            return {'key':key, 'value':{'string_value':value}}
+        root = {'trace_id':'trace1', 'span_id':'root', 'name':'POST /export', 'links':[{'trace_id':'remote1'}]}
+        job = {'trace_id':'trace1', 'span_id':'job', 'parent_span_id':'root', 'name':'rag.export'}
+        dep = {'trace_id':'trace1', 'span_id':'dep', 'parent_span_id':'job', 'name':'weaviate.iterate'}
+        logs = [{'trace_id':'trace1', 'span_id':span, 'body':{'string_value':body},
+                 'attributes':[] if span=='root' else [attr('rag.job_token','a'*32)]}
+                for span, body in [('root','rag.api.completed'),('job','rag.job.completed'),('dep','rag.dependency.completed')]]
+        metrics = []
+        for name in ('rag.api.requests','rag.api.duration','rag.dependency.calls','rag.job.completed'):
+            attributes = [attr(k, sorted(m.SCHEMA['metric_values'](name,k))[0]) for k in m.SCHEMA['METRICS'][name][2]]
+            kind = 'histogram' if m.SCHEMA['METRICS'][name][0] == 'create_histogram' else 'sum'
+            metrics.append({'name':name, kind:{'data_points':[{'as_int':'1','attributes':attributes}]}})
+        snapshot = {'overflow':0,'batches':[
+            {'signal':'traces','data':{'resource_spans':[{'scope_spans':[{'spans':[root,job,dep]}]}]}},
+            {'signal':'logs','data':{'resource_logs':[{'scope_logs':[{'log_records':logs}]}]}},
+            {'signal':'metrics','data':{'resource_metrics':[{'scope_metrics':[{'metrics':metrics}]}]}}]}
+        return m, snapshot, [('remote1','rag.export')]
+
+    def test_connected_received_tree_is_accepted(self):
+        m,snapshot,expected = self.fixture()
+        m.inspect(snapshot, expected)
+
+    def test_malformed_capture_shapes_fail_controlled(self):
+        m,valid,expected=self.fixture()
+        cases=[None,[],{'overflow':0,'batches':1}]
+        for path in (('batches',0),('batches',0,'data'),('batches',0,'data','resource_spans'),
+                     ('batches',0,'data','resource_spans',0),
+                     ('batches',0,'data','resource_spans',0,'scope_spans'),
+                     ('batches',0,'data','resource_spans',0,'scope_spans',0),
+                     ('batches',0,'data','resource_spans',0,'scope_spans',0,'spans'),
+                     ('batches',0,'data','resource_spans',0,'scope_spans',0,'spans',0)):
+            for invalid in (None, 1, 'bad'):
+                value=copy.deepcopy(valid); target=value
+                for key in path[:-1]:target=target[key]
+                target[path[-1]]=invalid;cases.append(value)
+        for value in cases:
+            with self.subTest(value=value), self.assertRaises(AssertionError):m.inspect(value,expected)
+        with patch.object(m,'sink',side_effect=[cases[-1],valid]),patch.object(m.time,'sleep'):
+            self.assertIs(m.await_capture(expected),valid)
+
+    def test_disabled_transition_terminates_old_pipeline_before_reset(self):
+        m,_,_=self.fixture(); events=[]
+        with patch.object(m,'enabled',side_effect=lambda value:events.append(('enabled',value))), \
+             patch.object(m,'compose',side_effect=lambda *args:events.append(args)), \
+             patch.object(m,'sink',side_effect=lambda *args:events.append(args)):
+            m.transition('disabled')
+        self.assertEqual(events,[('enabled',False),('stop','-t','10','otel-collector'),
+                                 ('restart','-t','10','otel-capture'),('/reset',True),('start','otel-collector')])
+
+    def test_duplicate_full_span_identities_rejected_before_lineage(self):
+        for index in range(3):
+            for change in ({}, {'parent_span_id':'different'}, {'name':'rag.query'},
+                           {'links':[{'trace_id':'different'}]}):
+                for prepend in (False,True):
+                    with self.subTest(index=index,change=change,prepend=prepend):
+                        m,snapshot,expected=self.fixture()
+                        duplicate=copy.deepcopy(m.records(snapshot,'traces')[index]);duplicate.update(change)
+                        batch={'signal':'traces','data':{'resource_spans':[{'scope_spans':[{'spans':[duplicate]}]}]}}
+                        snapshot['batches'].insert(0 if prepend else len(snapshot['batches']),batch)
+                        with self.assertRaisesRegex(AssertionError,'duplicate received span identity'):
+                            m.inspect(snapshot,expected)
+
+    def test_same_span_id_in_separate_traces_is_valid(self):
+        m,snapshot,expected=self.fixture()
+        other=copy.deepcopy(snapshot['batches'][0])
+        for span in other['data']['resource_spans'][0]['scope_spans'][0]['spans']:
+            span['trace_id']='trace2'
+            if 'links' in span:span['links']=[{'trace_id':'remote2'}]
+        snapshot['batches'].append(other)
+        # Only the original trace is requested; unrelated valid spans still
+        # participate in full received-identity validation.
+        m.inspect(snapshot,expected)
+
+    def test_dependency_sibling_is_not_worker_lineage(self):
+        m,snapshot,expected = self.fixture()
+        m.records(snapshot,'traces')[2]['parent_span_id'] = 'root'
+        with self.assertRaisesRegex(AssertionError,'parent chain'):
+            m.inspect(snapshot,expected)
+
+    def test_concurrent_job_context_leak_rejected(self):
+        m,snapshot,expected = self.fixture()
+        m.records(snapshot,'logs')[2]['attributes'][0]['value']['string_value'] = 'b'*32
+        with self.assertRaisesRegex(AssertionError,'crossed trace trees'):
+            m.inspect(snapshot,expected)
+
+    def test_trace_identity_metric_label_rejected(self):
+        m,snapshot,expected = self.fixture()
+        metric = m.records(snapshot,'metrics')[0]
+        metric['sum']['data_points'][0]['attributes'].append({'key':'trace_id','value':{'string_value':'trace1'}})
+        with self.assertRaisesRegex(AssertionError,'schema mismatch'):
+            m.inspect(snapshot,expected)
+
+    def test_content_sentinel_prevents_acceptance(self):
+        m = load('e2e', 'scripts/verify/telemetry_e2e.py')
+        with self.assertRaisesRegex(AssertionError, 'sentinel'):
+            m.inspect({'overflow': 0, 'batches': [{'data':m.SENTINELS[0]}]}, [])
+
+    def test_capture_overflow_prevents_acceptance(self):
+        m = load('e2e', 'scripts/verify/telemetry_e2e.py')
+        with self.assertRaisesRegex(AssertionError, 'overflow'):
+            m.inspect({'overflow': 1, 'batches': []}, [])
+
+
+class SamplingTests(unittest.TestCase):
+    def setUp(self):
+        self.m = load('e2e_sampling', 'scripts/verify/telemetry_e2e.py')
+
+    def test_compose_stats_queries_one_service_per_command(self):
+        value = json.dumps({'CPUPerc':'1.0%', 'MemUsage':'10MiB /256MiB', 'PIDs':'2'})
+        with patch.object(self.m, 'compose', return_value=value) as call:
+            samples = self.m.stats_snapshot(True)
+        self.assertEqual(set(samples), {'api','otel-collector'})
+        self.assertEqual([c.args for c in call.call_args_list], [
+            ('stats','--no-stream','--format','json','api'),
+            ('stats','--no-stream','--format','json','otel-collector')])
+        self.assertTrue(all(c.kwargs['capture_stderr'] for c in call.call_args_list))
+
+    def test_unavailable_collector_still_requires_api_measurement(self):
+        with patch.object(self.m,'compose',return_value='{"CPUPerc":"1%","MemUsage":"10MiB /256MiB"}') as call:
+            samples = self.m.stats_snapshot(False)
+        self.assertEqual(call.call_count,1)
+        self.assertEqual(samples['otel-collector'], {'state':'stopped_by_test'})
+        with patch.object(self.m,'compose',return_value='[]'):
+            with self.assertRaisesRegex(ValueError,'missing'):
+                self.m.stats_snapshot(False)
+
+    def test_sampling_failure_fails_acceptance_without_raw_diagnostics(self):
+        error = subprocess.CalledProcessError(2,['SECRET_COMMAND'],stderr='SENTINEL_SECRET_OUTPUT')
+        reached = threading.Event()
+        def fail(_):
+            reached.set()
+            raise error
+        with patch.object(self.m,'stats_snapshot',side_effect=fail):
+            with self.assertRaisesRegex(AssertionError,'resource sampling failed') as caught:
+                with self.m.resource_samples(True):
+                    self.assertTrue(reached.wait(2))
+        self.assertIn('"exit_code": 2',str(caught.exception))
+        self.assertNotIn('SECRET',str(caught.exception))
+
+    def test_workload_failure_preserved_with_sampler_diagnostic_note(self):
+        reached = threading.Event()
+        def fail(_):
+            reached.set()
+            raise subprocess.TimeoutExpired('SECRET_COMMAND',8,stderr='SECRET_OUTPUT')
+        original = ValueError('primary workload failure')
+        with patch.object(self.m,'stats_snapshot',side_effect=fail):
+            with self.assertRaises(ValueError) as caught:
+                with self.m.resource_samples(True):
+                    self.assertTrue(reached.wait(2))
+                    raise original
+        self.assertIs(caught.exception, original)
+        self.assertIn('TimeoutExpired',' '.join(original.__notes__))
+        self.assertNotIn('SECRET',' '.join(original.__notes__))
+
+    def test_cleanup_preserves_primary_and_attempts_all_actions(self):
+        original = ValueError('primary workload failure')
+        reached = []
+        def fail():
+            reached.append('first')
+            raise subprocess.CalledProcessError(4,['secret'],stderr='secret')
+        self.m.cleanup([('receiver',fail), ('collector',lambda:reached.append('second'))],original)
+        self.assertEqual(reached,['first','second'])
+        self.assertIn('"exit_code": 4',' '.join(original.__notes__))
+        self.assertNotIn('secret',' '.join(original.__notes__))
+        with self.assertRaisesRegex(AssertionError,'cleanup failed'):
+            self.m.cleanup([('receiver',fail)])
+
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
+
+### docker-compose.telemetry.verify.yml
+
+```yaml
+# Only loaded by the disposable harness with --telemetry.
+services:
+  api:
+    environment:
+      RAG_OTEL_ENABLED: "${RAG_VERIFY_OTEL_ENABLED:-true}"
+      RAG_OTEL_PROTOCOL: http/protobuf
+      RAG_OTEL_SERVICE_VERSION: "1.1.0"
+      RAG_OTEL_QUEUE_SIZE: "256"
+      RAG_OTEL_BATCH_SIZE: "64"
+      RAG_OTEL_ENDPOINT: http://otel-collector:4318
+      RAG_OTEL_SAMPLE_RATIO: "1"
+      RAG_OTEL_INTERVAL_MS: "1000"
+      RAG_OTEL_TIMEOUT_MS: "500"
+      RAG_OTEL_SHUTDOWN_MS: "3000"
+      RAG_OTEL_SERVICE_NAME: rag-api
+      RAG_OTEL_ENVIRONMENT: verification
+      RAG_OTEL_TRACES: "true"
+      RAG_OTEL_METRICS: "true"
+      RAG_OTEL_LOGS: "true"
+  otel-collector:
+    volumes:
+      - ${RAG_VERIFY_HARNESS:?harness path required}/scripts/verify/collector.yaml:/etc/otelcol/config.yaml:ro
+  otel-capture:
+    image: rag-verify-api:latest
+    profiles: [telemetry]
+    command: [python, /verify/telemetry_capture.py]
+    networks: [rag-internal]
+    ports: []
+    volumes:
+      - ${RAG_VERIFY_HARNESS:?harness path required}/scripts/verify:/verify:ro
+      - otel_capture:/capture
+    mem_limit: 256m
+    cpus: 0.5
+    stop_grace_period: 10s
+    read_only: true
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+volumes:
+  otel_capture:
+```
+
+
+### package-offline.sh
+
+```bash
+#!/usr/bin/env bash
+#
+# Build a fully self-contained OFFLINE bundle of this project.
+#
+#   bash package-offline.sh [output.tar]
+#
+# Unlike package.sh (source only, ~150 KB, needs the internet on first run),
+# this bundle contains everything required to run with NO network access:
+#
+#   * the source tree
+#   * all five Docker images, pre-built (docker save)
+#   * the Ollama model weights (phi3.5 + nomic-embed-text)
+#
+# Measured at 4.6 GB (2.5 GB images + 2.2 GB model weights) with both models
+# present. Build it on a machine where the stack already works,
+# then move the file to the target Mac and run install-offline.sh there.
+
+set -euo pipefail
+cd "$(dirname "$0")"
+
+TELEMETRY=0
+if [ "${1:-}" = --telemetry ]; then TELEMETRY=1; shift; fi
+[ "$#" -le 1 ] || { echo "Usage: bash package-offline.sh [--telemetry] [output.tar]" >&2; exit 2; }
+OUT="${1:-rag-docker-offline.tar}"
+OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"   # absolute
+
+# The MCP server is parked (see docker-compose.yml). Its image is deliberately
+# NOT bundled: nothing in the stack uses it, and requiring it here would make
+# packaging fail on a machine that has never built it. Re-add
+# rag-docker-mcp:latest when the MCP server is brought back.
+IMAGES=(
+  rag-docker-api:latest
+  rag-docker-ui:latest
+  semitechnologies/weaviate:1.39.6
+  ollama/ollama:0.3.14
+  nginx:1.29-alpine
+)
+
+echo "==> Checking prerequisites"
+for img in "${IMAGES[@]}"; do
+  docker image inspect "$img" >/dev/null 2>&1 \
+    || { echo "ERROR: image '$img' not found locally. Run 'docker compose build' and 'docker compose up -d' first." >&2; exit 1; }
+done
+
+# Resolve the compose project so we read the right volume.
+PROJECT="$(docker compose config --format json | tr -d ' \n' | sed -n 's/^{"name":"\([^"]*\)".*/\1/p')"
+[ -n "$PROJECT" ] || PROJECT="$(basename "$PWD" | tr '[:upper:]' '[:lower:]')"
+MODELVOL="${PROJECT}_ollama_models"
+docker volume inspect "$MODELVOL" >/dev/null 2>&1 \
+  || { echo "ERROR: volume '$MODELVOL' not found. Start the stack once so the models download." >&2; exit 1; }
+
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"' EXIT
+mkdir -p "$STAGE/rag-docker/offline"
+
+echo "==> Copying source"
+tar cf - \
+  --exclude='./.DS_Store' --exclude='*/.DS_Store' \
+  --exclude='*/node_modules/*' --exclude='*/__pycache__/*' \
+  --exclude='*.pyc' --exclude='*/dist/*' \
+  --exclude='*/.venv/*' --exclude='*/venv/*' \
+  --exclude='./.env' --exclude='*/.env' --exclude='*/.env.*' \
+  --exclude='./.git/*' --exclude='*.tar' --exclude='*.zip' \
+  --exclude='./offline/*' --exclude='./dev-docs/*' --exclude='./telemetry/secrets/*' \
+  --exclude='./ingest-inbox/*' \
+  --exclude='./exports/*' \
+  . | ( cd "$STAGE/rag-docker" && tar xf - )
+
+# Both zip and tar drop a directory once all its contents are excluded, so the
+# mount target is recreated explicitly. Without it Docker creates ./ingest-inbox
+# as root on the target machine and the user cannot drop files into it.
+mkdir -p "$STAGE/rag-docker/ingest-inbox"
+touch "$STAGE/rag-docker/ingest-inbox/.gitkeep"
+mkdir -p "$STAGE/rag-docker/exports"
+touch "$STAGE/rag-docker/exports/.gitkeep"
+
+echo "==> Saving images (this is the slow part)"
+docker save "${IMAGES[@]}" | gzip > "$STAGE/rag-docker/offline/images.tar.gz"
+
+if [ "$TELEMETRY" = 1 ]; then
+  echo "==> Saving optional pinned collector (Python 3.11+ required)"
+  python3 scripts/collector_offline.py package "$STAGE/rag-docker/offline"
+fi
+
+echo "==> Exporting model weights from volume '$MODELVOL'"
+# Uses the ollama image itself as the tar helper: it ships /usr/bin/tar and is
+# already part of the bundle, so no extra image is needed here or on the target.
+docker run --rm --entrypoint sh \
+  -v "$MODELVOL":/models:ro \
+  -v "$STAGE/rag-docker/offline":/out \
+  ollama/ollama:0.3.14 \
+  -c 'tar czf /out/ollama_models.tar.gz -C /models .'
+
+echo "==> Assembling bundle"
+rm -f "$OUT"
+tar cf "$OUT" -C "$STAGE" rag-docker
+
+echo
+echo "Created $OUT ($(du -h "$OUT" | cut -f1))"
+echo "  images:       $(du -h "$STAGE/rag-docker/offline/images.tar.gz" | cut -f1)"
+echo "  model weights:$(du -h "$STAGE/rag-docker/offline/ollama_models.tar.gz" | cut -f1)"
+echo
+echo "On the target Mac (no internet required):"
+echo "  tar xf $(basename "$OUT") && cd rag-docker"
+if [ "$TELEMETRY" = 1 ]; then
+  echo "  bash install-offline.sh --telemetry"
+else
+  echo "  bash install-offline.sh"
+fi
 ```

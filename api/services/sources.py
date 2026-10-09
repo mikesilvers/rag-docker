@@ -9,6 +9,7 @@ re-ingesting the same document stores one copy and records the extra logical
 name. Storage is proportional to the corpus rather than to upload count.
 """
 from __future__ import annotations
+from services import telemetry
 
 import hashlib
 import json
@@ -112,6 +113,7 @@ def restore_package(package: Path, collection: str) -> None:
     shutil.copyfile(src / INDEX_NAME, dest / INDEX_NAME)
 
 
+@telemetry.traced("rag.retain")
 def store(collection: str, filename: str, data: bytes, media_type: str | None = None) -> str:
     """Retain one accepted upload. Returns its sha256."""
     digest = hashlib.sha256(data).hexdigest()

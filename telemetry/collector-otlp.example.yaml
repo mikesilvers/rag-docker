@@ -1,0 +1,48 @@
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 192
+    spike_limit_mib: 32
+  batch:
+    timeout: 1s
+    send_batch_size: 128
+    send_batch_max_size: 128
+exporters:
+  otlp_http:
+    endpoint: ${env:RAG_COLLECTOR_DESTINATION}
+    compression: none
+    headers: ${file:/run/secrets/otel-headers.yaml}
+    timeout: 2s
+    sending_queue:
+      enabled: true
+      sizer: requests
+      queue_size: 32
+      num_consumers: 1
+      block_on_overflow: false
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 5s
+      max_elapsed_time: 10s
+service:
+  telemetry:
+    metrics:
+      level: none
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http]

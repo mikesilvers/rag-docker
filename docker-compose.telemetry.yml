@@ -1,0 +1,36 @@
+# Explicit opt-in: -f docker-compose.yml -f docker-compose.telemetry.yml --profile telemetry
+services:
+  api:
+    environment:
+      RAG_OTEL_ENABLED: "${RAG_OTEL_ENABLED:-true}"
+      RAG_OTEL_ENDPOINT: "${RAG_OTEL_ENDPOINT:-http://otel-collector:4318}"
+      RAG_OTEL_PROTOCOL: "${RAG_OTEL_PROTOCOL:-http/protobuf}"
+      RAG_OTEL_SERVICE_NAME: "${RAG_OTEL_SERVICE_NAME:-rag-api}"
+      RAG_OTEL_SERVICE_VERSION: "${RAG_OTEL_SERVICE_VERSION:-1.1.0}"
+      RAG_OTEL_ENVIRONMENT: "${RAG_OTEL_ENVIRONMENT:-development}"
+      RAG_OTEL_TRACES: "${RAG_OTEL_TRACES:-true}"
+      RAG_OTEL_LOGS: "${RAG_OTEL_LOGS:-true}"
+      RAG_OTEL_METRICS: "${RAG_OTEL_METRICS:-true}"
+      RAG_OTEL_SAMPLE_RATIO: "${RAG_OTEL_SAMPLE_RATIO:-1}"
+      RAG_OTEL_QUEUE_SIZE: "${RAG_OTEL_QUEUE_SIZE:-256}"
+      RAG_OTEL_BATCH_SIZE: "${RAG_OTEL_BATCH_SIZE:-64}"
+      RAG_OTEL_TIMEOUT_MS: "${RAG_OTEL_TIMEOUT_MS:-1000}"
+      RAG_OTEL_INTERVAL_MS: "${RAG_OTEL_INTERVAL_MS:-5000}"
+      RAG_OTEL_SHUTDOWN_MS: "${RAG_OTEL_SHUTDOWN_MS:-3000}"
+  otel-collector:
+    profiles: [telemetry]
+    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector:0.162.0@sha256:310a800ad69ee430e7c541796852a242c9c7db97aaad4daa5ccf843c525fbdb2
+    command: ["--config=/etc/otelcol/config.yaml"]
+    networks: [rag-internal]
+    ports: []
+    volumes:
+      - ./telemetry/collector.yaml:/etc/otelcol/config.yaml:ro
+    mem_limit: 256m
+    cpus: 0.5
+    stop_grace_period: 10s
+    read_only: true
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"

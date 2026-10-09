@@ -975,6 +975,8 @@ langchain-text-splitters>=0.3
 sentence-transformers>=3.0
 python-multipart>=0.0.9
 aiofiles>=23.0
+opentelemetry-sdk==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0
 ```
 
 **Dependency pinning (normative).** The list above is *intent*, held in
@@ -985,16 +987,16 @@ is current: that is exactly how `weaviate-client` drifted to a release requiring
 newer Weaviate server than the one pinned here, breaking every collection call
 while the stack still reported healthy.
 
-Regenerate the lock from the repo root after editing `requirements.in`:
+The SDK and OTLP HTTP exporter entries in `api/requirements.in` are required
+for enabled telemetry startup; lock regeneration must retain both at 1.44.0
+and resolve their transitive dependencies.
 
-```bash
-docker compose build api
-docker run --rm rag-docker-api:latest pip freeze \
-  | grep -viE '^(torch|torchvision)==' | LC_ALL=C sort > /tmp/pins.txt
-awk '/^[a-zA-Z0-9]/{exit} {print}' api/requirements.txt > /tmp/header.txt
-cat /tmp/header.txt /tmp/pins.txt > api/requirements.txt
-docker compose build api          # confirm the lock installs cleanly
-```
+Regenerate the lock from the repo root using the procedure at the top of
+`api/requirements.in`: resolve the edited inputs against the current API image
+with `pip install --dry-run --report`, incorporate the resolved pins into the
+sorted lock, rebuild, and compare the resulting image's `pip freeze` (excluding
+torch/torchvision) to the lock. Editing the input and rebuilding alone does not
+resolve new dependencies, because the Dockerfile installs only the lock.
 
 `LC_ALL=C` keeps ordering stable so a re-lock produces a clean diff.
 
@@ -2207,3 +2209,178 @@ Overlap retains internal whitespace-only windows to preserve exact character cov
       *Controlled restart cases in `test_batch_recovery.py`; startup deliberately does not delete targets using mutable recovery data.*
 
 - [x] After an interrupted tuning cutover is checked, startup durably records the outcome (`complete`, `stale`, or `other-instance`) and clears `cutover_pending`, preserving the recovery collection and journal. Later startups do not compare or re-flag that operation. An undecidable check or failed outcome write remains pending for retry.
+
+## Optional telemetry foundation (#282)
+
+The backend owns one optional private OpenTelemetry runtime initialized before
+startup clients and always closed on failed startup or shutdown. It is disabled
+by default with no exporter construction or telemetry egress. Enabled invalid
+configuration fails with field-only errors. Enabled RAG telemetry rejects a real
+process `OTEL_SDK_DISABLED` value whose stripped, lowercase value is `true`,
+before secret access or exporter construction, because all three pinned SDK
+providers otherwise silently disable signals. Explicit configuration mappings
+cannot mask this conflict; disabled RAG telemetry still returns a no-op. The
+runtime must not mutate the process environment or global providers.
+Configuration and finite safe schema
+are specified in README.md, “Optional backend telemetry”. No global providers,
+automatic request instrumentation, application log bridge or collector deployment
+are included in this foundation. Raw SDK providers remain internal; supported
+instrumentation uses the runtime tracer, safe logger and meter, with lifecycle
+through force_flush/shutdown. Python private-state access is outside this API
+contract, not prevented by a security sandbox.
+
+Only explicit service resource metadata, fixed instrumentation scope, finite
+operation/outcome/error values and trace identifiers may leave through OTLP.
+Prompts, answers, request/response bodies, credentials, filenames, paths,
+document text and free-form errors/events are excluded. Metric dimensions are
+restricted to the finite operational schema in #284. The
+export boundary rebuilds protobuf records; trace/log queue inputs are sanitized
+as well, including runtime-owned resource/scope metadata and log limits; queued
+logs retain neither exception objects nor caller context references. Processor
+sanitization must not modify caller-owned records. The runtime logger copies
+supplied plain records and wrapper/inner records before SDK processing so both
+normalization and exception expansion preserve caller-owned inputs; keyword
+emission remains supported. All three forms snapshot finite schema-approved
+attribute strings before SDK delegation, excluding forbidden mutable values;
+concurrent caller mutation during snapshot construction is unsupported. All
+non-mapping attributes normalize to empty. Each emission form is wrapped with
+runtime-owned limits before SDK processing, independent of ambient log/global
+attribute count and length limits.
+The private meter provider explicitly disables exemplar sampling so
+attributes removed by metric views cannot remain in exemplar reservoirs; ambient
+exemplar filter settings cannot override this policy. Existing application logging
+remains unchanged. Bounded SDK queues,
+one-attempt HTTP export and bounded lifecycle caller waits keep collector outages
+independent of application work; OS DNS cancellation is not guaranteed.
+
+Infrastructure verification runs real SDK traces/logs/metrics through a synthetic
+loopback OTLP receiver with sentinel content and checks disabled behavior,
+configuration validation, resources, sampling/signals, overload, export failure,
+flush/shutdown, and embedded implementation consistency. It requires no collector
+or external provider. Full acceptance runs only in the disposable verify project.
+
+
+## Request and background tracing (#283)
+
+Optional manual instrumentation uses the private application runtime. Request
+spans cover ASGI execution including streaming and cancellation, with only
+registered method-and-route names and finite response status classes. Incoming
+version-00 traceparent supplies at most one sanitized link to a locally sampled
+root; no remote baggage, trace state, authentication or sampling authority is
+accepted. Invalid headers are ignored without altering the response.
+
+Query stages, ingest stages, export/import, tuning, gold-standard generation and
+regeneration, and actual application-owned Ollama/Weaviate calls produce finite
+spans. Iterator consumption and batch finalization are included; backend-internal
+model execution is not inferred. Worker admission captures runtime and local
+parent context before raw executor/task/thread scheduling. A job is a child of
+the initiating request even when it executes after the response; concurrent
+jobs and reused threads cannot inherit one another's spans. Generation failure
+reporters retain originating lineage. No content or job/session IDs are exported.
+
+Safe outcome/error categories include handled failures and partial work, with no
+exception text or events. Preserve task ownership, guards, callbacks, cancellation,
+timeouts, status transitions and persistence semantics. A cancelled thread waiter
+cannot imply that its running work ended. Existing shutdown does not drain jobs;
+unfinished work or forced process termination does not guarantee final export.
+
+Synthetic offline verification exercises real API/service launchers and actual
+thread/task transitions with fake dependencies: parentage after 202, concurrent
+isolation, cancellation/timeout, dependency errors/timing, batch/iterator calls,
+header trust, disabled/failing telemetry, and sentinel-free serialized OTLP.
+Infrastructure suite 01 registers these checks; full acceptance remains on the
+disposable verify project. Collector setup remains a separate story.
+
+
+## Operational metrics and correlated logs (#284)
+
+The private runtime records API completion/duration/active work, dependency
+calls/duration/errors and job completion/duration/active work, using the exact
+names, units, finite dimensions and histogram buckets in README.md. No automatic
+instrumentation duplicates these manual counts. Nested stages do not count as
+additional jobs or requests. Metrics operate independently of trace recording,
+sampling and log signal toggles. Only executed work contributes; cancelled
+waiters cannot finish still-running workers. Active UpDownCounters settle on
+scope exit and represent current process concurrency, not persisted history.
+
+Finite dimensions are validated before aggregation, restricted per instrument
+by SDK views, and checked again during protobuf rebuilding. Valid multiple
+series survive export even with tiny trace/log batches. Malformed, duplicate or
+excess metric data rejects its record before admission. Other valid records
+remain eligible. Compatible same-name records merge distinct approved point
+identities; repeated identities retain the first snapshot without summation.
+Incompatible kinds, temporality or monotonicity reject the later record. Valid
+disjoint series are never truncated. Histogram statistics must be finite when
+present and preserve their optional presence, with ordered boundaries and
+consistent bucket totals.
+No job IDs, trace exemplars, collection names, user IDs, paths, content or raw
+exception values may become metric dimensions. Token usage is not fabricated.
+
+Structured operation completion logs have fixed bodies and finite attributes,
+current trace/span context when available, and a newly generated opaque job
+execution token for job/dependency correlation. No durable or supplied job ID
+is exported. Context survives admitted worker handoffs without leaking across
+concurrent jobs or into caller code across iterator yields. Iterators capture
+runtime, parent span and job token at construction, rebind them around lazy
+factory/iter/pulls and completion, and emit nothing if never consumed. Sanitization occurs
+before queueing and at the wire boundary. Existing Python logs are not bridged.
+The log and metric schemas do not change application errors, durable statuses,
+cancellation behavior or existing latency responses. Partial status normalizes
+to metric error while retaining partial in logs and durable storage.
+
+Suite 01 registers deterministic real-SDK tests for exact success/error/cancelled
+counts, durations and settled active work, actual job producer outcomes,
+concurrent correlation isolation, cardinality under changing IDs, multiple wire
+series, disabled/sampled-out tracing, telemetry faults and receiver errors.
+Synthetic dependencies require no hosted service; deployment acceptance remains
+#285. Abrupt process death or surviving workers after shutdown may lose final
+records; operational telemetry is not durable audit storage (#29).
+
+### Operational instrumentation failure contract
+
+SafeMeter is restricted to the registered counter, histogram and up/down
+factories, names and dimensions. Unknown names or wrong factory/name pairs
+return inert instruments; gauge/observable factories and arbitrary custom
+metrics are unsupported. This is not a general SDK Meter compatibility API.
+
+An active-instrument SDK factory/update failure suppresses the entire affected
+instrument for that runtime lifetime, including further updates and later wire
+exports. Both pre-mutation and mutate-then-raise failures are ambiguous: never
+retry or fabricate a reset. Independent instruments and completion logs remain
+available. Suppression loses active-instrument availability until restart; it
+does not reconstruct concurrency or retract prior backend history or exports
+already in flight. The two-instrument suppression registry is finite and local.
+Local validation rejection returns false without changing instrument health.
+
+## Optional Collector and end-to-end telemetry (#285)
+
+The explicit `docker-compose.telemetry.yml` overlay plus `telemetry` profile adds
+a digest-pinned local Collector and passes supported settings into the API.
+Base startup remains five services with telemetry disabled. Collector ingestion
+has no host-published ports and no application health dependency. Resource limits,
+finite queues/retries, local summary-only diagnostics and optional standard OTLP
+export with runtime mounted secrets are documented in `telemetry/README.md`.
+
+Optional offline packaging includes only the selected platform image. Before
+loading, validate its config identity against the tracked pin allow-list and
+layer hashes against that config; never trust archive tags or image overrides.
+Missing/mismatched optional images fail without pulling. Default offline behavior
+remains unchanged.
+
+The registered disposable telemetry suite distinguishes default-mode checks from
+explicit `--telemetry` acceptance. Enabled acceptance must decode received
+protobuf after the actual Collector: a real synthetic query and concurrent jobs
+have connected request/operation/worker/dependency spans and matching completion
+logs, finite safe metrics and no planted credential/content sentinels. Capture
+overflow is failed acceptance. Disabled mode emits zero application exports;
+Collector refusal and a slow destination preserve usable query/job work with
+bounded configuration and reported latency/resource observations. Restart and
+shutdown evidence does not imply job draining, durable queues or cross-restart
+trace continuity. Full default and enabled runs and their actual limitations are
+required; a resolved Compose file alone is not runtime acceptance.
+
+Collector verification binds exact harness-owned assets across alternate checkouts
+and pins verification protocol/version/export budgets. Disabled-mode observation
+requires termination of previous producer, Collector queues and capture handlers.
+Malformed decoded evidence is incomplete acceptance; malformed archive metadata
+and incomplete TAR framing are rejected before offline reconstruction.
