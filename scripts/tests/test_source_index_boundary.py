@@ -301,6 +301,95 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         self.assertEqual((job["status"], job["files_completed"], job["files_failed"],
                           job["chunks_stored"]), ("completed", 1, 0, 1))
 
+    def chunks_file(self, package, *digests):
+        """chunks.jsonl with one record per digest (None writes a null link)."""
+        records = [{"id": f"00000000-0000-4000-8000-00000000000{i}", "vector": [0.5],
+                    "properties": {"content": f"chunk {i}", "source_file": "document.txt"},
+                    "source_sha256": digest} for i, digest in enumerate(digests)]
+        (package / "chunks.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+
+    def test_export_writes_null_for_a_chunk_whose_blob_is_missing(self):
+        # #509: every chunk's source_sha256 names a blob in the package, or is null.
+        content = b"available source"
+        available = hashlib.sha256(content).hexdigest()
+        missing = hashlib.sha256(b"missing source").hexdigest()
+        retained = sources.collection_dir("Linked")
+        retained.mkdir(parents=True)
+        (retained / available).write_bytes(content)
+        (retained / "index.json").write_text(json.dumps({
+            "version": 1, "documents": {
+                available: {"filenames": ["available.txt"]},
+                missing: {"filenames": ["missing.txt"]},
+            }}))
+        stored = [Mock(uuid=f"00000000-0000-4000-8000-00000000000{i}", vector=[0.5],
+                       properties={"content": name, "source_file": name})
+                  for i, name in enumerate(("available.txt", "missing.txt"))]
+        backend = Mock()
+        backend.collections.get.return_value.iterator.return_value = iter(stored)
+        with patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager.wc, "get_client", return_value=backend), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={"embedding_model": settings.embed_model}), \
+             patch.object(packager.wc, "_meta_sync", return_value={}), \
+             patch.object(packager, "_ingest_config", return_value=None), \
+             patch.object(packager, "_export_retrieval_settings", return_value=({}, True)), \
+             patch.object(packager, "_goldstandard_sessions", return_value=[]):
+            result = packager.build("Linked")
+        self.assertTrue(any("1 chunk(s) could not be linked" in w for w in result["warnings"]))
+        opened = self.root / "linked"
+        opened.mkdir()
+        pkg, manifest = packager.open_package(self.root / result["filename"], opened)
+        links = [r["source_sha256"] for r in packager.iter_chunks_file(pkg)]
+        self.assertEqual(links, [available, None])
+        packager.verify_digests(pkg, manifest)
+        importer._validate_package_sources(pkg, manifest)
+
+    def test_import_refuses_a_chunk_naming_a_source_not_in_the_package(self):
+        content = b"retained source"
+        digest = hashlib.sha256(content).hexdigest()
+        absent = hashlib.sha256(b"a source the package does not carry").hexdigest()
+        (self.package / "sources" / digest).write_bytes(content)
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        self.chunks_file(self.package, digest, None, digest)
+        importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+        bare = self.root / "chunks-only"
+        bare.mkdir()
+        self.chunks_file(bare, None, None)
+        importer._validate_package_sources(bare, {"fidelity": "chunks-only"})
+        cases = ((self.package, "with-sources", (digest, absent), 2),
+                 (self.package, "with-sources", (None, 7), 2),
+                 (bare, "chunks-only", (None, None, digest), 3))
+        for package, fidelity, links, line in cases:
+            with self.subTest(fidelity=fidelity, links=links):
+                self.chunks_file(package, *links)
+                with self.assertRaises(PackageError) as raised:
+                    importer._validate_package_sources(package, {"fidelity": fidelity})
+                self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
+                self.assertEqual(raised.exception.detail, {"file": "chunks.jsonl", "line": line})
+
+    def test_unresolvable_chunk_source_fails_before_embedding_or_live_work(self):
+        content = b"retained source"
+        digest = hashlib.sha256(content).hexdigest()
+        (self.package / "sources" / digest).write_bytes(content)
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        self.chunks_file(self.package, hashlib.sha256(b"elsewhere").hexdigest())
+        manifest = {"fidelity": "with-sources", "files": {}}
+        job = {"status": "queued"}
+        with patch.object(settings, "upload_dir", str(self.root)), \
+             patch.object(importer, "_jobs", {"owned": job}), \
+             patch.object(importer, "_active", {"owned.tar.gz"}), \
+             patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager, "open_package", return_value=(self.package, manifest)), \
+             patch.object(importer, "_check_embedding") as check_embedding, \
+             patch.object(importer, "_ensure_models") as models, \
+             patch.object(importer.wc, "get_client") as backend:
+            importer._run("owned", "owned.tar.gz", "replace")
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["error_code"], "PACKAGE_CORRUPT")
+        self.assertEqual(job["error_detail"], {"file": "chunks.jsonl", "line": 1})
+        check_embedding.assert_not_called()
+        models.assert_not_called()
+        backend.assert_not_called()
+
 
 class ManifestFilesBoundaryTests(unittest.TestCase):
     """Check 3 never hashes a file outside the package (#371)."""

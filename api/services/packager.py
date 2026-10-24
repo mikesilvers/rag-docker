@@ -145,18 +145,22 @@ def _json_default(value: Any) -> Any:
 
 # ── Reading the collection (spec §4.5) ────────────────────────────────────────
 
-def read_chunks(collection: str) -> Iterator[dict]:
+def read_chunks(collection: str, documents: dict | None = None) -> Iterator[dict]:
     """One record per chunk, streamed. Never materialises the collection.
 
     A 100k-chunk corpus is roughly 880 MB of JSON, so nothing here accumulates.
+    `documents` is the retained sources the package ships, by digest; a chunk
+    links only to one of those (#509). None loads the whole index.
     """
     client = wc.get_client()
     col = client.collections.get(collection)
+    if documents is None:
+        documents = sources.load_index(collection)["documents"]
 
     # digests_for_filename() reloads the index on every call, which would be
     # O(chunks x documents). Build the reverse map once.
     by_filename: dict[str, list[str]] = {}
-    for digest, entry in sources.load_index(collection)["documents"].items():
+    for digest, entry in documents.items():
         for name in entry.get("filenames", []):
             by_filename.setdefault(name, []).append(digest)
 
@@ -392,6 +396,19 @@ def build(
                 {"collection": collection, "stored_model": stored_model,
                  "configured_model": settings.embed_model})
 
+        # The source index is read once, before the chunk stream, and both the
+        # chunk links and sources/ come from it (#509). The exporter holds the
+        # writer guard, so no guarded writer changes it meanwhile. A blob missing
+        # on disk is not shipped, and chunks naming it get a null source_sha256.
+        index = sources.load_index(collection)
+        shipped = {}
+        for digest, entry in index["documents"].items():
+            blob = sources.blob_path(collection, digest)
+            if not blob.exists():
+                warnings.append(f"retained source {digest[:12]} is missing on disk")
+                continue
+            shipped[digest] = entry
+
         # 1. chunks.jsonl — streamed, one line at a time.
         chunk_count = 0
         dimensions: int | None = None
@@ -401,7 +418,7 @@ def build(
         def write_chunks(path: Path) -> None:
             nonlocal chunk_count, dimensions, first_props, unresolved
             with path.open("w", encoding="utf-8") as fh:
-                for record in read_chunks(collection):
+                for record in read_chunks(collection, shipped):
                     if dimensions is None and record["vector"]:
                         dimensions = len(record["vector"])
                     if first_props is None:
@@ -433,15 +450,7 @@ def build(
         for session in _goldstandard_sessions(collection):
             b.add_json(f"goldstandard/{session['session_id']}.json", session)
 
-        # 5. sources, when they exist
-        index = sources.load_index(collection)
-        shipped = {}
-        for digest, entry in index["documents"].items():
-            blob = sources.blob_path(collection, digest)
-            if not blob.exists():
-                warnings.append(f"retained source {digest[:12]} is missing on disk")
-                continue
-            shipped[digest] = entry
+        # 5. sources, when they exist, from the index read before the chunks
         fidelity = "with-sources" if shipped else "chunks-only"
         source_document_count = len(shipped)
         if fidelity == "with-sources":

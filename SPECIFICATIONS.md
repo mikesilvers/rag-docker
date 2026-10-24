@@ -1425,9 +1425,17 @@ The job reports `models_bundled` — what the package actually carries, which is
 - **409 `COLLECTION_DELETING`** while a delete of the collection is in progress
   (§3.1.2; #302). No job is created.
 
-The build runs off the event loop, so an export does not block ingest or query.
-Chunks are streamed one at a time and never accumulated: a 100k-chunk corpus is
-roughly 880 MB of JSON.
+The build runs off the event loop, so an export never blocks queries or the API.
+It holds the collection's writer guard for its whole run (#509), so its chunks and
+retained sources come from one point in time: while it runs, guarded writes to that
+collection wait (ingest, re-ingest and tuning jobs stay `queued`; a replace-import
+waits before its conflict check) or,
+for gold-standard generation, are refused `409 COLLECTION_BUSY` after one second.
+Other collections are not affected. Settings saves and gold-standard session edits
+don't take the guard, so a package's config and session files are each coherent but
+may be newer than its chunks (`RAG_EXPORT_SPECIFICATIONS.md` §4.2). Chunks are
+streamed one at a time and never accumulated: a 100k-chunk corpus is roughly
+880 MB of JSON.
 
 ---
 
@@ -1453,7 +1461,8 @@ GET /export/job/{job_id}
 }
 ```
 
-`status` is `queued`, `running`, `completed` or `failed`. On failure `error`
+`status` is `queued`, `running`, `completed` or `failed`; an export waiting for its
+collection's writer guard reads `queued` (#509). On failure `error`
 carries the reason and `filename` stays null. Export, import and tune job records persist
 across an API restart like ingest's (§3.1.3); a job the restart interrupted reads `failed`
 with `error_code` `INTERRUPTED` and an `error` saying the API restarted while it was running. A failed build leaves nothing
@@ -1463,7 +1472,8 @@ collection's export slot is released. A build interrupted by a restart leaves th
 before the first request; completed packages are never touched (#377).
 
 `warnings` is non-fatal. It records, for example, chunks whose `source_sha256`
-could not be resolved to exactly one retained document.
+could not be resolved to exactly one retained document that the package carries;
+their `source_sha256` is `null` (#509).
 
 **404 `JOB_NOT_FOUND`** for an unknown id.
 
