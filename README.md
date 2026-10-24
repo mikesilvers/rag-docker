@@ -374,6 +374,10 @@ invalid source metadata fails with `PACKAGE_CORRUPT` before any live mutation.
 Evaluation-session metadata is also validated before importing models or
 changing a collection. Invalid session JSON, identities or schemas fail the
 import with `PACKAGE_CORRUPT`, naming the sidecar; they are not silently skipped.
+The package's retrieval and chunking settings are checked at the same point:
+settings the API wouldn't save fail the import with `PACKAGE_CORRUPT`, naming
+`retrieval_config.json` or `ingest_config.json`. Chunk sizes saved before the
+current 50-6000 bounds are still imported as they are.
 
 ### Carrying the models too
 

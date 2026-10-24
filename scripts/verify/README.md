@@ -180,7 +180,11 @@ uv run --no-project --python 3.11 \
 `scripts/tests/test_retrieval_import.py` adds controlled digest-valid malformed
 retrieval package rejection before model, backend, recovery, or sidecar mutation;
 historical defaults/coercion and `ef` round trips; and generated Python literal
-regressions. Run it with the same API dependencies as the session import test.
+regressions. Its `IngestImportTests` do the same for `ingest_config.json`
+(E35, #510): malformed ingest settings are refused `PACKAGE_CORRUPT` in every
+conflict mode before any live change, and valid ones, including chunk sizes from
+before the #53 bounds, are restored from the checked snapshot and read back
+through `GET /ingest/config`. Run it with the same API dependencies as the session import test.
 `05_transfer.sh` registers it and `retrieval_settings.py` (E28), which submits
 15 malformed settings imports across abort/rename/replace and verifies live
 collection counts and saved settings are unchanged. The normal rename import

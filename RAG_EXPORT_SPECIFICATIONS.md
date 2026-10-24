@@ -421,6 +421,7 @@ Checks run in this order and stop at the first failure:
 | 4 | **Embedding model and dimensions match this instance** | `EMBEDDING_MISMATCH` — refuse |
 | 4a | Every evaluation sidecar has a valid session schema, generated session ID, matching collection and unique identity within the package; the local session storage directory is a regular directory inside the upload directory | `PACKAGE_CORRUPT`, naming the sidecar |
 | 4b | Optional retrieval settings are a JSON object satisfying the API save schema, normalized with its defaults and numeric conversion | `PACKAGE_CORRUPT`, naming `retrieval_config.json` |
+| 4c | Optional ingest settings are a JSON object satisfying the API save schema, except the chunk bounds, normalized with its defaults and numeric conversion | `PACKAGE_CORRUPT`, naming `ingest_config.json` |
 | 5 | Collection name collision | resolved per `on_conflict` |
 
 Check 3 checks every `files` key before it hashes anything (#371). A key that is
@@ -440,6 +441,22 @@ and the completed job notes it. A missing settings file remains supported.
 Invalid JSON, non-object settings, invalid enum values, booleans in numeric fields
 (including `ef`), other out-of-range values, and non-finite alpha are refusals in
 every conflict mode.
+
+Check 4c applies the same rules to `ingest_config.json` (#510), with the
+`POST /ingest/config` save schema. It runs right after check 4b, before the same
+mutations, and its normalized snapshot, rebound to the actual import target, is
+what restoration publishes; the package file is not read again. Missing fields
+retain API defaults and unknown fields are ignored. The chunk bounds don't apply:
+a `chunk_size` or `min_chunk_size` saved before them (`SPECIFICATIONS.md` §8) is
+restored as it is, never clamped, so `chunk_size` only has to be an integer of at
+least 1 and `min_chunk_size` one of at least 0. A missing settings file remains
+supported. Invalid JSON, non-object settings, a non-regular file, an unknown
+`chunking_strategy`, booleans or non-integers in the size fields, a negative
+`chunk_overlap`, a `similarity_threshold` outside 0-1 or not finite, and a
+`chunk_overlap` not smaller than `chunk_size` for `overlap` or `language` are
+refusals in every conflict mode, with the message `Invalid ingest settings.`.
+Without this check such a package imported as `completed` and left the
+collection's chunking configuration unreadable.
 
 Check 4a runs before bundled-model installation, collection creation/deletion,
 or restoring any sidecar. All sessions MUST be preflighted together, including
@@ -903,6 +920,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E32 | Re-ingesting a changed file replaces its chunks and its retained source: one digest names it and the replaced blob is gone; re-chunking afterwards brings back only the new version, under each of its names (#22) |
 | E33 | An import whose manifest `files` map lists a key outside the package (an absolute key or a `..` key), with the outside file's real digest or a wrong one, fails `PACKAGE_CORRUPT` with `detail` `{"file": "manifest.json"}` and nothing else; the job reveals neither the outside path nor its digest, and no collection is created (#371) |
 | E34 | A model is bundled whole or not at all: when any of its files can't be copied, none of its files stay in the package or its `files` map, it is left out of `bundled_models`, and a warning names it, while another model before or after it is still bundled whole; when every model fails, the package has no `models/` folder and `models_bundled` is false. A model named for both embedding and the LLM, compared by name and tag (`x` and `x:latest`), is copied once (#449, #494), by `test_retrieval_import.py` |
+| E35 | Digest-valid malformed ingest settings (invalid JSON, a non-object, a wrong type or an invalid value) are refused `PACKAGE_CORRUPT`, naming `ingest_config.json`, before live mutation in all conflict modes, leaving the existing collection's settings unchanged; valid settings, including ones with missing or unknown fields, numeric strings and a `chunk_size`/`min_chunk_size` from before the chunk bounds, import and `GET /ingest/config/{collection}` returns them for the import target (#510), by `test_retrieval_import.py` |
 
 ---
 
