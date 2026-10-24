@@ -6019,18 +6019,22 @@ def _json_default(value: Any) -> Any:
 
 # ── Reading the collection (spec §4.5) ────────────────────────────────────────
 
-def read_chunks(collection: str) -> Iterator[dict]:
+def read_chunks(collection: str, documents: dict | None = None) -> Iterator[dict]:
     """One record per chunk, streamed. Never materialises the collection.
 
     A 100k-chunk corpus is roughly 880 MB of JSON, so nothing here accumulates.
+    `documents` is the retained sources the package ships, by digest; a chunk
+    links only to one of those (#509). None loads the whole index.
     """
     client = wc.get_client()
     col = client.collections.get(collection)
+    if documents is None:
+        documents = sources.load_index(collection)["documents"]
 
     # digests_for_filename() reloads the index on every call, which would be
     # O(chunks x documents). Build the reverse map once.
     by_filename: dict[str, list[str]] = {}
-    for digest, entry in sources.load_index(collection)["documents"].items():
+    for digest, entry in documents.items():
         for name in entry.get("filenames", []):
             by_filename.setdefault(name, []).append(digest)
 
@@ -6266,6 +6270,19 @@ def build(
                 {"collection": collection, "stored_model": stored_model,
                  "configured_model": settings.embed_model})
 
+        # The source index is read once, before the chunk stream, and both the
+        # chunk links and sources/ come from it (#509). The exporter holds the
+        # writer guard, so no guarded writer changes it meanwhile. A blob missing
+        # on disk is not shipped, and chunks naming it get a null source_sha256.
+        index = sources.load_index(collection)
+        shipped = {}
+        for digest, entry in index["documents"].items():
+            blob = sources.blob_path(collection, digest)
+            if not blob.exists():
+                warnings.append(f"retained source {digest[:12]} is missing on disk")
+                continue
+            shipped[digest] = entry
+
         # 1. chunks.jsonl — streamed, one line at a time.
         chunk_count = 0
         dimensions: int | None = None
@@ -6275,7 +6292,7 @@ def build(
         def write_chunks(path: Path) -> None:
             nonlocal chunk_count, dimensions, first_props, unresolved
             with path.open("w", encoding="utf-8") as fh:
-                for record in read_chunks(collection):
+                for record in read_chunks(collection, shipped):
                     if dimensions is None and record["vector"]:
                         dimensions = len(record["vector"])
                     if first_props is None:
@@ -6307,15 +6324,7 @@ def build(
         for session in _goldstandard_sessions(collection):
             b.add_json(f"goldstandard/{session['session_id']}.json", session)
 
-        # 5. sources, when they exist
-        index = sources.load_index(collection)
-        shipped = {}
-        for digest, entry in index["documents"].items():
-            blob = sources.blob_path(collection, digest)
-            if not blob.exists():
-                warnings.append(f"retained source {digest[:12]} is missing on disk")
-                continue
-            shipped[digest] = entry
+        # 5. sources, when they exist, from the index read before the chunks
         fidelity = "with-sources" if shipped else "chunks-only"
         source_document_count = len(shipped)
         if fidelity == "with-sources":
@@ -7094,12 +7103,12 @@ def _sync_dir(path: Path) -> None:
 ### api/services/exporter.py
 
 ```python
-"""The export job: lifecycle, progress and the one-at-a-time guard.
+"""The export job: lifecycle, progress, the one-at-a-time guard and the writer guard.
 
 Format lives in `packager.py`. This module only decides when a build runs, what
 its status looks like while it does, and that two builds of the same collection
 never overlap — they would race on the staging directory and the temporary
-archive.
+archive. A build runs under its collection's writer guard (#509).
 """
 from __future__ import annotations
 from services import telemetry
@@ -7144,7 +7153,6 @@ def active_job_for(collection: str) -> str | None:
 @telemetry.traced("rag.export")
 def _run(job_id: str, collection: str, include_models: bool) -> None:
     job = _jobs[job_id]
-    job["status"] = "running"
 
     def progress(written: int) -> None:
         job["chunks_written"] = written
@@ -7156,7 +7164,15 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
         job.update(fields)
 
     try:
-        result = packager.build(collection, include_models=include_models, progress=progress)
+        # The whole build holds the collection's writer guard (#509), so a
+        # re-ingest or tune can't commit between the chunk stream and the sources
+        # step: chunks and sources come from one point in time. Guarded writers of
+        # this collection wait (generation is refused busy); queries and other
+        # collections don't. The job reads `queued` until the guard is ours, and
+        # it is released before the terminal status is written.
+        with collection_writes.guard(collection):
+            job["status"] = "running"
+            result = packager.build(collection, include_models=include_models, progress=progress)
     except packager.PackageError as exc:
         telemetry.outcome("error", exc)
         _log.warning("Export of %r refused (%s): %s", collection, exc.code, exc.message)
@@ -7258,7 +7274,8 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
         started.set_result(None)
 
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
-    # export does not stall ingest or query (spec §6.1).
+    # export does not stall the API: queries and other collections carry on, and
+    # only guarded writes to this collection wait for it (spec §6.1, #509).
     task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, include_models))
     # _run ends it first; this also covers a task that never ran its worker.
     task.add_done_callback(lambda _task: collection_writes.end_job("export", job_id))
@@ -7828,19 +7845,24 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict, progress) -> int:
 @telemetry.traced("rag.validate")
 def _validate_package_sources(pkg: Path, manifest: dict) -> None:
     """Check source identities after verify_digests, before any live mutation."""
+    _check_chunk_sources(pkg, _validated_source_digests(pkg, manifest))
+
+
+def _validated_source_digests(pkg: Path, manifest: dict) -> set[str]:
+    """The digests of the package's validated source index; empty without one."""
     source_dir = pkg / "sources"
     if not source_dir.exists():
         if manifest.get("fidelity") == "with-sources":
             raise PackageError("PACKAGE_CORRUPT", "Retained sources are missing.",
                                {"file": "sources/index.json"})
-        return
+        return set()
     index_path = source_dir / sources.INDEX_NAME
     try:
         if source_dir.is_symlink() or not source_dir.is_dir():
             raise ValueError("Retained source directory is not a regular directory")
         if (not index_path.exists() and not index_path.is_symlink()
                 and manifest.get("fidelity") != "with-sources"):
-            return
+            return set()
         if index_path.is_symlink() or not index_path.is_file():
             raise ValueError("Retained source index is missing or is not a regular file")
         index = sources.validate_index(json.loads(index_path.read_text()))
@@ -7859,6 +7881,40 @@ def _validate_package_sources(pkg: Path, manifest: dict) -> None:
     except (OSError, ValueError, TypeError) as exc:
         raise PackageError("PACKAGE_CORRUPT", "Invalid retained source metadata.",
                            {"file": "sources/index.json"}) from exc
+    return set(index["documents"])
+
+
+def _check_chunk_sources(pkg: Path, digests: set[str]) -> None:
+    """Every chunk's source_sha256 is null or names a blob in `digests` (#509).
+
+    A package whose chunks name a source it doesn't carry mixes two points in
+    time, or was made by an older export that skipped a missing blob; it is
+    refused before any live mutation. Other record defects are left to the
+    chunk checks at insert.
+    """
+    path = pkg / "chunks.jsonl"
+    if not path.is_file():
+        return
+    with path.open("r", encoding="utf-8") as fh:
+        for number, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError as exc:
+                raise PackageError("PACKAGE_CORRUPT",
+                                   f"chunks.jsonl line {number} is not valid JSON.",
+                                   {"file": "chunks.jsonl", "line": number}) from exc
+            if not isinstance(record, dict):
+                continue
+            digest = record.get("source_sha256")
+            if digest is not None and (not isinstance(digest, str) or digest not in digests):
+                raise PackageError(
+                    "PACKAGE_CORRUPT",
+                    f"chunks.jsonl line {number} names a retained source that is not in "
+                    "the package. Export the collection again to get a consistent package.",
+                    {"file": "chunks.jsonl", "line": number})
 
 
 def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
@@ -14030,7 +14086,9 @@ retrieval route. The persistence cases cover failed import-config publication.
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
 
-`05_transfer.sh` registers the seven controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py` and `test_package_listing.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
+`05_transfer.sh` registers the eight controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py` and `test_package_listing.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work.
+
+`scripts/tests/test_export_snapshot.py` (#509, API container) drives `exporter._run` with the real `packager.build` and retained-source store and a mocked Weaviate backend whose iterator reads the stored chunks one at a time. A re-ingest that tries to commit new chunks and a new `doc.txt` source after the first chunk is streamed waits for the export: the package holds the old chunk text and the old source bytes and index, every chunk's `source_sha256` names a blob in `sources/`, and the re-ingest lands after the build. During an export, gold-standard generation preparation answers `COLLECTION_BUSY` (409) and a guarded chunk insert waits; an export started while another writer holds the guard reads `queued` until it is released; and the guard is free again after an export that succeeds, is refused (`PackageError`), fails or is cancelled. Orderings use events and the guard's waiter count. On the code before #509 the re-ingest, generation, insert, queued and guard-held checks fail.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -14490,7 +14548,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, review 404 codes and empty-edit refusal (#381), export schema, export name refusals (#370) |
 | `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E34; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E35; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
@@ -14500,7 +14558,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_reingest.py` | controlled re-ingest replacement, same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
-| `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
+| `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, registered by transfer |
+| `../tests/test_export_snapshot.py` | controlled export writer-guard regressions: a mid-export re-ingest can't change the package, busy and waiting writers, guard release (#509), registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`, and so is a manifest with a wrongly typed listed value (#451); run in the API image with no network, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
@@ -18878,7 +18937,7 @@ summary
 
 ```bash
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E34)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E35)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -18898,6 +18957,8 @@ section "Export, import and tuning"
 check "evaluation import and generated-session regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_source_index_boundary.py)
 check "retained-source index boundary regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_export_snapshot.py)
+check "export holds the writer guard: chunks and sources from one point in time (#509)" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_retrieval_import.py)
 check "retrieval import and generated-script trust-boundary regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_import_embedding.py)
@@ -26426,6 +26487,95 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         insert.assert_called_once()
         self.assertEqual((job["status"], job["files_completed"], job["files_failed"],
                           job["chunks_stored"]), ("completed", 1, 0, 1))
+
+    def chunks_file(self, package, *digests):
+        """chunks.jsonl with one record per digest (None writes a null link)."""
+        records = [{"id": f"00000000-0000-4000-8000-00000000000{i}", "vector": [0.5],
+                    "properties": {"content": f"chunk {i}", "source_file": "document.txt"},
+                    "source_sha256": digest} for i, digest in enumerate(digests)]
+        (package / "chunks.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+
+    def test_export_writes_null_for_a_chunk_whose_blob_is_missing(self):
+        # #509: every chunk's source_sha256 names a blob in the package, or is null.
+        content = b"available source"
+        available = hashlib.sha256(content).hexdigest()
+        missing = hashlib.sha256(b"missing source").hexdigest()
+        retained = sources.collection_dir("Linked")
+        retained.mkdir(parents=True)
+        (retained / available).write_bytes(content)
+        (retained / "index.json").write_text(json.dumps({
+            "version": 1, "documents": {
+                available: {"filenames": ["available.txt"]},
+                missing: {"filenames": ["missing.txt"]},
+            }}))
+        stored = [Mock(uuid=f"00000000-0000-4000-8000-00000000000{i}", vector=[0.5],
+                       properties={"content": name, "source_file": name})
+                  for i, name in enumerate(("available.txt", "missing.txt"))]
+        backend = Mock()
+        backend.collections.get.return_value.iterator.return_value = iter(stored)
+        with patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager.wc, "get_client", return_value=backend), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={"embedding_model": settings.embed_model}), \
+             patch.object(packager.wc, "_meta_sync", return_value={}), \
+             patch.object(packager, "_ingest_config", return_value=None), \
+             patch.object(packager, "_export_retrieval_settings", return_value=({}, True)), \
+             patch.object(packager, "_goldstandard_sessions", return_value=[]):
+            result = packager.build("Linked")
+        self.assertTrue(any("1 chunk(s) could not be linked" in w for w in result["warnings"]))
+        opened = self.root / "linked"
+        opened.mkdir()
+        pkg, manifest = packager.open_package(self.root / result["filename"], opened)
+        links = [r["source_sha256"] for r in packager.iter_chunks_file(pkg)]
+        self.assertEqual(links, [available, None])
+        packager.verify_digests(pkg, manifest)
+        importer._validate_package_sources(pkg, manifest)
+
+    def test_import_refuses_a_chunk_naming_a_source_not_in_the_package(self):
+        content = b"retained source"
+        digest = hashlib.sha256(content).hexdigest()
+        absent = hashlib.sha256(b"a source the package does not carry").hexdigest()
+        (self.package / "sources" / digest).write_bytes(content)
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        self.chunks_file(self.package, digest, None, digest)
+        importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+        bare = self.root / "chunks-only"
+        bare.mkdir()
+        self.chunks_file(bare, None, None)
+        importer._validate_package_sources(bare, {"fidelity": "chunks-only"})
+        cases = ((self.package, "with-sources", (digest, absent), 2),
+                 (self.package, "with-sources", (None, 7), 2),
+                 (bare, "chunks-only", (None, None, digest), 3))
+        for package, fidelity, links, line in cases:
+            with self.subTest(fidelity=fidelity, links=links):
+                self.chunks_file(package, *links)
+                with self.assertRaises(PackageError) as raised:
+                    importer._validate_package_sources(package, {"fidelity": fidelity})
+                self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
+                self.assertEqual(raised.exception.detail, {"file": "chunks.jsonl", "line": line})
+
+    def test_unresolvable_chunk_source_fails_before_embedding_or_live_work(self):
+        content = b"retained source"
+        digest = hashlib.sha256(content).hexdigest()
+        (self.package / "sources" / digest).write_bytes(content)
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        self.chunks_file(self.package, hashlib.sha256(b"elsewhere").hexdigest())
+        manifest = {"fidelity": "with-sources", "files": {}}
+        job = {"status": "queued"}
+        with patch.object(settings, "upload_dir", str(self.root)), \
+             patch.object(importer, "_jobs", {"owned": job}), \
+             patch.object(importer, "_active", {"owned.tar.gz"}), \
+             patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager, "open_package", return_value=(self.package, manifest)), \
+             patch.object(importer, "_check_embedding") as check_embedding, \
+             patch.object(importer, "_ensure_models") as models, \
+             patch.object(importer.wc, "get_client") as backend:
+            importer._run("owned", "owned.tar.gz", "replace")
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["error_code"], "PACKAGE_CORRUPT")
+        self.assertEqual(job["error_detail"], {"file": "chunks.jsonl", "line": 1})
+        check_embedding.assert_not_called()
+        models.assert_not_called()
+        backend.assert_not_called()
 
 
 class ManifestFilesBoundaryTests(unittest.TestCase):

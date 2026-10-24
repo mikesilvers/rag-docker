@@ -333,10 +333,16 @@ The package lands in `./exports/` on the host, named
 `README.md` explaining what it contains, how to import it and how to run its
 `retrieve.py`.
 
-Two things worth knowing before you move one:
+Three things worth knowing before you move one:
 
 - **Packages are not encrypted.** A `with-sources` package contains the original
   documents byte for byte. Treat the file as you would the corpus.
+- **An export holds its collection's writer guard.** Chunks and original
+  documents come from one point in time, so ingest, re-chunking and other writes to
+  that collection wait until the export finishes, and gold-standard generation for
+  it answers busy. Queries and other collections are not affected. Saved settings
+  and gold-standard sessions can still change meanwhile, so the package's copies of
+  them may be newer than its chunks.
 - **The embedding model must match.** Vectors made by a different embedding
   model are meaningless in this vector space, not merely different, so import
   refuses the mismatch rather than warning about it.
@@ -369,7 +375,10 @@ be readable, the format understood, every digest must match, and the embedding
 model must be the one this instance runs. Chunk UUIDs are preserved, so
 gold-standard sessions keep pointing at the right chunks after the move.
 Retained-source indexes and blobs are validated before the embedding check;
-invalid source metadata fails with `PACKAGE_CORRUPT` before any live mutation.
+invalid source metadata fails with `PACKAGE_CORRUPT` before any live mutation. So
+does a chunk whose `source_sha256` names a source the package doesn't carry
+(#509). Packages from older exports that skipped a missing source blob are refused
+this way; export the collection again.
 
 Evaluation-session metadata is also validated before importing models or
 changing a collection. Invalid session JSON, identities or schemas fail the

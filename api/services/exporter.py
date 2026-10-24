@@ -1,9 +1,9 @@
-"""The export job: lifecycle, progress and the one-at-a-time guard.
+"""The export job: lifecycle, progress, the one-at-a-time guard and the writer guard.
 
 Format lives in `packager.py`. This module only decides when a build runs, what
 its status looks like while it does, and that two builds of the same collection
 never overlap — they would race on the staging directory and the temporary
-archive.
+archive. A build runs under its collection's writer guard (#509).
 """
 from __future__ import annotations
 from services import telemetry
@@ -48,7 +48,6 @@ def active_job_for(collection: str) -> str | None:
 @telemetry.traced("rag.export")
 def _run(job_id: str, collection: str, include_models: bool) -> None:
     job = _jobs[job_id]
-    job["status"] = "running"
 
     def progress(written: int) -> None:
         job["chunks_written"] = written
@@ -60,7 +59,15 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
         job.update(fields)
 
     try:
-        result = packager.build(collection, include_models=include_models, progress=progress)
+        # The whole build holds the collection's writer guard (#509), so a
+        # re-ingest or tune can't commit between the chunk stream and the sources
+        # step: chunks and sources come from one point in time. Guarded writers of
+        # this collection wait (generation is refused busy); queries and other
+        # collections don't. The job reads `queued` until the guard is ours, and
+        # it is released before the terminal status is written.
+        with collection_writes.guard(collection):
+            job["status"] = "running"
+            result = packager.build(collection, include_models=include_models, progress=progress)
     except packager.PackageError as exc:
         telemetry.outcome("error", exc)
         _log.warning("Export of %r refused (%s): %s", collection, exc.code, exc.message)
@@ -162,7 +169,8 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
         started.set_result(None)
 
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
-    # export does not stall ingest or query (spec §6.1).
+    # export does not stall the API: queries and other collections carry on, and
+    # only guarded writes to this collection wait for it (spec §6.1, #509).
     task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, include_models))
     # _run ends it first; this also covers a task that never ran its worker.
     task.add_done_callback(lambda _task: collection_writes.end_job("export", job_id))

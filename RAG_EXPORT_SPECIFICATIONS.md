@@ -80,7 +80,8 @@ model installation, collection mutation, or sidecar restoration; a mismatch is
 `PACKAGE_CORRUPT`. Export and re-chunking refuse invalid identities or linked
 blobs at their read boundaries, so source metadata cannot select an arbitrary
 filesystem path. If an indexed blob is missing on disk, export warns and omits
-that entry from the shipped index; the package remains importable with its
+that entry from the shipped index, and a chunk that would link to it is exported
+with `source_sha256` `null` (#509); the package remains importable with its
 available sources and chunks. Existing valid indexes keep their original fidelity.
 An invalid on-disk index makes tuning options return a typed 409
 `SOURCE_INDEX_INVALID`, and re-chunking (or re-embedding with chunking
@@ -93,6 +94,9 @@ Retained-source import restores only blobs named by the validated index. Unindex
 files are ignored, including sources in chunks-only packages with no index. Older
 packages whose indexes name missing blobs remain rejected as `PACKAGE_CORRUPT`;
 re-export from the repaired source rather than silently reducing claimed fidelity.
+So are packages whose chunks name a `source_sha256` that isn't in the package's
+source index (#509), including those an older export made by skipping a missing
+blob while keeping its digest on the chunks: re-export them.
 After manifest digest verification, each indexed blob’s manifest digest must equal
 `sha256:<filename>`. This preserves content-addressed identity without hashing a
 listed blob twice. Indexed blobs not listed in the manifest are hashed separately;
@@ -218,6 +222,13 @@ can stop there (#383). Readers MUST NOT rely on that order: packages built befor
 What the listing takes from the manifest, and when a wrongly typed value makes
 it list the package as unreadable, is in §4.4 (#451).
 
+An export reads the collection's chunks and its retained sources at one point in
+time: it holds the collection's writer guard for its whole run (§6.1, #509), and
+every writer of chunks or retained sources takes that guard. The configuration
+files (`ingest_config.json`, `retrieval_config.json`) and the evaluation sessions
+are written by routes that don't take it, so each of those files in a package is
+coherent on its own but may be newer than the chunks.
+
 Exported evaluation sessions are validated, detached snapshots read from the persisted session files. The exporter MUST NOT serialize the live generation/edit cache; later cached pair or counter updates must not change a selected export snapshot. Atomic and serialized session persistence remains separate work.
 
 ### 4.3 Fidelity
@@ -292,7 +303,9 @@ One JSON object per line:
 
 - `properties` carries the eight stored properties, unchanged.
 - `source_sha256` links the chunk to its file in `sources/`, and is `null` in
-  `chunks-only` packages.
+  `chunks-only` packages. It is also `null` when the chunk's file name maps to
+  more than one retained digest, or to a blob missing on disk at export. A
+  non-null value always names a blob the package carries (#509).
 - Vectors are JSON numbers. A packed float32 sidecar was measured at only ~12%
   smaller after gzip and is rejected (`RAG_EXPORT_ANALYSIS.md` §6).
 
@@ -401,7 +414,17 @@ completion, the written filename.
   the manifest bind vectors to that stored model.
 - Failed export jobs expose typed package refusal fields `error_code` and
   `error_detail`, alongside the human-readable `error`.
-- Export MUST NOT block ingest or query.
+- Export holds the collection's writer guard, the lock its ingest, tuning and
+  import writers share, for its whole run, from before the settings and chunks are read until the archive
+  is renamed into place, so the chunks and retained sources come from one point
+  in time (#509). The job reads `queued` while it waits for the guard. Guarded
+  writes to that collection wait for the export, as they wait for any other
+  guard holder: ingest, re-ingest and tuning jobs stay `queued`, a replace-import
+  waits before its conflict check,
+  gold-standard generation answers `409 COLLECTION_BUSY` after its one-second
+  wait, and a delete is refused as for any active job. An export never blocks
+  queries, unguarded saves (§4.2), or anything for another collection. The build
+  runs off the event loop.
 - Writing is atomic: build under a temporary name in the same directory and
   rename on success, so a partial file is never mistaken for a package.
 
@@ -417,7 +440,7 @@ Checks run in this order and stop at the first failure:
 | 1 | File exists and is a readable `.tar.gz` | `PACKAGE_UNREADABLE` |
 | 2 | `manifest.json` present, `package_format` understood | `PACKAGE_FORMAT_UNSUPPORTED` |
 | 3 | Every `files` key is a normalised relative path inside the package, and every `files` digest matches | `PACKAGE_CORRUPT`, naming the file (`manifest.json` for a key outside the package) |
-| 3a | Retained-source index names only valid digest identities and matching regular blobs | `PACKAGE_CORRUPT`, naming `sources/index.json` |
+| 3a | Retained-source index names only valid digest identities and matching regular blobs; every chunk's `source_sha256` is `null` or a digest of that index (#509) | `PACKAGE_CORRUPT`, naming `sources/index.json`, or `chunks.jsonl` and the line for a chunk's digest |
 | 4 | **Embedding model and dimensions match this instance** | `EMBEDDING_MISMATCH` — refuse |
 | 4a | Every evaluation sidecar has a valid session schema, generated session ID, matching collection and unique identity within the package; the local session storage directory is a regular directory inside the upload directory | `PACKAGE_CORRUPT`, naming the sidecar |
 | 4b | Optional retrieval settings are a JSON object satisfying the API save schema, normalized with its defaults and numeric conversion | `PACKAGE_CORRUPT`, naming `retrieval_config.json` |
@@ -430,7 +453,10 @@ is refused as `PACKAGE_CORRUPT` with `detail` `{"file": "manifest.json"}`; the
 message and `detail` carry neither the key nor any digest, so a package can't
 make import hash, or report the digest of, a file outside it.
 
-Check 3a runs before embedding-model checks and all live mutation. Check 4b runs before model installation, collection creation/replacement, recovery
+Check 3a runs before embedding-model checks and all live mutation. It reads
+`chunks.jsonl` once: a chunk whose `source_sha256` is not `null` and is not a
+digest of the validated source index (any non-null value when the package has no
+index) is refused with `detail` `{"file": "chunks.jsonl", "line": <n>}` (#509). Check 4b runs before model installation, collection creation/replacement, recovery
 ownership, or sidecar publication. Keep its normalized snapshot for restoration;
 do not reread unvalidated settings after building the collection. Rebind the
 collection to the actual import target. Missing fields retain API defaults,
@@ -833,7 +859,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 |---|---|
 | `PACKAGE_UNREADABLE` | missing or not a readable archive |
 | `PACKAGE_FORMAT_UNSUPPORTED` | `package_format` newer than this instance |
-| `PACKAGE_CORRUPT` | digest mismatch, a manifest `files` key outside the package (check 3), invalid retained sources (check 3a), or invalid evaluation-session metadata (check 4a); names the file |
+| `PACKAGE_CORRUPT` | digest mismatch, a manifest `files` key outside the package (check 3), invalid retained sources or a chunk naming a source the package lacks (check 3a), or invalid evaluation-session metadata (check 4a); names the file |
 | `EMBEDDING_MISMATCH` | model or dimensions differ; names both |
 | `EMBEDDING_MODEL_MISSING` | target lacks the embedding model and the package does not bundle it |
 | `MODEL_INTEGRITY_FAILED` | the embedding model is installed but a file is missing or doesn't match its checksum; names the model |
@@ -897,12 +923,13 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E26 | Importing when the installed embedding model's files don't match their checksums fails `MODEL_INTEGRITY_FAILED`, leaves the model's files untouched and says to restore or re-pull it |
 | E27 | With a namespaced `LLM_MODEL` (`user/model`), an import of a package without bundled models succeeds and notes the model |
 | E28 | Digest-valid malformed retrieval settings are refused before live mutation in all conflict modes; valid historical settings round-trip, a legacy out-of-range integer `ef` imports as `null` with a note, and generated script defaults/metadata remain encoded typed literals. On export, a saved legacy out-of-range integer `ef` is written to the package as `null` with a warning and the saved settings are left alone; other invalid saved settings fail the export before any chunk is read, with an error naming the failing fields and the Retrieval page, and no package is published |
-| E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths; import and replace-mode recovery ignore unindexed source blobs; invalid-index tune options return `SOURCE_INDEX_INVALID`, and an invalid-index re-chunk or re-embed with chunking parameters is refused with HTTP 409 `SOURCE_INDEX_INVALID` before any job is created (#389), while record-only tuning still works; missing-blob exports pass import preflight |
+| E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths; import and replace-mode recovery ignore unindexed source blobs; invalid-index tune options return `SOURCE_INDEX_INVALID`, and an invalid-index re-chunk or re-embed with chunking parameters is refused with HTTP 409 `SOURCE_INDEX_INVALID` before any job is created (#389), while record-only tuning still works; missing-blob exports pass import preflight, with `null` for the chunks of the missing blob; a chunk whose non-null `source_sha256` isn't in the package's source index fails `PACKAGE_CORRUPT` naming `chunks.jsonl`, before live mutation (#509) |
 | E30 | Export refuses `EMBEDDING_MISMATCH` before streaming/bundling when the stored collection model is unknown, named-vector, or differs from the configured model; vectors are never relabeled from current environment settings |
 | E31 | Export, import and tune job records survive an API restart: a completed export reads back unchanged, and an export interrupted by the restart answers `200` with `status: failed`, `error_code: INTERRUPTED` and its `chunks_written` kept; an import interrupted by the restart answers the same (#309); tune likewise, by `test_jobstore.py` |
 | E32 | Re-ingesting a changed file replaces its chunks and its retained source: one digest names it and the replaced blob is gone; re-chunking afterwards brings back only the new version, under each of its names (#22) |
 | E33 | An import whose manifest `files` map lists a key outside the package (an absolute key or a `..` key), with the outside file's real digest or a wrong one, fails `PACKAGE_CORRUPT` with `detail` `{"file": "manifest.json"}` and nothing else; the job reveals neither the outside path nor its digest, and no collection is created (#371) |
 | E34 | A model is bundled whole or not at all: when any of its files can't be copied, none of its files stay in the package or its `files` map, it is left out of `bundled_models`, and a warning names it, while another model before or after it is still bundled whole; when every model fails, the package has no `models/` folder and `models_bundled` is false. A model named for both embedding and the LLM, compared by name and tag (`x` and `x:latest`), is copied once (#449, #494), by `test_retrieval_import.py` |
+| E35 | An export holds its collection's writer guard for its whole run: a re-ingest that tries to commit mid-export waits, and the package holds the old chunks with the old source bytes, every non-null `source_sha256` naming a blob in it; gold-standard generation is refused `COLLECTION_BUSY` and guarded writers wait meanwhile; an export started while another writer holds the guard reads `queued`; the guard is released when the export completes, fails or is cancelled (#509), by `test_export_snapshot.py` |
 
 ---
 

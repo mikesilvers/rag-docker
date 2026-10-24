@@ -558,19 +558,24 @@ def _insert_chunks(name: str, pkg: Path, manifest: dict, progress) -> int:
 @telemetry.traced("rag.validate")
 def _validate_package_sources(pkg: Path, manifest: dict) -> None:
     """Check source identities after verify_digests, before any live mutation."""
+    _check_chunk_sources(pkg, _validated_source_digests(pkg, manifest))
+
+
+def _validated_source_digests(pkg: Path, manifest: dict) -> set[str]:
+    """The digests of the package's validated source index; empty without one."""
     source_dir = pkg / "sources"
     if not source_dir.exists():
         if manifest.get("fidelity") == "with-sources":
             raise PackageError("PACKAGE_CORRUPT", "Retained sources are missing.",
                                {"file": "sources/index.json"})
-        return
+        return set()
     index_path = source_dir / sources.INDEX_NAME
     try:
         if source_dir.is_symlink() or not source_dir.is_dir():
             raise ValueError("Retained source directory is not a regular directory")
         if (not index_path.exists() and not index_path.is_symlink()
                 and manifest.get("fidelity") != "with-sources"):
-            return
+            return set()
         if index_path.is_symlink() or not index_path.is_file():
             raise ValueError("Retained source index is missing or is not a regular file")
         index = sources.validate_index(json.loads(index_path.read_text()))
@@ -589,6 +594,40 @@ def _validate_package_sources(pkg: Path, manifest: dict) -> None:
     except (OSError, ValueError, TypeError) as exc:
         raise PackageError("PACKAGE_CORRUPT", "Invalid retained source metadata.",
                            {"file": "sources/index.json"}) from exc
+    return set(index["documents"])
+
+
+def _check_chunk_sources(pkg: Path, digests: set[str]) -> None:
+    """Every chunk's source_sha256 is null or names a blob in `digests` (#509).
+
+    A package whose chunks name a source it doesn't carry mixes two points in
+    time, or was made by an older export that skipped a missing blob; it is
+    refused before any live mutation. Other record defects are left to the
+    chunk checks at insert.
+    """
+    path = pkg / "chunks.jsonl"
+    if not path.is_file():
+        return
+    with path.open("r", encoding="utf-8") as fh:
+        for number, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError as exc:
+                raise PackageError("PACKAGE_CORRUPT",
+                                   f"chunks.jsonl line {number} is not valid JSON.",
+                                   {"file": "chunks.jsonl", "line": number}) from exc
+            if not isinstance(record, dict):
+                continue
+            digest = record.get("source_sha256")
+            if digest is not None and (not isinstance(digest, str) or digest not in digests):
+                raise PackageError(
+                    "PACKAGE_CORRUPT",
+                    f"chunks.jsonl line {number} names a retained source that is not in "
+                    "the package. Export the collection again to get a consistent package.",
+                    {"file": "chunks.jsonl", "line": number})
 
 
 def _read_goldstandard_sessions(pkg: Path, original: str) -> list[dict]:
