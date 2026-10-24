@@ -13,7 +13,7 @@ class EmbeddedTelemetryTests(unittest.TestCase):
         spec = (ROOT/'SPECIFICATIONS.md').read_text()
         inputs = (ROOT/'api/requirements.in').read_text().splitlines()
         lock = (ROOT/'api/requirements.txt').read_text().splitlines()
-        for dependency in ('opentelemetry-sdk==1.44.0', 'opentelemetry-exporter-otlp-proto-http==1.44.0'):
+        for dependency in ('opentelemetry-sdk==1.45.1', 'opentelemetry-exporter-otlp-proto-http==1.45.1'):
             self.assertIn(dependency, spec)
             self.assertIn(dependency, inputs)
             self.assertIn(dependency, lock)

@@ -508,7 +508,9 @@ def _session(signal, config, health=None):
         def __init__(self):
             super().__init__()
             self.trust_env = False  # No ambient proxy, netrc, or credentials.
-        def post(self, url, data=None, **kwargs):
+        def request(self, method, url, data=None, **kwargs):
+            # The only send path: requests' post() (OTel 1.44) and the SDK's
+            # transport request() (1.45) both land here, never on the base class.
             result = requests.Response()
             result.status_code = 400  # SDK treats this as non-retryable.
             result._content = b"telemetry export failed"
@@ -519,9 +521,10 @@ def _session(signal, config, health=None):
                 self.cookies.clear()
                 self.headers.clear()
                 self.headers.update({"Content-Type": "application/x-protobuf", **config.headers})
-                with super().post(config.endpoint + "/v1/" + signal, data=payload,
-                                  timeout=config.timeout_ms / 1000, verify=config.ca_file or True,
-                                  allow_redirects=False, stream=True) as response:
+                self.cert = None  # The SDK transport copies ambient OTEL_* client certificates here.
+                with super().request("POST", config.endpoint + "/v1/" + signal, data=payload,
+                                     timeout=config.timeout_ms / 1000, verify=config.ca_file or True,
+                                     allow_redirects=False, stream=True) as response:
                     if 200 <= response.status_code < 300:
                         result.status_code = 200
                         result._content = b""
@@ -698,7 +701,8 @@ def bootstrap(env=None):
             provider.add_span_processor(SafeBatchSpans(exporter(OTLPSpanExporter, "traces"), **batch))
             runtime.tracer = provider.get_tracer("rag.telemetry")
         if config.logs:
-            provider = LoggerProvider(resource=resource, shutdown_on_exit=False, meter_provider=internal_meter)
+            provider = LoggerProvider(resource=resource, shutdown_on_exit=False, meter_provider=internal_meter,
+                                      log_record_limits=log_limits)  # Not ambient OTEL_* limits.
             runtime._providers.append(provider)
             provider.add_log_record_processor(SafeBatchLogs(exporter(OTLPLogExporter, "logs"), **batch))
             runtime.logger = SafeLogger(provider.get_logger("rag.telemetry"))

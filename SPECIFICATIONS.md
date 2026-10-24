@@ -1337,8 +1337,8 @@ langchain-text-splitters>=0.3
 sentence-transformers>=3.0
 python-multipart>=0.0.9
 aiofiles>=23.0
-opentelemetry-sdk==1.44.0
-opentelemetry-exporter-otlp-proto-http==1.44.0
+opentelemetry-sdk==1.45.1
+opentelemetry-exporter-otlp-proto-http==1.45.1
 ```
 
 **Dependency pinning (normative).** The list above is *intent*, held in
@@ -1350,7 +1350,7 @@ newer Weaviate server than the one pinned here, breaking every collection call
 while the stack still reported healthy.
 
 The SDK and OTLP HTTP exporter entries in `api/requirements.in` are required
-for enabled telemetry startup; lock regeneration must retain both at 1.44.0
+for enabled telemetry startup; lock regeneration must retain both at 1.45.1
 and resolve their transitive dependencies.
 
 Regenerate the lock from the repo root using the procedure at the top of
