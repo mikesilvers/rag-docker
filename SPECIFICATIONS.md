@@ -1990,6 +1990,16 @@ an error, and an earlier notice timer cannot clear a newer Saved! notice.
 After the selected collection's load resolves, the next Q&A request uses its
 settings, regardless of when a prior collection's save completes.
 
+Each question's answer belongs to the query that produced it (#511). Ctrl+Enter
+is ignored while a question is being answered, like the disabled Ask button.
+Asking a question or changing the collection starts a new query generation, and
+only the current generation's query may show its answer, citations, latency or
+error, or end the "Thinking…" state. Changing the collection (including leaving
+and returning to the same collection) clears the answer, citations, latency and
+error on screen, ends the wait so the new collection can be asked at once, and
+drops the response of any query still in flight; that query is not cancelled.
+The question and the citations toggle are kept.
+
 **Response format** sent to API:
 - End User role → `response_format: "end_user"`
 - Engineer and Developer → `response_format: "engineer"`
@@ -2743,6 +2753,13 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Chunking loads and save results stay with their selection generation, including A→B→A; save is unavailable until the selected config loads. Stale responses preserve current edits and errors, collection changes clear the saved notice, and failed collection lists or mismatched configurations are reported.
   *Evidence: `scripts/verify/browser/chunking_config.js` deferred load/save, stale failure, edited draft, collection-list failure, mismatched configuration and saved-notice cases in suite 06.*
 
+- [x] The Q&A page shows an answer only for the latest query on the selected collection: a response that arrives after the collection changed (including A→B→A) or after a newer query is dropped, success or failure; changing the collection clears the answer, citations, latency and error on screen and ends the wait; Ctrl+Enter sends nothing while a question is being answered (#511).
+      *Evidence: `scripts/verify/browser/qa_page.js` (suite 06, through `ui_criteria.js`) answers
+      every API call by request interception and holds each query's answer until the check
+      releases it: an answer and a failure for A released after the switch to B, an answer
+      released after A→B→A, two queries in flight released latest first, a second Ctrl+Enter
+      while loading, an answer and an error on screen when the collection changes, and Ask
+      used on B while A is still in flight. All eight checks fail on the code before #511.*
 - [x] Role selection persists across page navigation within same browser session.
 - [x] End User role shows only the Q&A page in navigation.
       *Nav shows only Q&A, and `/collections` redirects to `/qa`.*

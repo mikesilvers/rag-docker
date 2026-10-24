@@ -791,6 +791,22 @@ failed one is still shown. Every case also fails on a React page error. These fi
 make no backend calls; like the other modules, the file runs standalone with
 `RAG_UI_BASE` and `RAG_CHROMIUM_PATH`.
 
+## Q&A page answer checks
+
+`browser/qa_page.js` (#511), registered in `06_ui.sh` through `ui_criteria.js`, stubs every
+API call the Q&A page makes and holds each query's answer until the check releases it. Eight
+cases: an answer, and a failure, for collection A released after the switch to B show nothing
+under B; an answer released after A→B→A is not shown; with a query on A and a newer one on B
+in flight, A's answer arriving last does not replace B's; a second Ctrl+Enter while a question
+is being answered sends no query; changing the collection clears an answer (with its citations
+and latency) and an error already shown; and after the switch Ask is enabled at once and asks
+B. All eight fail on the code before #511. Like the other modules, it runs on its own against
+a UI with no backend:
+
+```bash
+RAG_UI_BASE=http://127.0.0.1:3000 RAG_CHROMIUM_PATH=/path/to/chromium node scripts/verify/browser/qa_page.js
+```
+
 ## Transfer page polling and failure checks
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
