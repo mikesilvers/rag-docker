@@ -1,0 +1,42 @@
+# Only loaded by the disposable harness with --telemetry.
+services:
+  api:
+    environment:
+      RAG_OTEL_ENABLED: "${RAG_VERIFY_OTEL_ENABLED:-true}"
+      RAG_OTEL_PROTOCOL: http/protobuf
+      RAG_OTEL_SERVICE_VERSION: "1.1.0"
+      RAG_OTEL_QUEUE_SIZE: "256"
+      RAG_OTEL_BATCH_SIZE: "64"
+      RAG_OTEL_ENDPOINT: http://otel-collector:4318
+      RAG_OTEL_SAMPLE_RATIO: "1"
+      RAG_OTEL_INTERVAL_MS: "1000"
+      RAG_OTEL_TIMEOUT_MS: "500"
+      RAG_OTEL_SHUTDOWN_MS: "3000"
+      RAG_OTEL_SERVICE_NAME: rag-api
+      RAG_OTEL_ENVIRONMENT: verification
+      RAG_OTEL_TRACES: "true"
+      RAG_OTEL_METRICS: "true"
+      RAG_OTEL_LOGS: "true"
+  otel-collector:
+    volumes:
+      - ${RAG_VERIFY_HARNESS:?harness path required}/scripts/verify/collector.yaml:/etc/otelcol/config.yaml:ro
+  otel-capture:
+    image: rag-verify-api:latest
+    profiles: [telemetry]
+    command: [python, /verify/telemetry_capture.py]
+    networks: [rag-internal]
+    ports: []
+    volumes:
+      - ${RAG_VERIFY_HARNESS:?harness path required}/scripts/verify:/verify:ro
+      - otel_capture:/capture
+    mem_limit: 256m
+    cpus: 0.5
+    stop_grace_period: 10s
+    read_only: true
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+volumes:
+  otel_capture:
