@@ -144,7 +144,7 @@ The API accepts `hnsw` and `flat` as aliases for Vector; selecting either does n
 
 ### 4. Ask questions
 
-Navigate to **Q&A**, select a collection, type your question, and press **Ask** (or Ctrl+Enter). Toggle **Show source citations** to see which chunks were used.
+Navigate to **Q&A**, select a collection, type your question, and press **Ask** (or Ctrl+Enter). Changing the collection clears the answer on screen, and an answer still on its way for the previous collection is not shown. Toggle **Show source citations** to see which chunks were used.
 
 ### 5. Generate gold standard data
 
