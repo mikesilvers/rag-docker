@@ -16,6 +16,7 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
   await require('./chunking_config').runChunkingConfigTests(browser, BASE, r);
 
   await require('./query_config').runQueryConfigTests(browser, BASE, r);
+  await require('./qa_page').runQaPageTests(browser, BASE, r);
 
   await require('./health_page').runHealthPageTests(browser, BASE, r);
   await require('./transfer_page').runTransferPageTests(browser, BASE, r);

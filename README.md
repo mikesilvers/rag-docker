@@ -144,7 +144,7 @@ The API accepts `hnsw` and `flat` as aliases for Vector; selecting either does n
 
 ### 4. Ask questions
 
-Navigate to **Q&A**, select a collection, type your question, and press **Ask** (or Ctrl+Enter). Toggle **Show source citations** to see which chunks were used.
+Navigate to **Q&A**, select a collection, type your question, and press **Ask** (or Ctrl+Enter). Changing the collection clears the answer on screen, and an answer still on its way for the previous collection is not shown. Toggle **Show source citations** to see which chunks were used.
 
 ### 5. Generate gold standard data
 
@@ -383,6 +383,10 @@ this way; export the collection again.
 Evaluation-session metadata is also validated before importing models or
 changing a collection. Invalid session JSON, identities or schemas fail the
 import with `PACKAGE_CORRUPT`, naming the sidecar; they are not silently skipped.
+The package's retrieval and chunking settings are checked at the same point:
+settings the API wouldn't save fail the import with `PACKAGE_CORRUPT`, naming
+`retrieval_config.json` or `ingest_config.json`. Chunk sizes saved before the
+current 50-6000 bounds are still imported as they are.
 
 ### Carrying the models too
 
@@ -824,10 +828,11 @@ At most one link survives, containing only fixed-size nonzero trace/span IDs and
 a sampled flag. Trace/span IDs remain correlation fields, never authentication.
 The operational metric allowlist and finite dimensions are documented below.
 The private meter validates values before SDK aggregation; instrument-specific
-views and the final export boundary enforce its schema. Export removes arbitrary
-descriptions and exemplars and preserves only fixed declared units. Metric
-exemplar sampling is explicitly disabled, regardless of ambient exemplar settings,
-so dropped attributes never enter an exemplar reservoir. The original
+views and the final export boundary enforce its schema. An explicit always-off
+exemplar filter prevents original measurement attributes from entering SDK
+exemplar reservoirs, even with ambient `OTEL_METRICS_EXEMPLAR_FILTER=always_on`.
+Export removes arbitrary
+descriptions and exemplars and preserves only fixed declared units. The original
 dimensionless `rag.telemetry.check` remains a one-point synthetic schema probe.
 All points in a metric are validated before admitting the record. Histograms
 require at most 31 finite, strictly increasing boundaries, consistent bucket
@@ -965,3 +970,13 @@ still emit, with absent trace/span IDs. Logs can be disabled independently.
 Existing application log messages are not forwarded to OTLP: exception text,
 credentials, document content and arbitrary bodies remain excluded. Telemetry
 measurement or logger failures do not change application results.
+
+### Optional local Collector and offline acceptance (#285)
+
+[Collector setup](telemetry/README.md) provides the explicit Compose overlay and
+profile, private HTTP/protobuf receiver, bounded local diagnostics, optional OTLP
+destination with runtime secret injection, and optional offline image packaging.
+The default five-service stack still disables application telemetry. Collector
+health is independent of API health. Run the full disposable suite both normally
+and with `--telemetry` to exercise actual query/job exports, content exclusions,
+concurrency, restart and receiver outages with measured overhead.

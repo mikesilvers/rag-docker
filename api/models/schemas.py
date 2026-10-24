@@ -130,6 +130,14 @@ class IngestConfig(BaseModel):
         return self
 
 
+class StoredIngestConfig(IngestConfig):
+    # Ingest settings in an import package (#510). A configuration saved before the
+    # #53 chunk bounds is imported as it is, never clamped, so these two fields keep
+    # the rules from before the bounds; every other save rule still applies.
+    chunk_size: PositiveSize = 1000
+    min_chunk_size: NonnegativeSize = 100
+
+
 class IngestConfigResponse(BaseModel):
     collection: str
     chunking_strategy: str

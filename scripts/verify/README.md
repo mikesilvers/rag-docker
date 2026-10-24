@@ -182,7 +182,11 @@ uv run --no-project --python 3.11 \
 `scripts/tests/test_retrieval_import.py` adds controlled digest-valid malformed
 retrieval package rejection before model, backend, recovery, or sidecar mutation;
 historical defaults/coercion and `ef` round trips; and generated Python literal
-regressions. Run it with the same API dependencies as the session import test.
+regressions. Its `IngestImportTests` do the same for `ingest_config.json`
+(E35, #510): malformed ingest settings are refused `PACKAGE_CORRUPT` in every
+conflict mode before any live change, and valid ones, including chunk sizes from
+before the #53 bounds, are restored from the checked snapshot and read back
+through `GET /ingest/config`. Run it with the same API dependencies as the session import test.
 `05_transfer.sh` registers it and `retrieval_settings.py` (E28), which submits
 15 malformed settings imports across abort/rename/replace and verifies live
 collection counts and saved settings are unchanged. The normal rename import
@@ -611,7 +615,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, review 404 codes and empty-edit refusal (#381), export schema, export name refusals (#370) |
 | `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E35; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E36; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
@@ -793,6 +797,22 @@ result (success or failure) or newer charts, while a late metrics result after a
 failed one is still shown. Every case also fails on a React page error. These fixtures
 make no backend calls; like the other modules, the file runs standalone with
 `RAG_UI_BASE` and `RAG_CHROMIUM_PATH`.
+
+## Q&A page answer checks
+
+`browser/qa_page.js` (#511), registered in `06_ui.sh` through `ui_criteria.js`, stubs every
+API call the Q&A page makes and holds each query's answer until the check releases it. Eight
+cases: an answer, and a failure, for collection A released after the switch to B show nothing
+under B; an answer released after A→B→A is not shown; with a query on A and a newer one on B
+in flight, A's answer arriving last does not replace B's; a second Ctrl+Enter while a question
+is being answered sends no query; changing the collection clears an answer (with its citations
+and latency) and an error already shown; and after the switch Ask is enabled at once and asks
+B. All eight fail on the code before #511. Like the other modules, it runs on its own against
+a UI with no backend:
+
+```bash
+RAG_UI_BASE=http://127.0.0.1:3000 RAG_CHROMIUM_PATH=/path/to/chromium node scripts/verify/browser/qa_page.js
+```
 
 ## Transfer page polling and failure checks
 
@@ -1052,3 +1072,53 @@ launchers use synthetic dependencies to prove handled outcomes preserve durable
 status. No live application content, external model or hosted collector is used.
 Exporter error and malformed-wire cases check bounded failure isolation;
 collector deployment acceptance remains #285.
+
+## Optional Collector acceptance (#285)
+
+```sh
+bash scripts/verify/stack.sh run
+bash scripts/verify/stack.sh run --telemetry
+# Targeted enabled acceptance, after the same guarded disposable startup:
+bash scripts/verify/stack.sh run --telemetry 15
+```
+
+Run these serially. The default run's registered `15_telemetry` suite verifies
+the API is disabled and explicitly reports enabled capture as unexercised.
+The enabled full run uses trusted overlays, the pinned private Collector and a
+bounded private protobuf receiver using the API image. Only the proxy publishes
+a host port. Narrow guard additions allow resource/log bounds only on these two
+services; live image, network, mount and port restrictions remain enforced.
+
+The suite recreates the disposable API through a guarded `telemetry-mode`
+command under the inherited lock to compare enabled/disabled settings. It submits
+real synthetic uploads, queries and concurrent export jobs; inspects actual
+received traces/metrics/logs, parent relationships, correlation and planted
+sentinels; stops/restarts only disposable services; and tests a slow receiver.
+Capture is memory-bounded (16 MiB, 1000 batches, 1 MiB/request, 16 handlers); overflow
+fails inspection. Raw payloads are synthetic and temporary. Summary output records
+five warm-ups and 20 timed health requests plus one query/two jobs per mode,
+latency distributions, sampled container stats and shutdown timing. Health timings
+include host guard overhead; samples are observations, not performance SLOs.
+`RAG_SKIP_SLOW=1` explicitly skips model-dependent enabled acceptance and cannot
+satisfy full telemetry acceptance. No real backend account or external egress is
+needed once dependencies/images/models are available.
+
+Suite 01 always runs capture/evidence regressions and offline/installer/package
+regressions in the built API image with network disabled, in both default and
+telemetry-enabled runs. Compose-only collector checks run on the host without
+starting services. Exact inventory and embedded-source checks also remain
+mandatory in suite 01.
+
+Standalone focused checks: `python3 scripts/tests/test_collector.py` (host stdlib and Compose
+configuration only), `python scripts/tests/test_telemetry_capture.py` (locked API
+dependencies), and the existing verify-stack tests. These complement, not replace,
+both full runs.
+
+Verification telemetry assets are absolute harness-owned paths, including when
+`--checkout` selects another source tree. Their exact read-only bind identities
+are checked; this preserves harness provenance, not a hostile-code sandbox.
+Protocol, version and export budgets are fixed in the verification overlay,
+independent of ambient operator telemetry variables. Before disabled-mode counting,
+the old API, Collector queues and capture handlers terminate; a fresh Collector
+and capture process isolate the zero-traffic observation from earlier exports.
+Malformed capture shapes fail as incomplete evidence, never partial success.
