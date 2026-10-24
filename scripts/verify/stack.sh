@@ -3,7 +3,7 @@
 # Run the verification suite on a disposable compose project, never on the
 # live stack (#152).
 #
-#   bash scripts/verify/stack.sh run [--checkout DIR] [suite ...]
+#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry] [suite ...]
 #   bash scripts/verify/stack.sh up [--checkout DIR] [--pull]
 #   bash scripts/verify/stack.sh down
 #
@@ -81,15 +81,26 @@ private_problem() {
 # ── arguments, checked before any Docker command ─────────────────────────────
 [ "$#" -ge 1 ] || usage
 CMD="$1"; shift
-case "$CMD" in up|down|run) ;; *) usage ;; esac
+case "$CMD" in up|down|run|telemetry-mode) ;; *) usage ;; esac
+if [ "$CMD" = telemetry-mode ]; then
+  [ "${RAG_VERIFY_LOCK_HELD:-}" = 1 ] || fail "telemetry-mode requires an inherited verification lock"
+fi
 CHECKOUT="$HARNESS"
 PULL=""
+TELEMETRY=0
+OTEL_ENABLED=true
 ARGS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --checkout)
       [ "$CMD" != down ] && [ "$#" -ge 2 ] || usage
       CHECKOUT="$2"; shift 2 ;;
+    --telemetry)
+      [ "$CMD" != down ] || usage
+      TELEMETRY=1; shift ;;
+    --disabled)
+      [ "$CMD" = telemetry-mode ] || usage
+      OTEL_ENABLED=false; shift ;;
     --pull)
       [ "$CMD" = up ] || usage
       PULL=1; shift ;;
@@ -165,6 +176,16 @@ trap 'exit 143' TERM
 unset COMPOSE_PATH_SEPARATOR
 export COMPOSE_PROJECT_NAME="$PROJECT"
 export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$HARNESS/docker-compose.verify.yml"
+# Ignore ambient Compose profiles; only this explicit option enables telemetry.
+unset COMPOSE_PROFILES
+export RAG_VERIFY_TELEMETRY="$TELEMETRY"
+export RAG_VERIFY_OTEL_ENABLED="$OTEL_ENABLED"
+export RAG_VERIFY_HARNESS="$HARNESS"
+export RAG_VERIFY_CHECKOUT="$CHECKOUT"
+if [ "$TELEMETRY" = 1 ]; then
+  export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.telemetry.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.telemetry.verify.yml"
+  export COMPOSE_PROFILES=telemetry
+fi
 export RAG_VERIFY_PORT="$PORT"
 export RAG_API="http://localhost:$PORT/api"
 export RAG_EXPECTED_PROXY_PORT="$PORT"
@@ -290,7 +311,7 @@ do_guard() {
     rm -f "$config"
     fail "docker compose config failed for $CHECKOUT."
   fi
-  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" <<'GUARDPY'
+  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" "$HARNESS" <<'GUARDPY'
 import json, os, sys
 
 checkout, exports, port, path = sys.argv[1:5]
@@ -337,8 +358,16 @@ if config.get('name') != 'rag-verify':
 
 # (h) service keys: only the base file's
 for svc, service in services.items():
-    if extra(service, SERVICE_KEYS):
-        problems.append(f"(h) service {svc!r} uses keys not allowed: {extra(service, SERVICE_KEYS)}")
+    allowed = SERVICE_KEYS
+    if svc in ('otel-collector', 'otel-capture'):
+        allowed = allowed | {'profiles', 'mem_limit', 'cpus', 'stop_grace_period', 'read_only', 'logging'}
+    if extra(service, allowed):
+        problems.append(f"(h) service {svc!r} uses keys not allowed: {extra(service, allowed)}")
+if {'otel-collector', 'otel-capture'} & services.keys():
+    import runpy
+    harness = sys.argv[5] if len(sys.argv) > 5 else checkout
+    guard = runpy.run_path(os.path.join(harness, 'scripts/verify/telemetry_guard.py'))
+    problems.extend(guard['check'](config, harness))
 
 # (i) builds: only a context and a Dockerfile, both inside the checkout
 for svc, service in services.items():
@@ -448,7 +477,10 @@ for svc, service in services.items():
             problems.append(f"(d) service {svc!r} mount {target!r} sets bind options")
         if mount.get('type') != 'bind' or (svc == 'api' and target == '/app/exports'):
             continue  # the api's exports: rule (f)
-        if not (os.path.isabs(source) and inside(source, checkout)):
+        trusted_asset = (
+            svc == 'otel-collector' and source == os.path.join(harness, 'scripts/verify', 'collector.yaml')
+            or svc == 'otel-capture' and source == os.path.join(harness, 'scripts/verify'))
+        if not (os.path.isabs(source) and (inside(source, checkout) or trusted_asset)):
             problems.append(f"(d) service {svc!r} binds {source!r}, outside the checkout")
         elif inside(source, checkout_exports) or inside(checkout_exports, source):
             problems.append(f"(d) service {svc!r} binds {source!r}, which is or holds the checkout's exports folder")
@@ -505,13 +537,23 @@ do_up() {
   done
   [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 within 60 seconds (last: $code)."
   printf '\nThe verify project is up at http://localhost:%s. To point commands at it:\n\n' "$PORT"
-  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT; do
+  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT RAG_VERIFY_TELEMETRY; do
     printf 'export %s=%q\n' "$var" "${!var}"
   done
+  if [ "$TELEMETRY" = 1 ]; then
+    for var in COMPOSE_PROFILES RAG_VERIFY_HARNESS RAG_VERIFY_CHECKOUT RAG_VERIFY_OTEL_ENABLED; do
+      printf 'export %s=%q\n' "$var" "${!var}"
+    done
+  fi
   printf '\n'
 }
 
 case "$CMD" in
+  telemetry-mode)
+    # Called only by a suite under the inherited lock and explicit opt-in.
+    [ "$TELEMETRY" = 1 ] || fail "telemetry-mode requires --telemetry"
+    do_guard
+    docker compose -p "$PROJECT" up -d --no-deps --no-build --pull never --wait --wait-timeout 120 api || fail "API telemetry reconfiguration failed" ;;
   down)
     do_down || exit 2 ;;
   up)

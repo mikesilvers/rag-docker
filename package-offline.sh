@@ -28,6 +28,9 @@ if [ -z "$TOP" ] || [ "$(cd "$TOP" && pwd -P)" != "$(pwd -P)" ]; then
   exit 1
 fi
 
+TELEMETRY=0
+if [ "${1:-}" = --telemetry ]; then TELEMETRY=1; shift; fi
+[ "$#" -le 1 ] || { echo "Usage: bash package-offline.sh [--telemetry] [output.tar]" >&2; exit 2; }
 OUT="${1:-rag-docker-offline.tar}"
 OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"   # absolute
 
@@ -69,6 +72,11 @@ git archive --format=tar HEAD | ( cd "$STAGE/rag-docker" && tar xf - )
 echo "==> Saving images (this is the slow part)"
 docker save "${IMAGES[@]}" | gzip > "$STAGE/rag-docker/offline/images.tar.gz"
 
+if [ "$TELEMETRY" = 1 ]; then
+  echo "==> Saving optional pinned collector (Python 3.11+ required)"
+  python3 scripts/collector_offline.py package "$STAGE/rag-docker/offline"
+fi
+
 echo "==> Exporting model weights from volume '$MODELVOL'"
 # Uses the ollama image itself as the tar helper: it ships /usr/bin/tar and is
 # already part of the bundle, so no extra image is needed here or on the target.
@@ -89,4 +97,8 @@ echo "  model weights:$(du -h "$STAGE/rag-docker/offline/ollama_models.tar.gz" |
 echo
 echo "On the target Mac (no internet required):"
 echo "  tar xf $(basename "$OUT") && cd rag-docker"
-echo "  bash install-offline.sh"
+if [ "$TELEMETRY" = 1 ]; then
+  echo "  bash install-offline.sh --telemetry"
+else
+  echo "  bash install-offline.sh"
+fi
