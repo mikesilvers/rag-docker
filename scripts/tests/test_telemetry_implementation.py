@@ -4,6 +4,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 FILES = [('api/main.py', 'python'), ('api/services/telemetry.py', 'python'), ('api/requirements.in', 'text'), ('api/requirements.txt', 'text'), ('scripts/tests/test_telemetry.py', 'python'), ('scripts/tests/test_telemetry_implementation.py', 'python'), ('scripts/tests/test_tracing.py', 'python'), ('scripts/tests/test_telemetry_operations.py', 'python'), ('scripts/verify/01_infrastructure.sh', 'bash'), ('scripts/verify/README.md', 'markdown'), ('api/services/batch_write.py', 'python'), ('api/services/chunker.py', 'python'), ('api/services/collection_recovery.py', 'python'), ('api/services/exporter.py', 'python'), ('api/services/goldstandard.py', 'python'), ('api/services/importer.py', 'python'), ('api/services/ingest_pipeline.py', 'python'), ('api/services/ollama_client.py', 'python'), ('api/services/packager.py', 'python'), ('api/services/rag_pipeline.py', 'python'), ('api/services/sources.py', 'python'), ('api/services/tuning.py', 'python'), ('api/services/weaviate_client.py', 'python')]
+FILES += [('scripts/verify/stack.sh', 'bash'), ('scripts/verify/service_inventory.py', 'python'), ('scripts/tests/test_service_inventory.py', 'python')]
+
+FILES += [('scripts/verify/telemetry_e2e.py', 'python'), ('scripts/verify/telemetry_guard.py', 'python'), ('scripts/collector_offline.py', 'python'), ('scripts/tests/test_collector.py', 'python'), ('scripts/tests/test_telemetry_capture.py', 'python'), ('docker-compose.telemetry.verify.yml', 'yaml'), ('package-offline.sh', 'bash'), ('install-offline.sh', 'bash')]
 
 class EmbeddedTelemetryTests(unittest.TestCase):
     def test_normative_telemetry_dependencies_match_inputs_and_lock(self):
@@ -21,8 +24,9 @@ class EmbeddedTelemetryTests(unittest.TestCase):
             with self.subTest(name=name):
                 fence = '````' if language == 'markdown' else '```'
                 # Existing dependency fences are intentionally plain text.
-                header = '### '+name+'\n\n'+fence
-                start = document.index('\n', document.index(header)+len(header))+1
+                header = '### '+name+'\n'
+                opening = document.index(fence, document.index(header)+len(header))
+                start = document.index('\n', opening)+1
                 end = document.index('\n'+fence+'\n', start)
                 self.assertEqual(document[start:end], (ROOT/name).read_text().rstrip('\n'))
 

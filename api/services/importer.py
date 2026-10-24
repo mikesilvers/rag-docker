@@ -36,9 +36,9 @@ from pathlib import Path
 from contextlib import nullcontext
 
 from config import settings
-from services import settings_store
 from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import goldstandard
+from services import ingest_config
 from services import model_bundle
 from services import packager
 from services import retrieval_config
@@ -653,22 +653,37 @@ def _read_retrieval_config(pkg: Path, original: str,
     return validated
 
 
+def _read_ingest_config(pkg: Path, original: str) -> dict | None:
+    """Validate once before live mutation; restore this normalized snapshot (#510).
+
+    Unusable settings would import and then break the collection's Chunking
+    Configuration page, so they refuse the import like retrieval settings do.
+    """
+    path = pkg / "ingest_config.json"
+    if not path.exists():
+        return None
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("Ingest settings must be a regular file")
+        return ingest_config.validate(json.loads(path.read_text()), original)
+    except (OSError, ValueError) as exc:
+        raise PackageError("PACKAGE_CORRUPT", "Invalid ingest settings.",
+                           {"file": "ingest_config.json"}) from exc
+
+
 def _restore_sidecars(target: str, pkg: Path, original: str,
                       validated_sessions: list[dict],
                       restored_sessions: list[dict] | None = None,
-                      validated_retrieval: dict | None = None) -> list[str]:
+                      validated_retrieval: dict | None = None,
+                      validated_ingest: dict | None = None) -> list[str]:
     """Sources, configs and gold-standard sessions. Returns notes for the job."""
     notes: list[str] = []
 
     sources.restore_package(pkg, target)
 
-    ingest_cfg = pkg / "ingest_config.json"
-    if ingest_cfg.is_file():
-        data = json.loads(ingest_cfg.read_text())
-        data["collection"] = target
-        out = Path(settings.upload_dir) / "ingest_configs"
-        out.mkdir(parents=True, exist_ok=True)
-        settings_store.publish(out / f"{_safe_file(target)}.json", data)
+    if validated_ingest is not None:
+        # The preflight snapshot, never the package file read again (#510).
+        ingest_config.save({**validated_ingest, "collection": target})
 
     if validated_retrieval is not None:
         data = {**validated_retrieval, "collection": target}
@@ -773,6 +788,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         validated_sessions = _read_goldstandard_sessions(pkg, original)
         retrieval_notes: list[str] = []
         validated_retrieval = _read_retrieval_config(pkg, original, retrieval_notes)
+        validated_ingest = _read_ingest_config(pkg, original)
 
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
@@ -838,7 +854,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             job.setdefault("restored_sessions", [])
             notes = model_notes + replace_notes + _restore_sidecars(
                 target, pkg, original, validated_sessions, job["restored_sessions"],
-                validated_retrieval) + retrieval_notes
+                validated_retrieval, validated_ingest) + retrieval_notes
 
             if staged and temp_collection:
                 try:

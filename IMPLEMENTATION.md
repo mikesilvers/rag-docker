@@ -856,6 +856,14 @@ class IngestConfig(BaseModel):
         return self
 
 
+class StoredIngestConfig(IngestConfig):
+    # Ingest settings in an import package (#510). A configuration saved before the
+    # #53 chunk bounds is imported as it is, never clamped, so these two fields keep
+    # the rules from before the bounds; every other save rule still applies.
+    chunk_size: PositiveSize = 1000
+    min_chunk_size: NonnegativeSize = 100
+
+
 class IngestConfigResponse(BaseModel):
     collection: str
     chunking_strategy: str
@@ -1528,6 +1536,7 @@ import re
 from pathlib import Path
 
 from config import settings
+from models.schemas import StoredIngestConfig
 from services import settings_store
 
 log = logging.getLogger(__name__)
@@ -1580,6 +1589,18 @@ def resolve(collection: str) -> tuple[dict, bool]:
     merged = {"collection": collection, **DEFAULTS, **saved}
     merged["collection"] = collection
     return merged, False
+
+
+def validate(config: dict, collection: str) -> dict:
+    """Check package settings against the save contract, bound to `collection` (#510).
+
+    Missing fields take the defaults and unknown fields are dropped, as on API
+    saves. A chunk_size or min_chunk_size from before the #53 bounds is kept as
+    it is. Raises ValueError for anything else the API would not save.
+    """
+    if not isinstance(config, dict):
+        raise ValueError("Ingest settings must be an object")
+    return {"collection": collection, **StoredIngestConfig.model_validate(config).model_dump()}
 
 
 def save(config: dict) -> dict:
@@ -7306,9 +7327,9 @@ from pathlib import Path
 from contextlib import nullcontext
 
 from config import settings
-from services import settings_store
 from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import goldstandard
+from services import ingest_config
 from services import model_bundle
 from services import packager
 from services import retrieval_config
@@ -7923,22 +7944,37 @@ def _read_retrieval_config(pkg: Path, original: str,
     return validated
 
 
+def _read_ingest_config(pkg: Path, original: str) -> dict | None:
+    """Validate once before live mutation; restore this normalized snapshot (#510).
+
+    Unusable settings would import and then break the collection's Chunking
+    Configuration page, so they refuse the import like retrieval settings do.
+    """
+    path = pkg / "ingest_config.json"
+    if not path.exists():
+        return None
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("Ingest settings must be a regular file")
+        return ingest_config.validate(json.loads(path.read_text()), original)
+    except (OSError, ValueError) as exc:
+        raise PackageError("PACKAGE_CORRUPT", "Invalid ingest settings.",
+                           {"file": "ingest_config.json"}) from exc
+
+
 def _restore_sidecars(target: str, pkg: Path, original: str,
                       validated_sessions: list[dict],
                       restored_sessions: list[dict] | None = None,
-                      validated_retrieval: dict | None = None) -> list[str]:
+                      validated_retrieval: dict | None = None,
+                      validated_ingest: dict | None = None) -> list[str]:
     """Sources, configs and gold-standard sessions. Returns notes for the job."""
     notes: list[str] = []
 
     sources.restore_package(pkg, target)
 
-    ingest_cfg = pkg / "ingest_config.json"
-    if ingest_cfg.is_file():
-        data = json.loads(ingest_cfg.read_text())
-        data["collection"] = target
-        out = Path(settings.upload_dir) / "ingest_configs"
-        out.mkdir(parents=True, exist_ok=True)
-        settings_store.publish(out / f"{_safe_file(target)}.json", data)
+    if validated_ingest is not None:
+        # The preflight snapshot, never the package file read again (#510).
+        ingest_config.save({**validated_ingest, "collection": target})
 
     if validated_retrieval is not None:
         data = {**validated_retrieval, "collection": target}
@@ -8043,6 +8079,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         validated_sessions = _read_goldstandard_sessions(pkg, original)
         retrieval_notes: list[str] = []
         validated_retrieval = _read_retrieval_config(pkg, original, retrieval_notes)
+        validated_ingest = _read_ingest_config(pkg, original)
 
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
@@ -8108,7 +8145,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             job.setdefault("restored_sessions", [])
             notes = model_notes + replace_notes + _restore_sidecars(
                 target, pkg, original, validated_sessions, job["restored_sessions"],
-                validated_retrieval) + retrieval_notes
+                validated_retrieval, validated_ingest) + retrieval_notes
 
             if staged and temp_collection:
                 try:
@@ -14082,7 +14119,11 @@ uv run --no-project --python 3.11 \
 `scripts/tests/test_retrieval_import.py` adds controlled digest-valid malformed
 retrieval package rejection before model, backend, recovery, or sidecar mutation;
 historical defaults/coercion and `ef` round trips; and generated Python literal
-regressions. Run it with the same API dependencies as the session import test.
+regressions. Its `IngestImportTests` do the same for `ingest_config.json`
+(E35, #510): malformed ingest settings are refused `PACKAGE_CORRUPT` in every
+conflict mode before any live change, and valid ones, including chunk sizes from
+before the #53 bounds, are restored from the checked snapshot and read back
+through `GET /ingest/config`. Run it with the same API dependencies as the session import test.
 `05_transfer.sh` registers it and `retrieval_settings.py` (E28), which submits
 15 malformed settings imports across abort/rename/replace and verifies live
 collection counts and saved settings are unchanged. The normal rename import
@@ -14967,6 +15008,56 @@ launchers use synthetic dependencies to prove handled outcomes preserve durable
 status. No live application content, external model or hosted collector is used.
 Exporter error and malformed-wire cases check bounded failure isolation;
 collector deployment acceptance remains #285.
+
+## Optional Collector acceptance (#285)
+
+```sh
+bash scripts/verify/stack.sh run
+bash scripts/verify/stack.sh run --telemetry
+# Targeted enabled acceptance, after the same guarded disposable startup:
+bash scripts/verify/stack.sh run --telemetry 15
+```
+
+Run these serially. The default run's registered `15_telemetry` suite verifies
+the API is disabled and explicitly reports enabled capture as unexercised.
+The enabled full run uses trusted overlays, the pinned private Collector and a
+bounded private protobuf receiver using the API image. Only the proxy publishes
+a host port. Narrow guard additions allow resource/log bounds only on these two
+services; live image, network, mount and port restrictions remain enforced.
+
+The suite recreates the disposable API through a guarded `telemetry-mode`
+command under the inherited lock to compare enabled/disabled settings. It submits
+real synthetic uploads, queries and concurrent export jobs; inspects actual
+received traces/metrics/logs, parent relationships, correlation and planted
+sentinels; stops/restarts only disposable services; and tests a slow receiver.
+Capture is memory-bounded (16 MiB, 1000 batches, 1 MiB/request, 16 handlers); overflow
+fails inspection. Raw payloads are synthetic and temporary. Summary output records
+five warm-ups and 20 timed health requests plus one query/two jobs per mode,
+latency distributions, sampled container stats and shutdown timing. Health timings
+include host guard overhead; samples are observations, not performance SLOs.
+`RAG_SKIP_SLOW=1` explicitly skips model-dependent enabled acceptance and cannot
+satisfy full telemetry acceptance. No real backend account or external egress is
+needed once dependencies/images/models are available.
+
+Suite 01 always runs capture/evidence regressions and offline/installer/package
+regressions in the built API image with network disabled, in both default and
+telemetry-enabled runs. Compose-only collector checks run on the host without
+starting services. Exact inventory and embedded-source checks also remain
+mandatory in suite 01.
+
+Standalone focused checks: `python3 scripts/tests/test_collector.py` (host stdlib and Compose
+configuration only), `python scripts/tests/test_telemetry_capture.py` (locked API
+dependencies), and the existing verify-stack tests. These complement, not replace,
+both full runs.
+
+Verification telemetry assets are absolute harness-owned paths, including when
+`--checkout` selects another source tree. Their exact read-only bind identities
+are checked; this preserves harness provenance, not a hostile-code sandbox.
+Protocol, version and export budgets are fixed in the verification overlay,
+independent of ambient operator telemetry variables. Before disabled-mode counting,
+the old API, Collector queues and capture handlers terminate; a fresh Collector
+and capture process isolate the zero-traffic observation from earlier exports.
+Malformed capture shapes fail as incomplete evidence, never partial success.
 ````
 
 ### scripts/verify/all.sh
@@ -15025,7 +15116,7 @@ printf '\nBuilding fixtures in %s\n' "$FIX"
 rm -rf "$FIX"; python3 ./fixtures.py "$FIX" >/dev/null
 export RAG_FIXTURES="$FIX"
 
-ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings)
+ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry)
 if [ "$#" -gt 0 ]; then
   SUITES=()
   for want in "$@"; do
@@ -15074,7 +15165,7 @@ exit "$overall"
 # Run the verification suite on a disposable compose project, never on the
 # live stack (#152).
 #
-#   bash scripts/verify/stack.sh run [--checkout DIR] [suite ...]
+#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry] [suite ...]
 #   bash scripts/verify/stack.sh up [--checkout DIR] [--pull]
 #   bash scripts/verify/stack.sh down
 #
@@ -15152,15 +15243,26 @@ private_problem() {
 # ── arguments, checked before any Docker command ─────────────────────────────
 [ "$#" -ge 1 ] || usage
 CMD="$1"; shift
-case "$CMD" in up|down|run) ;; *) usage ;; esac
+case "$CMD" in up|down|run|telemetry-mode) ;; *) usage ;; esac
+if [ "$CMD" = telemetry-mode ]; then
+  [ "${RAG_VERIFY_LOCK_HELD:-}" = 1 ] || fail "telemetry-mode requires an inherited verification lock"
+fi
 CHECKOUT="$HARNESS"
 PULL=""
+TELEMETRY=0
+OTEL_ENABLED=true
 ARGS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --checkout)
       [ "$CMD" != down ] && [ "$#" -ge 2 ] || usage
       CHECKOUT="$2"; shift 2 ;;
+    --telemetry)
+      [ "$CMD" != down ] || usage
+      TELEMETRY=1; shift ;;
+    --disabled)
+      [ "$CMD" = telemetry-mode ] || usage
+      OTEL_ENABLED=false; shift ;;
     --pull)
       [ "$CMD" = up ] || usage
       PULL=1; shift ;;
@@ -15236,6 +15338,16 @@ trap 'exit 143' TERM
 unset COMPOSE_PATH_SEPARATOR
 export COMPOSE_PROJECT_NAME="$PROJECT"
 export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$HARNESS/docker-compose.verify.yml"
+# Ignore ambient Compose profiles; only this explicit option enables telemetry.
+unset COMPOSE_PROFILES
+export RAG_VERIFY_TELEMETRY="$TELEMETRY"
+export RAG_VERIFY_OTEL_ENABLED="$OTEL_ENABLED"
+export RAG_VERIFY_HARNESS="$HARNESS"
+export RAG_VERIFY_CHECKOUT="$CHECKOUT"
+if [ "$TELEMETRY" = 1 ]; then
+  export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.telemetry.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.telemetry.verify.yml"
+  export COMPOSE_PROFILES=telemetry
+fi
 export RAG_VERIFY_PORT="$PORT"
 export RAG_API="http://localhost:$PORT/api"
 export RAG_EXPECTED_PROXY_PORT="$PORT"
@@ -15361,7 +15473,7 @@ do_guard() {
     rm -f "$config"
     fail "docker compose config failed for $CHECKOUT."
   fi
-  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" <<'GUARDPY'
+  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" "$HARNESS" <<'GUARDPY'
 import json, os, sys
 
 checkout, exports, port, path = sys.argv[1:5]
@@ -15408,8 +15520,16 @@ if config.get('name') != 'rag-verify':
 
 # (h) service keys: only the base file's
 for svc, service in services.items():
-    if extra(service, SERVICE_KEYS):
-        problems.append(f"(h) service {svc!r} uses keys not allowed: {extra(service, SERVICE_KEYS)}")
+    allowed = SERVICE_KEYS
+    if svc in ('otel-collector', 'otel-capture'):
+        allowed = allowed | {'profiles', 'mem_limit', 'cpus', 'stop_grace_period', 'read_only', 'logging'}
+    if extra(service, allowed):
+        problems.append(f"(h) service {svc!r} uses keys not allowed: {extra(service, allowed)}")
+if {'otel-collector', 'otel-capture'} & services.keys():
+    import runpy
+    harness = sys.argv[5] if len(sys.argv) > 5 else checkout
+    guard = runpy.run_path(os.path.join(harness, 'scripts/verify/telemetry_guard.py'))
+    problems.extend(guard['check'](config, harness))
 
 # (i) builds: only a context and a Dockerfile, both inside the checkout
 for svc, service in services.items():
@@ -15519,7 +15639,10 @@ for svc, service in services.items():
             problems.append(f"(d) service {svc!r} mount {target!r} sets bind options")
         if mount.get('type') != 'bind' or (svc == 'api' and target == '/app/exports'):
             continue  # the api's exports: rule (f)
-        if not (os.path.isabs(source) and inside(source, checkout)):
+        trusted_asset = (
+            svc == 'otel-collector' and source == os.path.join(harness, 'scripts/verify', 'collector.yaml')
+            or svc == 'otel-capture' and source == os.path.join(harness, 'scripts/verify'))
+        if not (os.path.isabs(source) and (inside(source, checkout) or trusted_asset)):
             problems.append(f"(d) service {svc!r} binds {source!r}, outside the checkout")
         elif inside(source, checkout_exports) or inside(checkout_exports, source):
             problems.append(f"(d) service {svc!r} binds {source!r}, which is or holds the checkout's exports folder")
@@ -15576,13 +15699,23 @@ do_up() {
   done
   [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 within 60 seconds (last: $code)."
   printf '\nThe verify project is up at http://localhost:%s. To point commands at it:\n\n' "$PORT"
-  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT; do
+  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT RAG_VERIFY_TELEMETRY; do
     printf 'export %s=%q\n' "$var" "${!var}"
   done
+  if [ "$TELEMETRY" = 1 ]; then
+    for var in COMPOSE_PROFILES RAG_VERIFY_HARNESS RAG_VERIFY_CHECKOUT RAG_VERIFY_OTEL_ENABLED; do
+      printf 'export %s=%q\n' "$var" "${!var}"
+    done
+  fi
   printf '\n'
 }
 
 case "$CMD" in
+  telemetry-mode)
+    # Called only by a suite under the inherited lock and explicit opt-in.
+    [ "$TELEMETRY" = 1 ] || fail "telemetry-mode requires --telemetry"
+    do_guard
+    docker compose -p "$PROJECT" up -d --no-deps --no-build --pull never --wait --wait-timeout 120 api || fail "API telemetry reconfiguration failed" ;;
   down)
     do_down || exit 2 ;;
   up)
@@ -16575,6 +16708,17 @@ check "OTel configuration, safe OTLP export and bounded lifecycle" $?
 check "OTel request, worker and dependency trace continuity" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_telemetry_operations.py)
 check "OTel operational metrics and sanitized correlated logs" $?
+# Collector evidence and packaging regressions run in both default and enabled
+# modes. Compose needs the host Docker CLI; Packager needs Git for its scratch
+# checkout. Neither class starts services (Packager stubs Docker).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_telemetry_capture.py)
+check "OTel capture evidence, identity and transition regressions" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo/scripts/tests "$(docker compose images -q api)" python -m unittest test_collector.Offline test_collector.Installer)
+check "OTel offline identity and installer regressions" $?
+python3 "$REPO_ROOT/scripts/tests/test_collector.py" Compose Packager
+check "OTel Compose isolation, verification configuration and package regressions" $?
+python3 "$REPO_ROOT/scripts/tests/test_service_inventory.py"
+check "exact default/telemetry infrastructure inventory policy" $?
 python3 "$REPO_ROOT/scripts/tests/test_telemetry_implementation.py"
 check "OTel embedded implementation stays synchronized" $?
 # Both distribution scripts in a scratch git repository, docker stubbed (#384).
@@ -16672,9 +16816,18 @@ for svc in api weaviate; do
   check_eq "$svc publishes nothing to the host" "$published" "0"
 done
 
-# ── five services, all reporting healthy where a healthcheck exists ──────────
-running=$( (cd "$REPO_ROOT" && docker compose ps --services --filter status=running) | grep -c .)
-check_eq "five services are running" "$running" "5"
+# ── exact service inventory for this guarded verification mode ──────────────
+# The default is exactly api/ollama/proxy/ui/weaviate. Only --telemetry adds
+# otel-collector and otel-capture; arbitrary five/seven services cannot pass.
+verify_service_inventory() {
+  (cd "$REPO_ROOT" && docker compose ps --services --filter status=running) > "$RAG_INFRA_TMP/vfy_running_services" || return 1
+  (cd "$REPO_ROOT" && docker compose ps --all --services) > "$RAG_INFRA_TMP/vfy_all_services" || return 1
+  python3 "$REPO_ROOT/scripts/verify/service_inventory.py" \
+    "$RAG_INFRA_TMP/vfy_compose.json" "$RAG_INFRA_TMP/vfy_running_services" "$RAG_INFRA_TMP/vfy_all_services" \
+    --mode "${RAG_VERIFY_TELEMETRY:-0}" --project "${COMPOSE_PROJECT_NAME:-}" --profiles "${COMPOSE_PROFILES:-}"
+}
+verify_service_inventory
+check "exact configured and running service inventory for verification mode" $?
 unhealthy=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Status}}') | grep -c 'unhealthy' || true)
 check_eq "no service reports unhealthy" "$unhealthy" "0"
 
@@ -16773,6 +16926,8 @@ elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   # Wait up to twice the limit, so a slow restart is still timed (#130).
   elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
   restart_timing_check "$restart_limit" "$elapsed"
+  verify_service_inventory
+  check "exact service inventory survives restart" $?
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_after.json"
   python3 -c "
 import json,sys,os
@@ -16863,6 +17018,8 @@ ENDPY
   elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
   [ -n "$elapsed" ]
   check "healthy again after a restart from the snapshot (took ${elapsed:-unknown}s)" $? "not healthy after $((restart_limit * 2))s"
+  verify_service_inventory
+  check "exact service inventory survives snapshot restart" $?
   # Weaviate logs the snapshot it started from on "raft node constructed".
   restored=$( (cd "$REPO_ROOT" && docker compose -p "$project" logs weaviate 2>/dev/null) | python3 -c "
 import json, sys
@@ -22910,6 +23067,9 @@ if [ -z "$TOP" ] || [ "$(cd "$TOP" && pwd -P)" != "$(pwd -P)" ]; then
   exit 1
 fi
 
+TELEMETRY=0
+if [ "${1:-}" = --telemetry ]; then TELEMETRY=1; shift; fi
+[ "$#" -le 1 ] || { echo "Usage: bash package-offline.sh [--telemetry] [output.tar]" >&2; exit 2; }
 OUT="${1:-rag-docker-offline.tar}"
 OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"   # absolute
 
@@ -22951,6 +23111,11 @@ git archive --format=tar HEAD | ( cd "$STAGE/rag-docker" && tar xf - )
 echo "==> Saving images (this is the slow part)"
 docker save "${IMAGES[@]}" | gzip > "$STAGE/rag-docker/offline/images.tar.gz"
 
+if [ "$TELEMETRY" = 1 ]; then
+  echo "==> Saving optional pinned collector (Python 3.11+ required)"
+  python3 scripts/collector_offline.py package "$STAGE/rag-docker/offline"
+fi
+
 echo "==> Exporting model weights from volume '$MODELVOL'"
 # Uses the ollama image itself as the tar helper: it ships /usr/bin/tar and is
 # already part of the bundle, so no extra image is needed here or on the target.
@@ -22971,7 +23136,11 @@ echo "  model weights:$(du -h "$STAGE/rag-docker/offline/ollama_models.tar.gz" |
 echo
 echo "On the target Mac (no internet required):"
 echo "  tar xf $(basename "$OUT") && cd rag-docker"
-echo "  bash install-offline.sh"
+if [ "$TELEMETRY" = 1 ]; then
+  echo "  bash install-offline.sh --telemetry"
+else
+  echo "  bash install-offline.sh"
+fi
 ```
 
 ### install-offline.sh
@@ -22998,6 +23167,19 @@ cd "$(dirname "$0")"
 [ -f offline/images.tar.gz ] || { echo "ERROR: offline/images.tar.gz missing. This is the source-only package, not the offline bundle (see package-offline.sh)." >&2; exit 1; }
 [ -f offline/ollama_models.tar.gz ] || { echo "ERROR: offline/ollama_models.tar.gz missing." >&2; exit 1; }
 
+TELEMETRY=0
+if [ "${1:-}" = --telemetry ]; then TELEMETRY=1; shift; fi
+[ "$#" = 0 ] || { echo "Usage: bash install-offline.sh [--telemetry]" >&2; exit 2; }
+if [ "$TELEMETRY" = 1 ]; then
+  # Validate bytes against tracked platform identities before docker load sees them.
+  COLLECTOR_STAGE="$(mktemp -d)"
+  trap 'rm -rf "$COLLECTOR_STAGE"' EXIT
+  COLLECTOR_ID="$(python3 scripts/collector_offline.py install offline --output "$COLLECTOR_STAGE/collector.tar")"
+  printf 'services:\n  otel-collector:\n    image: %s\n' "$COLLECTOR_ID" > "$COLLECTOR_STAGE/offline.yml"
+  export COMPOSE_FILE="$PWD/docker-compose.yml:$PWD/docker-compose.telemetry.yml:$COLLECTOR_STAGE/offline.yml"
+  export COMPOSE_PROFILES=telemetry
+fi
+
 docker info >/dev/null 2>&1 || { echo "ERROR: Docker is not running. Start Docker Desktop and retry." >&2; exit 1; }
 
 echo "==> Loading Docker images (no network used)"
@@ -23007,24 +23189,30 @@ echo "==> Restoring Ollama model weights"
 # `compose run` resolves the project's ollama_models volume for us, so this does
 # not depend on the directory name. The ollama image ships tar and was just
 # loaded above, so no extra image needs pulling.
-docker compose run --rm --no-deps --entrypoint sh \
+RESTORE_PULL=""
+[ "$TELEMETRY" = 0 ] || RESTORE_PULL="--pull=never"
+docker compose run --rm --no-deps ${RESTORE_PULL:+$RESTORE_PULL} --entrypoint sh \
   -v "$PWD/offline:/backup:ro" \
   ollama -c 'tar xzf /backup/ollama_models.tar.gz -C /root/.ollama && ls /root/.ollama'
 
 echo "==> Starting the stack (--no-build: nothing is compiled or pulled)"
-docker compose up -d --no-build
+if [ "$TELEMETRY" = 1 ]; then
+  docker compose up -d --no-build --pull never
+else
+  docker compose up -d --no-build
+fi
 
 echo
 echo "Waiting for services to report healthy..."
 for i in $(seq 1 60); do
   running=$(docker compose ps --services --filter status=running | wc -l | tr -d ' ')
-  [ "$running" = 5 ] && break
+  [ "$running" = "$((5 + TELEMETRY))" ] && break
   sleep 5
 done
 docker compose ps
 
 echo
-echo "If all five services are up, open http://localhost:8080"
+echo "If the requested services are up, open http://localhost:8080"
 echo "Verify the models were restored (no download should occur):"
 echo "  docker compose exec ollama ollama list"
 ```
@@ -25905,6 +26093,7 @@ class SettingsPersistenceTests(unittest.TestCase):
             pkg = root / 'package'
             pkg.mkdir()
             (pkg / 'ingest_config.json').write_text(json.dumps(incoming))
+            validated = importer._read_ingest_config(pkg, 'Original')
             path = ingest_config._path(old['collection'])
             before = path.read_bytes()
             entered = []
@@ -25916,11 +26105,13 @@ class SettingsPersistenceTests(unittest.TestCase):
             with patch.object(settings_store, '_write_lock', ObservedLock()), \
                  patch.object(Path, 'replace', side_effect=OSError('owned publication failure')):
                 with self.assertRaises(OSError):
-                    importer._restore_sidecars(old['collection'], pkg, 'Original', [])
+                    importer._restore_sidecars(old['collection'], pkg, 'Original', [],
+                                               validated_ingest=validated)
             self.assertEqual(entered, [True])
             self.assertEqual(path.read_bytes(), before)
             self.assertEqual(list(path.parent.glob('*.tmp')), [])
-            importer._restore_sidecars(old['collection'], pkg, 'Original', [])
+            importer._restore_sidecars(old['collection'], pkg, 'Original', [],
+                                       validated_ingest=validated)
             self.assertEqual(ingest_config.load(old['collection']), incoming)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
@@ -26122,9 +26313,11 @@ class SettingsPersistenceTests(unittest.TestCase):
             pkg = root / 'package'
             pkg.mkdir()
             (pkg / 'ingest_config.json').write_text(json.dumps(incoming))
+            validated = importer._read_ingest_config(pkg, 'Original')
             events = []
             with self.recorded(events):
-                importer._restore_sidecars(incoming['collection'], pkg, 'Original', [])
+                importer._restore_sidecars(incoming['collection'], pkg, 'Original', [],
+                                           validated_ingest=validated)
             after = self.after_replace(events)
             self.assertEqual([event[0] for event in after], ['open', 'fsync folder', 'close'], events)
             self.assertEqual(after[0][2], ingest_config._path(incoming['collection']).parent)
@@ -26590,7 +26783,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
 from config import settings
 from models.schemas import SaveRetrievalConfigBody
-from services import importer, model_bundle, packager, retrieval_config
+from services import importer, ingest_config, model_bundle, packager, retrieval_config
 
 
 INVALID = [None, [], 3, 'settings', {'top_k': '5; injected = True'},
@@ -27249,6 +27442,141 @@ class ModelTagFolderTests(unittest.TestCase):
         self.assertIsNone(self.installed('bar:y'))  # develop: bar:x's
         self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
         self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['bar:x'])
+
+
+# Ingest settings in a package (#510): the save contract, except that chunk_size and
+# min_chunk_size from before the #53 bounds are kept (SPECIFICATIONS.md section 8).
+INVALID_INGEST = [None, [], 3, 'settings', {'chunk_size': 'invalid'}, {'chunk_size': True},
+                  {'chunk_size': 0}, {'chunk_size': -1}, {'chunk_size': 1.5},
+                  {'chunking_strategy': 'unknown'}, {'chunk_overlap': -1},
+                  {'min_chunk_size': -1}, {'similarity_threshold': 1.5},
+                  {'similarity_threshold': float('nan')}, {'similarity_threshold': True},
+                  {'chunking_strategy': 'overlap', 'chunk_size': 200, 'chunk_overlap': 200}]
+
+
+class IngestImportTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.pkg = self.root / 'package'
+        self.pkg.mkdir()
+        self.uploads = self.root / 'uploads'
+        self.uploads.mkdir()
+        self.exports = self.root / 'exports'
+        self.exports.mkdir()
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        for key, value in [('upload_dir', self.uploads), ('exports_dir', self.exports),
+                           ('sources_dir', self.root / 'sources')]:
+            self.stack.enter_context(patch.object(settings, key, str(value)))
+        self.stack.enter_context(patch.object(ingest_config, '_DIR', None))
+        self.stack.enter_context(patch.object(retrieval_config, '_DIR', None))
+        self.stack.enter_context(patch.dict(importer._jobs, {}, clear=True))
+        self.stack.enter_context(patch.object(importer, '_log'))
+
+    def archive(self, data):
+        side = self.pkg / 'ingest_config.json'
+        if side.is_dir():
+            side.rmdir()
+        if data is not None:
+            side.write_text(data)
+        (self.pkg / 'chunks.jsonl').write_text('')
+        manifest = {'package_format': 1, 'collection': {'name': 'Corpus', 'chunk_count': 0},
+                    'embedding': {'model': settings.embed_model},
+                    'files': {p.name: 'sha256:' + packager.sha256_file(p)
+                              for p in self.pkg.iterdir() if p.is_file() and p.name != 'manifest.json'}}
+        (self.pkg / 'manifest.json').write_text(json.dumps(manifest))
+        with tarfile.open(self.exports / 'fixture.tar.gz', 'w:gz') as tar:
+            tar.add(self.pkg, arcname='package')
+
+    def served(self, collection):
+        from routers import ingest as ingest_router
+        import asyncio
+        return asyncio.run(ingest_router.get_ingest_config(collection)).model_dump()
+
+    def assert_refused_before_mutation(self):
+        saved = ingest_config._path('Corpus')
+        before = saved.read_bytes()
+        for conflict in ('abort', 'rename', 'replace'):
+            with self.subTest(conflict=conflict), ExitStack() as mocks:
+                operations = [mocks.enter_context(patch.object(module, name)) for module, name in [
+                    (importer, '_ensure_models'), (importer, '_build'),
+                    (importer.wc, '_collection_exists_sync'), (importer.wc, '_delete_collection_sync'),
+                    (importer.wc, 'get_client'), (importer, '_mark_started'),
+                    (importer.collection_recovery, 'begin'), (importer.sources, 'restore_package')]]
+                importer._jobs['test'] = {'status': 'queued'}
+                importer._run('test', 'fixture.tar.gz', conflict)
+                result = importer._jobs['test']
+                self.assertEqual(result['status'], 'failed', result)
+                self.assertEqual(result['error_code'], 'PACKAGE_CORRUPT', result)
+                self.assertEqual(result['error'], 'Invalid ingest settings.')
+                self.assertEqual(result['error_detail'], {'file': 'ingest_config.json'})
+                for operation in operations:
+                    operation.assert_not_called()
+                self.assertEqual(saved.read_bytes(), before)
+                self.assertIsNone(retrieval_config.load('Corpus'))
+                self.assertFalse((self.root / 'sources').exists())
+                self.assertFalse(list(self.uploads.glob('import-*')))
+
+    def test_digest_valid_bad_ingest_settings_refused_before_any_live_mutation(self):
+        # develop: imports as completed and publishes the raw file (#510).
+        ingest_config.save({**ingest_config.DEFAULTS, 'collection': 'Corpus', 'chunk_size': 900})
+        for data in [json.dumps(value) for value in INVALID_INGEST] + ['{']:
+            with self.subTest(data=data):
+                self.archive(data)
+                self.assert_refused_before_mutation()
+
+    def test_nonregular_ingest_settings_are_refused(self):
+        ingest_config.save({**ingest_config.DEFAULTS, 'collection': 'Corpus'})
+        self.archive(None)
+        (self.pkg / 'ingest_config.json').mkdir()
+        with self.assertRaises(packager.PackageError) as caught:
+            importer._read_ingest_config(self.pkg, 'Corpus')
+        self.assertEqual(caught.exception.code, 'PACKAGE_CORRUPT')
+        self.assertEqual(caught.exception.detail, {'file': 'ingest_config.json'})
+        self.assertIsNone(importer._read_ingest_config(self.root, 'Corpus'))
+
+    def test_valid_ingest_settings_import_and_are_served_unchanged(self):
+        full = {'chunking_strategy': 'semantic', 'chunk_size': 800, 'chunk_overlap': 0,
+                'similarity_threshold': 0.7, 'min_chunk_size': 40}
+        cases = [
+            (full, full),
+            ({}, dict(ingest_config.DEFAULTS)),
+            ({'collection': 'OldName', 'is_default': True, 'legacy_field': 'ignored',
+              'chunking_strategy': 'fixed', 'chunk_size': '150', 'chunk_overlap': '20',
+              'similarity_threshold': '0.5', 'min_chunk_size': '40'},
+             {'chunking_strategy': 'fixed', 'chunk_size': 150, 'chunk_overlap': 20,
+              'similarity_threshold': 0.5, 'min_chunk_size': 40}),
+            # Saved before the #53 bounds: served as it is, never clamped.
+            ({'chunking_strategy': 'fixed', 'chunk_size': 20, 'chunk_overlap': 10,
+              'similarity_threshold': None, 'min_chunk_size': 8000},
+             {'chunking_strategy': 'fixed', 'chunk_size': 20, 'chunk_overlap': 10,
+              'similarity_threshold': None, 'min_chunk_size': 8000}),
+        ]
+        for data, expected in cases:
+            with self.subTest(data=data):
+                self.archive(json.dumps(data))
+                with patch.object(importer, '_ensure_models', return_value=[]), \
+                     patch.object(importer.wc, '_collection_exists_sync', return_value=False), \
+                     patch.object(importer, '_build', return_value=0):
+                    importer._jobs['test'] = {'status': 'queued'}
+                    importer._run('test', 'fixture.tar.gz', 'abort')
+                self.assertEqual(importer._jobs['test']['status'], 'completed', importer._jobs['test'])
+                self.assertEqual(self.served('Corpus'),
+                                 {'collection': 'Corpus', **expected, 'is_default': False})
+                ingest_config.delete('Corpus')
+
+    def test_restore_uses_preflight_snapshot_and_rebinds_renamed_collection(self):
+        self.archive(json.dumps({'chunk_size': '800', 'collection': 'Corpus'}))
+        validated = importer._read_ingest_config(self.pkg, 'Corpus')
+        (self.pkg / 'ingest_config.json').write_text('{"chunk_size": "invalid"}')
+        with patch.object(importer.sources, 'restore_package'):
+            importer._restore_sidecars('Renamed', self.pkg, 'Corpus', [], validated_ingest=validated)
+        self.assertEqual(ingest_config.load('Renamed'), {**validated, 'collection': 'Renamed'})
+        self.assertEqual(validated['collection'], 'Corpus')
+        self.assertEqual(validated['chunk_size'], 800)
+
 
 if __name__ == '__main__':
     unittest.main()
@@ -32081,6 +32409,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 FILES = [('api/main.py', 'python'), ('api/services/telemetry.py', 'python'), ('api/requirements.in', 'text'), ('api/requirements.txt', 'text'), ('scripts/tests/test_telemetry.py', 'python'), ('scripts/tests/test_telemetry_implementation.py', 'python'), ('scripts/tests/test_tracing.py', 'python'), ('scripts/tests/test_telemetry_operations.py', 'python'), ('scripts/verify/01_infrastructure.sh', 'bash'), ('scripts/verify/README.md', 'markdown'), ('api/services/batch_write.py', 'python'), ('api/services/chunker.py', 'python'), ('api/services/collection_recovery.py', 'python'), ('api/services/exporter.py', 'python'), ('api/services/goldstandard.py', 'python'), ('api/services/importer.py', 'python'), ('api/services/ingest_pipeline.py', 'python'), ('api/services/ollama_client.py', 'python'), ('api/services/packager.py', 'python'), ('api/services/rag_pipeline.py', 'python'), ('api/services/sources.py', 'python'), ('api/services/tuning.py', 'python'), ('api/services/weaviate_client.py', 'python')]
+FILES += [('scripts/verify/stack.sh', 'bash'), ('scripts/verify/service_inventory.py', 'python'), ('scripts/tests/test_service_inventory.py', 'python')]
+
+FILES += [('scripts/verify/telemetry_e2e.py', 'python'), ('scripts/verify/telemetry_guard.py', 'python'), ('scripts/collector_offline.py', 'python'), ('scripts/tests/test_collector.py', 'python'), ('scripts/tests/test_telemetry_capture.py', 'python'), ('docker-compose.telemetry.verify.yml', 'yaml'), ('package-offline.sh', 'bash'), ('install-offline.sh', 'bash')]
 
 class EmbeddedTelemetryTests(unittest.TestCase):
     def test_normative_telemetry_dependencies_match_inputs_and_lock(self):
@@ -32098,8 +32429,9 @@ class EmbeddedTelemetryTests(unittest.TestCase):
             with self.subTest(name=name):
                 fence = '````' if language == 'markdown' else '```'
                 # Existing dependency fences are intentionally plain text.
-                header = '### '+name+'\n\n'+fence
-                start = document.index('\n', document.index(header)+len(header))+1
+                header = '### '+name+'\n'
+                opening = document.index(fence, document.index(header)+len(header))
+                start = document.index('\n', opening)+1
                 end = document.index('\n'+fence+'\n', start)
                 self.assertEqual(document[start:end], (ROOT/name).read_text().rstrip('\n'))
 
@@ -33449,6 +33781,1585 @@ class ProducerOperationsTests(unittest.IsolatedAsyncioTestCase):
 if __name__=='__main__':unittest.main()
 ```
 
+
+## Optional collector integration (#285)
+
+The telemetry overlay and profile wire the API to the private pinned Collector;
+operator setup, offline identity verification and bounds are in
+`telemetry/README.md`. `scripts/collector_offline.py` checks trusted platform
+config/layer hashes and sanitizes image archives before optional offline loading.
+The default Compose file and five-image path do not enable telemetry.
+
+`15_telemetry` is explicitly registered in the verification dispatcher. Enabled
+acceptance requires `stack.sh run --telemetry`, whose trusted overlay adds a
+bounded protobuf capture service using the existing API image. Configuration
+checks, focused synthetic tests and real disposable API/collector acceptance are
+separate evidence layers. The controller reports timings and resource samples;
+no production overhead result is implied by implementation or unit tests.
+
+
+### scripts/verify/service_inventory.py
+
+```python
+"""Exact service inventory for the default and guarded telemetry verify modes."""
+import argparse
+from collections import Counter
+import json
+from pathlib import Path
+
+BASE = frozenset(('api', 'ollama', 'proxy', 'ui', 'weaviate'))
+TELEMETRY = frozenset(('otel-collector', 'otel-capture'))
+
+
+def check(config, running, all_services, mode='0', project='', profiles=''):
+    if mode not in ('0', '1'):
+        return ['unknown telemetry verification mode']
+    if mode == '1' and (project != 'rag-verify' or config.get('name') != 'rag-verify'
+                        or 'telemetry' not in profiles.split(',')):
+        return ['telemetry inventory requires the guarded rag-verify project and profile']
+    expected = BASE | (TELEMETRY if mode == '1' else frozenset())
+    problems = []
+    if set(config.get('services', {})) != expected:
+        problems.append('configured service inventory differs from the selected verification mode')
+    # Counter equality rejects replacements, unexpected services and duplicate
+    # containers rather than merely accepting any five/seven running names.
+    wanted = Counter({name: 1 for name in expected})
+    if Counter(all_services) != wanted:
+        problems.append('project service inventory has missing, duplicate or unexpected services')
+    if Counter(running) != wanted:
+        problems.append('running service inventory differs from the required exact set')
+    return problems
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('config', type=Path)
+    parser.add_argument('running', type=Path)
+    parser.add_argument('all_services', type=Path)
+    parser.add_argument('--mode', default='0')
+    parser.add_argument('--project', default='')
+    parser.add_argument('--profiles', default='')
+    args = parser.parse_args()
+    problems = check(json.loads(args.config.read_text()), args.running.read_text().splitlines(),
+                     args.all_services.read_text().splitlines(), args.mode, args.project, args.profiles)
+    for problem in problems:
+        print(problem)
+    raise SystemExit(bool(problems))
+
+
+if __name__ == '__main__':
+    main()
+```
+
+
+### scripts/tests/test_service_inventory.py
+
+```python
+"""Default/optional infrastructure inventory acceptance without Docker."""
+import importlib.util
+from pathlib import Path
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+SPEC = importlib.util.spec_from_file_location('inventory', ROOT/'scripts/verify/service_inventory.py')
+INVENTORY = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(INVENTORY)
+
+
+class InventoryTests(unittest.TestCase):
+    def fixture(self, telemetry=False):
+        names = sorted(INVENTORY.BASE | (INVENTORY.TELEMETRY if telemetry else frozenset()))
+        config = {'name':'rag-verify', 'services':{name:{} for name in names}}
+        return config,names
+
+    def test_default_exact_five(self):
+        config,names = self.fixture()
+        self.assertEqual(INVENTORY.check(config,names,names),[])
+
+    def test_guarded_telemetry_exact_seven(self):
+        config,names = self.fixture(True)
+        self.assertEqual(INVENTORY.check(config,names,names,'1','rag-verify','telemetry'),[])
+
+    def test_same_count_replacement_does_not_pass(self):
+        for mode in (False,True):
+            with self.subTest(telemetry=mode):
+                config,names = self.fixture(mode)
+                replaced = ['unexpected' if n=='api' else n for n in names]
+                self.assertTrue(INVENTORY.check(config,replaced,replaced,str(int(mode)),'rag-verify','telemetry'))
+
+    def test_missing_stopped_duplicate_or_extra_service_is_refused(self):
+        config,names = self.fixture(True)
+        for running,all_services in [(names[:-1],names),(names,names+['orphan']),
+                                     (names+['api'],names+['api']), (names[:-1],names[:-1])]:
+            with self.subTest(running=running,all_services=all_services):
+                self.assertTrue(INVENTORY.check(config,running,all_services,'1','rag-verify','telemetry'))
+
+    def test_default_cannot_silently_accept_optional_services(self):
+        config,names = self.fixture(True)
+        self.assertTrue(INVENTORY.check(config,names,names))
+
+    def test_mode_requires_project_and_profile(self):
+        config,names = self.fixture(True)
+        for mode,project,profiles in [('1','rag-docker','telemetry'),('1','rag-verify',''),('anything','rag-verify','telemetry')]:
+            with self.subTest(mode=mode,project=project,profiles=profiles):
+                self.assertTrue(INVENTORY.check(config,names,names,mode,project,profiles))
+
+    def test_unexpected_configured_service_refused_even_when_not_running(self):
+        config,names = self.fixture(True)
+        config['services']['surprise'] = {}
+        self.assertTrue(INVENTORY.check(config,names,names,'1','rag-verify','telemetry'))
+
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
+
+### scripts/verify/telemetry_e2e.py
+
+```python
+"""Host controller for real disposable API -> Collector -> protobuf capture.
+
+Uses only stdlib on the host. The private sink decodes protobuf in the API image.
+Every mutation is limited to the explicit guarded rag-verify project.
+"""
+import base64
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+import json
+import os
+from pathlib import Path
+import statistics
+import runpy
+import threading
+import subprocess
+import time
+import urllib.request
+import uuid
+
+ROOT = Path(__file__).resolve().parents[2]
+API = os.environ.get('RAG_API', '')
+SCHEMA = runpy.run_path(str(ROOT / 'api/services/telemetry.py'))
+SENTINELS = ['OTEL285_SECRET_SENTINEL', 'OTEL285_CONTENT_SENTINEL', 'OTEL285_FILENAME_SENTINEL', 'OTEL285_PATH_SENTINEL']
+
+
+def owner():
+    subprocess.run(['bash', '-c', 'source "$1/scripts/verify/lock.sh"; _rag_lock_owner_ok',
+                    'telemetry-lock', str(ROOT)], check=True, stdout=subprocess.DEVNULL)
+
+
+def compose(*args, timeout=120, capture_stderr=False):
+    owner()
+    return subprocess.check_output(['docker', 'compose', '-p', 'rag-verify', *args],
+                                   text=True, timeout=timeout, stderr=subprocess.PIPE if capture_stderr else None)
+
+
+def safe_failure(exc):
+    """Only typed numeric diagnostics; never exporter output, URLs, bodies or argv."""
+    result = {'type': type(exc).__name__[:64]}
+    if isinstance(exc, subprocess.CalledProcessError):
+        result['exit_code'] = exc.returncode
+    elif isinstance(exc, subprocess.TimeoutExpired):
+        result['timeout_seconds'] = exc.timeout
+    elif isinstance(exc, urllib.error.HTTPError):
+        result['http_status'] = exc.code
+    return result
+
+
+def stats_snapshot(collector_running):
+    result = {}
+    # Compose stats accepts one SERVICE argument (unlike docker stats).
+    # Explicit per-service calls also establish which required sample was absent.
+    for service in ('api', 'otel-collector'):
+        if service == 'otel-collector' and not collector_running:
+            result[service] = {'state': 'stopped_by_test'}
+            continue
+        raw = compose('stats', '--no-stream', '--format', 'json', service,
+                      timeout=8, capture_stderr=True)
+        if len(raw) > 8192:
+            raise ValueError('oversized resource sample')
+        try:
+            rows = json.loads(raw)
+        except json.JSONDecodeError:
+            rows = [json.loads(line) for line in raw.splitlines() if line.strip()]
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+            raise ValueError('missing or ambiguous resource sample')
+        # Docker's stats fields contain measurements. Keep only the expected
+        # numeric display fields; container names and other metadata are unnecessary.
+        fields = ('CPUPerc', 'MemUsage', 'MemPerc', 'PIDs', 'BlockIO', 'NetIO')
+        sample = {k: rows[0][k] for k in fields if k in rows[0]}
+        if not all(k in sample for k in ('CPUPerc', 'MemUsage')):
+            raise ValueError('CPU or memory resource evidence missing')
+        if any(not isinstance(v, str) or len(v) > 128 for v in sample.values()):
+            raise ValueError('malformed resource measurement')
+        result[service] = sample
+    return result
+
+
+@contextmanager
+def resource_samples(collector_running):
+    measurements, failures = [], []
+    stopped = threading.Event()
+    def sample_stats():
+        while not stopped.is_set():
+            try:
+                measurements.append({'monotonic': time.monotonic(),
+                                     'stats': stats_snapshot(collector_running)})
+            except Exception as exc:
+                failures.append(safe_failure(exc))
+                return
+            stopped.wait(5)
+    sampler = threading.Thread(target=sample_stats, daemon=True)
+    sampler.start()
+    primary = None
+    try:
+        yield measurements
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        stopped.set()
+        sampler.join(20)
+        if sampler.is_alive():
+            failures.append({'type': 'SamplerJoinTimeout', 'timeout_seconds': 20})
+        if not measurements and not failures:
+            failures.append({'type': 'NoResourceSamples'})
+        if failures:
+            detail = 'resource sampling failed: ' + json.dumps(failures[:4], sort_keys=True)
+            if primary is not None:
+                primary.add_note(detail)
+            else:
+                raise AssertionError(detail) from None
+
+
+def cleanup(actions, primary=None):
+    failures = []
+    for stage, action in actions:
+        try:
+            action()
+        except Exception as exc:
+            failures.append({'stage': stage, **safe_failure(exc)})
+    if failures:
+        detail = 'telemetry cleanup failed: ' + json.dumps(failures[:4], sort_keys=True)
+        if primary is not None:
+            primary.add_note(detail)
+        else:
+            raise AssertionError(detail) from None
+
+
+def sink(path, post=False):
+    code = ('import urllib.request; print(urllib.request.urlopen(urllib.request.Request('
+            + repr('http://127.0.0.1:4319' + path) + ',method=' + repr('POST' if post else 'GET')
+            + '),timeout=10).read().decode())')
+    value = compose('exec', '-T', 'otel-capture', 'python', '-c', code)
+    return json.loads(value) if value.strip() else None
+
+
+def request(path, body=None, headers=None, method=None):
+    owner()
+    data = json.dumps(body).encode() if body is not None else None
+    h = {'Content-Type': 'application/json', 'Authorization': 'Bearer '+SENTINELS[0],
+         'Cookie': 'session='+SENTINELS[0], **(headers or {})}
+    with urllib.request.urlopen(urllib.request.Request(API+path, data=data, headers=h, method=method),
+                                timeout=600) as response:
+        return json.load(response)
+
+
+def trace_headers():
+    remote = uuid.uuid4().hex
+    return {'traceparent': f'00-{remote}-0123456789abcdef-01'}, base64.b64encode(bytes.fromhex(remote)).decode()
+
+
+def upload(collection):
+    owner()
+    h, remote = trace_headers()
+    boundary = uuid.uuid4().hex
+    fields = {'collection': collection, 'strategy': 'fixed', 'chunk_size': '200',
+              'chunk_overlap': '20', 'min_chunk_size': '20'}
+    chunks = []
+    for name, value in fields.items():
+        chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n')
+    chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="files"; filename="{SENTINELS[2]}.txt"\r\nContent-Type: text/plain\r\n\r\nManagers approve overtime. {SENTINELS[1]}. Synthetic path /private/{SENTINELS[3]}. The policy requires approval before work.\r\n--{boundary}--\r\n')
+    data = ''.join(chunks).encode()
+    with urllib.request.urlopen(urllib.request.Request(API+'/ingest/upload', data=data,
+            headers={**h, 'Content-Type': 'multipart/form-data; boundary='+boundary,
+                     'Authorization': 'Bearer '+SENTINELS[0]}), timeout=120) as r:
+        job = json.load(r)['job_id']
+    wait_job('/ingest/job/'+job)
+    return remote
+
+
+def wait_job(path):
+    deadline = time.monotonic()+900
+    while time.monotonic() < deadline:
+        data = request(path)
+        if data['status'] in ('completed', 'failed', 'cancelled'):
+            assert data['status'] == 'completed', 'synthetic job did not complete'
+            return
+        time.sleep(0.5)
+    raise AssertionError('synthetic job exceeded 900s')
+
+
+def export(collection):
+    h, remote = trace_headers()
+    job = request('/export', {'collection': collection, 'include_models': False}, h)['job_id']
+    wait_job('/export/job/'+job)
+    return remote
+
+
+def query(collection):
+    h, remote = trace_headers()
+    result = request('/query', {'question': 'Who approves overtime? '+SENTINELS[1],
+        'collection': collection, 'retrieval_mode': 'hnsw', 'top_k': 2, 'include_citations': False}, h)
+    assert result.get('answer', '').strip(), 'synthetic query has no answer'
+    return remote
+
+
+def records(snapshot, signal):
+    resource, scope, field = {'traces': ('resource_spans', 'scope_spans', 'spans'),
+        'logs': ('resource_logs', 'scope_logs', 'log_records'),
+        'metrics': ('resource_metrics', 'scope_metrics', 'metrics')}[signal]
+    assert isinstance(snapshot, dict), 'invalid capture snapshot'
+    batches = snapshot.get('batches')
+    assert isinstance(batches, list), 'invalid capture batches'
+    result = []
+    for batch in batches:
+        assert isinstance(batch, dict), 'invalid capture batch'
+        assert batch.get('signal') in ('traces', 'logs', 'metrics'), 'invalid capture signal'
+        data = batch.get('data')
+        assert isinstance(data, dict), 'invalid capture data'
+        if batch['signal'] != signal:
+            continue
+        resources = data.get(resource, [])
+        assert isinstance(resources, list), 'invalid capture resources'
+        for res in resources:
+            assert isinstance(res, dict), 'invalid capture resource'
+            scopes = res.get(scope, [])
+            assert isinstance(scopes, list), 'invalid capture scopes'
+            for sc in scopes:
+                assert isinstance(sc, dict), 'invalid capture scope'
+                rows = sc.get(field, [])
+                assert isinstance(rows, list) and all(isinstance(row, dict) for row in rows), 'invalid capture records'
+                result.extend(rows)
+    return result
+
+
+def inspect(snapshot, requests):
+    try:
+        return inspect_records(snapshot, requests)
+    except (TypeError, AttributeError, KeyError) as exc:
+        raise AssertionError('invalid capture evidence shape') from None
+
+
+def inspect_records(snapshot, requests):
+    assert isinstance(snapshot, dict), 'invalid capture snapshot'
+    assert snapshot['overflow'] == 0, 'capture overflow: inspection incomplete'
+    wire = json.dumps(snapshot)
+    assert all(s not in wire for s in SENTINELS), 'content/credential sentinel exported'
+    spans, logs, metrics = (records(snapshot, s) for s in ('traces', 'logs', 'metrics'))
+    identities = [(span['trace_id'], span['span_id']) for span in spans]
+    assert len(set(identities)) == len(identities), 'duplicate received span identity'
+    for item in [*spans, *logs]:
+        if 'name' in item:
+            assert item['name'] in SCHEMA['SPAN_NAMES'], 'unsafe span name'
+        if 'body' in item:
+            assert item['body'].get('string_value') in SCHEMA['LOG_BODIES'], 'unsafe log body'
+        for attr in item.get('attributes', []):
+            key, value = attr['key'], attr['value'].get('string_value')
+            if key == 'rag.job_token':
+                import re
+                assert re.fullmatch('[0-9a-f]{32}', value or '')
+            else:
+                assert value in SCHEMA['ENUMS'].get(key, ()), 'unsafe trace/log attribute'
+    names = {m['name'] for m in metrics}
+    assert names <= SCHEMA['METRIC_NAMES'], 'unsafe metric name'
+    assert {'rag.api.requests', 'rag.api.duration', 'rag.dependency.calls', 'rag.job.completed'} <= names
+    for metric in metrics:
+        expected_kind = 'histogram' if SCHEMA['METRICS'][metric['name']][0] == 'create_histogram' else 'sum'
+        assert expected_kind in metric, 'metric aggregation schema mismatch'
+        assert any(metric.get(k, {}).get('data_points') for k in ('sum', 'histogram')), 'empty metric payload'
+        for kind in ('sum', 'histogram'):
+            for point in metric.get(kind, {}).get('data_points', []):
+                assert not point.get('exemplars'), 'unexpected exemplar identity'
+                assert {a['key'] for a in point.get('attributes', [])} == set(SCHEMA['METRICS'][metric['name']][2]), 'metric label schema mismatch'
+                for attr in point.get('attributes', []):
+                    assert attr['key'] in SCHEMA['METRICS'][metric['name']][2]
+                    assert attr['value'].get('string_value') in SCHEMA['metric_values'](metric['name'], attr['key'])
+    roots, job_tokens = [], []
+    for remote, operation in requests:
+        candidates = [s for s in spans if any(l.get('trace_id') == remote for l in s.get('links', []))]
+        assert len(candidates) == 1, f'expected one linked request root for {operation}'
+        root = candidates[0]
+        roots.append(root['trace_id'])
+        tree = {s['span_id']: s for s in spans if s['trace_id'] == root['trace_id']}
+        target = [s for s in tree.values() if s['name'] == operation]
+        assert target, f'missing {operation} worker/operation span'
+        for item in target:
+            seen = set()
+            node = item
+            while node['span_id'] != root['span_id']:
+                assert node['span_id'] not in seen, 'cyclic span tree'
+                seen.add(node['span_id'])
+                node = tree[node['parent_span_id']]
+            correlated = [l for l in logs if l.get('trace_id') == item['trace_id']
+                          and l.get('span_id') == item['span_id']]
+            if operation != 'rag.query':
+                job_logs = [l for l in correlated if l.get('body', {}).get('string_value') == 'rag.job.completed']
+                assert job_logs, 'missing correlated job completion'
+                tokens = {a['value']['string_value'] for l in job_logs for a in l.get('attributes', [])
+                          if a['key'] == 'rag.job_token'}
+                assert len(tokens) == 1, 'job has no stable generated correlation token'
+                token = tokens.pop()
+                job_tokens.append(token)
+                for log in logs:
+                    if log.get('trace_id') == item['trace_id']:
+                        for attr in log.get('attributes', []):
+                            if attr['key'] == 'rag.job_token':
+                                assert attr['value']['string_value'] == token, 'job context crossed trace trees'
+        dependencies = [s for s in tree.values() if s['name'].startswith(('ollama.', 'weaviate.'))]
+        assert dependencies, 'missing dependency spans'
+        for operation_span in target:
+            connected = False
+            for dependency in dependencies:
+                cursor, visited = dependency, set()
+                while cursor.get('parent_span_id') in tree and cursor['span_id'] not in visited:
+                    visited.add(cursor['span_id'])
+                    cursor = tree[cursor['parent_span_id']]
+                    if cursor['span_id'] == operation_span['span_id']:
+                        connected = True
+                        break
+            assert connected, 'dependency has no parent chain through operation/worker'
+        assert any(l.get('trace_id') == root['trace_id'] and l.get('span_id') == root['span_id']
+                   and l.get('body', {}).get('string_value') == 'rag.api.completed' for l in logs)
+    assert len(roots) == len(set(roots)), 'concurrent requests share a local trace'
+    assert len(job_tokens) == len(set(job_tokens)), 'concurrent jobs share a correlation token'
+
+
+def await_capture(expected):
+    deadline = time.monotonic()+30
+    last = None
+    while time.monotonic() < deadline:
+        data = sink('/snapshot')
+        try:
+            inspect(data, expected)
+            return data
+        except (AssertionError, KeyError) as exc:
+            last = exc
+        time.sleep(1)
+    raise AssertionError(f'capture incomplete: {last}')
+
+
+def enabled(value):
+    owner()
+    harness = os.environ['RAG_VERIFY_HARNESS']
+    args = ['bash', harness+'/scripts/verify/stack.sh', 'telemetry-mode', '--telemetry',
+            '--checkout', os.environ['RAG_VERIFY_CHECKOUT']]
+    if not value:
+        args.append('--disabled')
+    subprocess.run(args, check=True, timeout=150, stdout=subprocess.DEVNULL)
+
+
+def transition(mode):
+    enabled(mode != 'disabled')
+    if mode == 'disabled':
+        # API replacement terminates the old producer. Terminate both the old
+        # collector queues and capture handlers before opening the zero-traffic
+        # window; elapsed quiet time alone cannot prove a drained pipeline.
+        compose('stop', '-t', '10', 'otel-collector')
+        compose('restart', '-t', '10', 'otel-capture')
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                sink('/reset', True)
+                break
+            except (OSError, subprocess.SubprocessError):
+                if time.monotonic() >= deadline:
+                    raise AssertionError('capture unavailable after disabled transition') from None
+                time.sleep(0.2)
+        compose('start', 'otel-collector')
+    else:
+        time.sleep(3)
+        sink('/reset', True)
+
+
+def samples(collections):
+    for _ in range(5):
+        request('/health')
+    durations = []
+    for _ in range(20):
+        start = time.monotonic()
+        request('/health')
+        durations.append(time.monotonic()-start)
+    start = time.monotonic()
+    q = query(collections[0])
+    query_seconds = time.monotonic()-start
+    start = time.monotonic()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = list(pool.map(export, collections))
+    return {'health_samples_seconds': durations, 'health_median_seconds': statistics.median(durations),
+            'health_max_seconds': max(durations), 'query_seconds': query_seconds,
+            'two_jobs_seconds': time.monotonic()-start}, [(q, 'rag.query'), *[(x, 'rag.export') for x in jobs]]
+
+
+def main():
+    assert os.environ.get('COMPOSE_PROJECT_NAME') == 'rag-verify'
+    assert os.environ.get('RAG_VERIFY_TELEMETRY') == '1'
+    assert API.startswith('http://localhost:') and API != 'http://localhost:8080/api'
+    owner()
+    config = json.loads(compose('config', '--format', 'json'))
+    assert config['name'] == 'rag-verify'
+    for service in ('otel-collector', 'otel-capture'):
+        assert not config['services'][service].get('ports')
+        cid = compose('ps', '-q', service).strip()
+        assert cid
+        runtime = json.loads(subprocess.check_output(['docker', 'inspect', cid]))[0]
+        assert not runtime['HostConfig']['PortBindings']
+        assert runtime['Config']['Labels']['com.docker.compose.project'] == 'rag-verify'
+    actual = compose('exec', '-T', 'api', 'python', '-c',
+        'import os; assert os.environ["RAG_OTEL_ENABLED"] == "true"; assert os.environ["RAG_OTEL_ENDPOINT"] == "http://otel-collector:4318"')
+    collections = ['VfyOtel'+uuid.uuid4().hex[:12] for _ in range(2)]
+    report = {'workload': '5 warm-up +20 timed health requests,1 real query,2 concurrent export jobs per mode',
+              'limits': 'small synthetic sample; health timings include host lock checks; no production SLO claim',
+              'modes': {}}
+    primary = None
+    try:
+        for c in collections:
+            request('/collections', {'name': c, 'index_type': 'hnsw', 'distance_metric': 'cosine',
+                    'hnsw_config': {'efConstruction': 128, 'maxConnections': 64, 'ef': 64}})
+        sink('/reset', True)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            ingest = list(pool.map(upload, collections))
+        await_capture([(r, 'rag.ingest') for r in ingest])
+        for mode in ('healthy', 'disabled', 'unavailable', 'slow'):
+            transition(mode)
+            if mode == 'unavailable':
+                compose('stop', '-t', '10', 'otel-collector')
+            if mode == 'slow':
+                sink('/slow', True)
+            with resource_samples(mode != 'unavailable') as statistics_samples:
+                result, expected = samples(collections)
+            result['container_stats_samples'] = statistics_samples
+            if mode == 'healthy':
+                captured = await_capture(expected)
+                result['captured_batches'] = len(captured['batches'])
+            elif mode == 'disabled':
+                time.sleep(4)
+                assert sink('/snapshot')['requests'] == 0, 'disabled application exported telemetry'
+            report['modes'][mode] = result
+            if mode == 'unavailable':
+                compose('start', 'otel-collector')
+            if mode == 'slow':
+                sink('/healthy', True)
+        # Healthy final buffered work, bounded stop and clean fresh request trees.
+        time.sleep(12)
+        assert all(s not in json.dumps(sink('/snapshot')) for s in SENTINELS), 'outage recovery leaked sentinel'
+        sink('/reset', True)
+        remote = query(collections[0])
+        start = time.monotonic()
+        compose('stop', '-t', '10', 'api')
+        report['api_stop_seconds'] = time.monotonic()-start
+        assert report['api_stop_seconds'] < 15
+        await_capture([(remote, 'rag.query')])
+        compose('start', 'api')
+        compose('restart', '-t', '10', 'otel-collector')
+        deadline = time.monotonic()+120
+        while True:
+            try:
+                request('/health')
+                break
+            except Exception:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(1)
+        time.sleep(3)
+        sink('/reset', True)
+        _, expected = samples(collections)
+        await_capture(expected)
+        print(json.dumps(report, indent=2))
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        cleanup([('receiver', lambda: sink('/healthy', True)),
+                 ('collector', lambda: compose('start', 'otel-collector')),
+                 ('api_mode', lambda: enabled(True)),
+                 *[('collection', lambda c=c: request('/collections/'+c+'?confirm=true', method='DELETE'))
+                   for c in collections]], primary)
+
+
+if __name__ == '__main__':
+    main()
+```
+
+
+### scripts/verify/telemetry_guard.py
+
+```python
+"""Additional service-specific restrictions for the optional disposable collector."""
+import json
+from pathlib import Path
+
+KEYS = {'profiles', 'mem_limit', 'cpus', 'stop_grace_period', 'read_only', 'logging'}
+SERVICES = {'otel-collector', 'otel-capture'}
+
+
+def check(config, root):
+    problems = []
+    services = config['services']
+    pin = json.loads((Path(root) / 'telemetry/image.json').read_text())['image']
+    for name in SERVICES & services.keys():
+        svc = services[name]
+        expected_image = pin if name == 'otel-collector' else 'rag-verify-api:latest'
+        if svc.get('image') != expected_image or 'build' in svc:
+            problems.append(f'{name}: unexpected telemetry image/build')
+        if (svc.get('profiles') != ['telemetry'] or str(svc.get('mem_limit')) != '268435456'
+                or svc.get('cpus') != 0.5 or svc.get('stop_grace_period') != '10s'
+                or svc.get('read_only') is not True):
+            problems.append(f'{name}: telemetry limits differ from approved bounds')
+        if svc.get('logging') != {'driver': 'json-file', 'options': {'max-size': '5m', 'max-file': '2'}}:
+            problems.append(f'{name}: unbounded telemetry logs')
+        expected_command = (['--config=/etc/otelcol/config.yaml'] if name == 'otel-collector'
+                            else ['python', '/verify/telemetry_capture.py'])
+        if svc.get('command') != expected_command or svc.get('entrypoint') is not None:
+            problems.append(f'{name}: telemetry command differs from harness contract')
+        expected_target = '/etc/otelcol/config.yaml' if name == 'otel-collector' else '/verify'
+        expected_source = Path(root) / 'scripts/verify'
+        if name == 'otel-collector':
+            expected_source /= 'collector.yaml'
+        mounts = [m for m in svc.get('volumes', []) if m.get('type') == 'bind']
+        if (len(mounts) != 1 or mounts[0].get('target') != expected_target
+                or mounts[0].get('source') != str(expected_source)
+                or Path(mounts[0].get('source', '/')).resolve() != expected_source
+                or mounts[0].get('read_only') is not True):
+            problems.append(f'{name}: expected exact read-only harness asset')
+        if svc.get('ports') or svc.get('depends_on'):
+            problems.append(f'{name}: telemetry has published ports/dependencies')
+    for name, svc in services.items():
+        if name not in SERVICES and SERVICES & set(svc.get('depends_on') or {}):
+            problems.append(f'{name}: collector is in the application dependency chain')
+    return problems
+```
+
+
+### scripts/collector_offline.py
+
+```python
+"""Offline collector identity validation; package metadata never selects an image.
+
+The tracked pin/config-ID allow-list is the trust root. Reconstruct a minimal
+Docker archive from hash-checked config and layers before loading: untrusted OCI
+indexes, repository tags, and unrelated image records never reach docker load.
+"""
+import argparse
+import hashlib
+import gzip
+import io
+import json
+from pathlib import Path
+import subprocess
+import tarfile
+import tempfile
+import re
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+PIN = json.loads((ROOT / 'telemetry/image.json').read_text())
+LIMIT = 512 * 1024 * 1024
+
+
+def sha(data):
+    return 'sha256:' + hashlib.sha256(data).hexdigest()
+
+
+def read_member(archive, name, limit=LIMIT):
+    if not isinstance(name, str) or not name:
+        raise ValueError('invalid collector member reference')
+    try:
+        member = archive.getmember(name)
+    except KeyError:
+        raise ValueError('missing collector archive member') from None
+    if not member.isfile() or member.size > limit:
+        raise ValueError('collector archive member is not a bounded regular file')
+    return archive.extractfile(member).read()
+
+
+def sanitize(source, destination, architecture, *, tag=None):
+    try:
+        return _sanitize(source, destination, architecture, tag=tag)
+    except tarfile.TarError:
+        raise ValueError("invalid collector TAR archive") from None
+
+
+def _sanitize(source, destination, architecture, *, tag=None):
+    expected = PIN['config_ids'][architecture]
+    if Path(source).stat().st_size > LIMIT:
+        raise ValueError('collector archive is oversized')
+    with tarfile.open(source, 'r:') as archive:
+        entries, total = [], 0
+        for member in archive:
+            entries.append(member)
+            total += member.size
+            if len(entries) > 40 or total > LIMIT:
+                raise ValueError('collector archive is oversized')
+        # tarfile accepts EOF without end markers and ignores bytes after them.
+        # Docker save produces an uncompressed TAR with two zero end blocks.
+        with Path(source).open('rb') as raw:
+            raw.seek(archive.offset)
+            tail = raw.read()
+        if len(tail) < 1024 or len(tail) % 512 or any(tail):
+            raise ValueError('invalid collector archive terminator/trailing bytes')
+        if len({e.name for e in entries}) != len(entries):
+            raise ValueError('duplicate collector archive members')
+        manifest = json.loads(read_member(archive, 'manifest.json', 65536))
+        if not isinstance(manifest, list) or len(manifest) != 1:
+            raise ValueError('expected exactly one collector image')
+        image = manifest[0]
+        if (not isinstance(image, dict) or not isinstance(image.get('Config'), str)
+                or not image['Config'] or not isinstance(image.get('Layers'), list)
+                or not all(isinstance(name, str) and name for name in image['Layers'])):
+            raise ValueError('invalid collector image manifest')
+        config = read_member(archive, image['Config'], 65536)
+        if sha(config) != expected:
+            raise ValueError('collector image differs from trusted platform pin')
+        parsed = json.loads(config)
+        if parsed['architecture'] != architecture or parsed['os'] != 'linux':
+            raise ValueError('collector platform mismatch')
+        diff_ids = parsed['rootfs']['diff_ids']
+        if len(image['Layers']) != len(diff_ids):
+            raise ValueError('collector layer count mismatch')
+        # Verify all bytes before producing an archive Docker will see.
+        layers = []
+        expanded = 0
+        for name, digest in zip(image['Layers'], diff_ids):
+            data = read_member(archive, name)
+            # containerd saves compressed OCI blobs; classic Docker saves TARs.
+            # diff_ids authenticate uncompressed layer bytes in either format.
+            if data.startswith(b'\x1f\x8b'):
+                try:
+                    with gzip.GzipFile(fileobj=io.BytesIO(data)) as compressed:
+                        data = compressed.read(LIMIT - expanded + 1)
+                except (OSError, EOFError):
+                    raise ValueError('invalid compressed collector layer') from None
+            expanded += len(data)
+            if expanded > LIMIT:
+                raise ValueError('expanded collector layers are oversized')
+            if sha(data) != digest:
+                raise ValueError('collector layer differs from trusted image config')
+            layers.append(data)
+    clean = {'Config': 'config.json', 'RepoTags': [tag] if tag else None,
+             'Layers': [f'layer-{i}.tar' for i in range(len(layers))]}
+    with tarfile.open(destination, 'w') as out:
+        for name, data in [('config.json', config), ('manifest.json', json.dumps([clean]).encode()),
+                           *zip(clean['Layers'], layers)]:
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            out.addfile(info, io.BytesIO(data))
+    return expected
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('mode', choices=['package', 'prepare', 'install'])
+    parser.add_argument('folder', type=Path)
+    parser.add_argument('--output', type=Path)
+    args = parser.parse_args()
+    if args.mode == 'package':
+        inspected = json.loads(subprocess.check_output(['docker', 'image', 'inspect', PIN['image']]))[0]
+        arch = inspected['Architecture']
+        if arch not in PIN['config_ids'] or inspected['Os'] != 'linux':
+            raise ValueError('local collector does not match trusted platform pin')
+        target = args.folder / 'collector.tar'
+        # Local Id can be a config or index digest, depending on Docker's store.
+        # Only the saved config/layer bytes establish the trusted identity.
+        with tempfile.TemporaryDirectory() as stage:
+            saved = Path(stage) / 'saved.tar'
+            subprocess.run(['docker', 'image', 'save', '-o', str(saved), PIN['image']], check=True)
+            sanitize(saved, target, arch)
+        with target.open('rb') as stream:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        metadata = {'architecture': arch, 'archive_sha256': digest}
+        (args.folder / 'collector.json').write_text(json.dumps(metadata) + '\n')
+    else:
+        if args.output is None:
+            parser.error('--output is required for prepare')
+        architecture = subprocess.check_output(['docker', 'info', '--format', '{{.Architecture}}'], text=True).strip()
+        architecture = {'aarch64': 'arm64', 'x86_64': 'amd64'}.get(architecture, architecture)
+        if architecture not in PIN['config_ids']:
+            raise ValueError('offline collector supports linux amd64/arm64 only')
+        metadata_path = args.folder / 'collector.json'
+        if metadata_path.stat().st_size > 4096:
+            raise ValueError('collector metadata is oversized')
+        metadata = json.loads(metadata_path.read_text())
+        if not isinstance(metadata, dict):
+            raise ValueError('invalid collector metadata object')
+        target = args.folder / 'collector.tar'
+        if target.stat().st_size > LIMIT:
+            raise ValueError('collector archive is oversized')
+        with target.open('rb') as stream:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        if metadata.get('architecture') != architecture or metadata.get('archive_sha256') != digest:
+            raise ValueError('collector archive checksum/platform mismatch')
+        if args.mode == 'prepare':
+            print(sanitize(target, args.output, architecture))
+        else:
+            # A locally generated tag locates the loaded image on both stores.
+            # Never retain a tag supplied by the offline archive.
+            tag = 'rag-offline-collector:' + PIN['config_ids'][architecture].split(':')[1]
+            sanitize(target, args.output, architecture, tag=tag)
+            subprocess.run(['docker', 'load', '-i', str(args.output)], check=True, stdout=sys.stderr)
+            identity = subprocess.check_output(
+                ['docker', 'image', 'inspect', tag, '--format', '{{.Id}}'], text=True).strip()
+            if not re.fullmatch(r'sha256:[0-9a-f]{64}', identity):
+                raise ValueError('invalid loaded collector identity')
+            # Check the exact immutable reference Compose will use, not the tag.
+            with tempfile.TemporaryDirectory() as stage:
+                saved = Path(stage) / 'loaded.tar'
+                subprocess.run(['docker', 'image', 'save', '-o', str(saved), identity], check=True)
+                sanitize(saved, Path(stage) / 'checked.tar', architecture)
+            print(identity)
+
+
+if __name__ == '__main__':
+    main()
+```
+
+
+### scripts/tests/test_collector.py
+
+```python
+"""Focused optional collector checks. Host stdlib plus Docker Compose config only.
+No application container is started by these checks.
+"""
+import copy
+import hashlib
+import gzip
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tarfile
+import tempfile
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, ROOT / path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def archive(path, config, layer=b'synthetic layer', tags=None):
+    with tarfile.open(path, 'w') as tar:
+        data = {'config': config, 'layer': layer,
+                'manifest.json': json.dumps([{'Config': 'config', 'Layers': ['layer'], 'RepoTags': tags}]).encode(),
+                'index.json': b'{"untrusted":"must not pass to Docker"}'}
+        for name, body in data.items():
+            item = tarfile.TarInfo(name); item.size = len(body)
+            tar.addfile(item, io.BytesIO(body))
+
+
+class Offline(unittest.TestCase):
+    def setUp(self):
+        self.module = load('collector_offline', 'scripts/collector_offline.py')
+        self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.input = Path(self.temp.name) / 'input.tar'
+        self.output = Path(self.temp.name) / 'output.tar'
+        self.config = json.dumps({'architecture': 'arm64', 'os': 'linux',
+            'rootfs': {'diff_ids': [self.module.sha(b'synthetic layer')]}}).encode()
+        self.module.PIN = {'config_ids': {'arm64': self.module.sha(self.config)}}
+
+    def test_verified_bytes_strip_untrusted_tags_and_index(self):
+        archive(self.input, self.config, tags=['rag-docker-api:latest'])
+        expected = self.module.sanitize(self.input, self.output, 'arm64')
+        self.assertEqual(expected, self.module.sha(self.config))
+        with tarfile.open(self.output) as tar:
+            self.assertEqual(set(tar.getnames()), {'config.json', 'manifest.json', 'layer-0.tar'})
+            manifest = json.load(tar.extractfile('manifest.json'))
+            self.assertIsNone(manifest[0]['RepoTags'])
+
+    def test_layer_tampering_rejected_before_output(self):
+        archive(self.input, self.config, b'tampered')
+        with self.assertRaisesRegex(ValueError, 'layer differs'):
+            self.module.sanitize(self.input, self.output, 'arm64')
+        self.assertFalse(self.output.exists())
+
+    def test_untrusted_config_cannot_select_image(self):
+        archive(self.input, b'{}')
+        with self.assertRaisesRegex(ValueError, 'trusted platform pin'):
+            self.module.sanitize(self.input, self.output, 'arm64')
+
+    def test_wrong_platform_refused(self):
+        archive(self.input, self.config)
+        with self.assertRaises(KeyError):
+            self.module.sanitize(self.input, self.output, 'amd64')
+
+    def test_duplicate_archive_names_refused(self):
+        archive(self.input, self.config)
+        with tarfile.open(self.input, 'a') as tar:
+            data = b'[]'; item = tarfile.TarInfo('manifest.json'); item.size = len(data)
+            tar.addfile(item, io.BytesIO(data))
+        with self.assertRaisesRegex(ValueError, 'duplicate'):
+            self.module.sanitize(self.input, self.output, 'arm64')
+
+    def test_tar_terminators_and_trailing_bytes(self):
+        archive(self.input, self.config)
+        original = self.input.read_bytes()
+        with tarfile.open(self.input) as tar:
+            list(tar)
+            end = tar.offset
+        for suffix in (b'', bytes(512), bytes(1023), bytes(1024)+b'x', bytes(1024)+b'x'*512):
+            with self.subTest(length=len(suffix)):
+                self.input.write_bytes(original[:end]+suffix)
+                with self.assertRaisesRegex(ValueError, 'terminator'):
+                    self.module.sanitize(self.input,self.output,'arm64')
+                self.assertFalse(self.output.exists())
+        for padding in (1024, 2048):
+            self.input.write_bytes(original[:end]+bytes(padding))
+            self.module.sanitize(self.input,self.output,'arm64')
+            self.output.unlink()
+
+    def test_manifest_shapes_and_missing_references(self):
+        for image in (None, [], 'bad', {}, {'Config':None,'Layers':[]},
+                      {'Config':'config','Layers':None}, {'Config':'config','Layers':['']},
+                      {'Config':'config','Layers':[1]}, {'Config':'missing','Layers':[]},
+                      {'Config':'config','Layers':['missing']}):
+            with self.subTest(image=image):
+                with tarfile.open(self.input,'w') as tar:
+                    for name, data in [('manifest.json',json.dumps([image]).encode()),('config',self.config)]:
+                        item=tarfile.TarInfo(name); item.size=len(data);tar.addfile(item,io.BytesIO(data))
+                with self.assertRaises(ValueError):
+                    self.module.sanitize(self.input,self.output,'arm64')
+                self.assertFalse(self.output.exists())
+
+    def test_package_checks_content_for_both_image_stores(self):
+        self.module.PIN['image'] = 'collector@sha256:' + 'a'*64
+        for identity in (self.module.sha(self.config), 'sha256:'+'b'*64):
+            for tampered in (False, True):
+                with self.subTest(identity=identity, tampered=tampered):
+                    layer = b'wrong' if tampered else b'synthetic layer'
+                    if identity != self.module.sha(self.config):
+                        layer = gzip.compress(layer)
+                    archive(self.input, self.config, layer)
+                    def save(command, **kwargs):
+                        self.assertEqual(command[-1], self.module.PIN['image'])
+                        shutil.copy(self.input, command[command.index('-o')+1])
+                    metadata = Path(self.temp.name)/'collector.json'
+                    metadata.unlink(missing_ok=True)
+                    with patch('sys.argv', ['collector_offline', 'package', self.temp.name]), \
+                         patch.object(self.module.subprocess, 'check_output', return_value=json.dumps([
+                             {'Id':identity, 'Architecture':'arm64', 'Os':'linux'}]).encode()), \
+                         patch.object(self.module.subprocess, 'run', side_effect=save):
+                        if tampered:
+                            with self.assertRaisesRegex(ValueError, 'layer differs'):
+                                self.module.main()
+                            self.assertFalse(metadata.exists())
+                        else:
+                            self.module.main()
+                            self.assertEqual(json.loads(metadata.read_text())['architecture'], 'arm64')
+                            self.module.sanitize(Path(self.temp.name)/'collector.tar', self.output, 'arm64')
+
+    def test_compressed_layer_expansion_is_bounded(self):
+        archive(self.input, self.config, gzip.compress(b'x'*100000))
+        with patch.object(self.module, 'LIMIT', 20000):
+            with self.assertRaisesRegex(ValueError, 'expanded collector layers'):
+                self.module.sanitize(self.input, self.output, 'arm64')
+        self.assertFalse(self.output.exists())
+
+    def test_prepare_metadata_shapes(self):
+        for data in (None, [], 'bad', 42, True):
+            with self.subTest(data=data):
+                Path(self.temp.name,'collector.json').write_text(json.dumps(data))
+                with patch('sys.argv',['collector_offline','prepare',self.temp.name,'--output',str(self.output)]), \
+                     patch.object(self.module.subprocess,'check_output',return_value='arm64'):
+                    with self.assertRaisesRegex(ValueError,'metadata object'):
+                        self.module.main()
+                self.assertFalse(self.output.exists())
+
+
+class Installer(unittest.TestCase):
+    def test_default_and_optional_commands_and_missing_payload(self):
+        for mode in ('default', 'optional', 'containerd', 'wrong-loaded', 'missing'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                for sub in ('scripts', 'telemetry', 'offline', 'bin'):
+                    (root/sub).mkdir()
+                shutil.copy(ROOT/'install-offline.sh', root/'install-offline.sh')
+                shutil.copy(ROOT/'scripts/collector_offline.py', root/'scripts/collector_offline.py')
+                layer = b'fixture layer'
+                config = json.dumps({'architecture':'arm64', 'os':'linux',
+                    'rootfs':{'diff_ids':['sha256:'+hashlib.sha256(layer).hexdigest()]}}).encode()
+                identity = 'sha256:'+hashlib.sha256(config).hexdigest()
+                (root/'telemetry/image.json').write_text(json.dumps({'config_ids':{'arm64':identity}}))
+                (root/'offline/images.tar.gz').touch()
+                (root/'offline/ollama_models.tar.gz').touch()
+                if mode in ('optional', 'containerd', 'wrong-loaded'):
+                    target = root/'offline/collector.tar'
+                    archive(target, config, layer)
+                    (root/'offline/collector.json').write_text(json.dumps({'architecture':'arm64',
+                        'archive_sha256':hashlib.sha256(target.read_bytes()).hexdigest()}))
+                stub = root/'bin/docker'
+                stub.write_text(r"""#!/usr/bin/env python3
+import json,os,sys,shutil,tarfile
+with open(os.environ['TEST_LOG'],'a') as f: f.write(json.dumps(sys.argv[1:])+'\n')
+a=sys.argv[1:]
+if a[:1]==['info'] and '--format' in a: print('aarch64')
+elif a[:1]==['load'] and a[-1].endswith('collector.tar'):
+ with tarfile.open(a[-1]) as tar:
+  manifest=json.load(tar.extractfile('manifest.json'))
+  assert manifest[0]['RepoTags']==['rag-offline-collector:'+os.environ['TEST_CONFIG'].split(':')[1]]
+  assert 'index.json' not in tar.getnames()
+elif a[:2]==['image','inspect']: print(os.environ['TEST_ID'])
+elif a[:2]==['image','save']:
+ assert a[-1]==os.environ['TEST_ID']
+ shutil.copy('offline/collector.tar',a[a.index('-o')+1])
+ if os.environ['TEST_MODE']=='wrong-loaded':
+  with tarfile.open(a[a.index('-o')+1], 'a') as tar:
+   import io
+   data=b'wrong'; item=tarfile.TarInfo('config'); item.size=len(data)
+   tar.addfile(item,io.BytesIO(data))
+elif a[:2]==['compose','ps'] and '--services' in a:
+ for i in range(int(os.environ['TEST_COUNT'])): print('service'+str(i))
+""")
+                stub.chmod(0o755)
+                env = {**os.environ, 'PATH':str(root/'bin')+os.pathsep+os.environ['PATH'],
+                       'TEST_LOG':str(root/'calls'), 'TEST_ID':identity if mode=='optional' else 'sha256:'+'b'*64, 'TEST_CONFIG':identity, 'TEST_MODE':mode, 'TEST_COUNT':'5' if mode=='default' else '6'}
+                run = subprocess.run(['bash', str(root/'install-offline.sh'), *([] if mode=='default' else ['--telemetry'])],
+                                     env=env, text=True, capture_output=True)
+                calls = [json.loads(x) for x in (root/'calls').read_text().splitlines()]
+                if mode == 'wrong-loaded':
+                    self.assertNotEqual(run.returncode,0)
+                    self.assertFalse(any(x[:1]==['compose'] for x in calls))
+                    continue
+                if mode == 'missing':
+                    self.assertNotEqual(run.returncode,0)
+                    self.assertFalse(any(x[0]=='load' or x[:2]==['compose','up'] for x in calls))
+                    continue
+                self.assertEqual(run.returncode,0,run.stderr)
+                up = next(x for x in calls if x[:2]==['compose','up'])
+                restore = next(x for x in calls if x[:2]==['compose','run'])
+                if mode in ('optional', 'containerd', 'wrong-loaded'):
+                    self.assertIn('--pull',up); self.assertIn('never',up)
+                    self.assertIn('--pull=never',restore)
+                else:
+                    self.assertEqual(up,['compose','up','-d','--no-build'])
+                    self.assertNotIn('--pull=never',restore)
+
+
+class Packager(unittest.TestCase):
+    def test_printed_install_command_matches_bundle_mode(self):
+        for telemetry in (False,True):
+            with self.subTest(telemetry=telemetry), tempfile.TemporaryDirectory() as folder:
+                root=Path(folder);(root/'bin').mkdir();(root/'scripts').mkdir()
+                shutil.copy(ROOT/'package-offline.sh',root/'package-offline.sh')
+                (root/'scripts/collector_offline.py').write_text("from pathlib import Path\nimport sys\nPath(sys.argv[2],'collector.tar').touch()\n")
+                stub=root/'bin/docker'
+                stub.write_text("""#!/usr/bin/env python3
+import sys,json,pathlib
+args=sys.argv[1:]
+if args[:2]==['compose','config']:print(json.dumps({'name':'fixture'}))
+if args[:1]==['run']:
+ for arg in args:
+  if arg.endswith(':/out'):pathlib.Path(arg[:-5],'ollama_models.tar.gz').touch()
+""")
+                stub.chmod(0o755)
+                # The packager archives committed source, so exercise a real
+                # scratch checkout while keeping Docker stubbed.
+                git = ['git', '-c', 'core.hooksPath=/dev/null',
+                       '-c', 'commit.gpgsign=false', '-c', 'user.name=Test',
+                       '-c', 'user.email=test@example.invalid']
+                for args in (['init', '-q'], ['add', 'package-offline.sh', 'scripts'],
+                             ['commit', '-qm', 'fixture']):
+                    subprocess.run(git + args, cwd=root, check=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                result=subprocess.run(['bash',str(root/'package-offline.sh'),*(['--telemetry'] if telemetry else []),'bundle.tar'],
+                    env={**os.environ,'PATH':str(root/'bin')+os.pathsep+os.environ['PATH']},text=True,capture_output=True)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(result.stdout.splitlines()[-1],'  bash install-offline.sh'+(' --telemetry' if telemetry else ''))
+                with tarfile.open(root/'bundle.tar') as tar:
+                    self.assertEqual('rag-docker/offline/collector.tar' in tar.getnames(),telemetry)
+
+
+class Compose(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.env = {**os.environ, 'RAG_VERIFY_PORT': '18081', 'RAG_EXPORTS_DIR': '/tmp/collector-test-exports',
+                   'COMPOSE_PROFILES': 'telemetry', 'RAG_VERIFY_HARNESS': str(ROOT)}
+        cls.cmd = ['docker', 'compose', '-p', 'rag-verify', '-f', str(ROOT/'docker-compose.yml'),
+                   '-f', str(ROOT/'docker-compose.telemetry.yml'), '-f', str(ROOT/'docker-compose.verify.yml'),
+                   '-f', str(ROOT/'docker-compose.telemetry.verify.yml'), 'config', '--format', 'json']
+        cls.config = json.loads(subprocess.check_output(cls.cmd, env=cls.env))
+        cls.guard = re.findall(r"python3 - [^\n]*<<'GUARDPY'\n(.*?)\nGUARDPY", (ROOT/'scripts/verify/stack.sh').read_text(), re.S)[0]
+
+    def run_guard(self, config, checkout=ROOT):
+        with tempfile.NamedTemporaryFile(mode='w') as file:
+            json.dump(config, file); file.flush()
+            return subprocess.run(['python3', '-', str(checkout), self.env['RAG_EXPORTS_DIR'], '18081', file.name, str(ROOT)],
+                                  input=self.guard, text=True, capture_output=True)
+
+    def test_optional_config_passes_full_guard(self):
+        result = self.run_guard(self.config)
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        api = self.config['services']['api']['environment']
+        self.assertEqual(api['RAG_OTEL_ENABLED'], 'true')
+        self.assertEqual(api['RAG_OTEL_ENDPOINT'], 'http://otel-collector:4318')
+
+    def test_default_does_not_include_collector_or_enable_api(self):
+        value = json.loads(subprocess.check_output(['docker', 'compose', '-f', str(ROOT/'docker-compose.yml'),
+                                                    'config', '--format', 'json']))
+        self.assertEqual(len(value['services']), 5)
+        self.assertNotIn('RAG_OTEL_ENABLED', value['services']['api']['environment'])
+
+    def test_ambient_inputs_and_distinct_checkout(self):
+        hostile={k:'invalid' for k in self.config['services']['api']['environment'] if k.startswith('RAG_OTEL_')}
+        config=json.loads(subprocess.check_output(self.cmd,env={**self.env,**hostile}))
+        self.assertEqual(config,self.config)
+        with tempfile.TemporaryDirectory() as folder:
+            checkout=Path(folder)
+            for name in ('docker-compose.yml','docker-compose.telemetry.yml'):
+                shutil.copy(ROOT/name,checkout/name)
+            cmd=[str(checkout/Path(x).name) if x in (str(ROOT/'docker-compose.yml'),str(ROOT/'docker-compose.telemetry.yml')) else x for x in self.cmd]
+            value=json.loads(subprocess.check_output(cmd,env=self.env))
+            for service in ('otel-collector','otel-capture'):
+                mount=next(v for v in value['services'][service]['volumes'] if v['type']=='bind')
+                self.assertTrue(mount['source'].startswith(str(ROOT/'scripts/verify')))
+            result=self.run_guard(value,checkout)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            guard=load('guard','scripts/verify/telemetry_guard.py')
+            self.assertEqual(guard.check(value,ROOT),[])
+            for service in ('otel-collector','otel-capture'):
+                changed=copy.deepcopy(value)
+                next(v for v in changed['services'][service]['volumes'] if v['type']=='bind')['source']=str(checkout/'scripts/verify')
+                self.assertTrue(guard.check(changed,ROOT))
+
+    def test_unsafe_variants_still_refused(self):
+        mutations = [
+            lambda c: c['services']['otel-collector'].update(command=['--config=http://outside.invalid/config']),
+            lambda c: c['services']['otel-capture'].update(command=['python', '/tmp/replacement.py']),
+            lambda c: c['services']['otel-capture'].update(entrypoint=['sh']),
+            lambda c: c['services']['otel-collector'].update(ports=[{'target':4318, 'published':'4318'}]),
+            lambda c: c['services']['otel-collector'].update(mem_limit='0'),
+            lambda c: c['services']['otel-collector'].update(image='evil:latest'),
+            lambda c: c['services']['api'].update(mem_limit='268435456'),
+            lambda c: c['services']['api']['depends_on'].update({'otel-collector': {'condition':'service_started'}}),
+            lambda c: c['services']['otel-capture']['volumes'][0].update(source='/private/secret'),
+            lambda c: c['services']['otel-collector'].update(logging={'driver':'json-file'}),
+        ]
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                config = copy.deepcopy(self.config); mutate(config)
+                self.assertNotEqual(self.run_guard(config).returncode, 0)
+
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
+
+### scripts/tests/test_telemetry_capture.py
+
+```python
+"""Receiver and decoded evidence assertions, run with the locked API dependencies."""
+import base64
+import importlib.util
+import json
+import copy
+from pathlib import Path
+import threading
+import unittest
+from unittest.mock import patch
+import subprocess
+import urllib.error
+import urllib.request
+from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, ROOT / path)
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    return module
+
+
+class CaptureTests(unittest.TestCase):
+    def setUp(self):
+        self.m = load('capture', 'scripts/verify/telemetry_capture.py')
+        self.server = self.m.Server(('127.0.0.1', 0), self.m.Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True); self.thread.start()
+        self.addCleanup(self.server.server_close); self.addCleanup(self.server.shutdown)
+        self.url = 'http://127.0.0.1:'+str(self.server.server_port)
+
+    def post(self, path, data=b''):
+        return urllib.request.urlopen(urllib.request.Request(self.url+path, data=data), timeout=2)
+
+    def test_real_protobuf_decodes_and_reset_zeros_counts(self):
+        msg = ExportTraceServiceRequest()
+        msg.resource_spans.add().scope_spans.add().spans.add(name='POST /query', trace_id=b'a'*16, span_id=b'b'*8)
+        self.assertEqual(self.post('/v1/traces', msg.SerializeToString()).status, 200)
+        data = json.load(urllib.request.urlopen(self.url+'/snapshot'))
+        self.assertEqual(data['requests'], 1)
+        self.assertEqual(data['batches'][0]['data']['resource_spans'][0]['scope_spans'][0]['spans'][0]['name'], 'POST /query')
+        self.post('/reset')
+        self.assertEqual(json.load(urllib.request.urlopen(self.url+'/snapshot'))['requests'], 0)
+
+    def test_capture_overflow_is_explicit_failure(self):
+        self.m.MAX_BATCHES = 1
+        self.post('/v1/traces')
+        with self.assertRaises(urllib.error.HTTPError) as exc:
+            self.post('/v1/traces')
+        self.assertEqual(exc.exception.code, 503)
+        self.assertEqual(self.m.capture.overflow, 1)
+
+    def test_oversized_body_refused(self):
+        self.m.MAX_BODY = 8
+        with self.assertRaises(urllib.error.HTTPError) as exc:
+            self.post('/v1/traces', b'0123456789')
+        self.assertEqual(exc.exception.code, 413)
+
+
+class EvidenceTests(unittest.TestCase):
+    def fixture(self):
+        m = load('e2e', 'scripts/verify/telemetry_e2e.py')
+        def attr(key, value):
+            return {'key':key, 'value':{'string_value':value}}
+        root = {'trace_id':'trace1', 'span_id':'root', 'name':'POST /export', 'links':[{'trace_id':'remote1'}]}
+        job = {'trace_id':'trace1', 'span_id':'job', 'parent_span_id':'root', 'name':'rag.export'}
+        dep = {'trace_id':'trace1', 'span_id':'dep', 'parent_span_id':'job', 'name':'weaviate.iterate'}
+        logs = [{'trace_id':'trace1', 'span_id':span, 'body':{'string_value':body},
+                 'attributes':[] if span=='root' else [attr('rag.job_token','a'*32)]}
+                for span, body in [('root','rag.api.completed'),('job','rag.job.completed'),('dep','rag.dependency.completed')]]
+        metrics = []
+        for name in ('rag.api.requests','rag.api.duration','rag.dependency.calls','rag.job.completed'):
+            attributes = [attr(k, sorted(m.SCHEMA['metric_values'](name,k))[0]) for k in m.SCHEMA['METRICS'][name][2]]
+            kind = 'histogram' if m.SCHEMA['METRICS'][name][0] == 'create_histogram' else 'sum'
+            metrics.append({'name':name, kind:{'data_points':[{'as_int':'1','attributes':attributes}]}})
+        snapshot = {'overflow':0,'batches':[
+            {'signal':'traces','data':{'resource_spans':[{'scope_spans':[{'spans':[root,job,dep]}]}]}},
+            {'signal':'logs','data':{'resource_logs':[{'scope_logs':[{'log_records':logs}]}]}},
+            {'signal':'metrics','data':{'resource_metrics':[{'scope_metrics':[{'metrics':metrics}]}]}}]}
+        return m, snapshot, [('remote1','rag.export')]
+
+    def test_connected_received_tree_is_accepted(self):
+        m,snapshot,expected = self.fixture()
+        m.inspect(snapshot, expected)
+
+    def test_malformed_capture_shapes_fail_controlled(self):
+        m,valid,expected=self.fixture()
+        cases=[None,[],{'overflow':0,'batches':1}]
+        for path in (('batches',0),('batches',0,'data'),('batches',0,'data','resource_spans'),
+                     ('batches',0,'data','resource_spans',0),
+                     ('batches',0,'data','resource_spans',0,'scope_spans'),
+                     ('batches',0,'data','resource_spans',0,'scope_spans',0),
+                     ('batches',0,'data','resource_spans',0,'scope_spans',0,'spans'),
+                     ('batches',0,'data','resource_spans',0,'scope_spans',0,'spans',0)):
+            for invalid in (None, 1, 'bad'):
+                value=copy.deepcopy(valid); target=value
+                for key in path[:-1]:target=target[key]
+                target[path[-1]]=invalid;cases.append(value)
+        for value in cases:
+            with self.subTest(value=value), self.assertRaises(AssertionError):m.inspect(value,expected)
+        with patch.object(m,'sink',side_effect=[cases[-1],valid]),patch.object(m.time,'sleep'):
+            self.assertIs(m.await_capture(expected),valid)
+
+    def test_disabled_transition_terminates_old_pipeline_before_reset(self):
+        m,_,_=self.fixture(); events=[]
+        with patch.object(m,'enabled',side_effect=lambda value:events.append(('enabled',value))), \
+             patch.object(m,'compose',side_effect=lambda *args:events.append(args)), \
+             patch.object(m,'sink',side_effect=lambda *args:events.append(args)):
+            m.transition('disabled')
+        self.assertEqual(events,[('enabled',False),('stop','-t','10','otel-collector'),
+                                 ('restart','-t','10','otel-capture'),('/reset',True),('start','otel-collector')])
+
+    def test_duplicate_full_span_identities_rejected_before_lineage(self):
+        for index in range(3):
+            for change in ({}, {'parent_span_id':'different'}, {'name':'rag.query'},
+                           {'links':[{'trace_id':'different'}]}):
+                for prepend in (False,True):
+                    with self.subTest(index=index,change=change,prepend=prepend):
+                        m,snapshot,expected=self.fixture()
+                        duplicate=copy.deepcopy(m.records(snapshot,'traces')[index]);duplicate.update(change)
+                        batch={'signal':'traces','data':{'resource_spans':[{'scope_spans':[{'spans':[duplicate]}]}]}}
+                        snapshot['batches'].insert(0 if prepend else len(snapshot['batches']),batch)
+                        with self.assertRaisesRegex(AssertionError,'duplicate received span identity'):
+                            m.inspect(snapshot,expected)
+
+    def test_same_span_id_in_separate_traces_is_valid(self):
+        m,snapshot,expected=self.fixture()
+        other=copy.deepcopy(snapshot['batches'][0])
+        for span in other['data']['resource_spans'][0]['scope_spans'][0]['spans']:
+            span['trace_id']='trace2'
+            if 'links' in span:span['links']=[{'trace_id':'remote2'}]
+        snapshot['batches'].append(other)
+        # Only the original trace is requested; unrelated valid spans still
+        # participate in full received-identity validation.
+        m.inspect(snapshot,expected)
+
+    def test_dependency_sibling_is_not_worker_lineage(self):
+        m,snapshot,expected = self.fixture()
+        m.records(snapshot,'traces')[2]['parent_span_id'] = 'root'
+        with self.assertRaisesRegex(AssertionError,'parent chain'):
+            m.inspect(snapshot,expected)
+
+    def test_concurrent_job_context_leak_rejected(self):
+        m,snapshot,expected = self.fixture()
+        m.records(snapshot,'logs')[2]['attributes'][0]['value']['string_value'] = 'b'*32
+        with self.assertRaisesRegex(AssertionError,'crossed trace trees'):
+            m.inspect(snapshot,expected)
+
+    def test_trace_identity_metric_label_rejected(self):
+        m,snapshot,expected = self.fixture()
+        metric = m.records(snapshot,'metrics')[0]
+        metric['sum']['data_points'][0]['attributes'].append({'key':'trace_id','value':{'string_value':'trace1'}})
+        with self.assertRaisesRegex(AssertionError,'schema mismatch'):
+            m.inspect(snapshot,expected)
+
+    def test_content_sentinel_prevents_acceptance(self):
+        m = load('e2e', 'scripts/verify/telemetry_e2e.py')
+        with self.assertRaisesRegex(AssertionError, 'sentinel'):
+            m.inspect({'overflow': 0, 'batches': [{'data':m.SENTINELS[0]}]}, [])
+
+    def test_capture_overflow_prevents_acceptance(self):
+        m = load('e2e', 'scripts/verify/telemetry_e2e.py')
+        with self.assertRaisesRegex(AssertionError, 'overflow'):
+            m.inspect({'overflow': 1, 'batches': []}, [])
+
+
+class SamplingTests(unittest.TestCase):
+    def setUp(self):
+        self.m = load('e2e_sampling', 'scripts/verify/telemetry_e2e.py')
+
+    def test_compose_stats_queries_one_service_per_command(self):
+        value = json.dumps({'CPUPerc':'1.0%', 'MemUsage':'10MiB /256MiB', 'PIDs':'2'})
+        with patch.object(self.m, 'compose', return_value=value) as call:
+            samples = self.m.stats_snapshot(True)
+        self.assertEqual(set(samples), {'api','otel-collector'})
+        self.assertEqual([c.args for c in call.call_args_list], [
+            ('stats','--no-stream','--format','json','api'),
+            ('stats','--no-stream','--format','json','otel-collector')])
+        self.assertTrue(all(c.kwargs['capture_stderr'] for c in call.call_args_list))
+
+    def test_unavailable_collector_still_requires_api_measurement(self):
+        with patch.object(self.m,'compose',return_value='{"CPUPerc":"1%","MemUsage":"10MiB /256MiB"}') as call:
+            samples = self.m.stats_snapshot(False)
+        self.assertEqual(call.call_count,1)
+        self.assertEqual(samples['otel-collector'], {'state':'stopped_by_test'})
+        with patch.object(self.m,'compose',return_value='[]'):
+            with self.assertRaisesRegex(ValueError,'missing'):
+                self.m.stats_snapshot(False)
+
+    def test_sampling_failure_fails_acceptance_without_raw_diagnostics(self):
+        error = subprocess.CalledProcessError(2,['SECRET_COMMAND'],stderr='SENTINEL_SECRET_OUTPUT')
+        reached = threading.Event()
+        def fail(_):
+            reached.set()
+            raise error
+        with patch.object(self.m,'stats_snapshot',side_effect=fail):
+            with self.assertRaisesRegex(AssertionError,'resource sampling failed') as caught:
+                with self.m.resource_samples(True):
+                    self.assertTrue(reached.wait(2))
+        self.assertIn('"exit_code": 2',str(caught.exception))
+        self.assertNotIn('SECRET',str(caught.exception))
+
+    def test_workload_failure_preserved_with_sampler_diagnostic_note(self):
+        reached = threading.Event()
+        def fail(_):
+            reached.set()
+            raise subprocess.TimeoutExpired('SECRET_COMMAND',8,stderr='SECRET_OUTPUT')
+        original = ValueError('primary workload failure')
+        with patch.object(self.m,'stats_snapshot',side_effect=fail):
+            with self.assertRaises(ValueError) as caught:
+                with self.m.resource_samples(True):
+                    self.assertTrue(reached.wait(2))
+                    raise original
+        self.assertIs(caught.exception, original)
+        self.assertIn('TimeoutExpired',' '.join(original.__notes__))
+        self.assertNotIn('SECRET',' '.join(original.__notes__))
+
+    def test_cleanup_preserves_primary_and_attempts_all_actions(self):
+        original = ValueError('primary workload failure')
+        reached = []
+        def fail():
+            reached.append('first')
+            raise subprocess.CalledProcessError(4,['secret'],stderr='secret')
+        self.m.cleanup([('receiver',fail), ('collector',lambda:reached.append('second'))],original)
+        self.assertEqual(reached,['first','second'])
+        self.assertIn('"exit_code": 4',' '.join(original.__notes__))
+        self.assertNotIn('secret',' '.join(original.__notes__))
+        with self.assertRaisesRegex(AssertionError,'cleanup failed'):
+            self.m.cleanup([('receiver',fail)])
+
+
+if __name__ == '__main__':
+    unittest.main()
+```
+
+
+### docker-compose.telemetry.verify.yml
+
+```yaml
+# Only loaded by the disposable harness with --telemetry.
+services:
+  api:
+    environment:
+      RAG_OTEL_ENABLED: "${RAG_VERIFY_OTEL_ENABLED:-true}"
+      RAG_OTEL_PROTOCOL: http/protobuf
+      RAG_OTEL_SERVICE_VERSION: "1.1.0"
+      RAG_OTEL_QUEUE_SIZE: "256"
+      RAG_OTEL_BATCH_SIZE: "64"
+      RAG_OTEL_ENDPOINT: http://otel-collector:4318
+      RAG_OTEL_SAMPLE_RATIO: "1"
+      RAG_OTEL_INTERVAL_MS: "1000"
+      RAG_OTEL_TIMEOUT_MS: "500"
+      RAG_OTEL_SHUTDOWN_MS: "3000"
+      RAG_OTEL_SERVICE_NAME: rag-api
+      RAG_OTEL_ENVIRONMENT: verification
+      RAG_OTEL_TRACES: "true"
+      RAG_OTEL_METRICS: "true"
+      RAG_OTEL_LOGS: "true"
+  otel-collector:
+    volumes:
+      - ${RAG_VERIFY_HARNESS:?harness path required}/scripts/verify/collector.yaml:/etc/otelcol/config.yaml:ro
+  otel-capture:
+    image: rag-verify-api:latest
+    profiles: [telemetry]
+    command: [python, /verify/telemetry_capture.py]
+    networks: [rag-internal]
+    ports: []
+    volumes:
+      - ${RAG_VERIFY_HARNESS:?harness path required}/scripts/verify:/verify:ro
+      - otel_capture:/capture
+    mem_limit: 256m
+    cpus: 0.5
+    stop_grace_period: 10s
+    read_only: true
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+volumes:
+  otel_capture:
+```
+
+
+### package-offline.sh
+
+```bash
+#!/usr/bin/env bash
+#
+# Build a fully self-contained OFFLINE bundle of this project.
+#
+#   bash package-offline.sh [output.tar]
+#
+# Unlike package.sh (source only, ~1.3 MB, needs the internet on first run),
+# this bundle contains everything required to run with NO network access:
+#
+#   * the source tree: the files git tracks in the current commit (HEAD),
+#     built with `git archive`, exactly as package.sh does. Untracked and
+#     ignored files and uncommitted changes are left out (#384).
+#   * all five Docker images, pre-built (docker save)
+#   * the Ollama model weights (phi3.5 + nomic-embed-text)
+#
+# Measured at 4.6 GB (2.5 GB images + 2.2 GB model weights) with both models
+# present. Build it on a machine where the stack already works,
+# then move the file to the target Mac and run install-offline.sh there.
+
+set -euo pipefail
+cd "$(dirname "$0")"
+
+# git archive works on the repository, so this directory must be the top level
+# of a git checkout. Checked first, before any image or volume is touched.
+TOP="$(git rev-parse --show-toplevel 2>/dev/null)" || TOP=""
+if [ -z "$TOP" ] || [ "$(cd "$TOP" && pwd -P)" != "$(pwd -P)" ]; then
+  echo "ERROR: $(pwd) is not the top level of a git checkout. package-offline.sh archives the tracked files of the current commit with git archive; run it in a clone of the repository." >&2
+  exit 1
+fi
+
+TELEMETRY=0
+if [ "${1:-}" = --telemetry ]; then TELEMETRY=1; shift; fi
+[ "$#" -le 1 ] || { echo "Usage: bash package-offline.sh [--telemetry] [output.tar]" >&2; exit 2; }
+OUT="${1:-rag-docker-offline.tar}"
+OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"   # absolute
+
+# The MCP server is parked (see docker-compose.yml). Its image is deliberately
+# NOT bundled: nothing in the stack uses it, and requiring it here would make
+# packaging fail on a machine that has never built it. Re-add
+# rag-docker-mcp:latest when the MCP server is brought back.
+IMAGES=(
+  rag-docker-api:latest
+  rag-docker-ui:latest
+  semitechnologies/weaviate:1.39.6
+  ollama/ollama:0.3.14
+  nginx:1.29-alpine
+)
+
+echo "==> Checking prerequisites"
+for img in "${IMAGES[@]}"; do
+  docker image inspect "$img" >/dev/null 2>&1 \
+    || { echo "ERROR: image '$img' not found locally. Run 'docker compose build' and 'docker compose up -d' first." >&2; exit 1; }
+done
+
+# Resolve the compose project so we read the right volume.
+PROJECT="$(docker compose config --format json | tr -d ' \n' | sed -n 's/^{"name":"\([^"]*\)".*/\1/p')"
+[ -n "$PROJECT" ] || PROJECT="$(basename "$PWD" | tr '[:upper:]' '[:lower:]')"
+MODELVOL="${PROJECT}_ollama_models"
+docker volume inspect "$MODELVOL" >/dev/null 2>&1 \
+  || { echo "ERROR: volume '$MODELVOL' not found. Start the stack once so the models download." >&2; exit 1; }
+
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"' EXIT
+mkdir -p "$STAGE/rag-docker/offline"
+
+echo "==> Copying source (tracked files of the current commit)"
+# ingest-inbox/.gitkeep and exports/.gitkeep are tracked, so both mount targets
+# exist on the target machine; without them Docker creates the directories as
+# root and the user cannot drop files into ./ingest-inbox.
+git archive --format=tar HEAD | ( cd "$STAGE/rag-docker" && tar xf - )
+
+echo "==> Saving images (this is the slow part)"
+docker save "${IMAGES[@]}" | gzip > "$STAGE/rag-docker/offline/images.tar.gz"
+
+if [ "$TELEMETRY" = 1 ]; then
+  echo "==> Saving optional pinned collector (Python 3.11+ required)"
+  python3 scripts/collector_offline.py package "$STAGE/rag-docker/offline"
+fi
+
+echo "==> Exporting model weights from volume '$MODELVOL'"
+# Uses the ollama image itself as the tar helper: it ships /usr/bin/tar and is
+# already part of the bundle, so no extra image is needed here or on the target.
+docker run --rm --entrypoint sh \
+  -v "$MODELVOL":/models:ro \
+  -v "$STAGE/rag-docker/offline":/out \
+  ollama/ollama:0.3.14 \
+  -c 'tar czf /out/ollama_models.tar.gz -C /models .'
+
+echo "==> Assembling bundle"
+rm -f "$OUT"
+tar cf "$OUT" -C "$STAGE" rag-docker
+
+echo
+echo "Created $OUT ($(du -h "$OUT" | cut -f1))"
+echo "  images:       $(du -h "$STAGE/rag-docker/offline/images.tar.gz" | cut -f1)"
+echo "  model weights:$(du -h "$STAGE/rag-docker/offline/ollama_models.tar.gz" | cut -f1)"
+echo
+echo "On the target Mac (no internet required):"
+echo "  tar xf $(basename "$OUT") && cd rag-docker"
+if [ "$TELEMETRY" = 1 ]; then
+  echo "  bash install-offline.sh --telemetry"
+else
+  echo "  bash install-offline.sh"
+fi
+```
 ### scripts/tests/test_jobstore.py
 
 ```python

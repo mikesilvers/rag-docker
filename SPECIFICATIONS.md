@@ -1501,6 +1501,21 @@ import into a collection another import is building fails with `error_code`
 nothing. A `rename` that moves to a new name competes for that name, not the
 original (#391).
 
+A package's ingest settings (`ingest_config.json`, optional) are checked before the
+import changes anything, like its retrieval settings (#510). They must be a JSON
+object that `POST /ingest/config` would accept, except that a `chunk_size` or
+`min_chunk_size` from before the chunk bounds (§8) is kept as it is: `chunk_size`
+only has to be an integer of at least 1 and `min_chunk_size` one of at least 0.
+Missing fields take the defaults, numeric strings are converted and unknown fields
+are dropped. Anything else (invalid JSON, a non-object, an unknown strategy, a wrong
+type or an out-of-range value) fails the job in every conflict mode with
+`error_code` `PACKAGE_CORRUPT`, `error` `Invalid ingest settings.` and
+`error_detail` `{"file": "ingest_config.json"}`, before models are installed or any
+collection, source or setting is touched. A completed import publishes the checked
+settings for the collection it imported, which `GET /ingest/config/{collection}`
+returns with `is_default: false`. Rules and order: `RAG_EXPORT_SPECIFICATIONS.md`
+§6.2, check 4c.
+
 ---
 
 ```
@@ -2405,6 +2420,8 @@ now lives once, in `api/services/ingest_config.py`.
       *`test_settings_validation.py` checks mocked work boundaries and persistence; `07_settings.sh` runs real HTTP rejection, unchanged-config and valid round-trip checks on an owned collection. Full affected ingest verification passes 18 checks.*
 - [x] Concurrent ingest/retrieval settings saves publish their own complete values; failed publication preserves the previous valid configuration (#141).
       *`test_settings_persistence.py` controls worker contention and first-save directory creation with events, observes each publication and unique temporary path, and injects serialization, creation, partial-write, close and replacement failures for both services. Suite 07 registers these controlled tests (including failed import publication), host-side `ImplementationTests`, and 15 rounds of 12 concurrent live saves per ingest/retrieval route; each round checks that the persisted config is one complete acknowledged response. Full-stack verification is recorded separately.*
+- [x] An import whose `ingest_config.json` is invalid JSON, not an object, or has a wrong type or invalid value fails `PACKAGE_CORRUPT` naming the file, in every conflict mode, before any live change; the existing collection's ingest settings are unchanged. After an import with valid ingest settings, `GET /ingest/config/{collection}` returns them for the imported collection, a `chunk_size`/`min_chunk_size` from before the bounds unchanged (#510).
+      *`test_retrieval_import.py` (`IngestImportTests`, run by `05_transfer.sh`) imports digest-valid packages with each refusal in abort, rename and replace mode with every live operation mocked and asserted unused, and reads valid imports back through the GET route. The refusal and numeric-string cases fail on the code before #510.*
 - [x] `chunk_size` is bounded to 50–6000 and `min_chunk_size` to 0–6000 wherever chunk settings are saved or used; a saved configuration from before the bounds is still returned and exported unchanged, and must be within them to be saved again or used for tuning (#53).
       *`test_settings_validation.py` saves and reads back both edges, rejects 49, 6001 and a minimum of 6001 without changing the saved configuration, and checks a saved 16000/8000 configuration is returned and exported unclamped but refused by save, rechunk and reembed. `07_settings.sh` checks both edges and their neighbours against the live stack.*
 
@@ -3158,3 +3175,36 @@ available. Suppression loses active-instrument availability until restart; it
 does not reconstruct concurrency or retract prior backend history or exports
 already in flight. The two-instrument suppression registry is finite and local.
 Local validation rejection returns false without changing instrument health.
+
+## Optional Collector and end-to-end telemetry (#285)
+
+The explicit `docker-compose.telemetry.yml` overlay plus `telemetry` profile adds
+a digest-pinned local Collector and passes supported settings into the API.
+Base startup remains five services with telemetry disabled. Collector ingestion
+has no host-published ports and no application health dependency. Resource limits,
+finite queues/retries, local summary-only diagnostics and optional standard OTLP
+export with runtime mounted secrets are documented in `telemetry/README.md`.
+
+Optional offline packaging includes only the selected platform image. Before
+loading, validate its config identity against the tracked pin allow-list and
+layer hashes against that config; never trust archive tags or image overrides.
+Missing/mismatched optional images fail without pulling. Default offline behavior
+remains unchanged.
+
+The registered disposable telemetry suite distinguishes default-mode checks from
+explicit `--telemetry` acceptance. Enabled acceptance must decode received
+protobuf after the actual Collector: a real synthetic query and concurrent jobs
+have connected request/operation/worker/dependency spans and matching completion
+logs, finite safe metrics and no planted credential/content sentinels. Capture
+overflow is failed acceptance. Disabled mode emits zero application exports;
+Collector refusal and a slow destination preserve usable query/job work with
+bounded configuration and reported latency/resource observations. Restart and
+shutdown evidence does not imply job draining, durable queues or cross-restart
+trace continuity. Full default and enabled runs and their actual limitations are
+required; a resolved Compose file alone is not runtime acceptance.
+
+Collector verification binds exact harness-owned assets across alternate checkouts
+and pins verification protocol/version/export budgets. Disabled-mode observation
+requires termination of previous producer, Collector queues and capture handlers.
+Malformed decoded evidence is incomplete acceptance; malformed archive metadata
+and incomplete TAR framing are rejected before offline reconstruction.

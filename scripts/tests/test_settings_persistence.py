@@ -40,6 +40,7 @@ class SettingsPersistenceTests(unittest.TestCase):
             pkg = root / 'package'
             pkg.mkdir()
             (pkg / 'ingest_config.json').write_text(json.dumps(incoming))
+            validated = importer._read_ingest_config(pkg, 'Original')
             path = ingest_config._path(old['collection'])
             before = path.read_bytes()
             entered = []
@@ -51,11 +52,13 @@ class SettingsPersistenceTests(unittest.TestCase):
             with patch.object(settings_store, '_write_lock', ObservedLock()), \
                  patch.object(Path, 'replace', side_effect=OSError('owned publication failure')):
                 with self.assertRaises(OSError):
-                    importer._restore_sidecars(old['collection'], pkg, 'Original', [])
+                    importer._restore_sidecars(old['collection'], pkg, 'Original', [],
+                                               validated_ingest=validated)
             self.assertEqual(entered, [True])
             self.assertEqual(path.read_bytes(), before)
             self.assertEqual(list(path.parent.glob('*.tmp')), [])
-            importer._restore_sidecars(old['collection'], pkg, 'Original', [])
+            importer._restore_sidecars(old['collection'], pkg, 'Original', [],
+                                       validated_ingest=validated)
             self.assertEqual(ingest_config.load(old['collection']), incoming)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
@@ -257,9 +260,11 @@ class SettingsPersistenceTests(unittest.TestCase):
             pkg = root / 'package'
             pkg.mkdir()
             (pkg / 'ingest_config.json').write_text(json.dumps(incoming))
+            validated = importer._read_ingest_config(pkg, 'Original')
             events = []
             with self.recorded(events):
-                importer._restore_sidecars(incoming['collection'], pkg, 'Original', [])
+                importer._restore_sidecars(incoming['collection'], pkg, 'Original', [],
+                                           validated_ingest=validated)
             after = self.after_replace(events)
             self.assertEqual([event[0] for event in after], ['open', 'fsync folder', 'close'], events)
             self.assertEqual(after[0][2], ingest_config._path(incoming['collection']).parent)
