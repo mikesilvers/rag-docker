@@ -856,6 +856,14 @@ class IngestConfig(BaseModel):
         return self
 
 
+class StoredIngestConfig(IngestConfig):
+    # Ingest settings in an import package (#510). A configuration saved before the
+    # #53 chunk bounds is imported as it is, never clamped, so these two fields keep
+    # the rules from before the bounds; every other save rule still applies.
+    chunk_size: PositiveSize = 1000
+    min_chunk_size: NonnegativeSize = 100
+
+
 class IngestConfigResponse(BaseModel):
     collection: str
     chunking_strategy: str
@@ -1528,6 +1536,7 @@ import re
 from pathlib import Path
 
 from config import settings
+from models.schemas import StoredIngestConfig
 from services import settings_store
 
 log = logging.getLogger(__name__)
@@ -1580,6 +1589,18 @@ def resolve(collection: str) -> tuple[dict, bool]:
     merged = {"collection": collection, **DEFAULTS, **saved}
     merged["collection"] = collection
     return merged, False
+
+
+def validate(config: dict, collection: str) -> dict:
+    """Check package settings against the save contract, bound to `collection` (#510).
+
+    Missing fields take the defaults and unknown fields are dropped, as on API
+    saves. A chunk_size or min_chunk_size from before the #53 bounds is kept as
+    it is. Raises ValueError for anything else the API would not save.
+    """
+    if not isinstance(config, dict):
+        raise ValueError("Ingest settings must be an object")
+    return {"collection": collection, **StoredIngestConfig.model_validate(config).model_dump()}
 
 
 def save(config: dict) -> dict:
@@ -7306,9 +7327,9 @@ from pathlib import Path
 from contextlib import nullcontext
 
 from config import settings
-from services import settings_store
 from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import goldstandard
+from services import ingest_config
 from services import model_bundle
 from services import packager
 from services import retrieval_config
@@ -7923,22 +7944,37 @@ def _read_retrieval_config(pkg: Path, original: str,
     return validated
 
 
+def _read_ingest_config(pkg: Path, original: str) -> dict | None:
+    """Validate once before live mutation; restore this normalized snapshot (#510).
+
+    Unusable settings would import and then break the collection's Chunking
+    Configuration page, so they refuse the import like retrieval settings do.
+    """
+    path = pkg / "ingest_config.json"
+    if not path.exists():
+        return None
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("Ingest settings must be a regular file")
+        return ingest_config.validate(json.loads(path.read_text()), original)
+    except (OSError, ValueError) as exc:
+        raise PackageError("PACKAGE_CORRUPT", "Invalid ingest settings.",
+                           {"file": "ingest_config.json"}) from exc
+
+
 def _restore_sidecars(target: str, pkg: Path, original: str,
                       validated_sessions: list[dict],
                       restored_sessions: list[dict] | None = None,
-                      validated_retrieval: dict | None = None) -> list[str]:
+                      validated_retrieval: dict | None = None,
+                      validated_ingest: dict | None = None) -> list[str]:
     """Sources, configs and gold-standard sessions. Returns notes for the job."""
     notes: list[str] = []
 
     sources.restore_package(pkg, target)
 
-    ingest_cfg = pkg / "ingest_config.json"
-    if ingest_cfg.is_file():
-        data = json.loads(ingest_cfg.read_text())
-        data["collection"] = target
-        out = Path(settings.upload_dir) / "ingest_configs"
-        out.mkdir(parents=True, exist_ok=True)
-        settings_store.publish(out / f"{_safe_file(target)}.json", data)
+    if validated_ingest is not None:
+        # The preflight snapshot, never the package file read again (#510).
+        ingest_config.save({**validated_ingest, "collection": target})
 
     if validated_retrieval is not None:
         data = {**validated_retrieval, "collection": target}
@@ -8043,6 +8079,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         validated_sessions = _read_goldstandard_sessions(pkg, original)
         retrieval_notes: list[str] = []
         validated_retrieval = _read_retrieval_config(pkg, original, retrieval_notes)
+        validated_ingest = _read_ingest_config(pkg, original)
 
         model_notes = _ensure_models(pkg, manifest)                 # spec §6.3
 
@@ -8108,7 +8145,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
             job.setdefault("restored_sessions", [])
             notes = model_notes + replace_notes + _restore_sidecars(
                 target, pkg, original, validated_sessions, job["restored_sessions"],
-                validated_retrieval) + retrieval_notes
+                validated_retrieval, validated_ingest) + retrieval_notes
 
             if staged and temp_collection:
                 try:
@@ -14061,7 +14098,11 @@ uv run --no-project --python 3.11 \
 `scripts/tests/test_retrieval_import.py` adds controlled digest-valid malformed
 retrieval package rejection before model, backend, recovery, or sidecar mutation;
 historical defaults/coercion and `ef` round trips; and generated Python literal
-regressions. Run it with the same API dependencies as the session import test.
+regressions. Its `IngestImportTests` do the same for `ingest_config.json`
+(E35, #510): malformed ingest settings are refused `PACKAGE_CORRUPT` in every
+conflict mode before any live change, and valid ones, including chunk sizes from
+before the #53 bounds, are restored from the checked snapshot and read back
+through `GET /ingest/config`. Run it with the same API dependencies as the session import test.
 `05_transfer.sh` registers it and `retrieval_settings.py` (E28), which submits
 15 malformed settings imports across abort/rename/replace and verifies live
 collection counts and saved settings are unchanged. The normal rename import
@@ -26014,6 +26055,7 @@ class SettingsPersistenceTests(unittest.TestCase):
             pkg = root / 'package'
             pkg.mkdir()
             (pkg / 'ingest_config.json').write_text(json.dumps(incoming))
+            validated = importer._read_ingest_config(pkg, 'Original')
             path = ingest_config._path(old['collection'])
             before = path.read_bytes()
             entered = []
@@ -26025,11 +26067,13 @@ class SettingsPersistenceTests(unittest.TestCase):
             with patch.object(settings_store, '_write_lock', ObservedLock()), \
                  patch.object(Path, 'replace', side_effect=OSError('owned publication failure')):
                 with self.assertRaises(OSError):
-                    importer._restore_sidecars(old['collection'], pkg, 'Original', [])
+                    importer._restore_sidecars(old['collection'], pkg, 'Original', [],
+                                               validated_ingest=validated)
             self.assertEqual(entered, [True])
             self.assertEqual(path.read_bytes(), before)
             self.assertEqual(list(path.parent.glob('*.tmp')), [])
-            importer._restore_sidecars(old['collection'], pkg, 'Original', [])
+            importer._restore_sidecars(old['collection'], pkg, 'Original', [],
+                                       validated_ingest=validated)
             self.assertEqual(ingest_config.load(old['collection']), incoming)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
@@ -26231,9 +26275,11 @@ class SettingsPersistenceTests(unittest.TestCase):
             pkg = root / 'package'
             pkg.mkdir()
             (pkg / 'ingest_config.json').write_text(json.dumps(incoming))
+            validated = importer._read_ingest_config(pkg, 'Original')
             events = []
             with self.recorded(events):
-                importer._restore_sidecars(incoming['collection'], pkg, 'Original', [])
+                importer._restore_sidecars(incoming['collection'], pkg, 'Original', [],
+                                           validated_ingest=validated)
             after = self.after_replace(events)
             self.assertEqual([event[0] for event in after], ['open', 'fsync folder', 'close'], events)
             self.assertEqual(after[0][2], ingest_config._path(incoming['collection']).parent)
@@ -26699,7 +26745,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
 from config import settings
 from models.schemas import SaveRetrievalConfigBody
-from services import importer, model_bundle, packager, retrieval_config
+from services import importer, ingest_config, model_bundle, packager, retrieval_config
 
 
 INVALID = [None, [], 3, 'settings', {'top_k': '5; injected = True'},
@@ -27358,6 +27404,141 @@ class ModelTagFolderTests(unittest.TestCase):
         self.assertIsNone(self.installed('bar:y'))  # develop: bar:x's
         self.assertIn("model 'bar' is absent and not bundled; queries will fail until it is pulled", notes)
         self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['bar:x'])
+
+
+# Ingest settings in a package (#510): the save contract, except that chunk_size and
+# min_chunk_size from before the #53 bounds are kept (SPECIFICATIONS.md section 8).
+INVALID_INGEST = [None, [], 3, 'settings', {'chunk_size': 'invalid'}, {'chunk_size': True},
+                  {'chunk_size': 0}, {'chunk_size': -1}, {'chunk_size': 1.5},
+                  {'chunking_strategy': 'unknown'}, {'chunk_overlap': -1},
+                  {'min_chunk_size': -1}, {'similarity_threshold': 1.5},
+                  {'similarity_threshold': float('nan')}, {'similarity_threshold': True},
+                  {'chunking_strategy': 'overlap', 'chunk_size': 200, 'chunk_overlap': 200}]
+
+
+class IngestImportTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.pkg = self.root / 'package'
+        self.pkg.mkdir()
+        self.uploads = self.root / 'uploads'
+        self.uploads.mkdir()
+        self.exports = self.root / 'exports'
+        self.exports.mkdir()
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        for key, value in [('upload_dir', self.uploads), ('exports_dir', self.exports),
+                           ('sources_dir', self.root / 'sources')]:
+            self.stack.enter_context(patch.object(settings, key, str(value)))
+        self.stack.enter_context(patch.object(ingest_config, '_DIR', None))
+        self.stack.enter_context(patch.object(retrieval_config, '_DIR', None))
+        self.stack.enter_context(patch.dict(importer._jobs, {}, clear=True))
+        self.stack.enter_context(patch.object(importer, '_log'))
+
+    def archive(self, data):
+        side = self.pkg / 'ingest_config.json'
+        if side.is_dir():
+            side.rmdir()
+        if data is not None:
+            side.write_text(data)
+        (self.pkg / 'chunks.jsonl').write_text('')
+        manifest = {'package_format': 1, 'collection': {'name': 'Corpus', 'chunk_count': 0},
+                    'embedding': {'model': settings.embed_model},
+                    'files': {p.name: 'sha256:' + packager.sha256_file(p)
+                              for p in self.pkg.iterdir() if p.is_file() and p.name != 'manifest.json'}}
+        (self.pkg / 'manifest.json').write_text(json.dumps(manifest))
+        with tarfile.open(self.exports / 'fixture.tar.gz', 'w:gz') as tar:
+            tar.add(self.pkg, arcname='package')
+
+    def served(self, collection):
+        from routers import ingest as ingest_router
+        import asyncio
+        return asyncio.run(ingest_router.get_ingest_config(collection)).model_dump()
+
+    def assert_refused_before_mutation(self):
+        saved = ingest_config._path('Corpus')
+        before = saved.read_bytes()
+        for conflict in ('abort', 'rename', 'replace'):
+            with self.subTest(conflict=conflict), ExitStack() as mocks:
+                operations = [mocks.enter_context(patch.object(module, name)) for module, name in [
+                    (importer, '_ensure_models'), (importer, '_build'),
+                    (importer.wc, '_collection_exists_sync'), (importer.wc, '_delete_collection_sync'),
+                    (importer.wc, 'get_client'), (importer, '_mark_started'),
+                    (importer.collection_recovery, 'begin'), (importer.sources, 'restore_package')]]
+                importer._jobs['test'] = {'status': 'queued'}
+                importer._run('test', 'fixture.tar.gz', conflict)
+                result = importer._jobs['test']
+                self.assertEqual(result['status'], 'failed', result)
+                self.assertEqual(result['error_code'], 'PACKAGE_CORRUPT', result)
+                self.assertEqual(result['error'], 'Invalid ingest settings.')
+                self.assertEqual(result['error_detail'], {'file': 'ingest_config.json'})
+                for operation in operations:
+                    operation.assert_not_called()
+                self.assertEqual(saved.read_bytes(), before)
+                self.assertIsNone(retrieval_config.load('Corpus'))
+                self.assertFalse((self.root / 'sources').exists())
+                self.assertFalse(list(self.uploads.glob('import-*')))
+
+    def test_digest_valid_bad_ingest_settings_refused_before_any_live_mutation(self):
+        # develop: imports as completed and publishes the raw file (#510).
+        ingest_config.save({**ingest_config.DEFAULTS, 'collection': 'Corpus', 'chunk_size': 900})
+        for data in [json.dumps(value) for value in INVALID_INGEST] + ['{']:
+            with self.subTest(data=data):
+                self.archive(data)
+                self.assert_refused_before_mutation()
+
+    def test_nonregular_ingest_settings_are_refused(self):
+        ingest_config.save({**ingest_config.DEFAULTS, 'collection': 'Corpus'})
+        self.archive(None)
+        (self.pkg / 'ingest_config.json').mkdir()
+        with self.assertRaises(packager.PackageError) as caught:
+            importer._read_ingest_config(self.pkg, 'Corpus')
+        self.assertEqual(caught.exception.code, 'PACKAGE_CORRUPT')
+        self.assertEqual(caught.exception.detail, {'file': 'ingest_config.json'})
+        self.assertIsNone(importer._read_ingest_config(self.root, 'Corpus'))
+
+    def test_valid_ingest_settings_import_and_are_served_unchanged(self):
+        full = {'chunking_strategy': 'semantic', 'chunk_size': 800, 'chunk_overlap': 0,
+                'similarity_threshold': 0.7, 'min_chunk_size': 40}
+        cases = [
+            (full, full),
+            ({}, dict(ingest_config.DEFAULTS)),
+            ({'collection': 'OldName', 'is_default': True, 'legacy_field': 'ignored',
+              'chunking_strategy': 'fixed', 'chunk_size': '150', 'chunk_overlap': '20',
+              'similarity_threshold': '0.5', 'min_chunk_size': '40'},
+             {'chunking_strategy': 'fixed', 'chunk_size': 150, 'chunk_overlap': 20,
+              'similarity_threshold': 0.5, 'min_chunk_size': 40}),
+            # Saved before the #53 bounds: served as it is, never clamped.
+            ({'chunking_strategy': 'fixed', 'chunk_size': 20, 'chunk_overlap': 10,
+              'similarity_threshold': None, 'min_chunk_size': 8000},
+             {'chunking_strategy': 'fixed', 'chunk_size': 20, 'chunk_overlap': 10,
+              'similarity_threshold': None, 'min_chunk_size': 8000}),
+        ]
+        for data, expected in cases:
+            with self.subTest(data=data):
+                self.archive(json.dumps(data))
+                with patch.object(importer, '_ensure_models', return_value=[]), \
+                     patch.object(importer.wc, '_collection_exists_sync', return_value=False), \
+                     patch.object(importer, '_build', return_value=0):
+                    importer._jobs['test'] = {'status': 'queued'}
+                    importer._run('test', 'fixture.tar.gz', 'abort')
+                self.assertEqual(importer._jobs['test']['status'], 'completed', importer._jobs['test'])
+                self.assertEqual(self.served('Corpus'),
+                                 {'collection': 'Corpus', **expected, 'is_default': False})
+                ingest_config.delete('Corpus')
+
+    def test_restore_uses_preflight_snapshot_and_rebinds_renamed_collection(self):
+        self.archive(json.dumps({'chunk_size': '800', 'collection': 'Corpus'}))
+        validated = importer._read_ingest_config(self.pkg, 'Corpus')
+        (self.pkg / 'ingest_config.json').write_text('{"chunk_size": "invalid"}')
+        with patch.object(importer.sources, 'restore_package'):
+            importer._restore_sidecars('Renamed', self.pkg, 'Corpus', [], validated_ingest=validated)
+        self.assertEqual(ingest_config.load('Renamed'), {**validated, 'collection': 'Renamed'})
+        self.assertEqual(validated['collection'], 'Corpus')
+        self.assertEqual(validated['chunk_size'], 800)
+
 
 if __name__ == '__main__':
     unittest.main()
