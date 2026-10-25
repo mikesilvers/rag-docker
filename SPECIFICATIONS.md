@@ -1463,7 +1463,9 @@ GET /export/job/{job_id}
 
 `status` is `queued`, `running`, `completed` or `failed`; an export waiting for its
 collection's writer guard reads `queued` (#509). On failure `error`
-carries the reason and `filename` stays null. Export, import and tune job records persist
+carries the reason and `filename` stays null. An export whose build is cancelled
+reads `failed`, with an `error` saying it was cancelled before it finished and to
+start it again (#521). Export, import and tune job records persist
 across an API restart like ingest's (§3.1.3); a job the restart interrupted reads `failed`
 with `error_code` `INTERRUPTED` and an `error` saying the API restarted while it was running. A failed build leaves nothing
 behind: the staging directory and the partial archive are both removed, and the

@@ -36,6 +36,10 @@ OLD = b"old version of the document\n"
 NEW = b"new version of the document\n"
 
 
+class Stopped(BaseException):
+    """A non-Exception that ends the build, as KeyboardInterrupt or SystemExit would."""
+
+
 def wait_until(condition, timeout=3.0):
     deadline = time.monotonic() + timeout
     while not condition():
@@ -239,6 +243,7 @@ class ExportSnapshotTests(unittest.TestCase):
             "refused": dict(side_effect=packager.PackageError("EMBEDDING_MISMATCH", "refused")),
             "failed": dict(side_effect=RuntimeError("build failed")),
             "cancelled": dict(side_effect=asyncio.CancelledError()),
+            "stopped": dict(side_effect=Stopped()),
         }
         for name, behaviour in outcomes.items():
             with self.subTest(outcome=name):
@@ -252,8 +257,9 @@ class ExportSnapshotTests(unittest.TestCase):
                     return _behaviour["return_value"]
 
                 with patch.object(packager, "build", build):
-                    if name == "cancelled":
-                        with self.assertRaises(asyncio.CancelledError):
+                    if name in ("cancelled", "stopped"):
+                        # The cancellation still propagates (#521).
+                        with self.assertRaises(type(behaviour["side_effect"])):
                             exporter._run(job_id, COLL, False)
                     else:
                         exporter._run(job_id, COLL, False)
@@ -269,9 +275,15 @@ class ExportSnapshotTests(unittest.TestCase):
                 thread.start()
                 thread.join(timeout=5)
                 self.assertEqual(acquired, [True])
-                if name != "cancelled":
-                    self.assertEqual(exporter._jobs[job_id]["status"],
-                                     "completed" if name == "success" else "failed")
+                job = exporter._jobs[job_id]
+                self.assertEqual(job["status"], "completed" if name == "success" else "failed")
+                if name in ("cancelled", "stopped"):
+                    # A terminal status, not `running` for the rest of the process (#521).
+                    kind = type(behaviour["side_effect"]).__name__
+                    self.assertEqual(job["error"], f"{kind}: the export was cancelled before "
+                                     "it finished. Start the export again.")
+                    self.assertIsNone(job.get("error_code"))
+                    self.assertIsNone(job.get("error_detail"))
 
 
 if __name__ == "__main__":

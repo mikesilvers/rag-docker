@@ -77,6 +77,15 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
         telemetry.outcome("error", exc)
         _log.exception("Export of %r failed", collection)
         finish(status="failed", error=f"{type(exc).__name__}: {exc}")
+    except BaseException as exc:
+        # A cancellation (or another non-Exception) ending the build still gives
+        # the job a terminal status, so a polling client sees it end (#521). The
+        # spec's export states have no `cancelled`; it is a failure that says so.
+        # Re-raised so the cancellation propagates; `traced` records the outcome.
+        _log.warning("Export of %r cancelled (%s)", collection, type(exc).__name__)
+        finish(status="failed", error=f"{type(exc).__name__}: the export was "
+               "cancelled before it finished. Start the export again.")
+        raise
     else:
         finish(
             status="completed",

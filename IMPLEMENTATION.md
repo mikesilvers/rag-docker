@@ -7205,6 +7205,15 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
         telemetry.outcome("error", exc)
         _log.exception("Export of %r failed", collection)
         finish(status="failed", error=f"{type(exc).__name__}: {exc}")
+    except BaseException as exc:
+        # A cancellation (or another non-Exception) ending the build still gives
+        # the job a terminal status, so a polling client sees it end (#521). The
+        # spec's export states have no `cancelled`; it is a failure that says so.
+        # Re-raised so the cancellation propagates; `traced` records the outcome.
+        _log.warning("Export of %r cancelled (%s)", collection, type(exc).__name__)
+        finish(status="failed", error=f"{type(exc).__name__}: the export was "
+               "cancelled before it finished. Start the export again.")
+        raise
     else:
         finish(
             status="completed",
@@ -14148,7 +14157,7 @@ Run `python3 scripts/tests/test_session_implementation.py` from the repository r
 
 `05_transfer.sh` registers the eight controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py` and `test_package_listing.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work.
 
-`scripts/tests/test_export_snapshot.py` (#509, API container) drives `exporter._run` with the real `packager.build` and retained-source store and a mocked Weaviate backend whose iterator reads the stored chunks one at a time. A re-ingest that tries to commit new chunks and a new `doc.txt` source after the first chunk is streamed waits for the export: the package holds the old chunk text and the old source bytes and index, every chunk's `source_sha256` names a blob in `sources/`, and the re-ingest lands after the build. During an export, gold-standard generation preparation answers `COLLECTION_BUSY` (409) and a guarded chunk insert waits; an export started while another writer holds the guard reads `queued` until it is released; and the guard is free again after an export that succeeds, is refused (`PackageError`), fails or is cancelled. Orderings use events and the guard's waiter count. On the code before #509 the re-ingest, generation, insert, queued and guard-held checks fail.
+`scripts/tests/test_export_snapshot.py` (#509, API container) drives `exporter._run` with the real `packager.build` and retained-source store and a mocked Weaviate backend whose iterator reads the stored chunks one at a time. A re-ingest that tries to commit new chunks and a new `doc.txt` source after the first chunk is streamed waits for the export: the package holds the old chunk text and the old source bytes and index, every chunk's `source_sha256` names a blob in `sources/`, and the re-ingest lands after the build. During an export, gold-standard generation preparation answers `COLLECTION_BUSY` (409) and a guarded chunk insert waits; an export started while another writer holds the guard reads `queued` until it is released; and the guard is free again after an export that succeeds, is refused (`PackageError`), fails or is cancelled. An export whose build is cancelled, or ended by another non-`Exception`, reads `failed` with an `error` naming the exception and saying it was cancelled, and the exception still propagates (#521). Orderings use events and the guard's waiter count. On the code before #509 the re-ingest, generation, insert, queued and guard-held checks fail; on the code before #521 the cancelled-status checks fail.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -14623,7 +14632,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, registered by transfer |
-| `../tests/test_export_snapshot.py` | controlled export writer-guard regressions: a mid-export re-ingest can't change the package, busy and waiting writers, guard release (#509), registered by transfer |
+| `../tests/test_export_snapshot.py` | controlled export writer-guard regressions: a mid-export re-ingest can't change the package, busy and waiting writers, guard release (#509), a cancelled export's status (#521), registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`, and so is a manifest with a wrongly typed listed value (#451); run in the API image with no network, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
