@@ -413,7 +413,9 @@ completion, the written filename.
   collection with this instance’s model before exporting. `collection.json` and
   the manifest bind vectors to that stored model.
 - Failed export jobs expose typed package refusal fields `error_code` and
-  `error_detail`, alongside the human-readable `error`.
+  `error_detail`, alongside the human-readable `error`. An export whose build is
+  cancelled ends `failed`, with an `error` saying it was cancelled before it
+  finished and to start it again, never staying `running` (#521).
 - Export holds the collection's writer guard, the lock its ingest, tuning and
   import writers share, for its whole run, from before the settings and chunks are read until the archive
   is renamed into place, so the chunks and retained sources come from one point
@@ -947,7 +949,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E33 | An import whose manifest `files` map lists a key outside the package (an absolute key or a `..` key), with the outside file's real digest or a wrong one, fails `PACKAGE_CORRUPT` with `detail` `{"file": "manifest.json"}` and nothing else; the job reveals neither the outside path nor its digest, and no collection is created (#371) |
 | E34 | A model is bundled whole or not at all: when any of its files can't be copied, none of its files stay in the package or its `files` map, it is left out of `bundled_models`, and a warning names it, while another model before or after it is still bundled whole; when every model fails, the package has no `models/` folder and `models_bundled` is false. A model named for both embedding and the LLM, compared by name and tag (`x` and `x:latest`), is copied once (#449, #494), by `test_retrieval_import.py` |
 | E35 | Digest-valid malformed ingest settings (invalid JSON, a non-object, a wrong type or an invalid value) are refused `PACKAGE_CORRUPT`, naming `ingest_config.json`, before live mutation in all conflict modes, leaving the existing collection's settings unchanged; valid settings, including ones with missing or unknown fields, numeric strings and a `chunk_size`/`min_chunk_size` from before the chunk bounds, import and `GET /ingest/config/{collection}` returns them for the import target (#510), by `test_retrieval_import.py` |
-| E36 | An export holds its collection's writer guard for its whole run: a re-ingest that tries to commit mid-export waits, and the package holds the old chunks with the old source bytes, every non-null `source_sha256` naming a blob in it; gold-standard generation is refused `COLLECTION_BUSY` and guarded writers wait meanwhile; an export started while another writer holds the guard reads `queued`; the guard is released when the export completes, fails or is cancelled (#509), by `test_export_snapshot.py` |
+| E36 | An export holds its collection's writer guard for its whole run: a re-ingest that tries to commit mid-export waits, and the package holds the old chunks with the old source bytes, every non-null `source_sha256` naming a blob in it; gold-standard generation is refused `COLLECTION_BUSY` and guarded writers wait meanwhile; an export started while another writer holds the guard reads `queued`; the guard is released when the export completes, fails or is cancelled (#509); a cancelled export ends `failed` with an `error` saying so, and the cancellation still propagates (#521), by `test_export_snapshot.py` |
 
 ---
 
