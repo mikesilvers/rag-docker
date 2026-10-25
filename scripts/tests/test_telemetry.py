@@ -22,11 +22,13 @@ from opentelemetry.trace import Status, StatusCode
 SECRET = 'SENTINEL-secret-prompt-document-/private/file.txt'
 
 @contextlib.contextmanager
-def receiver(status=200):
+def receiver(status=200, headers=None):
     records = []
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
             records.append((self.path, self.rfile.read(int(self.headers['Content-Length']))))
+            if headers is not None:
+                headers.append(dict(self.headers))
             self.send_response(status)
             self.send_header('Location', 'http://127.0.0.1:1/' + SECRET)
             self.end_headers()
@@ -977,10 +979,10 @@ class TelemetryTests(unittest.TestCase):
                 self.send_response(200); self.end_headers()
             def log_message(self, *args):
                 pass
-        post = requests.Session.post
-        def spy(session, url, *args, **kwargs):
+        send = requests.Session.request
+        def spy(session, method, url, *args, **kwargs):
             verify.append(kwargs.get('verify'))
-            return post(session, url, *args, **kwargs)
+            return send(session, method, url, *args, **kwargs)
         base = {'RAG_OTEL_ENABLED':'true', 'RAG_OTEL_ENDPOINT':'https://localhost:4318'}
         with tempfile.TemporaryDirectory() as directory:
             unreadable = os.path.join(directory, 'unreadable-'+SECRET.replace('/', '_'))
@@ -1002,7 +1004,7 @@ class TelemetryTests(unittest.TestCase):
                        'RAG_OTEL_LOGS':'false', 'RAG_OTEL_METRICS':'false'}
                 for name, ca_file, delivered in (('unset', None, False), ('other CA only', other['ca'], False),
                                                  ('bundle with both CAs', both, True)):
-                    with self.subTest(case=name), patch.object(requests.Session, 'post', spy):
+                    with self.subTest(case=name), patch.object(requests.Session, 'request', spy):
                         records.clear(); verify.clear()
                         runtime = bootstrap({**env, 'RAG_OTEL_CA_FILE':ca_file} if ca_file else env)
                         try:
@@ -1161,5 +1163,87 @@ class TelemetryTests(unittest.TestCase):
                     with self.assertRaises(TelemetryConfigError) as raised:
                         Config.from_env({**base, 'RAG_OTEL_HEADERS_FILE':path})
                     self.assertEqual(str(raised.exception), 'Invalid RAG_OTEL_HEADERS_FILE')
+
+    def test_every_export_goes_through_sanitize_wire(self):
+        # #522: OTel 1.45 sends through session.request(), which skipped the old
+        # post() override. Every body the collector gets must be one that
+        # sanitize_wire produced, one call per request, with none of the SDK's headers.
+        import services.telemetry as telemetry
+        real = telemetry.sanitize_wire
+        produced = []
+        def spy(data, signal, *args, **kwargs):
+            output = real(data, signal, *args, **kwargs)
+            produced.append(('/v1/' + signal, output))
+            return output
+        headers = []
+        with receiver(headers=headers) as (env, records), patch.object(telemetry, 'sanitize_wire', spy):
+            runtime = bootstrap({**env, 'RAG_OTEL_INTERVAL_MS': '60000'})
+            try:
+                with runtime.tracer.start_as_current_span('rag.query', attributes={'prompt': SECRET}):
+                    runtime.logger.emit(body=SECRET, attributes={'secret': SECRET})
+                runtime.meter.create_counter('rag.telemetry.check').add(1, {'secret': SECRET})
+                self.assertTrue(runtime.force_flush())
+            finally:
+                self.assertTrue(runtime.shutdown())
+        self.assertEqual({path for path, _ in records}, {'/v1/traces', '/v1/logs', '/v1/metrics'})
+        self.assertEqual(sorted(records), sorted(produced))
+        for path, body in records:
+            self.assertNotIn(SECRET.encode(), body)
+        self.assertEqual(len(headers), len(records))
+        for sent in headers:
+            self.assertEqual(sent.get('Content-Type'), 'application/x-protobuf')
+            self.assertFalse([value for value in sent.values() if 'OTel' in value or 'OTLP' in value], sent)
+
+    def test_session_request_and_post_send_only_sanitized_payloads(self):
+        # #522: whichever method the SDK calls, the session sends one sanitized
+        # POST to the configured endpoint, ignores the SDK's URL and headers,
+        # and answers 200 or 400 without raising.
+        source = ExportTraceServiceRequest()
+        span = source.resource_spans.add().scope_spans.add().spans.add(
+            name=SECRET, trace_id=b'\x01' * 16, span_id=b'\x02' * 8)
+        span.attributes.add(key='secret').value.string_value = SECRET
+        data = source.SerializeToString()
+        elsewhere = 'http://127.0.0.1:1/' + SECRET
+        for status, expected in ((200, 200), (500, 400)):
+            headers = []
+            with self.subTest(status=status), receiver(status, headers) as (env, records):
+                config = Config.from_env(env)
+                session = _session('traces', config)
+                calls = (lambda: session.request('POST', elsewhere, data=data, headers={'X-Sdk': SECRET}),
+                         lambda: session.post(elsewhere, data=data, headers={'X-Sdk': SECRET}))
+                for call in calls:
+                    self.assertEqual(call().status_code, expected)
+                self.assertEqual(session.request('POST', elsewhere, data=b'\xff\xff\xff').status_code, 400)
+                wanted = sanitize_wire(data, 'traces', config)
+                self.assertEqual(records, [('/v1/traces', wanted)] * 2)
+                self.assertNotIn(SECRET.encode(), wanted)
+                for sent in headers:
+                    self.assertNotIn('X-Sdk', sent)
+
+    def test_session_ignores_ambient_client_certificate(self):
+        # #522: the 1.45 transport copies OTEL_EXPORTER_OTLP_*CLIENT_CERTIFICATE
+        # onto the session; no export may present it.
+        import requests
+        seen = []
+        send = requests.Session.request
+        def spy(session, method, url, *args, **kwargs):
+            seen.append((session.cert, kwargs.get('cert')))
+            return send(session, method, url, *args, **kwargs)
+        with receiver() as (env, records), patch.object(requests.Session, 'request', spy):
+            session = _session('traces', Config.from_env(env))
+            session.cert = '/nonexistent/' + SECRET
+            self.assertEqual(session.request('POST', env['RAG_OTEL_ENDPOINT'] + '/v1/traces',
+                                             data=ExportTraceServiceRequest().SerializeToString()).status_code, 200)
+            with patch.dict(os.environ, {'OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE': '/nonexistent/' + SECRET,
+                                         'OTEL_EXPORTER_OTLP_CLIENT_KEY': '/nonexistent/key-' + SECRET}):
+                runtime = bootstrap({**env, 'RAG_OTEL_LOGS': 'false', 'RAG_OTEL_METRICS': 'false'})
+                try:
+                    with runtime.tracer.start_as_current_span('rag.query'):
+                        pass
+                    self.assertTrue(runtime.force_flush())
+                finally:
+                    self.assertTrue(runtime.shutdown())
+        self.assertEqual([path for path, _ in records], ['/v1/traces', '/v1/traces'])
+        self.assertEqual(seen, [(None, None)] * 2)
 
 if __name__ == '__main__':unittest.main()

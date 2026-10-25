@@ -48,5 +48,5 @@ sentence-transformers>=3.0        # resolved: 6.0.1
 python-multipart>=0.0.9           # resolved: 0.0.32
 
 # Private, optional OTLP HTTP/protobuf telemetry runtime (#282).
-opentelemetry-sdk==1.44.0
-opentelemetry-exporter-otlp-proto-http==1.44.0
+opentelemetry-sdk==1.45.1
+opentelemetry-exporter-otlp-proto-http==1.45.1
