@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     # in one request, gzipped members' output included (#298). A small ZIP of
     # zeros can otherwise unpack to gigabytes and fill Docker's disk.
     max_zip_expanded_bytes: int = 2 * 1024 * 1024 * 1024
+    # The most entries one ZIP may hold, folders included (#28), and the most a
+    # member of 1 MiB or more may expand relative to its compressed size, as
+    # declared and as actually read. Members under 1 MiB are exempt from the ratio.
+    max_zip_members: int = 5000
+    max_zip_member_ratio: int = 200
 
     class Config:
         env_file = ".env"

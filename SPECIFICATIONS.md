@@ -120,6 +120,11 @@ services:
       # The most one upload's ZIPs may expand to in all, gzipped members'
       # output included (2 GiB); over it the upload is refused (#298).
       MAX_ZIP_EXPANDED_BYTES: 2147483648
+      # The most entries one ZIP may hold, and the most a member of 1 MiB or
+      # more may expand relative to its compressed size; over either the
+      # upload is refused (#28).
+      MAX_ZIP_MEMBERS: 5000
+      MAX_ZIP_MEMBER_RATIO: 200
     volumes:
       - ingest_uploads:/app/uploads
       # Retained source documents; grows with the corpus.
@@ -551,6 +556,8 @@ unreadable member, is refused as a whole; nothing is repaired or recovered.
 | 400 | `ARCHIVE_UNREADABLE` | the ZIP is damaged: it can't be opened (truncated, e.g. an incomplete download, or a bad central directory), or a member can't be read (wrong offset, bad local header, bad CRC, truncated data) |
 | 400 | `ARCHIVE_UNSUPPORTED` | no member is damaged, but one is password-protected or uses a compression method the server can't read (e.g. Deflate64) |
 | 400 | `ARCHIVE_TOO_LARGE` | the upload's ZIPs expand to more than `max_zip_expanded_bytes` in all (2 GiB by default; below) |
+| 400 | `ARCHIVE_TOO_MANY_MEMBERS` | one ZIP holds more than `max_zip_members` entries (5,000 by default; below, #28) |
+| 400 | `ARCHIVE_RATIO_TOO_HIGH` | a ZIP member of 1 MiB or more expands to more than `max_zip_member_ratio` times its compressed size (200 by default; below, #28) |
 | 400 | `UPLOAD_WRITE_FAILED` | a filesystem error while saving the upload or extracting a member (disk full, name too long, ...); the message gives the reason |
 | 409 | `COLLECTION_DELETING` | a delete of the collection is in progress (§3.1.2; #302); nothing is saved or queued |
 | 503 | `SERVICE_UNAVAILABLE` | Weaviate can't be read to check that the collection exists (#366); nothing is saved or queued, `detail` is `{"collection": "<name>"}` and the cause is logged, not returned |
@@ -558,7 +565,18 @@ unreadable member, is refused as a whole; nothing is repaired or recovered.
 
 The ZIP messages name the upload, say nothing from it was imported, name the unreadable
 members with a reason each (up to 10, then "and N more") and suggest re-creating the ZIP.
-`detail` is `{"file": ..., "members": [{"member": ..., "reason": ...}, ...]}`.
+`detail` is `{"file": ..., "members": [{"member": ..., "reason": ...}, ...], "members_omitted": N}`:
+`members` holds at most the first 10 members, the ones the message names, and
+`members_omitted` counts the rest (0 when there are none; #28). Every refusal in this table
+that carries a `detail` with `file` (the ZIP refusals and `UPLOAD_WRITE_FAILED`) has this shape.
+
+**Members whose path leaves the archive (#28).** A member whose normalised path is absolute or
+starts with `..` (for example `../bad.txt` or `a/../../up.txt`) is never extracted. It is still
+validated like every other member, so a damaged one refuses the ZIP as `ARCHIVE_UNREADABLE`
+(an encrypted or unsupported-method one as `ARCHIVE_UNSUPPORTED`), and its own bytes count toward
+the expansion cap and the ratio cap below; it is not gunzipped to count gzip output, since the
+job never reads it. An accepted upload lists it in the job's `skipped` as
+`<zip filename>:<member path> (its path leaves the archive, so it was not extracted)`.
 
 **Expansion cap (#298).** All the ZIPs of one upload request may expand to at most
 `max_zip_expanded_bytes` (env `MAX_ZIP_EXPANDED_BYTES`, default 2,147,483,648 bytes = 2 GiB) in
@@ -574,10 +592,35 @@ whole request is refused, whatever else was found: 400 `ARCHIVE_TOO_LARGE`, `'<z
 more than 2,048 MB when unpacked, the most one upload's ZIPs can expand to, so nothing from it was
 imported. Split it into smaller zips and upload them in separate imports.` (`<zip>` is the ZIP
 being checked or read; the limit is in MB when it is a whole number of MiB, otherwise in bytes),
-`detail` `{"file": "<zip>", "members": []}`. A total equal to the cap is accepted. The ZIP work
+`detail` `{"file": "<zip>", "members": [], "members_omitted": 0}`. A total equal to the cap is accepted. The ZIP work
 (opening, the size check, validation, counting and extraction) runs in a worker thread, so the
-API keeps answering other requests meanwhile. The member-count and compression-ratio caps are
-#28's.
+API keeps answering other requests meanwhile.
+
+**Member-count and ratio caps (#28).** Each ZIP may hold at most `max_zip_members` entries (env
+`MAX_ZIP_MEMBERS`, default 5,000), counted per ZIP over every entry in its central directory:
+files, folders, unsupported files, macOS metadata and members whose path leaves the archive. The
+count is checked as soon as the ZIP is opened, before anything else; a count equal to the cap is
+accepted. Over it: 400 `ARCHIVE_TOO_MANY_MEMBERS`, `'<zip>' holds 5,001 entries, more than 5,000,
+the most one zip may hold, so nothing from it was imported. Split it into smaller zips and upload
+them in separate imports.`, `detail` `{"file": "<zip>", "members": [], "members_omitted": 0}`.
+
+A member of 1 MiB (1,048,576 bytes) or more, uncompressed, may expand to at most
+`max_zip_member_ratio` (env `MAX_ZIP_MEMBER_RATIO`, default 200) times its compressed size;
+smaller members are exempt, and exactly the ratio is accepted. It is checked on the sizes the
+ZIP declares, after the declared total and before any member is read, and again on the bytes the
+ZIP layer actually decompresses for each member, after every block read, so a member whose header
+understates its size is refused within a block of passing the ratio. Only the ZIP layer counts:
+a `.json.gz` or `.jsonl.gz` member's gzip output counts toward the expansion cap, not its ratio.
+Over it, whatever else was found: 400 `ARCHIVE_RATIO_TOO_HIGH`, `'<zip>' can't be imported: its
+member '<member>' expands to more than 200 times its compressed size, which is refused as a
+possible zip bomb, so nothing from it was imported. Remove that file from the zip, or upload it on
+its own, and upload again.`, `detail` `{"file": "<zip>", "members": [{"member": "<member>",
+"reason": "expands to more than 200 times its compressed size"}], "members_omitted": 0}`.
+
+For one ZIP the checks run in this order, the first refusal ending the request: the member count;
+the declared total (`ARCHIVE_TOO_LARGE`); the declared ratio; then, while each member is read,
+the total and the member's ratio; then unreadable members. So a ZIP over both the expansion cap
+and the ratio by its declared sizes is `ARCHIVE_TOO_LARGE`.
 
 **`.json.gz` members.** A ZIP member ending in `.json.gz` is extracted and queued like a
 supported file. The job decompresses it (at most 30,000,000 bytes decompressed, the JSON input limit of §5.1; #300) and parses the result
@@ -609,7 +652,8 @@ member that will be skipped. A ZIP holding nothing else is refused with `NO_SUPP
   path inside the archive, POSIX-style and normalised: `a/report.pdf` and `b/report.pdf`
   are two documents, `a/../b.txt` is `b.txt` and `./c.txt` is `c.txt`. Members at the
   archive's top level keep their bare name. A member whose path leaves the archive
-  (`../x.txt`, an absolute path) is not ingested. Error and skip messages still name a
+  (`../x.txt`, an absolute path) is not ingested; it is validated and listed in `skipped`
+  (§3.1.3, #28). Error and skip messages still name a
   member as `<zip filename>:<member path as stored in the archive>`.
 - Each queued file is staged in a directory of its own, so no input overwrites another's
   bytes.
@@ -1781,7 +1825,7 @@ Flat (KNN) index has no tunable parameters.
 | JSON | `.json` | Own converter; Unstructured (`partition_json`) for element files | Converted to readable `key: value` lines, keys in the file's order, non-ASCII text as is, strings unquoted, numbers as written, `true`/`false`/`null` as is. Nested keys are dotted paths (`meta.author: A`); an array of scalars is one line (`tags: a, b, c`); other arrays use indexed paths (`items[0].name: x`). A top-level array holding any object or array gives one element per item (scalar items included), separated by a blank line, so `language` and `context_aware` chunking split between records. Empty objects and arrays write nothing: `{}`, `[]` or an empty file completes with 0 chunks. Invalid JSON (including `NaN`/`Infinity` and non-UTF-8 text; a UTF-8 byte-order mark is accepted) fails that file with "is not valid JSON: <reason>". Because every line repeats its key path, the converted text is bounded: a file whose records, with the blank lines between them, would hold more than 10,000,000 characters (`MAX_TEXT_CHARACTERS`, the chunker's per-file limit for every strategy) fails with "converts to more than 10,000,000 characters of text …" before that text is built. A file keeps at most 1,000,000 records (records with no text don't count); more fails with "has more than 1,000,000 records …", before any element is built (#300). An element file's items count the same way, every item included, and are counted before `partition_json` builds them (#321). A file is parsed whole, so a `.json` file over 30,000,000 bytes (`MAX_JSON_INPUT_BYTES`, an element file included) fails before it is read with "is larger than 30,000,000 bytes, the most one JSON file can hold; split the file or convert it to JSON Lines", and a `.json.gz` member stops decompressing there ("decompresses to more than 30,000,000 bytes …"); the rest of the job carries on (#300). A non-empty array of serialized Unstructured elements is rehydrated by `partition_json` (#295) |
 | JSON Lines | `.jsonl`, `.jsonl.gz` | Own reader and the JSON converter above (#291) | One file is one document. Read one line at a time (lines end at `\n` or `\r\n`, so CRLF and LF files read the same; the last line needs no newline); a `.jsonl.gz` is decompressed as it is read, at most 512 MB. Each non-blank line is one record: its JSON value (any value, not only an object) converted by the JSON rules above from the root, so an array line is one record with indexed paths (`[0].a: 1`). Records are separated by a blank line and each is one element, so `language` and `context_aware` chunking split between lines; lines are never treated as Unstructured element files. A line with no text (`{}`, `[]`, `""`) adds nothing; an empty or blank-only file completes with 0 chunks. A UTF-8 byte-order mark on line 1 is accepted. The file fails as a whole, with nothing stored, at its first bad line: a blank line followed by another record (`line N is blank`; blank lines after the last record are accepted), invalid JSON (`line N is not valid JSON: <reason> at column C`), non-UTF-8 text, or a line over 10,000,000 bytes, not counting its line ending or line 1's byte-order mark (`line N is longer than 10,000,000 bytes …`; at most that much of one line is read, so one record's parse stays bounded; #314). A file holds at most 1,000,000 lines, the JSON record cap: every line counts, blank lines and lines with no text included, and reading stops at line 1,000,001, which fails the file (`has more than 1,000,000 records, the most one file can hold; split the file`; #314). The whole file's text, blank lines between records included, is bounded by the same 10,000,000 characters as JSON: reading stops at the line that passes it (`converts to more than 10,000,000 characters of text by line N …`). Larger corpora are #312. `source_type` is `jsonl` |
 
-For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings) and macOS metadata (`__MACOSX/` members and `._*` AppleDouble files, listed in `skipped`, #378). `.json.gz` members are also extracted; each is decompressed (at most 30,000,000 bytes, #300) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. `.jsonl` and `.jsonl.gz` members are extracted and read as JSON Lines (#291), like direct uploads. Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3). An upload's ZIPs may expand to at most `max_zip_expanded_bytes` (2 GiB) in all, gzipped members' output included; over it, the upload is refused with `ARCHIVE_TOO_LARGE` (§3.1.3, #298). This work runs in a worker thread, off the event loop.
+For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings) and macOS metadata (`__MACOSX/` members and `._*` AppleDouble files, listed in `skipped`, #378). `.json.gz` members are also extracted; each is decompressed (at most 30,000,000 bytes, #300) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. `.jsonl` and `.jsonl.gz` members are extracted and read as JSON Lines (#291), like direct uploads. Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3). An upload's ZIPs may expand to at most `max_zip_expanded_bytes` (2 GiB) in all, gzipped members' output included; over it, the upload is refused with `ARCHIVE_TOO_LARGE` (§3.1.3, #298). One ZIP may hold at most `max_zip_members` (5,000) entries, and a member of 1 MiB or more may expand to at most `max_zip_member_ratio` (200) times its compressed size, or the upload is refused with `ARCHIVE_TOO_MANY_MEMBERS` or `ARCHIVE_RATIO_TOO_HIGH`. Members whose path leaves the archive are validated and counted but never extracted, and are listed in `skipped` (§3.1.3, #28). This work runs in a worker thread, off the event loop.
 
 ### 5.2 Chunking Strategy Specifications
 
@@ -2263,6 +2307,8 @@ The `chunk_size` and `min_chunk_size` bounds apply whenever chunk settings are s
 | `maxConnections` | 64 | 16 | 128 | HNSW build param |
 | Gold standard `sample_size` | 20 | 1 | 100 | |
 | `max_zip_expanded_bytes` | 2147483648 | — | — | API setting (env `MAX_ZIP_EXPANDED_BYTES`), not a request parameter: the most one upload's ZIPs may expand to in all, gzipped members' output included (§3.1.3, #298) |
+| `max_zip_members` | 5000 | — | — | API setting (env `MAX_ZIP_MEMBERS`), not a request parameter: the most entries one ZIP may hold, folders included (§3.1.3, #28) |
+| `max_zip_member_ratio` | 200 | — | — | API setting (env `MAX_ZIP_MEMBER_RATIO`), not a request parameter: the most a ZIP member of 1 MiB or more may expand relative to its compressed size, declared and as read (§3.1.3, #28) |
 
 Optional telemetry (#282) is configured by API container environment settings, not request parameters. They are read only when `RAG_OTEL_ENABLED` is `true`; an invalid value fails API startup with an error naming the field only. See "Optional telemetry foundation (#282)" below and README "Optional backend telemetry".
 
@@ -2524,6 +2570,29 @@ now lives once, in `api/services/ingest_config.py`.
       whose gzip member expands to 2,112 MiB, while job polls are still answered;
       `06_ui.sh` checks the Import page shows the API's message and a failing status poll,
       which a new ingest and the next successful poll clear.*
+- [x] One ZIP holds at most `max_zip_members` (5,000) entries, or the upload is refused with `ARCHIVE_TOO_MANY_MEMBERS`; a ZIP member of 1 MiB or more expands to at most `max_zip_member_ratio` (200) times its compressed size, declared and as read, or the upload is refused with `ARCHIVE_RATIO_TOO_HIGH`; members whose path leaves the archive are validated and counted but never extracted, and are listed in `skipped`; a refusal's `detail.members` holds at most 10 members, with `members_omitted` counting the rest (#28).
+      *On develop a ZIP of 20,000 entries and one holding 50 MiB of zeros (about 1,000:1) were
+      accepted, a corrupt `../bad.txt` beside a valid file was dropped unvalidated and unlisted,
+      and 12 damaged members gave 12 `detail.members`. `test_zip_limits.py` (in the API image,
+      with a member cap of 20 set through `MAX_ZIP_MEMBERS`) covers the settings and defaults,
+      20 entries accepted and 21 refused before any member is read with the exact message and
+      `detail`, folders, unsupported files, macOS metadata and escaping members all counted, the
+      cap per ZIP, the count winning over damage, 5,001 entries refused at the default; the ratio
+      rule (under 1 MiB exempt, exactly the ratio accepted), a 1 MiB member of zeros refused
+      before anything is read, 1 MiB - 1 accepted, a stored member and a `.json.gz` member's gzip
+      output not counted toward the ratio, a member refused while read within a block of passing
+      the ratio when the declared check is bypassed, the expansion cap winning over the ratio and
+      the ratio over an earlier unreadable member; a corrupt escaping member refusing the ZIP,
+      escaping members listed in `skipped` and not staged, their bytes (not their gzip output)
+      counted and their ratio checked; and `detail.members` bounded to the ten the message
+      names. 19 of its 28 tests fail against develop's `ingest_pipeline.py`. Fixtures that used a
+      highly compressible Deflate member only to reach another limit now store it uncompressed
+      (`json_over_size_member.zip`, two `test_zip_expansion.py` cases, the gzip buffer tests).
+      `02_ingest.sh` runs the test in the verify project's API container, checks that the API
+      takes 5,000 and 200 from `docker-compose.yml`, and through the proxy refuses
+      `zip_many_members.zip` (5,001 entries) with `ARCHIVE_TOO_MANY_MEMBERS` and
+      `zip_high_ratio.zip` (2 MiB of zeros in 2 KB) with `ARCHIVE_RATIO_TOO_HIGH`, each with the
+      exact message and `detail`.*
 - [x] Each chunking strategy produces non-empty chunks for a test PDF.
       *fixed 3, overlap 1, language 4, context_aware 4, semantic 8 chunks.*
 - [x] Chunks below `min_chunk_size` are merged and not stored as independent objects.

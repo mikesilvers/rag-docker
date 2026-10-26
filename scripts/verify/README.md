@@ -311,7 +311,26 @@ container, checks that the API takes the 2 GiB cap from `docker-compose.yml`'s
 2,049 MiB) and `zip_over_gzip.zip` (a gzip member expanding to 2,112 MiB) through the proxy,
 checks each is refused with `ARCHIVE_TOO_LARGE` and the exact message, and that job polls sent
 while the second is counted are answered within a second (a smoke check; the controlled test is
-the one that tells off-loop from on-loop work).
+the one that tells off-loop from on-loop work). Cases there that use a large member of one
+repeated byte only to reach the total store it uncompressed, so the ratio cap (#28) doesn't
+refuse it first.
+
+`scripts/tests/test_zip_limits.py` (#28) checks the member-count and compression-ratio caps
+with a member cap of 20 set through `MAX_ZIP_MEMBERS` (`02_ingest.sh` passes it to the
+container; the test sets it when absent): the settings and their 5,000 and 200 defaults, 20
+entries accepted and 21 refused before any member is read, folders, unsupported files, macOS
+metadata and members leaving the archive all counted, the count per ZIP and winning over
+damage, 5,001 entries refused at the default; the ratio rule (under 1 MiB exempt, exactly the
+ratio accepted), a declared ratio refused before anything is read, a stored member and gzip
+output not counted toward the ratio, a member refused while read within a block of passing the
+ratio, the expansion cap winning over the ratio and the ratio over an earlier unreadable member;
+members whose path leaves the archive validated (a corrupt one refuses the ZIP), counted,
+never staged and listed in `skipped`; and `detail.members` bounded to the ten members the
+message names, with `members_omitted`. `02_ingest.sh` runs it in the API container, checks
+that the API takes `MAX_ZIP_MEMBERS` 5,000 and `MAX_ZIP_MEMBER_RATIO` 200 from
+`docker-compose.yml`, then sends `zip_many_members.zip` (5,001 entries) and
+`zip_high_ratio.zip` (2 MiB of zeros, Deflate) through the proxy and checks each is refused
+with `ARCHIVE_TOO_MANY_MEMBERS` or `ARCHIVE_RATIO_TOO_HIGH` and the exact message and `detail`.
 
 `scripts/tests/test_json_ingest.py` (#295) checks that ordinary JSON becomes readable
 `key: value` text: dotted and indexed paths, scalar arrays on one line, file key order,
@@ -618,6 +637,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E36; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
+| `../tests/test_zip_limits.py` | controlled ZIP member-count (cap of 20 from env), ratio, escaping-member and `detail` bound regressions (#28), registered by ingest |
 | `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
 | `../tests/test_jsonl_ingest.py` | controlled JSON Lines reading, conversion, limit and gzip regressions, registered by ingest |
 | `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |

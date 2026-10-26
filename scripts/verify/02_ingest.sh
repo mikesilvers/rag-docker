@@ -5,7 +5,7 @@ REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 # Regenerate when the newest fixture is missing, so a directory left by an
 # older run does not hide a check behind a missing file.
-[ -f "$FIX/json_over_size_member.zip" ] || python3 ./fixtures.py "$FIX" >/dev/null
+[ -f "$FIX/zip_high_ratio.zip" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
 # Run the independent text-storage window acceptance without model work.
@@ -131,7 +131,7 @@ try:
     e = json.load(open('/tmp/vfy_cap.json'))['error']
 except Exception:
     print(code, 'not-json', 'no'); raise SystemExit
-ok = e['message'] == want and e['detail'] == {'file': name, 'members': []}
+ok = e['message'] == want and e['detail'] == {'file': name, 'members': [], 'members_omitted': 0}
 print(code, e['code'], 'yes' if ok else 'no')
 ENDPY
 }
@@ -162,6 +162,56 @@ check "a ZIP whose gzip member expands past 2 GiB is refused with ARCHIVE_TOO_LA
 [ "$slow" = 0 ] && [ "$probes" -gt 0 ]
 check "job polls are answered while a ZIP is being counted" $? \
   "$probes probes, $slow slow or failed, slowest ${worst}s"
+
+# ── the member-count and ratio caps, escaping members, detail bound (#28) ─────
+# Controlled cases with a member cap of 20 set through the environment: the
+# count and what counts, the ratio rule, declared and read sizes, precedence,
+# members whose path leaves the archive, and the bound on detail.members.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app -e MAX_ZIP_MEMBERS=20 \
+  api python - < scripts/tests/test_zip_limits.py)
+check "ZIP member-count, ratio and escaping-member regressions (cap of 20 from env)" $?
+
+limits_env=$(cd "$REPO_ROOT" && docker compose exec -T api python -c \
+  'import os; from config import settings as s; print(os.environ.get("MAX_ZIP_MEMBERS"), s.max_zip_members, os.environ.get("MAX_ZIP_MEMBER_RATIO"), s.max_zip_member_ratio)' | tr -d '\r')
+[ "$limits_env" = "5000 5000 200 200" ]
+check "docker-compose.yml sets MAX_ZIP_MEMBERS 5000 and MAX_ZIP_MEMBER_RATIO 200 and the API uses them" $? \
+  "env and settings: $limits_env"
+
+# Both through the proxy at the defaults. Prints "<HTTP> <code> <exact ok>".
+zip_limit() {
+  local name="$1" code
+  code=$(curl -s -m 120 -o /tmp/vfy_limit.json -w '%{http_code}' -X POST "$API/ingest/upload" \
+    -F "collection=$C" -F "strategy=fixed" -F "files=@$FIX/$name")
+  python3 - "$code" "$name" <<'ENDPY'
+import json, sys
+code, name = sys.argv[1], sys.argv[2]
+if name == "zip_many_members.zip":
+    want = (f"'{name}' holds 5,001 entries, more than 5,000, the most one zip may hold, so "
+            f"nothing from it was imported. Split it into smaller zips and upload them in "
+            f"separate imports.")
+    members = []
+else:
+    want = (f"'{name}' can't be imported: its member 'zeros.txt' expands to more than 200 "
+            f"times its compressed size, which is refused as a possible zip bomb, so nothing "
+            f"from it was imported. Remove that file from the zip, or upload it on its own, "
+            f"and upload again.")
+    members = [{"member": "zeros.txt", "reason": "expands to more than 200 times its compressed size"}]
+try:
+    e = json.load(open('/tmp/vfy_limit.json'))['error']
+except Exception:
+    print(code, 'not-json', 'no'); raise SystemExit
+ok = e['message'] == want and e['detail'] == {'file': name, 'members': members, 'members_omitted': 0}
+print(code, e['code'], 'yes' if ok else 'no')
+ENDPY
+}
+read -r code err_code text_ok <<<"$(zip_limit zip_many_members.zip)"
+[ "$code" = 400 ] && [ "$err_code" = ARCHIVE_TOO_MANY_MEMBERS ] && [ "$text_ok" = yes ]
+check "a ZIP of 5,001 entries is refused with ARCHIVE_TOO_MANY_MEMBERS" $? \
+  "HTTP=$code code=$err_code exact-message=$text_ok"
+read -r code err_code text_ok <<<"$(zip_limit zip_high_ratio.zip)"
+[ "$code" = 400 ] && [ "$err_code" = ARCHIVE_RATIO_TOO_HIGH ] && [ "$text_ok" = yes ]
+check "a ZIP member expanding more than 200 times is refused with ARCHIVE_RATIO_TOO_HIGH" $? \
+  "HTTP=$code code=$err_code exact-message=$text_ok"
 
 # ── ordinary JSON as readable text (#295) ────────────────────────────────────
 # Controlled cases: every conversion rule, file key order, non-ASCII text,
