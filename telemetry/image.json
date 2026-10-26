@@ -1,7 +1,7 @@
 {
-  "image": "ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector:0.162.0@sha256:310a800ad69ee430e7c541796852a242c9c7db97aaad4daa5ccf843c525fbdb2",
+  "image": "ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector:0.163.2@sha256:63e5e8eccf4268be02388ba9f2dc36b80b5e47721291293411c0e83152d75bda",
   "config_ids": {
-    "arm64": "sha256:4b51986761b3b2894a21eb6949b9758f2bcad178a59d0bfb9d97e019df9203bf",
-    "amd64": "sha256:2e31a248c3aeb7acb7c3cb1830fa0a9d1674f016c6ab11e957d6c93138fd46e6"
+    "arm64": "sha256:f8df9074b0e47b6ded2e7c2a61d65a031572781e5b2b1616d659ee4a9783871b",
+    "amd64": "sha256:9efa7c39d438f6ab7ed8cfecc91c3a834d4b41fbe5d25b7ce8e67bd912d525a4"
   }
 }

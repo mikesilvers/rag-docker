@@ -19,7 +19,7 @@ services:
       RAG_OTEL_SHUTDOWN_MS: "${RAG_OTEL_SHUTDOWN_MS:-3000}"
   otel-collector:
     profiles: [telemetry]
-    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector:0.162.0@sha256:310a800ad69ee430e7c541796852a242c9c7db97aaad4daa5ccf843c525fbdb2
+    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector:0.163.2@sha256:63e5e8eccf4268be02388ba9f2dc36b80b5e47721291293411c0e83152d75bda
     command: ["--config=/etc/otelcol/config.yaml"]
     networks: [rag-internal]
     ports: []
