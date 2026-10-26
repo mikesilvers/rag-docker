@@ -140,7 +140,8 @@ class CapHarness(unittest.TestCase):
     def assert_too_large(self, status, body, name):
         self.assertEqual(status, 400, body)
         self.assertEqual(body["error"], {"code": "ARCHIVE_TOO_LARGE", "message": message(name),
-                                         "detail": {"file": name, "members": []}})
+                                         "detail": {"file": name, "members": [],
+                                                    "members_omitted": 0}})
         # Nothing queued and nothing left behind.
         self.assertEqual(set(ingest_pipeline._jobs), self.jobs_before)
         self.assertEqual(set(self.uploads.iterdir()), self.uploads_before)
@@ -189,8 +190,11 @@ class CapTests(CapHarness):
 
     # ── actual bytes ──────────────────────────────────────────────────────────
     def test_counting_refuses_even_when_declared_sizes_understate(self):
+        # Stored, so the member is not over the ratio cap (#28) and only the
+        # total is tested.
         with patch.object(ingest_pipeline, "_declared_size", lambda _members: 0):
-            status, body = self.post(upload("lies.zip", zip_bytes([("a.txt", "a" * (CAP + 1))])))
+            status, body = self.post(upload("lies.zip", zip_bytes([("a.txt", "a" * (CAP + 1))],
+                                                                  zipfile.ZIP_STORED)))
         self.assert_too_large(status, body, "lies.zip")
 
     def test_gzipped_members_count_their_output(self):
@@ -249,8 +253,9 @@ class CapTests(CapHarness):
     def test_no_member_is_read_after_the_cap_is_passed(self):
         read = []
         real = ingest_pipeline._member_problem
+        # Stored, so big.txt is not over the ratio cap (#28).
         data = zip_bytes([("big.txt", "a" * (CAP + 1)), ("later.txt", "text"),
-                          ("last.json.gz", gzip.compress(b"{}"))])
+                          ("last.json.gz", gzip.compress(b"{}"))], zipfile.ZIP_STORED)
         with patch.object(ingest_pipeline, "_declared_size", lambda _members: 0), \
                 patch.object(ingest_pipeline, "_member_problem",
                              lambda *a, **k: read.append(a[1].filename) or real(*a, **k)):
@@ -347,7 +352,8 @@ class GzipBufferTests(unittest.TestCase):
             reads.append(size)
             return real(member, size)
 
-        buf = io.BytesIO(zip_bytes([("a.json.gz", data)]))
+        # Stored: zero padding or a long name would pass the ratio cap (#28).
+        buf = io.BytesIO(zip_bytes([("a.json.gz", data)], zipfile.ZIP_STORED))
         with zipfile.ZipFile(buf) as z, \
                 patch.object(ingest_pipeline._CountedMember, "read", read):
             budget = ingest_pipeline._ExpansionBudget(10 * CAP)
@@ -378,7 +384,7 @@ class GzipBufferTests(unittest.TestCase):
         # gzip reader: _OverCap comes through the buffer and the gzip reader,
         # not swallowed as invalid gzip data.
         data = with_long_name(gzip.compress(b"x" * 1000), 2 * 1024 * 1024)
-        buf = io.BytesIO(zip_bytes([("a.json.gz", data)]))
+        buf = io.BytesIO(zip_bytes([("a.json.gz", data)], zipfile.ZIP_STORED))
         with zipfile.ZipFile(buf) as z:
             budget = ingest_pipeline._ExpansionBudget(CAP)
             with self.assertRaises(ingest_pipeline._OverCap):

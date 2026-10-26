@@ -98,6 +98,11 @@ services:
       # The most one upload's ZIPs may expand to in all, gzipped members'
       # output included (2 GiB); over it the upload is refused (#298).
       MAX_ZIP_EXPANDED_BYTES: 2147483648
+      # The most entries one ZIP may hold, and the most a member of 1 MiB or
+      # more may expand relative to its compressed size; over either the
+      # upload is refused (#28).
+      MAX_ZIP_MEMBERS: 5000
+      MAX_ZIP_MEMBER_RATIO: 200
     volumes:
       - ingest_uploads:/app/uploads
       # Retained source documents; grows with the corpus.

@@ -48,6 +48,11 @@ _jobs = jobstore.JobStore("ingest")
 _log = logging.getLogger(__name__)
 
 
+# How many unreadable members a refusal names in its message, and keeps in
+# detail.members; detail.members_omitted counts the rest (#28).
+_MAX_NAMED_MEMBERS = 10
+
+
 class UploadRejected(Exception):
     """An upload that cannot be unpacked. The whole request is refused with a
     readable 4xx instead of the bare 500 an unhandled exception became (#290)."""
@@ -58,7 +63,11 @@ class UploadRejected(Exception):
         self.status = status
         self.code = code
         self.message = message
-        self.detail = {"file": file, "members": members or []}
+        members = members or []
+        # The same members the message names, so a ZIP with thousands of
+        # unreadable members can't make the reply as large (#28).
+        self.detail = {"file": file, "members": members[:_MAX_NAMED_MEMBERS],
+                       "members_omitted": max(0, len(members) - _MAX_NAMED_MEMBERS)}
 
 
 def get_job(job_id: str) -> dict | None:
@@ -810,14 +819,29 @@ def _rejected(code: str, message: str, file: str,
     return UploadRejected(code, message, file, members)
 
 
-# How many unreadable members a refusal names in its message; detail lists all.
-_MAX_NAMED_MEMBERS = 10
-
 _BLOCK = 1024 * 1024
+
+# Members smaller than this, uncompressed, may expand by any ratio (#28): a few
+# KB of repeated text can legitimately pass 200:1 and can't exhaust anything.
+_RATIO_EXEMPT_BYTES = 1024 * 1024
 
 
 class _OverCap(Exception):
     """An upload's ZIPs expand past max_zip_expanded_bytes (#298)."""
+
+
+class _OverRatio(Exception):
+    """A ZIP member expands past max_zip_member_ratio (#28)."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.name = name
+
+
+def _over_ratio(size: int, compressed: int) -> bool:
+    """Whether a member of this uncompressed size expands past the ratio cap
+    (#28). Under 1 MiB is exempt; exactly the ratio is accepted."""
+    return size >= _RATIO_EXEMPT_BYTES and size > settings.max_zip_member_ratio * compressed
 
 
 class _ExpansionBudget:
@@ -848,11 +872,20 @@ class _CountedMember:
     It is what the gzip reader reads from, so an error raised here is about the
     ZIP member itself (damage), never about its gzip data; it is kept so the
     caller can tell the two apart.
+
+    Given the member's ZipInfo, it also checks the bytes read so far against
+    the member's compressed size after every block, so a member whose header
+    understates its size is refused within a block of passing the ratio cap
+    (#28). These are the ZIP layer's bytes only: a gzipped member's output
+    counts toward the total, not toward its ratio.
     """
 
-    def __init__(self, data: Any, budget: _ExpansionBudget) -> None:
+    def __init__(self, data: Any, budget: _ExpansionBudget,
+                 member: zipfile.ZipInfo | None = None) -> None:
         self.data = data
         self.budget = budget
+        self.member = member
+        self.read_bytes = 0
         self.error: BaseException | None = None
 
     def read(self, size: int = -1) -> bytes:
@@ -862,6 +895,9 @@ class _CountedMember:
             self.error = exc
             raise
         self.budget.spend(len(block))
+        self.read_bytes += len(block)
+        if self.member is not None and _over_ratio(self.read_bytes, self.member.compress_size):
+            raise _OverRatio(self.member.filename)
         return block
 
 
@@ -921,13 +957,14 @@ def _member_problem(z: zipfile.ZipFile, member: zipfile.ZipInfo, budget: _Expans
     """Why this member can't be read, and whether that is damage; None if it reads.
 
     Every block read is counted toward the request's expansion cap, and a
-    gzipped member's decompressed output too (#298); _OverCap stops the read.
+    gzipped member's decompressed output too (#298); _OverCap stops the read,
+    and so does _OverRatio when the member passes the ratio cap (#28).
     """
     if member.flag_bits & 0x1:
         return "password-protected", False
     try:
         with z.open(member) as data:
-            counted = _CountedMember(data, budget)
+            counted = _CountedMember(data, budget, member)
             if gunzip:
                 _count_gzip_output(counted, budget)
             # The rest of the member (all of it, if not gzip) is still read to
@@ -979,7 +1016,8 @@ class _Queue:
 def _member_name(filename: str) -> str | None:
     """A ZIP member's logical name: its normalised POSIX path inside the archive
     (#22), so a/report.pdf and b/report.pdf stay two documents and a/../b.txt is
-    b.txt. None for a path that leaves the archive, which is not ingested."""
+    b.txt. None for a path that leaves the archive, which is validated and
+    counted like any member but never extracted (#28)."""
     name = posixpath.normpath(filename)
     if name.startswith("/") or name in (".", "..") or name.startswith("../"):
         return None
@@ -1013,9 +1051,39 @@ def _too_large(safe_name: str, limit: int) -> UploadRejected:
         safe_name)
 
 
-def _declared_size(members: list[tuple[zipfile.ZipInfo, str]]) -> int:
+def _too_many_members(safe_name: str, count: int) -> UploadRejected:
+    return _rejected(
+        "ARCHIVE_TOO_MANY_MEMBERS",
+        f"'{safe_name}' holds {count:,} entries, more than {settings.max_zip_members:,}, the "
+        f"most one zip may hold, so nothing from it was imported. Split it into smaller zips "
+        f"and upload them in separate imports.",
+        safe_name)
+
+
+def _ratio_too_high(safe_name: str, member_name: str) -> UploadRejected:
+    ratio = f"{settings.max_zip_member_ratio:,}"
+    return _rejected(
+        "ARCHIVE_RATIO_TOO_HIGH",
+        f"'{safe_name}' can't be imported: its member '{member_name}' expands to more than "
+        f"{ratio} times its compressed size, which is refused as a possible zip bomb, so "
+        f"nothing from it was imported. Remove that file from the zip, or upload it on its "
+        f"own, and upload again.",
+        safe_name,
+        [{"member": member_name,
+          "reason": f"expands to more than {ratio} times its compressed size"}])
+
+
+def _declared_size(members: list[tuple[zipfile.ZipInfo, str | None]]) -> int:
     """What the ZIP's directory says these members decompress to."""
     return sum(member.file_size for member, _ in members)
+
+
+def _declared_ratio_member(members: list[tuple[zipfile.ZipInfo, str | None]]) -> str | None:
+    """The first member whose declared sizes pass the ratio cap (#28), or None."""
+    for member, _ in members:
+        if _over_ratio(member.file_size, member.compress_size):
+            return member.filename
+    return None
 
 
 def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBudget) -> None:
@@ -1032,6 +1100,13 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
     and the request is refused as soon as the total passes the cap. This runs
     in a worker thread: it can take seconds, and on the event loop it stalled
     every other request.
+
+    Before that, a ZIP with more than max_zip_members entries is refused (#28).
+    After the declared total, each member's declared sizes are checked against
+    the ratio cap, and while reading, the bytes it actually decompresses. Members
+    whose path leaves the archive are validated and counted like the others, so
+    a damaged one refuses the zip, but are never extracted: they are listed in
+    skipped (#28).
     """
     remedy = "Re-create the zip and upload it again."
     try:
@@ -1045,22 +1120,28 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
             safe_name) from exc
 
     with archive as z:
-        members = []
-        for member in z.infolist():
-            if member.is_dir():
-                continue
-            logical = _member_name(member.filename)
-            if logical is None:
-                continue
-            members.append((member, logical))
+        entries = z.infolist()
+        # Every entry counts, folders and members that are never extracted
+        # included, before anything is read (#28).
+        if len(entries) > settings.max_zip_members:
+            raise _too_many_members(safe_name, len(entries))
+
+        # A member whose path leaves the archive has no logical name (None).
+        members = [(member, _member_name(member.filename))
+                   for member in entries if not member.is_dir()]
 
         if not budget.fits(_declared_size(members)):
             raise _too_large(safe_name, budget.limit)
+        over = _declared_ratio_member(members)
+        if over is not None:
+            raise _ratio_too_high(safe_name, over)
 
         problems = []
         try:
             for member, logical in members:
-                basename = PurePosixPath(logical).name
+                # The job never reads a member that leaves the archive, so its
+                # gzip output, if any, is not counted; its own bytes are.
+                basename = PurePosixPath(logical).name if logical is not None else ""
                 problem = _member_problem(z, member, budget,
                                           _is_json_gz(basename) or _is_jsonl_gz(basename))
                 if problem is not None:
@@ -1068,6 +1149,9 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
         except _OverCap:
             # As soon as the total passes the cap, whatever else was found.
             raise _too_large(safe_name, budget.limit) from None
+        except _OverRatio as exc:
+            # Likewise as soon as a member passes the ratio cap (#28).
+            raise _ratio_too_high(safe_name, exc.name) from None
         if problems:
             damaged = any(is_damage for _, _, is_damage in problems)
             named = "; ".join(f"{name} ({reason})"
@@ -1089,6 +1173,11 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
                 [{"member": name, "reason": reason} for name, reason, _ in problems])
 
         for member, logical in members:
+            if logical is None:
+                queue.skipped.append(
+                    f"{safe_name}:{member.filename} (its path leaves the archive, so it was "
+                    f"not extracted)")
+                continue
             basename = PurePosixPath(logical).name
             if _is_macos_metadata(logical):
                 queue.skipped.append(

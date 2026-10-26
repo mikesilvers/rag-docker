@@ -136,7 +136,10 @@ class AdmissionTests(unittest.TestCase):
         job, queued, _ = self.admit(upload("u.zip", zip_bytes(
             [("../out.txt", "x"), ("/abs.txt", "y"), ("a/../../up.txt", "z"), ("in.txt", "ok")])))
         self.assertEqual(queued, [("in.txt", "u.zip:in.txt", "ok")])
-        self.assertEqual(job["skipped"], [])
+        # Never extracted, but no longer dropped without a word (#28).
+        leaves = "(its path leaves the archive, so it was not extracted)"
+        self.assertEqual(job["skipped"], [f"u.zip:../out.txt {leaves}", f"u.zip:/abs.txt {leaves}",
+                                          f"u.zip:a/../../up.txt {leaves}"])
 
     def test_a_dropped_input_leaves_no_staged_file(self):
         _, _, paths = self.admit(upload("r.txt", "first"), upload("r.txt", "second"))

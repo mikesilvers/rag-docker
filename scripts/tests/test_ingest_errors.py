@@ -117,7 +117,8 @@ class UploadErrorTests(unittest.TestCase):
         self.assert_refused(status, body, "ARCHIVE_UNREADABLE",
                             "'corpus.zip' is damaged and can't be read, so nothing from it was imported",
                             "truncated", "Re-create the zip")
-        self.assertEqual(body["error"]["detail"], {"file": "corpus.zip", "members": []})
+        self.assertEqual(body["error"]["detail"], {"file": "corpus.zip", "members": [],
+                                                   "members_omitted": 0})
 
     def test_wrong_member_offsets_name_every_unreadable_member(self):
         data = zip_bytes([("a.json", JSON_DOC), ("b.txt", "text " * 40),
@@ -137,7 +138,11 @@ class UploadErrorTests(unittest.TestCase):
         status, body = self.post(upload("many.zip", shifted_offsets(data, len(data))))
         self.assert_refused(status, body, "ARCHIVE_UNREADABLE", "m09.txt (damaged", "; and 2 more.")
         self.assertNotIn("m10.txt", body["error"]["message"])
-        self.assertEqual(len(body["error"]["detail"]["members"]), 12)
+        # detail keeps the same ten, in order, and counts the rest (#28).
+        detail = body["error"]["detail"]
+        self.assertEqual([m["member"] for m in detail["members"]],
+                         [f"m{i:02}.txt" for i in range(10)])
+        self.assertEqual(detail["members_omitted"], 2)
 
     def test_bad_crc_is_a_readable_400(self):
         data = bad_crc(zip_bytes([("a.txt", "x" * 100)], zipfile.ZIP_STORED), b"x" * 100)
@@ -160,7 +165,8 @@ class UploadErrorTests(unittest.TestCase):
         self.assert_refused(status, body, "ARCHIVE_UNSUPPORTED", "'d64.zip' can't be read",
                             "a.txt (unsupported compression method 9)", "standard (Deflate)")
         self.assertEqual(body["error"]["detail"], {"file": "d64.zip", "members": [
-            {"member": "a.txt", "reason": "unsupported compression method 9"}]})
+            {"member": "a.txt", "reason": "unsupported compression method 9"}],
+            "members_omitted": 0})
 
     def test_encrypted_member_is_a_readable_400(self):
         data = patch_header(zip_bytes([("a.txt", "text")]), 6, 8, 0x1, set_bits=True)
@@ -174,7 +180,7 @@ class UploadErrorTests(unittest.TestCase):
         self.assert_refused(status, body, "UPLOAD_WRITE_FAILED", "Could not extract",
                             "File name too long")
         self.assertEqual(body["error"]["detail"], {"file": "long.zip", "members": [
-            {"member": name, "reason": "File name too long"}]})
+            {"member": name, "reason": "File name too long"}], "members_omitted": 0})
 
     def test_saving_the_upload_fails_is_a_readable_400(self):
         # Saving the upload itself, before any unpacking (#298).
@@ -184,7 +190,8 @@ class UploadErrorTests(unittest.TestCase):
         self.assert_refused(status, body, "UPLOAD_WRITE_FAILED")
         self.assertEqual(body["error"]["message"],
                          "Could not save 'a.txt' on the server: No space left on device.")
-        self.assertEqual(body["error"]["detail"], {"file": "a.txt", "members": []})
+        self.assertEqual(body["error"]["detail"], {"file": "a.txt", "members": [],
+                                                   "members_omitted": 0})
 
     def test_damaged_and_unsupported_members_are_unreadable_with_the_generic_remedy(self):
         # Damage wins over an unsupported member: the code and remedy are the

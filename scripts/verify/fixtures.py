@@ -216,8 +216,21 @@ def write(target: pathlib.Path) -> None:
     with zipfile.ZipFile(target / "json_over_size_gz.zip", "w", zipfile.ZIP_STORED) as z:
         z.writestr("big.json.gz", gzip.compress(over, mtime=0))
     # Reviewer test (#300): the input limit applies to a plain .json ZIP member.
-    with zipfile.ZipFile(target / "json_over_size_member.zip", "w", zipfile.ZIP_DEFLATED) as z:
+    # Stored: 30 MB of spaces deflates past the ZIP ratio cap (#28), which would
+    # refuse the upload before the job reaches the JSON limit this tests.
+    with zipfile.ZipFile(target / "json_over_size_member.zip", "w", zipfile.ZIP_STORED) as z:
         z.writestr("big.json", over)
+
+    # Issue #28. One ZIP may hold at most 5,000 entries, and a member of 1 MiB
+    # or more may expand at most 200 times its compressed size.
+    # zip_many_members.zip holds 5,001 empty entries (about 500 KB);
+    # zip_high_ratio.zip holds 2 MiB of zeros, deflated to a few KB. Written
+    # last: 02_ingest.sh regenerates the fixtures when this one is missing.
+    with zipfile.ZipFile(target / "zip_many_members.zip", "w", zipfile.ZIP_STORED) as z:
+        for i in range(5001):
+            z.writestr(f"m{i:04}.txt", b"")
+    with zipfile.ZipFile(target / "zip_high_ratio.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("zeros.txt", bytes(2 * 1024 * 1024))
 
 
 if __name__ == "__main__":

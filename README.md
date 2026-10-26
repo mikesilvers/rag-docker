@@ -241,6 +241,8 @@ All API settings are environment variables in `docker-compose.yml`:
 | `UPLOAD_DIR` | `/app/uploads` | Container path for uploads and session data |
 | `RECOMMENDED_MEMORY_GB` | `12` | Memory recommendation reported by `/health`. Raise it if you allocate more to Docker; no rebuild needed |
 | `MAX_ZIP_EXPANDED_BYTES` | `2147483648` (2 GiB) | The most one upload's ZIPs may expand to in all, gzipped members' output included. Over it the upload is refused with `ARCHIVE_TOO_LARGE` |
+| `MAX_ZIP_MEMBERS` | `5000` | The most entries one ZIP may hold, folders included. Over it the upload is refused with `ARCHIVE_TOO_MANY_MEMBERS` |
+| `MAX_ZIP_MEMBER_RATIO` | `200` | The most a ZIP member of 1 MiB or more may expand relative to its compressed size. Over it the upload is refused with `ARCHIVE_RATIO_TOO_HIGH` |
 
 To swap the LLM (e.g. to `llama3.2`), update `LLM_MODEL` in `docker-compose.yml` and add the model name to `ollama/entrypoint.sh`.
 
