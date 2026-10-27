@@ -146,8 +146,14 @@ services:
       # upload is refused (#28).
       MAX_ZIP_MEMBERS: 5000
       MAX_ZIP_MEMBER_RATIO: 200
+      # Marks the session cookie Secure (#25). false for this loopback HTTP
+      # profile, where a Secure cookie would never be sent back; set true only
+      # when the stack is served over TLS (#26). Exactly true or false.
+      AUTH_COOKIE_SECURE: "false"
     volumes:
       - ingest_uploads:/app/uploads
+      # Accounts, sessions and the login throttle (#25), one SQLite file.
+      - auth_data:/app/auth_data
       # Retained source documents; grows with the corpus.
       - rag_sources:/app/sources
       # Bind mount, deliberately: an export is only useful if the user can
@@ -179,7 +185,7 @@ services:
   proxy:
     image: nginx:1.29-alpine
     ports:
-      # This unauthenticated workbench is local to the host by default.
+      # The workbench is local to the host by default; LAN exposure is #26.
       - "127.0.0.1:8080:80"
     volumes:
       - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
@@ -201,6 +207,7 @@ volumes:
   ollama_models:
   ingest_uploads:
   rag_sources:
+  auth_data:
 
 networks:
   rag-internal:
@@ -316,7 +323,8 @@ http {
         # its typed response instead of terminating at the generic 300s limit.
         location = /api/goldstandard/regenerate {
             proxy_pass http://api/goldstandard/regenerate;
-            proxy_set_header Host $host;
+            # The browser's Host, port included: the API compares it with Origin (#25).
+            proxy_set_header Host $http_host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_read_timeout 1860s;
@@ -338,7 +346,10 @@ http {
             # still applies: nginx checks Content-Length up front.
             proxy_request_buffering off;
             proxy_pass http://api/;
-            proxy_set_header Host $host;
+            # The browser's Host with its port ($host drops the port), so the API
+            # can check that a cookie-authenticated change came from this same
+            # origin: Origin http://localhost:8080 against Host localhost:8080 (#25).
+            proxy_set_header Host $http_host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_read_timeout 300s;
@@ -687,6 +698,7 @@ def collection_check_unavailable(name: str, outcome: str) -> JSONResponse:
 ### api/config.py
 
 ```python
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -720,6 +732,24 @@ class Settings(BaseSettings):
     # declared and as actually read. Members under 1 MiB are exempt from the ratio.
     max_zip_members: int = 5000
     max_zip_member_ratio: int = 200
+    # Accounts, sessions and the login throttle (#25): one SQLite file in the
+    # auth_data volume. Not /app/auth, which would hide the `auth` package that
+    # `python -m auth` runs.
+    auth_dir: str = "/app/auth_data"
+    # Marks the session cookie Secure. Off for the loopback HTTP profile, where a
+    # Secure cookie would never be sent back; turn it on only behind TLS (#26).
+    auth_cookie_secure: bool = False
+
+    @field_validator("auth_cookie_secure", mode="before")
+    @classmethod
+    def _exact_boolean(cls, value):
+        # pydantic would read "1", "yes" or "on" as true. A typo in a security
+        # setting must stop the API instead of silently meaning something.
+        if isinstance(value, bool):
+            return value
+        if value in ("true", "false"):
+            return value == "true"
+        raise ValueError("AUTH_COOKIE_SECURE must be exactly true or false")
 
     class Config:
         env_file = ".env"
@@ -1291,6 +1321,30 @@ class MetricsResponse(BaseModel):
     # entries and the UI polls every 30s, so returning all of them every time
     # would be wasteful.
     history: list[LatencyRecord]
+
+
+# ── Authentication (#25) ─────────────────────────────────────────────────────
+
+# Generous caps, so absurd input is a 422 before any hashing work; the real
+# rules (usernames 3-32 characters, passwords 12-256) are checked by the routes.
+class LoginRequest(BaseModel):
+    username: str = Field(max_length=256)
+    password: str = Field(max_length=1024)
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(max_length=1024)
+    new_password: str = Field(max_length=1024)
+
+
+class AuthStatus(BaseModel):
+    setup_required: bool
+
+
+class AuthUser(BaseModel):
+    username: str
+    role: Literal["end_user", "developer", "engineer"]
+    must_change_password: bool
 
 
 # ── Error ─────────────────────────────────────────────────────────────────────
@@ -10726,11 +10780,16 @@ own digest, and the other two are generated from it afterwards.
 
 ````markdown
 ```bash
-python3 retrieve.py "your question here"
-python3 retrieve.py --top-k 10 --mode hybrid "your question here"
-python3 retrieve.py --api-url http://localhost:9090/api "your question here"
-python3 retrieve.py --timeout 900 "a question that needs a long answer"
+python3 retrieve.py --username alice "your question here"
+python3 retrieve.py --username alice --top-k 10 --mode hybrid "your question here"
+python3 retrieve.py --username alice --api-url http://localhost:9090/api "your question here"
+python3 retrieve.py --username alice --timeout 900 "a question that needs a long answer"
 ```
+
+The API needs an account; any role may ask. The script asks for the password
+(or reads it from standard input with `--password-stdin`), logs in, asks and
+logs out. The password is never a flag or an environment variable;
+`RAG_USERNAME` may stand in for `--username`.
 
 It needs Python 3 and nothing else — no `pip install` — because the air-gapped
 case is the one this project targets. It exits 0 on success, 2 on bad usage,
@@ -10819,14 +10878,22 @@ The defaults below are the settings this collection was tuned with. Every one
 can be overridden with a flag. Standard library only, on purpose: this has to
 run on an air-gapped machine where `pip install` is not an option.
 
+The API needs an account (#25): pass --username, and type the password when
+asked, or give it on standard input with --password-stdin. It is never a flag
+or an environment variable, so it can't end up in the process list or a shell
+history. The script logs in, asks, and logs out again.
+
 Exit codes: 0 ok, 2 bad usage, 3 API unreachable, 4 collection absent,
-5 API returned an error.
+5 API returned an error (a refused login too).
 """
 
 import argparse
+import getpass
 import json
+import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # ── Baked in at export from the collection's saved retrieval settings ─────────
@@ -10847,6 +10914,7 @@ DEFAULT_TIMEOUT_SECONDS = 600
 # the API is down the proxy answers with a gateway error rather than refusing
 # the connection. That is still "unreachable", not "the API rejected this".
 GATEWAY_STATUSES = (502, 503, 504)
+SESSION_COOKIE = "rag_session"
 
 
 def build_parser():
@@ -10874,6 +10942,12 @@ def build_parser():
                    help="print the raw API response instead of formatted text")
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS,
                    help="seconds to wait for an answer (default: %(default)s)")
+    p.add_argument("--username", default=os.environ.get("RAG_USERNAME"),
+                   help="the account to log in with; any role may query "
+                        "(default: $RAG_USERNAME)")
+    p.add_argument("--password-stdin", action="store_true",
+                   help="read the password from the first line of standard input "
+                        "instead of asking for it")
     return p
 
 
@@ -10883,41 +10957,35 @@ def fail(code, message, hint):
     return code
 
 
-def main(argv=None):
-    args = build_parser().parse_args(argv)
+def session_token(set_cookies):
+    """The session cookie's value from a login's Set-Cookie headers, or None."""
+    for header in set_cookies:
+        name, _, rest = header.partition("=")
+        if name.strip() == SESSION_COOKIE:
+            return rest.split(";", 1)[0] or None
+    return None
 
-    if not args.question.strip():
-        return fail(2, "The question is empty.",
-                    'Pass it as one argument, e.g. retrieve.py "who approves overtime?"')
-    if not 1 <= args.top_k <= 50:
-        return fail(2, "--top-k must be between 1 and 50, got %d." % args.top_k,
-                    "The collection was exported with --top-k %s." % DEFAULT_TOP_K)
-    if not 0.0 <= args.alpha <= 1.0:
-        return fail(2, "--alpha must be between 0.0 and 1.0, got %s." % args.alpha,
-                    "0 is pure keyword matching, 1 is pure meaning.")
-    if args.timeout <= 0:
-        return fail(2, "--timeout must be greater than 0, got %s." % args.timeout,
-                    "It is a number of seconds to wait for the answer.")
 
-    url = args.api_url.rstrip("/") + "/query"
-    payload = json.dumps({
-        "question": args.question,
-        "collection": args.collection,
-        "retrieval_mode": args.mode,
-        "top_k": args.top_k,
-        "alpha": args.alpha,
-        "include_citations": bool(args.citations),
-        "response_format": args.response_format,
-    }).encode("utf-8")
+def logout(base, headers):
+    """End the session; a failure here changes nothing about the answer."""
+    try:
+        request = urllib.request.Request(base + "/auth/logout", data=b"", method="POST", headers=headers)
+        urllib.request.urlopen(request, timeout=10).close()
+    except Exception:
+        pass
 
+
+def post(args, url, payload, headers, refused):
+    """(parsed JSON body, Set-Cookie headers), or the exit code once the failure
+    is reported. `refused` begins the sentence for an error the API returns."""
     request = urllib.request.Request(
-        url, data=payload, method="POST",
-        headers={"Content-Type": "application/json"},
+        url, data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers=dict(headers, **{"Content-Type": "application/json"}),
     )
-
     try:
         with urllib.request.urlopen(request, timeout=args.timeout) as response:
-            body = json.loads(response.read().decode("utf-8"))
+            cookies = response.headers.get_all("Set-Cookie") or []
+            return json.loads(response.read().decode("utf-8")), cookies
     except urllib.error.HTTPError as exc:
         # A rag-docker error carries {"error": {"code", "message", "detail"}};
         # anything else is some other server that happened to answer.
@@ -10940,12 +11008,19 @@ def main(argv=None):
             return fail(5, "No rag-docker API answered at %s." % url,
                         "Something responded but it is not this API. Check "
                         "--api-url; it should end in /api.")
-        if exc.code in GATEWAY_STATUSES:
+        if exc.code in GATEWAY_STATUSES and code != "SETUP_REQUIRED":
             return fail(3, "The API is not responding behind %s (HTTP %s)."
                         % (args.api_url, exc.code),
                         "The proxy is up but the API is not. Check it with "
                         "`docker compose ps` and start it with `docker compose up -d`.")
-        return fail(5, "The API rejected the query: %s" % message,
+        if code == "AUTH_REQUIRED":
+            return fail(5, "%s: %s" % (refused, message),
+                        "The API needs an account: pass --username, and the password "
+                        "when asked or with --password-stdin.")
+        if code == "PASSWORD_CHANGE_REQUIRED":
+            return fail(5, "%s: %s" % (refused, message),
+                        "Log in to the web UI once and choose your own password.")
+        return fail(5, "%s: %s" % (refused, message),
                     "HTTP %s from %s." % (exc.code, url))
     except urllib.error.URLError as exc:
         # URLError subclasses OSError and wraps socket errors, so a connect
@@ -10968,6 +11043,73 @@ def main(argv=None):
     except ValueError:
         return fail(5, "The API returned a response that is not JSON.",
                     "Check that %s is a rag-docker API and not something else." % args.api_url)
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    if not args.question.strip():
+        return fail(2, "The question is empty.",
+                    'Pass it as one argument, e.g. retrieve.py "who approves overtime?"')
+    if not 1 <= args.top_k <= 50:
+        return fail(2, "--top-k must be between 1 and 50, got %d." % args.top_k,
+                    "The collection was exported with --top-k %s." % DEFAULT_TOP_K)
+    if not 0.0 <= args.alpha <= 1.0:
+        return fail(2, "--alpha must be between 0.0 and 1.0, got %s." % args.alpha,
+                    "0 is pure keyword matching, 1 is pure meaning.")
+    if args.timeout <= 0:
+        return fail(2, "--timeout must be greater than 0, got %s." % args.timeout,
+                    "It is a number of seconds to wait for the answer.")
+
+    if args.password_stdin and not args.username:
+        return fail(2, "--password-stdin needs --username.",
+                    "Pass the account to log in with, e.g. --username alice.")
+
+    base = args.api_url.rstrip("/")
+    url = base + "/query"
+    parts = urllib.parse.urlsplit(base)
+    # The API refuses a logged-in change (a POST) that doesn't say it comes from
+    # its own origin, as a browser would.
+    headers = {"Origin": "%s://%s" % (parts.scheme, parts.netloc)}
+
+    if args.username:
+        if args.password_stdin:
+            password = sys.stdin.readline().rstrip("\r\n")
+        else:
+            try:
+                password = getpass.getpass("Password for %s: " % args.username)
+            except (EOFError, KeyboardInterrupt):
+                password = ""
+        if not password:
+            return fail(2, "No password was given.",
+                        "Type it when asked, or pipe it in with --password-stdin.")
+        answer = post(args, base + "/auth/login", {"username": args.username, "password": password},
+                      headers, "The login was refused")
+        if isinstance(answer, int):
+            return answer
+        token = session_token(answer[1])
+        if token is None:
+            return fail(5, "The API did not start a session.",
+                        "Check that %s is a rag-docker API." % args.api_url)
+        headers["Cookie"] = "%s=%s" % (SESSION_COOKIE, token)
+
+    payload = {
+        "question": args.question,
+        "collection": args.collection,
+        "retrieval_mode": args.mode,
+        "top_k": args.top_k,
+        "alpha": args.alpha,
+        "include_citations": bool(args.citations),
+        "response_format": args.response_format,
+    }
+    try:
+        answer = post(args, url, payload, headers, "The API rejected the query")
+    finally:
+        if "Cookie" in headers:
+            logout(base, headers)
+    if isinstance(answer, int):
+        return answer
+    body = answer[0]
 
     if args.json:
         print(json.dumps(body, indent=2))
@@ -11108,6 +11250,1013 @@ alone.
 @@INCLUDE:encryption@@
 ```
 
+### api/auth/__init__.py
+
+```python
+"""Accounts, sessions and the API's endpoint/role matrix (#25).
+
+- `passwords`: the username and password rules, scrypt hashing, generated passwords.
+- `store`: the SQLite file in AUTH_DIR holding accounts, sessions and the login throttle.
+- `policy`: which role each route needs.
+- `middleware`: enforces the policy on every request, before the route sees its body.
+- `__main__`: the operator command, `python -m auth`, the only way to create or
+  recover accounts until in-app administration arrives.
+- `testing`: a real account and session in a temporary store, for in-process tests.
+"""
+```
+
+### api/auth/passwords.py
+
+```python
+"""Username and password rules, and password hashing (#25).
+
+Hashing is the standard library's scrypt, so no new dependency. The parameters
+are stored with each hash, so they can be raised later without breaking the
+hashes already stored.
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import os
+import re
+import secrets
+
+# n = 2^15, r = 8, p = 1: about 32 MiB and a few tens of milliseconds per hash.
+SCRYPT_LOG2_N = 15
+SCRYPT_R = 8
+SCRYPT_P = 1
+SALT_BYTES = 16
+HASH_BYTES = 32
+# hashlib's default limit is 32 MiB, exactly what n=2^15, r=8 needs, and scrypt
+# needs a little more than that, so the default refuses these parameters.
+_MAXMEM = 64 * 1024 * 1024
+
+USERNAME_RULE = "3-32 characters: lowercase letters, digits, '.', '_' or '-'"
+_USERNAME = re.compile(r"[a-z0-9._-]{3,32}")
+PASSWORD_MIN = 12
+PASSWORD_MAX = 256
+
+
+def normalize_username(username: str) -> str | None:
+    """The stored form of a username (lowercased), or None when it breaks the rule."""
+    if not isinstance(username, str):
+        return None
+    name = username.lower()
+    return name if _USERNAME.fullmatch(name) else None
+
+
+def password_problem(password: str, username: str) -> str | None:
+    """Why a new password is refused, or None when it is acceptable."""
+    if len(password) < PASSWORD_MIN:
+        return f"The password must be at least {PASSWORD_MIN} characters."
+    if len(password) > PASSWORD_MAX:
+        return f"The password must be at most {PASSWORD_MAX} characters."
+    if password.lower() == username.lower():
+        return "The password must not be the username."
+    return None
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def _scrypt(password: str, salt: bytes, log2_n: int, r: int, p: int, length: int) -> bytes:
+    return hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2 ** log2_n, r=r, p=p,
+                          maxmem=_MAXMEM, dklen=length)
+
+
+def hash_password(password: str) -> str:
+    """`scrypt$<log2 n>$<r>$<p>$<salt>$<hash>`, salt and hash in base64."""
+    salt = os.urandom(SALT_BYTES)
+    digest = _scrypt(password, salt, SCRYPT_LOG2_N, SCRYPT_R, SCRYPT_P, HASH_BYTES)
+    return "$".join(("scrypt", str(SCRYPT_LOG2_N), str(SCRYPT_R), str(SCRYPT_P),
+                     _b64(salt), _b64(digest)))
+
+
+def verify_password(password: str, stored: str) -> bool:
+    """Whether `password` matches `stored`. A malformed hash never matches."""
+    try:
+        scheme, log2_n, r, p, salt, digest = stored.split("$")
+        if scheme != "scrypt":
+            return False
+        log2_n, r, p = int(log2_n), int(r), int(p)
+        # Bounds, so a corrupted row can't ask for gigabytes of memory.
+        if not (1 <= log2_n <= 20 and 1 <= r <= 16 and 1 <= p <= 4):
+            return False
+        salt, digest = base64.b64decode(salt, validate=True), base64.b64decode(digest, validate=True)
+        if not salt or not digest:
+            return False
+        candidate = _scrypt(password, salt, log2_n, r, p, len(digest))
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(candidate, digest)
+
+
+def generate_password() -> str:
+    """A one-time password: 24 URL-safe characters, 144 random bits."""
+    return secrets.token_urlsafe(18)
+
+
+_dummy_hash: str | None = None
+
+
+def dummy_hash() -> str:
+    """A hash to verify against when the username is unknown, so a failed login
+    takes as long whether the account exists or not."""
+    global _dummy_hash
+    if _dummy_hash is None:
+        _dummy_hash = hash_password(secrets.token_urlsafe(18))
+    return _dummy_hash
+```
+
+### api/auth/policy.py
+
+```python
+"""The endpoint/role matrix (#25): which role every API route needs.
+
+Every route has exactly one entry; a route with none is refused for everyone,
+and test_auth.py fails when a route lacks an entry or an entry names no route.
+The client's own idea of its role is never consulted.
+"""
+from __future__ import annotations
+
+import re
+
+ROLES = ("end_user", "developer", "engineer")   # lowest to highest
+PUBLIC = "public"     # no session needed
+SESSION = "session"   # any logged-in user, even one who must change their password
+
+END_USER, DEVELOPER, ENGINEER = ROLES
+
+ACCESS: dict[tuple[str, str], str] = {
+    # Liveness for the container healthcheck, stack.sh and CI, unchanged (Q8).
+    ("GET", "/health"): PUBLIC,
+    ("GET", "/auth/status"): PUBLIC,
+    ("POST", "/auth/login"): PUBLIC,
+    ("GET", "/auth/me"): SESSION,
+    ("POST", "/auth/logout"): SESSION,
+    ("POST", "/auth/password"): SESSION,
+    # What the Q&A page needs (Q4).
+    ("GET", "/collections"): END_USER,
+    ("POST", "/query"): END_USER,
+    ("GET", "/retrieval/config/{collection}"): END_USER,
+    # Import, Chunking, Retrieval, Gold Standard and Transfer (Q2, Q4, Q6).
+    ("POST", "/collections"): DEVELOPER,
+    ("POST", "/ingest/upload"): DEVELOPER,
+    ("GET", "/ingest/job/{job_id}"): DEVELOPER,
+    ("GET", "/ingest/config/{collection}"): DEVELOPER,
+    ("POST", "/ingest/config"): DEVELOPER,
+    ("POST", "/retrieval/config"): DEVELOPER,
+    ("POST", "/goldstandard/generate"): DEVELOPER,
+    ("GET", "/goldstandard/session/{session_id}"): DEVELOPER,
+    ("PATCH", "/goldstandard/session/{session_id}/pair/{pair_id}"): DEVELOPER,
+    ("POST", "/goldstandard/regenerate"): DEVELOPER,
+    ("POST", "/goldstandard/save"): DEVELOPER,
+    ("GET", "/goldstandard/download/{filename}"): DEVELOPER,
+    ("POST", "/export"): DEVELOPER,
+    ("GET", "/export/job/{job_id}"): DEVELOPER,
+    ("POST", "/import"): DEVELOPER,
+    ("GET", "/import/job/{job_id}"): DEVELOPER,
+    ("GET", "/packages"): DEVELOPER,
+    ("GET", "/help/transfer"): DEVELOPER,
+    ("GET", "/tune/{collection}"): DEVELOPER,          # read by the Transfer page (Q3)
+    # Collections management, tuning, the Health page's data (Q3, Q5, Q6).
+    ("DELETE", "/collections/{name}"): ENGINEER,
+    ("POST", "/tune/rechunk"): ENGINEER,
+    ("POST", "/tune/reembed"): ENGINEER,
+    ("POST", "/tune/reindex"): ENGINEER,
+    ("GET", "/tune/job/{job_id}"): ENGINEER,
+    ("GET", "/metrics/latency"): ENGINEER,
+    ("GET", "/goldstandard/diagnostics"): ENGINEER,
+    # FastAPI's own API docs (N5).
+    ("GET", "/docs"): ENGINEER,
+    ("GET", "/docs/oauth2-redirect"): ENGINEER,
+    ("GET", "/redoc"): ENGINEER,
+    ("GET", "/openapi.json"): ENGINEER,
+}
+
+
+def required(method: str, path: str) -> str | None:
+    """The access a route needs, or None when it has no entry (refused)."""
+    return ACCESS.get(("GET" if method == "HEAD" else method, path))
+
+
+def rank(role: str) -> int:
+    return ROLES.index(role) if role in ROLES else -1
+
+
+def _compile(template: str):
+    # A {name} parameter matches one path segment, as Starlette's default str
+    # convertor does; no route here uses another convertor.
+    pattern = re.sub(r"\\\{[a-z_]+\\\}", "[^/]+", re.escape(template))
+    return re.compile(pattern + r"\Z")
+
+
+# Literal templates first, then by fewer parameters, so `/goldstandard/diagnostics`
+# wins over a parameter in the same place, as it does in the app.
+_TEMPLATES = sorted({path for _, path in ACCESS}, key=lambda t: (t.count("{"), -len(t)))
+_COMPILED = [(template, _compile(template)) for template in _TEMPLATES]
+
+
+def match(method: str, path: str) -> str | None:
+    """The template of the policy route this method and path reach, or None."""
+    method = "GET" if method == "HEAD" else method
+    for template, pattern in _COMPILED:
+        if (method, template) in ACCESS and pattern.match(path):
+            return template
+    return None
+```
+
+### api/auth/store.py
+
+```python
+"""Accounts, sessions and the login throttle, in one SQLite file (#25).
+
+The file is `auth.db` in AUTH_DIR, the auth_data volume, so all three survive an
+API restart. The API and the operator command (`python -m auth`) open it from
+separate processes; SQLite's locking keeps them consistent, and the
+last-engineer rule is checked inside a write transaction so two commands
+can't both pass it.
+
+Every function opens its own short connection. Nothing here is cached except
+the fact that the system is set up, which can't become false again: no
+command deletes an account.
+"""
+from __future__ import annotations
+
+import hashlib
+import os
+import secrets
+import sqlite3
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+
+from config import settings
+
+from . import passwords
+from .policy import ROLES
+
+COOKIE = "rag_session"
+IDLE_S = 12 * 3600               # a session ends after 12 hours without a request
+ABSOLUTE_S = 7 * 24 * 3600       # and 7 days after login, whichever is first
+_TOUCH_S = 60                    # last_seen is written at most once a minute
+THROTTLE_FAILURES = 5            # failed logins per (username, address) ...
+THROTTLE_WINDOW_S = 15 * 60      # ... within 15 minutes ...
+LOCKOUT_S = 15 * 60              # ... lock that pair for 15 minutes
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE,
+    role TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    must_change_password INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    created_at REAL NOT NULL,
+    last_seen REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
+CREATE TABLE IF NOT EXISTS login_failures (
+    username TEXT NOT NULL,
+    address TEXT NOT NULL,
+    at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS login_failures_pair ON login_failures(username, address);
+CREATE TABLE IF NOT EXISTS login_lockouts (
+    username TEXT NOT NULL,
+    address TEXT NOT NULL,
+    until REAL NOT NULL,
+    PRIMARY KEY (username, address)
+);
+"""
+
+_ready: set[str] = set()
+_set_up: set[str] = set()
+
+
+class Refused(Exception):
+    """An account change the rules don't allow; the message says why, in one line."""
+
+
+@dataclass(frozen=True)
+class Principal:
+    user_id: int
+    username: str
+    role: str
+    must_change_password: bool
+    token_hash: str
+
+
+@dataclass(frozen=True)
+class User:
+    id: int
+    username: str
+    role: str
+    password_hash: str
+    enabled: bool
+    must_change_password: bool
+    created_at: float
+
+
+def _now() -> float:
+    return time.time()
+
+
+def db_path() -> Path:
+    return Path(settings.auth_dir) / "auth.db"
+
+
+@contextmanager
+def _connect(write: bool = False):
+    path = db_path()
+    key = str(path)
+    if key not in _ready:
+        # Folder 0700 and file 0600: the file holds password hashes and session
+        # verifiers, and nobody but the API's own user needs to read it.
+        old = os.umask(0o077)
+        try:
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            conn = sqlite3.connect(path, timeout=10)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.executescript(_SCHEMA)
+                conn.execute("PRAGMA user_version = 1")
+                conn.commit()
+            finally:
+                conn.close()
+        finally:
+            os.umask(old)
+        _ready.add(key)
+    conn = sqlite3.connect(path, timeout=10, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+        try:
+            yield conn
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+
+def _user(row) -> User | None:
+    if row is None:
+        return None
+    return User(row["id"], row["username"], row["role"], row["password_hash"],
+                bool(row["enabled"]), bool(row["must_change_password"]), row["created_at"])
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+# ── setup ────────────────────────────────────────────────────────────────────
+
+def is_set_up() -> bool:
+    """True once any account exists; until then only public routes answer."""
+    key = str(db_path())
+    if key in _set_up:
+        return True
+    with _connect() as conn:
+        found = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
+    if found:
+        _set_up.add(key)
+    return found
+
+
+# ── accounts (the operator command) ──────────────────────────────────────────
+
+def get_user(username: str) -> User | None:
+    with _connect() as conn:
+        return _user(conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone())
+
+
+def list_users() -> list[User]:
+    with _connect() as conn:
+        return [_user(row) for row in conn.execute("SELECT * FROM users ORDER BY username")]
+
+
+def _check_role(role: str) -> None:
+    if role not in ROLES:
+        raise ValueError(f"unknown role {role!r}; use one of {', '.join(ROLES)}")
+
+
+def create_user(username: str, role: str, password: str, *, bootstrap: bool = False,
+                must_change_password: bool = True) -> User:
+    """Create an account. `bootstrap` only when none exists, otherwise only after one does."""
+    _check_role(role)
+    password_hash = passwords.hash_password(password)
+    now = _now()
+    with _connect(write=True) as conn:
+        exists = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
+        if bootstrap and exists:
+            raise Refused("the system is already set up; use create-user or reset-password")
+        if not bootstrap and not exists:
+            raise Refused("the system is not set up yet; run bootstrap first")
+        if conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+            raise Refused(f"the user {username!r} already exists")
+        conn.execute("INSERT INTO users (username, role, password_hash, enabled, must_change_password, "
+                     "created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?)",
+                     (username, role, password_hash, int(must_change_password), now, now))
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    return _user(row)
+
+
+def _existing(conn, username: str):
+    row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    if row is None:
+        raise Refused(f"there is no user {username!r}")
+    return row
+
+
+def _is_last_engineer(conn, row) -> bool:
+    if row["role"] != "engineer" or not row["enabled"]:
+        return False
+    others = conn.execute("SELECT COUNT(*) FROM users WHERE role = 'engineer' AND enabled = 1 AND id != ?",
+                          (row["id"],)).fetchone()[0]
+    return others == 0
+
+
+def reset_password(username: str, password: str) -> None:
+    """A new password the user must change at next login; every session of theirs ends."""
+    password_hash = passwords.hash_password(password)
+    with _connect(write=True) as conn:
+        row = _existing(conn, username)
+        conn.execute("UPDATE users SET password_hash = ?, must_change_password = 1, updated_at = ? "
+                     "WHERE id = ?", (password_hash, _now(), row["id"]))
+        conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+
+
+def set_role(username: str, role: str) -> None:
+    """Sessions stay; the next request of each one runs with the new role."""
+    _check_role(role)
+    with _connect(write=True) as conn:
+        row = _existing(conn, username)
+        if role != "engineer" and _is_last_engineer(conn, row):
+            raise Refused(f"{username!r} is the last enabled engineer; make another engineer first")
+        conn.execute("UPDATE users SET role = ?, updated_at = ? WHERE id = ?", (role, _now(), row["id"]))
+
+
+def set_enabled(username: str, enabled: bool) -> None:
+    """Disabling ends every session of the user."""
+    with _connect(write=True) as conn:
+        row = _existing(conn, username)
+        if not enabled and _is_last_engineer(conn, row):
+            raise Refused(f"{username!r} is the last enabled engineer; make another engineer first")
+        conn.execute("UPDATE users SET enabled = ?, updated_at = ? WHERE id = ?",
+                     (int(enabled), _now(), row["id"]))
+        if not enabled:
+            conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+
+
+# ── sessions ─────────────────────────────────────────────────────────────────
+
+def create_session(user_id: int) -> str:
+    """A new session; returns the token for the cookie. Only its SHA-256 is stored."""
+    token = secrets.token_urlsafe(32)
+    now = _now()
+    with _connect(write=True) as conn:
+        conn.execute("INSERT INTO sessions (token_hash, user_id, created_at, last_seen) VALUES (?, ?, ?, ?)",
+                     (_token_hash(token), user_id, now, now))
+    return token
+
+
+def authenticate(token: str | None) -> Principal | None:
+    """The session's user as they are now, or None. An ended session is deleted."""
+    if not token or len(token) > 256:
+        return None
+    digest = _token_hash(token)
+    now = _now()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT s.created_at, s.last_seen, u.id, u.username, u.role, u.enabled, u.must_change_password "
+            "FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?", (digest,)).fetchone()
+    if row is None:
+        return None
+    if now - row["last_seen"] > IDLE_S or now - row["created_at"] > ABSOLUTE_S or not row["enabled"]:
+        delete_session(digest)
+        return None
+    if now - row["last_seen"] > _TOUCH_S:
+        with _connect(write=True) as conn:
+            conn.execute("UPDATE sessions SET last_seen = ? WHERE token_hash = ?", (now, digest))
+    return Principal(row["id"], row["username"], row["role"], bool(row["must_change_password"]), digest)
+
+
+def delete_session(token_hash: str) -> None:
+    with _connect(write=True) as conn:
+        conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
+
+
+def change_password(principal: Principal, password: str) -> None:
+    """The user's own change: clears the forced change and ends their other sessions."""
+    password_hash = passwords.hash_password(password)
+    with _connect(write=True) as conn:
+        conn.execute("UPDATE users SET password_hash = ?, must_change_password = 0, updated_at = ? "
+                     "WHERE id = ?", (password_hash, _now(), principal.user_id))
+        conn.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?",
+                     (principal.user_id, principal.token_hash))
+
+
+# ── login throttle ───────────────────────────────────────────────────────────
+
+def locked(username: str, address: str) -> bool:
+    with _connect() as conn:
+        row = conn.execute("SELECT until FROM login_lockouts WHERE username = ? AND address = ?",
+                           (username, address)).fetchone()
+    return row is not None and row["until"] > _now()
+
+
+def record_failure(username: str, address: str) -> bool:
+    """Count a failed login; True when it locks the pair."""
+    now = _now()
+    with _connect(write=True) as conn:
+        conn.execute("DELETE FROM login_failures WHERE at <= ?", (now - THROTTLE_WINDOW_S,))
+        conn.execute("DELETE FROM login_lockouts WHERE until <= ?", (now,))
+        conn.execute("INSERT INTO login_failures (username, address, at) VALUES (?, ?, ?)",
+                     (username, address, now))
+        count = conn.execute("SELECT COUNT(*) FROM login_failures WHERE username = ? AND address = ?",
+                             (username, address)).fetchone()[0]
+        if count < THROTTLE_FAILURES:
+            return False
+        conn.execute("INSERT OR REPLACE INTO login_lockouts (username, address, until) VALUES (?, ?, ?)",
+                     (username, address, now + LOCKOUT_S))
+        conn.execute("DELETE FROM login_failures WHERE username = ? AND address = ?", (username, address))
+    return True
+
+
+def clear_failures(username: str, address: str) -> None:
+    with _connect(write=True) as conn:
+        conn.execute("DELETE FROM login_failures WHERE username = ? AND address = ?", (username, address))
+```
+
+### api/auth/middleware.py
+
+```python
+"""Enforces the endpoint/role matrix on every API request (#25).
+
+A pure ASGI middleware rather than a FastAPI dependency: FastAPI reads and
+parses a request's body before it runs dependencies, so an unauthenticated
+512 MB upload would be received in full before being refused. This answers
+before the route runs, and never reads the body of a request it refuses.
+
+The refusals, in the order they apply:
+  503 SETUP_REQUIRED          no account exists yet (python -m auth bootstrap)
+  401 AUTH_REQUIRED           no valid session cookie
+  403 CROSS_ORIGIN_REFUSED    a cookie-authenticated POST/PUT/PATCH/DELETE from another origin
+  403 PASSWORD_CHANGE_REQUIRED the user must change a generated password first
+  403 FORBIDDEN               the user's role is too low
+
+A route with no policy entry is never matched here, so it falls through to the
+app; test_auth.py fails when any route lacks an entry.
+"""
+from __future__ import annotations
+
+import asyncio
+from http.cookies import CookieError, SimpleCookie
+from types import SimpleNamespace
+from urllib.parse import urlsplit
+
+from starlette.requests import Request
+
+from utils import api_error
+
+from . import policy, store
+
+UNSAFE = frozenset(("POST", "PUT", "PATCH", "DELETE"))
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _header(scope, name: bytes) -> str | None:
+    for key, value in scope.get("headers") or ():
+        if key == name:
+            return value.decode("latin-1")
+    return None
+
+
+def session_token(scope) -> str | None:
+    raw = _header(scope, b"cookie")
+    if not raw:
+        return None
+    cookies = SimpleCookie()
+    try:
+        cookies.load(raw)
+    except CookieError:
+        return None
+    morsel = cookies.get(store.COOKIE)
+    return morsel.value if morsel else None
+
+
+def same_origin(scope) -> bool:
+    """Origin names the Host the request was sent to; or, with no Origin, the
+    browser says the request is same-origin. Anything else is cross-origin.
+
+    The proxy forwards the browser's Host with its port ($http_host), so
+    localhost:8080 is compared with localhost:8080, not with localhost.
+    """
+    origin = _header(scope, b"origin")
+    if origin is None:
+        return _header(scope, b"sec-fetch-site") == "same-origin"
+    host = _header(scope, b"host")
+    if not host or origin == "null":
+        return False
+    try:
+        sent = urlsplit(origin)
+        if sent.scheme not in _DEFAULT_PORTS or not sent.hostname:
+            return False
+        target = urlsplit("//" + host)
+        default = _DEFAULT_PORTS[sent.scheme]
+        return (sent.hostname == (target.hostname or "")
+                and (sent.port or default) == (target.port or default))
+    except ValueError:
+        return False
+
+
+class AuthMiddleware:
+    """Matches the request against the policy's own route templates, so it
+    depends on no router internals; test_auth.py checks that the templates and
+    the app's routes are the same set and resolve to each other."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        template = policy.match(scope["method"], scope["path"])
+        if template is None:
+            # No route for this method and path: the app's own 404 or 405, which
+            # reveal nothing protected.
+            return await self.app(scope, receive, send)
+        access = policy.required(scope["method"], template)
+        if access == policy.PUBLIC:
+            return await self.app(scope, receive, send)
+        refusal, principal = await self._check(scope, access)
+        if refusal is not None:
+            # Request tracing labels a request by the route it reached (its
+            # `path`); give a refused request the same label the router would.
+            scope["route"] = SimpleNamespace(path=template)
+            return await refusal(scope, receive, send)
+        scope.setdefault("state", {})["auth"] = principal
+        return await self.app(scope, receive, send)
+
+    async def _check(self, scope, access):
+        if not await asyncio.to_thread(store.is_set_up):
+            return api_error(503, "SETUP_REQUIRED",
+                             "No account exists yet. An operator must create the first Engineer with "
+                             "`docker compose exec api python -m auth bootstrap <username>`."), None
+        principal = await asyncio.to_thread(store.authenticate, session_token(scope))
+        if principal is None:
+            return api_error(401, "AUTH_REQUIRED", "Log in to use this."), None
+        if scope["method"] in UNSAFE and not same_origin(scope):
+            return api_error(403, "CROSS_ORIGIN_REFUSED",
+                             "This request came from another site and was refused."), None
+        if principal.must_change_password and access != policy.SESSION:
+            return api_error(403, "PASSWORD_CHANGE_REQUIRED",
+                             "Change your password before doing anything else."), None
+        if access != policy.SESSION and policy.rank(principal.role) < policy.rank(access):
+            return api_error(403, "FORBIDDEN", "Your role can't do this.",
+                             detail={"required_role": access}), None
+        return None, principal
+
+
+class Unlisted(Exception):
+    """A route reached with no policy entry, or with no session the policy needs."""
+
+
+def require_listed(request: Request) -> None:
+    """A global FastAPI dependency: the second, fail-closed half of the policy.
+
+    The middleware answers for every route in the policy. A route added without
+    an entry would reach its handler unchecked; this refuses it instead (403 for
+    everyone), and also refuses a protected route the middleware let through
+    without a session.
+    """
+    route = request.scope.get("route")
+    access = policy.required(request.method, getattr(route, "path", ""))
+    if access is None:
+        raise Unlisted()
+    if access != policy.PUBLIC and request.scope.get("state", {}).get("auth") is None:
+        raise Unlisted()
+```
+
+### api/auth/__main__.py
+
+```python
+"""The operator command for accounts (#25).
+
+    docker compose exec api python -m auth bootstrap USERNAME
+    docker compose exec api python -m auth create-user USERNAME ROLE
+    docker compose exec api python -m auth reset-password USERNAME
+    docker compose exec api python -m auth set-role USERNAME ROLE
+    docker compose exec api python -m auth disable USERNAME
+    docker compose exec api python -m auth enable USERNAME
+    docker compose exec api python -m auth list
+
+ROLE is end_user, developer or engineer. bootstrap, create-user and
+reset-password print a generated password, alone, on standard output; it is
+shown nowhere else, and the user must change it at their first login. Each
+action writes one line to standard error. Exit status: 0 done, 1 refused,
+2 usage error.
+
+The last enabled engineer can't be disabled or demoted. A lockout is recovered
+with create-user, enable or reset-password.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+
+from . import passwords, store
+from .policy import ROLES
+
+
+def _say(line: str) -> None:
+    print("auth: " + line, file=sys.stderr, flush=True)
+
+
+def _username(parser, value: str) -> str:
+    name = passwords.normalize_username(value)
+    if name is None:
+        parser.error(f"invalid username {value!r}: {passwords.USERNAME_RULE}")
+    return name
+
+
+def _role(parser, value: str) -> str:
+    if value not in ROLES:
+        parser.error(f"invalid role {value!r}: use one of {', '.join(ROLES)}")
+    return value
+
+
+def _new_password(username: str) -> str:
+    while True:
+        password = passwords.generate_password()
+        if passwords.password_problem(password, username) is None:
+            return password
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m auth", description="Manage RAG platform accounts.")
+    commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    p = commands.add_parser("bootstrap", help="create the first engineer (only when no account exists)")
+    p.add_argument("username")
+    p = commands.add_parser("create-user", help="create an account with a generated password")
+    p.add_argument("username")
+    p.add_argument("role")
+    p = commands.add_parser("reset-password", help="set a generated password and end the user's sessions")
+    p.add_argument("username")
+    p = commands.add_parser("set-role", help="change a user's role")
+    p.add_argument("username")
+    p.add_argument("role")
+    p = commands.add_parser("disable", help="disable an account and end its sessions")
+    p.add_argument("username")
+    p = commands.add_parser("enable", help="enable a disabled account")
+    p.add_argument("username")
+    commands.add_parser("list", help="list the accounts")
+    args = parser.parse_args(argv)
+
+    username = _username(parser, args.username) if hasattr(args, "username") else None
+    role = _role(parser, args.role) if hasattr(args, "role") else None
+    try:
+        if args.command in ("bootstrap", "create-user"):
+            password = _new_password(username)
+            role = "engineer" if args.command == "bootstrap" else role
+            store.create_user(username, role, password, bootstrap=args.command == "bootstrap")
+            print(password, flush=True)
+            _say(f"{args.command}: created {role} {username!r}; the password above must be changed at first login")
+        elif args.command == "reset-password":
+            password = _new_password(username)
+            store.reset_password(username, password)
+            print(password, flush=True)
+            _say(f"reset-password: new password for {username!r}, to be changed at next login; "
+                 "their sessions ended")
+        elif args.command == "set-role":
+            store.set_role(username, role)
+            _say(f"set-role: {username!r} is now {role}")
+        elif args.command in ("disable", "enable"):
+            store.set_enabled(username, args.command == "enable")
+            _say(f"{args.command}: {username!r} {args.command}d"
+                 + ("; their sessions ended" if args.command == "disable" else ""))
+        else:
+            for user in store.list_users():
+                created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(user.created_at))
+                print(f"{user.username}\t{user.role}\t{'enabled' if user.enabled else 'disabled'}\t"
+                      f"{'password change due' if user.must_change_password else '-'}\t{created}")
+    except store.Refused as exc:
+        _say(f"{args.command} refused: {exc}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+### api/auth/testing.py
+
+```python
+"""A real account and session for in-process tests (#25).
+
+    from auth import testing
+    client = TestClient(app, headers=testing.headers("developer"))
+
+Points settings.auth_dir at a temporary folder for the rest of the process
+(removed at exit), creates an account of the role with no password change due,
+and returns the headers a same-origin browser would send (one account per
+role, a new session per call): the session cookie
+and an Origin matching base_url. Requests still go through the middleware and
+the store; nothing is bypassed. Never used by the API itself.
+"""
+from __future__ import annotations
+
+import atexit
+import shutil
+import tempfile
+
+from config import settings
+
+from . import passwords, store
+
+_folder: str | None = None
+_count = 0
+
+
+def use_temporary_store() -> str:
+    """Point the store at this process's temporary folder; returns it."""
+    global _folder
+    if _folder is None:
+        _folder = tempfile.mkdtemp(prefix="rag-auth-test-")
+        atexit.register(shutil.rmtree, _folder, True)
+    settings.auth_dir = _folder
+    return _folder
+
+
+def account(role: str = "engineer") -> tuple[store.User, str]:
+    """A new enabled account of `role` in the temporary store, and its password."""
+    global _count
+    use_temporary_store()
+    if not store.is_set_up():
+        store.create_user("test-bootstrap", "engineer", passwords.generate_password(), bootstrap=True,
+                          must_change_password=False)
+    _count += 1
+    username = f"test-{role.replace('_', '-')}-{_count}"
+    password = passwords.generate_password()
+    store.create_user(username, role, password, must_change_password=False)
+    return store.get_user(username), password
+
+
+_accounts: dict[str, store.User] = {}
+
+
+def headers(role: str = "engineer", base_url: str = "http://testserver") -> dict[str, str]:
+    """Cookie and Origin headers for a fresh session of this process's `role` account."""
+    user = _accounts.get(role)
+    if user is None or store.get_user(user.username) is None:
+        user, _ = account(role)
+        _accounts[role] = user
+    token = store.create_session(user.id)
+    return {"Cookie": f"{store.COOKIE}={token}", "Origin": base_url.rstrip("/")}
+```
+
+### api/routers/auth.py
+
+```python
+"""Login, logout, the current user and their own password change (#25).
+
+Which role every other route needs is in auth/policy.py, enforced by
+auth/middleware.py before a route runs. Accounts are created and recovered by
+the operator command, `python -m auth`.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+
+from auth import passwords, store
+from config import settings
+from models.schemas import AuthStatus, AuthUser, LoginRequest, PasswordChangeRequest
+from utils import api_error
+
+router = APIRouter(prefix="/auth")
+# The API configures no logging, so only WARNING and above reach the container
+# log; login lines must reach it (one per attempt, never a password).
+_log = logging.getLogger("auth")
+
+LOGIN_FAILED = "The username or password is incorrect."
+
+
+def _address(request: Request) -> str:
+    # nginx sets X-Real-IP to the connection's address, replacing anything the
+    # client sent; every request reaches the API through it.
+    return request.headers.get("x-real-ip") or (request.client.host if request.client else "unknown")
+
+
+def _user_body(username: str, role: str, must_change_password: bool) -> dict:
+    return {"username": username, "role": role, "must_change_password": must_change_password}
+
+
+def _cookie(response: JSONResponse, token: str) -> None:
+    response.set_cookie(store.COOKIE, token, max_age=store.ABSOLUTE_S, path="/", httponly=True,
+                        samesite="strict", secure=settings.auth_cookie_secure)
+
+
+@router.get("/status", response_model=AuthStatus)
+async def auth_status():
+    return {"setup_required": not await asyncio.to_thread(store.is_set_up)}
+
+
+def _login(typed: str, password: str, address: str):
+    """('throttled' | 'failed' | 'ok', user, token). Blocking: scrypt and SQLite."""
+    key = typed.lower()
+    if store.locked(key, address):
+        return "throttled", None, None
+    username = passwords.normalize_username(typed)
+    user = store.get_user(username) if username else None
+    # Verified against a dummy hash when there is no such user, so a failure
+    # takes as long either way and the timing doesn't reveal which accounts exist.
+    matched = passwords.verify_password(password, user.password_hash if user else passwords.dummy_hash())
+    if not (matched and user and user.enabled):
+        store.record_failure(key, address)
+        return "failed", None, None
+    store.clear_failures(key, address)
+    return "ok", user, store.create_session(user.id)
+
+
+@router.post("/login", response_model=AuthUser)
+async def login(body: LoginRequest, request: Request):
+    if not await asyncio.to_thread(store.is_set_up):
+        return api_error(503, "SETUP_REQUIRED",
+                         "No account exists yet. An operator must create the first Engineer with "
+                         "`docker compose exec api python -m auth bootstrap <username>`.")
+    address = _address(request)
+    outcome, user, token = await asyncio.to_thread(_login, body.username, body.password, address)
+    if outcome == "throttled":
+        _log.warning("Login refused for %r from %s: too many failed attempts", body.username, address)
+        return api_error(429, "LOGIN_THROTTLED", "Too many failed logins. Wait 15 minutes and try again.")
+    if outcome == "failed":
+        _log.warning("Login failed for %r from %s", body.username, address)
+        return api_error(401, "LOGIN_FAILED", LOGIN_FAILED)
+    _log.warning("Login succeeded for %r (%s) from %s", user.username, user.role, address)
+    response = JSONResponse(_user_body(user.username, user.role, user.must_change_password))
+    _cookie(response, token)
+    return response
+
+
+@router.post("/logout")
+async def logout(request: Request):
+    principal = request.state.auth
+    await asyncio.to_thread(store.delete_session, principal.token_hash)
+    _log.warning("Logout of %r", principal.username)
+    response = JSONResponse({"status": "logged_out"})
+    response.delete_cookie(store.COOKIE, path="/", httponly=True, samesite="strict",
+                           secure=settings.auth_cookie_secure)
+    return response
+
+
+@router.get("/me", response_model=AuthUser)
+async def me(request: Request):
+    principal = request.state.auth
+    return _user_body(principal.username, principal.role, principal.must_change_password)
+
+
+def _change(principal, current: str, new: str):
+    user = store.get_user(principal.username)
+    if user is None or not passwords.verify_password(current, user.password_hash):
+        return "incorrect"
+    problem = passwords.password_problem(new, principal.username)
+    if problem:
+        return problem
+    store.change_password(principal, new)
+    return None
+
+
+@router.post("/password")
+async def change_password(body: PasswordChangeRequest, request: Request):
+    principal = request.state.auth
+    problem = await asyncio.to_thread(_change, principal, body.current_password, body.new_password)
+    if problem == "incorrect":
+        return api_error(403, "PASSWORD_INCORRECT", "The current password is incorrect.")
+    if problem:
+        return api_error(422, "INVALID_PASSWORD", problem)
+    _log.warning("Password changed by %r; their other sessions ended", principal.username)
+    return {"status": "changed", **_user_body(principal.username, principal.role, False)}
+```
+
 ### api/main.py
 
 ```python
@@ -11120,7 +12269,6 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from utils import api_error
-from fastapi.middleware.cors import CORSMiddleware
 
 
 @asynccontextmanager
@@ -11198,7 +12346,17 @@ async def lifespan(app: FastAPI):
             await asyncio.to_thread(runtime.shutdown)
 
 
-app = FastAPI(title="RAG API", lifespan=lifespan)
+from fastapi import Depends
+from auth.middleware import AuthMiddleware, Unlisted, require_listed
+
+# require_listed refuses any route that has no entry in auth/policy.py, so a new
+# route is closed until it is given one (#25).
+app = FastAPI(title="RAG API", lifespan=lifespan, dependencies=[Depends(require_listed)])
+
+
+@app.exception_handler(Unlisted)
+async def unlisted_route(request, exc):
+    return api_error(403, "FORBIDDEN", "This route is not open to any role.")
 
 
 @app.exception_handler(RequestValidationError)
@@ -11240,17 +12398,17 @@ async def unhandled_error(request, exc):
     return api_error(500, "INTERNAL_ERROR",
                      "The API hit an unexpected error. The cause is in the API log.")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Every route needs the role auth/policy.py gives it (#25). Added first, so it
+# runs inside request tracing and a refused request is still traced. No CORS
+# middleware: the UI is served from the same origin through nginx, so no other
+# origin needs to read the API's answers.
+app.add_middleware(AuthMiddleware)
 app.add_middleware(RequestTracing)
 
-from routers import help as help_router, health, collections, ingest, query, goldstandard, metrics, retrieval_config, transfer, tuning
+from routers import auth as auth_router, help as help_router, health, collections, ingest, query, goldstandard, metrics, retrieval_config, transfer, tuning
 
 app.include_router(health.router)
+app.include_router(auth_router.router)
 app.include_router(help_router.router)
 app.include_router(collections.router)
 app.include_router(ingest.router)
@@ -11439,18 +12597,18 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 
 ```typescript
 import { BrowserRouter } from 'react-router-dom'
-import { RoleProvider } from './context/RoleContext'
+import { AuthProvider } from './context/AuthContext'
 import { QueryConfigProvider } from './context/QueryConfigContext'
 import AppRouter from './router'
 
 export default function App() {
   return (
     <BrowserRouter>
-      <RoleProvider>
+      <AuthProvider>
         <QueryConfigProvider>
           <AppRouter />
         </QueryConfigProvider>
-      </RoleProvider>
+      </AuthProvider>
     </BrowserRouter>
   )
 }
@@ -11460,9 +12618,11 @@ export default function App() {
 
 ```typescript
 import { Routes, Route, Navigate } from 'react-router-dom'
-import { useRole } from './context/RoleContext'
+import { useAuth } from './context/AuthContext'
 import NavBar from './components/NavBar'
-import LandingPage from './pages/LandingPage'
+import LoginPage from './pages/LoginPage'
+import SetupRequiredPage from './pages/SetupRequiredPage'
+import ChangePasswordPage from './pages/ChangePasswordPage'
 import QAPage from './pages/QAPage'
 import ImportPage from './pages/ImportPage'
 import ChunkingPage from './pages/ChunkingPage'
@@ -11473,17 +12633,36 @@ import HealthPage from './pages/HealthPage'
 import TransferPage from './pages/TransferPage'
 import HelpTransferPage from './pages/HelpTransferPage'
 
+// What the API says decides what is shown (#25): set up, logged in, a password
+// change due, and the role. Hiding a page is a convenience; the API refuses
+// what the role can't do whatever the UI shows.
 export default function AppRouter() {
-  const { role } = useRole()
+  const { state } = useAuth()
 
-  if (!role) {
+  if (state.phase === 'loading') {
+    return <p className="p-8 text-sm text-gray-500">Loading…</p>
+  }
+  if (state.phase === 'error') {
+    return <p role="alert" className="p-8 text-sm text-red-600">{state.message}</p>
+  }
+  if (state.phase === 'setup_required') return <SetupRequiredPage />
+  if (state.phase === 'logged_out') {
     return (
       <Routes>
-        <Route path="/" element={<LandingPage />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
+        <Route path="/login" element={<LoginPage />} />
+        <Route path="*" element={<Navigate to="/login" replace />} />
       </Routes>
     )
   }
+  if (state.user.must_change_password) {
+    return (
+      <Routes>
+        <Route path="/account/password" element={<ChangePasswordPage forced />} />
+        <Route path="*" element={<Navigate to="/account/password" replace />} />
+      </Routes>
+    )
+  }
+  const role = state.user.role
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -11491,7 +12670,9 @@ export default function AppRouter() {
       <main className="max-w-6xl mx-auto px-4 py-6">
         <Routes>
           <Route path="/" element={<Navigate to="/qa" replace />} />
+          <Route path="/login" element={<Navigate to="/qa" replace />} />
           <Route path="/qa" element={<QAPage />} />
+          <Route path="/account/password" element={<ChangePasswordPage />} />
           {role !== 'end_user' && (
             <>
               <Route path="/import" element={<ImportPage />} />
@@ -11516,56 +12697,96 @@ export default function AppRouter() {
 }
 ```
 
-### ui/src/context/RoleContext.tsx
+### ui/src/context/AuthContext.tsx
 
 ```typescript
-import { createContext, useContext, useReducer, ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useState, ReactNode } from 'react'
+import { api, ApiError, AuthUser, Role, onAuthProblem } from '../api/client'
 
-type Role = 'engineer' | 'developer' | 'end_user' | null
+// Who is logged in, as the API says (#25). The role comes only from
+// GET /api/auth/me; the browser stores nothing about it.
+type AuthState =
+  | { phase: 'loading' }
+  | { phase: 'error'; message: string }
+  | { phase: 'setup_required' }
+  | { phase: 'logged_out' }
+  | { phase: 'logged_in'; user: AuthUser }
 
-interface RoleState { role: Role }
-type RoleAction = { type: 'SET_ROLE'; role: Role }
-
-const RoleContext = createContext<{ role: Role; setRole: (r: Role) => void } | null>(null)
-
-function reducer(_state: RoleState, action: RoleAction): RoleState {
-  return { role: action.role }
+interface AuthValue {
+  state: AuthState
+  user: AuthUser | null
+  login: (username: string, password: string) => Promise<void>
+  logout: () => Promise<void>
+  changePassword: (current: string, next: string) => Promise<void>
+  refresh: () => Promise<void>
 }
 
-function loadRole(): Role {
-  try {
-    const stored = sessionStorage.getItem('rag_role')
-    if (!stored) return null
-    const parsed = JSON.parse(stored)
-    return parsed.role ?? null
-  } catch {
-    return null
-  }
-}
+const AuthContext = createContext<AuthValue | null>(null)
 
-export function RoleProvider({ children }: { children: ReactNode }) {
-  const [state, dispatch] = useReducer(reducer, { role: loadRole() })
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [state, setState] = useState<AuthState>({ phase: 'loading' })
 
-  function setRole(role: Role) {
-    if (role) {
-      sessionStorage.setItem('rag_role', JSON.stringify({ role }))
-    } else {
-      sessionStorage.removeItem('rag_role')
+  const refresh = useCallback(async () => {
+    try {
+      const status = await api.authStatus()
+      if (status.setup_required) { setState({ phase: 'setup_required' }); return }
+    } catch (e) {
+      setState({ phase: 'error', message: e instanceof Error ? e.message : String(e) })
+      return
     }
-    dispatch({ type: 'SET_ROLE', role })
-  }
+    try {
+      setState({ phase: 'logged_in', user: await api.me() })
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) setState({ phase: 'logged_out' })
+      else if (e instanceof ApiError && e.code === 'SETUP_REQUIRED') setState({ phase: 'setup_required' })
+      else setState({ phase: 'error', message: e instanceof Error ? e.message : String(e) })
+    }
+  }, [])
 
+  useEffect(() => { refresh() }, [refresh])
+
+  // Any call that finds the session gone returns to the login page; one that
+  // finds a password change due returns to the password page.
+  useEffect(() => {
+    onAuthProblem(code => {
+      if (code === 'AUTH_REQUIRED') setState({ phase: 'logged_out' })
+      else setState(s => s.phase === 'logged_in' ? { phase: 'logged_in', user: { ...s.user, must_change_password: true } } : s)
+    })
+    return () => onAuthProblem(null)
+  }, [])
+
+  const login = useCallback(async (username: string, password: string) => {
+    const user = await api.login(username, password)
+    setState({ phase: 'logged_in', user })
+  }, [])
+
+  const logout = useCallback(async () => {
+    try { await api.logout() } finally { setState({ phase: 'logged_out' }) }
+  }, [])
+
+  const changePassword = useCallback(async (current: string, next: string) => {
+    const result = await api.changePassword(current, next)
+    setState({ phase: 'logged_in', user: { username: result.username, role: result.role, must_change_password: false } })
+  }, [])
+
+  const user = state.phase === 'logged_in' ? state.user : null
   return (
-    <RoleContext.Provider value={{ role: state.role, setRole }}>
+    <AuthContext.Provider value={{ state, user, login, logout, changePassword, refresh }}>
       {children}
-    </RoleContext.Provider>
+    </AuthContext.Provider>
   )
 }
 
-export function useRole() {
-  const ctx = useContext(RoleContext)
-  if (!ctx) throw new Error('useRole must be used within RoleProvider')
+export function useAuth() {
+  const ctx = useContext(AuthContext)
+  if (!ctx) throw new Error('useAuth must be used within AuthProvider')
   return ctx
+}
+
+// The logged-in user's role, for pages that adapt to it. Pages render only
+// after login, so a page never sees null in practice.
+export function useRole(): { role: Role | null } {
+  return { role: useAuth().user?.role ?? null }
 }
 ```
 
@@ -11754,6 +12975,24 @@ const PROXY_ERRORS: Record<number, string> = {
   504: 'The API took too long to respond.',
 }
 
+// An API error, with the API's error code when the answer carried one.
+export class ApiError extends Error {
+  status: number
+  code: string | null
+  constructor(message: string, status: number, code: string | null) {
+    super(message)
+    this.status = status
+    this.code = code
+  }
+}
+
+// The session ended (401 AUTH_REQUIRED) or a generated password must be changed
+// first (403 PASSWORD_CHANGE_REQUIRED), whichever call noticed it (#25). The
+// auth context listens and shows the login or password page.
+type AuthListener = (code: 'AUTH_REQUIRED' | 'PASSWORD_CHANGE_REQUIRED') => void
+let authListener: AuthListener | null = null
+export function onAuthProblem(listener: AuthListener | null) { authListener = listener }
+
 async function request<T>(method: string, path: string, body?: unknown, isFormData = false): Promise<T> {
   const headers: Record<string, string> = isFormData ? {} : { 'Content-Type': 'application/json' }
   const res = await fetch(`${BASE}${path}`, {
@@ -11767,7 +13006,9 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
   let data: any = null
   try { data = text ? JSON.parse(text) : null } catch { /* not JSON; handled below */ }
   if (!res.ok) {
-    throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
+    const code: string | null = typeof data?.error?.code === 'string' ? data.error.code : null
+    if (code === 'AUTH_REQUIRED' || code === 'PASSWORD_CHANGE_REQUIRED') authListener?.(code)
+    throw new ApiError(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`, res.status, code)
   }
   if (data === null && text) throw new Error('The server sent a response the UI could not read.')
   return data as T
@@ -11804,6 +13045,15 @@ async function getHealthResult(): Promise<HealthResult> {
 }
 
 export const api = {
+  // Accounts and sessions (#25). The session is an HttpOnly cookie the browser
+  // sends with every same-origin request; the UI never sees or stores it.
+  authStatus: () => request<{ setup_required: boolean }>('GET', '/auth/status'),
+  me: () => request<AuthUser>('GET', '/auth/me'),
+  login: (username: string, password: string) => request<AuthUser>('POST', '/auth/login', { username, password }),
+  logout: () => request<{ status: string }>('POST', '/auth/logout'),
+  changePassword: (current_password: string, new_password: string) =>
+    request<{ status: string } & AuthUser>('POST', '/auth/password', { current_password, new_password }),
+
   getCollections: () => request<{ collections: CollectionInfo[] }>('GET', '/collections'),
   // Answers with the name as stored, first letter capitalised (#372).
   createCollection: (body: CreateCollectionBody) => request<{ name: string; status: string }>('POST', '/collections', body),
@@ -11843,6 +13093,8 @@ export const api = {
 }
 
 // Types
+export type Role = 'engineer' | 'developer' | 'end_user'
+export interface AuthUser { username: string; role: Role; must_change_password: boolean }
 export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
   hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null
@@ -11968,15 +13220,16 @@ export interface HealthResult {
 
 ```typescript
 import { Link, useNavigate } from 'react-router-dom'
-import { useRole } from '../context/RoleContext'
+import { useAuth } from '../context/AuthContext'
 
 export default function NavBar() {
-  const { role, setRole } = useRole()
+  const { user, logout } = useAuth()
   const navigate = useNavigate()
+  const role = user?.role ?? null
 
-  function switchRole() {
-    setRole(null)
-    navigate('/')
+  async function logOut() {
+    await logout()
+    navigate('/login', { replace: true })
   }
 
   const roleLabel = role === 'engineer' ? 'AI Engineer' : role === 'developer' ? 'Developer' : 'End User'
@@ -12001,29 +13254,14 @@ export default function NavBar() {
         </>
       )}
       <div className="ml-auto flex items-center gap-3">
+        <span className="text-sm text-gray-700" data-testid="nav-username">{user?.username}</span>
         <span className="text-xs bg-blue-100 text-blue-800 px-2 py-1 rounded">{roleLabel}</span>
-        <button onClick={switchRole} className="text-sm text-gray-500 hover:text-blue-600">Switch Role</button>
+        {/* A button, not a link: the nav's links are the role's pages. */}
+        <button onClick={() => navigate('/account/password')} className="text-sm text-gray-500 hover:text-blue-600">Change password</button>
+        <button onClick={logOut} className="text-sm text-gray-500 hover:text-blue-600">Log out</button>
       </div>
     </nav>
   )
-}
-```
-
-### ui/src/components/RoleGate.tsx
-
-```typescript
-import { ReactNode } from 'react'
-import { useRole } from '../context/RoleContext'
-
-interface Props {
-  roles: string[]
-  children: ReactNode
-}
-
-export default function RoleGate({ roles, children }: Props) {
-  const { role } = useRole()
-  if (!role || !roles.includes(role)) return null
-  return <>{children}</>
 }
 ```
 
@@ -12181,55 +13419,165 @@ export default function LatencyCharts({ data }: { data: MetricsResult }) {
 }
 ```
 
-### ui/src/pages/LandingPage.tsx
+### ui/src/pages/LoginPage.tsx
 
 ```typescript
+import { FormEvent, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { useRole } from '../context/RoleContext'
+import { useAuth } from '../context/AuthContext'
 
-const ROLES = [
-  {
-    id: 'engineer' as const,
-    label: 'AI Engineer',
-    description: 'Full access: ingest, chunking, retrieval, gold standard, collection management, health dashboard.',
-  },
-  {
-    id: 'developer' as const,
-    label: 'Developer',
-    description: 'Ingest documents, configure chunking and retrieval, run Q&A, generate gold standard.',
-  },
-  {
-    id: 'end_user' as const,
-    label: 'End User',
-    description: 'Ask questions and get answers from the knowledge base.',
-  },
-]
-
-export default function LandingPage() {
-  const { setRole } = useRole()
+// Replaces the role picker (#25): the role now comes with the account.
+export default function LoginPage() {
+  const { login } = useAuth()
   const navigate = useNavigate()
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
 
-  function select(role: 'engineer' | 'developer' | 'end_user') {
-    setRole(role)
-    navigate('/qa')
+  async function submit(e: FormEvent) {
+    e.preventDefault()
+    setBusy(true)
+    setError('')
+    try {
+      await login(username, password)
+      navigate('/qa', { replace: true })
+    } catch (err) {
+      // The server's own message: generic for a failed login, "wait" when throttled.
+      setError(err instanceof Error ? err.message : String(err))
+      setPassword('')
+    } finally {
+      setBusy(false)
+    }
   }
 
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-8">
       <h1 className="text-3xl font-bold text-gray-800 mb-2">RAG Platform</h1>
-      <p className="text-gray-500 mb-10">Select your role to continue</p>
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 w-full max-w-3xl">
-        {ROLES.map(r => (
-          <button
-            key={r.id}
-            onClick={() => select(r.id)}
-            className="bg-white border-2 border-gray-200 hover:border-blue-500 rounded-xl p-6 text-left transition-all shadow-sm hover:shadow-md"
-          >
-            <h2 className="text-lg font-semibold text-gray-800 mb-2">{r.label}</h2>
-            <p className="text-sm text-gray-500">{r.description}</p>
-          </button>
-        ))}
+      <p className="text-gray-500 mb-8">Log in to continue</p>
+      <form onSubmit={submit} className="bg-white border border-gray-200 rounded-xl p-6 shadow-sm w-full max-w-sm space-y-4">
+        <label className="block text-sm text-gray-700">
+          Username
+          <input id="login-username" autoComplete="username" value={username} onChange={e => setUsername(e.target.value)}
+            className="mt-1 w-full border border-gray-300 rounded px-3 py-2 text-sm" required />
+        </label>
+        <label className="block text-sm text-gray-700">
+          Password
+          <input id="login-password" type="password" autoComplete="current-password" value={password}
+            onChange={e => setPassword(e.target.value)}
+            className="mt-1 w-full border border-gray-300 rounded px-3 py-2 text-sm" required />
+        </label>
+        {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
+        <button type="submit" disabled={busy || !username || !password}
+          className="w-full bg-blue-600 text-white rounded px-4 py-2 text-sm font-medium disabled:opacity-50">
+          {busy ? 'Logging in…' : 'Log in'}
+        </button>
+      </form>
+    </div>
+  )
+}
+```
+
+### ui/src/pages/SetupRequiredPage.tsx
+
+```typescript
+// Shown until an operator creates the first Engineer (#25). Nothing else in the
+// UI works until then: the API refuses every protected request.
+export default function SetupRequiredPage() {
+  return (
+    <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-8">
+      <h1 className="text-3xl font-bold text-gray-800 mb-2">RAG Platform</h1>
+      <div className="bg-white border border-gray-200 rounded-xl p-6 shadow-sm w-full max-w-xl space-y-3">
+        <h2 className="text-lg font-semibold text-gray-800">Not set up yet</h2>
+        <p className="text-sm text-gray-600">
+          No account exists. On the machine running the stack, create the first AI Engineer from the
+          project folder:
+        </p>
+        <pre className="bg-gray-100 rounded p-3 text-sm overflow-x-auto">docker compose exec api python -m auth bootstrap &lt;username&gt;</pre>
+        <p className="text-sm text-gray-600">
+          It prints a one-time password. Reload this page, log in with it, and choose a new password.
+        </p>
       </div>
+    </div>
+  )
+}
+```
+
+### ui/src/pages/ChangePasswordPage.tsx
+
+```typescript
+import { FormEvent, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { useAuth } from '../context/AuthContext'
+
+// The user's own password change (#25). When a generated password is due for
+// change, this is the only page the UI shows, with a way to log out.
+export default function ChangePasswordPage({ forced = false }: { forced?: boolean }) {
+  const { changePassword, logout, user } = useAuth()
+  const navigate = useNavigate()
+  const [current, setCurrent] = useState('')
+  const [next, setNext] = useState('')
+  const [confirm, setConfirm] = useState('')
+  const [error, setError] = useState('')
+  const [done, setDone] = useState(false)
+  const [busy, setBusy] = useState(false)
+
+  async function submit(e: FormEvent) {
+    e.preventDefault()
+    setError('')
+    setDone(false)
+    if (next !== confirm) { setError('The new passwords do not match.'); return }
+    setBusy(true)
+    try {
+      await changePassword(current, next)
+      setCurrent(''); setNext(''); setConfirm('')
+      if (forced) navigate('/qa', { replace: true })
+      else setDone(true)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const field = (id: string, label: string, value: string, set: (v: string) => void, autoComplete: string) => (
+    <label className="block text-sm text-gray-700">
+      {label}
+      <input id={id} type="password" autoComplete={autoComplete} value={value} onChange={e => set(e.target.value)}
+        className="mt-1 w-full border border-gray-300 rounded px-3 py-2 text-sm" required />
+    </label>
+  )
+
+  const form = (
+    <form onSubmit={submit} className="bg-white border border-gray-200 rounded-xl p-6 shadow-sm w-full max-w-sm space-y-4">
+      <h2 className="text-lg font-semibold text-gray-800">Change password</h2>
+      {forced && (
+        <p className="text-sm text-gray-600">
+          {user ? `${user.username}, your` : 'Your'} password was generated for you. Choose a new one to continue.
+        </p>
+      )}
+      {field('current-password', 'Current password', current, setCurrent, 'current-password')}
+      {field('new-password', 'New password (at least 12 characters)', next, setNext, 'new-password')}
+      {field('confirm-password', 'New password again', confirm, setConfirm, 'new-password')}
+      {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
+      {done && <p role="status" className="text-sm text-green-700">Password changed. Your other sessions were logged out.</p>}
+      <button type="submit" disabled={busy || !current || !next || !confirm}
+        className="w-full bg-blue-600 text-white rounded px-4 py-2 text-sm font-medium disabled:opacity-50">
+        {busy ? 'Changing…' : 'Change password'}
+      </button>
+      {forced && (
+        <button type="button" onClick={() => logout()} className="w-full text-sm text-gray-500 hover:text-blue-600">
+          Log out
+        </button>
+      )}
+    </form>
+  )
+
+  if (!forced) return <div className="flex justify-center">{form}</div>
+  return (
+    <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-8">
+      <h1 className="text-3xl font-bold text-gray-800 mb-6">RAG Platform</h1>
+      {form}
     </div>
   )
 }
@@ -12241,7 +13589,7 @@ export default function LandingPage() {
 import { useState, useEffect, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { api, CollectionInfo, Citation } from '../api/client'
-import { useRole } from '../context/RoleContext'
+import { useRole } from '../context/AuthContext'
 import { useQueryConfig } from '../context/QueryConfigContext'
 import CitationsPanel from '../components/CitationsPanel'
 
@@ -12385,7 +13733,7 @@ export default function QAPage() {
 ```typescript
 import { useState, useEffect } from 'react'
 import { api, CollectionInfo, JobStatus, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB } from '../api/client'
-import { useRole } from '../context/RoleContext'
+import { useRole } from '../context/AuthContext'
 import StrategyExplainer from '../components/StrategyExplainer'
 import ProgressPanel from '../components/ProgressPanel'
 
@@ -12644,7 +13992,7 @@ export default function ImportPage() {
 import { useState, useEffect, useRef } from 'react'
 import { api, CollectionInfo, IngestConfig } from '../api/client'
 import StrategyExplainer from '../components/StrategyExplainer'
-import { useRole } from '../context/RoleContext'
+import { useRole } from '../context/AuthContext'
 
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
 
@@ -12795,7 +14143,7 @@ export default function ChunkingPage() {
 ```typescript
 import { useEffect, useRef, useState } from 'react'
 import { api, CollectionInfo } from '../api/client'
-import { useRole } from '../context/RoleContext'
+import { useRole } from '../context/AuthContext'
 import { useQueryConfig, QueryConfig } from '../context/QueryConfigContext'
 
 const MODES = [
@@ -14117,6 +15465,41 @@ bash scripts/verify/stack.sh run 02 04              # only the named suites
 
 Exits non-zero if any check fails.
 
+## Test accounts (#25)
+
+Every API route but `/health` and the login needs a session, so the suites log in.
+`require_stack` (in `lib.sh`) runs `auth_setup.py ensure`, which makes sure the verify project
+has one account per role, `vfy-engineer`, `vfy-developer` and `vfy-end-user`, whose passwords it
+knows:
+
+- On a project that isn't set up yet it runs `python -m auth bootstrap vfy-engineer` in the api
+  container; a missing account is created with `create-user`, and one whose stored password no
+  longer works (a new verify project, say) gets `reset-password`. Each generated password is
+  replaced at first login with a fresh random one, as the API requires.
+- The operator command runs only when the target is the verify project as `stack.sh` sets it up
+  (`COMPOSE_PROJECT_NAME=rag-verify` and the overlay in `COMPOSE_FILE`, the same condition as
+  removing its volumes). Anywhere else a password that doesn't work is a failure, never a reset.
+- The passwords live only in `$RAG_AUTH_DIR/credentials` (default
+  `${TMPDIR:-/tmp}/rag-verify-auth-<uid>`): mode 0600, in a folder of mode 0700 that is the user's
+  own (a symlink, a file or someone else's folder there is refused), outside the checkout. They
+  are never printed, put on a command line or in the environment, or written to the `export`
+  lines `stack.sh up` prints (which CI copies into its job environment). They reach the API only
+  in request bodies, and the browser checks on standard input.
+
+`require_stack` then logs `vfy-engineer` in, into the curl cookie jar
+`$RAG_AUTH_DIR/engineer.jar` (0600), exported as `RAG_AUTH_JAR`. `lib.sh` defines `curl` as a
+function that adds that jar and an `Origin` matching `RAG_API` (the API refuses a
+cookie-authenticated change without one), so every curl in a suite, and the `api_*` helpers,
+send the session. A check that needs no session, another role or another origin calls `command
+curl`. `auth_jar <role>` logs another role in. The host-side Python helpers that call the API
+read the jar through `auth_headers.py`; in-process checks in the API image use
+`auth.testing.headers()`, a real account and session in a temporary store, never a bypass.
+
+`17_auth.sh` checks authentication itself: the endpoint/role matrix for no session and each
+role (written out in `auth_stack.py`, not read from the API), login, logout, cookies, origin
+rules, throttling, the operator command's effect on existing sessions (on throwaway `vfy-t-*`
+accounts), idle expiry, and that the API log holds no harness secret.
+
 ## Entry point and verify project
 
 `stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
@@ -14765,6 +16148,10 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
 | `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health` reports, so the status flips to `below_recommended` on any host (#536) |
 | `../tests/test_memory_override.py` | host-side, standard library: the derived override makes `system_info.memory_info` report `below_recommended` with a note for allocations below and above the 12.35 GB a fixed 13 GB could flip, and no override without a usable allocation (#536); embedded copies; registered by suite 01 |
+| `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command; registers `../tests/test_auth.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
+| `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
+| `auth_stack.py` | the stack checks of `17_auth.sh`, one per subcommand (#25) |
+| `auth_headers.py` | the suite's session as `Cookie` and `Origin` headers, for the host-side Python helpers (#25) |
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
 | `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
 | `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
@@ -14834,11 +16221,12 @@ through the proxy that download refuses other upload state with 400 (#370).
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the query metrics reload in `03_query.sh`, the batch recovery acceptance in `05_transfer.sh`, and retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`); never the `rag-docker` project |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the query metrics reload in `03_query.sh`, the batch recovery acceptance in `05_transfer.sh`, retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`, and a session and a login lockout across a restart in `17_auth.sh`); never the `rag-docker` project |
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
 | `RAG_NETWORK` | detected | compose network for the browser container |
+| `RAG_AUTH_DIR` | `${TMPDIR:-/tmp}/rag-verify-auth-<uid>` | the folder of the test accounts' credentials and cookie jars (#25) |
 
 ## Writing a check
 
@@ -15047,7 +16435,8 @@ nothing reaches the backend or a model. 67 cases:
   modal (HNSW slider defaults, bounds and labels, Flat hiding them, the create payload); the Import
   queue, slider visibility per strategy and role, Chunk Size pulling Overlap down, the upload
   form fields and the "+ New" modal; the Developer nav and the redirects of a Developer and an End
-  User (gating is client-side only until #25); the landing page and Switch Role; the Q&A box
+  User; the login page, logout, the setup-required page, the forced and voluntary password change
+  and the return to login on a 401 (#25), with `GET /api/auth/me` answered from the case's role; the Q&A box
   (Ctrl+Enter, plain Enter, Ask disabled while empty or loading), the citations toggle, markdown,
   the latency and error lines and the End User view with `response_format`; the Retrieval page's
   saved and default texts, alpha slider and Save while loading; and the client's handling of
@@ -15346,7 +16735,7 @@ printf '\nBuilding fixtures in %s\n' "$FIX"
 rm -rf "$FIX"; python3 ./fixtures.py "$FIX" >/dev/null
 export RAG_FIXTURES="$FIX"
 
-ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry)
+ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth)
 if [ "$#" -gt 0 ]; then
   SUITES=()
   for want in "$@"; do
@@ -16066,6 +17455,58 @@ require_stack() {
     printf '  Start the verify project first:  bash scripts/verify/stack.sh up\n\n'
     exit 2
   fi
+  auth_ensure
+}
+
+# ── test accounts (#25) ──────────────────────────────────────────────────────
+# Every API route but /health and the login needs a session. auth_setup.py keeps
+# one account per role (vfy-engineer, vfy-developer, vfy-end-user) with its
+# password in $RAG_AUTH_DIR/credentials (mode 0600, folder 0700, outside the
+# checkout), never printed, on a command line or in the environment. It runs
+# the operator command (`python -m auth`) only when the target is the verify
+# project as stack.sh sets it up, the same condition as removing its volumes;
+# anywhere else a password that doesn't work is a failure, never a reset.
+#
+# The suites then send the engineer's session with every request: the curl
+# function below adds the cookie jar and a same-origin Origin (the API refuses a
+# cookie-authenticated change without one) to every curl call in a suite,
+# api_* helpers included. A check that needs no session, another role or another
+# origin calls `command curl` and passes its own. Python helpers read the same
+# jar through auth_headers.py.
+RAG_AUTH_DIR="${RAG_AUTH_DIR:-$(printf '%s' "${TMPDIR:-/tmp}" | sed 's:/*$::')/rag-verify-auth-$(id -u)}"
+# The script that does it; test_verify_stack.py's sandboxes, which stub docker
+# and curl, put a stand-in here. The --operator condition below stays lib.sh's.
+RAG_AUTH_SETUP="${RAG_AUTH_SETUP:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/auth_setup.py}"
+RAG_AUTH_ORIGIN=$(python3 -c 'import sys; from urllib.parse import urlsplit; u = urlsplit(sys.argv[1]); print(u.scheme + "://" + u.netloc)' "$API")
+export RAG_AUTH_DIR RAG_AUTH_ORIGIN
+
+curl() {
+  if [ -n "${RAG_AUTH_JAR:-}" ]; then
+    command curl -b "$RAG_AUTH_JAR" -H "Origin: $RAG_AUTH_ORIGIN" "$@"
+  else
+    command curl "$@"
+  fi
+}
+
+# auth_jar <role>: logs the role's test account in and prints its cookie jar.
+auth_jar() {
+  local jar="$RAG_AUTH_DIR/$1.jar"
+  _rag_require_lock_owner
+  python3 "$RAG_AUTH_SETUP" login "$1" "$jar" || return 1
+  printf '%s' "$jar"
+}
+
+auth_ensure() {
+  local operator="" jar
+  _rag_require_lock_owner
+  [ -n "$(volume_removal_refusal_reason)" ] || operator=--operator
+  if ! python3 "$RAG_AUTH_SETUP" ensure $operator; then
+    printf '\n  Could not set up the test accounts on %s (see above).\n\n' "$API"
+    exit 2
+  fi
+  jar=$(auth_jar engineer) || { printf '\n  The test engineer could not log in.\n\n'; exit 2; }
+  RAG_AUTH_JAR="$jar"
+  export RAG_AUTH_JAR
 }
 
 # wait_for_job <url-path> [timeout-seconds] — polls until status is terminal.
@@ -16247,6 +17688,1721 @@ restart_timing_check() {
 case "$(basename "$0")" in
   [0-9][0-9]_*.sh) live_guard ;;
 esac
+```
+
+### scripts/verify/auth_setup.py
+
+```python
+"""Test accounts for the verify suites (#25). Host-side, standard library, Python 3.9+.
+
+    python3 auth_setup.py ensure [--operator]
+    python3 auth_setup.py login ROLE JAR
+    python3 auth_setup.py password ROLE | <a command reading it on stdin>
+
+`ensure` makes sure the verify project has one account per role
+(vfy-engineer, vfy-developer, vfy-end-user) whose password is in the
+credentials file, and that none of them has a password change due. It sets the
+project up (bootstrap) when it isn't yet, creates missing accounts and resets
+unknown passwords, all with the operator command `python -m auth` run in the
+api container: only with --operator, which lib.sh passes only when the target
+is the verify project as stack.sh sets it up. Without it, a stored password that
+doesn't work is a failure, never a reset.
+
+`login` logs ROLE in and writes the session to JAR, a curl cookie jar.
+`password` writes ROLE's password into a pipe, for a command that reads it on
+standard input (the packaged retrieve.py); it refuses to write it to a terminal.
+
+Secrets: the credentials file is mode 0600 in a folder of mode 0700 owned by
+this user, outside the checkout ($RAG_AUTH_DIR, default
+${TMPDIR:-/tmp}/rag-verify-auth-<uid>). Passwords travel only in request
+bodies and in the operator command's captured output: never on a command
+line, in the environment, or in anything this prints.
+"""
+import json
+import os
+import secrets
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+from urllib.parse import urlsplit
+
+ROLES = {"engineer": "vfy-engineer", "developer": "vfy-developer", "end_user": "vfy-end-user"}
+REPO = Path(__file__).resolve().parents[2]
+COOKIE = "rag_session"
+
+
+class SetupError(Exception):
+    pass
+
+
+def api_base():
+    return os.environ.get("RAG_API", "http://localhost:8080/api").rstrip("/")
+
+
+def origin(api=None):
+    parts = urlsplit(api or api_base())
+    return "{}://{}".format(parts.scheme, parts.netloc)
+
+
+def auth_dir():
+    configured = os.environ.get("RAG_AUTH_DIR")
+    if configured:
+        return Path(configured)
+    base = (os.environ.get("TMPDIR") or "/tmp").rstrip("/") or "/tmp"
+    return Path(base) / "rag-verify-auth-{}".format(os.getuid())
+
+
+def private_dir():
+    """The credentials folder, created 0700; refused if it is a symlink, not a
+    folder, or someone else's, so nobody can plant or read the file."""
+    folder = auth_dir()
+    if folder.is_symlink():
+        raise SetupError("{} is a symlink; refusing to use it".format(folder))
+    if folder.exists() and not folder.is_dir():
+        raise SetupError("{} exists and is not a folder; refusing to use it".format(folder))
+    if not folder.exists():
+        folder.mkdir(mode=0o700)
+    if folder.stat().st_uid != os.getuid():
+        raise SetupError("{} belongs to another user; refusing to use it".format(folder))
+    os.chmod(folder, 0o700)
+    return folder
+
+
+def read_credentials(folder):
+    path = folder / "credentials"
+    found = {}
+    if not path.exists():
+        return found
+    if path.is_symlink() or not path.is_file():
+        raise SetupError("{} is not a regular file; refusing to use it".format(path))
+    for line in path.read_text().splitlines():
+        parts = line.split(" ", 2)
+        if len(parts) == 3 and parts[0] in ROLES:
+            found[parts[0]] = (parts[1], parts[2])
+    return found
+
+
+def write_credentials(folder, credentials):
+    """Atomically, mode 0600 from the start."""
+    fd, tmp = tempfile.mkstemp(prefix=".credentials.", dir=str(folder))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            for role in ROLES:
+                if role in credentials:
+                    username, password = credentials[role]
+                    handle.write("{} {} {}\n".format(role, username, password))
+        os.replace(tmp, str(folder / "credentials"))
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def request(method, path, body=None, token=None, api=None):
+    """(status, parsed JSON or None, session token from Set-Cookie or None)."""
+    api = api or api_base()
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Origin": origin(api)}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    if token:
+        headers["Cookie"] = "{}={}".format(COOKIE, token)
+    req = urllib.request.Request(api + path, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            status, raw, cookies = response.status, response.read(), response.headers.get_all("Set-Cookie") or []
+    except urllib.error.HTTPError as error:
+        status, raw, cookies = error.code, error.read(), error.headers.get_all("Set-Cookie") or []
+    try:
+        parsed = json.loads(raw) if raw else None
+    except ValueError:
+        parsed = None
+    token_out = None
+    for cookie in cookies:
+        name, _, rest = cookie.partition("=")
+        if name.strip() == COOKIE:
+            token_out = rest.split(";", 1)[0] or None
+    return status, parsed, token_out
+
+
+def operator(*args):
+    """Run `python -m auth ARGS` in the verify project's api container.
+    Returns (exit status, stdout). stdout (a generated password) is captured,
+    never shown; stderr, one line naming the action, passes through."""
+    result = subprocess.run(["docker", "compose", "exec", "-T", "api", "python", "-m", "auth"] + list(args),
+                            cwd=str(REPO), stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                            universal_newlines=True)
+    return result.returncode, result.stdout.strip()
+
+
+def fresh_password():
+    return secrets.token_urlsafe(24)
+
+
+def settle(role, username, password):
+    """Log in; replace a generated password with a fresh one. Returns the
+    working password, or None when the login fails."""
+    status, body, token = request("POST", "/auth/login", {"username": username, "password": password})
+    if status != 200 or not token:
+        return None
+    if body.get("must_change_password"):
+        new = fresh_password()
+        status, _, _ = request("POST", "/auth/password", {"current_password": password, "new_password": new},
+                               token=token)
+        if status != 200:
+            raise SetupError("could not replace the generated password of {} (HTTP {})".format(username, status))
+        password = new
+    request("POST", "/auth/logout", token=token)
+    return password
+
+
+def ensure(allow_operator):
+    folder = private_dir()
+    credentials = read_credentials(folder)
+    status, body, _ = request("GET", "/auth/status")
+    if status != 200 or not isinstance(body, dict):
+        raise SetupError("GET /auth/status answered HTTP {}".format(status))
+    if body.get("setup_required"):
+        if not allow_operator:
+            raise SetupError("the verify project is not set up, and this target is not the verify project")
+        code, password = operator("bootstrap", ROLES["engineer"])
+        if code != 0 or not password:
+            raise SetupError("bootstrap failed (exit {})".format(code))
+        credentials["engineer"] = (ROLES["engineer"], password)
+    for role, username in ROLES.items():
+        stored = credentials.get(role)
+        working = settle(role, username, stored[1]) if stored and stored[0] == username else None
+        if working is None:
+            if not allow_operator:
+                raise SetupError("the stored password of {} doesn't work, and this target is not the verify "
+                                 "project, so it isn't reset".format(username))
+            code, password = operator("create-user", username, role)
+            if code == 1:
+                code, password = operator("reset-password", username)
+            if code != 0 or not password:
+                raise SetupError("could not create or reset {} (exit {})".format(username, code))
+            working = settle(role, username, password)
+            if working is None:
+                raise SetupError("{} can't log in with its new password".format(username))
+        credentials[role] = (username, working)
+        write_credentials(folder, credentials)
+
+
+def write_jar(jar, token, api=None):
+    """A curl cookie jar holding the session, mode 0600."""
+    host = urlsplit(api or api_base()).hostname
+    fd = os.open(str(jar), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write("# Netscape HTTP Cookie File\n")
+        handle.write("#HttpOnly_{}\tFALSE\t/\tFALSE\t0\t{}\t{}\n".format(host, COOKIE, token))
+
+
+def login(role, jar):
+    if role not in ROLES:
+        raise SetupError("unknown role {!r}".format(role))
+    folder = private_dir()
+    stored = read_credentials(folder).get(role)
+    if not stored:
+        raise SetupError("no stored password for {}; run ensure first".format(ROLES[role]))
+    status, body, token = request("POST", "/auth/login", {"username": stored[0], "password": stored[1]})
+    if status != 200 or not token or body.get("must_change_password"):
+        raise SetupError("{} could not log in (HTTP {})".format(stored[0], status))
+    write_jar(Path(jar), token)
+
+
+def password_to_pipe(role):
+    if role not in ROLES:
+        raise SetupError("unknown role {!r}".format(role))
+    if os.isatty(1):
+        raise SetupError("refusing to print a password to a terminal; pipe it into the command that needs it")
+    stored = read_credentials(private_dir()).get(role)
+    if not stored:
+        raise SetupError("no stored password for {}; run ensure first".format(ROLES[role]))
+    sys.stdout.write(stored[1] + "\n")
+
+
+def main(argv):
+    try:
+        if len(argv) >= 1 and argv[0] == "ensure" and argv[1:] in ([], ["--operator"]):
+            ensure(argv[1:] == ["--operator"])
+        elif len(argv) == 3 and argv[0] == "login":
+            login(argv[1], argv[2])
+        elif len(argv) == 2 and argv[0] == "password":
+            password_to_pipe(argv[1])
+        else:
+            print(__doc__.split("\n\n")[1], file=sys.stderr)
+            return 2
+    except SetupError as error:
+        print("auth_setup: {}".format(error), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+```
+
+### scripts/verify/auth_headers.py
+
+```python
+"""The suite's session for the host-side Python helpers that call the API (#25).
+
+lib.sh logs the test engineer in and exports RAG_AUTH_JAR (a curl cookie jar)
+and RAG_AUTH_ORIGIN. headers() returns the Cookie and Origin a same-origin
+browser would send. Standard library, Python 3.9+.
+"""
+import os
+
+COOKIE = "rag_session"
+
+
+def session_token(jar_path):
+    """The session cookie's value in a curl cookie jar, or None."""
+    try:
+        with open(jar_path) as jar:
+            lines = jar.read().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        # curl marks HttpOnly cookies with this prefix on an otherwise
+        # ordinary line; other lines starting with # are comments.
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif line.startswith("#") or not line.strip():
+            continue
+        fields = line.split("\t")
+        if len(fields) == 7 and fields[5] == COOKIE:
+            return fields[6]
+    return None
+
+
+def headers():
+    """{'Cookie', 'Origin'} for the suite's session; empty outside a suite."""
+    jar, origin = os.environ.get("RAG_AUTH_JAR"), os.environ.get("RAG_AUTH_ORIGIN")
+    token = session_token(jar) if jar else None
+    found = {}
+    if token:
+        found["Cookie"] = "{}={}".format(COOKIE, token)
+    if origin:
+        found["Origin"] = origin
+    return found
+```
+
+### scripts/verify/17_auth.sh
+
+```bash
+#!/usr/bin/env bash
+# Authentication and the endpoint/role matrix (#25): SPECIFICATIONS.md §3.1.8
+# and §10.6.
+#
+# The unit checks run in the API image with no network. The stack checks run
+# on the verify project through auth_stack.py, one check each; those that create
+# throwaway vfy-t-<random> accounts or age a session use the operator command,
+# so they run only on the verify project as stack.sh sets it up. The restart
+# check is opt-in (RAG_ALLOW_RESTART=1) like the other restart checks.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+require_stack
+
+operator=""
+[ -n "$(volume_removal_refusal_reason)" ] || operator=--operator
+stack() { _rag_require_lock_owner; python3 ./auth_stack.py "$@" $operator; }
+
+section "Auth units: passwords, store, policy, middleware, routes, operator command"
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_auth.py)
+check "test_auth.py registered regression checks" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_auth_enforcement.py)
+check "test_auth_enforcement.py: every protected route refuses a request without a session" $?
+python3 "$REPO_ROOT/scripts/tests/test_verify_auth.py"
+check "test_verify_auth.py: the harness keeps its credentials private" $?
+
+section "Endpoint/role matrix on the stack (H1)"
+stack public
+check "/health and /auth/status answer without a session" $?
+stack matrix anonymous
+check "without a session every protected route, downloads and job polling included, answers 401" $?
+stack matrix end_user
+check "End User: 403 exactly on the routes above its role" $?
+stack matrix developer
+check "Developer: 403 exactly on the routes above its role" $?
+stack matrix engineer
+check "Engineer: no 401 or 403 on any route" $?
+
+section "Sessions (H2)"
+stack login-logout
+check "login, GET /auth/me and logout; a logged-out session answers 401" $?
+stack cookie
+check "the session cookie is HttpOnly, SameSite=Strict, Path=/, Max-Age 7 days, not Secure on loopback" $?
+stack reset
+check "a password reset ends the user's sessions and forces a change" $?
+stack disable
+check "disabling a user ends their session and refuses their login; enable restores it" $?
+stack role-change
+check "a role change applies to an existing session on its next request" $?
+stack own-password
+check "the own password change: rules, current password, other sessions ended" $?
+stack idle-expiry
+check "a session idle for more than 12 hours answers 401" $?
+
+section "Request protection and login throttling (H4)"
+stack no-cors
+check "no Access-Control-* headers, preflight included" $?
+stack origin
+check "a cookie-authenticated change from another origin is refused; same-origin passes" $?
+stack generic-failure
+check "a wrong password and an unknown user get the same 401 LOGIN_FAILED" $?
+stack throttle
+check "five failed logins lock the username and address for 15 minutes" $?
+stack bootstrap-refused
+check "bootstrap is refused once set up; an invalid username is a usage error" $?
+stack no-secrets-logged
+check "the API log names logins and holds no harness password or session token" $?
+
+section "Restart persistence (opt-in: it restarts the api)"
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  restart_refusal=$(restart_refusal_reason)
+  if [ -n "$restart_refusal" ]; then
+    check "a session and a lockout survive an API restart" 1 "$restart_refusal"
+  else
+    stack restart-prepare
+    prepared=$?
+    project="$COMPOSE_PROJECT_NAME"
+    started=$(python3 -c "import time;print(time.time())")
+    (cd "$REPO_ROOT" && docker compose -p "$project" restart api >/dev/null 2>&1)
+    elapsed=$(wait_healthy_timed "$started" 300)
+    [ "$prepared" = 0 ] && stack restart-verify
+    check "a session and a lockout survive an API restart" $? "healthy after ${elapsed:-never}s"
+  fi
+else
+  skip "a session and a lockout survive an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+fi
+
+summary
+```
+
+### scripts/verify/auth_stack.py
+
+```python
+"""Authentication checks on the verify project (#25), one per subcommand. Host-side,
+standard library, Python 3.9+. Run by 17_auth.sh, which turns each exit status
+into a check:
+
+    python3 auth_stack.py CHECK [--operator]
+
+Exit 0 when the check holds, 1 when it doesn't (the reason on stderr). Checks
+that create throwaway accounts (vfy-t-<random>) or age a session need the
+operator command, so they need --operator, which 17_auth.sh passes only on the
+verify project as stack.sh sets it up. No password or session token is printed.
+"""
+import hashlib
+import json
+import os
+import secrets
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+import auth_headers
+import auth_setup
+from auth_setup import REPO, request
+
+ROLES = ("end_user", "developer", "engineer")
+X = "VfyAuthNoSuch"
+# S2.2 of the specifications, written out here rather than read from the API,
+# so the API is checked against the agreed matrix and not against itself.
+# (method, path, body, required role). Bodies are empty or invalid on purpose:
+# an allowed request must fail validation or find nothing, never do work.
+MATRIX = (
+    ("GET", "/collections", None, "end_user"),
+    ("POST", "/query", {}, "end_user"),
+    ("GET", "/retrieval/config/" + X, None, "end_user"),
+    ("POST", "/collections", {}, "developer"),
+    ("POST", "/ingest/upload", {}, "developer"),
+    ("GET", "/ingest/job/vfy-no-such-job", None, "developer"),
+    ("GET", "/ingest/config/" + X, None, "developer"),
+    ("POST", "/ingest/config", {}, "developer"),
+    ("POST", "/retrieval/config", {}, "developer"),
+    ("POST", "/goldstandard/generate", {}, "developer"),
+    ("GET", "/goldstandard/session/gs_vfynosuch", None, "developer"),
+    ("PATCH", "/goldstandard/session/gs_vfynosuch/pair/p", {}, "developer"),
+    ("POST", "/goldstandard/regenerate", {}, "developer"),
+    ("POST", "/goldstandard/save", {}, "developer"),
+    ("GET", "/goldstandard/download/vfy_no_such.json", None, "developer"),
+    ("POST", "/export", {}, "developer"),
+    ("GET", "/export/job/vfy-no-such-job", None, "developer"),
+    ("POST", "/import", {}, "developer"),
+    ("GET", "/import/job/vfy-no-such-job", None, "developer"),
+    ("GET", "/packages", None, "developer"),
+    ("GET", "/help/transfer", None, "developer"),
+    ("GET", "/tune/" + X, None, "developer"),
+    ("DELETE", "/collections/" + X + "?confirm=true", None, "engineer"),
+    ("POST", "/tune/rechunk", {}, "engineer"),
+    ("POST", "/tune/reembed", {}, "engineer"),
+    ("POST", "/tune/reindex", {}, "engineer"),
+    ("GET", "/tune/job/vfy-no-such-job", None, "engineer"),
+    ("GET", "/metrics/latency", None, "engineer"),
+    ("GET", "/goldstandard/diagnostics", None, "engineer"),
+    ("GET", "/docs", None, "engineer"),
+    ("GET", "/docs/oauth2-redirect", None, "engineer"),
+    ("GET", "/redoc", None, "engineer"),
+    ("GET", "/openapi.json", None, "engineer"),
+)
+SESSION_ROUTES = (("GET", "/auth/me", None), ("POST", "/auth/logout", None), ("POST", "/auth/password", {}))
+
+
+class CheckFailed(Exception):
+    pass
+
+
+def expect(condition, why):
+    if not condition:
+        raise CheckFailed(why)
+
+
+def compose(*args, stdin=None):
+    return subprocess.run(["docker", "compose"] + list(args), cwd=str(REPO), input=stdin,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+
+def role_token(role):
+    """A fresh session for the harness account of ROLE."""
+    username, password = auth_setup.read_credentials(auth_setup.private_dir())[role]
+    status, _, token = request("POST", "/auth/login", {"username": username, "password": password})
+    expect(status == 200 and token, "{} could not log in (HTTP {})".format(username, status))
+    return token
+
+
+def code(method, path, body=None, token=None, headers=None):
+    """The status of a request sent as a same-origin browser would, or with `headers` instead."""
+    api = auth_setup.api_base()
+    data = json.dumps(body).encode() if body is not None else None
+    sent = {"Origin": auth_setup.origin()} if headers is None else dict(headers)
+    if data is not None:
+        sent["Content-Type"] = "application/json"
+    if token:
+        sent["Cookie"] = "rag_session=" + token
+    req = urllib.request.Request(api + path, data=data, method=method, headers=sent)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            return response.status, response.read(), response.headers
+    except urllib.error.HTTPError as error:
+        return error.code, error.read(), error.headers
+
+
+def error_code(raw):
+    try:
+        return json.loads(raw)["error"]["code"]
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def throwaway(role, operator_ok):
+    """A new account of ROLE, logged in with its generated password replaced.
+    Returns (username, password, token)."""
+    expect(operator_ok, "needs the operator command, which runs only on the verify project")
+    username = "vfy-t-" + secrets.token_hex(4)
+    rc, password = auth_setup.operator("create-user", username, role)
+    expect(rc == 0 and password, "create-user {} failed (exit {})".format(username, rc))
+    status, body, token = request("POST", "/auth/login", {"username": username, "password": password})
+    expect(status == 200 and body.get("must_change_password") is True,
+           "a created account must change its password at first login (HTTP {}, {})".format(status, body))
+    status, raw, _ = code("GET", "/collections", token=token)
+    expect(status == 403 and error_code(raw) == "PASSWORD_CHANGE_REQUIRED",
+           "before the change, GET /collections answered {} {}".format(status, error_code(raw)))
+    new = secrets.token_urlsafe(18)
+    status, _, _ = code("POST", "/auth/password", {"current_password": password, "new_password": new}, token=token)
+    expect(status == 200, "the forced change answered {}".format(status))
+    return username, new, token
+
+
+# ── checks ───────────────────────────────────────────────────────────────────
+
+def check_matrix(who, operator_ok):
+    wrong = []
+    token = None if who == "anonymous" else role_token(who)
+    for method, path, body, need in MATRIX:
+        status, raw, _ = code(method, path, body, token=token)
+        if who == "anonymous":
+            ok = status == 401
+        elif ROLES.index(who) < ROLES.index(need):
+            ok = status == 403 and error_code(raw) == "FORBIDDEN"
+        else:
+            ok = status not in (401, 403)
+        if not ok:
+            wrong.append("{} {} -> {} {}".format(method, path, status, error_code(raw)))
+    if who == "anonymous":
+        for method, path, body in SESSION_ROUTES:
+            status, raw, _ = code(method, path, body)
+            if status != 401:
+                wrong.append("{} {} -> {}".format(method, path, status))
+    else:
+        request("POST", "/auth/logout", token=token)
+    expect(not wrong, "; ".join(wrong))
+
+
+def check_public(operator_ok):
+    status, raw, _ = code("GET", "/health", headers={})
+    expect(status in (200, 503), "GET /health without a session answered {}".format(status))
+    status, raw, _ = code("GET", "/auth/status", headers={})
+    expect(status == 200 and json.loads(raw) == {"setup_required": False},
+           "GET /auth/status answered {} {!r}".format(status, raw[:200]))
+
+
+def check_login_logout(operator_ok):
+    token = role_token("developer")
+    status, raw, _ = code("GET", "/auth/me", token=token)
+    body = json.loads(raw)
+    expect(status == 200 and body == {"username": "vfy-developer", "role": "developer", "must_change_password": False},
+           "GET /auth/me answered {} {}".format(status, body))
+    status, _, _ = code("POST", "/auth/logout", token=token)
+    expect(status == 200, "logout answered {}".format(status))
+    status, raw, _ = code("GET", "/auth/me", token=token)
+    expect(status == 401 and error_code(raw) == "AUTH_REQUIRED", "after logout the session answered {}".format(status))
+
+
+def check_cookie(operator_ok):
+    username, password = auth_setup.read_credentials(auth_setup.private_dir())["end_user"]
+    status, _, headers = code("POST", "/auth/login", {"username": username, "password": password})
+    cookies = headers.get_all("Set-Cookie") or []
+    expect(status == 200 and len(cookies) == 1, "login answered {} with {} cookies".format(status, len(cookies)))
+    attributes = [a.strip().lower() for a in cookies[0].split(";")[1:]]
+    for want in ("httponly", "samesite=strict", "path=/", "max-age=604800"):
+        expect(want in attributes, "the session cookie lacks {}".format(want))
+    expect("secure" not in attributes, "the loopback profile's cookie is marked Secure")
+    token = cookies[0].split(";", 1)[0].split("=", 1)[1]
+    request("POST", "/auth/logout", token=token)
+
+
+def check_no_cors(operator_ok):
+    token = role_token("engineer")
+    for method, path, headers in (("GET", "/collections", {"Origin": "http://other.example"}),
+                                  ("OPTIONS", "/collections", {"Origin": "http://other.example",
+                                                               "Access-Control-Request-Method": "DELETE"})):
+        _, _, answer = code(method, path, token=token, headers=headers)
+        expect(not any(k.lower().startswith("access-control-") for k in answer.keys()),
+               "{} {} answered with CORS headers".format(method, path))
+    request("POST", "/auth/logout", token=token)
+
+
+def check_origin(operator_ok):
+    token = role_token("developer")
+    # index_type 7 is invalid, so an allowed request is a 422 and creates nothing.
+    body = {"name": "VfyAuthOrigin" + secrets.token_hex(3), "index_type": 7}
+    cases = (("no Origin and no Sec-Fetch-Site", {}, 403),
+             ("another origin", {"Origin": "http://evil.example"}, 403),
+             ("the right host on another port", {"Origin": auth_setup.origin().rsplit(":", 1)[0] + ":1"}, 403),
+             ("Origin null", {"Origin": "null"}, 403),
+             ("Sec-Fetch-Site cross-site", {"Sec-Fetch-Site": "cross-site"}, 403),
+             ("Sec-Fetch-Site same-origin", {"Sec-Fetch-Site": "same-origin"}, None),
+             ("the same origin", {"Origin": auth_setup.origin()}, None))
+    for name, headers, want in cases:
+        status, raw, _ = code("POST", "/collections", body, token=token, headers=headers)
+        if want == 403:
+            expect(status == 403 and error_code(raw) == "CROSS_ORIGIN_REFUSED",
+                   "{}: answered {} {}".format(name, status, error_code(raw)))
+        else:
+            expect(status == 422, "{}: answered {} {}, wanted the 422 of an allowed request".format(
+                name, status, error_code(raw)))
+    status, _, _ = code("GET", "/collections", token=token, headers={"Origin": "http://evil.example"})
+    expect(status == 200, "a cross-origin GET answered {} (reads aren't origin-checked)".format(status))
+    request("POST", "/auth/logout", token=token)
+
+
+def check_generic_failure(operator_ok):
+    username, password = auth_setup.read_credentials(auth_setup.private_dir())["end_user"]
+    answers = []
+    for name, secret in ((username, password + "x"), ("vfy-nobody-" + secrets.token_hex(4), password)):
+        status, raw, _ = code("POST", "/auth/login", {"username": name, "password": secret})
+        answers.append((status, raw))
+    expect(answers[0] == answers[1] and answers[0][0] == 401 and error_code(answers[0][1]) == "LOGIN_FAILED",
+           "wrong password and unknown user answered differently: {}".format(
+               [(s, error_code(r)) for s, r in answers]))
+
+
+def check_throttle(operator_ok):
+    name = "vfy-throttle-" + secrets.token_hex(4)
+    seen = []
+    for _ in range(5):
+        status, raw, _ = code("POST", "/auth/login", {"username": name, "password": "x" * 12})
+        seen.append(status)
+    status, raw, _ = code("POST", "/auth/login", {"username": name, "password": "x" * 12})
+    expect(seen == [401] * 5 and status == 429 and error_code(raw) == "LOGIN_THROTTLED",
+           "five failures then {} {} (first five: {})".format(status, error_code(raw), seen))
+    if operator_ok:
+        username, password, token = throwaway("end_user", operator_ok)
+        for _ in range(5):
+            code("POST", "/auth/login", {"username": username, "password": "y" * 12})
+        status, raw, _ = code("POST", "/auth/login", {"username": username, "password": password})
+        expect(status == 429, "the right password during a lockout answered {}".format(status))
+        status, _, _ = code("GET", "/auth/me", token=token)
+        expect(status == 200, "a lockout ended the user's existing session ({})".format(status))
+
+
+def check_reset(operator_ok):
+    username, password, token = throwaway("developer", operator_ok)
+    rc, new = auth_setup.operator("reset-password", username)
+    expect(rc == 0 and new, "reset-password failed (exit {})".format(rc))
+    status, _, _ = code("GET", "/auth/me", token=token)
+    expect(status == 401, "a reset left the old session working ({})".format(status))
+    status, _, _ = code("POST", "/auth/login", {"username": username, "password": password})
+    expect(status == 401, "the old password still logs in ({})".format(status))
+    status, body, token = request("POST", "/auth/login", {"username": username, "password": new})
+    expect(status == 200 and body.get("must_change_password") is True, "the reset password must be changed")
+
+
+def check_disable(operator_ok):
+    username, password, token = throwaway("developer", operator_ok)
+    rc, _ = auth_setup.operator("disable", username)
+    expect(rc == 0, "disable failed (exit {})".format(rc))
+    status, _, _ = code("GET", "/collections", token=token)
+    expect(status == 401, "a disabled user's session still works ({})".format(status))
+    status, raw, _ = code("POST", "/auth/login", {"username": username, "password": password})
+    expect(status == 401 and error_code(raw) == "LOGIN_FAILED", "a disabled user can log in ({})".format(status))
+    rc, _ = auth_setup.operator("enable", username)
+    status, _, _ = code("POST", "/auth/login", {"username": username, "password": password})
+    expect(rc == 0 and status == 200, "enable did not restore the login ({}, {})".format(rc, status))
+
+
+def check_role_change(operator_ok):
+    username, password, token = throwaway("developer", operator_ok)
+    status, _, _ = code("GET", "/packages", token=token)
+    expect(status == 200, "a developer can't list packages ({})".format(status))
+    rc, _ = auth_setup.operator("set-role", username, "end_user")
+    status, raw, _ = code("GET", "/packages", token=token)
+    expect(rc == 0 and status == 403 and error_code(raw) == "FORBIDDEN",
+           "after the demotion the same session answered {} {}".format(status, error_code(raw)))
+    status, raw, _ = code("GET", "/auth/me", token=token)
+    expect(json.loads(raw).get("role") == "end_user", "GET /auth/me still names the old role")
+    rc, _ = auth_setup.operator("set-role", username, "engineer")
+    status, _, _ = code("GET", "/metrics/latency", token=token)
+    expect(rc == 0 and status == 200, "after a promotion the same session answered {}".format(status))
+
+
+def check_own_password(operator_ok):
+    username, password, token = throwaway("end_user", operator_ok)
+    status, body, other = request("POST", "/auth/login", {"username": username, "password": password})
+    expect(status == 200 and other, "a second login failed ({})".format(status))
+    status, raw, _ = code("POST", "/auth/password", {"current_password": "wrong" * 3, "new_password": "z" * 14},
+                          token=token)
+    expect(status == 403 and error_code(raw) == "PASSWORD_INCORRECT", "a wrong current password answered {}".format(status))
+    for bad in ("short", username.upper(), "q" * 257):
+        status, raw, _ = code("POST", "/auth/password", {"current_password": password, "new_password": bad},
+                              token=token)
+        expect(status == 422 and error_code(raw) == "INVALID_PASSWORD",
+               "a {}-character new password answered {}".format(len(bad), status))
+    new = secrets.token_urlsafe(18)
+    status, _, _ = code("POST", "/auth/password", {"current_password": password, "new_password": new}, token=token)
+    expect(status == 200, "the change answered {}".format(status))
+    expect(code("GET", "/auth/me", token=token)[0] == 200, "the change ended the session that made it")
+    expect(code("GET", "/auth/me", token=other)[0] == 401, "the change left another session working")
+
+
+def check_bootstrap_refused(operator_ok):
+    expect(operator_ok, "needs the operator command, which runs only on the verify project")
+    rc, out = auth_setup.operator("bootstrap", "vfy-second-" + secrets.token_hex(3))
+    expect(rc == 1 and not out, "bootstrap on a set-up project exited {} (printed {} characters)".format(rc, len(out)))
+    rc, out = auth_setup.operator("create-user", "x", "engineer")
+    expect(rc == 2 and not out, "an invalid username exited {}".format(rc))
+
+
+def check_idle_expiry(operator_ok):
+    username, password, token = throwaway("end_user", operator_ok)
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    # Ages this one session past the 12-hour idle limit, in the verify project's store.
+    script = ("import sqlite3,sys,time\nfrom auth import store\n"
+              "c=sqlite3.connect(store.db_path());c.execute('UPDATE sessions SET last_seen=? WHERE token_hash=?',"
+              "(time.time()-13*3600,sys.argv[1]));c.commit();print(c.total_changes)\n")
+    result = compose("exec", "-T", "api", "python", "-c", script, digest)
+    expect(result.returncode == 0 and result.stdout.strip() == "1", "could not age the session: {}".format(
+        result.stderr.strip()[-200:]))
+    status, raw, _ = code("GET", "/auth/me", token=token)
+    expect(status == 401 and error_code(raw) == "AUTH_REQUIRED", "an idle session still works ({})".format(status))
+
+
+def check_no_secrets_logged(operator_ok):
+    secrets_known = [password for _, password in auth_setup.read_credentials(auth_setup.private_dir()).values()]
+    token = auth_headers.session_token(os.environ.get("RAG_AUTH_JAR", ""))
+    if token:
+        secrets_known.append(token)
+    result = compose("logs", "--no-color", "api")
+    expect(result.returncode == 0, "docker compose logs failed")
+    leaked = sum(1 for s in secrets_known if s and s in result.stdout + result.stderr)
+    expect(leaked == 0, "{} harness secret(s) appear in the API log".format(leaked))
+    expect("Login succeeded for 'vfy-engineer'" in result.stdout + result.stderr,
+           "the API log has no login line for vfy-engineer")
+
+
+STATE = "restart-state.json"
+
+
+def check_restart_prepare(operator_ok):
+    username, password, token = throwaway("end_user", operator_ok)
+    name = "vfy-locked-" + secrets.token_hex(4)
+    for _ in range(5):
+        code("POST", "/auth/login", {"username": name, "password": "x" * 12})
+    path = auth_setup.private_dir() / STATE
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        json.dump({"token": token, "locked": name}, handle)
+
+
+def check_restart_verify(operator_ok):
+    path = auth_setup.private_dir() / STATE
+    state = json.loads(path.read_text())
+    path.unlink()
+    status, _, _ = code("GET", "/auth/me", token=state["token"])
+    expect(status == 200, "a session did not survive the API restart ({})".format(status))
+    status, _, _ = code("POST", "/auth/login", {"username": state["locked"], "password": "x" * 12})
+    expect(status == 429, "a lockout did not survive the API restart ({})".format(status))
+
+
+CHECKS = {name[len("check_"):].replace("_", "-"): fn for name, fn in globals().items() if name.startswith("check_")}
+
+
+def main(argv):
+    operator_ok = "--operator" in argv
+    names = [a for a in argv if a != "--operator"]
+    if len(names) == 2 and names[0] == "matrix" and names[1] in ROLES + ("anonymous",):
+        run = lambda: check_matrix(names[1], operator_ok)
+    elif len(names) == 1 and names[0] in CHECKS and names[0] != "matrix":
+        run = lambda: CHECKS[names[0]](operator_ok)
+    else:
+        print("usage: auth_stack.py {matrix ROLE|anonymous, " + ", ".join(sorted(CHECKS)) + "} [--operator]",
+              file=sys.stderr)
+        return 2
+    try:
+        run()
+    except (CheckFailed, auth_setup.SetupError) as failure:
+        print("    " + str(failure), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+```
+
+### scripts/tests/test_auth.py
+
+```python
+"""Accounts, sessions, the endpoint/role matrix and the operator command (#25).
+
+Runs with the API's dependencies, in the built API image with no network
+(`17_auth.sh`):
+
+    docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
+      "$(docker compose images -q api)" python scripts/tests/test_auth.py
+
+Every test uses its own temporary store (AUTH_DIR); requests go through
+`main.app` with FastAPI's TestClient, without the lifespan, and nothing reaches
+a backend.
+"""
+import asyncio
+import hashlib
+import logging
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+API_DIR = os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api")
+sys.path.insert(0, API_DIR)
+
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
+
+import config
+from config import settings
+from main import app
+from auth import passwords, policy, store
+from auth.middleware import AuthMiddleware, same_origin
+
+ORIGIN = "http://testserver"
+
+
+def logged(logs):
+    return "\n".join(logging.Formatter().format(record) for record in logs.records)
+
+
+class StoreTestCase(unittest.TestCase):
+    """A fresh, empty store per test."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.dir = temp.name
+        target = patch.object(settings, "auth_dir", self.dir)
+        target.start()
+        self.addCleanup(target.stop)
+        self.client = TestClient(app, raise_server_exceptions=False)
+        self.addCleanup(self.client.close)
+
+    def make(self, username, role, *, must_change=False):
+        password = passwords.generate_password()
+        store.create_user(username, role, password, bootstrap=not store.is_set_up(),
+                          must_change_password=must_change)
+        return password
+
+    def setup_roles(self):
+        """An engineer, a developer and an end user, all past their first login."""
+        self.passwords = {role: self.make(name, role) for role, name in
+                          (("engineer", "eng"), ("developer", "dev"), ("end_user", "user"))}
+
+    def login(self, username, password, **headers):
+        return self.client.post("/auth/login", json={"username": username, "password": password}, headers=headers)
+
+    def session(self, username):
+        """Cookie and Origin headers for a new session of `username`."""
+        token = store.create_session(store.get_user(username).id)
+        return {"Cookie": f"{store.COOKIE}={token}", "Origin": ORIGIN}, token
+
+
+class PasswordTests(unittest.TestCase):
+    def test_hash_format_and_parameters(self):
+        stored = passwords.hash_password("correct horse battery")
+        scheme, log2_n, r, p, salt, digest = stored.split("$")
+        self.assertEqual((scheme, log2_n, r, p), ("scrypt", "15", "8", "1"))
+        import base64
+        self.assertEqual(len(base64.b64decode(salt)), 16)
+        self.assertEqual(len(base64.b64decode(digest)), 32)
+        self.assertNotEqual(stored, passwords.hash_password("correct horse battery"), "salt is random")
+
+    def test_verify(self):
+        stored = passwords.hash_password("correct horse battery")
+        self.assertTrue(passwords.verify_password("correct horse battery", stored))
+        self.assertFalse(passwords.verify_password("correct horse batterY", stored))
+        for broken in ("", "plain", "md5$1$1$1$a$b", "scrypt$15$8$1$!!$!!", "scrypt$40$8$1$YQ==$YQ=="):
+            self.assertFalse(passwords.verify_password("x", broken), broken)
+
+    def test_username_rule(self):
+        self.assertEqual(passwords.normalize_username("Alice.B_c-1"), "alice.b_c-1")
+        for bad in ("ab", "a" * 33, "has space", "naïve", "semi;colon", "", None):
+            self.assertIsNone(passwords.normalize_username(bad), bad)
+
+    def test_password_rule(self):
+        self.assertIsNone(passwords.password_problem("x" * 12, "alice"))
+        self.assertIsNone(passwords.password_problem("x" * 256, "alice"))
+        self.assertIn("12", passwords.password_problem("x" * 11, "alice"))
+        self.assertIn("256", passwords.password_problem("x" * 257, "alice"))
+        self.assertIn("username", passwords.password_problem("Alice.Builder", "alice.builder"))
+
+    def test_generated_passwords(self):
+        generated = {passwords.generate_password() for _ in range(50)}
+        self.assertEqual(len(generated), 50)
+        self.assertTrue(all(len(p) >= 20 and passwords.password_problem(p, "alice") is None for p in generated))
+
+
+class SettingTests(unittest.TestCase):
+    def test_cookie_secure_accepts_only_true_or_false(self):
+        self.assertTrue(config.Settings(auth_cookie_secure="true").auth_cookie_secure)
+        self.assertFalse(config.Settings(auth_cookie_secure="false").auth_cookie_secure)
+        for bad in ("1", "yes", "on", "True", ""):
+            with self.subTest(value=bad), self.assertRaises(ValidationError):
+                config.Settings(auth_cookie_secure=bad)
+        with patch.dict(os.environ, {"AUTH_COOKIE_SECURE": "yes"}), self.assertRaises(ValidationError):
+            config.Settings()
+
+
+class StoreTests(StoreTestCase):
+    def test_file_and_folder_are_private(self):
+        nested = Path(self.dir) / "nested"
+        with patch.object(settings, "auth_dir", str(nested)):
+            self.assertFalse(store.is_set_up())
+            self.assertEqual(nested.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((nested / "auth.db").stat().st_mode & 0o777, 0o600)
+
+    def test_bootstrap_only_once_and_create_only_after(self):
+        with self.assertRaises(store.Refused):
+            store.create_user("dev", "developer", "x" * 12)
+        store.create_user("eng", "engineer", "x" * 12, bootstrap=True)
+        with self.assertRaises(store.Refused):
+            store.create_user("eng2", "engineer", "x" * 12, bootstrap=True)
+        with self.assertRaises(store.Refused):
+            store.create_user("eng", "developer", "x" * 12)
+        self.assertTrue(store.get_user("eng").must_change_password)
+
+    def test_only_hashes_and_token_hashes_are_stored(self):
+        password = self.make("eng", "engineer")
+        token = store.create_session(store.get_user("eng").id)
+        raw = Path(self.dir, "auth.db").read_bytes()
+        self.assertNotIn(password.encode(), raw)
+        self.assertNotIn(token.encode(), raw)
+        rows = sqlite3.connect(Path(self.dir, "auth.db")).execute("SELECT token_hash FROM sessions").fetchall()
+        self.assertEqual(rows, [(hashlib.sha256(token.encode()).hexdigest(),)])
+
+    def test_idle_and_absolute_expiry(self):
+        self.make("eng", "engineer")
+        user = store.get_user("eng")
+        start = 1000.0
+        with patch.object(store, "_now", return_value=start):
+            idle = store.create_session(user.id)
+            busy = store.create_session(user.id)
+        # Used every 30 minutes, a session lasts until the absolute limit and no longer.
+        at = start
+        while at + 1800 < start + store.ABSOLUTE_S:
+            at += 1800
+            with patch.object(store, "_now", return_value=at):
+                self.assertIsNotNone(store.authenticate(busy), f"ended after {(at - start) / 3600} h")
+        with patch.object(store, "_now", return_value=start + store.ABSOLUTE_S + 1):
+            self.assertIsNone(store.authenticate(busy))
+        # Unused, it lasts 12 hours.
+        with patch.object(store, "_now", return_value=start + store.IDLE_S - 1):
+            self.assertIsNotNone(store.authenticate(idle))
+        with patch.object(store, "_now", return_value=start + store.IDLE_S - 1 + store.IDLE_S + 1):
+            self.assertIsNone(store.authenticate(idle))
+        with patch.object(store, "_now", return_value=start + 1):
+            self.assertIsNone(store.authenticate(idle), "an ended session is deleted, not revived")
+
+    def test_revalidation_of_role_and_disabled_state(self):
+        self.make("eng", "engineer")
+        self.make("dev", "developer")
+        token = store.create_session(store.get_user("dev").id)
+        store.set_role("dev", "end_user")
+        self.assertEqual(store.authenticate(token).role, "end_user")
+        store.set_enabled("dev", False)
+        self.assertIsNone(store.authenticate(token))
+        store.set_enabled("dev", True)
+        self.assertIsNone(store.authenticate(token), "disabling deleted the session")
+
+    def test_reset_ends_sessions_and_forces_a_change(self):
+        self.make("eng", "engineer")
+        self.make("dev", "developer")
+        token = store.create_session(store.get_user("dev").id)
+        store.reset_password("dev", "n" * 20)
+        self.assertIsNone(store.authenticate(token))
+        self.assertTrue(store.get_user("dev").must_change_password)
+
+    def test_last_enabled_engineer_is_protected(self):
+        self.make("eng", "engineer")
+        for action in (lambda: store.set_enabled("eng", False), lambda: store.set_role("eng", "developer")):
+            with self.assertRaises(store.Refused):
+                action()
+        self.make("eng2", "engineer")
+        store.set_enabled("eng2", False)
+        with self.assertRaises(store.Refused, msg="a disabled engineer doesn't count"):
+            store.set_role("eng", "end_user")
+        store.set_enabled("eng2", True)
+        store.set_role("eng", "developer")
+        with self.assertRaises(store.Refused):
+            store.set_enabled("eng2", False)
+
+    def test_throttle_locks_a_pair_and_survives_a_new_handle(self):
+        for attempt in range(4):
+            self.assertFalse(store.record_failure("alice", "10.0.0.1"))
+        self.assertTrue(store.record_failure("alice", "10.0.0.1"))
+        store._ready.clear()                            # as after an API restart
+        self.assertTrue(store.locked("alice", "10.0.0.1"))
+        self.assertFalse(store.locked("alice", "10.0.0.2"))
+        self.assertFalse(store.locked("bob", "10.0.0.1"))
+        with patch.object(store, "_now", return_value=store._now() + store.LOCKOUT_S + 1):
+            self.assertFalse(store.locked("alice", "10.0.0.1"))
+
+    def test_failures_outside_the_window_do_not_count(self):
+        start = 5000.0
+        for minute in (0, 4, 8, 12):
+            with patch.object(store, "_now", return_value=start + minute * 60):
+                store.record_failure("alice", "a")
+        with patch.object(store, "_now", return_value=start + 16 * 60):
+            self.assertFalse(store.record_failure("alice", "a"), "the first failure left the 15-minute window")
+        store.clear_failures("alice", "a")
+        for _ in range(4):
+            store.record_failure("alice", "a")
+        self.assertFalse(store.locked("alice", "a"))
+
+
+class PolicyTests(unittest.TestCase):
+    def app_routes(self):
+        keys = set()
+        for path, item in app.openapi()["paths"].items():
+            keys |= {(method.upper(), path) for method in item}
+        for route in app.routes:      # FastAPI's own docs routes aren't in the schema
+            if getattr(route, "include_in_schema", True) is False or type(route).__name__ == "Route":
+                keys |= {(m, route.path) for m in route.methods if m != "HEAD"}
+        return keys
+
+    def test_every_route_has_exactly_one_entry_and_every_entry_a_route(self):
+        routes = self.app_routes()
+        self.assertEqual(sorted(routes - set(policy.ACCESS)), [], "routes with no policy entry")
+        self.assertEqual(sorted(set(policy.ACCESS) - routes), [], "policy entries with no route")
+
+    def test_the_matrix_is_the_agreed_one(self):
+        counts = {}
+        for access in policy.ACCESS.values():
+            counts[access] = counts.get(access, 0) + 1
+        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 19, "engineer": 11})
+        self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
+        self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
+        self.assertEqual(policy.ACCESS[("POST", "/collections")], "developer")
+        self.assertEqual(policy.ACCESS[("GET", "/tune/{collection}")], "developer")
+        self.assertEqual(policy.ACCESS[("GET", "/tune/job/{job_id}")], "engineer")
+
+    def test_each_template_resolves_to_itself(self):
+        for method, template in policy.ACCESS:
+            sample = template.replace("{", "x").replace("}", "")
+            with self.subTest(route=f"{method} {template}"):
+                self.assertEqual(policy.match(method, sample), template)
+        self.assertEqual(policy.match("GET", "/tune/job/abc"), "/tune/job/{job_id}")
+        self.assertEqual(policy.match("GET", "/tune/abc"), "/tune/{collection}")
+        self.assertEqual(policy.match("HEAD", "/collections"), "/collections")
+        self.assertIsNone(policy.match("PUT", "/collections"))
+        self.assertIsNone(policy.match("GET", "/collections/a/b"))
+
+    def test_an_unlisted_route_is_refused_for_everyone(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with patch.object(settings, "auth_dir", temp.name):
+            store.create_user("eng", "engineer", "x" * 12, bootstrap=True, must_change_password=False)
+            token = store.create_session(store.get_user("eng").id)
+
+            @app.get("/vfy-unlisted")
+            async def unlisted():
+                return {"reached": True}
+            self.addCleanup(lambda: app.router.routes.pop())
+            client = TestClient(app, headers={"Cookie": f"{store.COOKIE}={token}", "Origin": ORIGIN})
+            for headers in ({}, {"Cookie": ""}):
+                response = client.get("/vfy-unlisted", headers=headers)
+                self.assertEqual(response.status_code, 403, response.text)
+                self.assertEqual(response.json()["error"]["code"], "FORBIDDEN")
+
+
+class OriginTests(unittest.TestCase):
+    def scope(self, **headers):
+        return {"headers": [(k.replace("_", "-").encode(), v.encode()) for k, v in headers.items()]}
+
+    def test_same_origin_rules(self):
+        allowed = (dict(host="localhost:8080", origin="http://localhost:8080"),
+                   dict(host="localhost", origin="http://localhost:80"),
+                   dict(host="example.test", origin="https://example.test:443"),
+                   dict(host="localhost:8080", sec_fetch_site="same-origin"))
+        refused = (dict(host="localhost:8080"),
+                   dict(host="localhost:8080", origin="http://localhost:8081"),
+                   dict(host="localhost:8080", origin="http://evil.test:8080"),
+                   dict(host="localhost:8080", origin="null"),
+                   dict(host="localhost:8080", origin="file://"),
+                   dict(origin="http://localhost:8080"),
+                   dict(host="localhost:8080", sec_fetch_site="same-site"),
+                   dict(host="localhost:8080", sec_fetch_site="cross-site"))
+        for headers in allowed:
+            with self.subTest(allowed=headers):
+                self.assertTrue(same_origin(self.scope(**headers)))
+        for headers in refused:
+            with self.subTest(refused=headers):
+                self.assertFalse(same_origin(self.scope(**headers)))
+
+
+class MiddlewareTests(StoreTestCase):
+    def test_setup_required_before_bootstrap(self):
+        for method, path in (("GET", "/collections"), ("GET", "/auth/me"), ("POST", "/auth/login")):
+            response = self.client.request(method, path, json={"username": "a", "password": "b"} if method == "POST" else None)
+            self.assertEqual(response.status_code, 503, path)
+            self.assertEqual(response.json()["error"]["code"], "SETUP_REQUIRED")
+        self.assertEqual(self.client.get("/auth/status").json(), {"setup_required": True})
+        self.make("eng", "engineer")
+        self.assertEqual(self.client.get("/auth/status").json(), {"setup_required": False})
+
+    def test_role_matrix_through_the_app(self):
+        self.setup_roles()
+        need = {("GET", "/packages"): "developer", ("GET", "/metrics/latency"): "engineer",
+                ("GET", "/goldstandard/diagnostics"): "engineer", ("GET", "/openapi.json"): "engineer"}
+        names = {"engineer": "eng", "developer": "dev", "end_user": "user"}
+        for role, name in names.items():
+            headers, _ = self.session(name)
+            for (method, path), required in need.items():
+                with self.subTest(role=role, route=path):
+                    response = self.client.request(method, path, headers=headers)
+                    if policy.rank(role) < policy.rank(required):
+                        self.assertEqual(response.status_code, 403)
+                        self.assertEqual(response.json()["error"],
+                                         {"code": "FORBIDDEN", "message": "Your role can't do this.",
+                                          "detail": {"required_role": required}})
+                    else:
+                        self.assertNotIn(response.status_code, (401, 403), response.text[:200])
+
+    def test_refusal_order(self):
+        self.setup_roles()
+        headers, _ = self.session("user")
+        # Cross-origin wins over the role: an end user's cross-origin delete.
+        response = self.client.delete("/collections/X?confirm=true",
+                                      headers={**headers, "Origin": "http://evil.test"})
+        self.assertEqual(response.json()["error"]["code"], "CROSS_ORIGIN_REFUSED")
+        # A due password change wins over the role.
+        store.reset_password("user", "n" * 20)
+        user = store.get_user("user")
+        token = store.create_session(user.id)
+        response = self.client.delete("/collections/X?confirm=true",
+                                      headers={"Cookie": f"{store.COOKIE}={token}", "Origin": ORIGIN})
+        self.assertEqual(response.json()["error"]["code"], "PASSWORD_CHANGE_REQUIRED")
+        self.assertEqual(self.client.get("/auth/me", headers={"Cookie": f"{store.COOKIE}={token}"}).status_code, 200)
+        # No session at all: 401, whatever the origin.
+        response = self.client.delete("/collections/X?confirm=true", headers={"Origin": "http://evil.test"})
+        self.assertEqual(response.json()["error"]["code"], "AUTH_REQUIRED")
+
+    def test_a_refused_upload_never_reads_its_body(self):
+        self.make("eng", "engineer")
+        reads = []
+
+        async def receive():
+            reads.append(1)
+            return {"type": "http.request", "body": b"x" * 1024, "more_body": False}
+
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {"type": "http", "method": "POST", "path": "/ingest/upload", "raw_path": b"/ingest/upload",
+                 "root_path": "", "query_string": b"", "scheme": "http", "server": ("testserver", 80),
+                 "headers": [(b"host", b"testserver"), (b"content-type", b"multipart/form-data; boundary=x")]}
+
+        async def never(scope, receive, send):
+            raise AssertionError("the app was called")
+
+        asyncio.run(AuthMiddleware(never)(scope, receive, send))
+        self.assertEqual(reads, [])
+        self.assertEqual(sent[0]["status"], 401)
+
+    def test_a_refused_request_keeps_its_route_label(self):
+        self.make("eng", "engineer")
+        scope = {"type": "http", "method": "DELETE", "path": "/collections/Abc", "headers": []}
+
+        async def send(message):
+            pass
+
+        asyncio.run(AuthMiddleware(None)(scope, None, send))
+        self.assertEqual(scope["route"].path, "/collections/{name}")
+
+    def test_no_cors_headers(self):
+        self.setup_roles()
+        headers, _ = self.session("eng")
+        response = self.client.get("/collections", headers={**headers, "Origin": "http://evil.test"})
+        self.assertFalse([k for k in response.headers if k.lower().startswith("access-control-")])
+        response = self.client.options("/collections", headers={"Origin": "http://evil.test",
+                                                                "Access-Control-Request-Method": "DELETE"})
+        self.assertFalse([k for k in response.headers if k.lower().startswith("access-control-")])
+
+
+class RouteTests(StoreTestCase):
+    def test_login_success_cookie_and_me(self):
+        password = self.make("eng", "engineer", must_change=True)
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.login("ENG", password)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"username": "eng", "role": "engineer", "must_change_password": True})
+        cookie = response.headers["set-cookie"]
+        attributes = [a.strip().lower() for a in cookie.split(";")[1:]]
+        for want in ("httponly", "samesite=strict", "path=/", f"max-age={store.ABSOLUTE_S}"):
+            self.assertIn(want, attributes)
+        self.assertNotIn("secure", attributes)
+        self.assertIn("Login succeeded for 'eng'", logged(logs))
+        self.assertNotIn(password, logged(logs))
+        token = cookie.split(";")[0].split("=", 1)[1]
+        self.assertNotIn(token, logged(logs))
+        me = self.client.get("/auth/me", headers={"Cookie": f"{store.COOKIE}={token}"})
+        self.assertEqual(me.json()["username"], "eng")
+
+    def test_secure_cookie_under_the_setting(self):
+        password = self.make("eng", "engineer")
+        with patch.object(settings, "auth_cookie_secure", True):
+            response = self.login("eng", password)
+        self.assertIn("secure", [a.strip().lower() for a in response.headers["set-cookie"].split(";")])
+
+    def test_failures_are_generic(self):
+        password = self.make("eng", "engineer")
+        self.make("off", "developer")
+        store.set_enabled("off", False)
+        off_password = passwords.generate_password()
+        store.reset_password("off", off_password)
+        answers = [self.login("eng", password + "x"), self.login("nobody", password),
+                   self.login("x", password), self.login("off", off_password)]
+        bodies = {(r.status_code, r.text) for r in answers}
+        self.assertEqual(len(bodies), 1, bodies)
+        self.assertEqual(answers[0].status_code, 401)
+        self.assertEqual(answers[0].json()["error"]["code"], "LOGIN_FAILED")
+        self.assertNotIn("set-cookie", answers[0].headers)
+
+    def test_unknown_user_is_checked_against_a_hash_too(self):
+        self.make("eng", "engineer")
+        with patch.object(passwords, "verify_password", wraps=passwords.verify_password) as verify:
+            self.login("nobody", "x" * 12)
+        verify.assert_called_once()
+        self.assertEqual(verify.call_args.args[1], passwords.dummy_hash())
+
+    def test_throttle(self):
+        password = self.make("eng", "engineer")
+        with self.assertLogs("auth", "WARNING") as logs:
+            for _ in range(5):
+                self.assertEqual(self.login("eng", "wrong" * 3).status_code, 401)
+            response = self.login("eng", password)
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.json()["error"]["code"], "LOGIN_THROTTLED")
+        self.assertIn("too many failed attempts", logged(logs))
+        # Another address isn't locked; the proxy's X-Real-IP is the address.
+        self.assertEqual(self.login("eng", password, **{"X-Real-IP": "10.9.9.9"}).status_code, 200)
+        # The same for a user that doesn't exist: throttling reveals nothing.
+        for _ in range(5):
+            self.login("ghost", "wrong" * 3)
+        self.assertEqual(self.login("ghost", "wrong" * 3).status_code, 429)
+
+    def test_success_clears_the_count(self):
+        password = self.make("eng", "engineer")
+        for _ in range(4):
+            self.login("eng", "wrong" * 3)
+        self.assertEqual(self.login("eng", password).status_code, 200)
+        for _ in range(4):
+            self.login("eng", "wrong" * 3)
+        self.assertEqual(self.login("eng", password).status_code, 200)
+
+    def test_logout(self):
+        self.setup_roles()
+        headers, token = self.session("dev")
+        response = self.client.post("/auth/logout", headers=headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("max-age=0", response.headers["set-cookie"].lower())
+        self.assertEqual(self.client.get("/auth/me", headers=headers).status_code, 401)
+        self.assertEqual(self.client.post("/auth/logout", headers=headers).status_code, 401)
+
+    def test_logout_is_origin_checked(self):
+        self.setup_roles()
+        headers, token = self.session("dev")
+        response = self.client.post("/auth/logout", headers={**headers, "Origin": "http://evil.test"})
+        self.assertEqual(response.json()["error"]["code"], "CROSS_ORIGIN_REFUSED")
+        self.assertIsNotNone(store.authenticate(token))
+
+    def test_password_change(self):
+        self.setup_roles()
+        password = self.passwords["end_user"]
+        headers, token = self.session("user")
+        other_headers, other = self.session("user")
+        wrong = self.client.post("/auth/password", headers=headers,
+                                 json={"current_password": "nope" * 3, "new_password": "n" * 14})
+        self.assertEqual((wrong.status_code, wrong.json()["error"]["code"]), (403, "PASSWORD_INCORRECT"))
+        for new in ("short", "u" * 257):
+            response = self.client.post("/auth/password", headers=headers,
+                                        json={"current_password": password, "new_password": new})
+            self.assertEqual((response.status_code, response.json()["error"]["code"]), (422, "INVALID_PASSWORD"))
+        response = self.client.post("/auth/password", headers=headers,
+                                    json={"current_password": password, "new_password": "a-new-password"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIsNotNone(store.authenticate(token))
+        self.assertIsNone(store.authenticate(other))
+        self.assertEqual(self.login("user", "a-new-password").status_code, 200)
+        self.assertEqual(self.login("user", password).status_code, 401)
+
+    def test_password_equal_to_username_is_refused(self):
+        self.make("eng", "engineer")
+        self.make("long-username", "developer")
+        store.reset_password("long-username", "temporary-pass-1")
+        headers, _ = self.session("long-username")
+        response = self.client.post("/auth/password", headers=headers,
+                                    json={"current_password": "temporary-pass-1", "new_password": "LONG-USERNAME"})
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("username", response.json()["error"]["message"])
+
+    def test_forced_change_allows_only_session_routes(self):
+        self.make("eng", "engineer")
+        generated = passwords.generate_password()
+        store.create_user("dev", "developer", generated)
+        response = self.login("dev", generated)
+        self.assertTrue(response.json()["must_change_password"])
+        token = response.headers["set-cookie"].split(";")[0].split("=", 1)[1]
+        headers = {"Cookie": f"{store.COOKIE}={token}", "Origin": ORIGIN}
+        self.assertEqual(self.client.get("/collections", headers=headers).json()["error"]["code"],
+                         "PASSWORD_CHANGE_REQUIRED")
+        self.assertEqual(self.client.get("/auth/me", headers=headers).status_code, 200)
+        changed = self.client.post("/auth/password", headers=headers,
+                                   json={"current_password": generated, "new_password": "chosen-by-dev"})
+        self.assertEqual(changed.json()["must_change_password"], False)
+        self.assertNotEqual(self.client.get("/collections", headers=headers).status_code, 403)
+
+
+class CommandTests(unittest.TestCase):
+    """`python -m auth` in a subprocess, as an operator runs it."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.env = {**os.environ, "AUTH_DIR": temp.name}
+        self.dir = temp.name
+
+    def run_auth(self, *args):
+        return subprocess.run([sys.executable, "-m", "auth", *args], cwd=API_DIR, env=self.env,
+                              capture_output=True, text=True, timeout=120)
+
+    def users(self):
+        with patch.object(settings, "auth_dir", self.dir):
+            store._ready.discard(str(store.db_path()))
+            return {u.username: u for u in store.list_users()}
+
+    def test_bootstrap_create_and_reset_print_only_the_password(self):
+        result = self.run_auth("bootstrap", "Admin")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        password = result.stdout.strip()
+        self.assertEqual(result.stdout, password + "\n")
+        self.assertGreaterEqual(len(password), 20)
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+        self.assertNotIn(password, result.stderr)
+        admin = self.users()["admin"]
+        self.assertEqual((admin.role, admin.must_change_password), ("engineer", True))
+        self.assertTrue(passwords.verify_password(password, admin.password_hash))
+
+        refused = self.run_auth("bootstrap", "second")
+        self.assertEqual((refused.returncode, refused.stdout), (1, ""))
+        self.assertIn("already set up", refused.stderr)
+
+        created = self.run_auth("create-user", "dev", "developer")
+        self.assertEqual(created.returncode, 0, created.stderr)
+        self.assertTrue(self.users()["dev"].must_change_password)
+        reset = self.run_auth("reset-password", "dev")
+        self.assertEqual(reset.returncode, 0)
+        self.assertNotEqual(reset.stdout, created.stdout)
+        self.assertTrue(passwords.verify_password(reset.stdout.strip(), self.users()["dev"].password_hash))
+
+    def test_create_before_bootstrap_is_refused(self):
+        result = self.run_auth("create-user", "dev", "developer")
+        self.assertEqual((result.returncode, result.stdout), (1, ""))
+        self.assertIn("bootstrap", result.stderr)
+
+    def test_usage_errors(self):
+        for args in (("create-user", "x", "developer"), ("create-user", "dev", "admin"), ("frobnicate",), ()):
+            with self.subTest(args=args):
+                result = self.run_auth(*args)
+                self.assertEqual((result.returncode, result.stdout), (2, ""))
+
+    def test_last_engineer_and_recovery(self):
+        self.run_auth("bootstrap", "admin")
+        for args in (("disable", "admin"), ("set-role", "admin", "developer")):
+            result = self.run_auth(*args)
+            self.assertEqual(result.returncode, 1, args)
+            self.assertIn("last enabled engineer", result.stderr)
+        self.run_auth("create-user", "eng2", "engineer")
+        self.assertEqual(self.run_auth("disable", "admin").returncode, 0)
+        self.assertFalse(self.users()["admin"].enabled)
+        self.assertEqual(self.run_auth("enable", "admin").returncode, 0)
+        self.assertEqual(self.run_auth("set-role", "eng2", "end_user").returncode, 0)
+        self.assertEqual(self.users()["eng2"].role, "end_user")
+        self.assertEqual(self.run_auth("disable", "nobody").returncode, 1)
+
+    def test_list_shows_no_secret(self):
+        password = self.run_auth("bootstrap", "admin").stdout.strip()
+        result = self.run_auth("list")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("admin\tengineer\tenabled\tpassword change due\t", result.stdout)
+        self.assertNotIn(password, result.stdout)
+        self.assertNotIn("scrypt", result.stdout)
+
+
+class TestingHelperTests(unittest.TestCase):
+    def test_headers_are_a_real_session(self):
+        from auth import testing
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with patch.object(testing, "_folder", temp.name), patch.object(testing, "_accounts", {}), \
+                patch.object(settings, "auth_dir", settings.auth_dir):
+            headers = testing.headers("developer", base_url="http://owned/")
+            self.assertEqual(headers["Origin"], "http://owned")
+            token = headers["Cookie"].split("=", 1)[1]
+            self.assertEqual(store.authenticate(token).role, "developer")
+
+
+class ImplementationCopyTests(unittest.TestCase):
+    def test_embedded_copies_match(self):
+        root = Path(API_DIR).parent
+        document = (root / "IMPLEMENTATION.md").read_text()
+        for name in ("api/auth/__init__.py", "api/auth/passwords.py", "api/auth/store.py", "api/auth/policy.py",
+                     "api/auth/middleware.py", "api/auth/__main__.py", "api/auth/testing.py",
+                     "api/routers/auth.py", "api/main.py", "api/config.py", "proxy/nginx.conf",
+                     "scripts/verify/17_auth.sh", "scripts/verify/auth_setup.py", "scripts/verify/auth_stack.py",
+                     "scripts/verify/auth_headers.py"):
+            with self.subTest(name=name):
+                header = "### " + name + "\n\n```"
+                start = document.index("\n", document.index(header) + len(header)) + 1
+                end = document.index("\n```\n", start)
+                self.assertEqual(document[start:end], (root / name).read_text().rstrip("\n"))
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.CRITICAL)
+    unittest.main(verbosity=2)
+```
+
+### scripts/tests/test_auth_enforcement.py
+
+```python
+"""Every protected API route refuses a request without a session (#25).
+
+Before #25 the API had no authentication: any client could list, create and
+delete collections, ingest, export and poll jobs. This sends plain HTTP through
+`main.app`, so it runs unchanged on a checkout without the `auth` package and
+fails there. With it, the store is pointed at a temporary folder holding one
+account, so a refusal is 401 AUTH_REQUIRED rather than 503 SETUP_REQUIRED.
+
+Runs in the built API image with no network (`17_auth.sh`):
+
+    docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
+      "$(docker compose images -q api)" python scripts/tests/test_auth_enforcement.py
+"""
+import os
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+sys.path.insert(0, os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api"))
+
+from fastapi.testclient import TestClient
+
+from main import app
+from services import ollama_client
+from services import weaviate_client as wc
+
+try:
+    from auth import testing as auth_testing
+except ImportError:          # a checkout from before #25
+    auth_testing = None
+
+X = "VfyAuthNoSuch"
+# Every route but GET /health, with a request that would reach it.
+PROTECTED = (
+    ("GET", "/collections"), ("POST", "/collections"), ("DELETE", f"/collections/{X}?confirm=true"),
+    ("POST", "/query"), ("GET", f"/retrieval/config/{X}"), ("POST", "/retrieval/config"),
+    ("POST", "/ingest/upload"), ("GET", "/ingest/job/nope"), ("GET", f"/ingest/config/{X}"),
+    ("POST", "/ingest/config"),
+    ("POST", "/goldstandard/generate"), ("GET", "/goldstandard/session/gs_nope"),
+    ("PATCH", "/goldstandard/session/gs_nope/pair/p"), ("POST", "/goldstandard/regenerate"),
+    ("POST", "/goldstandard/save"), ("GET", "/goldstandard/download/nope.json"),
+    ("GET", "/goldstandard/diagnostics"),
+    ("POST", "/export"), ("GET", "/export/job/nope"), ("POST", "/import"), ("GET", "/import/job/nope"),
+    ("GET", "/packages"), ("GET", "/help/transfer"),
+    ("POST", "/tune/rechunk"), ("POST", "/tune/reembed"), ("POST", "/tune/reindex"),
+    ("GET", "/tune/job/nope"), ("GET", f"/tune/{X}"),
+    ("GET", "/metrics/latency"),
+    ("GET", "/docs"), ("GET", "/docs/oauth2-redirect"), ("GET", "/redoc"), ("GET", "/openapi.json"),
+)
+
+
+class UnauthenticatedTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if auth_testing is not None:
+            auth_testing.account("end_user")      # set up, so the answer is 401, not 503
+        cls.client = TestClient(app, raise_server_exceptions=False)
+
+    def test_every_protected_route_answers_401_without_a_session(self):
+        for method, path in PROTECTED:
+            with self.subTest(route=f"{method} {path}"):
+                response = self.client.request(method, path, json={} if method != "GET" else None)
+                self.assertEqual(response.status_code, 401, response.text[:200])
+                self.assertEqual(response.json()["error"]["code"], "AUTH_REQUIRED")
+
+    def test_health_stays_open(self):
+        # Backends mocked: nothing reaches a stack.
+        with patch.object(wc, "check_health", AsyncMock(return_value=True)), \
+                patch.object(ollama_client, "check_health", AsyncMock(return_value={})):
+            self.assertNotIn(self.client.get("/health").status_code, (401, 403))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+### scripts/tests/test_verify_auth.py
+
+```python
+"""Host-only checks that the verify harness keeps its test credentials private (#25).
+
+auth_setup.py keeps the test accounts' passwords in a 0600 file in a 0700
+folder of this user's own, refuses a folder someone could have planted, and
+never runs the operator command without --operator. auth_headers.py reads the
+session from curl's cookie jar. lib.sh passes --operator only on the verify
+project, and every curl a suite makes carries the session. Standard library
+only; no Docker or stack needed.
+
+Run: python3 scripts/tests/test_verify_auth.py
+"""
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[2]
+VERIFY = ROOT / "scripts" / "verify"
+sys.path.insert(0, str(VERIFY))
+
+import auth_headers  # noqa: E402
+import auth_setup    # noqa: E402
+
+
+class FolderTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+
+    def use(self, path):
+        return patch.dict(os.environ, {"RAG_AUTH_DIR": str(path)})
+
+    def test_folder_is_created_private_and_credentials_file_0600(self):
+        folder = self.base / "auth"
+        with self.use(folder):
+            made = auth_setup.private_dir()
+            auth_setup.write_credentials(made, {"engineer": ("vfy-engineer", "p" * 20)})
+        self.assertEqual(stat.S_IMODE(folder.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((folder / "credentials").stat().st_mode), 0o600)
+        self.assertEqual(auth_setup.read_credentials(folder), {"engineer": ("vfy-engineer", "p" * 20)})
+        self.assertEqual([p.name for p in folder.iterdir()], ["credentials"], "no temporary file left behind")
+
+    def test_a_loose_folder_is_tightened(self):
+        folder = self.base / "auth"
+        folder.mkdir(mode=0o755)
+        with self.use(folder):
+            auth_setup.private_dir()
+        self.assertEqual(stat.S_IMODE(folder.stat().st_mode), 0o700)
+
+    def test_a_symlink_or_file_is_refused(self):
+        target = self.base / "elsewhere"
+        target.mkdir()
+        link = self.base / "auth"
+        link.symlink_to(target)
+        with self.use(link), self.assertRaises(auth_setup.SetupError):
+            auth_setup.private_dir()
+        plain = self.base / "plain"
+        plain.write_text("")
+        with self.use(plain), self.assertRaises(auth_setup.SetupError):
+            auth_setup.private_dir()
+
+    def test_a_symlinked_credentials_file_is_refused(self):
+        folder = self.base / "auth"
+        folder.mkdir(mode=0o700)
+        (folder / "credentials").symlink_to(self.base / "planted")
+        (self.base / "planted").write_text("engineer vfy-engineer planted\n")
+        with self.assertRaises(auth_setup.SetupError):
+            auth_setup.read_credentials(folder)
+
+    def test_default_folder_is_outside_the_checkout(self):
+        with patch.dict(os.environ, {"TMPDIR": "/tmp/x/"}, clear=False):
+            os.environ.pop("RAG_AUTH_DIR", None)
+            self.assertEqual(auth_setup.auth_dir(), Path("/tmp/x/rag-verify-auth-{}".format(os.getuid())))
+
+    def test_jar_is_0600_and_readable_by_auth_headers(self):
+        jar = self.base / "engineer.jar"
+        auth_setup.write_jar(jar, "tok-123", api="http://localhost:8081/api")
+        self.assertEqual(stat.S_IMODE(jar.stat().st_mode), 0o600)
+        self.assertEqual(auth_headers.session_token(str(jar)), "tok-123")
+        with patch.dict(os.environ, {"RAG_AUTH_JAR": str(jar), "RAG_AUTH_ORIGIN": "http://localhost:8081"}):
+            self.assertEqual(auth_headers.headers(),
+                             {"Cookie": "rag_session=tok-123", "Origin": "http://localhost:8081"})
+
+    def test_auth_headers_reads_curls_own_jar_format(self):
+        jar = self.base / "curl.jar"
+        jar.write_text("# Netscape HTTP Cookie File\n# https://curl.se/docs/http-cookies.html\n\n"
+                       "#HttpOnly_localhost\tFALSE\t/\tFALSE\t1893456000\trag_session\tabc\n"
+                       "localhost\tFALSE\t/\tFALSE\t0\tother\tzzz\n")
+        self.assertEqual(auth_headers.session_token(str(jar)), "abc")
+        self.assertIsNone(auth_headers.session_token(str(self.base / "missing")))
+
+
+class OperatorTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        env = patch.dict(os.environ, {"RAG_AUTH_DIR": temp.name + "/auth"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_without_operator_nothing_is_reset_or_bootstrapped(self):
+        with patch.object(auth_setup, "operator") as operator, \
+                patch.object(auth_setup, "request", return_value=(200, {"setup_required": True}, None)):
+            with self.assertRaises(auth_setup.SetupError):
+                auth_setup.ensure(False)
+        operator.assert_not_called()
+        with patch.object(auth_setup, "operator") as operator, \
+                patch.object(auth_setup, "request", side_effect=[(200, {"setup_required": False}, None),
+                                                                 (401, None, None)]):
+            with self.assertRaises(auth_setup.SetupError):
+                auth_setup.ensure(False)
+        operator.assert_not_called()
+
+    def test_a_generated_password_is_replaced_and_stored_never_printed(self):
+        calls = []
+
+        def operator(*args):
+            calls.append(args)
+            return 0, "generated-" + args[1]
+
+        def request(method, path, body=None, token=None, api=None):
+            if path == "/auth/status":
+                return 200, {"setup_required": True}, None
+            if path == "/auth/login":
+                return 200, {"must_change_password": body["password"].startswith("generated-")}, "tok"
+            return 200, {}, None
+
+        with patch.object(auth_setup, "operator", side_effect=operator), \
+                patch.object(auth_setup, "request", side_effect=request), \
+                patch("sys.stdout") as out:
+            auth_setup.ensure(True)
+        self.assertEqual(calls[0], ("bootstrap", "vfy-engineer"))
+        stored = auth_setup.read_credentials(auth_setup.private_dir())
+        self.assertEqual(set(stored), {"engineer", "developer", "end_user"})
+        self.assertTrue(all(not p.startswith("generated-") for _, p in stored.values()))
+        self.assertFalse(out.write.called, "ensure printed something")
+
+
+class PasswordPipeTests(unittest.TestCase):
+    def test_the_password_goes_only_into_a_pipe(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        folder = Path(temp.name) / "auth"
+        env = {**os.environ, "RAG_AUTH_DIR": str(folder)}
+        with patch.dict(os.environ, {"RAG_AUTH_DIR": str(folder)}):
+            auth_setup.write_credentials(auth_setup.private_dir(), {"end_user": ("vfy-end-user", "s3cret pass word")})
+        piped = subprocess.run([sys.executable, str(VERIFY / "auth_setup.py"), "password", "end_user"],
+                               capture_output=True, text=True, env=env)
+        self.assertEqual((piped.returncode, piped.stdout, piped.stderr), (0, "s3cret pass word\n", ""))
+        with patch.dict(os.environ, {"RAG_AUTH_DIR": str(folder)}), patch.object(auth_setup.os, "isatty", return_value=True), \
+                self.assertRaises(auth_setup.SetupError):
+            auth_setup.password_to_pipe("end_user")
+
+
+class LibraryTests(unittest.TestCase):
+    def test_operator_only_on_the_verify_project_and_curl_carries_the_session(self):
+        text = (VERIFY / "lib.sh").read_text()
+        ensure = text[text.index("auth_ensure() {"):]
+        ensure = ensure[:ensure.index("\n}\n")]
+        self.assertIn('[ -n "$(volume_removal_refusal_reason)" ] || operator=--operator', ensure)
+        function = text[text.index("curl() {"):]
+        function = function[:function.index("\n}\n")]
+        self.assertIn('command curl -b "$RAG_AUTH_JAR" -H "Origin: $RAG_AUTH_ORIGIN" "$@"', function)
+        self.assertIn("auth_ensure", text[text.index("require_stack() {"):text.index("# ── test accounts")])
+
+    def test_no_password_on_a_command_line(self):
+        for name in ("lib.sh", "17_auth.sh", "06_ui.sh"):
+            text = (VERIFY / name).read_text()
+            with self.subTest(file=name):
+                self.assertNotIn("password", " ".join(line for line in text.splitlines()
+                                                      if "curl" in line and not line.lstrip().startswith("#")))
+
+    def test_the_suites_pass_the_shell_check(self):
+        for name in ("lib.sh", "17_auth.sh", "06_ui.sh", "all.sh"):
+            with self.subTest(file=name):
+                self.assertEqual(subprocess.run(["bash", "-n", str(VERIFY / name)]).returncode, 0)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
 ```
 
 ### scripts/verify/lock.sh
@@ -16920,7 +20076,7 @@ with tempfile.TemporaryDirectory() as td:
                    if isinstance(node, (ast.Import, ast.ImportFrom))
                    for n in ([a.name for a in node.names] if isinstance(node, ast.Import)
                              else [node.module or ""])}
-        STDLIB = {"argparse","json","sys","urllib","os","re"}
+        STDLIB = {"argparse","getpass","json","sys","urllib","os","re"}  # getpass: the login (#25)
         check("retrieve.py imports stdlib only", imports <= STDLIB, str(sorted(imports)))
     else:
         check("retrieve.py absent when retrieve_script is false",
@@ -17025,13 +20181,13 @@ ENDPY
 check "resolved Compose publishes only the proxy on host loopback" $?
 
 # ── cross-origin access, as SECURITY.md describes it ─────────────────────────
-# SECURITY.md says a web page open in a browser on this machine can call the
-# API, because CORS allows any origin (#25 tracks tightening it). Check that
-# this is still true, so the policy and the code can't drift apart silently:
-# when #25 changes CORS, this check and SECURITY.md change together.
-cors=$(curl -s -D - -o /dev/null -m 10 -H "Origin: http://other.example" "$API/health" \
+# SECURITY.md says the API has no CORS (#25): a page from another origin can't
+# read its answers, and a cookie-authenticated change from one is refused (see
+# 17_auth.sh). Check that no answer carries Access-Control-Allow-Origin, so the
+# policy and the code can't drift apart silently.
+cors=$(command curl -s -D - -o /dev/null -m 10 -H "Origin: http://other.example" "$API/health" \
   | tr -d '\r' | awk -F': ' 'tolower($1)=="access-control-allow-origin"{print $2}')
-check_eq "the API allows any origin, as SECURITY.md describes (#25)" "$cors" "*"
+check_eq "the API sends no Access-Control-Allow-Origin, as SECURITY.md describes (#25)" "$cors" ""
 
 (cd "$REPO_ROOT" && python3 - <<'ENDPY'
 import json, subprocess
@@ -17688,6 +20844,8 @@ ENDPY
       check "a first start from empty volumes brings every service healthy within 300s (took ${took}s)" $? \
         "$([ "$up_ok" = 0 ] || printf 'not healthy after 600s')"
       wait_healthy_timed "$(python3 -c "import time;print(time.time())")" 60 > /dev/null
+      # The accounts went with their volume too (#25): set the project up again.
+      auth_ensure
       # It started from nothing: the collection made above is gone with its volume.
       check_eq "that first start began with no collections" \
         "$(api_get "/collections" | jfield "['collections']")" "[]"
@@ -18658,6 +21816,7 @@ from unittest.mock import AsyncMock,patch
 from fastapi.testclient import TestClient
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import weaviate_client as wc,rag_pipeline as rag
 
 prefix=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Controls'+uuid.uuid4().hex[:10]
@@ -18669,7 +21828,7 @@ if importlib.util.find_spec('services.collection_recovery'):
 else:
     recovery=None  # The pre-recovery baseline sweeps legacy staging markers.
 
-client=TestClient(app)
+client=TestClient(app, headers=auth_testing.headers())
 with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patch.object(settings,'upload_dir',directory):
     try:
         for index in ('hnsw','flat'):
@@ -18908,6 +22067,7 @@ from fastapi.testclient import TestClient
 
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import weaviate_client as wc
 
 prefix = os.environ.get("RAG_TEST_PREFIX", "Vfy") + "Score" + uuid.uuid4().hex[:8]
@@ -18925,7 +22085,7 @@ CASES = {
     "l2-squared": ([[1.0, t, 0.0, 0.0] for t in (0.0, 0.5, 1.0, math.sqrt(3))], [1.0, 0.8, 0.5, 0.25]),
 }
 
-client = TestClient(app)
+client = TestClient(app, headers=auth_testing.headers())
 created = []
 failures = []
 
@@ -19026,6 +22186,7 @@ from unittest.mock import patch
 import httpx
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs,weaviate_client as wc
 
 collection=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Persistence'+uuid.uuid4().hex[:10]
@@ -19033,7 +22194,7 @@ created=False
 with tempfile.TemporaryDirectory(prefix='session-persistence-live-') as directory,patch.object(settings,'upload_dir',directory):
     async def run():
         global created
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-fixture') as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned-fixture'), base_url='http://owned-fixture') as client:
             created=True
             response=await client.post('/collections',json={'name':collection});assert response.status_code==201,response.text
             coll=wc.get_client().collections.get(collection)
@@ -19362,8 +22523,10 @@ fi
 # ── export filtering, schema and filename ────────────────────────────────────
 python3 - "$SID" "$API" <<'ENDPY'
 import json, sys, urllib.request
+import auth_headers  # the suite's session (#25); this runs from scripts/verify
 sid, api = sys.argv[1], sys.argv[2]
-pairs = json.load(urllib.request.urlopen(f"{api}/goldstandard/session/{sid}"))['pairs']
+pairs = json.load(urllib.request.urlopen(urllib.request.Request(
+    f"{api}/goldstandard/session/{sid}", headers=auth_headers.headers())))['pairs']
 plan = ["approved", "edited", "rejected", "pending", "approved"]
 for pair, status in zip(pairs, plan):
     body = {"status": status}
@@ -19372,7 +22535,7 @@ for pair, status in zip(pairs, plan):
     req = urllib.request.Request(
         f"{api}/goldstandard/session/{sid}/pair/{pair['pair_id']}",
         data=json.dumps(body).encode(), method="PATCH",
-        headers={"Content-Type": "application/json"})
+        headers={"Content-Type": "application/json", **auth_headers.headers()})
     urllib.request.urlopen(req)
 ENDPY
 api_post "/goldstandard/save" "{\"session_id\":\"$SID\"}" > /tmp/vfy_save.json
@@ -21027,7 +24190,11 @@ else
     name=${run%%:*}; want=${run#*:}
     args=(--api-url "$API" --json --citations)
     [ "$name" = top2 ] && args+=(--top-k 2)
-    python3 -I -S "$RTMP/retrieve.py" "${args[@]}" "$QUESTION" > /tmp/vfy_p_r.json 2> /tmp/vfy_p_r.err
+    # As the End User test account (#25): the password goes in on stdin.
+    _rag_require_lock_owner
+    python3 ./auth_setup.py password end_user \
+      | python3 -I -S "$RTMP/retrieve.py" --username vfy-end-user --password-stdin "${args[@]}" "$QUESTION" \
+        > /tmp/vfy_p_r.json 2> /tmp/vfy_p_r.err
     rc=$?
     python3 - "$want" <<'ENDPY'
 import json, sys
@@ -21042,8 +24209,9 @@ ENDPY
     check "E8/E9: retrieve.py ($name) answers with $want citation(s)" $? \
       "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
   done
-  python3 -I -S "$RTMP/retrieve.py" --api-url "$API" --collection "$IMP" "$QUESTION" \
-    > /tmp/vfy_p_r.out 2> /tmp/vfy_p_r.err
+  python3 ./auth_setup.py password end_user \
+    | python3 -I -S "$RTMP/retrieve.py" --username vfy-end-user --password-stdin --api-url "$API" \
+        --collection "$IMP" "$QUESTION" > /tmp/vfy_p_r.out 2> /tmp/vfy_p_r.err
   rc=$?
   [ "$rc" = 0 ] && [ -n "$(tr -d '[:space:]' < /tmp/vfy_p_r.out)" ]
   check "E11: retrieve.py answers from the imported collection" $? "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
@@ -21552,10 +24720,13 @@ fi
 C="${PREFIX}Ui"
 drop_collection "$C"; make_collection "$C"
 
-docker run --rm --network "$NETWORK" \
+# The test accounts' credentials go in on standard input (#25), never on a
+# command line or in the environment; browser/lib.js reads them once.
+_rag_require_lock_owner
+docker run --rm -i --network "$NETWORK" \
   -e RAG_UI_BASE="${RAG_UI_BASE:-http://proxy}" \
-  -e RAG_SKIP_SLOW="$SKIP_SLOW" \
-  -v "$PWD/browser":/w:ro -w /w "$IMAGE" node ui_criteria.js
+  -e RAG_SKIP_SLOW="$SKIP_SLOW" -e RAG_AUTH_STDIN=1 \
+  -v "$PWD/browser":/w:ro -w /w "$IMAGE" node ui_criteria.js < "$RAG_AUTH_DIR/credentials"
 rc=$?
 
 drop_collection "$C"
@@ -21580,11 +24751,12 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs, weaviate_client as wc, tuning
 
 collection=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Validity'+uuid.uuid4().hex[:12]
 session_id='gs_'+uuid.uuid4().hex[:8]
-client=TestClient(app)  # Do not run global startup sweeps alongside other tests.
+client=TestClient(app, headers=auth_testing.headers())  # Do not run global startup sweeps alongside other tests.
 creation_attempted=False
 with tempfile.TemporaryDirectory(prefix='validity-live-') as directory, patch.object(settings,'upload_dir',directory):
     try:
@@ -21811,9 +24983,62 @@ async function launch() {
   });
 }
 
+// The test accounts' credentials (#25), read once from standard input:
+// 06_ui.sh runs this container with the harness's credentials file as stdin
+// (RAG_AUTH_STDIN=1), so no password is on a command line or in the
+// environment. Lines are `role username password`.
+let credentials = null;
+function credentialsFor(role) {
+  if (credentials === null) {
+    credentials = {};
+    if (process.env.RAG_AUTH_STDIN === '1') {
+      for (const line of require('fs').readFileSync(0, 'utf8').split('\n')) {
+        const [r, username, ...rest] = line.split(' ');
+        if (r && username && rest.length) credentials[r] = { username, password: rest.join(' ') };
+      }
+    }
+  }
+  if (!credentials[role]) throw new Error(`no test credentials for ${role}; run through 06_ui.sh`);
+  return credentials[role];
+}
+
+// Logs the page's browser context in as the role's test account, through the
+// API, as the login page does. The session is the HttpOnly cookie the answer sets.
+async function login(page, base, role) {
+  const { username, password } = credentialsFor(role);
+  // Any same-origin page will do; /api/health is not the UI, so nothing asks
+  // GET /api/auth/me before the login and logs its 401 as a console error.
+  if (!page.url().startsWith(base)) await page.goto(base + '/api/health', { waitUntil: 'domcontentloaded' });
+  const status = await page.evaluate(async (u, p) => (await fetch('/api/auth/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: u, password: p }),
+  })).status, username, password);
+  if (status !== 200) throw new Error(`login as ${role} answered ${status}`);
+}
+
+// For fixtures that answer every /api/ request themselves: answers
+// GET /api/auth/status and GET /api/auth/me for `role` (null: logged out) and
+// passes everything else on. Registered after a fixture's own fetch stub, it
+// wraps that stub.
+async function stubAuth(page, role) {
+  await page.evaluateOnNewDocument(r => {
+    const inner = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+      const path = new URL(typeof input === 'string' ? input : input.url, location.href).pathname;
+      const reply = (status, body) => Promise.resolve(new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }));
+      if (path === '/api/auth/status') return reply(200, { setup_required: false });
+      if (path === '/api/auth/me') {
+        return r ? reply(200, { username: 'vfy-' + r.replace('_', '-'), role: r, must_change_password: false })
+                 : reply(401, { error: { code: 'AUTH_REQUIRED', message: 'Log in to use this.', detail: null } });
+      }
+      return inner(input, init);
+    };
+  }, role);
+}
+
 // A fresh browser context per role, with console errors and API calls recorded.
 // Console errors matter: a React component that throws unmounts the whole app,
 // which once turned every page blank after visiting /health.
+// With a role, the context is logged in as that role's test account.
 async function session(browser, base, role) {
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
@@ -21824,8 +25049,8 @@ async function session(browser, base, role) {
     const u = r.url();
     if (u.includes('/api/')) api.push({ method: r.method(), url: u.replace(/^https?:\/\/[^/]+/, ''), at: Date.now() });
   });
+  if (role) await login(page, base, role);
   await page.goto(base + '/', { waitUntil: 'networkidle2' });
-  if (role) await page.evaluate(r => sessionStorage.setItem('rag_role', JSON.stringify({ role: r })), role);
   return { ctx, page, errors, api };
 }
 
@@ -21848,7 +25073,7 @@ const clickByText = (page, text) => page.evaluate(t => {
   if (!el) return false; el.click(); return true;
 }, text);
 
-module.exports = { sleep, makeReporter, launch, session, bodyText, setValue, clickByText };
+module.exports = { sleep, makeReporter, launch, session, login, stubAuth, credentialsFor, bodyText, setValue, clickByText };
 ```
 
 ### scripts/verify/browser/query_config.js
@@ -21857,7 +25082,7 @@ module.exports = { sleep, makeReporter, launch, session, bodyText, setValue, cli
 // Deferred responses exercise the real provider, Retrieval page, and Q&A page.
 // All API calls are intercepted before application startup; no backend is used.
 const assert = require('node:assert/strict');
-const { sleep, makeReporter, setValue, clickByText } = require('./lib');
+const { sleep, makeReporter, setValue, clickByText, stubAuth } = require('./lib');
 
 const A = { collection: 'FixtureA', retrieval_mode: 'hybrid', top_k: 11, alpha: 0.25, ef: null, response_format: 'engineer', is_default: false };
 const B = { ...A, collection: 'FixtureB', retrieval_mode: 'semantic', top_k: 23, alpha: 0.6 };
@@ -21869,7 +25094,6 @@ async function fixture(browser, base) {
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.evaluateOnNewDocument((a, b) => {
-    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
     const realFetch = window.fetch.bind(window);
     const requests = [];
     window.queryConfigFixture = { requests };
@@ -21899,6 +25123,8 @@ async function fixture(browser, base) {
       return Promise.reject(new Error('Unexpected fixture API call: ' + method + ' ' + path));
     };
   }, A, B);
+  // The engineer, as GET /api/auth/me answers it, without a backend (#25).
+  await stubAuth(page, 'engineer');
   await page.goto(base + '/retrieval', { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => document.body.innerText.includes('Top-K Results: 11') && !document.body.innerText.includes('Loading saved settings'));
   return { ctx, page, errors };
@@ -22173,7 +25399,7 @@ if (require.main === module) {
 // chunking-strategy selector, `input[type=text]` missed an input with no type
 // attribute, and a row's delete link matched a class test meant for the modal's
 // confirm button.
-const { sleep, makeReporter, launch, session, bodyText, setValue, clickByText } = require('./lib');
+const { sleep, makeReporter, launch, session, credentialsFor, bodyText, setValue, clickByText } = require('./lib');
 
 const BASE = process.env.RAG_UI_BASE || 'http://proxy';
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic'];
@@ -22195,25 +25421,33 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
 
   await require('./ui_pages').runUiPageTests(browser, BASE, r);
 
-  // ── role persistence ───────────────────────────────────────────────────────
-  r.section('§10.4 role selection');
+  // ── login, persistence and logout against the real API (#25) ─────────────
+  r.section('§10.4 login and session');
   {
     const s = await session(browser, BASE, null);
-    await s.page.goto(BASE + '/', { waitUntil: 'networkidle2' });
-    await sleep(1200);
-    const picked = await s.page.evaluate(() => {
-      const b = [...document.querySelectorAll('button')].find(x => /Engineer/i.test(x.textContent));
-      if (!b) return false; b.click(); return true;
-    });
-    r.check('a role can be chosen on the landing page', picked);
-    const stored = await s.page.evaluate(() => sessionStorage.getItem('rag_role'));
-    r.check('the choice is persisted', !!stored, String(stored));
+    await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' });
+    r.check('logged out, the UI shows the login page', /Log in to continue/.test(await bodyText(s.page)) && new URL(s.page.url()).pathname === '/login');
+    const { username, password } = credentialsFor('engineer');
+    await setValue(s.page, "() => document.querySelector('#login-username')", username);
+    await setValue(s.page, "() => document.querySelector('#login-password')", password);
+    await clickByText(s.page, 'Log in');
+    await s.page.waitForFunction(() => location.pathname === '/qa' && document.querySelectorAll('nav a').length > 0, { timeout: 10000 }).catch(() => {});
+    const badge = await s.page.evaluate(() => document.querySelector('nav span.bg-blue-100')?.textContent.trim());
+    r.check('logging in through the form opens /qa as the account\'s role', badge === 'AI Engineer', String(badge));
+    const cookies = await s.page.cookies();
+    const cookie = cookies.find(c => c.name === 'rag_session');
+    r.check('the session is an HttpOnly, SameSite=Strict cookie, not script-readable',
+      !!cookie && cookie.httpOnly && cookie.sameSite === 'Strict' && !(await s.page.evaluate(() => document.cookie)).includes('rag_session'));
+    r.check('nothing about the user or role is kept in browser storage',
+      await s.page.evaluate(() => sessionStorage.length === 0 && localStorage.length === 0));
     for (const p of ['/qa', '/collections', '/health', '/qa']) {
-      await s.page.goto(BASE + p, { waitUntil: 'networkidle2' }); await sleep(700);
+      await s.page.goto(BASE + p, { waitUntil: 'networkidle2' }); await sleep(500);
     }
-    const after = await s.page.evaluate(() => sessionStorage.getItem('rag_role'));
-    const navPresent = await s.page.evaluate(() => document.querySelectorAll('nav a').length > 0);
-    r.check('the role survives navigation', after === stored && navPresent);
+    r.check('the session survives navigation and reloads', await s.page.evaluate(() => document.querySelectorAll('nav a').length === 8));
+    await clickByText(s.page, 'Log out');
+    await s.page.waitForFunction(() => location.pathname === '/login', { timeout: 10000 }).catch(() => {});
+    const me = await s.page.evaluate(async () => (await fetch('/api/auth/me')).status);
+    r.check('Log out ends the session at the API and returns to the login page', me === 401 && new URL(s.page.url()).pathname === '/login', `me=${me}`);
     await s.ctx.close();
   }
 
@@ -23668,6 +26902,8 @@ ENV/
 # Runtime data. UPLOAD_DIR is the named volume ingest_uploads mounted at
 # /app/uploads, so anything here would be baked in and then hidden by the mount.
 uploads/
+# The auth_data volume (accounts and sessions, #25) is mounted the same way.
+auth_data/
 
 # OS and editor noise
 .DS_Store
@@ -24209,6 +27445,7 @@ sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).reso
 import httpx
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs
 
 
@@ -24219,7 +27456,7 @@ def child_env():
     return {**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
 
 def client():
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app,raise_app_exceptions=False),base_url='http://owned-review')
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app,raise_app_exceptions=False),headers=auth_testing.headers(base_url='http://owned-review'), base_url='http://owned-review')
 
 class PersistenceTests(unittest.TestCase):
     def setUp(self):
@@ -24243,6 +27480,7 @@ from unittest.mock import patch, AsyncMock
 from config import settings
 settings.upload_dir = sys.argv[1]
 from main import app, lifespan
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs, weaviate_client as wc, importer, packager
 async def run():
     with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), patch.object(importer, 'sweep_interrupted_imports', return_value=[]), patch.object(importer, 'sweep_stale_workdirs', return_value=[]), patch.object(packager, 'sweep_build_leftovers', return_value=[]):
@@ -24590,7 +27828,7 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         with patch.object(gs,'_save_session_sync',side_effect=OSError('Owned marker write fault')):
             self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned completed deletion'),0)
         async def request():
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as client:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned-review'), base_url='http://owned-review') as client:
                 return await client.post('/goldstandard/save',json={'session_id':self.data['session_id'],'filename':'owned-review.json'})
         response=asyncio.run(request())
         self.assertEqual(response.status_code,409,response.text)
@@ -24640,7 +27878,7 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         return sid
 
     async def fetch(self,sid):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned-review'), base_url='http://owned-review') as client:
             return await client.get('/goldstandard/session/'+sid)
 
     def test_persistent_replace_failure_ends_generation_failed(self):
@@ -24831,11 +28069,12 @@ with patch.object(gs,'_save_session_sync',side_effect=OSError('Owned marker writ
         second="""import sys,asyncio,json,httpx
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs
 settings.upload_dir=sys.argv[1]
 gs.load_sessions_from_disk()
 async def run():
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as c:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned-review'), base_url='http://owned-review') as c:
         r=await c.post('/goldstandard/save',json={'session_id':'gs_450abcde','filename':'owned-restart.json'})
         return r.status_code,r.json()
 print(json.dumps({'export':list(asyncio.run(run())),'diagnostics':gs.session_diagnostics()}))
@@ -25025,7 +28264,12 @@ import json
 import os
 import uuid
 import urllib.error
+import sys
 import urllib.request
+
+# The suite's session (#25); found beside this file however the file is loaded.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import auth_headers  # noqa: E402
 
 api = os.environ.get('RAG_API', 'http://localhost:8080/api').rstrip('/')
 collection = 'VfySettings' + uuid.uuid4().hex[:12]
@@ -25034,7 +28278,7 @@ collection = 'VfySettings' + uuid.uuid4().hex[:12]
 def request(path, body=None, method=None, raw=None, content_type='application/json'):
     data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
     req = urllib.request.Request(api + path, data=data, method=method,
-                                 headers={'Content-Type': content_type})
+                                 headers={'Content-Type': content_type, **auth_headers.headers()})
     try:
         with urllib.request.urlopen(req, timeout=60) as response:
             return response.status, json.load(response)
@@ -25434,6 +28678,7 @@ from unittest.mock import patch
 import httpx
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import exporter,goldstandard as gs,importer,weaviate_client as wc
 
 
@@ -25506,7 +28751,7 @@ with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
     with patch.object(settings,'upload_dir',str(root/'uploads')),patch.object(settings,'sources_dir',str(root/'sources')),patch.object(settings,'exports_dir',str(root/'exports')),patch.object(gs,'_sessions',{}),patch.object(wc,'_create_collection_sync',side_effect=record_create):
         async def run():
             global neighbor_created
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-fixture') as client:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned-fixture'), base_url='http://owned-fixture') as client:
                 await bounded_poll_cases()
                 assert not await asyncio.to_thread(wc._collection_exists_sync,collection),'Owned name already exists'
                 assert not await asyncio.to_thread(wc._collection_exists_sync,protected_neighbor),'Protected fixture name already exists'
@@ -25902,6 +29147,7 @@ from unittest.mock import patch
 import httpx
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs, tuning, ingest_pipeline as ingest
 from services import weaviate_client as wc
 
@@ -26016,6 +29262,7 @@ async def retained_cutover_checks(api,client,name,temp,record_create,jobs,check)
     child="""import asyncio,json,sys
 from services import weaviate_client as wc,goldstandard as gs,tuning
 from main import app,lifespan
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 expected=json.load(sys.stdin)
 async def proof():
     async with lifespan(app):
@@ -26139,7 +29386,7 @@ async def main():
             def check(condition,label):
                 nonlocal checks
                 assert condition,label; checks+=1; print('PASS '+label,flush=True)
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned') as api:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned'), base_url='http://owned') as api:
                 try:
                     await asyncio.to_thread(wc._create_collection_sync,probe,'hnsw','cosine',{})
                     try:
@@ -26703,7 +29950,7 @@ class LifecycleTests(unittest.TestCase):
         client=SimpleNamespace(collections=SimpleNamespace(get=collection,exists=lambda name:canonical(name) in backend,delete=lambda name:backend.pop(canonical(name))))
         def check(condition,label):self.assertTrue(condition,label);checks.append(label)
         async def run(directory):
-            async with ns['httpx'].AsyncClient(transport=ns['httpx'].ASGITransport(app=ns['app']),base_url='http://owned') as api:
+            async with ns['httpx'].AsyncClient(transport=ns['httpx'].ASGITransport(app=ns['app']),headers=ns['auth_testing'].headers(base_url='http://owned'), base_url='http://owned') as api:
                 await ns['collection_deletion_checks'](api,client,'OwnedVerifier',directory,check)
         from routers import collections as collections_router
         with tempfile.TemporaryDirectory() as directory,patch.object(ns['settings'],'upload_dir',directory),patch.object(ns['settings'],'sources_dir',str(Path(directory)/'sources')),patch.object(ns['gs'],'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None),patch.object(collections_router,'_REGISTRY_FILE',None),patch.object(ns['wc'],'get_client',return_value=client),patch.object(ns['wc'],'_create_collection_sync',side_effect=create):
@@ -28458,15 +31705,20 @@ import sys
 import tarfile
 import tempfile
 import time
+import os
 import urllib.request
 import uuid
+
+# The suite's session (#25); found beside this file however the file is loaded.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import auth_headers  # noqa: E402
 
 
 def run(api, collection, package):
     def request(path, body=None):
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(api.rstrip('/') + path, data=data,
-                                     headers={'Content-Type': 'application/json'})
+                                     headers={'Content-Type': 'application/json', **auth_headers.headers()})
         with urllib.request.urlopen(req, timeout=60) as response:
             return json.load(response)
 
@@ -28538,7 +31790,7 @@ if __name__ == '__main__':
 ```javascript
 // Deferred API responses against the rendered Chunking page; no backend writes.
 const assert = require('node:assert/strict');
-const { makeReporter, clickByText, setValue } = require('./lib');
+const { makeReporter, clickByText, setValue, stubAuth } = require('./lib');
 const A = { collection: 'FixtureA', chunking_strategy: 'fixed', chunk_size: 100, chunk_overlap: 0, min_chunk_size: 0, similarity_threshold: null, is_default: false };
 const B = { ...A, collection: 'FixtureB', chunk_size: 2000 };
 const path = name => '/api/ingest/config/' + name;
@@ -28548,7 +31800,6 @@ async function fixture(browser, base, { collectionsFail = false } = {}) {
   const errors = [];
   page.on('pageerror', e => errors.push(e.message));
   await page.evaluateOnNewDocument((a, b, failCollections) => {
-    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
     const realFetch = window.fetch.bind(window);
     window.chunkingFixture = { requests: [] };
     window.fetch = (input, init = {}) => {
@@ -28564,6 +31815,8 @@ async function fixture(browser, base, { collectionsFail = false } = {}) {
       return Promise.reject(new Error('Unexpected fixture request ' + path));
     };
   }, A, B, collectionsFail);
+  // The engineer, as GET /api/auth/me answers it, without a backend (#25).
+  await stubAuth(page, 'engineer');
   await page.goto(base + '/chunking', { waitUntil: 'domcontentloaded' });
   if (!collectionsFail) await pending(page, path(A.collection));
   return { ctx, page, errors };
@@ -28718,7 +31971,7 @@ if (require.main === module) (async () => {
 // Health page refreshes with every API call stubbed and held in the page (#415);
 // no backend state. Each load is driven by hand through the captured 30s refresh.
 const assert = require('node:assert/strict');
-const { makeReporter } = require('./lib');
+const { makeReporter, stubAuth } = require('./lib');
 
 const HEALTH = '/api/health', METRICS = '/api/metrics/latency';
 const UNREADABLE = 'Service health could not be read: The server sent a response the UI could not read.';
@@ -28748,7 +32001,6 @@ async function fixture(browser, base) {
   const errors = [];
   page.on('pageerror', e => errors.push(e.message));
   await page.evaluateOnNewDocument((health, metrics) => {
-    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
     const original = window.setInterval;
     window.setInterval = (fn, delay, ...args) => {
       if (delay === 30000) { window.__healthRefresh = fn; return 45003; }
@@ -28774,6 +32026,8 @@ async function fixture(browser, base) {
       return Promise.reject(new Error('Unexpected fixture request ' + path));
     };
   }, HEALTH, METRICS);
+  // The engineer, as GET /api/auth/me answers it, without a backend (#25).
+  await stubAuth(page, 'engineer');
   await page.goto(base + '/health', { waitUntil: 'domcontentloaded' });
   await requested(page, 1);
   return { ctx, page, errors };
@@ -28917,7 +32171,7 @@ if (require.main === module) (async () => {
 // page's 2 s poll delay is cut to 20 ms, so 30 failed polls take well under a
 // second.
 const assert = require('node:assert/strict');
-const { makeReporter, setValue } = require('./lib');
+const { makeReporter, setValue, stubAuth } = require('./lib');
 
 const A = 'VfyTransferA', B = 'VfyTransferB';
 const PACKAGE = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz';
@@ -28952,7 +32206,6 @@ async function fixture(browser, base, { hold = [] } = {}) {
   };
   for (const key of hold) delete fixed[key];
   await page.evaluateOnNewDocument(answers => {
-    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
     const realTimeout = window.setTimeout.bind(window);
     window.setTimeout = (fn, ms, ...args) => realTimeout(fn, ms === 2000 ? 20 : ms, ...args);
     const realFetch = window.fetch.bind(window);
@@ -28968,6 +32221,8 @@ async function fixture(browser, base, { hold = [] } = {}) {
       return new Promise(resolve => { entry.resolve = (status, body) => { entry.done = true; resolve(new Response(body, { status })); }; });
     };
   }, fixed);
+  // The engineer, as GET /api/auth/me answers it, without a backend (#25).
+  await stubAuth(page, 'engineer');
   await page.goto(base + '/transfer', { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => document.querySelectorAll('select option').length > 0 && document.body.innerText.includes('Export a collection'));
   return { ctx, page, errors };
@@ -29146,7 +32401,7 @@ if (require.main === module) (async () => {
 // the final status, failed pairs and reasons, a stopped poll, Generate and
 // Regenerate while they run, and a refused edit. Every /api/ call from the page
 // is answered here; no backend writes.
-const { sleep, setValue, clickByText, bodyText, makeReporter } = require('./lib');
+const { sleep, setValue, clickByText, bodyText, makeReporter, stubAuth } = require('./lib');
 
 const SESSION = 'gs_0393abcd';
 const NAME_RE = /^FixtureGold_\d{8}_\d{6}\.json$/;
@@ -29174,7 +32429,6 @@ async function fixture(browser, base, opts = {}) {
   page.on('pageerror', e => errors.push(e.message));
   page.on('dialog', async d => { dialogs.push(d.message()); await d.dismiss(); });
   await page.evaluateOnNewDocument(realOpen => {
-    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
     window.__opened = [];
     if (!realOpen) window.open = url => { window.__opened.push(String(url)); return null; };
   }, !!opts.realOpen);
@@ -29235,6 +32489,8 @@ async function fixture(browser, base, opts = {}) {
     }
     return json(request, 404, { error: { code: 'NOT_FOUND', message: 'Not stubbed by the fixture.' } });
   });
+  // The engineer, as GET /api/auth/me answers it, without a backend (#25).
+  await stubAuth(page, 'engineer');
   await page.goto(base + '/goldstandard', { waitUntil: 'networkidle2' });
   await sleep(300);
   return { ctx, page, activation, errors, generates, polls, patches, regenerates, dialogs };
@@ -29562,7 +32818,15 @@ async function openPage(browser, base, { role = 'engineer', routes = {}, path = 
   const errors = [], unstubbed = [], calls = [];
   page.on('pageerror', e => errors.push(e.message));
   page.on('dialog', async d => { if (onDialog) await onDialog(d); else await d.dismiss(); });
-  await page.evaluateOnNewDocument((r, fast) => {
+  // Who is logged in, as the API would say (#25): `role`, or nobody for null. A
+  // case's own routes for these paths win.
+  routes = {
+    'GET /api/auth/status': json(200, { setup_required: false }),
+    'GET /api/auth/me': role ? json(200, { username: 'vfy-' + role.replace('_', '-'), role, must_change_password: false })
+                             : apiError(401, 'AUTH_REQUIRED', 'Log in to use this.'),
+    ...routes,
+  };
+  await page.evaluateOnNewDocument(fast => {
     // FormData bodies, which the request interception cannot read back reliably.
     window.__forms = [];
     const realFetch = window.fetch.bind(window);
@@ -29570,14 +32834,12 @@ async function openPage(browser, base, { role = 'engineer', routes = {}, path = 
       if (init && init.body instanceof FormData) window.__forms.push([...init.body.entries()].map(([k, v]) => [k, typeof v === 'string' ? v : 'file:' + v.name]));
       return realFetch(input, init);
     };
-    // Seeded once: a case that signs out must stay signed out on the next load.
-    if (r && !sessionStorage.getItem('vfy_seeded')) { sessionStorage.setItem('vfy_seeded', '1'); sessionStorage.setItem('rag_role', JSON.stringify({ role: r })); }
     if (fast) {
       const si = window.setInterval.bind(window), st = window.setTimeout.bind(window);
       window.setInterval = (fn, ms, ...a) => si(fn, ms === 2000 ? 20 : ms, ...a);
       window.setTimeout = (fn, ms, ...a) => st(fn, ms === 2000 ? 20 : ms, ...a);
     }
-  }, role, fastPolls);
+  }, fastPolls);
   await page.setRequestInterception(true);
   page.on('request', async request => {
     const url = new URL(request.url());
@@ -29917,7 +33179,6 @@ function importCases() {
 
 function navigationCases() {
   const gated = ['/import', '/chunking', '/retrieval', '/goldstandard', '/transfer', '/help/transfer'];
-  const badge = { engineer: 'AI Engineer', developer: 'Developer', end_user: 'End User' };
   const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
   return [
     { name: 'Developer nav has Q&A, Import, Chunking, Retrieval, Gold Standard and Transfer, and no Collections or Health', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
@@ -29937,34 +33198,110 @@ function navigationCases() {
       await waitText(s.page, 'Export and Import');
       await waitPath(s.page, '/help/transfer');
     } },
-    { name: 'End User opening a Developer page directly is sent to Q&A (gating is client-side only until #25)', open: { role: 'end_user', path: '/qa', routes: base() }, async run(s) {
+    { name: 'End User opening a Developer page directly is sent to Q&A (the API refuses those requests too, #25)', open: { role: 'end_user', path: '/qa', routes: base() }, async run(s) {
       for (const p of [...gated, '/collections', '/health']) {
         await goto(s.page, p);
         await waitText(s.page, 'Ask a Question');
         await waitPath(s.page, '/qa');
       }
     } },
-    ...['engineer', 'developer', 'end_user'].map(role => ({ name: `Choosing ${badge[role]} on the landing page opens /qa with that role badge and stores the role`, open: { role: null, path: '/', routes: base() }, async run(s) {
-      await waitText(s.page, 'Select your role to continue');
-      assert.equal(await s.page.evaluate(label => {
-        const b = [...document.querySelectorAll('button')].find(x => x.querySelector('h2')?.textContent.trim() === label);
-        if (!b) return false; b.click(); return true;
-      }, badge[role]), true);
+  ];
+}
+
+// Login, logout, setup, password changes (#25). The API is stubbed; the real
+// login and the API's own refusals are checked in ui_criteria.js and 17_auth.sh.
+function authCases() {
+  const badge = { engineer: 'AI Engineer', developer: 'Developer', end_user: 'End User' };
+  const user = (role, over = {}) => ({ username: 'vfy-' + role.replace('_', '-'), role, must_change_password: false, ...over });
+  const loginForm = async (page, username, password) => {
+    await fill(page, '#login-username', username);
+    await fill(page, '#login-password', password);
+    await press(page, 'Log in');
+  };
+  const submit = page => press(page, 'Change password', 'form button[type=submit]');
+  return [
+    { name: 'Logged out, any page shows the login page at /login with no nav and no role picker', open: { role: null, path: '/collections', routes: base() }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await waitPath(s.page, '/login');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav').length), 0);
+      assert.equal(await bodyHas(s.page, 'Select your role'), false);
+    } },
+    ...['engineer', 'developer', 'end_user'].map(role => ({ name: `Logging in as ${badge[role]} opens /qa with the role badge and username from the API, stored nowhere in the browser`, open: { role: null, path: '/login', routes: base({ 'POST /api/auth/login': json(200, user(role)) }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await loginForm(s.page, 'VFY-User', 'a password of twelve');
       await waitPath(s.page, '/qa');
       await waitText(s.page, 'Ask a Question');
       assert.equal(await s.page.evaluate(() => document.querySelector('nav span.bg-blue-100')?.textContent.trim()), badge[role]);
-      assert.deepEqual(JSON.parse(await s.page.evaluate(() => sessionStorage.getItem('rag_role'))), { role });
+      assert.equal(await s.page.evaluate(() => document.querySelector('[data-testid=nav-username]')?.textContent.trim()), user(role).username);
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/login').map(c => c.body), [{ username: 'VFY-User', password: 'a password of twelve' }]);
+      assert.deepEqual(await s.page.evaluate(() => [Object.keys(sessionStorage), Object.keys(localStorage)]), [[], []]);
     } })),
-    { name: 'Switch Role returns to the role chooser, forgets the role, and a later /qa visit goes back to it', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
+    { name: 'A failed login shows the API\'s generic message, clears the password and stays on /login', open: { role: null, path: '/login', routes: base({ 'POST /api/auth/login': apiError(401, 'LOGIN_FAILED', 'The username or password is incorrect.') }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await loginForm(s.page, 'someone', 'wrong password!');
+      await waitText(s.page, 'The username or password is incorrect.');
+      assert.equal(await s.page.evaluate(() => document.querySelector('#login-password').value), '');
+      await waitPath(s.page, '/login');
+    } },
+    { name: 'A throttled login says to wait', open: { role: null, path: '/login', routes: base({ 'POST /api/auth/login': apiError(429, 'LOGIN_THROTTLED', 'Too many failed logins. Wait 15 minutes and try again.') }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await loginForm(s.page, 'someone', 'wrong password!');
+      await waitText(s.page, 'Wait 15 minutes');
+    } },
+    { name: 'Log out calls the API and returns to the login page', open: { role: 'developer', path: '/qa', routes: base({ 'POST /api/auth/logout': json(200, { status: 'logged_out' }) }) }, async run(s) {
       await waitText(s.page, 'Ask a Question');
-      await press(s.page, 'Switch Role');
-      await waitPath(s.page, '/');
-      await waitText(s.page, 'Select your role to continue');
-      assert.equal(await s.page.evaluate(() => sessionStorage.getItem('rag_role')), null);
+      await press(s.page, 'Log out');
+      await waitText(s.page, 'Log in to continue');
+      await waitPath(s.page, '/login');
+      assert.equal(callsTo(s, 'POST', '/api/auth/logout').length, 1);
       assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav').length), 0);
-      await goto(s.page, '/qa');
-      await waitText(s.page, 'Select your role to continue');
-      await waitPath(s.page, '/');
+    } },
+    { name: 'Before setup, every page shows how to create the first Engineer and nothing else', open: { role: null, path: '/qa', routes: base({ 'GET /api/auth/status': json(200, { setup_required: true }) }) }, async run(s) {
+      await waitText(s.page, 'Not set up yet');
+      await waitText(s.page, 'docker compose exec api python -m auth bootstrap <username>');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav, form').length), 0);
+      assert.equal(callsTo(s, 'GET', '/api/auth/me').length, 0);
+    } },
+    { name: 'A due password change shows only the password page; a mismatch is caught before sending; the change opens /qa', open: { role: null, path: '/collections', routes: base({
+      'GET /api/auth/me': json(200, user('developer', { must_change_password: true })),
+      'POST /api/auth/password': json(200, { status: 'changed', ...user('developer') }),
+    }) }, async run(s) {
+      await waitPath(s.page, '/account/password');
+      await waitText(s.page, 'password was generated for you');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav').length), 0);
+      await fill(s.page, '#current-password', 'generated-one');
+      await fill(s.page, '#new-password', 'my new password');
+      await fill(s.page, '#confirm-password', 'my new passwor');
+      await submit(s.page);
+      await waitText(s.page, 'The new passwords do not match.');
+      assert.equal(callsTo(s, 'POST', '/api/auth/password').length, 0);
+      await fill(s.page, '#confirm-password', 'my new password');
+      await submit(s.page);
+      await waitPath(s.page, '/qa');
+      await waitText(s.page, 'Ask a Question');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/password').map(c => c.body), [{ current_password: 'generated-one', new_password: 'my new password' }]);
+    } },
+    { name: 'Change password in the nav opens the form; the API\'s rule message is shown; success says other sessions ended', open: { role: 'end_user', path: '/qa', routes: base({
+      'POST /api/auth/password': call => call.body.new_password === 'short' ? apiError(422, 'INVALID_PASSWORD', 'The password must be at least 12 characters.') : json(200, { status: 'changed', ...user('end_user') }),
+    }) }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      await press(s.page, 'Change password');
+      await waitPath(s.page, '/account/password');
+      for (const [id, v] of [['#current-password', 'the old one!'], ['#new-password', 'short'], ['#confirm-password', 'short']]) await fill(s.page, id, v);
+      await submit(s.page);
+      await waitText(s.page, 'at least 12 characters');
+      for (const [id, v] of [['#new-password', 'long enough now'], ['#confirm-password', 'long enough now']]) await fill(s.page, id, v);
+      await submit(s.page);
+      await waitText(s.page, 'Your other sessions were logged out.');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav').length), 1);
+    } },
+    { name: 'An API answer 401 AUTH_REQUIRED on any page returns to the login page', open: { role: 'engineer', path: '/collections', routes: base({ 'GET /api/collections': apiError(401, 'AUTH_REQUIRED', 'Log in to use this.') }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await waitPath(s.page, '/login');
+    } },
+    { name: 'An API answer 403 PASSWORD_CHANGE_REQUIRED returns to the password page', open: { role: 'engineer', path: '/collections', routes: base({ 'GET /api/collections': apiError(403, 'PASSWORD_CHANGE_REQUIRED', 'Change your password before doing anything else.') }) }, async run(s) {
+      await waitPath(s.page, '/account/password');
+      await waitText(s.page, 'password was generated for you');
     } },
   ];
 }
@@ -30161,7 +33498,8 @@ async function runUiControlTests(browser, baseUrl, reporter) {
   const run = (section, cases) => S.runCases(browser, baseUrl, reporter, section, cases);
   await run('Collections table and create modal (#400)', collectionsCases());
   await run('Import queue, sliders and "+ New" modal (#400)', importCases());
-  await run('Navigation, roles and redirects; gating is client-side only until #25 (#400)', navigationCases());
+  await run('Navigation, roles and redirects (#400); the API enforces the roles (#25)', navigationCases());
+  await run('Login, logout, setup and password changes (#25)', authCases());
   await run('Q&A input, citations toggle, answer display and End User view (#400)', qaCases());
   await run('Retrieval page status text, alpha slider and save (#400)', retrievalCases());
   await run('Client handling of the proxy error pages (#400)', proxyCases());
@@ -30789,7 +34127,12 @@ import sys
 import tarfile
 import tempfile
 import time
+import os
 import urllib.request
+
+# The suite's session (#25); found beside this file however the file is loaded.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import auth_headers  # noqa: E402
 
 WARNING = ("saved retrieval setting ef={} is outside 16-512 and was exported as null; "
            "ef is no longer used. Save this collection's settings on the Retrieval "
@@ -30805,7 +34148,7 @@ def run(api, collection, exports, repo_root):
     def request(path, body=None):
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(api.rstrip('/') + path, data=data,
-                                     headers={'Content-Type': 'application/json'})
+                                     headers={'Content-Type': 'application/json', **auth_headers.headers()})
         with urllib.request.urlopen(req, timeout=60) as response:
             return json.load(response)
 
@@ -30918,7 +34261,8 @@ def run(api, collection, exports, repo_root):
     finally:
         if renamed:
             urllib.request.urlopen(urllib.request.Request(
-                api.rstrip('/') + f'/collections/{renamed}?confirm=true', method='DELETE'),
+                api.rstrip('/') + f'/collections/{renamed}?confirm=true', method='DELETE',
+                headers=auth_headers.headers()),
                 timeout=120).read()
         request('/retrieval/config', saved)
     print(f'{len(failures)} legacy/invalid retrieval settings check(s) failed')
@@ -31159,7 +34503,7 @@ ENUMS = {
 SPAN_NAMES = frozenset("rag." + v for v in ENUMS["rag.operation"])
 
 # Explicit code-owned vocabulary. Raw URL/path values never enter this schema.
-ROUTES = frozenset(('DELETE /collections/{name}', 'GET /collections', 'GET /export/job/{job_id}', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /metrics/latency', 'GET /packages', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
+ROUTES = frozenset(('DELETE /collections/{name}', 'GET /auth/me', 'GET /auth/status', 'GET /collections', 'GET /export/job/{job_id}', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /metrics/latency', 'GET /packages', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/logout', 'POST /auth/password', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
 ENUMS.update({"http.route": ROUTES | {"unmatched"},
               "rag.tuning_operation": frozenset(("rechunk", "reembed", "reindex")),
               "http.status_class": frozenset(("1xx", "2xx", "3xx", "4xx", "5xx"))})
@@ -34887,8 +38231,13 @@ import runpy
 import threading
 import subprocess
 import time
+import sys
 import urllib.request
 import uuid
+
+# The suite's session (#25); found beside this file however the file is loaded.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import auth_headers  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 API = os.environ.get('RAG_API', '')
@@ -35013,8 +38362,11 @@ def sink(path, post=False):
 def request(path, body=None, headers=None, method=None):
     owner()
     data = json.dumps(body).encode() if body is not None else None
+    session = auth_headers.headers()
+    # The sentinel cookie beside the real session: neither may be exported.
+    cookie = '; '.join(c for c in ('session='+SENTINELS[0], session.get('Cookie')) if c)
     h = {'Content-Type': 'application/json', 'Authorization': 'Bearer '+SENTINELS[0],
-         'Cookie': 'session='+SENTINELS[0], **(headers or {})}
+         **session, 'Cookie': cookie, **(headers or {})}
     with urllib.request.urlopen(urllib.request.Request(API+path, data=data, headers=h, method=method),
                                 timeout=600) as response:
         return json.load(response)
@@ -35037,7 +38389,7 @@ def upload(collection):
     chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="files"; filename="{SENTINELS[2]}.txt"\r\nContent-Type: text/plain\r\n\r\nManagers approve overtime. {SENTINELS[1]}. Synthetic path /private/{SENTINELS[3]}. The policy requires approval before work.\r\n--{boundary}--\r\n')
     data = ''.join(chunks).encode()
     with urllib.request.urlopen(urllib.request.Request(API+'/ingest/upload', data=data,
-            headers={**h, 'Content-Type': 'multipart/form-data; boundary='+boundary,
+            headers={**h, **auth_headers.headers(), 'Content-Type': 'multipart/form-data; boundary='+boundary,
                      'Authorization': 'Bearer '+SENTINELS[0]}), timeout=120) as r:
         job = json.load(r)['job_id']
     wait_job('/ingest/job/'+job)
@@ -35111,6 +38463,8 @@ def inspect_records(snapshot, requests):
     assert snapshot['overflow'] == 0, 'capture overflow: inspection incomplete'
     wire = json.dumps(snapshot)
     assert all(s not in wire for s in SENTINELS), 'content/credential sentinel exported'
+    token = auth_headers.session_token(os.environ.get('RAG_AUTH_JAR', ''))
+    assert not token or token not in wire, 'the session cookie was exported'
     spans, logs, metrics = (records(snapshot, s) for s in ('traces', 'logs', 'metrics'))
     identities = [(span['trace_id'], span['span_id']) for span in spans]
     assert len(set(identities)) == len(identities), 'duplicate received span identity'

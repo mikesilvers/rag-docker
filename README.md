@@ -11,7 +11,7 @@ A self-contained, Dockerized Retrieval-Augmented Generation (RAG) platform. Uplo
 | Vector store | Weaviate 1.39.6 | Stores and retrieves document chunks |
 | LLM + embeddings | Ollama 0.3.14 | Runs phi3.5 (chat) and nomic-embed-text (embeddings) locally |
 | API | FastAPI + Python 3.11 | RAG pipeline, ingest, gold standard generation |
-| UI | React 18 + Vite + Tailwind | Three-role web interface |
+| UI | React 18 + Vite + Tailwind | Web interface with login and three roles |
 | Proxy | nginx 1.29 | Routes traffic; listens on port 80 in-container, published on host port 8080 |
 
 ## Prerequisites
@@ -21,7 +21,7 @@ A self-contained, Dockerized Retrieval-Augmented Generation (RAG) platform. Uplo
 - **20 GB disk minimum allocated to Docker, 32 GB recommended** — see [Storage requirements](#storage-requirements) below. Check your current limit before building — a small virtual disk (8 GB or so) cannot hold this stack, and the build fails partway through with a confusing error.
 - Port **8080** free on the host — `docker-compose.yml` publishes the proxy as `127.0.0.1:8080:80`, bound to host loopback on supported engines
 
-Check the daemon version with `docker version --format '{{.Server.Version}}'`. Docker documents that engines older than 28.0.0 allow same-network hosts to reach localhost-published ports; upgrade the engine before using this unauthenticated workbench. See [Docker port publishing](https://docs.docker.com/engine/network/port-publishing/#publishing-ports). This default assumes Docker's standard bridge/NAT configuration; custom direct-routing settings are outside this local profile.
+Check the daemon version with `docker version --format '{{.Server.Version}}'`. Docker documents that engines older than 28.0.0 allow same-network hosts to reach localhost-published ports; upgrade the engine before using this local workbench. See [Docker port publishing](https://docs.docker.com/engine/network/port-publishing/#publishing-ports). This default assumes Docker's standard bridge/NAT configuration; custom direct-routing settings are outside this local profile.
 
 No API keys, no cloud accounts, no Python or Node installs required on your machine.
 
@@ -71,7 +71,10 @@ docker compose up -d
 # 3. Watch Ollama download the models (first run only — ~5 minutes)
 docker compose logs -f ollama
 
-# 4. Open the UI once all services are healthy
+# 4. Create the first AI Engineer (first start only); it prints a one-time password
+docker compose exec api python -m auth bootstrap <username>
+
+# 5. Open the UI once all services are healthy, log in and choose a new password
 open http://localhost:8080       # macOS
 # or visit http://localhost:8080 in your browser
 ```
@@ -98,21 +101,113 @@ so the model wait begins several minutes in — the stack is not stuck.
 
 On subsequent starts everything is immediate: the images are built and the model weights are cached in the `ollama_models` Docker volume.
 
-## Roles
+## Accounts and roles
 
-The landing page asks you to choose a role. Role is stored in `sessionStorage` and persists across page refreshes within the same browser tab.
+Everyone logs in with their own account, and each account has one role (#25).
+The API enforces the role on every request; the UI only hides what the role
+can't use.
 
 | Role | Access |
 |---|---|
 | **End User** | Q&A only |
-| **Developer** | Q&A, Import, Chunking, Retrieval, Gold Standard |
-| **AI Engineer** | All of the above + Collections management + Health dashboard |
+| **Developer** | Q&A, Import, Chunking, Retrieval, Gold Standard, Transfer |
+| **AI Engineer** | All of the above + Collections management (deleting collections) + Health dashboard + tuning |
+
+Endpoint by endpoint (paths under `/api`):
+
+| Needs | Endpoints |
+|---|---|
+| nothing | `GET /health`, `GET /auth/status`, `POST /auth/login` |
+| any logged-in user | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password` |
+| End User | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
+| Developer | creating a collection; ingest (upload, job status, settings); saving retrieval settings; gold standard (generate, sessions, pairs, regenerate, save, download); export, import, their job status, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
+| AI Engineer | `DELETE /collections/{name}`; `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/job/{id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; the API docs (`/docs`, `/redoc`, `/openapi.json`) |
+
+Without a session the API answers `401 AUTH_REQUIRED`; with a role that is too
+low, `403 FORBIDDEN`. Jobs and gold-standard sessions belong to no particular
+user: anyone with the role may poll or open them.
+
+### Managing accounts
+
+Accounts are created and recovered by an operator, on the machine running the
+stack, with the `python -m auth` command in the api container. There is no
+self-registration and no email recovery.
+
+```bash
+docker compose exec api python -m auth bootstrap <username>          # the first AI Engineer, once
+docker compose exec api python -m auth create-user <username> <role> # end_user, developer or engineer
+docker compose exec api python -m auth reset-password <username>
+docker compose exec api python -m auth set-role <username> <role>
+docker compose exec api python -m auth disable <username>
+docker compose exec api python -m auth enable <username>
+docker compose exec api python -m auth list
+```
+
+`bootstrap`, `create-user` and `reset-password` print a generated password once,
+on the terminal only; it is never logged. The user must change it at their
+first login, from the page the UI shows them. Usernames are 3-32 characters of
+lowercase letters, digits, `.`, `_` and `-` (case doesn't matter); passwords are
+12-256 characters and not the username. Passwords are stored only as scrypt
+hashes. The last enabled AI Engineer can't be disabled or demoted; if you are
+locked out, `create-user`, `enable` or `reset-password` gets you back in.
+Disabling a user or resetting their password ends their sessions at once; a
+role change applies to their next request.
+
+### Sessions
+
+The browser keeps the session in an HttpOnly, `SameSite=Strict` cookie, which
+page scripts can't read. A session ends after 12 hours without a request or 7
+days after login, and survives an API restart and closing the browser. Five
+failed logins for a username from one address within 15 minutes lock that pair
+out for 15 minutes; every failure answers the same `LOGIN_FAILED`, whether or
+not the account exists. A change (POST, PATCH, DELETE) sent with the cookie must
+come from this same origin, or it is refused `403 CROSS_ORIGIN_REFUSED`. Each
+login, success or failure, is one line in `docker compose logs api`, with the
+username and address and never the password.
+
+### Calling the API from the command line
+
+Log in once with a cookie jar only you can read, then send the jar, and an
+`Origin` header for changes, with every request:
+
+```bash
+umask 077
+read -rs -p 'Password: ' RAG_PW; echo
+# printf is a shell builtin, so the password never appears in the process list.
+# (A password containing " or \ needs JSON escaping.)
+printf '{"username": "alice", "password": "%s"}' "$RAG_PW" \
+  | curl -s -c ~/.rag-session -H 'Content-Type: application/json' --data-binary @- \
+      http://localhost:8080/api/auth/login
+unset RAG_PW
+
+curl -b ~/.rag-session http://localhost:8080/api/collections
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/auth/logout
+```
+
+The curl examples below assume you are logged in this way. `GET /health` needs
+no session.
+
+### Upgrading from the role picker
+
+Before #25 the landing page let anyone pick a role and the API checked nothing.
+After upgrading, the API refuses everything but `/health` until an operator
+runs `docker compose exec api python -m auth bootstrap <username>`; until then
+the UI shows that command. Then create an account for each person with
+`create-user`. The role picker and the "Switch Role" button are gone, and
+nothing about the role is kept in the browser. Accounts live in the new
+`auth_data` volume.
+
+A package's `retrieve.py` now logs in: `python3 retrieve.py --username alice
+"question"` asks for the password (or reads it with `--password-stdin`). A
+`retrieve.py` from a package exported before this change sends no login, so the
+API refuses it with `AUTH_REQUIRED`; export the collection again for one that
+logs in.
 
 ## Workflow
 
 ### 1. Create a collection
 
-**AI Engineers** can manage collections from the dedicated **Collections** page. **Developers** can create a collection inline from the Import page using the **+ New** button next to the collection selector.
+**AI Engineers** can manage collections, including deleting them, from the dedicated **Collections** page. **Developers** can create a collection inline from the Import page using the **+ New** button next to the collection selector.
 
 A collection is a named vector index that holds chunks from one or more documents. Choose HNSW (approximate, fast) or Flat (exact, slower at scale).
 
@@ -245,6 +340,8 @@ All API settings are environment variables in `docker-compose.yml`:
 | `MAX_ZIP_EXPANDED_BYTES` | `2147483648` (2 GiB) | The most one upload's ZIPs may expand to in all, gzipped members' output included. Over it the upload is refused with `ARCHIVE_TOO_LARGE` |
 | `MAX_ZIP_MEMBERS` | `5000` | The most entries one ZIP may hold, folders included. Over it the upload is refused with `ARCHIVE_TOO_MANY_MEMBERS` |
 | `MAX_ZIP_MEMBER_RATIO` | `200` | The most a ZIP member of 1 MiB or more may expand relative to its compressed size. Over it the upload is refused with `ARCHIVE_RATIO_TOO_HIGH` |
+| `AUTH_COOKIE_SECURE` | `false` | Marks the session cookie `Secure`. Exactly `true` or `false`; anything else stops the API. Leave it `false` for the loopback HTTP profile, where a Secure cookie would never be sent back; turn it on only when the stack is served over TLS (#26) |
+| `AUTH_DIR` | `/app/auth_data` | Container path of the accounts store, the `auth_data` volume |
 
 To swap the LLM (e.g. to `llama3.2`), update `LLM_MODEL` in `docker-compose.yml` and add the model name to `ollama/entrypoint.sh`.
 
@@ -259,7 +356,7 @@ docker compose up -d --force-recreate ui proxy
 
 ## Data persistence
 
-Four named Docker volumes persist data across restarts:
+Five named Docker volumes persist data across restarts:
 
 | Volume | Contents |
 |---|---|
@@ -267,6 +364,7 @@ Four named Docker volumes persist data across restarts:
 | `ollama_models` | Downloaded model weights |
 | `ingest_uploads` | Ingest configs, gold standard sessions, exported gold-standard JSON files (`goldstandard_exports/`), metrics ring buffer (`metrics.jsonl`, bounded to 1,000 lines) |
 | `rag_sources` | Original uploaded documents, content-addressed per collection. Grows with your corpus |
+| `auth_data` | Accounts, password hashes, sessions and the login throttle (`auth.db`, SQLite, #25) |
 
 Run `docker compose down -v` to delete all volumes and start fresh.
 
@@ -321,15 +419,15 @@ the originals were retained) the source documents themselves.
 
 ```bash
 # start an export
-curl -X POST http://localhost:8080/api/export \
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/export \
   -H 'Content-Type: application/json' \
   -d '{"collection": "Policies"}'
 
 # poll it
-curl http://localhost:8080/api/export/job/<job_id>
+curl -b ~/.rag-session http://localhost:8080/api/export/job/<job_id>
 
 # list what is in ./exports
-curl http://localhost:8080/api/packages
+curl -b ~/.rag-session http://localhost:8080/api/packages
 ```
 
 The package lands in `./exports/` on the host, named
@@ -358,11 +456,11 @@ are never included when you package the project with `package.sh` or
 To import one, drop the `.tar.gz` into `./exports/` on the target machine and:
 
 ```bash
-curl -X POST http://localhost:8080/api/import \
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/import \
   -H 'Content-Type: application/json' \
   -d '{"filename": "ragpkg-policies-...tar.gz", "on_conflict": "abort"}'
 
-curl http://localhost:8080/api/import/job/<job_id>
+curl -b ~/.rag-session http://localhost:8080/api/import/job/<job_id>
 ```
 
 `on_conflict` is required and has no default, because the wrong choice can
@@ -400,7 +498,7 @@ meaningless rather than merely different. For a machine that has never pulled
 anything, export with the models included:
 
 ```bash
-curl -X POST http://localhost:8080/api/export \
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/export \
   -H 'Content-Type: application/json' \
   -d '{"collection": "Policies", "include_models": true}'
 ```
@@ -420,16 +518,16 @@ Once a collection is in, it can be rebuilt in place:
 
 ```bash
 # re-split the original documents differently (needs with-sources)
-curl -X POST http://localhost:8080/api/tune/rechunk \
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/tune/rechunk \
   -H 'Content-Type: application/json' \
   -d '{"collection": "Policies", "chunking_strategy": "fixed", "chunk_size": 600}'
 
 # regenerate vectors, leaving chunk boundaries alone
-curl -X POST http://localhost:8080/api/tune/reembed -d '{"collection": "Policies"}' \
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/tune/reembed -d '{"collection": "Policies"}' \
   -H 'Content-Type: application/json'
 
 # switch index type or distance metric, reusing the existing vectors
-curl -X POST http://localhost:8080/api/tune/reindex \
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/tune/reindex \
   -H 'Content-Type: application/json' \
   -d '{"collection": "Policies", "index_type": "flat", "distance_metric": "cosine"}'
 ```
@@ -735,15 +833,15 @@ Raise it in **Docker Desktop → Settings → Resources → Memory**, then resta
 | reference `mydocs` | **404 `COLLECTION_NOT_FOUND`** — interior case must match |
 | reference `MYDOCS` | **404 `COLLECTION_NOT_FOUND`** |
 
-So a lowercase first letter is fine, but `mydocs` will not find `MyDocs`. The API applies the same rule to every collection name it receives, so the collection's settings, retained originals, gold-standard sessions and query metrics are all kept under `MyDocs` whichever of the two spellings you use (#372). State saved under a lowercase-first spelling before that change is not migrated: re-ingest the documents and save the settings again to put them under the stored name. If you get a 404 for a collection you are sure exists, run `curl http://localhost:8080/api/collections` and copy the name exactly as listed.
+So a lowercase first letter is fine, but `mydocs` will not find `MyDocs`. The API applies the same rule to every collection name it receives, so the collection's settings, retained originals, gold-standard sessions and query metrics are all kept under `MyDocs` whichever of the two spellings you use (#372). State saved under a lowercase-first spelling before that change is not migrated: re-ingest the documents and save the settings again to put them under the stored name. If you get a 404 for a collection you are sure exists, run `curl -b ~/.rag-session http://localhost:8080/api/collections` (logged in as in "Calling the API from the command line") and copy the name exactly as listed.
 
 To check the behaviour yourself without waiting on the LLM, use the ingest endpoint — it validates the collection name and returns immediately:
 
 ```bash
-curl -s -X POST http://localhost:8080/api/collections \
+curl -s -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/collections \
   -H 'Content-Type: application/json' -d '{"name":"myDocs"}'
-curl -s http://localhost:8080/api/collections      # -> "MyDocs"
-curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/api/ingest/upload \
+curl -s -b ~/.rag-session http://localhost:8080/api/collections      # -> "MyDocs"
+curl -s -b ~/.rag-session -H 'Origin: http://localhost:8080' -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/api/ingest/upload \
   -F 'collection=mydocs' -F 'files=@/dev/null;type=text/plain'   # -> 404
 ```
 

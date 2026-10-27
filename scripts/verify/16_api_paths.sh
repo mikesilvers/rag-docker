@@ -206,6 +206,8 @@ ENDPY
       check "a first start from empty volumes brings every service healthy within 300s (took ${took}s)" $? \
         "$([ "$up_ok" = 0 ] || printf 'not healthy after 600s')"
       wait_healthy_timed "$(python3 -c "import time;print(time.time())")" 60 > /dev/null
+      # The accounts went with their volume too (#25): set the project up again.
+      auth_ensure
       # It started from nothing: the collection made above is gone with its volume.
       check_eq "that first start began with no collections" \
         "$(api_get "/collections" | jfield "['collections']")" "[]"

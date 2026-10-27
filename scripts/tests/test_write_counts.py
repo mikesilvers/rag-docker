@@ -24,6 +24,7 @@ import httpx
 
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import batch_write, ingest_pipeline
 from services import weaviate_client as wc
 
@@ -240,7 +241,7 @@ class StatusRouteTests(TempUploadDir):
     def get(self, job_id):
         async def run():
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
-                                         base_url="http://owned") as api:
+                                         headers=auth_testing.headers(base_url="http://owned"), base_url="http://owned") as api:
                 return await api.get(f"/ingest/job/{job_id}")
         return asyncio.run(run())
 

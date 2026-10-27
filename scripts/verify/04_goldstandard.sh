@@ -158,8 +158,10 @@ fi
 # ── export filtering, schema and filename ────────────────────────────────────
 python3 - "$SID" "$API" <<'ENDPY'
 import json, sys, urllib.request
+import auth_headers  # the suite's session (#25); this runs from scripts/verify
 sid, api = sys.argv[1], sys.argv[2]
-pairs = json.load(urllib.request.urlopen(f"{api}/goldstandard/session/{sid}"))['pairs']
+pairs = json.load(urllib.request.urlopen(urllib.request.Request(
+    f"{api}/goldstandard/session/{sid}", headers=auth_headers.headers())))['pairs']
 plan = ["approved", "edited", "rejected", "pending", "approved"]
 for pair, status in zip(pairs, plan):
     body = {"status": status}
@@ -168,7 +170,7 @@ for pair, status in zip(pairs, plan):
     req = urllib.request.Request(
         f"{api}/goldstandard/session/{sid}/pair/{pair['pair_id']}",
         data=json.dumps(body).encode(), method="PATCH",
-        headers={"Content-Type": "application/json"})
+        headers={"Content-Type": "application/json", **auth_headers.headers()})
     urllib.request.urlopen(req)
 ENDPY
 api_post "/goldstandard/save" "{\"session_id\":\"$SID\"}" > /tmp/vfy_save.json

@@ -36,6 +36,7 @@ from fastapi.testclient import TestClient
 
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import collection_writes, ingest_pipeline, metrics, ollama_client
 from services import rag_pipeline, retrieval_config, system_info
 from services import weaviate_client as wc
@@ -69,7 +70,7 @@ class ApiTestCase(unittest.TestCase):
             patcher = patch.object(target, attribute, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        self.client = TestClient(app, raise_server_exceptions=False)
+        self.client = TestClient(app, headers=auth_testing.headers(), raise_server_exceptions=False)
         self.addCleanup(self.client.close)
 
     def assert_error(self, response, status, code, message=None):

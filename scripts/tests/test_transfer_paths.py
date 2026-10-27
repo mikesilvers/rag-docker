@@ -34,6 +34,7 @@ from fastapi.testclient import TestClient
 
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import collection_writes, exporter, importer, metrics, ollama_client, packager
 from services import rag_pipeline, sources, tuning
 from services import weaviate_client as wc
@@ -43,7 +44,7 @@ WAIT = 10.0
 
 
 def asgi_client():
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://owned")
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), headers=auth_testing.headers(base_url="http://owned"), base_url="http://owned")
 
 
 async def until(condition, what):
@@ -70,7 +71,7 @@ class RouteTestCase(unittest.TestCase):
             stack.enter_context(change)
         (self.root / "uploads").mkdir()
         self.stack = stack
-        self.client = TestClient(app, raise_server_exceptions=False)    # no lifespan
+        self.client = TestClient(app, headers=auth_testing.headers(), raise_server_exceptions=False)    # no lifespan
         self.addCleanup(self.client.close)
 
     def assert_error(self, response, status, code, message=None, detail=None):

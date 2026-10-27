@@ -5,7 +5,7 @@
 // chunking-strategy selector, `input[type=text]` missed an input with no type
 // attribute, and a row's delete link matched a class test meant for the modal's
 // confirm button.
-const { sleep, makeReporter, launch, session, bodyText, setValue, clickByText } = require('./lib');
+const { sleep, makeReporter, launch, session, credentialsFor, bodyText, setValue, clickByText } = require('./lib');
 
 const BASE = process.env.RAG_UI_BASE || 'http://proxy';
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic'];
@@ -27,25 +27,33 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
 
   await require('./ui_pages').runUiPageTests(browser, BASE, r);
 
-  // ── role persistence ───────────────────────────────────────────────────────
-  r.section('§10.4 role selection');
+  // ── login, persistence and logout against the real API (#25) ─────────────
+  r.section('§10.4 login and session');
   {
     const s = await session(browser, BASE, null);
-    await s.page.goto(BASE + '/', { waitUntil: 'networkidle2' });
-    await sleep(1200);
-    const picked = await s.page.evaluate(() => {
-      const b = [...document.querySelectorAll('button')].find(x => /Engineer/i.test(x.textContent));
-      if (!b) return false; b.click(); return true;
-    });
-    r.check('a role can be chosen on the landing page', picked);
-    const stored = await s.page.evaluate(() => sessionStorage.getItem('rag_role'));
-    r.check('the choice is persisted', !!stored, String(stored));
+    await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' });
+    r.check('logged out, the UI shows the login page', /Log in to continue/.test(await bodyText(s.page)) && new URL(s.page.url()).pathname === '/login');
+    const { username, password } = credentialsFor('engineer');
+    await setValue(s.page, "() => document.querySelector('#login-username')", username);
+    await setValue(s.page, "() => document.querySelector('#login-password')", password);
+    await clickByText(s.page, 'Log in');
+    await s.page.waitForFunction(() => location.pathname === '/qa' && document.querySelectorAll('nav a').length > 0, { timeout: 10000 }).catch(() => {});
+    const badge = await s.page.evaluate(() => document.querySelector('nav span.bg-blue-100')?.textContent.trim());
+    r.check('logging in through the form opens /qa as the account\'s role', badge === 'AI Engineer', String(badge));
+    const cookies = await s.page.cookies();
+    const cookie = cookies.find(c => c.name === 'rag_session');
+    r.check('the session is an HttpOnly, SameSite=Strict cookie, not script-readable',
+      !!cookie && cookie.httpOnly && cookie.sameSite === 'Strict' && !(await s.page.evaluate(() => document.cookie)).includes('rag_session'));
+    r.check('nothing about the user or role is kept in browser storage',
+      await s.page.evaluate(() => sessionStorage.length === 0 && localStorage.length === 0));
     for (const p of ['/qa', '/collections', '/health', '/qa']) {
-      await s.page.goto(BASE + p, { waitUntil: 'networkidle2' }); await sleep(700);
+      await s.page.goto(BASE + p, { waitUntil: 'networkidle2' }); await sleep(500);
     }
-    const after = await s.page.evaluate(() => sessionStorage.getItem('rag_role'));
-    const navPresent = await s.page.evaluate(() => document.querySelectorAll('nav a').length > 0);
-    r.check('the role survives navigation', after === stored && navPresent);
+    r.check('the session survives navigation and reloads', await s.page.evaluate(() => document.querySelectorAll('nav a').length === 8));
+    await clickByText(s.page, 'Log out');
+    await s.page.waitForFunction(() => location.pathname === '/login', { timeout: 10000 }).catch(() => {});
+    const me = await s.page.evaluate(async () => (await fetch('/api/auth/me')).status);
+    r.check('Log out ends the session at the API and returns to the login page', me === 401 && new URL(s.page.url()).pathname === '/login', `me=${me}`);
     await s.ctx.close();
   }
 

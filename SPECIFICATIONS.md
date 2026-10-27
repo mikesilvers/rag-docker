@@ -125,8 +125,14 @@ services:
       # upload is refused (#28).
       MAX_ZIP_MEMBERS: 5000
       MAX_ZIP_MEMBER_RATIO: 200
+      # Marks the session cookie Secure (#25). false for this loopback HTTP
+      # profile, where a Secure cookie would never be sent back; set true only
+      # when the stack is served over TLS (#26). Exactly true or false.
+      AUTH_COOKIE_SECURE: "false"
     volumes:
       - ingest_uploads:/app/uploads
+      # Accounts, sessions and the login throttle (#25), one SQLite file.
+      - auth_data:/app/auth_data
       # Retained source documents; grows with the corpus.
       - rag_sources:/app/sources
       # Bind mount, deliberately: an export is only useful if the user can
@@ -158,7 +164,7 @@ services:
   proxy:
     image: nginx:1.29-alpine
     ports:
-      # This unauthenticated workbench is local to the host by default.
+      # The workbench is local to the host by default; LAN exposure is #26.
       - "127.0.0.1:8080:80"
     volumes:
       - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
@@ -180,6 +186,7 @@ volumes:
   ollama_models:
   ingest_uploads:
   rag_sources:
+  auth_data:
 
 networks:
   rag-internal:
@@ -192,7 +199,7 @@ networks:
 
 | Path prefix | Routes to | Notes |
 |---|---|---|
-| `/api/` | `http://api:8000/` | Strip `/api` prefix |
+| `/api/` | `http://api:8000/` | Strip `/api` prefix. Forwards the browser's `Host` with its port (`$http_host`), which the API compares with `Origin` (§3.1.8), and the client address as `X-Real-IP` |
 | `/` | `http://ui:3000/` | SPA fallback to `index.html` |
 
 ### 2.3 Model Initialization
@@ -1320,6 +1327,79 @@ objects as the aggregate stat row.
 
 ---
 
+#### 3.1.8 Authentication and the endpoint/role matrix (#25)
+
+Every route needs an account, except `GET /health` (unchanged, for container healthchecks), `GET /auth/status`
+and `POST /auth/login`. Roles are ordered `end_user` < `developer` < `engineer`; a role may do everything a lower
+one may. The role of a request is the one stored for its user at that moment, never anything the client sends.
+
+| Needs | Routes |
+|---|---|
+| nothing | `GET /health`, `GET /auth/status`, `POST /auth/login` |
+| any session (also one with a password change due) | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password` |
+| `end_user` | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
+| `developer` | `POST /collections`; `POST /ingest/upload`, `GET /ingest/job/{job_id}`, `GET /ingest/config/{collection}`, `POST /ingest/config`; `POST /retrieval/config`; `POST /goldstandard/generate`, `GET /goldstandard/session/{session_id}`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST /goldstandard/save`, `GET /goldstandard/download/{filename}`; `POST /export`, `GET /export/job/{job_id}`, `POST /import`, `GET /import/job/{job_id}`, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
+| `engineer` | `DELETE /collections/{name}`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json` |
+
+The matrix is one table in `api/auth/policy.py`. A route without an entry is refused for everyone (`403
+FORBIDDEN`), and a registered check fails when a route lacks an entry or an entry names no route. Jobs and
+gold-standard sessions have no owner: any user with the route's role may poll or open them. A path that matches
+no route keeps `404 NOT_FOUND`, and a wrong method `405 METHOD_NOT_ALLOWED`. The check runs before the route reads
+the request body, so a refused upload is never received.
+
+**Refusals**, the first that applies answering: `503 SETUP_REQUIRED` (no account exists yet); `401
+AUTH_REQUIRED` (no valid session); `403 CROSS_ORIGIN_REFUSED` (a cookie-authenticated `POST`, `PUT`, `PATCH` or
+`DELETE` whose `Origin` names another host or port than its `Host`, or that has no `Origin` and no `Sec-Fetch-Site:
+same-origin`); `403 PASSWORD_CHANGE_REQUIRED` (a generated password is due for change; only the session routes
+answer); `403 FORBIDDEN` (the role is too low; `detail: {"required_role": ...}`). The API has no CORS middleware
+and sends no `Access-Control-*` headers.
+
+**Accounts.** Usernames are 3-32 characters of lowercase letters, digits, `.`, `_` and `-`; input is lowercased,
+so they are case-insensitive. Passwords are 12-256 characters and not the username (ignoring case); no
+composition rules. They are stored only as `scrypt$<log2 n>$<r>$<p>$<salt>$<hash>` with n = 2^15, r = 8, p = 1
+and a random 16-byte salt. Accounts are created and changed only by the operator command (below).
+
+**Sessions.** Server-side, in the SQLite file `auth.db` in `AUTH_DIR` (the `auth_data` volume), with accounts
+and the login throttle, so all survive an API restart. The cookie `rag_session` holds a random 256-bit token; the
+store keeps its SHA-256. Cookie attributes: `HttpOnly`, `SameSite=Strict`, `Path=/`, `Max-Age=604800` (it
+survives closing the browser), and `Secure` when `AUTH_COOKIE_SECURE=true`. A session ends after 12 hours without
+a request or 7 days after login, whichever is first; an ended session is deleted. Every request re-reads the
+user: a role change applies to the next request; disabling an account, resetting its password and logging out
+delete its sessions.
+
+**Login throttling.** Failed logins are counted per (username as typed, lowercased; client address, `X-Real-IP`
+from nginx). Five within 15 minutes lock the pair for 15 minutes: its logins answer `429 LOGIN_THROTTLED`
+without checking the password. The same applies to unknown usernames. A successful login clears the pair's count.
+
+| Route | Request | Success |
+|---|---|---|
+| `GET /auth/status` | | `200 {"setup_required": bool}` |
+| `POST /auth/login` | `{"username", "password"}` | `200 {"username", "role", "must_change_password"}` and the cookie. Every failure (unknown user, wrong password, disabled account, malformed username) is the same `401 LOGIN_FAILED` "The username or password is incorrect.", checked against a hash either way so the time doesn't differ |
+| `GET /auth/me` | | `200 {"username", "role", "must_change_password"}` |
+| `POST /auth/logout` | | `200 {"status": "logged_out"}`; the session is deleted and the cookie expired |
+| `POST /auth/password` | `{"current_password", "new_password"}` | `200 {"status": "changed", "username", "role", "must_change_password": false}`; the user's other sessions end, this one stays. A wrong current password is `403 PASSWORD_INCORRECT`; a new one breaking the rules is `422 INVALID_PASSWORD` naming the rule |
+
+**Operator command**, inside the api container: `docker compose exec api python -m auth <subcommand>`.
+
+| Subcommand | Effect |
+|---|---|
+| `bootstrap USERNAME` | Only when no account exists: creates USERNAME as an engineer |
+| `create-user USERNAME ROLE` | Only after bootstrap; refused if the name exists |
+| `reset-password USERNAME` | New generated password; the user's sessions end |
+| `set-role USERNAME ROLE` | Applies to existing sessions on their next request |
+| `disable USERNAME` / `enable USERNAME` | Disabling ends the user's sessions |
+| `list` | Username, role, enabled, password change due, created; never a password or hash |
+
+`bootstrap`, `create-user` and `reset-password` print a generated password (24 characters, 144 random bits)
+alone on standard output and nowhere else, and mark it to be changed at first login. Each change writes one line
+to standard error; exit status 0 done, 1 refused, 2 usage error. The last enabled engineer can't be disabled or
+demoted; a lockout is recovered with `create-user`, `enable` or `reset-password`. No account or password comes
+from the environment, and none exists by default.
+
+**Logging.** One `WARNING` line per login attempt (success, failure, throttled) on logger `auth`, with the
+username and client address; never a password, token or cookie. The telemetry route vocabulary gains the five
+`/auth` routes as labels.
+
 ### 3.2 Error Response Format
 
 All errors use a consistent envelope, including the ones no route raises itself (#373): a
@@ -1366,6 +1446,15 @@ Standard error codes:
 | `PAIR_NOT_FOUND` | 404 | pair_id not found within the given session |
 | `SESSION_BUSY` | 409 | Operation not allowed while session is still generating |
 | `HISTORICAL_SESSION` | 409 | Explicit historical export choice required for stale/orphaned session |
+| `SETUP_REQUIRED` | 503 | No account exists yet; run `python -m auth bootstrap` (§3.1.8) |
+| `AUTH_REQUIRED` | 401 | No valid session: none, unknown, ended or of a disabled user |
+| `FORBIDDEN` | 403 | The user's role is too low (`detail.required_role`), or the route has no policy entry |
+| `CROSS_ORIGIN_REFUSED` | 403 | A cookie-authenticated change from another origin |
+| `PASSWORD_CHANGE_REQUIRED` | 403 | A generated password must be changed first; only `/auth/me`, `/auth/logout` and `/auth/password` answer |
+| `LOGIN_FAILED` | 401 | Login refused; the same answer for every cause |
+| `LOGIN_THROTTLED` | 429 | Five failed logins for this username and address within 15 minutes; wait 15 minutes |
+| `PASSWORD_INCORRECT` | 403 | The current password given to `POST /auth/password` is wrong |
+| `INVALID_PASSWORD` | 422 | The new password breaks a rule; the message names it |
 
 ---
 
@@ -1999,25 +2088,31 @@ If the model output is not valid JSON, the API retries once with an explicit rem
 **State management:** React Context + useReducer (no external state library)  
 **Routing:** React Router v6
 
-### 7.1 Role Selection
+### 7.1 Login (#25)
 
-**Route:** `/`
+The role picker is gone. The UI takes the user and role only from `GET /api/auth/me` and keeps nothing about
+them in browser storage; the session is the HttpOnly cookie. On load it asks `GET /api/auth/status`:
 
-On first load (or when no role in session storage), the landing page displays three role cards:
+| State | Shown |
+|---|---|
+| Setup required | "Not set up yet" with the command `docker compose exec api python -m auth bootstrap <username>`, and nothing else |
+| No valid session | The login page at `/login` (any other path redirects there): username, password, "Log in". A failure shows the API's message (the generic `LOGIN_FAILED`, or "wait" when throttled) and clears the password. Success opens `/qa` |
+| Password change due | Only the password page at `/account/password`: current password, new password, the new one again, "Change password" and "Log out". A mismatch is caught before sending; the API's rule message is shown; success opens `/qa` |
+| Logged in | The pages of the user's role (§7.2) and `/account/password`, where a change says the other sessions were logged out |
 
-| Role | Label | Description shown to user |
-|---|---|---|
-| `engineer` | AI Engineer | Full access: ingest, chunking, retrieval, gold standard, collection management, health |
-| `developer` | Developer | Ingest, simplified configuration, Q&A, gold standard |
-| `end_user` | End User | Q&A only |
+Any API answer `401 AUTH_REQUIRED` returns the UI to the login page, and `403 PASSWORD_CHANGE_REQUIRED` to the
+password page.
 
-Selecting a role stores `{ role: "<selected_role>" }` (e.g. `{ role: "engineer" }`, `{ role: "developer" }`, or `{ role: "end_user" }`) in `sessionStorage` under key `rag_role` and navigates to `/qa`.
-
-A "Switch Role" button is always visible in the navigation bar, which returns to this page.
+| Role | Label |
+|---|---|
+| `engineer` | AI Engineer |
+| `developer` | Developer |
+| `end_user` | End User |
 
 ### 7.2 Navigation Bar
 
-Visible on all pages post-role-selection. Contents vary by role:
+Visible on all pages after login. Contents vary by role; hiding a page is a convenience, and the API refuses
+what the role can't do (§3.1.8):
 
 | Nav Item | Engineer | Developer | End User |
 |---|---|---|---|
@@ -2026,9 +2121,12 @@ Visible on all pages post-role-selection. Contents vary by role:
 | Chunking Config | ✓ | ✓ | — |
 | Retrieval Config | ✓ | ✓ | — |
 | Gold Standard | ✓ | ✓ | — |
+| Transfer | ✓ | ✓ | — |
 | Collections | ✓ | — | — |
 | Health | ✓ | — | — |
-| Switch Role | ✓ | ✓ | ✓ |
+| Username and role badge | ✓ | ✓ | ✓ |
+| Change password (button) | ✓ | ✓ | ✓ |
+| Log out (button) | ✓ | ✓ | ✓ |
 
 ### 7.3 Q&A Page
 
@@ -2330,6 +2428,13 @@ Optional telemetry (#282) is configured by API container environment settings, n
 | `RAG_OTEL_INTERVAL_MS` | `5000` | Integer 1000–60000 |
 | `RAG_OTEL_SHUTDOWN_MS` | `3000` | Integer 100–30000 |
 
+Authentication (#25) has two API container settings:
+
+| Setting | Default | Accepted values |
+|---|---|---|
+| `AUTH_COOKIE_SECURE` | `false` | Exactly `true` or `false`; anything else fails API startup. `true` marks the session cookie `Secure`, for a stack served over TLS (#26); leave `false` on the loopback HTTP profile |
+| `AUTH_DIR` | `/app/auth_data` | The folder of `auth.db`, the `auth_data` volume |
+
 ---
 
 ## 9. File and Directory Structure
@@ -2367,7 +2472,15 @@ rag-docker/
 │   ├── requirements.txt        # Generated lock (pinned); installed by the build
 │   ├── main.py                  # FastAPI app entry point
 │   ├── utils.py                 # Shared helpers (api_error response factory)
+│   ├── auth/                    # Accounts, sessions, the role matrix (#25)
+│   │   ├── __main__.py          # The operator command, python -m auth
+│   │   ├── passwords.py         # Username/password rules, scrypt hashing
+│   │   ├── store.py             # SQLite accounts, sessions, login throttle
+│   │   ├── policy.py            # The endpoint/role matrix
+│   │   ├── middleware.py        # Enforces it before a route runs
+│   │   └── testing.py           # Real sessions for in-process tests
 │   ├── routers/
+│   │   ├── auth.py              # /auth/status, login, logout, me, password
 │   │   ├── health.py
 │   │   ├── collections.py
 │   │   ├── ingest.py
@@ -2420,10 +2533,12 @@ rag-docker/
 │   │   ├── App.tsx
 │   │   ├── router.tsx
 │   │   ├── context/
-│   │   │   ├── RoleContext.tsx
+│   │   │   ├── AuthContext.tsx      # The user and role, from GET /api/auth/me
 │   │   │   └── QueryConfigContext.tsx
 │   │   ├── pages/
-│   │   │   ├── LandingPage.tsx
+│   │   │   ├── LoginPage.tsx
+│   │   │   ├── SetupRequiredPage.tsx
+│   │   │   ├── ChangePasswordPage.tsx
 │   │   │   ├── QAPage.tsx
 │   │   │   ├── ImportPage.tsx
 │   │   │   ├── ChunkingPage.tsx
@@ -2435,7 +2550,6 @@ rag-docker/
 │   │   │   └── HealthPage.tsx
 │   │   ├── components/
 │   │   │   ├── NavBar.tsx
-│   │   │   ├── RoleGate.tsx
 │   │   │   ├── CitationsPanel.tsx
 │   │   │   ├── ProgressPanel.tsx
 │   │   │   ├── StrategyExplainer.tsx
@@ -2858,9 +2972,12 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       released after A→B→A, two queries in flight released latest first, a second Ctrl+Enter
       while loading, an answer and an error on screen when the collection changes, and Ask
       used on B while A is still in flight. All eight checks fail on the code before #511.*
-- [x] Role selection persists across page navigation within same browser session.
+- [x] Logging in through the login page opens `/qa` as the account's role; the session is an HttpOnly, `SameSite=Strict` cookie that page scripts can't read, nothing about the user is kept in browser storage, the session persists across navigation and reloads, and Log out ends it at the API and returns to the login page (#25).
+      *Evidence: `scripts/verify/browser/ui_criteria.js` (suite 06) logs in with the harness's engineer through the form against the real API, and checks the cookie, storage, navigation and logout.*
+- [x] Login page, setup-required page, forced and voluntary password change, the API's messages for a failed or throttled login, and the return to the login or password page on `401 AUTH_REQUIRED` or `403 PASSWORD_CHANGE_REQUIRED` (#25).
+      *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request interception.*
 - [x] End User role shows only the Q&A page in navigation.
-      *Nav shows only Q&A, and `/collections` redirects to `/qa`.*
+      *Nav shows only Q&A, and `/collections` redirects to `/qa`; the API refuses those pages' requests too (§10.6).*
 - [x] Citations toggle correctly hides/shows citation panel.
       *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06) answers `POST /query` by request
       interception and checks that the box starts unchecked and the query sends
@@ -2991,6 +3108,19 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   *Evidence: `scripts/tests/test_package_archives.py`, run on the host by suite 01 as the check `Distribution archives hold only the tracked files of HEAD (#384)`, runs both scripts in a scratch git repository with `docker` stubbed: untracked and ignored files and an uncommitted edit stay out of the zip and the offline bundle, executable bits are kept, both scripts refuse in an extracted copy and in a subdirectory of a checkout before calling docker, and a checkout reached through a symlink is not refused. The scratch repository and both scripts read no system or global git config, checked with a global config whose failing hook and `export-ignore` attributes would otherwise break or change the result (#447).*
 - [x] Every pull request to `develop` or `main` runs the verification suite in CI (#24): `.github/workflows/verify.yml` on `ubuntu-latest`, with `RAG_SKIP_SLOW=1`, on the disposable verify project (`stack.sh up`, `all.sh`, `stack.sh down`, never `RAG_VERIFY_LIVE`). It always uploads the compose logs as an artifact and caches the Ollama models under a key built from the model names `ollama/entrypoint.sh` pulls. It runs with `contents: read` only and no secrets, and pins every action, all GitHub's own, to a full commit SHA. The README shows its status badge.
   *Evidence: `scripts/tests/test_ci_workflow.py`, run on the host by suite 01 as the check `the CI workflow runs the verify suite on every pull request (#24)`, checks the trigger, permissions, pins, step order, the always-run logs, upload and teardown, the cache key and save conditions, the badge and the embedded copies; it fails on the code before #24. The workflow's own run on the #24 pull request is its first execution.*
+
+### 10.6 Authentication (#25)
+
+- [x] Every route but `GET /health`, `GET /auth/status` and `POST /auth/login` answers `401 AUTH_REQUIRED` without a session, downloads and job polling included, and each role gets `403 FORBIDDEN` exactly on the routes above it in the §3.1.8 matrix, whatever the UI shows.
+  *Evidence: `scripts/tests/test_auth_enforcement.py` in the API image (suite 17), which fails on the code before #25; `auth_stack.py matrix` for no session and each harness role on the running stack (suite 17), against the matrix written out in the check, not read from the API; `test_auth.py` checks that every app route has exactly one policy entry and every entry a route, and that a route without one is refused.*
+- [x] Before bootstrap every protected route and the login answer `503 SETUP_REQUIRED`; `bootstrap` works once and is then refused; `create-user` is refused before it; generated passwords are printed alone on standard output and must be changed at first login, when only the session routes answer; the last enabled engineer can't be disabled or demoted; usage errors exit 2.
+  *Evidence: `test_auth.py` (store and `python -m auth` in a subprocess); suite 17 on the stack: `bootstrap` refused, forced change on created accounts.*
+- [x] Login, `GET /auth/me` and logout; the cookie's attributes; a session survives an API restart (with `RAG_ALLOW_RESTART=1`) and ends after 12 hours idle or 7 days; a password reset or disable ends the user's sessions at once, and a role change applies to an existing session's next request; the own password change needs the current password, follows the rules, and ends the user's other sessions.
+  *Evidence: `test_auth.py` (expiry with a patched clock); suite 17 on the stack, with throwaway `vfy-t-*` accounts and a session aged in the store.*
+- [x] A cookie-authenticated change from another origin, or with neither `Origin` nor `Sec-Fetch-Site: same-origin`, is refused `403 CROSS_ORIGIN_REFUSED`; the API sends no `Access-Control-*` headers; every login failure is the same `401 LOGIN_FAILED`; five failures for a username and address within 15 minutes lock the pair for 15 minutes, for unknown usernames too, and the lockout survives a restart; the API log has one line per login and no password or session token.
+  *Evidence: `test_auth.py`; suite 17 on the stack; suite 01's CORS check.*
+- [x] The verify harness gets its test credentials without committing, printing or passing them on a command line or in the environment: one account per role, generated passwords replaced at first login, kept in a 0600 file in a 0700 folder of the user's own outside the checkout, with the operator command run only on the verify project.
+  *Evidence: `scripts/tests/test_verify_auth.py` on the host (suite 17); `auth_stack.py no-secrets-logged`.*
 
 ---
 

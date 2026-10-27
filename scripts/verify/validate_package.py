@@ -151,7 +151,7 @@ with tempfile.TemporaryDirectory() as td:
                    if isinstance(node, (ast.Import, ast.ImportFrom))
                    for n in ([a.name for a in node.names] if isinstance(node, ast.Import)
                              else [node.module or ""])}
-        STDLIB = {"argparse","json","sys","urllib","os","re"}
+        STDLIB = {"argparse","getpass","json","sys","urllib","os","re"}  # getpass: the login (#25)
         check("retrieve.py imports stdlib only", imports <= STDLIB, str(sorted(imports)))
     else:
         check("retrieve.py absent when retrieve_script is false",
