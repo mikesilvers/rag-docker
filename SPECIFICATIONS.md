@@ -614,9 +614,12 @@ them in separate imports.`, `detail` `{"file": "<zip>", "members": [], "members_
 A member of 1 MiB (1,048,576 bytes) or more, uncompressed, may expand to at most
 `max_zip_member_ratio` (env `MAX_ZIP_MEMBER_RATIO`, default 200) times its compressed size;
 smaller members are exempt, and exactly the ratio is accepted. It is checked on the sizes the
-ZIP declares, after the declared total and before any member is read, and again on the bytes the
-ZIP layer actually decompresses for each member, after every block read, so a member whose header
-understates its size is refused within a block of passing the ratio. Only the ZIP layer counts:
+ZIP declares, after the declared total and before any member is read, and again, as a backstop, on
+the bytes the ZIP layer decompresses for each member, after every block read. With CPython's
+zipfile that second check doesn't trigger: zipfile stops reading a member at its declared
+uncompressed size, so a member whose header understates its size fails its CRC check and is
+refused as unreadable (`ARCHIVE_UNREADABLE`, `damaged: Bad CRC-32 ...`), not as
+`ARCHIVE_RATIO_TOO_HIGH`. Only the ZIP layer counts:
 a `.json.gz` or `.jsonl.gz` member's gzip output counts toward the expansion cap, not its ratio.
 Over it, whatever else was found: 400 `ARCHIVE_RATIO_TOO_HIGH`, `'<zip>' can't be imported: its
 member '<member>' expands to more than 200 times its compressed size, which is refused as a

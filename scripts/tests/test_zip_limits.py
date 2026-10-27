@@ -232,6 +232,19 @@ class MemberCapTests(Harness):
                             {"file": "bigger.zip", "members": [], "members_omitted": 0})
         self.assertIn("holds 5,001 entries, more than 5,000,", body["error"]["message"])
 
+    def test_the_count_wins_over_the_declared_total(self):
+        # Reviewer test: the count is checked before the declared total, so a
+        # ZIP over both is ARCHIVE_TOO_MANY_MEMBERS (SPECIFICATIONS.md §3.1.3).
+        read, reading = self.reading()
+        data = zip_bytes([("big.txt", bytes(3 * MIB))]
+                         + [(f"m{i:02}.txt", "t") for i in range(MEMBERS)])
+        with reading, patch.object(settings, "max_zip_expanded_bytes", 2 * MIB):
+            status, body = self.post(upload("both.zip", data))
+        self.assert_refused(status, body, "ARCHIVE_TOO_MANY_MEMBERS",
+                            too_many("both.zip", MEMBERS + 1, MEMBERS),
+                            {"file": "both.zip", "members": [], "members_omitted": 0})
+        self.assertEqual(read, [])
+
 
 class RatioCapTests(Harness):
     def test_a_member_over_the_ratio_is_refused_before_anything_is_read(self):
@@ -304,6 +317,17 @@ class RatioCapTests(Harness):
             status, body = self.post(upload("mixed.zip", data))
         self.assert_ratio_refused(status, body, "mixed.zip", "zeros.txt")
 
+    def test_while_reading_the_total_wins_over_the_ratio(self):
+        # Reviewer test: with both declared checks out of the way, the first
+        # block read passes both the total and the ratio; the total is checked
+        # first, so it is ARCHIVE_TOO_LARGE (SPECIFICATIONS.md §3.1.3).
+        data = zip_bytes([("zeros.txt", bytes(3 * MIB))])
+        with patch.object(settings, "max_zip_expanded_bytes", MIB // 2), \
+                patch.object(ingest_pipeline, "_declared_size", lambda _members: 0), \
+                patch.object(ingest_pipeline, "_declared_ratio_member", lambda _members: None):
+            status, body = self.post(upload("both.zip", data))
+        self.assertEqual((status, body["error"]["code"]), (400, "ARCHIVE_TOO_LARGE"), body)
+
 
 class EscapingMemberTests(Harness):
     def test_a_damaged_member_leaving_the_archive_refuses_the_zip(self):
@@ -348,6 +372,21 @@ class EscapingMemberTests(Harness):
                                                                ("good.txt", "ok")])))
         self.assert_ratio_refused(status, body, "trav.zip", "../zeros.txt")
 
+    def test_an_encrypted_member_leaving_the_archive_is_unsupported(self):
+        # Reviewer test: validated like any member, so an encrypted one refuses
+        # the zip as ARCHIVE_UNSUPPORTED (SPECIFICATIONS.md §3.1.3).
+        data = bytearray(zip_bytes([("../locked.txt", "text"), ("good.txt", "ok")]))
+        central = data.index(b"PK\x01\x02")
+        for pos in (6, central + 8):   # the first member's flag bits, in both headers
+            data[pos] |= 0x01
+        status, body = self.post(upload("trav.zip", bytes(data)))
+        self.assert_refused(
+            status, body, "ARCHIVE_UNSUPPORTED", body["error"]["message"],
+            {"file": "trav.zip", "members": [{"member": "../locked.txt",
+                                              "reason": "password-protected"}],
+             "members_omitted": 0})
+        self.assertIn("../locked.txt (password-protected)", body["error"]["message"])
+
     def test_a_zip_of_only_such_members_has_no_supported_files(self):
         status, body = self.post(upload("only.zip", zip_bytes([("../out.txt", "x")])))
         self.assertEqual((status, body["error"]["code"]), (400, "NO_SUPPORTED_FILES"))
@@ -368,6 +407,19 @@ class DetailBoundTests(Harness):
         self.assertIn("m09.txt (damaged", body["error"]["message"])
         self.assertIn("; and 5 more.", body["error"]["message"])
         self.assertNotIn("m10.txt", body["error"]["message"])
+
+    def test_exactly_ten_members_omit_none(self):
+        # Reviewer test: the boundary of the bound, ten named and none omitted.
+        payloads = [f"payload {i:02} ".encode() * 10 for i in range(10)]
+        data = zip_bytes([(f"m{i:02}.txt", p) for i, p in enumerate(payloads)], zipfile.ZIP_STORED)
+        for p in payloads:
+            data = bad_crc(data, p)
+        status, body = self.post(upload("ten.zip", data))
+        self.assertEqual((status, body["error"]["code"]), (400, "ARCHIVE_UNREADABLE"))
+        detail = body["error"]["detail"]
+        self.assertEqual([m["member"] for m in detail["members"]], [f"m{i:02}.txt" for i in range(10)])
+        self.assertEqual(detail["members_omitted"], 0)
+        self.assertNotIn("more.", body["error"]["message"])
 
     def test_a_refusal_with_few_members_omits_none(self):
         payload = b"y" * 100
