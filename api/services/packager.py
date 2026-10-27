@@ -27,6 +27,7 @@ from pydantic import ValidationError
 
 from config import settings
 from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
+from services import age_stream
 from services import goldstandard
 from services import ingest_config
 from services import model_bundle
@@ -57,7 +58,8 @@ def exports_dir() -> Path:
 # hidden and root-owned, about 2.3 GB with models. Matched by exact name pattern
 # and by kind, never by age; anything else in the folder is left alone.
 _BUILD_DIR = ".build-*"
-_PARTIAL_ARCHIVE = ".*.tar.gz.partial"
+# An encrypted export is written as `.<stem>.tar.gz.age.partial` (#27).
+_PARTIAL_ARCHIVES = (".*.tar.gz.partial", ".*.tar.gz.age.partial")
 
 
 def remove_leftover(entry: Path, *, directory: bool = False,
@@ -101,7 +103,7 @@ def sweep_build_leftovers() -> list[str]:
         return removed
     for entry in sorted(root.iterdir()):
         as_dir = fnmatch.fnmatchcase(entry.name, _BUILD_DIR)
-        as_file = fnmatch.fnmatchcase(entry.name, _PARTIAL_ARCHIVE)
+        as_file = any(fnmatch.fnmatchcase(entry.name, p) for p in _PARTIAL_ARCHIVES)
         if not (as_dir or as_file):
             continue
         size = remove_leftover(entry, directory=as_dir, regular_file=as_file)
@@ -342,19 +344,36 @@ def _retrieve_section(has_script: bool, cfg: dict, collection: str) -> str:
             f"answer style `{cfg['response_format']}`.")
 
 
-def _write_archive(stage: Path, stem: str, dest: Path) -> None:
+def _add_members(tar: tarfile.TarFile, stage: Path, stem: str) -> None:
+    tar.add(stage, arcname=stem, recursive=False)
+    tar.add(stage / "manifest.json", arcname=f"{stem}/manifest.json")
+    for entry in sorted(os.listdir(stage)):
+        if entry != "manifest.json":
+            tar.add(stage / entry, arcname=f"{stem}/{entry}")
+
+
+def _write_archive(stage: Path, stem: str, dest: Path, passphrase: str | None = None) -> None:
     """Archive the staged package as `<stem>/`, with manifest.json first (#383).
 
     The directory entry, then the manifest, then everything else in the sorted
     order `tar.add(stage, arcname=stem)` gives, so the listing can stop reading
     at the manifest instead of decompressing chunks.jsonl to reach it.
+
+    With a passphrase the same tar.gz stream goes through the age encryptor on
+    its way to `dest` (#27): no plaintext archive is written, and only one
+    64 KiB chunk is held at a time, so a package of several GB streams.
     """
-    with tarfile.open(dest, "w:gz") as tar:
-        tar.add(stage, arcname=stem, recursive=False)
-        tar.add(stage / "manifest.json", arcname=f"{stem}/manifest.json")
-        for entry in sorted(os.listdir(stage)):
-            if entry != "manifest.json":
-                tar.add(stage / entry, arcname=f"{stem}/{entry}")
+    if passphrase is None:
+        with tarfile.open(dest, "w:gz") as tar:
+            _add_members(tar, stage, stem)
+        return
+    with dest.open("wb") as fh:
+        encryptor = age_stream.Encryptor(fh, passphrase)
+        with tarfile.open(fileobj=encryptor, mode="w|gz") as tar:
+            _add_members(tar, stage, stem)
+        # Writes the final chunk; an exception above skips it, and build()
+        # removes the partial file.
+        encryptor.close()
 
 
 @telemetry.traced("rag.package")
@@ -362,12 +381,16 @@ def build(
     collection: str,
     include_models: bool = False,
     progress: Callable[[int], None] | None = None,
+    passphrase: str | None = None,
 ) -> dict:
     """Write one package and return a summary. Blocking; run it in a thread.
 
     Assembly order matters (spec §6.2): content first, digests as we go, then
     the manifest from those digests, then README.md and retrieve.py which embed
     the manifest digest. Manifest last is what makes <id8> derivable.
+
+    With a passphrase the package is written encrypted, as `<stem>.tar.gz.age`
+    (#27). The passphrase is used, never stored or logged.
     """
     created = datetime.now(timezone.utc)
     created_at = created.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -552,7 +575,8 @@ def build(
 
         # 7. the generated pair, which embed <id8>
         stem = package_stem(collection, created, id8)
-        filename = f"{stem}.tar.gz"
+        # The README and retrieve.py name the file as delivered (#27).
+        filename = f"{stem}{age_stream.ENCRYPTED_SUFFIX if passphrase is not None else '.tar.gz'}"
 
         if has_saved_retrieval:
             (stage / "retrieve.py").write_text(_render_retrieve(collection, retrieval_cfg, {
@@ -575,13 +599,15 @@ def build(
             "CREATED_AT": created_at,
             "ID8": id8,
             "PACKAGE_FILENAME": filename,
+            "IMPORT_PASSPHRASE": (', "passphrase": "<the passphrase>"'
+                                  if passphrase is not None else ""),
             "RETRIEVE_SECTION": _retrieve_section(has_saved_retrieval, retrieval_cfg, collection),
         }))
 
         # 8. archive under a temporary name, then rename, so a partial file is
         #    never mistaken for a package.
-        tmp_archive = out_dir / f".{stem}.tar.gz.partial"
-        _write_archive(stage, stem, tmp_archive)
+        tmp_archive = out_dir / f".{filename}.partial"
+        _write_archive(stage, stem, tmp_archive, passphrase)
         final = out_dir / filename
         tmp_archive.replace(final)
         tmp_archive = None
@@ -595,6 +621,7 @@ def build(
             "models_bundled": models_bundled,
             "retrieve_script": has_saved_retrieval,
             "id8": id8,
+            "encrypted": passphrase is not None,
             "warnings": warnings,
         }
     finally:
@@ -678,6 +705,26 @@ def listing_fields(manifest: dict) -> dict:
     return fields
 
 
+def _check_member(member: tarfile.TarInfo, dest: Path, root: Path) -> None:
+    """Refuse a link, anything but a file or directory, or a path outside dest."""
+    if member.issym() or member.islnk():
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            f"Package contains a link ('{member.name}'), which is not allowed.",
+            {"member": member.name})
+    if not (member.isfile() or member.isdir()):
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            "Package contains a non-regular archive member.",
+            {"member": member.name})
+    target = (dest / member.name).resolve()
+    if target != root and root not in target.parents:
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            f"Package contains a path outside the archive ('{member.name}').",
+            {"member": member.name})
+
+
 def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
     """Extract, refusing any member that would land outside dest.
 
@@ -687,42 +734,80 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
     """
     root = dest.resolve()
     for member in tar.getmembers():
-        if member.issym() or member.islnk():
-            raise PackageError(
-                "PACKAGE_UNREADABLE",
-                f"Package contains a link ('{member.name}'), which is not allowed.",
-                {"member": member.name})
-        if not (member.isfile() or member.isdir()):
-            raise PackageError(
-                "PACKAGE_UNREADABLE",
-                "Package contains a non-regular archive member.",
-                {"member": member.name})
-        target = (dest / member.name).resolve()
-        if target != root and root not in target.parents:
-            raise PackageError(
-                "PACKAGE_UNREADABLE",
-                f"Package contains a path outside the archive ('{member.name}').",
-                {"member": member.name})
+        _check_member(member, dest, root)
     tar.extractall(dest)
 
 
+def _safe_extract_stream(tar: tarfile.TarFile, dest: Path) -> None:
+    """The same checks for a tar read as a stream, one member at a time (#27).
+
+    A stream can't be read twice, so each member is checked just before it is
+    extracted. A refusal part-way leaves only the job's own work directory
+    holding the members before it, and the job removes that directory.
+    """
+    root = dest.resolve()
+    for member in tar:
+        _check_member(member, dest, root)
+        tar.extract(member, dest)
+
+
+# Why an encrypted package could not be decrypted, for `error_detail.reason`.
+_DECRYPT_REASONS = {"work_factor": "work_factor", "passphrase": "passphrase",
+                    "hmac": "header", "payload": "payload"}
+
+
+def _extract_encrypted(archive: Path, dest: Path, passphrase: str) -> None:
+    """Check 1 for a `.tar.gz.age` package: decrypt it as a stream into the tar
+    reader, then authenticate the rest of the file to its end (#27).
+
+    No decrypted copy of the archive is written. Every failure comes before
+    check 2, so nothing outside the work directory has been touched.
+    """
+    try:
+        with archive.open("rb") as fh:
+            decryptor = age_stream.open_decrypt(fh, passphrase)
+            with tarfile.open(fileobj=decryptor, mode="r|gz") as tar:
+                _safe_extract_stream(tar, dest)
+            # tarfile stops at the end-of-archive blocks; the final chunk, and
+            # anything after it, still has to be authenticated.
+            decryptor.drain()
+    except age_stream.AgeError as exc:
+        if exc.kind in ("header", "recipient"):
+            raise PackageError(
+                "PACKAGE_UNREADABLE",
+                f"'{archive.name}' is not a passphrase-encrypted age file.",
+                {"reason": str(exc)}) from None
+        raise PackageError(
+            "DECRYPT_FAILED",
+            f"'{archive.name}' could not be decrypted: the passphrase is wrong or "
+            "the file is damaged.",
+            {"reason": _DECRYPT_REASONS[exc.kind]}) from None
+
+
 @telemetry.traced("rag.package")
-def open_package(archive: Path, dest: Path) -> tuple[Path, dict]:
+def open_package(archive: Path, dest: Path, passphrase: str | None = None) -> tuple[Path, dict]:
     """Checks 1 and 2 of spec §6.2: readable archive, understood format.
 
-    Returns (package root directory, manifest).
+    A `.tar.gz.age` package is decrypted with `passphrase` as it is unpacked
+    (#27); everything from check 2 on reads the decrypted files, as for an
+    unencrypted package. Returns (package root directory, manifest).
     """
     if not archive.is_file():
         raise PackageError("PACKAGE_UNREADABLE",
                            f"No package named '{archive.name}' in the exports directory.")
+    encrypted = age_stream.is_encrypted_name(archive.name)
     try:
-        with tarfile.open(archive, "r:gz") as tar:
-            _safe_extract(tar, dest)
+        if encrypted:
+            _extract_encrypted(archive, dest, passphrase or "")
+        else:
+            with tarfile.open(archive, "r:gz") as tar:
+                _safe_extract(tar, dest)
     except PackageError:
         raise
     except (tarfile.TarError, OSError, EOFError) as exc:
         raise PackageError("PACKAGE_UNREADABLE",
-                           f"'{archive.name}' is not a readable .tar.gz archive.",
+                           f"'{archive.name}' is not a readable "
+                           f"{'encrypted ' if encrypted else ''}.tar.gz archive.",
                            {"reason": f"{type(exc).__name__}: {exc}"}) from exc
 
     roots = [p for p in dest.iterdir() if p.is_dir()]

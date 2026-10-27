@@ -1446,6 +1446,18 @@ Long-running, so it follows the same job-and-poll shape as `/ingest/upload`.
 The job reports `models_bundled` — what the package actually carries, which is
 `false` with an explanation in `warnings` if the request could not be honoured.
 
+An optional `passphrase` (12 to 1024 characters, any characters) writes the
+package encrypted, as `<stem>.tar.gz.age`: an age v1 file with one scrypt
+(passphrase) recipient, work factor 18, streamed in 64 KiB chunks so no
+unencrypted archive is written and the package is never held in memory
+(`RAG_EXPORT_SPECIFICATIONS.md` §4.6; #27). Without it the export is unencrypted,
+as before. The passphrase is never stored in the job record, logged, attached to
+telemetry or returned; the job reports `encrypted`.
+
+- **422 `INVALID_PARAMETER`** for a `passphrase` shorter than 12 or longer than
+  1024 characters. No job is created, and the response does not contain the
+  passphrase.
+
 **Response 202:**
 ```json
 { "job_id": "0c5fd445", "status": "queued", "collection": "Policies" }
@@ -1500,6 +1512,7 @@ GET /export/job/{job_id}
   "fidelity": "with-sources",
   "models_bundled": false,
   "retrieve_script": true,
+  "encrypted": false,
   "warnings": [],
   "error": null
 }
@@ -1514,7 +1527,7 @@ across an API restart like ingest's (§3.1.3); a job the restart interrupted rea
 with `error_code` `INTERRUPTED` and an `error` saying the API restarted while it was running. A failed build leaves nothing
 behind: the staging directory and the partial archive are both removed, and the
 collection's export slot is released. A build interrupted by a restart leaves them in
-`EXPORTS_DIR` (`.build-*` and `.<stem>.tar.gz.partial`) until the next startup removes them,
+`EXPORTS_DIR` (`.build-*`, and `.<stem>.tar.gz.partial` or, encrypted, `.<stem>.tar.gz.age.partial`) until the next startup removes them,
 before the first request; completed packages are never touched (#377).
 
 `warnings` is non-fatal. It records, for example, chunks whose `source_sha256`
@@ -1541,13 +1554,27 @@ follows the job-and-poll pattern.
 could destroy a collection the caller did not mean to touch. It is one of
 `abort`, `rename` or `replace` (spec §6.4).
 
+`passphrase` is required for an encrypted package, one whose name ends in
+`.tar.gz.age`, and refused for any other (#27). It is not checked for length
+here. The job decrypts the package as a stream while unpacking it, and every
+check from the manifest on reads the decrypted files; it is never stored in the
+job record, logged, attached to telemetry or returned. The job reports
+`encrypted`.
+
 **Response 202:** `{ "job_id": "...", "status": "queued", "filename": "..." }`
+
+- **400 `PASSPHRASE_REQUIRED`** for a `.tar.gz.age` package sent without a
+  passphrase, and **400 `PASSPHRASE_NOT_EXPECTED`** for a passphrase sent with any
+  other package. Both are decided by the filename, before any job exists, and
+  change nothing; `detail` is `{"filename": "<as sent>"}`.
 
 **409 `IMPORT_IN_PROGRESS`** if the same package file is already being imported:
 the file's name in `./exports` is compared, so `x.tar.gz`, `./x.tar.gz` and
 `a/../x.tar.gz` are one file (#391).
 
-Everything else — unreadable archive, bad digest, embedding mismatch, name
+Everything else — unreadable archive, a wrong passphrase or a damaged encrypted
+package (`DECRYPT_FAILED`, with `error_detail.reason` `passphrase`, `header`,
+`payload` or `work_factor`; nothing is touched), bad digest, embedding mismatch, name
 collision, a target being deleted (`COLLECTION_DELETING`, §3.1.2), another import
 into the same target collection (`IMPORT_IN_PROGRESS`) — is reported through the
 job rather than this response, because none of it is knowable without reading the
@@ -1593,7 +1620,8 @@ GET /import/job/{job_id}
   "notes": ["3 gold-standard session(s) restored"],
   "error": null,
   "error_code": null,
-  "error_detail": null
+  "error_detail": null,
+  "encrypted": false
 }
 ```
 
@@ -1742,11 +1770,19 @@ dropped in to be imported.
       "chunk_count": 1842,
       "fidelity": "with-sources",
       "created_at": "2026-09-18T15:31:27Z",
-      "readable": true
+      "readable": true,
+      "encrypted": false
     }
   ]
 }
 ```
+
+Encrypted packages (`ragpkg-*.tar.gz.age`, #27) are listed too, with
+`encrypted: true` and `collection`, `chunk_count`, `fidelity` and `created_at`
+null: their manifest can't be read without the passphrase, and no plaintext
+metadata is kept beside them. Their `readable` says whether the file starts with a
+valid age passphrase header; the listing never needs the passphrase and never runs
+scrypt.
 
 A file that cannot be read as a package is still listed, with `readable: false`
 and null metadata, so it does not silently disappear from the UI. Import reports
@@ -2244,16 +2280,25 @@ A retained session can be loaded/refreshed by its session ID, including when its
   to the selected collection; a late answer for another one is ignored.
 - "Include the models" checkbox, labelled with the ~2.3 GB cost and when it is
   needed.
-- Progress while the job runs, then the filename, size, fidelity, whether models
-  were bundled and whether `retrieve.py` was generated. Warnings from the job are
+- "Encrypt with a passphrase" checkbox (#27). Checked, it shows a passphrase field
+  and a confirmation field; Export stays disabled, with a hint naming the unmet
+  rule, until the passphrase has 12 to 1024 characters and both fields match. The
+  passphrase is sent only when the box is checked, is kept only in the page's
+  state, and both fields are cleared once the export has started.
+- Progress while the job runs, then the filename, size, fidelity, whether it is
+  encrypted, whether models were bundled and whether `retrieve.py` was generated. Warnings from the job are
   shown in full. A failed export shows its `error_code` (for example
   `EMBEDDING_MISMATCH`) before the error, as the import half does.
 
 **Import elements:**
 
 - Package selector listing `GET /packages`, each entry showing the collection,
-  chunk count, fidelity and size. Unreadable files are listed too, marked as
-  such, so nothing silently disappears. A failed `GET /packages` shows "Could not
+  chunk count, fidelity and size, or "encrypted" and the size for an encrypted
+  package. Unreadable files are listed too, marked as such, so nothing silently
+  disappears.
+- A passphrase field when the selected package is encrypted (#27); Import stays
+  disabled until it is filled. The passphrase is sent only for an encrypted
+  package and the field is cleared once the import has started. A failed `GET /packages` shows "Could not
   list the packages in ./exports:" with the reason, instead of the empty-folder
   hint; the last list loaded stays, and the next good load clears the message.
 - `on_conflict` radio group — `abort`, `rename`, `replace` — each with its
@@ -2388,6 +2433,7 @@ rag-docker/
 │   │   ├── retrieval_config.py  # Per-collection retrieval settings (atomic JSON)
 │   │   ├── settings_store.py    # Shared serialized settings publication
 │   │   ├── packager.py          # Package format: naming, digests, manifest, reader
+│   │   ├── age_stream.py        # Streaming age passphrase encryption of packages (#27)
 │   │   ├── exporter.py          # Export job lifecycle and the per-collection guard
 │   │   ├── jobstore.py          # Job records that survive an API restart
 │   │   ├── importer.py          # Import job: validation order, conflicts, atomicity
@@ -2948,7 +2994,7 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Job records persist under `{UPLOAD_DIR}/jobs/{kind}/`: status changes and terminal records are written at once and atomically, progress at most once a second but never left unwritten, a failed write never fails the job, startup marks jobs left `queued` or `running` as interrupted, unreadable records are kept and logged, and the newest 200 per kind are kept, at startup and while the API runs, never removing an unfinished job (#23, #309). The first record is written off the event loop, and a start cancelled during it leaves no record or guard (#309).
   *Evidence: `test_jobstore.py` (35 cases in the API image, run by `02_ingest.sh`), including a real lifespan run over a stored running job, the four job starts and their cancellation, retention ordered by real writes, an abandoned first write that fails, a second export start waiting for the first one's record (#326), and that wait's error paths and its bound with `EXPORT_STARTING` (#338); with `RAG_ALLOW_RESTART=1`, live restarts of ingest (`partial` and `failed`), export and import jobs.*
 
-- [x] At startup, before the first request, what a killed job left behind is removed (#377): an interrupted ingest's upload staging (`{UPLOAD_DIR}/ingest-*`), and an interrupted export's `.build-*` directory and `.<stem>.tar.gz.partial` archive in `EXPORTS_DIR`. Only those names at the top of each folder, and only a real directory or regular file as the name says, are removed: completed packages, look-alike names and anything in a sub-folder are kept, and a symlink is never followed. What is removed is logged by name and size; a removal that fails is logged and not reported as removed. An export sweep that fails is logged and startup carries on, with the ingest staging still swept (#423).
+- [x] At startup, before the first request, what a killed job left behind is removed (#377): an interrupted ingest's upload staging (`{UPLOAD_DIR}/ingest-*`), and an interrupted export's `.build-*` directory and `.<stem>.tar.gz.partial` archive (`.<stem>.tar.gz.age.partial` for an encrypted export, #27) in `EXPORTS_DIR`. Only those names at the top of each folder, and only a real directory or regular file as the name says, are removed: completed packages, look-alike names and anything in a sub-folder are kept, and a symlink is never followed. What is removed is logged by name and size; a removal that fails is logged and not reported as removed. An export sweep that fails is logged and startup carries on, with the ingest staging still swept (#423).
   *Evidence: `test_startup_sweep.py` (13 cases in the API image, run by `02_ingest.sh`), including a real lifespan run that removes both kinds and logs them, and one whose export sweep raises: the error is logged, the API still starts and the ingest staging is removed (#423). With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` checks that its two killed ingests' `ingest-*` staging existed before the restart and is gone after it (#423), and `05_transfer.sh` that the killed export's build directory and temporary archive are gone after its restart, with the completed package kept.*
 
 
@@ -2975,6 +3021,10 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *Evidence: `scripts/tests/test_package_listing.py` in the built API image with `--network none` (suite 05): a package cut off after its manifest still lists, listing reads under 1 MiB of a package carrying 8 MiB after its manifest, an oversized manifest is refused unread, a manifest of exactly 16 MiB lists while one byte more is refused, and seven kinds of unreadable file are each listed `readable: false`; its cut-off, bytes-read, oversized-manifest, JSON-array and archive-order checks fail on the code before #383. `validate_package.py` checks a real export puts the manifest first, and suite 05 checks that `GET /packages` lists that export as readable with its collection, chunk count, fidelity and creation time.*
 - [x] `GET /packages` lists a package whose manifest has a wrongly typed listed value (`collection` not an object, `name`, `fidelity` or `created_at` not a string, `chunk_count` not an integer) as `readable: false` with null metadata, never coercing it, and still answers 200; a `null` or absent value is listed as `null` (#451).
       *Evidence: `scripts/tests/test_package_listing.py` in the built API image with `--network none` (suite 05): eight wrongly typed manifests are each listed `readable: false` beside a readable package, and `collection: null` and absent values list as `null`; both checks fail on the code before #451 (the listing answered 500).*
+- [x] Export with a `passphrase` writes `<stem>.tar.gz.age`, an age v1 scrypt (passphrase) file at work factor 18 that the same passphrase decrypts to the package an unencrypted export would write, with no unencrypted archive written and the package streamed in 64 KiB chunks; the README and `retrieve.py` name the `.age` file; a passphrase outside 12 to 1024 characters is refused 422 without being echoed; export and import jobs report `encrypted` and never hold the passphrase; `GET /packages` lists an encrypted package with `encrypted: true` and null metadata, without scrypt (#27).
+      *Evidence: `scripts/tests/test_export_encryption.py` in the built API image with `--network none` (suite 05): the age module passes every applicable C2SP CCTV age vector (vendored in `scripts/tests/fixtures/age-testkit`) and an independent decryption written from the age specification; suite 05 exports the transfer collection encrypted, checks the file header and work factor, validates the decrypted package with `validate_package.py` and checks the listing entry; `browser/transfer_page.js` (suite 06) checks the passphrase rules, what the page sends and that it clears the fields.*
+- [x] Import of a `.tar.gz.age` package decrypts it as a stream while unpacking it, checking each member before extraction and authenticating the file to its end; a wrong passphrase, a damaged or truncated file or a work factor above 22 fails the job `DECRYPT_FAILED` (with `error_detail.reason`) and a file without a valid age passphrase header `PACKAGE_UNREADABLE`, before any collection, marker, setting or session is touched and with the package file unchanged; an encrypted package without a passphrase is refused 400 `PASSPHRASE_REQUIRED` and a passphrase for any other package 400 `PASSPHRASE_NOT_EXPECTED`, before any job (#27).
+      *Evidence: `scripts/tests/test_export_encryption.py` (suite 05) through `packager.open_package`, `importer._run` and the API; suite 05 imports the encrypted export with a wrong passphrase against the existing collection (`replace`) and checks the collections, their counts, the package file and the import work directories are unchanged, checks both 400 refusals, then imports it with the right passphrase (`rename`) with every chunk.*
 - [x] `GET /ingest/config` returns `is_default: true` for a collection with no saved config; `is_default: false` after saving one.
 - [x] `GET /retrieval/config/{collection}` answers 200 with the defaults and `is_default: true`, and logs a warning naming the collection, when the saved file can't be read, isn't JSON, holds JSON that isn't an object, has a field the response can't carry (a wrong type, a fractional or nested `top_k`, a `NaN` or infinite `alpha`) or holds the response-only key `is_default`; missing fields are filled from the defaults, and coercible and out-of-range values are still served as saved (#439, #477).
       *Evidence: `RetrievalConfigFileTests` in `scripts/tests/test_api_paths.py`, in the built API image with `--network none` (suite 01, through `16_api_paths.sh`), sends each saved file through the app; its non-object, wrong-type and fractional or nested checks fail on the code before #439, and its non-finite `alpha` and `is_default` checks fail on the code before #477.*

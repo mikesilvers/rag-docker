@@ -2,22 +2,30 @@
 
     python3 validate_package.py <path-to-ragpkg-*.tar.gz>
 
+An encrypted package (`*.tar.gz.age`, #27) is checked the same way after
+decryption. That needs the API's age module and its `cryptography`, so it runs
+in the API container with the passphrase in RAG_PACKAGE_PASSPHRASE:
+
+    docker compose exec -T -e RAG_PACKAGE_PASSPHRASE=... api \
+      python - /app/exports/<package> < scripts/verify/validate_package.py
+
 Exits non-zero if any clause fails. Checks the filename convention, that <id8>
 really is the manifest digest, every listed digest, that nothing in the archive
 is unlisted, the chunks.jsonl record shape, source content-addressing, and the
 generated README and retrieve.py.
 """
-import ast, hashlib, json, re, sys, tarfile, tempfile
+import ast, hashlib, json, os, re, sys, tarfile, tempfile
 from pathlib import Path
 
 archive = Path(sys.argv[1])
+SUFFIX = ".tar.gz.age" if archive.name.endswith(".tar.gz.age") else ".tar.gz"
 fails = []
 def check(name, ok, detail=""):
     print(f"  {'PASS' if ok else 'FAIL'}  {name}" + (f"  — {detail}" if detail else ""))
     if not ok: fails.append(name)
 
 # E5 — filename (§4.1)
-NAME_RE = re.compile(r"^ragpkg-([a-z0-9]+(?:-[a-z0-9]+)*)-(\d{8}T\d{6}Z)-([0-9a-f]{8})\.tar\.gz$")
+NAME_RE = re.compile(r"^ragpkg-([a-z0-9]+(?:-[a-z0-9]+)*)-(\d{8}T\d{6}Z)-([0-9a-f]{8})\.tar\.gz(?:\.age)?$")
 m = NAME_RE.match(archive.name)
 check("E5 filename matches the §4.1 pattern", m is not None, archive.name)
 if not m:
@@ -25,18 +33,30 @@ if not m:
 slug, ts, id8 = m.groups()
 
 with tempfile.TemporaryDirectory() as td:
-    with tarfile.open(archive, "r:gz") as tar:
+    source = archive
+    if SUFFIX == ".tar.gz.age":
+        # A decrypted copy in the temporary folder is fine for a check; import
+        # itself never writes one (#27).
+        sys.path.insert(0, os.environ.get("RAG_TEST_API_DIR") or "/app")
+        from services import age_stream
+        source = Path(td) / "decrypted.tar.gz"
+        with archive.open("rb") as fh, source.open("wb") as out:
+            decryptor = age_stream.open_decrypt(fh, os.environ["RAG_PACKAGE_PASSPHRASE"])
+            while block := decryptor.read(1024 * 1024):
+                out.write(block)
+        check("#27 the encrypted package decrypts with its passphrase", True)
+    with tarfile.open(source, "r:gz") as tar:
         names = tar.getnames()
-        tar.extractall(td)
-    root = Path(td)
+        tar.extractall(Path(td) / "x")
+    root = Path(td) / "x"
+    stem = archive.name[:-len(SUFFIX)]
     tops = {n.split("/")[0] for n in names}
     check("archive expands to a single directory", len(tops) == 1, str(tops))
-    check("that directory is the filename minus .tar.gz",
-          tops == {archive.name[:-len(".tar.gz")]}, str(tops))
+    check(f"that directory is the filename minus {SUFFIX}", tops == {stem}, str(tops))
     # §4.2 — the manifest comes right after the directory entry (#383)
     check("§4.2 manifest.json is the archive's first file",
-          names[1:2] == [archive.name[:-len(".tar.gz")] + "/manifest.json"], str(names[:3]))
-    pkg = root / archive.name[:-len(".tar.gz")]
+          names[1:2] == [stem + "/manifest.json"], str(names[:3]))
+    pkg = root / stem
 
     manifest = json.loads((pkg / "manifest.json").read_text())
 
@@ -131,7 +151,11 @@ with tempfile.TemporaryDirectory() as td:
           str(set(re.findall(r"@@[A-Z_0-9]+@@", readme))))
     check("E19 README states the collection name", name in readme)
     check("E19 README states the fidelity", fid in readme)
-    check("E19 README carries the encryption warning", "not encrypted" in readme.lower())
+    # The encryption section is shared with /help/transfer, so it describes
+    # both forms; the README also names the file as delivered (#27).
+    check("E19 README carries the encryption section",
+          "## Encryption" in readme and "is not encrypted" in readme and ".tar.gz.age" in readme)
+    check("E19 README names the package file as delivered", archive.name in readme)
 
     if manifest.get("retrieve_script"):
         rp = pkg / "retrieve.py"
