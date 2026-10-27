@@ -23194,14 +23194,6 @@ jobs:
           # The suites run this PR's code; leave no token in its git config.
           persist-credentials: false
 
-      # The images, their build cache, the models and the models' cache copy
-      # need more than a runner has free. None of these toolchains is used.
-      - name: Free disk space
-        run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          df -h /
-
       # The cache key is the models ollama/entrypoint.sh pulls. The copies in
       # and out of the model volume run in the ollama image docker-compose.yml
       # pins, as stack.sh's own model copy does.
