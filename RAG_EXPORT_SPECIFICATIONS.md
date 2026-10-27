@@ -330,7 +330,8 @@ the same passphrase.
 - **Decryption** accepts only a header that parses under the age grammar and
   holds one stanza, of type `scrypt`, with a canonical 16-byte salt, a decimal
   work factor with no sign or leading zero, and a 32-byte body. A work factor
-  above 22 (age's own limit, about 4 GiB of scrypt memory) is refused without
+  above 20 (about 1 GiB of scrypt memory; a maintainer decision on #27, below
+  age's own limit of 22, about 4 GiB) is refused `DECRYPT_FAILED` without
   deriving anything, and at most one scrypt derivation runs at a time in the API.
   The header MAC is checked before any plaintext is released, and every payload
   chunk is authenticated before it is; a truncated payload, a missing or
@@ -484,7 +485,7 @@ Checks run in this order and stop at the first failure:
 
 | # | Check | On failure |
 |---|---|---|
-| 1 | File exists and is a readable `.tar.gz`; for a `.tar.gz.age` package, it has a valid age passphrase header and decrypts with the passphrase (§4.6) | `PACKAGE_UNREADABLE`; `DECRYPT_FAILED` for a wrong passphrase, damaged or truncated encrypted data, or a work factor above 22 |
+| 1 | File exists and is a readable `.tar.gz`; for a `.tar.gz.age` package, it has a valid age passphrase header and decrypts with the passphrase (§4.6) | `PACKAGE_UNREADABLE`; `DECRYPT_FAILED` for a wrong passphrase, damaged or truncated encrypted data, or a work factor above 20 |
 | 2 | `manifest.json` present, `package_format` understood | `PACKAGE_FORMAT_UNSUPPORTED` |
 | 3 | Every `files` key is a normalised relative path inside the package, and every `files` digest matches | `PACKAGE_CORRUPT`, naming the file (`manifest.json` for a key outside the package) |
 | 3a | Retained-source index names only valid digest identities and matching regular blobs; every chunk's `source_sha256` is `null` or a digest of that index (#509) | `PACKAGE_CORRUPT`, naming `sources/index.json`, or `chunks.jsonl` and the line for a chunk's digest |
@@ -938,7 +939,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | Code | Meaning |
 |---|---|
 | `PACKAGE_UNREADABLE` | missing or not a readable archive, or a `.tar.gz.age` file that is not an age passphrase file |
-| `DECRYPT_FAILED` | an encrypted package could not be decrypted: wrong passphrase, damaged or truncated data, or a work factor above 22; `error_detail.reason` is `passphrase`, `header`, `payload` or `work_factor`; nothing is touched (#27) |
+| `DECRYPT_FAILED` | an encrypted package could not be decrypted: wrong passphrase, damaged or truncated data, or a work factor above 20; `error_detail.reason` is `passphrase`, `header`, `payload` or `work_factor`; nothing is touched (#27) |
 | `PASSPHRASE_REQUIRED` | HTTP 400 from `POST /import`: a `.tar.gz.age` package without a passphrase; no job (#27) |
 | `PASSPHRASE_NOT_EXPECTED` | HTTP 400 from `POST /import`: a passphrase for a package that is not encrypted; no job (#27) |
 | `PACKAGE_FORMAT_UNSUPPORTED` | `package_format` newer than this instance |
@@ -1015,7 +1016,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E35 | Digest-valid malformed ingest settings (invalid JSON, a non-object, a wrong type or an invalid value) are refused `PACKAGE_CORRUPT`, naming `ingest_config.json`, before live mutation in all conflict modes, leaving the existing collection's settings unchanged; valid settings, including ones with missing or unknown fields, numeric strings and a `chunk_size`/`min_chunk_size` from before the chunk bounds, import and `GET /ingest/config/{collection}` returns them for the import target (#510), by `test_retrieval_import.py` |
 | E36 | An export holds its collection's writer guard for its whole run: a re-ingest that tries to commit mid-export waits, and the package holds the old chunks with the old source bytes, every non-null `source_sha256` naming a blob in it; gold-standard generation is refused `COLLECTION_BUSY` and guarded writers wait meanwhile; an export started while another writer holds the guard reads `queued`; the guard is released when the export completes, fails or is cancelled (#509); a cancelled export ends `failed` with an `error` saying so, and the cancellation still propagates (#521), by `test_export_snapshot.py` |
 | E37 | An export with a `passphrase` writes `<stem>.tar.gz.age`, an age v1 scrypt file at work factor 18 whose decryption satisfies §4.1 to §4.5 and that the listing shows `encrypted: true` with null metadata; the export and import jobs report `encrypted` and hold no passphrase (#27), by `test_export_encryption.py` and suite 05 |
-| E38 | Importing an encrypted package with a wrong passphrase fails `DECRYPT_FAILED` (`reason` `passphrase`), and a damaged, truncated or over-limit file fails `DECRYPT_FAILED` or `PACKAGE_UNREADABLE`, with no collection, marker, setting, session or package file changed and no work directory left; the right passphrase imports it with every chunk (#27), by `test_export_encryption.py` and suite 05 |
+| E38 | Importing an encrypted package with a wrong passphrase fails `DECRYPT_FAILED` (`reason` `passphrase`), and a damaged or truncated file fails `DECRYPT_FAILED` or `PACKAGE_UNREADABLE` and a scrypt work factor above 20 (21 included) fails `DECRYPT_FAILED` before any key derivation, with no collection, marker, setting, session or package file changed and no work directory left; the right passphrase imports it with every chunk (#27), by `test_export_encryption.py` and suite 05 |
 | E39 | `POST /import` refuses an encrypted package without a passphrase `400 PASSPHRASE_REQUIRED` and a passphrase for any other package `400 PASSPHRASE_NOT_EXPECTED`, before any job; `POST /export` refuses a passphrase outside 12 to 1024 characters `422 INVALID_PARAMETER` without echoing it (#27) |
 | E40 | The age implementation passes every applicable C2SP CCTV age testkit vector, and its output decrypts with an independent decryption written from the age specification (#27), by `test_export_encryption.py` |
 

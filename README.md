@@ -370,7 +370,10 @@ curl -X POST http://localhost:8080/api/export \
 The package is then written as `ragpkg-...tar.gz.age`: an
 [age](https://age-encryption.org) file encrypted with that passphrase (scrypt),
 streamed so a package of several GB never sits in memory or on disk unencrypted.
-Import needs the same passphrase, and `age -d` opens the file as well. The
+Import needs the same passphrase, and `age -d` opens the file as well. Import
+accepts a scrypt work factor of at most 20 (about 1 GiB of memory to derive the
+key) and refuses a higher one as `DECRYPT_FAILED` before deriving anything; age's
+own default, 18, which export uses, is well within it. The
 passphrase is never stored, logged or returned, and it can't be recovered: send it
 by a different channel than the file. Once a package is decrypted or imported, its
 contents are plaintext again on that machine.

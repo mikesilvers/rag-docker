@@ -259,16 +259,31 @@ class RoundTrip(unittest.TestCase):
         other = base64.b64encode(bytes([mac[0] ^ 1]) + mac[1:]).rstrip(b"=")
         return blob[:start] + other + blob[start + 43:]
 
-    def test_a_work_factor_above_22_is_refused_before_any_derivation(self):
+    def test_the_import_work_factor_limit_is_20(self):
+        self.assertEqual(age_stream.MAX_WORK_FACTOR, 20)
+
+    def test_a_work_factor_above_20_is_refused_before_any_derivation(self):
         blob = encrypt(b"data")
         line = blob.split(b"\n")[1]
-        for factor in (b"23", b"64", b"99999999999999999999"):
+        for factor in (b"21", b"22", b"23", b"64", b"99999999999999999999"):
             hostile = blob.replace(line, line.rsplit(b" ", 1)[0] + b" " + factor, 1)
             with self.subTest(factor=factor), \
                  patch.object(age_stream, "_scrypt", side_effect=AssertionError("scrypt ran")), \
                  self.assertRaises(age_stream.AgeError) as caught:
                 decrypt(hostile)
             self.assertEqual(caught.exception.kind, "work_factor")
+
+    def test_a_work_factor_of_20_still_reaches_derivation(self):
+        blob = encrypt(b"data")
+        line = blob.split(b"\n")[1]
+        at_limit = blob.replace(line, line.rsplit(b" ", 1)[0] + b" 20", 1)
+        derived = []
+        with patch.object(age_stream, "_scrypt",
+                          side_effect=lambda p, salt, wf: derived.append(wf) or bytes(32)), \
+             self.assertRaises(age_stream.AgeError) as caught:
+            decrypt(at_limit)
+        # A stand-in key, so the stanza doesn't unwrap; what matters is that it ran.
+        self.assertEqual((derived, caught.exception.kind), ([20], "passphrase"))
 
     def test_scrypt_derivations_run_one_at_a_time(self):
         active, peak, lock = [0], [0], threading.Lock()
@@ -480,7 +495,7 @@ class OpenEncrypted(Fixture):
         good = self.sealed().read_bytes()
         line = good.split(b"\n")[1]
         archive = self.exports / "ragpkg-wf.tar.gz.age"
-        archive.write_bytes(good.replace(line, line.rsplit(b" ", 1)[0] + b" 23", 1))
+        archive.write_bytes(good.replace(line, line.rsplit(b" ", 1)[0] + b" 21", 1))
         with patch.object(age_stream, "_scrypt", side_effect=AssertionError("scrypt ran")):
             self.assertEqual(self.refused(archive, "DECRYPT_FAILED").detail, {"reason": "work_factor"})
 

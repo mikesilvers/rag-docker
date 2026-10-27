@@ -6981,10 +6981,11 @@ _TAG = 16
 _FILE_KEY = 16
 _NONCE = 16
 # age's default for new passphrase files: about 256 MiB of memory (128 * r * N)
-# and about a second of work. Import accepts up to age's own decryption limit,
-# 22: about 4 GiB and over a minute, and refuses more without deriving anything.
+# and about a second of work. Import accepts at most 20 (about 1 GiB; the
+# maintainer's limit on #27, below age's own 22, which needs about 4 GiB and over
+# a minute), and refuses more without deriving anything.
 WORK_FACTOR = 18
-MAX_WORK_FACTOR = 22
+MAX_WORK_FACTOR = 20
 _SCRYPT_LABEL = b"age-encryption.org/v1/scrypt"
 # A passphrase file's header is about 150 bytes. Reading stops well before a
 # hostile file could make the parser hold a large one.
@@ -6992,8 +6993,8 @@ HEADER_MAX = 64 * 1024
 
 _B64 = re.compile(rb"^[A-Za-z0-9+/]*$")
 _WORK_FACTOR_TEXT = re.compile(r"^[1-9][0-9]*$")
-# One scrypt derivation at a time in this process: a hostile file at work factor
-# 22 needs about 4 GiB, and concurrent imports must not multiply that.
+# One scrypt derivation at a time in this process: a hostile file at the work
+# factor limit needs about 1 GiB, and concurrent imports must not multiply that.
 _scrypt_lock = threading.Lock()
 
 
@@ -15638,7 +15639,7 @@ RAG_UI_BASE=http://127.0.0.1:3000 RAG_CHROMIUM_PATH=/path/to/chromium node scrip
 `api/services/age_stream.py` writes and reads the age v1 passphrase format on the locked
 `cryptography`: `Encryptor` is the writable file `packager._write_archive` streams the tar.gz
 into (`tarfile` mode `w|gz`), holding back each full chunk until it knows whether it is the
-last; `open_decrypt` parses the header, refuses a work factor above 22 before scrypt, unwraps
+last; `open_decrypt` parses the header, refuses a work factor above 20 before scrypt, unwraps
 the file key under a process-wide lock, checks the header MAC and returns `Decryptor`, the
 readable file `packager.open_package` unpacks in `tarfile` mode `r|gz`, checking each member
 before extracting it, then drains to authenticate the rest. A `.tar.gz.age` name selects the

@@ -880,7 +880,7 @@ RAG_UI_BASE=http://127.0.0.1:3000 RAG_CHROMIUM_PATH=/path/to/chromium node scrip
 `api/services/age_stream.py` writes and reads the age v1 passphrase format on the locked
 `cryptography`: `Encryptor` is the writable file `packager._write_archive` streams the tar.gz
 into (`tarfile` mode `w|gz`), holding back each full chunk until it knows whether it is the
-last; `open_decrypt` parses the header, refuses a work factor above 22 before scrypt, unwraps
+last; `open_decrypt` parses the header, refuses a work factor above 20 before scrypt, unwraps
 the file key under a process-wide lock, checks the header MAC and returns `Decryptor`, the
 readable file `packager.open_package` unpacks in `tarfile` mode `r|gz`, checking each member
 before extracting it, then drains to authenticate the rest. A `.tar.gz.age` name selects the
