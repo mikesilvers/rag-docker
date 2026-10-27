@@ -1,0 +1,145 @@
+# Run the verification suite on every pull request to develop or main (#24).
+#
+# The suite runs as it does locally: on the disposable verify project that
+# scripts/verify/stack.sh builds from this checkout (compose project
+# rag-verify, port 8081), never with RAG_VERIFY_LIVE. `stack.sh run` removes
+# the project before its logs could be saved, so this takes the documented
+# `stack.sh up`, all.sh, `stack.sh down` route and saves the compose logs in
+# between. RAG_SKIP_SLOW=1 leaves out the LLM work; ingest still needs the
+# embedding model, so Ollama starts with both models, restored from the cache
+# when it has them. Pull requests from outside contributors run only after the
+# maintainer approves them.
+name: Verify
+on:
+  pull_request:
+    branches: [develop, main]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    # Up to two 15-minute starts (stack.sh), the build and the suite.
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      RAG_SKIP_SLOW: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The suites run this PR's code; leave no token in its git config.
+          persist-credentials: false
+
+      # The images, their build cache, the models and the models' cache copy
+      # need more than a runner has free. None of these toolchains is used.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # The cache key is the models ollama/entrypoint.sh pulls. The copies in
+      # and out of the model volume run in the ollama image docker-compose.yml
+      # pins, as stack.sh's own model copy does.
+      - name: Read the model names
+        id: models
+        run: |
+          names=$(sed -n 's/^pull_with_retry \([A-Za-z0-9._:-]*\)$/\1/p' ollama/entrypoint.sh | tr '\n' ' ')
+          names=${names% }
+          image=$(sed -n '/^  ollama:$/,/^  [a-z]/s/^    image: *//p' docker-compose.yml | head -1 | tr -d "\"'")
+          [ -n "$names" ] || { echo "no pull_with_retry lines in ollama/entrypoint.sh" >&2; exit 1; }
+          [ -n "$image" ] || { echo "no ollama image in docker-compose.yml" >&2; exit 1; }
+          echo "models: $names; image: $image"
+          {
+            echo "names=$names"
+            echo "image=$image"
+            echo "key=ollama-models-${names// /-}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore the models
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ollama-models
+          key: ${{ steps.models.outputs.key }}
+
+      # Into the verify project's model volume before it starts, so Ollama
+      # finds the models and pulls nothing. stack.sh keeps this volume.
+      - name: Load the cached models
+        if: steps.cache.outputs.cache-hit == 'true'
+        env:
+          IMAGE: ${{ steps.models.outputs.image }}
+        run: |
+          docker volume create --label rag-verify.models=1 rag-verify-ollama-models
+          docker run --rm --network none --entrypoint /bin/cp \
+            -v rag-verify-ollama-models:/copy -v "$RUNNER_TEMP/ollama-models:/cache:ro" \
+            "$IMAGE" -a /cache/models /copy/
+          rm -rf "$RUNNER_TEMP/ollama-models"
+
+      # stack.sh up waits for every service to be healthy and for /api/health
+      # to answer 200, then prints the exports that point compose and the
+      # suites at the verify project; they go to the later steps' environment.
+      - name: Start the verify project
+        run: |
+          bash scripts/verify/stack.sh up | tee "$RUNNER_TEMP/stack-up.log"
+          grep '^export ' "$RUNNER_TEMP/stack-up.log" > "$RUNNER_TEMP/verify-env.sh"
+          . "$RUNNER_TEMP/verify-env.sh"
+          sed -n 's/^export \([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$RUNNER_TEMP/verify-env.sh" \
+            | while read -r var; do printf '%s=%s\n' "$var" "${!var}"; done >> "$GITHUB_ENV"
+
+      - name: Run the verify suite
+        run: bash scripts/verify/all.sh
+
+      # By project name from a neutral folder, as stack.sh down does, so it
+      # also works when up failed before printing its exports.
+      - name: Collect the compose logs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/verify-logs"
+          cd /
+          env -u COMPOSE_FILE docker compose -p rag-verify ps -a > "$RUNNER_TEMP/verify-logs/ps.txt" 2>&1 || true
+          env -u COMPOSE_FILE docker compose -p rag-verify logs --no-color --timestamps > "$RUNNER_TEMP/verify-logs/compose.log" 2>&1 || true
+
+      - name: Upload the compose logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: compose-logs
+          path: ${{ runner.temp }}/verify-logs
+
+      - name: Remove the verify project
+        if: always()
+        run: bash scripts/verify/stack.sh down
+
+      # On a cache miss, once the project is gone: only the models/ tree, never
+      # the key pair Ollama keeps beside it, and only when every model's
+      # manifest is there. A failure here fails only this step.
+      - name: Copy the models out for the cache
+        id: export
+        if: always() && steps.models.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        env:
+          IMAGE: ${{ steps.models.outputs.image }}
+          NAMES: ${{ steps.models.outputs.names }}
+        run: |
+          rm -rf "$RUNNER_TEMP/ollama-models"
+          mkdir -p "$RUNNER_TEMP/ollama-models"
+          docker run --rm --network none --user "$(id -u):$(id -g)" -e NAMES --entrypoint /bin/bash \
+            -v rag-verify-ollama-models:/copy:ro -v "$RUNNER_TEMP/ollama-models:/cache" \
+            "$IMAGE" -c '
+              set -eu
+              for model in $NAMES; do
+                name=${model%%:*}; tag=latest
+                case "$model" in *:*) tag=${model#*:} ;; esac
+                [ -f "/copy/models/manifests/registry.ollama.ai/library/$name/$tag" ] \
+                  || { echo "no manifest for $model; not caching" >&2; exit 1; }
+              done
+              cp -R /copy/models /cache/'
+
+      - name: Save the models
+        if: always() && steps.export.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ollama-models
+          key: ${{ steps.models.outputs.key }}

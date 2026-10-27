@@ -1,5 +1,7 @@
 # RAG Platform
 
+[![Verify](https://github.com/mikesilvers/rag-docker/actions/workflows/verify.yml/badge.svg?branch=develop)](https://github.com/mikesilvers/rag-docker/actions/workflows/verify.yml)
+
 A self-contained, Dockerized Retrieval-Augmented Generation (RAG) platform. Upload documents, ask questions, and generate evaluation datasets — all running locally with no external API keys required.
 
 ## What's included
@@ -463,6 +465,10 @@ the run. `stack.sh` doesn't build, start or stop your own stack, and only
 reads its model volume, to copy the models. That guards against accidents,
 not hostile code: a branch's scripts run on your host with full access to
 Docker. Exits non-zero if any check fails, so it can gate a commit.
+
+Every pull request to `develop` or `main` also runs it in GitHub Actions, with
+`RAG_SKIP_SLOW=1` (`.github/workflows/verify.yml`, the badge above). See
+"Continuous integration" in `scripts/verify/README.md`.
 
 These are integration tests on purpose. Every defect this project has produced
 was invisible to a unit test of the same function: a parser dependency missing

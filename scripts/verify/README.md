@@ -124,6 +124,44 @@ nothing.
 configuration check and both refusals, with Docker replaced by a stub, so it
 needs no stack.
 
+## Continuous integration
+
+`.github/workflows/verify.yml` runs the suite on GitHub Actions for every pull
+request to `develop` or `main` (#24), on `ubuntu-latest`, with `RAG_SKIP_SLOW=1`.
+It uses the same verify project as a local run and never sets
+`RAG_VERIFY_LIVE`; nothing in it changes the refusals above. The badge at the
+top of the main `README.md` shows its result on `develop`.
+
+- **Up, suites, logs, down.** `stack.sh run` removes the project before its
+  logs could be saved, so the workflow takes the `up` route: `stack.sh up`
+  (which waits for every service and for `/api/health`), `all.sh` with the
+  environment `up` prints, then the logs, then `stack.sh down`. The logs and
+  `down` steps run whether the earlier steps passed or not.
+- **The `compose-logs` artifact.** Every run uploads `docker compose logs` of
+  every service, with timestamps, and `docker compose ps -a`, also when `up`
+  failed.
+- **The model cache.** Even with `RAG_SKIP_SLOW=1`, ingest needs the embedding
+  model, so Ollama starts with both models (about 2.5 GB). The cache key is
+  built from the models `ollama/entrypoint.sh` pulls
+  (`ollama-models-phi3.5-nomic-embed-text`). On a hit, the cached models are
+  copied into `rag-verify-ollama-models` before `up`, and Ollama pulls
+  nothing. On a miss, Ollama pulls them; after `down`, the workflow copies the
+  volume's `models/` folder out, only once every model's manifest is there,
+  and saves it under that key. Ollama's key pair, kept beside `models/`, is
+  never cached. Both copies run in the ollama image `docker-compose.yml` pins,
+  with no network. GitHub scopes a cache saved by a pull request run to that
+  pull request, so a pull request reuses it on later pushes and re-runs; the
+  next pull request pulls the models once again.
+- **Permissions.** The workflow can only read the repository
+  (`contents: read`), uses no secrets, and leaves no token in the checkout.
+  Its actions are GitHub's own, each pinned to a full commit SHA. Pull
+  requests from outside contributors run only after the maintainer approves
+  them.
+
+`python3 scripts/tests/test_ci_workflow.py`, run by `01_infrastructure.sh`,
+checks these rules on the workflow file. The workflow's own run on the pull
+request is its real test.
+
 ## Settings publication regressions
 
 With API dependencies installed, run
@@ -655,6 +693,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
+| `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
 | `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
