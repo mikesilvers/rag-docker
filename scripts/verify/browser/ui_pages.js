@@ -274,7 +274,9 @@ function packageCases() {
   const xfer = (routes = {}) => ({ role: 'developer', path: '/transfer', fastPolls: true, routes: common(routes) });
   const withPkgs = (routes = {}) => xfer({ 'GET /api/packages': json(200, { packages: PACKAGES }), ...routes });
   const pick = (page, name) => fillNth(page, 'select', 1, name);
-  const start = async (page, name = PKG_OK) => { await waitFor(page, n => [...document.querySelectorAll('select')[1].options].length > 1, 'the packages'); await pick(page, name); await press(page, 'Import'); };
+  // The page renders only once GET /api/auth/me has answered (#25), so the
+  // select may not exist yet on the first poll.
+  const start = async (page, name = PKG_OK) => { await waitFor(page, () => document.querySelectorAll('select')[1]?.options.length > 1, 'the packages'); await pick(page, name); await press(page, 'Import'); };
   return [
     { name: 'A readable package shows its collection, chunks, fidelity and size; an unreadable one says so', open: withPkgs(), async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('select')[1]?.options.length > 1, 'the packages');
