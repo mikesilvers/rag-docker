@@ -362,9 +362,11 @@ damage, 5,001 entries refused at the default; the ratio rule (under 1 MiB exempt
 ratio accepted), a declared ratio refused before anything is read, a stored member and gzip
 output not counted toward the ratio, a member refused while read within a block of passing the
 ratio, the expansion cap winning over the ratio and the ratio over an earlier unreadable member;
-members whose path leaves the archive validated (a corrupt one refuses the ZIP), counted,
-never staged and listed in `skipped`; and `detail.members` bounded to the ten members the
-message names, with `members_omitted`. `02_ingest.sh` runs it in the API container, checks
+the count winning over the declared total, and the total over the ratio while a member is read
+(#534); members whose path leaves the archive validated (a corrupt one refuses the ZIP, an
+encrypted one makes it `ARCHIVE_UNSUPPORTED`), counted, never staged and listed in `skipped`;
+and `detail.members` bounded to the ten members the message names, with `members_omitted`
+(0 at exactly ten). `02_ingest.sh` runs it in the API container, checks
 that the API takes `MAX_ZIP_MEMBERS` 5,000 and `MAX_ZIP_MEMBER_RATIO` 200 from
 `docker-compose.yml`, then sends `zip_many_members.zip` (5,001 entries) and
 `zip_high_ratio.zip` (2 MiB of zeros, Deflate) through the proxy and checks each is refused
