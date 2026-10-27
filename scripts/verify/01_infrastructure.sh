@@ -36,6 +36,8 @@ python3 "$REPO_ROOT/scripts/tests/test_suite_registration.py"
 check "the verify suites run the test files #386 registered" $?
 python3 "$REPO_ROOT/scripts/tests/test_dependency_floors.py"
 check "pinned dependencies are at or above their patched versions (#522)" $?
+python3 "$REPO_ROOT/scripts/tests/test_ci_workflow.py"
+check "the CI workflow runs the verify suite on every pull request (#24)" $?
 # Through the app with Weaviate and Ollama mocked, in the same isolated container (#373).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_error_envelope.py)
 check "API errors answer in the JSON envelope, dependency failures 503 (#373)" $?

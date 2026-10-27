@@ -14229,6 +14229,44 @@ nothing.
 configuration check and both refusals, with Docker replaced by a stub, so it
 needs no stack.
 
+## Continuous integration
+
+`.github/workflows/verify.yml` runs the suite on GitHub Actions for every pull
+request to `develop` or `main` (#24), on `ubuntu-latest`, with `RAG_SKIP_SLOW=1`.
+It uses the same verify project as a local run and never sets
+`RAG_VERIFY_LIVE`; nothing in it changes the refusals above. The badge at the
+top of the main `README.md` shows its result on `develop`.
+
+- **Up, suites, logs, down.** `stack.sh run` removes the project before its
+  logs could be saved, so the workflow takes the `up` route: `stack.sh up`
+  (which waits for every service and for `/api/health`), `all.sh` with the
+  environment `up` prints, then the logs, then `stack.sh down`. The logs and
+  `down` steps run whether the earlier steps passed or not.
+- **The `compose-logs` artifact.** Every run uploads `docker compose logs` of
+  every service, with timestamps, and `docker compose ps -a`, also when `up`
+  failed.
+- **The model cache.** Even with `RAG_SKIP_SLOW=1`, ingest needs the embedding
+  model, so Ollama starts with both models (about 2.5 GB). The cache key is
+  built from the models `ollama/entrypoint.sh` pulls
+  (`ollama-models-phi3.5-nomic-embed-text`). On a hit, the cached models are
+  copied into `rag-verify-ollama-models` before `up`, and Ollama pulls
+  nothing. On a miss, Ollama pulls them; after `down`, the workflow copies the
+  volume's `models/` folder out, only once every model's manifest is there,
+  and saves it under that key. Ollama's key pair, kept beside `models/`, is
+  never cached. Both copies run in the ollama image `docker-compose.yml` pins,
+  with no network. GitHub scopes a cache saved by a pull request run to that
+  pull request, so a pull request reuses it on later pushes and re-runs; the
+  next pull request pulls the models once again.
+- **Permissions.** The workflow can only read the repository
+  (`contents: read`), uses no secrets, and leaves no token in the checkout.
+  Its actions are GitHub's own, each pinned to a full commit SHA. Pull
+  requests from outside contributors run only after the maintainer approves
+  them.
+
+`python3 scripts/tests/test_ci_workflow.py`, run by `01_infrastructure.sh`,
+checks these rules on the workflow file. The workflow's own run on the pull
+request is its real test.
+
 ## Settings publication regressions
 
 With API dependencies installed, run
@@ -14762,6 +14800,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
+| `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
 | `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
@@ -16932,6 +16971,8 @@ python3 "$REPO_ROOT/scripts/tests/test_suite_registration.py"
 check "the verify suites run the test files #386 registered" $?
 python3 "$REPO_ROOT/scripts/tests/test_dependency_floors.py"
 check "pinned dependencies are at or above their patched versions (#522)" $?
+python3 "$REPO_ROOT/scripts/tests/test_ci_workflow.py"
+check "the CI workflow runs the verify suite on every pull request (#24)" $?
 # Through the app with Weaviate and Ollama mocked, in the same isolated container (#373).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_error_envelope.py)
 check "API errors answer in the JSON envelope, dependency failures 503 (#373)" $?
@@ -23272,6 +23313,325 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
   await browser.close();
   process.exit(r.summary() ? 0 : 1);
 })().catch(e => { console.log('  HARNESS FAILURE: ' + e.message); process.exit(2); });
+```
+
+### .github/workflows/verify.yml
+
+The CI run of the verification suite on every pull request to `develop` or
+`main` (#24); see "Continuous integration" in `scripts/verify/README.md`.
+
+```yaml
+# Run the verification suite on every pull request to develop or main (#24).
+#
+# The suite runs as it does locally: on the disposable verify project that
+# scripts/verify/stack.sh builds from this checkout (compose project
+# rag-verify, port 8081), never with RAG_VERIFY_LIVE. `stack.sh run` removes
+# the project before its logs could be saved, so this takes the documented
+# `stack.sh up`, all.sh, `stack.sh down` route and saves the compose logs in
+# between. RAG_SKIP_SLOW=1 leaves out the LLM work; ingest still needs the
+# embedding model, so Ollama starts with both models, restored from the cache
+# when it has them. Pull requests from outside contributors run only after the
+# maintainer approves them.
+name: Verify
+on:
+  pull_request:
+    branches: [develop, main]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    # Up to two 15-minute starts (stack.sh), the build and the suite.
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      RAG_SKIP_SLOW: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The suites run this PR's code; leave no token in its git config.
+          persist-credentials: false
+
+      # The cache key is the models ollama/entrypoint.sh pulls. The copies in
+      # and out of the model volume run in the ollama image docker-compose.yml
+      # pins, as stack.sh's own model copy does.
+      - name: Read the model names
+        id: models
+        run: |
+          names=$(sed -n 's/^pull_with_retry \([A-Za-z0-9._:-]*\)$/\1/p' ollama/entrypoint.sh | tr '\n' ' ')
+          names=${names% }
+          image=$(sed -n '/^  ollama:$/,/^  [a-z]/s/^    image: *//p' docker-compose.yml | head -1 | tr -d "\"'")
+          [ -n "$names" ] || { echo "no pull_with_retry lines in ollama/entrypoint.sh" >&2; exit 1; }
+          [ -n "$image" ] || { echo "no ollama image in docker-compose.yml" >&2; exit 1; }
+          echo "models: $names; image: $image"
+          {
+            echo "names=$names"
+            echo "image=$image"
+            echo "key=ollama-models-${names// /-}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore the models
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ollama-models
+          key: ${{ steps.models.outputs.key }}
+
+      # Into the verify project's model volume before it starts, so Ollama
+      # finds the models and pulls nothing. stack.sh keeps this volume.
+      - name: Load the cached models
+        if: steps.cache.outputs.cache-hit == 'true'
+        env:
+          IMAGE: ${{ steps.models.outputs.image }}
+        run: |
+          docker volume create --label rag-verify.models=1 rag-verify-ollama-models
+          docker run --rm --network none --entrypoint /bin/cp \
+            -v rag-verify-ollama-models:/copy -v "$RUNNER_TEMP/ollama-models:/cache:ro" \
+            "$IMAGE" -a /cache/models /copy/
+          rm -rf "$RUNNER_TEMP/ollama-models"
+
+      # stack.sh up waits for every service to be healthy and for /api/health
+      # to answer 200, then prints the exports that point compose and the
+      # suites at the verify project; they go to the later steps' environment.
+      - name: Start the verify project
+        run: |
+          bash scripts/verify/stack.sh up | tee "$RUNNER_TEMP/stack-up.log"
+          grep '^export ' "$RUNNER_TEMP/stack-up.log" > "$RUNNER_TEMP/verify-env.sh"
+          . "$RUNNER_TEMP/verify-env.sh"
+          sed -n 's/^export \([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$RUNNER_TEMP/verify-env.sh" \
+            | while read -r var; do printf '%s=%s\n' "$var" "${!var}"; done >> "$GITHUB_ENV"
+
+      - name: Run the verify suite
+        run: bash scripts/verify/all.sh
+
+      # By project name from a neutral folder, as stack.sh down does, so it
+      # also works when up failed before printing its exports.
+      - name: Collect the compose logs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/verify-logs"
+          cd /
+          env -u COMPOSE_FILE docker compose -p rag-verify ps -a > "$RUNNER_TEMP/verify-logs/ps.txt" 2>&1 || true
+          env -u COMPOSE_FILE docker compose -p rag-verify logs --no-color --timestamps > "$RUNNER_TEMP/verify-logs/compose.log" 2>&1 || true
+
+      - name: Upload the compose logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: compose-logs
+          path: ${{ runner.temp }}/verify-logs
+
+      - name: Remove the verify project
+        if: always()
+        run: bash scripts/verify/stack.sh down
+
+      # On a cache miss, once the project is gone: only the models/ tree, never
+      # the key pair Ollama keeps beside it, and only when every model's
+      # manifest is there. A failure here fails only this step.
+      - name: Copy the models out for the cache
+        id: export
+        if: always() && steps.models.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        env:
+          IMAGE: ${{ steps.models.outputs.image }}
+          NAMES: ${{ steps.models.outputs.names }}
+        run: |
+          rm -rf "$RUNNER_TEMP/ollama-models"
+          mkdir -p "$RUNNER_TEMP/ollama-models"
+          docker run --rm --network none --user "$(id -u):$(id -g)" -e NAMES --entrypoint /bin/bash \
+            -v rag-verify-ollama-models:/copy:ro -v "$RUNNER_TEMP/ollama-models:/cache" \
+            "$IMAGE" -c '
+              set -eu
+              for model in $NAMES; do
+                name=${model%%:*}; tag=latest
+                case "$model" in *:*) tag=${model#*:} ;; esac
+                [ -f "/copy/models/manifests/registry.ollama.ai/library/$name/$tag" ] \
+                  || { echo "no manifest for $model; not caching" >&2; exit 1; }
+              done
+              cp -R /copy/models /cache/'
+
+      - name: Save the models
+        if: always() && steps.export.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ollama-models
+          key: ${{ steps.models.outputs.key }}
+```
+
+### scripts/tests/test_ci_workflow.py
+
+Host-only check of the workflow's rules, the README badge and these embedded
+copies, run by `01_infrastructure.sh`.
+
+```python
+"""Host-only check of the CI workflow that runs the verify suite on pull requests (#24).
+
+Reads .github/workflows/verify.yml as text: its trigger, permissions and
+action pins, the stack.sh up / all.sh / stack.sh down sequence on the
+disposable verify project, the compose logs artifact and the model cache. Also
+checks the README badge and the copies embedded in IMPLEMENTATION.md. The
+workflow's real run is the pull request's own; this keeps its rules from
+drifting. Standard library only; no Docker or stack needed.
+
+Run: python3 scripts/tests/test_ci_workflow.py
+"""
+from pathlib import Path
+import re
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+WORKFLOW = '.github/workflows/verify.yml'
+BADGE = ('[![Verify](https://github.com/mikesilvers/rag-docker/actions/workflows/verify.yml/badge.svg?branch=develop)]'
+         '(https://github.com/mikesilvers/rag-docker/actions/workflows/verify.yml)')
+# The pattern the workflow's sed uses on ollama/entrypoint.sh, in Python.
+MODEL_LINE = re.compile(r'^pull_with_retry ([A-Za-z0-9._:-]*)$', re.M)
+
+
+def workflow():
+    return (ROOT / WORKFLOW).read_text()
+
+
+def code(text):
+    """The workflow without its comment lines."""
+    return '\n'.join(line for line in text.splitlines() if not line.lstrip().startswith('#'))
+
+
+def top_block(text, key):
+    """The lines of a top-level key's block, the key's own line included."""
+    lines = text.splitlines()
+    start = lines.index(key + ':')
+    block = [lines[start]]
+    for line in lines[start + 1:]:
+        if line and not line.startswith((' ', '#')):
+            break
+        block.append(line)
+    return [line for line in block if line.strip() and not line.lstrip().startswith('#')]
+
+
+def steps(text):
+    """Each step's text, in order, comments left out."""
+    lines = text.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.strip() == 'steps:')
+    found = []
+    for line in lines[start + 1:]:
+        if line.lstrip().startswith('#'):
+            continue
+        if line.startswith('      - '):
+            found.append([])
+        if found:
+            found[-1].append(line)
+    return ['\n'.join(step) for step in found]
+
+
+def step_with(text, needle):
+    matches = [i for i, step in enumerate(steps(text)) if needle in step]
+    if len(matches) != 1:
+        raise AssertionError('{} steps contain {!r}, wanted 1'.format(len(matches), needle))
+    return matches[0], steps(text)[matches[0]]
+
+
+class TriggerAndPermissionTests(unittest.TestCase):
+    def test_runs_on_every_pull_request_to_develop_and_main_only(self):
+        text = workflow()
+        self.assertEqual(top_block(text, 'on'),
+                         ['on:', '  pull_request:', '    branches: [develop, main]'])
+        self.assertNotIn('pull_request_target', text)
+
+    def test_one_job_on_ubuntu_latest_with_a_timeout(self):
+        text = workflow()
+        self.assertEqual(re.findall(r'^    runs-on: (.*)$', text, re.M), ['ubuntu-latest'])
+        self.assertRegex(text, r'(?m)^    timeout-minutes: \d+$')
+
+    def test_least_privilege_and_no_secrets(self):
+        text = workflow()
+        self.assertEqual(top_block(text, 'permissions'), ['permissions:', '  contents: read'])
+        self.assertEqual(len(re.findall(r'(?m)^\s*permissions:', text)), 1)
+        for refused in ('secrets.', 'GITHUB_TOKEN'):
+            with self.subTest(refused=refused):
+                self.assertFalse(refused in text, refused + ' is used')
+
+    def test_every_action_is_github_owned_and_pinned_to_a_full_sha(self):
+        uses = re.findall(r'(?m)^\s*(?:- )?uses: (.*)$', workflow())
+        self.assertTrue(uses)
+        for value in uses:
+            with self.subTest(uses=value):
+                self.assertRegex(value, r'^actions/[a-z-]+(/[a-z-]+)?@[0-9a-f]{40} # v\d+\.\d+\.\d+$')
+
+    def test_checkout_leaves_no_credentials(self):
+        _, step = step_with(workflow(), 'actions/checkout@')
+        self.assertIn('persist-credentials: false', step)
+
+
+class SuiteTests(unittest.TestCase):
+    def test_skip_slow_on_the_verify_project_never_the_live_stack(self):
+        text = code(workflow())
+        self.assertRegex(text, r"(?m)^      RAG_SKIP_SLOW: '1'$")
+        for refused in ('RAG_VERIFY_LIVE', 'stack.sh run'):
+            with self.subTest(refused=refused):
+                self.assertFalse(refused in text, refused + ' is used')
+        self.assertIsNone(re.search(r'docker compose[^\n]* up\b', text), 'docker compose up is used')
+
+    def test_up_suite_logs_upload_down_in_order(self):
+        text = workflow()
+        order = [step_with(text, needle)[0] for needle in (
+            'bash scripts/verify/stack.sh up', 'bash scripts/verify/all.sh',
+            'docker compose -p rag-verify logs', 'actions/upload-artifact@',
+            'bash scripts/verify/stack.sh down')]
+        self.assertEqual(order, sorted(order))
+
+    def test_logs_upload_and_down_always_run(self):
+        text = workflow()
+        for needle in ('docker compose -p rag-verify logs', 'actions/upload-artifact@',
+                       'bash scripts/verify/stack.sh down'):
+            with self.subTest(step=needle):
+                self.assertIn('if: always()', step_with(text, needle)[1])
+
+
+class ModelCacheTests(unittest.TestCase):
+    def test_key_is_the_models_the_entrypoint_pulls(self):
+        text = workflow()
+        _, step = step_with(text, 'id: models')
+        self.assertIn('ollama/entrypoint.sh', step)
+        self.assertIn(r"sed -n 's/^pull_with_retry \([A-Za-z0-9._:-]*\)$/\1/p'", step)
+        self.assertIn('key=ollama-models-', step)
+        self.assertTrue(MODEL_LINE.findall((ROOT / 'ollama/entrypoint.sh').read_text()))
+
+    def test_restored_before_start_and_saved_only_after_a_miss(self):
+        text = workflow()
+        restore, restore_step = step_with(text, 'actions/cache/restore@')
+        start, _ = step_with(text, 'bash scripts/verify/stack.sh up')
+        export, export_step = step_with(text, 'id: export')
+        save, save_step = step_with(text, 'actions/cache/save@')
+        down, _ = step_with(text, 'bash scripts/verify/stack.sh down')
+        self.assertLess(restore, start)
+        self.assertLess(down, export)
+        self.assertLess(export, save)
+        for step in (restore_step, save_step):
+            self.assertIn('key: ${{ steps.models.outputs.key }}', step)
+        self.assertIn("steps.cache.outputs.cache-hit != 'true'", export_step)
+        self.assertIn('/copy/models', export_step)
+        self.assertIn("steps.export.outcome == 'success'", save_step)
+
+
+class DocumentationTests(unittest.TestCase):
+    def test_readme_shows_the_badge(self):
+        self.assertIn(BADGE, (ROOT / 'README.md').read_text())
+
+    def test_embedded_copies_match(self):
+        text = (ROOT / 'IMPLEMENTATION.md').read_text()
+        for name, language in ((WORKFLOW, 'yaml'), ('scripts/tests/test_ci_workflow.py', 'python')):
+            with self.subTest(file=name):
+                header = '### {}\n\n'.format(name)
+                start = text.index(header) + len(header)
+                start = text.index('```{}\n'.format(language), start) + len(language) + 4
+                end = text.index('\n```\n', start)
+                self.assertEqual(text[start:end], (ROOT / name).read_text().rstrip('\n'))
+
+
+if __name__ == '__main__':
+    unittest.main()
 ```
 
 ## 6. Packaging and Offline Distribution
