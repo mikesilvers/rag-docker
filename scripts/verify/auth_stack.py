@@ -164,6 +164,24 @@ def check_public(operator_ok):
            "GET /auth/status answered {} {!r}".format(status, raw[:200]))
 
 
+def check_control_path(operator_ok):
+    # Starlette would route /ingest/upload%0A to the upload handler; the API
+    # refuses it as an unknown path before reading the body (#25 review).
+    body = b"--x\r\nContent-Disposition: form-data; name=\"collection\"\r\n\r\nVfyAuthNoSuch\r\n--x--\r\n"
+    req = urllib.request.Request(auth_setup.api_base() + "/ingest/upload%0A", data=body, method="POST",
+                                 headers={"Content-Type": "multipart/form-data; boundary=x"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            status, raw = response.status, response.read()
+    except urllib.error.HTTPError as error:
+        status, raw = error.code, error.read()
+    # The API's own 404, or nginx refusing the path itself (400); anything else
+    # (a 403 from the app's fail-closed check, a 422 from the handler) means the
+    # request got past the middleware and its body was read.
+    expect((status == 404 and error_code(raw) == "NOT_FOUND") or (status == 400 and error_code(raw) is None),
+           "POST /api/ingest/upload%0A without a session answered {} {}".format(status, error_code(raw)))
+
+
 def check_login_logout(operator_ok):
     token = role_token("developer")
     status, raw, _ = code("GET", "/auth/me", token=token)
@@ -306,6 +324,9 @@ def check_own_password(operator_ok):
                               token=token)
         expect(status == 422 and error_code(raw) == "INVALID_PASSWORD",
                "a {}-character new password answered {}".format(len(bad), status))
+    status, raw, _ = code("POST", "/auth/password", {"current_password": password, "new_password": password},
+                          token=token)
+    expect(status == 422 and error_code(raw) == "INVALID_PASSWORD", "the same password again answered {}".format(status))
     new = secrets.token_urlsafe(18)
     status, _, _ = code("POST", "/auth/password", {"current_password": password, "new_password": new}, token=token)
     expect(status == 200, "the change answered {}".format(status))

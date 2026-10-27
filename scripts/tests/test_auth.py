@@ -227,6 +227,23 @@ class StoreTests(StoreTestCase):
         self.assertFalse(store.locked("alice", "a"))
 
 
+    def test_attempts_are_counted_before_they_are_checked(self):
+        # Five attempts still being checked fill the window: a sixth, in
+        # parallel, is refused before its password is looked at.
+        for _ in range(store.THROTTLE_FAILURES):
+            self.assertTrue(store.reserve_attempt("alice", "a"))
+        self.assertFalse(store.reserve_attempt("alice", "a"))
+        self.assertTrue(store.reserve_attempt("alice", "b"))
+        # They fail: with five counted in the window, the pair is locked.
+        locks = [store.finish_attempt("alice", "a", False) for _ in range(store.THROTTLE_FAILURES)]
+        self.assertTrue(any(locks))
+        self.assertTrue(store.locked("alice", "a"))
+        # A success clears the pair's count.
+        store.finish_attempt("alice", "b", True)
+        for _ in range(store.THROTTLE_FAILURES):
+            self.assertTrue(store.reserve_attempt("alice", "b"))
+
+
 class PolicyTests(unittest.TestCase):
     def app_routes(self):
         keys = set()
@@ -378,6 +395,35 @@ class MiddlewareTests(StoreTestCase):
         self.assertEqual(reads, [])
         self.assertEqual(sent[0]["status"], 401)
 
+    def test_a_control_character_in_the_path_is_refused_before_the_body(self):
+        # Starlette routes `/ingest/upload\n` (%0A) to the upload handler; the
+        # policy must not let it through unchecked, or the body would be read.
+        self.make("eng", "engineer")
+        reads, sent = [], []
+
+        async def receive():
+            reads.append(1)
+            return {"type": "http.request", "body": b"x" * 1024, "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        async def never(scope, receive, send):
+            raise AssertionError("the app was called")
+
+        for path in ("/ingest/upload\n", "/collections\r", "/collections/A\x00"):
+            with self.subTest(path=path):
+                reads.clear(); sent.clear()
+                scope = {"type": "http", "method": "POST", "path": path, "headers": [(b"host", b"testserver")]}
+                asyncio.run(AuthMiddleware(never)(scope, receive, send))
+                self.assertEqual(reads, [])
+                self.assertEqual(sent[0]["status"], 404)
+        response = self.client.post("/ingest/upload%0A", files={"files": ("a.txt", b"x" * 4096)},
+                                    data={"collection": "C"})
+        self.assertEqual((response.status_code, response.json()["error"]["code"]), (404, "NOT_FOUND"))
+        headers, _ = self.session("eng")
+        self.assertEqual(self.client.get("/collections%0A", headers=headers).status_code, 404)
+
     def test_a_refused_request_keeps_its_route_label(self):
         self.make("eng", "engineer")
         scope = {"type": "http", "method": "DELETE", "path": "/collections/Abc", "headers": []}
@@ -515,6 +561,34 @@ class RouteTests(StoreTestCase):
         self.assertEqual(response.status_code, 422)
         self.assertIn("username", response.json()["error"]["message"])
 
+    def test_the_new_password_must_differ_from_the_current_one(self):
+        self.make("eng", "engineer")
+        generated = passwords.generate_password()
+        store.create_user("dev", "developer", generated)
+        token = self.login("dev", generated).headers["set-cookie"].split(";")[0].split("=", 1)[1]
+        headers = {"Cookie": f"{store.COOKIE}={token}", "Origin": ORIGIN}
+        same = self.client.post("/auth/password", headers=headers,
+                                json={"current_password": generated, "new_password": generated})
+        self.assertEqual((same.status_code, same.json()["error"]["code"]), (422, "INVALID_PASSWORD"))
+        self.assertIn("differ", same.json()["error"]["message"])
+        self.assertTrue(store.get_user("dev").must_change_password, "the generated password is still due")
+        self.assertTrue(passwords.verify_password(generated, store.get_user("dev").password_hash))
+
+    def test_wrong_current_passwords_are_throttled(self):
+        self.setup_roles()
+        headers, token = self.session("user")
+        for _ in range(store.THROTTLE_FAILURES):
+            wrong = self.client.post("/auth/password", headers=headers,
+                                     json={"current_password": "nope" * 3, "new_password": "n" * 14})
+            self.assertEqual(wrong.json()["error"]["code"], "PASSWORD_INCORRECT")
+        with self.assertLogs("auth", "WARNING") as logs:
+            right = self.client.post("/auth/password", headers=headers,
+                                     json={"current_password": self.passwords["end_user"], "new_password": "n" * 14})
+        self.assertEqual((right.status_code, right.json()["error"]["code"]), (429, "LOGIN_THROTTLED"))
+        self.assertNotIn(self.passwords["end_user"], logged(logs))
+        # The same pair as the login: the login is locked too.
+        self.assertEqual(self.login("user", self.passwords["end_user"]).status_code, 429)
+
     def test_forced_change_allows_only_session_routes(self):
         self.make("eng", "engineer")
         generated = passwords.generate_password()
@@ -530,6 +604,43 @@ class RouteTests(StoreTestCase):
                                    json={"current_password": generated, "new_password": "chosen-by-dev"})
         self.assertEqual(changed.json()["must_change_password"], False)
         self.assertNotEqual(self.client.get("/collections", headers=headers).status_code, 403)
+    def test_a_failed_login_is_logged_without_the_password(self):
+        # Q30: one API log line per login, failures included, never a password.
+        password = self.make("eng", "engineer")
+        typed = "a-wrong-password-" + passwords.generate_password()
+        with self.assertLogs("auth", "WARNING") as logs:
+            self.assertEqual(self.login("eng", typed).status_code, 401)
+            self.assertEqual(self.login("nobody", typed).status_code, 401)
+        text = logged(logs)
+        self.assertEqual(len(logs.records), 2, text)
+        self.assertIn("Login failed for 'eng'", text)
+        self.assertIn("Login failed for 'nobody'", text)
+        self.assertNotIn(typed, text)
+        self.assertNotIn(password, text)
+
+    def test_a_due_change_still_allows_logout(self):
+        self.make("eng", "engineer")
+        generated = passwords.generate_password()
+        store.create_user("dev", "developer", generated)
+        token = self.login("dev", generated).headers["set-cookie"].split(";")[0].split("=", 1)[1]
+        headers = {"Cookie": f"{store.COOKIE}={token}", "Origin": ORIGIN}
+        self.assertEqual(self.client.post("/auth/logout", headers=headers).status_code, 200)
+        self.assertIsNone(store.authenticate(token))
+
+    def test_head_is_enforced_like_get(self):
+        self.setup_roles()
+        self.assertEqual(self.client.head("/collections").status_code, 401)
+        headers, _ = self.session("user")
+        self.assertEqual(self.client.head("/packages", headers=headers).status_code, 403)
+
+    def test_oversized_login_is_refused_before_any_hashing(self):
+        self.make("eng", "engineer")
+        with patch.object(passwords, "verify_password", wraps=passwords.verify_password) as verify:
+            for body in ({"username": "u" * 257, "password": "x" * 12},
+                         {"username": "eng", "password": "x" * 1025}):
+                with self.subTest(body={k: len(v) for k, v in body.items()}):
+                    self.assertEqual(self.client.post("/auth/login", json=body).status_code, 422)
+        verify.assert_not_called()
 
 
 class CommandTests(unittest.TestCase):
@@ -606,6 +717,20 @@ class CommandTests(unittest.TestCase):
         self.assertIn("admin\tengineer\tenabled\tpassword change due\t", result.stdout)
         self.assertNotIn(password, result.stdout)
         self.assertNotIn("scrypt", result.stdout)
+    def test_every_action_writes_one_stderr_line(self):
+        # N4: one line per action on standard error, naming no password.
+        password = self.run_auth("bootstrap", "admin").stdout.strip()
+        created = self.run_auth("create-user", "dev", "developer")
+        for args in (("reset-password", "dev"), ("set-role", "dev", "end_user"), ("disable", "dev"),
+                     ("enable", "dev"), ("disable", "admin")):
+            with self.subTest(args=args):
+                result = self.run_auth(*args)
+                lines = result.stderr.strip().splitlines()
+                self.assertEqual(len(lines), 1, result.stderr)
+                self.assertTrue(lines[0].startswith("auth: " + args[0]), lines[0])
+                for secret in (password, created.stdout.strip(), result.stdout.strip()):
+                    if secret:
+                        self.assertNotIn(secret, result.stderr)
 
 
 class TestingHelperTests(unittest.TestCase):

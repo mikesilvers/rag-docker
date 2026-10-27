@@ -47,11 +47,13 @@ check "disabling a user ends their session and refuses their login; enable resto
 stack role-change
 check "a role change applies to an existing session on its next request" $?
 stack own-password
-check "the own password change: rules, current password, other sessions ended" $?
+check "the own password change: rules, current password, not the same password, other sessions ended" $?
 stack idle-expiry
 check "a session idle for more than 12 hours answers 401" $?
 
 section "Request protection and login throttling (H4)"
+stack control-path
+check "a path ending in %0A is refused before its body is read, not routed past the check" $?
 stack no-cors
 check "no Access-Control-* headers, preflight included" $?
 stack origin

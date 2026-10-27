@@ -147,9 +147,12 @@ docker compose exec api python -m auth list
 on the terminal only; it is never logged. The user must change it at their
 first login, from the page the UI shows them. Usernames are 3-32 characters of
 lowercase letters, digits, `.`, `_` and `-` (case doesn't matter); passwords are
-12-256 characters and not the username. Passwords are stored only as scrypt
-hashes. The last enabled AI Engineer can't be disabled or demoted; if you are
-locked out, `create-user`, `enable` or `reset-password` gets you back in.
+12-256 characters, not the username, and a change must pick a password other
+than the current one. Passwords are stored only as scrypt hashes. The last
+enabled AI Engineer can't be disabled or demoted. If you are locked out of your
+account (a lost password, a disabled account), `create-user`, `enable` or
+`reset-password` gets you back in; these don't lift a login throttle (below),
+which ends by itself after 15 minutes.
 Disabling a user or resetting their password ends their sessions at once; a
 role change applies to their next request.
 
@@ -158,9 +161,12 @@ role change applies to their next request.
 The browser keeps the session in an HttpOnly, `SameSite=Strict` cookie, which
 page scripts can't read. A session ends after 12 hours without a request or 7
 days after login, and survives an API restart and closing the browser. Five
-failed logins for a username from one address within 15 minutes lock that pair
-out for 15 minutes; every failure answers the same `LOGIN_FAILED`, whether or
-not the account exists. A change (POST, PATCH, DELETE) sent with the cookie must
+failed logins for a username from one address within 15 minutes throttle that
+pair for 15 minutes (`429 LOGIN_THROTTLED`); a wrong current password on the
+password-change page counts the same way. Every failure answers the same
+`LOGIN_FAILED`, whether or not the account exists. Behind Docker's port
+publishing every browser on the host may reach the API from the same address,
+so in practice the throttle is per username. A change (POST, PATCH, DELETE) sent with the cookie must
 come from this same origin, or it is refused `403 CROSS_ORIGIN_REFUSED`. Each
 login, success or failure, is one line in `docker compose logs api`, with the
 username and address and never the password.
@@ -196,6 +202,15 @@ the UI shows that command. Then create an account for each person with
 `create-user`. The role picker and the "Switch Role" button are gone, and
 nothing about the role is kept in the browser. Accounts live in the new
 `auth_data` volume.
+
+**Recreate the proxy when you upgrade.** `proxy/nginx.conf` now forwards the
+browser's `Host` with its port, which the API's same-origin check compares with
+`Origin`. The file is a single-file bind mount, so a running proxy keeps the old
+copy: until it is recreated, every change the UI sends (a query, an upload,
+logout, a password change) is refused `403 CROSS_ORIGIN_REFUSED`, although the
+login itself works. After pulling, run
+`docker compose up -d --build --force-recreate` (or at least
+`docker compose up -d --force-recreate proxy`).
 
 A package's `retrieve.py` now logs in: `python3 retrieve.py --username alice
 "question"` asks for the password (or reads it with `--password-stdin`). A
@@ -774,7 +789,7 @@ If this fails after Docker restarts, Docker's internal networking is broken — 
 
 **Port 8080 already in use** — The proxy publishes on host loopback port 8080 (`docker-compose.yml`, the `proxy` service: `"127.0.0.1:8080:80"`). Change the middle number to any free port, for example `"127.0.0.1:9090:80"`, then access the UI at `http://localhost:9090`. Keep the `127.0.0.1` host address and container port 80.
 
-**Sharing with your office** — The default binding is now local to the Docker host. An existing installation accessed from another computer will stop accepting those connections after its proxy is recreated. This workbench currently has no API authentication; authenticated LAN access with TLS is tracked in issue #26 and is not yet provided. Keep the loopback binding for the current local setup.
+**Sharing with your office** — The default binding is now local to the Docker host. An existing installation accessed from another computer will stop accepting those connections after its proxy is recreated. The API requires an account (see [Accounts and roles](#accounts-and-roles)), but LAN access, with TLS, is tracked in issue #26 and is not yet provided. Keep the loopback binding for the current local setup.
 **Upload fails with "larger than the 512 MB limit" or HTTP 413** — The upload is over the proxy's limit (see [Configuration](#configuration)). The limit covers the whole request, so split a large batch into several uploads, or raise the limit. Before issue #21 the proxy used nginx's 1 MB default, so a 413 on an ordinary PDF means the proxy is running an old `nginx.conf`: run `docker compose up -d --force-recreate proxy`.
 
 **Build fails with `ERROR: Could not install packages due to an OSError: [Errno 28] No space left on device`** — Docker's virtual disk is full, not your host disk — the two are reported separately, and `df -h` on the host will look fine. A virtual disk of 8 GB or so cannot hold ~6.5 GB of images plus build cache, so the build runs out of room partway through `pip install`. Check the real numbers with:

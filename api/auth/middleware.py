@@ -29,6 +29,11 @@ from utils import api_error
 from . import policy, store
 
 UNSAFE = frozenset(("POST", "PUT", "PATCH", "DELETE"))
+# Starlette's route patterns end in `$`, which also matches before a trailing
+# newline, so it routes `/ingest/upload\n` (sent as %0A) to the upload handler
+# while a policy template wouldn't match it. No route has a control character
+# in its path, so such a path is refused outright, before anything else.
+_CONTROL = frozenset(chr(c) for c in range(32)) | {"\x7f"}
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
@@ -88,6 +93,9 @@ class AuthMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        if any(ch in _CONTROL for ch in scope["path"]):
+            # Answered here, so the body of such a request is never read.
+            return await api_error(404, "NOT_FOUND", "No API route matches this path.")(scope, receive, send)
         template = policy.match(scope["method"], scope["path"])
         if template is None:
             # No route for this method and path: the app's own 404 or 405, which

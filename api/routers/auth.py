@@ -48,17 +48,19 @@ async def auth_status():
 def _login(typed: str, password: str, address: str):
     """('throttled' | 'failed' | 'ok', user, token). Blocking: scrypt and SQLite."""
     key = typed.lower()
-    if store.locked(key, address):
+    # The attempt is counted before the password is checked, in the same
+    # transaction as the lockout check, so parallel requests can't all slip in.
+    if not store.reserve_attempt(key, address):
         return "throttled", None, None
     username = passwords.normalize_username(typed)
     user = store.get_user(username) if username else None
     # Verified against a dummy hash when there is no such user, so a failure
     # takes as long either way and the timing doesn't reveal which accounts exist.
     matched = passwords.verify_password(password, user.password_hash if user else passwords.dummy_hash())
-    if not (matched and user and user.enabled):
-        store.record_failure(key, address)
+    ok = bool(matched and user and user.enabled)
+    store.finish_attempt(key, address, ok)
+    if not ok:
         return "failed", None, None
-    store.clear_failures(key, address)
     return "ok", user, store.create_session(user.id)
 
 
@@ -99,13 +101,22 @@ async def me(request: Request):
     return _user_body(principal.username, principal.role, principal.must_change_password)
 
 
-def _change(principal, current: str, new: str):
+def _change(principal, current: str, new: str, address: str):
+    # A wrong current password counts against the same throttle as a failed
+    # login, so a session left open can't be used to guess the password.
+    if not store.reserve_attempt(principal.username, address):
+        return "throttled"
     user = store.get_user(principal.username)
-    if user is None or not passwords.verify_password(current, user.password_hash):
+    right = user is not None and passwords.verify_password(current, user.password_hash)
+    store.finish_attempt(principal.username, address, right)
+    if not right:
         return "incorrect"
     problem = passwords.password_problem(new, principal.username)
     if problem:
         return problem
+    # A generated password must really be replaced (N2), and so must any other.
+    if new == current:
+        return "The new password must differ from the current one."
     store.change_password(principal, new)
     return None
 
@@ -113,8 +124,13 @@ def _change(principal, current: str, new: str):
 @router.post("/password")
 async def change_password(body: PasswordChangeRequest, request: Request):
     principal = request.state.auth
-    problem = await asyncio.to_thread(_change, principal, body.current_password, body.new_password)
+    address = _address(request)
+    problem = await asyncio.to_thread(_change, principal, body.current_password, body.new_password, address)
+    if problem == "throttled":
+        _log.warning("Password change refused for %r from %s: too many failed attempts", principal.username, address)
+        return api_error(429, "LOGIN_THROTTLED", "Too many failed attempts. Wait 15 minutes and try again.")
     if problem == "incorrect":
+        _log.warning("Password change failed for %r from %s: wrong current password", principal.username, address)
         return api_error(403, "PASSWORD_INCORRECT", "The current password is incorrect.")
     if problem:
         return api_error(422, "INVALID_PASSWORD", problem)

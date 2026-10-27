@@ -1344,8 +1344,10 @@ one may. The role of a request is the one stored for its user at that moment, ne
 The matrix is one table in `api/auth/policy.py`. A route without an entry is refused for everyone (`403
 FORBIDDEN`), and a registered check fails when a route lacks an entry or an entry names no route. Jobs and
 gold-standard sessions have no owner: any user with the route's role may poll or open them. A path that matches
-no route keeps `404 NOT_FOUND`, and a wrong method `405 METHOD_NOT_ALLOWED`. The check runs before the route reads
-the request body, so a refused upload is never received.
+no route keeps `404 NOT_FOUND`, and a wrong method `405 METHOD_NOT_ALLOWED`. A path holding a control character
+(for example a trailing newline, `%0A`, which Starlette's `$`-anchored routes would still match) answers
+`404 NOT_FOUND` before anything else. The check runs before the route reads the request body, so a refused upload
+is never received.
 
 **Refusals**, the first that applies answering: `503 SETUP_REQUIRED` (no account exists yet); `401
 AUTH_REQUIRED` (no valid session); `403 CROSS_ORIGIN_REFUSED` (a cookie-authenticated `POST`, `PUT`, `PATCH` or
@@ -1368,8 +1370,12 @@ user: a role change applies to the next request; disabling an account, resetting
 delete its sessions.
 
 **Login throttling.** Failed logins are counted per (username as typed, lowercased; client address, `X-Real-IP`
-from nginx). Five within 15 minutes lock the pair for 15 minutes: its logins answer `429 LOGIN_THROTTLED`
-without checking the password. The same applies to unknown usernames. A successful login clears the pair's count.
+from nginx). Five within 15 minutes throttle the pair for 15 minutes: its logins answer `429 LOGIN_THROTTLED`
+without checking the password. The same applies to unknown usernames. An attempt is counted before its password
+is checked, in the same transaction as the throttle check, so parallel attempts can't exceed five. A successful
+login clears the pair's count. A wrong current password on `POST /auth/password` counts against the same pair, and
+a throttled pair's password change answers `429 LOGIN_THROTTLED`. Behind Docker's port publishing every client on
+the host may share one address, so in practice the throttle is per username.
 
 | Route | Request | Success |
 |---|---|---|
@@ -1377,7 +1383,7 @@ without checking the password. The same applies to unknown usernames. A successf
 | `POST /auth/login` | `{"username", "password"}` | `200 {"username", "role", "must_change_password"}` and the cookie. Every failure (unknown user, wrong password, disabled account, malformed username) is the same `401 LOGIN_FAILED` "The username or password is incorrect.", checked against a hash either way so the time doesn't differ |
 | `GET /auth/me` | | `200 {"username", "role", "must_change_password"}` |
 | `POST /auth/logout` | | `200 {"status": "logged_out"}`; the session is deleted and the cookie expired |
-| `POST /auth/password` | `{"current_password", "new_password"}` | `200 {"status": "changed", "username", "role", "must_change_password": false}`; the user's other sessions end, this one stays. A wrong current password is `403 PASSWORD_INCORRECT`; a new one breaking the rules is `422 INVALID_PASSWORD` naming the rule |
+| `POST /auth/password` | `{"current_password", "new_password"}` | `200 {"status": "changed", "username", "role", "must_change_password": false}`; the user's other sessions end, this one stays. A wrong current password is `403 PASSWORD_INCORRECT`; a new one breaking the rules, or equal to the current one (so a generated password can't be kept), is `422 INVALID_PASSWORD` naming the rule |
 
 **Operator command**, inside the api container: `docker compose exec api python -m auth <subcommand>`.
 
@@ -1393,8 +1399,14 @@ without checking the password. The same applies to unknown usernames. A successf
 `bootstrap`, `create-user` and `reset-password` print a generated password (24 characters, 144 random bits)
 alone on standard output and nowhere else, and mark it to be changed at first login. Each change writes one line
 to standard error; exit status 0 done, 1 refused, 2 usage error. The last enabled engineer can't be disabled or
-demoted; a lockout is recovered with `create-user`, `enable` or `reset-password`. No account or password comes
+demoted; an account a user is locked out of (lost password, disabled) is recovered with `create-user`, `enable` or
+`reset-password`, which don't lift a login throttle (it ends by itself after 15 minutes). No account or password comes
 from the environment, and none exists by default.
+
+**Upgrading.** An existing install answers `503 SETUP_REQUIRED` everywhere but `/health` until `bootstrap`. The
+proxy must be recreated (`docker compose up -d --force-recreate proxy`, or the whole stack): `proxy/nginx.conf`
+is a single-file bind mount, and a proxy still running the old copy sends `Host` without the port, so every
+cookie-authenticated change fails the origin check with `403 CROSS_ORIGIN_REFUSED`.
 
 **Logging.** One `WARNING` line per login attempt (success, failure, throttled) on logger `auth`, with the
 username and client address; never a password, token or cookie. The telemetry route vocabulary gains the five
@@ -3117,7 +3129,7 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   *Evidence: `test_auth.py` (store and `python -m auth` in a subprocess); suite 17 on the stack: `bootstrap` refused, forced change on created accounts.*
 - [x] Login, `GET /auth/me` and logout; the cookie's attributes; a session survives an API restart (with `RAG_ALLOW_RESTART=1`) and ends after 12 hours idle or 7 days; a password reset or disable ends the user's sessions at once, and a role change applies to an existing session's next request; the own password change needs the current password, follows the rules, and ends the user's other sessions.
   *Evidence: `test_auth.py` (expiry with a patched clock); suite 17 on the stack, with throwaway `vfy-t-*` accounts and a session aged in the store.*
-- [x] A cookie-authenticated change from another origin, or with neither `Origin` nor `Sec-Fetch-Site: same-origin`, is refused `403 CROSS_ORIGIN_REFUSED`; the API sends no `Access-Control-*` headers; every login failure is the same `401 LOGIN_FAILED`; five failures for a username and address within 15 minutes lock the pair for 15 minutes, for unknown usernames too, and the lockout survives a restart; the API log has one line per login and no password or session token.
+- [x] A cookie-authenticated change from another origin, or with neither `Origin` nor `Sec-Fetch-Site: same-origin`, is refused `403 CROSS_ORIGIN_REFUSED`; the API sends no `Access-Control-*` headers; every login failure is the same `401 LOGIN_FAILED`; five failures for a username and address within 15 minutes throttle the pair for 15 minutes, for unknown usernames too, attempts are counted before they are checked, a wrong current password on `POST /auth/password` counts too, and the throttle survives a restart; a path with a control character (`%0A`) is refused `404` before its body is read; a password change to the current password is refused; the API log has one line per login and no password or session token.
   *Evidence: `test_auth.py`; suite 17 on the stack; suite 01's CORS check.*
 - [x] The verify harness gets its test credentials without committing, printing or passing them on a command line or in the environment: one account per role, generated passwords replaced at first login, kept in a 0600 file in a 0700 folder of the user's own outside the checkout, with the operator command run only on the verify project.
   *Evidence: `scripts/tests/test_verify_auth.py` on the host (suite 17); `auth_stack.py no-secrets-logged`.*

@@ -322,6 +322,45 @@ def record_failure(username: str, address: str) -> bool:
     return True
 
 
+def reserve_attempt(username: str, address: str) -> bool:
+    """Count an attempt before its password is checked; False when the pair is
+    locked or already has its 5 counted attempts in the window (some of them
+    possibly still being checked). Check and count are one transaction, so
+    parallel attempts can't all pass the check. finish_attempt settles it."""
+    now = _now()
+    with _connect(write=True) as conn:
+        conn.execute("DELETE FROM login_failures WHERE at <= ?", (now - THROTTLE_WINDOW_S,))
+        conn.execute("DELETE FROM login_lockouts WHERE until <= ?", (now,))
+        if conn.execute("SELECT 1 FROM login_lockouts WHERE username = ? AND address = ?",
+                        (username, address)).fetchone():
+            return False
+        count = conn.execute("SELECT COUNT(*) FROM login_failures WHERE username = ? AND address = ?",
+                             (username, address)).fetchone()[0]
+        if count >= THROTTLE_FAILURES:
+            return False
+        conn.execute("INSERT INTO login_failures (username, address, at) VALUES (?, ?, ?)",
+                     (username, address, now))
+    return True
+
+
+def finish_attempt(username: str, address: str, succeeded: bool) -> bool:
+    """Settle a reserved attempt: a success clears the pair's count; a failure
+    keeps its row and, at 5 in the window, locks the pair. True when it locks."""
+    now = _now()
+    with _connect(write=True) as conn:
+        if succeeded:
+            conn.execute("DELETE FROM login_failures WHERE username = ? AND address = ?", (username, address))
+            return False
+        count = conn.execute("SELECT COUNT(*) FROM login_failures WHERE username = ? AND address = ? AND at > ?",
+                             (username, address, now - THROTTLE_WINDOW_S)).fetchone()[0]
+        if count < THROTTLE_FAILURES:
+            return False
+        conn.execute("INSERT OR REPLACE INTO login_lockouts (username, address, until) VALUES (?, ?, ?)",
+                     (username, address, now + LOCKOUT_S))
+        conn.execute("DELETE FROM login_failures WHERE username = ? AND address = ?", (username, address))
+    return True
+
+
 def clear_failures(username: str, address: str) -> None:
     with _connect(write=True) as conn:
         conn.execute("DELETE FROM login_failures WHERE username = ? AND address = ?", (username, address))
