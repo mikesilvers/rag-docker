@@ -173,8 +173,13 @@ check "the memory status agrees with the reported allocation" $?
 
 # Raise the recommendation past the actual allocation (in-process only --
 # neither the running server nor docker-compose.yml is touched) and confirm
-# the status flips and a note is attached.
-(cd "$REPO_ROOT" && docker compose exec -T api env RECOMMENDED_MEMORY_GB=13 python3 -c "
+# the status flips and a note is attached. The override comes from the
+# allocation /health reported, never a constant: a fixed 13 GB stayed 'ok' on
+# any host giving Docker 12.35 GB or more (#536).
+python3 "$REPO_ROOT/scripts/tests/test_memory_override.py"
+check "the memory override always exceeds the reported allocation (#536)" $?
+mem_override=$(python3 "$REPO_ROOT/scripts/verify/memory_override.py" "$RAG_INFRA_TMP/vfy_health.json")
+(cd "$REPO_ROOT" && docker compose exec -T api env RECOMMENDED_MEMORY_GB="$mem_override" python3 -c "
 import json
 from config import Settings
 from services import system_info
