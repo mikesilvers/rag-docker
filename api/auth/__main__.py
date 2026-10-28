@@ -44,13 +44,6 @@ def _role(parser, value: str) -> str:
     return value
 
 
-def _new_password(username: str) -> str:
-    while True:
-        password = passwords.generate_password()
-        if passwords.password_problem(password, username) is None:
-            return password
-
-
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m auth", description="Manage RAG platform accounts.")
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
@@ -75,13 +68,13 @@ def main(argv=None) -> int:
     role = _role(parser, args.role) if hasattr(args, "role") else None
     try:
         if args.command in ("bootstrap", "create-user"):
-            password = _new_password(username)
+            password = passwords.new_password(username)
             role = "engineer" if args.command == "bootstrap" else role
             store.create_user(username, role, password, bootstrap=args.command == "bootstrap")
             print(password, flush=True)
             _say(f"{args.command}: created {role} {username!r}; the password above must be changed at first login")
         elif args.command == "reset-password":
-            password = _new_password(username)
+            password = passwords.new_password(username)
             store.reset_password(username, password)
             print(password, flush=True)
             _say(f"reset-password: new password for {username!r}, to be changed at next login; "

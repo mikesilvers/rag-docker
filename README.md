@@ -111,7 +111,7 @@ can't use.
 |---|---|
 | **End User** | Q&A only |
 | **Developer** | Q&A, Import, Chunking, Retrieval, Gold Standard, Transfer |
-| **AI Engineer** | All of the above + Collections management (deleting collections) + Health dashboard + tuning |
+| **AI Engineer** | All of the above + Collections management (deleting collections) + Health dashboard + tuning + Users (account management) |
 
 Endpoint by endpoint (paths under `/api`):
 
@@ -121,7 +121,7 @@ Endpoint by endpoint (paths under `/api`):
 | any logged-in user | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password` |
 | End User | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
 | Developer | creating a collection; ingest (upload, job status, settings); saving retrieval settings; gold standard (generate, sessions, pairs, regenerate, save, download); export, import, their job status, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
-| AI Engineer | `DELETE /collections/{name}`; `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/job/{id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; the API docs (`/docs`, `/redoc`, `/openapi.json`) |
+| AI Engineer | `DELETE /collections/{name}`; `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/job/{id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; the API docs (`/docs`, `/redoc`, `/openapi.json`); account management (`GET` and `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `/role`, `/disable`, `/enable`) |
 
 Without a session the API answers `401 AUTH_REQUIRED`; with a role that is too
 low, `403 FORBIDDEN`. Jobs and gold-standard sessions belong to no particular
@@ -129,8 +129,11 @@ user: anyone with the role may poll or open them.
 
 ### Managing accounts
 
-Accounts are created and recovered by an operator, on the machine running the
-stack, with the `python -m auth` command in the api container. There is no
+An operator creates the first AI Engineer on the machine running the stack,
+with the `python -m auth` command in the api container. After that, AI
+Engineers manage accounts on the **Users** page: create an account, reset a
+password, change a role, disable and enable. The operator command stays
+available for the same changes and for recovery. There is no
 self-registration and no email recovery.
 
 ```bash
@@ -155,6 +158,15 @@ account (a lost password, a disabled account), `create-user`, `enable` or
 which ends by itself after 15 minutes.
 Disabling a user or resetting their password ends their sessions at once; a
 role change applies to their next request.
+
+On the Users page, creating an account or resetting a password shows the
+generated password once, to the AI Engineer, who passes it on; the user
+changes it at first login. An AI Engineer's own password is changed with
+"Change password" (it needs the current one), not reset on the Users page.
+Accounts are disabled, never deleted, so a username always means the same
+person. The last enabled AI Engineer can't be demoted or disabled here either.
+Each change made on the Users page is one line in `docker compose logs api`,
+naming the AI Engineer, the change and the account, never a password.
 
 ### Sessions
 

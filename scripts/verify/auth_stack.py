@@ -62,6 +62,14 @@ MATRIX = (
     ("GET", "/docs/oauth2-redirect", None, "engineer"),
     ("GET", "/redoc", None, "engineer"),
     ("GET", "/openapi.json", None, "engineer"),
+    # Account administration (PR 2 of #25): an allowed request lists, or is a
+    # 422 or a 404 for an account that doesn't exist; it changes nothing.
+    ("GET", "/auth/users", None, "engineer"),
+    ("POST", "/auth/users", {}, "engineer"),
+    ("POST", "/auth/users/vfy-no-such-user/reset-password", None, "engineer"),
+    ("POST", "/auth/users/vfy-no-such-user/role", {}, "engineer"),
+    ("POST", "/auth/users/vfy-no-such-user/disable", None, "engineer"),
+    ("POST", "/auth/users/vfy-no-such-user/enable", None, "engineer"),
 )
 SESSION_ROUTES = (("GET", "/auth/me", None), ("POST", "/auth/logout", None), ("POST", "/auth/password", {}))
 
@@ -332,6 +340,70 @@ def check_own_password(operator_ok):
     expect(status == 200, "the change answered {}".format(status))
     expect(code("GET", "/auth/me", token=token)[0] == 200, "the change ended the session that made it")
     expect(code("GET", "/auth/me", token=other)[0] == 401, "the change left another session working")
+
+
+def check_admin_accounts(operator_ok):
+    """The Engineer's account administration through the API (PR 2 of #25), on a
+    throwaway vfy-t-<random> account."""
+    expect(operator_ok, "creates accounts, so it runs only on the verify project")
+    admin = role_token("engineer")
+    username = "vfy-t-" + secrets.token_hex(4)
+    generated = []
+
+    def call(path, body=None, method="POST"):
+        status, raw, headers = code(method, "/auth/users" + path, body, token=admin)
+        return status, (json.loads(raw) if raw else {}), headers
+
+    status, body, headers = call("", {"username": username.upper(), "role": "developer"})
+    expect(status == 201 and body["user"]["username"] == username and body["user"]["must_change_password"] is True,
+           "create answered {} {}".format(status, error_code(json.dumps(body).encode())))
+    expect(headers.get("Cache-Control") == "no-store", "the created password's answer may be cached")
+    generated.append(body["password"])
+    status, listed, _ = call("", method="GET")
+    expect(status == 200 and username in [u["username"] for u in listed["users"]], "the new account isn't listed")
+    expect(generated[0] not in json.dumps(listed), "the list holds the generated password")
+    status, body, token = request("POST", "/auth/login", {"username": username, "password": generated[0]})
+    expect(status == 200 and body.get("must_change_password") is True, "the generated password must be changed first")
+    new = secrets.token_urlsafe(18)
+    status, _, _ = code("POST", "/auth/password", {"current_password": generated[0], "new_password": new}, token=token)
+    expect(status == 200, "the forced change answered {}".format(status))
+
+    status, body, _ = call("/{}/role".format(username), {"role": "end_user"})
+    expect(status == 200 and body["user"]["role"] == "end_user", "the role change answered {}".format(status))
+    status, raw, _ = code("GET", "/packages", token=token)
+    expect(status == 403 and error_code(raw) == "FORBIDDEN", "the demoted session answered {}".format(status))
+
+    status, body, _ = call("/{}/reset-password".format(username))
+    expect(status == 200 and body["user"]["must_change_password"] is True, "the reset answered {}".format(status))
+    generated.append(body["password"])
+    expect(code("GET", "/auth/me", token=token)[0] == 401, "a reset left the user's session working")
+    status, _, token = request("POST", "/auth/login", {"username": username, "password": generated[1]})
+    expect(status == 200 and token, "the reset password doesn't log in ({})".format(status))
+
+    status, body, _ = call("/{}/disable".format(username))
+    expect(status == 200 and body["user"]["enabled"] is False, "disable answered {}".format(status))
+    expect(code("GET", "/auth/me", token=token)[0] == 401, "a disabled user's session still works")
+    status, raw, _ = code("POST", "/auth/login", {"username": username, "password": generated[1]})
+    expect(status == 401 and error_code(raw) == "LOGIN_FAILED", "a disabled user can log in ({})".format(status))
+    status, body, _ = call("/{}/enable".format(username))
+    expect(status == 200 and body["user"]["enabled"] is True, "enable answered {}".format(status))
+    status, _, _ = code("POST", "/auth/login", {"username": username, "password": generated[1]})
+    expect(status == 200, "enable did not restore the login ({})".format(status))
+
+    me = auth_setup.read_credentials(auth_setup.private_dir())["engineer"][0]
+    status, body, _ = call("/{}/reset-password".format(me))
+    expect(status == 409 and body["error"]["code"] == "SELF_RESET_REFUSED",
+           "the Engineer's own reset answered {}".format(status))
+    expect(code("GET", "/auth/me", token=admin)[0] == 200, "the refused own reset ended the session")
+    request("POST", "/auth/logout", token=admin)
+
+    result = compose("logs", "--no-color", "api")
+    log = result.stdout + result.stderr
+    expect(result.returncode == 0, "docker compose logs failed")
+    expect(not [p for p in generated if p in log], "a generated password appears in the API log")
+    for line in ("created developer '{}'".format(username), "reset the password of '{}'".format(username),
+                 "disabled '{}'".format(username), "enabled '{}'".format(username)):
+        expect("Admin '{}' {}".format(me, line) in log, "the API log has no line \"Admin ... {}\"".format(line))
 
 
 def check_bootstrap_refused(operator_ok):

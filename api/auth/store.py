@@ -71,7 +71,13 @@ _set_up: set[str] = set()
 
 
 class Refused(Exception):
-    """An account change the rules don't allow; the message says why, in one line."""
+    """An account change the rules don't allow; the message says why, in one line.
+    `code` names the reason for the API: USER_EXISTS, USER_NOT_FOUND,
+    LAST_ENGINEER, or REFUSED for the bootstrap rules."""
+
+    def __init__(self, message: str, code: str = "REFUSED"):
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -162,7 +168,7 @@ def is_set_up() -> bool:
     return found
 
 
-# ── accounts (the operator command) ──────────────────────────────────────────
+# ── accounts (the operator command and the admin routes) ─────────────────────
 
 def get_user(username: str) -> User | None:
     with _connect() as conn:
@@ -192,7 +198,7 @@ def create_user(username: str, role: str, password: str, *, bootstrap: bool = Fa
         if not bootstrap and not exists:
             raise Refused("the system is not set up yet; run bootstrap first")
         if conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
-            raise Refused(f"the user {username!r} already exists")
+            raise Refused(f"the user {username!r} already exists", "USER_EXISTS")
         conn.execute("INSERT INTO users (username, role, password_hash, enabled, must_change_password, "
                      "created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?)",
                      (username, role, password_hash, int(must_change_password), now, now))
@@ -203,7 +209,7 @@ def create_user(username: str, role: str, password: str, *, bootstrap: bool = Fa
 def _existing(conn, username: str):
     row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
     if row is None:
-        raise Refused(f"there is no user {username!r}")
+        raise Refused(f"there is no user {username!r}", "USER_NOT_FOUND")
     return row
 
 
@@ -231,7 +237,8 @@ def set_role(username: str, role: str) -> None:
     with _connect(write=True) as conn:
         row = _existing(conn, username)
         if role != "engineer" and _is_last_engineer(conn, row):
-            raise Refused(f"{username!r} is the last enabled engineer; make another engineer first")
+            raise Refused(f"{username!r} is the last enabled engineer; make another engineer first",
+                          "LAST_ENGINEER")
         conn.execute("UPDATE users SET role = ?, updated_at = ? WHERE id = ?", (role, _now(), row["id"]))
 
 
@@ -240,7 +247,8 @@ def set_enabled(username: str, enabled: bool) -> None:
     with _connect(write=True) as conn:
         row = _existing(conn, username)
         if not enabled and _is_last_engineer(conn, row):
-            raise Refused(f"{username!r} is the last enabled engineer; make another engineer first")
+            raise Refused(f"{username!r} is the last enabled engineer; make another engineer first",
+                          "LAST_ENGINEER")
         conn.execute("UPDATE users SET enabled = ?, updated_at = ? WHERE id = ?",
                      (int(enabled), _now(), row["id"]))
         if not enabled:

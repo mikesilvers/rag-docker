@@ -624,6 +624,32 @@ class AuthUser(BaseModel):
     must_change_password: bool
 
 
+class AdminUser(BaseModel):
+    username: str
+    role: Literal["end_user", "developer", "engineer"]
+    enabled: bool
+    must_change_password: bool
+    created_at: str
+
+
+class AdminUserList(BaseModel):
+    users: list[AdminUser]
+
+
+class AdminUserResult(BaseModel):
+    user: AdminUser
+    password: Optional[str] = None   # a generated password, in this answer only
+
+
+class UserCreateRequest(BaseModel):
+    username: str = Field(max_length=256)
+    role: Literal["end_user", "developer", "engineer"]
+
+
+class RoleChangeRequest(BaseModel):
+    role: Literal["end_user", "developer", "engineer"]
+
+
 # ── Error ─────────────────────────────────────────────────────────────────────
 
 class ErrorDetail(BaseModel):
