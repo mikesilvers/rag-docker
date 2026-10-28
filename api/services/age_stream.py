@@ -56,7 +56,10 @@ _SCRYPT_LABEL = b"age-encryption.org/v1/scrypt"
 HEADER_MAX = 64 * 1024
 
 _B64 = re.compile(rb"^[A-Za-z0-9+/]*$")
-_WORK_FACTOR_TEXT = re.compile(r"^[1-9][0-9]*$")
+# One or two digits, no sign or leading zero: every accepted value (1 to 20) fits,
+# and a longer field is refused before int(), which raises on a very long one
+# (Python's int string-length limit), so no field can reach an unhandled error.
+_WORK_FACTOR_TEXT = re.compile(r"^[1-9][0-9]?$")
 # One scrypt derivation at a time in this process: a hostile file at the work
 # factor limit needs about 1 GiB, and concurrent imports must not multiply that.
 _scrypt_lock = threading.Lock()
@@ -67,7 +70,9 @@ class AgeError(Exception):
 
     header      not a valid age header (or not an age file at all)
     recipient   a valid age header, but not for a passphrase
-    work_factor the scrypt work factor is above MAX_WORK_FACTOR
+    work_factor the scrypt work factor is above MAX_WORK_FACTOR, or is not one or
+                two decimal digits without a sign or leading zero
+    nonce       the file ends inside the 16-byte payload nonce
     passphrase  the passphrase does not unwrap the file key
     hmac        the header MAC does not match: the header was changed
     payload     a payload chunk failed authentication, or the payload is
@@ -197,7 +202,8 @@ def scrypt_stanza(header: Header) -> tuple[bytes, int, bytes]:
     if len(salt) != 16:
         raise AgeError("header", "malformed scrypt salt")
     if not _WORK_FACTOR_TEXT.match(stanza.args[2]):
-        raise AgeError("header", "malformed scrypt work factor")
+        raise AgeError("work_factor", "the scrypt work factor is not one or two decimal "
+                       "digits without a leading zero")
     if len(stanza.body) != _FILE_KEY + _TAG:
         raise AgeError("header", "malformed scrypt stanza body")
     return salt, int(stanza.args[2]), stanza.body
@@ -237,10 +243,14 @@ def verify_mac(header: Header, file_key: bytes) -> None:
 
 def check_header(fh: BinaryIO) -> bool:
     """True when `fh` starts with a valid age passphrase header. No scrypt runs,
-    and the work factor is not held against the limit; for the listing."""
+    and the work factor is not held against the limit; for the listing.
+
+    Any failure reading or parsing the file is False, never an exception: one
+    bad file must not break the listing of the others (#27 review).
+    """
     try:
         scrypt_stanza(read_header(fh))
-    except AgeError:
+    except Exception:                                 # noqa: BLE001 - see above
         return False
     return True
 
@@ -267,8 +277,9 @@ class Decryptor(io.RawIOBase):
         self._fh = fh
         nonce = self._read(_NONCE)
         if len(nonce) != _NONCE:
-            # The testkit counts the nonce as part of the header.
-            raise AgeError("header", "the age payload nonce is missing")
+            # The testkit counts the nonce as part of the header; for import it
+            # is a truncated file, after a valid header (#27 review).
+            raise AgeError("nonce", "the age payload nonce is missing")
         self._aead = ChaCha20Poly1305(_hkdf(file_key, nonce, b"payload"))
         self._counter = 0
         self._plain = memoryview(b"")

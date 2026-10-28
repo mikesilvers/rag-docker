@@ -1458,7 +1458,7 @@ as before. The passphrase is never stored in the job record, logged, attached to
 telemetry or returned; the job reports `encrypted`.
 
 - **422 `INVALID_PARAMETER`** for a `passphrase` shorter than 12 or longer than
-  1024 characters. No job is created, and the response does not contain the
+  1024 characters, or one with no UTF-8 form (a lone surrogate). No job is created, and the response does not contain the
   passphrase.
 
 **Response 202:**
@@ -1559,7 +1559,8 @@ could destroy a collection the caller did not mean to touch. It is one of
 
 `passphrase` is required for an encrypted package, one whose name ends in
 `.tar.gz.age`, and refused for any other (#27). It is not checked for length
-here. The job decrypts the package as a stream while unpacking it, and every
+here; one with no UTF-8 form (a lone surrogate) is refused `422
+INVALID_PARAMETER`, as on export. The job decrypts the package as a stream while unpacking it, and every
 check from the manifest on reads the decrypted files; it is never stored in the
 job record, logged, attached to telemetry or returned. The job reports
 `encrypted`.
@@ -1577,7 +1578,7 @@ the file's name in `./exports` is compared, so `x.tar.gz`, `./x.tar.gz` and
 
 Everything else — unreadable archive, a wrong passphrase or a damaged encrypted
 package (`DECRYPT_FAILED`, with `error_detail.reason` `passphrase`, `header`,
-`payload` or `work_factor`, the last for a scrypt work factor above 20, refused before any key derivation; nothing is touched), bad digest, embedding mismatch, name
+`payload` or `work_factor`, the last for a scrypt work factor above 20 or not written as one or two decimal digits, refused before any key derivation; a file cut inside the payload nonce is `payload`; nothing is touched), bad digest, embedding mismatch, name
 collision, a target being deleted (`COLLECTION_DELETING`, §3.1.2), another import
 into the same target collection (`IMPORT_IN_PROGRESS`) — is reported through the
 job rather than this response, because none of it is knowable without reading the
@@ -1785,7 +1786,8 @@ Encrypted packages (`ragpkg-*.tar.gz.age`, #27) are listed too, with
 null: their manifest can't be read without the passphrase, and no plaintext
 metadata is kept beside them. Their `readable` says whether the file starts with a
 valid age passphrase header; the listing never needs the passphrase and never runs
-scrypt.
+scrypt. A file that can't be read or parsed is listed `readable: false` and never
+fails the listing of the others.
 
 A file that cannot be read as a package is still listed, with `readable: false`
 and null metadata, so it does not silently disappear from the UI. Import reports

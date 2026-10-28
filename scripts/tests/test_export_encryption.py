@@ -56,7 +56,7 @@ CHUNK = age_stream.CHUNK
 STEM = "ragpkg-corpus-20261027T000000Z-0123abcd"
 # The testkit's outcomes, and the AgeError kinds that mean each.
 OUTCOME = {"header": "header failure", "work_factor": "header failure",
-           "recipient": "no match", "passphrase": "no match",
+           "recipient": "no match", "passphrase": "no match", "nonce": "header failure",
            "hmac": "HMAC failure", "payload": "payload failure"}
 
 
@@ -126,6 +126,12 @@ def vectors():
         if meta.get("compressed") == "zlib":
             body = zlib.decompress(body)
         yield path.name, meta, passphrases, body
+
+
+# Audit hooks can't be removed once added: one is installed for the whole run and
+# hands each event to the hooks a test has registered here.
+_AUDIT_HOOKS = []
+sys.addaudithook(lambda event, args: [hook(event, args) for hook in list(_AUDIT_HOOKS)])
 
 
 def read_all(dec, released):
@@ -273,6 +279,24 @@ class RoundTrip(unittest.TestCase):
                 decrypt(hostile)
             self.assertEqual(caught.exception.kind, "work_factor")
 
+    def test_a_malformed_or_overlong_work_factor_is_refused_before_int(self):
+        """A field of thousands of digits once made int() raise ValueError, which
+        broke the listing and turned an import into IMPORT_FAILED (#27 review)."""
+        blob = encrypt(b"data")
+        line = blob.split(b"\n")[1]
+        for factor in (b"9" * 5000, b"100", b"018", b"+18", b"0x12", b"1e1", b"0"):
+            hostile = blob.replace(line, line.rsplit(b" ", 1)[0] + b" " + factor, 1)
+            with self.subTest(factor=factor[:12]), \
+                 patch.object(age_stream, "_scrypt", side_effect=AssertionError("scrypt ran")), \
+                 self.assertRaises(age_stream.AgeError) as caught:
+                decrypt(hostile)
+            self.assertEqual(caught.exception.kind, "work_factor")
+            self.assertFalse(age_stream.check_header(io.BytesIO(hostile)))
+
+    def test_check_header_never_raises(self):
+        with patch.object(age_stream, "read_header", side_effect=RuntimeError("unexpected")):
+            self.assertFalse(age_stream.check_header(io.BytesIO(encrypt(b"x"))))
+
     def test_a_work_factor_of_20_still_reaches_derivation(self):
         blob = encrypt(b"data")
         line = blob.split(b"\n")[1]
@@ -380,8 +404,8 @@ class Export(Fixture):
         sealed = self.sealed(stage=stage)
         with plain.open("rb") as fh:
             expected = [(m.name, m.size) for m in tarfile.open(fileobj=fh, mode="r:gz")]
-        dec = age_stream.open_decrypt(sealed.open("rb"), PASSPHRASE)
-        with tarfile.open(fileobj=dec, mode="r|gz") as tar:
+        with sealed.open("rb") as fh, \
+             tarfile.open(fileobj=age_stream.open_decrypt(fh, PASSPHRASE), mode="r|gz") as tar:
             got = [(m.name, m.size) for m in tar]
         self.assertEqual(got, expected)
         self.assertEqual(got[1][0], STEM + "/manifest.json")
@@ -499,6 +523,23 @@ class OpenEncrypted(Fixture):
         with patch.object(age_stream, "_scrypt", side_effect=AssertionError("scrypt ran")):
             self.assertEqual(self.refused(archive, "DECRYPT_FAILED").detail, {"reason": "work_factor"})
 
+    def test_an_overlong_work_factor_is_decrypt_failed_not_import_failed(self):
+        good = self.sealed().read_bytes()
+        line = good.split(b"\n")[1]
+        archive = self.exports / "ragpkg-wf-long.tar.gz.age"
+        archive.write_bytes(good.replace(line, line.rsplit(b" ", 1)[0] + b" " + b"9" * 5000, 1))
+        with patch.object(age_stream, "_scrypt", side_effect=AssertionError("scrypt ran")):
+            self.assertEqual(self.refused(archive, "DECRYPT_FAILED").detail, {"reason": "work_factor"})
+
+    def test_a_file_cut_inside_the_nonce_is_decrypt_failed(self):
+        good = self.sealed().read_bytes()
+        header_end = good.index(b"\n", good.index(b"\n---") + 1) + 1
+        archive = self.exports / "ragpkg-nonce.tar.gz.age"
+        for cut in (0, 5, 15):
+            archive.write_bytes(good[:header_end + cut])
+            with self.subTest(cut=cut):
+                self.assertEqual(self.refused(archive, "DECRYPT_FAILED").detail, {"reason": "payload"})
+
     def test_a_file_that_is_not_a_passphrase_age_file_is_unreadable(self):
         x25519 = next(body for name, _m, _p, body in vectors() if name == "x25519")
         plain = self.root / "plain.tar.gz"
@@ -516,6 +557,48 @@ class OpenEncrypted(Fixture):
         archive.write_bytes(encrypt(b"plain text, not gzip\n"))
         error = self.refused(archive, "PACKAGE_UNREADABLE")
         self.assertEqual(error.message, "'ragpkg-text.tar.gz.age' is not a readable encrypted .tar.gz archive.")
+
+    def test_import_writes_no_decrypted_copy_of_the_archive(self):
+        """Decision 9 on #27: the package is decrypted as a stream while it is
+        unpacked, so the only files written are the package's own members,
+        inside the work directory. Every file opened for writing is recorded
+        through the interpreter's audit hook, whichever API opened it."""
+        stage = self.stage(extra={"README.md": b"readme"})
+        archive = self.sealed(stage=stage)
+        dest = self.root / "work-nocopy"
+        dest.mkdir()
+        written, watching = [], [False]
+        write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND
+
+        def hook(event, args):
+            if not watching[0] or event != "open":
+                return
+            path, mode, flags = (tuple(args) + (None, None))[:3]
+            if isinstance(mode, str) and any(c in mode for c in "wax+"):
+                written.append(str(path))
+            elif mode is None and isinstance(flags, int) and flags & write_flags:
+                written.append(str(path))
+        _AUDIT_HOOKS.append(hook)
+        watching[0] = True
+        try:
+            pkg, _manifest = packager.open_package(archive, dest, PASSPHRASE)
+        finally:
+            watching[0] = False
+            _AUDIT_HOOKS.remove(hook)
+        root = (dest / STEM).resolve()
+        members = sorted(p.name for p in stage.iterdir())
+        self.assertEqual(pkg.resolve(), root)
+        self.assertTrue(written, "the audit hook saw no write at all")
+        for path in written:
+            resolved = Path(path).resolve()
+            self.assertEqual(resolved.parent, root, f"a file was written outside the package: {path}")
+            self.assertIn(resolved.name, members, f"a file that is not a package member was written: {path}")
+        self.assertEqual(sorted(Path(p).name for p in written), members)
+
+    def test_an_empty_passphrase_is_tried_and_refused_as_decrypt_failed(self):
+        """Import takes any passphrase (decision 4); an empty one unwraps nothing."""
+        self.assertEqual(self.refused(self.sealed(), "DECRYPT_FAILED", passphrase="").detail,
+                         {"reason": "passphrase"})
 
     def test_unsafe_members_are_refused_before_extraction(self):
         outside = self.root / "escape-27.txt"
@@ -621,6 +704,26 @@ class Api(Fixture):
                 self.assertEqual(dict(importer._jobs), {})
                 self.assertEqual(importer._active, set())
 
+    def test_an_empty_passphrase_counts_as_given(self):
+        """`""` is a passphrase, not an absent one: it is refused for a plain
+        package, and for an encrypted one it starts a job that will fail."""
+        with patch.object(importer, "_run", side_effect=AssertionError("a job ran")):
+            response = self.client.post("/import", json={"filename": STEM + ".tar.gz",
+                                                         "on_conflict": "abort", "passphrase": ""})
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(response.json()["error"]["code"], "PASSPHRASE_NOT_EXPECTED")
+        self.assertEqual(dict(importer._jobs), {})
+        seen = []
+        with patch.object(importer, "_run", side_effect=lambda *args: seen.append(args)):
+            response = self.client.post("/import", json={"filename": STEM + ".tar.gz.age",
+                                                         "on_conflict": "abort", "passphrase": ""})
+            self.assertEqual(response.status_code, 202, response.text)
+            for _ in range(100):
+                if seen:
+                    break
+                time.sleep(0.02)
+        self.assertEqual(seen[0][1:], (STEM + ".tar.gz.age", "abort", ""))
+
     def test_import_with_a_passphrase_starts_a_job_that_records_only_encrypted(self):
         seen = []
         with patch.object(importer, "_run", side_effect=lambda *args: seen.append(args)):
@@ -646,6 +749,39 @@ class Api(Fixture):
                 self.assertEqual(response.json()["error"]["code"], "INVALID_PARAMETER")
                 self.assertNotIn(phrase, response.text)
                 self.assertIn("12 to 1024 characters", response.text)
+
+    def test_a_lone_surrogate_passphrase_is_refused_by_validation(self):
+        bodies = (("/export", '{"collection": "Corpus", "passphrase": "\\ud800aaaaaaaaaaaaaa"}'),
+                  ("/import", '{"filename": "%s.tar.gz.age", "on_conflict": "abort", '
+                              '"passphrase": "abc\\udfffdef"}' % STEM))
+        for path, body in bodies:
+            with self.subTest(path=path), \
+                 patch.object(exporter, "start_export_job", side_effect=AssertionError("a job started")), \
+                 patch.object(importer, "_run", side_effect=AssertionError("a job ran")):
+                response = self.client.post(path, content=body, headers={"Content-Type": "application/json"})
+                self.assertEqual(response.status_code, 422, response.text)
+                self.assertEqual(response.json()["error"]["code"], "INVALID_PARAMETER")
+                self.assertIn("lone surrogates", response.text)
+                self.assertNotIn("aaaaaaaa", response.text)
+        self.assertEqual(dict(importer._jobs), {})
+
+    def test_one_bad_encrypted_file_never_breaks_the_listing(self):
+        good = self.sealed()
+        line = good.read_bytes().split(b"\n")[1]
+        (self.exports / "ragpkg-long.tar.gz.age").write_bytes(
+            good.read_bytes().replace(line, line.rsplit(b" ", 1)[0] + b" " + b"9" * 5000, 1))
+        packager._write_archive(self.stage(), STEM, self.exports / (STEM + ".tar.gz"))
+        response = self.client.get("/packages")
+        self.assertEqual(response.status_code, 200, response.text)
+        listed = {p["filename"]: p for p in response.json()["packages"]}
+        self.assertEqual((listed["ragpkg-long.tar.gz.age"]["readable"], listed[good.name]["readable"],
+                          listed[STEM + ".tar.gz"]["readable"]), (False, True, True))
+        with patch.object(age_stream, "check_header", side_effect=RuntimeError("unexpected")):
+            response = self.client.get("/packages")
+        self.assertEqual(response.status_code, 200, response.text)
+        listed = {p["filename"]: p for p in response.json()["packages"]}
+        self.assertFalse(listed[good.name]["readable"])
+        self.assertTrue(listed[STEM + ".tar.gz"]["readable"])
 
     def test_export_bounds_count_characters(self):
         seen = []

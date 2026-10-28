@@ -928,6 +928,18 @@ PASSPHRASE_MIN = 12
 PASSPHRASE_MAX = 1024
 
 
+def _utf8_passphrase(v: Optional[SecretStr]) -> Optional[SecretStr]:
+    """A passphrase is used as UTF-8. JSON can carry a lone surrogate (`\\ud800`),
+    which has no UTF-8 form; it is refused here, as a 422, instead of failing in
+    the worker (#27 review). The message never contains the value."""
+    if v is not None:
+        try:
+            v.get_secret_value().encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("passphrase must be valid Unicode text (no lone surrogates)") from None
+    return v
+
+
 class ExportRequest(BaseModel):
     collection: CollectionName
     include_models: bool = False
@@ -941,7 +953,7 @@ class ExportRequest(BaseModel):
     def _passphrase(cls, v: Optional[SecretStr]) -> Optional[SecretStr]:
         if v is not None and not PASSPHRASE_MIN <= len(v.get_secret_value()) <= PASSPHRASE_MAX:
             raise ValueError(f"passphrase must be {PASSPHRASE_MIN} to {PASSPHRASE_MAX} characters")
-        return v
+        return _utf8_passphrase(v)
 
 
 class ExportStartResponse(BaseModel):
@@ -978,8 +990,13 @@ class ImportRequest(BaseModel):
     # delete a collection the caller did not mean to touch.
     on_conflict: str
     # Required for a `.tar.gz.age` package and refused for any other (#27).
-    # Checked on export only; any value is tried here.
+    # Its length is checked on export only; any encodable value is tried here.
     passphrase: Optional[SecretStr] = None
+
+    @field_validator("passphrase")
+    @classmethod
+    def _passphrase(cls, v: Optional[SecretStr]) -> Optional[SecretStr]:
+        return _utf8_passphrase(v)
 
     @field_validator("on_conflict")
     @classmethod
@@ -6785,7 +6802,7 @@ def _safe_extract_stream(tar: tarfile.TarFile, dest: Path) -> None:
 
 # Why an encrypted package could not be decrypted, for `error_detail.reason`.
 _DECRYPT_REASONS = {"work_factor": "work_factor", "passphrase": "passphrase",
-                    "hmac": "header", "payload": "payload"}
+                    "hmac": "header", "payload": "payload", "nonce": "payload"}
 
 
 def _extract_encrypted(archive: Path, dest: Path, passphrase: str) -> None:
@@ -6995,7 +7012,10 @@ _SCRYPT_LABEL = b"age-encryption.org/v1/scrypt"
 HEADER_MAX = 64 * 1024
 
 _B64 = re.compile(rb"^[A-Za-z0-9+/]*$")
-_WORK_FACTOR_TEXT = re.compile(r"^[1-9][0-9]*$")
+# One or two digits, no sign or leading zero: every accepted value (1 to 20) fits,
+# and a longer field is refused before int(), which raises on a very long one
+# (Python's int string-length limit), so no field can reach an unhandled error.
+_WORK_FACTOR_TEXT = re.compile(r"^[1-9][0-9]?$")
 # One scrypt derivation at a time in this process: a hostile file at the work
 # factor limit needs about 1 GiB, and concurrent imports must not multiply that.
 _scrypt_lock = threading.Lock()
@@ -7006,7 +7026,9 @@ class AgeError(Exception):
 
     header      not a valid age header (or not an age file at all)
     recipient   a valid age header, but not for a passphrase
-    work_factor the scrypt work factor is above MAX_WORK_FACTOR
+    work_factor the scrypt work factor is above MAX_WORK_FACTOR, or is not one or
+                two decimal digits without a sign or leading zero
+    nonce       the file ends inside the 16-byte payload nonce
     passphrase  the passphrase does not unwrap the file key
     hmac        the header MAC does not match: the header was changed
     payload     a payload chunk failed authentication, or the payload is
@@ -7136,7 +7158,8 @@ def scrypt_stanza(header: Header) -> tuple[bytes, int, bytes]:
     if len(salt) != 16:
         raise AgeError("header", "malformed scrypt salt")
     if not _WORK_FACTOR_TEXT.match(stanza.args[2]):
-        raise AgeError("header", "malformed scrypt work factor")
+        raise AgeError("work_factor", "the scrypt work factor is not one or two decimal "
+                       "digits without a leading zero")
     if len(stanza.body) != _FILE_KEY + _TAG:
         raise AgeError("header", "malformed scrypt stanza body")
     return salt, int(stanza.args[2]), stanza.body
@@ -7176,10 +7199,14 @@ def verify_mac(header: Header, file_key: bytes) -> None:
 
 def check_header(fh: BinaryIO) -> bool:
     """True when `fh` starts with a valid age passphrase header. No scrypt runs,
-    and the work factor is not held against the limit; for the listing."""
+    and the work factor is not held against the limit; for the listing.
+
+    Any failure reading or parsing the file is False, never an exception: one
+    bad file must not break the listing of the others (#27 review).
+    """
     try:
         scrypt_stanza(read_header(fh))
-    except AgeError:
+    except Exception:                                 # noqa: BLE001 - see above
         return False
     return True
 
@@ -7206,8 +7233,9 @@ class Decryptor(io.RawIOBase):
         self._fh = fh
         nonce = self._read(_NONCE)
         if len(nonce) != _NONCE:
-            # The testkit counts the nonce as part of the header.
-            raise AgeError("header", "the age payload nonce is missing")
+            # The testkit counts the nonce as part of the header; for import it
+            # is a truncated file, after a valid header (#27 review).
+            raise AgeError("nonce", "the age payload nonce is missing")
         self._aead = ChaCha20Poly1305(_hkdf(file_key, nonce, b"payload"))
         self._counter = 0
         self._plain = memoryview(b"")
@@ -10638,9 +10666,11 @@ def _list_packages_sync() -> list[dict]:
             try:
                 with p.open("rb") as fh:
                     readable = age_stream.check_header(fh)
-            except OSError:
-                readable = False
-            out.append({"filename": p.name, "size_bytes": p.stat().st_size,
+                size = p.stat().st_size
+            except Exception:                         # noqa: BLE001
+                # One bad file never breaks the listing of the others.
+                readable, size = False, 0
+            out.append({"filename": p.name, "size_bytes": size,
                         "collection": None, "chunk_count": None, "fidelity": None,
                         "created_at": None, "readable": readable, "encrypted": True})
             continue

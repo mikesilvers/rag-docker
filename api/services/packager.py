@@ -753,7 +753,7 @@ def _safe_extract_stream(tar: tarfile.TarFile, dest: Path) -> None:
 
 # Why an encrypted package could not be decrypted, for `error_detail.reason`.
 _DECRYPT_REASONS = {"work_factor": "work_factor", "passphrase": "passphrase",
-                    "hmac": "header", "payload": "payload"}
+                    "hmac": "header", "payload": "payload", "nonce": "payload"}
 
 
 def _extract_encrypted(archive: Path, dest: Path, passphrase: str) -> None:

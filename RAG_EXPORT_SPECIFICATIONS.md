@@ -328,21 +328,28 @@ the same passphrase.
   temporary file: no unencrypted archive is written, and only one chunk is held in
   memory.
 - **Decryption** accepts only a header that parses under the age grammar and
-  holds one stanza, of type `scrypt`, with a canonical 16-byte salt, a decimal
-  work factor with no sign or leading zero, and a 32-byte body. A work factor
+  holds one stanza, of type `scrypt`, with a canonical 16-byte salt, a work
+  factor, and a 32-byte body. A work factor that is not one or two decimal digits
+  without a sign or leading zero is refused `DECRYPT_FAILED` (`reason`
+  `work_factor`) before it is converted, so no field length can cause an
+  unhandled error; a work factor
   above 20 (about 1 GiB of scrypt memory; a maintainer decision on #27, below
   age's own limit of 22, about 4 GiB) is refused `DECRYPT_FAILED` without
   deriving anything, and at most one scrypt derivation runs at a time in the API.
   The header MAC is checked before any plaintext is released, and every payload
-  chunk is authenticated before it is; a truncated payload, a missing or
+  chunk is authenticated before it is; a file that ends inside the payload nonce,
+  a truncated payload, a missing or
   misplaced final chunk, or data after it fails.
 - **Passphrase.** 12 to 1024 characters, any characters, checked at export. It is
-  encoded as UTF-8, never stored, logged, attached to telemetry or returned.
+  encoded as UTF-8; a passphrase that has no UTF-8 form (a lone surrogate, which
+  JSON can carry) is refused `422 INVALID_PARAMETER` by `POST /export` and
+  `POST /import` alike. It is never stored, logged, attached to telemetry or returned.
 - **Implementation.** `api/services/age_stream.py`, on `cryptography` (a direct
   dependency since #27, at its locked version). It passes every applicable vector
   of the C2SP CCTV age testkit, vendored in `scripts/tests/fixtures/age-testkit`.
 - **Listing.** No metadata is kept beside an encrypted package; `GET /packages`
-  lists it with `encrypted: true` and null metadata.
+  lists it with `encrypted: true` and null metadata. A file that can't be read or
+  parsed is listed `readable: false`; it never fails the listing of the others.
 
 ---
 
@@ -1016,8 +1023,8 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E35 | Digest-valid malformed ingest settings (invalid JSON, a non-object, a wrong type or an invalid value) are refused `PACKAGE_CORRUPT`, naming `ingest_config.json`, before live mutation in all conflict modes, leaving the existing collection's settings unchanged; valid settings, including ones with missing or unknown fields, numeric strings and a `chunk_size`/`min_chunk_size` from before the chunk bounds, import and `GET /ingest/config/{collection}` returns them for the import target (#510), by `test_retrieval_import.py` |
 | E36 | An export holds its collection's writer guard for its whole run: a re-ingest that tries to commit mid-export waits, and the package holds the old chunks with the old source bytes, every non-null `source_sha256` naming a blob in it; gold-standard generation is refused `COLLECTION_BUSY` and guarded writers wait meanwhile; an export started while another writer holds the guard reads `queued`; the guard is released when the export completes, fails or is cancelled (#509); a cancelled export ends `failed` with an `error` saying so, and the cancellation still propagates (#521), by `test_export_snapshot.py` |
 | E37 | An export with a `passphrase` writes `<stem>.tar.gz.age`, an age v1 scrypt file at work factor 18 whose decryption satisfies §4.1 to §4.5 and that the listing shows `encrypted: true` with null metadata; the export and import jobs report `encrypted` and hold no passphrase (#27), by `test_export_encryption.py` and suite 05 |
-| E38 | Importing an encrypted package with a wrong passphrase fails `DECRYPT_FAILED` (`reason` `passphrase`), and a damaged or truncated file fails `DECRYPT_FAILED` or `PACKAGE_UNREADABLE` and a scrypt work factor above 20 (21 included) fails `DECRYPT_FAILED` before any key derivation, with no collection, marker, setting, session or package file changed and no work directory left; the right passphrase imports it with every chunk (#27), by `test_export_encryption.py` and suite 05 |
-| E39 | `POST /import` refuses an encrypted package without a passphrase `400 PASSPHRASE_REQUIRED` and a passphrase for any other package `400 PASSPHRASE_NOT_EXPECTED`, before any job; `POST /export` refuses a passphrase outside 12 to 1024 characters `422 INVALID_PARAMETER` without echoing it (#27) |
+| E38 | Importing an encrypted package with a wrong passphrase fails `DECRYPT_FAILED` (`reason` `passphrase`), and a damaged or truncated file fails `DECRYPT_FAILED` or `PACKAGE_UNREADABLE` and a scrypt work factor above 20 (21 included) or not one or two decimal digits (thousands of digits included) fails `DECRYPT_FAILED` before any key derivation; a file cut inside the payload nonce fails `DECRYPT_FAILED`, with no collection, marker, setting, session or package file changed and no work directory left; the right passphrase imports it with every chunk (#27), by `test_export_encryption.py` and suite 05 |
+| E39 | `POST /import` refuses an encrypted package without a passphrase `400 PASSPHRASE_REQUIRED` and a passphrase for any other package `400 PASSPHRASE_NOT_EXPECTED`, before any job; `POST /export` refuses a passphrase outside 12 to 1024 characters, and both refuse one with no UTF-8 form (a lone surrogate), `422 INVALID_PARAMETER` without echoing it; one bad encrypted file never fails `GET /packages` (#27) |
 | E40 | The age implementation passes every applicable C2SP CCTV age testkit vector, and its output decrypts with an independent decryption written from the age specification (#27), by `test_export_encryption.py` |
 
 ---

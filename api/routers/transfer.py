@@ -106,9 +106,11 @@ def _list_packages_sync() -> list[dict]:
             try:
                 with p.open("rb") as fh:
                     readable = age_stream.check_header(fh)
-            except OSError:
-                readable = False
-            out.append({"filename": p.name, "size_bytes": p.stat().st_size,
+                size = p.stat().st_size
+            except Exception:                         # noqa: BLE001
+                # One bad file never breaks the listing of the others.
+                readable, size = False, 0
+            out.append({"filename": p.name, "size_bytes": size,
                         "collection": None, "chunk_count": None, "fidelity": None,
                         "created_at": None, "readable": readable, "encrypted": True})
             continue
