@@ -50,3 +50,8 @@ python-multipart>=0.0.9           # resolved: 0.0.32
 # Private, optional OTLP HTTP/protobuf telemetry runtime (#282).
 opentelemetry-sdk==1.45.1
 opentelemetry-exporter-otlp-proto-http==1.45.1
+
+# Passphrase encryption of export packages in the age format (#27). Already in
+# the lock as a transitive dependency; listed here because the API now imports
+# it directly. Pinned at the locked version, so the lock does not move.
+cryptography==50.0.1

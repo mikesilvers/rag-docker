@@ -46,7 +46,8 @@ def active_job_for(collection: str) -> str | None:
 
 
 @telemetry.traced("rag.export")
-def _run(job_id: str, collection: str, include_models: bool) -> None:
+def _run(job_id: str, collection: str, include_models: bool,
+         passphrase: str | None = None) -> None:
     job = _jobs[job_id]
 
     def progress(written: int) -> None:
@@ -67,7 +68,8 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
         # it is released before the terminal status is written.
         with collection_writes.guard(collection):
             job["status"] = "running"
-            result = packager.build(collection, include_models=include_models, progress=progress)
+            result = packager.build(collection, include_models=include_models, progress=progress,
+                                    passphrase=passphrase)
     except packager.PackageError as exc:
         telemetry.outcome("error", exc)
         _log.warning("Export of %r refused (%s): %s", collection, exc.code, exc.message)
@@ -106,8 +108,12 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
                 del _active[collection]
 
 
-async def start_export_job(collection: str, include_models: bool = False) -> str:
+async def start_export_job(collection: str, include_models: bool = False,
+                           passphrase: str | None = None) -> str:
     """Register the job and run the build off the event loop.
+
+    A passphrase makes the package encrypted (#27). It is handed to the worker
+    as an argument only: the job record says `encrypted`, never the passphrase.
 
     Raises RuntimeError carrying the running job id if one is already in flight
     for this collection; that job's record is always stored by then (#326).
@@ -161,6 +167,7 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
                 "fidelity": None,
                 "models_bundled": None,
                 "retrieve_script": None,
+                "encrypted": passphrase is not None,
                 "warnings": [],
                 "error": None,
                 "error_code": None,
@@ -180,7 +187,8 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
     # export does not stall the API: queries and other collections carry on, and
     # only guarded writes to this collection wait for it (spec §6.1, #509).
-    task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, include_models))
+    task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, include_models,
+                                         passphrase))
     # _run ends it first; this also covers a task that never ran its worker.
     task.add_done_callback(lambda _task: collection_writes.end_job("export", job_id))
     return job_id

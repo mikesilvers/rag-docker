@@ -25,6 +25,15 @@ const CONFLICT = [
 const POLL_MS = 2000
 const POLL_ATTEMPTS = 30
 
+// Passphrase bounds for an encrypted export, as the API checks them (#27).
+const PASSPHRASE_MIN = 12
+const PASSPHRASE_MAX = 1024
+
+// Characters, not UTF-16 units, as the API counts them.
+function charCount(s: string): number {
+  return Array.from(s).length
+}
+
 function message(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
@@ -35,6 +44,11 @@ export default function TransferPage() {
   const [tune, setTune] = useState<TuneOptions | null>(null)
   const [tuneError, setTuneError] = useState('')
   const [includeModels, setIncludeModels] = useState(false)
+  // Passphrases live only in this component's state, and are cleared once a
+  // job has started with them (#27).
+  const [encrypt, setEncrypt] = useState(false)
+  const [passphrase, setPassphrase] = useState('')
+  const [confirmPassphrase, setConfirmPassphrase] = useState('')
   const [exportJob, setExportJob] = useState<ExportJob | null>(null)
   const [exportError, setExportError] = useState('')
   const [exportWatching, setExportWatching] = useState(false)
@@ -44,6 +58,7 @@ export default function TransferPage() {
   const [packagesError, setPackagesError] = useState('')
   const [filename, setFilename] = useState('')
   const [onConflict, setOnConflict] = useState('abort')
+  const [importPassphrase, setImportPassphrase] = useState('')
   const [importJob, setImportJob] = useState<ImportJob | null>(null)
   const [importError, setImportError] = useState('')
   const [importWatching, setImportWatching] = useState(false)
@@ -153,7 +168,10 @@ export default function TransferPage() {
   async function startExport() {
     setExportError(''); setExportPollError(''); setExportJob(null)
     try {
-      const r = await api.startExport({ collection, include_models: includeModels })
+      const r = await api.startExport(encrypt
+        ? { collection, include_models: includeModels, passphrase }
+        : { collection, include_models: includeModels })
+      setPassphrase(''); setConfirmPassphrase('')
       if (!alive.current) return
       exportPoll.current = r.job_id
       setExportWatching(true)
@@ -166,7 +184,10 @@ export default function TransferPage() {
   async function startImport() {
     setImportError(''); setImportPollError(''); setImportJob(null)
     try {
-      const r = await api.startImport({ filename, on_conflict: onConflict })
+      const r = await api.startImport(selectedEncrypted
+        ? { filename, on_conflict: onConflict, passphrase: importPassphrase }
+        : { filename, on_conflict: onConflict })
+      setImportPassphrase('')
       if (!alive.current) return
       importPoll.current = r.job_id
       setImportWatching(true)
@@ -178,6 +199,15 @@ export default function TransferPage() {
 
   const exportBusy = exportWatching
   const importBusy = importWatching
+
+  // What still stops an encrypted export, or '' when nothing does.
+  const passphraseLength = charCount(passphrase)
+  const passphraseProblem = !encrypt ? ''
+    : passphraseLength < PASSPHRASE_MIN ? `The passphrase needs at least ${PASSPHRASE_MIN} characters.`
+    : passphraseLength > PASSPHRASE_MAX ? `The passphrase can have at most ${PASSPHRASE_MAX} characters.`
+    : passphrase !== confirmPassphrase ? 'The two passphrases do not match.'
+    : ''
+  const selectedEncrypted = packages.some(p => p.filename === filename && p.encrypted)
 
   return (
     <div className="max-w-3xl mx-auto">
@@ -236,9 +266,31 @@ export default function TransferPage() {
           </span>
         </label>
 
+        <label className="flex items-start gap-2 text-sm mb-3">
+          <input type="checkbox" checked={encrypt} onChange={e => setEncrypt(e.target.checked)} className="mt-1" />
+          <span>
+            Encrypt with a passphrase
+            <span className="block text-xs text-gray-500">
+              Writes an encrypted <code>.tar.gz.age</code> package that only this passphrase opens.
+              It can't be recovered, so keep it safe and send it separately from the file.
+            </span>
+          </span>
+        </label>
+        {encrypt && (
+          <div className="mb-3 space-y-2">
+            <input type="password" autoComplete="new-password" placeholder="Passphrase"
+                   value={passphrase} onChange={e => setPassphrase(e.target.value)}
+                   className="w-full border rounded px-3 py-2 text-sm" />
+            <input type="password" autoComplete="new-password" placeholder="Confirm the passphrase"
+                   value={confirmPassphrase} onChange={e => setConfirmPassphrase(e.target.value)}
+                   className="w-full border rounded px-3 py-2 text-sm" />
+            {passphraseProblem && <p className="text-xs text-amber-700">{passphraseProblem}</p>}
+          </div>
+        )}
+
         <button
           onClick={startExport}
-          disabled={!collection || exportBusy}
+          disabled={!collection || exportBusy || passphraseProblem !== ''}
           className="bg-blue-600 text-white px-5 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50"
         >
           {exportBusy ? 'Exporting…' : 'Export'}
@@ -258,6 +310,7 @@ export default function TransferPage() {
                 <code className="text-xs break-all">{exportJob.filename}</code>
                 <span className="text-gray-500 text-xs">
                   {' '}({sizeLabel(exportJob.size_bytes)}, {exportJob.fidelity}
+                  {exportJob.encrypted ? ', encrypted' : ''}
                   {exportJob.models_bundled ? ', models included' : ''}
                   {exportJob.retrieve_script ? ', with retrieve.py' : ', no retrieve.py'})
                 </span>
@@ -293,7 +346,9 @@ export default function TransferPage() {
           {packages.map(p => (
             <option key={p.filename} value={p.filename}>
               {p.filename}
-              {p.readable
+              {p.encrypted
+                ? (p.readable ? ` — encrypted, ${sizeLabel(p.size_bytes)}` : ' — encrypted, unreadable')
+                : p.readable
                 ? ` — ${p.collection}, ${p.chunk_count} chunks, ${p.fidelity}, ${sizeLabel(p.size_bytes)}`
                 : ' — unreadable'}
             </option>
@@ -304,6 +359,18 @@ export default function TransferPage() {
           <p className="text-xs text-gray-500 mb-3">
             Nothing in <code>./exports</code> yet. Copy a package there and press Refresh.
           </p>
+        )}
+
+        {selectedEncrypted && (
+          <div className="mb-3">
+            <label className="block text-sm font-medium mb-1">Passphrase</label>
+            <input type="password" autoComplete="off" value={importPassphrase}
+                   onChange={e => setImportPassphrase(e.target.value)}
+                   className="w-full border rounded px-3 py-2 text-sm" />
+            <p className="text-xs text-gray-500 mt-1">
+              This package is encrypted. Enter the passphrase it was exported with.
+            </p>
+          </div>
         )}
 
         <label className="block text-sm font-medium mb-2">If the collection already exists</label>
@@ -322,7 +389,7 @@ export default function TransferPage() {
 
         <button
           onClick={startImport}
-          disabled={!filename || importBusy}
+          disabled={!filename || importBusy || (selectedEncrypted && importPassphrase === '')}
           className="bg-blue-600 text-white px-5 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50"
         >
           {importBusy ? 'Importing…' : 'Import'}

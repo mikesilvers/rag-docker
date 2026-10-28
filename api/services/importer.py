@@ -37,6 +37,7 @@ from contextlib import nullcontext
 
 from config import settings
 from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
+from services import age_stream
 from services import goldstandard
 from services import ingest_config
 from services import model_bundle
@@ -65,6 +66,15 @@ _lock = threading.Lock()
 # Weaviate capitalises the first character of a collection name and rejects
 # anything outside [A-Za-z0-9_]. Both were confirmed against the live server.
 _NAME_OK = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+class PassphraseError(Exception):
+    """A passphrase missing for an encrypted package, or given for one that is
+    not encrypted (#27). Raised before any job exists; `code` is the API code."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
 
 
 def get_job(job_id: str) -> dict | None:
@@ -784,7 +794,7 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
 
 
 @telemetry.traced("rag.import")
-def _run(job_id: str, filename: str, on_conflict: str) -> None:
+def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = None) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
     work = Path(tempfile.mkdtemp(prefix="import-", dir=settings.upload_dir))
@@ -807,7 +817,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
     try:
         archive = packager.exports_dir() / Path(filename).name
-        pkg, manifest = packager.open_package(archive, work)        # checks 1, 2
+        pkg, manifest = packager.open_package(archive, work, passphrase)  # checks 1, 2
         packager.verify_digests(pkg, manifest)                      # check 3
         _validate_package_sources(pkg, manifest)
         _check_embedding(manifest)                                  # check 4
@@ -948,9 +958,23 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         _release_targets(job_id)
 
 
-async def start_import_job(filename: str, on_conflict: str) -> str:
-    job_id = str(uuid.uuid4())[:8]
+async def start_import_job(filename: str, on_conflict: str, passphrase: str | None = None) -> str:
+    """Register the job and run the import off the event loop.
+
+    An encrypted package is known by its name (`.tar.gz.age`, #27), so a missing
+    or unexpected passphrase is refused here, before any job or guard. The
+    passphrase reaches the worker as an argument only, never the job record.
+    """
     key = _package_key(filename)
+    encrypted = age_stream.is_encrypted_name(key)
+    if encrypted and passphrase is None:
+        raise PassphraseError("PASSPHRASE_REQUIRED",
+                              f"'{key}' is encrypted. Send its passphrase to import it.")
+    if not encrypted and passphrase is not None:
+        raise PassphraseError("PASSPHRASE_NOT_EXPECTED",
+                              f"'{key}' is not encrypted, so it takes no passphrase. "
+                              "Anyone with the file can read it.")
+    job_id = str(uuid.uuid4())[:8]
     with _lock:
         if key in _active:
             raise RuntimeError(filename)
@@ -974,10 +998,12 @@ async def start_import_job(filename: str, on_conflict: str) -> str:
             "error": None,
             "error_code": None,
             "error_detail": None,
+            "encrypted": encrypted,
         })
     except BaseException:
         with _lock:
             _active.discard(key)
         raise
-    asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict))
+    asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict,
+                                          passphrase))
     return job_id

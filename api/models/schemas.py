@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
-from pydantic import AfterValidator, BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator, SecretStr
 
 from services.collection_writes import canonical
 
@@ -179,9 +179,38 @@ class HelpResponse(BaseModel):
 
 # ── Export / Import ───────────────────────────────────────────────────────────
 
+# Passphrase length for an encrypted export (#27): long enough to resist
+# guessing with scrypt in the way, short enough to bound the request.
+PASSPHRASE_MIN = 12
+PASSPHRASE_MAX = 1024
+
+
+def _utf8_passphrase(v: Optional[SecretStr]) -> Optional[SecretStr]:
+    """A passphrase is used as UTF-8. JSON can carry a lone surrogate (`\\ud800`),
+    which has no UTF-8 form; it is refused here, as a 422, instead of failing in
+    the worker (#27 review). The message never contains the value."""
+    if v is not None:
+        try:
+            v.get_secret_value().encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("passphrase must be valid Unicode text (no lone surrogates)") from None
+    return v
+
+
 class ExportRequest(BaseModel):
     collection: CollectionName
     include_models: bool = False
+    # Optional: given, the package is written encrypted as `.tar.gz.age` (#27).
+    # SecretStr keeps it out of any repr or log line, and the 422 handler drops
+    # `input`, so a refused passphrase is never echoed.
+    passphrase: Optional[SecretStr] = None
+
+    @field_validator("passphrase")
+    @classmethod
+    def _passphrase(cls, v: Optional[SecretStr]) -> Optional[SecretStr]:
+        if v is not None and not PASSPHRASE_MIN <= len(v.get_secret_value()) <= PASSPHRASE_MAX:
+            raise ValueError(f"passphrase must be {PASSPHRASE_MIN} to {PASSPHRASE_MAX} characters")
+        return _utf8_passphrase(v)
 
 
 class ExportStartResponse(BaseModel):
@@ -205,6 +234,9 @@ class ExportJobStatusResponse(BaseModel):
     retrieve_script: Optional[bool]
     warnings: list[str]
     error: Optional[str]
+    # Whether the export was requested with a passphrase (#27). Records from
+    # before #27 have no such key.
+    encrypted: bool = False
 
     error_code: Optional[str] = None
     error_detail: Optional[dict] = None
@@ -214,6 +246,14 @@ class ImportRequest(BaseModel):
     # Required, no default (spec §6.4): silently picking a conflict policy could
     # delete a collection the caller did not mean to touch.
     on_conflict: str
+    # Required for a `.tar.gz.age` package and refused for any other (#27).
+    # Its length is checked on export only; any encodable value is tried here.
+    passphrase: Optional[SecretStr] = None
+
+    @field_validator("passphrase")
+    @classmethod
+    def _passphrase(cls, v: Optional[SecretStr]) -> Optional[SecretStr]:
+        return _utf8_passphrase(v)
 
     @field_validator("on_conflict")
     @classmethod
@@ -253,6 +293,7 @@ class ImportJobStatusResponse(BaseModel):
     error: Optional[str]
     error_code: Optional[str]
     error_detail: Optional[dict]
+    encrypted: bool = False
 
 
 class PackageSummary(BaseModel):
@@ -265,6 +306,10 @@ class PackageSummary(BaseModel):
     fidelity: Optional[str]
     created_at: Optional[str]
     readable: bool
+    # An encrypted package (`.tar.gz.age`, #27) lists no metadata: its manifest
+    # can't be read without the passphrase. `readable` then says whether its
+    # age header is valid.
+    encrypted: bool = False
 
 
 class PackageListResponse(BaseModel):

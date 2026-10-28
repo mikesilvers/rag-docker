@@ -81,7 +81,7 @@ class ImportGuardTests(unittest.TestCase):
 
     # Mocked package, markers and backend
 
-    def open_package(self, archive, work):
+    def open_package(self, archive, work, passphrase=None):
         collection = self.packages[Path(archive).name]
         held = self.contents.get(Path(archive).name, Path(archive).name)
         pkg = self.root / "packages" / Path(archive).name

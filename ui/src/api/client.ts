@@ -208,15 +208,18 @@ export interface MetricsResult {
   total_latency: LatencyStats
   history: LatencyRecord[]
 }
-export interface ExportBody { collection: string; include_models: boolean }
+// passphrase: only for an encrypted export (#27), 12 to 1024 characters.
+export interface ExportBody { collection: string; include_models: boolean; passphrase?: string }
 export interface ExportStart { job_id: string; status: string; collection: string }
 export interface ExportJob {
   job_id: string; status: string; collection: string; chunks_written: number
   filename: string | null; size_bytes: number | null; source_document_count: number | null
   fidelity: string | null; models_bundled: boolean | null; retrieve_script: boolean | null
   warnings: string[]; error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
+  encrypted?: boolean
 }
-export interface ImportBody { filename: string; on_conflict: string }
+// passphrase: required for a .tar.gz.age package and refused for any other (#27).
+export interface ImportBody { filename: string; on_conflict: string; passphrase?: string }
 export interface ImportStart { job_id: string; status: string; filename: string }
 export interface ImportJob {
   job_id: string; status: string; filename: string; on_conflict: string
@@ -224,10 +227,12 @@ export interface ImportJob {
   fidelity: string | null; renamed: boolean; notes: string[]
   restored_sessions?: { source_session_id: string; session_id: string; collection: string }[]
   error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
+  encrypted?: boolean
 }
 export interface PackageSummary {
   filename: string; size_bytes: number; collection: string | null
   chunk_count: number | null; fidelity: string | null; created_at: string | null; readable: boolean
+  encrypted?: boolean
 }
 export interface TuneOptions {
   collection: string; fidelity: string; source_document_count: number

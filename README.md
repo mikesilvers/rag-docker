@@ -452,8 +452,9 @@ The package lands in `./exports/` on the host, named
 
 Three things worth knowing before you move one:
 
-- **Packages are not encrypted.** A `with-sources` package contains the original
-  documents byte for byte. Treat the file as you would the corpus.
+- **Packages are not encrypted unless you give a passphrase.** A `with-sources`
+  package contains the original documents byte for byte. Treat a plain `.tar.gz`
+  as you would the corpus, or encrypt it (below).
 - **An export holds its collection's writer guard.** Chunks and original
   documents come from one point in time, so ingest, re-chunking and other writes to
   that collection wait until the export finishes, and gold-standard generation for
@@ -468,7 +469,34 @@ Three things worth knowing before you move one:
 are never included when you package the project with `package.sh` or
 `package-offline.sh` — the directory ships, the corpus does not.
 
-To import one, drop the `.tar.gz` into `./exports/` on the target machine and:
+### Encrypting a package
+
+Add a `passphrase` (12 to 1024 characters) to the export, or tick **Encrypt with a
+passphrase** on the Transfer page:
+
+```bash
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/export \
+  -H 'Content-Type: application/json' \
+  -d '{"collection": "Policies", "passphrase": "<a long passphrase>"}'
+```
+
+The package is then written as `ragpkg-...tar.gz.age`: an
+[age](https://age-encryption.org) file encrypted with that passphrase (scrypt).
+The archive is encrypted as it is written, so it is never held in memory and no
+unencrypted archive is written. While the export runs, though, the package's
+files are staged unencrypted in a hidden `./exports/.build-*` folder, which is
+removed when the export ends (or at the next start-up if the API was killed).
+Since `./exports/` is a host folder, anyone who can read it during an export can
+read those files; moving the staging out of it is a follow-up.
+Import needs the same passphrase, and `age -d` opens the file as well. Import
+accepts a scrypt work factor of at most 20 (about 1 GiB of memory to derive the
+key) and refuses a higher one as `DECRYPT_FAILED` before deriving anything; age's
+own default, 18, which export uses, is well within it. The
+passphrase is never stored, logged or returned, and it can't be recovered: send it
+by a different channel than the file. Once a package is decrypted or imported, its
+contents are plaintext again on that machine.
+
+To import one, drop the package into `./exports/` on the target machine and:
 
 ```bash
 curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/import \
@@ -477,6 +505,12 @@ curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localho
 
 curl -b ~/.rag-session http://localhost:8080/api/import/job/<job_id>
 ```
+
+An encrypted package needs its passphrase in the same request
+(`"passphrase": "..."`); without it the import is refused `400
+PASSPHRASE_REQUIRED`, and a passphrase sent for an unencrypted package is refused
+`400 PASSPHRASE_NOT_EXPECTED`. A wrong passphrase, or a damaged encrypted file,
+fails the import job with `DECRYPT_FAILED` before anything is touched.
 
 `on_conflict` is required and has no default, because the wrong choice can
 delete a collection:

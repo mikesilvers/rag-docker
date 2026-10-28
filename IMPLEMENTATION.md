@@ -664,6 +664,11 @@ python-multipart>=0.0.9           # resolved: 0.0.32
 # Private, optional OTLP HTTP/protobuf telemetry runtime (#282).
 opentelemetry-sdk==1.45.1
 opentelemetry-exporter-otlp-proto-http==1.45.1
+
+# Passphrase encryption of export packages in the age format (#27). Already in
+# the lock as a transitive dependency; listed here because the API now imports
+# it directly. Pinned at the locked version, so the lock does not move.
+cryptography==50.0.1
 ```
 
 ### api/utils.py
@@ -768,7 +773,7 @@ settings = Settings()
 ```python
 from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
-from pydantic import AfterValidator, BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator, SecretStr
 
 from services.collection_writes import canonical
 
@@ -947,9 +952,38 @@ class HelpResponse(BaseModel):
 
 # ── Export / Import ───────────────────────────────────────────────────────────
 
+# Passphrase length for an encrypted export (#27): long enough to resist
+# guessing with scrypt in the way, short enough to bound the request.
+PASSPHRASE_MIN = 12
+PASSPHRASE_MAX = 1024
+
+
+def _utf8_passphrase(v: Optional[SecretStr]) -> Optional[SecretStr]:
+    """A passphrase is used as UTF-8. JSON can carry a lone surrogate (`\\ud800`),
+    which has no UTF-8 form; it is refused here, as a 422, instead of failing in
+    the worker (#27 review). The message never contains the value."""
+    if v is not None:
+        try:
+            v.get_secret_value().encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("passphrase must be valid Unicode text (no lone surrogates)") from None
+    return v
+
+
 class ExportRequest(BaseModel):
     collection: CollectionName
     include_models: bool = False
+    # Optional: given, the package is written encrypted as `.tar.gz.age` (#27).
+    # SecretStr keeps it out of any repr or log line, and the 422 handler drops
+    # `input`, so a refused passphrase is never echoed.
+    passphrase: Optional[SecretStr] = None
+
+    @field_validator("passphrase")
+    @classmethod
+    def _passphrase(cls, v: Optional[SecretStr]) -> Optional[SecretStr]:
+        if v is not None and not PASSPHRASE_MIN <= len(v.get_secret_value()) <= PASSPHRASE_MAX:
+            raise ValueError(f"passphrase must be {PASSPHRASE_MIN} to {PASSPHRASE_MAX} characters")
+        return _utf8_passphrase(v)
 
 
 class ExportStartResponse(BaseModel):
@@ -973,6 +1007,9 @@ class ExportJobStatusResponse(BaseModel):
     retrieve_script: Optional[bool]
     warnings: list[str]
     error: Optional[str]
+    # Whether the export was requested with a passphrase (#27). Records from
+    # before #27 have no such key.
+    encrypted: bool = False
 
     error_code: Optional[str] = None
     error_detail: Optional[dict] = None
@@ -982,6 +1019,14 @@ class ImportRequest(BaseModel):
     # Required, no default (spec §6.4): silently picking a conflict policy could
     # delete a collection the caller did not mean to touch.
     on_conflict: str
+    # Required for a `.tar.gz.age` package and refused for any other (#27).
+    # Its length is checked on export only; any encodable value is tried here.
+    passphrase: Optional[SecretStr] = None
+
+    @field_validator("passphrase")
+    @classmethod
+    def _passphrase(cls, v: Optional[SecretStr]) -> Optional[SecretStr]:
+        return _utf8_passphrase(v)
 
     @field_validator("on_conflict")
     @classmethod
@@ -1021,6 +1066,7 @@ class ImportJobStatusResponse(BaseModel):
     error: Optional[str]
     error_code: Optional[str]
     error_detail: Optional[dict]
+    encrypted: bool = False
 
 
 class PackageSummary(BaseModel):
@@ -1033,6 +1079,10 @@ class PackageSummary(BaseModel):
     fidelity: Optional[str]
     created_at: Optional[str]
     readable: bool
+    # An encrypted package (`.tar.gz.age`, #27) lists no metadata: its manifest
+    # can't be read without the passphrase. `readable` then says whether its
+    # age header is valid.
+    encrypted: bool = False
 
 
 class PackageListResponse(BaseModel):
@@ -6080,6 +6130,7 @@ from pydantic import ValidationError
 
 from config import settings
 from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
+from services import age_stream
 from services import goldstandard
 from services import ingest_config
 from services import model_bundle
@@ -6110,7 +6161,8 @@ def exports_dir() -> Path:
 # hidden and root-owned, about 2.3 GB with models. Matched by exact name pattern
 # and by kind, never by age; anything else in the folder is left alone.
 _BUILD_DIR = ".build-*"
-_PARTIAL_ARCHIVE = ".*.tar.gz.partial"
+# An encrypted export is written as `.<stem>.tar.gz.age.partial` (#27).
+_PARTIAL_ARCHIVES = (".*.tar.gz.partial", ".*.tar.gz.age.partial")
 
 
 def remove_leftover(entry: Path, *, directory: bool = False,
@@ -6154,7 +6206,7 @@ def sweep_build_leftovers() -> list[str]:
         return removed
     for entry in sorted(root.iterdir()):
         as_dir = fnmatch.fnmatchcase(entry.name, _BUILD_DIR)
-        as_file = fnmatch.fnmatchcase(entry.name, _PARTIAL_ARCHIVE)
+        as_file = any(fnmatch.fnmatchcase(entry.name, p) for p in _PARTIAL_ARCHIVES)
         if not (as_dir or as_file):
             continue
         size = remove_leftover(entry, directory=as_dir, regular_file=as_file)
@@ -6395,19 +6447,36 @@ def _retrieve_section(has_script: bool, cfg: dict, collection: str) -> str:
             f"answer style `{cfg['response_format']}`.")
 
 
-def _write_archive(stage: Path, stem: str, dest: Path) -> None:
+def _add_members(tar: tarfile.TarFile, stage: Path, stem: str) -> None:
+    tar.add(stage, arcname=stem, recursive=False)
+    tar.add(stage / "manifest.json", arcname=f"{stem}/manifest.json")
+    for entry in sorted(os.listdir(stage)):
+        if entry != "manifest.json":
+            tar.add(stage / entry, arcname=f"{stem}/{entry}")
+
+
+def _write_archive(stage: Path, stem: str, dest: Path, passphrase: str | None = None) -> None:
     """Archive the staged package as `<stem>/`, with manifest.json first (#383).
 
     The directory entry, then the manifest, then everything else in the sorted
     order `tar.add(stage, arcname=stem)` gives, so the listing can stop reading
     at the manifest instead of decompressing chunks.jsonl to reach it.
+
+    With a passphrase the same tar.gz stream goes through the age encryptor on
+    its way to `dest` (#27): no plaintext archive is written, and only one
+    64 KiB chunk is held at a time, so a package of several GB streams.
     """
-    with tarfile.open(dest, "w:gz") as tar:
-        tar.add(stage, arcname=stem, recursive=False)
-        tar.add(stage / "manifest.json", arcname=f"{stem}/manifest.json")
-        for entry in sorted(os.listdir(stage)):
-            if entry != "manifest.json":
-                tar.add(stage / entry, arcname=f"{stem}/{entry}")
+    if passphrase is None:
+        with tarfile.open(dest, "w:gz") as tar:
+            _add_members(tar, stage, stem)
+        return
+    with dest.open("wb") as fh:
+        encryptor = age_stream.Encryptor(fh, passphrase)
+        with tarfile.open(fileobj=encryptor, mode="w|gz") as tar:
+            _add_members(tar, stage, stem)
+        # Writes the final chunk; an exception above skips it, and build()
+        # removes the partial file.
+        encryptor.close()
 
 
 @telemetry.traced("rag.package")
@@ -6415,12 +6484,16 @@ def build(
     collection: str,
     include_models: bool = False,
     progress: Callable[[int], None] | None = None,
+    passphrase: str | None = None,
 ) -> dict:
     """Write one package and return a summary. Blocking; run it in a thread.
 
     Assembly order matters (spec §6.2): content first, digests as we go, then
     the manifest from those digests, then README.md and retrieve.py which embed
     the manifest digest. Manifest last is what makes <id8> derivable.
+
+    With a passphrase the package is written encrypted, as `<stem>.tar.gz.age`
+    (#27). The passphrase is used, never stored or logged.
     """
     created = datetime.now(timezone.utc)
     created_at = created.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -6605,7 +6678,8 @@ def build(
 
         # 7. the generated pair, which embed <id8>
         stem = package_stem(collection, created, id8)
-        filename = f"{stem}.tar.gz"
+        # The README and retrieve.py name the file as delivered (#27).
+        filename = f"{stem}{age_stream.ENCRYPTED_SUFFIX if passphrase is not None else '.tar.gz'}"
 
         if has_saved_retrieval:
             (stage / "retrieve.py").write_text(_render_retrieve(collection, retrieval_cfg, {
@@ -6628,13 +6702,15 @@ def build(
             "CREATED_AT": created_at,
             "ID8": id8,
             "PACKAGE_FILENAME": filename,
+            "IMPORT_PASSPHRASE": (', "passphrase": "<the passphrase>"'
+                                  if passphrase is not None else ""),
             "RETRIEVE_SECTION": _retrieve_section(has_saved_retrieval, retrieval_cfg, collection),
         }))
 
         # 8. archive under a temporary name, then rename, so a partial file is
         #    never mistaken for a package.
-        tmp_archive = out_dir / f".{stem}.tar.gz.partial"
-        _write_archive(stage, stem, tmp_archive)
+        tmp_archive = out_dir / f".{filename}.partial"
+        _write_archive(stage, stem, tmp_archive, passphrase)
         final = out_dir / filename
         tmp_archive.replace(final)
         tmp_archive = None
@@ -6648,6 +6724,7 @@ def build(
             "models_bundled": models_bundled,
             "retrieve_script": has_saved_retrieval,
             "id8": id8,
+            "encrypted": passphrase is not None,
             "warnings": warnings,
         }
     finally:
@@ -6731,6 +6808,26 @@ def listing_fields(manifest: dict) -> dict:
     return fields
 
 
+def _check_member(member: tarfile.TarInfo, dest: Path, root: Path) -> None:
+    """Refuse a link, anything but a file or directory, or a path outside dest."""
+    if member.issym() or member.islnk():
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            f"Package contains a link ('{member.name}'), which is not allowed.",
+            {"member": member.name})
+    if not (member.isfile() or member.isdir()):
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            "Package contains a non-regular archive member.",
+            {"member": member.name})
+    target = (dest / member.name).resolve()
+    if target != root and root not in target.parents:
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            f"Package contains a path outside the archive ('{member.name}').",
+            {"member": member.name})
+
+
 def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
     """Extract, refusing any member that would land outside dest.
 
@@ -6740,42 +6837,80 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
     """
     root = dest.resolve()
     for member in tar.getmembers():
-        if member.issym() or member.islnk():
-            raise PackageError(
-                "PACKAGE_UNREADABLE",
-                f"Package contains a link ('{member.name}'), which is not allowed.",
-                {"member": member.name})
-        if not (member.isfile() or member.isdir()):
-            raise PackageError(
-                "PACKAGE_UNREADABLE",
-                "Package contains a non-regular archive member.",
-                {"member": member.name})
-        target = (dest / member.name).resolve()
-        if target != root and root not in target.parents:
-            raise PackageError(
-                "PACKAGE_UNREADABLE",
-                f"Package contains a path outside the archive ('{member.name}').",
-                {"member": member.name})
+        _check_member(member, dest, root)
     tar.extractall(dest)
 
 
+def _safe_extract_stream(tar: tarfile.TarFile, dest: Path) -> None:
+    """The same checks for a tar read as a stream, one member at a time (#27).
+
+    A stream can't be read twice, so each member is checked just before it is
+    extracted. A refusal part-way leaves only the job's own work directory
+    holding the members before it, and the job removes that directory.
+    """
+    root = dest.resolve()
+    for member in tar:
+        _check_member(member, dest, root)
+        tar.extract(member, dest)
+
+
+# Why an encrypted package could not be decrypted, for `error_detail.reason`.
+_DECRYPT_REASONS = {"work_factor": "work_factor", "passphrase": "passphrase",
+                    "hmac": "header", "payload": "payload", "nonce": "payload"}
+
+
+def _extract_encrypted(archive: Path, dest: Path, passphrase: str) -> None:
+    """Check 1 for a `.tar.gz.age` package: decrypt it as a stream into the tar
+    reader, then authenticate the rest of the file to its end (#27).
+
+    No decrypted copy of the archive is written. Every failure comes before
+    check 2, so nothing outside the work directory has been touched.
+    """
+    try:
+        with archive.open("rb") as fh:
+            decryptor = age_stream.open_decrypt(fh, passphrase)
+            with tarfile.open(fileobj=decryptor, mode="r|gz") as tar:
+                _safe_extract_stream(tar, dest)
+            # tarfile stops at the end-of-archive blocks; the final chunk, and
+            # anything after it, still has to be authenticated.
+            decryptor.drain()
+    except age_stream.AgeError as exc:
+        if exc.kind in ("header", "recipient"):
+            raise PackageError(
+                "PACKAGE_UNREADABLE",
+                f"'{archive.name}' is not a passphrase-encrypted age file.",
+                {"reason": str(exc)}) from None
+        raise PackageError(
+            "DECRYPT_FAILED",
+            f"'{archive.name}' could not be decrypted: the passphrase is wrong or "
+            "the file is damaged.",
+            {"reason": _DECRYPT_REASONS[exc.kind]}) from None
+
+
 @telemetry.traced("rag.package")
-def open_package(archive: Path, dest: Path) -> tuple[Path, dict]:
+def open_package(archive: Path, dest: Path, passphrase: str | None = None) -> tuple[Path, dict]:
     """Checks 1 and 2 of spec §6.2: readable archive, understood format.
 
-    Returns (package root directory, manifest).
+    A `.tar.gz.age` package is decrypted with `passphrase` as it is unpacked
+    (#27); everything from check 2 on reads the decrypted files, as for an
+    unencrypted package. Returns (package root directory, manifest).
     """
     if not archive.is_file():
         raise PackageError("PACKAGE_UNREADABLE",
                            f"No package named '{archive.name}' in the exports directory.")
+    encrypted = age_stream.is_encrypted_name(archive.name)
     try:
-        with tarfile.open(archive, "r:gz") as tar:
-            _safe_extract(tar, dest)
+        if encrypted:
+            _extract_encrypted(archive, dest, passphrase or "")
+        else:
+            with tarfile.open(archive, "r:gz") as tar:
+                _safe_extract(tar, dest)
     except PackageError:
         raise
     except (tarfile.TarError, OSError, EOFError) as exc:
         raise PackageError("PACKAGE_UNREADABLE",
-                           f"'{archive.name}' is not a readable .tar.gz archive.",
+                           f"'{archive.name}' is not a readable "
+                           f"{'encrypted ' if encrypted else ''}.tar.gz archive.",
                            {"reason": f"{type(exc).__name__}: {exc}"}) from exc
 
     roots = [p for p in dest.iterdir() if p.is_dir()]
@@ -6868,6 +7003,417 @@ def iter_chunks_file(pkg: Path) -> Iterator[dict]:
                 raise PackageError("PACKAGE_CORRUPT",
                                    f"chunks.jsonl line {number} is not valid JSON.",
                                    {"file": "chunks.jsonl", "line": number}) from exc
+```
+
+### api/services/age_stream.py
+
+```python
+"""Passphrase encryption of export packages in the age v1 format (#27).
+
+An encrypted package is an ordinary age file with one `scrypt` (passphrase)
+recipient, so `age -d` opens it as well as import does. The format is the C2SP
+age specification (https://c2sp.org/age); this module implements only the parts
+a passphrase file uses, on the `cryptography` package the API already locks:
+
+    age-encryption.org/v1
+    -> scrypt <salt, base64> <work factor>
+    <wrapped file key, base64>
+    --- <header MAC, base64>
+    <16-byte nonce><STREAM payload: 64 KiB chunks, ChaCha20-Poly1305>
+
+pyrage was not used: its passphrase API takes and returns whole byte strings,
+and a package can be several GB. Both directions here stream: the encryptor is a
+writable file object tarfile writes into, and the decryptor a readable one
+tarfile reads from, holding one chunk at a time.
+
+Every rule the parser enforces is one the age testkit (C2SP CCTV, vendored in
+scripts/tests/fixtures/age-testkit) has a vector for; the tests run all of them.
+"""
+from __future__ import annotations
+
+import base64
+import binascii
+import hmac
+import io
+import os
+import re
+import threading
+from dataclasses import dataclass
+from hashlib import sha256
+from typing import BinaryIO
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+
+ENCRYPTED_SUFFIX = ".tar.gz.age"
+VERSION_LINE = b"age-encryption.org/v1"
+CHUNK = 64 * 1024
+_TAG = 16
+_FILE_KEY = 16
+_NONCE = 16
+# age's default for new passphrase files: about 256 MiB of memory (128 * r * N)
+# and about a second of work. Import accepts at most 20 (about 1 GiB; the
+# maintainer's limit on #27, below age's own 22, which needs about 4 GiB and over
+# a minute), and refuses more without deriving anything.
+WORK_FACTOR = 18
+MAX_WORK_FACTOR = 20
+_SCRYPT_LABEL = b"age-encryption.org/v1/scrypt"
+# A passphrase file's header is about 150 bytes. Reading stops well before a
+# hostile file could make the parser hold a large one.
+HEADER_MAX = 64 * 1024
+
+_B64 = re.compile(rb"^[A-Za-z0-9+/]*$")
+# One or two digits, no sign or leading zero: every accepted value (1 to 20) fits,
+# and a longer field is refused before int(), which raises on a very long one
+# (Python's int string-length limit), so no field can reach an unhandled error.
+_WORK_FACTOR_TEXT = re.compile(r"^[1-9][0-9]?$")
+# One scrypt derivation at a time in this process: a hostile file at the work
+# factor limit needs about 1 GiB, and concurrent imports must not multiply that.
+_scrypt_lock = threading.Lock()
+
+
+class AgeError(Exception):
+    """A file that can't be decrypted. `kind` says why, without any secret:
+
+    header      not a valid age header (or not an age file at all)
+    recipient   a valid age header, but not for a passphrase
+    work_factor the scrypt work factor is above MAX_WORK_FACTOR, or is not one or
+                two decimal digits without a sign or leading zero
+    nonce       the file ends inside the 16-byte payload nonce
+    passphrase  the passphrase does not unwrap the file key
+    hmac        the header MAC does not match: the header was changed
+    payload     a payload chunk failed authentication, or the payload is
+                truncated or has data after its final chunk
+    """
+
+    def __init__(self, kind: str, message: str):
+        super().__init__(message)
+        self.kind = kind
+
+
+def is_encrypted_name(name: str) -> bool:
+    """Encrypted packages are recognised by name first (#27, decision 7)."""
+    return name.endswith(ENCRYPTED_SUFFIX)
+
+
+# ── Header ────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Stanza:
+    args: list[str]
+    body: bytes
+
+
+@dataclass
+class Header:
+    stanzas: list[Stanza]
+    mac_input: bytes      # everything up to and including "---"
+    mac: bytes
+
+
+def _b64decode(text: bytes) -> bytes:
+    """Canonical, unpadded standard base64, as the age header requires."""
+    if not _B64.match(text) or len(text) % 4 == 1:
+        raise AgeError("header", "invalid base64 in the age header")
+    try:
+        data = base64.b64decode(text + b"=" * (-len(text) % 4), validate=True)
+    except binascii.Error:
+        raise AgeError("header", "invalid base64 in the age header") from None
+    # Unused trailing bits must be zero: re-encoding has to give the same text.
+    if base64.b64encode(data).rstrip(b"=") != text:
+        raise AgeError("header", "non-canonical base64 in the age header")
+    return data
+
+
+def _b64encode(data: bytes) -> bytes:
+    return base64.b64encode(data).rstrip(b"=")
+
+
+def read_header(fh: BinaryIO) -> Header:
+    """Parse an age header from `fh`, leaving it at the first payload byte.
+
+    Lines end in LF only. A stanza is `-> arg...` then its body in lines of
+    exactly 64 base64 characters ending with one shorter line (possibly empty).
+    The header ends with `--- <MAC>`.
+    """
+    consumed = 0
+
+    def line() -> bytes:
+        nonlocal consumed
+        raw = fh.readline(HEADER_MAX - consumed + 1)
+        consumed += len(raw)
+        if consumed > HEADER_MAX:
+            raise AgeError("header", "the age header is too long")
+        if not raw.endswith(b"\n"):
+            raise AgeError("header", "the age header ends early")
+        return raw[:-1]
+
+    first = fh.readline(len(VERSION_LINE) + 1)
+    consumed += len(first)
+    if first != VERSION_LINE + b"\n":
+        raise AgeError("header", "not an age v1 file")
+    mac_input = bytearray(first)
+    stanzas: list[Stanza] = []
+    current = line()
+    while True:
+        if current.startswith(b"---"):
+            if not current.startswith(b"--- "):
+                raise AgeError("header", "malformed age header MAC line")
+            mac = _b64decode(current[4:])
+            if len(mac) != 32:
+                raise AgeError("header", "malformed age header MAC")
+            mac_input += b"---"
+            break
+        if not current.startswith(b"->"):
+            raise AgeError("header", "malformed age header line")
+        parts = current[2:].split(b" ")
+        # "->" is followed by one or more " <argument>": the first split part is
+        # the empty string before the first space.
+        if len(parts) < 2 or parts[0] != b"" or any(
+                not p or any(c < 0x21 or c > 0x7E for c in p) for p in parts[1:]):
+            raise AgeError("header", "malformed age stanza arguments")
+        mac_input += current + b"\n"
+        body = bytearray()
+        while True:
+            body_line = line()
+            mac_input += body_line + b"\n"
+            if len(body_line) > 64:
+                raise AgeError("header", "age stanza body line too long")
+            body += _b64decode(body_line)
+            if len(body_line) < 64:
+                break
+        stanzas.append(Stanza([p.decode("ascii") for p in parts[1:]], bytes(body)))
+        current = line()
+    if not stanzas:
+        raise AgeError("header", "the age header has no recipient stanza")
+    return Header(stanzas, bytes(mac_input), mac)
+
+
+def scrypt_stanza(header: Header) -> tuple[bytes, int, bytes]:
+    """The salt, work factor and wrapped key of the header's one scrypt stanza.
+
+    A passphrase file has exactly one stanza, of type `scrypt`; age refuses a
+    scrypt stanza next to any other, since anyone holding the other key could
+    otherwise change the file without the passphrase. The work factor is
+    returned unchecked against MAX_WORK_FACTOR; `unwrap_file_key` checks it.
+    """
+    types = [s.args[0] for s in header.stanzas]
+    if "scrypt" in types and len(types) > 1:
+        raise AgeError("header", "a scrypt stanza must be the only stanza")
+    if types != ["scrypt"]:
+        raise AgeError("recipient", "the age file is not passphrase-encrypted")
+    stanza = header.stanzas[0]
+    if len(stanza.args) != 3:
+        raise AgeError("header", "malformed scrypt stanza")
+    salt = _b64decode(stanza.args[1].encode("ascii"))
+    if len(salt) != 16:
+        raise AgeError("header", "malformed scrypt salt")
+    if not _WORK_FACTOR_TEXT.match(stanza.args[2]):
+        raise AgeError("work_factor", "the scrypt work factor is not one or two decimal "
+                       "digits without a leading zero")
+    if len(stanza.body) != _FILE_KEY + _TAG:
+        raise AgeError("header", "malformed scrypt stanza body")
+    return salt, int(stanza.args[2]), stanza.body
+
+
+def _scrypt(passphrase: bytes, salt: bytes, work_factor: int) -> bytes:
+    with _scrypt_lock:
+        return Scrypt(salt=_SCRYPT_LABEL + salt, length=32, n=2 ** work_factor,
+                      r=8, p=1).derive(passphrase)
+
+
+def unwrap_file_key(header: Header, passphrase: str) -> bytes:
+    salt, work_factor, body = scrypt_stanza(header)
+    if work_factor > MAX_WORK_FACTOR:
+        raise AgeError("work_factor",
+                       f"the scrypt work factor {work_factor} is above the limit of "
+                       f"{MAX_WORK_FACTOR}")
+    key = _scrypt(passphrase.encode("utf-8"), salt, work_factor)
+    try:
+        return ChaCha20Poly1305(key).decrypt(b"\x00" * 12, body, None)
+    except InvalidTag:
+        raise AgeError("passphrase", "the passphrase does not decrypt this file") from None
+
+
+def _hkdf(key: bytes, salt: bytes | None, info: bytes) -> bytes:
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=info).derive(key)
+
+
+def _header_mac(file_key: bytes, mac_input: bytes) -> bytes:
+    return hmac.new(_hkdf(file_key, None, b"header"), mac_input, sha256).digest()
+
+
+def verify_mac(header: Header, file_key: bytes) -> None:
+    if not hmac.compare_digest(_header_mac(file_key, header.mac_input), header.mac):
+        raise AgeError("hmac", "the age header MAC does not match")
+
+
+def check_header(fh: BinaryIO) -> bool:
+    """True when `fh` starts with a valid age passphrase header. No scrypt runs,
+    and the work factor is not held against the limit; for the listing.
+
+    Any failure reading or parsing the file is False, never an exception: one
+    bad file must not break the listing of the others (#27 review).
+    """
+    try:
+        scrypt_stanza(read_header(fh))
+    except Exception:                                 # noqa: BLE001 - see above
+        return False
+    return True
+
+
+# ── Payload (STREAM) ──────────────────────────────────────────────────────────
+
+def _chunk_nonce(counter: int, last: bool) -> bytes:
+    return counter.to_bytes(11, "big") + (b"\x01" if last else b"\x00")
+
+
+class Decryptor(io.RawIOBase):
+    """The authenticated plaintext of an age payload, as a readable stream.
+
+    Only plaintext from chunks that passed authentication is ever returned. The
+    rules follow the reference implementation, which the testkit encodes: a
+    short chunk is the last; a full chunk is tried as a middle chunk, then as
+    the last; the last chunk may be empty only when it is the only one; nothing
+    may follow it. A payload that breaks any of these raises
+    `AgeError("payload")` once the plaintext authenticated before it is read.
+    """
+
+    def __init__(self, fh: BinaryIO, file_key: bytes):
+        super().__init__()
+        self._fh = fh
+        nonce = self._read(_NONCE)
+        if len(nonce) != _NONCE:
+            # The testkit counts the nonce as part of the header; for import it
+            # is a truncated file, after a valid header (#27 review).
+            raise AgeError("nonce", "the age payload nonce is missing")
+        self._aead = ChaCha20Poly1305(_hkdf(file_key, nonce, b"payload"))
+        self._counter = 0
+        self._plain = memoryview(b"")
+        self._done = False
+        self._error: AgeError | None = None
+
+    def _read(self, n: int) -> bytes:
+        data = bytearray()
+        while len(data) < n:
+            block = self._fh.read(n - len(data))
+            if not block:
+                break
+            data += block
+        return bytes(data)
+
+    def _next_chunk(self) -> bytes:
+        data = self._read(CHUNK + _TAG)
+        if not data:
+            raise AgeError("payload", "the age payload is truncated: its last chunk is missing")
+        last = len(data) < CHUNK + _TAG
+        if last and len(data) == _TAG and self._counter > 0:
+            raise AgeError("payload", "the age payload ends with an empty chunk")
+        try:
+            plain = self._aead.decrypt(_chunk_nonce(self._counter, last), data, None)
+        except InvalidTag:
+            plain = None
+        if plain is None and not last:
+            # A full-length chunk can be the last one.
+            last = True
+            try:
+                plain = self._aead.decrypt(_chunk_nonce(self._counter, True), data, None)
+            except InvalidTag:
+                pass
+        if plain is None:
+            raise AgeError("payload", "an age payload chunk failed authentication")
+        self._counter += 1
+        if last:
+            self._done = True
+            if self._fh.read(1):
+                # Released first: the chunk itself was authentic.
+                self._error = AgeError("payload", "the age file has data after its last chunk")
+        return plain
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        while not self._plain:
+            if self._error is not None:
+                raise self._error
+            if self._done:
+                return 0
+            self._plain = memoryview(self._next_chunk())
+        n = min(len(buffer), len(self._plain))
+        buffer[:n] = self._plain[:n]
+        self._plain = self._plain[n:]
+        return n
+
+    def drain(self) -> None:
+        """Read and authenticate the rest of the payload, to its last chunk."""
+        self._plain = memoryview(b"")
+        while not self._done:
+            self._next_chunk()
+        if self._error is not None:
+            raise self._error
+
+
+def open_decrypt(fh: BinaryIO, passphrase: str) -> Decryptor:
+    """Parse the header, unwrap the key, check the MAC; then stream the payload."""
+    header = read_header(fh)
+    file_key = unwrap_file_key(header, passphrase)
+    verify_mac(header, file_key)
+    return Decryptor(fh, file_key)
+
+
+class Encryptor(io.RawIOBase):
+    """Writes an age passphrase file to `fh` from the plaintext written to it.
+
+    The last chunk carries the final flag, so a full chunk is held back until
+    either more data or `close()` shows whether it is the last. `close()` writes
+    it and leaves `fh` open: the caller owns that file.
+    """
+
+    def __init__(self, fh: BinaryIO, passphrase: str, work_factor: int | None = None):
+        super().__init__()
+        self._fh = fh
+        work_factor = WORK_FACTOR if work_factor is None else work_factor
+        file_key = os.urandom(_FILE_KEY)
+        salt = os.urandom(16)
+        key = _scrypt(passphrase.encode("utf-8"), salt, work_factor)
+        wrapped = ChaCha20Poly1305(key).encrypt(b"\x00" * 12, file_key, None)
+        mac_input = (VERSION_LINE + b"\n"
+                     + b"-> scrypt " + _b64encode(salt) + b" " + str(work_factor).encode() + b"\n"
+                     + _b64encode(wrapped) + b"\n"   # 43 characters: one short line
+                     + b"---")
+        nonce = os.urandom(_NONCE)
+        fh.write(mac_input + b" " + _b64encode(_header_mac(file_key, mac_input)) + b"\n" + nonce)
+        self._aead = ChaCha20Poly1305(_hkdf(file_key, nonce, b"payload"))
+        self._counter = 0
+        self._buf = bytearray()
+
+    def _emit(self, plain: bytes, last: bool) -> None:
+        self._fh.write(self._aead.encrypt(_chunk_nonce(self._counter, last), plain, None))
+        self._counter += 1
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, data) -> int:
+        if self.closed:
+            raise ValueError("write to a closed Encryptor")
+        view = memoryview(data).cast("B")
+        self._buf += view
+        # Strictly more than a chunk: a chunk that may be the last is kept.
+        while len(self._buf) > CHUNK:
+            self._emit(bytes(self._buf[:CHUNK]), last=False)
+            del self._buf[:CHUNK]
+        return len(view)
+
+    def close(self) -> None:
+        if not self.closed:
+            self._emit(bytes(self._buf), last=True)
+            self._buf = bytearray()
+        super().close()
 ```
 
 ### api/services/jobstore.py
@@ -7330,7 +7876,8 @@ def active_job_for(collection: str) -> str | None:
 
 
 @telemetry.traced("rag.export")
-def _run(job_id: str, collection: str, include_models: bool) -> None:
+def _run(job_id: str, collection: str, include_models: bool,
+         passphrase: str | None = None) -> None:
     job = _jobs[job_id]
 
     def progress(written: int) -> None:
@@ -7351,7 +7898,8 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
         # it is released before the terminal status is written.
         with collection_writes.guard(collection):
             job["status"] = "running"
-            result = packager.build(collection, include_models=include_models, progress=progress)
+            result = packager.build(collection, include_models=include_models, progress=progress,
+                                    passphrase=passphrase)
     except packager.PackageError as exc:
         telemetry.outcome("error", exc)
         _log.warning("Export of %r refused (%s): %s", collection, exc.code, exc.message)
@@ -7390,8 +7938,12 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
                 del _active[collection]
 
 
-async def start_export_job(collection: str, include_models: bool = False) -> str:
+async def start_export_job(collection: str, include_models: bool = False,
+                           passphrase: str | None = None) -> str:
     """Register the job and run the build off the event loop.
+
+    A passphrase makes the package encrypted (#27). It is handed to the worker
+    as an argument only: the job record says `encrypted`, never the passphrase.
 
     Raises RuntimeError carrying the running job id if one is already in flight
     for this collection; that job's record is always stored by then (#326).
@@ -7445,6 +7997,7 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
                 "fidelity": None,
                 "models_bundled": None,
                 "retrieve_script": None,
+                "encrypted": passphrase is not None,
                 "warnings": [],
                 "error": None,
                 "error_code": None,
@@ -7464,7 +8017,8 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
     # export does not stall the API: queries and other collections carry on, and
     # only guarded writes to this collection wait for it (spec §6.1, #509).
-    task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, include_models))
+    task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, include_models,
+                                         passphrase))
     # _run ends it first; this also covers a task that never ran its worker.
     task.add_done_callback(lambda _task: collection_writes.end_job("export", job_id))
     return job_id
@@ -7512,6 +8066,7 @@ from contextlib import nullcontext
 
 from config import settings
 from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
+from services import age_stream
 from services import goldstandard
 from services import ingest_config
 from services import model_bundle
@@ -7540,6 +8095,15 @@ _lock = threading.Lock()
 # Weaviate capitalises the first character of a collection name and rejects
 # anything outside [A-Za-z0-9_]. Both were confirmed against the live server.
 _NAME_OK = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+class PassphraseError(Exception):
+    """A passphrase missing for an encrypted package, or given for one that is
+    not encrypted (#27). Raised before any job exists; `code` is the API code."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
 
 
 def get_job(job_id: str) -> dict | None:
@@ -8259,7 +8823,7 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
 
 
 @telemetry.traced("rag.import")
-def _run(job_id: str, filename: str, on_conflict: str) -> None:
+def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = None) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
     work = Path(tempfile.mkdtemp(prefix="import-", dir=settings.upload_dir))
@@ -8282,7 +8846,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
     try:
         archive = packager.exports_dir() / Path(filename).name
-        pkg, manifest = packager.open_package(archive, work)        # checks 1, 2
+        pkg, manifest = packager.open_package(archive, work, passphrase)  # checks 1, 2
         packager.verify_digests(pkg, manifest)                      # check 3
         _validate_package_sources(pkg, manifest)
         _check_embedding(manifest)                                  # check 4
@@ -8423,9 +8987,23 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         _release_targets(job_id)
 
 
-async def start_import_job(filename: str, on_conflict: str) -> str:
-    job_id = str(uuid.uuid4())[:8]
+async def start_import_job(filename: str, on_conflict: str, passphrase: str | None = None) -> str:
+    """Register the job and run the import off the event loop.
+
+    An encrypted package is known by its name (`.tar.gz.age`, #27), so a missing
+    or unexpected passphrase is refused here, before any job or guard. The
+    passphrase reaches the worker as an argument only, never the job record.
+    """
     key = _package_key(filename)
+    encrypted = age_stream.is_encrypted_name(key)
+    if encrypted and passphrase is None:
+        raise PassphraseError("PASSPHRASE_REQUIRED",
+                              f"'{key}' is encrypted. Send its passphrase to import it.")
+    if not encrypted and passphrase is not None:
+        raise PassphraseError("PASSPHRASE_NOT_EXPECTED",
+                              f"'{key}' is not encrypted, so it takes no passphrase. "
+                              "Anyone with the file can read it.")
+    job_id = str(uuid.uuid4())[:8]
     with _lock:
         if key in _active:
             raise RuntimeError(filename)
@@ -8449,12 +9027,14 @@ async def start_import_job(filename: str, on_conflict: str) -> str:
             "error": None,
             "error_code": None,
             "error_detail": None,
+            "encrypted": encrypted,
         })
     except BaseException:
         with _lock:
             _active.discard(key)
         raise
-    asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict))
+    asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict,
+                                          passphrase))
     return job_id
 ```
 
@@ -10055,7 +10635,7 @@ from models.schemas import (
     PackageListResponse,
     PackageSummary,
 )
-from services import exporter, importer, packager
+from services import age_stream, exporter, importer, packager
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError
 from utils import api_error, collection_check_unavailable, collection_deleting_error
@@ -10078,7 +10658,9 @@ async def start_export(body: ExportRequest):
         return api_error(404, "COLLECTION_NOT_FOUND",
                          f"Collection '{body.collection}' not found.")
     try:
-        job_id = await exporter.start_export_job(body.collection, body.include_models)
+        job_id = await exporter.start_export_job(
+            body.collection, body.include_models,
+            body.passphrase.get_secret_value() if body.passphrase is not None else None)
     except CollectionDeletingError:
         return collection_deleting_error(body.collection)
     except exporter.ExportStartingError:
@@ -10108,8 +10690,12 @@ async def start_import(body: ImportRequest):
     # Everything else — unreadable archive, bad digest, embedding mismatch,
     # name collision — is reported through the job, because it is only knowable
     # after reading the package, which takes long enough to need a job.
+    passphrase = body.passphrase.get_secret_value() if body.passphrase is not None else None
     try:
-        job_id = await importer.start_import_job(body.filename, body.on_conflict)
+        job_id = await importer.start_import_job(body.filename, body.on_conflict, passphrase)
+    except importer.PassphraseError as exc:
+        # Decided by the filename before any job exists (#27).
+        return api_error(400, exc.code, str(exc), detail={"filename": body.filename})
     except RuntimeError as exc:
         return api_error(409, "IMPORT_IN_PROGRESS",
                          f"An import of '{exc}' is already running.",
@@ -10127,7 +10713,21 @@ async def import_job_status(job_id: str):
 
 def _list_packages_sync() -> list[dict]:
     out = []
-    for p in sorted(packager.exports_dir().glob("ragpkg-*.tar.gz")):
+    root = packager.exports_dir()
+    for p in sorted([*root.glob("ragpkg-*.tar.gz"), *root.glob("ragpkg-*" + age_stream.ENCRYPTED_SUFFIX)]):
+        if age_stream.is_encrypted_name(p.name):
+            # No metadata without the passphrase, and no scrypt to list (#27).
+            try:
+                with p.open("rb") as fh:
+                    readable = age_stream.check_header(fh)
+                size = p.stat().st_size
+            except Exception:                         # noqa: BLE001
+                # One bad file never breaks the listing of the others.
+                readable, size = False, 0
+            out.append({"filename": p.name, "size_bytes": size,
+                        "collection": None, "chunk_count": None, "fidelity": None,
+                        "created_at": None, "readable": readable, "encrypted": True})
+            continue
         try:
             fields = packager.listing_fields(packager.read_manifest(p))
         except Exception:
@@ -10709,12 +11309,21 @@ def get_summary(
 ### api/templates/partials/encryption.md
 
 ```markdown
-## ⚠ Packages are not encrypted
+## Encryption
 
-Nothing in a package is protected. `sources/` holds the original documents byte
-for byte, and `chunks.jsonl` holds their text. If the corpus contains
-confidential or personal material, the package does too. Move and store it
-accordingly.
+A package is encrypted only when it was exported with a passphrase. Its name
+then ends in `.tar.gz.age`: it is an [age](https://age-encryption.org) file that
+only that passphrase opens, whether through import here or with `age -d`. The
+passphrase can't be recovered, and without it the package can't be opened. Send
+it by a different channel than the file.
+
+A package whose name ends in `.tar.gz` is not encrypted. Nothing in it is
+protected: `sources/` holds the original documents byte for byte, and
+`chunks.jsonl` holds their text. If the corpus contains confidential or personal
+material, the package does too. Move and store it accordingly.
+
+Encryption protects the file while it is moved and stored. Once it is decrypted
+or imported, its contents are plaintext again, on the machine that opened it.
 ```
 
 ### api/templates/partials/fidelity_table.md
@@ -10746,6 +11355,7 @@ Check any machine with `docker compose exec ollama ollama list`.
 ````markdown
 ```
 ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz
+ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz.age    (exported with a passphrase)
 ```
 
 The collection name in the filename is lowercased and stripped of punctuation,
@@ -10835,13 +11445,13 @@ This package is **`@@FIDELITY@@`**. @@FIDELITY_NOTE@@
 
 ## Importing
 
-1. Copy this `.tar.gz` into the target instance's `./exports/` directory.
+1. Copy this package file into the target instance's `./exports/` directory.
 2. Open the web UI and go to **Transfer → Import**, or call the API directly:
 
 ```bash
 curl -X POST http://localhost:8080/api/import \
   -H 'Content-Type: application/json' \
-  -d '{"filename": "@@PACKAGE_FILENAME@@", "on_conflict": "abort"}'
+  -d '{"filename": "@@PACKAGE_FILENAME@@", "on_conflict": "abort"@@IMPORT_PASSPHRASE@@}'
 ```
 
 3. Poll the returned `job_id` at `GET /api/import/job/{job_id}`.
@@ -11147,7 +11757,8 @@ if __name__ == "__main__":
 ```markdown
 # Moving a RAG between machines
 
-A collection can be exported as a single `.tar.gz` and imported somewhere else —
+A collection can be exported as a single `.tar.gz` (or, with a passphrase, an
+encrypted `.tar.gz.age`) and imported somewhere else —
 another laptop, a customer's machine, an air-gapped network. The package carries
 the chunks and their vectors, the settings the collection was tuned with, a
 standalone query script and, when the originals were retained, the source
@@ -11161,8 +11772,9 @@ Everything below is rendered from the same templates that generate the
 Both directions use `./exports/` in the project directory, which is a bind mount
 rather than a Docker volume so you can pick files up and drop them in directly.
 
-- **Exporting** writes the `.tar.gz` there.
-- **Importing** reads from there: copy a package in first, then import by filename.
+- **Exporting** writes the package there.
+- **Importing** reads from there: copy a package in first, then import by filename,
+  with its passphrase when the package is encrypted.
 
 `GET /api/packages` lists what is currently in that directory, including files it
 cannot read — those are shown rather than hidden, so nothing disappears silently.
@@ -13234,15 +13846,18 @@ export interface MetricsResult {
   total_latency: LatencyStats
   history: LatencyRecord[]
 }
-export interface ExportBody { collection: string; include_models: boolean }
+// passphrase: only for an encrypted export (#27), 12 to 1024 characters.
+export interface ExportBody { collection: string; include_models: boolean; passphrase?: string }
 export interface ExportStart { job_id: string; status: string; collection: string }
 export interface ExportJob {
   job_id: string; status: string; collection: string; chunks_written: number
   filename: string | null; size_bytes: number | null; source_document_count: number | null
   fidelity: string | null; models_bundled: boolean | null; retrieve_script: boolean | null
   warnings: string[]; error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
+  encrypted?: boolean
 }
-export interface ImportBody { filename: string; on_conflict: string }
+// passphrase: required for a .tar.gz.age package and refused for any other (#27).
+export interface ImportBody { filename: string; on_conflict: string; passphrase?: string }
 export interface ImportStart { job_id: string; status: string; filename: string }
 export interface ImportJob {
   job_id: string; status: string; filename: string; on_conflict: string
@@ -13250,10 +13865,12 @@ export interface ImportJob {
   fidelity: string | null; renamed: boolean; notes: string[]
   restored_sessions?: { source_session_id: string; session_id: string; collection: string }[]
   error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
+  encrypted?: boolean
 }
 export interface PackageSummary {
   filename: string; size_bytes: number; collection: string | null
   chunk_count: number | null; fidelity: string | null; created_at: string | null; readable: boolean
+  encrypted?: boolean
 }
 export interface TuneOptions {
   collection: string; fidelity: string; source_document_count: number
@@ -14950,6 +15567,15 @@ const CONFLICT = [
 const POLL_MS = 2000
 const POLL_ATTEMPTS = 30
 
+// Passphrase bounds for an encrypted export, as the API checks them (#27).
+const PASSPHRASE_MIN = 12
+const PASSPHRASE_MAX = 1024
+
+// Characters, not UTF-16 units, as the API counts them.
+function charCount(s: string): number {
+  return Array.from(s).length
+}
+
 function message(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
@@ -14960,6 +15586,11 @@ export default function TransferPage() {
   const [tune, setTune] = useState<TuneOptions | null>(null)
   const [tuneError, setTuneError] = useState('')
   const [includeModels, setIncludeModels] = useState(false)
+  // Passphrases live only in this component's state, and are cleared once a
+  // job has started with them (#27).
+  const [encrypt, setEncrypt] = useState(false)
+  const [passphrase, setPassphrase] = useState('')
+  const [confirmPassphrase, setConfirmPassphrase] = useState('')
   const [exportJob, setExportJob] = useState<ExportJob | null>(null)
   const [exportError, setExportError] = useState('')
   const [exportWatching, setExportWatching] = useState(false)
@@ -14969,6 +15600,7 @@ export default function TransferPage() {
   const [packagesError, setPackagesError] = useState('')
   const [filename, setFilename] = useState('')
   const [onConflict, setOnConflict] = useState('abort')
+  const [importPassphrase, setImportPassphrase] = useState('')
   const [importJob, setImportJob] = useState<ImportJob | null>(null)
   const [importError, setImportError] = useState('')
   const [importWatching, setImportWatching] = useState(false)
@@ -15078,7 +15710,10 @@ export default function TransferPage() {
   async function startExport() {
     setExportError(''); setExportPollError(''); setExportJob(null)
     try {
-      const r = await api.startExport({ collection, include_models: includeModels })
+      const r = await api.startExport(encrypt
+        ? { collection, include_models: includeModels, passphrase }
+        : { collection, include_models: includeModels })
+      setPassphrase(''); setConfirmPassphrase('')
       if (!alive.current) return
       exportPoll.current = r.job_id
       setExportWatching(true)
@@ -15091,7 +15726,10 @@ export default function TransferPage() {
   async function startImport() {
     setImportError(''); setImportPollError(''); setImportJob(null)
     try {
-      const r = await api.startImport({ filename, on_conflict: onConflict })
+      const r = await api.startImport(selectedEncrypted
+        ? { filename, on_conflict: onConflict, passphrase: importPassphrase }
+        : { filename, on_conflict: onConflict })
+      setImportPassphrase('')
       if (!alive.current) return
       importPoll.current = r.job_id
       setImportWatching(true)
@@ -15103,6 +15741,15 @@ export default function TransferPage() {
 
   const exportBusy = exportWatching
   const importBusy = importWatching
+
+  // What still stops an encrypted export, or '' when nothing does.
+  const passphraseLength = charCount(passphrase)
+  const passphraseProblem = !encrypt ? ''
+    : passphraseLength < PASSPHRASE_MIN ? `The passphrase needs at least ${PASSPHRASE_MIN} characters.`
+    : passphraseLength > PASSPHRASE_MAX ? `The passphrase can have at most ${PASSPHRASE_MAX} characters.`
+    : passphrase !== confirmPassphrase ? 'The two passphrases do not match.'
+    : ''
+  const selectedEncrypted = packages.some(p => p.filename === filename && p.encrypted)
 
   return (
     <div className="max-w-3xl mx-auto">
@@ -15161,9 +15808,31 @@ export default function TransferPage() {
           </span>
         </label>
 
+        <label className="flex items-start gap-2 text-sm mb-3">
+          <input type="checkbox" checked={encrypt} onChange={e => setEncrypt(e.target.checked)} className="mt-1" />
+          <span>
+            Encrypt with a passphrase
+            <span className="block text-xs text-gray-500">
+              Writes an encrypted <code>.tar.gz.age</code> package that only this passphrase opens.
+              It can't be recovered, so keep it safe and send it separately from the file.
+            </span>
+          </span>
+        </label>
+        {encrypt && (
+          <div className="mb-3 space-y-2">
+            <input type="password" autoComplete="new-password" placeholder="Passphrase"
+                   value={passphrase} onChange={e => setPassphrase(e.target.value)}
+                   className="w-full border rounded px-3 py-2 text-sm" />
+            <input type="password" autoComplete="new-password" placeholder="Confirm the passphrase"
+                   value={confirmPassphrase} onChange={e => setConfirmPassphrase(e.target.value)}
+                   className="w-full border rounded px-3 py-2 text-sm" />
+            {passphraseProblem && <p className="text-xs text-amber-700">{passphraseProblem}</p>}
+          </div>
+        )}
+
         <button
           onClick={startExport}
-          disabled={!collection || exportBusy}
+          disabled={!collection || exportBusy || passphraseProblem !== ''}
           className="bg-blue-600 text-white px-5 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50"
         >
           {exportBusy ? 'Exporting…' : 'Export'}
@@ -15183,6 +15852,7 @@ export default function TransferPage() {
                 <code className="text-xs break-all">{exportJob.filename}</code>
                 <span className="text-gray-500 text-xs">
                   {' '}({sizeLabel(exportJob.size_bytes)}, {exportJob.fidelity}
+                  {exportJob.encrypted ? ', encrypted' : ''}
                   {exportJob.models_bundled ? ', models included' : ''}
                   {exportJob.retrieve_script ? ', with retrieve.py' : ', no retrieve.py'})
                 </span>
@@ -15218,7 +15888,9 @@ export default function TransferPage() {
           {packages.map(p => (
             <option key={p.filename} value={p.filename}>
               {p.filename}
-              {p.readable
+              {p.encrypted
+                ? (p.readable ? ` — encrypted, ${sizeLabel(p.size_bytes)}` : ' — encrypted, unreadable')
+                : p.readable
                 ? ` — ${p.collection}, ${p.chunk_count} chunks, ${p.fidelity}, ${sizeLabel(p.size_bytes)}`
                 : ' — unreadable'}
             </option>
@@ -15229,6 +15901,18 @@ export default function TransferPage() {
           <p className="text-xs text-gray-500 mb-3">
             Nothing in <code>./exports</code> yet. Copy a package there and press Refresh.
           </p>
+        )}
+
+        {selectedEncrypted && (
+          <div className="mb-3">
+            <label className="block text-sm font-medium mb-1">Passphrase</label>
+            <input type="password" autoComplete="off" value={importPassphrase}
+                   onChange={e => setImportPassphrase(e.target.value)}
+                   className="w-full border rounded px-3 py-2 text-sm" />
+            <p className="text-xs text-gray-500 mt-1">
+              This package is encrypted. Enter the passphrase it was exported with.
+            </p>
+          </div>
         )}
 
         <label className="block text-sm font-medium mb-2">If the collection already exists</label>
@@ -15247,7 +15931,7 @@ export default function TransferPage() {
 
         <button
           onClick={startImport}
-          disabled={!filename || importBusy}
+          disabled={!filename || importBusy || (selectedEncrypted && importPassphrase === '')}
           className="bg-blue-600 text-white px-5 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50"
         >
           {importBusy ? 'Importing…' : 'Import'}
@@ -15741,7 +16425,7 @@ retrieval route. The persistence cases cover failed import-config publication.
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
 
-`05_transfer.sh` registers the eight controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py` and `test_package_listing.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work.
+`05_transfer.sh` registers the nine controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py`, `test_package_listing.py` and `test_export_encryption.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work.
 
 `scripts/tests/test_export_snapshot.py` (#509, API container) drives `exporter._run` with the real `packager.build` and retained-source store and a mocked Weaviate backend whose iterator reads the stored chunks one at a time. A re-ingest that tries to commit new chunks and a new `doc.txt` source after the first chunk is streamed waits for the export: the package holds the old chunk text and the old source bytes and index, every chunk's `source_sha256` names a blob in `sources/`, and the re-ingest lands after the build. During an export, gold-standard generation preparation answers `COLLECTION_BUSY` (409) and a guarded chunk insert waits; an export started while another writer holds the guard reads `queued` until it is released; and the guard is free again after an export that succeeds, is refused (`PackageError`), fails or is cancelled. An export whose build is cancelled, or ended by another non-`Exception`, reads `failed` with an `error` naming the exception and saying it was cancelled, and the exception still propagates (#521). Orderings use events and the guard's waiter count. On the code before #509 the re-ingest, generation, insert, queued and guard-held checks fail; on the code before #521 the cancelled-status checks fail.
 
@@ -16234,7 +16918,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, review 404 codes and empty-edit refusal (#381), export schema, export name refusals (#370) |
 | `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E36; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E40, encrypted packages (#27); destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
 | `../tests/test_zip_limits.py` | controlled ZIP member-count (cap of 20 from env), ratio, escaping-member and `detail` bound regressions (#28), registered by ingest |
@@ -16437,18 +17121,44 @@ a UI with no backend:
 RAG_UI_BASE=http://127.0.0.1:3000 RAG_CHROMIUM_PATH=/path/to/chromium node scripts/verify/browser/qa_page.js
 ```
 
+## Export encryption (#27)
+
+`api/services/age_stream.py` writes and reads the age v1 passphrase format on the locked
+`cryptography`: `Encryptor` is the writable file `packager._write_archive` streams the tar.gz
+into (`tarfile` mode `w|gz`), holding back each full chunk until it knows whether it is the
+last; `open_decrypt` parses the header, refuses a work factor above 20 before scrypt, unwraps
+the file key under a process-wide lock, checks the header MAC and returns `Decryptor`, the
+readable file `packager.open_package` unpacks in `tarfile` mode `r|gz`, checking each member
+before extracting it, then drains to authenticate the rest. A `.tar.gz.age` name selects the
+encrypted path everywhere: the listing (header check only), the import refusals in
+`importer.start_import_job` (`PassphraseError`, mapped to 400 by the router) and check 1. The
+passphrase travels as a function argument to the worker thread and is never put in a job
+record; the request models hold it as `SecretStr`.
+
+`scripts/tests/test_export_encryption.py`, run by `05_transfer.sh` in the API image with no
+network, checks the module against the vendored C2SP CCTV vectors
+(`scripts/tests/fixtures/age-testkit`, with their source in `SOURCE`) and an independent
+decryption written from the specification, and the export, import, listing, refusals and
+secrecy rules above. Suite 05 then exports the transfer collection encrypted, validates it
+with `validate_package.py` in the API container (`RAG_PACKAGE_PASSPHRASE`), and checks a wrong
+passphrase, both refusals and a round trip on the live verify stack.
+
 ## Transfer page polling and failure checks
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
 Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
-20 ms (#382). Fourteen cases: for each half, a failed poll (a proxy 502) is shown and retried
+20 ms (#382). Seventeen cases: for each half, a failed poll (a proxy 502) is shown and retried
 with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
 show the last error and enable the button again, and a new start clears the message; a poll in
 flight when the page is left schedules no further poll. An export start answered after the page
 is left starts no polling. A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune` is labelled
 "Fidelity: unknown", a good lookup shows the fidelity, and a late answer for a collection no
 longer selected is ignored. A failed export shows its `error_code`, and a failed package list
-is shown without the empty-folder hint until a good Refresh. Like `query_config.js`, it can run
+is shown without the empty-folder hint until a good Refresh. Three cases cover encryption (#27):
+an export passphrase holds Export until it has 12 characters and matches its confirmation, is
+sent only when the box is checked, and both fields clear once the export starts; an encrypted
+package is labelled, asks for its passphrase, sends it and clears it, and a plain package sends
+none. Like `query_config.js`, it can run
 on its own against a UI with no backend (`RAG_UI_BASE`, `RAG_CHROMIUM_PATH`):
 
 ```bash
@@ -20144,22 +20854,30 @@ if __name__ == "__main__":
 
     python3 validate_package.py <path-to-ragpkg-*.tar.gz>
 
+An encrypted package (`*.tar.gz.age`, #27) is checked the same way after
+decryption. That needs the API's age module and its `cryptography`, so it runs
+in the API container with the passphrase in RAG_PACKAGE_PASSPHRASE:
+
+    docker compose exec -T -e RAG_PACKAGE_PASSPHRASE=... api \
+      python - /app/exports/<package> < scripts/verify/validate_package.py
+
 Exits non-zero if any clause fails. Checks the filename convention, that <id8>
 really is the manifest digest, every listed digest, that nothing in the archive
 is unlisted, the chunks.jsonl record shape, source content-addressing, and the
 generated README and retrieve.py.
 """
-import ast, hashlib, json, re, sys, tarfile, tempfile
+import ast, hashlib, json, os, re, sys, tarfile, tempfile
 from pathlib import Path
 
 archive = Path(sys.argv[1])
+SUFFIX = ".tar.gz.age" if archive.name.endswith(".tar.gz.age") else ".tar.gz"
 fails = []
 def check(name, ok, detail=""):
     print(f"  {'PASS' if ok else 'FAIL'}  {name}" + (f"  — {detail}" if detail else ""))
     if not ok: fails.append(name)
 
 # E5 — filename (§4.1)
-NAME_RE = re.compile(r"^ragpkg-([a-z0-9]+(?:-[a-z0-9]+)*)-(\d{8}T\d{6}Z)-([0-9a-f]{8})\.tar\.gz$")
+NAME_RE = re.compile(r"^ragpkg-([a-z0-9]+(?:-[a-z0-9]+)*)-(\d{8}T\d{6}Z)-([0-9a-f]{8})\.tar\.gz(?:\.age)?$")
 m = NAME_RE.match(archive.name)
 check("E5 filename matches the §4.1 pattern", m is not None, archive.name)
 if not m:
@@ -20167,18 +20885,30 @@ if not m:
 slug, ts, id8 = m.groups()
 
 with tempfile.TemporaryDirectory() as td:
-    with tarfile.open(archive, "r:gz") as tar:
+    source = archive
+    if SUFFIX == ".tar.gz.age":
+        # A decrypted copy in the temporary folder is fine for a check; import
+        # itself never writes one (#27).
+        sys.path.insert(0, os.environ.get("RAG_TEST_API_DIR") or "/app")
+        from services import age_stream
+        source = Path(td) / "decrypted.tar.gz"
+        with archive.open("rb") as fh, source.open("wb") as out:
+            decryptor = age_stream.open_decrypt(fh, os.environ["RAG_PACKAGE_PASSPHRASE"])
+            while block := decryptor.read(1024 * 1024):
+                out.write(block)
+        check("#27 the encrypted package decrypts with its passphrase", True)
+    with tarfile.open(source, "r:gz") as tar:
         names = tar.getnames()
-        tar.extractall(td)
-    root = Path(td)
+        tar.extractall(Path(td) / "x")
+    root = Path(td) / "x"
+    stem = archive.name[:-len(SUFFIX)]
     tops = {n.split("/")[0] for n in names}
     check("archive expands to a single directory", len(tops) == 1, str(tops))
-    check("that directory is the filename minus .tar.gz",
-          tops == {archive.name[:-len(".tar.gz")]}, str(tops))
+    check(f"that directory is the filename minus {SUFFIX}", tops == {stem}, str(tops))
     # §4.2 — the manifest comes right after the directory entry (#383)
     check("§4.2 manifest.json is the archive's first file",
-          names[1:2] == [archive.name[:-len(".tar.gz")] + "/manifest.json"], str(names[:3]))
-    pkg = root / archive.name[:-len(".tar.gz")]
+          names[1:2] == [stem + "/manifest.json"], str(names[:3]))
+    pkg = root / stem
 
     manifest = json.loads((pkg / "manifest.json").read_text())
 
@@ -20273,7 +21003,11 @@ with tempfile.TemporaryDirectory() as td:
           str(set(re.findall(r"@@[A-Z_0-9]+@@", readme))))
     check("E19 README states the collection name", name in readme)
     check("E19 README states the fidelity", fid in readme)
-    check("E19 README carries the encryption warning", "not encrypted" in readme.lower())
+    # The encryption section is shared with /help/transfer, so it describes
+    # both forms; the README also names the file as delivered (#27).
+    check("E19 README carries the encryption section",
+          "## Encryption" in readme and "is not encrypted" in readme and ".tar.gz.age" in readme)
+    check("E19 README names the package file as delivered", archive.name in readme)
 
     if manifest.get("retrieve_script"):
         rp = pkg / "retrieve.py"
@@ -22909,7 +23643,7 @@ summary
 
 ```bash
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E36)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E40)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -22950,6 +23684,10 @@ check "real embedding model exported, installed and refused when mismatched" $?
 # The package listing reads each manifest without decompressing the package (#383).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_package_listing.py)
 check "the package listing reads only up to each manifest (#383)" $?
+# Passphrase encryption (#27): the age module against the CCTV vectors, export,
+# import, listing and refusals, with no backend.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_export_encryption.py)
+check "export encryption: age format, encrypted export and import, refusals (#27)" $?
 
 python3 "$REPO_ROOT/scripts/tests/test_batch_implementation.py"
 check "test_batch_implementation.py registered regression checks" $?
@@ -22995,6 +23733,102 @@ sys.exit(0 if entry and entry["readable"] is True and entry["collection"] == col
          and entry["chunk_count"] == chunks and entry["fidelity"] == "with-sources" and entry["created_at"] else 1)
 ENDPY
 check "GET /packages lists the new export as readable with its manifest metadata (#383)" $? "$(tail -1 /tmp/vfy_pkglist.txt)"
+
+# ── encrypted packages (#27) ─────────────────────────────────────────────────
+# An encrypted export of the same collection, validated after decryption; a
+# wrong passphrase fails DECRYPT_FAILED with nothing touched; the passphrase
+# refusals; the right passphrase imports it. The passphrase is test data.
+PASS27="vfy-27 correct horse battery"
+post_code() {   # path body outfile -> the HTTP status
+  _rag_require_lock_owner
+  curl -s -m 600 -o "$3" -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"
+}
+code=$(post_code "/export" "{\"collection\":\"$C\",\"passphrase\":\"short-pass\"}" /tmp/vfy_enc_short.json)
+python3 - "$code" > /tmp/vfy_enc_short.txt 2>&1 <<'ENDPY'
+import json, sys
+body = open("/tmp/vfy_enc_short.json").read()
+print(sys.argv[1], body[:300])
+sys.exit(0 if sys.argv[1] == "422" and json.loads(body)["error"]["code"] == "INVALID_PARAMETER"
+         and "short-pass" not in body else 1)
+ENDPY
+check "#27 an 11-character passphrase is refused 422 INVALID_PARAMETER without being echoed" $? "$(tail -1 /tmp/vfy_enc_short.txt)"
+
+api_post "/export" "{\"collection\":\"$C\",\"passphrase\":\"$PASS27\"}" > /tmp/vfy_enc_exp.json
+encjob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_enc_exp.json'))['job_id'])")
+encstatus=$(wait_for_job "/export/job/$encjob" 1800)
+check_eq "#27 an encrypted export completes" "$encstatus" "completed"
+api_get "/export/job/$encjob" > /tmp/vfy_enc_expjob.json
+ENCPKG=$(python3 -c "import json;print(json.load(open('/tmp/vfy_enc_expjob.json'))['filename'])")
+python3 - "$EXPORTS/$ENCPKG" "$PASS27" > /tmp/vfy_enc_file.txt 2>&1 <<'ENDPY'
+import json, pathlib, sys
+path, phrase = pathlib.Path(sys.argv[1]), sys.argv[2]
+job = json.load(open("/tmp/vfy_enc_expjob.json"))
+head = path.read_bytes()[:200] if path.is_file() else b""
+lines = head.split(b"\n")
+print(path.name, job.get("encrypted"), lines[:2])
+sys.exit(0 if path.name.endswith(".tar.gz.age") and job.get("encrypted") is True
+         and lines[0] == b"age-encryption.org/v1" and lines[1].startswith(b"-> scrypt ")
+         and lines[1].endswith(b" 18") and phrase.encode() not in path.read_bytes()
+         and phrase not in json.dumps(job) else 1)
+ENDPY
+check "#27 the job reports encrypted and the file is an age scrypt file (work factor 18) named .tar.gz.age" $? "$(tail -1 /tmp/vfy_enc_file.txt)"
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_PACKAGE_PASSPHRASE="$PASS27" api \
+  python - "/app/exports/$ENCPKG" < scripts/verify/validate_package.py) > /tmp/vfy_enc_val.txt 2>&1
+check "#27 the decrypted package satisfies every §4 clause" $? "$(tail -2 /tmp/vfy_enc_val.txt | head -1)"
+api_get "/packages" > /tmp/vfy_enc_list.json
+python3 - "$ENCPKG" > /tmp/vfy_enc_list.txt 2>&1 <<'ENDPY'
+import json, sys
+entry = next((p for p in json.load(open("/tmp/vfy_enc_list.json"))["packages"] if p["filename"] == sys.argv[1]), None)
+print(entry)
+sys.exit(0 if entry and entry["encrypted"] is True and entry["readable"] is True
+         and all(entry[k] is None for k in ("collection", "chunk_count", "fidelity", "created_at")) else 1)
+ENDPY
+check "#27 GET /packages lists the encrypted package with encrypted: true and no metadata" $? "$(tail -1 /tmp/vfy_enc_list.txt)"
+
+# Wrong passphrase, on_conflict=replace against the existing collection: nothing touched.
+enc_sum() { python3 -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$EXPORTS/$ENCPKG"; }
+enc_state() { api_get "/collections" | python3 -c "
+import json,sys; c=json.load(sys.stdin)['collections']; print(sorted((x['name'], x['object_count']) for x in c))"; }
+enc_workdirs() { (cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/uploads/import-* 2>/dev/null | wc -l') | tr -d ' \r'; }
+sum_before=$(enc_sum); state_before=$(enc_state); workdirs_before=$(enc_workdirs)
+api_post "/import" "{\"filename\":\"$ENCPKG\",\"on_conflict\":\"replace\",\"passphrase\":\"not the passphrase\"}" > /tmp/vfy_enc_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_enc_imp.json'))['job_id'])")
+wait_for_job "/import/job/$ijob" 900 >/dev/null
+api_get "/import/job/$ijob" > /tmp/vfy_enc_impjob.json
+python3 > /tmp/vfy_enc_wrong.txt 2>&1 <<'ENDPY'
+import json, sys
+d = json.load(open("/tmp/vfy_enc_impjob.json"))
+print(d["status"], d["error_code"], d["error_detail"], d.get("encrypted"))
+sys.exit(0 if d["status"] == "failed" and d["error_code"] == "DECRYPT_FAILED"
+         and d["error_detail"] == {"reason": "passphrase"} and d.get("encrypted") is True
+         and "not the passphrase" not in json.dumps(d) else 1)
+ENDPY
+check "#27 a wrong passphrase fails the import DECRYPT_FAILED (reason passphrase)" $? "$(tail -1 /tmp/vfy_enc_wrong.txt)"
+[ "$(enc_state)" = "$state_before" ] && [ "$(enc_sum)" = "$sum_before" ]
+check "#27 ... and touches nothing: collections, their counts and the package file unchanged" $?
+check_eq "#27 ... and leaves no import work directory behind" "$(enc_workdirs)" "$workdirs_before"
+
+code=$(post_code "/import" "{\"filename\":\"$ENCPKG\",\"on_conflict\":\"rename\"}" /tmp/vfy_enc_req.json)
+check_eq "#27 an encrypted package without a passphrase is refused 400" "$code" "400"
+check_eq "#27 ... with PASSPHRASE_REQUIRED" "$(jfield "['error']['code']" < /tmp/vfy_enc_req.json)" "PASSPHRASE_REQUIRED"
+code=$(post_code "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"rename\",\"passphrase\":\"$PASS27\"}" /tmp/vfy_enc_nexp.json)
+check_eq "#27 a passphrase for an unencrypted package is refused 400" "$code" "400"
+check_eq "#27 ... with PASSPHRASE_NOT_EXPECTED" "$(jfield "['error']['code']" < /tmp/vfy_enc_nexp.json)" "PASSPHRASE_NOT_EXPECTED"
+[ "$(enc_state)" = "$state_before" ]
+check "#27 ... and neither refusal changed any collection" $?
+
+api_post "/import" "{\"filename\":\"$ENCPKG\",\"on_conflict\":\"rename\",\"passphrase\":\"$PASS27\"}" > /tmp/vfy_enc_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_enc_imp.json'))['job_id'])")
+wait_for_job "/import/job/$ijob" 1800 >/dev/null
+api_get "/import/job/$ijob" > /tmp/vfy_enc_impjob.json
+read -r encstat encname encwritten encflag <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_enc_impjob.json'))
+print(d['status'], d['collection'], d['chunks_written'], d.get('encrypted'))")"
+check_eq "#27 the right passphrase imports the encrypted package" "$encstat" "completed"
+[ "$encname" != "$C" ] && [ "$encwritten" = "$chunks_before" ] && [ "$encflag" = "True" ]
+check "#27 ... under a new name with every chunk, and the job reports encrypted" $? "$encname $encwritten/$chunks_before $encflag"
+[ -n "$encname" ] && [ "$encname" != "$C" ] && [ "$encname" != "None" ] && drop_collection "$encname"
+rm -f "$EXPORTS/$ENCPKG"
 
 # ── E30: vectors are attributed to the collection's stored model (#196) ──────
 EMBED_MODEL=$(cd "$REPO_ROOT" && docker compose exec -T api python -c 'from config import settings; print(settings.embed_model)' | tr -d '\r')
@@ -32395,7 +33229,12 @@ const { makeReporter, setValue, stubAuth } = require('./lib');
 const A = 'VfyTransferA', B = 'VfyTransferB';
 const PACKAGE = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz';
 const collectionsBody = { collections: [A, B].map(name => ({ name, object_count: 3, index_type: 'hnsw', distance_metric: 'cosine', created_at: null })) };
-const packagesBody = { packages: [{ filename: PACKAGE, size_bytes: 2048, collection: A, chunk_count: 3, fidelity: 'with-sources', created_at: null, readable: true }] };
+// An encrypted package lists no metadata (#27).
+const SEALED = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz.age';
+const packagesBody = { packages: [
+  { filename: PACKAGE, size_bytes: 2048, collection: A, chunk_count: 3, fidelity: 'with-sources', created_at: null, readable: true, encrypted: false },
+  { filename: SEALED, size_bytes: 2100, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: true, encrypted: true },
+] };
 const tuneBody = name => ({ collection: name, fidelity: 'with-sources', source_document_count: 2, can_rechunk: true, can_reembed: true, can_reindex: true, note: '' });
 const json = (status, body) => ({ status, body: JSON.stringify(body) });
 const apiError = (status, code, msg) => json(status, { error: { code, message: msg, detail: null } });
@@ -32433,7 +33272,7 @@ async function fixture(browser, base, { hold = [] } = {}) {
       const path = new URL(input, location.href).pathname;
       if (!path.startsWith('/api/')) return realFetch(input, init);
       const method = init.method || 'GET';
-      const entry = { path, method, done: false };
+      const entry = { path, method, done: false, body: init.body || null };
       window.transferFixture.requests.push(entry);
       const answer = answers[method + ' ' + path];
       if (answer) { entry.done = true; return Promise.resolve(new Response(answer.body, { status: answer.status })); }
@@ -32497,6 +33336,19 @@ const retrying = half => `Could not check ${HALVES[half].progress}, retrying: ${
 const stopped = half => `Stopped checking ${HALVES[half].progress} after 30 failed attempts; the ${half} may still be running. Last error: ${DOWN}`;
 
 async function sleep(ms) { await new Promise(r => setTimeout(r, ms)); }
+
+// Encryption controls (#27).
+const passwords = page => page.evaluate(() => [...document.querySelectorAll('input[type=password]')].map(i => i.value));
+const typePassword = (page, index, value) => setValue(page, `() => document.querySelectorAll('input[type=password]')[${index}]`, value);
+const checkEncrypt = page => page.evaluate(() => {
+  const label = [...document.querySelectorAll('label')].find(l => l.textContent.includes('Encrypt with a passphrase'));
+  if (!label) return false; label.querySelector('input[type=checkbox]').click(); return true;
+});
+const sentBody = (page, path) => page.evaluate(p => {
+  const r = window.transferFixture.requests.filter(x => x.path === p && x.method === 'POST').pop();
+  return r && r.body ? JSON.parse(r.body) : null;
+}, path);
+const selectPackage = (page, name) => setValue(page, `() => [...document.querySelectorAll('select')].find(s => [...s.options].some(o => o.value === ${JSON.stringify(name)}))`, name);
 
 async function runTransferPageTests(browser, base, reporter) {
   reporter.section('Transfer page polling and failures (#382)');
@@ -32592,6 +33444,58 @@ async function runTransferPageTests(browser, base, reporter) {
     const listed = await page.evaluate(p => [...document.querySelectorAll('option')].some(o => o.value === p), PACKAGE);
     assert.equal(listed, true, 'the package is not listed after a good Refresh');
   }, { hold: ['GET /api/packages'] }]);
+
+  cases.push(['export encryption: the passphrase rules hold Export, a valid matching pair sends it, and the fields clear (#27)', async page => {
+    assert.deepEqual(await passwords(page), [], 'passphrase fields shown before the box is checked');
+    assert.equal(await checkEncrypt(page), true, 'no "Encrypt with a passphrase" checkbox');
+    await page.waitForFunction(() => document.querySelectorAll('input[type=password]').length === 2);
+    await waitText(page, 'The passphrase needs at least 12 characters.');
+    assert.equal((await button(page, 'export')).disabled, true, 'Export enabled with no passphrase');
+    await typePassword(page, 0, 'eleven-char');
+    await typePassword(page, 1, 'eleven-char');
+    await waitText(page, 'The passphrase needs at least 12 characters.');
+    assert.equal((await button(page, 'export')).disabled, true, 'Export enabled with 11 characters');
+    await typePassword(page, 0, 'correct horse battery');
+    await waitText(page, 'The two passphrases do not match.');
+    assert.equal((await button(page, 'export')).disabled, true, 'Export enabled with a mismatch');
+    await typePassword(page, 1, 'correct horse battery');
+    await waitText(page, 'The two passphrases do not match.', true);
+    await expectButton(page, 'export', false);
+    assert.equal(await click(page, 'Export'), true, 'no Export button');
+    await pending(page, '/api/export', 'POST');
+    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false, passphrase: 'correct horse battery' });
+    await release(page, '/api/export', HALVES.export.started, 'POST');
+    await page.waitForFunction(() => [...document.querySelectorAll('input[type=password]')].every(i => i.value === ''));
+    await release(page, HALVES.export.poll, exportJob('completed', { chunks_written: 3, filename: 'ragpkg-vfy.tar.gz.age', size_bytes: 4096, fidelity: 'with-sources', models_bundled: false, retrieve_script: true, encrypted: true }));
+    await waitText(page, 'with-sources, encrypted');
+  }]);
+  cases.push(['export encryption: an unchecked box sends no passphrase (#27)', async page => {
+    await start(page, 'export');
+    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false });
+  }]);
+  cases.push(['import encryption: an encrypted package is labelled, asks for its passphrase and sends it; a plain one sends none (#27)', async page => {
+    const label = await page.evaluate(n => [...document.querySelectorAll('option')].find(o => o.value === n)?.textContent || '', SEALED);
+    assert.ok(label.includes('encrypted') && !label.includes('null'), label);
+    await selectPackage(page, SEALED);
+    await waitText(page, 'This package is encrypted. Enter the passphrase it was exported with.');
+    assert.equal((await button(page, 'import')).disabled, true, 'Import enabled without a passphrase');
+    await typePassword(page, 0, 'correct horse battery');
+    await expectButton(page, 'import', false);
+    assert.equal(await click(page, 'Import'), true, 'no Import button');
+    await pending(page, '/api/import', 'POST');
+    assert.deepEqual(await sentBody(page, '/api/import'), { filename: SEALED, on_conflict: 'abort', passphrase: 'correct horse battery' });
+    await release(page, '/api/import', json(202, { job_id: 'vfyimp', status: 'queued', filename: SEALED }), 'POST');
+    await page.waitForFunction(() => [...document.querySelectorAll('input[type=password]')].every(i => i.value === ''));
+    await release(page, HALVES.import.poll, importJob('failed', { filename: SEALED, error_code: 'DECRYPT_FAILED', error: "'x' could not be decrypted: the passphrase is wrong or the file is damaged." }));
+    await waitText(page, 'the passphrase is wrong or the file is damaged');
+    await selectPackage(page, PACKAGE);
+    await waitText(page, 'This package is encrypted.', true);
+    assert.deepEqual(await passwords(page), [], 'a passphrase field for a plain package');
+    await expectButton(page, 'import', false);
+    assert.equal(await click(page, 'Import'), true, 'no Import button');
+    await pending(page, '/api/import', 'POST');
+    assert.deepEqual(await sentBody(page, '/api/import'), { filename: PACKAGE, on_conflict: 'abort' });
+  }]);
 
   for (const [name, test, opts] of cases) {
     let s;

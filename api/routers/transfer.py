@@ -21,7 +21,7 @@ from models.schemas import (
     PackageListResponse,
     PackageSummary,
 )
-from services import exporter, importer, packager
+from services import age_stream, exporter, importer, packager
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError
 from utils import api_error, collection_check_unavailable, collection_deleting_error
@@ -44,7 +44,9 @@ async def start_export(body: ExportRequest):
         return api_error(404, "COLLECTION_NOT_FOUND",
                          f"Collection '{body.collection}' not found.")
     try:
-        job_id = await exporter.start_export_job(body.collection, body.include_models)
+        job_id = await exporter.start_export_job(
+            body.collection, body.include_models,
+            body.passphrase.get_secret_value() if body.passphrase is not None else None)
     except CollectionDeletingError:
         return collection_deleting_error(body.collection)
     except exporter.ExportStartingError:
@@ -74,8 +76,12 @@ async def start_import(body: ImportRequest):
     # Everything else — unreadable archive, bad digest, embedding mismatch,
     # name collision — is reported through the job, because it is only knowable
     # after reading the package, which takes long enough to need a job.
+    passphrase = body.passphrase.get_secret_value() if body.passphrase is not None else None
     try:
-        job_id = await importer.start_import_job(body.filename, body.on_conflict)
+        job_id = await importer.start_import_job(body.filename, body.on_conflict, passphrase)
+    except importer.PassphraseError as exc:
+        # Decided by the filename before any job exists (#27).
+        return api_error(400, exc.code, str(exc), detail={"filename": body.filename})
     except RuntimeError as exc:
         return api_error(409, "IMPORT_IN_PROGRESS",
                          f"An import of '{exc}' is already running.",
@@ -93,7 +99,21 @@ async def import_job_status(job_id: str):
 
 def _list_packages_sync() -> list[dict]:
     out = []
-    for p in sorted(packager.exports_dir().glob("ragpkg-*.tar.gz")):
+    root = packager.exports_dir()
+    for p in sorted([*root.glob("ragpkg-*.tar.gz"), *root.glob("ragpkg-*" + age_stream.ENCRYPTED_SUFFIX)]):
+        if age_stream.is_encrypted_name(p.name):
+            # No metadata without the passphrase, and no scrypt to list (#27).
+            try:
+                with p.open("rb") as fh:
+                    readable = age_stream.check_header(fh)
+                size = p.stat().st_size
+            except Exception:                         # noqa: BLE001
+                # One bad file never breaks the listing of the others.
+                readable, size = False, 0
+            out.append({"filename": p.name, "size_bytes": size,
+                        "collection": None, "chunk_count": None, "fidelity": None,
+                        "created_at": None, "readable": readable, "encrypted": True})
+            continue
         try:
             fields = packager.listing_fields(packager.read_manifest(p))
         except Exception:

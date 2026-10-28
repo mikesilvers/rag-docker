@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E36)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E40)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -40,6 +40,10 @@ check "real embedding model exported, installed and refused when mismatched" $?
 # The package listing reads each manifest without decompressing the package (#383).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_package_listing.py)
 check "the package listing reads only up to each manifest (#383)" $?
+# Passphrase encryption (#27): the age module against the CCTV vectors, export,
+# import, listing and refusals, with no backend.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_export_encryption.py)
+check "export encryption: age format, encrypted export and import, refusals (#27)" $?
 
 python3 "$REPO_ROOT/scripts/tests/test_batch_implementation.py"
 check "test_batch_implementation.py registered regression checks" $?
@@ -85,6 +89,102 @@ sys.exit(0 if entry and entry["readable"] is True and entry["collection"] == col
          and entry["chunk_count"] == chunks and entry["fidelity"] == "with-sources" and entry["created_at"] else 1)
 ENDPY
 check "GET /packages lists the new export as readable with its manifest metadata (#383)" $? "$(tail -1 /tmp/vfy_pkglist.txt)"
+
+# ── encrypted packages (#27) ─────────────────────────────────────────────────
+# An encrypted export of the same collection, validated after decryption; a
+# wrong passphrase fails DECRYPT_FAILED with nothing touched; the passphrase
+# refusals; the right passphrase imports it. The passphrase is test data.
+PASS27="vfy-27 correct horse battery"
+post_code() {   # path body outfile -> the HTTP status
+  _rag_require_lock_owner
+  curl -s -m 600 -o "$3" -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"
+}
+code=$(post_code "/export" "{\"collection\":\"$C\",\"passphrase\":\"short-pass\"}" /tmp/vfy_enc_short.json)
+python3 - "$code" > /tmp/vfy_enc_short.txt 2>&1 <<'ENDPY'
+import json, sys
+body = open("/tmp/vfy_enc_short.json").read()
+print(sys.argv[1], body[:300])
+sys.exit(0 if sys.argv[1] == "422" and json.loads(body)["error"]["code"] == "INVALID_PARAMETER"
+         and "short-pass" not in body else 1)
+ENDPY
+check "#27 an 11-character passphrase is refused 422 INVALID_PARAMETER without being echoed" $? "$(tail -1 /tmp/vfy_enc_short.txt)"
+
+api_post "/export" "{\"collection\":\"$C\",\"passphrase\":\"$PASS27\"}" > /tmp/vfy_enc_exp.json
+encjob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_enc_exp.json'))['job_id'])")
+encstatus=$(wait_for_job "/export/job/$encjob" 1800)
+check_eq "#27 an encrypted export completes" "$encstatus" "completed"
+api_get "/export/job/$encjob" > /tmp/vfy_enc_expjob.json
+ENCPKG=$(python3 -c "import json;print(json.load(open('/tmp/vfy_enc_expjob.json'))['filename'])")
+python3 - "$EXPORTS/$ENCPKG" "$PASS27" > /tmp/vfy_enc_file.txt 2>&1 <<'ENDPY'
+import json, pathlib, sys
+path, phrase = pathlib.Path(sys.argv[1]), sys.argv[2]
+job = json.load(open("/tmp/vfy_enc_expjob.json"))
+head = path.read_bytes()[:200] if path.is_file() else b""
+lines = head.split(b"\n")
+print(path.name, job.get("encrypted"), lines[:2])
+sys.exit(0 if path.name.endswith(".tar.gz.age") and job.get("encrypted") is True
+         and lines[0] == b"age-encryption.org/v1" and lines[1].startswith(b"-> scrypt ")
+         and lines[1].endswith(b" 18") and phrase.encode() not in path.read_bytes()
+         and phrase not in json.dumps(job) else 1)
+ENDPY
+check "#27 the job reports encrypted and the file is an age scrypt file (work factor 18) named .tar.gz.age" $? "$(tail -1 /tmp/vfy_enc_file.txt)"
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_PACKAGE_PASSPHRASE="$PASS27" api \
+  python - "/app/exports/$ENCPKG" < scripts/verify/validate_package.py) > /tmp/vfy_enc_val.txt 2>&1
+check "#27 the decrypted package satisfies every §4 clause" $? "$(tail -2 /tmp/vfy_enc_val.txt | head -1)"
+api_get "/packages" > /tmp/vfy_enc_list.json
+python3 - "$ENCPKG" > /tmp/vfy_enc_list.txt 2>&1 <<'ENDPY'
+import json, sys
+entry = next((p for p in json.load(open("/tmp/vfy_enc_list.json"))["packages"] if p["filename"] == sys.argv[1]), None)
+print(entry)
+sys.exit(0 if entry and entry["encrypted"] is True and entry["readable"] is True
+         and all(entry[k] is None for k in ("collection", "chunk_count", "fidelity", "created_at")) else 1)
+ENDPY
+check "#27 GET /packages lists the encrypted package with encrypted: true and no metadata" $? "$(tail -1 /tmp/vfy_enc_list.txt)"
+
+# Wrong passphrase, on_conflict=replace against the existing collection: nothing touched.
+enc_sum() { python3 -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$EXPORTS/$ENCPKG"; }
+enc_state() { api_get "/collections" | python3 -c "
+import json,sys; c=json.load(sys.stdin)['collections']; print(sorted((x['name'], x['object_count']) for x in c))"; }
+enc_workdirs() { (cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/uploads/import-* 2>/dev/null | wc -l') | tr -d ' \r'; }
+sum_before=$(enc_sum); state_before=$(enc_state); workdirs_before=$(enc_workdirs)
+api_post "/import" "{\"filename\":\"$ENCPKG\",\"on_conflict\":\"replace\",\"passphrase\":\"not the passphrase\"}" > /tmp/vfy_enc_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_enc_imp.json'))['job_id'])")
+wait_for_job "/import/job/$ijob" 900 >/dev/null
+api_get "/import/job/$ijob" > /tmp/vfy_enc_impjob.json
+python3 > /tmp/vfy_enc_wrong.txt 2>&1 <<'ENDPY'
+import json, sys
+d = json.load(open("/tmp/vfy_enc_impjob.json"))
+print(d["status"], d["error_code"], d["error_detail"], d.get("encrypted"))
+sys.exit(0 if d["status"] == "failed" and d["error_code"] == "DECRYPT_FAILED"
+         and d["error_detail"] == {"reason": "passphrase"} and d.get("encrypted") is True
+         and "not the passphrase" not in json.dumps(d) else 1)
+ENDPY
+check "#27 a wrong passphrase fails the import DECRYPT_FAILED (reason passphrase)" $? "$(tail -1 /tmp/vfy_enc_wrong.txt)"
+[ "$(enc_state)" = "$state_before" ] && [ "$(enc_sum)" = "$sum_before" ]
+check "#27 ... and touches nothing: collections, their counts and the package file unchanged" $?
+check_eq "#27 ... and leaves no import work directory behind" "$(enc_workdirs)" "$workdirs_before"
+
+code=$(post_code "/import" "{\"filename\":\"$ENCPKG\",\"on_conflict\":\"rename\"}" /tmp/vfy_enc_req.json)
+check_eq "#27 an encrypted package without a passphrase is refused 400" "$code" "400"
+check_eq "#27 ... with PASSPHRASE_REQUIRED" "$(jfield "['error']['code']" < /tmp/vfy_enc_req.json)" "PASSPHRASE_REQUIRED"
+code=$(post_code "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"rename\",\"passphrase\":\"$PASS27\"}" /tmp/vfy_enc_nexp.json)
+check_eq "#27 a passphrase for an unencrypted package is refused 400" "$code" "400"
+check_eq "#27 ... with PASSPHRASE_NOT_EXPECTED" "$(jfield "['error']['code']" < /tmp/vfy_enc_nexp.json)" "PASSPHRASE_NOT_EXPECTED"
+[ "$(enc_state)" = "$state_before" ]
+check "#27 ... and neither refusal changed any collection" $?
+
+api_post "/import" "{\"filename\":\"$ENCPKG\",\"on_conflict\":\"rename\",\"passphrase\":\"$PASS27\"}" > /tmp/vfy_enc_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_enc_imp.json'))['job_id'])")
+wait_for_job "/import/job/$ijob" 1800 >/dev/null
+api_get "/import/job/$ijob" > /tmp/vfy_enc_impjob.json
+read -r encstat encname encwritten encflag <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_enc_impjob.json'))
+print(d['status'], d['collection'], d['chunks_written'], d.get('encrypted'))")"
+check_eq "#27 the right passphrase imports the encrypted package" "$encstat" "completed"
+[ "$encname" != "$C" ] && [ "$encwritten" = "$chunks_before" ] && [ "$encflag" = "True" ]
+check "#27 ... under a new name with every chunk, and the job reports encrypted" $? "$encname $encwritten/$chunks_before $encflag"
+[ -n "$encname" ] && [ "$encname" != "$C" ] && [ "$encname" != "None" ] && drop_collection "$encname"
+rm -f "$EXPORTS/$ENCPKG"
 
 # ── E30: vectors are attributed to the collection's stored model (#196) ──────
 EMBED_MODEL=$(cd "$REPO_ROOT" && docker compose exec -T api python -c 'from config import settings; print(settings.embed_model)' | tr -d '\r')

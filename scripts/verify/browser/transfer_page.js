@@ -12,7 +12,12 @@ const { makeReporter, setValue, stubAuth } = require('./lib');
 const A = 'VfyTransferA', B = 'VfyTransferB';
 const PACKAGE = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz';
 const collectionsBody = { collections: [A, B].map(name => ({ name, object_count: 3, index_type: 'hnsw', distance_metric: 'cosine', created_at: null })) };
-const packagesBody = { packages: [{ filename: PACKAGE, size_bytes: 2048, collection: A, chunk_count: 3, fidelity: 'with-sources', created_at: null, readable: true }] };
+// An encrypted package lists no metadata (#27).
+const SEALED = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz.age';
+const packagesBody = { packages: [
+  { filename: PACKAGE, size_bytes: 2048, collection: A, chunk_count: 3, fidelity: 'with-sources', created_at: null, readable: true, encrypted: false },
+  { filename: SEALED, size_bytes: 2100, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: true, encrypted: true },
+] };
 const tuneBody = name => ({ collection: name, fidelity: 'with-sources', source_document_count: 2, can_rechunk: true, can_reembed: true, can_reindex: true, note: '' });
 const json = (status, body) => ({ status, body: JSON.stringify(body) });
 const apiError = (status, code, msg) => json(status, { error: { code, message: msg, detail: null } });
@@ -50,7 +55,7 @@ async function fixture(browser, base, { hold = [] } = {}) {
       const path = new URL(input, location.href).pathname;
       if (!path.startsWith('/api/')) return realFetch(input, init);
       const method = init.method || 'GET';
-      const entry = { path, method, done: false };
+      const entry = { path, method, done: false, body: init.body || null };
       window.transferFixture.requests.push(entry);
       const answer = answers[method + ' ' + path];
       if (answer) { entry.done = true; return Promise.resolve(new Response(answer.body, { status: answer.status })); }
@@ -114,6 +119,19 @@ const retrying = half => `Could not check ${HALVES[half].progress}, retrying: ${
 const stopped = half => `Stopped checking ${HALVES[half].progress} after 30 failed attempts; the ${half} may still be running. Last error: ${DOWN}`;
 
 async function sleep(ms) { await new Promise(r => setTimeout(r, ms)); }
+
+// Encryption controls (#27).
+const passwords = page => page.evaluate(() => [...document.querySelectorAll('input[type=password]')].map(i => i.value));
+const typePassword = (page, index, value) => setValue(page, `() => document.querySelectorAll('input[type=password]')[${index}]`, value);
+const checkEncrypt = page => page.evaluate(() => {
+  const label = [...document.querySelectorAll('label')].find(l => l.textContent.includes('Encrypt with a passphrase'));
+  if (!label) return false; label.querySelector('input[type=checkbox]').click(); return true;
+});
+const sentBody = (page, path) => page.evaluate(p => {
+  const r = window.transferFixture.requests.filter(x => x.path === p && x.method === 'POST').pop();
+  return r && r.body ? JSON.parse(r.body) : null;
+}, path);
+const selectPackage = (page, name) => setValue(page, `() => [...document.querySelectorAll('select')].find(s => [...s.options].some(o => o.value === ${JSON.stringify(name)}))`, name);
 
 async function runTransferPageTests(browser, base, reporter) {
   reporter.section('Transfer page polling and failures (#382)');
@@ -209,6 +227,58 @@ async function runTransferPageTests(browser, base, reporter) {
     const listed = await page.evaluate(p => [...document.querySelectorAll('option')].some(o => o.value === p), PACKAGE);
     assert.equal(listed, true, 'the package is not listed after a good Refresh');
   }, { hold: ['GET /api/packages'] }]);
+
+  cases.push(['export encryption: the passphrase rules hold Export, a valid matching pair sends it, and the fields clear (#27)', async page => {
+    assert.deepEqual(await passwords(page), [], 'passphrase fields shown before the box is checked');
+    assert.equal(await checkEncrypt(page), true, 'no "Encrypt with a passphrase" checkbox');
+    await page.waitForFunction(() => document.querySelectorAll('input[type=password]').length === 2);
+    await waitText(page, 'The passphrase needs at least 12 characters.');
+    assert.equal((await button(page, 'export')).disabled, true, 'Export enabled with no passphrase');
+    await typePassword(page, 0, 'eleven-char');
+    await typePassword(page, 1, 'eleven-char');
+    await waitText(page, 'The passphrase needs at least 12 characters.');
+    assert.equal((await button(page, 'export')).disabled, true, 'Export enabled with 11 characters');
+    await typePassword(page, 0, 'correct horse battery');
+    await waitText(page, 'The two passphrases do not match.');
+    assert.equal((await button(page, 'export')).disabled, true, 'Export enabled with a mismatch');
+    await typePassword(page, 1, 'correct horse battery');
+    await waitText(page, 'The two passphrases do not match.', true);
+    await expectButton(page, 'export', false);
+    assert.equal(await click(page, 'Export'), true, 'no Export button');
+    await pending(page, '/api/export', 'POST');
+    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false, passphrase: 'correct horse battery' });
+    await release(page, '/api/export', HALVES.export.started, 'POST');
+    await page.waitForFunction(() => [...document.querySelectorAll('input[type=password]')].every(i => i.value === ''));
+    await release(page, HALVES.export.poll, exportJob('completed', { chunks_written: 3, filename: 'ragpkg-vfy.tar.gz.age', size_bytes: 4096, fidelity: 'with-sources', models_bundled: false, retrieve_script: true, encrypted: true }));
+    await waitText(page, 'with-sources, encrypted');
+  }]);
+  cases.push(['export encryption: an unchecked box sends no passphrase (#27)', async page => {
+    await start(page, 'export');
+    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false });
+  }]);
+  cases.push(['import encryption: an encrypted package is labelled, asks for its passphrase and sends it; a plain one sends none (#27)', async page => {
+    const label = await page.evaluate(n => [...document.querySelectorAll('option')].find(o => o.value === n)?.textContent || '', SEALED);
+    assert.ok(label.includes('encrypted') && !label.includes('null'), label);
+    await selectPackage(page, SEALED);
+    await waitText(page, 'This package is encrypted. Enter the passphrase it was exported with.');
+    assert.equal((await button(page, 'import')).disabled, true, 'Import enabled without a passphrase');
+    await typePassword(page, 0, 'correct horse battery');
+    await expectButton(page, 'import', false);
+    assert.equal(await click(page, 'Import'), true, 'no Import button');
+    await pending(page, '/api/import', 'POST');
+    assert.deepEqual(await sentBody(page, '/api/import'), { filename: SEALED, on_conflict: 'abort', passphrase: 'correct horse battery' });
+    await release(page, '/api/import', json(202, { job_id: 'vfyimp', status: 'queued', filename: SEALED }), 'POST');
+    await page.waitForFunction(() => [...document.querySelectorAll('input[type=password]')].every(i => i.value === ''));
+    await release(page, HALVES.import.poll, importJob('failed', { filename: SEALED, error_code: 'DECRYPT_FAILED', error: "'x' could not be decrypted: the passphrase is wrong or the file is damaged." }));
+    await waitText(page, 'the passphrase is wrong or the file is damaged');
+    await selectPackage(page, PACKAGE);
+    await waitText(page, 'This package is encrypted.', true);
+    assert.deepEqual(await passwords(page), [], 'a passphrase field for a plain package');
+    await expectButton(page, 'import', false);
+    assert.equal(await click(page, 'Import'), true, 'no Import button');
+    await pending(page, '/api/import', 'POST');
+    assert.deepEqual(await sentBody(page, '/api/import'), { filename: PACKAGE, on_conflict: 'abort' });
+  }]);
 
   for (const [name, test, opts] of cases) {
     let s;

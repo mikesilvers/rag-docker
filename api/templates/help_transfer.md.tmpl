@@ -1,6 +1,7 @@
 # Moving a RAG between machines
 
-A collection can be exported as a single `.tar.gz` and imported somewhere else —
+A collection can be exported as a single `.tar.gz` (or, with a passphrase, an
+encrypted `.tar.gz.age`) and imported somewhere else —
 another laptop, a customer's machine, an air-gapped network. The package carries
 the chunks and their vectors, the settings the collection was tuned with, a
 standalone query script and, when the originals were retained, the source
@@ -14,8 +15,9 @@ Everything below is rendered from the same templates that generate the
 Both directions use `./exports/` in the project directory, which is a bind mount
 rather than a Docker volume so you can pick files up and drop them in directly.
 
-- **Exporting** writes the `.tar.gz` there.
-- **Importing** reads from there: copy a package in first, then import by filename.
+- **Exporting** writes the package there.
+- **Importing** reads from there: copy a package in first, then import by filename,
+  with its passphrase when the package is encrypted.
 
 `GET /api/packages` lists what is currently in that directory, including files it
 cannot read — those are shown rather than hidden, so nothing disappears silently.

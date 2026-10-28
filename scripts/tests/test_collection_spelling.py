@@ -156,7 +156,7 @@ class JobTests(SpellingTestCase):
         response = self.client.post("/export", json={"collection": TYPED})
         self.assertEqual(response.status_code, 202, response.text)
         self.assertEqual(response.json()["collection"], STORED)
-        start.assert_awaited_once_with(STORED, False)
+        start.assert_awaited_once_with(STORED, False, None)
 
     def test_tune_starts_under_the_stored_name(self):
         start = self.mock(tuning, "start_tune_job", return_value="tune-1")
