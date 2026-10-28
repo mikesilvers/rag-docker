@@ -45,7 +45,7 @@ services:
   weaviate:
     # 1.27.0 is the minimum supported by weaviate-client 4.23.1 (pinned in
     # api/requirements.txt); 1.25.x fails at connect with WeaviateStartUpError.
-    image: semitechnologies/weaviate:1.39.6
+    image: semitechnologies/weaviate:1.40.2
     environment:
       QUERY_DEFAULTS_LIMIT: 25
       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
@@ -16256,6 +16256,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
+| `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530), registered by infrastructure |
 | `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
 | `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
@@ -20343,6 +20344,8 @@ python3 "$REPO_ROOT/scripts/tests/test_suite_registration.py"
 check "the verify suites run the test files #386 registered" $?
 python3 "$REPO_ROOT/scripts/tests/test_dependency_floors.py"
 check "pinned dependencies are at or above their patched versions (#522)" $?
+python3 "$REPO_ROOT/scripts/tests/test_weaviate_pin.py"
+check "the Weaviate pin is the same everywhere and Dependabot leaves it alone (#530)" $?
 python3 "$REPO_ROOT/scripts/tests/test_ci_workflow.py"
 check "the CI workflow runs the verify suite on every pull request (#24)" $?
 # Through the app with Weaviate and Ollama mocked, in the same isolated container (#373).
@@ -27308,7 +27311,7 @@ OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"   # absolute
 IMAGES=(
   rag-docker-api:latest
   rag-docker-ui:latest
-  semitechnologies/weaviate:1.39.6
+  semitechnologies/weaviate:1.40.2
   ollama/ollama:0.3.14
   nginx:1.29-alpine
 )
@@ -39823,7 +39826,7 @@ OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"   # absolute
 IMAGES=(
   rag-docker-api:latest
   rag-docker-ui:latest
-  semitechnologies/weaviate:1.39.6
+  semitechnologies/weaviate:1.40.2
   ollama/ollama:0.3.14
   nginx:1.29-alpine
 )

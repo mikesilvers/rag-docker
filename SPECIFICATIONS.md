@@ -24,7 +24,7 @@ services:
   weaviate:
     # 1.27.0 is the minimum supported by weaviate-client 4.23.1 (pinned in
     # api/requirements.txt); 1.25.x fails at connect with WeaviateStartUpError.
-    image: semitechnologies/weaviate:1.39.6
+    image: semitechnologies/weaviate:1.40.2
     environment:
       QUERY_DEFAULTS_LIMIT: 25
       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
@@ -3198,7 +3198,7 @@ rag-docker/
 
 The image list MUST match the images `docker compose config` resolves. It is
 `rag-docker-api:latest`, `rag-docker-ui:latest`,
-`semitechnologies/weaviate:1.39.4`, `ollama/ollama:0.3.14`, `nginx:1.27-alpine`.
+`semitechnologies/weaviate:1.40.2`, `ollama/ollama:0.3.14`, `nginx:1.27-alpine`.
 A stale entry here silently ships a superseded server.
 
 ### 11.4 Offline install procedure
