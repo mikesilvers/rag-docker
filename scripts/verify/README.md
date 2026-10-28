@@ -362,9 +362,11 @@ damage, 5,001 entries refused at the default; the ratio rule (under 1 MiB exempt
 ratio accepted), a declared ratio refused before anything is read, a stored member and gzip
 output not counted toward the ratio, a member refused while read within a block of passing the
 ratio, the expansion cap winning over the ratio and the ratio over an earlier unreadable member;
-members whose path leaves the archive validated (a corrupt one refuses the ZIP), counted,
-never staged and listed in `skipped`; and `detail.members` bounded to the ten members the
-message names, with `members_omitted`. `02_ingest.sh` runs it in the API container, checks
+the count winning over the declared total, and the total over the ratio while a member is read
+(#534); members whose path leaves the archive validated (a corrupt one refuses the ZIP, an
+encrypted one makes it `ARCHIVE_UNSUPPORTED`), counted, never staged and listed in `skipped`;
+and `detail.members` bounded to the ten members the message names, with `members_omitted`
+(0 at exactly ten). `02_ingest.sh` runs it in the API container, checks
 that the API takes `MAX_ZIP_MEMBERS` 5,000 and `MAX_ZIP_MEMBER_RATIO` 200 from
 `docker-compose.yml`, then sends `zip_many_members.zip` (5,001 entries) and
 `zip_high_ratio.zip` (2 MiB of zeros, Deflate) through the proxy and checks each is refused
@@ -696,6 +698,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
+| `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530), registered by infrastructure |
 | `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
 | `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |

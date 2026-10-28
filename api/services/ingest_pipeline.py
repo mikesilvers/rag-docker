@@ -874,10 +874,13 @@ class _CountedMember:
     caller can tell the two apart.
 
     Given the member's ZipInfo, it also checks the bytes read so far against
-    the member's compressed size after every block, so a member whose header
-    understates its size is refused within a block of passing the ratio cap
-    (#28). These are the ZIP layer's bytes only: a gzipped member's output
-    counts toward the total, not toward its ratio.
+    the member's compressed size after every block, as a backstop to the
+    declared ratio check (#28). With CPython's zipfile it does not trigger:
+    zipfile stops reading a member at its declared uncompressed size, so a
+    header that understates the size fails the member's CRC check and is
+    refused as damaged (ARCHIVE_UNREADABLE), not for its ratio. These are the
+    ZIP layer's bytes only: a gzipped member's output counts toward the total,
+    not toward its ratio.
     """
 
     def __init__(self, data: Any, budget: _ExpansionBudget,
