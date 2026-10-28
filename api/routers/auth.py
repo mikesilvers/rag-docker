@@ -1,9 +1,10 @@
-"""Login, logout, the current user, their own password change, and account
-administration for Engineers (#25).
+"""Login, logout, the current user, their own password change, account
+administration, and service principals and their API keys, for Engineers (#25).
 
 Which role every other route needs is in auth/policy.py, enforced by
-auth/middleware.py before a route runs; the /auth/users routes need an
-Engineer. The first account is created by the operator command, `python -m
+auth/middleware.py before a route runs; the /auth/users and
+/auth/service-principals routes need an Engineer's session (an API key can't
+use them). The first account is created by the operator command, `python -m
 auth`, which also recovers lockouts.
 """
 from __future__ import annotations
@@ -17,8 +18,9 @@ from fastapi.responses import JSONResponse
 
 from auth import passwords, store
 from config import settings
-from models.schemas import (AdminUserList, AdminUserResult, AuthStatus, AuthUser, LoginRequest,
-                            PasswordChangeRequest, RoleChangeRequest, UserCreateRequest)
+from models.schemas import (AdminUserList, AdminUserResult, AuthStatus, AuthUser, KeyIssueRequest, LoginRequest,
+                            PasswordChangeRequest, PrincipalCreateRequest, RoleChangeRequest,
+                            ServicePrincipalList, ServicePrincipalResult, UserCreateRequest)
 from utils import api_error
 
 router = APIRouter(prefix="/auth")
@@ -58,10 +60,12 @@ def _login(typed: str, password: str, address: str):
         return "throttled", None, None
     username = passwords.normalize_username(typed)
     user = store.get_user(username) if username else None
-    # Verified against a dummy hash when there is no such user, so a failure
-    # takes as long either way and the timing doesn't reveal which accounts exist.
-    matched = passwords.verify_password(password, user.password_hash if user else passwords.dummy_hash())
-    ok = bool(matched and user and user.enabled)
+    # Verified against a dummy hash when there is no such user, or the name is a
+    # service principal's (it can't log in, Q21), so a failure takes as long
+    # either way and the timing doesn't reveal which accounts exist.
+    person = user if user and user.kind == "user" else None
+    matched = passwords.verify_password(password, person.password_hash if person else passwords.dummy_hash())
+    ok = bool(matched and person and person.enabled)
     store.finish_attempt(key, address, ok)
     if not ok:
         return "failed", None, None
@@ -101,8 +105,10 @@ async def logout(request: Request):
 
 @router.get("/me", response_model=AuthUser)
 async def me(request: Request):
+    # A session's user (kind "user") or an API key's service principal ("service").
     principal = request.state.auth
-    return _user_body(principal.username, principal.role, principal.must_change_password)
+    return {**_user_body(principal.username, principal.role, principal.must_change_password),
+            "kind": principal.kind}
 
 
 def _change(principal, current: str, new: str, address: str):
@@ -204,7 +210,7 @@ async def create_user(body: UserCreateRequest, request: Request):
 
 def _reset(username: str):
     password = passwords.new_password(username)
-    store.reset_password(username, password)
+    store.reset_password(username, password, "user")
     return store.get_user(username), password
 
 
@@ -241,7 +247,7 @@ async def set_user_role(username: str, body: RoleChangeRequest, request: Request
     if target is None:
         return _not_found(actor, "set-role", username)
     try:
-        user = await asyncio.to_thread(_apply, store.set_role, target, body.role)
+        user = await asyncio.to_thread(_apply, store.set_role, target, body.role, "user")
     except store.Refused as exc:
         return _refused(actor, "set-role", target, exc)
     _log.warning("Admin %r set the role of %r to %s", actor, target, body.role)
@@ -255,7 +261,7 @@ async def _set_enabled(username: str, request: Request, enabled: bool):
     if target is None:
         return _not_found(actor, action, username)
     try:
-        user = await asyncio.to_thread(_apply, store.set_enabled, target, enabled)
+        user = await asyncio.to_thread(_apply, store.set_enabled, target, enabled, "user")
     except store.Refused as exc:
         return _refused(actor, action, target, exc)
     _log.warning("Admin %r %sd %r%s", actor, action, target, "" if enabled else "; their sessions ended")
@@ -270,3 +276,145 @@ async def disable_user(username: str, request: Request):
 @router.post("/users/{username}/enable", response_model=AdminUserResult, response_model_exclude_none=True)
 async def enable_user(username: str, request: Request):
     return await _set_enabled(username, request, True)
+
+
+# ── service principals and their API keys (Engineers only; PR 3) ─────────────
+# A principal is an account that can't log in and authenticates only with its
+# keys (auth/keys.py). Each change and each refusal is one WARNING line naming
+# the Engineer, the principal and the key id; a key is in its 201 answer only.
+
+_PRINCIPAL_STATUS = {"PRINCIPAL_NOT_FOUND": 404, "PRINCIPAL_EXISTS": 409, "KEY_NOT_FOUND": 404}
+
+
+def _iso(at: float | None) -> str | None:
+    return None if at is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+
+
+def _key_body(key: store.Key, now: float) -> dict:
+    return {"id": key.id, "label": key.label, "created_at": _iso(key.created_at), "expires_at": _iso(key.expires_at),
+            "revoked_at": _iso(key.revoked_at), "last_used_at": _iso(key.last_used), "status": key.status(now)}
+
+
+def _principal_body(principal: store.ServicePrincipal) -> dict:
+    now = time.time()
+    return {"name": principal.name, "role": principal.role, "enabled": principal.enabled,
+            "created_at": _iso(principal.created_at), "keys": [_key_body(k, now) for k in principal.keys]}
+
+
+def _principal_refusal(actor: str, action: str, target: str, code: str, message: str):
+    _log.warning("Admin %r: %s of service principal %r refused: %s", actor, action, target, message)
+    return api_error(_PRINCIPAL_STATUS.get(code, 409), code, message)
+
+
+def _principal_refused(actor: str, action: str, target: str, exc: store.Refused):
+    message = str(exc)
+    return _principal_refusal(actor, action, target, exc.code, message[:1].upper() + message[1:] + ".")
+
+
+def _principal_not_found(actor: str, action: str, typed: str):
+    return _principal_refusal(actor, action, typed, "PRINCIPAL_NOT_FOUND", f"There is no service principal {typed!r}.")
+
+
+@router.get("/service-principals", response_model=ServicePrincipalList)
+async def list_principals():
+    principals = await asyncio.to_thread(store.list_principals)
+    return {"principals": [_principal_body(p) for p in principals]}
+
+
+@router.post("/service-principals", status_code=201, response_model=ServicePrincipalResult)
+async def create_principal(body: PrincipalCreateRequest, request: Request):
+    actor = request.state.auth.username
+    name = passwords.normalize_username(body.name)
+    if name is None:
+        _log.warning("Admin %r: create of service principal %r refused: invalid name", actor, body.name)
+        return api_error(422, "INVALID_USERNAME", f"The name must be {passwords.USERNAME_RULE}.")
+    try:
+        principal = await asyncio.to_thread(store.create_principal, name, body.role)
+    except store.Refused as exc:
+        return _principal_refused(actor, "create", name, exc)
+    _log.warning("Admin %r created service principal %r (%s)", actor, name, body.role)
+    return JSONResponse({"principal": _principal_body(principal)}, status_code=201)
+
+
+def _change_principal(action, name: str, *args):
+    action(name, *args, "service")
+    return store.get_principal(name)
+
+
+@router.post("/service-principals/{name}/role", response_model=ServicePrincipalResult)
+async def set_principal_role(name: str, body: RoleChangeRequest, request: Request):
+    actor = request.state.auth.username
+    target = _target(name)
+    if target is None:
+        return _principal_not_found(actor, "set-role", name)
+    try:
+        principal = await asyncio.to_thread(_change_principal, store.set_role, target, body.role)
+    except store.Refused as exc:
+        return _principal_refused(actor, "set-role", target, exc)
+    _log.warning("Admin %r set the role of service principal %r to %s", actor, target, body.role)
+    return JSONResponse({"principal": _principal_body(principal)})
+
+
+async def _set_principal_enabled(name: str, request: Request, enabled: bool):
+    actor = request.state.auth.username
+    action = "enable" if enabled else "disable"
+    target = _target(name)
+    if target is None:
+        return _principal_not_found(actor, action, name)
+    try:
+        principal = await asyncio.to_thread(_change_principal, store.set_enabled, target, enabled)
+    except store.Refused as exc:
+        return _principal_refused(actor, action, target, exc)
+    _log.warning("Admin %r %sd service principal %r%s", actor, action, target,
+                 "" if enabled else "; its keys stop working")
+    return JSONResponse({"principal": _principal_body(principal)})
+
+
+@router.post("/service-principals/{name}/disable", response_model=ServicePrincipalResult)
+async def disable_principal(name: str, request: Request):
+    return await _set_principal_enabled(name, request, False)
+
+
+@router.post("/service-principals/{name}/enable", response_model=ServicePrincipalResult)
+async def enable_principal(name: str, request: Request):
+    return await _set_principal_enabled(name, request, True)
+
+
+def _issue(name: str, days: int, label: str):
+    key, secret = store.issue_key(name, days, label)
+    return store.get_principal(name), key, secret
+
+
+@router.post("/service-principals/{name}/keys", status_code=201, response_model=ServicePrincipalResult)
+async def issue_key(name: str, body: KeyIssueRequest, request: Request):
+    actor = request.state.auth.username
+    target = _target(name)
+    if target is None:
+        return _principal_not_found(actor, "issue-key", name)
+    try:
+        principal, key, secret = await asyncio.to_thread(_issue, target, body.days, body.label)
+    except store.Refused as exc:
+        return _principal_refused(actor, "issue-key", target, exc)
+    _log.warning("Admin %r issued key %s for service principal %r, expiring %s", actor, key.id, target,
+                 _iso(key.expires_at))
+    return JSONResponse({"principal": _principal_body(principal), "key": _key_body(key, time.time()),
+                         "secret": secret}, status_code=201, headers=_NO_STORE)
+
+
+def _revoke(name: str, key_id: str):
+    store.revoke_key(name, key_id)
+    return store.get_principal(name)
+
+
+@router.post("/service-principals/{name}/keys/{key_id}/revoke", response_model=ServicePrincipalResult)
+async def revoke_key(name: str, key_id: str, request: Request):
+    actor = request.state.auth.username
+    target = _target(name)
+    if target is None:
+        return _principal_not_found(actor, "revoke-key", name)
+    try:
+        principal = await asyncio.to_thread(_revoke, target, key_id)
+    except store.Refused as exc:
+        return _principal_refused(actor, "revoke-key", target, exc)
+    _log.warning("Admin %r revoked key %s of service principal %r", actor, key_id, target)
+    return JSONResponse({"principal": _principal_body(principal)})

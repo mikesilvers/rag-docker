@@ -5,9 +5,11 @@ into a check:
     python3 auth_stack.py CHECK [--operator]
 
 Exit 0 when the check holds, 1 when it doesn't (the reason on stderr). Checks
-that create throwaway accounts (vfy-t-<random>) or age a session need the
-operator command, so they need --operator, which 17_auth.sh passes only on the
-verify project as stack.sh sets it up. No password or session token is printed.
+that create throwaway accounts (vfy-t-<random>), service principals
+(vfy-s-<random>) or age a session need the operator command, so they need
+--operator, which 17_auth.sh passes only on the verify project as stack.sh sets
+it up. No password, session token or API key is printed; keys are held in
+memory only.
 """
 import hashlib
 import json
@@ -70,7 +72,18 @@ MATRIX = (
     ("POST", "/auth/users/vfy-no-such-user/role", {}, "engineer"),
     ("POST", "/auth/users/vfy-no-such-user/disable", None, "engineer"),
     ("POST", "/auth/users/vfy-no-such-user/enable", None, "engineer"),
+    # Service principals and keys (PR 3 of #25): likewise a list, a 422 or a 404.
+    ("GET", "/auth/service-principals", None, "engineer"),
+    ("POST", "/auth/service-principals", {}, "engineer"),
+    ("POST", "/auth/service-principals/vfy-no-such-svc/role", {}, "engineer"),
+    ("POST", "/auth/service-principals/vfy-no-such-svc/disable", None, "engineer"),
+    ("POST", "/auth/service-principals/vfy-no-such-svc/enable", None, "engineer"),
+    ("POST", "/auth/service-principals/vfy-no-such-svc/keys", {}, "engineer"),
+    ("POST", "/auth/service-principals/vfy-no-such-svc/keys/nosuchkey123/revoke", None, "engineer"),
 )
+# Routes an API key can't use whatever its role (S5 of PR 3): every account,
+# principal and key route, logout and the password change.
+KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password")
 SESSION_ROUTES = (("GET", "/auth/me", None), ("POST", "/auth/logout", None), ("POST", "/auth/password", {}))
 
 
@@ -139,6 +152,29 @@ def throwaway(role, operator_ok):
     return username, new, token
 
 
+def bearer(key):
+    """The headers of a service sending its key: no Origin, no cookie."""
+    return {"Authorization": "Bearer " + key}
+
+
+def new_principal(admin, role):
+    """A throwaway vfy-s-<random> principal of ROLE with one key, through the
+    API as the harness Engineer (session token `admin`). Returns (name, key id, key)."""
+    name = "vfy-s-" + secrets.token_hex(4)
+    status, raw, _ = code("POST", "/auth/service-principals", {"name": name, "role": role}, token=admin)
+    expect(status == 201, "creating principal {} answered {} {}".format(name, status, error_code(raw)))
+    key_id, key = issue(admin, name)
+    return name, key_id, key
+
+
+def issue(admin, name, body=None):
+    status, raw, headers = code("POST", "/auth/service-principals/{}/keys".format(name), body or {}, token=admin)
+    expect(status == 201, "issuing a key for {} answered {} {}".format(name, status, error_code(raw)))
+    expect(headers.get("Cache-Control") == "no-store", "the issued key's answer may be cached")
+    answer = json.loads(raw)
+    return answer["key"]["id"], answer["secret"]
+
+
 # ── checks ───────────────────────────────────────────────────────────────────
 
 def check_matrix(who, operator_ok):
@@ -162,6 +198,134 @@ def check_matrix(who, operator_ok):
     else:
         request("POST", "/auth/logout", token=token)
     expect(not wrong, "; ".join(wrong))
+
+
+def check_key_matrix(role, operator_ok):
+    """The matrix with an API key of ROLE, sent without Origin (S8.2 of PR 3)."""
+    expect(operator_ok, "creates a service principal, so it runs only on the verify project")
+    admin = role_token("engineer")
+    name, key_id, key = new_principal(admin, role)
+    wrong = []
+    try:
+        for method, path, body, need in MATRIX:
+            status, raw, _ = code(method, path, body, headers=bearer(key))
+            if path.startswith(KEY_REFUSED):
+                ok = status == 403 and error_code(raw) == "KEY_NOT_ALLOWED"
+            elif ROLES.index(role) < ROLES.index(need):
+                ok = status == 403 and error_code(raw) == "FORBIDDEN"
+            else:
+                ok = status not in (401, 403)
+            if not ok:
+                wrong.append("{} {} -> {} {}".format(method, path, status, error_code(raw)))
+        for method, path, body in SESSION_ROUTES:
+            status, raw, _ = code(method, path, body, headers=bearer(key))
+            if path == "/auth/me":
+                me = json.loads(raw) if status == 200 else {}
+                if (me.get("username"), me.get("role"), me.get("kind")) != (name, role, "service"):
+                    wrong.append("GET /auth/me -> {} {}".format(status, me))
+            elif not (status == 403 and error_code(raw) == "KEY_NOT_ALLOWED"):
+                wrong.append("{} {} -> {} {}".format(method, path, status, error_code(raw)))
+    finally:
+        code("POST", "/auth/service-principals/{}/keys/{}/revoke".format(name, key_id), token=admin)
+        code("POST", "/auth/service-principals/{}/disable".format(name), token=admin)
+        request("POST", "/auth/logout", token=admin)
+    expect(not wrong, "; ".join(wrong))
+
+
+def check_service_keys(operator_ok):
+    """A service principal's keys through their life (S8.2 of PR 3), as the
+    harness Engineer through the API."""
+    expect(operator_ok, "creates a service principal, so it runs only on the verify project")
+    admin = role_token("engineer")
+    me = auth_setup.read_credentials(auth_setup.private_dir())["engineer"][0]
+    name, first_id, first = new_principal(admin, "developer")
+    issued = [first]
+
+    def works(key, path="/packages"):
+        return code("GET", path, headers=bearer(key))[0]
+
+    def invalid(key_or_header, why):
+        status, raw, _ = code("GET", "/collections", headers={"Authorization": key_or_header})
+        expect(status == 401 and error_code(raw) == "KEY_INVALID", "{}: answered {} {}".format(
+            why, status, error_code(raw)))
+
+    def admin_post(path, body=None):
+        status, raw, _ = code("POST", "/auth/service-principals/{}{}".format(name, path), body, token=admin)
+        expect(status == 200, "POST {} answered {} {}".format(path, status, error_code(raw)))
+        return json.loads(raw)["principal"]
+
+    # The principal can't log in (Q21).
+    status, raw, _ = code("POST", "/auth/login", {"username": name, "password": "x" * 12})
+    expect(status == 401 and error_code(raw) == "LOGIN_FAILED", "the principal's login answered {}".format(status))
+    # A change without Origin is accepted (Q26): index_type 7 is invalid, so it's a 422 and creates nothing.
+    status, raw, _ = code("POST", "/collections", {"name": "VfyKey" + secrets.token_hex(3), "index_type": 7},
+                          headers=bearer(first))
+    expect(status == 422, "a key's change without Origin answered {} {}".format(status, error_code(raw)))
+    # Rotation: a second key; both work (Q24).
+    second_id, second = issue(admin, name, {"label": "rotated", "days": 1})
+    issued.append(second)
+    expect(works(first) == 200 and works(second) == 200, "after rotation both keys must work")
+    # A role change applies to the keys at once.
+    admin_post("/role", {"role": "end_user"})
+    status, raw, _ = code("GET", "/packages", headers=bearer(first))
+    expect(status == 403 and error_code(raw) == "FORBIDDEN", "after the demotion the key answered {}".format(status))
+    admin_post("/role", {"role": "developer"})
+    # Disabling the principal stops its keys; enabling restores them.
+    admin_post("/disable")
+    invalid("Bearer " + first, "a disabled principal's key")
+    admin_post("/enable")
+    expect(works(first) == 200, "enabling the principal did not restore its key")
+    # Revocation stops one key; the other keeps working.
+    principal = admin_post("/keys/{}/revoke".format(first_id))
+    invalid("Bearer " + first, "a revoked key")
+    expect(works(second) == 200, "revoking one key stopped the other")
+    expect([k["status"] for k in principal["keys"] if k["id"] == first_id] == ["revoked"], "the revoked key isn't listed as revoked")
+    # Expiry: the second key, aged past its end in the verify project's store.
+    script = ("import sqlite3,sys,time\nfrom auth import store\n"
+              "c=sqlite3.connect(store.db_path());c.execute('UPDATE api_keys SET expires_at=? WHERE id=?',"
+              "(time.time()-1,sys.argv[1]));c.commit();print(c.total_changes)\n")
+    result = compose("exec", "-T", "api", "python", "-c", script, second_id)
+    expect(result.returncode == 0 and result.stdout.strip() == "1", "could not age the key: {}".format(
+        result.stderr.strip()[-200:]))
+    invalid("Bearer " + second, "an expired key")
+    # Unknown, malformed and non-Bearer keys; a bad key never falls back to a valid cookie.
+    third_id, third = issue(admin, name)
+    issued.append(third)
+    invalid("Bearer rag_" + secrets.token_hex(6) + "_" + secrets.token_urlsafe(32), "an unknown key")
+    invalid("Bearer " + third[:-1], "a malformed key")
+    invalid("Basic " + third, "a Basic header")
+    status, raw, _ = code("GET", "/metrics/latency", token=admin, headers={"Authorization": "Bearer nonsense"})
+    expect(status == 401 and error_code(raw) == "KEY_INVALID", "a bad key with a valid cookie answered {} {}".format(
+        status, error_code(raw)))
+    # A key in the query string is no credential. It reaches the access log there,
+    # which is why keys are never accepted from URLs: revoked at once, and left
+    # out of the log check below.
+    query_id, query_key = issue(admin, name)
+    status, raw, _ = code("GET", "/collections?api_key=" + query_key, headers={})
+    expect(status == 401 and error_code(raw) == "AUTH_REQUIRED", "a key in the query string answered {} {}".format(
+        status, error_code(raw)))
+    admin_post("/keys/{}/revoke".format(query_id))
+    # Keys appear in no listing and not in the API log, which has the admin lines.
+    status, raw, _ = code("GET", "/auth/service-principals", token=admin)
+    expect(status == 200 and not [k for k in issued + [query_key] if k in raw.decode()], "a listing holds a key")
+    admin_post("/keys/{}/revoke".format(third_id))
+    admin_post("/disable")
+    result = compose("logs", "--no-color", "api")
+    log = result.stdout + result.stderr
+    expect(result.returncode == 0, "docker compose logs failed")
+    expect(not [k for k in issued if k in log], "an API key appears in the API log")
+    for line in ("created service principal '{}' (developer)".format(name),
+                 "issued key {} for service principal '{}'".format(second_id, name),
+                 "revoked key {} of service principal '{}'".format(first_id, name),
+                 "disabled service principal '{}'".format(name)):
+        expect("Admin '{}' {}".format(me, line) in log, "the API log has no line \"Admin ... {}\"".format(line))
+    # The operator command marks the principal in its list and won't reset its password.
+    rc, listed = auth_setup.operator("list")
+    expect(rc == 0 and "{}\tdeveloper\tdisabled\tservice account\t".format(name) in listed,
+           "the operator's list doesn't mark the principal")
+    rc, out = auth_setup.operator("reset-password", name)
+    expect(rc == 1 and not out, "reset-password of a principal exited {}".format(rc))
+    request("POST", "/auth/logout", token=admin)
 
 
 def check_public(operator_ok):
@@ -194,7 +358,8 @@ def check_login_logout(operator_ok):
     token = role_token("developer")
     status, raw, _ = code("GET", "/auth/me", token=token)
     body = json.loads(raw)
-    expect(status == 200 and body == {"username": "vfy-developer", "role": "developer", "must_change_password": False},
+    expect(status == 200 and body == {"username": "vfy-developer", "role": "developer", "must_change_password": False,
+                                      "kind": "user"},
            "GET /auth/me answered {} {}".format(status, body))
     status, _, _ = code("POST", "/auth/logout", token=token)
     expect(status == 200, "logout answered {}".format(status))
@@ -473,10 +638,13 @@ def main(argv):
     names = [a for a in argv if a != "--operator"]
     if len(names) == 2 and names[0] == "matrix" and names[1] in ROLES + ("anonymous",):
         run = lambda: check_matrix(names[1], operator_ok)
-    elif len(names) == 1 and names[0] in CHECKS and names[0] != "matrix":
+    elif len(names) == 2 and names[0] == "key-matrix" and names[1] in ROLES:
+        run = lambda: check_key_matrix(names[1], operator_ok)
+    elif len(names) == 1 and names[0] in CHECKS and names[0] not in ("matrix", "key-matrix"):
         run = lambda: CHECKS[names[0]](operator_ok)
     else:
-        print("usage: auth_stack.py {matrix ROLE|anonymous, " + ", ".join(sorted(CHECKS)) + "} [--operator]",
+        print("usage: auth_stack.py {matrix ROLE|anonymous, key-matrix ROLE, "
+              + ", ".join(sorted(set(CHECKS) - {"matrix", "key-matrix"})) + "} [--operator]",
               file=sys.stderr)
         return 2
     try:

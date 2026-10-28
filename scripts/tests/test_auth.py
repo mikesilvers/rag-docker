@@ -1,4 +1,5 @@
-"""Accounts, sessions, the endpoint/role matrix and the operator command (#25).
+"""Accounts, sessions, service principals and API keys, the endpoint/role
+matrix and the operator command (#25).
 
 Runs with the API's dependencies, in the built API image with no network
 (`17_auth.sh`):
@@ -31,7 +32,7 @@ from pydantic import ValidationError
 import config
 from config import settings
 from main import app
-from auth import passwords, policy, store
+from auth import keys, passwords, policy, store
 from auth.middleware import AuthMiddleware, same_origin
 
 ORIGIN = "http://testserver"
@@ -278,7 +279,7 @@ class PolicyTests(unittest.TestCase):
         counts = {}
         for access in policy.ACCESS.values():
             counts[access] = counts.get(access, 0) + 1
-        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 19, "engineer": 17})
+        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 19, "engineer": 24})
         self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
         self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
         self.assertEqual(policy.ACCESS[("POST", "/collections")], "developer")
@@ -293,6 +294,22 @@ class PolicyTests(unittest.TestCase):
                                       ("POST", "/auth/users/{username}/enable")})
         self.assertEqual(set(admin.values()), {"engineer"})
         self.assertFalse([key for key in policy.ACCESS if key[0] == "DELETE" and key[1].startswith("/auth")])
+        # Service principals and keys (PR 3): the Engineer's, and nothing deletes a principal.
+        principals = {key: access for key, access in policy.ACCESS.items()
+                      if key[1].startswith("/auth/service-principals")}
+        self.assertEqual(set(principals), {
+            ("GET", "/auth/service-principals"), ("POST", "/auth/service-principals"),
+            ("POST", "/auth/service-principals/{name}/role"), ("POST", "/auth/service-principals/{name}/disable"),
+            ("POST", "/auth/service-principals/{name}/enable"), ("POST", "/auth/service-principals/{name}/keys"),
+            ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke")})
+        self.assertEqual(set(principals.values()), {"engineer"})
+
+    def test_keys_cannot_reach_administration_or_the_session_routes(self):
+        # S5 of PR 3: every account, principal and key route, logout and the
+        # password change; GET /auth/me stays open to a key.
+        admin = {path for _, path in policy.ACCESS if path.startswith(("/auth/users", "/auth/service-principals"))}
+        self.assertEqual(policy.HUMAN_ONLY, admin | {"/auth/logout", "/auth/password"})
+        self.assertNotIn("/auth/me", policy.HUMAN_ONLY)
 
     def test_each_template_resolves_to_itself(self):
         for method, template in policy.ACCESS:
@@ -859,6 +876,472 @@ class AdminRouteTests(StoreTestCase):
             self.assertNotIn(secret, logged(logs))
 
 
+class KeyTestCase(StoreTestCase):
+    """A store with an engineer, a developer and an end user, plus helpers for principals and keys."""
+
+    def setUp(self):
+        super().setUp()
+        self.setup_roles()
+
+    def principal(self, name, role, days=90, label=""):
+        store.create_principal(name, role)
+        key_row, key = store.issue_key(name, days, label)
+        return key_row, key
+
+    def bearer(self, key):
+        return {"Authorization": f"Bearer {key}"}
+
+
+class KeyFormatTests(unittest.TestCase):
+    def test_format(self):
+        seen = set()
+        for _ in range(50):
+            key_id, key = keys.generate()
+            self.assertRegex(key, r"^rag_[a-z0-9]{12}_[A-Za-z0-9_-]{43}$")
+            self.assertEqual(len(key), 60)
+            self.assertEqual(keys.key_id(key), key_id)
+            seen.add(key)
+        self.assertEqual(len(seen), 50)
+
+    def test_bearer_parsing(self):
+        _, key = keys.generate()
+        self.assertEqual(keys.bearer("Bearer " + key), key)
+        self.assertEqual(keys.bearer("bearer " + key), key)
+        for value in (None, "", key, "Basic " + key, "Bearer  " + key, "Bearer " + key + " ", "Bearer " + key[:-1],
+                      "Bearer rag_ABCDEFGHIJKL_" + "a" * 43, "Token " + key):
+            with self.subTest(value=value):
+                self.assertIsNone(keys.bearer(value))
+
+
+class KeyStoreTests(KeyTestCase):
+    def test_a_version_1_store_gains_the_kind_column(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        conn = sqlite3.connect(Path(temp.name, "auth.db"))
+        conn.executescript("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, "
+                           "role TEXT NOT NULL, password_hash TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, "
+                           "must_change_password INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL, "
+                           "updated_at REAL NOT NULL);"
+                           "INSERT INTO users VALUES (1, 'old', 'engineer', 'x', 1, 0, 1.0, 1.0);"
+                           "PRAGMA user_version = 1;")
+        conn.commit()
+        conn.close()
+        with patch.object(settings, "auth_dir", temp.name):
+            self.assertEqual(store.get_user("old").kind, "user")
+            version = sqlite3.connect(Path(temp.name, "auth.db")).execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(version, 2)
+            store.create_principal("svc", "developer")
+            self.assertEqual([p.name for p in store.list_principals()], ["svc"])
+
+    def test_only_the_key_hash_is_stored(self):
+        key_row, key = self.principal("svc", "developer")
+        raw = Path(self.dir, "auth.db").read_bytes()
+        self.assertNotIn(key.encode(), raw)
+        self.assertNotIn(key.split("_", 2)[2].encode(), raw)
+        rows = sqlite3.connect(Path(self.dir, "auth.db")).execute("SELECT id, key_hash FROM api_keys").fetchall()
+        self.assertEqual(rows, [(key_row.id, hashlib.sha256(key.encode()).hexdigest())])
+
+    def test_a_valid_key_is_its_principal_as_it_is_now(self):
+        _, key = self.principal("svc", "developer")
+        principal = store.authenticate_key(key)
+        self.assertEqual((principal.username, principal.role, principal.kind, principal.must_change_password),
+                         ("svc", "developer", "service", False))
+        store.set_role("svc", "end_user")
+        self.assertEqual(store.authenticate_key(key).role, "end_user")
+        for wrong in (None, "", key[:-1] + ("A" if key[-1] != "A" else "B"), "rag_" + "a" * 12 + "_" + "b" * 43,
+                      key + "x"):
+            with self.subTest(wrong=wrong):
+                self.assertIsNone(store.authenticate_key(wrong))
+
+    def test_expiry_boundary(self):
+        start = 10_000.0
+        with patch.object(store, "_now", return_value=start):
+            key_row, key = self.principal("svc", "developer", days=1)
+        self.assertEqual(key_row.expires_at, start + 86400)
+        with patch.object(store, "_now", return_value=start + 86399):
+            self.assertIsNotNone(store.authenticate_key(key))
+        with patch.object(store, "_now", return_value=start + 86400):
+            self.assertIsNone(store.authenticate_key(key))
+            self.assertEqual(store.get_principal("svc").keys[0].status(start + 86400), "expired")
+
+    def test_lifetimes(self):
+        store.create_principal("svc", "developer")
+        for days in (0, 366, -1, 1.5, "90"):
+            with self.subTest(days=days), self.assertRaises(ValueError):
+                store.issue_key("svc", days)
+        key_row, _ = store.issue_key("svc")
+        self.assertAlmostEqual(key_row.expires_at - key_row.created_at, 90 * 86400)
+        key_row, _ = store.issue_key("svc", 365)
+        self.assertAlmostEqual(key_row.expires_at - key_row.created_at, 365 * 86400)
+
+    def test_revocation_and_rotation(self):
+        old_row, old = self.principal("svc", "developer")
+        new_row, new = store.issue_key("svc", 30, "rotated")
+        self.assertIsNotNone(store.authenticate_key(old), "the old key stays valid after rotation (Q24)")
+        self.assertIsNotNone(store.authenticate_key(new))
+        first = store.revoke_key("svc", old_row.id)
+        self.assertIsNone(store.authenticate_key(old))
+        self.assertIsNotNone(store.authenticate_key(new))
+        with patch.object(store, "_now", return_value=first.revoked_at + 100):
+            again = store.revoke_key("svc", old_row.id)
+        self.assertEqual(again.revoked_at, first.revoked_at, "a second revoke keeps the first time")
+        listed = store.get_principal("svc").keys
+        self.assertEqual([k.id for k in listed], [new_row.id, old_row.id])
+        self.assertEqual([k.status() for k in listed], ["active", "revoked"])
+        with self.assertRaises(store.Refused) as refused:
+            store.revoke_key("svc", "nosuchkey123")
+        self.assertEqual(refused.exception.code, "KEY_NOT_FOUND")
+        store.create_principal("other", "developer")
+        with self.assertRaises(store.Refused) as refused:
+            store.revoke_key("other", new_row.id)
+        self.assertEqual(refused.exception.code, "KEY_NOT_FOUND")
+
+    def test_a_disabled_principal_has_no_valid_key(self):
+        _, key = self.principal("svc", "developer")
+        store.set_enabled("svc", False)
+        self.assertIsNone(store.authenticate_key(key))
+        _, issued_while_disabled = store.issue_key("svc")
+        self.assertIsNone(store.authenticate_key(issued_while_disabled))
+        store.set_enabled("svc", True)
+        self.assertIsNotNone(store.authenticate_key(key))
+        self.assertIsNotNone(store.authenticate_key(issued_while_disabled))
+
+    def test_last_used_is_written_at_most_once_a_minute(self):
+        key_row, key = self.principal("svc", "developer")
+        self.assertIsNone(key_row.last_used)
+        with patch.object(store, "_now", return_value=key_row.created_at + 10):
+            store.authenticate_key(key)
+        self.assertEqual(store.get_principal("svc").keys[0].last_used, key_row.created_at + 10)
+        with patch.object(store, "_now", return_value=key_row.created_at + 50):
+            store.authenticate_key(key)
+        self.assertEqual(store.get_principal("svc").keys[0].last_used, key_row.created_at + 10)
+        with patch.object(store, "_now", return_value=key_row.created_at + 80):
+            store.authenticate_key(key)
+        self.assertEqual(store.get_principal("svc").keys[0].last_used, key_row.created_at + 80)
+
+    def test_one_name_pool(self):
+        store.create_principal("svc", "developer")
+        with self.assertRaises(store.Refused) as refused:
+            store.create_principal("dev", "developer")
+        self.assertEqual(refused.exception.code, "PRINCIPAL_EXISTS")
+        with self.assertRaises(store.Refused) as refused:
+            store.create_principal("svc", "end_user")
+        self.assertEqual(refused.exception.code, "PRINCIPAL_EXISTS")
+        with self.assertRaises(store.Refused) as refused:
+            store.create_user("svc", "developer", passwords.generate_password())
+        self.assertEqual(refused.exception.code, "USER_EXISTS")
+        self.assertEqual([u.username for u in store.list_users()], ["dev", "eng", "user"])
+        self.assertEqual([u.username for u in store.list_users(kind=None)], ["dev", "eng", "svc", "user"])
+
+    def test_principals_have_no_password_and_are_kind_checked(self):
+        store.create_principal("svc", "engineer")
+        user = store.get_user("svc")
+        self.assertEqual((user.kind, user.must_change_password), ("service", False))
+        self.assertFalse(passwords.verify_password("", user.password_hash))
+        self.assertFalse(passwords.verify_password(store.NO_PASSWORD, user.password_hash))
+        with self.assertRaises(store.Refused) as refused:
+            store.reset_password("svc", passwords.generate_password())
+        self.assertEqual(refused.exception.code, "NOT_A_USER")
+        with self.assertRaises(store.Refused) as refused:
+            store.set_role("svc", "developer", "user")
+        self.assertEqual(refused.exception.code, "USER_NOT_FOUND")
+        with self.assertRaises(store.Refused) as refused:
+            store.issue_key("dev")
+        self.assertEqual(refused.exception.code, "PRINCIPAL_NOT_FOUND")
+        with self.assertRaises(store.Refused) as refused:
+            store.get_principal("eng")
+        self.assertEqual(refused.exception.code, "PRINCIPAL_NOT_FOUND")
+
+    def test_an_engineer_principal_does_not_count_as_an_engineer(self):
+        store.create_principal("svc", "engineer")
+        with self.assertRaises(store.Refused) as refused:
+            store.set_enabled("eng", False)
+        self.assertEqual(refused.exception.code, "LAST_ENGINEER")
+        store.set_enabled("svc", False)
+        store.set_role("svc", "end_user")
+
+
+class KeyMiddlewareTests(KeyTestCase):
+    """Authenticating with a key through main.app (S3 of PR 3's specifications)."""
+
+    def code(self, response):
+        return response.json()["error"]["code"]
+
+    def test_a_key_follows_its_role_without_an_origin(self):
+        _, key = self.principal("svc", "developer")
+        headers = self.bearer(key)
+        self.assertEqual(self.client.get("/collections", headers=headers).status_code != 401, True)
+        response = self.client.get("/packages", headers=headers)
+        self.assertNotIn(response.status_code, (401, 403), response.text)
+        # A change with no Origin and no Sec-Fetch-Site: the key skips the origin check (Q26).
+        response = self.client.post("/collections", json={"name": "VfyKey", "index_type": 7}, headers=headers)
+        self.assertEqual(response.status_code, 422, response.text)
+        response = self.client.post("/tune/rechunk", json={}, headers=headers)
+        self.assertEqual((response.status_code, self.code(response)), (403, "FORBIDDEN"))
+        self.assertEqual(response.json()["error"]["detail"], {"required_role": "engineer"})
+
+    def test_keys_are_refused_on_administration_and_session_routes(self):
+        _, key = self.principal("svc", "engineer")
+        headers = self.bearer(key)
+        for method, path, body in (("GET", "/auth/users", None),
+                                   ("POST", "/auth/users", {"username": "minted", "role": "engineer"}),
+                                   ("POST", "/auth/users/dev/reset-password", None),
+                                   ("POST", "/auth/users/dev/role", {"role": "engineer"}),
+                                   ("POST", "/auth/users/dev/disable", None),
+                                   ("POST", "/auth/users/dev/enable", None),
+                                   ("GET", "/auth/service-principals", None),
+                                   ("POST", "/auth/service-principals", {"name": "minted", "role": "engineer"}),
+                                   ("POST", "/auth/service-principals/svc/role", {"role": "engineer"}),
+                                   ("POST", "/auth/service-principals/svc/disable", None),
+                                   ("POST", "/auth/service-principals/svc/enable", None),
+                                   ("POST", "/auth/service-principals/svc/keys", {}),
+                                   ("POST", "/auth/service-principals/svc/keys/abc/revoke", None),
+                                   ("POST", "/auth/logout", None),
+                                   ("POST", "/auth/password", {"current_password": "x", "new_password": "y" * 12})):
+            with self.subTest(route=f"{method} {path}"):
+                response = self.client.request(method, path, json=body, headers=headers)
+                self.assertEqual((response.status_code, self.code(response)), (403, "KEY_NOT_ALLOWED"))
+        self.assertIsNone(store.get_user("minted"))
+        self.assertEqual(len(store.get_principal("svc").keys), 1)
+        # Engineer-level data routes stay open to an engineer key.
+        self.assertNotIn(self.client.get("/metrics/latency", headers=headers).status_code, (401, 403))
+
+    def test_me_names_the_principal(self):
+        _, key = self.principal("svc", "end_user")
+        response = self.client.get("/auth/me", headers=self.bearer(key))
+        self.assertEqual(response.json(), {"username": "svc", "role": "end_user", "must_change_password": False,
+                                           "kind": "service"})
+        headers, _ = self.session("dev")
+        self.assertEqual(self.client.get("/auth/me", headers=headers).json()["kind"], "user")
+
+    def test_invalid_keys_get_one_answer(self):
+        key_row, key = self.principal("svc", "developer")
+        revoked_row, revoked = store.issue_key("svc")
+        store.revoke_key("svc", revoked_row.id)
+        with patch.object(store, "_now", return_value=key_row.created_at - 2 * 86400):
+            _, expired = store.issue_key("svc", 1)
+        store.create_principal("off", "developer")
+        _, disabled = store.issue_key("off")
+        store.set_enabled("off", False)
+        answers = set()
+        for value in ("Bearer " + revoked, "Bearer " + expired, "Bearer " + disabled, "Bearer " + key[:-2] + "zz",
+                      "Bearer rag_aaaaaaaaaaaa_" + "b" * 43, "Bearer nonsense", "Basic dXNlcjpwYXNz", "", key,
+                      "Bearer"):
+            with self.subTest(value=value):
+                response = self.client.get("/collections", headers={"Authorization": value})
+                self.assertEqual((response.status_code, self.code(response)), (401, "KEY_INVALID"))
+                answers.add(response.text)
+        self.assertEqual(len(answers), 1, "every failure gets the same answer")
+
+    def test_two_authorization_headers_are_refused(self):
+        _, key = self.principal("svc", "developer")
+        response = self.client.get("/collections", headers=[("Authorization", "Bearer " + key),
+                                                            ("Authorization", "Bearer " + key)])
+        self.assertEqual((response.status_code, self.code(response)), (401, "KEY_INVALID"))
+
+    def test_the_header_decides_and_never_falls_back_to_the_cookie(self):
+        _, key = self.principal("svc", "end_user")
+        session, _ = self.session("eng")
+        response = self.client.get("/metrics/latency", headers={**session, "Authorization": "Bearer nonsense"})
+        self.assertEqual((response.status_code, self.code(response)), (401, "KEY_INVALID"))
+        response = self.client.get("/metrics/latency", headers={**session, **self.bearer(key)})
+        self.assertEqual((response.status_code, self.code(response)), (403, "FORBIDDEN"))
+        self.assertEqual(self.client.get("/auth/me", headers={**session, **self.bearer(key)}).json()["username"], "svc")
+
+    def test_a_key_anywhere_but_the_header_is_no_credential(self):
+        _, key = self.principal("svc", "developer")
+        for path, headers in ((f"/collections?api_key={key}", {}), (f"/collections?key={key}", {}),
+                              (f"/collections?access_token={key}", {}),
+                              ("/collections", {"X-Api-Key": key}),
+                              ("/collections", {"Cookie": f"{store.COOKIE}={key}"}),
+                              ("/collections", {"Cookie": f"api_key={key}"})):
+            with self.subTest(path=path, headers=list(headers)):
+                response = self.client.get(path, headers=headers)
+                self.assertEqual((response.status_code, self.code(response)), (401, "AUTH_REQUIRED"))
+
+    def test_public_routes_ignore_the_header(self):
+        response = self.client.get("/auth/status", headers={"Authorization": "Bearer nonsense"})
+        self.assertEqual(response.status_code, 200)
+        response = self.login("dev", self.passwords["developer"], Authorization="Bearer nonsense")
+        self.assertEqual(response.status_code, 200)
+
+    def test_a_principal_cannot_log_in(self):
+        store.create_principal("svc", "engineer")
+        with patch.object(passwords, "verify_password", wraps=passwords.verify_password) as verify:
+            for password in ("", store.NO_PASSWORD, "anything at all"):
+                response = self.login("svc", password)
+                self.assertEqual((response.status_code, self.code(response)), (401, "LOGIN_FAILED"))
+        self.assertTrue(all(call.args[1] == passwords.dummy_hash() for call in verify.call_args_list),
+                        "a principal's login is checked against the dummy hash")
+
+    def test_failed_key_requests_are_not_logged(self):
+        logger = logging.getLogger("auth")
+        with patch.object(logger, "warning") as warning:
+            for _ in range(3):
+                self.client.get("/collections", headers={"Authorization": "Bearer nonsense"})
+        warning.assert_not_called()
+
+
+class PrincipalRouteTests(KeyTestCase):
+    """The Engineer-only principal and key routes (S4, S5 of PR 3's specifications)."""
+
+    BASE = "/auth/service-principals"
+
+    def setUp(self):
+        super().setUp()
+        self.eng, _ = self.session("eng")
+
+    def admin(self, method, path, body=None, headers=None):
+        return self.client.request(method, self.BASE + path, json=body, headers=headers or self.eng)
+
+    def code(self, response):
+        return response.json()["error"]["code"]
+
+    def routes(self):
+        return (("GET", "", None), ("POST", "", {"name": "newsvc", "role": "end_user"}),
+                ("POST", "/svc/role", {"role": "engineer"}), ("POST", "/svc/disable", None),
+                ("POST", "/svc/enable", None), ("POST", "/svc/keys", {}),
+                ("POST", f"/svc/keys/{self.key_id}/revoke", None))
+
+    def test_only_engineers_reach_them(self):
+        key_row, _ = self.principal("svc", "developer")
+        self.key_id = key_row.id
+        for name in ("dev", "user"):
+            headers, _ = self.session(name)
+            for method, path, body in self.routes():
+                with self.subTest(user=name, route=f"{method} {path}"):
+                    response = self.admin(method, path, body, headers)
+                    self.assertEqual((response.status_code, self.code(response)), (403, "FORBIDDEN"))
+        for method, path, body in self.routes():
+            with self.subTest(anonymous=f"{method} {path}"):
+                response = self.client.request(method, self.BASE + path, json=body)
+                self.assertEqual((response.status_code, self.code(response)), (401, "AUTH_REQUIRED"))
+        principal = store.get_principal("svc")
+        self.assertEqual((principal.role, principal.enabled, len(principal.keys)), ("developer", True, 1))
+        self.assertIsNone(principal.keys[0].revoked_at)
+        response = self.admin("POST", "/svc/disable", headers={**self.eng, "Origin": "http://evil.test"})
+        self.assertEqual(self.code(response), "CROSS_ORIGIN_REFUSED")
+
+    def test_create_list_and_shapes(self):
+        response = self.admin("POST", "", {"name": "Nightly.Import", "role": "developer"})
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json(), {"principal": {
+            "name": "nightly.import", "role": "developer", "enabled": True,
+            "created_at": response.json()["principal"]["created_at"], "keys": []}})
+        response = self.admin("GET", "")
+        self.assertEqual([p["name"] for p in response.json()["principals"]], ["nightly.import"])
+        self.assertNotIn("dev", [p["name"] for p in response.json()["principals"]])
+        users = self.client.get("/auth/users", headers=self.eng).json()["users"]
+        self.assertNotIn("nightly.import", [u["username"] for u in users])
+
+    def test_issue_shows_the_key_once(self):
+        self.admin("POST", "", {"name": "svc", "role": "developer"})
+        response = self.admin("POST", "/svc/keys", {"label": "nightly import", "days": 30})
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        body = response.json()
+        secret = body["secret"]
+        self.assertEqual(keys.key_id(secret), body["key"]["id"])
+        self.assertEqual(set(body["key"]), {"id", "label", "created_at", "expires_at", "revoked_at", "last_used_at",
+                                            "status"})
+        self.assertEqual((body["key"]["label"], body["key"]["status"], body["key"]["revoked_at"],
+                          body["key"]["last_used_at"]), ("nightly import", "active", None, None))
+        self.assertEqual(body["principal"]["keys"], [body["key"]])
+        # The key works, and is in no later answer.
+        self.assertEqual(self.client.get("/auth/me", headers=self.bearer(secret)).json()["username"], "svc")
+        for later in (self.admin("GET", ""), self.admin("POST", "/svc/keys", {}),
+                      self.admin("POST", f"/svc/keys/{body['key']['id']}/revoke")):
+            self.assertNotIn(secret, later.text)
+        self.assertIsNotNone(self.admin("GET", "").json()["principals"][0]["keys"][1]["revoked_at"])
+        default = self.admin("POST", "/svc/keys", {}).json()["key"]
+        self.assertEqual(default["label"], "")
+
+    def test_refusals(self):
+        self.admin("POST", "", {"name": "svc", "role": "developer"})
+        for name in ("ab", "x" * 33, "has space", ""):
+            with self.subTest(name=name), self.assertLogs("auth", "WARNING") as logs:
+                response = self.admin("POST", "", {"name": name, "role": "end_user"})
+                self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_USERNAME"))
+                self.assertEqual(len(logs.records), 1)
+        for name in ("SVC", "dev"):
+            with self.subTest(taken=name), self.assertLogs("auth", "WARNING") as logs:
+                response = self.admin("POST", "", {"name": name, "role": "end_user"})
+                self.assertEqual((response.status_code, self.code(response)), (409, "PRINCIPAL_EXISTS"))
+                self.assertEqual(len(logs.records), 1)
+        for path, body in (("/nobody/role", {"role": "developer"}), ("/dev/disable", None), ("/eng/enable", None),
+                           ("/dev/keys", {}), ("/a/keys", {}), ("/dev/keys/abc/revoke", None)):
+            with self.subTest(path=path), self.assertLogs("auth", "WARNING") as logs:
+                response = self.admin("POST", path, body)
+                self.assertEqual((response.status_code, self.code(response)), (404, "PRINCIPAL_NOT_FOUND"))
+                self.assertEqual(len(logs.records), 1)
+        self.assertTrue(store.get_user("dev").enabled)
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/svc/keys/nosuchkey123/revoke")
+        self.assertEqual((response.status_code, self.code(response)), (404, "KEY_NOT_FOUND"))
+        self.assertEqual(len(logs.records), 1)
+        for body in ({"days": 0}, {"days": 366}, {"days": 1.5}, {"days": "90"}, {"days": True},
+                     {"label": "l" * 65}, {"label": None}):
+            with self.subTest(body=body):
+                response = self.admin("POST", "/svc/keys", body)
+                self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_PARAMETER"))
+        for body in ({"name": "newsvc", "role": "admin"}, {"name": "newsvc"}, {"role": "end_user"}):
+            with self.subTest(body=body):
+                response = self.admin("POST", "", body)
+                self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_PARAMETER"))
+        self.assertEqual(store.get_principal("svc").keys, ())
+        self.assertIsNone(store.get_user("newsvc"))
+
+    def test_role_disable_enable(self):
+        self.admin("POST", "", {"name": "svc", "role": "developer"})
+        secret = self.admin("POST", "/svc/keys", {}).json()["secret"]
+        response = self.admin("POST", "/svc/role", {"role": "end_user"})
+        self.assertEqual(response.json()["principal"]["role"], "end_user")
+        self.assertEqual(self.client.get("/packages", headers=self.bearer(secret)).status_code, 403)
+        self.assertEqual(self.admin("POST", "/svc/role", {"role": "end_user"}).status_code, 200)
+        response = self.admin("POST", "/svc/disable")
+        self.assertFalse(response.json()["principal"]["enabled"])
+        self.assertEqual(self.code(self.client.get("/collections", headers=self.bearer(secret))), "KEY_INVALID")
+        self.assertEqual(self.admin("POST", "/svc/disable").status_code, 200)
+        self.assertTrue(self.admin("POST", "/svc/enable").json()["principal"]["enabled"])
+        self.assertNotIn(self.client.get("/collections", headers=self.bearer(secret)).status_code, (401, 403))
+
+    def test_human_routes_stay_human(self):
+        self.admin("POST", "", {"name": "svc", "role": "engineer"})
+        for path, body in (("/svc/reset-password", None), ("/svc/role", {"role": "developer"}),
+                           ("/svc/disable", None), ("/svc/enable", None)):
+            with self.subTest(path=path):
+                response = self.client.post("/auth/users" + path, json=body, headers=self.eng)
+                self.assertEqual((response.status_code, self.code(response)), (404, "USER_NOT_FOUND"))
+        response = self.client.post("/auth/users", json={"username": "svc", "role": "developer"}, headers=self.eng)
+        self.assertEqual((response.status_code, self.code(response)), (409, "USER_EXISTS"))
+        self.assertEqual(store.get_principal("svc").role, "engineer")
+        # An engineer principal doesn't stand in for the last enabled Engineer.
+        response = self.client.post("/auth/users/eng/disable", headers=self.eng)
+        self.assertEqual((response.status_code, self.code(response)), (409, "LAST_ENGINEER"))
+
+    def test_changes_are_logged_one_line_each_without_secrets(self):
+        with self.assertLogs("auth", "WARNING") as logs:
+            self.admin("POST", "", {"name": "svc", "role": "developer"})
+            issued = self.admin("POST", "/svc/keys", {"days": 7}).json()
+            self.admin("POST", "/svc/role", {"role": "end_user"})
+            self.admin("POST", "/svc/disable")
+            self.admin("POST", "/svc/enable")
+            self.admin("POST", f"/svc/keys/{issued['key']['id']}/revoke")
+            self.admin("GET", "")
+        text = logged(logs)
+        self.assertEqual(len(logs.records), 6, text)
+        self.assertTrue(all(r.getMessage().startswith("Admin 'eng' ") for r in logs.records), text)
+        for line in ("created service principal 'svc' (developer)",
+                     f"issued key {issued['key']['id']} for service principal 'svc', expiring "
+                     f"{issued['key']['expires_at']}",
+                     "set the role of service principal 'svc' to end_user", "disabled service principal 'svc'",
+                     "enabled service principal 'svc'", f"revoked key {issued['key']['id']} of service principal 'svc'"):
+            self.assertIn(line, text)
+        self.assertNotIn(issued["secret"], text)
+        self.assertNotIn(issued["secret"].split("_", 2)[2], text)
+        self.assertNotIn(keys.digest(issued["secret"]), text)
+
+
 class CommandTests(unittest.TestCase):
     """`python -m auth` in a subprocess, as an operator runs it."""
 
@@ -933,6 +1416,32 @@ class CommandTests(unittest.TestCase):
         self.assertIn("admin\tengineer\tenabled\tpassword change due\t", result.stdout)
         self.assertNotIn(password, result.stdout)
         self.assertNotIn("scrypt", result.stdout)
+    def test_service_principals(self):
+        # S2 of PR 3: list marks principals; set-role, disable and enable work on
+        # them; reset-password refuses one; create-user can't take its name.
+        self.run_auth("bootstrap", "admin")
+        with patch.object(settings, "auth_dir", self.dir):
+            store._ready.discard(str(store.db_path()))
+            store.create_principal("svc", "developer")
+            _, key = store.issue_key("svc")
+        listed = self.run_auth("list")
+        self.assertIn("svc\tdeveloper\tenabled\tservice account\t", listed.stdout)
+        self.assertNotIn(key, listed.stdout)
+        reset = self.run_auth("reset-password", "svc")
+        self.assertEqual((reset.returncode, reset.stdout), (1, ""))
+        self.assertIn("service principal", reset.stderr)
+        self.assertEqual(len(reset.stderr.strip().splitlines()), 1)
+        self.assertEqual(self.run_auth("create-user", "svc", "end_user").returncode, 1)
+        self.assertEqual(self.run_auth("set-role", "svc", "end_user").returncode, 0)
+        self.assertEqual(self.run_auth("disable", "svc").returncode, 0)
+        with patch.object(settings, "auth_dir", self.dir):
+            self.assertIsNone(store.authenticate_key(key))
+            self.assertEqual(store.get_user("svc").role, "end_user")
+        self.assertEqual(self.run_auth("enable", "svc").returncode, 0)
+        with patch.object(settings, "auth_dir", self.dir):
+            self.assertIsNotNone(store.authenticate_key(key))
+        self.assertNotIn("key", self.run_auth("--help").stdout.lower().replace("keys", ""))
+
     def test_every_action_writes_one_stderr_line(self):
         # N4: one line per action on standard error, naming no password.
         password = self.run_auth("bootstrap", "admin").stdout.strip()
@@ -968,7 +1477,8 @@ class ImplementationCopyTests(unittest.TestCase):
         document = (root / "IMPLEMENTATION.md").read_text()
         for name in ("api/auth/__init__.py", "api/auth/passwords.py", "api/auth/store.py", "api/auth/policy.py",
                      "api/auth/middleware.py", "api/auth/__main__.py", "api/auth/testing.py",
-                     "api/routers/auth.py", "api/main.py", "ui/src/pages/UsersPage.tsx", "api/config.py", "proxy/nginx.conf",
+                     "api/routers/auth.py", "api/main.py", "ui/src/pages/UsersPage.tsx",
+                     "api/auth/keys.py", "ui/src/pages/ServiceKeysPage.tsx", "api/config.py", "proxy/nginx.conf",
                      "scripts/verify/17_auth.sh", "scripts/verify/auth_setup.py", "scripts/verify/auth_stack.py",
                      "scripts/verify/auth_headers.py"):
             with self.subTest(name=name):

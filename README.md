@@ -111,7 +111,7 @@ can't use.
 |---|---|
 | **End User** | Q&A only |
 | **Developer** | Q&A, Import, Chunking, Retrieval, Gold Standard, Transfer |
-| **AI Engineer** | All of the above + Collections management (deleting collections) + Health dashboard + tuning + Users (account management) |
+| **AI Engineer** | All of the above + Collections management (deleting collections) + Health dashboard + tuning + Users (account management) + Service keys (API keys for programs) |
 
 Endpoint by endpoint (paths under `/api`):
 
@@ -121,10 +121,11 @@ Endpoint by endpoint (paths under `/api`):
 | any logged-in user | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password` |
 | End User | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
 | Developer | creating a collection; ingest (upload, job status, settings); saving retrieval settings; gold standard (generate, sessions, pairs, regenerate, save, download); export, import, their job status, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
-| AI Engineer | `DELETE /collections/{name}`; `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/job/{id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; the API docs (`/docs`, `/redoc`, `/openapi.json`); account management (`GET` and `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `/role`, `/disable`, `/enable`) |
+| AI Engineer | `DELETE /collections/{name}`; `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/job/{id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; the API docs (`/docs`, `/redoc`, `/openapi.json`); account management (`GET` and `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `/role`, `/disable`, `/enable`); service keys (`GET` and `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `/disable`, `/enable`, `/keys`, `/keys/{key_id}/revoke`) |
 
 Without a session the API answers `401 AUTH_REQUIRED`; with a role that is too
-low, `403 FORBIDDEN`. Jobs and gold-standard sessions belong to no particular
+low, `403 FORBIDDEN`. Programs use service API keys instead of a session
+([Service keys](#service-keys)). Jobs and gold-standard sessions belong to no particular
 user: anyone with the role may poll or open them.
 
 ### Managing accounts
@@ -182,6 +183,53 @@ so in practice the throttle is per username. A change (POST, PATCH, DELETE) sent
 come from this same origin, or it is refused `403 CROSS_ORIGIN_REFUSED`. Each
 login, success or failure, is one line in `docker compose logs api`, with the
 username and address and never the password.
+
+### Service keys
+
+Programs (a nightly import, a script, later the MCP server) call the API with a
+service API key instead of logging in. A key belongs to a **service
+principal**: an account for a program, with a name and one role (End User,
+Developer or AI Engineer), that can't log in to the browser. Keys are issued
+only to service principals, never to people.
+
+AI Engineers manage them on the **Service keys** page: create a principal,
+change its role, disable or enable it, issue keys and revoke them. A new key
+is shown once, on that page; the API stores only its SHA-256, so a lost key
+can't be shown again, only replaced. A key looks like `rag_<12-character id>_<43
+characters>`; the id names it in the list and in the log. Send it in the
+`Authorization` header, never in a URL:
+
+```bash
+curl -H "Authorization: Bearer $RAG_KEY" http://localhost:8080/api/collections
+```
+
+- A key can do what its principal's role allows at the time of each request: a
+  role change applies at once. It can't manage accounts, principals or keys,
+  log out or change a password, whatever the role (`403 KEY_NOT_ALLOWED`), so a
+  leaked key can't mint new credentials. `GET /auth/me` tells a program which
+  principal and role its key has.
+- Every key expires. Choose its lifetime in whole days when issuing it, 1 to
+  365, 90 by default. It can't be extended.
+- **Rotating** a key: issue a new key for the same principal, switch the
+  service over to it, then revoke the old one. Both keys work until then.
+- **Revoking** a key stops it at once. Revoked and expired keys stay listed and
+  never work again.
+- **Disabling** a principal stops all its keys until it is enabled again;
+  enabling makes its unrevoked, unexpired keys work again, so after a leak,
+  revoke the leaked key too. If no AI Engineer can log in, the operator command
+  can disable a principal: `docker compose exec api python -m auth disable <name>`.
+- An invalid, expired or revoked key, or one of a disabled principal, gets
+  `401 KEY_INVALID`. A request with an `Authorization` header is judged by that
+  header only, even if it also carries a session cookie. Key requests need no
+  `Origin` header.
+- Principals share the username rule and the name pool with people, and are
+  disabled, never deleted, so a name always means the same account. They don't
+  appear on the Users page. The operator command's `list` shows them as
+  `service account`; `set-role`, `disable` and `enable` work on them, and
+  `reset-password` refuses them (they have no password). The command can't
+  issue keys.
+- Each change on the Service keys page is one line in `docker compose logs api`,
+  naming the AI Engineer, the principal and the key id, never the key.
 
 ### Calling the API from the command line
 

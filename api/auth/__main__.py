@@ -16,6 +16,12 @@ action writes one line to standard error. Exit status: 0 done, 1 refused,
 
 The last enabled engineer can't be disabled or demoted. A lockout is recovered
 with create-user, enable or reset-password.
+
+Service principals (API keys, PR 3) are created and given keys by Engineers in
+the app; this command issues no key. `list` shows principals too, marked
+"service account"; set-role, disable and enable work on them (disabling one
+stops its keys, an escape hatch for a leaked key when no Engineer can log in);
+reset-password refuses one, since it has no password.
 """
 from __future__ import annotations
 
@@ -87,10 +93,12 @@ def main(argv=None) -> int:
             _say(f"{args.command}: {username!r} {args.command}d"
                  + ("; their sessions ended" if args.command == "disable" else ""))
         else:
-            for user in store.list_users():
+            for user in store.list_users(kind=None):
                 created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(user.created_at))
+                password = ("service account" if user.kind == "service"
+                            else "password change due" if user.must_change_password else "-")
                 print(f"{user.username}\t{user.role}\t{'enabled' if user.enabled else 'disabled'}\t"
-                      f"{'password change due' if user.must_change_password else '-'}\t{created}")
+                      f"{password}\t{created}")
     except store.Refused as exc:
         _say(f"{args.command} refused: {exc}")
         return 1

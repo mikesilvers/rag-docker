@@ -104,6 +104,20 @@ export const api = {
     request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/role`, { role }),
   disableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/disable`),
   enableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/enable`),
+  // Service principals and their API keys (Engineers only, #25 PR 3).
+  listPrincipals: () => request<{ principals: ServicePrincipal[] }>('GET', '/auth/service-principals'),
+  createPrincipal: (name: string, role: Role) =>
+    request<{ principal: ServicePrincipal }>('POST', '/auth/service-principals', { name, role }),
+  setPrincipalRole: (name: string, role: Role) =>
+    request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/role`, { role }),
+  disablePrincipal: (name: string) =>
+    request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/disable`),
+  enablePrincipal: (name: string) =>
+    request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/enable`),
+  issueKey: (name: string, label: string, days: number) =>
+    request<{ principal: ServicePrincipal; key: ServiceKey; secret: string }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/keys`, { label, days }),
+  revokeKey: (name: string, keyId: string) =>
+    request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/keys/${encodeURIComponent(keyId)}/revoke`),
 
   getCollections: () => request<{ collections: CollectionInfo[] }>('GET', '/collections'),
   // Answers with the name as stored, first letter capitalised (#372).
@@ -145,8 +159,13 @@ export const api = {
 
 // Types
 export type Role = 'engineer' | 'developer' | 'end_user'
-export interface AuthUser { username: string; role: Role; must_change_password: boolean }
+export interface AuthUser { username: string; role: Role; must_change_password: boolean; kind?: 'user' | 'service' }
 export interface AdminUser { username: string; role: Role; enabled: boolean; must_change_password: boolean; created_at: string }
+export interface ServiceKey {
+  id: string; label: string; created_at: string; expires_at: string
+  revoked_at: string | null; last_used_at: string | null; status: 'active' | 'expired' | 'revoked'
+}
+export interface ServicePrincipal { name: string; role: Role; enabled: boolean; created_at: string; keys: ServiceKey[] }
 export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
   hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null

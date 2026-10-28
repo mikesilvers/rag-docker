@@ -61,12 +61,29 @@ ACCESS: dict[tuple[str, str], str] = {
     ("POST", "/auth/users/{username}/role"): ENGINEER,
     ("POST", "/auth/users/{username}/disable"): ENGINEER,
     ("POST", "/auth/users/{username}/enable"): ENGINEER,
+    # Service principals and their keys (PR 3 of #25). Nothing deletes a principal.
+    ("GET", "/auth/service-principals"): ENGINEER,
+    ("POST", "/auth/service-principals"): ENGINEER,
+    ("POST", "/auth/service-principals/{name}/role"): ENGINEER,
+    ("POST", "/auth/service-principals/{name}/disable"): ENGINEER,
+    ("POST", "/auth/service-principals/{name}/enable"): ENGINEER,
+    ("POST", "/auth/service-principals/{name}/keys"): ENGINEER,
+    ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke"): ENGINEER,
     # FastAPI's own API docs (N5).
     ("GET", "/docs"): ENGINEER,
     ("GET", "/docs/oauth2-redirect"): ENGINEER,
     ("GET", "/redoc"): ENGINEER,
     ("GET", "/openapi.json"): ENGINEER,
 }
+
+
+# Routes an API key can't use, whatever its principal's role (S5 of PR 3):
+# account, principal and key administration, so a leaked key can't mint further
+# keys or accounts that outlive its revocation, and the session's own routes.
+# GET /auth/me answers for a key.
+HUMAN_ONLY = frozenset(path for _, path in ACCESS
+                       if path.startswith(("/auth/users", "/auth/service-principals"))) | {
+    "/auth/logout", "/auth/password"}
 
 
 def required(method: str, path: str) -> str | None:

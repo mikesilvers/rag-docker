@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
-from pydantic import AfterValidator, BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator, SecretStr
+from pydantic import AfterValidator, BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator, SecretStr, StrictInt
 
 from services.collection_writes import canonical
 
@@ -622,6 +622,7 @@ class AuthUser(BaseModel):
     username: str
     role: Literal["end_user", "developer", "engineer"]
     must_change_password: bool
+    kind: Optional[Literal["user", "service"]] = None   # GET /auth/me: a session's user or a key's principal
 
 
 class AdminUser(BaseModel):
@@ -648,6 +649,44 @@ class UserCreateRequest(BaseModel):
 
 class RoleChangeRequest(BaseModel):
     role: Literal["end_user", "developer", "engineer"]
+
+
+class ServiceKey(BaseModel):
+    id: str
+    label: str
+    created_at: str
+    expires_at: str
+    revoked_at: Optional[str]
+    last_used_at: Optional[str]
+    status: Literal["active", "expired", "revoked"]
+
+
+class ServicePrincipal(BaseModel):
+    name: str
+    role: Literal["end_user", "developer", "engineer"]
+    enabled: bool
+    created_at: str
+    keys: list[ServiceKey]
+
+
+class ServicePrincipalList(BaseModel):
+    principals: list[ServicePrincipal]
+
+
+class ServicePrincipalResult(BaseModel):
+    principal: ServicePrincipal
+    key: Optional[ServiceKey] = None
+    secret: Optional[str] = None   # a newly issued key, in this answer only
+
+
+class PrincipalCreateRequest(BaseModel):
+    name: str = Field(max_length=256)
+    role: Literal["end_user", "developer", "engineer"]
+
+
+class KeyIssueRequest(BaseModel):
+    label: str = Field(default="", max_length=64)
+    days: StrictInt = Field(default=90, ge=1, le=365)
 
 
 # ── Error ─────────────────────────────────────────────────────────────────────

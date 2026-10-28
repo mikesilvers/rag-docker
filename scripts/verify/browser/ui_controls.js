@@ -403,9 +403,9 @@ function usersCases() {
   const rowButtons = (page, username) => page.evaluate(u => [...document.querySelectorAll(`tr[data-username="${u}"] button`)].map(b => b.textContent.trim()), username);
   const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
   return [
-    { name: 'Engineer nav ends with Users, which opens the Users page', open: { role: 'engineer', path: '/qa', routes: usersApi() }, async run(s) {
+    { name: 'Engineer nav has Users, which opens the Users page', open: { role: 'engineer', path: '/qa', routes: usersApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
-      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users']);
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys']);
       await press(s.page, 'Users', 'nav a');
       await waitPath(s.page, '/users');
       await waitText(s.page, 'vfy-developer');
@@ -477,6 +477,143 @@ function usersCases() {
     } },
     { name: 'A list that cannot be loaded says so', open: open({ 'GET /api/auth/users': apiError(500, 'INTERNAL_ERROR', 'Synthetic failure.') }), async run(s) {
       await waitText(s.page, 'Could not load the users: Synthetic failure.');
+    } },
+  ];
+}
+
+// The Service keys page (PR 3 of #25): Engineers manage service principals and
+// their API keys. The API is stubbed with a small in-memory list; the real
+// routes are checked in 17_auth.sh.
+function serviceKeysCases() {
+  const SECRET = 'rag_newkey00000a_' + 'S'.repeat(43);
+  const key = (id, over = {}) => ({ id, label: '', created_at: '2026-10-01T12:00:00Z', expires_at: '2026-12-30T12:00:00Z', revoked_at: null, last_used_at: null, status: 'active', ...over });
+  const principal = (name, role, over = {}) => ({ name, role, enabled: true, created_at: '2026-10-01T12:00:00Z', keys: [], ...over });
+  const keysApi = (extra = {}) => {
+    const list = [
+      principal('vfy-svc', 'developer', { keys: [key('activekey0001', { label: 'nightly', last_used_at: '2026-10-20T08:00:00Z' }), key('expiredkey001', { status: 'expired' }), key('revokedkey01', { status: 'revoked', revoked_at: '2026-10-05T00:00:00Z' })] }),
+      principal('vfy-off', 'end_user', { enabled: false }),
+    ];
+    const find = call => list.find(p => p.name === decodeURIComponent(call.path.split('/')[4]));
+    return base({
+      'GET /api/auth/service-principals': () => json(200, { principals: JSON.parse(JSON.stringify(list)) }),
+      'POST /api/auth/service-principals': call => {
+        const p = principal(call.body.name.toLowerCase(), call.body.role);
+        list.push(p);
+        return json(201, { principal: p });
+      },
+      'POST /api/auth/service-principals/*': call => {
+        const p = find(call), parts = call.path.split('/');
+        if (!p) return apiError(404, 'PRINCIPAL_NOT_FOUND', 'There is no service principal.');
+        if (parts[5] === 'keys' && parts.length === 6) {
+          const k = key('newkey00000a', { label: call.body.label });
+          p.keys.unshift(k);
+          return json(201, { principal: p, key: k, secret: SECRET });
+        }
+        if (parts[5] === 'keys' && parts[7] === 'revoke') {
+          const k = p.keys.find(x => x.id === parts[6]);
+          if (!k) return apiError(404, 'KEY_NOT_FOUND', 'No such key.');
+          k.status = 'revoked'; k.revoked_at = '2026-10-28T00:00:00Z';
+        }
+        if (parts[5] === 'role') p.role = call.body.role;
+        if (parts[5] === 'disable') p.enabled = false;
+        if (parts[5] === 'enable') p.enabled = true;
+        return json(200, { principal: p });
+      },
+      ...extra,
+    });
+  };
+  const open = (extra = {}) => ({ role: 'engineer', path: '/service-keys', routes: keysApi(extra) });
+  const keyRows = (page, name) => page.evaluate(n => [...document.querySelectorAll(`section[data-principal="${n}"] tbody tr`)].map(r => [...r.querySelectorAll('td')].map(c => c.textContent.trim())), name);
+  const sectionPress = async (page, name, label) => {
+    const done = await page.evaluate((n, t) => {
+      const b = [...document.querySelectorAll(`section[data-principal="${n}"] button`)].find(x => x.textContent.trim() === t);
+      if (!b) return false; b.click(); return true;
+    }, name, label);
+    if (!done) throw new Error(`no "${label}" button for ${name}`);
+  };
+  const status = (page, name) => page.evaluate(n => document.querySelector(`section[data-principal="${n}"] [data-testid=principal-status]`)?.textContent.trim(), name);
+  const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
+  return [
+    { name: 'Engineer nav ends with Service keys, which opens the page', open: { role: 'engineer', path: '/qa', routes: keysApi() }, async run(s) {
+      await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
+      assert.equal((await nav(s.page)).at(-1), 'Service keys');
+      await press(s.page, 'Service keys', 'nav a');
+      await waitPath(s.page, '/service-keys');
+      await waitText(s.page, 'vfy-svc');
+    } },
+    ...['developer', 'end_user'].map(role => ({ name: `${role === 'developer' ? 'Developer' : 'End User'} has no Service keys link and is sent from /service-keys to Q&A`, open: { role, path: '/qa', routes: base() }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      assert.equal((await nav(s.page)).includes('Service keys'), false);
+      await goto(s.page, '/service-keys');
+      await waitText(s.page, 'Ask a Question');
+      await waitPath(s.page, '/qa');
+      assert.equal(callsTo(s, 'GET', '/api/auth/service-principals').length, 0);
+    } })),
+    { name: 'The list shows each principal and its keys; only active keys can be revoked; rotation is explained', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      const day = v => s.page.evaluate(x => new Date(x).toLocaleDateString(), v);
+      assert.deepEqual(await keyRows(s.page, 'vfy-svc'), [
+        ['activekey0001', 'nightly', await day('2026-10-01T12:00:00Z'), await day('2026-12-30T12:00:00Z'), await day('2026-10-20T08:00:00Z'), 'Active', 'Revoke'],
+        ['expiredkey001', '', await day('2026-10-01T12:00:00Z'), await day('2026-12-30T12:00:00Z'), 'never', 'Expired', ''],
+        ['revokedkey01', '', await day('2026-10-01T12:00:00Z'), await day('2026-12-30T12:00:00Z'), 'never', 'Revoked', ''],
+      ]);
+      assert.deepEqual([await status(s.page, 'vfy-svc'), await status(s.page, 'vfy-off')], ['Enabled', 'Disabled']);
+      assert.equal(await s.page.evaluate(() => document.querySelector('select[aria-label="Role of vfy-svc"]').value), 'developer');
+      assert.ok(await bodyHas(s.page, 'To rotate a key, issue a new one, switch the service over to it, then revoke the old one'));
+      assert.ok(await bodyHas(s.page, 'Authorization: Bearer <key>'));
+      assert.equal(await s.page.evaluate(() => document.querySelector('input[aria-label="Lifetime in days for a new key of vfy-svc"]').value), '90');
+    } },
+    { name: 'Create principal sends the name and role', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await fill(s.page, '#new-principal-name', 'Nightly.Import');
+      await fill(s.page, '#new-principal-role', 'developer');
+      await press(s.page, 'Create principal');
+      await waitFor(s.page, () => !!document.querySelector('section[data-principal="nightly.import"]'), 'the new principal');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/service-principals').map(c => c.body), [{ name: 'Nightly.Import', role: 'developer' }]);
+      assert.equal(await s.page.evaluate(() => document.querySelector('#new-principal-name').value), '');
+    } },
+    { name: 'Issue key sends the label and lifetime, shows the key once, and Done removes it', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await fill(s.page, 'input[aria-label="Label for a new key of vfy-svc"]', 'rotated');
+      await fill(s.page, 'input[aria-label="Lifetime in days for a new key of vfy-svc"]', '30');
+      await sectionPress(s.page, 'vfy-svc', 'Issue key');
+      await waitText(s.page, SECRET);
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/service-principals/vfy-svc/keys').map(c => c.body), [{ label: 'rotated', days: 30 }]);
+      await waitText(s.page, 'shown only once');
+      await waitFor(s.page, () => !!document.querySelector('tr[data-key="newkey00000a"]'), 'the new key row');
+      assert.deepEqual(await s.page.evaluate(() => [Object.keys(sessionStorage), Object.keys(localStorage)]), [[], []]);
+      await press(s.page, 'Done');
+      await waitText(s.page, SECRET, true);
+      assert.equal(await bodyHas(s.page, SECRET), false);
+    } },
+    { name: 'Revoke, a role change, Disable and Enable call the API for that principal', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await sectionPress(s.page, 'vfy-svc', 'Revoke');
+      await waitFor(s.page, () => document.querySelector('tr[data-key="activekey0001"] td:nth-child(6)').textContent.trim() === 'Revoked', 'Revoked');
+      assert.equal(callsTo(s, 'POST', '/api/auth/service-principals/vfy-svc/keys/activekey0001/revoke').length, 1);
+      await fill(s.page, 'select[aria-label="Role of vfy-svc"]', 'end_user');
+      await waitFor(s.page, () => document.querySelector('select[aria-label="Role of vfy-svc"]').value === 'end_user', 'the new role');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/service-principals/vfy-svc/role').map(c => c.body), [{ role: 'end_user' }]);
+      await sectionPress(s.page, 'vfy-svc', 'Disable');
+      await waitFor(s.page, () => document.querySelector('section[data-principal="vfy-svc"] [data-testid=principal-status]').textContent.trim() === 'Disabled', 'Disabled');
+      await sectionPress(s.page, 'vfy-off', 'Enable');
+      await waitFor(s.page, () => document.querySelector('section[data-principal="vfy-off"] [data-testid=principal-status]').textContent.trim() === 'Enabled', 'Enabled');
+      assert.equal(callsTo(s, 'POST', '/api/auth/service-principals/vfy-svc/disable').length, 1);
+      assert.equal(callsTo(s, 'POST', '/api/auth/service-principals/vfy-off/enable').length, 1);
+    } },
+    { name: 'A refusal shows the API\'s message and reloads the list', open: open({
+      'POST /api/auth/service-principals': apiError(409, 'PRINCIPAL_EXISTS', "The name 'vfy-svc' is already taken."),
+    }), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      const before = callsTo(s, 'GET', '/api/auth/service-principals').length;
+      await fill(s.page, '#new-principal-name', 'vfy-svc');
+      await press(s.page, 'Create principal');
+      await waitText(s.page, 'is already taken');
+      await waitFor(s.page, () => document.querySelector('[role=alert]') !== null, 'the alert');
+      assert.ok(callsTo(s, 'GET', '/api/auth/service-principals').length > before, 'the list was reloaded');
+    } },
+    { name: 'A list that cannot be loaded says so', open: open({ 'GET /api/auth/service-principals': apiError(500, 'INTERNAL_ERROR', 'Synthetic failure.') }), async run(s) {
+      await waitText(s.page, 'Could not load the service principals: Synthetic failure.');
     } },
   ];
 }
@@ -676,6 +813,7 @@ async function runUiControlTests(browser, baseUrl, reporter) {
   await run('Navigation, roles and redirects (#400); the API enforces the roles (#25)', navigationCases());
   await run('Login, logout, setup and password changes (#25)', authCases());
   await run('Users page: Engineers manage accounts (#25)', usersCases());
+  await run('Service keys page: Engineers manage service principals and keys (#25)', serviceKeysCases());
   await run('Q&A input, citations toggle, answer display and End User view (#400)', qaCases());
   await run('Retrieval page status text, alpha slider and save (#400)', retrievalCases());
   await run('Client handling of the proxy error pages (#400)', proxyCases());

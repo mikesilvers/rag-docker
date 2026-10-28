@@ -1342,7 +1342,7 @@ one may. The role of a request is the one stored for its user at that moment, ne
 | any session (also one with a password change due) | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password` |
 | `end_user` | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
 | `developer` | `POST /collections`; `POST /ingest/upload`, `GET /ingest/job/{job_id}`, `GET /ingest/config/{collection}`, `POST /ingest/config`; `POST /retrieval/config`; `POST /goldstandard/generate`, `GET /goldstandard/session/{session_id}`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST /goldstandard/save`, `GET /goldstandard/download/{filename}`; `POST /export`, `GET /export/job/{job_id}`, `POST /import`, `GET /import/job/{job_id}`, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
-| `engineer` | `DELETE /collections/{name}`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json`; account administration: `GET /auth/users`, `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `POST /auth/users/{username}/role`, `POST /auth/users/{username}/disable`, `POST /auth/users/{username}/enable` |
+| `engineer` | `DELETE /collections/{name}`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json`; account administration: `GET /auth/users`, `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `POST /auth/users/{username}/role`, `POST /auth/users/{username}/disable`, `POST /auth/users/{username}/enable`; service principals and keys: `GET /auth/service-principals`, `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `POST /auth/service-principals/{name}/disable`, `POST /auth/service-principals/{name}/enable`, `POST /auth/service-principals/{name}/keys`, `POST /auth/service-principals/{name}/keys/{key_id}/revoke` |
 
 The matrix is one table in `api/auth/policy.py`. A route without an entry is refused for everyone (`403
 FORBIDDEN`), and a registered check fails when a route lacks an entry or an entry names no route. Jobs and
@@ -1357,7 +1357,8 @@ AUTH_REQUIRED` (no valid session); `403 CROSS_ORIGIN_REFUSED` (a cookie-authenti
 `DELETE` whose `Origin` names another host or port than its `Host`, or that has no `Origin` and no `Sec-Fetch-Site:
 same-origin`); `403 PASSWORD_CHANGE_REQUIRED` (a generated password is due for change; only the session routes
 answer); `403 FORBIDDEN` (the role is too low; `detail: {"required_role": ...}`). The API has no CORS middleware
-and sends no `Access-Control-*` headers.
+and sends no `Access-Control-*` headers. A request with an `Authorization` header is a service key request and
+has its own refusals (**Service keys**, below).
 
 **Accounts.** Usernames are 3-32 characters of lowercase letters, digits, `.`, `_` and `-`; input is lowercased,
 so they are case-insensitive. Passwords are 12-256 characters and not the username (ignoring case); no
@@ -1386,7 +1387,7 @@ the host may share one address, so in practice the throttle is per username.
 |---|---|---|
 | `GET /auth/status` | | `200 {"setup_required": bool}` |
 | `POST /auth/login` | `{"username", "password"}` | `200 {"username", "role", "must_change_password"}` and the cookie. Every failure (unknown user, wrong password, disabled account, malformed username) is the same `401 LOGIN_FAILED` "The username or password is incorrect.", checked against a hash either way so the time doesn't differ |
-| `GET /auth/me` | | `200 {"username", "role", "must_change_password"}` |
+| `GET /auth/me` | | `200 {"username", "role", "must_change_password", "kind"}`; `kind` is `user` for a session and `service` for an API key (whose `must_change_password` is `false`) |
 | `POST /auth/logout` | | `200 {"status": "logged_out"}`; the session is deleted and the cookie expired |
 | `POST /auth/password` | `{"current_password", "new_password"}` | `200 {"status": "changed", "username", "role", "must_change_password": false}`; the user's other sessions end, this one stays. A wrong current password is `403 PASSWORD_INCORRECT`; a new one breaking the rules, or equal to the current one (so a generated password can't be kept), is `422 INVALID_PASSWORD` naming the rule |
 
@@ -1410,6 +1411,54 @@ LAST_ENGINEER`, for the engineer's own account too; the check and the change are
 engineer may demote or disable themselves (disabling ends their own session). Setting the current role, or
 disabling a disabled account, succeeds and changes nothing.
 
+**Service keys** (PR 3 of #25). A *service principal* is an account with `kind = 'service'` in the same `users`
+table (an existing store gains the `kind` column on first open, every existing row `user`; schema version 2). It
+has a name under the username rule, sharing one name pool with people, and one role; it has no usable password
+and no session, so a login with its name is the generic `401 LOGIN_FAILED` (checked against the dummy hash). It is
+disabled, never deleted. Keys are issued only to principals. The last-enabled-engineer rule counts people only.
+
+A key is `rag_` + a 12-character id (lowercase letters and digits) + `_` + 43 characters of
+`secrets.token_urlsafe(32)` (256 bits), 60 characters. The `api_keys` table keeps the id, the principal, the
+key's SHA-256, a label (0-64 characters), created, expires, revoked and last used (written at most once a minute);
+never the key. A key expires a whole number of days after issuance, 1-365, default 90, and can't be extended;
+revoking is immediate; revoked and expired keys stay listed and never work again. There is no rotate operation:
+issuing another key rotates, and the old key works until it is revoked or expires. A principal may hold any
+number of keys.
+
+A request with an `Authorization` header is authenticated by it alone; a session cookie on it is ignored, with no
+fallback. The header must be exactly one `Bearer <key>` (scheme case-insensitive) with a key of that form; a key in
+a query parameter, a cookie or another header is no credential (`401 AUTH_REQUIRED`). A valid key (known, hash
+matching, not revoked, not expired, its principal enabled) runs as its principal with the principal's role at that
+moment, so a role change applies at once, disabling stops all the principal's keys and enabling restores the
+unrevoked, unexpired ones. Refusals, first that applies: `503 SETUP_REQUIRED`; `401 KEY_INVALID` "The API key is
+invalid, expired or revoked." for every reason; `403 KEY_NOT_ALLOWED` on every `/auth/users...` and
+`/auth/service-principals...` route, `POST /auth/logout` and `POST /auth/password`, whatever the role; `403
+FORBIDDEN` when the role is too low. A key request has no origin check and no password-change check. Public
+routes ignore the header. Failed key requests are neither logged one by one nor throttled.
+
+**Service principal and key administration** (engineers' sessions only). `Principal` is `{"name", "role",
+"enabled", "created_at", "keys": [Key, ...]}`, keys newest first; `Key` is `{"id", "label", "created_at",
+"expires_at", "revoked_at", "last_used_at", "status"}`, times ISO 8601 UTC or `null`, `status` `revoked`, else
+`expired`, else `active`. Neither holds a key, hash or password.
+
+| Route | Request | Success |
+|---|---|---|
+| `GET /auth/service-principals` | | `200 {"principals": [Principal, ...]}`, by name |
+| `POST /auth/service-principals` | `{"name", "role"}` | `201 {"principal"}`. A name breaking the rule is `422 INVALID_USERNAME`; one a person or principal holds is `409 PRINCIPAL_EXISTS` |
+| `POST /auth/service-principals/{name}/role` | `{"role"}` | `200 {"principal"}`; its keys take the role on their next request |
+| `POST /auth/service-principals/{name}/disable` | | `200 {"principal"}`; its keys fail until it is enabled |
+| `POST /auth/service-principals/{name}/enable` | | `200 {"principal"}` |
+| `POST /auth/service-principals/{name}/keys` | `{"label"?, "days"?}` | `201 {"principal", "key", "secret"}`, with `Cache-Control: no-store`; `secret` is the key, in this answer only |
+| `POST /auth/service-principals/{name}/keys/{key_id}/revoke` | | `200 {"principal"}`; revoking again keeps the first revoked time |
+
+A `{name}` that isn't a principal (unknown, a person's account, or breaking the rule) is `404 PRINCIPAL_NOT_FOUND`;
+a `{key_id}` not of that principal is `404 KEY_NOT_FOUND`; a bad role, `days` outside 1-365 or not a whole number,
+a label over 64 characters, or a missing field is `422 INVALID_PARAMETER`. Setting the current role, or disabling a
+disabled principal, changes nothing. A key may be issued to a disabled principal; it works once the principal is
+enabled. The account routes stay for people: `GET /auth/users` lists no principal, a principal's name in a
+`/auth/users/{username}/...` path is `404 USER_NOT_FOUND`, and `POST /auth/users` with a principal's name is
+`409 USER_EXISTS`.
+
 **Operator command**, inside the api container: `docker compose exec api python -m auth <subcommand>`.
 
 | Subcommand | Effect |
@@ -1419,14 +1468,16 @@ disabling a disabled account, succeeds and changes nothing.
 | `reset-password USERNAME` | New generated password; the user's sessions end |
 | `set-role USERNAME ROLE` | Applies to existing sessions on their next request |
 | `disable USERNAME` / `enable USERNAME` | Disabling ends the user's sessions |
-| `list` | Username, role, enabled, password change due, created; never a password or hash |
+| `list` | Username, role, enabled, password change due (`service account` for a service principal), created; never a password, hash or key |
 
 `bootstrap`, `create-user` and `reset-password` print a generated password (24 characters, 144 random bits)
 alone on standard output and nowhere else, and mark it to be changed at first login. Each change writes one line
 to standard error; exit status 0 done, 1 refused, 2 usage error. The last enabled engineer can't be disabled or
 demoted; an account a user is locked out of (lost password, disabled) is recovered with `create-user`, `enable` or
 `reset-password`, which don't lift a login throttle (it ends by itself after 15 minutes). No account or password comes
-from the environment, and none exists by default.
+from the environment, and none exists by default. The command issues no keys; `set-role`, `disable` and `enable`
+work on service principals too (disabling one stops its keys), `reset-password` refuses one (exit 1), and
+`create-user` is refused for a principal's name.
 
 **Upgrading.** An existing install answers `503 SETUP_REQUIRED` everywhere but `/health` until `bootstrap`. The
 proxy must be recreated (`docker compose up -d --force-recreate proxy`, or the whole stack): `proxy/nginx.conf`
@@ -1437,7 +1488,10 @@ cookie-authenticated change fails the origin check with `403 CROSS_ORIGIN_REFUSE
 username and client address; never a password, token or cookie. One `WARNING` line per account administration
 change (create, reset, role, disable, enable) naming the engineer, the change and the account, and one per refusal
 (`INVALID_USERNAME`, `USER_EXISTS`, `USER_NOT_FOUND`, `LAST_ENGINEER`, `SELF_RESET_REFUSED`) saying why; never a
-password. The telemetry route vocabulary gains the eleven `/auth` routes as labels.
+password. One `WARNING` line per service principal or key change (create, role, disable, enable, key issued, key
+revoked) naming the engineer, the principal and the key id (and the role or expiry), and one per refusal
+(`INVALID_USERNAME`, `PRINCIPAL_EXISTS`, `PRINCIPAL_NOT_FOUND`, `KEY_NOT_FOUND`); never a key or its hash.
+Successful key requests aren't logged one by one (`last_used_at` records them). The telemetry route vocabulary gains the eighteen `/auth` routes as labels.
 
 ### 3.2 Error Response Format
 
@@ -1499,6 +1553,11 @@ Standard error codes:
 | `USER_NOT_FOUND` | 404 | No account has the username in the path |
 | `LAST_ENGINEER` | 409 | The change would demote or disable the last enabled engineer |
 | `SELF_RESET_REFUSED` | 409 | An engineer's reset of their own password; they use `POST /auth/password` |
+| `KEY_INVALID` | 401 | An `Authorization` header that isn't one valid `Bearer` key: unknown, malformed, expired, revoked or of a disabled principal |
+| `KEY_NOT_ALLOWED` | 403 | An API key on account, principal or key administration, logout or password change |
+| `PRINCIPAL_EXISTS` | 409 | `POST /auth/service-principals`: a person or principal already has the name |
+| `PRINCIPAL_NOT_FOUND` | 404 | No service principal has the name in the path |
+| `KEY_NOT_FOUND` | 404 | The principal has no key with the id in the path |
 
 ---
 
@@ -2207,6 +2266,7 @@ what the role can't do (§3.1.8):
 | Collections | ✓ | — | — |
 | Health | ✓ | — | — |
 | Users | ✓ | — | — |
+| Service keys | ✓ | — | — |
 | Username and role badge | ✓ | ✓ | ✓ |
 | Change password (button) | ✓ | ✓ | ✓ |
 | Log out (button) | ✓ | ✓ | ✓ |
@@ -2494,6 +2554,24 @@ page renders as one undifferentiated block.
 - A refused change shows the API's message as an alert and reloads the list. After a change to the engineer's own
   account the UI re-reads `GET /auth/me`: a demoted engineer leaves the page, a disabled one is logged out.
 
+### 7.13 Service Keys Page (#25)
+
+**Route:** `/service-keys`  
+**Roles:** Engineer only (others are sent to `/qa`)
+
+- A short explanation: a principal is an account for a program that can't log in; its keys are sent as
+  `Authorization: Bearer <key>` and can do what its role allows, except manage accounts or keys; rotating is
+  issuing a new key, switching the service over, then revoking the old one.
+- A form with name, role (End User by default) and "Create principal". The name rule is shown under it.
+- Each principal from `GET /auth/service-principals` in its own section: its name, a role selector that sends the
+  role change, Enabled or Disabled, and "Disable" or "Enable"; a form to issue a key (label, optional; lifetime in
+  days, 90 by default, 1-365; "Issue key"); and a table of its keys: id, label, created, expires, last used
+  ("never" when empty), status (Active, Expired, Revoked), and "Revoke" on active keys only.
+- After issuance a panel shows the principal's name and the key, says it is shown only once and is sent as
+  `Authorization: Bearer <key>`, and has "Done", which removes it. The key is kept only in the page's memory.
+- A refused change shows the API's message as an alert and reloads the list; a list that can't be loaded says
+  "Could not load the service principals:" with the reason.
+
 ## 8. Configuration Defaults and Constraints
 
 The table gives API request bounds; narrower UI sliders are presentation choices. Internal import/rebuild preserves positive stored HNSW construction/connections settings and stored `ef=-1` (dynamic) or positive values beyond new-request limits. Index/distance enums and numeric type validation still apply; no clamping or migration is performed.
@@ -2580,15 +2658,16 @@ rag-docker/
 │   ├── requirements.txt        # Generated lock (pinned); installed by the build
 │   ├── main.py                  # FastAPI app entry point
 │   ├── utils.py                 # Shared helpers (api_error response factory)
-│   ├── auth/                    # Accounts, sessions, the role matrix (#25)
+│   ├── auth/                    # Accounts, sessions, service keys, the role matrix (#25)
 │   │   ├── __main__.py          # The operator command, python -m auth
 │   │   ├── passwords.py         # Username/password rules, scrypt hashing
-│   │   ├── store.py             # SQLite accounts, sessions, login throttle
+│   │   ├── keys.py              # Service API key format (rag_<id>_<secret>)
+│   │   ├── store.py             # SQLite accounts, principals, keys, sessions, login throttle
 │   │   ├── policy.py            # The endpoint/role matrix
 │   │   ├── middleware.py        # Enforces it before a route runs
 │   │   └── testing.py           # Real sessions for in-process tests
 │   ├── routers/
-│   │   ├── auth.py              # /auth/status, login, logout, me, password
+│   │   ├── auth.py              # /auth/status, login, logout, me, password, users, service principals
 │   │   ├── health.py
 │   │   ├── collections.py
 │   │   ├── ingest.py
@@ -2657,7 +2736,8 @@ rag-docker/
 │   │   │   ├── HelpTransferPage.tsx
 │   │   │   ├── CollectionsPage.tsx
 │   │   │   ├── HealthPage.tsx
-│   │   │   └── UsersPage.tsx          # Engineers manage accounts (#25)
+│   │   │   ├── UsersPage.tsx          # Engineers manage accounts (#25)
+│   │   │   └── ServiceKeysPage.tsx    # Engineers manage service principals and keys (#25)
 │   │   ├── components/
 │   │   │   ├── NavBar.tsx
 │   │   │   ├── CitationsPanel.tsx
@@ -3249,6 +3329,24 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   password once until "Done"; no reset on the own row; role change, disable and enable; a refusal's message.
   *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request
   interception; `ui_criteria.js` checks the real engineer's nav includes Users.*
+- [x] Service keys: only engineers' sessions reach the principal and key routes; a key is issued only to a service
+  principal, shown once (`Cache-Control: no-store`) and stored only as its SHA-256; a principal can't log in; a key
+  works only as `Authorization: Bearer`, with its principal's current role and no `Origin`, and never on account,
+  principal or key administration, logout or password change; a header decides even with a cookie; rotation keeps
+  the old key until it is revoked or expires; revoked, expired, unknown and malformed keys and keys of a disabled
+  principal get `401 KEY_INVALID`; a key in a URL is no credential; expiry is 1-365 days, 90 by default; principals
+  share the name pool and don't count for the last-engineer rule; the operator command lists principals, refuses
+  their password reset and issues no key; each change and refusal is one API log line, and no key reaches the log.
+  *Evidence: `test_auth.py` `KeyFormatTests`, `KeyStoreTests`, `KeyMiddlewareTests`, `PrincipalRouteTests`, the
+  `CommandTests` principal case and the policy checks (suite 17); `test_auth_enforcement.py` with the seven routes;
+  `auth_stack.py matrix` with the seven routes for every role, `auth_stack.py key-matrix` with a key of each role,
+  and `auth_stack.py service-keys` on the running stack with throwaway `vfy-s-*` principals and the API log
+  searched for the keys (suite 17). These checks fail on the code before PR 3 of #25, which has no keys.*
+- [x] The Service keys page: an engineer-only nav link and route; the principals and their keys; create, role
+  change, disable and enable; issuance shows the key once until "Done"; revoke only on active keys; a refusal's
+  message.
+  *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request
+  interception; `ui_criteria.js` checks the real engineer's nav includes Service keys.*
 
 ---
 
