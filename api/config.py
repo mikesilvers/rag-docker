@@ -37,19 +37,23 @@ class Settings(BaseSettings):
     # `python -m auth` runs.
     auth_dir: str = "/app/auth_data"
     # Marks the session cookie Secure. Off for the loopback HTTP profile, where a
-    # Secure cookie would never be sent back; turn it on only behind TLS (#26).
+    # Secure cookie would never be sent back; LAN mode serves TLS and turns it on (#26).
     auth_cookie_secure: bool = False
+    # LAN mode (#26), set only by docker-compose.lan.yml. When true the API
+    # refuses to start unless the cookie is Secure and an enabled Engineer
+    # exists (lan_mode.py).
+    rag_lan_mode: bool = False
 
-    @field_validator("auth_cookie_secure", mode="before")
+    @field_validator("auth_cookie_secure", "rag_lan_mode", mode="before")
     @classmethod
-    def _exact_boolean(cls, value):
+    def _exact_boolean(cls, value, info):
         # pydantic would read "1", "yes" or "on" as true. A typo in a security
         # setting must stop the API instead of silently meaning something.
         if isinstance(value, bool):
             return value
         if value in ("true", "false"):
             return value == "true"
-        raise ValueError("AUTH_COOKIE_SECURE must be exactly true or false")
+        raise ValueError(f"{info.field_name.upper()} must be exactly true or false")
 
     class Config:
         env_file = ".env"

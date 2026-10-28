@@ -147,8 +147,9 @@ services:
       MAX_ZIP_MEMBERS: 5000
       MAX_ZIP_MEMBER_RATIO: 200
       # Marks the session cookie Secure (#25). false for this loopback HTTP
-      # profile, where a Secure cookie would never be sent back; set true only
-      # when the stack is served over TLS (#26). Exactly true or false.
+      # profile, where a Secure cookie would never be sent back. LAN mode's
+      # docker-compose.lan.yml serves TLS and sets it true (#26). Exactly true
+      # or false.
       AUTH_COOKIE_SECURE: "false"
     volumes:
       - ingest_uploads:/app/uploads
@@ -185,10 +186,13 @@ services:
   proxy:
     image: nginx:1.29-alpine
     ports:
-      # The workbench is local to the host by default; LAN exposure is #26.
+      # The workbench is local to the host by default. LAN mode (#26) is the
+      # opt-in docker-compose.lan.yml, which replaces this with TLS on port 443.
       - "127.0.0.1:8080:80"
     volumes:
       - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+      # The routes, shared with LAN mode's nginx.lan.conf (#26).
+      - ./proxy/locations.conf:/etc/nginx/rag/locations.conf:ro
     networks: [rag-internal]
     depends_on: [ui, api]
 
@@ -246,6 +250,90 @@ volumes:
   ollama_models:
     external: true
     name: rag-verify-ollama-models
+```
+
+### docker-compose.lan.yml
+
+```yaml
+# LAN mode (#26): share the workbench with other machines on your network, over
+# TLS. Opt-in, and only together with the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.lan.yml up -d
+#
+# Create the first AI Engineer in the default (loopback) mode before switching:
+# in LAN mode the API refuses to start without an enabled Engineer, or without
+# a Secure session cookie, and then nothing is published (api/lan_mode.py).
+# See README "Sharing with your office".
+#
+# What this changes:
+# - the proxy publishes TLS on every host interface, port RAG_LAN_PORT
+#   (default 443), instead of plain HTTP on 127.0.0.1:8080. Nothing listens on
+#   port 80 and nothing redirects from it;
+# - the API runs in LAN mode with the session cookie marked Secure;
+# - tls-init, a one-shot step in the API image (no other image), prepares the
+#   certificate before the proxy starts: your own proxy/certs/cert.pem and
+#   key.pem if both are there, otherwise a self-signed certificate for
+#   RAG_LAN_HOSTNAMES plus localhost (api/tls_cert.py).
+#
+# RAG_LAN_HOSTNAMES and RAG_LAN_PORT come from your shell or a .env file next
+# to this one. After changing the certificate or the names, run `up -d` again
+# and restart the proxy so nginx loads the new pair.
+services:
+  tls-init:
+    image: rag-docker-api:latest
+    command: ["python", "-m", "tls_cert"]
+    environment:
+      # The names and addresses clients use to reach this machine, comma-
+      # separated (my-mac.local,192.168.1.20). Not needed with your own pair.
+      RAG_LAN_HOSTNAMES: "${RAG_LAN_HOSTNAMES:-}"
+    volumes:
+      # Your own certificate and key, if any; read-only.
+      - ./proxy/certs:/byo:ro
+      - lan_certs:/certs
+    networks: [rag-internal]
+
+  api:
+    environment:
+      RAG_LAN_MODE: "true"
+      AUTH_COOKIE_SECURE: "true"
+
+  proxy:
+    ports: !override
+      # Every host interface, on purpose: this is what LAN mode is for. Your
+      # host firewall decides which networks can actually reach it.
+      - "0.0.0.0:${RAG_LAN_PORT:-443}:443"
+    volumes:
+      # Same target as the base file's nginx.conf, so this one replaces it.
+      - ./proxy/nginx.lan.conf:/etc/nginx/nginx.conf:ro
+      - lan_certs:/etc/nginx/certs:ro
+    depends_on:
+      tls-init: { condition: service_completed_successfully }
+
+volumes:
+  # The active certificate and key, written by tls-init, read by the proxy.
+  lan_certs:
+```
+
+### docker-compose.lan.verify.yml
+
+```yaml
+# Overlay for LAN mode on the disposable verify project (#26). Loaded only by
+# scripts/verify/stack.sh --lan, after docker-compose.lan.yml and
+# docker-compose.verify.yml, from the harness checkout. Run any other way, it
+# refuses to resolve.
+services:
+  proxy:
+    # Loopback only, at the verify port: the verify project never publishes on
+    # another address, LAN mode included. Replaces the override's 0.0.0.0:443.
+    ports: !override
+      - "127.0.0.1:${RAG_VERIFY_PORT:?set by scripts/verify/stack.sh}:443"
+  tls-init:
+    # The verify image: the override's rag-docker-api:latest is the live tag.
+    image: rag-verify-api:latest
+    environment:
+      # Reserved names (RFC 2606 .invalid, RFC 5737 TEST-NET-1), so the test
+      # certificate can't name a real host.
+      RAG_LAN_HOSTNAMES: "vfy-lan.invalid,192.0.2.10"
 ```
 
 ### ollama/entrypoint.sh
@@ -318,51 +406,114 @@ http {
     server {
         listen 80;
 
-        # Regeneration permits three model attempts with a transport retry each.
-        # The API bounds model work at 1800s; leave time for durable commit and
-        # its typed response instead of terminating at the generic 300s limit.
-        location = /api/goldstandard/regenerate {
-            proxy_pass http://api/goldstandard/regenerate;
-            # The browser's Host, port included: the API compares it with Origin (#25).
-            proxy_set_header Host $http_host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_read_timeout 1860s;
-            proxy_connect_timeout 10s;
-        }
+        # The routes live in locations.conf, shared with LAN mode's nginx.lan.conf (#26).
+        include /etc/nginx/rag/locations.conf;
+    }
+}
+```
 
-        location /api/ {
-            # nginx's default request-body limit is 1 MB, which rejected most
-            # real PDFs with a 413 before the API saw them (issue #21). 512 MB
-            # covers a ZIP of a firm's documents in one upload. It is the limit
-            # for the whole request, so a multi-file upload counts every file.
-            # ui/src/api/client.ts holds the same number to warn before sending;
-            # change both together.
-            client_max_body_size 512m;
-            # Stream uploads straight to the API instead of spooling each one to
-            # nginx's temp directory first. Buffering would write up to 512 MB
-            # into the container's writable layer, on Docker's often-small
-            # virtual disk, before the API even starts reading. The limit above
-            # still applies: nginx checks Content-Length up front.
-            proxy_request_buffering off;
-            proxy_pass http://api/;
-            # The browser's Host with its port ($host drops the port), so the API
-            # can check that a cookie-authenticated change came from this same
-            # origin: Origin http://localhost:8080 against Host localhost:8080 (#25).
-            proxy_set_header Host $http_host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_read_timeout 300s;
-            proxy_connect_timeout 10s;
-        }
+### proxy/locations.conf
 
-        location / {
-            proxy_pass http://ui;
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_intercept_errors on;
-            error_page 404 = /index.html;
-        }
+```nginx
+# The routes of the proxy (#26): included by both nginx.conf (the default
+# loopback HTTP server) and nginx.lan.conf (LAN mode's TLS server), so the two
+# can't drift apart. Mounted at /etc/nginx/rag/locations.conf.
+
+# Regeneration permits three model attempts with a transport retry each.
+# The API bounds model work at 1800s; leave time for durable commit and
+# its typed response instead of terminating at the generic 300s limit.
+location = /api/goldstandard/regenerate {
+    proxy_pass http://api/goldstandard/regenerate;
+    # The browser's Host, port included: the API compares it with Origin (#25).
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 1860s;
+    proxy_connect_timeout 10s;
+}
+
+location /api/ {
+    # nginx's default request-body limit is 1 MB, which rejected most
+    # real PDFs with a 413 before the API saw them (issue #21). 512 MB
+    # covers a ZIP of a firm's documents in one upload. It is the limit
+    # for the whole request, so a multi-file upload counts every file.
+    # ui/src/api/client.ts holds the same number to warn before sending;
+    # change both together.
+    client_max_body_size 512m;
+    # Stream uploads straight to the API instead of spooling each one to
+    # nginx's temp directory first. Buffering would write up to 512 MB
+    # into the container's writable layer, on Docker's often-small
+    # virtual disk, before the API even starts reading. The limit above
+    # still applies: nginx checks Content-Length up front.
+    proxy_request_buffering off;
+    proxy_pass http://api/;
+    # The browser's Host with its port ($host drops the port), so the API
+    # can check that a cookie-authenticated change came from this same
+    # origin: Origin http://localhost:8080 against Host localhost:8080 (#25).
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 300s;
+    proxy_connect_timeout 10s;
+}
+
+location / {
+    proxy_pass http://ui;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_intercept_errors on;
+    error_page 404 = /index.html;
+}
+```
+
+### proxy/nginx.lan.conf
+
+```nginx
+# LAN mode's proxy configuration (#26), mounted over nginx.conf by
+# docker-compose.lan.yml. One TLS server on container port 443 and nothing on
+# port 80: no plain-HTTP listener and no redirect, so the only way in is TLS.
+# The routes are the default server's, from the shared locations.conf.
+events {
+    worker_connections 1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    upstream api {
+        server api:8000;
+    }
+
+    upstream ui {
+        server ui:3000;
+    }
+
+    server {
+        listen 443 ssl;
+        http2 on;
+
+        # The active pair the tls-init step left in the lan_certs volume (read-only
+        # here): your own from proxy/certs, or the self-signed one it generated.
+        # `live` is a symlink it replaces atomically.
+        ssl_certificate     /etc/nginx/certs/live/cert.pem;
+        ssl_certificate_key /etc/nginx/certs/live/key.pem;
+
+        # Mozilla's "intermediate" profile: TLS 1.2 and 1.3 only. TLS 1.3 picks
+        # its own ciphers; this list applies to TLS 1.2. The DHE entries stay
+        # unused without ssl_dhparam, as nginx has no built-in DH parameters.
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305;
+        ssl_prefer_server_ciphers off;
+        ssl_session_timeout 1d;
+        ssl_session_cache shared:SSL:10m;
+        ssl_session_tickets off;
+
+        # No Strict-Transport-Security header, deliberately. With a self-signed
+        # or mkcert certificate, HSTS would turn a later certificate change into
+        # a browser error with no way to click through.
+
+        include /etc/nginx/rag/locations.conf;
     }
 }
 ```
@@ -742,25 +893,326 @@ class Settings(BaseSettings):
     # `python -m auth` runs.
     auth_dir: str = "/app/auth_data"
     # Marks the session cookie Secure. Off for the loopback HTTP profile, where a
-    # Secure cookie would never be sent back; turn it on only behind TLS (#26).
+    # Secure cookie would never be sent back; LAN mode serves TLS and turns it on (#26).
     auth_cookie_secure: bool = False
+    # LAN mode (#26), set only by docker-compose.lan.yml. When true the API
+    # refuses to start unless the cookie is Secure and an enabled Engineer
+    # exists (lan_mode.py).
+    rag_lan_mode: bool = False
 
-    @field_validator("auth_cookie_secure", mode="before")
+    @field_validator("auth_cookie_secure", "rag_lan_mode", mode="before")
     @classmethod
-    def _exact_boolean(cls, value):
+    def _exact_boolean(cls, value, info):
         # pydantic would read "1", "yes" or "on" as true. A typo in a security
         # setting must stop the API instead of silently meaning something.
         if isinstance(value, bool):
             return value
         if value in ("true", "false"):
             return value == "true"
-        raise ValueError("AUTH_COOKIE_SECURE must be exactly true or false")
+        raise ValueError(f"{info.field_name.upper()} must be exactly true or false")
 
     class Config:
         env_file = ".env"
 
 
 settings = Settings()
+```
+
+### api/lan_mode.py
+
+```python
+"""LAN mode's startup refusal (#26).
+
+docker-compose.lan.yml publishes the proxy on every host interface, over TLS,
+and sets RAG_LAN_MODE=true and AUTH_COOKIE_SECURE=true. Before the API serves
+anything in that mode it checks that
+
+  (b) AUTH_COOKIE_SECURE is true, so the session cookie never travels over
+      plain HTTP, and
+  (a) an enabled human Engineer exists, so the system is set up and someone
+      can administer it from the LAN,
+
+in that order, and otherwise exits with one line on standard error. The API
+then never becomes healthy, so the ui and the proxy, which wait for it, don't
+start either and nothing is published: LAN mode fails closed.
+
+main.py calls enforce() before anything else, so uvicorn's import of the app
+stops here. Nothing else in the API depends on LAN mode.
+"""
+from __future__ import annotations
+
+import sys
+
+from config import settings
+
+PREFIX = "LAN mode refused: "
+
+
+def refusal() -> str | None:
+    """The line explaining why LAN mode can't start, or None."""
+    if not settings.rag_lan_mode:
+        return None
+    if not settings.auth_cookie_secure:
+        return (PREFIX + "AUTH_COOKIE_SECURE must be true when RAG_LAN_MODE is true, so the session cookie is "
+                "sent only over TLS. Start LAN mode with docker-compose.lan.yml, which sets both.")
+    from auth import store
+    if not store.has_enabled_engineer():
+        return (PREFIX + "there is no enabled AI Engineer account. Create the first one in the default "
+                "(loopback) mode, then switch: docker compose up -d && docker compose exec api python -m auth "
+                "bootstrap <username> (README, \"Sharing with your office\").")
+    return None
+
+
+def enforce() -> None:
+    """Exit with the refusal line if LAN mode can't start; otherwise do nothing."""
+    reason = refusal()
+    if reason:
+        # One line, and SystemExit, which Python doesn't print as a traceback.
+        print(reason, file=sys.stderr, flush=True)
+        raise SystemExit(1)
+```
+
+### api/tls_cert.py
+
+```python
+"""LAN mode's certificate step (#26): `python -m tls_cert`, the one-shot
+`tls-init` service of docker-compose.lan.yml, run in the API image before the
+proxy starts, on every start in LAN mode.
+
+It leaves the pair nginx serves in the lan_certs volume (/certs here, read-only
+/etc/nginx/certs in the proxy):
+
+- Bring your own: when proxy/certs/cert.pem and proxy/certs/key.pem (/byo,
+  read-only) both exist, they are used. cert.pem may hold a chain, server
+  certificate first. Only one of the two, a file that doesn't parse or a key
+  that doesn't match the certificate is refused; an expired certificate is
+  used with a warning.
+- Otherwise a self-signed certificate for RAG_LAN_HOSTNAMES (comma-separated
+  DNS names and IP addresses) plus localhost, valid for 825 days, the most
+  Apple platforms accept. It is reused on later starts and regenerated only
+  when the active pair is missing or unreadable, has expired, names other
+  hosts, or came from bring-your-own files that are gone.
+
+Layout: /certs/live is a symlink to a pair-<random> folder holding cert.pem,
+key.pem (mode 0600) and `source` (self-signed or byo). A new pair is written
+into a fresh folder and `live` is switched with one rename, so nginx never
+finds a certificate beside a key that doesn't match it; older pairs are then
+removed.
+
+It prints one line naming the certificate (source, names, expiry, SHA-256
+fingerprint, which is what a browser shows when asked to trust it) and exits
+0, or prints one line on standard error and exits 1; the proxy then doesn't
+start.
+"""
+from __future__ import annotations
+
+import datetime
+import ipaddress
+import os
+import re
+import secrets
+import shutil
+import sys
+from pathlib import Path
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+BYO_DIR = Path("/byo")
+OUT_DIR = Path("/certs")
+VALID_DAYS = 825
+LIVE = "live"
+SELF_SIGNED = "self-signed"
+BYO = "byo"
+_LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+class CertError(Exception):
+    """A reason the step can't produce a pair; one line for standard error."""
+
+
+# ── names ─────────────────────────────────────────────────────────────────────
+
+def _name(entry: str) -> str:
+    """An IP address in its normal form, or a lowercased DNS name; else CertError."""
+    try:
+        return str(ipaddress.ip_address(entry))
+    except ValueError:
+        pass
+    name = entry.lower()
+    if len(name) > 253 or not all(_LABEL.match(label) for label in name.split(".")):
+        raise CertError(f"RAG_LAN_HOSTNAMES: {entry!r} is neither a DNS name nor an IP address")
+    return name
+
+
+def wanted_names(raw: str | None) -> list[str]:
+    """The certificate's names: the listed entries in order, then localhost, without duplicates."""
+    entries = [entry.strip() for entry in (raw or "").split(",")]
+    if not any(entries):
+        raise CertError("RAG_LAN_HOSTNAMES is empty: set it to the names and addresses clients use to reach this "
+                        "machine (comma-separated), or put your own cert.pem and key.pem in proxy/certs")
+    names: list[str] = []
+    for entry in entries:
+        if not entry:
+            raise CertError("RAG_LAN_HOSTNAMES has an empty entry")
+        name = _name(entry)
+        if name not in names:
+            names.append(name)
+    if "localhost" not in names:
+        names.append("localhost")
+    return names
+
+
+def _cert_names(cert: x509.Certificate) -> set[str]:
+    try:
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    except x509.ExtensionNotFound:
+        return set()
+    return ({name.lower() for name in san.get_values_for_type(x509.DNSName)}
+            | {str(address) for address in san.get_values_for_type(x509.IPAddress)})
+
+
+# ── reading and describing pairs ─────────────────────────────────────────────
+
+def _public(key) -> bytes:
+    return key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+
+
+def load_pair(cert_bytes: bytes, key_bytes: bytes):
+    """(server certificate, chain) for a matching pair; CertError otherwise."""
+    try:
+        chain = x509.load_pem_x509_certificates(cert_bytes)
+    except ValueError:
+        raise CertError("cert.pem doesn't hold a PEM certificate") from None
+    try:
+        key = serialization.load_pem_private_key(key_bytes, password=None)
+    except (ValueError, TypeError):
+        raise CertError("key.pem doesn't hold an unencrypted PEM private key") from None
+    if _public(key.public_key()) != _public(chain[0].public_key()):
+        raise CertError("key.pem doesn't match the first certificate in cert.pem")
+    return chain[0], chain
+
+
+def fingerprint(cert: x509.Certificate) -> str:
+    return cert.fingerprint(hashes.SHA256()).hex(":").upper()
+
+
+def describe(cert: x509.Certificate) -> str:
+    names = ", ".join(sorted(_cert_names(cert))) or "none"
+    expires = cert.not_valid_after_utc.strftime("%Y-%m-%d %H:%M UTC")
+    return f"names {names}; expires {expires}; SHA-256 {fingerprint(cert)}"
+
+
+def _read_live(out_dir: Path):
+    """(source, cert bytes, key bytes) of the active pair, or None if it is missing or unreadable."""
+    live = out_dir / LIVE
+    try:
+        return ((live / "source").read_text().strip(), (live / "cert.pem").read_bytes(),
+                (live / "key.pem").read_bytes())
+    except OSError:
+        return None
+
+
+# ── writing ──────────────────────────────────────────────────────────────────
+
+def install(out_dir: Path, cert_bytes: bytes, key_bytes: bytes, source: str) -> None:
+    """Write a new pair folder and switch `live` to it with one rename; then remove older pairs."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pair = out_dir / f"pair-{secrets.token_hex(8)}"
+    pair.mkdir(mode=0o700)
+    (pair / "cert.pem").write_bytes(cert_bytes)
+    fd = os.open(pair / "key.pem", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(key_bytes)
+    (pair / "source").write_text(source + "\n")
+    link = out_dir / f".live-{secrets.token_hex(8)}"
+    os.symlink(pair.name, link)
+    os.replace(link, out_dir / LIVE)
+    for old in out_dir.iterdir():
+        if old.name.startswith("pair-") and old.name != pair.name:
+            shutil.rmtree(old, ignore_errors=True)
+        elif old.name.startswith(".live-"):
+            old.unlink(missing_ok=True)
+
+
+def self_signed(names: list[str], now: datetime.datetime) -> tuple[bytes, bytes]:
+    """A new P-256 key and a self-signed server certificate for `names`, valid for 825 days from `now`.
+    Not a CA certificate and without key usage, so OpenSSL-based clients and browsers accept it as
+    its own trust anchor once trusted."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, names[0])])
+    alternatives = []
+    for name in names:
+        try:
+            alternatives.append(x509.IPAddress(ipaddress.ip_address(name)))
+        except ValueError:
+            alternatives.append(x509.DNSName(name))
+    cert = (x509.CertificateBuilder()
+            .subject_name(subject).issuer_name(subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(days=VALID_DAYS))
+            .add_extension(x509.SubjectAlternativeName(alternatives), critical=False)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+            .sign(key, hashes.SHA256()))
+    return (cert.public_bytes(serialization.Encoding.PEM),
+            key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                              serialization.NoEncryption()))
+
+
+# ── the step ─────────────────────────────────────────────────────────────────
+
+def run(byo_dir: Path, out_dir: Path, hostnames: str | None, now: datetime.datetime | None = None,
+        out=sys.stdout, err=sys.stderr) -> int:
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    try:
+        line = _step(byo_dir, out_dir, hostnames, now, err)
+    except CertError as error:
+        print(f"tls-init: {error}", file=err, flush=True)
+        return 1
+    except OSError as error:
+        print(f"tls-init: could not read or write the certificate files: {error}", file=err, flush=True)
+        return 1
+    print(f"tls-init: {line}", file=out, flush=True)
+    return 0
+
+
+def _step(byo_dir: Path, out_dir: Path, hostnames: str | None, now: datetime.datetime, err) -> str:
+    byo_cert, byo_key = byo_dir / "cert.pem", byo_dir / "key.pem"
+    if byo_cert.exists() or byo_key.exists():
+        if not (byo_cert.is_file() and byo_key.is_file()):
+            raise CertError("proxy/certs needs both cert.pem and key.pem; only one of them is there")
+        cert_bytes, key_bytes = byo_cert.read_bytes(), byo_key.read_bytes()
+        cert, _ = load_pair(cert_bytes, key_bytes)
+        if cert.not_valid_after_utc <= now:
+            print(f"tls-init: warning: the certificate in proxy/certs expired on "
+                  f"{cert.not_valid_after_utc:%Y-%m-%d}; browsers will refuse it", file=err, flush=True)
+        if _read_live(out_dir) != (BYO, cert_bytes, key_bytes):
+            install(out_dir, cert_bytes, key_bytes, BYO)
+        return f"using your certificate from proxy/certs: {describe(cert)}"
+
+    names = wanted_names(hostnames)
+    current = _read_live(out_dir)
+    if current and current[0] == SELF_SIGNED:
+        try:
+            cert, _ = load_pair(current[1], current[2])
+        except CertError:
+            cert = None
+        if cert is not None and cert.not_valid_after_utc > now and _cert_names(cert) == set(names):
+            return f"reusing the self-signed certificate: {describe(cert)}"
+    cert_bytes, key_bytes = self_signed(names, now)
+    install(out_dir, cert_bytes, key_bytes, SELF_SIGNED)
+    cert, _ = load_pair(cert_bytes, key_bytes)
+    return f"generated a self-signed certificate: {describe(cert)}"
+
+
+if __name__ == "__main__":
+    sys.exit(run(BYO_DIR, OUT_DIR, os.environ.get("RAG_LAN_HOSTNAMES")))
 ```
 
 ### api/models/__init__.py
@@ -12477,6 +12929,14 @@ def is_set_up() -> bool:
     return found
 
 
+def has_enabled_engineer() -> bool:
+    """True when an enabled human Engineer exists: LAN mode refuses to start
+    without one (#26). A service principal can't log in, so it doesn't count."""
+    with _connect() as conn:
+        return conn.execute("SELECT 1 FROM users WHERE role = 'engineer' AND enabled = 1 AND kind = 'user' "
+                            "LIMIT 1").fetchone() is not None
+
+
 # ── accounts (the operator command and the admin routes) ─────────────────────
 
 def get_user(username: str) -> User | None:
@@ -13578,6 +14038,12 @@ async def revoke_key(name: str, key_id: str, request: Request):
 
 ```python
 from __future__ import annotations
+# LAN mode (#26) refuses to start without a Secure cookie and an enabled
+# Engineer. First, so uvicorn's import of this module stops before any other
+# import, any startup work and any request.
+import lan_mode
+lan_mode.enforce()
+
 import logging
 from contextlib import asynccontextmanager
 
@@ -14281,7 +14747,7 @@ export function useQueryConfig() {
 ```typescript
 const BASE = '/api'
 
-// The proxy's request-body limit: `client_max_body_size` in proxy/nginx.conf.
+// The proxy's request-body limit: `client_max_body_size` in proxy/locations.conf.
 // It covers a whole request, so a multi-file upload counts every file. Kept
 // here only so the Import page can warn before sending; nginx enforces it.
 // Change both together.
@@ -17222,6 +17688,7 @@ verify project, never the live stack (#152).
 bash scripts/verify/stack.sh run                    # everything, ~20 min plus start-up
 RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run    # skip LLM work, ~8 min, start-up included
 bash scripts/verify/stack.sh run 02 04              # only the named suites
+bash scripts/verify/stack.sh run --lan              # LAN mode, TLS on loopback only (#26)
 ```
 
 Exits non-zero if any check fails.
@@ -17276,8 +17743,8 @@ against" below).
 
 | Command | What it does |
 |---|---|
-| `stack.sh run [--checkout DIR] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
-| `stack.sh up [--checkout DIR] [--pull]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. |
+| `stack.sh run [--checkout DIR] [--telemetry \| --lan] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
+| `stack.sh up [--checkout DIR] [--pull] [--lan]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. |
 | `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
 
 `--checkout` is the checkout to build and test; the default is the one holding
@@ -17342,6 +17809,45 @@ What makes it separate from the live stack:
   suite, exit 3, when it fails. Not re-checked: direct `curl` and
   `docker compose exec` calls in the suites, and the Python helpers, which
   end on their own timeouts (up to 900 s).
+
+### LAN mode (#26)
+
+`stack.sh run --lan` (and `up --lan`) runs the verify project in LAN mode
+without exposing the host:
+
+1. It comes up in its default configuration, checked by the guard as usual.
+2. It creates the first Engineer, `vfy-engineer`, with the operator command,
+   as the README tells users to before switching (the project is always new
+   here). The generated password is discarded unseen; `auth_setup.py` resets
+   it later like any password it doesn't know.
+3. It switches `COMPOSE_FILE` to the base file, the checkout's
+   `docker-compose.lan.yml`, this checkout's `docker-compose.verify.yml` and
+   `docker-compose.lan.verify.yml`. That harness-only overlay replaces the
+   override's `0.0.0.0:443` with `127.0.0.1:<verify port>:443`, gives `tls-init`
+   the verify image and sets `RAG_LAN_HOSTNAMES` to reserved test names
+   (`vfy-lan.invalid`, `192.0.2.10`).
+4. The guard checks that configuration, with rule (c) wanting exactly
+   `proxy:127.0.0.1:<verify port>->443/tcp`; every other rule is unchanged, for
+   `tls-init` too. Then `up --no-build --wait` recreates what changed.
+5. It copies the certificate `tls-init` generated from the proxy to
+   `${TMPDIR:-/tmp}/rag-verify-<uid>/lan-cert.pem` (0600) and exports
+   `RAG_API=https://localhost:<port>/api`, and that file as `CURL_CA_BUNDLE`,
+   `SSL_CERT_FILE` and `RAG_VERIFY_LAN_CERT`, so curl and Python trust it, and
+   only it, with the name `localhost`. `RAG_VERIFY_LAN=1` tells the suites.
+
+Without suite names a `--lan` run runs `18_lan` only: the other suites expect
+the default configuration (suite 01's binding and service-inventory checks
+would fail by design). `--lan` can't be combined with `--telemetry`.
+
+`18_lan.sh` runs in every run. It always checks the real override with
+`lan_config.py` (`docker compose config` of the base file plus
+`docker-compose.lan.yml`, under the project name `rag-lan-config`, with no
+`.env`; nothing is created) and runs `../tests/test_lan_mode.py` in the API
+image. Only in a `--lan` run does it check the running LAN project through
+`lan_stack.py`: HTTPS with the generated certificate, TLS versions and HTTP/2,
+the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
+and the API's refusal in one-off containers (`docker compose run --rm
+--no-deps`, no ports); it also prints the client address nginx recorded.
 
 **Memory.** The verify project runs next to the live stack on the same Docker
 VM. With 12 GB allocated, both fit while one LLM is loaded; when both stacks
@@ -17920,6 +18426,11 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
 | `auth_stack.py` | the stack checks of `17_auth.sh`, one per subcommand (#25) |
 | `auth_headers.py` | the suite's session as `Cookie` and `Origin` headers, for the host-side Python helpers (#25) |
+| `18_lan.sh` | §2.5 and §10.5 — LAN mode (#26): the real override resolved without starting it; registers `../tests/test_lan_mode.py`; with `stack.sh run --lan`, the running LAN project on loopback |
+| `lan_config.py` | host-side, standard library: `docker-compose.lan.yml` as `docker compose config` resolves it, at the default port and `RAG_LAN_PORT=8443` (#26) |
+| `lan_stack.py` | the stack checks of `18_lan.sh` in a `--lan` run, one per subcommand (#26) |
+| `../tests/test_lan_mode.py` | API image, no network: `RAG_LAN_MODE` parsing, the startup refusal (also through `import main`), the certificate step, both nginx configurations, embedded copies (#26) |
+| `docker-compose.lan.verify.yml` | the harness overlay of a `--lan` run: TLS on loopback at the verify port, the verify image for `tls-init`, reserved test names (#26) |
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
 | `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
 | `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
@@ -18530,7 +19041,7 @@ printf '\nBuilding fixtures in %s\n' "$FIX"
 rm -rf "$FIX"; python3 ./fixtures.py "$FIX" >/dev/null
 export RAG_FIXTURES="$FIX"
 
-ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth)
+ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan)
 if [ "$#" -gt 0 ]; then
   SUITES=()
   for want in "$@"; do
@@ -18579,8 +19090,8 @@ exit "$overall"
 # Run the verification suite on a disposable compose project, never on the
 # live stack (#152).
 #
-#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry] [suite ...]
-#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull]
+#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry | --lan] [suite ...]
+#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull] [--lan]
 #   bash scripts/verify/stack.sh down
 #
 # `run` brings the verify project up, runs that checkout's all.sh against it
@@ -18616,6 +19127,16 @@ exit "$overall"
 # exports folder), apart from the api's own exports folder; the Docker socket.
 # It can't see env_file, which compose merges into the environment.
 #
+# --lan (#26) runs the verify project in LAN mode. It comes up in its default
+# configuration first, where the first Engineer (vfy-engineer) is created, as
+# the README tells users to do, and then switches to the LAN configuration:
+# the checkout's docker-compose.lan.yml plus this checkout's
+# docker-compose.lan.verify.yml, which publishes TLS on loopback only, at the
+# verify port. The guard checks that configuration too, with rule (c) wanting
+# exactly proxy:127.0.0.1:<verify port>->443/tcp. The suites then reach it at
+# https://localhost:<port>/api and trust the certificate it generated, copied
+# into the private folder. Without suite names, a --lan run runs 18_lan.
+#
 # What this does not do: the suites, and anything else the checkout runs on the
 # host, still have full access to Docker. It keeps verification away from the
 # live stack by accident, not from hostile code; that is the security review's.
@@ -18632,6 +19153,10 @@ SCRATCH="${SCRATCH%/}"
 # local user can't pre-create it or plant a symlink there (#154).
 PRIVATE="$SCRATCH/rag-verify-$(id -u)"
 EXPORTS="$PRIVATE/exports"
+# LAN mode's certificate, copied from the proxy so the suites can verify it (#26).
+LAN_CERT="$PRIVATE/lan-cert.pem"
+# Which rule (c) the guard applies: default (port 80) or lan (port 443).
+GUARD_MODE=default
 
 usage() {
   sed -n '6,8p' "${BASH_SOURCE[0]}" | sed 's/^#  //' >&2
@@ -18664,6 +19189,7 @@ fi
 CHECKOUT="$HARNESS"
 PULL=""
 TELEMETRY=0
+LAN=0
 OTEL_ENABLED=true
 ARGS=()
 while [ "$#" -gt 0 ]; do
@@ -18674,6 +19200,9 @@ while [ "$#" -gt 0 ]; do
     --telemetry)
       [ "$CMD" != down ] || usage
       TELEMETRY=1; shift ;;
+    --lan)
+      { [ "$CMD" = up ] || [ "$CMD" = run ]; } || usage
+      LAN=1; shift ;;
     --disabled)
       [ "$CMD" = telemetry-mode ] || usage
       OTEL_ENABLED=false; shift ;;
@@ -18686,6 +19215,8 @@ while [ "$#" -gt 0 ]; do
       ARGS+=("$1"); shift ;;
   esac
 done
+
+[ "$TELEMETRY" = 0 ] || [ "$LAN" = 0 ] || fail "--lan and --telemetry can't be combined."
 
 PORT="${RAG_VERIFY_PORT:-8081}"
 case "$PORT" in
@@ -18762,6 +19293,9 @@ if [ "$TELEMETRY" = 1 ]; then
   export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.telemetry.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.telemetry.verify.yml"
   export COMPOSE_PROFILES=telemetry
 fi
+# LAN mode's configuration, switched to once the default one is up and set up.
+LAN_COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.lan.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.lan.verify.yml"
+export RAG_VERIFY_LAN="$LAN"
 export RAG_VERIFY_PORT="$PORT"
 export RAG_API="http://localhost:$PORT/api"
 export RAG_EXPECTED_PROXY_PORT="$PORT"
@@ -18800,6 +19334,7 @@ do_down() {
     return 2
   fi
   [ ! -d "$EXPORTS" ] || rm -rf "$EXPORTS"
+  rm -f "$LAN_CERT"
   left="$(docker ps -aq --filter "$filter")$(docker network ls -q --filter "$filter")$(docker volume ls -q --filter "$filter" | grep -vx "$MODELS")$(labelled_images)"
   if [ -e "$EXPORTS" ] || [ -L "$EXPORTS" ]; then
     left="$left $EXPORTS"
@@ -18887,10 +19422,13 @@ do_guard() {
     rm -f "$config"
     fail "docker compose config failed for $CHECKOUT."
   fi
-  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" "$HARNESS" <<'GUARDPY'
+  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" "$HARNESS" "$GUARD_MODE" <<'GUARDPY'
 import json, os, sys
 
 checkout, exports, port, path = sys.argv[1:5]
+# default, or lan (#26): LAN mode's proxy serves TLS on container port 443.
+mode = sys.argv[6] if len(sys.argv) > 6 else 'default'
+target = 443 if mode == 'lan' else 80
 config = json.load(open(path))
 services = config.get('services') or {}
 volumes = config.get('volumes') or {}
@@ -19021,16 +19559,17 @@ for svc, service in services.items():
         if options:
             problems.append(f"(j) service {svc!r} sets options on network {name!r}")
 
-# (c) exactly one published port: the proxy, on loopback, the verify port
+# (c) exactly one published port: the proxy, on loopback, the verify port,
+# container port 80 (443 in LAN mode)
 ports = [(svc, p) for svc, service in services.items() for p in service.get('ports') or []]
 if not (len(ports) == 1 and ports[0][0] == 'proxy'
         and ports[0][1].get('host_ip') == '127.0.0.1'
         and str(ports[0][1].get('published')) == port
-        and ports[0][1].get('target') == 80
+        and ports[0][1].get('target') == target
         and ports[0][1].get('protocol', 'tcp') == 'tcp'):
     shown = ', '.join(f"{svc}:{p.get('host_ip', '')}:{p.get('published')}->{p.get('target')}/{p.get('protocol', 'tcp')}"
                       for svc, p in ports) or 'none'
-    problems.append(f"(c) published ports must be exactly proxy:127.0.0.1:{port}->80/tcp, not {shown}")
+    problems.append(f"(c) published ports must be exactly proxy:127.0.0.1:{port}->{target}/tcp, not {shown}")
 
 # (d) mounts: volumes and binds only, with no options; binds read-only, from
 # inside the checkout but not its exports folder; (e) never the socket
@@ -19080,6 +19619,45 @@ GUARDPY
   [ "$rc" -eq 0 ] || fail "the verify project's configuration is refused (see above); nothing was built or started."
 }
 
+# ── LAN mode (#26) ───────────────────────────────────────────────────────────
+# From the default configuration, up and healthy, to LAN mode, as the README
+# tells users: create the first Engineer, then switch. do_up always clears the
+# project first, so it is never set up here. The generated password is
+# discarded unseen; the suites' account setup resets it like any password it
+# doesn't know.
+lan_switch() {
+  local i code=000 service state health
+  printf 'creating the first Engineer, then switching to LAN mode...\n'
+  docker compose -p "$PROJECT" exec -T api python -m auth bootstrap vfy-engineer >/dev/null \
+    || fail "could not create the first Engineer for LAN mode."
+  export COMPOSE_FILE="$LAN_COMPOSE_FILE"
+  GUARD_MODE=lan
+  do_guard
+  if ! docker compose -p "$PROJECT" up -d --no-build --pull never --wait --wait-timeout 300; then
+    docker compose -p "$PROJECT" ps -a --format '{{.Service}} {{.State}} {{.Health}}' \
+      | while read -r service state health; do
+          case "$state/${health:-}" in
+            running/healthy|running/) ;;
+            *) printf '\n── %s (%s %s) ──\n' "$service" "$state" "${health:-}"
+               docker compose -p "$PROJECT" logs --tail 50 "$service" ;;
+          esac
+        done
+    fail "the verify project did not come up in LAN mode."
+  fi
+  rm -f "$LAN_CERT"
+  (umask 077 && docker compose -p "$PROJECT" exec -T proxy cat /etc/nginx/certs/live/cert.pem > "$LAN_CERT") \
+    && [ -s "$LAN_CERT" ] || fail "could not copy LAN mode's certificate from the proxy."
+  export RAG_API="https://localhost:$PORT/api"
+  # curl and Python's ssl trust only this certificate for the run.
+  export CURL_CA_BUNDLE="$LAN_CERT" SSL_CERT_FILE="$LAN_CERT" RAG_VERIFY_LAN_CERT="$LAN_CERT"
+  for i in $(seq 1 60); do
+    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' --cacert "$LAN_CERT" "$RAG_API/health" 2>/dev/null)
+    [ "$code" = 200 ] && break
+    sleep 1
+  done
+  [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 over TLS within 60 seconds (last: $code)."
+}
+
 # ── up ───────────────────────────────────────────────────────────────────────
 do_up() {
   local i code=000 service state health
@@ -19112,10 +19690,16 @@ do_up() {
     sleep 1
   done
   [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 within 60 seconds (last: $code)."
-  printf '\nThe verify project is up at http://localhost:%s. To point commands at it:\n\n' "$PORT"
-  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT RAG_VERIFY_TELEMETRY; do
+  [ "$LAN" = 0 ] || lan_switch
+  printf '\nThe verify project is up at %s. To point commands at it:\n\n' "${RAG_API%/api}"
+  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT RAG_VERIFY_TELEMETRY RAG_VERIFY_LAN; do
     printf 'export %s=%q\n' "$var" "${!var}"
   done
+  if [ "$LAN" = 1 ]; then
+    for var in CURL_CA_BUNDLE SSL_CERT_FILE RAG_VERIFY_LAN_CERT; do
+      printf 'export %s=%q\n' "$var" "${!var}"
+    done
+  fi
   if [ "$TELEMETRY" = 1 ]; then
     for var in COMPOSE_PROFILES RAG_VERIFY_HARNESS RAG_VERIFY_CHECKOUT RAG_VERIFY_OTEL_ENABLED; do
       printf 'export %s=%q\n' "$var" "${!var}"
@@ -19138,6 +19722,8 @@ case "$CMD" in
     TEARDOWN=1
     do_up
     rc=0
+    # A LAN run checks LAN mode; other suites assume the default configuration.
+    [ "$LAN" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(18_lan)
     # In the background with job control on, all.sh leads a process group of
     # its own (pgid $!), which stop_suite ends; and `wait`, unlike a foreground
     # command, returns as soon as INT or TERM arrives, so the traps act at once.
@@ -20560,6 +21146,869 @@ def main(argv):
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
 ```
+
+### scripts/verify/18_lan.sh
+
+```bash
+#!/usr/bin/env bash
+# LAN mode (#26): SPECIFICATIONS.md §2.5 and §10.5.
+#
+# Every run checks the real docker-compose.lan.yml as `docker compose config`
+# resolves it (nothing is started) and runs the LAN unit tests in the API image
+# with no network. The checks of a running LAN project need
+# `stack.sh run --lan`, which switches the verify project to LAN mode with TLS
+# on 127.0.0.1:<verify port> only; anywhere else they are skipped.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+require_stack
+
+section "LAN override, resolved without starting it"
+python3 ./lan_config.py "$REPO_ROOT"
+check "docker-compose.lan.yml publishes only the proxy on every interface at 443 (RAG_LAN_PORT changes it), in LAN mode with a Secure cookie, after tls-init" $?
+
+section "LAN units: setting, startup refusal, certificate step, nginx configuration"
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_lan_mode.py)
+check "test_lan_mode.py registered regression checks" $?
+
+if [ "${RAG_VERIFY_LAN:-0}" != 1 ]; then
+  skip "LAN mode on the running verify project" "run stack.sh run --lan"
+  summary
+  exit $?
+fi
+
+lan() { _rag_require_lock_owner; python3 ./lan_stack.py "$1"; }
+
+section "LAN mode on the verify project (TLS on loopback only)"
+lan https
+check "HTTPS answers with the generated certificate: localhost and the test names, 825 days" $?
+lan tls
+check "TLS 1.2 and 1.3 connect, TLS 1.1 is refused, ALPN picks HTTP/2" $?
+lan bindings
+check "the only published port is the proxy's 127.0.0.1 TLS port; plain HTTP gets no API answer" $?
+lan cookie
+check "a login over HTTPS sets the session cookie Secure, HttpOnly and SameSite=Strict" $?
+lan origin
+check "a same-origin change over HTTPS is accepted, another origin's refused 403 CROSS_ORIGIN_REFUSED" $?
+lan refusals
+check "the API refuses LAN mode with one line when AUTH_COOKIE_SECURE is false or no Engineer exists" $?
+lan address
+
+summary
+```
+
+### scripts/verify/lan_config.py
+
+```python
+"""The real LAN override, resolved without starting it (#26). Host-side, standard library, Python 3.9+.
+
+    python3 lan_config.py CHECKOUT
+
+Resolves CHECKOUT's docker-compose.yml plus docker-compose.lan.yml with
+`docker compose config` (which creates no container, volume or network), under
+a project name that is neither rag-docker nor rag-verify, with no .env file and
+none of the caller's COMPOSE_* or RAG_LAN_* variables, and checks what LAN mode
+publishes and sets: the proxy alone on every interface at port 443 (8443 with
+RAG_LAN_PORT=8443), the API in LAN mode with a Secure cookie, the certificate
+step in the API image before the proxy, and the read-only mounts. The verify
+project never runs this configuration as is: there, docker-compose.lan.verify.yml
+keeps the publication on loopback. Prints each problem; exits 0 or 1.
+"""
+import json
+import os
+import subprocess
+import sys
+
+PROJECT = "rag-lan-config"
+
+
+def resolve(checkout, port=None):
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("COMPOSE_", "RAG_LAN_"))}
+    if port is not None:
+        env["RAG_LAN_PORT"] = port
+    result = subprocess.run(
+        ["docker", "compose", "--env-file", os.devnull, "-p", PROJECT,
+         "-f", os.path.join(checkout, "docker-compose.yml"), "-f", os.path.join(checkout, "docker-compose.lan.yml"),
+         "config", "--format", "json"],
+        cwd=checkout, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError("docker compose config failed: " + result.stderr.strip())
+    return json.loads(result.stdout)
+
+
+def mount(service, target):
+    found = [m for m in service.get("volumes") or [] if m.get("target") == target]
+    return found[0] if len(found) == 1 else None
+
+
+def problems(config, checkout, port):
+    found = []
+    services = config.get("services") or {}
+    ports = [(name, p) for name, service in services.items() for p in service.get("ports") or []]
+    shown = ", ".join("{}:{}:{}->{}/{}".format(n, p.get("host_ip", ""), p.get("published"), p.get("target"),
+                                              p.get("protocol", "tcp")) for n, p in ports) or "none"
+    if not (len(ports) == 1 and ports[0][0] == "proxy" and ports[0][1].get("host_ip") == "0.0.0.0"
+            and str(ports[0][1].get("published")) == port and ports[0][1].get("target") == 443
+            and ports[0][1].get("protocol", "tcp") == "tcp"):
+        found.append("publications are {}, not exactly proxy:0.0.0.0:{}->443/tcp".format(shown, port))
+    environment = (services.get("api") or {}).get("environment") or {}
+    for key in ("RAG_LAN_MODE", "AUTH_COOKIE_SECURE"):
+        if environment.get(key) != "true":
+            found.append("the api's {} is {!r}, not 'true'".format(key, environment.get(key)))
+    init = services.get("tls-init") or {}
+    if init.get("image") != "rag-docker-api:latest":
+        found.append("tls-init uses {!r}, not the API image rag-docker-api:latest".format(init.get("image")))
+    if init.get("command") != ["python", "-m", "tls_cert"]:
+        found.append("tls-init runs {!r}, not python -m tls_cert".format(init.get("command")))
+    if init.get("ports"):
+        found.append("tls-init publishes a port")
+    proxy = services.get("proxy") or {}
+    wait = (proxy.get("depends_on") or {}).get("tls-init") or {}
+    if wait.get("condition") != "service_completed_successfully":
+        found.append("the proxy doesn't wait for tls-init to complete successfully")
+    expected = [
+        ("proxy", "/etc/nginx/nginx.conf", "bind", os.path.join(checkout, "proxy", "nginx.lan.conf"), True),
+        ("proxy", "/etc/nginx/rag/locations.conf", "bind", os.path.join(checkout, "proxy", "locations.conf"), True),
+        ("proxy", "/etc/nginx/certs", "volume", "lan_certs", True),
+        ("tls-init", "/byo", "bind", os.path.join(checkout, "proxy", "certs"), True),
+        ("tls-init", "/certs", "volume", "lan_certs", False),
+    ]
+    for name, target, kind, source, read_only in expected:
+        found_mount = mount(services.get(name) or {}, target)
+        ok = (found_mount is not None and found_mount.get("type") == kind
+              and (os.path.realpath(found_mount.get("source") or "") == os.path.realpath(source)
+                   if kind == "bind" else found_mount.get("source") == source)
+              and bool(found_mount.get("read_only")) == read_only)
+        if not ok:
+            found.append("{} doesn't mount {} {} at {}{}".format(
+                name, kind, source, target, " read-only" if read_only else ""))
+    if "lan_certs" not in (config.get("volumes") or {}):
+        found.append("no lan_certs volume")
+    return found
+
+
+def main(argv):
+    if len(argv) != 1:
+        print(__doc__.split("\n\n")[1], file=sys.stderr)
+        return 2
+    checkout = os.path.realpath(argv[0])
+    failed = False
+    for port in (None, "8443"):
+        try:
+            config = resolve(checkout, port)
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
+            print("lan_config: {}".format(error), file=sys.stderr)
+            return 1
+        for problem in problems(config, checkout, port or "443"):
+            failed = True
+            print("lan_config{}: {}".format(" (RAG_LAN_PORT=8443)" if port else "", problem), file=sys.stderr)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+```
+
+### scripts/verify/lan_stack.py
+
+```python
+"""LAN mode on the verify project (#26). Host-side, standard library, Python 3.9+.
+
+    python3 lan_stack.py https|tls|bindings|cookie|origin|refusals|address
+
+Run by 18_lan.sh in a `stack.sh run --lan`, which brings the verify project up
+in LAN mode with TLS on 127.0.0.1:<verify port> only, copies the certificate
+the tls-init step generated to RAG_VERIFY_LAN_CERT and points RAG_API at
+https://localhost:<port>/api. Each subcommand is one check and exits 0 or 1,
+printing what failed:
+
+  https     /api/health over TLS, verified against that certificate and the
+            name localhost; the certificate names exactly localhost and the
+            harness's test names and is valid for 825 days
+  tls       TLS 1.2 and 1.3 connect, TLS 1.1 is refused, ALPN picks HTTP/2
+  bindings  the project's only published port is the proxy's
+            127.0.0.1:<port>->443/tcp, and plain HTTP to it gets no API answer
+  cookie    a login over TLS sets the session cookie Secure, HttpOnly and
+            SameSite=Strict
+  origin    a cookie-authenticated change from another origin is refused 403
+            CROSS_ORIGIN_REFUSED, and from https://localhost:<port> accepted
+  refusals  a one-off api container of the LAN configuration (no ports, the
+            running project untouched) refuses to start, with one line, when
+            AUTH_COOKIE_SECURE is false and when its account store is empty
+  address   prints the client address nginx recorded for these requests
+            (always exits 0; information for the README)
+
+The harness Engineer's password comes from auth_setup.py's credentials file and
+travels only in request bodies; nothing here prints it.
+"""
+import http.client
+import json
+import os
+import re
+import secrets
+import socket
+import ssl
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import auth_setup  # noqa: E402
+
+NAMES = {("DNS", "localhost"), ("DNS", "vfy-lan.invalid"), ("IP Address", "192.0.2.10")}
+VALID_S = 825 * 86400
+REFUSED = "LAN mode refused:"
+
+
+def port():
+    return int(os.environ["RAG_VERIFY_PORT"])
+
+
+def cert():
+    return os.environ["RAG_VERIFY_LAN_CERT"]
+
+
+def origin():
+    return "https://localhost:{}".format(port())
+
+
+def context():
+    return ssl.create_default_context(cafile=cert())
+
+
+def request(method, path, body=None, headers=None):
+    """(status, parsed JSON or None, Set-Cookie values) over verified TLS."""
+    conn = http.client.HTTPSConnection("localhost", port(), context=context(), timeout=60)
+    try:
+        data = json.dumps(body).encode() if body is not None else None
+        sent = dict(headers or {})
+        if data is not None:
+            sent["Content-Type"] = "application/json"
+        conn.request(method, "/api" + path, body=data, headers=sent)
+        response = conn.getresponse()
+        raw = response.read()
+        cookies = [value for name, value in response.getheaders() if name.lower() == "set-cookie"]
+        try:
+            parsed = json.loads(raw) if raw else None
+        except ValueError:
+            parsed = None
+        return response.status, parsed, cookies
+    finally:
+        conn.close()
+
+
+def login():
+    """(session token, Set-Cookie value) for the harness Engineer."""
+    stored = auth_setup.read_credentials(auth_setup.private_dir()).get("engineer")
+    if not stored:
+        raise AssertionError("no stored credentials for the harness Engineer")
+    status, body, cookies = request("POST", "/auth/login", {"username": stored[0], "password": stored[1]},
+                                    {"Origin": origin()})
+    session = [c for c in cookies if c.split("=", 1)[0].strip() == auth_setup.COOKIE]
+    if status != 200 or len(session) != 1:
+        raise AssertionError("login answered HTTP {} with {} session cookie(s)".format(status, len(session)))
+    token = session[0].split("=", 1)[1].split(";", 1)[0]
+    return token, session[0]
+
+
+def check_https():
+    conn = http.client.HTTPSConnection("localhost", port(), context=context(), timeout=60)
+    try:
+        conn.request("GET", "/api/health")
+        response = conn.getresponse()
+        response.read()
+        peer = conn.sock.getpeercert()
+    finally:
+        conn.close()
+    assert response.status == 200, "GET /api/health answered {}".format(response.status)
+    names = set(peer.get("subjectAltName", ()))
+    assert names == NAMES, "the certificate names {}, not {}".format(sorted(names), sorted(NAMES))
+    valid = ssl.cert_time_to_seconds(peer["notAfter"]) - ssl.cert_time_to_seconds(peer["notBefore"])
+    assert valid == VALID_S, "the certificate is valid for {} s, not {} (825 days)".format(valid, VALID_S)
+
+
+def handshake(ctx, alpn=None):
+    with socket.create_connection(("localhost", port()), timeout=30) as raw:
+        with ctx.wrap_socket(raw, server_hostname="localhost") as tls:
+            return tls.version(), tls.selected_alpn_protocol()
+
+
+def check_tls():
+    for version, name in ((ssl.TLSVersion.TLSv1_2, "TLSv1.2"), (ssl.TLSVersion.TLSv1_3, "TLSv1.3")):
+        ctx = context()
+        ctx.minimum_version = ctx.maximum_version = version
+        got, _ = handshake(ctx)
+        assert got == name, "asked for {}, got {}".format(name, got)
+    old = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    old.load_verify_locations(cert())
+    # Security level 0, so this client really offers TLS 1.1 and only the
+    # server can refuse it.
+    old.set_ciphers("DEFAULT:@SECLEVEL=0")
+    old.minimum_version = old.maximum_version = ssl.TLSVersion.TLSv1_1
+    try:
+        got, _ = handshake(old)
+    except (ssl.SSLError, OSError):
+        got = None
+    assert got is None, "a TLS 1.1 connection was accepted ({})".format(got)
+    ctx = context()
+    ctx.set_alpn_protocols(["h2", "http/1.1"])
+    _, alpn = handshake(ctx)
+    assert alpn == "h2", "ALPN picked {!r}, not h2".format(alpn)
+
+
+def docker(*args):
+    result = subprocess.run(["docker"] + list(args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, universal_newlines=True, timeout=120)
+    if result.returncode != 0:
+        raise AssertionError("docker {} failed: {}".format(" ".join(args[:2]), result.stderr.strip()))
+    return result.stdout
+
+
+def check_bindings():
+    project = os.environ.get("COMPOSE_PROJECT_NAME", "")
+    assert project == "rag-verify", "COMPOSE_PROJECT_NAME is {!r}, not rag-verify".format(project)
+    ids = docker("ps", "-q", "--filter", "label=com.docker.compose.project=rag-verify").split()
+    bindings = []
+    for container in json.loads(docker("inspect", *ids)) if ids else []:
+        service = container["Config"]["Labels"].get("com.docker.compose.service")
+        for target, published in (container["NetworkSettings"]["Ports"] or {}).items():
+            for binding in published or []:
+                bindings.append((service, target, binding.get("HostIp"), binding.get("HostPort")))
+    want = [("proxy", "443/tcp", "127.0.0.1", str(port()))]
+    assert bindings == want, "published bindings are {}, not {}".format(bindings, want)
+    with socket.create_connection(("127.0.0.1", port()), timeout=30) as raw:
+        raw.sendall(b"GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        answer = b""
+        while len(answer) < 65536:
+            chunk = raw.recv(4096)
+            if not chunk:
+                break
+            answer += chunk
+    first = answer.split(b"\r\n", 1)[0]
+    assert not re.match(rb"HTTP/1\.[01] 200", first), "plain HTTP got {!r}".format(first)
+    assert b'"status"' not in answer, "plain HTTP got an API answer"
+
+
+def check_cookie():
+    token, header = login()
+    try:
+        attributes = {part.strip().lower() for part in header.split(";")[1:]}
+        for wanted in ("secure", "httponly", "samesite=strict"):
+            assert wanted in attributes, "the session cookie lacks {} ({})".format(
+                wanted, sorted(a for a in attributes if not a.startswith("expires")))
+    finally:
+        request("POST", "/auth/logout", headers={"Cookie": "{}={}".format(auth_setup.COOKIE, token),
+                                                 "Origin": origin()})
+
+
+def check_origin():
+    token, _ = login()
+    cookie = "{}={}".format(auth_setup.COOKIE, token)
+    status, body, _ = request("POST", "/auth/logout", headers={"Cookie": cookie, "Origin": "https://vfy-lan.invalid"})
+    code = ((body or {}).get("error") or {}).get("code")
+    assert (status, code) == (403, "CROSS_ORIGIN_REFUSED"), "another origin got {} {}".format(status, code)
+    status, _, _ = request("GET", "/auth/me", headers={"Cookie": cookie})
+    assert status == 200, "the session didn't survive the refused change ({})".format(status)
+    status, _, _ = request("POST", "/auth/logout", headers={"Cookie": cookie, "Origin": origin()})
+    assert status == 200, "the same-origin change answered {}".format(status)
+    status, _, _ = request("GET", "/auth/me", headers={"Cookie": cookie})
+    assert status == 401, "the session still works after logout ({})".format(status)
+
+
+def one_off(*env):
+    """A one-off api container of the LAN configuration: (exit status, its output lines)."""
+    args = ["docker", "compose", "run", "--rm", "--no-deps", "-T"]
+    for item in env:
+        args += ["-e", item]
+    result = subprocess.run(args + ["api"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, universal_newlines=True, timeout=300)
+    return result.returncode, result.stdout.splitlines()
+
+
+def check_refusals():
+    project = os.environ.get("COMPOSE_PROJECT_NAME", "")
+    assert project == "rag-verify", "COMPOSE_PROJECT_NAME is {!r}, not rag-verify".format(project)
+    cases = [(("AUTH_COOKIE_SECURE=false",), "AUTH_COOKIE_SECURE"),
+             (("AUTH_DIR=/tmp/vfy-lan-empty-" + secrets.token_hex(4),), "no enabled AI Engineer")]
+    for env, cause in cases:
+        status, lines = one_off(*env)
+        refused = [line for line in lines if REFUSED in line]
+        assert status != 0, "{}: the API started (exit 0)".format(env[0])
+        assert len(refused) == 1 and cause in refused[0], "{}: refusal lines {}".format(env[0], refused or lines[-5:])
+        tracebacks = [line for line in lines if line.startswith("Traceback")]
+        assert not tracebacks, "{}: the refusal printed a traceback".format(env[0])
+    status, _, _ = request("GET", "/health")
+    assert status == 200, "the running API isn't healthy after the one-off containers ({})".format(status)
+
+
+def check_address():
+    logs = subprocess.run(["docker", "compose", "logs", "--no-color", "--tail", "500", "proxy"],
+                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          universal_newlines=True, timeout=120).stdout
+    seen = re.findall(r"\|\s+(\S+) - \S+ \[[^\]]*\] \"GET /api/health ", logs)
+    print("    nginx recorded the client address {} for this host's loopback requests (in X-Real-IP for the "
+          "API)".format(seen[-1] if seen else "(none found)"))
+
+
+CHECKS = {"https": check_https, "tls": check_tls, "bindings": check_bindings, "cookie": check_cookie,
+          "origin": check_origin, "refusals": check_refusals, "address": check_address}
+
+
+def main(argv):
+    if len(argv) != 1 or argv[0] not in CHECKS:
+        print(__doc__.split("\n\n")[1], file=sys.stderr)
+        return 2
+    try:
+        CHECKS[argv[0]]()
+    except (AssertionError, OSError, ssl.SSLError, subprocess.SubprocessError, KeyError, auth_setup.SetupError) as error:
+        print("    lan_stack {}: {}".format(argv[0], error or type(error).__name__), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+```
+
+### scripts/tests/test_lan_mode.py
+
+````python
+"""LAN mode (issue #26): the RAG_LAN_MODE setting, the API's startup refusal
+(api/lan_mode.py), the certificate step (api/tls_cert.py), LAN mode's nginx
+configuration and the embedded copies of the new files.
+
+Runs with the API's dependencies, in the built API image with no network
+(`18_lan.sh`):
+
+    docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
+      "$(docker compose images -q api)" python scripts/tests/test_lan_mode.py
+
+Stores and certificate folders are temporary; nothing is started or published.
+"""
+import ast
+import datetime
+import io
+import ipaddress
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+API_DIR = os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api")
+sys.path.insert(0, API_DIR)
+ROOT = Path(API_DIR).parent
+
+from cryptography import x509  # noqa: E402
+from cryptography.hazmat.primitives import serialization  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
+
+import config  # noqa: E402
+import lan_mode  # noqa: E402
+import tls_cert  # noqa: E402
+from auth import passwords, store  # noqa: E402
+from config import settings  # noqa: E402
+
+NOW = datetime.datetime(2026, 10, 28, 12, 0, tzinfo=datetime.timezone.utc)
+
+
+class SettingTests(unittest.TestCase):
+    def test_exactly_true_or_false(self):
+        self.assertTrue(config.Settings(rag_lan_mode="true").rag_lan_mode)
+        self.assertFalse(config.Settings(rag_lan_mode="false").rag_lan_mode)
+        self.assertFalse(config.Settings().rag_lan_mode, "LAN mode must be off by default")
+        for bad in ("1", "yes", "on", "True", "TRUE", ""):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValidationError) as caught:
+                    config.Settings(rag_lan_mode=bad)
+                self.assertIn("RAG_LAN_MODE must be exactly true or false", str(caught.exception))
+
+    def test_the_cookie_setting_keeps_its_own_name_in_the_message(self):
+        with self.assertRaises(ValidationError) as caught:
+            config.Settings(auth_cookie_secure="yes")
+        self.assertIn("AUTH_COOKIE_SECURE must be exactly true or false", str(caught.exception))
+
+
+class RefusalTests(unittest.TestCase):
+    """S2.2: with LAN mode on, a Secure cookie (checked first) and an enabled human Engineer."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        for name, value in (("auth_dir", temp.name), ("rag_lan_mode", True), ("auth_cookie_secure", True)):
+            target = patch.object(settings, name, value)
+            target.start()
+            self.addCleanup(target.stop)
+
+    def make(self, username, role):
+        store.create_user(username, role, passwords.generate_password(), bootstrap=not store.is_set_up())
+
+    def test_off_never_refuses(self):
+        with patch.object(settings, "rag_lan_mode", False), patch.object(settings, "auth_cookie_secure", False):
+            self.assertIsNone(lan_mode.refusal())
+
+    def test_an_enabled_human_engineer_and_a_secure_cookie_pass(self):
+        self.make("eng", "engineer")
+        self.assertIsNone(lan_mode.refusal())
+
+    def test_the_cookie_must_be_secure(self):
+        self.make("eng", "engineer")
+        with patch.object(settings, "auth_cookie_secure", False):
+            line = lan_mode.refusal()
+        self.assertTrue(line.startswith("LAN mode refused: AUTH_COOKIE_SECURE must be true"), line)
+
+    def test_the_cookie_is_checked_first(self):
+        with patch.object(settings, "auth_cookie_secure", False):
+            self.assertIn("AUTH_COOKIE_SECURE", lan_mode.refusal())
+
+    def test_who_counts_as_an_engineer(self):
+        engineer_line = "LAN mode refused: there is no enabled AI Engineer account"
+        self.assertTrue(lan_mode.refusal().startswith(engineer_line), "an empty store")
+        self.make("user", "end_user")
+        self.make("dev", "developer")
+        self.assertTrue(lan_mode.refusal().startswith(engineer_line), "only an End User and a Developer")
+        store.create_principal("svc", "engineer")
+        self.assertTrue(lan_mode.refusal().startswith(engineer_line), "a service principal can't log in")
+        self.make("eng", "engineer")
+        self.make("eng2", "engineer")
+        store.set_enabled("eng2", False)
+        self.assertIsNone(lan_mode.refusal())
+        # The last-Engineer rule refuses disabling eng now, so check a disabled-only store directly.
+        with store._connect(write=True) as conn:
+            conn.execute("UPDATE users SET enabled = 0 WHERE username = 'eng'")
+        self.assertTrue(lan_mode.refusal().startswith(engineer_line), "a disabled Engineer")
+
+    def test_each_refusal_is_one_line(self):
+        for secure in (False, True):
+            with self.subTest(secure=secure), patch.object(settings, "auth_cookie_secure", secure):
+                line = lan_mode.refusal()
+                self.assertNotIn("\n", line)
+
+    def test_enforce_prints_the_line_and_exits(self):
+        err = io.StringIO()
+        with patch("sys.stderr", err), self.assertRaises(SystemExit) as caught:
+            lan_mode.enforce()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual(len(err.getvalue().splitlines()), 1)
+        self.make("eng", "engineer")
+        lan_mode.enforce()   # no refusal: returns
+
+
+class MainImportTests(unittest.TestCase):
+    """S2.2/S2.6: uvicorn's import of main stops first, with one line and no traceback."""
+
+    def test_enforce_is_mains_first_statement(self):
+        tree = ast.parse((Path(API_DIR) / "main.py").read_text())
+        body = [node for node in tree.body
+                if not (isinstance(node, ast.ImportFrom) and node.module == "__future__")
+                and not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant))]
+        self.assertEqual(ast.unparse(body[0]), "import lan_mode")
+        self.assertEqual(ast.unparse(body[1]), "lan_mode.enforce()")
+
+    def run_import(self, **env):
+        with tempfile.TemporaryDirectory() as folder:
+            full = {**os.environ, "AUTH_DIR": folder, "PYTHONDONTWRITEBYTECODE": "1", **env}
+            return subprocess.run([sys.executable, "-c", "import main"], cwd=API_DIR, env=full,
+                                  capture_output=True, text=True, timeout=300)
+
+    def test_lan_mode_without_a_secure_cookie_exits_with_one_line(self):
+        result = self.run_import(RAG_LAN_MODE="true", AUTH_COOKIE_SECURE="false")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        lines = result.stderr.splitlines()
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertTrue(lines[0].startswith("LAN mode refused: AUTH_COOKIE_SECURE"), lines)
+
+    def test_lan_mode_with_an_empty_store_exits_with_one_line(self):
+        result = self.run_import(RAG_LAN_MODE="true", AUTH_COOKIE_SECURE="true")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        lines = result.stderr.splitlines()
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertIn("no enabled AI Engineer", lines[0])
+
+    def test_an_invalid_value_stops_the_api(self):
+        result = self.run_import(RAG_LAN_MODE="yes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("RAG_LAN_MODE must be exactly true or false", result.stderr)
+
+
+# ── the certificate step ─────────────────────────────────────────────────────
+
+def certificate(names, days=30, now=NOW):
+    """A self-signed pair as a bring-your-own certificate would be: (cert PEM, key PEM)."""
+    cert_bytes, key_bytes = tls_cert.self_signed(names, now - datetime.timedelta(days=825 - days))
+    return cert_bytes, key_bytes
+
+
+class CertTestCase(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.byo = Path(temp.name) / "byo"
+        self.out = Path(temp.name) / "certs"
+        self.byo.mkdir()
+
+    def step(self, hostnames="office.example,192.168.1.20", now=NOW):
+        out, err = io.StringIO(), io.StringIO()
+        code = tls_cert.run(self.byo, self.out, hostnames, now, out=out, err=err)
+        return code, out.getvalue(), err.getvalue()
+
+    def live(self):
+        live = self.out / "live"
+        cert = x509.load_pem_x509_certificate((live / "cert.pem").read_bytes())
+        return live, cert, (live / "source").read_text().strip()
+
+    def names(self, cert):
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        return ([n for n in san.get_values_for_type(x509.DNSName)],
+                [str(a) for a in san.get_values_for_type(x509.IPAddress)])
+
+
+class SelfSignedTests(CertTestCase):
+    """S4.3-S4.6."""
+
+    def test_generates_for_the_names_plus_localhost(self):
+        code, out, err = self.step("Office.Example, 192.168.1.20 ,office.example,::1")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(len(out.splitlines()), 1)
+        self.assertIn("generated a self-signed certificate", out)
+        live, cert, source = self.live()
+        self.assertEqual(source, "self-signed")
+        self.assertEqual(self.names(cert), (["office.example", "localhost"], ["192.168.1.20", "::1"]))
+        self.assertEqual(cert.subject.rfc4514_string(), "CN=office.example")
+        self.assertEqual(cert.not_valid_after_utc - cert.not_valid_before_utc, datetime.timedelta(days=825))
+        self.assertEqual(cert.not_valid_before_utc, NOW)
+        self.assertFalse(cert.extensions.get_extension_for_class(x509.BasicConstraints).value.ca)
+        self.assertTrue(cert.extensions.get_extension_for_class(x509.BasicConstraints).critical)
+        self.assertEqual(list(cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value),
+                         [x509.oid.ExtendedKeyUsageOID.SERVER_AUTH])
+        with self.assertRaises(x509.ExtensionNotFound):
+            cert.extensions.get_extension_for_class(x509.KeyUsage)
+        key = serialization.load_pem_private_key((live / "key.pem").read_bytes(), None)
+        self.assertEqual(key.curve.name, "secp256r1")
+        self.assertEqual((live / "key.pem").stat().st_mode & 0o777, 0o600)
+        self.assertIn(tls_cert.fingerprint(cert), out)
+        self.assertTrue((self.out / "live").is_symlink())
+
+    def test_names_are_required_and_checked(self):
+        for raw, part in ((None, "empty"), ("", "empty"), ("  ", "empty"), ("a,,b", "empty entry"),
+                          ("bad_name", "'bad_name'"), ("-x.example", "'-x.example'"),
+                          ("x" * 64 + ".example", "neither"), ("*.example", "'*.example'"),
+                          ("a." * 127 + "ab", "neither")):
+            with self.subTest(raw=raw):
+                code, out, err = self.step(raw)
+                self.assertEqual(code, 1)
+                self.assertEqual(out, "")
+                self.assertEqual(len(err.splitlines()), 1, err)
+                self.assertIn(part, err)
+                self.assertFalse((self.out / "live").exists())
+
+    def test_reused_while_valid_and_for_the_same_names(self):
+        self.step()
+        _, first, _ = self.live()
+        code, out, _ = self.step("192.168.1.20, OFFICE.example", now=NOW + datetime.timedelta(days=800))
+        self.assertEqual(code, 0)
+        self.assertIn("reusing the self-signed certificate", out)
+        self.assertEqual(self.live()[1], first)
+        self.assertEqual(len([p for p in self.out.iterdir() if p.name.startswith("pair-")]), 1)
+
+    def regenerated(self, out):
+        self.assertIn("generated a self-signed certificate", out)
+
+    def test_regenerated_when_expired(self):
+        self.step()
+        _, first, _ = self.live()
+        code, out, _ = self.step(now=NOW + datetime.timedelta(days=825))
+        self.assertEqual(code, 0)
+        self.regenerated(out)
+        self.assertNotEqual(self.live()[1], first)
+
+    def test_regenerated_when_the_names_change(self):
+        self.step()
+        code, out, _ = self.step("office.example")
+        self.regenerated(out)
+        self.assertEqual(self.names(self.live()[1]), (["office.example", "localhost"], []))
+
+    def test_regenerated_when_missing_unreadable_or_mismatched(self):
+        self.step()
+        live, _, _ = self.live()
+        (live / "key.pem").write_bytes(certificate(["other"])[1])
+        _, out, _ = self.step()
+        self.regenerated(out)
+        live, _, _ = self.live()
+        (live / "cert.pem").write_bytes(b"not a certificate")
+        _, out, _ = self.step()
+        self.regenerated(out)
+        live, _, _ = self.live()
+        (live / "key.pem").unlink()
+        _, out, _ = self.step()
+        self.regenerated(out)
+        (self.out / "live").unlink()
+        _, out, _ = self.step()
+        self.regenerated(out)
+        self.assertEqual(len([p for p in self.out.iterdir() if p.name.startswith("pair-")]), 1,
+                         "older pairs are removed")
+
+    def test_regenerated_after_bring_your_own_files_are_removed(self):
+        cert_bytes, key_bytes = certificate(["office.example", "192.168.1.20", "localhost"])
+        (self.byo / "cert.pem").write_bytes(cert_bytes)
+        (self.byo / "key.pem").write_bytes(key_bytes)
+        self.step()
+        self.assertEqual(self.live()[2], "byo")
+        (self.byo / "cert.pem").unlink()
+        (self.byo / "key.pem").unlink()
+        code, out, _ = self.step()
+        self.assertEqual(code, 0)
+        self.regenerated(out)
+        self.assertEqual(self.live()[2], "self-signed")
+
+    def test_a_failed_write_leaves_the_live_pair(self):
+        self.step()
+        before = os.readlink(self.out / "live")
+        with patch.object(tls_cert.os, "symlink", side_effect=OSError("disk full")):
+            code, out, err = self.step("office.example")
+        self.assertEqual(code, 1)
+        self.assertEqual(len(err.splitlines()), 1)
+        self.assertEqual(os.readlink(self.out / "live"), before)
+        live, cert, _ = self.live()
+        key = serialization.load_pem_private_key((live / "key.pem").read_bytes(), None)
+        self.assertEqual(tls_cert._public(key.public_key()), tls_cert._public(cert.public_key()))
+
+
+class BringYourOwnTests(CertTestCase):
+    """S4.2."""
+
+    def put(self, cert_bytes=None, key_bytes=None):
+        if cert_bytes is not None:
+            (self.byo / "cert.pem").write_bytes(cert_bytes)
+        if key_bytes is not None:
+            (self.byo / "key.pem").write_bytes(key_bytes)
+
+    def test_used_as_given_with_a_chain(self):
+        server_cert, key_bytes = certificate(["files.example"])
+        other_cert, _ = certificate(["intermediate.example"])
+        self.put(server_cert + other_cert, key_bytes)
+        code, out, err = self.step(hostnames=None)
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("using your certificate from proxy/certs", out)
+        self.assertIn("files.example", out)
+        live, _, source = self.live()
+        self.assertEqual(source, "byo")
+        self.assertEqual((live / "cert.pem").read_bytes(), server_cert + other_cert)
+        self.assertEqual((live / "key.pem").read_bytes(), key_bytes)
+        self.assertEqual((live / "key.pem").stat().st_mode & 0o777, 0o600)
+        pair = os.readlink(self.out / "live")
+        self.step(hostnames=None)
+        self.assertEqual(os.readlink(self.out / "live"), pair, "unchanged files aren't installed again")
+
+    def test_wins_over_hostnames_and_replaces_a_self_signed_pair(self):
+        self.step()
+        self.assertEqual(self.live()[2], "self-signed")
+        self.put(*certificate(["files.example"]))
+        code, out, _ = self.step()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.live()[2], "byo")
+
+    def test_refusals(self):
+        cert_bytes, key_bytes = certificate(["files.example"])
+        _, other_key = certificate(["other.example"])
+        cases = [("only cert.pem", cert_bytes, None, "only one"),
+                 ("only key.pem", None, key_bytes, "only one"),
+                 ("not PEM", b"junk", key_bytes, "cert.pem"),
+                 ("key not PEM", cert_bytes, b"junk", "key.pem"),
+                 ("mismatched key", cert_bytes, other_key, "doesn't match")]
+        for name, cert_part, key_part, part in cases:
+            with self.subTest(case=name):
+                for path in self.byo.iterdir():
+                    path.unlink()
+                self.put(cert_part, key_part)
+                code, out, err = self.step()
+                self.assertEqual(code, 1)
+                self.assertEqual(out, "")
+                self.assertEqual(len(err.splitlines()), 1, err)
+                self.assertIn(part, err)
+                self.assertFalse((self.out / "live").exists())
+
+    def test_an_expired_certificate_is_used_with_a_warning(self):
+        self.put(*certificate(["files.example"], days=-1))
+        code, out, err = self.step()
+        self.assertEqual(code, 0)
+        self.assertIn("warning: the certificate in proxy/certs expired", err)
+        self.assertEqual(self.live()[2], "byo")
+
+
+# ── nginx ────────────────────────────────────────────────────────────────────
+
+def directives(text):
+    return [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+
+
+class NginxTests(unittest.TestCase):
+    """S3.1-S3.4."""
+
+    def setUp(self):
+        self.lan = (ROOT / "proxy" / "nginx.lan.conf").read_text()
+        self.default = (ROOT / "proxy" / "nginx.conf").read_text()
+        self.locations = (ROOT / "proxy" / "locations.conf").read_text()
+
+    def test_one_tls_server_on_443(self):
+        lines = directives(self.lan)
+        self.assertEqual([l for l in lines if l.startswith("listen")], ["listen 443 ssl;"])
+        self.assertEqual(lines.count("server {"), 1)
+        self.assertIn("http2 on;", lines)
+        self.assertIn("ssl_certificate     /etc/nginx/certs/live/cert.pem;", lines)
+        self.assertIn("ssl_certificate_key /etc/nginx/certs/live/key.pem;", lines)
+
+    def test_protocols_ciphers_and_no_hsts(self):
+        lines = directives(self.lan)
+        self.assertIn("ssl_protocols TLSv1.2 TLSv1.3;", lines)
+        self.assertIn("ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:"
+                      "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
+                      "DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305;", lines)
+        self.assertIn("ssl_prefer_server_ciphers off;", lines)
+        self.assertIn("ssl_session_tickets off;", lines)
+        for text in (self.lan, self.locations):
+            self.assertNotIn("strict-transport-security", "\n".join(directives(text)).lower())
+
+    def test_both_servers_share_the_locations(self):
+        include = "include /etc/nginx/rag/locations.conf;"
+        for text in (self.lan, self.default):
+            lines = directives(text)
+            self.assertEqual(lines.count(include), 1)
+            self.assertEqual([l for l in lines if l.startswith("location")], [], "locations belong in locations.conf")
+        self.assertEqual([l for l in directives(self.default) if l.startswith("listen")], ["listen 80;"])
+        upstreams = lambda text: re.findall(r"upstream \w+ \{[^}]*\}", text)
+        self.assertEqual(upstreams(self.lan), upstreams(self.default))
+        lines = directives(self.locations)
+        self.assertEqual([l for l in lines if l.startswith("location")],
+                         ["location = /api/goldstandard/regenerate {", "location /api/ {", "location / {"])
+        self.assertEqual(lines.count("proxy_set_header Host $http_host;"), 2)
+
+
+# ── embedded copies ──────────────────────────────────────────────────────────
+
+class ImplementationCopyTests(unittest.TestCase):
+    def test_embedded_copies_match(self):
+        document = (ROOT / "IMPLEMENTATION.md").read_text()
+        for name in ("docker-compose.lan.yml", "docker-compose.lan.verify.yml", "proxy/nginx.lan.conf",
+                     "proxy/locations.conf", "api/lan_mode.py", "api/tls_cert.py", "scripts/verify/18_lan.sh",
+                     "scripts/verify/lan_config.py", "scripts/verify/lan_stack.py", "scripts/tests/test_lan_mode.py"):
+            with self.subTest(name=name):
+                # A file holding ``` itself (this one) is fenced with ````.
+                header = "### " + name + "\n\n"
+                fence_at = document.index(header) + len(header)
+                fence_line = document[fence_at:document.index("\n", fence_at)]
+                ticks = fence_line[:len(fence_line) - len(fence_line.lstrip("`"))]
+                start = fence_at + len(fence_line) + 1
+                end = document.index("\n" + ticks + "\n", start)
+                self.assertEqual(document[start:end], (ROOT / name).read_text().rstrip("\n"))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+````
 
 ### scripts/tests/test_auth.py
 

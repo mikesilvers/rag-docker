@@ -21,6 +21,10 @@ ingest-inbox/*
 !ingest-inbox/.gitkeep
 
 # ── Secrets ──────────────────────────────────────────────────────────────────
+# Your own certificate and key for LAN mode (#26); the folder itself is kept so
+# docker-compose.lan.yml's read-only mount has something to mount.
+proxy/certs/*
+!proxy/certs/.gitkeep
 .env
 .env.*
 !.env.example

@@ -229,6 +229,14 @@ def is_set_up() -> bool:
     return found
 
 
+def has_enabled_engineer() -> bool:
+    """True when an enabled human Engineer exists: LAN mode refuses to start
+    without one (#26). A service principal can't log in, so it doesn't count."""
+    with _connect() as conn:
+        return conn.execute("SELECT 1 FROM users WHERE role = 'engineer' AND enabled = 1 AND kind = 'user' "
+                            "LIMIT 1").fetchone() is not None
+
+
 # ── accounts (the operator command and the admin routes) ─────────────────────
 
 def get_user(username: str) -> User | None:
