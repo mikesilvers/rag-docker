@@ -21,11 +21,19 @@ import uuid
 # The suite's session (#25); found beside this file however the file is loaded.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import auth_headers  # noqa: E402
+import auth_stack  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 API = os.environ.get('RAG_API', '')
 SCHEMA = runpy.run_path(str(ROOT / 'api/services/telemetry.py'))
 SENTINELS = ['OTEL285_SECRET_SENTINEL', 'OTEL285_CONTENT_SENTINEL', 'OTEL285_FILENAME_SENTINEL', 'OTEL285_PATH_SENTINEL']
+# The run's service key (#559), issued in main() and held in memory only.
+KEY = None
+
+
+def secrets_sent():
+    """Every planted or real secret value that must never be exported."""
+    return [*SENTINELS, *([KEY, KEY.split('_', 2)[2]] if KEY else [])]
 
 
 def owner():
@@ -146,9 +154,11 @@ def request(path, body=None, headers=None, method=None):
     owner()
     data = json.dumps(body).encode() if body is not None else None
     session = auth_headers.headers()
-    # The sentinel cookie beside the real session: neither may be exported.
+    # The run's real service key authenticates (an Authorization header alone
+    # decides, #552); the sentinel cookie and the real session go beside it.
+    # None of them may be exported.
     cookie = '; '.join(c for c in ('session='+SENTINELS[0], session.get('Cookie')) if c)
-    h = {'Content-Type': 'application/json', 'Authorization': 'Bearer '+SENTINELS[0],
+    h = {'Content-Type': 'application/json', 'Authorization': 'Bearer '+KEY,
          **session, 'Cookie': cookie, **(headers or {})}
     with urllib.request.urlopen(urllib.request.Request(API+path, data=data, headers=h, method=method),
                                 timeout=600) as response:
@@ -173,7 +183,7 @@ def upload(collection):
     data = ''.join(chunks).encode()
     with urllib.request.urlopen(urllib.request.Request(API+'/ingest/upload', data=data,
             headers={**h, **auth_headers.headers(), 'Content-Type': 'multipart/form-data; boundary='+boundary,
-                     'Authorization': 'Bearer '+SENTINELS[0]}), timeout=120) as r:
+                     'Authorization': 'Bearer '+KEY}), timeout=120) as r:
         job = json.load(r)['job_id']
     wait_job('/ingest/job/'+job)
     return remote
@@ -245,7 +255,7 @@ def inspect_records(snapshot, requests):
     assert isinstance(snapshot, dict), 'invalid capture snapshot'
     assert snapshot['overflow'] == 0, 'capture overflow: inspection incomplete'
     wire = json.dumps(snapshot)
-    assert all(s not in wire for s in SENTINELS), 'content/credential sentinel exported'
+    assert all(s not in wire for s in secrets_sent()), 'content/credential sentinel exported'
     token = auth_headers.session_token(os.environ.get('RAG_AUTH_JAR', ''))
     assert not token or token not in wire, 'the session cookie was exported'
     spans, logs, metrics = (records(snapshot, s) for s in ('traces', 'logs', 'metrics'))
@@ -393,7 +403,14 @@ def samples(collections):
             'two_jobs_seconds': time.monotonic()-start}, [(q, 'rag.query'), *[(x, 'rag.export') for x in jobs]]
 
 
+def admin_post(admin, path):
+    owner()
+    status = auth_stack.code('POST', '/auth/service-principals/'+path, token=admin)[0]
+    assert status == 200, 'service principal cleanup refused'
+
+
 def main():
+    global KEY
     assert os.environ.get('COMPOSE_PROJECT_NAME') == 'rag-verify'
     assert os.environ.get('RAG_VERIFY_TELEMETRY') == '1'
     assert API.startswith('http://localhost:') and API != 'http://localhost:8080/api'
@@ -414,7 +431,12 @@ def main():
               'limits': 'small synthetic sample; health timings include host lock checks; no production SLO claim',
               'modes': {}}
     primary = None
+    admin = name = key_id = None
     try:
+        owner()
+        admin = auth_headers.session_token(os.environ.get('RAG_AUTH_JAR', ''))
+        assert admin, 'no suite session to issue the service key with'
+        name, key_id, KEY = auth_stack.new_principal(admin, 'engineer')
         for c in collections:
             request('/collections', {'name': c, 'index_type': 'hnsw', 'distance_metric': 'cosine',
                     'hnsw_config': {'efConstruction': 128, 'maxConnections': 64, 'ef': 64}})
@@ -444,7 +466,7 @@ def main():
                 sink('/healthy', True)
         # Healthy final buffered work, bounded stop and clean fresh request trees.
         time.sleep(12)
-        assert all(s not in json.dumps(sink('/snapshot')) for s in SENTINELS), 'outage recovery leaked sentinel'
+        assert all(s not in json.dumps(sink('/snapshot')) for s in secrets_sent()), 'outage recovery leaked sentinel'
         sink('/reset', True)
         remote = query(collections[0])
         start = time.monotonic()
@@ -475,8 +497,10 @@ def main():
         cleanup([('receiver', lambda: sink('/healthy', True)),
                  ('collector', lambda: compose('start', 'otel-collector')),
                  ('api_mode', lambda: enabled(True)),
-                 *[('collection', lambda c=c: request('/collections/'+c+'?confirm=true', method='DELETE'))
-                   for c in collections]], primary)
+                 *([('collection', lambda c=c: request('/collections/'+c+'?confirm=true', method='DELETE'))
+                    for c in collections] if KEY else []),
+                 *([('key', lambda: admin_post(admin, name+'/keys/'+key_id+'/revoke')),
+                    ('principal', lambda: admin_post(admin, name+'/disable'))] if KEY else [])], primary)
 
 
 if __name__ == '__main__':
