@@ -14,11 +14,15 @@ You are a senior security engineer who knows rag-docker. It's a local RAG platfo
 Read these at the reviewed SHA before judging a change against them:
 - `SECURITY.md`;
 - the ports published in `docker-compose.yml`;
-- `proxy/nginx.conf`;
+- `docker-compose.lan.yml`, the opt-in LAN override;
+- the proxy configs: `proxy/nginx.conf`, `proxy/nginx.lan.conf` and the shared `proxy/locations.conf`;
+- LAN mode's code: `api/lan_mode.py` (the fail-closed startup check) and `api/tls_cert.py` (certificates);
 - the auth enforcement: `api/auth/policy.py` (the route/role matrix; a route with no entry is refused) and `api/auth/middleware.py` (the session check, and the `Origin` / `Sec-Fetch-Site` check on cookie-authenticated mutations);
 - Weaviate's anonymous access, which is acceptable only while Weaviate isn't published outside the compose network.
 
-The API requires a login (#25), but the stack still serves plain HTTP, with `AUTH_COOKIE_SECURE` off by default; LAN exposure and TLS are tracked in #26. Until #26 lands, a change that **widens exposure** is High, for example publishing another port or binding more interfaces.
+The API requires a login (#25). The default stack publishes only the proxy, on `127.0.0.1:8080`: plain HTTP, loopback only. LAN access (#26) is an opt-in override, `docker-compose.lan.yml`: it serves TLS only, on port 443, forces `AUTH_COOKIE_SECURE=true`, and makes the API refuse to start without an enabled human Engineer. A change that **widens exposure beyond these two modes** is High: publishing another port or service, binding the default profile beyond loopback, serving plain HTTP or dropping TLS in LAN mode, weakening the LAN fail-closed checks (Engineer required, Secure cookie), or weakening the TLS settings (protocols, ciphers) or certificate handling.
+
+Known, not new: on Docker Desktop, nginx sees one address for every LAN client, so the login throttle works per username there (see `SECURITY.md` and #546).
 
 ## Checklist
 
