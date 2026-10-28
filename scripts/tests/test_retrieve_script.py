@@ -33,7 +33,8 @@ ANSWER = {"answer": "Managers approve overtime.",
           "citations": [{"source_file": "policies.txt", "chunk_index": 2, "score": 0.9123,
                          "excerpt": "Overtime must be approved by a manager."}],
           "retrieval_latency_ms": 12, "llm_latency_ms": 345, "chunks_retrieved": 1}
-STDLIB = {"argparse", "json", "sys", "urllib.error", "urllib.request"}
+STDLIB = {"argparse", "getpass", "json", "os", "sys", "urllib.error", "urllib.parse", "urllib.request"}
+TOKEN = "stub-session-token"
 
 
 class Stub(BaseHTTPRequestHandler):
@@ -41,7 +42,24 @@ class Stub(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self.server.headers.append((self.path, self.headers.get("Origin"), self.headers.get("Cookie")))
+        if self.path.endswith("/auth/logout"):
+            self.server.requests.append((self.path, None))
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.server.requests.append((self.path, json.loads(body.decode("utf-8"))))
+        if self.path.endswith("/auth/login"):
+            status, payload = self.server.login
+            self.send_response(status)
+            if status == 200:
+                self.send_header("Set-Cookie", "rag_session=%s; HttpOnly; Max-Age=604800; Path=/; SameSite=strict" % TOKEN)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         status, payload, delay = self.server.reply
         if delay and self.server.release.wait(delay):
             return
@@ -70,6 +88,9 @@ class RetrieveScriptTests(unittest.TestCase):
     def setUp(self):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Stub)
         self.server.requests = []
+        self.server.headers = []
+        self.server.login = (200, json.dumps({"username": "alice", "role": "end_user",
+                                              "must_change_password": False}).encode("utf-8"))
         self.server.release = threading.Event()
         self.server.daemon_threads = True
         self.reply(200, ANSWER)
@@ -84,10 +105,11 @@ class RetrieveScriptTests(unittest.TestCase):
         data = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
         self.server.reply = (status, data, delay)
 
-    def run_script(self, *args, api=True):
+    def run_script(self, *args, api=True, stdin=None):
         argv = [sys.executable, "-I", "-S", str(self.script)]
         argv += (["--api-url", self.api] if api else []) + list(args)
-        return subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        env = {k: v for k, v in os.environ.items() if k != "RAG_USERNAME"}
+        return subprocess.run(argv, capture_output=True, text=True, timeout=60, input=stdin or "", env=env)
 
     def assert_failure(self, result, code, sentence):
         self.assertEqual(result.returncode, code, result.stderr)
@@ -209,6 +231,62 @@ class RetrieveScriptTests(unittest.TestCase):
     def test_a_response_that_is_not_json_exits_5(self):
         self.reply(200, b"<html>not json</html>")
         self.assert_failure(self.run_script("q"), 5, "The API returned a response that is not JSON.")
+
+
+    # -- #25: the API needs an account -----------------------------------------
+
+    def test_with_an_account_it_logs_in_asks_and_logs_out(self):
+        result = self.run_script("--username", "alice", "--password-stdin", "q", stdin="a password here\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([path for path, _ in self.server.requests],
+                         ["/api/auth/login", "/api/query", "/api/auth/logout"])
+        self.assertEqual(self.server.requests[0][1], {"username": "alice", "password": "a password here"})
+        origin = self.api.rsplit("/api", 1)[0]
+        self.assertEqual(self.server.headers[0], ("/api/auth/login", origin, None))
+        self.assertEqual(self.server.headers[1], ("/api/query", origin, "rag_session=" + TOKEN))
+        self.assertEqual(self.server.headers[2], ("/api/auth/logout", origin, "rag_session=" + TOKEN))
+        self.assertNotIn("a password here", result.stdout + result.stderr)
+
+    def test_the_username_can_come_from_the_environment(self):
+        argv = [sys.executable, "-I", "-S", str(self.script), "--api-url", self.api, "--password-stdin", "q"]
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=60, input="pw\n",
+                                env={**os.environ, "RAG_USERNAME": "bob"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.server.requests[0][1]["username"], "bob")
+
+    def test_a_refused_login_exits_5_and_asks_nothing(self):
+        self.server.login = (401, json.dumps({"error": {"code": "LOGIN_FAILED",
+                                                        "message": "The username or password is incorrect.",
+                                                        "detail": None}}).encode("utf-8"))
+        result = self.run_script("--username", "alice", "--password-stdin", "q", stdin="wrong\n")
+        self.assert_failure(result, 5, "The login was refused: The username or password is incorrect.")
+        self.assertEqual([path for path, _ in self.server.requests], ["/api/auth/login"])
+
+    def test_without_an_account_the_api_refusal_says_how_to_log_in(self):
+        self.reply(401, {"error": {"code": "AUTH_REQUIRED", "message": "Log in to use this.", "detail": None}})
+        result = self.run_script("q")
+        self.assert_failure(result, 5, "The API rejected the query: Log in to use this.")
+        self.assertIn("--username", result.stderr)
+
+    def test_a_password_change_due_says_to_use_the_web_ui(self):
+        self.reply(403, {"error": {"code": "PASSWORD_CHANGE_REQUIRED",
+                                   "message": "Change your password before doing anything else.", "detail": None}})
+        result = self.run_script("--username", "alice", "--password-stdin", "q", stdin="pw\n")
+        self.assert_failure(result, 5, "Change your password before doing anything else.")
+        self.assertIn("web UI", result.stderr)
+        self.assertEqual(self.server.requests[-1][0], "/api/auth/logout")
+
+    def test_password_usage_errors_exit_2_without_a_request(self):
+        self.assert_failure(self.run_script("--password-stdin", "q", stdin="pw\n"), 2,
+                            "--password-stdin needs --username.")
+        self.assert_failure(self.run_script("--username", "alice", "--password-stdin", "q", stdin=""), 2,
+                            "No password was given.")
+        self.assertEqual(self.server.requests, [])
+
+    def test_the_password_is_never_a_flag(self):
+        result = self.run_script("--help", api=False)
+        self.assertNotIn("--password ", result.stdout)
+        self.assertNotIn("--password=", result.stdout)
 
 
 if __name__ == "__main__":

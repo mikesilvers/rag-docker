@@ -555,6 +555,30 @@ class MetricsResponse(BaseModel):
     history: list[LatencyRecord]
 
 
+# ── Authentication (#25) ─────────────────────────────────────────────────────
+
+# Generous caps, so absurd input is a 422 before any hashing work; the real
+# rules (usernames 3-32 characters, passwords 12-256) are checked by the routes.
+class LoginRequest(BaseModel):
+    username: str = Field(max_length=256)
+    password: str = Field(max_length=1024)
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(max_length=1024)
+    new_password: str = Field(max_length=1024)
+
+
+class AuthStatus(BaseModel):
+    setup_required: bool
+
+
+class AuthUser(BaseModel):
+    username: str
+    role: Literal["end_user", "developer", "engineer"]
+    must_change_password: bool
+
+
 # ── Error ─────────────────────────────────────────────────────────────────────
 
 class ErrorDetail(BaseModel):

@@ -8,6 +8,7 @@ sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).reso
 import httpx
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs
 
 
@@ -18,7 +19,7 @@ def child_env():
     return {**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
 
 def client():
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app,raise_app_exceptions=False),base_url='http://owned-review')
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app,raise_app_exceptions=False),headers=auth_testing.headers(base_url='http://owned-review'), base_url='http://owned-review')
 
 class PersistenceTests(unittest.TestCase):
     def setUp(self):
@@ -42,6 +43,7 @@ from unittest.mock import patch, AsyncMock
 from config import settings
 settings.upload_dir = sys.argv[1]
 from main import app, lifespan
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs, weaviate_client as wc, importer, packager
 async def run():
     with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), patch.object(importer, 'sweep_interrupted_imports', return_value=[]), patch.object(importer, 'sweep_stale_workdirs', return_value=[]), patch.object(packager, 'sweep_build_leftovers', return_value=[]):
@@ -389,7 +391,7 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         with patch.object(gs,'_save_session_sync',side_effect=OSError('Owned marker write fault')):
             self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned completed deletion'),0)
         async def request():
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as client:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned-review'), base_url='http://owned-review') as client:
                 return await client.post('/goldstandard/save',json={'session_id':self.data['session_id'],'filename':'owned-review.json'})
         response=asyncio.run(request())
         self.assertEqual(response.status_code,409,response.text)
@@ -439,7 +441,7 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         return sid
 
     async def fetch(self,sid):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned-review'), base_url='http://owned-review') as client:
             return await client.get('/goldstandard/session/'+sid)
 
     def test_persistent_replace_failure_ends_generation_failed(self):
@@ -630,11 +632,12 @@ with patch.object(gs,'_save_session_sync',side_effect=OSError('Owned marker writ
         second="""import sys,asyncio,json,httpx
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs
 settings.upload_dir=sys.argv[1]
 gs.load_sessions_from_disk()
 async def run():
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as c:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned-review'), base_url='http://owned-review') as c:
         r=await c.post('/goldstandard/save',json={'session_id':'gs_450abcde','filename':'owned-restart.json'})
         return r.status_code,r.json()
 print(json.dumps({'export':list(asyncio.run(run())),'diagnostics':gs.session_diagnostics()}))

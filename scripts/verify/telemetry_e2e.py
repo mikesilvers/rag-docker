@@ -14,8 +14,13 @@ import runpy
 import threading
 import subprocess
 import time
+import sys
 import urllib.request
 import uuid
+
+# The suite's session (#25); found beside this file however the file is loaded.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import auth_headers  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 API = os.environ.get('RAG_API', '')
@@ -140,8 +145,11 @@ def sink(path, post=False):
 def request(path, body=None, headers=None, method=None):
     owner()
     data = json.dumps(body).encode() if body is not None else None
+    session = auth_headers.headers()
+    # The sentinel cookie beside the real session: neither may be exported.
+    cookie = '; '.join(c for c in ('session='+SENTINELS[0], session.get('Cookie')) if c)
     h = {'Content-Type': 'application/json', 'Authorization': 'Bearer '+SENTINELS[0],
-         'Cookie': 'session='+SENTINELS[0], **(headers or {})}
+         **session, 'Cookie': cookie, **(headers or {})}
     with urllib.request.urlopen(urllib.request.Request(API+path, data=data, headers=h, method=method),
                                 timeout=600) as response:
         return json.load(response)
@@ -164,7 +172,7 @@ def upload(collection):
     chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="files"; filename="{SENTINELS[2]}.txt"\r\nContent-Type: text/plain\r\n\r\nManagers approve overtime. {SENTINELS[1]}. Synthetic path /private/{SENTINELS[3]}. The policy requires approval before work.\r\n--{boundary}--\r\n')
     data = ''.join(chunks).encode()
     with urllib.request.urlopen(urllib.request.Request(API+'/ingest/upload', data=data,
-            headers={**h, 'Content-Type': 'multipart/form-data; boundary='+boundary,
+            headers={**h, **auth_headers.headers(), 'Content-Type': 'multipart/form-data; boundary='+boundary,
                      'Authorization': 'Bearer '+SENTINELS[0]}), timeout=120) as r:
         job = json.load(r)['job_id']
     wait_job('/ingest/job/'+job)
@@ -238,6 +246,8 @@ def inspect_records(snapshot, requests):
     assert snapshot['overflow'] == 0, 'capture overflow: inspection incomplete'
     wire = json.dumps(snapshot)
     assert all(s not in wire for s in SENTINELS), 'content/credential sentinel exported'
+    token = auth_headers.session_token(os.environ.get('RAG_AUTH_JAR', ''))
+    assert not token or token not in wire, 'the session cookie was exported'
     spans, logs, metrics = (records(snapshot, s) for s in ('traces', 'logs', 'metrics'))
     identities = [(span['trace_id'], span['span_id']) for span in spans]
     assert len(set(identities)) == len(identities), 'duplicate received span identity'

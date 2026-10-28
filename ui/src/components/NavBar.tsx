@@ -1,13 +1,14 @@
 import { Link, useNavigate } from 'react-router-dom'
-import { useRole } from '../context/RoleContext'
+import { useAuth } from '../context/AuthContext'
 
 export default function NavBar() {
-  const { role, setRole } = useRole()
+  const { user, logout } = useAuth()
   const navigate = useNavigate()
+  const role = user?.role ?? null
 
-  function switchRole() {
-    setRole(null)
-    navigate('/')
+  async function logOut() {
+    await logout()
+    navigate('/login', { replace: true })
   }
 
   const roleLabel = role === 'engineer' ? 'AI Engineer' : role === 'developer' ? 'Developer' : 'End User'
@@ -32,8 +33,11 @@ export default function NavBar() {
         </>
       )}
       <div className="ml-auto flex items-center gap-3">
+        <span className="text-sm text-gray-700" data-testid="nav-username">{user?.username}</span>
         <span className="text-xs bg-blue-100 text-blue-800 px-2 py-1 rounded">{roleLabel}</span>
-        <button onClick={switchRole} className="text-sm text-gray-500 hover:text-blue-600">Switch Role</button>
+        {/* A button, not a link: the nav's links are the role's pages. */}
+        <button onClick={() => navigate('/account/password')} className="text-sm text-gray-500 hover:text-blue-600">Change password</button>
+        <button onClick={logOut} className="text-sm text-gray-500 hover:text-blue-600">Log out</button>
       </div>
     </nav>
   )

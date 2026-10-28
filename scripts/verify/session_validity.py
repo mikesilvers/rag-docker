@@ -12,11 +12,12 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs, weaviate_client as wc, tuning
 
 collection=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Validity'+uuid.uuid4().hex[:12]
 session_id='gs_'+uuid.uuid4().hex[:8]
-client=TestClient(app)  # Do not run global startup sweeps alongside other tests.
+client=TestClient(app, headers=auth_testing.headers())  # Do not run global startup sweeps alongside other tests.
 creation_attempted=False
 with tempfile.TemporaryDirectory(prefix='validity-live-') as directory, patch.object(settings,'upload_dir',directory):
     try:

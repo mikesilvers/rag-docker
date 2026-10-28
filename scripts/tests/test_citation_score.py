@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 from weaviate.classes.config import VectorDistances
 
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from models.schemas import Citation
 from services import metrics, rag_pipeline
 from services import weaviate_client as wc
@@ -136,7 +137,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         answer = {"answer": "A", "retrieval_latency_ms": 1, "llm_latency_ms": 1, "chunks_retrieved": 2,
                   "citations": [{"source_file": "a.txt", "chunk_index": 0, "score": 0.91, "excerpt": "x"},
                                 {"source_file": "b.txt", "chunk_index": 1, "score": None, "excerpt": "y"}]}
-        client = TestClient(app, raise_server_exceptions=False)
+        client = TestClient(app, headers=auth_testing.headers(), raise_server_exceptions=False)
         self.addCleanup(client.close)
         with patch.object(wc, "collection_exists", AsyncMock(return_value=True)), \
                 patch.object(rag_pipeline, "run_query", AsyncMock(return_value=answer)), \
@@ -153,7 +154,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 weaviate = client_for(VectorDistances.COSINE, [obj(0, 0.1)])
                 coll = weaviate.collections.get.return_value
                 coll.config.get.side_effect = RuntimeError("config read failed")
-                client = TestClient(app, raise_server_exceptions=False)
+                client = TestClient(app, headers=auth_testing.headers(), raise_server_exceptions=False)
                 self.addCleanup(client.close)
                 with patch.object(wc, "get_client", return_value=weaviate), \
                         patch.object(wc, "collection_exists", AsyncMock(return_value=True)), \

@@ -229,7 +229,11 @@ else
     name=${run%%:*}; want=${run#*:}
     args=(--api-url "$API" --json --citations)
     [ "$name" = top2 ] && args+=(--top-k 2)
-    python3 -I -S "$RTMP/retrieve.py" "${args[@]}" "$QUESTION" > /tmp/vfy_p_r.json 2> /tmp/vfy_p_r.err
+    # As the End User test account (#25): the password goes in on stdin.
+    _rag_require_lock_owner
+    python3 ./auth_setup.py password end_user \
+      | python3 -I -S "$RTMP/retrieve.py" --username vfy-end-user --password-stdin "${args[@]}" "$QUESTION" \
+        > /tmp/vfy_p_r.json 2> /tmp/vfy_p_r.err
     rc=$?
     python3 - "$want" <<'ENDPY'
 import json, sys
@@ -244,8 +248,9 @@ ENDPY
     check "E8/E9: retrieve.py ($name) answers with $want citation(s)" $? \
       "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
   done
-  python3 -I -S "$RTMP/retrieve.py" --api-url "$API" --collection "$IMP" "$QUESTION" \
-    > /tmp/vfy_p_r.out 2> /tmp/vfy_p_r.err
+  python3 ./auth_setup.py password end_user \
+    | python3 -I -S "$RTMP/retrieve.py" --username vfy-end-user --password-stdin --api-url "$API" \
+        --collection "$IMP" "$QUESTION" > /tmp/vfy_p_r.out 2> /tmp/vfy_p_r.err
   rc=$?
   [ "$rc" = 0 ] && [ -n "$(tr -d '[:space:]' < /tmp/vfy_p_r.out)" ]
   check "E11: retrieve.py answers from the imported collection" $? "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"

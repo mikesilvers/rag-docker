@@ -25,6 +25,8 @@ ENV/
 # Runtime data. UPLOAD_DIR is the named volume ingest_uploads mounted at
 # /app/uploads, so anything here would be baked in and then hidden by the mount.
 uploads/
+# The auth_data volume (accounts and sessions, #25) is mounted the same way.
+auth_data/
 
 # OS and editor noise
 .DS_Store

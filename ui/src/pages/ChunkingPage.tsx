@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { api, CollectionInfo, IngestConfig } from '../api/client'
 import StrategyExplainer from '../components/StrategyExplainer'
-import { useRole } from '../context/RoleContext'
+import { useRole } from '../context/AuthContext'
 
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
 

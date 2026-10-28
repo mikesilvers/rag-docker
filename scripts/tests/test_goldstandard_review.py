@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs
 
 SID = "gs_381abcde"
@@ -55,7 +56,7 @@ class ReviewErrorTests(unittest.TestCase):
         self.addCleanup(model.stop)
         gs.store_session(session())
         self.sessions = Path(self.temp.name) / "goldstandard_sessions"
-        self.client = TestClient(app)        # no startup sweeps
+        self.client = TestClient(app, headers=auth_testing.headers())        # no startup sweeps
 
     def state(self):
         """The session store on disk and in the cache."""

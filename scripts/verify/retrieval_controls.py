@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock,patch
 from fastapi.testclient import TestClient
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import weaviate_client as wc,rag_pipeline as rag
 
 prefix=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Controls'+uuid.uuid4().hex[:10]
@@ -25,7 +26,7 @@ if importlib.util.find_spec('services.collection_recovery'):
 else:
     recovery=None  # The pre-recovery baseline sweeps legacy staging markers.
 
-client=TestClient(app)
+client=TestClient(app, headers=auth_testing.headers())
 with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patch.object(settings,'upload_dir',directory):
     try:
         for index in ('hnsw','flat'):
