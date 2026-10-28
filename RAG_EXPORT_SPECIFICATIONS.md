@@ -326,7 +326,10 @@ the same passphrase.
   payload in 64 KiB plaintext chunks with ChaCha20-Poly1305, all as the age
   specification defines. The tar.gz writer streams through the encryptor into the
   temporary file: no unencrypted archive is written, and only one chunk is held in
-  memory.
+  memory. The package's files are still staged unencrypted in
+  `./exports/.build-*` while the export runs (§6.1), removed when it ends or by
+  the next start-up's sweep; moving that staging out of the bind mount is a
+  follow-up.
 - **Decryption** accepts only a header that parses under the age grammar and
   holds one stanza, of type `scrypt`, with a canonical 16-byte salt, a work
   factor, and a 32-byte body. A work factor that is not one or two decimal digits

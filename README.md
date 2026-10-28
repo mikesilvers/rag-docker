@@ -475,14 +475,19 @@ Add a `passphrase` (12 to 1024 characters) to the export, or tick **Encrypt with
 passphrase** on the Transfer page:
 
 ```bash
-curl -X POST http://localhost:8080/api/export \
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/export \
   -H 'Content-Type: application/json' \
   -d '{"collection": "Policies", "passphrase": "<a long passphrase>"}'
 ```
 
 The package is then written as `ragpkg-...tar.gz.age`: an
-[age](https://age-encryption.org) file encrypted with that passphrase (scrypt),
-streamed so a package of several GB never sits in memory or on disk unencrypted.
+[age](https://age-encryption.org) file encrypted with that passphrase (scrypt).
+The archive is encrypted as it is written, so it is never held in memory and no
+unencrypted archive is written. While the export runs, though, the package's
+files are staged unencrypted in a hidden `./exports/.build-*` folder, which is
+removed when the export ends (or at the next start-up if the API was killed).
+Since `./exports/` is a host folder, anyone who can read it during an export can
+read those files; moving the staging out of it is a follow-up.
 Import needs the same passphrase, and `age -d` opens the file as well. Import
 accepts a scrypt work factor of at most 20 (about 1 GiB of memory to derive the
 key) and refuses a higher one as `DECRYPT_FAILED` before deriving anything; age's

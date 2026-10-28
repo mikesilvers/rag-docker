@@ -45,6 +45,7 @@ from fastapi.testclient import TestClient
 
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import age_stream, exporter, importer, packager, retrieval_config
 from services import weaviate_client as wc
 
@@ -684,7 +685,7 @@ class ImportJob(Fixture):
 class Api(Fixture):
     def setUp(self):
         super().setUp()
-        self.client = TestClient(app, raise_server_exceptions=False)
+        self.client = TestClient(app, headers=auth_testing.headers(), raise_server_exceptions=False)
         self.stack.enter_context(patch.object(importer, "_active", set()))
 
     def test_import_refuses_a_missing_or_unexpected_passphrase_before_any_job(self):
@@ -839,6 +840,88 @@ class Api(Fixture):
         self.assertEqual((plain["encrypted"], plain["readable"], plain["collection"]), (False, True, "Corpus"))
         self.assertEqual(sorted(p.name for p in self.exports.iterdir()),
                          sorted(listed), "the listing wrote something beside the packages")
+
+
+class Telemetry(Fixture):
+    """Decision 5 on #27: the passphrase never reaches telemetry. An encrypted
+    export, an import with a wrong passphrase and one with the right one run
+    through the router with tracing on; no span (its name, attributes, events or
+    status, serialized as it would be sent) and no telemetry log record holds it."""
+
+    def test_the_passphrase_never_reaches_telemetry(self):
+        import httpx
+        from fastapi import FastAPI
+        from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+        from opentelemetry.sdk.trace.sampling import TraceIdRatioBased
+        from routers import transfer
+        from services import telemetry as ot
+
+        memory = InMemorySpanExporter()
+        provider = TracerProvider(sampler=TraceIdRatioBased(1), shutdown_on_exit=False)
+        provider.add_span_processor(SimpleSpanProcessor(memory))
+        self.addCleanup(provider.shutdown)
+        runtime = ot.Runtime(ot.Config())
+        runtime.tracer = provider.get_tracer("test")
+        runtime.logger = MagicMock()
+        api = FastAPI()
+        api.state.telemetry = runtime
+        api.add_middleware(ot.RequestTracing)
+        api.include_router(transfer.router)
+        wrong = "a wrong passphrase, also secret"
+
+        async def until(predicate):
+            for _ in range(2000):
+                if predicate():
+                    return
+                await asyncio.sleep(0.005)
+            self.fail("the job did not finish")
+
+        async def scenario():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api), base_url="http://test") as client:
+                started = await client.post("/export", json={"collection": "Corpus", "passphrase": PASSPHRASE})
+                self.assertEqual(started.status_code, 202, started.text)
+                export_id = started.json()["job_id"]
+                await until(lambda: exporter.get_job(export_id)["status"] in ("completed", "failed"))
+                job = exporter.get_job(export_id)
+                self.assertEqual(job["status"], "completed", job)
+                ids = []
+                for phrase in (wrong, PASSPHRASE):
+                    response = await client.post("/import", json={"filename": job["filename"], "on_conflict": "abort",
+                                                                   "passphrase": phrase})
+                    self.assertEqual(response.status_code, 202, response.text)
+                    ids.append(response.json()["job_id"])
+                    await until(lambda: importer.get_job(ids[-1])["status"] in ("completed", "failed"))
+                return [importer.get_job(i) for i in ids]
+
+        with patch.object(wc, "collection_exists", return_value=True), \
+             patch.object(packager, "read_chunks", return_value=[]), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={"embedding_model": settings.embed_model}), \
+             patch.object(packager, "_ingest_config", return_value=None), \
+             patch.object(packager, "_goldstandard_sessions", return_value=[]), \
+             patch.object(packager.sources, "load_index", return_value={"documents": {}}), \
+             patch.object(packager.wc, "_meta_sync", return_value={"version": "test"}), \
+             patch.object(importer, "_check_embedding"), \
+             patch.object(importer, "_ensure_models", return_value=[]), \
+             patch.object(wc, "_collection_exists_sync", side_effect=RuntimeError("stop before the backend")), \
+             patch.object(importer, "_active", set()):
+            failed, stopped = asyncio.run(scenario())
+        self.assertEqual(failed["error_code"], "DECRYPT_FAILED")
+        self.assertEqual(stopped["error_code"], "IMPORT_FAILED")   # past decryption, at the mocked backend
+        spans = memory.get_finished_spans()
+        names = {span.name for span in spans}
+        self.assertTrue({"rag.export", "rag.import"} <= names, names)
+        wire = encode_spans(spans).SerializeToString()
+        self.assertTrue(runtime.logger.emit.called, "no telemetry log record was emitted")
+        records = repr(runtime.logger.mock_calls).encode()
+        for phrase in (PASSPHRASE, wrong):
+            with self.subTest(phrase=phrase[:8]):
+                self.assertNotIn(phrase.encode(), wire)
+                self.assertNotIn(phrase.encode(), records)
+                for span in spans:
+                    self.assertNotIn(phrase, repr(dict(span.attributes or {})) + repr(span.events) + repr(span.status))
 
 
 class EmbeddedCopies(unittest.TestCase):
