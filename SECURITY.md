@@ -49,8 +49,17 @@ request but `/health` and the login (#25).
   HTTP the session cookie is not marked `Secure` (`AUTH_COOKIE_SECURE=false`);
   set it to `true` only when the stack is served over TLS. LAN exposure and TLS
   are tracked in #26.
-- **Not covered yet.** Service API keys for automation (and the MCP server,
-  #39) are a later part of #25; a durable audit trail is #29. `GET /health` is open, for container healthchecks, and
+- **Service API keys.** Programs authenticate with keys issued by AI Engineers
+  to service principals, accounts that can't log in to the browser; keys are
+  never issued to people. A key is 256 random bits, shown once at issuance;
+  only its SHA-256 is stored. It is accepted only as `Authorization: Bearer`,
+  never from a URL, cookie or other header, and is never logged. A key has its
+  principal's role at each request, can't manage accounts or keys, expires
+  (at most 365 days, 90 by default) and can be revoked; disabling the principal
+  stops all its keys. Key requests carry no cookie, so they skip the origin
+  check. See README "Service keys".
+- **Not covered yet.** The MCP server's use of keys is #39; a durable audit
+  trail is #29. `GET /health` is open, for container healthchecks, and
   reports service status and host resources.
 
 Exposing the workbench to an untrusted network is outside the supported

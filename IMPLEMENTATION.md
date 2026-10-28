@@ -773,7 +773,7 @@ settings = Settings()
 ```python
 from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
-from pydantic import AfterValidator, BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator, SecretStr
+from pydantic import AfterValidator, BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator, SecretStr, StrictInt
 
 from services.collection_writes import canonical
 
@@ -1395,6 +1395,7 @@ class AuthUser(BaseModel):
     username: str
     role: Literal["end_user", "developer", "engineer"]
     must_change_password: bool
+    kind: Optional[Literal["user", "service"]] = None   # GET /auth/me: a session's user or a key's principal
 
 
 class AdminUser(BaseModel):
@@ -1421,6 +1422,44 @@ class UserCreateRequest(BaseModel):
 
 class RoleChangeRequest(BaseModel):
     role: Literal["end_user", "developer", "engineer"]
+
+
+class ServiceKey(BaseModel):
+    id: str
+    label: str
+    created_at: str
+    expires_at: str
+    revoked_at: Optional[str]
+    last_used_at: Optional[str]
+    status: Literal["active", "expired", "revoked"]
+
+
+class ServicePrincipal(BaseModel):
+    name: str
+    role: Literal["end_user", "developer", "engineer"]
+    enabled: bool
+    created_at: str
+    keys: list[ServiceKey]
+
+
+class ServicePrincipalList(BaseModel):
+    principals: list[ServicePrincipal]
+
+
+class ServicePrincipalResult(BaseModel):
+    principal: ServicePrincipal
+    key: Optional[ServiceKey] = None
+    secret: Optional[str] = None   # a newly issued key, in this answer only
+
+
+class PrincipalCreateRequest(BaseModel):
+    name: str = Field(max_length=256)
+    role: Literal["end_user", "developer", "engineer"]
+
+
+class KeyIssueRequest(BaseModel):
+    label: str = Field(default="", max_length=64)
+    days: StrictInt = Field(default=90, ge=1, le=365)
 
 
 # ── Error ─────────────────────────────────────────────────────────────────────
@@ -11894,15 +11933,18 @@ alone.
 ### api/auth/__init__.py
 
 ```python
-"""Accounts, sessions and the API's endpoint/role matrix (#25).
+"""Accounts, sessions, service API keys and the API's endpoint/role matrix (#25).
 
 - `passwords`: the username and password rules, scrypt hashing, generated passwords.
-- `store`: the SQLite file in AUTH_DIR holding accounts, sessions and the login throttle.
+- `store`: the SQLite file in AUTH_DIR holding accounts, service principals and
+  their API keys, sessions and the login throttle.
+- `keys`: the service API key format (`Authorization: Bearer rag_<id>_<secret>`).
 - `policy`: which role each route needs.
 - `middleware`: enforces the policy on every request, before the route sees its body.
 - `__main__`: the operator command, `python -m auth`, which creates the first
   Engineer and recovers lockouts; Engineers manage accounts in the app too
-  (routers/auth.py, the Users page).
+  (routers/auth.py, the Users page) and service principals and their keys
+  (the Service keys page).
 - `testing`: a real account and session in a temporary store, for in-process tests.
 """
 ```
@@ -12021,6 +12063,64 @@ def dummy_hash() -> str:
     return _dummy_hash
 ```
 
+### api/auth/keys.py
+
+```python
+"""The service API key format (#25, PR 3).
+
+A key is `rag_` + a 12-character key id + `_` + 43 random characters
+(secrets.token_urlsafe(32), 256 bits): 60 characters. The id names the key in
+listings and logs and finds its row; it doesn't authenticate on its own. The
+store keeps only the id and the SHA-256 of the whole key: the key is random
+and high-entropy, so a slow hash would add nothing (as for session tokens).
+
+Keys are sent only as `Authorization: Bearer <key>`; nothing reads one from a
+query parameter, a cookie or another header.
+"""
+from __future__ import annotations
+
+import hashlib
+import re
+import secrets
+import string
+
+PREFIX = "rag_"
+ID_LENGTH = 12
+SECRET_LENGTH = 43
+LENGTH = len(PREFIX) + ID_LENGTH + 1 + SECRET_LENGTH
+_ID_ALPHABET = string.ascii_lowercase + string.digits
+_KEY = re.compile(r"rag_([a-z0-9]{12})_[A-Za-z0-9_-]{43}")
+
+
+def generate() -> tuple[str, str]:
+    """A new (key id, key)."""
+    key_id = "".join(secrets.choice(_ID_ALPHABET) for _ in range(ID_LENGTH))
+    return key_id, f"{PREFIX}{key_id}_{secrets.token_urlsafe(32)}"
+
+
+def key_id(key: str) -> str | None:
+    """The id of a key of the right shape, or None."""
+    if not isinstance(key, str) or len(key) != LENGTH:
+        return None
+    found = _KEY.fullmatch(key)
+    return found.group(1) if found else None
+
+
+def digest(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def bearer(value: str | None) -> str | None:
+    """The key in an `Authorization` value of the form `Bearer <key>` (scheme
+    case-insensitive, one space), or None."""
+    if not value:
+        return None
+    scheme, sep, key = value.partition(" ")
+    if not sep or scheme.lower() != "bearer" or key_id(key) is None:
+        return None
+    return key
+```
+
 ### api/auth/policy.py
 
 ```python
@@ -12087,12 +12187,29 @@ ACCESS: dict[tuple[str, str], str] = {
     ("POST", "/auth/users/{username}/role"): ENGINEER,
     ("POST", "/auth/users/{username}/disable"): ENGINEER,
     ("POST", "/auth/users/{username}/enable"): ENGINEER,
+    # Service principals and their keys (PR 3 of #25). Nothing deletes a principal.
+    ("GET", "/auth/service-principals"): ENGINEER,
+    ("POST", "/auth/service-principals"): ENGINEER,
+    ("POST", "/auth/service-principals/{name}/role"): ENGINEER,
+    ("POST", "/auth/service-principals/{name}/disable"): ENGINEER,
+    ("POST", "/auth/service-principals/{name}/enable"): ENGINEER,
+    ("POST", "/auth/service-principals/{name}/keys"): ENGINEER,
+    ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke"): ENGINEER,
     # FastAPI's own API docs (N5).
     ("GET", "/docs"): ENGINEER,
     ("GET", "/docs/oauth2-redirect"): ENGINEER,
     ("GET", "/redoc"): ENGINEER,
     ("GET", "/openapi.json"): ENGINEER,
 }
+
+
+# Routes an API key can't use, whatever its principal's role (S5 of PR 3):
+# account, principal and key administration, so a leaked key can't mint further
+# keys or accounts that outlive its revocation, and the session's own routes.
+# GET /auth/me answers for a key.
+HUMAN_ONLY = frozenset(path for _, path in ACCESS
+                       if path.startswith(("/auth/users", "/auth/service-principals"))) | {
+    "/auth/logout", "/auth/password"}
 
 
 def required(method: str, path: str) -> str | None:
@@ -12129,7 +12246,8 @@ def match(method: str, path: str) -> str | None:
 ### api/auth/store.py
 
 ```python
-"""Accounts, sessions and the login throttle, in one SQLite file (#25).
+"""Accounts, service principals and their keys, sessions and the login
+throttle, in one SQLite file (#25).
 
 The file is `auth.db` in AUTH_DIR, the auth_data volume, so all three survive an
 API restart. The API and the operator command (`python -m auth`) open it from
@@ -12140,10 +12258,15 @@ can't both pass it.
 Every function opens its own short connection. Nothing here is cached except
 the fact that the system is set up, which can't become false again: no
 command deletes an account.
+
+A service principal (PR 3) is a `users` row with kind 'service': it shares the
+username rule and name pool with people, has no usable password and no
+session, and authenticates only with its API keys (`api_keys`, keys.py).
 """
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 import secrets
 import sqlite3
@@ -12154,7 +12277,7 @@ from pathlib import Path
 
 from config import settings
 
-from . import passwords
+from . import keys, passwords
 from .policy import ROLES
 
 COOKIE = "rag_session"
@@ -12164,6 +12287,11 @@ _TOUCH_S = 60                    # last_seen is written at most once a minute
 THROTTLE_FAILURES = 5            # failed logins per (username, address) ...
 THROTTLE_WINDOW_S = 15 * 60      # ... within 15 minutes ...
 LOCKOUT_S = 15 * 60              # ... lock that pair for 15 minutes
+KEY_DAYS_DEFAULT = 90            # a key's lifetime when none is given (Q23) ...
+KEY_DAYS_MAX = 365               # ... and the longest allowed
+_DAY_S = 86400
+NO_PASSWORD = "!"                # a principal's password hash: never verifies
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -12195,6 +12323,17 @@ CREATE TABLE IF NOT EXISTS login_lockouts (
     until REAL NOT NULL,
     PRIMARY KEY (username, address)
 );
+CREATE TABLE IF NOT EXISTS api_keys (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    key_hash TEXT NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    revoked_at REAL,
+    last_used REAL
+);
+CREATE INDEX IF NOT EXISTS api_keys_user ON api_keys(user_id);
 """
 
 _ready: set[str] = set()
@@ -12204,7 +12343,8 @@ _set_up: set[str] = set()
 class Refused(Exception):
     """An account change the rules don't allow; the message says why, in one line.
     `code` names the reason for the API: USER_EXISTS, USER_NOT_FOUND,
-    LAST_ENGINEER, or REFUSED for the bootstrap rules."""
+    LAST_ENGINEER, PRINCIPAL_EXISTS, PRINCIPAL_NOT_FOUND, KEY_NOT_FOUND,
+    NOT_A_USER, or REFUSED for the bootstrap rules."""
 
     def __init__(self, message: str, code: str = "REFUSED"):
         super().__init__(message)
@@ -12217,7 +12357,9 @@ class Principal:
     username: str
     role: str
     must_change_password: bool
-    token_hash: str
+    token_hash: str              # the session's; "" for a key
+    kind: str = "user"           # "service" when authenticated by a key
+    key_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -12229,6 +12371,32 @@ class User:
     enabled: bool
     must_change_password: bool
     created_at: float
+    kind: str = "user"
+
+
+@dataclass(frozen=True)
+class Key:
+    id: str
+    label: str
+    created_at: float
+    expires_at: float
+    revoked_at: float | None
+    last_used: float | None
+
+    def status(self, now: float | None = None) -> str:
+        if self.revoked_at is not None:
+            return "revoked"
+        return "expired" if (now if now is not None else _now()) >= self.expires_at else "active"
+
+
+@dataclass(frozen=True)
+class ServicePrincipal:
+    id: int
+    name: str
+    role: str
+    enabled: bool
+    created_at: float
+    keys: tuple[Key, ...]
 
 
 def _now() -> float:
@@ -12253,8 +12421,7 @@ def _connect(write: bool = False):
             try:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.executescript(_SCHEMA)
-                conn.execute("PRAGMA user_version = 1")
-                conn.commit()
+                _migrate(conn)
             finally:
                 conn.close()
         finally:
@@ -12274,11 +12441,22 @@ def _connect(write: bool = False):
         conn.close()
 
 
+def _migrate(conn) -> None:
+    """Version 2 (PR 3): users.kind. In a write transaction, so the API and the
+    operator command can't both add the column."""
+    conn.execute("BEGIN IMMEDIATE")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+    if "kind" not in columns:
+        conn.execute("ALTER TABLE users ADD COLUMN kind TEXT NOT NULL DEFAULT 'user'")
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    conn.commit()
+
+
 def _user(row) -> User | None:
     if row is None:
         return None
     return User(row["id"], row["username"], row["role"], row["password_hash"],
-                bool(row["enabled"]), bool(row["must_change_password"]), row["created_at"])
+                bool(row["enabled"]), bool(row["must_change_password"]), row["created_at"], row["kind"])
 
 
 def _token_hash(token: str) -> str:
@@ -12306,9 +12484,14 @@ def get_user(username: str) -> User | None:
         return _user(conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone())
 
 
-def list_users() -> list[User]:
+def list_users(kind: str | None = "user") -> list[User]:
+    """Human accounts by default; kind=None lists principals too (the operator's `list`)."""
     with _connect() as conn:
-        return [_user(row) for row in conn.execute("SELECT * FROM users ORDER BY username")]
+        if kind is None:
+            rows = conn.execute("SELECT * FROM users ORDER BY username")
+        else:
+            rows = conn.execute("SELECT * FROM users WHERE kind = ? ORDER BY username", (kind,))
+        return [_user(row) for row in rows]
 
 
 def _check_role(role: str) -> None:
@@ -12329,7 +12512,8 @@ def create_user(username: str, role: str, password: str, *, bootstrap: bool = Fa
         if not bootstrap and not exists:
             raise Refused("the system is not set up yet; run bootstrap first")
         if conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
-            raise Refused(f"the user {username!r} already exists", "USER_EXISTS")
+            # One name pool for people and service principals (S3).
+            raise Refused(f"the name {username!r} is already taken", "USER_EXISTS")
         conn.execute("INSERT INTO users (username, role, password_hash, enabled, must_change_password, "
                      "created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?)",
                      (username, role, password_hash, int(must_change_password), now, now))
@@ -12337,46 +12521,54 @@ def create_user(username: str, role: str, password: str, *, bootstrap: bool = Fa
     return _user(row)
 
 
-def _existing(conn, username: str):
+def _existing(conn, username: str, kind: str | None = None):
+    """The row of `username`; with `kind`, only an account of that kind counts."""
     row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
-    if row is None:
+    if row is None or (kind is not None and row["kind"] != kind):
+        if kind == "service":
+            raise Refused(f"there is no service principal {username!r}", "PRINCIPAL_NOT_FOUND")
         raise Refused(f"there is no user {username!r}", "USER_NOT_FOUND")
     return row
 
 
 def _is_last_engineer(conn, row) -> bool:
-    if row["role"] != "engineer" or not row["enabled"]:
+    # Only people count: a service principal can't log in to administer (S4).
+    if row["role"] != "engineer" or not row["enabled"] or row["kind"] != "user":
         return False
-    others = conn.execute("SELECT COUNT(*) FROM users WHERE role = 'engineer' AND enabled = 1 AND id != ?",
-                          (row["id"],)).fetchone()[0]
+    others = conn.execute("SELECT COUNT(*) FROM users WHERE role = 'engineer' AND enabled = 1 AND kind = 'user' "
+                          "AND id != ?", (row["id"],)).fetchone()[0]
     return others == 0
 
 
-def reset_password(username: str, password: str) -> None:
-    """A new password the user must change at next login; every session of theirs ends."""
+def reset_password(username: str, password: str, kind: str | None = None) -> None:
+    """A new password the user must change at next login; every session of theirs ends.
+    A service principal has no password, so it is refused."""
     password_hash = passwords.hash_password(password)
     with _connect(write=True) as conn:
-        row = _existing(conn, username)
+        row = _existing(conn, username, kind)
+        if row["kind"] != "user":
+            raise Refused(f"{username!r} is a service principal; it has no password", "NOT_A_USER")
         conn.execute("UPDATE users SET password_hash = ?, must_change_password = 1, updated_at = ? "
                      "WHERE id = ?", (password_hash, _now(), row["id"]))
         conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
 
 
-def set_role(username: str, role: str) -> None:
-    """Sessions stay; the next request of each one runs with the new role."""
+def set_role(username: str, role: str, kind: str | None = None) -> None:
+    """Sessions and keys stay; the next request of each one runs with the new role."""
     _check_role(role)
     with _connect(write=True) as conn:
-        row = _existing(conn, username)
+        row = _existing(conn, username, kind)
         if role != "engineer" and _is_last_engineer(conn, row):
             raise Refused(f"{username!r} is the last enabled engineer; make another engineer first",
                           "LAST_ENGINEER")
         conn.execute("UPDATE users SET role = ?, updated_at = ? WHERE id = ?", (role, _now(), row["id"]))
 
 
-def set_enabled(username: str, enabled: bool) -> None:
-    """Disabling ends every session of the user."""
+def set_enabled(username: str, enabled: bool, kind: str | None = None) -> None:
+    """Disabling ends every session of the user; a disabled principal's keys fail
+    until it is enabled again."""
     with _connect(write=True) as conn:
-        row = _existing(conn, username)
+        row = _existing(conn, username, kind)
         if not enabled and _is_last_engineer(conn, row):
             raise Refused(f"{username!r} is the last enabled engineer; make another engineer first",
                           "LAST_ENGINEER")
@@ -12384,6 +12576,93 @@ def set_enabled(username: str, enabled: bool) -> None:
                      (int(enabled), _now(), row["id"]))
         if not enabled:
             conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+
+
+# ── service principals and their keys (PR 3) ─────────────────────────────────
+
+def _key(row) -> Key:
+    return Key(row["id"], row["label"], row["created_at"], row["expires_at"], row["revoked_at"], row["last_used"])
+
+
+def _principal(conn, row) -> ServicePrincipal:
+    rows = conn.execute("SELECT * FROM api_keys WHERE user_id = ? ORDER BY created_at DESC, id",
+                        (row["id"],)).fetchall()
+    return ServicePrincipal(row["id"], row["username"], row["role"], bool(row["enabled"]), row["created_at"],
+                            tuple(_key(k) for k in rows))
+
+
+def create_principal(name: str, role: str) -> ServicePrincipal:
+    """A service principal: no usable password, no session, keys only. Only after bootstrap."""
+    _check_role(role)
+    now = _now()
+    with _connect(write=True) as conn:
+        if conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is None:
+            raise Refused("the system is not set up yet; run bootstrap first")
+        if conn.execute("SELECT 1 FROM users WHERE username = ?", (name,)).fetchone():
+            raise Refused(f"the name {name!r} is already taken", "PRINCIPAL_EXISTS")
+        conn.execute("INSERT INTO users (username, role, password_hash, enabled, must_change_password, "
+                     "created_at, updated_at, kind) VALUES (?, ?, ?, 1, 0, ?, ?, 'service')",
+                     (name, role, NO_PASSWORD, now, now))
+        return _principal(conn, _existing(conn, name, "service"))
+
+
+def get_principal(name: str) -> ServicePrincipal:
+    with _connect() as conn:
+        return _principal(conn, _existing(conn, name, "service"))
+
+
+def list_principals() -> list[ServicePrincipal]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT * FROM users WHERE kind = 'service' ORDER BY username").fetchall()
+        return [_principal(conn, row) for row in rows]
+
+
+def issue_key(name: str, days: int = KEY_DAYS_DEFAULT, label: str = "") -> tuple[Key, str]:
+    """A new key for the principal; returns it and its plaintext, which is stored
+    nowhere. Older keys stay valid until revoked or expired (Q24)."""
+    if not (isinstance(days, int) and 1 <= days <= KEY_DAYS_MAX):
+        raise ValueError(f"days must be a whole number from 1 to {KEY_DAYS_MAX}")
+    key_id, key = keys.generate()
+    now = _now()
+    with _connect(write=True) as conn:
+        row = _existing(conn, name, "service")
+        conn.execute("INSERT INTO api_keys (id, user_id, key_hash, label, created_at, expires_at) "
+                     "VALUES (?, ?, ?, ?, ?, ?)", (key_id, row["id"], keys.digest(key), label, now,
+                                                   now + days * _DAY_S))
+        stored = conn.execute("SELECT * FROM api_keys WHERE id = ?", (key_id,)).fetchone()
+    return _key(stored), key
+
+
+def revoke_key(name: str, key_id: str) -> Key:
+    """Revoke a key of the principal; a revoked key keeps its first revoked time."""
+    with _connect(write=True) as conn:
+        row = _existing(conn, name, "service")
+        found = conn.execute("SELECT * FROM api_keys WHERE id = ? AND user_id = ?", (key_id, row["id"])).fetchone()
+        if found is None:
+            raise Refused(f"{name!r} has no key {key_id!r}", "KEY_NOT_FOUND")
+        conn.execute("UPDATE api_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", (_now(), key_id))
+        return _key(conn.execute("SELECT * FROM api_keys WHERE id = ?", (key_id,)).fetchone())
+
+
+def authenticate_key(key: str | None) -> Principal | None:
+    """The key's principal as it is now, or None when the key is malformed,
+    unknown, revoked or expired, or its principal is disabled."""
+    key_id = keys.key_id(key) if key else None
+    if key_id is None:
+        return None
+    now = _now()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT k.key_hash, k.expires_at, k.revoked_at, k.last_used, u.id, u.username, u.role, u.enabled, "
+            "u.kind FROM api_keys k JOIN users u ON u.id = k.user_id WHERE k.id = ?", (key_id,)).fetchone()
+    if row is None or not hmac.compare_digest(row["key_hash"], keys.digest(key)):
+        return None
+    if row["revoked_at"] is not None or now >= row["expires_at"] or not row["enabled"] or row["kind"] != "service":
+        return None
+    if row["last_used"] is None or now - row["last_used"] > _TOUCH_S:
+        with _connect(write=True) as conn:
+            conn.execute("UPDATE api_keys SET last_used = ? WHERE id = ?", (now, key_id))
+    return Principal(row["id"], row["username"], row["role"], False, "", "service", key_id)
 
 
 # ── sessions ─────────────────────────────────────────────────────────────────
@@ -12522,6 +12801,14 @@ The refusals, in the order they apply:
   403 PASSWORD_CHANGE_REQUIRED the user must change a generated password first
   403 FORBIDDEN               the user's role is too low
 
+A request with an `Authorization` header is a service key request (PR 3): the
+header alone decides and any cookie is ignored, with no fallback to it.
+  503 SETUP_REQUIRED          as above
+  401 KEY_INVALID             not one `Bearer <key>` header with a valid key (one answer for every reason)
+  403 KEY_NOT_ALLOWED         a route keys can't use (policy.HUMAN_ONLY)
+  403 FORBIDDEN               the principal's role is too low
+It has no origin check (it carries no cookie, Q26) and no password change.
+
 A route with no policy entry is never matched here, so it falls through to the
 app; test_auth.py fails when any route lacks an entry.
 """
@@ -12536,7 +12823,7 @@ from starlette.requests import Request
 
 from utils import api_error
 
-from . import policy, store
+from . import keys, policy, store
 
 UNSAFE = frozenset(("POST", "PUT", "PATCH", "DELETE"))
 # Starlette's route patterns end in `$`, which also matches before a trailing
@@ -12552,6 +12839,10 @@ def _header(scope, name: bytes) -> str | None:
         if key == name:
             return value.decode("latin-1")
     return None
+
+
+def _headers(scope, name: bytes) -> list[str]:
+    return [value.decode("latin-1") for key, value in scope.get("headers") or () if key == name]
 
 
 def session_token(scope) -> str | None:
@@ -12614,7 +12905,7 @@ class AuthMiddleware:
         access = policy.required(scope["method"], template)
         if access == policy.PUBLIC:
             return await self.app(scope, receive, send)
-        refusal, principal = await self._check(scope, access)
+        refusal, principal = await self._check(scope, access, template)
         if refusal is not None:
             # Request tracing labels a request by the route it reached (its
             # `path`); give a refused request the same label the router would.
@@ -12623,11 +12914,14 @@ class AuthMiddleware:
         scope.setdefault("state", {})["auth"] = principal
         return await self.app(scope, receive, send)
 
-    async def _check(self, scope, access):
+    async def _check(self, scope, access, template):
         if not await asyncio.to_thread(store.is_set_up):
             return api_error(503, "SETUP_REQUIRED",
                              "No account exists yet. An operator must create the first Engineer with "
                              "`docker compose exec api python -m auth bootstrap <username>`."), None
+        authorization = _headers(scope, b"authorization")
+        if authorization:
+            return await self._check_key(access, template, authorization)
         principal = await asyncio.to_thread(store.authenticate, session_token(scope))
         if principal is None:
             return api_error(401, "AUTH_REQUIRED", "Log in to use this."), None
@@ -12637,6 +12931,18 @@ class AuthMiddleware:
         if principal.must_change_password and access != policy.SESSION:
             return api_error(403, "PASSWORD_CHANGE_REQUIRED",
                              "Change your password before doing anything else."), None
+        if access != policy.SESSION and policy.rank(principal.role) < policy.rank(access):
+            return api_error(403, "FORBIDDEN", "Your role can't do this.",
+                             detail={"required_role": access}), None
+        return None, principal
+
+    async def _check_key(self, access, template, authorization):
+        key = keys.bearer(authorization[0]) if len(authorization) == 1 else None
+        principal = await asyncio.to_thread(store.authenticate_key, key) if key else None
+        if principal is None:
+            return api_error(401, "KEY_INVALID", "The API key is invalid, expired or revoked."), None
+        if template in policy.HUMAN_ONLY:
+            return api_error(403, "KEY_NOT_ALLOWED", "API keys can't be used for this."), None
         if access != policy.SESSION and policy.rank(principal.role) < policy.rank(access):
             return api_error(403, "FORBIDDEN", "Your role can't do this.",
                              detail={"required_role": access}), None
@@ -12684,6 +12990,12 @@ action writes one line to standard error. Exit status: 0 done, 1 refused,
 
 The last enabled engineer can't be disabled or demoted. A lockout is recovered
 with create-user, enable or reset-password.
+
+Service principals (API keys, PR 3) are created and given keys by Engineers in
+the app; this command issues no key. `list` shows principals too, marked
+"service account"; set-role, disable and enable work on them (disabling one
+stops its keys, an escape hatch for a leaked key when no Engineer can log in);
+reset-password refuses one, since it has no password.
 """
 from __future__ import annotations
 
@@ -12755,10 +13067,12 @@ def main(argv=None) -> int:
             _say(f"{args.command}: {username!r} {args.command}d"
                  + ("; their sessions ended" if args.command == "disable" else ""))
         else:
-            for user in store.list_users():
+            for user in store.list_users(kind=None):
                 created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(user.created_at))
+                password = ("service account" if user.kind == "service"
+                            else "password change due" if user.must_change_password else "-")
                 print(f"{user.username}\t{user.role}\t{'enabled' if user.enabled else 'disabled'}\t"
-                      f"{'password change due' if user.must_change_password else '-'}\t{created}")
+                      f"{password}\t{created}")
     except store.Refused as exc:
         _say(f"{args.command} refused: {exc}")
         return 1
@@ -12838,12 +13152,13 @@ def headers(role: str = "engineer", base_url: str = "http://testserver") -> dict
 ### api/routers/auth.py
 
 ```python
-"""Login, logout, the current user, their own password change, and account
-administration for Engineers (#25).
+"""Login, logout, the current user, their own password change, account
+administration, and service principals and their API keys, for Engineers (#25).
 
 Which role every other route needs is in auth/policy.py, enforced by
-auth/middleware.py before a route runs; the /auth/users routes need an
-Engineer. The first account is created by the operator command, `python -m
+auth/middleware.py before a route runs; the /auth/users and
+/auth/service-principals routes need an Engineer's session (an API key can't
+use them). The first account is created by the operator command, `python -m
 auth`, which also recovers lockouts.
 """
 from __future__ import annotations
@@ -12857,8 +13172,9 @@ from fastapi.responses import JSONResponse
 
 from auth import passwords, store
 from config import settings
-from models.schemas import (AdminUserList, AdminUserResult, AuthStatus, AuthUser, LoginRequest,
-                            PasswordChangeRequest, RoleChangeRequest, UserCreateRequest)
+from models.schemas import (AdminUserList, AdminUserResult, AuthStatus, AuthUser, KeyIssueRequest, LoginRequest,
+                            PasswordChangeRequest, PrincipalCreateRequest, RoleChangeRequest,
+                            ServicePrincipalList, ServicePrincipalResult, UserCreateRequest)
 from utils import api_error
 
 router = APIRouter(prefix="/auth")
@@ -12898,10 +13214,12 @@ def _login(typed: str, password: str, address: str):
         return "throttled", None, None
     username = passwords.normalize_username(typed)
     user = store.get_user(username) if username else None
-    # Verified against a dummy hash when there is no such user, so a failure
-    # takes as long either way and the timing doesn't reveal which accounts exist.
-    matched = passwords.verify_password(password, user.password_hash if user else passwords.dummy_hash())
-    ok = bool(matched and user and user.enabled)
+    # Verified against a dummy hash when there is no such user, or the name is a
+    # service principal's (it can't log in, Q21), so a failure takes as long
+    # either way and the timing doesn't reveal which accounts exist.
+    person = user if user and user.kind == "user" else None
+    matched = passwords.verify_password(password, person.password_hash if person else passwords.dummy_hash())
+    ok = bool(matched and person and person.enabled)
     store.finish_attempt(key, address, ok)
     if not ok:
         return "failed", None, None
@@ -12941,8 +13259,10 @@ async def logout(request: Request):
 
 @router.get("/me", response_model=AuthUser)
 async def me(request: Request):
+    # A session's user (kind "user") or an API key's service principal ("service").
     principal = request.state.auth
-    return _user_body(principal.username, principal.role, principal.must_change_password)
+    return {**_user_body(principal.username, principal.role, principal.must_change_password),
+            "kind": principal.kind}
 
 
 def _change(principal, current: str, new: str, address: str):
@@ -13044,7 +13364,7 @@ async def create_user(body: UserCreateRequest, request: Request):
 
 def _reset(username: str):
     password = passwords.new_password(username)
-    store.reset_password(username, password)
+    store.reset_password(username, password, "user")
     return store.get_user(username), password
 
 
@@ -13081,7 +13401,7 @@ async def set_user_role(username: str, body: RoleChangeRequest, request: Request
     if target is None:
         return _not_found(actor, "set-role", username)
     try:
-        user = await asyncio.to_thread(_apply, store.set_role, target, body.role)
+        user = await asyncio.to_thread(_apply, store.set_role, target, body.role, "user")
     except store.Refused as exc:
         return _refused(actor, "set-role", target, exc)
     _log.warning("Admin %r set the role of %r to %s", actor, target, body.role)
@@ -13095,7 +13415,7 @@ async def _set_enabled(username: str, request: Request, enabled: bool):
     if target is None:
         return _not_found(actor, action, username)
     try:
-        user = await asyncio.to_thread(_apply, store.set_enabled, target, enabled)
+        user = await asyncio.to_thread(_apply, store.set_enabled, target, enabled, "user")
     except store.Refused as exc:
         return _refused(actor, action, target, exc)
     _log.warning("Admin %r %sd %r%s", actor, action, target, "" if enabled else "; their sessions ended")
@@ -13110,6 +13430,148 @@ async def disable_user(username: str, request: Request):
 @router.post("/users/{username}/enable", response_model=AdminUserResult, response_model_exclude_none=True)
 async def enable_user(username: str, request: Request):
     return await _set_enabled(username, request, True)
+
+
+# ── service principals and their API keys (Engineers only; PR 3) ─────────────
+# A principal is an account that can't log in and authenticates only with its
+# keys (auth/keys.py). Each change and each refusal is one WARNING line naming
+# the Engineer, the principal and the key id; a key is in its 201 answer only.
+
+_PRINCIPAL_STATUS = {"PRINCIPAL_NOT_FOUND": 404, "PRINCIPAL_EXISTS": 409, "KEY_NOT_FOUND": 404}
+
+
+def _iso(at: float | None) -> str | None:
+    return None if at is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+
+
+def _key_body(key: store.Key, now: float) -> dict:
+    return {"id": key.id, "label": key.label, "created_at": _iso(key.created_at), "expires_at": _iso(key.expires_at),
+            "revoked_at": _iso(key.revoked_at), "last_used_at": _iso(key.last_used), "status": key.status(now)}
+
+
+def _principal_body(principal: store.ServicePrincipal) -> dict:
+    now = time.time()
+    return {"name": principal.name, "role": principal.role, "enabled": principal.enabled,
+            "created_at": _iso(principal.created_at), "keys": [_key_body(k, now) for k in principal.keys]}
+
+
+def _principal_refusal(actor: str, action: str, target: str, code: str, message: str):
+    _log.warning("Admin %r: %s of service principal %r refused: %s", actor, action, target, message)
+    return api_error(_PRINCIPAL_STATUS.get(code, 409), code, message)
+
+
+def _principal_refused(actor: str, action: str, target: str, exc: store.Refused):
+    message = str(exc)
+    return _principal_refusal(actor, action, target, exc.code, message[:1].upper() + message[1:] + ".")
+
+
+def _principal_not_found(actor: str, action: str, typed: str):
+    return _principal_refusal(actor, action, typed, "PRINCIPAL_NOT_FOUND", f"There is no service principal {typed!r}.")
+
+
+@router.get("/service-principals", response_model=ServicePrincipalList)
+async def list_principals():
+    principals = await asyncio.to_thread(store.list_principals)
+    return {"principals": [_principal_body(p) for p in principals]}
+
+
+@router.post("/service-principals", status_code=201, response_model=ServicePrincipalResult)
+async def create_principal(body: PrincipalCreateRequest, request: Request):
+    actor = request.state.auth.username
+    name = passwords.normalize_username(body.name)
+    if name is None:
+        _log.warning("Admin %r: create of service principal %r refused: invalid name", actor, body.name)
+        return api_error(422, "INVALID_USERNAME", f"The name must be {passwords.USERNAME_RULE}.")
+    try:
+        principal = await asyncio.to_thread(store.create_principal, name, body.role)
+    except store.Refused as exc:
+        return _principal_refused(actor, "create", name, exc)
+    _log.warning("Admin %r created service principal %r (%s)", actor, name, body.role)
+    return JSONResponse({"principal": _principal_body(principal)}, status_code=201)
+
+
+def _change_principal(action, name: str, *args):
+    action(name, *args, "service")
+    return store.get_principal(name)
+
+
+@router.post("/service-principals/{name}/role", response_model=ServicePrincipalResult)
+async def set_principal_role(name: str, body: RoleChangeRequest, request: Request):
+    actor = request.state.auth.username
+    target = _target(name)
+    if target is None:
+        return _principal_not_found(actor, "set-role", name)
+    try:
+        principal = await asyncio.to_thread(_change_principal, store.set_role, target, body.role)
+    except store.Refused as exc:
+        return _principal_refused(actor, "set-role", target, exc)
+    _log.warning("Admin %r set the role of service principal %r to %s", actor, target, body.role)
+    return JSONResponse({"principal": _principal_body(principal)})
+
+
+async def _set_principal_enabled(name: str, request: Request, enabled: bool):
+    actor = request.state.auth.username
+    action = "enable" if enabled else "disable"
+    target = _target(name)
+    if target is None:
+        return _principal_not_found(actor, action, name)
+    try:
+        principal = await asyncio.to_thread(_change_principal, store.set_enabled, target, enabled)
+    except store.Refused as exc:
+        return _principal_refused(actor, action, target, exc)
+    _log.warning("Admin %r %sd service principal %r%s", actor, action, target,
+                 "" if enabled else "; its keys stop working")
+    return JSONResponse({"principal": _principal_body(principal)})
+
+
+@router.post("/service-principals/{name}/disable", response_model=ServicePrincipalResult)
+async def disable_principal(name: str, request: Request):
+    return await _set_principal_enabled(name, request, False)
+
+
+@router.post("/service-principals/{name}/enable", response_model=ServicePrincipalResult)
+async def enable_principal(name: str, request: Request):
+    return await _set_principal_enabled(name, request, True)
+
+
+def _issue(name: str, days: int, label: str):
+    key, secret = store.issue_key(name, days, label)
+    return store.get_principal(name), key, secret
+
+
+@router.post("/service-principals/{name}/keys", status_code=201, response_model=ServicePrincipalResult)
+async def issue_key(name: str, body: KeyIssueRequest, request: Request):
+    actor = request.state.auth.username
+    target = _target(name)
+    if target is None:
+        return _principal_not_found(actor, "issue-key", name)
+    try:
+        principal, key, secret = await asyncio.to_thread(_issue, target, body.days, body.label)
+    except store.Refused as exc:
+        return _principal_refused(actor, "issue-key", target, exc)
+    _log.warning("Admin %r issued key %s for service principal %r, expiring %s", actor, key.id, target,
+                 _iso(key.expires_at))
+    return JSONResponse({"principal": _principal_body(principal), "key": _key_body(key, time.time()),
+                         "secret": secret}, status_code=201, headers=_NO_STORE)
+
+
+def _revoke(name: str, key_id: str):
+    store.revoke_key(name, key_id)
+    return store.get_principal(name)
+
+
+@router.post("/service-principals/{name}/keys/{key_id}/revoke", response_model=ServicePrincipalResult)
+async def revoke_key(name: str, key_id: str, request: Request):
+    actor = request.state.auth.username
+    target = _target(name)
+    if target is None:
+        return _principal_not_found(actor, "revoke-key", name)
+    try:
+        principal = await asyncio.to_thread(_revoke, target, key_id)
+    except store.Refused as exc:
+        return _principal_refused(actor, "revoke-key", target, exc)
+    _log.warning("Admin %r revoked key %s of service principal %r", actor, key_id, target)
+    return JSONResponse({"principal": _principal_body(principal)})
 ```
 
 ### api/main.py
@@ -13486,6 +13948,7 @@ import GoldStandardPage from './pages/GoldStandardPage'
 import CollectionsPage from './pages/CollectionsPage'
 import HealthPage from './pages/HealthPage'
 import UsersPage from './pages/UsersPage'
+import ServiceKeysPage from './pages/ServiceKeysPage'
 import TransferPage from './pages/TransferPage'
 import HelpTransferPage from './pages/HelpTransferPage'
 
@@ -13544,6 +14007,7 @@ export default function AppRouter() {
               <Route path="/collections" element={<CollectionsPage />} />
               <Route path="/health" element={<HealthPage />} />
               <Route path="/users" element={<UsersPage />} />
+              <Route path="/service-keys" element={<ServiceKeysPage />} />
             </>
           )}
           <Route path="*" element={<Navigate to="/qa" replace />} />
@@ -13921,6 +14385,20 @@ export const api = {
     request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/role`, { role }),
   disableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/disable`),
   enableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/enable`),
+  // Service principals and their API keys (Engineers only, #25 PR 3).
+  listPrincipals: () => request<{ principals: ServicePrincipal[] }>('GET', '/auth/service-principals'),
+  createPrincipal: (name: string, role: Role) =>
+    request<{ principal: ServicePrincipal }>('POST', '/auth/service-principals', { name, role }),
+  setPrincipalRole: (name: string, role: Role) =>
+    request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/role`, { role }),
+  disablePrincipal: (name: string) =>
+    request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/disable`),
+  enablePrincipal: (name: string) =>
+    request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/enable`),
+  issueKey: (name: string, label: string, days: number) =>
+    request<{ principal: ServicePrincipal; key: ServiceKey; secret: string }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/keys`, { label, days }),
+  revokeKey: (name: string, keyId: string) =>
+    request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/keys/${encodeURIComponent(keyId)}/revoke`),
 
   getCollections: () => request<{ collections: CollectionInfo[] }>('GET', '/collections'),
   // Answers with the name as stored, first letter capitalised (#372).
@@ -13962,8 +14440,13 @@ export const api = {
 
 // Types
 export type Role = 'engineer' | 'developer' | 'end_user'
-export interface AuthUser { username: string; role: Role; must_change_password: boolean }
+export interface AuthUser { username: string; role: Role; must_change_password: boolean; kind?: 'user' | 'service' }
 export interface AdminUser { username: string; role: Role; enabled: boolean; must_change_password: boolean; created_at: string }
+export interface ServiceKey {
+  id: string; label: string; created_at: string; expires_at: string
+  revoked_at: string | null; last_used_at: string | null; status: 'active' | 'expired' | 'revoked'
+}
+export interface ServicePrincipal { name: string; role: Role; enabled: boolean; created_at: string; keys: ServiceKey[] }
 export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
   hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null
@@ -14126,6 +14609,7 @@ export default function NavBar() {
           <Link to="/collections" className="text-sm text-gray-700 hover:text-blue-600">Collections</Link>
           <Link to="/health" className="text-sm text-gray-700 hover:text-blue-600">Health</Link>
           <Link to="/users" className="text-sm text-gray-700 hover:text-blue-600">Users</Link>
+          <Link to="/service-keys" className="text-sm text-gray-700 hover:text-blue-600">Service keys</Link>
         </>
       )}
       <div className="ml-auto flex items-center gap-3">
@@ -16464,6 +16948,196 @@ export default function UsersPage() {
 }
 ```
 
+### ui/src/pages/ServiceKeysPage.tsx
+
+```typescript
+import { FormEvent, useEffect, useState } from 'react'
+import { api, Role, ServiceKey, ServicePrincipal } from '../api/client'
+
+const ROLES: Role[] = ['end_user', 'developer', 'engineer']
+const ROLE_LABELS: Record<Role, string> = { end_user: 'End User', developer: 'Developer', engineer: 'AI Engineer' }
+const STATUS_LABELS: Record<ServiceKey['status'], string> = { active: 'Active', expired: 'Expired', revoked: 'Revoked' }
+
+const day = (iso: string | null) => (iso ? new Date(iso).toLocaleDateString() : 'never')
+
+// Service principals and their API keys, for Engineers (#25, PR 3). A principal
+// is an account that can't log in; services call the API with its keys, sent as
+// `Authorization: Bearer <key>`, and a key can do what the principal's role
+// allows. The API decides everything: keys expire (1-365 days, default 90),
+// revoked and expired keys stay listed and never work again, and principals
+// are disabled, never deleted. A new key is shown once, from the answer that
+// carried it, and kept only in this page's memory until "Done".
+export default function ServiceKeysPage() {
+  const [principals, setPrincipals] = useState<ServicePrincipal[]>([])
+  const [listError, setListError] = useState('')
+  const [actionError, setActionError] = useState('')
+  const [name, setName] = useState('')
+  const [role, setRole] = useState<Role>('end_user')
+  const [labels, setLabels] = useState<Record<string, string>>({})
+  const [days, setDays] = useState<Record<string, string>>({})
+  const [busy, setBusy] = useState(false)
+  const [shown, setShown] = useState<{ name: string; secret: string } | null>(null)
+
+  async function load() {
+    try {
+      setPrincipals((await api.listPrincipals()).principals)
+      setListError('')
+    } catch (e: unknown) {
+      setListError(`Could not load the service principals: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  useEffect(() => { load() }, [])
+
+  async function act(run: () => Promise<{ principal: ServicePrincipal; secret?: string }>) {
+    setActionError('')
+    setBusy(true)
+    try {
+      const result = await run()
+      if (result.secret) setShown({ name: result.principal.name, secret: result.secret })
+      await load()
+      return true
+    } catch (e: unknown) {
+      setActionError(e instanceof Error ? e.message : String(e))
+      await load()
+      return false
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function create(e: FormEvent) {
+    e.preventDefault()
+    if (await act(() => api.createPrincipal(name, role))) setName('')
+  }
+
+  async function issue(e: FormEvent, principal: string) {
+    e.preventDefault()
+    const lifetime = Number(days[principal] ?? '90')
+    if (await act(() => api.issueKey(principal, labels[principal] ?? '', lifetime))) {
+      setLabels(l => ({ ...l, [principal]: '' }))
+    }
+  }
+
+  return (
+    <div className="max-w-5xl mx-auto">
+      <h1 className="text-2xl font-bold mb-2">Service keys</h1>
+      <p className="text-sm text-gray-600 mb-6">
+        A service principal is an account for a program, not a person: it can't log in, and calls the API with its
+        keys, sent as <code>Authorization: Bearer &lt;key&gt;</code>. A key can do what the principal's role allows,
+        except manage accounts or keys. To rotate a key, issue a new one, switch the service over to it, then revoke
+        the old one; both work until then.
+      </p>
+      {listError && <p role="alert" className="text-red-600 text-sm mb-4">{listError}</p>}
+
+      {shown && (
+        <div data-testid="one-time-key" className="mb-6 border border-amber-300 bg-amber-50 rounded p-4 text-sm">
+          <p className="mb-2">
+            New key for <strong>{shown.name}</strong>: <code className="bg-white border border-gray-200 rounded px-2 py-1 select-all break-all">{shown.secret}</code>
+          </p>
+          <p className="text-gray-700 mb-3">
+            It is shown only once. Give it to the service, which sends it as <code>Authorization: Bearer &lt;key&gt;</code>.
+          </p>
+          <button onClick={() => setShown(null)} className="bg-blue-600 text-white px-3 py-1 rounded text-sm hover:bg-blue-700">Done</button>
+        </div>
+      )}
+
+      <form onSubmit={create} className="flex flex-wrap items-end gap-3 mb-6">
+        <label className="text-sm text-gray-700">
+          Name
+          <input id="new-principal-name" value={name} onChange={e => setName(e.target.value)} autoComplete="off"
+            className="mt-1 block border border-gray-300 rounded px-3 py-2 text-sm" required />
+        </label>
+        <label className="text-sm text-gray-700">
+          Role
+          <select id="new-principal-role" value={role} onChange={e => setRole(e.target.value as Role)}
+            className="mt-1 block border border-gray-300 rounded px-3 py-2 text-sm">
+            {ROLES.map(r => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
+          </select>
+        </label>
+        <button type="submit" disabled={busy || !name}
+          className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50">Create principal</button>
+        <p className="text-xs text-gray-500 basis-full">
+          3-32 characters: lowercase letters, digits, '.', '_' or '-'; a name no person or service already has.
+        </p>
+      </form>
+
+      {actionError && <p role="alert" className="text-red-600 text-sm mb-4">{actionError}</p>}
+
+      {principals.length === 0 && !listError && <p className="text-sm text-gray-500">No service principals yet.</p>}
+
+      {principals.map(p => (
+        <section key={p.name} data-principal={p.name} className="border border-gray-200 rounded p-4 mb-4">
+          <div className="flex flex-wrap items-center gap-4 mb-3">
+            <h2 className="font-semibold">{p.name}</h2>
+            <select aria-label={`Role of ${p.name}`} value={p.role} disabled={busy}
+              onChange={e => { const next = e.target.value as Role; act(() => api.setPrincipalRole(p.name, next)) }}
+              className="border border-gray-300 rounded px-2 py-1 text-sm">
+              {ROLES.map(r => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
+            </select>
+            <span data-testid="principal-status" className="text-sm">{p.enabled ? 'Enabled' : 'Disabled'}</span>
+            <button disabled={busy}
+              onClick={() => act(() => p.enabled ? api.disablePrincipal(p.name) : api.enablePrincipal(p.name))}
+              className="text-sm text-blue-600 hover:underline disabled:opacity-50">{p.enabled ? 'Disable' : 'Enable'}</button>
+          </div>
+
+          <form onSubmit={e => issue(e, p.name)} className="flex flex-wrap items-end gap-3 mb-3">
+            <label className="text-sm text-gray-700">
+              Label (optional)
+              <input aria-label={`Label for a new key of ${p.name}`} value={labels[p.name] ?? ''} maxLength={64}
+                onChange={e => setLabels(l => ({ ...l, [p.name]: e.target.value }))} autoComplete="off"
+                className="mt-1 block border border-gray-300 rounded px-3 py-2 text-sm" />
+            </label>
+            <label className="text-sm text-gray-700">
+              Lifetime (days)
+              <input aria-label={`Lifetime in days for a new key of ${p.name}`} type="number" min={1} max={365} step={1}
+                value={days[p.name] ?? '90'} onChange={e => setDays(d => ({ ...d, [p.name]: e.target.value }))}
+                className="mt-1 block w-24 border border-gray-300 rounded px-3 py-2 text-sm" required />
+            </label>
+            <button type="submit" disabled={busy}
+              className="bg-blue-600 text-white px-3 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50">Issue key</button>
+          </form>
+
+          {p.keys.length > 0 && (
+            <table className="w-full text-sm border-collapse">
+              <thead>
+                <tr className="border-b border-gray-200 text-left text-gray-600">
+                  <th className="py-2 pr-4">Key</th>
+                  <th className="py-2 pr-4">Label</th>
+                  <th className="py-2 pr-4">Created</th>
+                  <th className="py-2 pr-4">Expires</th>
+                  <th className="py-2 pr-4">Last used</th>
+                  <th className="py-2 pr-4">Status</th>
+                  <th className="py-2"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {p.keys.map(k => (
+                  <tr key={k.id} data-key={k.id} className="border-b border-gray-100">
+                    <td className="py-2 pr-4 font-mono">{k.id}</td>
+                    <td className="py-2 pr-4">{k.label}</td>
+                    <td className="py-2 pr-4">{day(k.created_at)}</td>
+                    <td className="py-2 pr-4">{day(k.expires_at)}</td>
+                    <td className="py-2 pr-4">{day(k.last_used_at)}</td>
+                    <td className="py-2 pr-4">{STATUS_LABELS[k.status]}</td>
+                    <td className="py-2">
+                      {k.status === 'active' && (
+                        <button disabled={busy} onClick={() => act(() => api.revokeKey(p.name, k.id))}
+                          className="text-blue-600 hover:underline disabled:opacity-50">Revoke</button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </section>
+      ))}
+    </div>
+  )
+}
+```
+
 ---
 
 *End of Implementation — Version 1.0*
@@ -16586,8 +17260,11 @@ read the jar through `auth_headers.py`; in-process checks in the API image use
 role (written out in `auth_stack.py`, not read from the API), login, logout, cookies, origin
 rules, throttling, the operator command's effect on existing sessions (on throwaway `vfy-t-*`
 accounts), an Engineer's account administration through the API (on a throwaway account; the
-generated passwords must not reach the API log), idle expiry, and that the API log holds no
-harness secret.
+generated passwords must not reach the API log), service API keys (throwaway `vfy-s-*`
+principals created through the API by the harness Engineer: the matrix with a key of each role
+and no `Origin`, rotation, revocation, expiry, a disabled principal, invalid keys; the keys stay in
+memory, are never printed and must not reach the API log), idle expiry, and that the API log holds
+no harness secret.
 
 ## Entry point and verify project
 
@@ -17239,7 +17916,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
 | `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health` reports, so the status flips to `below_recommended` on any host (#536) |
 | `../tests/test_memory_override.py` | host-side, standard library: the derived override makes `system_info.memory_info` report `below_recommended` with a note for allocations below and above the 12.35 GB a fixed 13 GB could flip, and no override without a usable allocation (#536); embedded copies; registered by suite 01 |
-| `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command, account administration; registers `../tests/test_auth.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
+| `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command, account administration, service API keys; registers `../tests/test_auth.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
 | `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
 | `auth_stack.py` | the stack checks of `17_auth.sh`, one per subcommand (#25) |
 | `auth_headers.py` | the suite's session as `Cookie` and `Origin` headers, for the host-side Python helpers (#25) |
@@ -19120,8 +19797,9 @@ def headers():
 #
 # The unit checks run in the API image with no network. The stack checks run
 # on the verify project through auth_stack.py, one check each; those that create
-# throwaway vfy-t-<random> accounts or age a session use the operator command,
-# so they run only on the verify project as stack.sh sets it up. The restart
+# throwaway vfy-t-<random> accounts or vfy-s-<random> service principals, or age
+# a session or a key, use the operator command, so they run only on the verify
+# project as stack.sh sets it up. The restart
 # check is opt-in (RAG_ALLOW_RESTART=1) like the other restart checks.
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
@@ -19171,6 +19849,16 @@ section "Account administration by Engineers (PR 2)"
 stack admin-accounts
 check "an Engineer creates, resets, re-roles, disables and enables an account through the API; own reset refused; no password logged" $?
 
+section "Service principals and API keys (PR 3, H3)"
+stack key-matrix end_user
+check "End User key, no Origin: 403 above its role and on account/key administration, logout and password change" $?
+stack key-matrix developer
+check "Developer key, no Origin: 403 above its role and on account/key administration, logout and password change" $?
+stack key-matrix engineer
+check "Engineer key, no Origin: no 401 or 403 on data routes; 403 KEY_NOT_ALLOWED on account/key administration" $?
+stack service-keys
+check "keys: no principal login, rotation, role change, disable, revoke and expiry; bad keys 401; no key in listings or the log" $?
+
 section "Request protection and login throttling (H4)"
 stack control-path
 check "a path ending in %0A is refused before its body is read, not routed past the check" $?
@@ -19219,9 +19907,11 @@ into a check:
     python3 auth_stack.py CHECK [--operator]
 
 Exit 0 when the check holds, 1 when it doesn't (the reason on stderr). Checks
-that create throwaway accounts (vfy-t-<random>) or age a session need the
-operator command, so they need --operator, which 17_auth.sh passes only on the
-verify project as stack.sh sets it up. No password or session token is printed.
+that create throwaway accounts (vfy-t-<random>), service principals
+(vfy-s-<random>) or age a session need the operator command, so they need
+--operator, which 17_auth.sh passes only on the verify project as stack.sh sets
+it up. No password, session token or API key is printed; keys are held in
+memory only.
 """
 import hashlib
 import json
@@ -19284,7 +19974,18 @@ MATRIX = (
     ("POST", "/auth/users/vfy-no-such-user/role", {}, "engineer"),
     ("POST", "/auth/users/vfy-no-such-user/disable", None, "engineer"),
     ("POST", "/auth/users/vfy-no-such-user/enable", None, "engineer"),
+    # Service principals and keys (PR 3 of #25): likewise a list, a 422 or a 404.
+    ("GET", "/auth/service-principals", None, "engineer"),
+    ("POST", "/auth/service-principals", {}, "engineer"),
+    ("POST", "/auth/service-principals/vfy-no-such-svc/role", {}, "engineer"),
+    ("POST", "/auth/service-principals/vfy-no-such-svc/disable", None, "engineer"),
+    ("POST", "/auth/service-principals/vfy-no-such-svc/enable", None, "engineer"),
+    ("POST", "/auth/service-principals/vfy-no-such-svc/keys", {}, "engineer"),
+    ("POST", "/auth/service-principals/vfy-no-such-svc/keys/nosuchkey123/revoke", None, "engineer"),
 )
+# Routes an API key can't use whatever its role (S5 of PR 3): every account,
+# principal and key route, logout and the password change.
+KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password")
 SESSION_ROUTES = (("GET", "/auth/me", None), ("POST", "/auth/logout", None), ("POST", "/auth/password", {}))
 
 
@@ -19353,6 +20054,29 @@ def throwaway(role, operator_ok):
     return username, new, token
 
 
+def bearer(key):
+    """The headers of a service sending its key: no Origin, no cookie."""
+    return {"Authorization": "Bearer " + key}
+
+
+def new_principal(admin, role):
+    """A throwaway vfy-s-<random> principal of ROLE with one key, through the
+    API as the harness Engineer (session token `admin`). Returns (name, key id, key)."""
+    name = "vfy-s-" + secrets.token_hex(4)
+    status, raw, _ = code("POST", "/auth/service-principals", {"name": name, "role": role}, token=admin)
+    expect(status == 201, "creating principal {} answered {} {}".format(name, status, error_code(raw)))
+    key_id, key = issue(admin, name)
+    return name, key_id, key
+
+
+def issue(admin, name, body=None):
+    status, raw, headers = code("POST", "/auth/service-principals/{}/keys".format(name), body or {}, token=admin)
+    expect(status == 201, "issuing a key for {} answered {} {}".format(name, status, error_code(raw)))
+    expect(headers.get("Cache-Control") == "no-store", "the issued key's answer may be cached")
+    answer = json.loads(raw)
+    return answer["key"]["id"], answer["secret"]
+
+
 # ── checks ───────────────────────────────────────────────────────────────────
 
 def check_matrix(who, operator_ok):
@@ -19376,6 +20100,134 @@ def check_matrix(who, operator_ok):
     else:
         request("POST", "/auth/logout", token=token)
     expect(not wrong, "; ".join(wrong))
+
+
+def check_key_matrix(role, operator_ok):
+    """The matrix with an API key of ROLE, sent without Origin (S8.2 of PR 3)."""
+    expect(operator_ok, "creates a service principal, so it runs only on the verify project")
+    admin = role_token("engineer")
+    name, key_id, key = new_principal(admin, role)
+    wrong = []
+    try:
+        for method, path, body, need in MATRIX:
+            status, raw, _ = code(method, path, body, headers=bearer(key))
+            if path.startswith(KEY_REFUSED):
+                ok = status == 403 and error_code(raw) == "KEY_NOT_ALLOWED"
+            elif ROLES.index(role) < ROLES.index(need):
+                ok = status == 403 and error_code(raw) == "FORBIDDEN"
+            else:
+                ok = status not in (401, 403)
+            if not ok:
+                wrong.append("{} {} -> {} {}".format(method, path, status, error_code(raw)))
+        for method, path, body in SESSION_ROUTES:
+            status, raw, _ = code(method, path, body, headers=bearer(key))
+            if path == "/auth/me":
+                me = json.loads(raw) if status == 200 else {}
+                if (me.get("username"), me.get("role"), me.get("kind")) != (name, role, "service"):
+                    wrong.append("GET /auth/me -> {} {}".format(status, me))
+            elif not (status == 403 and error_code(raw) == "KEY_NOT_ALLOWED"):
+                wrong.append("{} {} -> {} {}".format(method, path, status, error_code(raw)))
+    finally:
+        code("POST", "/auth/service-principals/{}/keys/{}/revoke".format(name, key_id), token=admin)
+        code("POST", "/auth/service-principals/{}/disable".format(name), token=admin)
+        request("POST", "/auth/logout", token=admin)
+    expect(not wrong, "; ".join(wrong))
+
+
+def check_service_keys(operator_ok):
+    """A service principal's keys through their life (S8.2 of PR 3), as the
+    harness Engineer through the API."""
+    expect(operator_ok, "creates a service principal, so it runs only on the verify project")
+    admin = role_token("engineer")
+    me = auth_setup.read_credentials(auth_setup.private_dir())["engineer"][0]
+    name, first_id, first = new_principal(admin, "developer")
+    issued = [first]
+
+    def works(key, path="/packages"):
+        return code("GET", path, headers=bearer(key))[0]
+
+    def invalid(key_or_header, why):
+        status, raw, _ = code("GET", "/collections", headers={"Authorization": key_or_header})
+        expect(status == 401 and error_code(raw) == "KEY_INVALID", "{}: answered {} {}".format(
+            why, status, error_code(raw)))
+
+    def admin_post(path, body=None):
+        status, raw, _ = code("POST", "/auth/service-principals/{}{}".format(name, path), body, token=admin)
+        expect(status == 200, "POST {} answered {} {}".format(path, status, error_code(raw)))
+        return json.loads(raw)["principal"]
+
+    # The principal can't log in (Q21).
+    status, raw, _ = code("POST", "/auth/login", {"username": name, "password": "x" * 12})
+    expect(status == 401 and error_code(raw) == "LOGIN_FAILED", "the principal's login answered {}".format(status))
+    # A change without Origin is accepted (Q26): index_type 7 is invalid, so it's a 422 and creates nothing.
+    status, raw, _ = code("POST", "/collections", {"name": "VfyKey" + secrets.token_hex(3), "index_type": 7},
+                          headers=bearer(first))
+    expect(status == 422, "a key's change without Origin answered {} {}".format(status, error_code(raw)))
+    # Rotation: a second key; both work (Q24).
+    second_id, second = issue(admin, name, {"label": "rotated", "days": 1})
+    issued.append(second)
+    expect(works(first) == 200 and works(second) == 200, "after rotation both keys must work")
+    # A role change applies to the keys at once.
+    admin_post("/role", {"role": "end_user"})
+    status, raw, _ = code("GET", "/packages", headers=bearer(first))
+    expect(status == 403 and error_code(raw) == "FORBIDDEN", "after the demotion the key answered {}".format(status))
+    admin_post("/role", {"role": "developer"})
+    # Disabling the principal stops its keys; enabling restores them.
+    admin_post("/disable")
+    invalid("Bearer " + first, "a disabled principal's key")
+    admin_post("/enable")
+    expect(works(first) == 200, "enabling the principal did not restore its key")
+    # Revocation stops one key; the other keeps working.
+    principal = admin_post("/keys/{}/revoke".format(first_id))
+    invalid("Bearer " + first, "a revoked key")
+    expect(works(second) == 200, "revoking one key stopped the other")
+    expect([k["status"] for k in principal["keys"] if k["id"] == first_id] == ["revoked"], "the revoked key isn't listed as revoked")
+    # Expiry: the second key, aged past its end in the verify project's store.
+    script = ("import sqlite3,sys,time\nfrom auth import store\n"
+              "c=sqlite3.connect(store.db_path());c.execute('UPDATE api_keys SET expires_at=? WHERE id=?',"
+              "(time.time()-1,sys.argv[1]));c.commit();print(c.total_changes)\n")
+    result = compose("exec", "-T", "api", "python", "-c", script, second_id)
+    expect(result.returncode == 0 and result.stdout.strip() == "1", "could not age the key: {}".format(
+        result.stderr.strip()[-200:]))
+    invalid("Bearer " + second, "an expired key")
+    # Unknown, malformed and non-Bearer keys; a bad key never falls back to a valid cookie.
+    third_id, third = issue(admin, name)
+    issued.append(third)
+    invalid("Bearer rag_" + secrets.token_hex(6) + "_" + secrets.token_urlsafe(32), "an unknown key")
+    invalid("Bearer " + third[:-1], "a malformed key")
+    invalid("Basic " + third, "a Basic header")
+    status, raw, _ = code("GET", "/metrics/latency", token=admin, headers={"Authorization": "Bearer nonsense"})
+    expect(status == 401 and error_code(raw) == "KEY_INVALID", "a bad key with a valid cookie answered {} {}".format(
+        status, error_code(raw)))
+    # A key in the query string is no credential. It reaches the access log there,
+    # which is why keys are never accepted from URLs: revoked at once, and left
+    # out of the log check below.
+    query_id, query_key = issue(admin, name)
+    status, raw, _ = code("GET", "/collections?api_key=" + query_key, headers={})
+    expect(status == 401 and error_code(raw) == "AUTH_REQUIRED", "a key in the query string answered {} {}".format(
+        status, error_code(raw)))
+    admin_post("/keys/{}/revoke".format(query_id))
+    # Keys appear in no listing and not in the API log, which has the admin lines.
+    status, raw, _ = code("GET", "/auth/service-principals", token=admin)
+    expect(status == 200 and not [k for k in issued + [query_key] if k in raw.decode()], "a listing holds a key")
+    admin_post("/keys/{}/revoke".format(third_id))
+    admin_post("/disable")
+    result = compose("logs", "--no-color", "api")
+    log = result.stdout + result.stderr
+    expect(result.returncode == 0, "docker compose logs failed")
+    expect(not [k for k in issued if k in log], "an API key appears in the API log")
+    for line in ("created service principal '{}' (developer)".format(name),
+                 "issued key {} for service principal '{}'".format(second_id, name),
+                 "revoked key {} of service principal '{}'".format(first_id, name),
+                 "disabled service principal '{}'".format(name)):
+        expect("Admin '{}' {}".format(me, line) in log, "the API log has no line \"Admin ... {}\"".format(line))
+    # The operator command marks the principal in its list and won't reset its password.
+    rc, listed = auth_setup.operator("list")
+    expect(rc == 0 and "{}\tdeveloper\tdisabled\tservice account\t".format(name) in listed,
+           "the operator's list doesn't mark the principal")
+    rc, out = auth_setup.operator("reset-password", name)
+    expect(rc == 1 and not out, "reset-password of a principal exited {}".format(rc))
+    request("POST", "/auth/logout", token=admin)
 
 
 def check_public(operator_ok):
@@ -19408,7 +20260,8 @@ def check_login_logout(operator_ok):
     token = role_token("developer")
     status, raw, _ = code("GET", "/auth/me", token=token)
     body = json.loads(raw)
-    expect(status == 200 and body == {"username": "vfy-developer", "role": "developer", "must_change_password": False},
+    expect(status == 200 and body == {"username": "vfy-developer", "role": "developer", "must_change_password": False,
+                                      "kind": "user"},
            "GET /auth/me answered {} {}".format(status, body))
     status, _, _ = code("POST", "/auth/logout", token=token)
     expect(status == 200, "logout answered {}".format(status))
@@ -19687,10 +20540,13 @@ def main(argv):
     names = [a for a in argv if a != "--operator"]
     if len(names) == 2 and names[0] == "matrix" and names[1] in ROLES + ("anonymous",):
         run = lambda: check_matrix(names[1], operator_ok)
-    elif len(names) == 1 and names[0] in CHECKS and names[0] != "matrix":
+    elif len(names) == 2 and names[0] == "key-matrix" and names[1] in ROLES:
+        run = lambda: check_key_matrix(names[1], operator_ok)
+    elif len(names) == 1 and names[0] in CHECKS and names[0] not in ("matrix", "key-matrix"):
         run = lambda: CHECKS[names[0]](operator_ok)
     else:
-        print("usage: auth_stack.py {matrix ROLE|anonymous, " + ", ".join(sorted(CHECKS)) + "} [--operator]",
+        print("usage: auth_stack.py {matrix ROLE|anonymous, key-matrix ROLE, "
+              + ", ".join(sorted(set(CHECKS) - {"matrix", "key-matrix"})) + "} [--operator]",
               file=sys.stderr)
         return 2
     try:
@@ -19708,7 +20564,8 @@ if __name__ == "__main__":
 ### scripts/tests/test_auth.py
 
 ```python
-"""Accounts, sessions, the endpoint/role matrix and the operator command (#25).
+"""Accounts, sessions, service principals and API keys, the endpoint/role
+matrix and the operator command (#25).
 
 Runs with the API's dependencies, in the built API image with no network
 (`17_auth.sh`):
@@ -19741,7 +20598,7 @@ from pydantic import ValidationError
 import config
 from config import settings
 from main import app
-from auth import passwords, policy, store
+from auth import keys, passwords, policy, store
 from auth.middleware import AuthMiddleware, same_origin
 
 ORIGIN = "http://testserver"
@@ -19988,7 +20845,7 @@ class PolicyTests(unittest.TestCase):
         counts = {}
         for access in policy.ACCESS.values():
             counts[access] = counts.get(access, 0) + 1
-        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 19, "engineer": 17})
+        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 19, "engineer": 24})
         self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
         self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
         self.assertEqual(policy.ACCESS[("POST", "/collections")], "developer")
@@ -20003,6 +20860,22 @@ class PolicyTests(unittest.TestCase):
                                       ("POST", "/auth/users/{username}/enable")})
         self.assertEqual(set(admin.values()), {"engineer"})
         self.assertFalse([key for key in policy.ACCESS if key[0] == "DELETE" and key[1].startswith("/auth")])
+        # Service principals and keys (PR 3): the Engineer's, and nothing deletes a principal.
+        principals = {key: access for key, access in policy.ACCESS.items()
+                      if key[1].startswith("/auth/service-principals")}
+        self.assertEqual(set(principals), {
+            ("GET", "/auth/service-principals"), ("POST", "/auth/service-principals"),
+            ("POST", "/auth/service-principals/{name}/role"), ("POST", "/auth/service-principals/{name}/disable"),
+            ("POST", "/auth/service-principals/{name}/enable"), ("POST", "/auth/service-principals/{name}/keys"),
+            ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke")})
+        self.assertEqual(set(principals.values()), {"engineer"})
+
+    def test_keys_cannot_reach_administration_or_the_session_routes(self):
+        # S5 of PR 3: every account, principal and key route, logout and the
+        # password change; GET /auth/me stays open to a key.
+        admin = {path for _, path in policy.ACCESS if path.startswith(("/auth/users", "/auth/service-principals"))}
+        self.assertEqual(policy.HUMAN_ONLY, admin | {"/auth/logout", "/auth/password"})
+        self.assertNotIn("/auth/me", policy.HUMAN_ONLY)
 
     def test_each_template_resolves_to_itself(self):
         for method, template in policy.ACCESS:
@@ -20569,6 +21442,472 @@ class AdminRouteTests(StoreTestCase):
             self.assertNotIn(secret, logged(logs))
 
 
+class KeyTestCase(StoreTestCase):
+    """A store with an engineer, a developer and an end user, plus helpers for principals and keys."""
+
+    def setUp(self):
+        super().setUp()
+        self.setup_roles()
+
+    def principal(self, name, role, days=90, label=""):
+        store.create_principal(name, role)
+        key_row, key = store.issue_key(name, days, label)
+        return key_row, key
+
+    def bearer(self, key):
+        return {"Authorization": f"Bearer {key}"}
+
+
+class KeyFormatTests(unittest.TestCase):
+    def test_format(self):
+        seen = set()
+        for _ in range(50):
+            key_id, key = keys.generate()
+            self.assertRegex(key, r"^rag_[a-z0-9]{12}_[A-Za-z0-9_-]{43}$")
+            self.assertEqual(len(key), 60)
+            self.assertEqual(keys.key_id(key), key_id)
+            seen.add(key)
+        self.assertEqual(len(seen), 50)
+
+    def test_bearer_parsing(self):
+        _, key = keys.generate()
+        self.assertEqual(keys.bearer("Bearer " + key), key)
+        self.assertEqual(keys.bearer("bearer " + key), key)
+        for value in (None, "", key, "Basic " + key, "Bearer  " + key, "Bearer " + key + " ", "Bearer " + key[:-1],
+                      "Bearer rag_ABCDEFGHIJKL_" + "a" * 43, "Token " + key):
+            with self.subTest(value=value):
+                self.assertIsNone(keys.bearer(value))
+
+
+class KeyStoreTests(KeyTestCase):
+    def test_a_version_1_store_gains_the_kind_column(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        conn = sqlite3.connect(Path(temp.name, "auth.db"))
+        conn.executescript("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, "
+                           "role TEXT NOT NULL, password_hash TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, "
+                           "must_change_password INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL, "
+                           "updated_at REAL NOT NULL);"
+                           "INSERT INTO users VALUES (1, 'old', 'engineer', 'x', 1, 0, 1.0, 1.0);"
+                           "PRAGMA user_version = 1;")
+        conn.commit()
+        conn.close()
+        with patch.object(settings, "auth_dir", temp.name):
+            self.assertEqual(store.get_user("old").kind, "user")
+            version = sqlite3.connect(Path(temp.name, "auth.db")).execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(version, 2)
+            store.create_principal("svc", "developer")
+            self.assertEqual([p.name for p in store.list_principals()], ["svc"])
+
+    def test_only_the_key_hash_is_stored(self):
+        key_row, key = self.principal("svc", "developer")
+        raw = Path(self.dir, "auth.db").read_bytes()
+        self.assertNotIn(key.encode(), raw)
+        self.assertNotIn(key.split("_", 2)[2].encode(), raw)
+        rows = sqlite3.connect(Path(self.dir, "auth.db")).execute("SELECT id, key_hash FROM api_keys").fetchall()
+        self.assertEqual(rows, [(key_row.id, hashlib.sha256(key.encode()).hexdigest())])
+
+    def test_a_valid_key_is_its_principal_as_it_is_now(self):
+        _, key = self.principal("svc", "developer")
+        principal = store.authenticate_key(key)
+        self.assertEqual((principal.username, principal.role, principal.kind, principal.must_change_password),
+                         ("svc", "developer", "service", False))
+        store.set_role("svc", "end_user")
+        self.assertEqual(store.authenticate_key(key).role, "end_user")
+        for wrong in (None, "", key[:-1] + ("A" if key[-1] != "A" else "B"), "rag_" + "a" * 12 + "_" + "b" * 43,
+                      key + "x"):
+            with self.subTest(wrong=wrong):
+                self.assertIsNone(store.authenticate_key(wrong))
+
+    def test_expiry_boundary(self):
+        start = 10_000.0
+        with patch.object(store, "_now", return_value=start):
+            key_row, key = self.principal("svc", "developer", days=1)
+        self.assertEqual(key_row.expires_at, start + 86400)
+        with patch.object(store, "_now", return_value=start + 86399):
+            self.assertIsNotNone(store.authenticate_key(key))
+        with patch.object(store, "_now", return_value=start + 86400):
+            self.assertIsNone(store.authenticate_key(key))
+            self.assertEqual(store.get_principal("svc").keys[0].status(start + 86400), "expired")
+
+    def test_lifetimes(self):
+        store.create_principal("svc", "developer")
+        for days in (0, 366, -1, 1.5, "90"):
+            with self.subTest(days=days), self.assertRaises(ValueError):
+                store.issue_key("svc", days)
+        key_row, _ = store.issue_key("svc")
+        self.assertAlmostEqual(key_row.expires_at - key_row.created_at, 90 * 86400)
+        key_row, _ = store.issue_key("svc", 365)
+        self.assertAlmostEqual(key_row.expires_at - key_row.created_at, 365 * 86400)
+
+    def test_revocation_and_rotation(self):
+        old_row, old = self.principal("svc", "developer")
+        new_row, new = store.issue_key("svc", 30, "rotated")
+        self.assertIsNotNone(store.authenticate_key(old), "the old key stays valid after rotation (Q24)")
+        self.assertIsNotNone(store.authenticate_key(new))
+        first = store.revoke_key("svc", old_row.id)
+        self.assertIsNone(store.authenticate_key(old))
+        self.assertIsNotNone(store.authenticate_key(new))
+        with patch.object(store, "_now", return_value=first.revoked_at + 100):
+            again = store.revoke_key("svc", old_row.id)
+        self.assertEqual(again.revoked_at, first.revoked_at, "a second revoke keeps the first time")
+        listed = store.get_principal("svc").keys
+        self.assertEqual([k.id for k in listed], [new_row.id, old_row.id])
+        self.assertEqual([k.status() for k in listed], ["active", "revoked"])
+        with self.assertRaises(store.Refused) as refused:
+            store.revoke_key("svc", "nosuchkey123")
+        self.assertEqual(refused.exception.code, "KEY_NOT_FOUND")
+        store.create_principal("other", "developer")
+        with self.assertRaises(store.Refused) as refused:
+            store.revoke_key("other", new_row.id)
+        self.assertEqual(refused.exception.code, "KEY_NOT_FOUND")
+
+    def test_a_disabled_principal_has_no_valid_key(self):
+        _, key = self.principal("svc", "developer")
+        store.set_enabled("svc", False)
+        self.assertIsNone(store.authenticate_key(key))
+        _, issued_while_disabled = store.issue_key("svc")
+        self.assertIsNone(store.authenticate_key(issued_while_disabled))
+        store.set_enabled("svc", True)
+        self.assertIsNotNone(store.authenticate_key(key))
+        self.assertIsNotNone(store.authenticate_key(issued_while_disabled))
+
+    def test_last_used_is_written_at_most_once_a_minute(self):
+        key_row, key = self.principal("svc", "developer")
+        self.assertIsNone(key_row.last_used)
+        with patch.object(store, "_now", return_value=key_row.created_at + 10):
+            store.authenticate_key(key)
+        self.assertEqual(store.get_principal("svc").keys[0].last_used, key_row.created_at + 10)
+        with patch.object(store, "_now", return_value=key_row.created_at + 50):
+            store.authenticate_key(key)
+        self.assertEqual(store.get_principal("svc").keys[0].last_used, key_row.created_at + 10)
+        with patch.object(store, "_now", return_value=key_row.created_at + 80):
+            store.authenticate_key(key)
+        self.assertEqual(store.get_principal("svc").keys[0].last_used, key_row.created_at + 80)
+
+    def test_one_name_pool(self):
+        store.create_principal("svc", "developer")
+        with self.assertRaises(store.Refused) as refused:
+            store.create_principal("dev", "developer")
+        self.assertEqual(refused.exception.code, "PRINCIPAL_EXISTS")
+        with self.assertRaises(store.Refused) as refused:
+            store.create_principal("svc", "end_user")
+        self.assertEqual(refused.exception.code, "PRINCIPAL_EXISTS")
+        with self.assertRaises(store.Refused) as refused:
+            store.create_user("svc", "developer", passwords.generate_password())
+        self.assertEqual(refused.exception.code, "USER_EXISTS")
+        self.assertEqual([u.username for u in store.list_users()], ["dev", "eng", "user"])
+        self.assertEqual([u.username for u in store.list_users(kind=None)], ["dev", "eng", "svc", "user"])
+
+    def test_principals_have_no_password_and_are_kind_checked(self):
+        store.create_principal("svc", "engineer")
+        user = store.get_user("svc")
+        self.assertEqual((user.kind, user.must_change_password), ("service", False))
+        self.assertFalse(passwords.verify_password("", user.password_hash))
+        self.assertFalse(passwords.verify_password(store.NO_PASSWORD, user.password_hash))
+        with self.assertRaises(store.Refused) as refused:
+            store.reset_password("svc", passwords.generate_password())
+        self.assertEqual(refused.exception.code, "NOT_A_USER")
+        with self.assertRaises(store.Refused) as refused:
+            store.set_role("svc", "developer", "user")
+        self.assertEqual(refused.exception.code, "USER_NOT_FOUND")
+        with self.assertRaises(store.Refused) as refused:
+            store.issue_key("dev")
+        self.assertEqual(refused.exception.code, "PRINCIPAL_NOT_FOUND")
+        with self.assertRaises(store.Refused) as refused:
+            store.get_principal("eng")
+        self.assertEqual(refused.exception.code, "PRINCIPAL_NOT_FOUND")
+
+    def test_an_engineer_principal_does_not_count_as_an_engineer(self):
+        store.create_principal("svc", "engineer")
+        with self.assertRaises(store.Refused) as refused:
+            store.set_enabled("eng", False)
+        self.assertEqual(refused.exception.code, "LAST_ENGINEER")
+        store.set_enabled("svc", False)
+        store.set_role("svc", "end_user")
+
+
+class KeyMiddlewareTests(KeyTestCase):
+    """Authenticating with a key through main.app (S3 of PR 3's specifications)."""
+
+    def code(self, response):
+        return response.json()["error"]["code"]
+
+    def test_a_key_follows_its_role_without_an_origin(self):
+        _, key = self.principal("svc", "developer")
+        headers = self.bearer(key)
+        self.assertEqual(self.client.get("/collections", headers=headers).status_code != 401, True)
+        response = self.client.get("/packages", headers=headers)
+        self.assertNotIn(response.status_code, (401, 403), response.text)
+        # A change with no Origin and no Sec-Fetch-Site: the key skips the origin check (Q26).
+        response = self.client.post("/collections", json={"name": "VfyKey", "index_type": 7}, headers=headers)
+        self.assertEqual(response.status_code, 422, response.text)
+        response = self.client.post("/tune/rechunk", json={}, headers=headers)
+        self.assertEqual((response.status_code, self.code(response)), (403, "FORBIDDEN"))
+        self.assertEqual(response.json()["error"]["detail"], {"required_role": "engineer"})
+
+    def test_keys_are_refused_on_administration_and_session_routes(self):
+        _, key = self.principal("svc", "engineer")
+        headers = self.bearer(key)
+        for method, path, body in (("GET", "/auth/users", None),
+                                   ("POST", "/auth/users", {"username": "minted", "role": "engineer"}),
+                                   ("POST", "/auth/users/dev/reset-password", None),
+                                   ("POST", "/auth/users/dev/role", {"role": "engineer"}),
+                                   ("POST", "/auth/users/dev/disable", None),
+                                   ("POST", "/auth/users/dev/enable", None),
+                                   ("GET", "/auth/service-principals", None),
+                                   ("POST", "/auth/service-principals", {"name": "minted", "role": "engineer"}),
+                                   ("POST", "/auth/service-principals/svc/role", {"role": "engineer"}),
+                                   ("POST", "/auth/service-principals/svc/disable", None),
+                                   ("POST", "/auth/service-principals/svc/enable", None),
+                                   ("POST", "/auth/service-principals/svc/keys", {}),
+                                   ("POST", "/auth/service-principals/svc/keys/abc/revoke", None),
+                                   ("POST", "/auth/logout", None),
+                                   ("POST", "/auth/password", {"current_password": "x", "new_password": "y" * 12})):
+            with self.subTest(route=f"{method} {path}"):
+                response = self.client.request(method, path, json=body, headers=headers)
+                self.assertEqual((response.status_code, self.code(response)), (403, "KEY_NOT_ALLOWED"))
+        self.assertIsNone(store.get_user("minted"))
+        self.assertEqual(len(store.get_principal("svc").keys), 1)
+        # Engineer-level data routes stay open to an engineer key.
+        self.assertNotIn(self.client.get("/metrics/latency", headers=headers).status_code, (401, 403))
+
+    def test_me_names_the_principal(self):
+        _, key = self.principal("svc", "end_user")
+        response = self.client.get("/auth/me", headers=self.bearer(key))
+        self.assertEqual(response.json(), {"username": "svc", "role": "end_user", "must_change_password": False,
+                                           "kind": "service"})
+        headers, _ = self.session("dev")
+        self.assertEqual(self.client.get("/auth/me", headers=headers).json()["kind"], "user")
+
+    def test_invalid_keys_get_one_answer(self):
+        key_row, key = self.principal("svc", "developer")
+        revoked_row, revoked = store.issue_key("svc")
+        store.revoke_key("svc", revoked_row.id)
+        with patch.object(store, "_now", return_value=key_row.created_at - 2 * 86400):
+            _, expired = store.issue_key("svc", 1)
+        store.create_principal("off", "developer")
+        _, disabled = store.issue_key("off")
+        store.set_enabled("off", False)
+        answers = set()
+        for value in ("Bearer " + revoked, "Bearer " + expired, "Bearer " + disabled, "Bearer " + key[:-2] + "zz",
+                      "Bearer rag_aaaaaaaaaaaa_" + "b" * 43, "Bearer nonsense", "Basic dXNlcjpwYXNz", "", key,
+                      "Bearer"):
+            with self.subTest(value=value):
+                response = self.client.get("/collections", headers={"Authorization": value})
+                self.assertEqual((response.status_code, self.code(response)), (401, "KEY_INVALID"))
+                answers.add(response.text)
+        self.assertEqual(len(answers), 1, "every failure gets the same answer")
+
+    def test_two_authorization_headers_are_refused(self):
+        _, key = self.principal("svc", "developer")
+        response = self.client.get("/collections", headers=[("Authorization", "Bearer " + key),
+                                                            ("Authorization", "Bearer " + key)])
+        self.assertEqual((response.status_code, self.code(response)), (401, "KEY_INVALID"))
+
+    def test_the_header_decides_and_never_falls_back_to_the_cookie(self):
+        _, key = self.principal("svc", "end_user")
+        session, _ = self.session("eng")
+        response = self.client.get("/metrics/latency", headers={**session, "Authorization": "Bearer nonsense"})
+        self.assertEqual((response.status_code, self.code(response)), (401, "KEY_INVALID"))
+        response = self.client.get("/metrics/latency", headers={**session, **self.bearer(key)})
+        self.assertEqual((response.status_code, self.code(response)), (403, "FORBIDDEN"))
+        self.assertEqual(self.client.get("/auth/me", headers={**session, **self.bearer(key)}).json()["username"], "svc")
+
+    def test_a_key_anywhere_but_the_header_is_no_credential(self):
+        _, key = self.principal("svc", "developer")
+        for path, headers in ((f"/collections?api_key={key}", {}), (f"/collections?key={key}", {}),
+                              (f"/collections?access_token={key}", {}),
+                              ("/collections", {"X-Api-Key": key}),
+                              ("/collections", {"Cookie": f"{store.COOKIE}={key}"}),
+                              ("/collections", {"Cookie": f"api_key={key}"})):
+            with self.subTest(path=path, headers=list(headers)):
+                response = self.client.get(path, headers=headers)
+                self.assertEqual((response.status_code, self.code(response)), (401, "AUTH_REQUIRED"))
+
+    def test_public_routes_ignore_the_header(self):
+        response = self.client.get("/auth/status", headers={"Authorization": "Bearer nonsense"})
+        self.assertEqual(response.status_code, 200)
+        response = self.login("dev", self.passwords["developer"], Authorization="Bearer nonsense")
+        self.assertEqual(response.status_code, 200)
+
+    def test_a_principal_cannot_log_in(self):
+        store.create_principal("svc", "engineer")
+        with patch.object(passwords, "verify_password", wraps=passwords.verify_password) as verify:
+            for password in ("", store.NO_PASSWORD, "anything at all"):
+                response = self.login("svc", password)
+                self.assertEqual((response.status_code, self.code(response)), (401, "LOGIN_FAILED"))
+        self.assertTrue(all(call.args[1] == passwords.dummy_hash() for call in verify.call_args_list),
+                        "a principal's login is checked against the dummy hash")
+
+    def test_failed_key_requests_are_not_logged(self):
+        logger = logging.getLogger("auth")
+        with patch.object(logger, "warning") as warning:
+            for _ in range(3):
+                self.client.get("/collections", headers={"Authorization": "Bearer nonsense"})
+        warning.assert_not_called()
+
+
+class PrincipalRouteTests(KeyTestCase):
+    """The Engineer-only principal and key routes (S4, S5 of PR 3's specifications)."""
+
+    BASE = "/auth/service-principals"
+
+    def setUp(self):
+        super().setUp()
+        self.eng, _ = self.session("eng")
+
+    def admin(self, method, path, body=None, headers=None):
+        return self.client.request(method, self.BASE + path, json=body, headers=headers or self.eng)
+
+    def code(self, response):
+        return response.json()["error"]["code"]
+
+    def routes(self):
+        return (("GET", "", None), ("POST", "", {"name": "newsvc", "role": "end_user"}),
+                ("POST", "/svc/role", {"role": "engineer"}), ("POST", "/svc/disable", None),
+                ("POST", "/svc/enable", None), ("POST", "/svc/keys", {}),
+                ("POST", f"/svc/keys/{self.key_id}/revoke", None))
+
+    def test_only_engineers_reach_them(self):
+        key_row, _ = self.principal("svc", "developer")
+        self.key_id = key_row.id
+        for name in ("dev", "user"):
+            headers, _ = self.session(name)
+            for method, path, body in self.routes():
+                with self.subTest(user=name, route=f"{method} {path}"):
+                    response = self.admin(method, path, body, headers)
+                    self.assertEqual((response.status_code, self.code(response)), (403, "FORBIDDEN"))
+        for method, path, body in self.routes():
+            with self.subTest(anonymous=f"{method} {path}"):
+                response = self.client.request(method, self.BASE + path, json=body)
+                self.assertEqual((response.status_code, self.code(response)), (401, "AUTH_REQUIRED"))
+        principal = store.get_principal("svc")
+        self.assertEqual((principal.role, principal.enabled, len(principal.keys)), ("developer", True, 1))
+        self.assertIsNone(principal.keys[0].revoked_at)
+        response = self.admin("POST", "/svc/disable", headers={**self.eng, "Origin": "http://evil.test"})
+        self.assertEqual(self.code(response), "CROSS_ORIGIN_REFUSED")
+
+    def test_create_list_and_shapes(self):
+        response = self.admin("POST", "", {"name": "Nightly.Import", "role": "developer"})
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json(), {"principal": {
+            "name": "nightly.import", "role": "developer", "enabled": True,
+            "created_at": response.json()["principal"]["created_at"], "keys": []}})
+        response = self.admin("GET", "")
+        self.assertEqual([p["name"] for p in response.json()["principals"]], ["nightly.import"])
+        self.assertNotIn("dev", [p["name"] for p in response.json()["principals"]])
+        users = self.client.get("/auth/users", headers=self.eng).json()["users"]
+        self.assertNotIn("nightly.import", [u["username"] for u in users])
+
+    def test_issue_shows_the_key_once(self):
+        self.admin("POST", "", {"name": "svc", "role": "developer"})
+        response = self.admin("POST", "/svc/keys", {"label": "nightly import", "days": 30})
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        body = response.json()
+        secret = body["secret"]
+        self.assertEqual(keys.key_id(secret), body["key"]["id"])
+        self.assertEqual(set(body["key"]), {"id", "label", "created_at", "expires_at", "revoked_at", "last_used_at",
+                                            "status"})
+        self.assertEqual((body["key"]["label"], body["key"]["status"], body["key"]["revoked_at"],
+                          body["key"]["last_used_at"]), ("nightly import", "active", None, None))
+        self.assertEqual(body["principal"]["keys"], [body["key"]])
+        # The key works, and is in no later answer.
+        self.assertEqual(self.client.get("/auth/me", headers=self.bearer(secret)).json()["username"], "svc")
+        for later in (self.admin("GET", ""), self.admin("POST", "/svc/keys", {}),
+                      self.admin("POST", f"/svc/keys/{body['key']['id']}/revoke")):
+            self.assertNotIn(secret, later.text)
+        self.assertIsNotNone(self.admin("GET", "").json()["principals"][0]["keys"][1]["revoked_at"])
+        default = self.admin("POST", "/svc/keys", {}).json()["key"]
+        self.assertEqual(default["label"], "")
+
+    def test_refusals(self):
+        self.admin("POST", "", {"name": "svc", "role": "developer"})
+        for name in ("ab", "x" * 33, "has space", ""):
+            with self.subTest(name=name), self.assertLogs("auth", "WARNING") as logs:
+                response = self.admin("POST", "", {"name": name, "role": "end_user"})
+                self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_USERNAME"))
+                self.assertEqual(len(logs.records), 1)
+        for name in ("SVC", "dev"):
+            with self.subTest(taken=name), self.assertLogs("auth", "WARNING") as logs:
+                response = self.admin("POST", "", {"name": name, "role": "end_user"})
+                self.assertEqual((response.status_code, self.code(response)), (409, "PRINCIPAL_EXISTS"))
+                self.assertEqual(len(logs.records), 1)
+        for path, body in (("/nobody/role", {"role": "developer"}), ("/dev/disable", None), ("/eng/enable", None),
+                           ("/dev/keys", {}), ("/a/keys", {}), ("/dev/keys/abc/revoke", None)):
+            with self.subTest(path=path), self.assertLogs("auth", "WARNING") as logs:
+                response = self.admin("POST", path, body)
+                self.assertEqual((response.status_code, self.code(response)), (404, "PRINCIPAL_NOT_FOUND"))
+                self.assertEqual(len(logs.records), 1)
+        self.assertTrue(store.get_user("dev").enabled)
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/svc/keys/nosuchkey123/revoke")
+        self.assertEqual((response.status_code, self.code(response)), (404, "KEY_NOT_FOUND"))
+        self.assertEqual(len(logs.records), 1)
+        for body in ({"days": 0}, {"days": 366}, {"days": 1.5}, {"days": "90"}, {"days": True},
+                     {"label": "l" * 65}, {"label": None}):
+            with self.subTest(body=body):
+                response = self.admin("POST", "/svc/keys", body)
+                self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_PARAMETER"))
+        for body in ({"name": "newsvc", "role": "admin"}, {"name": "newsvc"}, {"role": "end_user"}):
+            with self.subTest(body=body):
+                response = self.admin("POST", "", body)
+                self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_PARAMETER"))
+        self.assertEqual(store.get_principal("svc").keys, ())
+        self.assertIsNone(store.get_user("newsvc"))
+
+    def test_role_disable_enable(self):
+        self.admin("POST", "", {"name": "svc", "role": "developer"})
+        secret = self.admin("POST", "/svc/keys", {}).json()["secret"]
+        response = self.admin("POST", "/svc/role", {"role": "end_user"})
+        self.assertEqual(response.json()["principal"]["role"], "end_user")
+        self.assertEqual(self.client.get("/packages", headers=self.bearer(secret)).status_code, 403)
+        self.assertEqual(self.admin("POST", "/svc/role", {"role": "end_user"}).status_code, 200)
+        response = self.admin("POST", "/svc/disable")
+        self.assertFalse(response.json()["principal"]["enabled"])
+        self.assertEqual(self.code(self.client.get("/collections", headers=self.bearer(secret))), "KEY_INVALID")
+        self.assertEqual(self.admin("POST", "/svc/disable").status_code, 200)
+        self.assertTrue(self.admin("POST", "/svc/enable").json()["principal"]["enabled"])
+        self.assertNotIn(self.client.get("/collections", headers=self.bearer(secret)).status_code, (401, 403))
+
+    def test_human_routes_stay_human(self):
+        self.admin("POST", "", {"name": "svc", "role": "engineer"})
+        for path, body in (("/svc/reset-password", None), ("/svc/role", {"role": "developer"}),
+                           ("/svc/disable", None), ("/svc/enable", None)):
+            with self.subTest(path=path):
+                response = self.client.post("/auth/users" + path, json=body, headers=self.eng)
+                self.assertEqual((response.status_code, self.code(response)), (404, "USER_NOT_FOUND"))
+        response = self.client.post("/auth/users", json={"username": "svc", "role": "developer"}, headers=self.eng)
+        self.assertEqual((response.status_code, self.code(response)), (409, "USER_EXISTS"))
+        self.assertEqual(store.get_principal("svc").role, "engineer")
+        # An engineer principal doesn't stand in for the last enabled Engineer.
+        response = self.client.post("/auth/users/eng/disable", headers=self.eng)
+        self.assertEqual((response.status_code, self.code(response)), (409, "LAST_ENGINEER"))
+
+    def test_changes_are_logged_one_line_each_without_secrets(self):
+        with self.assertLogs("auth", "WARNING") as logs:
+            self.admin("POST", "", {"name": "svc", "role": "developer"})
+            issued = self.admin("POST", "/svc/keys", {"days": 7}).json()
+            self.admin("POST", "/svc/role", {"role": "end_user"})
+            self.admin("POST", "/svc/disable")
+            self.admin("POST", "/svc/enable")
+            self.admin("POST", f"/svc/keys/{issued['key']['id']}/revoke")
+            self.admin("GET", "")
+        text = logged(logs)
+        self.assertEqual(len(logs.records), 6, text)
+        self.assertTrue(all(r.getMessage().startswith("Admin 'eng' ") for r in logs.records), text)
+        for line in ("created service principal 'svc' (developer)",
+                     f"issued key {issued['key']['id']} for service principal 'svc', expiring "
+                     f"{issued['key']['expires_at']}",
+                     "set the role of service principal 'svc' to end_user", "disabled service principal 'svc'",
+                     "enabled service principal 'svc'", f"revoked key {issued['key']['id']} of service principal 'svc'"):
+            self.assertIn(line, text)
+        self.assertNotIn(issued["secret"], text)
+        self.assertNotIn(issued["secret"].split("_", 2)[2], text)
+        self.assertNotIn(keys.digest(issued["secret"]), text)
+
+
 class CommandTests(unittest.TestCase):
     """`python -m auth` in a subprocess, as an operator runs it."""
 
@@ -20643,6 +21982,32 @@ class CommandTests(unittest.TestCase):
         self.assertIn("admin\tengineer\tenabled\tpassword change due\t", result.stdout)
         self.assertNotIn(password, result.stdout)
         self.assertNotIn("scrypt", result.stdout)
+    def test_service_principals(self):
+        # S2 of PR 3: list marks principals; set-role, disable and enable work on
+        # them; reset-password refuses one; create-user can't take its name.
+        self.run_auth("bootstrap", "admin")
+        with patch.object(settings, "auth_dir", self.dir):
+            store._ready.discard(str(store.db_path()))
+            store.create_principal("svc", "developer")
+            _, key = store.issue_key("svc")
+        listed = self.run_auth("list")
+        self.assertIn("svc\tdeveloper\tenabled\tservice account\t", listed.stdout)
+        self.assertNotIn(key, listed.stdout)
+        reset = self.run_auth("reset-password", "svc")
+        self.assertEqual((reset.returncode, reset.stdout), (1, ""))
+        self.assertIn("service principal", reset.stderr)
+        self.assertEqual(len(reset.stderr.strip().splitlines()), 1)
+        self.assertEqual(self.run_auth("create-user", "svc", "end_user").returncode, 1)
+        self.assertEqual(self.run_auth("set-role", "svc", "end_user").returncode, 0)
+        self.assertEqual(self.run_auth("disable", "svc").returncode, 0)
+        with patch.object(settings, "auth_dir", self.dir):
+            self.assertIsNone(store.authenticate_key(key))
+            self.assertEqual(store.get_user("svc").role, "end_user")
+        self.assertEqual(self.run_auth("enable", "svc").returncode, 0)
+        with patch.object(settings, "auth_dir", self.dir):
+            self.assertIsNotNone(store.authenticate_key(key))
+        self.assertNotIn("key", self.run_auth("--help").stdout.lower().replace("keys", ""))
+
     def test_every_action_writes_one_stderr_line(self):
         # N4: one line per action on standard error, naming no password.
         password = self.run_auth("bootstrap", "admin").stdout.strip()
@@ -20678,7 +22043,8 @@ class ImplementationCopyTests(unittest.TestCase):
         document = (root / "IMPLEMENTATION.md").read_text()
         for name in ("api/auth/__init__.py", "api/auth/passwords.py", "api/auth/store.py", "api/auth/policy.py",
                      "api/auth/middleware.py", "api/auth/__main__.py", "api/auth/testing.py",
-                     "api/routers/auth.py", "api/main.py", "ui/src/pages/UsersPage.tsx", "api/config.py", "proxy/nginx.conf",
+                     "api/routers/auth.py", "api/main.py", "ui/src/pages/UsersPage.tsx",
+                     "api/auth/keys.py", "ui/src/pages/ServiceKeysPage.tsx", "api/config.py", "proxy/nginx.conf",
                      "scripts/verify/17_auth.sh", "scripts/verify/auth_setup.py", "scripts/verify/auth_stack.py",
                      "scripts/verify/auth_headers.py"):
             with self.subTest(name=name):
@@ -20748,6 +22114,10 @@ PROTECTED = (
     ("GET", "/auth/users"), ("POST", "/auth/users"), ("POST", "/auth/users/nobody/reset-password"),
     ("POST", "/auth/users/nobody/role"), ("POST", "/auth/users/nobody/disable"),
     ("POST", "/auth/users/nobody/enable"),
+    ("GET", "/auth/service-principals"), ("POST", "/auth/service-principals"),
+    ("POST", "/auth/service-principals/nobody/role"), ("POST", "/auth/service-principals/nobody/disable"),
+    ("POST", "/auth/service-principals/nobody/enable"), ("POST", "/auth/service-principals/nobody/keys"),
+    ("POST", "/auth/service-principals/nobody/keys/nokey/revoke"),
 )
 
 
@@ -27130,7 +28500,7 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     for (const p of ['/qa', '/collections', '/health', '/qa']) {
       await s.page.goto(BASE + p, { waitUntil: 'networkidle2' }); await sleep(500);
     }
-    r.check('the session survives navigation and reloads', await s.page.evaluate(() => document.querySelectorAll('nav a').length === 9));  // the Engineer's links, Users included
+    r.check('the session survives navigation and reloads', await s.page.evaluate(() => document.querySelectorAll('nav a').length === 10));  // the Engineer's links, Users and Service keys included
     await clickByText(s.page, 'Log out');
     await s.page.waitForFunction(() => location.pathname === '/login', { timeout: 10000 }).catch(() => {});
     const me = await s.page.evaluate(async () => (await fetch('/api/auth/me')).status);
@@ -27231,7 +28601,7 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     const s = await session(browser, BASE, 'engineer');
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(1500);
     const links = await s.page.evaluate(() => [...document.querySelectorAll('nav a')].map(a => a.textContent.trim()));
-    for (const want of ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users']) {
+    for (const want of ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys']) {
       r.check(`Engineer nav includes ${want}`, links.includes(want), JSON.stringify(links));
     }
     await s.ctx.close();
@@ -35102,9 +36472,9 @@ function usersCases() {
   const rowButtons = (page, username) => page.evaluate(u => [...document.querySelectorAll(`tr[data-username="${u}"] button`)].map(b => b.textContent.trim()), username);
   const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
   return [
-    { name: 'Engineer nav ends with Users, which opens the Users page', open: { role: 'engineer', path: '/qa', routes: usersApi() }, async run(s) {
+    { name: 'Engineer nav has Users, which opens the Users page', open: { role: 'engineer', path: '/qa', routes: usersApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
-      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users']);
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys']);
       await press(s.page, 'Users', 'nav a');
       await waitPath(s.page, '/users');
       await waitText(s.page, 'vfy-developer');
@@ -35176,6 +36546,143 @@ function usersCases() {
     } },
     { name: 'A list that cannot be loaded says so', open: open({ 'GET /api/auth/users': apiError(500, 'INTERNAL_ERROR', 'Synthetic failure.') }), async run(s) {
       await waitText(s.page, 'Could not load the users: Synthetic failure.');
+    } },
+  ];
+}
+
+// The Service keys page (PR 3 of #25): Engineers manage service principals and
+// their API keys. The API is stubbed with a small in-memory list; the real
+// routes are checked in 17_auth.sh.
+function serviceKeysCases() {
+  const SECRET = 'rag_newkey00000a_' + 'S'.repeat(43);
+  const key = (id, over = {}) => ({ id, label: '', created_at: '2026-10-01T12:00:00Z', expires_at: '2026-12-30T12:00:00Z', revoked_at: null, last_used_at: null, status: 'active', ...over });
+  const principal = (name, role, over = {}) => ({ name, role, enabled: true, created_at: '2026-10-01T12:00:00Z', keys: [], ...over });
+  const keysApi = (extra = {}) => {
+    const list = [
+      principal('vfy-svc', 'developer', { keys: [key('activekey0001', { label: 'nightly', last_used_at: '2026-10-20T08:00:00Z' }), key('expiredkey001', { status: 'expired' }), key('revokedkey01', { status: 'revoked', revoked_at: '2026-10-05T00:00:00Z' })] }),
+      principal('vfy-off', 'end_user', { enabled: false }),
+    ];
+    const find = call => list.find(p => p.name === decodeURIComponent(call.path.split('/')[4]));
+    return base({
+      'GET /api/auth/service-principals': () => json(200, { principals: JSON.parse(JSON.stringify(list)) }),
+      'POST /api/auth/service-principals': call => {
+        const p = principal(call.body.name.toLowerCase(), call.body.role);
+        list.push(p);
+        return json(201, { principal: p });
+      },
+      'POST /api/auth/service-principals/*': call => {
+        const p = find(call), parts = call.path.split('/');
+        if (!p) return apiError(404, 'PRINCIPAL_NOT_FOUND', 'There is no service principal.');
+        if (parts[5] === 'keys' && parts.length === 6) {
+          const k = key('newkey00000a', { label: call.body.label });
+          p.keys.unshift(k);
+          return json(201, { principal: p, key: k, secret: SECRET });
+        }
+        if (parts[5] === 'keys' && parts[7] === 'revoke') {
+          const k = p.keys.find(x => x.id === parts[6]);
+          if (!k) return apiError(404, 'KEY_NOT_FOUND', 'No such key.');
+          k.status = 'revoked'; k.revoked_at = '2026-10-28T00:00:00Z';
+        }
+        if (parts[5] === 'role') p.role = call.body.role;
+        if (parts[5] === 'disable') p.enabled = false;
+        if (parts[5] === 'enable') p.enabled = true;
+        return json(200, { principal: p });
+      },
+      ...extra,
+    });
+  };
+  const open = (extra = {}) => ({ role: 'engineer', path: '/service-keys', routes: keysApi(extra) });
+  const keyRows = (page, name) => page.evaluate(n => [...document.querySelectorAll(`section[data-principal="${n}"] tbody tr`)].map(r => [...r.querySelectorAll('td')].map(c => c.textContent.trim())), name);
+  const sectionPress = async (page, name, label) => {
+    const done = await page.evaluate((n, t) => {
+      const b = [...document.querySelectorAll(`section[data-principal="${n}"] button`)].find(x => x.textContent.trim() === t);
+      if (!b) return false; b.click(); return true;
+    }, name, label);
+    if (!done) throw new Error(`no "${label}" button for ${name}`);
+  };
+  const status = (page, name) => page.evaluate(n => document.querySelector(`section[data-principal="${n}"] [data-testid=principal-status]`)?.textContent.trim(), name);
+  const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
+  return [
+    { name: 'Engineer nav ends with Service keys, which opens the page', open: { role: 'engineer', path: '/qa', routes: keysApi() }, async run(s) {
+      await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
+      assert.equal((await nav(s.page)).at(-1), 'Service keys');
+      await press(s.page, 'Service keys', 'nav a');
+      await waitPath(s.page, '/service-keys');
+      await waitText(s.page, 'vfy-svc');
+    } },
+    ...['developer', 'end_user'].map(role => ({ name: `${role === 'developer' ? 'Developer' : 'End User'} has no Service keys link and is sent from /service-keys to Q&A`, open: { role, path: '/qa', routes: base() }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      assert.equal((await nav(s.page)).includes('Service keys'), false);
+      await goto(s.page, '/service-keys');
+      await waitText(s.page, 'Ask a Question');
+      await waitPath(s.page, '/qa');
+      assert.equal(callsTo(s, 'GET', '/api/auth/service-principals').length, 0);
+    } })),
+    { name: 'The list shows each principal and its keys; only active keys can be revoked; rotation is explained', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      const day = v => s.page.evaluate(x => new Date(x).toLocaleDateString(), v);
+      assert.deepEqual(await keyRows(s.page, 'vfy-svc'), [
+        ['activekey0001', 'nightly', await day('2026-10-01T12:00:00Z'), await day('2026-12-30T12:00:00Z'), await day('2026-10-20T08:00:00Z'), 'Active', 'Revoke'],
+        ['expiredkey001', '', await day('2026-10-01T12:00:00Z'), await day('2026-12-30T12:00:00Z'), 'never', 'Expired', ''],
+        ['revokedkey01', '', await day('2026-10-01T12:00:00Z'), await day('2026-12-30T12:00:00Z'), 'never', 'Revoked', ''],
+      ]);
+      assert.deepEqual([await status(s.page, 'vfy-svc'), await status(s.page, 'vfy-off')], ['Enabled', 'Disabled']);
+      assert.equal(await s.page.evaluate(() => document.querySelector('select[aria-label="Role of vfy-svc"]').value), 'developer');
+      assert.ok(await bodyHas(s.page, 'To rotate a key, issue a new one, switch the service over to it, then revoke the old one'));
+      assert.ok(await bodyHas(s.page, 'Authorization: Bearer <key>'));
+      assert.equal(await s.page.evaluate(() => document.querySelector('input[aria-label="Lifetime in days for a new key of vfy-svc"]').value), '90');
+    } },
+    { name: 'Create principal sends the name and role', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await fill(s.page, '#new-principal-name', 'Nightly.Import');
+      await fill(s.page, '#new-principal-role', 'developer');
+      await press(s.page, 'Create principal');
+      await waitFor(s.page, () => !!document.querySelector('section[data-principal="nightly.import"]'), 'the new principal');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/service-principals').map(c => c.body), [{ name: 'Nightly.Import', role: 'developer' }]);
+      assert.equal(await s.page.evaluate(() => document.querySelector('#new-principal-name').value), '');
+    } },
+    { name: 'Issue key sends the label and lifetime, shows the key once, and Done removes it', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await fill(s.page, 'input[aria-label="Label for a new key of vfy-svc"]', 'rotated');
+      await fill(s.page, 'input[aria-label="Lifetime in days for a new key of vfy-svc"]', '30');
+      await sectionPress(s.page, 'vfy-svc', 'Issue key');
+      await waitText(s.page, SECRET);
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/service-principals/vfy-svc/keys').map(c => c.body), [{ label: 'rotated', days: 30 }]);
+      await waitText(s.page, 'shown only once');
+      await waitFor(s.page, () => !!document.querySelector('tr[data-key="newkey00000a"]'), 'the new key row');
+      assert.deepEqual(await s.page.evaluate(() => [Object.keys(sessionStorage), Object.keys(localStorage)]), [[], []]);
+      await press(s.page, 'Done');
+      await waitText(s.page, SECRET, true);
+      assert.equal(await bodyHas(s.page, SECRET), false);
+    } },
+    { name: 'Revoke, a role change, Disable and Enable call the API for that principal', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await sectionPress(s.page, 'vfy-svc', 'Revoke');
+      await waitFor(s.page, () => document.querySelector('tr[data-key="activekey0001"] td:nth-child(6)').textContent.trim() === 'Revoked', 'Revoked');
+      assert.equal(callsTo(s, 'POST', '/api/auth/service-principals/vfy-svc/keys/activekey0001/revoke').length, 1);
+      await fill(s.page, 'select[aria-label="Role of vfy-svc"]', 'end_user');
+      await waitFor(s.page, () => document.querySelector('select[aria-label="Role of vfy-svc"]').value === 'end_user', 'the new role');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/service-principals/vfy-svc/role').map(c => c.body), [{ role: 'end_user' }]);
+      await sectionPress(s.page, 'vfy-svc', 'Disable');
+      await waitFor(s.page, () => document.querySelector('section[data-principal="vfy-svc"] [data-testid=principal-status]').textContent.trim() === 'Disabled', 'Disabled');
+      await sectionPress(s.page, 'vfy-off', 'Enable');
+      await waitFor(s.page, () => document.querySelector('section[data-principal="vfy-off"] [data-testid=principal-status]').textContent.trim() === 'Enabled', 'Enabled');
+      assert.equal(callsTo(s, 'POST', '/api/auth/service-principals/vfy-svc/disable').length, 1);
+      assert.equal(callsTo(s, 'POST', '/api/auth/service-principals/vfy-off/enable').length, 1);
+    } },
+    { name: 'A refusal shows the API\'s message and reloads the list', open: open({
+      'POST /api/auth/service-principals': apiError(409, 'PRINCIPAL_EXISTS', "The name 'vfy-svc' is already taken."),
+    }), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      const before = callsTo(s, 'GET', '/api/auth/service-principals').length;
+      await fill(s.page, '#new-principal-name', 'vfy-svc');
+      await press(s.page, 'Create principal');
+      await waitText(s.page, 'is already taken');
+      await waitFor(s.page, () => document.querySelector('[role=alert]') !== null, 'the alert');
+      assert.ok(callsTo(s, 'GET', '/api/auth/service-principals').length > before, 'the list was reloaded');
+    } },
+    { name: 'A list that cannot be loaded says so', open: open({ 'GET /api/auth/service-principals': apiError(500, 'INTERNAL_ERROR', 'Synthetic failure.') }), async run(s) {
+      await waitText(s.page, 'Could not load the service principals: Synthetic failure.');
     } },
   ];
 }
@@ -35375,6 +36882,7 @@ async function runUiControlTests(browser, baseUrl, reporter) {
   await run('Navigation, roles and redirects (#400); the API enforces the roles (#25)', navigationCases());
   await run('Login, logout, setup and password changes (#25)', authCases());
   await run('Users page: Engineers manage accounts (#25)', usersCases());
+  await run('Service keys page: Engineers manage service principals and keys (#25)', serviceKeysCases());
   await run('Q&A input, citations toggle, answer display and End User view (#400)', qaCases());
   await run('Retrieval page status text, alpha slider and save (#400)', retrievalCases());
   await run('Client handling of the proxy error pages (#400)', proxyCases());
@@ -36380,7 +37888,7 @@ ENUMS = {
 SPAN_NAMES = frozenset("rag." + v for v in ENUMS["rag.operation"])
 
 # Explicit code-owned vocabulary. Raw URL/path values never enter this schema.
-ROUTES = frozenset(('DELETE /collections/{name}', 'GET /auth/me', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /export/job/{job_id}', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /metrics/latency', 'GET /packages', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/logout', 'POST /auth/password', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
+ROUTES = frozenset(('DELETE /collections/{name}', 'GET /auth/me', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /export/job/{job_id}', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /metrics/latency', 'GET /packages', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/logout', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
 ENUMS.update({"http.route": ROUTES | {"unmatched"},
               "rag.tuning_operation": frozenset(("rechunk", "reembed", "reindex")),
               "http.status_class": frozenset(("1xx", "2xx", "3xx", "4xx", "5xx"))})

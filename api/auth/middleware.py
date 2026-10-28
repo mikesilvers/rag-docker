@@ -12,6 +12,14 @@ The refusals, in the order they apply:
   403 PASSWORD_CHANGE_REQUIRED the user must change a generated password first
   403 FORBIDDEN               the user's role is too low
 
+A request with an `Authorization` header is a service key request (PR 3): the
+header alone decides and any cookie is ignored, with no fallback to it.
+  503 SETUP_REQUIRED          as above
+  401 KEY_INVALID             not one `Bearer <key>` header with a valid key (one answer for every reason)
+  403 KEY_NOT_ALLOWED         a route keys can't use (policy.HUMAN_ONLY)
+  403 FORBIDDEN               the principal's role is too low
+It has no origin check (it carries no cookie, Q26) and no password change.
+
 A route with no policy entry is never matched here, so it falls through to the
 app; test_auth.py fails when any route lacks an entry.
 """
@@ -26,7 +34,7 @@ from starlette.requests import Request
 
 from utils import api_error
 
-from . import policy, store
+from . import keys, policy, store
 
 UNSAFE = frozenset(("POST", "PUT", "PATCH", "DELETE"))
 # Starlette's route patterns end in `$`, which also matches before a trailing
@@ -42,6 +50,10 @@ def _header(scope, name: bytes) -> str | None:
         if key == name:
             return value.decode("latin-1")
     return None
+
+
+def _headers(scope, name: bytes) -> list[str]:
+    return [value.decode("latin-1") for key, value in scope.get("headers") or () if key == name]
 
 
 def session_token(scope) -> str | None:
@@ -104,7 +116,7 @@ class AuthMiddleware:
         access = policy.required(scope["method"], template)
         if access == policy.PUBLIC:
             return await self.app(scope, receive, send)
-        refusal, principal = await self._check(scope, access)
+        refusal, principal = await self._check(scope, access, template)
         if refusal is not None:
             # Request tracing labels a request by the route it reached (its
             # `path`); give a refused request the same label the router would.
@@ -113,11 +125,14 @@ class AuthMiddleware:
         scope.setdefault("state", {})["auth"] = principal
         return await self.app(scope, receive, send)
 
-    async def _check(self, scope, access):
+    async def _check(self, scope, access, template):
         if not await asyncio.to_thread(store.is_set_up):
             return api_error(503, "SETUP_REQUIRED",
                              "No account exists yet. An operator must create the first Engineer with "
                              "`docker compose exec api python -m auth bootstrap <username>`."), None
+        authorization = _headers(scope, b"authorization")
+        if authorization:
+            return await self._check_key(access, template, authorization)
         principal = await asyncio.to_thread(store.authenticate, session_token(scope))
         if principal is None:
             return api_error(401, "AUTH_REQUIRED", "Log in to use this."), None
@@ -127,6 +142,18 @@ class AuthMiddleware:
         if principal.must_change_password and access != policy.SESSION:
             return api_error(403, "PASSWORD_CHANGE_REQUIRED",
                              "Change your password before doing anything else."), None
+        if access != policy.SESSION and policy.rank(principal.role) < policy.rank(access):
+            return api_error(403, "FORBIDDEN", "Your role can't do this.",
+                             detail={"required_role": access}), None
+        return None, principal
+
+    async def _check_key(self, access, template, authorization):
+        key = keys.bearer(authorization[0]) if len(authorization) == 1 else None
+        principal = await asyncio.to_thread(store.authenticate_key, key) if key else None
+        if principal is None:
+            return api_error(401, "KEY_INVALID", "The API key is invalid, expired or revoked."), None
+        if template in policy.HUMAN_ONLY:
+            return api_error(403, "KEY_NOT_ALLOWED", "API keys can't be used for this."), None
         if access != policy.SESSION and policy.rank(principal.role) < policy.rank(access):
             return api_error(403, "FORBIDDEN", "Your role can't do this.",
                              detail={"required_role": access}), None

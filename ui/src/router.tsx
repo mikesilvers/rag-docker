@@ -12,6 +12,7 @@ import GoldStandardPage from './pages/GoldStandardPage'
 import CollectionsPage from './pages/CollectionsPage'
 import HealthPage from './pages/HealthPage'
 import UsersPage from './pages/UsersPage'
+import ServiceKeysPage from './pages/ServiceKeysPage'
 import TransferPage from './pages/TransferPage'
 import HelpTransferPage from './pages/HelpTransferPage'
 
@@ -70,6 +71,7 @@ export default function AppRouter() {
               <Route path="/collections" element={<CollectionsPage />} />
               <Route path="/health" element={<HealthPage />} />
               <Route path="/users" element={<UsersPage />} />
+              <Route path="/service-keys" element={<ServiceKeysPage />} />
             </>
           )}
           <Route path="*" element={<Navigate to="/qa" replace />} />

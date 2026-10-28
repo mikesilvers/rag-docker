@@ -4,8 +4,9 @@
 #
 # The unit checks run in the API image with no network. The stack checks run
 # on the verify project through auth_stack.py, one check each; those that create
-# throwaway vfy-t-<random> accounts or age a session use the operator command,
-# so they run only on the verify project as stack.sh sets it up. The restart
+# throwaway vfy-t-<random> accounts or vfy-s-<random> service principals, or age
+# a session or a key, use the operator command, so they run only on the verify
+# project as stack.sh sets it up. The restart
 # check is opt-in (RAG_ALLOW_RESTART=1) like the other restart checks.
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
@@ -54,6 +55,16 @@ check "a session idle for more than 12 hours answers 401" $?
 section "Account administration by Engineers (PR 2)"
 stack admin-accounts
 check "an Engineer creates, resets, re-roles, disables and enables an account through the API; own reset refused; no password logged" $?
+
+section "Service principals and API keys (PR 3, H3)"
+stack key-matrix end_user
+check "End User key, no Origin: 403 above its role and on account/key administration, logout and password change" $?
+stack key-matrix developer
+check "Developer key, no Origin: 403 above its role and on account/key administration, logout and password change" $?
+stack key-matrix engineer
+check "Engineer key, no Origin: no 401 or 403 on data routes; 403 KEY_NOT_ALLOWED on account/key administration" $?
+stack service-keys
+check "keys: no principal login, rotation, role change, disable, revoke and expiry; bad keys 401; no key in listings or the log" $?
 
 section "Request protection and login throttling (H4)"
 stack control-path

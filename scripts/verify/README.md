@@ -46,8 +46,11 @@ read the jar through `auth_headers.py`; in-process checks in the API image use
 role (written out in `auth_stack.py`, not read from the API), login, logout, cookies, origin
 rules, throttling, the operator command's effect on existing sessions (on throwaway `vfy-t-*`
 accounts), an Engineer's account administration through the API (on a throwaway account; the
-generated passwords must not reach the API log), idle expiry, and that the API log holds no
-harness secret.
+generated passwords must not reach the API log), service API keys (throwaway `vfy-s-*`
+principals created through the API by the harness Engineer: the matrix with a key of each role
+and no `Origin`, rotation, revocation, expiry, a disabled principal, invalid keys; the keys stay in
+memory, are never printed and must not reach the API log), idle expiry, and that the API log holds
+no harness secret.
 
 ## Entry point and verify project
 
@@ -699,7 +702,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
 | `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health` reports, so the status flips to `below_recommended` on any host (#536) |
 | `../tests/test_memory_override.py` | host-side, standard library: the derived override makes `system_info.memory_info` report `below_recommended` with a note for allocations below and above the 12.35 GB a fixed 13 GB could flip, and no override without a usable allocation (#536); embedded copies; registered by suite 01 |
-| `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command, account administration; registers `../tests/test_auth.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
+| `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command, account administration, service API keys; registers `../tests/test_auth.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
 | `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
 | `auth_stack.py` | the stack checks of `17_auth.sh`, one per subcommand (#25) |
 | `auth_headers.py` | the suite's session as `Cookie` and `Origin` headers, for the host-side Python helpers (#25) |

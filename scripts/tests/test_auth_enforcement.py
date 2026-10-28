@@ -50,6 +50,10 @@ PROTECTED = (
     ("GET", "/auth/users"), ("POST", "/auth/users"), ("POST", "/auth/users/nobody/reset-password"),
     ("POST", "/auth/users/nobody/role"), ("POST", "/auth/users/nobody/disable"),
     ("POST", "/auth/users/nobody/enable"),
+    ("GET", "/auth/service-principals"), ("POST", "/auth/service-principals"),
+    ("POST", "/auth/service-principals/nobody/role"), ("POST", "/auth/service-principals/nobody/disable"),
+    ("POST", "/auth/service-principals/nobody/enable"), ("POST", "/auth/service-principals/nobody/keys"),
+    ("POST", "/auth/service-principals/nobody/keys/nokey/revoke"),
 )
 
 
