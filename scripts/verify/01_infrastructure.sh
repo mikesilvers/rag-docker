@@ -92,13 +92,13 @@ ENDPY
 check "resolved Compose publishes only the proxy on host loopback" $?
 
 # ── cross-origin access, as SECURITY.md describes it ─────────────────────────
-# SECURITY.md says a web page open in a browser on this machine can call the
-# API, because CORS allows any origin (#25 tracks tightening it). Check that
-# this is still true, so the policy and the code can't drift apart silently:
-# when #25 changes CORS, this check and SECURITY.md change together.
-cors=$(curl -s -D - -o /dev/null -m 10 -H "Origin: http://other.example" "$API/health" \
+# SECURITY.md says the API has no CORS (#25): a page from another origin can't
+# read its answers, and a cookie-authenticated change from one is refused (see
+# 17_auth.sh). Check that no answer carries Access-Control-Allow-Origin, so the
+# policy and the code can't drift apart silently.
+cors=$(command curl -s -D - -o /dev/null -m 10 -H "Origin: http://other.example" "$API/health" \
   | tr -d '\r' | awk -F': ' 'tolower($1)=="access-control-allow-origin"{print $2}')
-check_eq "the API allows any origin, as SECURITY.md describes (#25)" "$cors" "*"
+check_eq "the API sends no Access-Control-Allow-Origin, as SECURITY.md describes (#25)" "$cors" ""
 
 (cd "$REPO_ROOT" && python3 - <<'ENDPY'
 import json, subprocess

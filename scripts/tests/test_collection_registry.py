@@ -34,6 +34,7 @@ from fastapi.testclient import TestClient
 
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from models.schemas import CreateCollectionRequest
 from routers import collections as route
 from services import weaviate_client as wc
@@ -72,7 +73,7 @@ class RegistryTestCase(unittest.TestCase):
                         patch.object(route, "_registry_lock", asyncio.Lock())):
             patcher.start()
             self.addCleanup(patcher.stop)
-        self.client = TestClient(app, raise_server_exceptions=False)
+        self.client = TestClient(app, headers=auth_testing.headers(), raise_server_exceptions=False)
         self.addCleanup(self.client.close)
 
     def write(self, registry):
@@ -423,6 +424,7 @@ import asyncio, sys
 from unittest.mock import AsyncMock, patch
 sys.path.insert(0, sys.argv[1])
 from main import app, lifespan
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import importer, packager, weaviate_client as wc
 async def run():
     with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), \\

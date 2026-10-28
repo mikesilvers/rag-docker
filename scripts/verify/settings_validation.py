@@ -7,7 +7,12 @@ import json
 import os
 import uuid
 import urllib.error
+import sys
 import urllib.request
+
+# The suite's session (#25); found beside this file however the file is loaded.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import auth_headers  # noqa: E402
 
 api = os.environ.get('RAG_API', 'http://localhost:8080/api').rstrip('/')
 collection = 'VfySettings' + uuid.uuid4().hex[:12]
@@ -16,7 +21,7 @@ collection = 'VfySettings' + uuid.uuid4().hex[:12]
 def request(path, body=None, method=None, raw=None, content_type='application/json'):
     data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
     req = urllib.request.Request(api + path, data=data, method=method,
-                                 headers={'Content-Type': content_type})
+                                 headers={'Content-Type': content_type, **auth_headers.headers()})
     try:
         with urllib.request.urlopen(req, timeout=60) as response:
             return response.status, json.load(response)

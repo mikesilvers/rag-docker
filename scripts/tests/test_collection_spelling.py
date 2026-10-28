@@ -29,6 +29,7 @@ from fastapi.testclient import TestClient
 
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from routers import collections as collections_router
 from services import (exporter, goldstandard, ingest_config, ingest_pipeline, metrics,
                       rag_pipeline, retrieval_config, sources, tuning)
@@ -61,7 +62,7 @@ class SpellingTestCase(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.root = root
-        self.client = TestClient(app, raise_server_exceptions=False)
+        self.client = TestClient(app, headers=auth_testing.headers(), raise_server_exceptions=False)
         self.addCleanup(self.client.close)
 
     def mock(self, target, name, **kwargs):

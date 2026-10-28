@@ -12,6 +12,41 @@ bash scripts/verify/stack.sh run 02 04              # only the named suites
 
 Exits non-zero if any check fails.
 
+## Test accounts (#25)
+
+Every API route but `/health` and the login needs a session, so the suites log in.
+`require_stack` (in `lib.sh`) runs `auth_setup.py ensure`, which makes sure the verify project
+has one account per role, `vfy-engineer`, `vfy-developer` and `vfy-end-user`, whose passwords it
+knows:
+
+- On a project that isn't set up yet it runs `python -m auth bootstrap vfy-engineer` in the api
+  container; a missing account is created with `create-user`, and one whose stored password no
+  longer works (a new verify project, say) gets `reset-password`. Each generated password is
+  replaced at first login with a fresh random one, as the API requires.
+- The operator command runs only when the target is the verify project as `stack.sh` sets it up
+  (`COMPOSE_PROJECT_NAME=rag-verify` and the overlay in `COMPOSE_FILE`, the same condition as
+  removing its volumes). Anywhere else a password that doesn't work is a failure, never a reset.
+- The passwords live only in `$RAG_AUTH_DIR/credentials` (default
+  `${TMPDIR:-/tmp}/rag-verify-auth-<uid>`): mode 0600, in a folder of mode 0700 that is the user's
+  own (a symlink, a file or someone else's folder there is refused), outside the checkout. They
+  are never printed, put on a command line or in the environment, or written to the `export`
+  lines `stack.sh up` prints (which CI copies into its job environment). They reach the API only
+  in request bodies, and the browser checks on standard input.
+
+`require_stack` then logs `vfy-engineer` in, into the curl cookie jar
+`$RAG_AUTH_DIR/engineer.jar` (0600), exported as `RAG_AUTH_JAR`. `lib.sh` defines `curl` as a
+function that adds that jar and an `Origin` matching `RAG_API` (the API refuses a
+cookie-authenticated change without one), so every curl in a suite, and the `api_*` helpers,
+send the session. A check that needs no session, another role or another origin calls `command
+curl`. `auth_jar <role>` logs another role in. The host-side Python helpers that call the API
+read the jar through `auth_headers.py`; in-process checks in the API image use
+`auth.testing.headers()`, a real account and session in a temporary store, never a bypass.
+
+`17_auth.sh` checks authentication itself: the endpoint/role matrix for no session and each
+role (written out in `auth_stack.py`, not read from the API), login, logout, cookies, origin
+rules, throttling, the operator command's effect on existing sessions (on throwaway `vfy-t-*`
+accounts), idle expiry, and that the API log holds no harness secret.
+
 ## Entry point and verify project
 
 `stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
@@ -662,6 +697,10 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
 | `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health` reports, so the status flips to `below_recommended` on any host (#536) |
 | `../tests/test_memory_override.py` | host-side, standard library: the derived override makes `system_info.memory_info` report `below_recommended` with a note for allocations below and above the 12.35 GB a fixed 13 GB could flip, and no override without a usable allocation (#536); embedded copies; registered by suite 01 |
+| `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command; registers `../tests/test_auth.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
+| `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
+| `auth_stack.py` | the stack checks of `17_auth.sh`, one per subcommand (#25) |
+| `auth_headers.py` | the suite's session as `Cookie` and `Origin` headers, for the host-side Python helpers (#25) |
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
 | `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
 | `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
@@ -732,11 +771,12 @@ through the proxy that download refuses other upload state with 400 (#370).
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the query metrics reload in `03_query.sh`, the batch recovery acceptance in `05_transfer.sh`, and retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`); never the `rag-docker` project |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the query metrics reload in `03_query.sh`, the batch recovery acceptance in `05_transfer.sh`, retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`, and a session and a login lockout across a restart in `17_auth.sh`); never the `rag-docker` project |
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
 | `RAG_NETWORK` | detected | compose network for the browser container |
+| `RAG_AUTH_DIR` | `${TMPDIR:-/tmp}/rag-verify-auth-<uid>` | the folder of the test accounts' credentials and cookie jars (#25) |
 
 ## Writing a check
 
@@ -971,7 +1011,8 @@ nothing reaches the backend or a model. 67 cases:
   modal (HNSW slider defaults, bounds and labels, Flat hiding them, the create payload); the Import
   queue, slider visibility per strategy and role, Chunk Size pulling Overlap down, the upload
   form fields and the "+ New" modal; the Developer nav and the redirects of a Developer and an End
-  User (gating is client-side only until #25); the landing page and Switch Role; the Q&A box
+  User; the login page, logout, the setup-required page, the forced and voluntary password change
+  and the return to login on a 401 (#25), with `GET /api/auth/me` answered from the case's role; the Q&A box
   (Ctrl+Enter, plain Enter, Ask disabled while empty or loading), the citations toggle, markdown,
   the latency and error lines and the End User view with `response_format`; the Retrieval page's
   saved and default texts, alpha slider and Save while loading; and the client's handling of

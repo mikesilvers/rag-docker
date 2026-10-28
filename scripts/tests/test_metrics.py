@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient
 
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import metrics, rag_pipeline
 from services import weaviate_client as wc
 
@@ -110,7 +111,7 @@ class FailedWriteTests(MetricsTestCase):
     """S1: the query keeps its answer when its metrics record can't be written."""
 
     def ask(self):
-        client = TestClient(app, raise_server_exceptions=False)
+        client = TestClient(app, headers=auth_testing.headers(), raise_server_exceptions=False)
         self.addCleanup(client.close)
         # Capture the log without assertLogs, so that on code that doesn't log the
         # failure the status assertion below still runs and shows the 500.
@@ -143,7 +144,7 @@ class FailedWriteTests(MetricsTestCase):
         self.assertNotIn(ANSWER["answer"], log)
         # The record still counts in the ring and in GET /metrics/latency.
         self.assertEqual(len(metrics._ring), 1)
-        client = TestClient(app, raise_server_exceptions=False)
+        client = TestClient(app, headers=auth_testing.headers(), raise_server_exceptions=False)
         self.addCleanup(client.close)
         latency = client.get("/metrics/latency", params={"collection": QUESTION["collection"]})
         self.assertEqual(latency.status_code, 200, latency.text)

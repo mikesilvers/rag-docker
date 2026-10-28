@@ -15,6 +15,24 @@ const PROXY_ERRORS: Record<number, string> = {
   504: 'The API took too long to respond.',
 }
 
+// An API error, with the API's error code when the answer carried one.
+export class ApiError extends Error {
+  status: number
+  code: string | null
+  constructor(message: string, status: number, code: string | null) {
+    super(message)
+    this.status = status
+    this.code = code
+  }
+}
+
+// The session ended (401 AUTH_REQUIRED) or a generated password must be changed
+// first (403 PASSWORD_CHANGE_REQUIRED), whichever call noticed it (#25). The
+// auth context listens and shows the login or password page.
+type AuthListener = (code: 'AUTH_REQUIRED' | 'PASSWORD_CHANGE_REQUIRED') => void
+let authListener: AuthListener | null = null
+export function onAuthProblem(listener: AuthListener | null) { authListener = listener }
+
 async function request<T>(method: string, path: string, body?: unknown, isFormData = false): Promise<T> {
   const headers: Record<string, string> = isFormData ? {} : { 'Content-Type': 'application/json' }
   const res = await fetch(`${BASE}${path}`, {
@@ -28,7 +46,9 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
   let data: any = null
   try { data = text ? JSON.parse(text) : null } catch { /* not JSON; handled below */ }
   if (!res.ok) {
-    throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
+    const code: string | null = typeof data?.error?.code === 'string' ? data.error.code : null
+    if (code === 'AUTH_REQUIRED' || code === 'PASSWORD_CHANGE_REQUIRED') authListener?.(code)
+    throw new ApiError(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`, res.status, code)
   }
   if (data === null && text) throw new Error('The server sent a response the UI could not read.')
   return data as T
@@ -65,6 +85,15 @@ async function getHealthResult(): Promise<HealthResult> {
 }
 
 export const api = {
+  // Accounts and sessions (#25). The session is an HttpOnly cookie the browser
+  // sends with every same-origin request; the UI never sees or stores it.
+  authStatus: () => request<{ setup_required: boolean }>('GET', '/auth/status'),
+  me: () => request<AuthUser>('GET', '/auth/me'),
+  login: (username: string, password: string) => request<AuthUser>('POST', '/auth/login', { username, password }),
+  logout: () => request<{ status: string }>('POST', '/auth/logout'),
+  changePassword: (current_password: string, new_password: string) =>
+    request<{ status: string } & AuthUser>('POST', '/auth/password', { current_password, new_password }),
+
   getCollections: () => request<{ collections: CollectionInfo[] }>('GET', '/collections'),
   // Answers with the name as stored, first letter capitalised (#372).
   createCollection: (body: CreateCollectionBody) => request<{ name: string; status: string }>('POST', '/collections', body),
@@ -104,6 +133,8 @@ export const api = {
 }
 
 // Types
+export type Role = 'engineer' | 'developer' | 'end_user'
+export interface AuthUser { username: string; role: Role; must_change_password: boolean }
 export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
   hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null

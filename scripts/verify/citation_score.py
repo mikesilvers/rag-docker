@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import weaviate_client as wc
 
 prefix = os.environ.get("RAG_TEST_PREFIX", "Vfy") + "Score" + uuid.uuid4().hex[:8]
@@ -39,7 +40,7 @@ CASES = {
     "l2-squared": ([[1.0, t, 0.0, 0.0] for t in (0.0, 0.5, 1.0, math.sqrt(3))], [1.0, 0.8, 0.5, 0.25]),
 }
 
-client = TestClient(app)
+client = TestClient(app, headers=auth_testing.headers())
 created = []
 failures = []
 

@@ -242,7 +242,8 @@ class ValidityServiceTests(unittest.TestCase):
     def test_request_validation_errors_use_project_envelope_without_input(self):
         from fastapi.testclient import TestClient
         from main import app
-        client=TestClient(app)
+        from auth import testing as auth_testing  # a real session in a temporary store (#25)
+        client=TestClient(app, headers=auth_testing.headers())
         response=client.post('/goldstandard/save',json={'filename':'secret-input.json'})
         self.assertEqual(response.status_code,422,response.text)
         body=response.json()

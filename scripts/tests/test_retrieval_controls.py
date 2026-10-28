@@ -142,7 +142,7 @@ class VerifierCleanupTests(unittest.TestCase):
                 return self._body
 
         class FakeClient:
-            def __init__(self, app):
+            def __init__(self, app, **kwargs):     # headers: the verifier's session (#25)
                 pass
 
             def post(self, path, json):

@@ -103,8 +103,14 @@ services:
       # upload is refused (#28).
       MAX_ZIP_MEMBERS: 5000
       MAX_ZIP_MEMBER_RATIO: 200
+      # Marks the session cookie Secure (#25). false for this loopback HTTP
+      # profile, where a Secure cookie would never be sent back; set true only
+      # when the stack is served over TLS (#26). Exactly true or false.
+      AUTH_COOKIE_SECURE: "false"
     volumes:
       - ingest_uploads:/app/uploads
+      # Accounts, sessions and the login throttle (#25), one SQLite file.
+      - auth_data:/app/auth_data
       # Retained source documents; grows with the corpus.
       - rag_sources:/app/sources
       # Bind mount, deliberately: an export is only useful if the user can
@@ -136,7 +142,7 @@ services:
   proxy:
     image: nginx:1.29-alpine
     ports:
-      # This unauthenticated workbench is local to the host by default.
+      # The workbench is local to the host by default; LAN exposure is #26.
       - "127.0.0.1:8080:80"
     volumes:
       - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
@@ -158,6 +164,7 @@ volumes:
   ollama_models:
   ingest_uploads:
   rag_sources:
+  auth_data:
 
 networks:
   rag-internal:

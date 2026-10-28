@@ -368,8 +368,9 @@ literals, and substitution MUST NOT interpret tokens inside inserted data.
 
 ### 5.1 Requirements
 
-1. **Standard library only.** `urllib.request`, `json`, `argparse`. Anything
-   needing `pip install` fails in the air-gapped case this project targets.
+1. **Standard library only.** `urllib.request`, `json`, `argparse` (and, for the
+   login, `getpass`, `os` and `urllib.parse`). Anything needing `pip install` fails
+   in the air-gapped case this project targets.
 2. **Targets the RAG API** (`POST /query`), not Weaviate and Ollama directly.
    Reimplementing the pipeline would drift from `rag_pipeline.py`.
 3. **Baked defaults, overridable by flags:**
@@ -384,6 +385,18 @@ python retrieve.py --timeout 900 "..."
    Defaults: collection and parameters from the package; `--api-url` defaults to
    `http://localhost:8080/api`; `--timeout` defaults to 600 seconds, because
    generation runs on CPU and a single answer was measured at 236 s.
+3a. **Logs in (#25).** The API needs an account. `--username` (default
+   `$RAG_USERNAME`) names it; the password is asked for with `getpass`, or read
+   from the first line of standard input with `--password-stdin`, and is never a
+   flag or an environment variable. The script logs in (`POST /auth/login`),
+   sends the query with the session cookie and an `Origin` matching
+   `--api-url`, and logs out. A refused login is exit `5`, quoting the API; so is
+   a query refused for want of a login (`AUTH_REQUIRED`, whose hint names
+   `--username`) or a password change due (`PASSWORD_CHANGE_REQUIRED`, whose
+   hint says to log in to the web UI once). `--password-stdin` without
+   `--username`, or an empty password, is `2`. Scripts in packages exported
+   before #25 send no login and get `AUTH_REQUIRED`; export again for one that
+   logs in.
 4. **Records its provenance** — the source manifest's `id8` and `created_at` in the
    script's `PACKAGE_METADATA` literal, beside `package_filename`, `embed_model` and
    `embed_dimensions`, so a script separated from its package can still be traced.
@@ -419,6 +432,12 @@ because nothing signals the discrepancy.
 
 Both are long-running and both follow the existing job-and-poll pattern used by
 `/ingest/upload`.
+
+**Who may call them (#25).** `POST /export`, `GET /export/job/{job_id}`, `POST /import`,
+`GET /import/job/{job_id}`, `GET /packages` and `GET /help/transfer` need the Developer role or
+higher; without a session they answer `401 AUTH_REQUIRED`, and for an End User `403 FORBIDDEN`
+(SPECIFICATIONS.md §3.1.8). A `with-sources` package carries the original documents, so any
+Developer can take every document out of a collection.
 
 ### 6.1 Export
 
@@ -797,6 +816,10 @@ longer needed. Import never modifies or deletes the original package in `./expor
 ## 7. Tuning After Import
 
 ### 7.1 Available operations
+
+`POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex` and `GET /tune/job/{job_id}` need
+the AI Engineer role; `GET /tune/{collection}`, which the Transfer page reads, needs Developer (#25,
+SPECIFICATIONS.md §3.1.8).
 
 | Goal | Requires | Mechanism |
 |---|---|---|

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, CollectionInfo } from '../api/client'
-import { useRole } from '../context/RoleContext'
+import { useRole } from '../context/AuthContext'
 import { useQueryConfig, QueryConfig } from '../context/QueryConfigContext'
 
 const MODES = [

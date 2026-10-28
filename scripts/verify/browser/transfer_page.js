@@ -7,7 +7,7 @@
 // page's 2 s poll delay is cut to 20 ms, so 30 failed polls take well under a
 // second.
 const assert = require('node:assert/strict');
-const { makeReporter, setValue } = require('./lib');
+const { makeReporter, setValue, stubAuth } = require('./lib');
 
 const A = 'VfyTransferA', B = 'VfyTransferB';
 const PACKAGE = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz';
@@ -47,7 +47,6 @@ async function fixture(browser, base, { hold = [] } = {}) {
   };
   for (const key of hold) delete fixed[key];
   await page.evaluateOnNewDocument(answers => {
-    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
     const realTimeout = window.setTimeout.bind(window);
     window.setTimeout = (fn, ms, ...args) => realTimeout(fn, ms === 2000 ? 20 : ms, ...args);
     const realFetch = window.fetch.bind(window);
@@ -63,6 +62,8 @@ async function fixture(browser, base, { hold = [] } = {}) {
       return new Promise(resolve => { entry.resolve = (status, body) => { entry.done = true; resolve(new Response(body, { status })); }; });
     };
   }, fixed);
+  // The engineer, as GET /api/auth/me answers it, without a backend (#25).
+  await stubAuth(page, 'engineer');
   await page.goto(base + '/transfer', { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => document.querySelectorAll('select option').length > 0 && document.body.innerText.includes('Export a collection'));
   return { ctx, page, errors };

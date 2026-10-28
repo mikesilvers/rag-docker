@@ -27,6 +27,7 @@ import httpx
 
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import collection_writes as writes
 from services import importer
 from services import weaviate_client as wc
@@ -210,7 +211,7 @@ class ImportGuardTests(unittest.TestCase):
 
         async def post(filename):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
-                                         base_url="http://guard") as api:
+                                         headers=auth_testing.headers(base_url="http://guard"), base_url="http://guard") as api:
                 return await api.post("/import", json={"filename": filename, "on_conflict": "abort"})
         for spelling in ("./x.tar.gz", "a/../x.tar.gz", "x.tar.gz"):
             with self.subTest(spelling=spelling):
@@ -335,7 +336,7 @@ class ImportGuardTests(unittest.TestCase):
 
         async def post():
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
-                                         base_url="http://guard") as api:
+                                         headers=auth_testing.headers(base_url="http://guard"), base_url="http://guard") as api:
                 return await api.post("/import", json={"filename": "b.tar.gz", "on_conflict": "abort"})
         # The target refusal is the job's, not the request's: POST still answers 202.
         response = loop.run_until_complete(post())

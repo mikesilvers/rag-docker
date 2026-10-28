@@ -1,7 +1,7 @@
 // Health page refreshes with every API call stubbed and held in the page (#415);
 // no backend state. Each load is driven by hand through the captured 30s refresh.
 const assert = require('node:assert/strict');
-const { makeReporter } = require('./lib');
+const { makeReporter, stubAuth } = require('./lib');
 
 const HEALTH = '/api/health', METRICS = '/api/metrics/latency';
 const UNREADABLE = 'Service health could not be read: The server sent a response the UI could not read.';
@@ -31,7 +31,6 @@ async function fixture(browser, base) {
   const errors = [];
   page.on('pageerror', e => errors.push(e.message));
   await page.evaluateOnNewDocument((health, metrics) => {
-    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
     const original = window.setInterval;
     window.setInterval = (fn, delay, ...args) => {
       if (delay === 30000) { window.__healthRefresh = fn; return 45003; }
@@ -57,6 +56,8 @@ async function fixture(browser, base) {
       return Promise.reject(new Error('Unexpected fixture request ' + path));
     };
   }, HEALTH, METRICS);
+  // The engineer, as GET /api/auth/me answers it, without a backend (#25).
+  await stubAuth(page, 'engineer');
   await page.goto(base + '/health', { waitUntil: 'domcontentloaded' });
   await requested(page, 1);
   return { ctx, page, errors };

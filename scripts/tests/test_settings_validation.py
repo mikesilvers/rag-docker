@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from pydantic.fields import FieldInfo
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from models.schemas import CreateCollectionRequest, HnswConfig, IngestConfig, QueryRequest, RechunkRequest, ReembedRequest, SaveRetrievalConfigBody
 from routers import collections, ingest, tuning as tuning_router, query, retrieval_config as retrieval_router
 from services import weaviate_client as wc, chunker, rag_pipeline, ingest_config, retrieval_config, ingest_pipeline, packager
@@ -44,7 +45,7 @@ class SettingsTests(unittest.TestCase):
         self.ingest_job = self.stack.enter_context(patch.object(ingest.ingest_pipeline, 'start_ingest_job', new=AsyncMock(return_value='ingest')))
         self.tune_job = self.stack.enter_context(patch.object(tuning_router.tuning, 'start_tune_job', new=AsyncMock(return_value='tune')))
         self.query_work = self.stack.enter_context(patch.object(query.rag_pipeline, 'run_query', new=AsyncMock()))
-        self.client = TestClient(app)  # No lifespan: these tests never connect a stack.
+        self.client = TestClient(app, headers=auth_testing.headers())  # No lifespan: these tests never connect a stack.
         self.addCleanup(self.client.close)
 
     def assert_rejected_without_work(self, path, payload):

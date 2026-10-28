@@ -6,15 +6,20 @@ import sys
 import tarfile
 import tempfile
 import time
+import os
 import urllib.request
 import uuid
+
+# The suite's session (#25); found beside this file however the file is loaded.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import auth_headers  # noqa: E402
 
 
 def run(api, collection, package):
     def request(path, body=None):
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(api.rstrip('/') + path, data=data,
-                                     headers={'Content-Type': 'application/json'})
+                                     headers={'Content-Type': 'application/json', **auth_headers.headers()})
         with urllib.request.urlopen(req, timeout=60) as response:
             return json.load(response)
 

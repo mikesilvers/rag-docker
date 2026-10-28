@@ -237,7 +237,6 @@ function importCases() {
 
 function navigationCases() {
   const gated = ['/import', '/chunking', '/retrieval', '/goldstandard', '/transfer', '/help/transfer'];
-  const badge = { engineer: 'AI Engineer', developer: 'Developer', end_user: 'End User' };
   const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
   return [
     { name: 'Developer nav has Q&A, Import, Chunking, Retrieval, Gold Standard and Transfer, and no Collections or Health', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
@@ -257,34 +256,110 @@ function navigationCases() {
       await waitText(s.page, 'Export and Import');
       await waitPath(s.page, '/help/transfer');
     } },
-    { name: 'End User opening a Developer page directly is sent to Q&A (gating is client-side only until #25)', open: { role: 'end_user', path: '/qa', routes: base() }, async run(s) {
+    { name: 'End User opening a Developer page directly is sent to Q&A (the API refuses those requests too, #25)', open: { role: 'end_user', path: '/qa', routes: base() }, async run(s) {
       for (const p of [...gated, '/collections', '/health']) {
         await goto(s.page, p);
         await waitText(s.page, 'Ask a Question');
         await waitPath(s.page, '/qa');
       }
     } },
-    ...['engineer', 'developer', 'end_user'].map(role => ({ name: `Choosing ${badge[role]} on the landing page opens /qa with that role badge and stores the role`, open: { role: null, path: '/', routes: base() }, async run(s) {
-      await waitText(s.page, 'Select your role to continue');
-      assert.equal(await s.page.evaluate(label => {
-        const b = [...document.querySelectorAll('button')].find(x => x.querySelector('h2')?.textContent.trim() === label);
-        if (!b) return false; b.click(); return true;
-      }, badge[role]), true);
+  ];
+}
+
+// Login, logout, setup, password changes (#25). The API is stubbed; the real
+// login and the API's own refusals are checked in ui_criteria.js and 17_auth.sh.
+function authCases() {
+  const badge = { engineer: 'AI Engineer', developer: 'Developer', end_user: 'End User' };
+  const user = (role, over = {}) => ({ username: 'vfy-' + role.replace('_', '-'), role, must_change_password: false, ...over });
+  const loginForm = async (page, username, password) => {
+    await fill(page, '#login-username', username);
+    await fill(page, '#login-password', password);
+    await press(page, 'Log in');
+  };
+  const submit = page => press(page, 'Change password', 'form button[type=submit]');
+  return [
+    { name: 'Logged out, any page shows the login page at /login with no nav and no role picker', open: { role: null, path: '/collections', routes: base() }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await waitPath(s.page, '/login');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav').length), 0);
+      assert.equal(await bodyHas(s.page, 'Select your role'), false);
+    } },
+    ...['engineer', 'developer', 'end_user'].map(role => ({ name: `Logging in as ${badge[role]} opens /qa with the role badge and username from the API, stored nowhere in the browser`, open: { role: null, path: '/login', routes: base({ 'POST /api/auth/login': json(200, user(role)) }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await loginForm(s.page, 'VFY-User', 'a password of twelve');
       await waitPath(s.page, '/qa');
       await waitText(s.page, 'Ask a Question');
       assert.equal(await s.page.evaluate(() => document.querySelector('nav span.bg-blue-100')?.textContent.trim()), badge[role]);
-      assert.deepEqual(JSON.parse(await s.page.evaluate(() => sessionStorage.getItem('rag_role'))), { role });
+      assert.equal(await s.page.evaluate(() => document.querySelector('[data-testid=nav-username]')?.textContent.trim()), user(role).username);
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/login').map(c => c.body), [{ username: 'VFY-User', password: 'a password of twelve' }]);
+      assert.deepEqual(await s.page.evaluate(() => [Object.keys(sessionStorage), Object.keys(localStorage)]), [[], []]);
     } })),
-    { name: 'Switch Role returns to the role chooser, forgets the role, and a later /qa visit goes back to it', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
+    { name: 'A failed login shows the API\'s generic message, clears the password and stays on /login', open: { role: null, path: '/login', routes: base({ 'POST /api/auth/login': apiError(401, 'LOGIN_FAILED', 'The username or password is incorrect.') }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await loginForm(s.page, 'someone', 'wrong password!');
+      await waitText(s.page, 'The username or password is incorrect.');
+      assert.equal(await s.page.evaluate(() => document.querySelector('#login-password').value), '');
+      await waitPath(s.page, '/login');
+    } },
+    { name: 'A throttled login says to wait', open: { role: null, path: '/login', routes: base({ 'POST /api/auth/login': apiError(429, 'LOGIN_THROTTLED', 'Too many failed logins. Wait 15 minutes and try again.') }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await loginForm(s.page, 'someone', 'wrong password!');
+      await waitText(s.page, 'Wait 15 minutes');
+    } },
+    { name: 'Log out calls the API and returns to the login page', open: { role: 'developer', path: '/qa', routes: base({ 'POST /api/auth/logout': json(200, { status: 'logged_out' }) }) }, async run(s) {
       await waitText(s.page, 'Ask a Question');
-      await press(s.page, 'Switch Role');
-      await waitPath(s.page, '/');
-      await waitText(s.page, 'Select your role to continue');
-      assert.equal(await s.page.evaluate(() => sessionStorage.getItem('rag_role')), null);
+      await press(s.page, 'Log out');
+      await waitText(s.page, 'Log in to continue');
+      await waitPath(s.page, '/login');
+      assert.equal(callsTo(s, 'POST', '/api/auth/logout').length, 1);
       assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav').length), 0);
-      await goto(s.page, '/qa');
-      await waitText(s.page, 'Select your role to continue');
-      await waitPath(s.page, '/');
+    } },
+    { name: 'Before setup, every page shows how to create the first Engineer and nothing else', open: { role: null, path: '/qa', routes: base({ 'GET /api/auth/status': json(200, { setup_required: true }) }) }, async run(s) {
+      await waitText(s.page, 'Not set up yet');
+      await waitText(s.page, 'docker compose exec api python -m auth bootstrap <username>');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav, form').length), 0);
+      assert.equal(callsTo(s, 'GET', '/api/auth/me').length, 0);
+    } },
+    { name: 'A due password change shows only the password page; a mismatch is caught before sending; the change opens /qa', open: { role: null, path: '/collections', routes: base({
+      'GET /api/auth/me': json(200, user('developer', { must_change_password: true })),
+      'POST /api/auth/password': json(200, { status: 'changed', ...user('developer') }),
+    }) }, async run(s) {
+      await waitPath(s.page, '/account/password');
+      await waitText(s.page, 'password was generated for you');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav').length), 0);
+      await fill(s.page, '#current-password', 'generated-one');
+      await fill(s.page, '#new-password', 'my new password');
+      await fill(s.page, '#confirm-password', 'my new passwor');
+      await submit(s.page);
+      await waitText(s.page, 'The new passwords do not match.');
+      assert.equal(callsTo(s, 'POST', '/api/auth/password').length, 0);
+      await fill(s.page, '#confirm-password', 'my new password');
+      await submit(s.page);
+      await waitPath(s.page, '/qa');
+      await waitText(s.page, 'Ask a Question');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/password').map(c => c.body), [{ current_password: 'generated-one', new_password: 'my new password' }]);
+    } },
+    { name: 'Change password in the nav opens the form; the API\'s rule message is shown; success says other sessions ended', open: { role: 'end_user', path: '/qa', routes: base({
+      'POST /api/auth/password': call => call.body.new_password === 'short' ? apiError(422, 'INVALID_PASSWORD', 'The password must be at least 12 characters.') : json(200, { status: 'changed', ...user('end_user') }),
+    }) }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      await press(s.page, 'Change password');
+      await waitPath(s.page, '/account/password');
+      for (const [id, v] of [['#current-password', 'the old one!'], ['#new-password', 'short'], ['#confirm-password', 'short']]) await fill(s.page, id, v);
+      await submit(s.page);
+      await waitText(s.page, 'at least 12 characters');
+      for (const [id, v] of [['#new-password', 'long enough now'], ['#confirm-password', 'long enough now']]) await fill(s.page, id, v);
+      await submit(s.page);
+      await waitText(s.page, 'Your other sessions were logged out.');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav').length), 1);
+    } },
+    { name: 'An API answer 401 AUTH_REQUIRED on any page returns to the login page', open: { role: 'engineer', path: '/collections', routes: base({ 'GET /api/collections': apiError(401, 'AUTH_REQUIRED', 'Log in to use this.') }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await waitPath(s.page, '/login');
+    } },
+    { name: 'An API answer 403 PASSWORD_CHANGE_REQUIRED returns to the password page', open: { role: 'engineer', path: '/collections', routes: base({ 'GET /api/collections': apiError(403, 'PASSWORD_CHANGE_REQUIRED', 'Change your password before doing anything else.') }) }, async run(s) {
+      await waitPath(s.page, '/account/password');
+      await waitText(s.page, 'password was generated for you');
     } },
   ];
 }
@@ -481,7 +556,8 @@ async function runUiControlTests(browser, baseUrl, reporter) {
   const run = (section, cases) => S.runCases(browser, baseUrl, reporter, section, cases);
   await run('Collections table and create modal (#400)', collectionsCases());
   await run('Import queue, sliders and "+ New" modal (#400)', importCases());
-  await run('Navigation, roles and redirects; gating is client-side only until #25 (#400)', navigationCases());
+  await run('Navigation, roles and redirects (#400); the API enforces the roles (#25)', navigationCases());
+  await run('Login, logout, setup and password changes (#25)', authCases());
   await run('Q&A input, citations toggle, answer display and End User view (#400)', qaCases());
   await run('Retrieval page status text, alpha slider and save (#400)', retrievalCases());
   await run('Client handling of the proxy error pages (#400)', proxyCases());

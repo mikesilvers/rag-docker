@@ -5,6 +5,7 @@ from unittest.mock import patch
 import httpx
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs, tuning, ingest_pipeline as ingest
 from services import weaviate_client as wc
 
@@ -119,6 +120,7 @@ async def retained_cutover_checks(api,client,name,temp,record_create,jobs,check)
     child="""import asyncio,json,sys
 from services import weaviate_client as wc,goldstandard as gs,tuning
 from main import app,lifespan
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 expected=json.load(sys.stdin)
 async def proof():
     async with lifespan(app):
@@ -242,7 +244,7 @@ async def main():
             def check(condition,label):
                 nonlocal checks
                 assert condition,label; checks+=1; print('PASS '+label,flush=True)
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned') as api:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned'), base_url='http://owned') as api:
                 try:
                     await asyncio.to_thread(wc._create_collection_sync,probe,'hnsw','cosine',{})
                     try:

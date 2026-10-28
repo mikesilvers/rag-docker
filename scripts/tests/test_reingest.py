@@ -778,8 +778,9 @@ class RechunkTests(unittest.TestCase):
         # with the guards released and Weaviate never read.
         from fastapi.testclient import TestClient
         from main import app
+        from auth import testing as auth_testing  # a real session in a temporary store (#25)
         from services import collection_writes
-        client = TestClient(app)  # No lifespan: nothing connects to a stack.
+        client = TestClient(app, headers=auth_testing.headers())  # No lifespan: nothing connects to a stack.
         self.addCleanup(client.close)
         requests = {
             "rechunk": ("/tune/rechunk", {"collection": "Coll"}),
@@ -810,9 +811,10 @@ class RechunkTests(unittest.TestCase):
         # retained sources, so an invalid index doesn't refuse them.
         from fastapi.testclient import TestClient
         from main import app
+        from auth import testing as auth_testing  # a real session in a temporary store (#25)
         from services import collection_writes
         import anyio.from_thread
-        client = TestClient(app)  # No lifespan: nothing connects to a stack.
+        client = TestClient(app, headers=auth_testing.headers())  # No lifespan: nothing connects to a stack.
         self.addCleanup(client.close)
         # #389 (reviewer): one event loop for every request. With TestClient's
         # per-request loop, a started job's task could be cancelled before it
@@ -856,8 +858,9 @@ class RechunkTests(unittest.TestCase):
         # COLLECTION_DELETING, and the refusal leaves the other tune's guard alone.
         from fastapi.testclient import TestClient
         from main import app
+        from auth import testing as auth_testing  # a real session in a temporary store (#25)
         from services import collection_writes
-        client = TestClient(app)  # No lifespan: nothing connects to a stack.
+        client = TestClient(app, headers=auth_testing.headers())  # No lifespan: nothing connects to a stack.
         self.addCleanup(client.close)
         body = {"collection": "Coll", "chunking_strategy": "fixed", "chunk_size": 80}
         before = set(tuning._jobs)
@@ -1034,8 +1037,9 @@ class RechunkTests(unittest.TestCase):
         # options, for its existence check and its re-chunk check (#369).
         from fastapi.testclient import TestClient
         from main import app
+        from auth import testing as auth_testing  # a real session in a temporary store (#25)
         from services import collection_writes
-        client = TestClient(app)  # No lifespan: nothing connects to a stack.
+        client = TestClient(app, headers=auth_testing.headers())  # No lifespan: nothing connects to a stack.
         self.addCleanup(client.close)
         sources.store("Coll", "a.txt", b"one", replace=True)
 
@@ -1079,8 +1083,9 @@ class RechunkTests(unittest.TestCase):
         # walk fails or the connection does, with no job and the guards released.
         from fastapi.testclient import TestClient
         from main import app
+        from auth import testing as auth_testing  # a real session in a temporary store (#25)
         from services import collection_writes
-        client = TestClient(app)  # No lifespan: nothing connects to a stack.
+        client = TestClient(app, headers=auth_testing.headers())  # No lifespan: nothing connects to a stack.
         self.addCleanup(client.close)
         sources.store("Coll", "a.txt", b"one", replace=True)
 
@@ -1261,7 +1266,8 @@ class ExistenceCheckTests(unittest.TestCase):
         # client (not a plain 500), for each of the six routes (#369).
         from fastapi.testclient import TestClient
         from main import app
-        client = TestClient(app)  # No lifespan: nothing connects to a stack.
+        from auth import testing as auth_testing  # a real session in a temporary store (#25)
+        client = TestClient(app, headers=auth_testing.headers())  # No lifespan: nothing connects to a stack.
         self.addCleanup(client.close)
         requests = {
             "query": lambda: client.post("/query", json={"question": "q?", "collection": "Coll"}),

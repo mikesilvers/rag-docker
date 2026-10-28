@@ -398,7 +398,7 @@ class RestartGuardTests(unittest.TestCase):
 
     def test_every_restart_section_asks_first(self):
         for name in ('01_infrastructure.sh', '02_ingest.sh', '03_query.sh', '04_goldstandard.sh', '05_transfer.sh',
-                     '16_api_paths.sh'):
+                     '16_api_paths.sh', '17_auth.sh'):
             with self.subTest(suite=name):
                 text = (VERIFY / name).read_text()
                 block = text[text.index('if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]'):]
@@ -474,18 +474,28 @@ class ApiPathsFirstStartTests(unittest.TestCase):
 
     def run_suite(self, **env):
         box = Sandbox(self)
+        # The test accounts (#25): a stand-in that logs every call and logs in no one.
+        setup = box.root / 'auth_setup.py'
+        (box.root / 'auth').mkdir()
+        setup.write_text('import json, os, sys\n'
+                         'open(os.environ["STUB_LOG"], "a").write(json.dumps(["auth_setup"] + sys.argv[1:]) + "\\n")\n'
+                         'if sys.argv[1] == "login": open(sys.argv[3], "w").close()\n')
         result = box.run(['bash', str(VERIFY / '16_api_paths.sh')], STUB_CURL_CODE='200',
                          RAG_API='http://localhost:9/api', RAG_ALLOW_RESTART='1', RAG_SKIP_SLOW='1',
-                         RAG_RESTART_LIMIT_S='5', **env)
+                         RAG_RESTART_LIMIT_S='5', RAG_AUTH_SETUP=str(setup),
+                         RAG_AUTH_DIR=str(box.root / 'auth'), **env)
         compose = [call for call in box.calls() if call[:2] == ['docker', 'compose']]
         removed = [call for call in compose if 'down' in call and '-v' in call]
         restarted = [call for call in compose if 'down' in call and '-v' not in call]
+        self.setups = [call for call in box.calls() if call[:1] == ['auth_setup']]
         self.assertTrue(restarted, 'the suite did not reach its restart check: ' + result.stdout + result.stderr)
         return result, removed
 
     def test_another_project_keeps_its_volumes(self):
         result, removed = self.run_suite(COMPOSE_PROJECT_NAME='my-rag', COMPOSE_FILE=self.BOTH)
         self.assertEqual(removed, [])
+        # Not the verify project: the operator command is never allowed (#25).
+        self.assertNotIn('--operator', [arg for call in self.setups for arg in call])
         self.assertRegex(result.stdout, r'FAIL\s+a first start from empty volumes[^\n]*rag-verify')
 
     def test_verify_project_without_the_overlay_keeps_its_volumes(self):
@@ -496,6 +506,9 @@ class ApiPathsFirstStartTests(unittest.TestCase):
     def test_verify_project_with_the_overlay_removes_them(self):
         result, removed = self.run_suite(COMPOSE_PROJECT_NAME='rag-verify', COMPOSE_FILE=self.BOTH)
         self.assertEqual([call[-2:] for call in removed], [['down', '-v']])
+        # The accounts went with the volumes: the suite sets them up again (#25).
+        self.assertEqual(self.setups[-2:], [['auth_setup', 'ensure', '--operator'],
+                                            ['auth_setup', 'login', 'engineer', self.setups[-1][-1]]])
         self.assertIn('-p', removed[0])
         self.assertEqual(removed[0][removed[0].index('-p') + 1], 'rag-verify')
 
