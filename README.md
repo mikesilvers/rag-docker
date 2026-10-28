@@ -278,6 +278,122 @@ A package's `retrieve.py` now logs in: `python3 retrieve.py --username alice
 API refuses it with `AUTH_REQUIRED`; export the collection again for one that
 logs in.
 
+## Sharing with your office
+
+By default the workbench answers only on the machine running Docker: the proxy
+is published on `127.0.0.1:8080`, over plain HTTP. LAN mode (#26) lets other
+machines on your network use it, over TLS. It is opt-in: without
+`docker-compose.lan.yml` nothing changes.
+
+In LAN mode:
+
+- the proxy publishes HTTPS on every network interface of this machine, port
+  443, and nothing else. `http://localhost:8080` stops answering, and there is
+  no plain-HTTP port or redirect;
+- the session cookie is marked `Secure`, so browsers send it only over TLS;
+- the API refuses to start unless an enabled AI Engineer account exists and the
+  cookie is `Secure`. It then exits with one line in `docker compose logs api`
+  saying why, and the proxy doesn't start, so nothing is published.
+
+### 1. Create the first AI Engineer in the default mode
+
+LAN mode won't start without one, so set the system up first, as in the
+[Quick start](#quick-start):
+
+```bash
+docker compose up -d
+docker compose exec api python -m auth bootstrap <your-username>
+```
+
+Log in at `http://localhost:8080` and choose your new password. Create the
+other accounts now or later from the Users page.
+
+### 2. Choose a certificate
+
+Browsers check that the certificate names the address they typed. Pick one of:
+
+- **A self-signed certificate (the default).** Name every way clients will
+  reach this machine in `RAG_LAN_HOSTNAMES`, comma-separated, in your shell or
+  in a `.env` file next to `docker-compose.yml`:
+
+  ```bash
+  RAG_LAN_HOSTNAMES=office-mac.local,192.168.1.20
+  ```
+
+  On first start the `tls-init` step generates a certificate for those names
+  plus `localhost`, valid for 825 days, and keeps it in the `lan_certs` volume.
+  It is reused on later starts, and replaced when it expires or the names
+  change. Browsers warn that it isn't trusted: compare the SHA-256 fingerprint
+  the browser shows with the one `docker compose logs tls-init` prints before
+  you accept it, once per browser.
+- **Your own certificate.** Put the certificate (with its chain, server
+  certificate first) and its unencrypted key in `proxy/certs/cert.pem` and
+  `proxy/certs/key.pem`. git ignores everything in that folder. When both files
+  are there they are used, and `RAG_LAN_HOSTNAMES` isn't needed. A key that
+  doesn't match the certificate stops the start; an expired certificate is used,
+  with a warning in `docker compose logs tls-init`.
+- **mkcert, for a small office.** [mkcert](https://github.com/FiloSottile/mkcert)
+  makes a local certificate authority and certificates signed by it, so
+  browsers that trust that authority show no warning:
+
+  ```bash
+  mkcert -install                  # creates the local authority on this machine
+  mkcert -cert-file proxy/certs/cert.pem -key-file proxy/certs/key.pem \
+    office-mac.local 192.168.1.20 localhost
+  mkcert -CAROOT                   # the folder holding rootCA.pem
+  ```
+
+  Install `rootCA.pem` (never `rootCA-key.pem`, which can sign certificates for
+  any site) as a trusted root on each client machine: on a Mac, open it in
+  Keychain Access, then set it to "Always Trust".
+
+After changing the certificate files or `RAG_LAN_HOSTNAMES` on a running LAN
+stack, run the `up` command below again, then restart the proxy so nginx loads
+the new pair:
+`docker compose -f docker-compose.yml -f docker-compose.lan.yml restart proxy`.
+
+### 3. Start in LAN mode
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.lan.yml up -d
+```
+
+Use the same two `-f` options for every `docker compose` command while in LAN
+mode (or `export COMPOSE_FILE=docker-compose.yml:docker-compose.lan.yml`).
+Clients open `https://office-mac.local/` (one of your names). Port 443 taken?
+Set `RAG_LAN_PORT=8443` the same way as the names and open
+`https://office-mac.local:8443/`.
+
+Allow incoming connections to Docker in the host firewall if it asks; the
+firewall, not this project, decides which networks can reach the port.
+
+### Going back to the default
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.lan.yml down
+docker compose up -d
+```
+
+Accounts, collections and everything else are kept (`down` without `-v`).
+The `tls-init` container and the `lan_certs` volume stay unused until you
+switch again.
+
+### Things to know
+
+- **No HSTS.** The proxy doesn't send `Strict-Transport-Security`. With a
+  self-signed or mkcert certificate, HSTS would turn a later certificate change
+  into a browser error with no way past it.
+- **Client addresses on Docker Desktop.** The login throttle locks a username
+  for 15 minutes after 5 failures from one client address. Measured on Docker
+  Desktop for Mac (#26): nginx doesn't see the client's own address. A request
+  to the port through this Mac's LAN address arrived from `192.168.65.1`
+  (Docker Desktop's address for the host) and one through `localhost` from the
+  Docker network's gateway. Other machines' connections take the same port
+  forwarding, so expect them to share one address: then 5 wrong passwords for a
+  username, from anyone on the network, lock that username for everyone for 15
+  minutes. Docker Engine on Linux normally keeps the real client address.
+- **Engine 28.0.0 or newer** is still required, as for the default mode.
+
 ## Workflow
 
 ### 1. Create a collection
@@ -415,19 +531,27 @@ All API settings are environment variables in `docker-compose.yml`:
 | `MAX_ZIP_EXPANDED_BYTES` | `2147483648` (2 GiB) | The most one upload's ZIPs may expand to in all, gzipped members' output included. Over it the upload is refused with `ARCHIVE_TOO_LARGE` |
 | `MAX_ZIP_MEMBERS` | `5000` | The most entries one ZIP may hold, folders included. Over it the upload is refused with `ARCHIVE_TOO_MANY_MEMBERS` |
 | `MAX_ZIP_MEMBER_RATIO` | `200` | The most a ZIP member of 1 MiB or more may expand relative to its compressed size. Over it the upload is refused with `ARCHIVE_RATIO_TOO_HIGH` |
-| `AUTH_COOKIE_SECURE` | `false` | Marks the session cookie `Secure`. Exactly `true` or `false`; anything else stops the API. Leave it `false` for the loopback HTTP profile, where a Secure cookie would never be sent back; turn it on only when the stack is served over TLS (#26) |
+| `AUTH_COOKIE_SECURE` | `false` | Marks the session cookie `Secure`. Exactly `true` or `false`; anything else stops the API. Leave it `false` for the loopback HTTP profile, where a Secure cookie would never be sent back. `docker-compose.lan.yml` sets it `true` for LAN mode's TLS (#26) |
+| `RAG_LAN_MODE` | `false` | LAN mode (#26), set `true` only by `docker-compose.lan.yml`. Exactly `true` or `false`; anything else stops the API. When `true` the API refuses to start unless `AUTH_COOKIE_SECURE` is `true` and an enabled AI Engineer exists. See [Sharing with your office](#sharing-with-your-office) |
 | `AUTH_DIR` | `/app/auth_data` | Container path of the accounts store, the `auth_data` volume |
+
+LAN mode reads two more settings from your shell or a `.env` file next to `docker-compose.yml`, used by `docker-compose.lan.yml`:
+
+| Variable | Default | Description |
+|---|---|---|
+| `RAG_LAN_HOSTNAMES` | empty | The names and IP addresses clients use to reach this machine, comma-separated. The self-signed certificate names them plus `localhost`. Required unless `proxy/certs/` holds your own `cert.pem` and `key.pem` |
+| `RAG_LAN_PORT` | `443` | The host port LAN mode publishes HTTPS on, on every interface |
 
 To swap the LLM (e.g. to `llama3.2`), update `LLM_MODEL` in `docker-compose.yml` and add the model name to `ollama/entrypoint.sh`.
 
-**Upload size limit.** One upload (all files in it together, or one ZIP) can be at most **512 MB**. The proxy enforces it with `client_max_body_size` in `proxy/nginx.conf`. To change it, edit that value and `MAX_UPLOAD_MB` in `ui/src/api/client.ts` (the Import page uses it to warn before sending), then rebuild the UI and recreate the proxy:
+**Upload size limit.** One upload (all files in it together, or one ZIP) can be at most **512 MB**. The proxy enforces it with `client_max_body_size` in `proxy/locations.conf`. To change it, edit that value and `MAX_UPLOAD_MB` in `ui/src/api/client.ts` (the Import page uses it to warn before sending), then rebuild the UI and recreate the proxy:
 
 ```bash
 docker compose build ui
 docker compose up -d --force-recreate ui proxy
 ```
 
-`--force-recreate` matters for the proxy. `nginx.conf` is mounted as a single file, and most editors save by replacing the file, so a running container keeps reading the old copy until it is recreated.
+`--force-recreate` matters for the proxy. `locations.conf` is mounted as a single file, and most editors save by replacing the file, so a running container keeps reading the old copy until it is recreated.
 
 ## Data persistence
 
@@ -475,9 +599,13 @@ rag-docker/
 ├── ollama/
 │   └── entrypoint.sh     # Pulls models on first start
 ├── proxy/
-│   └── nginx.conf        # Routes /api/ to API, / to UI
+│   ├── nginx.conf        # The default server: HTTP on port 80
+│   ├── nginx.lan.conf    # LAN mode's server: TLS on port 443 (#26)
+│   ├── locations.conf    # Routes /api/ to API, / to UI; shared by both
+│   └── certs/            # Your own LAN mode certificate, if any (ignored by git)
 ├── exports/              # Export packages land here (bind mount)
-└── docker-compose.yml
+├── docker-compose.yml
+└── docker-compose.lan.yml # LAN mode, opt-in (#26)
 ```
 
 ## Exporting and importing a RAG
@@ -881,10 +1009,12 @@ If this fails after Docker restarts, Docker's internal networking is broken — 
 
 **LLM answers are garbage or time out** — Answers come back in mixed scripts or as fragments of unrelated instructions, run to thousands of characters, or time out, while `/api/health` still reports the LLM as ok. Ollama's model runner has degraded; it does not recover on its own. Restart it with `docker compose restart ollama`. `scripts/verify/all.sh` checks for this before its LLM suites and stops with the same advice.
 
-**Port 8080 already in use** — The proxy publishes on host loopback port 8080 (`docker-compose.yml`, the `proxy` service: `"127.0.0.1:8080:80"`). Change the middle number to any free port, for example `"127.0.0.1:9090:80"`, then access the UI at `http://localhost:9090`. Keep the `127.0.0.1` host address and container port 80.
+**Port 8080 already in use** — The proxy publishes on host loopback port 8080 (`docker-compose.yml`, the `proxy` service: `"127.0.0.1:8080:80"`). Change the middle number to any free port, for example `"127.0.0.1:9090:80"`, then access the UI at `http://localhost:9090`. Keep the `127.0.0.1` host address and container port 80. In LAN mode the port is 443 on every interface instead; set `RAG_LAN_PORT` to use another (see [Sharing with your office](#sharing-with-your-office)).
 
-**Sharing with your office** — The default binding is now local to the Docker host. An existing installation accessed from another computer will stop accepting those connections after its proxy is recreated. The API requires an account (see [Accounts and roles](#accounts-and-roles)), but LAN access, with TLS, is tracked in issue #26 and is not yet provided. Keep the loopback binding for the current local setup.
-**Upload fails with "larger than the 512 MB limit" or HTTP 413** — The upload is over the proxy's limit (see [Configuration](#configuration)). The limit covers the whole request, so split a large batch into several uploads, or raise the limit. Before issue #21 the proxy used nginx's 1 MB default, so a 413 on an ordinary PDF means the proxy is running an old `nginx.conf`: run `docker compose up -d --force-recreate proxy`.
+**Other computers can't reach the workbench** — By default it answers only on the Docker host (`127.0.0.1`). To share it on your network, use LAN mode: see [Sharing with your office](#sharing-with-your-office).
+
+**LAN mode doesn't start** — `docker compose -f docker-compose.yml -f docker-compose.lan.yml logs api tls-init` says why in one line: no enabled AI Engineer yet (create one in the default mode first), `AUTH_COOKIE_SECURE` not `true`, `RAG_LAN_HOSTNAMES` empty or holding something that isn't a name or address, or a `proxy/certs` key that doesn't match its certificate.
+**Upload fails with "larger than the 512 MB limit" or HTTP 413** — The upload is over the proxy's limit (see [Configuration](#configuration)). The limit covers the whole request, so split a large batch into several uploads, or raise the limit. Before issue #21 the proxy used nginx's 1 MB default, so a 413 on an ordinary PDF means the proxy is running an old configuration: run `docker compose up -d --force-recreate proxy`.
 
 **Build fails with `ERROR: Could not install packages due to an OSError: [Errno 28] No space left on device`** — Docker's virtual disk is full, not your host disk — the two are reported separately, and `df -h` on the host will look fine. A virtual disk of 8 GB or so cannot hold ~6.5 GB of images plus build cache, so the build runs out of room partway through `pip install`. Check the real numbers with:
 

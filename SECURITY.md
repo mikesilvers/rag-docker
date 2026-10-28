@@ -47,8 +47,23 @@ request but `/health` and the login (#25).
   is a prerequisite. This assumes Docker's standard bridge/NAT networking;
   custom direct-routing setups are outside this local configuration. Over plain
   HTTP the session cookie is not marked `Secure` (`AUTH_COOKIE_SECURE=false`);
-  set it to `true` only when the stack is served over TLS. LAN exposure and TLS
-  are tracked in #26.
+  set it to `true` only when the stack is served over TLS, as LAN mode does.
+- **LAN mode (opt-in, #26).** `docker-compose.lan.yml` publishes the proxy on
+  every host interface, TLS only (TLS 1.2 and 1.3, Mozilla's intermediate
+  ciphers), on port 443 by default, with no plain-HTTP port or redirect; the
+  host firewall decides which networks reach it. It marks the session cookie
+  `Secure`, and the API refuses to start in LAN mode unless the cookie is
+  `Secure` and an enabled AI Engineer exists; then the proxy doesn't start
+  either, so nothing is published. The certificate is your own (from
+  `proxy/certs/`, ignored by git) or one self-signed on first start for the
+  names in `RAG_LAN_HOSTNAMES` plus `localhost`, kept in the `lan_certs`
+  volume with its key readable only by its owner; its SHA-256 fingerprint is
+  logged so users can check what their browser shows. No HSTS header is sent,
+  so a certificate change can't lock browsers out. On Docker Desktop nginx
+  doesn't see clients' own addresses (measured: `192.168.65.1` for a request
+  through the host's LAN address), so the per-username-and-address login
+  throttle works per username there: anyone on the network can lock a username
+  for 15 minutes with 5 wrong passwords. See README "Sharing with your office".
 - **Service API keys.** Programs authenticate with keys issued by AI Engineers
   to service principals, accounts that can't log in to the browser; keys are
   never issued to people. A key is 256 random bits, shown once at issuance;

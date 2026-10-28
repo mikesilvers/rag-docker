@@ -1,0 +1,57 @@
+# LAN mode (#26): share the workbench with other machines on your network, over
+# TLS. Opt-in, and only together with the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.lan.yml up -d
+#
+# Create the first AI Engineer in the default (loopback) mode before switching:
+# in LAN mode the API refuses to start without an enabled Engineer, or without
+# a Secure session cookie, and then nothing is published (api/lan_mode.py).
+# See README "Sharing with your office".
+#
+# What this changes:
+# - the proxy publishes TLS on every host interface, port RAG_LAN_PORT
+#   (default 443), instead of plain HTTP on 127.0.0.1:8080. Nothing listens on
+#   port 80 and nothing redirects from it;
+# - the API runs in LAN mode with the session cookie marked Secure;
+# - tls-init, a one-shot step in the API image (no other image), prepares the
+#   certificate before the proxy starts: your own proxy/certs/cert.pem and
+#   key.pem if both are there, otherwise a self-signed certificate for
+#   RAG_LAN_HOSTNAMES plus localhost (api/tls_cert.py).
+#
+# RAG_LAN_HOSTNAMES and RAG_LAN_PORT come from your shell or a .env file next
+# to this one. After changing the certificate or the names, run `up -d` again
+# and restart the proxy so nginx loads the new pair.
+services:
+  tls-init:
+    image: rag-docker-api:latest
+    command: ["python", "-m", "tls_cert"]
+    environment:
+      # The names and addresses clients use to reach this machine, comma-
+      # separated (my-mac.local,192.168.1.20). Not needed with your own pair.
+      RAG_LAN_HOSTNAMES: "${RAG_LAN_HOSTNAMES:-}"
+    volumes:
+      # Your own certificate and key, if any; read-only.
+      - ./proxy/certs:/byo:ro
+      - lan_certs:/certs
+    networks: [rag-internal]
+
+  api:
+    environment:
+      RAG_LAN_MODE: "true"
+      AUTH_COOKIE_SECURE: "true"
+
+  proxy:
+    ports: !override
+      # Every host interface, on purpose: this is what LAN mode is for. Your
+      # host firewall decides which networks can actually reach it.
+      - "0.0.0.0:${RAG_LAN_PORT:-443}:443"
+    volumes:
+      # Same target as the base file's nginx.conf, so this one replaces it.
+      - ./proxy/nginx.lan.conf:/etc/nginx/nginx.conf:ro
+      - lan_certs:/etc/nginx/certs:ro
+    depends_on:
+      tls-init: { condition: service_completed_successfully }
+
+volumes:
+  # The active certificate and key, written by tls-init, read by the proxy.
+  lan_certs:

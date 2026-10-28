@@ -8,6 +8,7 @@ verify project, never the live stack (#152).
 bash scripts/verify/stack.sh run                    # everything, ~20 min plus start-up
 RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run    # skip LLM work, ~8 min, start-up included
 bash scripts/verify/stack.sh run 02 04              # only the named suites
+bash scripts/verify/stack.sh run --lan              # LAN mode, TLS on loopback only (#26)
 ```
 
 Exits non-zero if any check fails.
@@ -62,8 +63,8 @@ against" below).
 
 | Command | What it does |
 |---|---|
-| `stack.sh run [--checkout DIR] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
-| `stack.sh up [--checkout DIR] [--pull]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. |
+| `stack.sh run [--checkout DIR] [--telemetry \| --lan] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
+| `stack.sh up [--checkout DIR] [--pull] [--lan]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. |
 | `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
 
 `--checkout` is the checkout to build and test; the default is the one holding
@@ -128,6 +129,45 @@ What makes it separate from the live stack:
   suite, exit 3, when it fails. Not re-checked: direct `curl` and
   `docker compose exec` calls in the suites, and the Python helpers, which
   end on their own timeouts (up to 900 s).
+
+### LAN mode (#26)
+
+`stack.sh run --lan` (and `up --lan`) runs the verify project in LAN mode
+without exposing the host:
+
+1. It comes up in its default configuration, checked by the guard as usual.
+2. It creates the first Engineer, `vfy-engineer`, with the operator command,
+   as the README tells users to before switching (the project is always new
+   here). The generated password is discarded unseen; `auth_setup.py` resets
+   it later like any password it doesn't know.
+3. It switches `COMPOSE_FILE` to the base file, the checkout's
+   `docker-compose.lan.yml`, this checkout's `docker-compose.verify.yml` and
+   `docker-compose.lan.verify.yml`. That harness-only overlay replaces the
+   override's `0.0.0.0:443` with `127.0.0.1:<verify port>:443`, gives `tls-init`
+   the verify image and sets `RAG_LAN_HOSTNAMES` to reserved test names
+   (`vfy-lan.invalid`, `192.0.2.10`).
+4. The guard checks that configuration, with rule (c) wanting exactly
+   `proxy:127.0.0.1:<verify port>->443/tcp`; every other rule is unchanged, for
+   `tls-init` too. Then `up --no-build --wait` recreates what changed.
+5. It copies the certificate `tls-init` generated from the proxy to
+   `${TMPDIR:-/tmp}/rag-verify-<uid>/lan-cert.pem` (0600) and exports
+   `RAG_API=https://localhost:<port>/api`, and that file as `CURL_CA_BUNDLE`,
+   `SSL_CERT_FILE` and `RAG_VERIFY_LAN_CERT`, so curl and Python trust it, and
+   only it, with the name `localhost`. `RAG_VERIFY_LAN=1` tells the suites.
+
+Without suite names a `--lan` run runs `18_lan` only: the other suites expect
+the default configuration (suite 01's binding and service-inventory checks
+would fail by design). `--lan` can't be combined with `--telemetry`.
+
+`18_lan.sh` runs in every run. It always checks the real override with
+`lan_config.py` (`docker compose config` of the base file plus
+`docker-compose.lan.yml`, under the project name `rag-lan-config`, with no
+`.env`; nothing is created) and runs `../tests/test_lan_mode.py` in the API
+image. Only in a `--lan` run does it check the running LAN project through
+`lan_stack.py`: HTTPS with the generated certificate, TLS versions and HTTP/2,
+the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
+and the API's refusal in one-off containers (`docker compose run --rm
+--no-deps`, no ports); it also prints the client address nginx recorded.
 
 **Memory.** The verify project runs next to the live stack on the same Docker
 VM. With 12 GB allocated, both fit while one LLM is loaded; when both stacks
@@ -706,6 +746,11 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
 | `auth_stack.py` | the stack checks of `17_auth.sh`, one per subcommand (#25) |
 | `auth_headers.py` | the suite's session as `Cookie` and `Origin` headers, for the host-side Python helpers (#25) |
+| `18_lan.sh` | §2.5 and §10.5 — LAN mode (#26): the real override resolved without starting it; registers `../tests/test_lan_mode.py`; with `stack.sh run --lan`, the running LAN project on loopback |
+| `lan_config.py` | host-side, standard library: `docker-compose.lan.yml` as `docker compose config` resolves it, at the default port and `RAG_LAN_PORT=8443` (#26) |
+| `lan_stack.py` | the stack checks of `18_lan.sh` in a `--lan` run, one per subcommand (#26) |
+| `../tests/test_lan_mode.py` | API image, no network: `RAG_LAN_MODE` parsing, the startup refusal (also through `import main`), the certificate step, both nginx configurations, embedded copies (#26) |
+| `docker-compose.lan.verify.yml` | the harness overlay of a `--lan` run: TLS on loopback at the verify port, the verify image for `tls-init`, reserved test names (#26) |
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
 | `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
 | `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |

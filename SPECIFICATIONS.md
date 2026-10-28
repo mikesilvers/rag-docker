@@ -126,8 +126,9 @@ services:
       MAX_ZIP_MEMBERS: 5000
       MAX_ZIP_MEMBER_RATIO: 200
       # Marks the session cookie Secure (#25). false for this loopback HTTP
-      # profile, where a Secure cookie would never be sent back; set true only
-      # when the stack is served over TLS (#26). Exactly true or false.
+      # profile, where a Secure cookie would never be sent back. LAN mode's
+      # docker-compose.lan.yml serves TLS and sets it true (#26). Exactly true
+      # or false.
       AUTH_COOKIE_SECURE: "false"
     volumes:
       - ingest_uploads:/app/uploads
@@ -164,10 +165,13 @@ services:
   proxy:
     image: nginx:1.29-alpine
     ports:
-      # The workbench is local to the host by default; LAN exposure is #26.
+      # The workbench is local to the host by default. LAN mode (#26) is the
+      # opt-in docker-compose.lan.yml, which replaces this with TLS on port 443.
       - "127.0.0.1:8080:80"
     volumes:
       - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+      # The routes, shared with LAN mode's nginx.lan.conf (#26).
+      - ./proxy/locations.conf:/etc/nginx/rag/locations.conf:ro
     networks: [rag-internal]
     depends_on: [ui, api]
 
@@ -195,7 +199,9 @@ networks:
 
 ### 2.2 Nginx Routing
 
-**File:** `proxy/nginx.conf`
+**Files:** `proxy/nginx.conf` (the default server, HTTP on container port 80) and `proxy/nginx.lan.conf` (LAN mode's
+TLS server on container port 443, §2.5) both include `proxy/locations.conf`, which holds the routes, so the two
+servers route identically.
 
 | Path prefix | Routes to | Notes |
 |---|---|---|
@@ -238,6 +244,53 @@ healthcheck:
 3. API starts → verifies both downstream connections → healthcheck passes
 4. UI starts (static build, no runtime deps)
 5. Nginx proxy starts
+
+### 2.5 LAN Mode (#26)
+
+LAN mode shares the workbench on the local network over TLS. It is opt-in: only
+`docker compose -f docker-compose.yml -f docker-compose.lan.yml ...` turns it on, and without the override the stack
+is exactly as in §2.1.
+
+**File:** `docker-compose.lan.yml`. Over the base file it:
+
+- replaces the proxy's publication with exactly one, `0.0.0.0:${RAG_LAN_PORT:-443}->443/tcp`: TLS on every host
+  interface, nothing on port 80 and no redirect;
+- sets `RAG_LAN_MODE: "true"` and `AUTH_COOKIE_SECURE: "true"` on the api;
+- mounts `proxy/nginx.lan.conf` over `nginx.conf` and the `lan_certs` volume at `/etc/nginx/certs`, both read-only,
+  and starts the proxy only after `tls-init` has completed successfully;
+- adds `tls-init`, a one-shot service in the API image (`rag-docker-api:latest`, `python -m tls_cert`), with
+  `RAG_LAN_HOSTNAMES` from the shell or `.env`, `proxy/certs` mounted read-only at `/byo` and `lan_certs` at
+  `/certs`.
+
+**Startup refusal** (`api/lan_mode.py`, called first by `api/main.py`). With `RAG_LAN_MODE=true` the API checks,
+before any other import, startup work or request, that `AUTH_COOKIE_SECURE` is `true` and then that an enabled human
+(not service principal) AI Engineer exists. On the first failure it writes one line, starting `LAN mode refused:`, to
+standard error and exits 1. The ui waits for a healthy api and the proxy for the ui, so nothing is published. The
+check runs once; LAN mode changes nothing else in the API. The operator command is unaffected, and the first
+Engineer is created in the default mode before switching.
+
+**TLS server** (`proxy/nginx.lan.conf`): one server, `listen 443 ssl`, `http2 on`, TLS 1.2 and 1.3 only, Mozilla's
+intermediate cipher list for TLS 1.2, `ssl_prefer_server_ciphers off`, session tickets off, no
+`Strict-Transport-Security` header, the pair at `/etc/nginx/certs/live/{cert,key}.pem`, and the shared routes.
+
+**Certificate step** (`api/tls_cert.py`, run by `tls-init` on every start in LAN mode):
+
+| Case | Result |
+|---|---|
+| `proxy/certs/cert.pem` and `key.pem` both present | Used as given (a chain allowed, server certificate first). Refused, exit 1, when either doesn't parse or the key doesn't match; an expired certificate is used with a warning |
+| Only one of the two present | Refused, exit 1 |
+| Neither present | A self-signed certificate for `RAG_LAN_HOSTNAMES` (comma-separated DNS names and IP addresses) plus `localhost`: ECDSA P-256, CN the first name, valid 825 days, `CA:FALSE`, server-authentication EKU. An empty value or an entry that is neither a DNS name nor an IP address is refused, exit 1 |
+| A self-signed pair already active | Reused, unless it is unreadable, its key doesn't match, it has expired, its names differ from the ones wanted now, or the active pair came from bring-your-own files that are gone |
+
+The active pair lives in `lan_certs` as `live`, a symlink to a `pair-<random>` folder (`cert.pem`, `key.pem` mode
+0600, `source`), switched with one rename, so a failed step never leaves a certificate beside a key that doesn't match
+it. The step prints one line with the source, names, expiry and SHA-256 fingerprint, or one line on standard error
+when it refuses; then the proxy doesn't start. `proxy/certs/` is tracked through `.gitkeep`; everything else in it is
+ignored by git.
+
+**Client address.** nginx passes `$remote_addr` to the API as `X-Real-IP`, which keys the login throttle. Measured
+on Docker Desktop for Mac: a request through the host's LAN address arrives from `192.168.65.1` and one through
+`localhost` from the Docker network's gateway, not from the client's own address.
 
 ---
 
@@ -506,7 +559,7 @@ Content-Type: multipart/form-data
 
 Accepts one or more files. For ZIP uploads, extracts and processes all supported files within the archive. For folder-equivalent uploads (multiple files in one request), processes all submitted files.
 
-**Size limit:** one request may be at most **512 MB**, all files together. The proxy enforces this (`client_max_body_size` in `proxy/nginx.conf`) and answers an oversize request itself with **HTTP 413**, an nginx HTML page rather than the API's JSON error shape, before the API sees it. The proxy streams accepted uploads to the API without buffering them, and the API writes each file to disk in blocks rather than holding it in memory. The Import page refuses a selection over the limit before sending it.
+**Size limit:** one request may be at most **512 MB**, all files together. The proxy enforces this (`client_max_body_size` in `proxy/locations.conf`) and answers an oversize request itself with **HTTP 413**, an nginx HTML page rather than the API's JSON error shape, before the API sees it. The proxy streams accepted uploads to the API without buffering them, and the API writes each file to disk in blocks rather than holding it in memory. The Import page refuses a selection over the limit before sending it.
 
 **Form fields:**
 
@@ -2618,8 +2671,17 @@ Authentication (#25) has two API container settings:
 
 | Setting | Default | Accepted values |
 |---|---|---|
-| `AUTH_COOKIE_SECURE` | `false` | Exactly `true` or `false`; anything else fails API startup. `true` marks the session cookie `Secure`, for a stack served over TLS (#26); leave `false` on the loopback HTTP profile |
+| `AUTH_COOKIE_SECURE` | `false` | Exactly `true` or `false`; anything else fails API startup. `true` marks the session cookie `Secure`, for a stack served over TLS (LAN mode sets it, #26); leave `false` on the loopback HTTP profile |
 | `AUTH_DIR` | `/app/auth_data` | The folder of `auth.db`, the `auth_data` volume |
+
+LAN mode (#26, §2.5) adds one API container setting and two read by `docker-compose.lan.yml` from the shell or
+`.env`:
+
+| Setting | Default | Accepted values |
+|---|---|---|
+| `RAG_LAN_MODE` | `false` | Exactly `true` or `false`; anything else fails API startup. `true` only through `docker-compose.lan.yml`; then the API refuses to start unless `AUTH_COOKIE_SECURE` is `true` and an enabled human AI Engineer exists |
+| `RAG_LAN_HOSTNAMES` | empty | Comma-separated DNS names and IP addresses for the self-signed certificate; required unless `proxy/certs` holds `cert.pem` and `key.pem` |
+| `RAG_LAN_PORT` | `443` | The host port of LAN mode's TLS publication, on every interface |
 
 ---
 
@@ -2647,8 +2709,12 @@ rag-docker/
 ├── package.sh                  # Source-only zip (~1.3 MB; target needs internet)
 ├── package-offline.sh          # Self-contained bundle (~4.6 GB; no network needed)
 ├── install-offline.sh          # Installs from that bundle on an air-gapped Mac
+├── docker-compose.lan.yml      # LAN mode, opt-in (#26)
 ├── proxy/
-│   └── nginx.conf
+│   ├── nginx.conf              # Default server: HTTP, container port 80
+│   ├── nginx.lan.conf          # LAN mode: TLS, container port 443
+│   ├── locations.conf          # The routes, included by both
+│   └── certs/                  # Bring-your-own LAN certificate (ignored by git but .gitkeep)
 ├── ollama/
 │   └── entrypoint.sh            # Starts server, pulls models, waits
 ├── api/
@@ -2709,6 +2775,8 @@ rag-docker/
 │   │       ├── fidelity_table.md
 │   │       ├── naming.md
 │   │       └── retrieve_usage.md
+│   ├── lan_mode.py              # LAN mode's startup refusal (#26)
+│   ├── tls_cert.py              # LAN mode's certificate step, `python -m tls_cert` (#26)
 │   └── config.py                # Environment variable config
 ├── ui/
 │   ├── Dockerfile
@@ -3294,6 +3362,18 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       weaviate publish nothing; ollama and ui expose container ports only.*
 - [x] Docker Engine is 28.0.0 or newer; older engines are outside the supported localhost-isolation profile. The infrastructure suite checks the daemon version.
 - [x] Resolved Compose configuration and live Docker bindings contain exactly one published TCP port, on the proxy at host address `127.0.0.1`, targeting container port 80. A missing or all-interface host address fails verification. A different free host port preserves loopback and matches `RAG_EXPECTED_PROXY_PORT` (default `8080`); verified at `18080` on a disposable deployment.
+- [x] LAN mode is opt-in (#26, §2.5): only `docker-compose.lan.yml` turns it on; with it the proxy publishes exactly one port, `0.0.0.0:443->443/tcp` (`RAG_LAN_PORT` changes the host port), nothing on port 80; the api runs with `RAG_LAN_MODE=true` and `AUTH_COOKIE_SECURE=true`; `tls-init` runs in the API image and the proxy waits for it to complete successfully; nginx's LAN configuration and the certificate volume are mounted read-only. Without the override the default publication and routes are unchanged.
+  *Evidence: `scripts/verify/lan_config.py` (suite 18, every run) resolves the real override with `docker compose config`, starting nothing, at the default port and at `RAG_LAN_PORT=8443`; suite 01's binding checks still pass on the base file.*
+- [x] With `RAG_LAN_MODE=true` the API exits 1 before any other import, startup work or request, with exactly one `LAN mode refused:` line on standard error and no traceback, when `AUTH_COOKIE_SECURE` isn't `true` (checked first) or no enabled human AI Engineer exists (an End User, a Developer, a disabled Engineer or an engineer-role service principal doesn't count); `RAG_LAN_MODE` accepts exactly `true` or `false` (#26).
+  *Evidence: `scripts/tests/test_lan_mode.py` in the built API image with `--network none` (suite 18), including `import main` in a subprocess for each refusal and an AST check that `lan_mode.enforce()` is `main.py`'s first statement; in a `stack.sh run --lan`, one-off api containers of the LAN configuration refuse with `AUTH_COOKIE_SECURE=false` and with an empty account store while the running project stays healthy.*
+- [x] LAN mode's nginx serves one TLS server on container port 443 with HTTP/2, TLS 1.2 and 1.3 only, Mozilla's intermediate ciphers, no session tickets and no HSTS header, routing exactly as the default server through the shared `locations.conf` (#26).
+  *Evidence: `test_lan_mode.py` checks both configurations; in a `stack.sh run --lan`, suite 18 checks that TLS 1.2 and 1.3 connect, TLS 1.1 is refused and ALPN picks `h2`, that the only live binding is `127.0.0.1:<verify port>->443/tcp` and plain HTTP to it gets no API answer, and that a cookie-authenticated change over HTTPS from `https://localhost:<port>` is accepted and from another origin refused `403 CROSS_ORIGIN_REFUSED`.*
+- [x] The certificate step uses `proxy/certs/cert.pem` and `key.pem` when both are present, refuses one alone, an unparsable file or a non-matching key, and warns on an expired certificate; otherwise it generates a self-signed certificate for `RAG_LAN_HOSTNAMES` plus `localhost` (refusing an empty value or an invalid entry), valid 825 days, reused until it is unreadable, mismatched, expired, names other hosts or replaces removed bring-your-own files; the pair is switched atomically with the key at mode 0600 (#26).
+  *Evidence: `test_lan_mode.py` (suite 18) covers each case and a failed write; in a `stack.sh run --lan`, suite 18 verifies `/api/health` over HTTPS against the generated certificate with the name `localhost` and checks its names and 825-day validity.*
+- [x] In LAN mode a login over HTTPS sets the session cookie `Secure`, `HttpOnly` and `SameSite=Strict` (#26, #25 Q12).
+  *Evidence: `lan_stack.py cookie` in a `stack.sh run --lan` (suite 18).*
+- [x] The verify project runs LAN mode only on loopback: `stack.sh run --lan` comes up in the default configuration, creates the first Engineer, then switches to `docker-compose.lan.yml` plus the harness's `docker-compose.lan.verify.yml` (TLS on `127.0.0.1:<verify port>`), whose guard rule (c) wants exactly `proxy:127.0.0.1:<port>->443/tcp` (#26).
+  *Evidence: `scripts/tests/test_verify_stack.py` (the LAN guard rule and its refused variants, the `--lan` argument refusals and the Docker calls of `up --lan` in order); the `stack.sh run --lan` on the #26 pull request.*
 - [x] Optional OpenTelemetry foundation (#282, #356): disabled by default with no providers, exporters or file reads; an invalid enabled configuration (§8), including a `RAG_OTEL_HEADERS_FILE` or `RAG_OTEL_CA_FILE` that is not a regular file, fails startup with field-only errors, its bounds accepted at their edges and refused beyond them; private providers leave the global OTel providers and root logging unchanged; only schema-approved fields reach OTLP; bounded queues, one-attempt export and bounded lifecycle waits keep a collector that answers with an error, refuses the connection or hangs from holding application work; an optional `RAG_OTEL_CA_FILE` is validated at startup and is the only trust store for HTTPS export when set.
   *Evidence: `scripts/tests/test_telemetry.py` in the built API image with `--network none` (suite 01) against loopback OTLP receivers, including an HTTPS receiver signed by a test-generated private CA; `scripts/tests/test_telemetry_implementation.py` keeps the embedded copies in step.*
 - [x] Every API error answers in the JSON envelope (#373): an unknown route `404 NOT_FOUND`, a wrong method `405 METHOD_NOT_ALLOWED` with its `Allow` header, and an unhandled error `500 INTERNAL_ERROR`. `GET /collections` answers 503 `SERVICE_UNAVAILABLE` when Weaviate can't be read, a missing or unreadable help template answers 500 `HELP_RENDER_FAILED`, and `CREATE_FAILED` and `DELETE_FAILED` send a fixed message with `detail` `null`. In each case the cause is logged, not returned. A help template that fails to render (`RuntimeError`) answers 500 `HELP_RENDER_FAILED` with its own message, and other HTTP errors (FastAPI's 400 for a body it can't parse) keep FastAPI's own `{"detail": ...}` answer (#411).

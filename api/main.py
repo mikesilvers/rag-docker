@@ -1,4 +1,10 @@
 from __future__ import annotations
+# LAN mode (#26) refuses to start without a Secure cookie and an enabled
+# Engineer. First, so uvicorn's import of this module stops before any other
+# import, any startup work and any request.
+import lan_mode
+lan_mode.enforce()
+
 import logging
 from contextlib import asynccontextmanager
 

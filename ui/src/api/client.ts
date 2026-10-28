@@ -1,6 +1,6 @@
 const BASE = '/api'
 
-// The proxy's request-body limit: `client_max_body_size` in proxy/nginx.conf.
+// The proxy's request-body limit: `client_max_body_size` in proxy/locations.conf.
 // It covers a whole request, so a multi-file upload counts every file. Kept
 // here only so the Import page can warn before sending; nginx enforces it.
 // Change both together.
