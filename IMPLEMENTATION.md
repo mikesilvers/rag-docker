@@ -146,8 +146,15 @@ services:
       # upload is refused (#28).
       MAX_ZIP_MEMBERS: 5000
       MAX_ZIP_MEMBER_RATIO: 200
+      # Marks the session cookie Secure (#25). false for this loopback HTTP
+      # profile, where a Secure cookie would never be sent back. LAN mode's
+      # docker-compose.lan.yml serves TLS and sets it true (#26). Exactly true
+      # or false.
+      AUTH_COOKIE_SECURE: "false"
     volumes:
       - ingest_uploads:/app/uploads
+      # Accounts, sessions and the login throttle (#25), one SQLite file.
+      - auth_data:/app/auth_data
       # Retained source documents; grows with the corpus.
       - rag_sources:/app/sources
       # Bind mount, deliberately: an export is only useful if the user can
@@ -179,10 +186,13 @@ services:
   proxy:
     image: nginx:1.29-alpine
     ports:
-      # This unauthenticated workbench is local to the host by default.
+      # The workbench is local to the host by default. LAN mode (#26) is the
+      # opt-in docker-compose.lan.yml, which replaces this with TLS on port 443.
       - "127.0.0.1:8080:80"
     volumes:
       - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+      # The routes, shared with LAN mode's nginx.lan.conf (#26).
+      - ./proxy/locations.conf:/etc/nginx/rag/locations.conf:ro
     networks: [rag-internal]
     depends_on: [ui, api]
 
@@ -201,6 +211,7 @@ volumes:
   ollama_models:
   ingest_uploads:
   rag_sources:
+  auth_data:
 
 networks:
   rag-internal:
@@ -239,6 +250,90 @@ volumes:
   ollama_models:
     external: true
     name: rag-verify-ollama-models
+```
+
+### docker-compose.lan.yml
+
+```yaml
+# LAN mode (#26): share the workbench with other machines on your network, over
+# TLS. Opt-in, and only together with the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.lan.yml up -d
+#
+# Create the first AI Engineer in the default (loopback) mode before switching:
+# in LAN mode the API refuses to start without an enabled Engineer, or without
+# a Secure session cookie, and then nothing is published (api/lan_mode.py).
+# See README "Sharing with your office".
+#
+# What this changes:
+# - the proxy publishes TLS on every host interface, port RAG_LAN_PORT
+#   (default 443), instead of plain HTTP on 127.0.0.1:8080. Nothing listens on
+#   port 80 and nothing redirects from it;
+# - the API runs in LAN mode with the session cookie marked Secure;
+# - tls-init, a one-shot step in the API image (no other image), prepares the
+#   certificate before the proxy starts: your own proxy/certs/cert.pem and
+#   key.pem if both are there, otherwise a self-signed certificate for
+#   RAG_LAN_HOSTNAMES plus localhost (api/tls_cert.py).
+#
+# RAG_LAN_HOSTNAMES and RAG_LAN_PORT come from your shell or a .env file next
+# to this one. After changing the certificate or the names, run `up -d` again
+# and restart the proxy so nginx loads the new pair.
+services:
+  tls-init:
+    image: rag-docker-api:latest
+    command: ["python", "-m", "tls_cert"]
+    environment:
+      # The names and addresses clients use to reach this machine, comma-
+      # separated (my-mac.local,192.168.1.20). Not needed with your own pair.
+      RAG_LAN_HOSTNAMES: "${RAG_LAN_HOSTNAMES:-}"
+    volumes:
+      # Your own certificate and key, if any; read-only.
+      - ./proxy/certs:/byo:ro
+      - lan_certs:/certs
+    networks: [rag-internal]
+
+  api:
+    environment:
+      RAG_LAN_MODE: "true"
+      AUTH_COOKIE_SECURE: "true"
+
+  proxy:
+    ports: !override
+      # Every host interface, on purpose: this is what LAN mode is for. Your
+      # host firewall decides which networks can actually reach it.
+      - "0.0.0.0:${RAG_LAN_PORT:-443}:443"
+    volumes:
+      # Same target as the base file's nginx.conf, so this one replaces it.
+      - ./proxy/nginx.lan.conf:/etc/nginx/nginx.conf:ro
+      - lan_certs:/etc/nginx/certs:ro
+    depends_on:
+      tls-init: { condition: service_completed_successfully }
+
+volumes:
+  # The active certificate and key, written by tls-init, read by the proxy.
+  lan_certs:
+```
+
+### docker-compose.lan.verify.yml
+
+```yaml
+# Overlay for LAN mode on the disposable verify project (#26). Loaded only by
+# scripts/verify/stack.sh --lan, after docker-compose.lan.yml and
+# docker-compose.verify.yml, from the harness checkout. Run any other way, it
+# refuses to resolve.
+services:
+  proxy:
+    # Loopback only, at the verify port: the verify project never publishes on
+    # another address, LAN mode included. Replaces the override's 0.0.0.0:443.
+    ports: !override
+      - "127.0.0.1:${RAG_VERIFY_PORT:?set by scripts/verify/stack.sh}:443"
+  tls-init:
+    # The verify image: the override's rag-docker-api:latest is the live tag.
+    image: rag-verify-api:latest
+    environment:
+      # Reserved names (RFC 2606 .invalid, RFC 5737 TEST-NET-1), so the test
+      # certificate can't name a real host.
+      RAG_LAN_HOSTNAMES: "vfy-lan.invalid,192.0.2.10"
 ```
 
 ### ollama/entrypoint.sh
@@ -311,47 +406,114 @@ http {
     server {
         listen 80;
 
-        # Regeneration permits three model attempts with a transport retry each.
-        # The API bounds model work at 1800s; leave time for durable commit and
-        # its typed response instead of terminating at the generic 300s limit.
-        location = /api/goldstandard/regenerate {
-            proxy_pass http://api/goldstandard/regenerate;
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_read_timeout 1860s;
-            proxy_connect_timeout 10s;
-        }
+        # The routes live in locations.conf, shared with LAN mode's nginx.lan.conf (#26).
+        include /etc/nginx/rag/locations.conf;
+    }
+}
+```
 
-        location /api/ {
-            # nginx's default request-body limit is 1 MB, which rejected most
-            # real PDFs with a 413 before the API saw them (issue #21). 512 MB
-            # covers a ZIP of a firm's documents in one upload. It is the limit
-            # for the whole request, so a multi-file upload counts every file.
-            # ui/src/api/client.ts holds the same number to warn before sending;
-            # change both together.
-            client_max_body_size 512m;
-            # Stream uploads straight to the API instead of spooling each one to
-            # nginx's temp directory first. Buffering would write up to 512 MB
-            # into the container's writable layer, on Docker's often-small
-            # virtual disk, before the API even starts reading. The limit above
-            # still applies: nginx checks Content-Length up front.
-            proxy_request_buffering off;
-            proxy_pass http://api/;
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_read_timeout 300s;
-            proxy_connect_timeout 10s;
-        }
+### proxy/locations.conf
 
-        location / {
-            proxy_pass http://ui;
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_intercept_errors on;
-            error_page 404 = /index.html;
-        }
+```nginx
+# The routes of the proxy (#26): included by both nginx.conf (the default
+# loopback HTTP server) and nginx.lan.conf (LAN mode's TLS server), so the two
+# can't drift apart. Mounted at /etc/nginx/rag/locations.conf.
+
+# Regeneration permits three model attempts with a transport retry each.
+# The API bounds model work at 1800s; leave time for durable commit and
+# its typed response instead of terminating at the generic 300s limit.
+location = /api/goldstandard/regenerate {
+    proxy_pass http://api/goldstandard/regenerate;
+    # The browser's Host, port included: the API compares it with Origin (#25).
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 1860s;
+    proxy_connect_timeout 10s;
+}
+
+location /api/ {
+    # nginx's default request-body limit is 1 MB, which rejected most
+    # real PDFs with a 413 before the API saw them (issue #21). 512 MB
+    # covers a ZIP of a firm's documents in one upload. It is the limit
+    # for the whole request, so a multi-file upload counts every file.
+    # ui/src/api/client.ts holds the same number to warn before sending;
+    # change both together.
+    client_max_body_size 512m;
+    # Stream uploads straight to the API instead of spooling each one to
+    # nginx's temp directory first. Buffering would write up to 512 MB
+    # into the container's writable layer, on Docker's often-small
+    # virtual disk, before the API even starts reading. The limit above
+    # still applies: nginx checks Content-Length up front.
+    proxy_request_buffering off;
+    proxy_pass http://api/;
+    # The browser's Host with its port ($host drops the port), so the API
+    # can check that a cookie-authenticated change came from this same
+    # origin: Origin http://localhost:8080 against Host localhost:8080 (#25).
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 300s;
+    proxy_connect_timeout 10s;
+}
+
+location / {
+    proxy_pass http://ui;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_intercept_errors on;
+    error_page 404 = /index.html;
+}
+```
+
+### proxy/nginx.lan.conf
+
+```nginx
+# LAN mode's proxy configuration (#26), mounted over nginx.conf by
+# docker-compose.lan.yml. One TLS server on container port 443 and nothing on
+# port 80: no plain-HTTP listener and no redirect, so the only way in is TLS.
+# The routes are the default server's, from the shared locations.conf.
+events {
+    worker_connections 1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    upstream api {
+        server api:8000;
+    }
+
+    upstream ui {
+        server ui:3000;
+    }
+
+    server {
+        listen 443 ssl;
+        http2 on;
+
+        # The active pair the tls-init step left in the lan_certs volume (read-only
+        # here): your own from proxy/certs, or the self-signed one it generated.
+        # `live` is a symlink it replaces atomically.
+        ssl_certificate     /etc/nginx/certs/live/cert.pem;
+        ssl_certificate_key /etc/nginx/certs/live/key.pem;
+
+        # Mozilla's "intermediate" profile: TLS 1.2 and 1.3 only. TLS 1.3 picks
+        # its own ciphers; this list applies to TLS 1.2. The DHE entries stay
+        # unused without ssl_dhparam, as nginx has no built-in DH parameters.
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305;
+        ssl_prefer_server_ciphers off;
+        ssl_session_timeout 1d;
+        ssl_session_cache shared:SSL:10m;
+        ssl_session_tickets off;
+
+        # No Strict-Transport-Security header, deliberately. With a self-signed
+        # or mkcert certificate, HSTS would turn a later certificate change into
+        # a browser error with no way to click through.
+
+        include /etc/nginx/rag/locations.conf;
     }
 }
 ```
@@ -653,6 +815,11 @@ python-multipart>=0.0.9           # resolved: 0.0.32
 # Private, optional OTLP HTTP/protobuf telemetry runtime (#282).
 opentelemetry-sdk==1.45.1
 opentelemetry-exporter-otlp-proto-http==1.45.1
+
+# Passphrase encryption of export packages in the age format (#27). Already in
+# the lock as a transitive dependency; listed here because the API now imports
+# it directly. Pinned at the locked version, so the lock does not move.
+cryptography==50.0.1
 ```
 
 ### api/utils.py
@@ -687,6 +854,7 @@ def collection_check_unavailable(name: str, outcome: str) -> JSONResponse:
 ### api/config.py
 
 ```python
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -720,12 +888,331 @@ class Settings(BaseSettings):
     # declared and as actually read. Members under 1 MiB are exempt from the ratio.
     max_zip_members: int = 5000
     max_zip_member_ratio: int = 200
+    # Accounts, sessions and the login throttle (#25): one SQLite file in the
+    # auth_data volume. Not /app/auth, which would hide the `auth` package that
+    # `python -m auth` runs.
+    auth_dir: str = "/app/auth_data"
+    # Marks the session cookie Secure. Off for the loopback HTTP profile, where a
+    # Secure cookie would never be sent back; LAN mode serves TLS and turns it on (#26).
+    auth_cookie_secure: bool = False
+    # LAN mode (#26), set only by docker-compose.lan.yml. When true the API
+    # refuses to start unless the cookie is Secure and an enabled Engineer
+    # exists (lan_mode.py).
+    rag_lan_mode: bool = False
+
+    @field_validator("auth_cookie_secure", "rag_lan_mode", mode="before")
+    @classmethod
+    def _exact_boolean(cls, value, info):
+        # pydantic would read "1", "yes" or "on" as true. A typo in a security
+        # setting must stop the API instead of silently meaning something.
+        if isinstance(value, bool):
+            return value
+        if value in ("true", "false"):
+            return value == "true"
+        raise ValueError(f"{info.field_name.upper()} must be exactly true or false")
 
     class Config:
         env_file = ".env"
 
 
 settings = Settings()
+```
+
+### api/lan_mode.py
+
+```python
+"""LAN mode's startup refusal (#26).
+
+docker-compose.lan.yml publishes the proxy on every host interface, over TLS,
+and sets RAG_LAN_MODE=true and AUTH_COOKIE_SECURE=true. Before the API serves
+anything in that mode it checks that
+
+  (b) AUTH_COOKIE_SECURE is true, so the session cookie never travels over
+      plain HTTP, and
+  (a) an enabled human Engineer exists, so the system is set up and someone
+      can administer it from the LAN,
+
+in that order, and otherwise exits with one line on standard error. The API
+then never becomes healthy, so the ui and the proxy, which wait for it, don't
+start either and nothing is published: LAN mode fails closed.
+
+main.py calls enforce() before anything else, so uvicorn's import of the app
+stops here. Nothing else in the API depends on LAN mode.
+"""
+from __future__ import annotations
+
+import sys
+
+from config import settings
+
+PREFIX = "LAN mode refused: "
+
+
+def refusal() -> str | None:
+    """The line explaining why LAN mode can't start, or None."""
+    if not settings.rag_lan_mode:
+        return None
+    if not settings.auth_cookie_secure:
+        return (PREFIX + "AUTH_COOKIE_SECURE must be true when RAG_LAN_MODE is true, so the session cookie is "
+                "sent only over TLS. Start LAN mode with docker-compose.lan.yml, which sets both.")
+    from auth import store
+    if not store.has_enabled_engineer():
+        return (PREFIX + "there is no enabled AI Engineer account. Create the first one in the default "
+                "(loopback) mode, then switch: docker compose up -d && docker compose exec api python -m auth "
+                "bootstrap <username> (README, \"Sharing with your office\").")
+    return None
+
+
+def enforce() -> None:
+    """Exit with the refusal line if LAN mode can't start; otherwise do nothing."""
+    reason = refusal()
+    if reason:
+        # One line, and SystemExit, which Python doesn't print as a traceback.
+        print(reason, file=sys.stderr, flush=True)
+        raise SystemExit(1)
+```
+
+### api/tls_cert.py
+
+```python
+"""LAN mode's certificate step (#26): `python -m tls_cert`, the one-shot
+`tls-init` service of docker-compose.lan.yml, run in the API image before the
+proxy starts, on every start in LAN mode.
+
+It leaves the pair nginx serves in the lan_certs volume (/certs here, read-only
+/etc/nginx/certs in the proxy):
+
+- Bring your own: when proxy/certs/cert.pem and proxy/certs/key.pem (/byo,
+  read-only) both exist, they are used. cert.pem may hold a chain, server
+  certificate first. Only one of the two, a file that doesn't parse or a key
+  that doesn't match the certificate is refused; an expired certificate is
+  used with a warning.
+- Otherwise a self-signed certificate for RAG_LAN_HOSTNAMES (comma-separated
+  DNS names and IP addresses) plus localhost, valid for 825 days, the most
+  Apple platforms accept. It is reused on later starts and regenerated only
+  when the active pair is missing or unreadable, has expired, names other
+  hosts, or came from bring-your-own files that are gone.
+
+Layout: /certs/live is a symlink to a pair-<random> folder holding cert.pem,
+key.pem (mode 0600) and `source` (self-signed or byo). A new pair is written
+into a fresh folder and `live` is switched with one rename, so nginx never
+finds a certificate beside a key that doesn't match it; older pairs are then
+removed.
+
+It prints one line naming the certificate (source, names, expiry, SHA-256
+fingerprint, which is what a browser shows when asked to trust it) and exits
+0, or prints one line on standard error and exits 1; the proxy then doesn't
+start.
+"""
+from __future__ import annotations
+
+import datetime
+import ipaddress
+import os
+import re
+import secrets
+import shutil
+import sys
+from pathlib import Path
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+BYO_DIR = Path("/byo")
+OUT_DIR = Path("/certs")
+VALID_DAYS = 825
+LIVE = "live"
+SELF_SIGNED = "self-signed"
+BYO = "byo"
+_LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+class CertError(Exception):
+    """A reason the step can't produce a pair; one line for standard error."""
+
+
+# ── names ─────────────────────────────────────────────────────────────────────
+
+def _name(entry: str) -> str:
+    """An IP address in its normal form, or a lowercased DNS name; else CertError."""
+    try:
+        return str(ipaddress.ip_address(entry))
+    except ValueError:
+        pass
+    name = entry.lower()
+    if len(name) > 253 or not all(_LABEL.match(label) for label in name.split(".")):
+        raise CertError(f"RAG_LAN_HOSTNAMES: {entry!r} is neither a DNS name nor an IP address")
+    return name
+
+
+def wanted_names(raw: str | None) -> list[str]:
+    """The certificate's names: the listed entries in order, then localhost, without duplicates."""
+    entries = [entry.strip() for entry in (raw or "").split(",")]
+    if not any(entries):
+        raise CertError("RAG_LAN_HOSTNAMES is empty: set it to the names and addresses clients use to reach this "
+                        "machine (comma-separated), or put your own cert.pem and key.pem in proxy/certs")
+    names: list[str] = []
+    for entry in entries:
+        if not entry:
+            raise CertError("RAG_LAN_HOSTNAMES has an empty entry")
+        name = _name(entry)
+        if name not in names:
+            names.append(name)
+    if "localhost" not in names:
+        names.append("localhost")
+    return names
+
+
+def _cert_names(cert: x509.Certificate) -> set[str]:
+    try:
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    except x509.ExtensionNotFound:
+        return set()
+    return ({name.lower() for name in san.get_values_for_type(x509.DNSName)}
+            | {str(address) for address in san.get_values_for_type(x509.IPAddress)})
+
+
+# ── reading and describing pairs ─────────────────────────────────────────────
+
+def _public(key) -> bytes:
+    return key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+
+
+def load_pair(cert_bytes: bytes, key_bytes: bytes):
+    """(server certificate, chain) for a matching pair; CertError otherwise."""
+    try:
+        chain = x509.load_pem_x509_certificates(cert_bytes)
+    except ValueError:
+        raise CertError("cert.pem doesn't hold a PEM certificate") from None
+    try:
+        key = serialization.load_pem_private_key(key_bytes, password=None)
+    except (ValueError, TypeError):
+        raise CertError("key.pem doesn't hold an unencrypted PEM private key") from None
+    if _public(key.public_key()) != _public(chain[0].public_key()):
+        raise CertError("key.pem doesn't match the first certificate in cert.pem")
+    return chain[0], chain
+
+
+def fingerprint(cert: x509.Certificate) -> str:
+    return cert.fingerprint(hashes.SHA256()).hex(":").upper()
+
+
+def describe(cert: x509.Certificate) -> str:
+    names = ", ".join(sorted(_cert_names(cert))) or "none"
+    expires = cert.not_valid_after_utc.strftime("%Y-%m-%d %H:%M UTC")
+    return f"names {names}; expires {expires}; SHA-256 {fingerprint(cert)}"
+
+
+def _read_live(out_dir: Path):
+    """(source, cert bytes, key bytes) of the active pair, or None if it is missing or unreadable."""
+    live = out_dir / LIVE
+    try:
+        return ((live / "source").read_text().strip(), (live / "cert.pem").read_bytes(),
+                (live / "key.pem").read_bytes())
+    except OSError:
+        return None
+
+
+# ── writing ──────────────────────────────────────────────────────────────────
+
+def install(out_dir: Path, cert_bytes: bytes, key_bytes: bytes, source: str) -> None:
+    """Write a new pair folder and switch `live` to it with one rename; then remove older pairs."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pair = out_dir / f"pair-{secrets.token_hex(8)}"
+    pair.mkdir(mode=0o700)
+    (pair / "cert.pem").write_bytes(cert_bytes)
+    fd = os.open(pair / "key.pem", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(key_bytes)
+    (pair / "source").write_text(source + "\n")
+    link = out_dir / f".live-{secrets.token_hex(8)}"
+    os.symlink(pair.name, link)
+    os.replace(link, out_dir / LIVE)
+    for old in out_dir.iterdir():
+        if old.name.startswith("pair-") and old.name != pair.name:
+            shutil.rmtree(old, ignore_errors=True)
+        elif old.name.startswith(".live-"):
+            old.unlink(missing_ok=True)
+
+
+def self_signed(names: list[str], now: datetime.datetime) -> tuple[bytes, bytes]:
+    """A new P-256 key and a self-signed server certificate for `names`, valid for 825 days from `now`.
+    Not a CA certificate and without key usage, so OpenSSL-based clients and browsers accept it as
+    its own trust anchor once trusted."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, names[0])])
+    alternatives = []
+    for name in names:
+        try:
+            alternatives.append(x509.IPAddress(ipaddress.ip_address(name)))
+        except ValueError:
+            alternatives.append(x509.DNSName(name))
+    cert = (x509.CertificateBuilder()
+            .subject_name(subject).issuer_name(subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(days=VALID_DAYS))
+            .add_extension(x509.SubjectAlternativeName(alternatives), critical=False)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+            .sign(key, hashes.SHA256()))
+    return (cert.public_bytes(serialization.Encoding.PEM),
+            key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                              serialization.NoEncryption()))
+
+
+# ── the step ─────────────────────────────────────────────────────────────────
+
+def run(byo_dir: Path, out_dir: Path, hostnames: str | None, now: datetime.datetime | None = None,
+        out=sys.stdout, err=sys.stderr) -> int:
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    try:
+        line = _step(byo_dir, out_dir, hostnames, now, err)
+    except CertError as error:
+        print(f"tls-init: {error}", file=err, flush=True)
+        return 1
+    except OSError as error:
+        print(f"tls-init: could not read or write the certificate files: {error}", file=err, flush=True)
+        return 1
+    print(f"tls-init: {line}", file=out, flush=True)
+    return 0
+
+
+def _step(byo_dir: Path, out_dir: Path, hostnames: str | None, now: datetime.datetime, err) -> str:
+    byo_cert, byo_key = byo_dir / "cert.pem", byo_dir / "key.pem"
+    if byo_cert.exists() or byo_key.exists():
+        if not (byo_cert.is_file() and byo_key.is_file()):
+            raise CertError("proxy/certs needs both cert.pem and key.pem; only one of them is there")
+        cert_bytes, key_bytes = byo_cert.read_bytes(), byo_key.read_bytes()
+        cert, _ = load_pair(cert_bytes, key_bytes)
+        if cert.not_valid_after_utc <= now:
+            print(f"tls-init: warning: the certificate in proxy/certs expired on "
+                  f"{cert.not_valid_after_utc:%Y-%m-%d}; browsers will refuse it", file=err, flush=True)
+        if _read_live(out_dir) != (BYO, cert_bytes, key_bytes):
+            install(out_dir, cert_bytes, key_bytes, BYO)
+        return f"using your certificate from proxy/certs: {describe(cert)}"
+
+    names = wanted_names(hostnames)
+    current = _read_live(out_dir)
+    if current and current[0] == SELF_SIGNED:
+        try:
+            cert, _ = load_pair(current[1], current[2])
+        except CertError:
+            cert = None
+        if cert is not None and cert.not_valid_after_utc > now and _cert_names(cert) == set(names):
+            return f"reusing the self-signed certificate: {describe(cert)}"
+    cert_bytes, key_bytes = self_signed(names, now)
+    install(out_dir, cert_bytes, key_bytes, SELF_SIGNED)
+    cert, _ = load_pair(cert_bytes, key_bytes)
+    return f"generated a self-signed certificate: {describe(cert)}"
+
+
+if __name__ == "__main__":
+    sys.exit(run(BYO_DIR, OUT_DIR, os.environ.get("RAG_LAN_HOSTNAMES")))
 ```
 
 ### api/models/__init__.py
@@ -738,7 +1225,7 @@ settings = Settings()
 ```python
 from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
-from pydantic import AfterValidator, BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator, SecretStr, StrictInt
 
 from services.collection_writes import canonical
 
@@ -917,9 +1404,38 @@ class HelpResponse(BaseModel):
 
 # ── Export / Import ───────────────────────────────────────────────────────────
 
+# Passphrase length for an encrypted export (#27): long enough to resist
+# guessing with scrypt in the way, short enough to bound the request.
+PASSPHRASE_MIN = 12
+PASSPHRASE_MAX = 1024
+
+
+def _utf8_passphrase(v: Optional[SecretStr]) -> Optional[SecretStr]:
+    """A passphrase is used as UTF-8. JSON can carry a lone surrogate (`\\ud800`),
+    which has no UTF-8 form; it is refused here, as a 422, instead of failing in
+    the worker (#27 review). The message never contains the value."""
+    if v is not None:
+        try:
+            v.get_secret_value().encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("passphrase must be valid Unicode text (no lone surrogates)") from None
+    return v
+
+
 class ExportRequest(BaseModel):
     collection: CollectionName
     include_models: bool = False
+    # Optional: given, the package is written encrypted as `.tar.gz.age` (#27).
+    # SecretStr keeps it out of any repr or log line, and the 422 handler drops
+    # `input`, so a refused passphrase is never echoed.
+    passphrase: Optional[SecretStr] = None
+
+    @field_validator("passphrase")
+    @classmethod
+    def _passphrase(cls, v: Optional[SecretStr]) -> Optional[SecretStr]:
+        if v is not None and not PASSPHRASE_MIN <= len(v.get_secret_value()) <= PASSPHRASE_MAX:
+            raise ValueError(f"passphrase must be {PASSPHRASE_MIN} to {PASSPHRASE_MAX} characters")
+        return _utf8_passphrase(v)
 
 
 class ExportStartResponse(BaseModel):
@@ -943,6 +1459,9 @@ class ExportJobStatusResponse(BaseModel):
     retrieve_script: Optional[bool]
     warnings: list[str]
     error: Optional[str]
+    # Whether the export was requested with a passphrase (#27). Records from
+    # before #27 have no such key.
+    encrypted: bool = False
 
     error_code: Optional[str] = None
     error_detail: Optional[dict] = None
@@ -952,6 +1471,14 @@ class ImportRequest(BaseModel):
     # Required, no default (spec §6.4): silently picking a conflict policy could
     # delete a collection the caller did not mean to touch.
     on_conflict: str
+    # Required for a `.tar.gz.age` package and refused for any other (#27).
+    # Its length is checked on export only; any encodable value is tried here.
+    passphrase: Optional[SecretStr] = None
+
+    @field_validator("passphrase")
+    @classmethod
+    def _passphrase(cls, v: Optional[SecretStr]) -> Optional[SecretStr]:
+        return _utf8_passphrase(v)
 
     @field_validator("on_conflict")
     @classmethod
@@ -991,6 +1518,7 @@ class ImportJobStatusResponse(BaseModel):
     error: Optional[str]
     error_code: Optional[str]
     error_detail: Optional[dict]
+    encrypted: bool = False
 
 
 class PackageSummary(BaseModel):
@@ -1003,6 +1531,10 @@ class PackageSummary(BaseModel):
     fidelity: Optional[str]
     created_at: Optional[str]
     readable: bool
+    # An encrypted package (`.tar.gz.age`, #27) lists no metadata: its manifest
+    # can't be read without the passphrase. `readable` then says whether its
+    # age header is valid.
+    encrypted: bool = False
 
 
 class PackageListResponse(BaseModel):
@@ -1291,6 +1823,95 @@ class MetricsResponse(BaseModel):
     # entries and the UI polls every 30s, so returning all of them every time
     # would be wasteful.
     history: list[LatencyRecord]
+
+
+# ── Authentication (#25) ─────────────────────────────────────────────────────
+
+# Generous caps, so absurd input is a 422 before any hashing work; the real
+# rules (usernames 3-32 characters, passwords 12-256) are checked by the routes.
+class LoginRequest(BaseModel):
+    username: str = Field(max_length=256)
+    password: str = Field(max_length=1024)
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(max_length=1024)
+    new_password: str = Field(max_length=1024)
+
+
+class AuthStatus(BaseModel):
+    setup_required: bool
+
+
+class AuthUser(BaseModel):
+    username: str
+    role: Literal["end_user", "developer", "engineer"]
+    must_change_password: bool
+    kind: Optional[Literal["user", "service"]] = None   # GET /auth/me: a session's user or a key's principal
+
+
+class AdminUser(BaseModel):
+    username: str
+    role: Literal["end_user", "developer", "engineer"]
+    enabled: bool
+    must_change_password: bool
+    created_at: str
+
+
+class AdminUserList(BaseModel):
+    users: list[AdminUser]
+
+
+class AdminUserResult(BaseModel):
+    user: AdminUser
+    password: Optional[str] = None   # a generated password, in this answer only
+
+
+class UserCreateRequest(BaseModel):
+    username: str = Field(max_length=256)
+    role: Literal["end_user", "developer", "engineer"]
+
+
+class RoleChangeRequest(BaseModel):
+    role: Literal["end_user", "developer", "engineer"]
+
+
+class ServiceKey(BaseModel):
+    id: str
+    label: str
+    created_at: str
+    expires_at: str
+    revoked_at: Optional[str]
+    last_used_at: Optional[str]
+    status: Literal["active", "expired", "revoked"]
+
+
+class ServicePrincipal(BaseModel):
+    name: str
+    role: Literal["end_user", "developer", "engineer"]
+    enabled: bool
+    created_at: str
+    keys: list[ServiceKey]
+
+
+class ServicePrincipalList(BaseModel):
+    principals: list[ServicePrincipal]
+
+
+class ServicePrincipalResult(BaseModel):
+    principal: ServicePrincipal
+    key: Optional[ServiceKey] = None
+    secret: Optional[str] = None   # a newly issued key, in this answer only
+
+
+class PrincipalCreateRequest(BaseModel):
+    name: str = Field(max_length=256)
+    role: Literal["end_user", "developer", "engineer"]
+
+
+class KeyIssueRequest(BaseModel):
+    label: str = Field(default="", max_length=64)
+    days: StrictInt = Field(default=90, ge=1, le=365)
 
 
 # ── Error ─────────────────────────────────────────────────────────────────────
@@ -6026,6 +6647,7 @@ from pydantic import ValidationError
 
 from config import settings
 from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
+from services import age_stream
 from services import goldstandard
 from services import ingest_config
 from services import model_bundle
@@ -6056,7 +6678,8 @@ def exports_dir() -> Path:
 # hidden and root-owned, about 2.3 GB with models. Matched by exact name pattern
 # and by kind, never by age; anything else in the folder is left alone.
 _BUILD_DIR = ".build-*"
-_PARTIAL_ARCHIVE = ".*.tar.gz.partial"
+# An encrypted export is written as `.<stem>.tar.gz.age.partial` (#27).
+_PARTIAL_ARCHIVES = (".*.tar.gz.partial", ".*.tar.gz.age.partial")
 
 
 def remove_leftover(entry: Path, *, directory: bool = False,
@@ -6100,7 +6723,7 @@ def sweep_build_leftovers() -> list[str]:
         return removed
     for entry in sorted(root.iterdir()):
         as_dir = fnmatch.fnmatchcase(entry.name, _BUILD_DIR)
-        as_file = fnmatch.fnmatchcase(entry.name, _PARTIAL_ARCHIVE)
+        as_file = any(fnmatch.fnmatchcase(entry.name, p) for p in _PARTIAL_ARCHIVES)
         if not (as_dir or as_file):
             continue
         size = remove_leftover(entry, directory=as_dir, regular_file=as_file)
@@ -6341,19 +6964,36 @@ def _retrieve_section(has_script: bool, cfg: dict, collection: str) -> str:
             f"answer style `{cfg['response_format']}`.")
 
 
-def _write_archive(stage: Path, stem: str, dest: Path) -> None:
+def _add_members(tar: tarfile.TarFile, stage: Path, stem: str) -> None:
+    tar.add(stage, arcname=stem, recursive=False)
+    tar.add(stage / "manifest.json", arcname=f"{stem}/manifest.json")
+    for entry in sorted(os.listdir(stage)):
+        if entry != "manifest.json":
+            tar.add(stage / entry, arcname=f"{stem}/{entry}")
+
+
+def _write_archive(stage: Path, stem: str, dest: Path, passphrase: str | None = None) -> None:
     """Archive the staged package as `<stem>/`, with manifest.json first (#383).
 
     The directory entry, then the manifest, then everything else in the sorted
     order `tar.add(stage, arcname=stem)` gives, so the listing can stop reading
     at the manifest instead of decompressing chunks.jsonl to reach it.
+
+    With a passphrase the same tar.gz stream goes through the age encryptor on
+    its way to `dest` (#27): no plaintext archive is written, and only one
+    64 KiB chunk is held at a time, so a package of several GB streams.
     """
-    with tarfile.open(dest, "w:gz") as tar:
-        tar.add(stage, arcname=stem, recursive=False)
-        tar.add(stage / "manifest.json", arcname=f"{stem}/manifest.json")
-        for entry in sorted(os.listdir(stage)):
-            if entry != "manifest.json":
-                tar.add(stage / entry, arcname=f"{stem}/{entry}")
+    if passphrase is None:
+        with tarfile.open(dest, "w:gz") as tar:
+            _add_members(tar, stage, stem)
+        return
+    with dest.open("wb") as fh:
+        encryptor = age_stream.Encryptor(fh, passphrase)
+        with tarfile.open(fileobj=encryptor, mode="w|gz") as tar:
+            _add_members(tar, stage, stem)
+        # Writes the final chunk; an exception above skips it, and build()
+        # removes the partial file.
+        encryptor.close()
 
 
 @telemetry.traced("rag.package")
@@ -6361,12 +7001,16 @@ def build(
     collection: str,
     include_models: bool = False,
     progress: Callable[[int], None] | None = None,
+    passphrase: str | None = None,
 ) -> dict:
     """Write one package and return a summary. Blocking; run it in a thread.
 
     Assembly order matters (spec §6.2): content first, digests as we go, then
     the manifest from those digests, then README.md and retrieve.py which embed
     the manifest digest. Manifest last is what makes <id8> derivable.
+
+    With a passphrase the package is written encrypted, as `<stem>.tar.gz.age`
+    (#27). The passphrase is used, never stored or logged.
     """
     created = datetime.now(timezone.utc)
     created_at = created.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -6551,7 +7195,8 @@ def build(
 
         # 7. the generated pair, which embed <id8>
         stem = package_stem(collection, created, id8)
-        filename = f"{stem}.tar.gz"
+        # The README and retrieve.py name the file as delivered (#27).
+        filename = f"{stem}{age_stream.ENCRYPTED_SUFFIX if passphrase is not None else '.tar.gz'}"
 
         if has_saved_retrieval:
             (stage / "retrieve.py").write_text(_render_retrieve(collection, retrieval_cfg, {
@@ -6574,13 +7219,15 @@ def build(
             "CREATED_AT": created_at,
             "ID8": id8,
             "PACKAGE_FILENAME": filename,
+            "IMPORT_PASSPHRASE": (', "passphrase": "<the passphrase>"'
+                                  if passphrase is not None else ""),
             "RETRIEVE_SECTION": _retrieve_section(has_saved_retrieval, retrieval_cfg, collection),
         }))
 
         # 8. archive under a temporary name, then rename, so a partial file is
         #    never mistaken for a package.
-        tmp_archive = out_dir / f".{stem}.tar.gz.partial"
-        _write_archive(stage, stem, tmp_archive)
+        tmp_archive = out_dir / f".{filename}.partial"
+        _write_archive(stage, stem, tmp_archive, passphrase)
         final = out_dir / filename
         tmp_archive.replace(final)
         tmp_archive = None
@@ -6594,6 +7241,7 @@ def build(
             "models_bundled": models_bundled,
             "retrieve_script": has_saved_retrieval,
             "id8": id8,
+            "encrypted": passphrase is not None,
             "warnings": warnings,
         }
     finally:
@@ -6677,6 +7325,26 @@ def listing_fields(manifest: dict) -> dict:
     return fields
 
 
+def _check_member(member: tarfile.TarInfo, dest: Path, root: Path) -> None:
+    """Refuse a link, anything but a file or directory, or a path outside dest."""
+    if member.issym() or member.islnk():
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            f"Package contains a link ('{member.name}'), which is not allowed.",
+            {"member": member.name})
+    if not (member.isfile() or member.isdir()):
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            "Package contains a non-regular archive member.",
+            {"member": member.name})
+    target = (dest / member.name).resolve()
+    if target != root and root not in target.parents:
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            f"Package contains a path outside the archive ('{member.name}').",
+            {"member": member.name})
+
+
 def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
     """Extract, refusing any member that would land outside dest.
 
@@ -6686,42 +7354,80 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
     """
     root = dest.resolve()
     for member in tar.getmembers():
-        if member.issym() or member.islnk():
-            raise PackageError(
-                "PACKAGE_UNREADABLE",
-                f"Package contains a link ('{member.name}'), which is not allowed.",
-                {"member": member.name})
-        if not (member.isfile() or member.isdir()):
-            raise PackageError(
-                "PACKAGE_UNREADABLE",
-                "Package contains a non-regular archive member.",
-                {"member": member.name})
-        target = (dest / member.name).resolve()
-        if target != root and root not in target.parents:
-            raise PackageError(
-                "PACKAGE_UNREADABLE",
-                f"Package contains a path outside the archive ('{member.name}').",
-                {"member": member.name})
+        _check_member(member, dest, root)
     tar.extractall(dest)
 
 
+def _safe_extract_stream(tar: tarfile.TarFile, dest: Path) -> None:
+    """The same checks for a tar read as a stream, one member at a time (#27).
+
+    A stream can't be read twice, so each member is checked just before it is
+    extracted. A refusal part-way leaves only the job's own work directory
+    holding the members before it, and the job removes that directory.
+    """
+    root = dest.resolve()
+    for member in tar:
+        _check_member(member, dest, root)
+        tar.extract(member, dest)
+
+
+# Why an encrypted package could not be decrypted, for `error_detail.reason`.
+_DECRYPT_REASONS = {"work_factor": "work_factor", "passphrase": "passphrase",
+                    "hmac": "header", "payload": "payload", "nonce": "payload"}
+
+
+def _extract_encrypted(archive: Path, dest: Path, passphrase: str) -> None:
+    """Check 1 for a `.tar.gz.age` package: decrypt it as a stream into the tar
+    reader, then authenticate the rest of the file to its end (#27).
+
+    No decrypted copy of the archive is written. Every failure comes before
+    check 2, so nothing outside the work directory has been touched.
+    """
+    try:
+        with archive.open("rb") as fh:
+            decryptor = age_stream.open_decrypt(fh, passphrase)
+            with tarfile.open(fileobj=decryptor, mode="r|gz") as tar:
+                _safe_extract_stream(tar, dest)
+            # tarfile stops at the end-of-archive blocks; the final chunk, and
+            # anything after it, still has to be authenticated.
+            decryptor.drain()
+    except age_stream.AgeError as exc:
+        if exc.kind in ("header", "recipient"):
+            raise PackageError(
+                "PACKAGE_UNREADABLE",
+                f"'{archive.name}' is not a passphrase-encrypted age file.",
+                {"reason": str(exc)}) from None
+        raise PackageError(
+            "DECRYPT_FAILED",
+            f"'{archive.name}' could not be decrypted: the passphrase is wrong or "
+            "the file is damaged.",
+            {"reason": _DECRYPT_REASONS[exc.kind]}) from None
+
+
 @telemetry.traced("rag.package")
-def open_package(archive: Path, dest: Path) -> tuple[Path, dict]:
+def open_package(archive: Path, dest: Path, passphrase: str | None = None) -> tuple[Path, dict]:
     """Checks 1 and 2 of spec §6.2: readable archive, understood format.
 
-    Returns (package root directory, manifest).
+    A `.tar.gz.age` package is decrypted with `passphrase` as it is unpacked
+    (#27); everything from check 2 on reads the decrypted files, as for an
+    unencrypted package. Returns (package root directory, manifest).
     """
     if not archive.is_file():
         raise PackageError("PACKAGE_UNREADABLE",
                            f"No package named '{archive.name}' in the exports directory.")
+    encrypted = age_stream.is_encrypted_name(archive.name)
     try:
-        with tarfile.open(archive, "r:gz") as tar:
-            _safe_extract(tar, dest)
+        if encrypted:
+            _extract_encrypted(archive, dest, passphrase or "")
+        else:
+            with tarfile.open(archive, "r:gz") as tar:
+                _safe_extract(tar, dest)
     except PackageError:
         raise
     except (tarfile.TarError, OSError, EOFError) as exc:
         raise PackageError("PACKAGE_UNREADABLE",
-                           f"'{archive.name}' is not a readable .tar.gz archive.",
+                           f"'{archive.name}' is not a readable "
+                           f"{'encrypted ' if encrypted else ''}.tar.gz archive.",
                            {"reason": f"{type(exc).__name__}: {exc}"}) from exc
 
     roots = [p for p in dest.iterdir() if p.is_dir()]
@@ -6814,6 +7520,417 @@ def iter_chunks_file(pkg: Path) -> Iterator[dict]:
                 raise PackageError("PACKAGE_CORRUPT",
                                    f"chunks.jsonl line {number} is not valid JSON.",
                                    {"file": "chunks.jsonl", "line": number}) from exc
+```
+
+### api/services/age_stream.py
+
+```python
+"""Passphrase encryption of export packages in the age v1 format (#27).
+
+An encrypted package is an ordinary age file with one `scrypt` (passphrase)
+recipient, so `age -d` opens it as well as import does. The format is the C2SP
+age specification (https://c2sp.org/age); this module implements only the parts
+a passphrase file uses, on the `cryptography` package the API already locks:
+
+    age-encryption.org/v1
+    -> scrypt <salt, base64> <work factor>
+    <wrapped file key, base64>
+    --- <header MAC, base64>
+    <16-byte nonce><STREAM payload: 64 KiB chunks, ChaCha20-Poly1305>
+
+pyrage was not used: its passphrase API takes and returns whole byte strings,
+and a package can be several GB. Both directions here stream: the encryptor is a
+writable file object tarfile writes into, and the decryptor a readable one
+tarfile reads from, holding one chunk at a time.
+
+Every rule the parser enforces is one the age testkit (C2SP CCTV, vendored in
+scripts/tests/fixtures/age-testkit) has a vector for; the tests run all of them.
+"""
+from __future__ import annotations
+
+import base64
+import binascii
+import hmac
+import io
+import os
+import re
+import threading
+from dataclasses import dataclass
+from hashlib import sha256
+from typing import BinaryIO
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+
+ENCRYPTED_SUFFIX = ".tar.gz.age"
+VERSION_LINE = b"age-encryption.org/v1"
+CHUNK = 64 * 1024
+_TAG = 16
+_FILE_KEY = 16
+_NONCE = 16
+# age's default for new passphrase files: about 256 MiB of memory (128 * r * N)
+# and about a second of work. Import accepts at most 20 (about 1 GiB; the
+# maintainer's limit on #27, below age's own 22, which needs about 4 GiB and over
+# a minute), and refuses more without deriving anything.
+WORK_FACTOR = 18
+MAX_WORK_FACTOR = 20
+_SCRYPT_LABEL = b"age-encryption.org/v1/scrypt"
+# A passphrase file's header is about 150 bytes. Reading stops well before a
+# hostile file could make the parser hold a large one.
+HEADER_MAX = 64 * 1024
+
+_B64 = re.compile(rb"^[A-Za-z0-9+/]*$")
+# One or two digits, no sign or leading zero: every accepted value (1 to 20) fits,
+# and a longer field is refused before int(), which raises on a very long one
+# (Python's int string-length limit), so no field can reach an unhandled error.
+_WORK_FACTOR_TEXT = re.compile(r"^[1-9][0-9]?$")
+# One scrypt derivation at a time in this process: a hostile file at the work
+# factor limit needs about 1 GiB, and concurrent imports must not multiply that.
+_scrypt_lock = threading.Lock()
+
+
+class AgeError(Exception):
+    """A file that can't be decrypted. `kind` says why, without any secret:
+
+    header      not a valid age header (or not an age file at all)
+    recipient   a valid age header, but not for a passphrase
+    work_factor the scrypt work factor is above MAX_WORK_FACTOR, or is not one or
+                two decimal digits without a sign or leading zero
+    nonce       the file ends inside the 16-byte payload nonce
+    passphrase  the passphrase does not unwrap the file key
+    hmac        the header MAC does not match: the header was changed
+    payload     a payload chunk failed authentication, or the payload is
+                truncated or has data after its final chunk
+    """
+
+    def __init__(self, kind: str, message: str):
+        super().__init__(message)
+        self.kind = kind
+
+
+def is_encrypted_name(name: str) -> bool:
+    """Encrypted packages are recognised by name first (#27, decision 7)."""
+    return name.endswith(ENCRYPTED_SUFFIX)
+
+
+# ── Header ────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Stanza:
+    args: list[str]
+    body: bytes
+
+
+@dataclass
+class Header:
+    stanzas: list[Stanza]
+    mac_input: bytes      # everything up to and including "---"
+    mac: bytes
+
+
+def _b64decode(text: bytes) -> bytes:
+    """Canonical, unpadded standard base64, as the age header requires."""
+    if not _B64.match(text) or len(text) % 4 == 1:
+        raise AgeError("header", "invalid base64 in the age header")
+    try:
+        data = base64.b64decode(text + b"=" * (-len(text) % 4), validate=True)
+    except binascii.Error:
+        raise AgeError("header", "invalid base64 in the age header") from None
+    # Unused trailing bits must be zero: re-encoding has to give the same text.
+    if base64.b64encode(data).rstrip(b"=") != text:
+        raise AgeError("header", "non-canonical base64 in the age header")
+    return data
+
+
+def _b64encode(data: bytes) -> bytes:
+    return base64.b64encode(data).rstrip(b"=")
+
+
+def read_header(fh: BinaryIO) -> Header:
+    """Parse an age header from `fh`, leaving it at the first payload byte.
+
+    Lines end in LF only. A stanza is `-> arg...` then its body in lines of
+    exactly 64 base64 characters ending with one shorter line (possibly empty).
+    The header ends with `--- <MAC>`.
+    """
+    consumed = 0
+
+    def line() -> bytes:
+        nonlocal consumed
+        raw = fh.readline(HEADER_MAX - consumed + 1)
+        consumed += len(raw)
+        if consumed > HEADER_MAX:
+            raise AgeError("header", "the age header is too long")
+        if not raw.endswith(b"\n"):
+            raise AgeError("header", "the age header ends early")
+        return raw[:-1]
+
+    first = fh.readline(len(VERSION_LINE) + 1)
+    consumed += len(first)
+    if first != VERSION_LINE + b"\n":
+        raise AgeError("header", "not an age v1 file")
+    mac_input = bytearray(first)
+    stanzas: list[Stanza] = []
+    current = line()
+    while True:
+        if current.startswith(b"---"):
+            if not current.startswith(b"--- "):
+                raise AgeError("header", "malformed age header MAC line")
+            mac = _b64decode(current[4:])
+            if len(mac) != 32:
+                raise AgeError("header", "malformed age header MAC")
+            mac_input += b"---"
+            break
+        if not current.startswith(b"->"):
+            raise AgeError("header", "malformed age header line")
+        parts = current[2:].split(b" ")
+        # "->" is followed by one or more " <argument>": the first split part is
+        # the empty string before the first space.
+        if len(parts) < 2 or parts[0] != b"" or any(
+                not p or any(c < 0x21 or c > 0x7E for c in p) for p in parts[1:]):
+            raise AgeError("header", "malformed age stanza arguments")
+        mac_input += current + b"\n"
+        body = bytearray()
+        while True:
+            body_line = line()
+            mac_input += body_line + b"\n"
+            if len(body_line) > 64:
+                raise AgeError("header", "age stanza body line too long")
+            body += _b64decode(body_line)
+            if len(body_line) < 64:
+                break
+        stanzas.append(Stanza([p.decode("ascii") for p in parts[1:]], bytes(body)))
+        current = line()
+    if not stanzas:
+        raise AgeError("header", "the age header has no recipient stanza")
+    return Header(stanzas, bytes(mac_input), mac)
+
+
+def scrypt_stanza(header: Header) -> tuple[bytes, int, bytes]:
+    """The salt, work factor and wrapped key of the header's one scrypt stanza.
+
+    A passphrase file has exactly one stanza, of type `scrypt`; age refuses a
+    scrypt stanza next to any other, since anyone holding the other key could
+    otherwise change the file without the passphrase. The work factor is
+    returned unchecked against MAX_WORK_FACTOR; `unwrap_file_key` checks it.
+    """
+    types = [s.args[0] for s in header.stanzas]
+    if "scrypt" in types and len(types) > 1:
+        raise AgeError("header", "a scrypt stanza must be the only stanza")
+    if types != ["scrypt"]:
+        raise AgeError("recipient", "the age file is not passphrase-encrypted")
+    stanza = header.stanzas[0]
+    if len(stanza.args) != 3:
+        raise AgeError("header", "malformed scrypt stanza")
+    salt = _b64decode(stanza.args[1].encode("ascii"))
+    if len(salt) != 16:
+        raise AgeError("header", "malformed scrypt salt")
+    if not _WORK_FACTOR_TEXT.match(stanza.args[2]):
+        raise AgeError("work_factor", "the scrypt work factor is not one or two decimal "
+                       "digits without a leading zero")
+    if len(stanza.body) != _FILE_KEY + _TAG:
+        raise AgeError("header", "malformed scrypt stanza body")
+    return salt, int(stanza.args[2]), stanza.body
+
+
+def _scrypt(passphrase: bytes, salt: bytes, work_factor: int) -> bytes:
+    with _scrypt_lock:
+        return Scrypt(salt=_SCRYPT_LABEL + salt, length=32, n=2 ** work_factor,
+                      r=8, p=1).derive(passphrase)
+
+
+def unwrap_file_key(header: Header, passphrase: str) -> bytes:
+    salt, work_factor, body = scrypt_stanza(header)
+    if work_factor > MAX_WORK_FACTOR:
+        raise AgeError("work_factor",
+                       f"the scrypt work factor {work_factor} is above the limit of "
+                       f"{MAX_WORK_FACTOR}")
+    key = _scrypt(passphrase.encode("utf-8"), salt, work_factor)
+    try:
+        return ChaCha20Poly1305(key).decrypt(b"\x00" * 12, body, None)
+    except InvalidTag:
+        raise AgeError("passphrase", "the passphrase does not decrypt this file") from None
+
+
+def _hkdf(key: bytes, salt: bytes | None, info: bytes) -> bytes:
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=info).derive(key)
+
+
+def _header_mac(file_key: bytes, mac_input: bytes) -> bytes:
+    return hmac.new(_hkdf(file_key, None, b"header"), mac_input, sha256).digest()
+
+
+def verify_mac(header: Header, file_key: bytes) -> None:
+    if not hmac.compare_digest(_header_mac(file_key, header.mac_input), header.mac):
+        raise AgeError("hmac", "the age header MAC does not match")
+
+
+def check_header(fh: BinaryIO) -> bool:
+    """True when `fh` starts with a valid age passphrase header. No scrypt runs,
+    and the work factor is not held against the limit; for the listing.
+
+    Any failure reading or parsing the file is False, never an exception: one
+    bad file must not break the listing of the others (#27 review).
+    """
+    try:
+        scrypt_stanza(read_header(fh))
+    except Exception:                                 # noqa: BLE001 - see above
+        return False
+    return True
+
+
+# ── Payload (STREAM) ──────────────────────────────────────────────────────────
+
+def _chunk_nonce(counter: int, last: bool) -> bytes:
+    return counter.to_bytes(11, "big") + (b"\x01" if last else b"\x00")
+
+
+class Decryptor(io.RawIOBase):
+    """The authenticated plaintext of an age payload, as a readable stream.
+
+    Only plaintext from chunks that passed authentication is ever returned. The
+    rules follow the reference implementation, which the testkit encodes: a
+    short chunk is the last; a full chunk is tried as a middle chunk, then as
+    the last; the last chunk may be empty only when it is the only one; nothing
+    may follow it. A payload that breaks any of these raises
+    `AgeError("payload")` once the plaintext authenticated before it is read.
+    """
+
+    def __init__(self, fh: BinaryIO, file_key: bytes):
+        super().__init__()
+        self._fh = fh
+        nonce = self._read(_NONCE)
+        if len(nonce) != _NONCE:
+            # The testkit counts the nonce as part of the header; for import it
+            # is a truncated file, after a valid header (#27 review).
+            raise AgeError("nonce", "the age payload nonce is missing")
+        self._aead = ChaCha20Poly1305(_hkdf(file_key, nonce, b"payload"))
+        self._counter = 0
+        self._plain = memoryview(b"")
+        self._done = False
+        self._error: AgeError | None = None
+
+    def _read(self, n: int) -> bytes:
+        data = bytearray()
+        while len(data) < n:
+            block = self._fh.read(n - len(data))
+            if not block:
+                break
+            data += block
+        return bytes(data)
+
+    def _next_chunk(self) -> bytes:
+        data = self._read(CHUNK + _TAG)
+        if not data:
+            raise AgeError("payload", "the age payload is truncated: its last chunk is missing")
+        last = len(data) < CHUNK + _TAG
+        if last and len(data) == _TAG and self._counter > 0:
+            raise AgeError("payload", "the age payload ends with an empty chunk")
+        try:
+            plain = self._aead.decrypt(_chunk_nonce(self._counter, last), data, None)
+        except InvalidTag:
+            plain = None
+        if plain is None and not last:
+            # A full-length chunk can be the last one.
+            last = True
+            try:
+                plain = self._aead.decrypt(_chunk_nonce(self._counter, True), data, None)
+            except InvalidTag:
+                pass
+        if plain is None:
+            raise AgeError("payload", "an age payload chunk failed authentication")
+        self._counter += 1
+        if last:
+            self._done = True
+            if self._fh.read(1):
+                # Released first: the chunk itself was authentic.
+                self._error = AgeError("payload", "the age file has data after its last chunk")
+        return plain
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        while not self._plain:
+            if self._error is not None:
+                raise self._error
+            if self._done:
+                return 0
+            self._plain = memoryview(self._next_chunk())
+        n = min(len(buffer), len(self._plain))
+        buffer[:n] = self._plain[:n]
+        self._plain = self._plain[n:]
+        return n
+
+    def drain(self) -> None:
+        """Read and authenticate the rest of the payload, to its last chunk."""
+        self._plain = memoryview(b"")
+        while not self._done:
+            self._next_chunk()
+        if self._error is not None:
+            raise self._error
+
+
+def open_decrypt(fh: BinaryIO, passphrase: str) -> Decryptor:
+    """Parse the header, unwrap the key, check the MAC; then stream the payload."""
+    header = read_header(fh)
+    file_key = unwrap_file_key(header, passphrase)
+    verify_mac(header, file_key)
+    return Decryptor(fh, file_key)
+
+
+class Encryptor(io.RawIOBase):
+    """Writes an age passphrase file to `fh` from the plaintext written to it.
+
+    The last chunk carries the final flag, so a full chunk is held back until
+    either more data or `close()` shows whether it is the last. `close()` writes
+    it and leaves `fh` open: the caller owns that file.
+    """
+
+    def __init__(self, fh: BinaryIO, passphrase: str, work_factor: int | None = None):
+        super().__init__()
+        self._fh = fh
+        work_factor = WORK_FACTOR if work_factor is None else work_factor
+        file_key = os.urandom(_FILE_KEY)
+        salt = os.urandom(16)
+        key = _scrypt(passphrase.encode("utf-8"), salt, work_factor)
+        wrapped = ChaCha20Poly1305(key).encrypt(b"\x00" * 12, file_key, None)
+        mac_input = (VERSION_LINE + b"\n"
+                     + b"-> scrypt " + _b64encode(salt) + b" " + str(work_factor).encode() + b"\n"
+                     + _b64encode(wrapped) + b"\n"   # 43 characters: one short line
+                     + b"---")
+        nonce = os.urandom(_NONCE)
+        fh.write(mac_input + b" " + _b64encode(_header_mac(file_key, mac_input)) + b"\n" + nonce)
+        self._aead = ChaCha20Poly1305(_hkdf(file_key, nonce, b"payload"))
+        self._counter = 0
+        self._buf = bytearray()
+
+    def _emit(self, plain: bytes, last: bool) -> None:
+        self._fh.write(self._aead.encrypt(_chunk_nonce(self._counter, last), plain, None))
+        self._counter += 1
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, data) -> int:
+        if self.closed:
+            raise ValueError("write to a closed Encryptor")
+        view = memoryview(data).cast("B")
+        self._buf += view
+        # Strictly more than a chunk: a chunk that may be the last is kept.
+        while len(self._buf) > CHUNK:
+            self._emit(bytes(self._buf[:CHUNK]), last=False)
+            del self._buf[:CHUNK]
+        return len(view)
+
+    def close(self) -> None:
+        if not self.closed:
+            self._emit(bytes(self._buf), last=True)
+            self._buf = bytearray()
+        super().close()
 ```
 
 ### api/services/jobstore.py
@@ -7276,7 +8393,8 @@ def active_job_for(collection: str) -> str | None:
 
 
 @telemetry.traced("rag.export")
-def _run(job_id: str, collection: str, include_models: bool) -> None:
+def _run(job_id: str, collection: str, include_models: bool,
+         passphrase: str | None = None) -> None:
     job = _jobs[job_id]
 
     def progress(written: int) -> None:
@@ -7297,7 +8415,8 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
         # it is released before the terminal status is written.
         with collection_writes.guard(collection):
             job["status"] = "running"
-            result = packager.build(collection, include_models=include_models, progress=progress)
+            result = packager.build(collection, include_models=include_models, progress=progress,
+                                    passphrase=passphrase)
     except packager.PackageError as exc:
         telemetry.outcome("error", exc)
         _log.warning("Export of %r refused (%s): %s", collection, exc.code, exc.message)
@@ -7336,8 +8455,12 @@ def _run(job_id: str, collection: str, include_models: bool) -> None:
                 del _active[collection]
 
 
-async def start_export_job(collection: str, include_models: bool = False) -> str:
+async def start_export_job(collection: str, include_models: bool = False,
+                           passphrase: str | None = None) -> str:
     """Register the job and run the build off the event loop.
+
+    A passphrase makes the package encrypted (#27). It is handed to the worker
+    as an argument only: the job record says `encrypted`, never the passphrase.
 
     Raises RuntimeError carrying the running job id if one is already in flight
     for this collection; that job's record is always stored by then (#326).
@@ -7391,6 +8514,7 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
                 "fidelity": None,
                 "models_bundled": None,
                 "retrieve_script": None,
+                "encrypted": passphrase is not None,
                 "warnings": [],
                 "error": None,
                 "error_code": None,
@@ -7410,7 +8534,8 @@ async def start_export_job(collection: str, include_models: bool = False) -> str
     # to_thread keeps the blocking Weaviate iteration off the event loop, so an
     # export does not stall the API: queries and other collections carry on, and
     # only guarded writes to this collection wait for it (spec §6.1, #509).
-    task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, include_models))
+    task = asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, collection, include_models,
+                                         passphrase))
     # _run ends it first; this also covers a task that never ran its worker.
     task.add_done_callback(lambda _task: collection_writes.end_job("export", job_id))
     return job_id
@@ -7458,6 +8583,7 @@ from contextlib import nullcontext
 
 from config import settings
 from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
+from services import age_stream
 from services import goldstandard
 from services import ingest_config
 from services import model_bundle
@@ -7486,6 +8612,15 @@ _lock = threading.Lock()
 # Weaviate capitalises the first character of a collection name and rejects
 # anything outside [A-Za-z0-9_]. Both were confirmed against the live server.
 _NAME_OK = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+class PassphraseError(Exception):
+    """A passphrase missing for an encrypted package, or given for one that is
+    not encrypted (#27). Raised before any job exists; `code` is the API code."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
 
 
 def get_job(job_id: str) -> dict | None:
@@ -8205,7 +9340,7 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
 
 
 @telemetry.traced("rag.import")
-def _run(job_id: str, filename: str, on_conflict: str) -> None:
+def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = None) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
     work = Path(tempfile.mkdtemp(prefix="import-", dir=settings.upload_dir))
@@ -8228,7 +9363,7 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
 
     try:
         archive = packager.exports_dir() / Path(filename).name
-        pkg, manifest = packager.open_package(archive, work)        # checks 1, 2
+        pkg, manifest = packager.open_package(archive, work, passphrase)  # checks 1, 2
         packager.verify_digests(pkg, manifest)                      # check 3
         _validate_package_sources(pkg, manifest)
         _check_embedding(manifest)                                  # check 4
@@ -8369,9 +9504,23 @@ def _run(job_id: str, filename: str, on_conflict: str) -> None:
         _release_targets(job_id)
 
 
-async def start_import_job(filename: str, on_conflict: str) -> str:
-    job_id = str(uuid.uuid4())[:8]
+async def start_import_job(filename: str, on_conflict: str, passphrase: str | None = None) -> str:
+    """Register the job and run the import off the event loop.
+
+    An encrypted package is known by its name (`.tar.gz.age`, #27), so a missing
+    or unexpected passphrase is refused here, before any job or guard. The
+    passphrase reaches the worker as an argument only, never the job record.
+    """
     key = _package_key(filename)
+    encrypted = age_stream.is_encrypted_name(key)
+    if encrypted and passphrase is None:
+        raise PassphraseError("PASSPHRASE_REQUIRED",
+                              f"'{key}' is encrypted. Send its passphrase to import it.")
+    if not encrypted and passphrase is not None:
+        raise PassphraseError("PASSPHRASE_NOT_EXPECTED",
+                              f"'{key}' is not encrypted, so it takes no passphrase. "
+                              "Anyone with the file can read it.")
+    job_id = str(uuid.uuid4())[:8]
     with _lock:
         if key in _active:
             raise RuntimeError(filename)
@@ -8395,12 +9544,14 @@ async def start_import_job(filename: str, on_conflict: str) -> str:
             "error": None,
             "error_code": None,
             "error_detail": None,
+            "encrypted": encrypted,
         })
     except BaseException:
         with _lock:
             _active.discard(key)
         raise
-    asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict))
+    asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict,
+                                          passphrase))
     return job_id
 ```
 
@@ -10001,7 +11152,7 @@ from models.schemas import (
     PackageListResponse,
     PackageSummary,
 )
-from services import exporter, importer, packager
+from services import age_stream, exporter, importer, packager
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError
 from utils import api_error, collection_check_unavailable, collection_deleting_error
@@ -10024,7 +11175,9 @@ async def start_export(body: ExportRequest):
         return api_error(404, "COLLECTION_NOT_FOUND",
                          f"Collection '{body.collection}' not found.")
     try:
-        job_id = await exporter.start_export_job(body.collection, body.include_models)
+        job_id = await exporter.start_export_job(
+            body.collection, body.include_models,
+            body.passphrase.get_secret_value() if body.passphrase is not None else None)
     except CollectionDeletingError:
         return collection_deleting_error(body.collection)
     except exporter.ExportStartingError:
@@ -10054,8 +11207,12 @@ async def start_import(body: ImportRequest):
     # Everything else — unreadable archive, bad digest, embedding mismatch,
     # name collision — is reported through the job, because it is only knowable
     # after reading the package, which takes long enough to need a job.
+    passphrase = body.passphrase.get_secret_value() if body.passphrase is not None else None
     try:
-        job_id = await importer.start_import_job(body.filename, body.on_conflict)
+        job_id = await importer.start_import_job(body.filename, body.on_conflict, passphrase)
+    except importer.PassphraseError as exc:
+        # Decided by the filename before any job exists (#27).
+        return api_error(400, exc.code, str(exc), detail={"filename": body.filename})
     except RuntimeError as exc:
         return api_error(409, "IMPORT_IN_PROGRESS",
                          f"An import of '{exc}' is already running.",
@@ -10073,7 +11230,21 @@ async def import_job_status(job_id: str):
 
 def _list_packages_sync() -> list[dict]:
     out = []
-    for p in sorted(packager.exports_dir().glob("ragpkg-*.tar.gz")):
+    root = packager.exports_dir()
+    for p in sorted([*root.glob("ragpkg-*.tar.gz"), *root.glob("ragpkg-*" + age_stream.ENCRYPTED_SUFFIX)]):
+        if age_stream.is_encrypted_name(p.name):
+            # No metadata without the passphrase, and no scrypt to list (#27).
+            try:
+                with p.open("rb") as fh:
+                    readable = age_stream.check_header(fh)
+                size = p.stat().st_size
+            except Exception:                         # noqa: BLE001
+                # One bad file never breaks the listing of the others.
+                readable, size = False, 0
+            out.append({"filename": p.name, "size_bytes": size,
+                        "collection": None, "chunk_count": None, "fidelity": None,
+                        "created_at": None, "readable": readable, "encrypted": True})
+            continue
         try:
             fields = packager.listing_fields(packager.read_manifest(p))
         except Exception:
@@ -10655,12 +11826,21 @@ def get_summary(
 ### api/templates/partials/encryption.md
 
 ```markdown
-## ⚠ Packages are not encrypted
+## Encryption
 
-Nothing in a package is protected. `sources/` holds the original documents byte
-for byte, and `chunks.jsonl` holds their text. If the corpus contains
-confidential or personal material, the package does too. Move and store it
-accordingly.
+A package is encrypted only when it was exported with a passphrase. Its name
+then ends in `.tar.gz.age`: it is an [age](https://age-encryption.org) file that
+only that passphrase opens, whether through import here or with `age -d`. The
+passphrase can't be recovered, and without it the package can't be opened. Send
+it by a different channel than the file.
+
+A package whose name ends in `.tar.gz` is not encrypted. Nothing in it is
+protected: `sources/` holds the original documents byte for byte, and
+`chunks.jsonl` holds their text. If the corpus contains confidential or personal
+material, the package does too. Move and store it accordingly.
+
+Encryption protects the file while it is moved and stored. Once it is decrypted
+or imported, its contents are plaintext again, on the machine that opened it.
 ```
 
 ### api/templates/partials/fidelity_table.md
@@ -10692,6 +11872,7 @@ Check any machine with `docker compose exec ollama ollama list`.
 ````markdown
 ```
 ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz
+ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz.age    (exported with a passphrase)
 ```
 
 The collection name in the filename is lowercased and stripped of punctuation,
@@ -10729,11 +11910,16 @@ own digest, and the other two are generated from it afterwards.
 
 ````markdown
 ```bash
-python3 retrieve.py "your question here"
-python3 retrieve.py --top-k 10 --mode hybrid "your question here"
-python3 retrieve.py --api-url http://localhost:9090/api "your question here"
-python3 retrieve.py --timeout 900 "a question that needs a long answer"
+python3 retrieve.py --username alice "your question here"
+python3 retrieve.py --username alice --top-k 10 --mode hybrid "your question here"
+python3 retrieve.py --username alice --api-url http://localhost:9090/api "your question here"
+python3 retrieve.py --username alice --timeout 900 "a question that needs a long answer"
 ```
+
+The API needs an account; any role may ask. The script asks for the password
+(or reads it from standard input with `--password-stdin`), logs in, asks and
+logs out. The password is never a flag or an environment variable;
+`RAG_USERNAME` may stand in for `--username`.
 
 It needs Python 3 and nothing else — no `pip install` — because the air-gapped
 case is the one this project targets. It exits 0 on success, 2 on bad usage,
@@ -10776,13 +11962,13 @@ This package is **`@@FIDELITY@@`**. @@FIDELITY_NOTE@@
 
 ## Importing
 
-1. Copy this `.tar.gz` into the target instance's `./exports/` directory.
+1. Copy this package file into the target instance's `./exports/` directory.
 2. Open the web UI and go to **Transfer → Import**, or call the API directly:
 
 ```bash
 curl -X POST http://localhost:8080/api/import \
   -H 'Content-Type: application/json' \
-  -d '{"filename": "@@PACKAGE_FILENAME@@", "on_conflict": "abort"}'
+  -d '{"filename": "@@PACKAGE_FILENAME@@", "on_conflict": "abort"@@IMPORT_PASSPHRASE@@}'
 ```
 
 3. Poll the returned `job_id` at `GET /api/import/job/{job_id}`.
@@ -10822,14 +12008,22 @@ The defaults below are the settings this collection was tuned with. Every one
 can be overridden with a flag. Standard library only, on purpose: this has to
 run on an air-gapped machine where `pip install` is not an option.
 
+The API needs an account (#25): pass --username, and type the password when
+asked, or give it on standard input with --password-stdin. It is never a flag
+or an environment variable, so it can't end up in the process list or a shell
+history. The script logs in, asks, and logs out again.
+
 Exit codes: 0 ok, 2 bad usage, 3 API unreachable, 4 collection absent,
-5 API returned an error.
+5 API returned an error (a refused login too).
 """
 
 import argparse
+import getpass
 import json
+import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # ── Baked in at export from the collection's saved retrieval settings ─────────
@@ -10850,6 +12044,7 @@ DEFAULT_TIMEOUT_SECONDS = 600
 # the API is down the proxy answers with a gateway error rather than refusing
 # the connection. That is still "unreachable", not "the API rejected this".
 GATEWAY_STATUSES = (502, 503, 504)
+SESSION_COOKIE = "rag_session"
 
 
 def build_parser():
@@ -10877,6 +12072,12 @@ def build_parser():
                    help="print the raw API response instead of formatted text")
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS,
                    help="seconds to wait for an answer (default: %(default)s)")
+    p.add_argument("--username", default=os.environ.get("RAG_USERNAME"),
+                   help="the account to log in with; any role may query "
+                        "(default: $RAG_USERNAME)")
+    p.add_argument("--password-stdin", action="store_true",
+                   help="read the password from the first line of standard input "
+                        "instead of asking for it")
     return p
 
 
@@ -10886,41 +12087,35 @@ def fail(code, message, hint):
     return code
 
 
-def main(argv=None):
-    args = build_parser().parse_args(argv)
+def session_token(set_cookies):
+    """The session cookie's value from a login's Set-Cookie headers, or None."""
+    for header in set_cookies:
+        name, _, rest = header.partition("=")
+        if name.strip() == SESSION_COOKIE:
+            return rest.split(";", 1)[0] or None
+    return None
 
-    if not args.question.strip():
-        return fail(2, "The question is empty.",
-                    'Pass it as one argument, e.g. retrieve.py "who approves overtime?"')
-    if not 1 <= args.top_k <= 50:
-        return fail(2, "--top-k must be between 1 and 50, got %d." % args.top_k,
-                    "The collection was exported with --top-k %s." % DEFAULT_TOP_K)
-    if not 0.0 <= args.alpha <= 1.0:
-        return fail(2, "--alpha must be between 0.0 and 1.0, got %s." % args.alpha,
-                    "0 is pure keyword matching, 1 is pure meaning.")
-    if args.timeout <= 0:
-        return fail(2, "--timeout must be greater than 0, got %s." % args.timeout,
-                    "It is a number of seconds to wait for the answer.")
 
-    url = args.api_url.rstrip("/") + "/query"
-    payload = json.dumps({
-        "question": args.question,
-        "collection": args.collection,
-        "retrieval_mode": args.mode,
-        "top_k": args.top_k,
-        "alpha": args.alpha,
-        "include_citations": bool(args.citations),
-        "response_format": args.response_format,
-    }).encode("utf-8")
+def logout(base, headers):
+    """End the session; a failure here changes nothing about the answer."""
+    try:
+        request = urllib.request.Request(base + "/auth/logout", data=b"", method="POST", headers=headers)
+        urllib.request.urlopen(request, timeout=10).close()
+    except Exception:
+        pass
 
+
+def post(args, url, payload, headers, refused):
+    """(parsed JSON body, Set-Cookie headers), or the exit code once the failure
+    is reported. `refused` begins the sentence for an error the API returns."""
     request = urllib.request.Request(
-        url, data=payload, method="POST",
-        headers={"Content-Type": "application/json"},
+        url, data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers=dict(headers, **{"Content-Type": "application/json"}),
     )
-
     try:
         with urllib.request.urlopen(request, timeout=args.timeout) as response:
-            body = json.loads(response.read().decode("utf-8"))
+            cookies = response.headers.get_all("Set-Cookie") or []
+            return json.loads(response.read().decode("utf-8")), cookies
     except urllib.error.HTTPError as exc:
         # A rag-docker error carries {"error": {"code", "message", "detail"}};
         # anything else is some other server that happened to answer.
@@ -10943,12 +12138,19 @@ def main(argv=None):
             return fail(5, "No rag-docker API answered at %s." % url,
                         "Something responded but it is not this API. Check "
                         "--api-url; it should end in /api.")
-        if exc.code in GATEWAY_STATUSES:
+        if exc.code in GATEWAY_STATUSES and code != "SETUP_REQUIRED":
             return fail(3, "The API is not responding behind %s (HTTP %s)."
                         % (args.api_url, exc.code),
                         "The proxy is up but the API is not. Check it with "
                         "`docker compose ps` and start it with `docker compose up -d`.")
-        return fail(5, "The API rejected the query: %s" % message,
+        if code == "AUTH_REQUIRED":
+            return fail(5, "%s: %s" % (refused, message),
+                        "The API needs an account: pass --username, and the password "
+                        "when asked or with --password-stdin.")
+        if code == "PASSWORD_CHANGE_REQUIRED":
+            return fail(5, "%s: %s" % (refused, message),
+                        "Log in to the web UI once and choose your own password.")
+        return fail(5, "%s: %s" % (refused, message),
                     "HTTP %s from %s." % (exc.code, url))
     except urllib.error.URLError as exc:
         # URLError subclasses OSError and wraps socket errors, so a connect
@@ -10971,6 +12173,73 @@ def main(argv=None):
     except ValueError:
         return fail(5, "The API returned a response that is not JSON.",
                     "Check that %s is a rag-docker API and not something else." % args.api_url)
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    if not args.question.strip():
+        return fail(2, "The question is empty.",
+                    'Pass it as one argument, e.g. retrieve.py "who approves overtime?"')
+    if not 1 <= args.top_k <= 50:
+        return fail(2, "--top-k must be between 1 and 50, got %d." % args.top_k,
+                    "The collection was exported with --top-k %s." % DEFAULT_TOP_K)
+    if not 0.0 <= args.alpha <= 1.0:
+        return fail(2, "--alpha must be between 0.0 and 1.0, got %s." % args.alpha,
+                    "0 is pure keyword matching, 1 is pure meaning.")
+    if args.timeout <= 0:
+        return fail(2, "--timeout must be greater than 0, got %s." % args.timeout,
+                    "It is a number of seconds to wait for the answer.")
+
+    if args.password_stdin and not args.username:
+        return fail(2, "--password-stdin needs --username.",
+                    "Pass the account to log in with, e.g. --username alice.")
+
+    base = args.api_url.rstrip("/")
+    url = base + "/query"
+    parts = urllib.parse.urlsplit(base)
+    # The API refuses a logged-in change (a POST) that doesn't say it comes from
+    # its own origin, as a browser would.
+    headers = {"Origin": "%s://%s" % (parts.scheme, parts.netloc)}
+
+    if args.username:
+        if args.password_stdin:
+            password = sys.stdin.readline().rstrip("\r\n")
+        else:
+            try:
+                password = getpass.getpass("Password for %s: " % args.username)
+            except (EOFError, KeyboardInterrupt):
+                password = ""
+        if not password:
+            return fail(2, "No password was given.",
+                        "Type it when asked, or pipe it in with --password-stdin.")
+        answer = post(args, base + "/auth/login", {"username": args.username, "password": password},
+                      headers, "The login was refused")
+        if isinstance(answer, int):
+            return answer
+        token = session_token(answer[1])
+        if token is None:
+            return fail(5, "The API did not start a session.",
+                        "Check that %s is a rag-docker API." % args.api_url)
+        headers["Cookie"] = "%s=%s" % (SESSION_COOKIE, token)
+
+    payload = {
+        "question": args.question,
+        "collection": args.collection,
+        "retrieval_mode": args.mode,
+        "top_k": args.top_k,
+        "alpha": args.alpha,
+        "include_citations": bool(args.citations),
+        "response_format": args.response_format,
+    }
+    try:
+        answer = post(args, url, payload, headers, "The API rejected the query")
+    finally:
+        if "Cookie" in headers:
+            logout(base, headers)
+    if isinstance(answer, int):
+        return answer
+    body = answer[0]
 
     if args.json:
         print(json.dumps(body, indent=2))
@@ -11005,7 +12274,8 @@ if __name__ == "__main__":
 ```markdown
 # Moving a RAG between machines
 
-A collection can be exported as a single `.tar.gz` and imported somewhere else —
+A collection can be exported as a single `.tar.gz` (or, with a passphrase, an
+encrypted `.tar.gz.age`) and imported somewhere else —
 another laptop, a customer's machine, an air-gapped network. The package carries
 the chunks and their vectors, the settings the collection was tuned with, a
 standalone query script and, when the originals were retained, the source
@@ -11019,8 +12289,9 @@ Everything below is rendered from the same templates that generate the
 Both directions use `./exports/` in the project directory, which is a bind mount
 rather than a Docker volume so you can pick files up and drop them in directly.
 
-- **Exporting** writes the `.tar.gz` there.
-- **Importing** reads from there: copy a package in first, then import by filename.
+- **Exporting** writes the package there.
+- **Importing** reads from there: copy a package in first, then import by filename,
+  with its passphrase when the package is encrypted.
 
 `GET /api/packages` lists what is currently in that directory, including files it
 cannot read — those are shown rather than hidden, so nothing disappears silently.
@@ -11111,10 +12382,1668 @@ alone.
 @@INCLUDE:encryption@@
 ```
 
+### api/auth/__init__.py
+
+```python
+"""Accounts, sessions, service API keys and the API's endpoint/role matrix (#25).
+
+- `passwords`: the username and password rules, scrypt hashing, generated passwords.
+- `store`: the SQLite file in AUTH_DIR holding accounts, service principals and
+  their API keys, sessions and the login throttle.
+- `keys`: the service API key format (`Authorization: Bearer rag_<id>_<secret>`).
+- `policy`: which role each route needs.
+- `middleware`: enforces the policy on every request, before the route sees its body.
+- `__main__`: the operator command, `python -m auth`, which creates the first
+  Engineer and recovers lockouts; Engineers manage accounts in the app too
+  (routers/auth.py, the Users page) and service principals and their keys
+  (the Service keys page).
+- `testing`: a real account and session in a temporary store, for in-process tests.
+"""
+```
+
+### api/auth/passwords.py
+
+```python
+"""Username and password rules, and password hashing (#25).
+
+Hashing is the standard library's scrypt, so no new dependency. The parameters
+are stored with each hash, so they can be raised later without breaking the
+hashes already stored.
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import os
+import re
+import secrets
+
+# n = 2^15, r = 8, p = 1: about 32 MiB and a few tens of milliseconds per hash.
+SCRYPT_LOG2_N = 15
+SCRYPT_R = 8
+SCRYPT_P = 1
+SALT_BYTES = 16
+HASH_BYTES = 32
+# hashlib's default limit is 32 MiB, exactly what n=2^15, r=8 needs, and scrypt
+# needs a little more than that, so the default refuses these parameters.
+_MAXMEM = 64 * 1024 * 1024
+
+USERNAME_RULE = "3-32 characters: lowercase letters, digits, '.', '_' or '-'"
+_USERNAME = re.compile(r"[a-z0-9._-]{3,32}")
+PASSWORD_MIN = 12
+PASSWORD_MAX = 256
+
+
+def normalize_username(username: str) -> str | None:
+    """The stored form of a username (lowercased), or None when it breaks the rule."""
+    if not isinstance(username, str):
+        return None
+    name = username.lower()
+    return name if _USERNAME.fullmatch(name) else None
+
+
+def password_problem(password: str, username: str) -> str | None:
+    """Why a new password is refused, or None when it is acceptable."""
+    if len(password) < PASSWORD_MIN:
+        return f"The password must be at least {PASSWORD_MIN} characters."
+    if len(password) > PASSWORD_MAX:
+        return f"The password must be at most {PASSWORD_MAX} characters."
+    if password.lower() == username.lower():
+        return "The password must not be the username."
+    return None
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def _scrypt(password: str, salt: bytes, log2_n: int, r: int, p: int, length: int) -> bytes:
+    return hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2 ** log2_n, r=r, p=p,
+                          maxmem=_MAXMEM, dklen=length)
+
+
+def hash_password(password: str) -> str:
+    """`scrypt$<log2 n>$<r>$<p>$<salt>$<hash>`, salt and hash in base64."""
+    salt = os.urandom(SALT_BYTES)
+    digest = _scrypt(password, salt, SCRYPT_LOG2_N, SCRYPT_R, SCRYPT_P, HASH_BYTES)
+    return "$".join(("scrypt", str(SCRYPT_LOG2_N), str(SCRYPT_R), str(SCRYPT_P),
+                     _b64(salt), _b64(digest)))
+
+
+def verify_password(password: str, stored: str) -> bool:
+    """Whether `password` matches `stored`. A malformed hash never matches."""
+    try:
+        scheme, log2_n, r, p, salt, digest = stored.split("$")
+        if scheme != "scrypt":
+            return False
+        log2_n, r, p = int(log2_n), int(r), int(p)
+        # Bounds, so a corrupted row can't ask for gigabytes of memory.
+        if not (1 <= log2_n <= 20 and 1 <= r <= 16 and 1 <= p <= 4):
+            return False
+        salt, digest = base64.b64decode(salt, validate=True), base64.b64decode(digest, validate=True)
+        if not salt or not digest:
+            return False
+        candidate = _scrypt(password, salt, log2_n, r, p, len(digest))
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(candidate, digest)
+
+
+def generate_password() -> str:
+    """A one-time password: 24 URL-safe characters, 144 random bits."""
+    return secrets.token_urlsafe(18)
+
+
+def new_password(username: str) -> str:
+    """A generated password that meets the password rule for `username`."""
+    while True:
+        password = generate_password()
+        if password_problem(password, username) is None:
+            return password
+
+
+_dummy_hash: str | None = None
+
+
+def dummy_hash() -> str:
+    """A hash to verify against when the username is unknown, so a failed login
+    takes as long whether the account exists or not."""
+    global _dummy_hash
+    if _dummy_hash is None:
+        _dummy_hash = hash_password(secrets.token_urlsafe(18))
+    return _dummy_hash
+```
+
+### api/auth/keys.py
+
+```python
+"""The service API key format (#25, PR 3).
+
+A key is `rag_` + a 12-character key id + `_` + 43 random characters
+(secrets.token_urlsafe(32), 256 bits): 60 characters. The id names the key in
+listings and logs and finds its row; it doesn't authenticate on its own. The
+store keeps only the id and the SHA-256 of the whole key: the key is random
+and high-entropy, so a slow hash would add nothing (as for session tokens).
+
+Keys are sent only as `Authorization: Bearer <key>`; nothing reads one from a
+query parameter, a cookie or another header.
+"""
+from __future__ import annotations
+
+import hashlib
+import re
+import secrets
+import string
+
+PREFIX = "rag_"
+ID_LENGTH = 12
+SECRET_LENGTH = 43
+LENGTH = len(PREFIX) + ID_LENGTH + 1 + SECRET_LENGTH
+_ID_ALPHABET = string.ascii_lowercase + string.digits
+_KEY = re.compile(r"rag_([a-z0-9]{12})_[A-Za-z0-9_-]{43}")
+
+
+def generate() -> tuple[str, str]:
+    """A new (key id, key)."""
+    key_id = "".join(secrets.choice(_ID_ALPHABET) for _ in range(ID_LENGTH))
+    return key_id, f"{PREFIX}{key_id}_{secrets.token_urlsafe(32)}"
+
+
+def key_id(key: str) -> str | None:
+    """The id of a key of the right shape, or None."""
+    if not isinstance(key, str) or len(key) != LENGTH:
+        return None
+    found = _KEY.fullmatch(key)
+    return found.group(1) if found else None
+
+
+def digest(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def bearer(value: str | None) -> str | None:
+    """The key in an `Authorization` value of the form `Bearer <key>` (scheme
+    case-insensitive, one space), or None."""
+    if not value:
+        return None
+    scheme, sep, key = value.partition(" ")
+    if not sep or scheme.lower() != "bearer" or key_id(key) is None:
+        return None
+    return key
+```
+
+### api/auth/policy.py
+
+```python
+"""The endpoint/role matrix (#25): which role every API route needs.
+
+Every route has exactly one entry; a route with none is refused for everyone,
+and test_auth.py fails when a route lacks an entry or an entry names no route.
+The client's own idea of its role is never consulted.
+"""
+from __future__ import annotations
+
+import re
+
+ROLES = ("end_user", "developer", "engineer")   # lowest to highest
+PUBLIC = "public"     # no session needed
+SESSION = "session"   # any logged-in user, even one who must change their password
+
+END_USER, DEVELOPER, ENGINEER = ROLES
+
+ACCESS: dict[tuple[str, str], str] = {
+    # Liveness for the container healthcheck, stack.sh and CI, unchanged (Q8).
+    ("GET", "/health"): PUBLIC,
+    ("GET", "/auth/status"): PUBLIC,
+    ("POST", "/auth/login"): PUBLIC,
+    ("GET", "/auth/me"): SESSION,
+    ("POST", "/auth/logout"): SESSION,
+    ("POST", "/auth/password"): SESSION,
+    # What the Q&A page needs (Q4).
+    ("GET", "/collections"): END_USER,
+    ("POST", "/query"): END_USER,
+    ("GET", "/retrieval/config/{collection}"): END_USER,
+    # Import, Chunking, Retrieval, Gold Standard and Transfer (Q2, Q4, Q6).
+    ("POST", "/collections"): DEVELOPER,
+    ("POST", "/ingest/upload"): DEVELOPER,
+    ("GET", "/ingest/job/{job_id}"): DEVELOPER,
+    ("GET", "/ingest/config/{collection}"): DEVELOPER,
+    ("POST", "/ingest/config"): DEVELOPER,
+    ("POST", "/retrieval/config"): DEVELOPER,
+    ("POST", "/goldstandard/generate"): DEVELOPER,
+    ("GET", "/goldstandard/session/{session_id}"): DEVELOPER,
+    ("PATCH", "/goldstandard/session/{session_id}/pair/{pair_id}"): DEVELOPER,
+    ("POST", "/goldstandard/regenerate"): DEVELOPER,
+    ("POST", "/goldstandard/save"): DEVELOPER,
+    ("GET", "/goldstandard/download/{filename}"): DEVELOPER,
+    ("POST", "/export"): DEVELOPER,
+    ("GET", "/export/job/{job_id}"): DEVELOPER,
+    ("POST", "/import"): DEVELOPER,
+    ("GET", "/import/job/{job_id}"): DEVELOPER,
+    ("GET", "/packages"): DEVELOPER,
+    ("GET", "/help/transfer"): DEVELOPER,
+    ("GET", "/tune/{collection}"): DEVELOPER,          # read by the Transfer page (Q3)
+    # Collections management, tuning, the Health page's data (Q3, Q5, Q6).
+    ("DELETE", "/collections/{name}"): ENGINEER,
+    ("POST", "/tune/rechunk"): ENGINEER,
+    ("POST", "/tune/reembed"): ENGINEER,
+    ("POST", "/tune/reindex"): ENGINEER,
+    ("GET", "/tune/job/{job_id}"): ENGINEER,
+    ("GET", "/metrics/latency"): ENGINEER,
+    ("GET", "/goldstandard/diagnostics"): ENGINEER,
+    # Account administration (Q20, PR 2 of #25). No route deletes an account.
+    ("GET", "/auth/users"): ENGINEER,
+    ("POST", "/auth/users"): ENGINEER,
+    ("POST", "/auth/users/{username}/reset-password"): ENGINEER,
+    ("POST", "/auth/users/{username}/role"): ENGINEER,
+    ("POST", "/auth/users/{username}/disable"): ENGINEER,
+    ("POST", "/auth/users/{username}/enable"): ENGINEER,
+    # Service principals and their keys (PR 3 of #25). Nothing deletes a principal.
+    ("GET", "/auth/service-principals"): ENGINEER,
+    ("POST", "/auth/service-principals"): ENGINEER,
+    ("POST", "/auth/service-principals/{name}/role"): ENGINEER,
+    ("POST", "/auth/service-principals/{name}/disable"): ENGINEER,
+    ("POST", "/auth/service-principals/{name}/enable"): ENGINEER,
+    ("POST", "/auth/service-principals/{name}/keys"): ENGINEER,
+    ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke"): ENGINEER,
+    # FastAPI's own API docs (N5).
+    ("GET", "/docs"): ENGINEER,
+    ("GET", "/docs/oauth2-redirect"): ENGINEER,
+    ("GET", "/redoc"): ENGINEER,
+    ("GET", "/openapi.json"): ENGINEER,
+}
+
+
+# Routes an API key can't use, whatever its principal's role (S5 of PR 3):
+# account, principal and key administration, so a leaked key can't mint further
+# keys or accounts that outlive its revocation, and the session's own routes.
+# GET /auth/me answers for a key.
+HUMAN_ONLY = frozenset(path for _, path in ACCESS
+                       if path.startswith(("/auth/users", "/auth/service-principals"))) | {
+    "/auth/logout", "/auth/password"}
+
+
+def required(method: str, path: str) -> str | None:
+    """The access a route needs, or None when it has no entry (refused)."""
+    return ACCESS.get(("GET" if method == "HEAD" else method, path))
+
+
+def rank(role: str) -> int:
+    return ROLES.index(role) if role in ROLES else -1
+
+
+def _compile(template: str):
+    # A {name} parameter matches one path segment, as Starlette's default str
+    # convertor does; no route here uses another convertor.
+    pattern = re.sub(r"\\\{[a-z_]+\\\}", "[^/]+", re.escape(template))
+    return re.compile(pattern + r"\Z")
+
+
+# Literal templates first, then by fewer parameters, so `/goldstandard/diagnostics`
+# wins over a parameter in the same place, as it does in the app.
+_TEMPLATES = sorted({path for _, path in ACCESS}, key=lambda t: (t.count("{"), -len(t)))
+_COMPILED = [(template, _compile(template)) for template in _TEMPLATES]
+
+
+def match(method: str, path: str) -> str | None:
+    """The template of the policy route this method and path reach, or None."""
+    method = "GET" if method == "HEAD" else method
+    for template, pattern in _COMPILED:
+        if (method, template) in ACCESS and pattern.match(path):
+            return template
+    return None
+```
+
+### api/auth/store.py
+
+```python
+"""Accounts, service principals and their keys, sessions and the login
+throttle, in one SQLite file (#25).
+
+The file is `auth.db` in AUTH_DIR, the auth_data volume, so all three survive an
+API restart. The API and the operator command (`python -m auth`) open it from
+separate processes; SQLite's locking keeps them consistent, and the
+last-engineer rule is checked inside a write transaction so two commands
+can't both pass it.
+
+Every function opens its own short connection. Nothing here is cached except
+the fact that the system is set up, which can't become false again: no
+command deletes an account.
+
+A service principal (PR 3) is a `users` row with kind 'service': it shares the
+username rule and name pool with people, has no usable password and no
+session, and authenticates only with its API keys (`api_keys`, keys.py).
+"""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import os
+import secrets
+import sqlite3
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+
+from config import settings
+
+from . import keys, passwords
+from .policy import ROLES
+
+COOKIE = "rag_session"
+IDLE_S = 12 * 3600               # a session ends after 12 hours without a request
+ABSOLUTE_S = 7 * 24 * 3600       # and 7 days after login, whichever is first
+_TOUCH_S = 60                    # last_seen is written at most once a minute
+THROTTLE_FAILURES = 5            # failed logins per (username, address) ...
+THROTTLE_WINDOW_S = 15 * 60      # ... within 15 minutes ...
+LOCKOUT_S = 15 * 60              # ... lock that pair for 15 minutes
+KEY_DAYS_DEFAULT = 90            # a key's lifetime when none is given (Q23) ...
+KEY_DAYS_MAX = 365               # ... and the longest allowed
+_DAY_S = 86400
+NO_PASSWORD = "!"                # a principal's password hash: never verifies
+SCHEMA_VERSION = 2
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE,
+    role TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    must_change_password INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    created_at REAL NOT NULL,
+    last_seen REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
+CREATE TABLE IF NOT EXISTS login_failures (
+    username TEXT NOT NULL,
+    address TEXT NOT NULL,
+    at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS login_failures_pair ON login_failures(username, address);
+CREATE TABLE IF NOT EXISTS login_lockouts (
+    username TEXT NOT NULL,
+    address TEXT NOT NULL,
+    until REAL NOT NULL,
+    PRIMARY KEY (username, address)
+);
+CREATE TABLE IF NOT EXISTS api_keys (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    key_hash TEXT NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    revoked_at REAL,
+    last_used REAL
+);
+CREATE INDEX IF NOT EXISTS api_keys_user ON api_keys(user_id);
+"""
+
+_ready: set[str] = set()
+_set_up: set[str] = set()
+
+
+class Refused(Exception):
+    """An account change the rules don't allow; the message says why, in one line.
+    `code` names the reason for the API: USER_EXISTS, USER_NOT_FOUND,
+    LAST_ENGINEER, PRINCIPAL_EXISTS, PRINCIPAL_NOT_FOUND, KEY_NOT_FOUND,
+    NOT_A_USER, or REFUSED for the bootstrap rules."""
+
+    def __init__(self, message: str, code: str = "REFUSED"):
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class Principal:
+    user_id: int
+    username: str
+    role: str
+    must_change_password: bool
+    token_hash: str              # the session's; "" for a key
+    kind: str = "user"           # "service" when authenticated by a key
+    key_id: str | None = None
+
+
+@dataclass(frozen=True)
+class User:
+    id: int
+    username: str
+    role: str
+    password_hash: str
+    enabled: bool
+    must_change_password: bool
+    created_at: float
+    kind: str = "user"
+
+
+@dataclass(frozen=True)
+class Key:
+    id: str
+    label: str
+    created_at: float
+    expires_at: float
+    revoked_at: float | None
+    last_used: float | None
+
+    def status(self, now: float | None = None) -> str:
+        if self.revoked_at is not None:
+            return "revoked"
+        return "expired" if (now if now is not None else _now()) >= self.expires_at else "active"
+
+
+@dataclass(frozen=True)
+class ServicePrincipal:
+    id: int
+    name: str
+    role: str
+    enabled: bool
+    created_at: float
+    keys: tuple[Key, ...]
+
+
+def _now() -> float:
+    return time.time()
+
+
+def db_path() -> Path:
+    return Path(settings.auth_dir) / "auth.db"
+
+
+@contextmanager
+def _connect(write: bool = False):
+    path = db_path()
+    key = str(path)
+    if key not in _ready:
+        # Folder 0700 and file 0600: the file holds password hashes and session
+        # verifiers, and nobody but the API's own user needs to read it.
+        old = os.umask(0o077)
+        try:
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            conn = sqlite3.connect(path, timeout=10)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.executescript(_SCHEMA)
+                _migrate(conn)
+            finally:
+                conn.close()
+        finally:
+            os.umask(old)
+        _ready.add(key)
+    conn = sqlite3.connect(path, timeout=10, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+        try:
+            yield conn
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+
+def _migrate(conn) -> None:
+    """Version 2 (PR 3): users.kind. In a write transaction, so the API and the
+    operator command can't both add the column."""
+    conn.execute("BEGIN IMMEDIATE")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+    if "kind" not in columns:
+        conn.execute("ALTER TABLE users ADD COLUMN kind TEXT NOT NULL DEFAULT 'user'")
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    conn.commit()
+
+
+def _user(row) -> User | None:
+    if row is None:
+        return None
+    return User(row["id"], row["username"], row["role"], row["password_hash"],
+                bool(row["enabled"]), bool(row["must_change_password"]), row["created_at"], row["kind"])
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+# ── setup ────────────────────────────────────────────────────────────────────
+
+def is_set_up() -> bool:
+    """True once any account exists; until then only public routes answer."""
+    key = str(db_path())
+    if key in _set_up:
+        return True
+    with _connect() as conn:
+        found = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
+    if found:
+        _set_up.add(key)
+    return found
+
+
+def has_enabled_engineer() -> bool:
+    """True when an enabled human Engineer exists: LAN mode refuses to start
+    without one (#26). A service principal can't log in, so it doesn't count."""
+    with _connect() as conn:
+        return conn.execute("SELECT 1 FROM users WHERE role = 'engineer' AND enabled = 1 AND kind = 'user' "
+                            "LIMIT 1").fetchone() is not None
+
+
+# ── accounts (the operator command and the admin routes) ─────────────────────
+
+def get_user(username: str) -> User | None:
+    with _connect() as conn:
+        return _user(conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone())
+
+
+def list_users(kind: str | None = "user") -> list[User]:
+    """Human accounts by default; kind=None lists principals too (the operator's `list`)."""
+    with _connect() as conn:
+        if kind is None:
+            rows = conn.execute("SELECT * FROM users ORDER BY username")
+        else:
+            rows = conn.execute("SELECT * FROM users WHERE kind = ? ORDER BY username", (kind,))
+        return [_user(row) for row in rows]
+
+
+def _check_role(role: str) -> None:
+    if role not in ROLES:
+        raise ValueError(f"unknown role {role!r}; use one of {', '.join(ROLES)}")
+
+
+def create_user(username: str, role: str, password: str, *, bootstrap: bool = False,
+                must_change_password: bool = True) -> User:
+    """Create an account. `bootstrap` only when none exists, otherwise only after one does."""
+    _check_role(role)
+    password_hash = passwords.hash_password(password)
+    now = _now()
+    with _connect(write=True) as conn:
+        exists = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
+        if bootstrap and exists:
+            raise Refused("the system is already set up; use create-user or reset-password")
+        if not bootstrap and not exists:
+            raise Refused("the system is not set up yet; run bootstrap first")
+        if conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+            # One name pool for people and service principals (S3).
+            raise Refused(f"the name {username!r} is already taken", "USER_EXISTS")
+        conn.execute("INSERT INTO users (username, role, password_hash, enabled, must_change_password, "
+                     "created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?)",
+                     (username, role, password_hash, int(must_change_password), now, now))
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    return _user(row)
+
+
+def _existing(conn, username: str, kind: str | None = None):
+    """The row of `username`; with `kind`, only an account of that kind counts."""
+    row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    if row is None or (kind is not None and row["kind"] != kind):
+        if kind == "service":
+            raise Refused(f"there is no service principal {username!r}", "PRINCIPAL_NOT_FOUND")
+        raise Refused(f"there is no user {username!r}", "USER_NOT_FOUND")
+    return row
+
+
+def _is_last_engineer(conn, row) -> bool:
+    # Only people count: a service principal can't log in to administer (S4).
+    if row["role"] != "engineer" or not row["enabled"] or row["kind"] != "user":
+        return False
+    others = conn.execute("SELECT COUNT(*) FROM users WHERE role = 'engineer' AND enabled = 1 AND kind = 'user' "
+                          "AND id != ?", (row["id"],)).fetchone()[0]
+    return others == 0
+
+
+def reset_password(username: str, password: str, kind: str | None = None) -> None:
+    """A new password the user must change at next login; every session of theirs ends.
+    A service principal has no password, so it is refused."""
+    password_hash = passwords.hash_password(password)
+    with _connect(write=True) as conn:
+        row = _existing(conn, username, kind)
+        if row["kind"] != "user":
+            raise Refused(f"{username!r} is a service principal; it has no password", "NOT_A_USER")
+        conn.execute("UPDATE users SET password_hash = ?, must_change_password = 1, updated_at = ? "
+                     "WHERE id = ?", (password_hash, _now(), row["id"]))
+        conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+
+
+def set_role(username: str, role: str, kind: str | None = None) -> None:
+    """Sessions and keys stay; the next request of each one runs with the new role."""
+    _check_role(role)
+    with _connect(write=True) as conn:
+        row = _existing(conn, username, kind)
+        if role != "engineer" and _is_last_engineer(conn, row):
+            raise Refused(f"{username!r} is the last enabled engineer; make another engineer first",
+                          "LAST_ENGINEER")
+        conn.execute("UPDATE users SET role = ?, updated_at = ? WHERE id = ?", (role, _now(), row["id"]))
+
+
+def set_enabled(username: str, enabled: bool, kind: str | None = None) -> None:
+    """Disabling ends every session of the user; a disabled principal's keys fail
+    until it is enabled again."""
+    with _connect(write=True) as conn:
+        row = _existing(conn, username, kind)
+        if not enabled and _is_last_engineer(conn, row):
+            raise Refused(f"{username!r} is the last enabled engineer; make another engineer first",
+                          "LAST_ENGINEER")
+        conn.execute("UPDATE users SET enabled = ?, updated_at = ? WHERE id = ?",
+                     (int(enabled), _now(), row["id"]))
+        if not enabled:
+            conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+
+
+# ── service principals and their keys (PR 3) ─────────────────────────────────
+
+def _key(row) -> Key:
+    return Key(row["id"], row["label"], row["created_at"], row["expires_at"], row["revoked_at"], row["last_used"])
+
+
+def _principal(conn, row) -> ServicePrincipal:
+    rows = conn.execute("SELECT * FROM api_keys WHERE user_id = ? ORDER BY created_at DESC, id",
+                        (row["id"],)).fetchall()
+    return ServicePrincipal(row["id"], row["username"], row["role"], bool(row["enabled"]), row["created_at"],
+                            tuple(_key(k) for k in rows))
+
+
+def create_principal(name: str, role: str) -> ServicePrincipal:
+    """A service principal: no usable password, no session, keys only. Only after bootstrap."""
+    _check_role(role)
+    now = _now()
+    with _connect(write=True) as conn:
+        if conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is None:
+            raise Refused("the system is not set up yet; run bootstrap first")
+        if conn.execute("SELECT 1 FROM users WHERE username = ?", (name,)).fetchone():
+            raise Refused(f"the name {name!r} is already taken", "PRINCIPAL_EXISTS")
+        conn.execute("INSERT INTO users (username, role, password_hash, enabled, must_change_password, "
+                     "created_at, updated_at, kind) VALUES (?, ?, ?, 1, 0, ?, ?, 'service')",
+                     (name, role, NO_PASSWORD, now, now))
+        return _principal(conn, _existing(conn, name, "service"))
+
+
+def get_principal(name: str) -> ServicePrincipal:
+    with _connect() as conn:
+        return _principal(conn, _existing(conn, name, "service"))
+
+
+def list_principals() -> list[ServicePrincipal]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT * FROM users WHERE kind = 'service' ORDER BY username").fetchall()
+        return [_principal(conn, row) for row in rows]
+
+
+def issue_key(name: str, days: int = KEY_DAYS_DEFAULT, label: str = "") -> tuple[Key, str]:
+    """A new key for the principal; returns it and its plaintext, which is stored
+    nowhere. Older keys stay valid until revoked or expired (Q24)."""
+    if not (isinstance(days, int) and 1 <= days <= KEY_DAYS_MAX):
+        raise ValueError(f"days must be a whole number from 1 to {KEY_DAYS_MAX}")
+    key_id, key = keys.generate()
+    now = _now()
+    with _connect(write=True) as conn:
+        row = _existing(conn, name, "service")
+        conn.execute("INSERT INTO api_keys (id, user_id, key_hash, label, created_at, expires_at) "
+                     "VALUES (?, ?, ?, ?, ?, ?)", (key_id, row["id"], keys.digest(key), label, now,
+                                                   now + days * _DAY_S))
+        stored = conn.execute("SELECT * FROM api_keys WHERE id = ?", (key_id,)).fetchone()
+    return _key(stored), key
+
+
+def revoke_key(name: str, key_id: str) -> Key:
+    """Revoke a key of the principal; a revoked key keeps its first revoked time."""
+    with _connect(write=True) as conn:
+        row = _existing(conn, name, "service")
+        found = conn.execute("SELECT * FROM api_keys WHERE id = ? AND user_id = ?", (key_id, row["id"])).fetchone()
+        if found is None:
+            raise Refused(f"{name!r} has no key {key_id!r}", "KEY_NOT_FOUND")
+        conn.execute("UPDATE api_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", (_now(), key_id))
+        return _key(conn.execute("SELECT * FROM api_keys WHERE id = ?", (key_id,)).fetchone())
+
+
+def authenticate_key(key: str | None) -> Principal | None:
+    """The key's principal as it is now, or None when the key is malformed,
+    unknown, revoked or expired, or its principal is disabled."""
+    key_id = keys.key_id(key) if key else None
+    if key_id is None:
+        return None
+    now = _now()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT k.key_hash, k.expires_at, k.revoked_at, k.last_used, u.id, u.username, u.role, u.enabled, "
+            "u.kind FROM api_keys k JOIN users u ON u.id = k.user_id WHERE k.id = ?", (key_id,)).fetchone()
+    if row is None or not hmac.compare_digest(row["key_hash"], keys.digest(key)):
+        return None
+    if row["revoked_at"] is not None or now >= row["expires_at"] or not row["enabled"] or row["kind"] != "service":
+        return None
+    if row["last_used"] is None or now - row["last_used"] > _TOUCH_S:
+        with _connect(write=True) as conn:
+            conn.execute("UPDATE api_keys SET last_used = ? WHERE id = ?", (now, key_id))
+    return Principal(row["id"], row["username"], row["role"], False, "", "service", key_id)
+
+
+# ── sessions ─────────────────────────────────────────────────────────────────
+
+def create_session(user_id: int) -> str:
+    """A new session; returns the token for the cookie. Only its SHA-256 is stored."""
+    token = secrets.token_urlsafe(32)
+    now = _now()
+    with _connect(write=True) as conn:
+        conn.execute("INSERT INTO sessions (token_hash, user_id, created_at, last_seen) VALUES (?, ?, ?, ?)",
+                     (_token_hash(token), user_id, now, now))
+    return token
+
+
+def authenticate(token: str | None) -> Principal | None:
+    """The session's user as they are now, or None. An ended session is deleted."""
+    if not token or len(token) > 256:
+        return None
+    digest = _token_hash(token)
+    now = _now()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT s.created_at, s.last_seen, u.id, u.username, u.role, u.enabled, u.must_change_password "
+            "FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?", (digest,)).fetchone()
+    if row is None:
+        return None
+    if now - row["last_seen"] > IDLE_S or now - row["created_at"] > ABSOLUTE_S or not row["enabled"]:
+        delete_session(digest)
+        return None
+    if now - row["last_seen"] > _TOUCH_S:
+        with _connect(write=True) as conn:
+            conn.execute("UPDATE sessions SET last_seen = ? WHERE token_hash = ?", (now, digest))
+    return Principal(row["id"], row["username"], row["role"], bool(row["must_change_password"]), digest)
+
+
+def delete_session(token_hash: str) -> None:
+    with _connect(write=True) as conn:
+        conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
+
+
+def change_password(principal: Principal, password: str) -> None:
+    """The user's own change: clears the forced change and ends their other sessions."""
+    password_hash = passwords.hash_password(password)
+    with _connect(write=True) as conn:
+        conn.execute("UPDATE users SET password_hash = ?, must_change_password = 0, updated_at = ? "
+                     "WHERE id = ?", (password_hash, _now(), principal.user_id))
+        conn.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?",
+                     (principal.user_id, principal.token_hash))
+
+
+# ── login throttle ───────────────────────────────────────────────────────────
+
+def locked(username: str, address: str) -> bool:
+    with _connect() as conn:
+        row = conn.execute("SELECT until FROM login_lockouts WHERE username = ? AND address = ?",
+                           (username, address)).fetchone()
+    return row is not None and row["until"] > _now()
+
+
+def record_failure(username: str, address: str) -> bool:
+    """Count a failed login; True when it locks the pair."""
+    now = _now()
+    with _connect(write=True) as conn:
+        conn.execute("DELETE FROM login_failures WHERE at <= ?", (now - THROTTLE_WINDOW_S,))
+        conn.execute("DELETE FROM login_lockouts WHERE until <= ?", (now,))
+        conn.execute("INSERT INTO login_failures (username, address, at) VALUES (?, ?, ?)",
+                     (username, address, now))
+        count = conn.execute("SELECT COUNT(*) FROM login_failures WHERE username = ? AND address = ?",
+                             (username, address)).fetchone()[0]
+        if count < THROTTLE_FAILURES:
+            return False
+        conn.execute("INSERT OR REPLACE INTO login_lockouts (username, address, until) VALUES (?, ?, ?)",
+                     (username, address, now + LOCKOUT_S))
+        conn.execute("DELETE FROM login_failures WHERE username = ? AND address = ?", (username, address))
+    return True
+
+
+def reserve_attempt(username: str, address: str) -> bool:
+    """Count an attempt before its password is checked; False when the pair is
+    locked or already has its 5 counted attempts in the window (some of them
+    possibly still being checked). Check and count are one transaction, so
+    parallel attempts can't all pass the check. finish_attempt settles it."""
+    now = _now()
+    with _connect(write=True) as conn:
+        conn.execute("DELETE FROM login_failures WHERE at <= ?", (now - THROTTLE_WINDOW_S,))
+        conn.execute("DELETE FROM login_lockouts WHERE until <= ?", (now,))
+        if conn.execute("SELECT 1 FROM login_lockouts WHERE username = ? AND address = ?",
+                        (username, address)).fetchone():
+            return False
+        count = conn.execute("SELECT COUNT(*) FROM login_failures WHERE username = ? AND address = ?",
+                             (username, address)).fetchone()[0]
+        if count >= THROTTLE_FAILURES:
+            return False
+        conn.execute("INSERT INTO login_failures (username, address, at) VALUES (?, ?, ?)",
+                     (username, address, now))
+    return True
+
+
+def finish_attempt(username: str, address: str, succeeded: bool) -> bool:
+    """Settle a reserved attempt: a success clears the pair's count; a failure
+    keeps its row and, at 5 in the window, locks the pair. True when it locks."""
+    now = _now()
+    with _connect(write=True) as conn:
+        if succeeded:
+            conn.execute("DELETE FROM login_failures WHERE username = ? AND address = ?", (username, address))
+            return False
+        count = conn.execute("SELECT COUNT(*) FROM login_failures WHERE username = ? AND address = ? AND at > ?",
+                             (username, address, now - THROTTLE_WINDOW_S)).fetchone()[0]
+        if count < THROTTLE_FAILURES:
+            return False
+        conn.execute("INSERT OR REPLACE INTO login_lockouts (username, address, until) VALUES (?, ?, ?)",
+                     (username, address, now + LOCKOUT_S))
+        conn.execute("DELETE FROM login_failures WHERE username = ? AND address = ?", (username, address))
+    return True
+
+
+def clear_failures(username: str, address: str) -> None:
+    with _connect(write=True) as conn:
+        conn.execute("DELETE FROM login_failures WHERE username = ? AND address = ?", (username, address))
+```
+
+### api/auth/middleware.py
+
+```python
+"""Enforces the endpoint/role matrix on every API request (#25).
+
+A pure ASGI middleware rather than a FastAPI dependency: FastAPI reads and
+parses a request's body before it runs dependencies, so an unauthenticated
+512 MB upload would be received in full before being refused. This answers
+before the route runs, and never reads the body of a request it refuses.
+
+The refusals, in the order they apply:
+  503 SETUP_REQUIRED          no account exists yet (python -m auth bootstrap)
+  401 AUTH_REQUIRED           no valid session cookie
+  403 CROSS_ORIGIN_REFUSED    a cookie-authenticated POST/PUT/PATCH/DELETE from another origin
+  403 PASSWORD_CHANGE_REQUIRED the user must change a generated password first
+  403 FORBIDDEN               the user's role is too low
+
+A request with an `Authorization` header is a service key request (PR 3): the
+header alone decides and any cookie is ignored, with no fallback to it.
+  503 SETUP_REQUIRED          as above
+  401 KEY_INVALID             not one `Bearer <key>` header with a valid key (one answer for every reason)
+  403 KEY_NOT_ALLOWED         a route keys can't use (policy.HUMAN_ONLY)
+  403 FORBIDDEN               the principal's role is too low
+It has no origin check (it carries no cookie, Q26) and no password change.
+
+A route with no policy entry is never matched here, so it falls through to the
+app; test_auth.py fails when any route lacks an entry.
+"""
+from __future__ import annotations
+
+import asyncio
+from http.cookies import CookieError, SimpleCookie
+from types import SimpleNamespace
+from urllib.parse import urlsplit
+
+from starlette.requests import Request
+
+from utils import api_error
+
+from . import keys, policy, store
+
+UNSAFE = frozenset(("POST", "PUT", "PATCH", "DELETE"))
+# Starlette's route patterns end in `$`, which also matches before a trailing
+# newline, so it routes `/ingest/upload\n` (sent as %0A) to the upload handler
+# while a policy template wouldn't match it. No route has a control character
+# in its path, so such a path is refused outright, before anything else.
+_CONTROL = frozenset(chr(c) for c in range(32)) | {"\x7f"}
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _header(scope, name: bytes) -> str | None:
+    for key, value in scope.get("headers") or ():
+        if key == name:
+            return value.decode("latin-1")
+    return None
+
+
+def _headers(scope, name: bytes) -> list[str]:
+    return [value.decode("latin-1") for key, value in scope.get("headers") or () if key == name]
+
+
+def session_token(scope) -> str | None:
+    raw = _header(scope, b"cookie")
+    if not raw:
+        return None
+    cookies = SimpleCookie()
+    try:
+        cookies.load(raw)
+    except CookieError:
+        return None
+    morsel = cookies.get(store.COOKIE)
+    return morsel.value if morsel else None
+
+
+def same_origin(scope) -> bool:
+    """Origin names the Host the request was sent to; or, with no Origin, the
+    browser says the request is same-origin. Anything else is cross-origin.
+
+    The proxy forwards the browser's Host with its port ($http_host), so
+    localhost:8080 is compared with localhost:8080, not with localhost.
+    """
+    origin = _header(scope, b"origin")
+    if origin is None:
+        return _header(scope, b"sec-fetch-site") == "same-origin"
+    host = _header(scope, b"host")
+    if not host or origin == "null":
+        return False
+    try:
+        sent = urlsplit(origin)
+        if sent.scheme not in _DEFAULT_PORTS or not sent.hostname:
+            return False
+        target = urlsplit("//" + host)
+        default = _DEFAULT_PORTS[sent.scheme]
+        return (sent.hostname == (target.hostname or "")
+                and (sent.port or default) == (target.port or default))
+    except ValueError:
+        return False
+
+
+class AuthMiddleware:
+    """Matches the request against the policy's own route templates, so it
+    depends on no router internals; test_auth.py checks that the templates and
+    the app's routes are the same set and resolve to each other."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        if any(ch in _CONTROL for ch in scope["path"]):
+            # Answered here, so the body of such a request is never read.
+            return await api_error(404, "NOT_FOUND", "No API route matches this path.")(scope, receive, send)
+        template = policy.match(scope["method"], scope["path"])
+        if template is None:
+            # No route for this method and path: the app's own 404 or 405, which
+            # reveal nothing protected.
+            return await self.app(scope, receive, send)
+        access = policy.required(scope["method"], template)
+        if access == policy.PUBLIC:
+            return await self.app(scope, receive, send)
+        refusal, principal = await self._check(scope, access, template)
+        if refusal is not None:
+            # Request tracing labels a request by the route it reached (its
+            # `path`); give a refused request the same label the router would.
+            scope["route"] = SimpleNamespace(path=template)
+            return await refusal(scope, receive, send)
+        scope.setdefault("state", {})["auth"] = principal
+        return await self.app(scope, receive, send)
+
+    async def _check(self, scope, access, template):
+        if not await asyncio.to_thread(store.is_set_up):
+            return api_error(503, "SETUP_REQUIRED",
+                             "No account exists yet. An operator must create the first Engineer with "
+                             "`docker compose exec api python -m auth bootstrap <username>`."), None
+        authorization = _headers(scope, b"authorization")
+        if authorization:
+            return await self._check_key(access, template, authorization)
+        principal = await asyncio.to_thread(store.authenticate, session_token(scope))
+        if principal is None:
+            return api_error(401, "AUTH_REQUIRED", "Log in to use this."), None
+        if scope["method"] in UNSAFE and not same_origin(scope):
+            return api_error(403, "CROSS_ORIGIN_REFUSED",
+                             "This request came from another site and was refused."), None
+        if principal.must_change_password and access != policy.SESSION:
+            return api_error(403, "PASSWORD_CHANGE_REQUIRED",
+                             "Change your password before doing anything else."), None
+        if access != policy.SESSION and policy.rank(principal.role) < policy.rank(access):
+            return api_error(403, "FORBIDDEN", "Your role can't do this.",
+                             detail={"required_role": access}), None
+        return None, principal
+
+    async def _check_key(self, access, template, authorization):
+        key = keys.bearer(authorization[0]) if len(authorization) == 1 else None
+        principal = await asyncio.to_thread(store.authenticate_key, key) if key else None
+        if principal is None:
+            return api_error(401, "KEY_INVALID", "The API key is invalid, expired or revoked."), None
+        if template in policy.HUMAN_ONLY:
+            return api_error(403, "KEY_NOT_ALLOWED", "API keys can't be used for this."), None
+        if access != policy.SESSION and policy.rank(principal.role) < policy.rank(access):
+            return api_error(403, "FORBIDDEN", "Your role can't do this.",
+                             detail={"required_role": access}), None
+        return None, principal
+
+
+class Unlisted(Exception):
+    """A route reached with no policy entry, or with no session the policy needs."""
+
+
+def require_listed(request: Request) -> None:
+    """A global FastAPI dependency: the second, fail-closed half of the policy.
+
+    The middleware answers for every route in the policy. A route added without
+    an entry would reach its handler unchecked; this refuses it instead (403 for
+    everyone), and also refuses a protected route the middleware let through
+    without a session.
+    """
+    route = request.scope.get("route")
+    access = policy.required(request.method, getattr(route, "path", ""))
+    if access is None:
+        raise Unlisted()
+    if access != policy.PUBLIC and request.scope.get("state", {}).get("auth") is None:
+        raise Unlisted()
+```
+
+### api/auth/__main__.py
+
+```python
+"""The operator command for accounts (#25).
+
+    docker compose exec api python -m auth bootstrap USERNAME
+    docker compose exec api python -m auth create-user USERNAME ROLE
+    docker compose exec api python -m auth reset-password USERNAME
+    docker compose exec api python -m auth set-role USERNAME ROLE
+    docker compose exec api python -m auth disable USERNAME
+    docker compose exec api python -m auth enable USERNAME
+    docker compose exec api python -m auth list
+
+ROLE is end_user, developer or engineer. bootstrap, create-user and
+reset-password print a generated password, alone, on standard output; it is
+shown nowhere else, and the user must change it at their first login. Each
+action writes one line to standard error. Exit status: 0 done, 1 refused,
+2 usage error.
+
+The last enabled engineer can't be disabled or demoted. A lockout is recovered
+with create-user, enable or reset-password.
+
+Service principals (API keys, PR 3) are created and given keys by Engineers in
+the app; this command issues no key. `list` shows principals too, marked
+"service account"; set-role, disable and enable work on them (disabling one
+stops its keys, an escape hatch for a leaked key when no Engineer can log in);
+reset-password refuses one, since it has no password.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+
+from . import passwords, store
+from .policy import ROLES
+
+
+def _say(line: str) -> None:
+    print("auth: " + line, file=sys.stderr, flush=True)
+
+
+def _username(parser, value: str) -> str:
+    name = passwords.normalize_username(value)
+    if name is None:
+        parser.error(f"invalid username {value!r}: {passwords.USERNAME_RULE}")
+    return name
+
+
+def _role(parser, value: str) -> str:
+    if value not in ROLES:
+        parser.error(f"invalid role {value!r}: use one of {', '.join(ROLES)}")
+    return value
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m auth", description="Manage RAG platform accounts.")
+    commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    p = commands.add_parser("bootstrap", help="create the first engineer (only when no account exists)")
+    p.add_argument("username")
+    p = commands.add_parser("create-user", help="create an account with a generated password")
+    p.add_argument("username")
+    p.add_argument("role")
+    p = commands.add_parser("reset-password", help="set a generated password and end the user's sessions")
+    p.add_argument("username")
+    p = commands.add_parser("set-role", help="change a user's role")
+    p.add_argument("username")
+    p.add_argument("role")
+    p = commands.add_parser("disable", help="disable an account and end its sessions")
+    p.add_argument("username")
+    p = commands.add_parser("enable", help="enable a disabled account")
+    p.add_argument("username")
+    commands.add_parser("list", help="list the accounts")
+    args = parser.parse_args(argv)
+
+    username = _username(parser, args.username) if hasattr(args, "username") else None
+    role = _role(parser, args.role) if hasattr(args, "role") else None
+    try:
+        if args.command in ("bootstrap", "create-user"):
+            password = passwords.new_password(username)
+            role = "engineer" if args.command == "bootstrap" else role
+            store.create_user(username, role, password, bootstrap=args.command == "bootstrap")
+            print(password, flush=True)
+            _say(f"{args.command}: created {role} {username!r}; the password above must be changed at first login")
+        elif args.command == "reset-password":
+            password = passwords.new_password(username)
+            store.reset_password(username, password)
+            print(password, flush=True)
+            _say(f"reset-password: new password for {username!r}, to be changed at next login; "
+                 "their sessions ended")
+        elif args.command == "set-role":
+            store.set_role(username, role)
+            _say(f"set-role: {username!r} is now {role}")
+        elif args.command in ("disable", "enable"):
+            store.set_enabled(username, args.command == "enable")
+            _say(f"{args.command}: {username!r} {args.command}d"
+                 + ("; their sessions ended" if args.command == "disable" else ""))
+        else:
+            for user in store.list_users(kind=None):
+                created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(user.created_at))
+                password = ("service account" if user.kind == "service"
+                            else "password change due" if user.must_change_password else "-")
+                print(f"{user.username}\t{user.role}\t{'enabled' if user.enabled else 'disabled'}\t"
+                      f"{password}\t{created}")
+    except store.Refused as exc:
+        _say(f"{args.command} refused: {exc}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+### api/auth/testing.py
+
+```python
+"""A real account and session for in-process tests (#25).
+
+    from auth import testing
+    client = TestClient(app, headers=testing.headers("developer"))
+
+Points settings.auth_dir at a temporary folder for the rest of the process
+(removed at exit), creates an account of the role with no password change due,
+and returns the headers a same-origin browser would send (one account per
+role, a new session per call): the session cookie
+and an Origin matching base_url. Requests still go through the middleware and
+the store; nothing is bypassed. Never used by the API itself.
+"""
+from __future__ import annotations
+
+import atexit
+import shutil
+import tempfile
+
+from config import settings
+
+from . import passwords, store
+
+_folder: str | None = None
+_count = 0
+
+
+def use_temporary_store() -> str:
+    """Point the store at this process's temporary folder; returns it."""
+    global _folder
+    if _folder is None:
+        _folder = tempfile.mkdtemp(prefix="rag-auth-test-")
+        atexit.register(shutil.rmtree, _folder, True)
+    settings.auth_dir = _folder
+    return _folder
+
+
+def account(role: str = "engineer") -> tuple[store.User, str]:
+    """A new enabled account of `role` in the temporary store, and its password."""
+    global _count
+    use_temporary_store()
+    if not store.is_set_up():
+        store.create_user("test-bootstrap", "engineer", passwords.generate_password(), bootstrap=True,
+                          must_change_password=False)
+    _count += 1
+    username = f"test-{role.replace('_', '-')}-{_count}"
+    password = passwords.generate_password()
+    store.create_user(username, role, password, must_change_password=False)
+    return store.get_user(username), password
+
+
+_accounts: dict[str, store.User] = {}
+
+
+def headers(role: str = "engineer", base_url: str = "http://testserver") -> dict[str, str]:
+    """Cookie and Origin headers for a fresh session of this process's `role` account."""
+    user = _accounts.get(role)
+    if user is None or store.get_user(user.username) is None:
+        user, _ = account(role)
+        _accounts[role] = user
+    token = store.create_session(user.id)
+    return {"Cookie": f"{store.COOKIE}={token}", "Origin": base_url.rstrip("/")}
+```
+
+### api/routers/auth.py
+
+```python
+"""Login, logout, the current user, their own password change, account
+administration, and service principals and their API keys, for Engineers (#25).
+
+Which role every other route needs is in auth/policy.py, enforced by
+auth/middleware.py before a route runs; the /auth/users and
+/auth/service-principals routes need an Engineer's session (an API key can't
+use them). The first account is created by the operator command, `python -m
+auth`, which also recovers lockouts.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+
+from auth import passwords, store
+from config import settings
+from models.schemas import (AdminUserList, AdminUserResult, AuthStatus, AuthUser, KeyIssueRequest, LoginRequest,
+                            PasswordChangeRequest, PrincipalCreateRequest, RoleChangeRequest,
+                            ServicePrincipalList, ServicePrincipalResult, UserCreateRequest)
+from utils import api_error
+
+router = APIRouter(prefix="/auth")
+# The API configures no logging, so only WARNING and above reach the container
+# log; login lines must reach it (one per attempt, never a password).
+_log = logging.getLogger("auth")
+
+LOGIN_FAILED = "The username or password is incorrect."
+
+
+def _address(request: Request) -> str:
+    # nginx sets X-Real-IP to the connection's address, replacing anything the
+    # client sent; every request reaches the API through it.
+    return request.headers.get("x-real-ip") or (request.client.host if request.client else "unknown")
+
+
+def _user_body(username: str, role: str, must_change_password: bool) -> dict:
+    return {"username": username, "role": role, "must_change_password": must_change_password}
+
+
+def _cookie(response: JSONResponse, token: str) -> None:
+    response.set_cookie(store.COOKIE, token, max_age=store.ABSOLUTE_S, path="/", httponly=True,
+                        samesite="strict", secure=settings.auth_cookie_secure)
+
+
+@router.get("/status", response_model=AuthStatus)
+async def auth_status():
+    return {"setup_required": not await asyncio.to_thread(store.is_set_up)}
+
+
+def _login(typed: str, password: str, address: str):
+    """('throttled' | 'failed' | 'ok', user, token). Blocking: scrypt and SQLite."""
+    key = typed.lower()
+    # The attempt is counted before the password is checked, in the same
+    # transaction as the lockout check, so parallel requests can't all slip in.
+    if not store.reserve_attempt(key, address):
+        return "throttled", None, None
+    username = passwords.normalize_username(typed)
+    user = store.get_user(username) if username else None
+    # Verified against a dummy hash when there is no such user, or the name is a
+    # service principal's (it can't log in, Q21), so a failure takes as long
+    # either way and the timing doesn't reveal which accounts exist.
+    person = user if user and user.kind == "user" else None
+    matched = passwords.verify_password(password, person.password_hash if person else passwords.dummy_hash())
+    ok = bool(matched and person and person.enabled)
+    store.finish_attempt(key, address, ok)
+    if not ok:
+        return "failed", None, None
+    return "ok", user, store.create_session(user.id)
+
+
+@router.post("/login", response_model=AuthUser)
+async def login(body: LoginRequest, request: Request):
+    if not await asyncio.to_thread(store.is_set_up):
+        return api_error(503, "SETUP_REQUIRED",
+                         "No account exists yet. An operator must create the first Engineer with "
+                         "`docker compose exec api python -m auth bootstrap <username>`.")
+    address = _address(request)
+    outcome, user, token = await asyncio.to_thread(_login, body.username, body.password, address)
+    if outcome == "throttled":
+        _log.warning("Login refused for %r from %s: too many failed attempts", body.username, address)
+        return api_error(429, "LOGIN_THROTTLED", "Too many failed logins. Wait 15 minutes and try again.")
+    if outcome == "failed":
+        _log.warning("Login failed for %r from %s", body.username, address)
+        return api_error(401, "LOGIN_FAILED", LOGIN_FAILED)
+    _log.warning("Login succeeded for %r (%s) from %s", user.username, user.role, address)
+    response = JSONResponse(_user_body(user.username, user.role, user.must_change_password))
+    _cookie(response, token)
+    return response
+
+
+@router.post("/logout")
+async def logout(request: Request):
+    principal = request.state.auth
+    await asyncio.to_thread(store.delete_session, principal.token_hash)
+    _log.warning("Logout of %r", principal.username)
+    response = JSONResponse({"status": "logged_out"})
+    response.delete_cookie(store.COOKIE, path="/", httponly=True, samesite="strict",
+                           secure=settings.auth_cookie_secure)
+    return response
+
+
+@router.get("/me", response_model=AuthUser)
+async def me(request: Request):
+    # A session's user (kind "user") or an API key's service principal ("service").
+    principal = request.state.auth
+    return {**_user_body(principal.username, principal.role, principal.must_change_password),
+            "kind": principal.kind}
+
+
+def _change(principal, current: str, new: str, address: str):
+    # A wrong current password counts against the same throttle as a failed
+    # login, so a session left open can't be used to guess the password.
+    if not store.reserve_attempt(principal.username, address):
+        return "throttled"
+    user = store.get_user(principal.username)
+    right = user is not None and passwords.verify_password(current, user.password_hash)
+    store.finish_attempt(principal.username, address, right)
+    if not right:
+        return "incorrect"
+    problem = passwords.password_problem(new, principal.username)
+    if problem:
+        return problem
+    # A generated password must really be replaced (N2), and so must any other.
+    if new == current:
+        return "The new password must differ from the current one."
+    store.change_password(principal, new)
+    return None
+
+
+@router.post("/password")
+async def change_password(body: PasswordChangeRequest, request: Request):
+    principal = request.state.auth
+    address = _address(request)
+    problem = await asyncio.to_thread(_change, principal, body.current_password, body.new_password, address)
+    if problem == "throttled":
+        _log.warning("Password change refused for %r from %s: too many failed attempts", principal.username, address)
+        return api_error(429, "LOGIN_THROTTLED", "Too many failed attempts. Wait 15 minutes and try again.")
+    if problem == "incorrect":
+        _log.warning("Password change failed for %r from %s: wrong current password", principal.username, address)
+        return api_error(403, "PASSWORD_INCORRECT", "The current password is incorrect.")
+    if problem:
+        return api_error(422, "INVALID_PASSWORD", problem)
+    _log.warning("Password changed by %r; their other sessions ended", principal.username)
+    return {"status": "changed", **_user_body(principal.username, principal.role, False)}
+
+
+# ── account administration (Engineers only, in auth/policy.py) ───────────────
+# Each change and each refusal is one WARNING line naming the Engineer, the
+# action and the account (Q30); a generated password is in its answer only.
+
+_REFUSED_STATUS = {"USER_NOT_FOUND": 404, "USER_EXISTS": 409, "LAST_ENGINEER": 409}
+_NO_STORE = {"Cache-Control": "no-store"}
+
+
+def _admin_user(user: store.User) -> dict:
+    return {"username": user.username, "role": user.role, "enabled": user.enabled,
+            "must_change_password": user.must_change_password,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(user.created_at))}
+
+
+def _target(username: str) -> str | None:
+    """The stored form of a username in a path, or None when no account can have it."""
+    return passwords.normalize_username(username)
+
+
+def _refusal(actor: str, action: str, target: str, code: str, message: str):
+    _log.warning("Admin %r: %s of %r refused: %s", actor, action, target, message)
+    return api_error(_REFUSED_STATUS.get(code, 409), code, message)
+
+
+def _not_found(actor: str, action: str, typed: str):
+    return _refusal(actor, action, typed, "USER_NOT_FOUND", f"There is no user {typed!r}.")
+
+
+def _refused(actor: str, action: str, target: str, exc: store.Refused):
+    message = str(exc)
+    return _refusal(actor, action, target, exc.code, message[:1].upper() + message[1:] + ".")
+
+
+@router.get("/users", response_model=AdminUserList)
+async def list_users():
+    users = await asyncio.to_thread(store.list_users)
+    return {"users": [_admin_user(user) for user in users]}
+
+
+def _create(username: str, role: str):
+    password = passwords.new_password(username)
+    store.create_user(username, role, password)
+    return store.get_user(username), password
+
+
+@router.post("/users", status_code=201, response_model=AdminUserResult)
+async def create_user(body: UserCreateRequest, request: Request):
+    actor = request.state.auth.username
+    username = passwords.normalize_username(body.username)
+    if username is None:
+        _log.warning("Admin %r: create of %r refused: invalid username", actor, body.username)
+        return api_error(422, "INVALID_USERNAME", f"The username must be {passwords.USERNAME_RULE}.")
+    try:
+        user, password = await asyncio.to_thread(_create, username, body.role)
+    except store.Refused as exc:
+        return _refused(actor, "create", username, exc)
+    _log.warning("Admin %r created %s %r; a generated password is due for change", actor, user.role, user.username)
+    return JSONResponse({"user": _admin_user(user), "password": password}, status_code=201, headers=_NO_STORE)
+
+
+def _reset(username: str):
+    password = passwords.new_password(username)
+    store.reset_password(username, password, "user")
+    return store.get_user(username), password
+
+
+@router.post("/users/{username}/reset-password", response_model=AdminUserResult)
+async def reset_user_password(username: str, request: Request):
+    actor = request.state.auth.username
+    target = _target(username)
+    if target is None:
+        return _not_found(actor, "reset-password", username)
+    if target == actor:
+        # R3: an Engineer's own password is changed with the current one (Q19);
+        # the operator command can still reset it, for recovery.
+        _log.warning("Admin %r: reset-password of their own account refused", actor)
+        return api_error(409, "SELF_RESET_REFUSED",
+                         "You can't reset your own password here. Use Change password, which needs your "
+                         "current password.")
+    try:
+        user, password = await asyncio.to_thread(_reset, target)
+    except store.Refused as exc:
+        return _refused(actor, "reset-password", target, exc)
+    _log.warning("Admin %r reset the password of %r; their sessions ended", actor, target)
+    return JSONResponse({"user": _admin_user(user), "password": password}, headers=_NO_STORE)
+
+
+def _apply(action, target: str, *args):
+    action(target, *args)
+    return store.get_user(target)
+
+
+@router.post("/users/{username}/role", response_model=AdminUserResult, response_model_exclude_none=True)
+async def set_user_role(username: str, body: RoleChangeRequest, request: Request):
+    actor = request.state.auth.username
+    target = _target(username)
+    if target is None:
+        return _not_found(actor, "set-role", username)
+    try:
+        user = await asyncio.to_thread(_apply, store.set_role, target, body.role, "user")
+    except store.Refused as exc:
+        return _refused(actor, "set-role", target, exc)
+    _log.warning("Admin %r set the role of %r to %s", actor, target, body.role)
+    return {"user": _admin_user(user)}
+
+
+async def _set_enabled(username: str, request: Request, enabled: bool):
+    actor = request.state.auth.username
+    action = "enable" if enabled else "disable"
+    target = _target(username)
+    if target is None:
+        return _not_found(actor, action, username)
+    try:
+        user = await asyncio.to_thread(_apply, store.set_enabled, target, enabled, "user")
+    except store.Refused as exc:
+        return _refused(actor, action, target, exc)
+    _log.warning("Admin %r %sd %r%s", actor, action, target, "" if enabled else "; their sessions ended")
+    return {"user": _admin_user(user)}
+
+
+@router.post("/users/{username}/disable", response_model=AdminUserResult, response_model_exclude_none=True)
+async def disable_user(username: str, request: Request):
+    return await _set_enabled(username, request, False)
+
+
+@router.post("/users/{username}/enable", response_model=AdminUserResult, response_model_exclude_none=True)
+async def enable_user(username: str, request: Request):
+    return await _set_enabled(username, request, True)
+
+
+# ── service principals and their API keys (Engineers only; PR 3) ─────────────
+# A principal is an account that can't log in and authenticates only with its
+# keys (auth/keys.py). Each change and each refusal is one WARNING line naming
+# the Engineer, the principal and the key id; a key is in its 201 answer only.
+
+_PRINCIPAL_STATUS = {"PRINCIPAL_NOT_FOUND": 404, "PRINCIPAL_EXISTS": 409, "KEY_NOT_FOUND": 404}
+
+
+def _iso(at: float | None) -> str | None:
+    return None if at is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+
+
+def _key_body(key: store.Key, now: float) -> dict:
+    return {"id": key.id, "label": key.label, "created_at": _iso(key.created_at), "expires_at": _iso(key.expires_at),
+            "revoked_at": _iso(key.revoked_at), "last_used_at": _iso(key.last_used), "status": key.status(now)}
+
+
+def _principal_body(principal: store.ServicePrincipal) -> dict:
+    now = time.time()
+    return {"name": principal.name, "role": principal.role, "enabled": principal.enabled,
+            "created_at": _iso(principal.created_at), "keys": [_key_body(k, now) for k in principal.keys]}
+
+
+def _principal_refusal(actor: str, action: str, target: str, code: str, message: str):
+    _log.warning("Admin %r: %s of service principal %r refused: %s", actor, action, target, message)
+    return api_error(_PRINCIPAL_STATUS.get(code, 409), code, message)
+
+
+def _principal_refused(actor: str, action: str, target: str, exc: store.Refused):
+    message = str(exc)
+    return _principal_refusal(actor, action, target, exc.code, message[:1].upper() + message[1:] + ".")
+
+
+def _principal_not_found(actor: str, action: str, typed: str):
+    return _principal_refusal(actor, action, typed, "PRINCIPAL_NOT_FOUND", f"There is no service principal {typed!r}.")
+
+
+@router.get("/service-principals", response_model=ServicePrincipalList)
+async def list_principals():
+    principals = await asyncio.to_thread(store.list_principals)
+    return {"principals": [_principal_body(p) for p in principals]}
+
+
+@router.post("/service-principals", status_code=201, response_model=ServicePrincipalResult)
+async def create_principal(body: PrincipalCreateRequest, request: Request):
+    actor = request.state.auth.username
+    name = passwords.normalize_username(body.name)
+    if name is None:
+        _log.warning("Admin %r: create of service principal %r refused: invalid name", actor, body.name)
+        return api_error(422, "INVALID_USERNAME", f"The name must be {passwords.USERNAME_RULE}.")
+    try:
+        principal = await asyncio.to_thread(store.create_principal, name, body.role)
+    except store.Refused as exc:
+        return _principal_refused(actor, "create", name, exc)
+    _log.warning("Admin %r created service principal %r (%s)", actor, name, body.role)
+    return JSONResponse({"principal": _principal_body(principal)}, status_code=201)
+
+
+def _change_principal(action, name: str, *args):
+    action(name, *args, "service")
+    return store.get_principal(name)
+
+
+@router.post("/service-principals/{name}/role", response_model=ServicePrincipalResult)
+async def set_principal_role(name: str, body: RoleChangeRequest, request: Request):
+    actor = request.state.auth.username
+    target = _target(name)
+    if target is None:
+        return _principal_not_found(actor, "set-role", name)
+    try:
+        principal = await asyncio.to_thread(_change_principal, store.set_role, target, body.role)
+    except store.Refused as exc:
+        return _principal_refused(actor, "set-role", target, exc)
+    _log.warning("Admin %r set the role of service principal %r to %s", actor, target, body.role)
+    return JSONResponse({"principal": _principal_body(principal)})
+
+
+async def _set_principal_enabled(name: str, request: Request, enabled: bool):
+    actor = request.state.auth.username
+    action = "enable" if enabled else "disable"
+    target = _target(name)
+    if target is None:
+        return _principal_not_found(actor, action, name)
+    try:
+        principal = await asyncio.to_thread(_change_principal, store.set_enabled, target, enabled)
+    except store.Refused as exc:
+        return _principal_refused(actor, action, target, exc)
+    _log.warning("Admin %r %sd service principal %r%s", actor, action, target,
+                 "" if enabled else "; its keys stop working")
+    return JSONResponse({"principal": _principal_body(principal)})
+
+
+@router.post("/service-principals/{name}/disable", response_model=ServicePrincipalResult)
+async def disable_principal(name: str, request: Request):
+    return await _set_principal_enabled(name, request, False)
+
+
+@router.post("/service-principals/{name}/enable", response_model=ServicePrincipalResult)
+async def enable_principal(name: str, request: Request):
+    return await _set_principal_enabled(name, request, True)
+
+
+def _issue(name: str, days: int, label: str):
+    key, secret = store.issue_key(name, days, label)
+    return store.get_principal(name), key, secret
+
+
+@router.post("/service-principals/{name}/keys", status_code=201, response_model=ServicePrincipalResult)
+async def issue_key(name: str, body: KeyIssueRequest, request: Request):
+    actor = request.state.auth.username
+    target = _target(name)
+    if target is None:
+        return _principal_not_found(actor, "issue-key", name)
+    try:
+        principal, key, secret = await asyncio.to_thread(_issue, target, body.days, body.label)
+    except store.Refused as exc:
+        return _principal_refused(actor, "issue-key", target, exc)
+    _log.warning("Admin %r issued key %s for service principal %r, expiring %s", actor, key.id, target,
+                 _iso(key.expires_at))
+    return JSONResponse({"principal": _principal_body(principal), "key": _key_body(key, time.time()),
+                         "secret": secret}, status_code=201, headers=_NO_STORE)
+
+
+def _revoke(name: str, key_id: str):
+    store.revoke_key(name, key_id)
+    return store.get_principal(name)
+
+
+@router.post("/service-principals/{name}/keys/{key_id}/revoke", response_model=ServicePrincipalResult)
+async def revoke_key(name: str, key_id: str, request: Request):
+    actor = request.state.auth.username
+    target = _target(name)
+    if target is None:
+        return _principal_not_found(actor, "revoke-key", name)
+    try:
+        principal = await asyncio.to_thread(_revoke, target, key_id)
+    except store.Refused as exc:
+        return _principal_refused(actor, "revoke-key", target, exc)
+    _log.warning("Admin %r revoked key %s of service principal %r", actor, key_id, target)
+    return JSONResponse({"principal": _principal_body(principal)})
+```
+
 ### api/main.py
 
 ```python
 from __future__ import annotations
+# LAN mode (#26) refuses to start without a Secure cookie and an enabled
+# Engineer. First, so uvicorn's import of this module stops before any other
+# import, any startup work and any request.
+import lan_mode
+lan_mode.enforce()
+
 import logging
 from contextlib import asynccontextmanager
 
@@ -11123,7 +14052,6 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from utils import api_error
-from fastapi.middleware.cors import CORSMiddleware
 
 
 @asynccontextmanager
@@ -11201,7 +14129,17 @@ async def lifespan(app: FastAPI):
             await asyncio.to_thread(runtime.shutdown)
 
 
-app = FastAPI(title="RAG API", lifespan=lifespan)
+from fastapi import Depends
+from auth.middleware import AuthMiddleware, Unlisted, require_listed
+
+# require_listed refuses any route that has no entry in auth/policy.py, so a new
+# route is closed until it is given one (#25).
+app = FastAPI(title="RAG API", lifespan=lifespan, dependencies=[Depends(require_listed)])
+
+
+@app.exception_handler(Unlisted)
+async def unlisted_route(request, exc):
+    return api_error(403, "FORBIDDEN", "This route is not open to any role.")
 
 
 @app.exception_handler(RequestValidationError)
@@ -11243,17 +14181,17 @@ async def unhandled_error(request, exc):
     return api_error(500, "INTERNAL_ERROR",
                      "The API hit an unexpected error. The cause is in the API log.")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Every route needs the role auth/policy.py gives it (#25). Added first, so it
+# runs inside request tracing and a refused request is still traced. No CORS
+# middleware: the UI is served from the same origin through nginx, so no other
+# origin needs to read the API's answers.
+app.add_middleware(AuthMiddleware)
 app.add_middleware(RequestTracing)
 
-from routers import help as help_router, health, collections, ingest, query, goldstandard, metrics, retrieval_config, transfer, tuning
+from routers import auth as auth_router, help as help_router, health, collections, ingest, query, goldstandard, metrics, retrieval_config, transfer, tuning
 
 app.include_router(health.router)
+app.include_router(auth_router.router)
 app.include_router(help_router.router)
 app.include_router(collections.router)
 app.include_router(ingest.router)
@@ -11442,18 +14380,18 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 
 ```typescript
 import { BrowserRouter } from 'react-router-dom'
-import { RoleProvider } from './context/RoleContext'
+import { AuthProvider } from './context/AuthContext'
 import { QueryConfigProvider } from './context/QueryConfigContext'
 import AppRouter from './router'
 
 export default function App() {
   return (
     <BrowserRouter>
-      <RoleProvider>
+      <AuthProvider>
         <QueryConfigProvider>
           <AppRouter />
         </QueryConfigProvider>
-      </RoleProvider>
+      </AuthProvider>
     </BrowserRouter>
   )
 }
@@ -11463,9 +14401,11 @@ export default function App() {
 
 ```typescript
 import { Routes, Route, Navigate } from 'react-router-dom'
-import { useRole } from './context/RoleContext'
+import { useAuth } from './context/AuthContext'
 import NavBar from './components/NavBar'
-import LandingPage from './pages/LandingPage'
+import LoginPage from './pages/LoginPage'
+import SetupRequiredPage from './pages/SetupRequiredPage'
+import ChangePasswordPage from './pages/ChangePasswordPage'
 import QAPage from './pages/QAPage'
 import ImportPage from './pages/ImportPage'
 import ChunkingPage from './pages/ChunkingPage'
@@ -11473,20 +14413,41 @@ import RetrievalPage from './pages/RetrievalPage'
 import GoldStandardPage from './pages/GoldStandardPage'
 import CollectionsPage from './pages/CollectionsPage'
 import HealthPage from './pages/HealthPage'
+import UsersPage from './pages/UsersPage'
+import ServiceKeysPage from './pages/ServiceKeysPage'
 import TransferPage from './pages/TransferPage'
 import HelpTransferPage from './pages/HelpTransferPage'
 
+// What the API says decides what is shown (#25): set up, logged in, a password
+// change due, and the role. Hiding a page is a convenience; the API refuses
+// what the role can't do whatever the UI shows.
 export default function AppRouter() {
-  const { role } = useRole()
+  const { state } = useAuth()
 
-  if (!role) {
+  if (state.phase === 'loading') {
+    return <p className="p-8 text-sm text-gray-500">Loading…</p>
+  }
+  if (state.phase === 'error') {
+    return <p role="alert" className="p-8 text-sm text-red-600">{state.message}</p>
+  }
+  if (state.phase === 'setup_required') return <SetupRequiredPage />
+  if (state.phase === 'logged_out') {
     return (
       <Routes>
-        <Route path="/" element={<LandingPage />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
+        <Route path="/login" element={<LoginPage />} />
+        <Route path="*" element={<Navigate to="/login" replace />} />
       </Routes>
     )
   }
+  if (state.user.must_change_password) {
+    return (
+      <Routes>
+        <Route path="/account/password" element={<ChangePasswordPage forced />} />
+        <Route path="*" element={<Navigate to="/account/password" replace />} />
+      </Routes>
+    )
+  }
+  const role = state.user.role
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -11494,7 +14455,9 @@ export default function AppRouter() {
       <main className="max-w-6xl mx-auto px-4 py-6">
         <Routes>
           <Route path="/" element={<Navigate to="/qa" replace />} />
+          <Route path="/login" element={<Navigate to="/qa" replace />} />
           <Route path="/qa" element={<QAPage />} />
+          <Route path="/account/password" element={<ChangePasswordPage />} />
           {role !== 'end_user' && (
             <>
               <Route path="/import" element={<ImportPage />} />
@@ -11509,6 +14472,8 @@ export default function AppRouter() {
             <>
               <Route path="/collections" element={<CollectionsPage />} />
               <Route path="/health" element={<HealthPage />} />
+              <Route path="/users" element={<UsersPage />} />
+              <Route path="/service-keys" element={<ServiceKeysPage />} />
             </>
           )}
           <Route path="*" element={<Navigate to="/qa" replace />} />
@@ -11519,56 +14484,96 @@ export default function AppRouter() {
 }
 ```
 
-### ui/src/context/RoleContext.tsx
+### ui/src/context/AuthContext.tsx
 
 ```typescript
-import { createContext, useContext, useReducer, ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useState, ReactNode } from 'react'
+import { api, ApiError, AuthUser, Role, onAuthProblem } from '../api/client'
 
-type Role = 'engineer' | 'developer' | 'end_user' | null
+// Who is logged in, as the API says (#25). The role comes only from
+// GET /api/auth/me; the browser stores nothing about it.
+type AuthState =
+  | { phase: 'loading' }
+  | { phase: 'error'; message: string }
+  | { phase: 'setup_required' }
+  | { phase: 'logged_out' }
+  | { phase: 'logged_in'; user: AuthUser }
 
-interface RoleState { role: Role }
-type RoleAction = { type: 'SET_ROLE'; role: Role }
-
-const RoleContext = createContext<{ role: Role; setRole: (r: Role) => void } | null>(null)
-
-function reducer(_state: RoleState, action: RoleAction): RoleState {
-  return { role: action.role }
+interface AuthValue {
+  state: AuthState
+  user: AuthUser | null
+  login: (username: string, password: string) => Promise<void>
+  logout: () => Promise<void>
+  changePassword: (current: string, next: string) => Promise<void>
+  refresh: () => Promise<void>
 }
 
-function loadRole(): Role {
-  try {
-    const stored = sessionStorage.getItem('rag_role')
-    if (!stored) return null
-    const parsed = JSON.parse(stored)
-    return parsed.role ?? null
-  } catch {
-    return null
-  }
-}
+const AuthContext = createContext<AuthValue | null>(null)
 
-export function RoleProvider({ children }: { children: ReactNode }) {
-  const [state, dispatch] = useReducer(reducer, { role: loadRole() })
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [state, setState] = useState<AuthState>({ phase: 'loading' })
 
-  function setRole(role: Role) {
-    if (role) {
-      sessionStorage.setItem('rag_role', JSON.stringify({ role }))
-    } else {
-      sessionStorage.removeItem('rag_role')
+  const refresh = useCallback(async () => {
+    try {
+      const status = await api.authStatus()
+      if (status.setup_required) { setState({ phase: 'setup_required' }); return }
+    } catch (e) {
+      setState({ phase: 'error', message: e instanceof Error ? e.message : String(e) })
+      return
     }
-    dispatch({ type: 'SET_ROLE', role })
-  }
+    try {
+      setState({ phase: 'logged_in', user: await api.me() })
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) setState({ phase: 'logged_out' })
+      else if (e instanceof ApiError && e.code === 'SETUP_REQUIRED') setState({ phase: 'setup_required' })
+      else setState({ phase: 'error', message: e instanceof Error ? e.message : String(e) })
+    }
+  }, [])
 
+  useEffect(() => { refresh() }, [refresh])
+
+  // Any call that finds the session gone returns to the login page; one that
+  // finds a password change due returns to the password page.
+  useEffect(() => {
+    onAuthProblem(code => {
+      if (code === 'AUTH_REQUIRED') setState({ phase: 'logged_out' })
+      else setState(s => s.phase === 'logged_in' ? { phase: 'logged_in', user: { ...s.user, must_change_password: true } } : s)
+    })
+    return () => onAuthProblem(null)
+  }, [])
+
+  const login = useCallback(async (username: string, password: string) => {
+    const user = await api.login(username, password)
+    setState({ phase: 'logged_in', user })
+  }, [])
+
+  const logout = useCallback(async () => {
+    try { await api.logout() } finally { setState({ phase: 'logged_out' }) }
+  }, [])
+
+  const changePassword = useCallback(async (current: string, next: string) => {
+    const result = await api.changePassword(current, next)
+    setState({ phase: 'logged_in', user: { username: result.username, role: result.role, must_change_password: false } })
+  }, [])
+
+  const user = state.phase === 'logged_in' ? state.user : null
   return (
-    <RoleContext.Provider value={{ role: state.role, setRole }}>
+    <AuthContext.Provider value={{ state, user, login, logout, changePassword, refresh }}>
       {children}
-    </RoleContext.Provider>
+    </AuthContext.Provider>
   )
 }
 
-export function useRole() {
-  const ctx = useContext(RoleContext)
-  if (!ctx) throw new Error('useRole must be used within RoleProvider')
+export function useAuth() {
+  const ctx = useContext(AuthContext)
+  if (!ctx) throw new Error('useAuth must be used within AuthProvider')
   return ctx
+}
+
+// The logged-in user's role, for pages that adapt to it. Pages render only
+// after login, so a page never sees null in practice.
+export function useRole(): { role: Role | null } {
+  return { role: useAuth().user?.role ?? null }
 }
 ```
 
@@ -11742,7 +14747,7 @@ export function useQueryConfig() {
 ```typescript
 const BASE = '/api'
 
-// The proxy's request-body limit: `client_max_body_size` in proxy/nginx.conf.
+// The proxy's request-body limit: `client_max_body_size` in proxy/locations.conf.
 // It covers a whole request, so a multi-file upload counts every file. Kept
 // here only so the Import page can warn before sending; nginx enforces it.
 // Change both together.
@@ -11757,6 +14762,24 @@ const PROXY_ERRORS: Record<number, string> = {
   504: 'The API took too long to respond.',
 }
 
+// An API error, with the API's error code when the answer carried one.
+export class ApiError extends Error {
+  status: number
+  code: string | null
+  constructor(message: string, status: number, code: string | null) {
+    super(message)
+    this.status = status
+    this.code = code
+  }
+}
+
+// The session ended (401 AUTH_REQUIRED) or a generated password must be changed
+// first (403 PASSWORD_CHANGE_REQUIRED), whichever call noticed it (#25). The
+// auth context listens and shows the login or password page.
+type AuthListener = (code: 'AUTH_REQUIRED' | 'PASSWORD_CHANGE_REQUIRED') => void
+let authListener: AuthListener | null = null
+export function onAuthProblem(listener: AuthListener | null) { authListener = listener }
+
 async function request<T>(method: string, path: string, body?: unknown, isFormData = false): Promise<T> {
   const headers: Record<string, string> = isFormData ? {} : { 'Content-Type': 'application/json' }
   const res = await fetch(`${BASE}${path}`, {
@@ -11770,7 +14793,9 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
   let data: any = null
   try { data = text ? JSON.parse(text) : null } catch { /* not JSON; handled below */ }
   if (!res.ok) {
-    throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
+    const code: string | null = typeof data?.error?.code === 'string' ? data.error.code : null
+    if (code === 'AUTH_REQUIRED' || code === 'PASSWORD_CHANGE_REQUIRED') authListener?.(code)
+    throw new ApiError(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`, res.status, code)
   }
   if (data === null && text) throw new Error('The server sent a response the UI could not read.')
   return data as T
@@ -11807,6 +14832,40 @@ async function getHealthResult(): Promise<HealthResult> {
 }
 
 export const api = {
+  // Accounts and sessions (#25). The session is an HttpOnly cookie the browser
+  // sends with every same-origin request; the UI never sees or stores it.
+  authStatus: () => request<{ setup_required: boolean }>('GET', '/auth/status'),
+  me: () => request<AuthUser>('GET', '/auth/me'),
+  login: (username: string, password: string) => request<AuthUser>('POST', '/auth/login', { username, password }),
+  logout: () => request<{ status: string }>('POST', '/auth/logout'),
+  changePassword: (current_password: string, new_password: string) =>
+    request<{ status: string } & AuthUser>('POST', '/auth/password', { current_password, new_password }),
+  // Account administration, Engineers only (#25). A generated password is in
+  // the answer to a create or a reset, once; the page shows it and keeps it nowhere.
+  listUsers: () => request<{ users: AdminUser[] }>('GET', '/auth/users'),
+  createUser: (username: string, role: Role) =>
+    request<{ user: AdminUser; password: string }>('POST', '/auth/users', { username, role }),
+  resetUserPassword: (username: string) =>
+    request<{ user: AdminUser; password: string }>('POST', `/auth/users/${encodeURIComponent(username)}/reset-password`),
+  setUserRole: (username: string, role: Role) =>
+    request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/role`, { role }),
+  disableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/disable`),
+  enableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/enable`),
+  // Service principals and their API keys (Engineers only, #25 PR 3).
+  listPrincipals: () => request<{ principals: ServicePrincipal[] }>('GET', '/auth/service-principals'),
+  createPrincipal: (name: string, role: Role) =>
+    request<{ principal: ServicePrincipal }>('POST', '/auth/service-principals', { name, role }),
+  setPrincipalRole: (name: string, role: Role) =>
+    request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/role`, { role }),
+  disablePrincipal: (name: string) =>
+    request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/disable`),
+  enablePrincipal: (name: string) =>
+    request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/enable`),
+  issueKey: (name: string, label: string, days: number) =>
+    request<{ principal: ServicePrincipal; key: ServiceKey; secret: string }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/keys`, { label, days }),
+  revokeKey: (name: string, keyId: string) =>
+    request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/keys/${encodeURIComponent(keyId)}/revoke`),
+
   getCollections: () => request<{ collections: CollectionInfo[] }>('GET', '/collections'),
   // Answers with the name as stored, first letter capitalised (#372).
   createCollection: (body: CreateCollectionBody) => request<{ name: string; status: string }>('POST', '/collections', body),
@@ -11846,6 +14905,14 @@ export const api = {
 }
 
 // Types
+export type Role = 'engineer' | 'developer' | 'end_user'
+export interface AuthUser { username: string; role: Role; must_change_password: boolean; kind?: 'user' | 'service' }
+export interface AdminUser { username: string; role: Role; enabled: boolean; must_change_password: boolean; created_at: string }
+export interface ServiceKey {
+  id: string; label: string; created_at: string; expires_at: string
+  revoked_at: string | null; last_used_at: string | null; status: 'active' | 'expired' | 'revoked'
+}
+export interface ServicePrincipal { name: string; role: Role; enabled: boolean; created_at: string; keys: ServiceKey[] }
 export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
   hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null
@@ -11919,15 +14986,18 @@ export interface MetricsResult {
   total_latency: LatencyStats
   history: LatencyRecord[]
 }
-export interface ExportBody { collection: string; include_models: boolean }
+// passphrase: only for an encrypted export (#27), 12 to 1024 characters.
+export interface ExportBody { collection: string; include_models: boolean; passphrase?: string }
 export interface ExportStart { job_id: string; status: string; collection: string }
 export interface ExportJob {
   job_id: string; status: string; collection: string; chunks_written: number
   filename: string | null; size_bytes: number | null; source_document_count: number | null
   fidelity: string | null; models_bundled: boolean | null; retrieve_script: boolean | null
   warnings: string[]; error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
+  encrypted?: boolean
 }
-export interface ImportBody { filename: string; on_conflict: string }
+// passphrase: required for a .tar.gz.age package and refused for any other (#27).
+export interface ImportBody { filename: string; on_conflict: string; passphrase?: string }
 export interface ImportStart { job_id: string; status: string; filename: string }
 export interface ImportJob {
   job_id: string; status: string; filename: string; on_conflict: string
@@ -11935,10 +15005,12 @@ export interface ImportJob {
   fidelity: string | null; renamed: boolean; notes: string[]
   restored_sessions?: { source_session_id: string; session_id: string; collection: string }[]
   error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
+  encrypted?: boolean
 }
 export interface PackageSummary {
   filename: string; size_bytes: number; collection: string | null
   chunk_count: number | null; fidelity: string | null; created_at: string | null; readable: boolean
+  encrypted?: boolean
 }
 export interface TuneOptions {
   collection: string; fidelity: string; source_document_count: number
@@ -11971,15 +15043,16 @@ export interface HealthResult {
 
 ```typescript
 import { Link, useNavigate } from 'react-router-dom'
-import { useRole } from '../context/RoleContext'
+import { useAuth } from '../context/AuthContext'
 
 export default function NavBar() {
-  const { role, setRole } = useRole()
+  const { user, logout } = useAuth()
   const navigate = useNavigate()
+  const role = user?.role ?? null
 
-  function switchRole() {
-    setRole(null)
-    navigate('/')
+  async function logOut() {
+    await logout()
+    navigate('/login', { replace: true })
   }
 
   const roleLabel = role === 'engineer' ? 'AI Engineer' : role === 'developer' ? 'Developer' : 'End User'
@@ -12001,32 +15074,19 @@ export default function NavBar() {
         <>
           <Link to="/collections" className="text-sm text-gray-700 hover:text-blue-600">Collections</Link>
           <Link to="/health" className="text-sm text-gray-700 hover:text-blue-600">Health</Link>
+          <Link to="/users" className="text-sm text-gray-700 hover:text-blue-600">Users</Link>
+          <Link to="/service-keys" className="text-sm text-gray-700 hover:text-blue-600">Service keys</Link>
         </>
       )}
       <div className="ml-auto flex items-center gap-3">
+        <span className="text-sm text-gray-700" data-testid="nav-username">{user?.username}</span>
         <span className="text-xs bg-blue-100 text-blue-800 px-2 py-1 rounded">{roleLabel}</span>
-        <button onClick={switchRole} className="text-sm text-gray-500 hover:text-blue-600">Switch Role</button>
+        {/* A button, not a link: the nav's links are the role's pages. */}
+        <button onClick={() => navigate('/account/password')} className="text-sm text-gray-500 hover:text-blue-600">Change password</button>
+        <button onClick={logOut} className="text-sm text-gray-500 hover:text-blue-600">Log out</button>
       </div>
     </nav>
   )
-}
-```
-
-### ui/src/components/RoleGate.tsx
-
-```typescript
-import { ReactNode } from 'react'
-import { useRole } from '../context/RoleContext'
-
-interface Props {
-  roles: string[]
-  children: ReactNode
-}
-
-export default function RoleGate({ roles, children }: Props) {
-  const { role } = useRole()
-  if (!role || !roles.includes(role)) return null
-  return <>{children}</>
 }
 ```
 
@@ -12184,55 +15244,165 @@ export default function LatencyCharts({ data }: { data: MetricsResult }) {
 }
 ```
 
-### ui/src/pages/LandingPage.tsx
+### ui/src/pages/LoginPage.tsx
 
 ```typescript
+import { FormEvent, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { useRole } from '../context/RoleContext'
+import { useAuth } from '../context/AuthContext'
 
-const ROLES = [
-  {
-    id: 'engineer' as const,
-    label: 'AI Engineer',
-    description: 'Full access: ingest, chunking, retrieval, gold standard, collection management, health dashboard.',
-  },
-  {
-    id: 'developer' as const,
-    label: 'Developer',
-    description: 'Ingest documents, configure chunking and retrieval, run Q&A, generate gold standard.',
-  },
-  {
-    id: 'end_user' as const,
-    label: 'End User',
-    description: 'Ask questions and get answers from the knowledge base.',
-  },
-]
-
-export default function LandingPage() {
-  const { setRole } = useRole()
+// Replaces the role picker (#25): the role now comes with the account.
+export default function LoginPage() {
+  const { login } = useAuth()
   const navigate = useNavigate()
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
 
-  function select(role: 'engineer' | 'developer' | 'end_user') {
-    setRole(role)
-    navigate('/qa')
+  async function submit(e: FormEvent) {
+    e.preventDefault()
+    setBusy(true)
+    setError('')
+    try {
+      await login(username, password)
+      navigate('/qa', { replace: true })
+    } catch (err) {
+      // The server's own message: generic for a failed login, "wait" when throttled.
+      setError(err instanceof Error ? err.message : String(err))
+      setPassword('')
+    } finally {
+      setBusy(false)
+    }
   }
 
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-8">
       <h1 className="text-3xl font-bold text-gray-800 mb-2">RAG Platform</h1>
-      <p className="text-gray-500 mb-10">Select your role to continue</p>
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 w-full max-w-3xl">
-        {ROLES.map(r => (
-          <button
-            key={r.id}
-            onClick={() => select(r.id)}
-            className="bg-white border-2 border-gray-200 hover:border-blue-500 rounded-xl p-6 text-left transition-all shadow-sm hover:shadow-md"
-          >
-            <h2 className="text-lg font-semibold text-gray-800 mb-2">{r.label}</h2>
-            <p className="text-sm text-gray-500">{r.description}</p>
-          </button>
-        ))}
+      <p className="text-gray-500 mb-8">Log in to continue</p>
+      <form onSubmit={submit} className="bg-white border border-gray-200 rounded-xl p-6 shadow-sm w-full max-w-sm space-y-4">
+        <label className="block text-sm text-gray-700">
+          Username
+          <input id="login-username" autoComplete="username" value={username} onChange={e => setUsername(e.target.value)}
+            className="mt-1 w-full border border-gray-300 rounded px-3 py-2 text-sm" required />
+        </label>
+        <label className="block text-sm text-gray-700">
+          Password
+          <input id="login-password" type="password" autoComplete="current-password" value={password}
+            onChange={e => setPassword(e.target.value)}
+            className="mt-1 w-full border border-gray-300 rounded px-3 py-2 text-sm" required />
+        </label>
+        {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
+        <button type="submit" disabled={busy || !username || !password}
+          className="w-full bg-blue-600 text-white rounded px-4 py-2 text-sm font-medium disabled:opacity-50">
+          {busy ? 'Logging in…' : 'Log in'}
+        </button>
+      </form>
+    </div>
+  )
+}
+```
+
+### ui/src/pages/SetupRequiredPage.tsx
+
+```typescript
+// Shown until an operator creates the first Engineer (#25). Nothing else in the
+// UI works until then: the API refuses every protected request.
+export default function SetupRequiredPage() {
+  return (
+    <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-8">
+      <h1 className="text-3xl font-bold text-gray-800 mb-2">RAG Platform</h1>
+      <div className="bg-white border border-gray-200 rounded-xl p-6 shadow-sm w-full max-w-xl space-y-3">
+        <h2 className="text-lg font-semibold text-gray-800">Not set up yet</h2>
+        <p className="text-sm text-gray-600">
+          No account exists. On the machine running the stack, create the first AI Engineer from the
+          project folder:
+        </p>
+        <pre className="bg-gray-100 rounded p-3 text-sm overflow-x-auto">docker compose exec api python -m auth bootstrap &lt;username&gt;</pre>
+        <p className="text-sm text-gray-600">
+          It prints a one-time password. Reload this page, log in with it, and choose a new password.
+        </p>
       </div>
+    </div>
+  )
+}
+```
+
+### ui/src/pages/ChangePasswordPage.tsx
+
+```typescript
+import { FormEvent, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { useAuth } from '../context/AuthContext'
+
+// The user's own password change (#25). When a generated password is due for
+// change, this is the only page the UI shows, with a way to log out.
+export default function ChangePasswordPage({ forced = false }: { forced?: boolean }) {
+  const { changePassword, logout, user } = useAuth()
+  const navigate = useNavigate()
+  const [current, setCurrent] = useState('')
+  const [next, setNext] = useState('')
+  const [confirm, setConfirm] = useState('')
+  const [error, setError] = useState('')
+  const [done, setDone] = useState(false)
+  const [busy, setBusy] = useState(false)
+
+  async function submit(e: FormEvent) {
+    e.preventDefault()
+    setError('')
+    setDone(false)
+    if (next !== confirm) { setError('The new passwords do not match.'); return }
+    setBusy(true)
+    try {
+      await changePassword(current, next)
+      setCurrent(''); setNext(''); setConfirm('')
+      if (forced) navigate('/qa', { replace: true })
+      else setDone(true)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const field = (id: string, label: string, value: string, set: (v: string) => void, autoComplete: string) => (
+    <label className="block text-sm text-gray-700">
+      {label}
+      <input id={id} type="password" autoComplete={autoComplete} value={value} onChange={e => set(e.target.value)}
+        className="mt-1 w-full border border-gray-300 rounded px-3 py-2 text-sm" required />
+    </label>
+  )
+
+  const form = (
+    <form onSubmit={submit} className="bg-white border border-gray-200 rounded-xl p-6 shadow-sm w-full max-w-sm space-y-4">
+      <h2 className="text-lg font-semibold text-gray-800">Change password</h2>
+      {forced && (
+        <p className="text-sm text-gray-600">
+          {user ? `${user.username}, your` : 'Your'} password was generated for you. Choose a new one to continue.
+        </p>
+      )}
+      {field('current-password', 'Current password', current, setCurrent, 'current-password')}
+      {field('new-password', 'New password (at least 12 characters)', next, setNext, 'new-password')}
+      {field('confirm-password', 'New password again', confirm, setConfirm, 'new-password')}
+      {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
+      {done && <p role="status" className="text-sm text-green-700">Password changed. Your other sessions were logged out.</p>}
+      <button type="submit" disabled={busy || !current || !next || !confirm}
+        className="w-full bg-blue-600 text-white rounded px-4 py-2 text-sm font-medium disabled:opacity-50">
+        {busy ? 'Changing…' : 'Change password'}
+      </button>
+      {forced && (
+        <button type="button" onClick={() => logout()} className="w-full text-sm text-gray-500 hover:text-blue-600">
+          Log out
+        </button>
+      )}
+    </form>
+  )
+
+  if (!forced) return <div className="flex justify-center">{form}</div>
+  return (
+    <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-8">
+      <h1 className="text-3xl font-bold text-gray-800 mb-6">RAG Platform</h1>
+      {form}
     </div>
   )
 }
@@ -12244,7 +15414,7 @@ export default function LandingPage() {
 import { useState, useEffect, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { api, CollectionInfo, Citation } from '../api/client'
-import { useRole } from '../context/RoleContext'
+import { useRole } from '../context/AuthContext'
 import { useQueryConfig } from '../context/QueryConfigContext'
 import CitationsPanel from '../components/CitationsPanel'
 
@@ -12388,7 +15558,7 @@ export default function QAPage() {
 ```typescript
 import { useState, useEffect } from 'react'
 import { api, CollectionInfo, JobStatus, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB } from '../api/client'
-import { useRole } from '../context/RoleContext'
+import { useRole } from '../context/AuthContext'
 import StrategyExplainer from '../components/StrategyExplainer'
 import ProgressPanel from '../components/ProgressPanel'
 
@@ -12647,7 +15817,7 @@ export default function ImportPage() {
 import { useState, useEffect, useRef } from 'react'
 import { api, CollectionInfo, IngestConfig } from '../api/client'
 import StrategyExplainer from '../components/StrategyExplainer'
-import { useRole } from '../context/RoleContext'
+import { useRole } from '../context/AuthContext'
 
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
 
@@ -12798,7 +15968,7 @@ export default function ChunkingPage() {
 ```typescript
 import { useEffect, useRef, useState } from 'react'
 import { api, CollectionInfo } from '../api/client'
-import { useRole } from '../context/RoleContext'
+import { useRole } from '../context/AuthContext'
 import { useQueryConfig, QueryConfig } from '../context/QueryConfigContext'
 
 const MODES = [
@@ -13539,6 +16709,15 @@ const CONFLICT = [
 const POLL_MS = 2000
 const POLL_ATTEMPTS = 30
 
+// Passphrase bounds for an encrypted export, as the API checks them (#27).
+const PASSPHRASE_MIN = 12
+const PASSPHRASE_MAX = 1024
+
+// Characters, not UTF-16 units, as the API counts them.
+function charCount(s: string): number {
+  return Array.from(s).length
+}
+
 function message(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
@@ -13549,6 +16728,11 @@ export default function TransferPage() {
   const [tune, setTune] = useState<TuneOptions | null>(null)
   const [tuneError, setTuneError] = useState('')
   const [includeModels, setIncludeModels] = useState(false)
+  // Passphrases live only in this component's state, and are cleared once a
+  // job has started with them (#27).
+  const [encrypt, setEncrypt] = useState(false)
+  const [passphrase, setPassphrase] = useState('')
+  const [confirmPassphrase, setConfirmPassphrase] = useState('')
   const [exportJob, setExportJob] = useState<ExportJob | null>(null)
   const [exportError, setExportError] = useState('')
   const [exportWatching, setExportWatching] = useState(false)
@@ -13558,6 +16742,7 @@ export default function TransferPage() {
   const [packagesError, setPackagesError] = useState('')
   const [filename, setFilename] = useState('')
   const [onConflict, setOnConflict] = useState('abort')
+  const [importPassphrase, setImportPassphrase] = useState('')
   const [importJob, setImportJob] = useState<ImportJob | null>(null)
   const [importError, setImportError] = useState('')
   const [importWatching, setImportWatching] = useState(false)
@@ -13667,7 +16852,10 @@ export default function TransferPage() {
   async function startExport() {
     setExportError(''); setExportPollError(''); setExportJob(null)
     try {
-      const r = await api.startExport({ collection, include_models: includeModels })
+      const r = await api.startExport(encrypt
+        ? { collection, include_models: includeModels, passphrase }
+        : { collection, include_models: includeModels })
+      setPassphrase(''); setConfirmPassphrase('')
       if (!alive.current) return
       exportPoll.current = r.job_id
       setExportWatching(true)
@@ -13680,7 +16868,10 @@ export default function TransferPage() {
   async function startImport() {
     setImportError(''); setImportPollError(''); setImportJob(null)
     try {
-      const r = await api.startImport({ filename, on_conflict: onConflict })
+      const r = await api.startImport(selectedEncrypted
+        ? { filename, on_conflict: onConflict, passphrase: importPassphrase }
+        : { filename, on_conflict: onConflict })
+      setImportPassphrase('')
       if (!alive.current) return
       importPoll.current = r.job_id
       setImportWatching(true)
@@ -13692,6 +16883,15 @@ export default function TransferPage() {
 
   const exportBusy = exportWatching
   const importBusy = importWatching
+
+  // What still stops an encrypted export, or '' when nothing does.
+  const passphraseLength = charCount(passphrase)
+  const passphraseProblem = !encrypt ? ''
+    : passphraseLength < PASSPHRASE_MIN ? `The passphrase needs at least ${PASSPHRASE_MIN} characters.`
+    : passphraseLength > PASSPHRASE_MAX ? `The passphrase can have at most ${PASSPHRASE_MAX} characters.`
+    : passphrase !== confirmPassphrase ? 'The two passphrases do not match.'
+    : ''
+  const selectedEncrypted = packages.some(p => p.filename === filename && p.encrypted)
 
   return (
     <div className="max-w-3xl mx-auto">
@@ -13750,9 +16950,31 @@ export default function TransferPage() {
           </span>
         </label>
 
+        <label className="flex items-start gap-2 text-sm mb-3">
+          <input type="checkbox" checked={encrypt} onChange={e => setEncrypt(e.target.checked)} className="mt-1" />
+          <span>
+            Encrypt with a passphrase
+            <span className="block text-xs text-gray-500">
+              Writes an encrypted <code>.tar.gz.age</code> package that only this passphrase opens.
+              It can't be recovered, so keep it safe and send it separately from the file.
+            </span>
+          </span>
+        </label>
+        {encrypt && (
+          <div className="mb-3 space-y-2">
+            <input type="password" autoComplete="new-password" placeholder="Passphrase"
+                   value={passphrase} onChange={e => setPassphrase(e.target.value)}
+                   className="w-full border rounded px-3 py-2 text-sm" />
+            <input type="password" autoComplete="new-password" placeholder="Confirm the passphrase"
+                   value={confirmPassphrase} onChange={e => setConfirmPassphrase(e.target.value)}
+                   className="w-full border rounded px-3 py-2 text-sm" />
+            {passphraseProblem && <p className="text-xs text-amber-700">{passphraseProblem}</p>}
+          </div>
+        )}
+
         <button
           onClick={startExport}
-          disabled={!collection || exportBusy}
+          disabled={!collection || exportBusy || passphraseProblem !== ''}
           className="bg-blue-600 text-white px-5 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50"
         >
           {exportBusy ? 'Exporting…' : 'Export'}
@@ -13772,6 +16994,7 @@ export default function TransferPage() {
                 <code className="text-xs break-all">{exportJob.filename}</code>
                 <span className="text-gray-500 text-xs">
                   {' '}({sizeLabel(exportJob.size_bytes)}, {exportJob.fidelity}
+                  {exportJob.encrypted ? ', encrypted' : ''}
                   {exportJob.models_bundled ? ', models included' : ''}
                   {exportJob.retrieve_script ? ', with retrieve.py' : ', no retrieve.py'})
                 </span>
@@ -13807,7 +17030,9 @@ export default function TransferPage() {
           {packages.map(p => (
             <option key={p.filename} value={p.filename}>
               {p.filename}
-              {p.readable
+              {p.encrypted
+                ? (p.readable ? ` — encrypted, ${sizeLabel(p.size_bytes)}` : ' — encrypted, unreadable')
+                : p.readable
                 ? ` — ${p.collection}, ${p.chunk_count} chunks, ${p.fidelity}, ${sizeLabel(p.size_bytes)}`
                 : ' — unreadable'}
             </option>
@@ -13818,6 +17043,18 @@ export default function TransferPage() {
           <p className="text-xs text-gray-500 mb-3">
             Nothing in <code>./exports</code> yet. Copy a package there and press Refresh.
           </p>
+        )}
+
+        {selectedEncrypted && (
+          <div className="mb-3">
+            <label className="block text-sm font-medium mb-1">Passphrase</label>
+            <input type="password" autoComplete="off" value={importPassphrase}
+                   onChange={e => setImportPassphrase(e.target.value)}
+                   className="w-full border rounded px-3 py-2 text-sm" />
+            <p className="text-xs text-gray-500 mt-1">
+              This package is encrypted. Enter the passphrase it was exported with.
+            </p>
+          </div>
         )}
 
         <label className="block text-sm font-medium mb-2">If the collection already exists</label>
@@ -13836,7 +17073,7 @@ export default function TransferPage() {
 
         <button
           onClick={startImport}
-          disabled={!filename || importBusy}
+          disabled={!filename || importBusy || (selectedEncrypted && importPassphrase === '')}
           className="bg-blue-600 text-white px-5 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50"
         >
           {importBusy ? 'Importing…' : 'Import'}
@@ -14032,6 +17269,341 @@ export default function HealthPage() {
 }
 ```
 
+### ui/src/pages/UsersPage.tsx
+
+```typescript
+import { FormEvent, useEffect, useState } from 'react'
+import { api, AdminUser, Role } from '../api/client'
+import { useAuth } from '../context/AuthContext'
+
+const ROLES: Role[] = ['end_user', 'developer', 'engineer']
+const ROLE_LABELS: Record<Role, string> = { end_user: 'End User', developer: 'Developer', engineer: 'AI Engineer' }
+
+// Account administration for Engineers (#25). The API decides what is allowed:
+// the last enabled Engineer can't be demoted or disabled, and an Engineer's own
+// password is changed on the Change password page, not reset here. Accounts are
+// disabled, never deleted. A generated password is shown once, from the answer
+// that carried it, and kept only in this page's memory until "Done".
+export default function UsersPage() {
+  const { user: me, refresh } = useAuth()
+  const [users, setUsers] = useState<AdminUser[]>([])
+  const [listError, setListError] = useState('')
+  const [actionError, setActionError] = useState('')
+  const [username, setUsername] = useState('')
+  const [role, setRole] = useState<Role>('end_user')
+  const [busy, setBusy] = useState(false)
+  const [shown, setShown] = useState<{ username: string; password: string } | null>(null)
+
+  async function load() {
+    try {
+      setUsers((await api.listUsers()).users)
+      setListError('')
+    } catch (e: unknown) {
+      setListError(`Could not load the users: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  useEffect(() => { load() }, [])
+
+  async function act(target: string, run: () => Promise<{ user: AdminUser; password?: string }>) {
+    setActionError('')
+    setBusy(true)
+    try {
+      const result = await run()
+      if (result.password) setShown({ username: result.user.username, password: result.password })
+      await load()
+      // A demoted Engineer leaves this page, a disabled one is logged out.
+      if (target === me?.username) await refresh()
+      return true
+    } catch (e: unknown) {
+      setActionError(e instanceof Error ? e.message : String(e))
+      await load()
+      return false
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function create(e: FormEvent) {
+    e.preventDefault()
+    if (await act('', () => api.createUser(username, role))) setUsername('')
+  }
+
+  return (
+    <div className="max-w-5xl mx-auto">
+      <h1 className="text-2xl font-bold mb-6">Users</h1>
+      {listError && <p role="alert" className="text-red-600 text-sm mb-4">{listError}</p>}
+
+      {shown && (
+        <div data-testid="one-time-password" className="mb-6 border border-amber-300 bg-amber-50 rounded p-4 text-sm">
+          <p className="mb-2">
+            Password for <strong>{shown.username}</strong>: <code className="bg-white border border-gray-200 rounded px-2 py-1 select-all">{shown.password}</code>
+          </p>
+          <p className="text-gray-700 mb-3">
+            It is shown only once. Give it to the user; they must change it when they first log in.
+          </p>
+          <button onClick={() => setShown(null)} className="bg-blue-600 text-white px-3 py-1 rounded text-sm hover:bg-blue-700">Done</button>
+        </div>
+      )}
+
+      <form onSubmit={create} className="flex flex-wrap items-end gap-3 mb-6">
+        <label className="text-sm text-gray-700">
+          Username
+          <input id="new-username" value={username} onChange={e => setUsername(e.target.value)} autoComplete="off"
+            className="mt-1 block border border-gray-300 rounded px-3 py-2 text-sm" required />
+        </label>
+        <label className="text-sm text-gray-700">
+          Role
+          <select id="new-role" value={role} onChange={e => setRole(e.target.value as Role)}
+            className="mt-1 block border border-gray-300 rounded px-3 py-2 text-sm">
+            {ROLES.map(r => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
+          </select>
+        </label>
+        <button type="submit" disabled={busy || !username}
+          className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50">Create user</button>
+        <p className="text-xs text-gray-500 basis-full">
+          3-32 characters: lowercase letters, digits, '.', '_' or '-'. The account gets a generated password.
+        </p>
+      </form>
+
+      {actionError && <p role="alert" className="text-red-600 text-sm mb-4">{actionError}</p>}
+
+      <table className="w-full text-sm border-collapse">
+        <thead>
+          <tr className="border-b border-gray-200 text-left text-gray-600">
+            <th className="py-2 pr-4">Username</th>
+            <th className="py-2 pr-4">Role</th>
+            <th className="py-2 pr-4">Status</th>
+            <th className="py-2 pr-4">Password</th>
+            <th className="py-2 pr-4">Created</th>
+            <th className="py-2"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {users.map(u => {
+            const own = u.username === me?.username
+            return (
+              <tr key={u.username} className="border-b border-gray-100" data-username={u.username}>
+                <td className="py-2 pr-4 font-medium">{u.username}{own && <span className="text-gray-500 font-normal"> (you)</span>}</td>
+                <td className="py-2 pr-4">
+                  <select aria-label={`Role of ${u.username}`} value={u.role} disabled={busy}
+                    onChange={e => { const next = e.target.value as Role; act(u.username, () => api.setUserRole(u.username, next)) }}
+                    className="border border-gray-300 rounded px-2 py-1 text-sm">
+                    {ROLES.map(r => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
+                  </select>
+                </td>
+                <td className="py-2 pr-4">{u.enabled ? 'Enabled' : 'Disabled'}</td>
+                <td className="py-2 pr-4">{u.must_change_password ? 'Change due' : 'Set'}</td>
+                <td className="py-2 pr-4">{new Date(u.created_at).toLocaleDateString()}</td>
+                <td className="py-2 space-x-3 whitespace-nowrap">
+                  {own
+                    ? <span className="text-xs text-gray-500">Use Change password for your own</span>
+                    : <button disabled={busy} onClick={() => act(u.username, () => api.resetUserPassword(u.username))}
+                        className="text-blue-600 hover:underline disabled:opacity-50">Reset password</button>}
+                  <button disabled={busy}
+                    onClick={() => act(u.username, () => u.enabled ? api.disableUser(u.username) : api.enableUser(u.username))}
+                    className="text-blue-600 hover:underline disabled:opacity-50">{u.enabled ? 'Disable' : 'Enable'}</button>
+                </td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+```
+
+### ui/src/pages/ServiceKeysPage.tsx
+
+```typescript
+import { FormEvent, useEffect, useState } from 'react'
+import { api, Role, ServiceKey, ServicePrincipal } from '../api/client'
+
+const ROLES: Role[] = ['end_user', 'developer', 'engineer']
+const ROLE_LABELS: Record<Role, string> = { end_user: 'End User', developer: 'Developer', engineer: 'AI Engineer' }
+const STATUS_LABELS: Record<ServiceKey['status'], string> = { active: 'Active', expired: 'Expired', revoked: 'Revoked' }
+
+const day = (iso: string | null) => (iso ? new Date(iso).toLocaleDateString() : 'never')
+
+// Service principals and their API keys, for Engineers (#25, PR 3). A principal
+// is an account that can't log in; services call the API with its keys, sent as
+// `Authorization: Bearer <key>`, and a key can do what the principal's role
+// allows. The API decides everything: keys expire (1-365 days, default 90),
+// revoked and expired keys stay listed and never work again, and principals
+// are disabled, never deleted. A new key is shown once, from the answer that
+// carried it, and kept only in this page's memory until "Done".
+export default function ServiceKeysPage() {
+  const [principals, setPrincipals] = useState<ServicePrincipal[]>([])
+  const [listError, setListError] = useState('')
+  const [actionError, setActionError] = useState('')
+  const [name, setName] = useState('')
+  const [role, setRole] = useState<Role>('end_user')
+  const [labels, setLabels] = useState<Record<string, string>>({})
+  const [days, setDays] = useState<Record<string, string>>({})
+  const [busy, setBusy] = useState(false)
+  const [shown, setShown] = useState<{ name: string; secret: string } | null>(null)
+
+  async function load() {
+    try {
+      setPrincipals((await api.listPrincipals()).principals)
+      setListError('')
+    } catch (e: unknown) {
+      setListError(`Could not load the service principals: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  useEffect(() => { load() }, [])
+
+  async function act(run: () => Promise<{ principal: ServicePrincipal; secret?: string }>) {
+    setActionError('')
+    setBusy(true)
+    try {
+      const result = await run()
+      if (result.secret) setShown({ name: result.principal.name, secret: result.secret })
+      await load()
+      return true
+    } catch (e: unknown) {
+      setActionError(e instanceof Error ? e.message : String(e))
+      await load()
+      return false
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function create(e: FormEvent) {
+    e.preventDefault()
+    if (await act(() => api.createPrincipal(name, role))) setName('')
+  }
+
+  async function issue(e: FormEvent, principal: string) {
+    e.preventDefault()
+    const lifetime = Number(days[principal] ?? '90')
+    if (await act(() => api.issueKey(principal, labels[principal] ?? '', lifetime))) {
+      setLabels(l => ({ ...l, [principal]: '' }))
+    }
+  }
+
+  return (
+    <div className="max-w-5xl mx-auto">
+      <h1 className="text-2xl font-bold mb-2">Service keys</h1>
+      <p className="text-sm text-gray-600 mb-6">
+        A service principal is an account for a program, not a person: it can't log in, and calls the API with its
+        keys, sent as <code>Authorization: Bearer &lt;key&gt;</code>. A key can do what the principal's role allows,
+        except manage accounts or keys. To rotate a key, issue a new one, switch the service over to it, then revoke
+        the old one; both work until then.
+      </p>
+      {listError && <p role="alert" className="text-red-600 text-sm mb-4">{listError}</p>}
+
+      {shown && (
+        <div data-testid="one-time-key" className="mb-6 border border-amber-300 bg-amber-50 rounded p-4 text-sm">
+          <p className="mb-2">
+            New key for <strong>{shown.name}</strong>: <code className="bg-white border border-gray-200 rounded px-2 py-1 select-all break-all">{shown.secret}</code>
+          </p>
+          <p className="text-gray-700 mb-3">
+            It is shown only once. Give it to the service, which sends it as <code>Authorization: Bearer &lt;key&gt;</code>.
+          </p>
+          <button onClick={() => setShown(null)} className="bg-blue-600 text-white px-3 py-1 rounded text-sm hover:bg-blue-700">Done</button>
+        </div>
+      )}
+
+      <form onSubmit={create} className="flex flex-wrap items-end gap-3 mb-6">
+        <label className="text-sm text-gray-700">
+          Name
+          <input id="new-principal-name" value={name} onChange={e => setName(e.target.value)} autoComplete="off"
+            className="mt-1 block border border-gray-300 rounded px-3 py-2 text-sm" required />
+        </label>
+        <label className="text-sm text-gray-700">
+          Role
+          <select id="new-principal-role" value={role} onChange={e => setRole(e.target.value as Role)}
+            className="mt-1 block border border-gray-300 rounded px-3 py-2 text-sm">
+            {ROLES.map(r => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
+          </select>
+        </label>
+        <button type="submit" disabled={busy || !name}
+          className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50">Create principal</button>
+        <p className="text-xs text-gray-500 basis-full">
+          3-32 characters: lowercase letters, digits, '.', '_' or '-'; a name no person or service already has.
+        </p>
+      </form>
+
+      {actionError && <p role="alert" className="text-red-600 text-sm mb-4">{actionError}</p>}
+
+      {principals.length === 0 && !listError && <p className="text-sm text-gray-500">No service principals yet.</p>}
+
+      {principals.map(p => (
+        <section key={p.name} data-principal={p.name} className="border border-gray-200 rounded p-4 mb-4">
+          <div className="flex flex-wrap items-center gap-4 mb-3">
+            <h2 className="font-semibold">{p.name}</h2>
+            <select aria-label={`Role of ${p.name}`} value={p.role} disabled={busy}
+              onChange={e => { const next = e.target.value as Role; act(() => api.setPrincipalRole(p.name, next)) }}
+              className="border border-gray-300 rounded px-2 py-1 text-sm">
+              {ROLES.map(r => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
+            </select>
+            <span data-testid="principal-status" className="text-sm">{p.enabled ? 'Enabled' : 'Disabled'}</span>
+            <button disabled={busy}
+              onClick={() => act(() => p.enabled ? api.disablePrincipal(p.name) : api.enablePrincipal(p.name))}
+              className="text-sm text-blue-600 hover:underline disabled:opacity-50">{p.enabled ? 'Disable' : 'Enable'}</button>
+          </div>
+
+          <form onSubmit={e => issue(e, p.name)} className="flex flex-wrap items-end gap-3 mb-3">
+            <label className="text-sm text-gray-700">
+              Label (optional)
+              <input aria-label={`Label for a new key of ${p.name}`} value={labels[p.name] ?? ''} maxLength={64}
+                onChange={e => setLabels(l => ({ ...l, [p.name]: e.target.value }))} autoComplete="off"
+                className="mt-1 block border border-gray-300 rounded px-3 py-2 text-sm" />
+            </label>
+            <label className="text-sm text-gray-700">
+              Lifetime (days)
+              <input aria-label={`Lifetime in days for a new key of ${p.name}`} type="number" min={1} max={365} step={1}
+                value={days[p.name] ?? '90'} onChange={e => setDays(d => ({ ...d, [p.name]: e.target.value }))}
+                className="mt-1 block w-24 border border-gray-300 rounded px-3 py-2 text-sm" required />
+            </label>
+            <button type="submit" disabled={busy}
+              className="bg-blue-600 text-white px-3 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50">Issue key</button>
+          </form>
+
+          {p.keys.length > 0 && (
+            <table className="w-full text-sm border-collapse">
+              <thead>
+                <tr className="border-b border-gray-200 text-left text-gray-600">
+                  <th className="py-2 pr-4">Key</th>
+                  <th className="py-2 pr-4">Label</th>
+                  <th className="py-2 pr-4">Created</th>
+                  <th className="py-2 pr-4">Expires</th>
+                  <th className="py-2 pr-4">Last used</th>
+                  <th className="py-2 pr-4">Status</th>
+                  <th className="py-2"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {p.keys.map(k => (
+                  <tr key={k.id} data-key={k.id} className="border-b border-gray-100">
+                    <td className="py-2 pr-4 font-mono">{k.id}</td>
+                    <td className="py-2 pr-4">{k.label}</td>
+                    <td className="py-2 pr-4">{day(k.created_at)}</td>
+                    <td className="py-2 pr-4">{day(k.expires_at)}</td>
+                    <td className="py-2 pr-4">{day(k.last_used_at)}</td>
+                    <td className="py-2 pr-4">{STATUS_LABELS[k.status]}</td>
+                    <td className="py-2">
+                      {k.status === 'active' && (
+                        <button disabled={busy} onClick={() => act(() => api.revokeKey(p.name, k.id))}
+                          className="text-blue-600 hover:underline disabled:opacity-50">Revoke</button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </section>
+      ))}
+    </div>
+  )
+}
+```
+
 ---
 
 *End of Implementation — Version 1.0*
@@ -14116,9 +17688,50 @@ verify project, never the live stack (#152).
 bash scripts/verify/stack.sh run                    # everything, ~20 min plus start-up
 RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run    # skip LLM work, ~8 min, start-up included
 bash scripts/verify/stack.sh run 02 04              # only the named suites
+bash scripts/verify/stack.sh run --lan              # LAN mode, TLS on loopback only (#26)
 ```
 
 Exits non-zero if any check fails.
+
+## Test accounts (#25)
+
+Every API route but `/health` and the login needs a session, so the suites log in.
+`require_stack` (in `lib.sh`) runs `auth_setup.py ensure`, which makes sure the verify project
+has one account per role, `vfy-engineer`, `vfy-developer` and `vfy-end-user`, whose passwords it
+knows:
+
+- On a project that isn't set up yet it runs `python -m auth bootstrap vfy-engineer` in the api
+  container; a missing account is created with `create-user`, and one whose stored password no
+  longer works (a new verify project, say) gets `reset-password`. Each generated password is
+  replaced at first login with a fresh random one, as the API requires.
+- The operator command runs only when the target is the verify project as `stack.sh` sets it up
+  (`COMPOSE_PROJECT_NAME=rag-verify` and the overlay in `COMPOSE_FILE`, the same condition as
+  removing its volumes). Anywhere else a password that doesn't work is a failure, never a reset.
+- The passwords live only in `$RAG_AUTH_DIR/credentials` (default
+  `${TMPDIR:-/tmp}/rag-verify-auth-<uid>`): mode 0600, in a folder of mode 0700 that is the user's
+  own (a symlink, a file or someone else's folder there is refused), outside the checkout. They
+  are never printed, put on a command line or in the environment, or written to the `export`
+  lines `stack.sh up` prints (which CI copies into its job environment). They reach the API only
+  in request bodies, and the browser checks on standard input.
+
+`require_stack` then logs `vfy-engineer` in, into the curl cookie jar
+`$RAG_AUTH_DIR/engineer.jar` (0600), exported as `RAG_AUTH_JAR`. `lib.sh` defines `curl` as a
+function that adds that jar and an `Origin` matching `RAG_API` (the API refuses a
+cookie-authenticated change without one), so every curl in a suite, and the `api_*` helpers,
+send the session. A check that needs no session, another role or another origin calls `command
+curl`. `auth_jar <role>` logs another role in. The host-side Python helpers that call the API
+read the jar through `auth_headers.py`; in-process checks in the API image use
+`auth.testing.headers()`, a real account and session in a temporary store, never a bypass.
+
+`17_auth.sh` checks authentication itself: the endpoint/role matrix for no session and each
+role (written out in `auth_stack.py`, not read from the API), login, logout, cookies, origin
+rules, throttling, the operator command's effect on existing sessions (on throwaway `vfy-t-*`
+accounts), an Engineer's account administration through the API (on a throwaway account; the
+generated passwords must not reach the API log), service API keys (throwaway `vfy-s-*`
+principals created through the API by the harness Engineer: the matrix with a key of each role
+and no `Origin`, rotation, revocation, expiry, a disabled principal, invalid keys; the keys stay in
+memory, are never printed and must not reach the API log), idle expiry, and that the API log holds
+no harness secret.
 
 ## Entry point and verify project
 
@@ -14130,8 +17743,8 @@ against" below).
 
 | Command | What it does |
 |---|---|
-| `stack.sh run [--checkout DIR] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
-| `stack.sh up [--checkout DIR] [--pull]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. |
+| `stack.sh run [--checkout DIR] [--telemetry \| --lan] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
+| `stack.sh up [--checkout DIR] [--pull] [--lan]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. |
 | `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
 
 `--checkout` is the checkout to build and test; the default is the one holding
@@ -14196,6 +17809,45 @@ What makes it separate from the live stack:
   suite, exit 3, when it fails. Not re-checked: direct `curl` and
   `docker compose exec` calls in the suites, and the Python helpers, which
   end on their own timeouts (up to 900 s).
+
+### LAN mode (#26)
+
+`stack.sh run --lan` (and `up --lan`) runs the verify project in LAN mode
+without exposing the host:
+
+1. It comes up in its default configuration, checked by the guard as usual.
+2. It creates the first Engineer, `vfy-engineer`, with the operator command,
+   as the README tells users to before switching (the project is always new
+   here). The generated password is discarded unseen; `auth_setup.py` resets
+   it later like any password it doesn't know.
+3. It switches `COMPOSE_FILE` to the base file, the checkout's
+   `docker-compose.lan.yml`, this checkout's `docker-compose.verify.yml` and
+   `docker-compose.lan.verify.yml`. That harness-only overlay replaces the
+   override's `0.0.0.0:443` with `127.0.0.1:<verify port>:443`, gives `tls-init`
+   the verify image and sets `RAG_LAN_HOSTNAMES` to reserved test names
+   (`vfy-lan.invalid`, `192.0.2.10`).
+4. The guard checks that configuration, with rule (c) wanting exactly
+   `proxy:127.0.0.1:<verify port>->443/tcp`; every other rule is unchanged, for
+   `tls-init` too. Then `up --no-build --wait` recreates what changed.
+5. It copies the certificate `tls-init` generated from the proxy to
+   `${TMPDIR:-/tmp}/rag-verify-<uid>/lan-cert.pem` (0600) and exports
+   `RAG_API=https://localhost:<port>/api`, and that file as `CURL_CA_BUNDLE`,
+   `SSL_CERT_FILE` and `RAG_VERIFY_LAN_CERT`, so curl and Python trust it, and
+   only it, with the name `localhost`. `RAG_VERIFY_LAN=1` tells the suites.
+
+Without suite names a `--lan` run runs `18_lan` only: the other suites expect
+the default configuration (suite 01's binding and service-inventory checks
+would fail by design). `--lan` can't be combined with `--telemetry`.
+
+`18_lan.sh` runs in every run. It always checks the real override with
+`lan_config.py` (`docker compose config` of the base file plus
+`docker-compose.lan.yml`, under the project name `rag-lan-config`, with no
+`.env`; nothing is created) and runs `../tests/test_lan_mode.py` in the API
+image. Only in a `--lan` run does it check the running LAN project through
+`lan_stack.py`: HTTPS with the generated certificate, TLS versions and HTTP/2,
+the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
+and the API's refusal in one-off containers (`docker compose run --rm
+--no-deps`, no ports); it also prints the client address nginx recorded.
 
 **Memory.** The verify project runs next to the live stack on the same Docker
 VM. With 12 GB allocated, both fit while one LLM is loaded; when both stacks
@@ -14295,7 +17947,7 @@ retrieval route. The persistence cases cover failed import-config publication.
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
 
-`05_transfer.sh` registers the eight controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py` and `test_package_listing.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work.
+`05_transfer.sh` registers the nine controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py`, `test_package_listing.py` and `test_export_encryption.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work.
 
 `scripts/tests/test_export_snapshot.py` (#509, API container) drives `exporter._run` with the real `packager.build` and retained-source store and a mocked Weaviate backend whose iterator reads the stored chunks one at a time. A re-ingest that tries to commit new chunks and a new `doc.txt` source after the first chunk is streamed waits for the export: the package holds the old chunk text and the old source bytes and index, every chunk's `source_sha256` names a blob in `sources/`, and the re-ingest lands after the build. During an export, gold-standard generation preparation answers `COLLECTION_BUSY` (409) and a guarded chunk insert waits; an export started while another writer holds the guard reads `queued` until it is released; and the guard is free again after an export that succeeds, is refused (`PackageError`), fails or is cancelled. An export whose build is cancelled, or ended by another non-`Exception`, reads `failed` with an `error` naming the exception and saying it was cancelled, and the exception still propagates (#521). Orderings use events and the guard's waiter count. On the code before #509 the re-ingest, generation, insert, queued and guard-held checks fail; on the code before #521 the cancelled-status checks fail.
 
@@ -14770,6 +18422,15 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
 | `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health` reports, so the status flips to `below_recommended` on any host (#536) |
 | `../tests/test_memory_override.py` | host-side, standard library: the derived override makes `system_info.memory_info` report `below_recommended` with a note for allocations below and above the 12.35 GB a fixed 13 GB could flip, and no override without a usable allocation (#536); embedded copies; registered by suite 01 |
+| `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command, account administration, service API keys; registers `../tests/test_auth.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
+| `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
+| `auth_stack.py` | the stack checks of `17_auth.sh`, one per subcommand (#25) |
+| `auth_headers.py` | the suite's session as `Cookie` and `Origin` headers, for the host-side Python helpers (#25) |
+| `18_lan.sh` | §2.5 and §10.5 — LAN mode (#26): the real override resolved without starting it; registers `../tests/test_lan_mode.py`; with `stack.sh run --lan`, the running LAN project on loopback |
+| `lan_config.py` | host-side, standard library: `docker-compose.lan.yml` as `docker compose config` resolves it, at the default port and `RAG_LAN_PORT=8443` (#26) |
+| `lan_stack.py` | the stack checks of `18_lan.sh` in a `--lan` run, one per subcommand (#26) |
+| `../tests/test_lan_mode.py` | API image, no network: `RAG_LAN_MODE` parsing, the startup refusal (also through `import main`), the certificate step, both nginx configurations, embedded copies (#26) |
+| `docker-compose.lan.verify.yml` | the harness overlay of a `--lan` run: TLS on loopback at the verify port, the verify image for `tls-init`, reserved test names (#26) |
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
 | `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
 | `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
@@ -14784,7 +18445,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, review 404 codes and empty-edit refusal (#381), export schema, export name refusals (#370) |
 | `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E36; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E40, encrypted packages (#27); destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
 | `../tests/test_zip_limits.py` | controlled ZIP member-count (cap of 20 from env), ratio, escaping-member and `detail` bound regressions (#28), registered by ingest |
@@ -14840,11 +18501,12 @@ through the proxy that download refuses other upload state with 400 (#370).
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the query metrics reload in `03_query.sh`, the batch recovery acceptance in `05_transfer.sh`, and retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`); never the `rag-docker` project |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the query metrics reload in `03_query.sh`, the batch recovery acceptance in `05_transfer.sh`, retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`, and a session and a login lockout across a restart in `17_auth.sh`); never the `rag-docker` project |
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
 | `RAG_NETWORK` | detected | compose network for the browser container |
+| `RAG_AUTH_DIR` | `${TMPDIR:-/tmp}/rag-verify-auth-<uid>` | the folder of the test accounts' credentials and cookie jars (#25) |
 
 ## Writing a check
 
@@ -14986,18 +18648,44 @@ a UI with no backend:
 RAG_UI_BASE=http://127.0.0.1:3000 RAG_CHROMIUM_PATH=/path/to/chromium node scripts/verify/browser/qa_page.js
 ```
 
+## Export encryption (#27)
+
+`api/services/age_stream.py` writes and reads the age v1 passphrase format on the locked
+`cryptography`: `Encryptor` is the writable file `packager._write_archive` streams the tar.gz
+into (`tarfile` mode `w|gz`), holding back each full chunk until it knows whether it is the
+last; `open_decrypt` parses the header, refuses a work factor above 20 before scrypt, unwraps
+the file key under a process-wide lock, checks the header MAC and returns `Decryptor`, the
+readable file `packager.open_package` unpacks in `tarfile` mode `r|gz`, checking each member
+before extracting it, then drains to authenticate the rest. A `.tar.gz.age` name selects the
+encrypted path everywhere: the listing (header check only), the import refusals in
+`importer.start_import_job` (`PassphraseError`, mapped to 400 by the router) and check 1. The
+passphrase travels as a function argument to the worker thread and is never put in a job
+record; the request models hold it as `SecretStr`.
+
+`scripts/tests/test_export_encryption.py`, run by `05_transfer.sh` in the API image with no
+network, checks the module against the vendored C2SP CCTV vectors
+(`scripts/tests/fixtures/age-testkit`, with their source in `SOURCE`) and an independent
+decryption written from the specification, and the export, import, listing, refusals and
+secrecy rules above. Suite 05 then exports the transfer collection encrypted, validates it
+with `validate_package.py` in the API container (`RAG_PACKAGE_PASSPHRASE`), and checks a wrong
+passphrase, both refusals and a round trip on the live verify stack.
+
 ## Transfer page polling and failure checks
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
 Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
-20 ms (#382). Fourteen cases: for each half, a failed poll (a proxy 502) is shown and retried
+20 ms (#382). Seventeen cases: for each half, a failed poll (a proxy 502) is shown and retried
 with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
 show the last error and enable the button again, and a new start clears the message; a poll in
 flight when the page is left schedules no further poll. An export start answered after the page
 is left starts no polling. A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune` is labelled
 "Fidelity: unknown", a good lookup shows the fidelity, and a late answer for a collection no
 longer selected is ignored. A failed export shows its `error_code`, and a failed package list
-is shown without the empty-folder hint until a good Refresh. Like `query_config.js`, it can run
+is shown without the empty-folder hint until a good Refresh. Three cases cover encryption (#27):
+an export passphrase holds Export until it has 12 characters and matches its confirmation, is
+sent only when the box is checked, and both fields clear once the export starts; an encrypted
+package is labelled, asks for its passphrase, sends it and clears it, and a plain package sends
+none. Like `query_config.js`, it can run
 on its own against a UI with no backend (`RAG_UI_BASE`, `RAG_CHROMIUM_PATH`):
 
 ```bash
@@ -15053,7 +18741,8 @@ nothing reaches the backend or a model. 67 cases:
   modal (HNSW slider defaults, bounds and labels, Flat hiding them, the create payload); the Import
   queue, slider visibility per strategy and role, Chunk Size pulling Overlap down, the upload
   form fields and the "+ New" modal; the Developer nav and the redirects of a Developer and an End
-  User (gating is client-side only until #25); the landing page and Switch Role; the Q&A box
+  User; the login page, logout, the setup-required page, the forced and voluntary password change
+  and the return to login on a 401 (#25), with `GET /api/auth/me` answered from the case's role; the Q&A box
   (Ctrl+Enter, plain Enter, Ask disabled while empty or loading), the citations toggle, markdown,
   the latency and error lines and the End User view with `response_format`; the Retrieval page's
   saved and default texts, alpha slider and Save while loading; and the client's handling of
@@ -15352,7 +19041,7 @@ printf '\nBuilding fixtures in %s\n' "$FIX"
 rm -rf "$FIX"; python3 ./fixtures.py "$FIX" >/dev/null
 export RAG_FIXTURES="$FIX"
 
-ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry)
+ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan)
 if [ "$#" -gt 0 ]; then
   SUITES=()
   for want in "$@"; do
@@ -15401,8 +19090,8 @@ exit "$overall"
 # Run the verification suite on a disposable compose project, never on the
 # live stack (#152).
 #
-#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry] [suite ...]
-#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull]
+#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry | --lan] [suite ...]
+#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull] [--lan]
 #   bash scripts/verify/stack.sh down
 #
 # `run` brings the verify project up, runs that checkout's all.sh against it
@@ -15438,6 +19127,16 @@ exit "$overall"
 # exports folder), apart from the api's own exports folder; the Docker socket.
 # It can't see env_file, which compose merges into the environment.
 #
+# --lan (#26) runs the verify project in LAN mode. It comes up in its default
+# configuration first, where the first Engineer (vfy-engineer) is created, as
+# the README tells users to do, and then switches to the LAN configuration:
+# the checkout's docker-compose.lan.yml plus this checkout's
+# docker-compose.lan.verify.yml, which publishes TLS on loopback only, at the
+# verify port. The guard checks that configuration too, with rule (c) wanting
+# exactly proxy:127.0.0.1:<verify port>->443/tcp. The suites then reach it at
+# https://localhost:<port>/api and trust the certificate it generated, copied
+# into the private folder. Without suite names, a --lan run runs 18_lan.
+#
 # What this does not do: the suites, and anything else the checkout runs on the
 # host, still have full access to Docker. It keeps verification away from the
 # live stack by accident, not from hostile code; that is the security review's.
@@ -15454,6 +19153,10 @@ SCRATCH="${SCRATCH%/}"
 # local user can't pre-create it or plant a symlink there (#154).
 PRIVATE="$SCRATCH/rag-verify-$(id -u)"
 EXPORTS="$PRIVATE/exports"
+# LAN mode's certificate, copied from the proxy so the suites can verify it (#26).
+LAN_CERT="$PRIVATE/lan-cert.pem"
+# Which rule (c) the guard applies: default (port 80) or lan (port 443).
+GUARD_MODE=default
 
 usage() {
   sed -n '6,8p' "${BASH_SOURCE[0]}" | sed 's/^#  //' >&2
@@ -15486,6 +19189,7 @@ fi
 CHECKOUT="$HARNESS"
 PULL=""
 TELEMETRY=0
+LAN=0
 OTEL_ENABLED=true
 ARGS=()
 while [ "$#" -gt 0 ]; do
@@ -15496,6 +19200,9 @@ while [ "$#" -gt 0 ]; do
     --telemetry)
       [ "$CMD" != down ] || usage
       TELEMETRY=1; shift ;;
+    --lan)
+      { [ "$CMD" = up ] || [ "$CMD" = run ]; } || usage
+      LAN=1; shift ;;
     --disabled)
       [ "$CMD" = telemetry-mode ] || usage
       OTEL_ENABLED=false; shift ;;
@@ -15508,6 +19215,8 @@ while [ "$#" -gt 0 ]; do
       ARGS+=("$1"); shift ;;
   esac
 done
+
+[ "$TELEMETRY" = 0 ] || [ "$LAN" = 0 ] || fail "--lan and --telemetry can't be combined."
 
 PORT="${RAG_VERIFY_PORT:-8081}"
 case "$PORT" in
@@ -15584,6 +19293,9 @@ if [ "$TELEMETRY" = 1 ]; then
   export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.telemetry.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.telemetry.verify.yml"
   export COMPOSE_PROFILES=telemetry
 fi
+# LAN mode's configuration, switched to once the default one is up and set up.
+LAN_COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.lan.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.lan.verify.yml"
+export RAG_VERIFY_LAN="$LAN"
 export RAG_VERIFY_PORT="$PORT"
 export RAG_API="http://localhost:$PORT/api"
 export RAG_EXPECTED_PROXY_PORT="$PORT"
@@ -15622,6 +19334,7 @@ do_down() {
     return 2
   fi
   [ ! -d "$EXPORTS" ] || rm -rf "$EXPORTS"
+  rm -f "$LAN_CERT"
   left="$(docker ps -aq --filter "$filter")$(docker network ls -q --filter "$filter")$(docker volume ls -q --filter "$filter" | grep -vx "$MODELS")$(labelled_images)"
   if [ -e "$EXPORTS" ] || [ -L "$EXPORTS" ]; then
     left="$left $EXPORTS"
@@ -15709,10 +19422,13 @@ do_guard() {
     rm -f "$config"
     fail "docker compose config failed for $CHECKOUT."
   fi
-  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" "$HARNESS" <<'GUARDPY'
+  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" "$HARNESS" "$GUARD_MODE" <<'GUARDPY'
 import json, os, sys
 
 checkout, exports, port, path = sys.argv[1:5]
+# default, or lan (#26): LAN mode's proxy serves TLS on container port 443.
+mode = sys.argv[6] if len(sys.argv) > 6 else 'default'
+target = 443 if mode == 'lan' else 80
 config = json.load(open(path))
 services = config.get('services') or {}
 volumes = config.get('volumes') or {}
@@ -15843,16 +19559,17 @@ for svc, service in services.items():
         if options:
             problems.append(f"(j) service {svc!r} sets options on network {name!r}")
 
-# (c) exactly one published port: the proxy, on loopback, the verify port
+# (c) exactly one published port: the proxy, on loopback, the verify port,
+# container port 80 (443 in LAN mode)
 ports = [(svc, p) for svc, service in services.items() for p in service.get('ports') or []]
 if not (len(ports) == 1 and ports[0][0] == 'proxy'
         and ports[0][1].get('host_ip') == '127.0.0.1'
         and str(ports[0][1].get('published')) == port
-        and ports[0][1].get('target') == 80
+        and ports[0][1].get('target') == target
         and ports[0][1].get('protocol', 'tcp') == 'tcp'):
     shown = ', '.join(f"{svc}:{p.get('host_ip', '')}:{p.get('published')}->{p.get('target')}/{p.get('protocol', 'tcp')}"
                       for svc, p in ports) or 'none'
-    problems.append(f"(c) published ports must be exactly proxy:127.0.0.1:{port}->80/tcp, not {shown}")
+    problems.append(f"(c) published ports must be exactly proxy:127.0.0.1:{port}->{target}/tcp, not {shown}")
 
 # (d) mounts: volumes and binds only, with no options; binds read-only, from
 # inside the checkout but not its exports folder; (e) never the socket
@@ -15902,6 +19619,45 @@ GUARDPY
   [ "$rc" -eq 0 ] || fail "the verify project's configuration is refused (see above); nothing was built or started."
 }
 
+# ── LAN mode (#26) ───────────────────────────────────────────────────────────
+# From the default configuration, up and healthy, to LAN mode, as the README
+# tells users: create the first Engineer, then switch. do_up always clears the
+# project first, so it is never set up here. The generated password is
+# discarded unseen; the suites' account setup resets it like any password it
+# doesn't know.
+lan_switch() {
+  local i code=000 service state health
+  printf 'creating the first Engineer, then switching to LAN mode...\n'
+  docker compose -p "$PROJECT" exec -T api python -m auth bootstrap vfy-engineer >/dev/null \
+    || fail "could not create the first Engineer for LAN mode."
+  export COMPOSE_FILE="$LAN_COMPOSE_FILE"
+  GUARD_MODE=lan
+  do_guard
+  if ! docker compose -p "$PROJECT" up -d --no-build --pull never --wait --wait-timeout 300; then
+    docker compose -p "$PROJECT" ps -a --format '{{.Service}} {{.State}} {{.Health}}' \
+      | while read -r service state health; do
+          case "$state/${health:-}" in
+            running/healthy|running/) ;;
+            *) printf '\n── %s (%s %s) ──\n' "$service" "$state" "${health:-}"
+               docker compose -p "$PROJECT" logs --tail 50 "$service" ;;
+          esac
+        done
+    fail "the verify project did not come up in LAN mode."
+  fi
+  rm -f "$LAN_CERT"
+  (umask 077 && docker compose -p "$PROJECT" exec -T proxy cat /etc/nginx/certs/live/cert.pem > "$LAN_CERT") \
+    && [ -s "$LAN_CERT" ] || fail "could not copy LAN mode's certificate from the proxy."
+  export RAG_API="https://localhost:$PORT/api"
+  # curl and Python's ssl trust only this certificate for the run.
+  export CURL_CA_BUNDLE="$LAN_CERT" SSL_CERT_FILE="$LAN_CERT" RAG_VERIFY_LAN_CERT="$LAN_CERT"
+  for i in $(seq 1 60); do
+    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' --cacert "$LAN_CERT" "$RAG_API/health" 2>/dev/null)
+    [ "$code" = 200 ] && break
+    sleep 1
+  done
+  [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 over TLS within 60 seconds (last: $code)."
+}
+
 # ── up ───────────────────────────────────────────────────────────────────────
 do_up() {
   local i code=000 service state health
@@ -15934,10 +19690,16 @@ do_up() {
     sleep 1
   done
   [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 within 60 seconds (last: $code)."
-  printf '\nThe verify project is up at http://localhost:%s. To point commands at it:\n\n' "$PORT"
-  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT RAG_VERIFY_TELEMETRY; do
+  [ "$LAN" = 0 ] || lan_switch
+  printf '\nThe verify project is up at %s. To point commands at it:\n\n' "${RAG_API%/api}"
+  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT RAG_VERIFY_TELEMETRY RAG_VERIFY_LAN; do
     printf 'export %s=%q\n' "$var" "${!var}"
   done
+  if [ "$LAN" = 1 ]; then
+    for var in CURL_CA_BUNDLE SSL_CERT_FILE RAG_VERIFY_LAN_CERT; do
+      printf 'export %s=%q\n' "$var" "${!var}"
+    done
+  fi
   if [ "$TELEMETRY" = 1 ]; then
     for var in COMPOSE_PROFILES RAG_VERIFY_HARNESS RAG_VERIFY_CHECKOUT RAG_VERIFY_OTEL_ENABLED; do
       printf 'export %s=%q\n' "$var" "${!var}"
@@ -15960,6 +19722,8 @@ case "$CMD" in
     TEARDOWN=1
     do_up
     rc=0
+    # A LAN run checks LAN mode; other suites assume the default configuration.
+    [ "$LAN" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(18_lan)
     # In the background with job control on, all.sh leads a process group of
     # its own (pgid $!), which stop_suite ends; and `wait`, unlike a foreground
     # command, returns as soon as INT or TERM arrives, so the traps act at once.
@@ -16072,6 +19836,58 @@ require_stack() {
     printf '  Start the verify project first:  bash scripts/verify/stack.sh up\n\n'
     exit 2
   fi
+  auth_ensure
+}
+
+# ── test accounts (#25) ──────────────────────────────────────────────────────
+# Every API route but /health and the login needs a session. auth_setup.py keeps
+# one account per role (vfy-engineer, vfy-developer, vfy-end-user) with its
+# password in $RAG_AUTH_DIR/credentials (mode 0600, folder 0700, outside the
+# checkout), never printed, on a command line or in the environment. It runs
+# the operator command (`python -m auth`) only when the target is the verify
+# project as stack.sh sets it up, the same condition as removing its volumes;
+# anywhere else a password that doesn't work is a failure, never a reset.
+#
+# The suites then send the engineer's session with every request: the curl
+# function below adds the cookie jar and a same-origin Origin (the API refuses a
+# cookie-authenticated change without one) to every curl call in a suite,
+# api_* helpers included. A check that needs no session, another role or another
+# origin calls `command curl` and passes its own. Python helpers read the same
+# jar through auth_headers.py.
+RAG_AUTH_DIR="${RAG_AUTH_DIR:-$(printf '%s' "${TMPDIR:-/tmp}" | sed 's:/*$::')/rag-verify-auth-$(id -u)}"
+# The script that does it; test_verify_stack.py's sandboxes, which stub docker
+# and curl, put a stand-in here. The --operator condition below stays lib.sh's.
+RAG_AUTH_SETUP="${RAG_AUTH_SETUP:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/auth_setup.py}"
+RAG_AUTH_ORIGIN=$(python3 -c 'import sys; from urllib.parse import urlsplit; u = urlsplit(sys.argv[1]); print(u.scheme + "://" + u.netloc)' "$API")
+export RAG_AUTH_DIR RAG_AUTH_ORIGIN
+
+curl() {
+  if [ -n "${RAG_AUTH_JAR:-}" ]; then
+    command curl -b "$RAG_AUTH_JAR" -H "Origin: $RAG_AUTH_ORIGIN" "$@"
+  else
+    command curl "$@"
+  fi
+}
+
+# auth_jar <role>: logs the role's test account in and prints its cookie jar.
+auth_jar() {
+  local jar="$RAG_AUTH_DIR/$1.jar"
+  _rag_require_lock_owner
+  python3 "$RAG_AUTH_SETUP" login "$1" "$jar" || return 1
+  printf '%s' "$jar"
+}
+
+auth_ensure() {
+  local operator="" jar
+  _rag_require_lock_owner
+  [ -n "$(volume_removal_refusal_reason)" ] || operator=--operator
+  if ! python3 "$RAG_AUTH_SETUP" ensure $operator; then
+    printf '\n  Could not set up the test accounts on %s (see above).\n\n' "$API"
+    exit 2
+  fi
+  jar=$(auth_jar engineer) || { printf '\n  The test engineer could not log in.\n\n'; exit 2; }
+  RAG_AUTH_JAR="$jar"
+  export RAG_AUTH_JAR
 }
 
 # wait_for_job <url-path> [timeout-seconds] — polls until status is terminal.
@@ -16253,6 +20069,3720 @@ restart_timing_check() {
 case "$(basename "$0")" in
   [0-9][0-9]_*.sh) live_guard ;;
 esac
+```
+
+### scripts/verify/auth_setup.py
+
+```python
+"""Test accounts for the verify suites (#25). Host-side, standard library, Python 3.9+.
+
+    python3 auth_setup.py ensure [--operator]
+    python3 auth_setup.py login ROLE JAR
+    python3 auth_setup.py password ROLE | <a command reading it on stdin>
+
+`ensure` makes sure the verify project has one account per role
+(vfy-engineer, vfy-developer, vfy-end-user) whose password is in the
+credentials file, and that none of them has a password change due. It sets the
+project up (bootstrap) when it isn't yet, creates missing accounts and resets
+unknown passwords, all with the operator command `python -m auth` run in the
+api container: only with --operator, which lib.sh passes only when the target
+is the verify project as stack.sh sets it up. Without it, a stored password that
+doesn't work is a failure, never a reset.
+
+`login` logs ROLE in and writes the session to JAR, a curl cookie jar.
+`password` writes ROLE's password into a pipe, for a command that reads it on
+standard input (the packaged retrieve.py); it refuses to write it to a terminal.
+
+Secrets: the credentials file is mode 0600 in a folder of mode 0700 owned by
+this user, outside the checkout ($RAG_AUTH_DIR, default
+${TMPDIR:-/tmp}/rag-verify-auth-<uid>). Passwords travel only in request
+bodies and in the operator command's captured output: never on a command
+line, in the environment, or in anything this prints.
+"""
+import json
+import os
+import secrets
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+from urllib.parse import urlsplit
+
+ROLES = {"engineer": "vfy-engineer", "developer": "vfy-developer", "end_user": "vfy-end-user"}
+REPO = Path(__file__).resolve().parents[2]
+COOKIE = "rag_session"
+
+
+class SetupError(Exception):
+    pass
+
+
+def api_base():
+    return os.environ.get("RAG_API", "http://localhost:8080/api").rstrip("/")
+
+
+def origin(api=None):
+    parts = urlsplit(api or api_base())
+    return "{}://{}".format(parts.scheme, parts.netloc)
+
+
+def auth_dir():
+    configured = os.environ.get("RAG_AUTH_DIR")
+    if configured:
+        return Path(configured)
+    base = (os.environ.get("TMPDIR") or "/tmp").rstrip("/") or "/tmp"
+    return Path(base) / "rag-verify-auth-{}".format(os.getuid())
+
+
+def private_dir():
+    """The credentials folder, created 0700; refused if it is a symlink, not a
+    folder, or someone else's, so nobody can plant or read the file."""
+    folder = auth_dir()
+    if folder.is_symlink():
+        raise SetupError("{} is a symlink; refusing to use it".format(folder))
+    if folder.exists() and not folder.is_dir():
+        raise SetupError("{} exists and is not a folder; refusing to use it".format(folder))
+    if not folder.exists():
+        folder.mkdir(mode=0o700)
+    if folder.stat().st_uid != os.getuid():
+        raise SetupError("{} belongs to another user; refusing to use it".format(folder))
+    os.chmod(folder, 0o700)
+    return folder
+
+
+def read_credentials(folder):
+    path = folder / "credentials"
+    found = {}
+    if not path.exists():
+        return found
+    if path.is_symlink() or not path.is_file():
+        raise SetupError("{} is not a regular file; refusing to use it".format(path))
+    for line in path.read_text().splitlines():
+        parts = line.split(" ", 2)
+        if len(parts) == 3 and parts[0] in ROLES:
+            found[parts[0]] = (parts[1], parts[2])
+    return found
+
+
+def write_credentials(folder, credentials):
+    """Atomically, mode 0600 from the start."""
+    fd, tmp = tempfile.mkstemp(prefix=".credentials.", dir=str(folder))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            for role in ROLES:
+                if role in credentials:
+                    username, password = credentials[role]
+                    handle.write("{} {} {}\n".format(role, username, password))
+        os.replace(tmp, str(folder / "credentials"))
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def request(method, path, body=None, token=None, api=None):
+    """(status, parsed JSON or None, session token from Set-Cookie or None)."""
+    api = api or api_base()
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Origin": origin(api)}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    if token:
+        headers["Cookie"] = "{}={}".format(COOKIE, token)
+    req = urllib.request.Request(api + path, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            status, raw, cookies = response.status, response.read(), response.headers.get_all("Set-Cookie") or []
+    except urllib.error.HTTPError as error:
+        status, raw, cookies = error.code, error.read(), error.headers.get_all("Set-Cookie") or []
+    try:
+        parsed = json.loads(raw) if raw else None
+    except ValueError:
+        parsed = None
+    token_out = None
+    for cookie in cookies:
+        name, _, rest = cookie.partition("=")
+        if name.strip() == COOKIE:
+            token_out = rest.split(";", 1)[0] or None
+    return status, parsed, token_out
+
+
+def operator(*args):
+    """Run `python -m auth ARGS` in the verify project's api container.
+    Returns (exit status, stdout). stdout (a generated password) is captured,
+    never shown; stderr, one line naming the action, passes through."""
+    result = subprocess.run(["docker", "compose", "exec", "-T", "api", "python", "-m", "auth"] + list(args),
+                            cwd=str(REPO), stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                            universal_newlines=True)
+    return result.returncode, result.stdout.strip()
+
+
+def fresh_password():
+    return secrets.token_urlsafe(24)
+
+
+def settle(role, username, password):
+    """Log in; replace a generated password with a fresh one. Returns the
+    working password, or None when the login fails."""
+    status, body, token = request("POST", "/auth/login", {"username": username, "password": password})
+    if status != 200 or not token:
+        return None
+    if body.get("must_change_password"):
+        new = fresh_password()
+        status, _, _ = request("POST", "/auth/password", {"current_password": password, "new_password": new},
+                               token=token)
+        if status != 200:
+            raise SetupError("could not replace the generated password of {} (HTTP {})".format(username, status))
+        password = new
+    request("POST", "/auth/logout", token=token)
+    return password
+
+
+def ensure(allow_operator):
+    folder = private_dir()
+    credentials = read_credentials(folder)
+    status, body, _ = request("GET", "/auth/status")
+    if status != 200 or not isinstance(body, dict):
+        raise SetupError("GET /auth/status answered HTTP {}".format(status))
+    if body.get("setup_required"):
+        if not allow_operator:
+            raise SetupError("the verify project is not set up, and this target is not the verify project")
+        code, password = operator("bootstrap", ROLES["engineer"])
+        if code != 0 or not password:
+            raise SetupError("bootstrap failed (exit {})".format(code))
+        credentials["engineer"] = (ROLES["engineer"], password)
+    for role, username in ROLES.items():
+        stored = credentials.get(role)
+        working = settle(role, username, stored[1]) if stored and stored[0] == username else None
+        if working is None:
+            if not allow_operator:
+                raise SetupError("the stored password of {} doesn't work, and this target is not the verify "
+                                 "project, so it isn't reset".format(username))
+            code, password = operator("create-user", username, role)
+            if code == 1:
+                code, password = operator("reset-password", username)
+            if code != 0 or not password:
+                raise SetupError("could not create or reset {} (exit {})".format(username, code))
+            working = settle(role, username, password)
+            if working is None:
+                raise SetupError("{} can't log in with its new password".format(username))
+        credentials[role] = (username, working)
+        write_credentials(folder, credentials)
+
+
+def write_jar(jar, token, api=None):
+    """A curl cookie jar holding the session, mode 0600."""
+    host = urlsplit(api or api_base()).hostname
+    fd = os.open(str(jar), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write("# Netscape HTTP Cookie File\n")
+        handle.write("#HttpOnly_{}\tFALSE\t/\tFALSE\t0\t{}\t{}\n".format(host, COOKIE, token))
+
+
+def login(role, jar):
+    if role not in ROLES:
+        raise SetupError("unknown role {!r}".format(role))
+    folder = private_dir()
+    stored = read_credentials(folder).get(role)
+    if not stored:
+        raise SetupError("no stored password for {}; run ensure first".format(ROLES[role]))
+    status, body, token = request("POST", "/auth/login", {"username": stored[0], "password": stored[1]})
+    if status != 200 or not token or body.get("must_change_password"):
+        raise SetupError("{} could not log in (HTTP {})".format(stored[0], status))
+    write_jar(Path(jar), token)
+
+
+def password_to_pipe(role):
+    if role not in ROLES:
+        raise SetupError("unknown role {!r}".format(role))
+    if os.isatty(1):
+        raise SetupError("refusing to print a password to a terminal; pipe it into the command that needs it")
+    stored = read_credentials(private_dir()).get(role)
+    if not stored:
+        raise SetupError("no stored password for {}; run ensure first".format(ROLES[role]))
+    sys.stdout.write(stored[1] + "\n")
+
+
+def main(argv):
+    try:
+        if len(argv) >= 1 and argv[0] == "ensure" and argv[1:] in ([], ["--operator"]):
+            ensure(argv[1:] == ["--operator"])
+        elif len(argv) == 3 and argv[0] == "login":
+            login(argv[1], argv[2])
+        elif len(argv) == 2 and argv[0] == "password":
+            password_to_pipe(argv[1])
+        else:
+            print(__doc__.split("\n\n")[1], file=sys.stderr)
+            return 2
+    except SetupError as error:
+        print("auth_setup: {}".format(error), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+```
+
+### scripts/verify/auth_headers.py
+
+```python
+"""The suite's session for the host-side Python helpers that call the API (#25).
+
+lib.sh logs the test engineer in and exports RAG_AUTH_JAR (a curl cookie jar)
+and RAG_AUTH_ORIGIN. headers() returns the Cookie and Origin a same-origin
+browser would send. Standard library, Python 3.9+.
+"""
+import os
+
+COOKIE = "rag_session"
+
+
+def session_token(jar_path):
+    """The session cookie's value in a curl cookie jar, or None."""
+    try:
+        with open(jar_path) as jar:
+            lines = jar.read().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        # curl marks HttpOnly cookies with this prefix on an otherwise
+        # ordinary line; other lines starting with # are comments.
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif line.startswith("#") or not line.strip():
+            continue
+        fields = line.split("\t")
+        if len(fields) == 7 and fields[5] == COOKIE:
+            return fields[6]
+    return None
+
+
+def headers():
+    """{'Cookie', 'Origin'} for the suite's session; empty outside a suite."""
+    jar, origin = os.environ.get("RAG_AUTH_JAR"), os.environ.get("RAG_AUTH_ORIGIN")
+    token = session_token(jar) if jar else None
+    found = {}
+    if token:
+        found["Cookie"] = "{}={}".format(COOKIE, token)
+    if origin:
+        found["Origin"] = origin
+    return found
+```
+
+### scripts/verify/17_auth.sh
+
+```bash
+#!/usr/bin/env bash
+# Authentication and the endpoint/role matrix (#25): SPECIFICATIONS.md §3.1.8
+# and §10.6.
+#
+# The unit checks run in the API image with no network. The stack checks run
+# on the verify project through auth_stack.py, one check each; those that create
+# throwaway vfy-t-<random> accounts or vfy-s-<random> service principals, or age
+# a session or a key, use the operator command, so they run only on the verify
+# project as stack.sh sets it up. The restart
+# check is opt-in (RAG_ALLOW_RESTART=1) like the other restart checks.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+require_stack
+
+operator=""
+[ -n "$(volume_removal_refusal_reason)" ] || operator=--operator
+stack() { _rag_require_lock_owner; python3 ./auth_stack.py "$@" $operator; }
+
+section "Auth units: passwords, store, policy, middleware, routes, operator command"
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_auth.py)
+check "test_auth.py registered regression checks" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_auth_enforcement.py)
+check "test_auth_enforcement.py: every protected route refuses a request without a session" $?
+python3 "$REPO_ROOT/scripts/tests/test_verify_auth.py"
+check "test_verify_auth.py: the harness keeps its credentials private" $?
+
+section "Endpoint/role matrix on the stack (H1)"
+stack public
+check "/health and /auth/status answer without a session" $?
+stack matrix anonymous
+check "without a session every protected route, downloads and job polling included, answers 401" $?
+stack matrix end_user
+check "End User: 403 exactly on the routes above its role" $?
+stack matrix developer
+check "Developer: 403 exactly on the routes above its role" $?
+stack matrix engineer
+check "Engineer: no 401 or 403 on any route" $?
+
+section "Sessions (H2)"
+stack login-logout
+check "login, GET /auth/me and logout; a logged-out session answers 401" $?
+stack cookie
+check "the session cookie is HttpOnly, SameSite=Strict, Path=/, Max-Age 7 days, not Secure on loopback" $?
+stack reset
+check "a password reset ends the user's sessions and forces a change" $?
+stack disable
+check "disabling a user ends their session and refuses their login; enable restores it" $?
+stack role-change
+check "a role change applies to an existing session on its next request" $?
+stack own-password
+check "the own password change: rules, current password, not the same password, other sessions ended" $?
+stack idle-expiry
+check "a session idle for more than 12 hours answers 401" $?
+
+section "Account administration by Engineers (PR 2)"
+stack admin-accounts
+check "an Engineer creates, resets, re-roles, disables and enables an account through the API; own reset refused; no password logged" $?
+
+section "Service principals and API keys (PR 3, H3)"
+stack key-matrix end_user
+check "End User key, no Origin: 403 above its role and on account/key administration, logout and password change" $?
+stack key-matrix developer
+check "Developer key, no Origin: 403 above its role and on account/key administration, logout and password change" $?
+stack key-matrix engineer
+check "Engineer key, no Origin: no 401 or 403 on data routes; 403 KEY_NOT_ALLOWED on account/key administration" $?
+stack service-keys
+check "keys: no principal login, rotation, role change, disable, revoke and expiry; bad keys 401; no key in listings or the log" $?
+
+section "Request protection and login throttling (H4)"
+stack control-path
+check "a path ending in %0A is refused before its body is read, not routed past the check" $?
+stack no-cors
+check "no Access-Control-* headers, preflight included" $?
+stack origin
+check "a cookie-authenticated change from another origin is refused; same-origin passes" $?
+stack generic-failure
+check "a wrong password and an unknown user get the same 401 LOGIN_FAILED" $?
+stack throttle
+check "five failed logins lock the username and address for 15 minutes" $?
+stack bootstrap-refused
+check "bootstrap is refused once set up; an invalid username is a usage error" $?
+stack no-secrets-logged
+check "the API log names logins and holds no harness password or session token" $?
+
+section "Restart persistence (opt-in: it restarts the api)"
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  restart_refusal=$(restart_refusal_reason)
+  if [ -n "$restart_refusal" ]; then
+    check "a session and a lockout survive an API restart" 1 "$restart_refusal"
+  else
+    stack restart-prepare
+    prepared=$?
+    project="$COMPOSE_PROJECT_NAME"
+    started=$(python3 -c "import time;print(time.time())")
+    (cd "$REPO_ROOT" && docker compose -p "$project" restart api >/dev/null 2>&1)
+    elapsed=$(wait_healthy_timed "$started" 300)
+    [ "$prepared" = 0 ] && stack restart-verify
+    check "a session and a lockout survive an API restart" $? "healthy after ${elapsed:-never}s"
+  fi
+else
+  skip "a session and a lockout survive an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+fi
+
+summary
+```
+
+### scripts/verify/auth_stack.py
+
+```python
+"""Authentication checks on the verify project (#25), one per subcommand. Host-side,
+standard library, Python 3.9+. Run by 17_auth.sh, which turns each exit status
+into a check:
+
+    python3 auth_stack.py CHECK [--operator]
+
+Exit 0 when the check holds, 1 when it doesn't (the reason on stderr). Checks
+that create throwaway accounts (vfy-t-<random>), service principals
+(vfy-s-<random>) or age a session need the operator command, so they need
+--operator, which 17_auth.sh passes only on the verify project as stack.sh sets
+it up. No password, session token or API key is printed; keys are held in
+memory only.
+"""
+import hashlib
+import json
+import os
+import secrets
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+import auth_headers
+import auth_setup
+from auth_setup import REPO, request
+
+ROLES = ("end_user", "developer", "engineer")
+X = "VfyAuthNoSuch"
+# S2.2 of the specifications, written out here rather than read from the API,
+# so the API is checked against the agreed matrix and not against itself.
+# (method, path, body, required role). Bodies are empty or invalid on purpose:
+# an allowed request must fail validation or find nothing, never do work.
+MATRIX = (
+    ("GET", "/collections", None, "end_user"),
+    ("POST", "/query", {}, "end_user"),
+    ("GET", "/retrieval/config/" + X, None, "end_user"),
+    ("POST", "/collections", {}, "developer"),
+    ("POST", "/ingest/upload", {}, "developer"),
+    ("GET", "/ingest/job/vfy-no-such-job", None, "developer"),
+    ("GET", "/ingest/config/" + X, None, "developer"),
+    ("POST", "/ingest/config", {}, "developer"),
+    ("POST", "/retrieval/config", {}, "developer"),
+    ("POST", "/goldstandard/generate", {}, "developer"),
+    ("GET", "/goldstandard/session/gs_vfynosuch", None, "developer"),
+    ("PATCH", "/goldstandard/session/gs_vfynosuch/pair/p", {}, "developer"),
+    ("POST", "/goldstandard/regenerate", {}, "developer"),
+    ("POST", "/goldstandard/save", {}, "developer"),
+    ("GET", "/goldstandard/download/vfy_no_such.json", None, "developer"),
+    ("POST", "/export", {}, "developer"),
+    ("GET", "/export/job/vfy-no-such-job", None, "developer"),
+    ("POST", "/import", {}, "developer"),
+    ("GET", "/import/job/vfy-no-such-job", None, "developer"),
+    ("GET", "/packages", None, "developer"),
+    ("GET", "/help/transfer", None, "developer"),
+    ("GET", "/tune/" + X, None, "developer"),
+    ("DELETE", "/collections/" + X + "?confirm=true", None, "engineer"),
+    ("POST", "/tune/rechunk", {}, "engineer"),
+    ("POST", "/tune/reembed", {}, "engineer"),
+    ("POST", "/tune/reindex", {}, "engineer"),
+    ("GET", "/tune/job/vfy-no-such-job", None, "engineer"),
+    ("GET", "/metrics/latency", None, "engineer"),
+    ("GET", "/goldstandard/diagnostics", None, "engineer"),
+    ("GET", "/docs", None, "engineer"),
+    ("GET", "/docs/oauth2-redirect", None, "engineer"),
+    ("GET", "/redoc", None, "engineer"),
+    ("GET", "/openapi.json", None, "engineer"),
+    # Account administration (PR 2 of #25): an allowed request lists, or is a
+    # 422 or a 404 for an account that doesn't exist; it changes nothing.
+    ("GET", "/auth/users", None, "engineer"),
+    ("POST", "/auth/users", {}, "engineer"),
+    ("POST", "/auth/users/vfy-no-such-user/reset-password", None, "engineer"),
+    ("POST", "/auth/users/vfy-no-such-user/role", {}, "engineer"),
+    ("POST", "/auth/users/vfy-no-such-user/disable", None, "engineer"),
+    ("POST", "/auth/users/vfy-no-such-user/enable", None, "engineer"),
+    # Service principals and keys (PR 3 of #25): likewise a list, a 422 or a 404.
+    ("GET", "/auth/service-principals", None, "engineer"),
+    ("POST", "/auth/service-principals", {}, "engineer"),
+    ("POST", "/auth/service-principals/vfy-no-such-svc/role", {}, "engineer"),
+    ("POST", "/auth/service-principals/vfy-no-such-svc/disable", None, "engineer"),
+    ("POST", "/auth/service-principals/vfy-no-such-svc/enable", None, "engineer"),
+    ("POST", "/auth/service-principals/vfy-no-such-svc/keys", {}, "engineer"),
+    ("POST", "/auth/service-principals/vfy-no-such-svc/keys/nosuchkey123/revoke", None, "engineer"),
+)
+# Routes an API key can't use whatever its role (S5 of PR 3): every account,
+# principal and key route, logout and the password change.
+KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password")
+SESSION_ROUTES = (("GET", "/auth/me", None), ("POST", "/auth/logout", None), ("POST", "/auth/password", {}))
+
+
+class CheckFailed(Exception):
+    pass
+
+
+def expect(condition, why):
+    if not condition:
+        raise CheckFailed(why)
+
+
+def compose(*args, stdin=None):
+    return subprocess.run(["docker", "compose"] + list(args), cwd=str(REPO), input=stdin,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+
+def role_token(role):
+    """A fresh session for the harness account of ROLE."""
+    username, password = auth_setup.read_credentials(auth_setup.private_dir())[role]
+    status, _, token = request("POST", "/auth/login", {"username": username, "password": password})
+    expect(status == 200 and token, "{} could not log in (HTTP {})".format(username, status))
+    return token
+
+
+def code(method, path, body=None, token=None, headers=None):
+    """The status of a request sent as a same-origin browser would, or with `headers` instead."""
+    api = auth_setup.api_base()
+    data = json.dumps(body).encode() if body is not None else None
+    sent = {"Origin": auth_setup.origin()} if headers is None else dict(headers)
+    if data is not None:
+        sent["Content-Type"] = "application/json"
+    if token:
+        sent["Cookie"] = "rag_session=" + token
+    req = urllib.request.Request(api + path, data=data, method=method, headers=sent)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            return response.status, response.read(), response.headers
+    except urllib.error.HTTPError as error:
+        return error.code, error.read(), error.headers
+
+
+def error_code(raw):
+    try:
+        return json.loads(raw)["error"]["code"]
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def throwaway(role, operator_ok):
+    """A new account of ROLE, logged in with its generated password replaced.
+    Returns (username, password, token)."""
+    expect(operator_ok, "needs the operator command, which runs only on the verify project")
+    username = "vfy-t-" + secrets.token_hex(4)
+    rc, password = auth_setup.operator("create-user", username, role)
+    expect(rc == 0 and password, "create-user {} failed (exit {})".format(username, rc))
+    status, body, token = request("POST", "/auth/login", {"username": username, "password": password})
+    expect(status == 200 and body.get("must_change_password") is True,
+           "a created account must change its password at first login (HTTP {}, {})".format(status, body))
+    status, raw, _ = code("GET", "/collections", token=token)
+    expect(status == 403 and error_code(raw) == "PASSWORD_CHANGE_REQUIRED",
+           "before the change, GET /collections answered {} {}".format(status, error_code(raw)))
+    new = secrets.token_urlsafe(18)
+    status, _, _ = code("POST", "/auth/password", {"current_password": password, "new_password": new}, token=token)
+    expect(status == 200, "the forced change answered {}".format(status))
+    return username, new, token
+
+
+def bearer(key):
+    """The headers of a service sending its key: no Origin, no cookie."""
+    return {"Authorization": "Bearer " + key}
+
+
+def new_principal(admin, role):
+    """A throwaway vfy-s-<random> principal of ROLE with one key, through the
+    API as the harness Engineer (session token `admin`). Returns (name, key id, key)."""
+    name = "vfy-s-" + secrets.token_hex(4)
+    status, raw, _ = code("POST", "/auth/service-principals", {"name": name, "role": role}, token=admin)
+    expect(status == 201, "creating principal {} answered {} {}".format(name, status, error_code(raw)))
+    key_id, key = issue(admin, name)
+    return name, key_id, key
+
+
+def issue(admin, name, body=None):
+    status, raw, headers = code("POST", "/auth/service-principals/{}/keys".format(name), body or {}, token=admin)
+    expect(status == 201, "issuing a key for {} answered {} {}".format(name, status, error_code(raw)))
+    expect(headers.get("Cache-Control") == "no-store", "the issued key's answer may be cached")
+    answer = json.loads(raw)
+    return answer["key"]["id"], answer["secret"]
+
+
+# ── checks ───────────────────────────────────────────────────────────────────
+
+def check_matrix(who, operator_ok):
+    wrong = []
+    token = None if who == "anonymous" else role_token(who)
+    for method, path, body, need in MATRIX:
+        status, raw, _ = code(method, path, body, token=token)
+        if who == "anonymous":
+            ok = status == 401
+        elif ROLES.index(who) < ROLES.index(need):
+            ok = status == 403 and error_code(raw) == "FORBIDDEN"
+        else:
+            ok = status not in (401, 403)
+        if not ok:
+            wrong.append("{} {} -> {} {}".format(method, path, status, error_code(raw)))
+    if who == "anonymous":
+        for method, path, body in SESSION_ROUTES:
+            status, raw, _ = code(method, path, body)
+            if status != 401:
+                wrong.append("{} {} -> {}".format(method, path, status))
+    else:
+        request("POST", "/auth/logout", token=token)
+    expect(not wrong, "; ".join(wrong))
+
+
+def check_key_matrix(role, operator_ok):
+    """The matrix with an API key of ROLE, sent without Origin (S8.2 of PR 3)."""
+    expect(operator_ok, "creates a service principal, so it runs only on the verify project")
+    admin = role_token("engineer")
+    name, key_id, key = new_principal(admin, role)
+    wrong = []
+    try:
+        for method, path, body, need in MATRIX:
+            status, raw, _ = code(method, path, body, headers=bearer(key))
+            if path.startswith(KEY_REFUSED):
+                ok = status == 403 and error_code(raw) == "KEY_NOT_ALLOWED"
+            elif ROLES.index(role) < ROLES.index(need):
+                ok = status == 403 and error_code(raw) == "FORBIDDEN"
+            else:
+                ok = status not in (401, 403)
+            if not ok:
+                wrong.append("{} {} -> {} {}".format(method, path, status, error_code(raw)))
+        for method, path, body in SESSION_ROUTES:
+            status, raw, _ = code(method, path, body, headers=bearer(key))
+            if path == "/auth/me":
+                me = json.loads(raw) if status == 200 else {}
+                if (me.get("username"), me.get("role"), me.get("kind")) != (name, role, "service"):
+                    wrong.append("GET /auth/me -> {} {}".format(status, me))
+            elif not (status == 403 and error_code(raw) == "KEY_NOT_ALLOWED"):
+                wrong.append("{} {} -> {} {}".format(method, path, status, error_code(raw)))
+    finally:
+        code("POST", "/auth/service-principals/{}/keys/{}/revoke".format(name, key_id), token=admin)
+        code("POST", "/auth/service-principals/{}/disable".format(name), token=admin)
+        request("POST", "/auth/logout", token=admin)
+    expect(not wrong, "; ".join(wrong))
+
+
+def check_service_keys(operator_ok):
+    """A service principal's keys through their life (S8.2 of PR 3), as the
+    harness Engineer through the API."""
+    expect(operator_ok, "creates a service principal, so it runs only on the verify project")
+    admin = role_token("engineer")
+    me = auth_setup.read_credentials(auth_setup.private_dir())["engineer"][0]
+    name, first_id, first = new_principal(admin, "developer")
+    issued = [first]
+
+    def works(key, path="/packages"):
+        return code("GET", path, headers=bearer(key))[0]
+
+    def invalid(key_or_header, why):
+        status, raw, _ = code("GET", "/collections", headers={"Authorization": key_or_header})
+        expect(status == 401 and error_code(raw) == "KEY_INVALID", "{}: answered {} {}".format(
+            why, status, error_code(raw)))
+
+    def admin_post(path, body=None):
+        status, raw, _ = code("POST", "/auth/service-principals/{}{}".format(name, path), body, token=admin)
+        expect(status == 200, "POST {} answered {} {}".format(path, status, error_code(raw)))
+        return json.loads(raw)["principal"]
+
+    # The principal can't log in (Q21).
+    status, raw, _ = code("POST", "/auth/login", {"username": name, "password": "x" * 12})
+    expect(status == 401 and error_code(raw) == "LOGIN_FAILED", "the principal's login answered {}".format(status))
+    # A change without Origin is accepted (Q26): index_type 7 is invalid, so it's a 422 and creates nothing.
+    status, raw, _ = code("POST", "/collections", {"name": "VfyKey" + secrets.token_hex(3), "index_type": 7},
+                          headers=bearer(first))
+    expect(status == 422, "a key's change without Origin answered {} {}".format(status, error_code(raw)))
+    # Rotation: a second key; both work (Q24).
+    second_id, second = issue(admin, name, {"label": "rotated", "days": 1})
+    issued.append(second)
+    expect(works(first) == 200 and works(second) == 200, "after rotation both keys must work")
+    # A role change applies to the keys at once.
+    admin_post("/role", {"role": "end_user"})
+    status, raw, _ = code("GET", "/packages", headers=bearer(first))
+    expect(status == 403 and error_code(raw) == "FORBIDDEN", "after the demotion the key answered {}".format(status))
+    admin_post("/role", {"role": "developer"})
+    # Disabling the principal stops its keys; enabling restores them.
+    admin_post("/disable")
+    invalid("Bearer " + first, "a disabled principal's key")
+    admin_post("/enable")
+    expect(works(first) == 200, "enabling the principal did not restore its key")
+    # Revocation stops one key; the other keeps working.
+    principal = admin_post("/keys/{}/revoke".format(first_id))
+    invalid("Bearer " + first, "a revoked key")
+    expect(works(second) == 200, "revoking one key stopped the other")
+    expect([k["status"] for k in principal["keys"] if k["id"] == first_id] == ["revoked"], "the revoked key isn't listed as revoked")
+    # Expiry: the second key, aged past its end in the verify project's store.
+    script = ("import sqlite3,sys,time\nfrom auth import store\n"
+              "c=sqlite3.connect(store.db_path());c.execute('UPDATE api_keys SET expires_at=? WHERE id=?',"
+              "(time.time()-1,sys.argv[1]));c.commit();print(c.total_changes)\n")
+    result = compose("exec", "-T", "api", "python", "-c", script, second_id)
+    expect(result.returncode == 0 and result.stdout.strip() == "1", "could not age the key: {}".format(
+        result.stderr.strip()[-200:]))
+    invalid("Bearer " + second, "an expired key")
+    # Unknown, malformed and non-Bearer keys; a bad key never falls back to a valid cookie.
+    third_id, third = issue(admin, name)
+    issued.append(third)
+    invalid("Bearer rag_" + secrets.token_hex(6) + "_" + secrets.token_urlsafe(32), "an unknown key")
+    invalid("Bearer " + third[:-1], "a malformed key")
+    invalid("Basic " + third, "a Basic header")
+    status, raw, _ = code("GET", "/metrics/latency", token=admin, headers={"Authorization": "Bearer nonsense"})
+    expect(status == 401 and error_code(raw) == "KEY_INVALID", "a bad key with a valid cookie answered {} {}".format(
+        status, error_code(raw)))
+    # A key in the query string is no credential. It reaches the access log there,
+    # which is why keys are never accepted from URLs: revoked at once, and left
+    # out of the log check below.
+    query_id, query_key = issue(admin, name)
+    status, raw, _ = code("GET", "/collections?api_key=" + query_key, headers={})
+    expect(status == 401 and error_code(raw) == "AUTH_REQUIRED", "a key in the query string answered {} {}".format(
+        status, error_code(raw)))
+    admin_post("/keys/{}/revoke".format(query_id))
+    # Keys appear in no listing and not in the API log, which has the admin lines.
+    status, raw, _ = code("GET", "/auth/service-principals", token=admin)
+    expect(status == 200 and not [k for k in issued + [query_key] if k in raw.decode()], "a listing holds a key")
+    admin_post("/keys/{}/revoke".format(third_id))
+    admin_post("/disable")
+    result = compose("logs", "--no-color", "api")
+    log = result.stdout + result.stderr
+    expect(result.returncode == 0, "docker compose logs failed")
+    expect(not [k for k in issued if k in log], "an API key appears in the API log")
+    for line in ("created service principal '{}' (developer)".format(name),
+                 "issued key {} for service principal '{}'".format(second_id, name),
+                 "revoked key {} of service principal '{}'".format(first_id, name),
+                 "disabled service principal '{}'".format(name)):
+        expect("Admin '{}' {}".format(me, line) in log, "the API log has no line \"Admin ... {}\"".format(line))
+    # The operator command marks the principal in its list and won't reset its password.
+    rc, listed = auth_setup.operator("list")
+    expect(rc == 0 and "{}\tdeveloper\tdisabled\tservice account\t".format(name) in listed,
+           "the operator's list doesn't mark the principal")
+    rc, out = auth_setup.operator("reset-password", name)
+    expect(rc == 1 and not out, "reset-password of a principal exited {}".format(rc))
+    request("POST", "/auth/logout", token=admin)
+
+
+def check_public(operator_ok):
+    status, raw, _ = code("GET", "/health", headers={})
+    expect(status in (200, 503), "GET /health without a session answered {}".format(status))
+    status, raw, _ = code("GET", "/auth/status", headers={})
+    expect(status == 200 and json.loads(raw) == {"setup_required": False},
+           "GET /auth/status answered {} {!r}".format(status, raw[:200]))
+
+
+def check_control_path(operator_ok):
+    # Starlette would route /ingest/upload%0A to the upload handler; the API
+    # refuses it as an unknown path before reading the body (#25 review).
+    body = b"--x\r\nContent-Disposition: form-data; name=\"collection\"\r\n\r\nVfyAuthNoSuch\r\n--x--\r\n"
+    req = urllib.request.Request(auth_setup.api_base() + "/ingest/upload%0A", data=body, method="POST",
+                                 headers={"Content-Type": "multipart/form-data; boundary=x"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            status, raw = response.status, response.read()
+    except urllib.error.HTTPError as error:
+        status, raw = error.code, error.read()
+    # The API's own 404, or nginx refusing the path itself (400); anything else
+    # (a 403 from the app's fail-closed check, a 422 from the handler) means the
+    # request got past the middleware and its body was read.
+    expect((status == 404 and error_code(raw) == "NOT_FOUND") or (status == 400 and error_code(raw) is None),
+           "POST /api/ingest/upload%0A without a session answered {} {}".format(status, error_code(raw)))
+
+
+def check_login_logout(operator_ok):
+    token = role_token("developer")
+    status, raw, _ = code("GET", "/auth/me", token=token)
+    body = json.loads(raw)
+    expect(status == 200 and body == {"username": "vfy-developer", "role": "developer", "must_change_password": False,
+                                      "kind": "user"},
+           "GET /auth/me answered {} {}".format(status, body))
+    status, _, _ = code("POST", "/auth/logout", token=token)
+    expect(status == 200, "logout answered {}".format(status))
+    status, raw, _ = code("GET", "/auth/me", token=token)
+    expect(status == 401 and error_code(raw) == "AUTH_REQUIRED", "after logout the session answered {}".format(status))
+
+
+def check_cookie(operator_ok):
+    username, password = auth_setup.read_credentials(auth_setup.private_dir())["end_user"]
+    status, _, headers = code("POST", "/auth/login", {"username": username, "password": password})
+    cookies = headers.get_all("Set-Cookie") or []
+    expect(status == 200 and len(cookies) == 1, "login answered {} with {} cookies".format(status, len(cookies)))
+    attributes = [a.strip().lower() for a in cookies[0].split(";")[1:]]
+    for want in ("httponly", "samesite=strict", "path=/", "max-age=604800"):
+        expect(want in attributes, "the session cookie lacks {}".format(want))
+    expect("secure" not in attributes, "the loopback profile's cookie is marked Secure")
+    token = cookies[0].split(";", 1)[0].split("=", 1)[1]
+    request("POST", "/auth/logout", token=token)
+
+
+def check_no_cors(operator_ok):
+    token = role_token("engineer")
+    for method, path, headers in (("GET", "/collections", {"Origin": "http://other.example"}),
+                                  ("OPTIONS", "/collections", {"Origin": "http://other.example",
+                                                               "Access-Control-Request-Method": "DELETE"})):
+        _, _, answer = code(method, path, token=token, headers=headers)
+        expect(not any(k.lower().startswith("access-control-") for k in answer.keys()),
+               "{} {} answered with CORS headers".format(method, path))
+    request("POST", "/auth/logout", token=token)
+
+
+def check_origin(operator_ok):
+    token = role_token("developer")
+    # index_type 7 is invalid, so an allowed request is a 422 and creates nothing.
+    body = {"name": "VfyAuthOrigin" + secrets.token_hex(3), "index_type": 7}
+    cases = (("no Origin and no Sec-Fetch-Site", {}, 403),
+             ("another origin", {"Origin": "http://evil.example"}, 403),
+             ("the right host on another port", {"Origin": auth_setup.origin().rsplit(":", 1)[0] + ":1"}, 403),
+             ("Origin null", {"Origin": "null"}, 403),
+             ("Sec-Fetch-Site cross-site", {"Sec-Fetch-Site": "cross-site"}, 403),
+             ("Sec-Fetch-Site same-origin", {"Sec-Fetch-Site": "same-origin"}, None),
+             ("the same origin", {"Origin": auth_setup.origin()}, None))
+    for name, headers, want in cases:
+        status, raw, _ = code("POST", "/collections", body, token=token, headers=headers)
+        if want == 403:
+            expect(status == 403 and error_code(raw) == "CROSS_ORIGIN_REFUSED",
+                   "{}: answered {} {}".format(name, status, error_code(raw)))
+        else:
+            expect(status == 422, "{}: answered {} {}, wanted the 422 of an allowed request".format(
+                name, status, error_code(raw)))
+    status, _, _ = code("GET", "/collections", token=token, headers={"Origin": "http://evil.example"})
+    expect(status == 200, "a cross-origin GET answered {} (reads aren't origin-checked)".format(status))
+    request("POST", "/auth/logout", token=token)
+
+
+def check_generic_failure(operator_ok):
+    username, password = auth_setup.read_credentials(auth_setup.private_dir())["end_user"]
+    answers = []
+    for name, secret in ((username, password + "x"), ("vfy-nobody-" + secrets.token_hex(4), password)):
+        status, raw, _ = code("POST", "/auth/login", {"username": name, "password": secret})
+        answers.append((status, raw))
+    expect(answers[0] == answers[1] and answers[0][0] == 401 and error_code(answers[0][1]) == "LOGIN_FAILED",
+           "wrong password and unknown user answered differently: {}".format(
+               [(s, error_code(r)) for s, r in answers]))
+
+
+def check_throttle(operator_ok):
+    name = "vfy-throttle-" + secrets.token_hex(4)
+    seen = []
+    for _ in range(5):
+        status, raw, _ = code("POST", "/auth/login", {"username": name, "password": "x" * 12})
+        seen.append(status)
+    status, raw, _ = code("POST", "/auth/login", {"username": name, "password": "x" * 12})
+    expect(seen == [401] * 5 and status == 429 and error_code(raw) == "LOGIN_THROTTLED",
+           "five failures then {} {} (first five: {})".format(status, error_code(raw), seen))
+    if operator_ok:
+        username, password, token = throwaway("end_user", operator_ok)
+        for _ in range(5):
+            code("POST", "/auth/login", {"username": username, "password": "y" * 12})
+        status, raw, _ = code("POST", "/auth/login", {"username": username, "password": password})
+        expect(status == 429, "the right password during a lockout answered {}".format(status))
+        status, _, _ = code("GET", "/auth/me", token=token)
+        expect(status == 200, "a lockout ended the user's existing session ({})".format(status))
+
+
+def check_reset(operator_ok):
+    username, password, token = throwaway("developer", operator_ok)
+    rc, new = auth_setup.operator("reset-password", username)
+    expect(rc == 0 and new, "reset-password failed (exit {})".format(rc))
+    status, _, _ = code("GET", "/auth/me", token=token)
+    expect(status == 401, "a reset left the old session working ({})".format(status))
+    status, _, _ = code("POST", "/auth/login", {"username": username, "password": password})
+    expect(status == 401, "the old password still logs in ({})".format(status))
+    status, body, token = request("POST", "/auth/login", {"username": username, "password": new})
+    expect(status == 200 and body.get("must_change_password") is True, "the reset password must be changed")
+
+
+def check_disable(operator_ok):
+    username, password, token = throwaway("developer", operator_ok)
+    rc, _ = auth_setup.operator("disable", username)
+    expect(rc == 0, "disable failed (exit {})".format(rc))
+    status, _, _ = code("GET", "/collections", token=token)
+    expect(status == 401, "a disabled user's session still works ({})".format(status))
+    status, raw, _ = code("POST", "/auth/login", {"username": username, "password": password})
+    expect(status == 401 and error_code(raw) == "LOGIN_FAILED", "a disabled user can log in ({})".format(status))
+    rc, _ = auth_setup.operator("enable", username)
+    status, _, _ = code("POST", "/auth/login", {"username": username, "password": password})
+    expect(rc == 0 and status == 200, "enable did not restore the login ({}, {})".format(rc, status))
+
+
+def check_role_change(operator_ok):
+    username, password, token = throwaway("developer", operator_ok)
+    status, _, _ = code("GET", "/packages", token=token)
+    expect(status == 200, "a developer can't list packages ({})".format(status))
+    rc, _ = auth_setup.operator("set-role", username, "end_user")
+    status, raw, _ = code("GET", "/packages", token=token)
+    expect(rc == 0 and status == 403 and error_code(raw) == "FORBIDDEN",
+           "after the demotion the same session answered {} {}".format(status, error_code(raw)))
+    status, raw, _ = code("GET", "/auth/me", token=token)
+    expect(json.loads(raw).get("role") == "end_user", "GET /auth/me still names the old role")
+    rc, _ = auth_setup.operator("set-role", username, "engineer")
+    status, _, _ = code("GET", "/metrics/latency", token=token)
+    expect(rc == 0 and status == 200, "after a promotion the same session answered {}".format(status))
+
+
+def check_own_password(operator_ok):
+    username, password, token = throwaway("end_user", operator_ok)
+    status, body, other = request("POST", "/auth/login", {"username": username, "password": password})
+    expect(status == 200 and other, "a second login failed ({})".format(status))
+    status, raw, _ = code("POST", "/auth/password", {"current_password": "wrong" * 3, "new_password": "z" * 14},
+                          token=token)
+    expect(status == 403 and error_code(raw) == "PASSWORD_INCORRECT", "a wrong current password answered {}".format(status))
+    for bad in ("short", username.upper(), "q" * 257):
+        status, raw, _ = code("POST", "/auth/password", {"current_password": password, "new_password": bad},
+                              token=token)
+        expect(status == 422 and error_code(raw) == "INVALID_PASSWORD",
+               "a {}-character new password answered {}".format(len(bad), status))
+    status, raw, _ = code("POST", "/auth/password", {"current_password": password, "new_password": password},
+                          token=token)
+    expect(status == 422 and error_code(raw) == "INVALID_PASSWORD", "the same password again answered {}".format(status))
+    new = secrets.token_urlsafe(18)
+    status, _, _ = code("POST", "/auth/password", {"current_password": password, "new_password": new}, token=token)
+    expect(status == 200, "the change answered {}".format(status))
+    expect(code("GET", "/auth/me", token=token)[0] == 200, "the change ended the session that made it")
+    expect(code("GET", "/auth/me", token=other)[0] == 401, "the change left another session working")
+
+
+def check_admin_accounts(operator_ok):
+    """The Engineer's account administration through the API (PR 2 of #25), on a
+    throwaway vfy-t-<random> account."""
+    expect(operator_ok, "creates accounts, so it runs only on the verify project")
+    admin = role_token("engineer")
+    username = "vfy-t-" + secrets.token_hex(4)
+    generated = []
+
+    def call(path, body=None, method="POST"):
+        status, raw, headers = code(method, "/auth/users" + path, body, token=admin)
+        return status, (json.loads(raw) if raw else {}), headers
+
+    status, body, headers = call("", {"username": username.upper(), "role": "developer"})
+    expect(status == 201 and body["user"]["username"] == username and body["user"]["must_change_password"] is True,
+           "create answered {} {}".format(status, error_code(json.dumps(body).encode())))
+    expect(headers.get("Cache-Control") == "no-store", "the created password's answer may be cached")
+    generated.append(body["password"])
+    status, listed, _ = call("", method="GET")
+    expect(status == 200 and username in [u["username"] for u in listed["users"]], "the new account isn't listed")
+    expect(generated[0] not in json.dumps(listed), "the list holds the generated password")
+    status, body, token = request("POST", "/auth/login", {"username": username, "password": generated[0]})
+    expect(status == 200 and body.get("must_change_password") is True, "the generated password must be changed first")
+    new = secrets.token_urlsafe(18)
+    status, _, _ = code("POST", "/auth/password", {"current_password": generated[0], "new_password": new}, token=token)
+    expect(status == 200, "the forced change answered {}".format(status))
+
+    status, body, _ = call("/{}/role".format(username), {"role": "end_user"})
+    expect(status == 200 and body["user"]["role"] == "end_user", "the role change answered {}".format(status))
+    status, raw, _ = code("GET", "/packages", token=token)
+    expect(status == 403 and error_code(raw) == "FORBIDDEN", "the demoted session answered {}".format(status))
+
+    status, body, _ = call("/{}/reset-password".format(username))
+    expect(status == 200 and body["user"]["must_change_password"] is True, "the reset answered {}".format(status))
+    generated.append(body["password"])
+    expect(code("GET", "/auth/me", token=token)[0] == 401, "a reset left the user's session working")
+    status, _, token = request("POST", "/auth/login", {"username": username, "password": generated[1]})
+    expect(status == 200 and token, "the reset password doesn't log in ({})".format(status))
+
+    status, body, _ = call("/{}/disable".format(username))
+    expect(status == 200 and body["user"]["enabled"] is False, "disable answered {}".format(status))
+    expect(code("GET", "/auth/me", token=token)[0] == 401, "a disabled user's session still works")
+    status, raw, _ = code("POST", "/auth/login", {"username": username, "password": generated[1]})
+    expect(status == 401 and error_code(raw) == "LOGIN_FAILED", "a disabled user can log in ({})".format(status))
+    status, body, _ = call("/{}/enable".format(username))
+    expect(status == 200 and body["user"]["enabled"] is True, "enable answered {}".format(status))
+    status, _, _ = code("POST", "/auth/login", {"username": username, "password": generated[1]})
+    expect(status == 200, "enable did not restore the login ({})".format(status))
+
+    me = auth_setup.read_credentials(auth_setup.private_dir())["engineer"][0]
+    status, body, _ = call("/{}/reset-password".format(me))
+    expect(status == 409 and body["error"]["code"] == "SELF_RESET_REFUSED",
+           "the Engineer's own reset answered {}".format(status))
+    expect(code("GET", "/auth/me", token=admin)[0] == 200, "the refused own reset ended the session")
+    request("POST", "/auth/logout", token=admin)
+
+    result = compose("logs", "--no-color", "api")
+    log = result.stdout + result.stderr
+    expect(result.returncode == 0, "docker compose logs failed")
+    expect(not [p for p in generated if p in log], "a generated password appears in the API log")
+    for line in ("created developer '{}'".format(username), "reset the password of '{}'".format(username),
+                 "disabled '{}'".format(username), "enabled '{}'".format(username)):
+        expect("Admin '{}' {}".format(me, line) in log, "the API log has no line \"Admin ... {}\"".format(line))
+
+
+def check_bootstrap_refused(operator_ok):
+    expect(operator_ok, "needs the operator command, which runs only on the verify project")
+    rc, out = auth_setup.operator("bootstrap", "vfy-second-" + secrets.token_hex(3))
+    expect(rc == 1 and not out, "bootstrap on a set-up project exited {} (printed {} characters)".format(rc, len(out)))
+    rc, out = auth_setup.operator("create-user", "x", "engineer")
+    expect(rc == 2 and not out, "an invalid username exited {}".format(rc))
+
+
+def check_idle_expiry(operator_ok):
+    username, password, token = throwaway("end_user", operator_ok)
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    # Ages this one session past the 12-hour idle limit, in the verify project's store.
+    script = ("import sqlite3,sys,time\nfrom auth import store\n"
+              "c=sqlite3.connect(store.db_path());c.execute('UPDATE sessions SET last_seen=? WHERE token_hash=?',"
+              "(time.time()-13*3600,sys.argv[1]));c.commit();print(c.total_changes)\n")
+    result = compose("exec", "-T", "api", "python", "-c", script, digest)
+    expect(result.returncode == 0 and result.stdout.strip() == "1", "could not age the session: {}".format(
+        result.stderr.strip()[-200:]))
+    status, raw, _ = code("GET", "/auth/me", token=token)
+    expect(status == 401 and error_code(raw) == "AUTH_REQUIRED", "an idle session still works ({})".format(status))
+
+
+def check_no_secrets_logged(operator_ok):
+    secrets_known = [password for _, password in auth_setup.read_credentials(auth_setup.private_dir()).values()]
+    token = auth_headers.session_token(os.environ.get("RAG_AUTH_JAR", ""))
+    if token:
+        secrets_known.append(token)
+    result = compose("logs", "--no-color", "api")
+    expect(result.returncode == 0, "docker compose logs failed")
+    leaked = sum(1 for s in secrets_known if s and s in result.stdout + result.stderr)
+    expect(leaked == 0, "{} harness secret(s) appear in the API log".format(leaked))
+    expect("Login succeeded for 'vfy-engineer'" in result.stdout + result.stderr,
+           "the API log has no login line for vfy-engineer")
+
+
+STATE = "restart-state.json"
+
+
+def check_restart_prepare(operator_ok):
+    username, password, token = throwaway("end_user", operator_ok)
+    name = "vfy-locked-" + secrets.token_hex(4)
+    for _ in range(5):
+        code("POST", "/auth/login", {"username": name, "password": "x" * 12})
+    path = auth_setup.private_dir() / STATE
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        json.dump({"token": token, "locked": name}, handle)
+
+
+def check_restart_verify(operator_ok):
+    path = auth_setup.private_dir() / STATE
+    state = json.loads(path.read_text())
+    path.unlink()
+    status, _, _ = code("GET", "/auth/me", token=state["token"])
+    expect(status == 200, "a session did not survive the API restart ({})".format(status))
+    status, _, _ = code("POST", "/auth/login", {"username": state["locked"], "password": "x" * 12})
+    expect(status == 429, "a lockout did not survive the API restart ({})".format(status))
+
+
+CHECKS = {name[len("check_"):].replace("_", "-"): fn for name, fn in globals().items() if name.startswith("check_")}
+
+
+def main(argv):
+    operator_ok = "--operator" in argv
+    names = [a for a in argv if a != "--operator"]
+    if len(names) == 2 and names[0] == "matrix" and names[1] in ROLES + ("anonymous",):
+        run = lambda: check_matrix(names[1], operator_ok)
+    elif len(names) == 2 and names[0] == "key-matrix" and names[1] in ROLES:
+        run = lambda: check_key_matrix(names[1], operator_ok)
+    elif len(names) == 1 and names[0] in CHECKS and names[0] not in ("matrix", "key-matrix"):
+        run = lambda: CHECKS[names[0]](operator_ok)
+    else:
+        print("usage: auth_stack.py {matrix ROLE|anonymous, key-matrix ROLE, "
+              + ", ".join(sorted(set(CHECKS) - {"matrix", "key-matrix"})) + "} [--operator]",
+              file=sys.stderr)
+        return 2
+    try:
+        run()
+    except (CheckFailed, auth_setup.SetupError) as failure:
+        print("    " + str(failure), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+```
+
+### scripts/verify/18_lan.sh
+
+```bash
+#!/usr/bin/env bash
+# LAN mode (#26): SPECIFICATIONS.md §2.5 and §10.5.
+#
+# Every run checks the real docker-compose.lan.yml as `docker compose config`
+# resolves it (nothing is started) and runs the LAN unit tests in the API image
+# with no network. The checks of a running LAN project need
+# `stack.sh run --lan`, which switches the verify project to LAN mode with TLS
+# on 127.0.0.1:<verify port> only; anywhere else they are skipped.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+require_stack
+
+section "LAN override, resolved without starting it"
+python3 ./lan_config.py "$REPO_ROOT"
+check "docker-compose.lan.yml publishes only the proxy on every interface at 443 (RAG_LAN_PORT changes it), in LAN mode with a Secure cookie, after tls-init" $?
+
+section "LAN units: setting, startup refusal, certificate step, nginx configuration"
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_lan_mode.py)
+check "test_lan_mode.py registered regression checks" $?
+
+if [ "${RAG_VERIFY_LAN:-0}" != 1 ]; then
+  skip "LAN mode on the running verify project" "run stack.sh run --lan"
+  summary
+  exit $?
+fi
+
+lan() { _rag_require_lock_owner; python3 ./lan_stack.py "$1"; }
+
+section "LAN mode on the verify project (TLS on loopback only)"
+lan https
+check "HTTPS answers with the generated certificate: localhost and the test names, 825 days" $?
+lan tls
+check "TLS 1.2 and 1.3 connect, TLS 1.1 is refused, ALPN picks HTTP/2" $?
+lan bindings
+check "the only published port is the proxy's 127.0.0.1 TLS port; plain HTTP gets no API answer" $?
+lan cookie
+check "a login over HTTPS sets the session cookie Secure, HttpOnly and SameSite=Strict" $?
+lan origin
+check "a same-origin change over HTTPS is accepted, another origin's refused 403 CROSS_ORIGIN_REFUSED" $?
+lan refusals
+check "the API refuses LAN mode with one line when AUTH_COOKIE_SECURE is false or no Engineer exists" $?
+lan address
+
+summary
+```
+
+### scripts/verify/lan_config.py
+
+```python
+"""The real LAN override, resolved without starting it (#26). Host-side, standard library, Python 3.9+.
+
+    python3 lan_config.py CHECKOUT
+
+Resolves CHECKOUT's docker-compose.yml plus docker-compose.lan.yml with
+`docker compose config` (which creates no container, volume or network), under
+a project name that is neither rag-docker nor rag-verify, with no .env file and
+none of the caller's COMPOSE_* or RAG_LAN_* variables, and checks what LAN mode
+publishes and sets: the proxy alone on every interface at port 443 (8443 with
+RAG_LAN_PORT=8443), the API in LAN mode with a Secure cookie, the certificate
+step in the API image before the proxy, and the read-only mounts. The verify
+project never runs this configuration as is: there, docker-compose.lan.verify.yml
+keeps the publication on loopback. Prints each problem; exits 0 or 1.
+"""
+import json
+import os
+import subprocess
+import sys
+
+PROJECT = "rag-lan-config"
+
+
+def resolve(checkout, port=None):
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("COMPOSE_", "RAG_LAN_"))}
+    if port is not None:
+        env["RAG_LAN_PORT"] = port
+    result = subprocess.run(
+        ["docker", "compose", "--env-file", os.devnull, "-p", PROJECT,
+         "-f", os.path.join(checkout, "docker-compose.yml"), "-f", os.path.join(checkout, "docker-compose.lan.yml"),
+         "config", "--format", "json"],
+        cwd=checkout, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError("docker compose config failed: " + result.stderr.strip())
+    return json.loads(result.stdout)
+
+
+def mount(service, target):
+    found = [m for m in service.get("volumes") or [] if m.get("target") == target]
+    return found[0] if len(found) == 1 else None
+
+
+def problems(config, checkout, port):
+    found = []
+    services = config.get("services") or {}
+    ports = [(name, p) for name, service in services.items() for p in service.get("ports") or []]
+    shown = ", ".join("{}:{}:{}->{}/{}".format(n, p.get("host_ip", ""), p.get("published"), p.get("target"),
+                                              p.get("protocol", "tcp")) for n, p in ports) or "none"
+    if not (len(ports) == 1 and ports[0][0] == "proxy" and ports[0][1].get("host_ip") == "0.0.0.0"
+            and str(ports[0][1].get("published")) == port and ports[0][1].get("target") == 443
+            and ports[0][1].get("protocol", "tcp") == "tcp"):
+        found.append("publications are {}, not exactly proxy:0.0.0.0:{}->443/tcp".format(shown, port))
+    environment = (services.get("api") or {}).get("environment") or {}
+    for key in ("RAG_LAN_MODE", "AUTH_COOKIE_SECURE"):
+        if environment.get(key) != "true":
+            found.append("the api's {} is {!r}, not 'true'".format(key, environment.get(key)))
+    init = services.get("tls-init") or {}
+    if init.get("image") != "rag-docker-api:latest":
+        found.append("tls-init uses {!r}, not the API image rag-docker-api:latest".format(init.get("image")))
+    if init.get("command") != ["python", "-m", "tls_cert"]:
+        found.append("tls-init runs {!r}, not python -m tls_cert".format(init.get("command")))
+    if init.get("ports"):
+        found.append("tls-init publishes a port")
+    proxy = services.get("proxy") or {}
+    wait = (proxy.get("depends_on") or {}).get("tls-init") or {}
+    if wait.get("condition") != "service_completed_successfully":
+        found.append("the proxy doesn't wait for tls-init to complete successfully")
+    expected = [
+        ("proxy", "/etc/nginx/nginx.conf", "bind", os.path.join(checkout, "proxy", "nginx.lan.conf"), True),
+        ("proxy", "/etc/nginx/rag/locations.conf", "bind", os.path.join(checkout, "proxy", "locations.conf"), True),
+        ("proxy", "/etc/nginx/certs", "volume", "lan_certs", True),
+        ("tls-init", "/byo", "bind", os.path.join(checkout, "proxy", "certs"), True),
+        ("tls-init", "/certs", "volume", "lan_certs", False),
+    ]
+    for name, target, kind, source, read_only in expected:
+        found_mount = mount(services.get(name) or {}, target)
+        ok = (found_mount is not None and found_mount.get("type") == kind
+              and (os.path.realpath(found_mount.get("source") or "") == os.path.realpath(source)
+                   if kind == "bind" else found_mount.get("source") == source)
+              and bool(found_mount.get("read_only")) == read_only)
+        if not ok:
+            found.append("{} doesn't mount {} {} at {}{}".format(
+                name, kind, source, target, " read-only" if read_only else ""))
+    if "lan_certs" not in (config.get("volumes") or {}):
+        found.append("no lan_certs volume")
+    return found
+
+
+def main(argv):
+    if len(argv) != 1:
+        print(__doc__.split("\n\n")[1], file=sys.stderr)
+        return 2
+    checkout = os.path.realpath(argv[0])
+    failed = False
+    for port in (None, "8443"):
+        try:
+            config = resolve(checkout, port)
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
+            print("lan_config: {}".format(error), file=sys.stderr)
+            return 1
+        for problem in problems(config, checkout, port or "443"):
+            failed = True
+            print("lan_config{}: {}".format(" (RAG_LAN_PORT=8443)" if port else "", problem), file=sys.stderr)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+```
+
+### scripts/verify/lan_stack.py
+
+```python
+"""LAN mode on the verify project (#26). Host-side, standard library, Python 3.9+.
+
+    python3 lan_stack.py https|tls|bindings|cookie|origin|refusals|address
+
+Run by 18_lan.sh in a `stack.sh run --lan`, which brings the verify project up
+in LAN mode with TLS on 127.0.0.1:<verify port> only, copies the certificate
+the tls-init step generated to RAG_VERIFY_LAN_CERT and points RAG_API at
+https://localhost:<port>/api. Each subcommand is one check and exits 0 or 1,
+printing what failed:
+
+  https     /api/health over TLS, verified against that certificate and the
+            name localhost; the certificate names exactly localhost and the
+            harness's test names and is valid for 825 days
+  tls       TLS 1.2 and 1.3 connect, TLS 1.1 is refused, ALPN picks HTTP/2
+  bindings  the project's only published port is the proxy's
+            127.0.0.1:<port>->443/tcp, and plain HTTP to it gets no API answer
+  cookie    a login over TLS sets the session cookie Secure, HttpOnly and
+            SameSite=Strict
+  origin    a cookie-authenticated change from another origin is refused 403
+            CROSS_ORIGIN_REFUSED, and from https://localhost:<port> accepted
+  refusals  a one-off api container of the LAN configuration (no ports, the
+            running project untouched) refuses to start, with one line, when
+            AUTH_COOKIE_SECURE is false and when its account store is empty
+  address   prints the client address nginx recorded for these requests
+            (always exits 0; information for the README)
+
+The harness Engineer's password comes from auth_setup.py's credentials file and
+travels only in request bodies; nothing here prints it.
+"""
+import http.client
+import json
+import os
+import re
+import secrets
+import socket
+import ssl
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import auth_setup  # noqa: E402
+
+NAMES = {("DNS", "localhost"), ("DNS", "vfy-lan.invalid"), ("IP Address", "192.0.2.10")}
+VALID_S = 825 * 86400
+REFUSED = "LAN mode refused:"
+
+
+def port():
+    return int(os.environ["RAG_VERIFY_PORT"])
+
+
+def cert():
+    return os.environ["RAG_VERIFY_LAN_CERT"]
+
+
+def origin():
+    return "https://localhost:{}".format(port())
+
+
+def context():
+    return ssl.create_default_context(cafile=cert())
+
+
+def request(method, path, body=None, headers=None):
+    """(status, parsed JSON or None, Set-Cookie values) over verified TLS."""
+    conn = http.client.HTTPSConnection("localhost", port(), context=context(), timeout=60)
+    try:
+        data = json.dumps(body).encode() if body is not None else None
+        sent = dict(headers or {})
+        if data is not None:
+            sent["Content-Type"] = "application/json"
+        conn.request(method, "/api" + path, body=data, headers=sent)
+        response = conn.getresponse()
+        raw = response.read()
+        cookies = [value for name, value in response.getheaders() if name.lower() == "set-cookie"]
+        try:
+            parsed = json.loads(raw) if raw else None
+        except ValueError:
+            parsed = None
+        return response.status, parsed, cookies
+    finally:
+        conn.close()
+
+
+def login():
+    """(session token, Set-Cookie value) for the harness Engineer."""
+    stored = auth_setup.read_credentials(auth_setup.private_dir()).get("engineer")
+    if not stored:
+        raise AssertionError("no stored credentials for the harness Engineer")
+    status, body, cookies = request("POST", "/auth/login", {"username": stored[0], "password": stored[1]},
+                                    {"Origin": origin()})
+    session = [c for c in cookies if c.split("=", 1)[0].strip() == auth_setup.COOKIE]
+    if status != 200 or len(session) != 1:
+        raise AssertionError("login answered HTTP {} with {} session cookie(s)".format(status, len(session)))
+    token = session[0].split("=", 1)[1].split(";", 1)[0]
+    return token, session[0]
+
+
+def check_https():
+    conn = http.client.HTTPSConnection("localhost", port(), context=context(), timeout=60)
+    try:
+        conn.request("GET", "/api/health")
+        response = conn.getresponse()
+        response.read()
+        peer = conn.sock.getpeercert()
+    finally:
+        conn.close()
+    assert response.status == 200, "GET /api/health answered {}".format(response.status)
+    names = set(peer.get("subjectAltName", ()))
+    assert names == NAMES, "the certificate names {}, not {}".format(sorted(names), sorted(NAMES))
+    valid = ssl.cert_time_to_seconds(peer["notAfter"]) - ssl.cert_time_to_seconds(peer["notBefore"])
+    assert valid == VALID_S, "the certificate is valid for {} s, not {} (825 days)".format(valid, VALID_S)
+
+
+def handshake(ctx, alpn=None):
+    with socket.create_connection(("localhost", port()), timeout=30) as raw:
+        with ctx.wrap_socket(raw, server_hostname="localhost") as tls:
+            return tls.version(), tls.selected_alpn_protocol()
+
+
+def check_tls():
+    for version, name in ((ssl.TLSVersion.TLSv1_2, "TLSv1.2"), (ssl.TLSVersion.TLSv1_3, "TLSv1.3")):
+        ctx = context()
+        ctx.minimum_version = ctx.maximum_version = version
+        got, _ = handshake(ctx)
+        assert got == name, "asked for {}, got {}".format(name, got)
+    old = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    old.load_verify_locations(cert())
+    # Security level 0, so this client really offers TLS 1.1 and only the
+    # server can refuse it.
+    old.set_ciphers("DEFAULT:@SECLEVEL=0")
+    old.minimum_version = old.maximum_version = ssl.TLSVersion.TLSv1_1
+    try:
+        got, _ = handshake(old)
+    except (ssl.SSLError, OSError):
+        got = None
+    assert got is None, "a TLS 1.1 connection was accepted ({})".format(got)
+    ctx = context()
+    ctx.set_alpn_protocols(["h2", "http/1.1"])
+    _, alpn = handshake(ctx)
+    assert alpn == "h2", "ALPN picked {!r}, not h2".format(alpn)
+
+
+def docker(*args):
+    result = subprocess.run(["docker"] + list(args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, universal_newlines=True, timeout=120)
+    if result.returncode != 0:
+        raise AssertionError("docker {} failed: {}".format(" ".join(args[:2]), result.stderr.strip()))
+    return result.stdout
+
+
+def check_bindings():
+    project = os.environ.get("COMPOSE_PROJECT_NAME", "")
+    assert project == "rag-verify", "COMPOSE_PROJECT_NAME is {!r}, not rag-verify".format(project)
+    ids = docker("ps", "-q", "--filter", "label=com.docker.compose.project=rag-verify").split()
+    bindings = []
+    for container in json.loads(docker("inspect", *ids)) if ids else []:
+        service = container["Config"]["Labels"].get("com.docker.compose.service")
+        for target, published in (container["NetworkSettings"]["Ports"] or {}).items():
+            for binding in published or []:
+                bindings.append((service, target, binding.get("HostIp"), binding.get("HostPort")))
+    want = [("proxy", "443/tcp", "127.0.0.1", str(port()))]
+    assert bindings == want, "published bindings are {}, not {}".format(bindings, want)
+    with socket.create_connection(("127.0.0.1", port()), timeout=30) as raw:
+        raw.sendall(b"GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        answer = b""
+        while len(answer) < 65536:
+            chunk = raw.recv(4096)
+            if not chunk:
+                break
+            answer += chunk
+    first = answer.split(b"\r\n", 1)[0]
+    assert not re.match(rb"HTTP/1\.[01] 200", first), "plain HTTP got {!r}".format(first)
+    assert b'"status"' not in answer, "plain HTTP got an API answer"
+
+
+def check_cookie():
+    token, header = login()
+    try:
+        attributes = {part.strip().lower() for part in header.split(";")[1:]}
+        for wanted in ("secure", "httponly", "samesite=strict"):
+            assert wanted in attributes, "the session cookie lacks {} ({})".format(
+                wanted, sorted(a for a in attributes if not a.startswith("expires")))
+    finally:
+        request("POST", "/auth/logout", headers={"Cookie": "{}={}".format(auth_setup.COOKIE, token),
+                                                 "Origin": origin()})
+
+
+def check_origin():
+    token, _ = login()
+    cookie = "{}={}".format(auth_setup.COOKIE, token)
+    status, body, _ = request("POST", "/auth/logout", headers={"Cookie": cookie, "Origin": "https://vfy-lan.invalid"})
+    code = ((body or {}).get("error") or {}).get("code")
+    assert (status, code) == (403, "CROSS_ORIGIN_REFUSED"), "another origin got {} {}".format(status, code)
+    status, _, _ = request("GET", "/auth/me", headers={"Cookie": cookie})
+    assert status == 200, "the session didn't survive the refused change ({})".format(status)
+    status, _, _ = request("POST", "/auth/logout", headers={"Cookie": cookie, "Origin": origin()})
+    assert status == 200, "the same-origin change answered {}".format(status)
+    status, _, _ = request("GET", "/auth/me", headers={"Cookie": cookie})
+    assert status == 401, "the session still works after logout ({})".format(status)
+
+
+def one_off(*env):
+    """A one-off api container of the LAN configuration: (exit status, its output lines)."""
+    args = ["docker", "compose", "run", "--rm", "--no-deps", "-T"]
+    for item in env:
+        args += ["-e", item]
+    result = subprocess.run(args + ["api"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, universal_newlines=True, timeout=300)
+    return result.returncode, result.stdout.splitlines()
+
+
+def check_refusals():
+    project = os.environ.get("COMPOSE_PROJECT_NAME", "")
+    assert project == "rag-verify", "COMPOSE_PROJECT_NAME is {!r}, not rag-verify".format(project)
+    cases = [(("AUTH_COOKIE_SECURE=false",), "AUTH_COOKIE_SECURE"),
+             (("AUTH_DIR=/tmp/vfy-lan-empty-" + secrets.token_hex(4),), "no enabled AI Engineer")]
+    for env, cause in cases:
+        status, lines = one_off(*env)
+        refused = [line for line in lines if REFUSED in line]
+        assert status != 0, "{}: the API started (exit 0)".format(env[0])
+        assert len(refused) == 1 and cause in refused[0], "{}: refusal lines {}".format(env[0], refused or lines[-5:])
+        tracebacks = [line for line in lines if line.startswith("Traceback")]
+        assert not tracebacks, "{}: the refusal printed a traceback".format(env[0])
+    status, _, _ = request("GET", "/health")
+    assert status == 200, "the running API isn't healthy after the one-off containers ({})".format(status)
+
+
+def check_address():
+    logs = subprocess.run(["docker", "compose", "logs", "--no-color", "--tail", "500", "proxy"],
+                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          universal_newlines=True, timeout=120).stdout
+    seen = re.findall(r"\|\s+(\S+) - \S+ \[[^\]]*\] \"GET /api/health ", logs)
+    print("    nginx recorded the client address {} for this host's loopback requests (in X-Real-IP for the "
+          "API)".format(seen[-1] if seen else "(none found)"))
+
+
+CHECKS = {"https": check_https, "tls": check_tls, "bindings": check_bindings, "cookie": check_cookie,
+          "origin": check_origin, "refusals": check_refusals, "address": check_address}
+
+
+def main(argv):
+    if len(argv) != 1 or argv[0] not in CHECKS:
+        print(__doc__.split("\n\n")[1], file=sys.stderr)
+        return 2
+    try:
+        CHECKS[argv[0]]()
+    except (AssertionError, OSError, ssl.SSLError, subprocess.SubprocessError, KeyError, auth_setup.SetupError) as error:
+        print("    lan_stack {}: {}".format(argv[0], error or type(error).__name__), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+```
+
+### scripts/tests/test_lan_mode.py
+
+````python
+"""LAN mode (issue #26): the RAG_LAN_MODE setting, the API's startup refusal
+(api/lan_mode.py), the certificate step (api/tls_cert.py), LAN mode's nginx
+configuration and the embedded copies of the new files.
+
+Runs with the API's dependencies, in the built API image with no network
+(`18_lan.sh`):
+
+    docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
+      "$(docker compose images -q api)" python scripts/tests/test_lan_mode.py
+
+Stores and certificate folders are temporary; nothing is started or published.
+"""
+import ast
+import datetime
+import io
+import ipaddress
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+API_DIR = os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api")
+sys.path.insert(0, API_DIR)
+ROOT = Path(API_DIR).parent
+
+from cryptography import x509  # noqa: E402
+from cryptography.hazmat.primitives import serialization  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
+
+import config  # noqa: E402
+import lan_mode  # noqa: E402
+import tls_cert  # noqa: E402
+from auth import passwords, store  # noqa: E402
+from config import settings  # noqa: E402
+
+NOW = datetime.datetime(2026, 10, 28, 12, 0, tzinfo=datetime.timezone.utc)
+
+
+class SettingTests(unittest.TestCase):
+    def test_exactly_true_or_false(self):
+        self.assertTrue(config.Settings(rag_lan_mode="true").rag_lan_mode)
+        self.assertFalse(config.Settings(rag_lan_mode="false").rag_lan_mode)
+        self.assertFalse(config.Settings().rag_lan_mode, "LAN mode must be off by default")
+        for bad in ("1", "yes", "on", "True", "TRUE", ""):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValidationError) as caught:
+                    config.Settings(rag_lan_mode=bad)
+                self.assertIn("RAG_LAN_MODE must be exactly true or false", str(caught.exception))
+
+    def test_the_cookie_setting_keeps_its_own_name_in_the_message(self):
+        with self.assertRaises(ValidationError) as caught:
+            config.Settings(auth_cookie_secure="yes")
+        self.assertIn("AUTH_COOKIE_SECURE must be exactly true or false", str(caught.exception))
+
+
+class RefusalTests(unittest.TestCase):
+    """S2.2: with LAN mode on, a Secure cookie (checked first) and an enabled human Engineer."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        for name, value in (("auth_dir", temp.name), ("rag_lan_mode", True), ("auth_cookie_secure", True)):
+            target = patch.object(settings, name, value)
+            target.start()
+            self.addCleanup(target.stop)
+
+    def make(self, username, role):
+        store.create_user(username, role, passwords.generate_password(), bootstrap=not store.is_set_up())
+
+    def test_off_never_refuses(self):
+        with patch.object(settings, "rag_lan_mode", False), patch.object(settings, "auth_cookie_secure", False):
+            self.assertIsNone(lan_mode.refusal())
+
+    def test_an_enabled_human_engineer_and_a_secure_cookie_pass(self):
+        self.make("eng", "engineer")
+        self.assertIsNone(lan_mode.refusal())
+
+    def test_the_cookie_must_be_secure(self):
+        self.make("eng", "engineer")
+        with patch.object(settings, "auth_cookie_secure", False):
+            line = lan_mode.refusal()
+        self.assertTrue(line.startswith("LAN mode refused: AUTH_COOKIE_SECURE must be true"), line)
+
+    def test_the_cookie_is_checked_first(self):
+        with patch.object(settings, "auth_cookie_secure", False):
+            self.assertIn("AUTH_COOKIE_SECURE", lan_mode.refusal())
+
+    def test_who_counts_as_an_engineer(self):
+        engineer_line = "LAN mode refused: there is no enabled AI Engineer account"
+        self.assertTrue(lan_mode.refusal().startswith(engineer_line), "an empty store")
+        self.make("user", "end_user")
+        self.make("dev", "developer")
+        self.assertTrue(lan_mode.refusal().startswith(engineer_line), "only an End User and a Developer")
+        store.create_principal("svc", "engineer")
+        self.assertTrue(lan_mode.refusal().startswith(engineer_line), "a service principal can't log in")
+        self.make("eng", "engineer")
+        self.make("eng2", "engineer")
+        store.set_enabled("eng2", False)
+        self.assertIsNone(lan_mode.refusal())
+        # The last-Engineer rule refuses disabling eng now, so check a disabled-only store directly.
+        with store._connect(write=True) as conn:
+            conn.execute("UPDATE users SET enabled = 0 WHERE username = 'eng'")
+        self.assertTrue(lan_mode.refusal().startswith(engineer_line), "a disabled Engineer")
+
+    def test_each_refusal_is_one_line(self):
+        for secure in (False, True):
+            with self.subTest(secure=secure), patch.object(settings, "auth_cookie_secure", secure):
+                line = lan_mode.refusal()
+                self.assertNotIn("\n", line)
+
+    def test_enforce_prints_the_line_and_exits(self):
+        err = io.StringIO()
+        with patch("sys.stderr", err), self.assertRaises(SystemExit) as caught:
+            lan_mode.enforce()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual(len(err.getvalue().splitlines()), 1)
+        self.make("eng", "engineer")
+        lan_mode.enforce()   # no refusal: returns
+
+
+class MainImportTests(unittest.TestCase):
+    """S2.2/S2.6: uvicorn's import of main stops first, with one line and no traceback."""
+
+    def test_enforce_is_mains_first_statement(self):
+        tree = ast.parse((Path(API_DIR) / "main.py").read_text())
+        body = [node for node in tree.body
+                if not (isinstance(node, ast.ImportFrom) and node.module == "__future__")
+                and not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant))]
+        self.assertEqual(ast.unparse(body[0]), "import lan_mode")
+        self.assertEqual(ast.unparse(body[1]), "lan_mode.enforce()")
+
+    def run_import(self, **env):
+        with tempfile.TemporaryDirectory() as folder:
+            full = {**os.environ, "AUTH_DIR": folder, "PYTHONDONTWRITEBYTECODE": "1", **env}
+            return subprocess.run([sys.executable, "-c", "import main"], cwd=API_DIR, env=full,
+                                  capture_output=True, text=True, timeout=300)
+
+    def test_lan_mode_without_a_secure_cookie_exits_with_one_line(self):
+        result = self.run_import(RAG_LAN_MODE="true", AUTH_COOKIE_SECURE="false")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        lines = result.stderr.splitlines()
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertTrue(lines[0].startswith("LAN mode refused: AUTH_COOKIE_SECURE"), lines)
+
+    def test_lan_mode_with_an_empty_store_exits_with_one_line(self):
+        result = self.run_import(RAG_LAN_MODE="true", AUTH_COOKIE_SECURE="true")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        lines = result.stderr.splitlines()
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertIn("no enabled AI Engineer", lines[0])
+
+    def test_an_invalid_value_stops_the_api(self):
+        result = self.run_import(RAG_LAN_MODE="yes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("RAG_LAN_MODE must be exactly true or false", result.stderr)
+
+
+# ── the certificate step ─────────────────────────────────────────────────────
+
+def certificate(names, days=30, now=NOW):
+    """A self-signed pair as a bring-your-own certificate would be: (cert PEM, key PEM)."""
+    cert_bytes, key_bytes = tls_cert.self_signed(names, now - datetime.timedelta(days=825 - days))
+    return cert_bytes, key_bytes
+
+
+class CertTestCase(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.byo = Path(temp.name) / "byo"
+        self.out = Path(temp.name) / "certs"
+        self.byo.mkdir()
+
+    def step(self, hostnames="office.example,192.168.1.20", now=NOW):
+        out, err = io.StringIO(), io.StringIO()
+        code = tls_cert.run(self.byo, self.out, hostnames, now, out=out, err=err)
+        return code, out.getvalue(), err.getvalue()
+
+    def live(self):
+        live = self.out / "live"
+        cert = x509.load_pem_x509_certificate((live / "cert.pem").read_bytes())
+        return live, cert, (live / "source").read_text().strip()
+
+    def names(self, cert):
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        return ([n for n in san.get_values_for_type(x509.DNSName)],
+                [str(a) for a in san.get_values_for_type(x509.IPAddress)])
+
+
+class SelfSignedTests(CertTestCase):
+    """S4.3-S4.6."""
+
+    def test_generates_for_the_names_plus_localhost(self):
+        code, out, err = self.step("Office.Example, 192.168.1.20 ,office.example,::1")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(len(out.splitlines()), 1)
+        self.assertIn("generated a self-signed certificate", out)
+        live, cert, source = self.live()
+        self.assertEqual(source, "self-signed")
+        self.assertEqual(self.names(cert), (["office.example", "localhost"], ["192.168.1.20", "::1"]))
+        self.assertEqual(cert.subject.rfc4514_string(), "CN=office.example")
+        self.assertEqual(cert.not_valid_after_utc - cert.not_valid_before_utc, datetime.timedelta(days=825))
+        self.assertEqual(cert.not_valid_before_utc, NOW)
+        self.assertFalse(cert.extensions.get_extension_for_class(x509.BasicConstraints).value.ca)
+        self.assertTrue(cert.extensions.get_extension_for_class(x509.BasicConstraints).critical)
+        self.assertEqual(list(cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value),
+                         [x509.oid.ExtendedKeyUsageOID.SERVER_AUTH])
+        with self.assertRaises(x509.ExtensionNotFound):
+            cert.extensions.get_extension_for_class(x509.KeyUsage)
+        key = serialization.load_pem_private_key((live / "key.pem").read_bytes(), None)
+        self.assertEqual(key.curve.name, "secp256r1")
+        self.assertEqual((live / "key.pem").stat().st_mode & 0o777, 0o600)
+        self.assertIn(tls_cert.fingerprint(cert), out)
+        self.assertTrue((self.out / "live").is_symlink())
+
+    def test_names_are_required_and_checked(self):
+        for raw, part in ((None, "empty"), ("", "empty"), ("  ", "empty"), ("a,,b", "empty entry"),
+                          ("bad_name", "'bad_name'"), ("-x.example", "'-x.example'"),
+                          ("x" * 64 + ".example", "neither"), ("*.example", "'*.example'"),
+                          ("a." * 127 + "ab", "neither")):
+            with self.subTest(raw=raw):
+                code, out, err = self.step(raw)
+                self.assertEqual(code, 1)
+                self.assertEqual(out, "")
+                self.assertEqual(len(err.splitlines()), 1, err)
+                self.assertIn(part, err)
+                self.assertFalse((self.out / "live").exists())
+
+    def test_reused_while_valid_and_for_the_same_names(self):
+        self.step()
+        _, first, _ = self.live()
+        code, out, _ = self.step("192.168.1.20, OFFICE.example", now=NOW + datetime.timedelta(days=800))
+        self.assertEqual(code, 0)
+        self.assertIn("reusing the self-signed certificate", out)
+        self.assertEqual(self.live()[1], first)
+        self.assertEqual(len([p for p in self.out.iterdir() if p.name.startswith("pair-")]), 1)
+
+    def regenerated(self, out):
+        self.assertIn("generated a self-signed certificate", out)
+
+    def test_regenerated_when_expired(self):
+        self.step()
+        _, first, _ = self.live()
+        code, out, _ = self.step(now=NOW + datetime.timedelta(days=825))
+        self.assertEqual(code, 0)
+        self.regenerated(out)
+        self.assertNotEqual(self.live()[1], first)
+
+    def test_regenerated_when_the_names_change(self):
+        self.step()
+        code, out, _ = self.step("office.example")
+        self.regenerated(out)
+        self.assertEqual(self.names(self.live()[1]), (["office.example", "localhost"], []))
+
+    def test_regenerated_when_missing_unreadable_or_mismatched(self):
+        self.step()
+        live, _, _ = self.live()
+        (live / "key.pem").write_bytes(certificate(["other"])[1])
+        _, out, _ = self.step()
+        self.regenerated(out)
+        live, _, _ = self.live()
+        (live / "cert.pem").write_bytes(b"not a certificate")
+        _, out, _ = self.step()
+        self.regenerated(out)
+        live, _, _ = self.live()
+        (live / "key.pem").unlink()
+        _, out, _ = self.step()
+        self.regenerated(out)
+        (self.out / "live").unlink()
+        _, out, _ = self.step()
+        self.regenerated(out)
+        self.assertEqual(len([p for p in self.out.iterdir() if p.name.startswith("pair-")]), 1,
+                         "older pairs are removed")
+
+    def test_regenerated_after_bring_your_own_files_are_removed(self):
+        cert_bytes, key_bytes = certificate(["office.example", "192.168.1.20", "localhost"])
+        (self.byo / "cert.pem").write_bytes(cert_bytes)
+        (self.byo / "key.pem").write_bytes(key_bytes)
+        self.step()
+        self.assertEqual(self.live()[2], "byo")
+        (self.byo / "cert.pem").unlink()
+        (self.byo / "key.pem").unlink()
+        code, out, _ = self.step()
+        self.assertEqual(code, 0)
+        self.regenerated(out)
+        self.assertEqual(self.live()[2], "self-signed")
+
+    def test_a_failed_write_leaves_the_live_pair(self):
+        self.step()
+        before = os.readlink(self.out / "live")
+        with patch.object(tls_cert.os, "symlink", side_effect=OSError("disk full")):
+            code, out, err = self.step("office.example")
+        self.assertEqual(code, 1)
+        self.assertEqual(len(err.splitlines()), 1)
+        self.assertEqual(os.readlink(self.out / "live"), before)
+        live, cert, _ = self.live()
+        key = serialization.load_pem_private_key((live / "key.pem").read_bytes(), None)
+        self.assertEqual(tls_cert._public(key.public_key()), tls_cert._public(cert.public_key()))
+
+
+class BringYourOwnTests(CertTestCase):
+    """S4.2."""
+
+    def put(self, cert_bytes=None, key_bytes=None):
+        if cert_bytes is not None:
+            (self.byo / "cert.pem").write_bytes(cert_bytes)
+        if key_bytes is not None:
+            (self.byo / "key.pem").write_bytes(key_bytes)
+
+    def test_used_as_given_with_a_chain(self):
+        server_cert, key_bytes = certificate(["files.example"])
+        other_cert, _ = certificate(["intermediate.example"])
+        self.put(server_cert + other_cert, key_bytes)
+        code, out, err = self.step(hostnames=None)
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("using your certificate from proxy/certs", out)
+        self.assertIn("files.example", out)
+        live, _, source = self.live()
+        self.assertEqual(source, "byo")
+        self.assertEqual((live / "cert.pem").read_bytes(), server_cert + other_cert)
+        self.assertEqual((live / "key.pem").read_bytes(), key_bytes)
+        self.assertEqual((live / "key.pem").stat().st_mode & 0o777, 0o600)
+        pair = os.readlink(self.out / "live")
+        self.step(hostnames=None)
+        self.assertEqual(os.readlink(self.out / "live"), pair, "unchanged files aren't installed again")
+
+    def test_wins_over_hostnames_and_replaces_a_self_signed_pair(self):
+        self.step()
+        self.assertEqual(self.live()[2], "self-signed")
+        self.put(*certificate(["files.example"]))
+        code, out, _ = self.step()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.live()[2], "byo")
+
+    def test_refusals(self):
+        cert_bytes, key_bytes = certificate(["files.example"])
+        _, other_key = certificate(["other.example"])
+        cases = [("only cert.pem", cert_bytes, None, "only one"),
+                 ("only key.pem", None, key_bytes, "only one"),
+                 ("not PEM", b"junk", key_bytes, "cert.pem"),
+                 ("key not PEM", cert_bytes, b"junk", "key.pem"),
+                 ("mismatched key", cert_bytes, other_key, "doesn't match")]
+        for name, cert_part, key_part, part in cases:
+            with self.subTest(case=name):
+                for path in self.byo.iterdir():
+                    path.unlink()
+                self.put(cert_part, key_part)
+                code, out, err = self.step()
+                self.assertEqual(code, 1)
+                self.assertEqual(out, "")
+                self.assertEqual(len(err.splitlines()), 1, err)
+                self.assertIn(part, err)
+                self.assertFalse((self.out / "live").exists())
+
+    def test_an_expired_certificate_is_used_with_a_warning(self):
+        self.put(*certificate(["files.example"], days=-1))
+        code, out, err = self.step()
+        self.assertEqual(code, 0)
+        self.assertIn("warning: the certificate in proxy/certs expired", err)
+        self.assertEqual(self.live()[2], "byo")
+
+
+# ── nginx ────────────────────────────────────────────────────────────────────
+
+def directives(text):
+    return [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+
+
+class NginxTests(unittest.TestCase):
+    """S3.1-S3.4."""
+
+    def setUp(self):
+        self.lan = (ROOT / "proxy" / "nginx.lan.conf").read_text()
+        self.default = (ROOT / "proxy" / "nginx.conf").read_text()
+        self.locations = (ROOT / "proxy" / "locations.conf").read_text()
+
+    def test_one_tls_server_on_443(self):
+        lines = directives(self.lan)
+        self.assertEqual([l for l in lines if l.startswith("listen")], ["listen 443 ssl;"])
+        self.assertEqual(lines.count("server {"), 1)
+        self.assertIn("http2 on;", lines)
+        self.assertIn("ssl_certificate     /etc/nginx/certs/live/cert.pem;", lines)
+        self.assertIn("ssl_certificate_key /etc/nginx/certs/live/key.pem;", lines)
+
+    def test_protocols_ciphers_and_no_hsts(self):
+        lines = directives(self.lan)
+        self.assertIn("ssl_protocols TLSv1.2 TLSv1.3;", lines)
+        self.assertIn("ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:"
+                      "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
+                      "DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305;", lines)
+        self.assertIn("ssl_prefer_server_ciphers off;", lines)
+        self.assertIn("ssl_session_tickets off;", lines)
+        for text in (self.lan, self.locations):
+            self.assertNotIn("strict-transport-security", "\n".join(directives(text)).lower())
+
+    def test_both_servers_share_the_locations(self):
+        include = "include /etc/nginx/rag/locations.conf;"
+        for text in (self.lan, self.default):
+            lines = directives(text)
+            self.assertEqual(lines.count(include), 1)
+            self.assertEqual([l for l in lines if l.startswith("location")], [], "locations belong in locations.conf")
+        self.assertEqual([l for l in directives(self.default) if l.startswith("listen")], ["listen 80;"])
+        upstreams = lambda text: re.findall(r"upstream \w+ \{[^}]*\}", text)
+        self.assertEqual(upstreams(self.lan), upstreams(self.default))
+        lines = directives(self.locations)
+        self.assertEqual([l for l in lines if l.startswith("location")],
+                         ["location = /api/goldstandard/regenerate {", "location /api/ {", "location / {"])
+        self.assertEqual(lines.count("proxy_set_header Host $http_host;"), 2)
+
+
+# ── embedded copies ──────────────────────────────────────────────────────────
+
+class ImplementationCopyTests(unittest.TestCase):
+    def test_embedded_copies_match(self):
+        document = (ROOT / "IMPLEMENTATION.md").read_text()
+        for name in ("docker-compose.lan.yml", "docker-compose.lan.verify.yml", "proxy/nginx.lan.conf",
+                     "proxy/locations.conf", "api/lan_mode.py", "api/tls_cert.py", "scripts/verify/18_lan.sh",
+                     "scripts/verify/lan_config.py", "scripts/verify/lan_stack.py", "scripts/tests/test_lan_mode.py"):
+            with self.subTest(name=name):
+                # A file holding ``` itself (this one) is fenced with ````.
+                header = "### " + name + "\n\n"
+                fence_at = document.index(header) + len(header)
+                fence_line = document[fence_at:document.index("\n", fence_at)]
+                ticks = fence_line[:len(fence_line) - len(fence_line.lstrip("`"))]
+                start = fence_at + len(fence_line) + 1
+                end = document.index("\n" + ticks + "\n", start)
+                self.assertEqual(document[start:end], (ROOT / name).read_text().rstrip("\n"))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+````
+
+### scripts/tests/test_auth.py
+
+```python
+"""Accounts, sessions, service principals and API keys, the endpoint/role
+matrix and the operator command (#25).
+
+Runs with the API's dependencies, in the built API image with no network
+(`17_auth.sh`):
+
+    docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
+      "$(docker compose images -q api)" python scripts/tests/test_auth.py
+
+Every test uses its own temporary store (AUTH_DIR); requests go through
+`main.app` with FastAPI's TestClient, without the lifespan, and nothing reaches
+a backend.
+"""
+import asyncio
+import hashlib
+import logging
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+API_DIR = os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api")
+sys.path.insert(0, API_DIR)
+
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
+
+import config
+from config import settings
+from main import app
+from auth import keys, passwords, policy, store
+from auth.middleware import AuthMiddleware, same_origin
+
+ORIGIN = "http://testserver"
+
+
+def logged(logs):
+    return "\n".join(logging.Formatter().format(record) for record in logs.records)
+
+
+class StoreTestCase(unittest.TestCase):
+    """A fresh, empty store per test."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.dir = temp.name
+        target = patch.object(settings, "auth_dir", self.dir)
+        target.start()
+        self.addCleanup(target.stop)
+        self.client = TestClient(app, raise_server_exceptions=False)
+        self.addCleanup(self.client.close)
+
+    def make(self, username, role, *, must_change=False):
+        password = passwords.generate_password()
+        store.create_user(username, role, password, bootstrap=not store.is_set_up(),
+                          must_change_password=must_change)
+        return password
+
+    def setup_roles(self):
+        """An engineer, a developer and an end user, all past their first login."""
+        self.passwords = {role: self.make(name, role) for role, name in
+                          (("engineer", "eng"), ("developer", "dev"), ("end_user", "user"))}
+
+    def login(self, username, password, **headers):
+        return self.client.post("/auth/login", json={"username": username, "password": password}, headers=headers)
+
+    def session(self, username):
+        """Cookie and Origin headers for a new session of `username`."""
+        token = store.create_session(store.get_user(username).id)
+        return {"Cookie": f"{store.COOKIE}={token}", "Origin": ORIGIN}, token
+
+
+class PasswordTests(unittest.TestCase):
+    def test_hash_format_and_parameters(self):
+        stored = passwords.hash_password("correct horse battery")
+        scheme, log2_n, r, p, salt, digest = stored.split("$")
+        self.assertEqual((scheme, log2_n, r, p), ("scrypt", "15", "8", "1"))
+        import base64
+        self.assertEqual(len(base64.b64decode(salt)), 16)
+        self.assertEqual(len(base64.b64decode(digest)), 32)
+        self.assertNotEqual(stored, passwords.hash_password("correct horse battery"), "salt is random")
+
+    def test_verify(self):
+        stored = passwords.hash_password("correct horse battery")
+        self.assertTrue(passwords.verify_password("correct horse battery", stored))
+        self.assertFalse(passwords.verify_password("correct horse batterY", stored))
+        for broken in ("", "plain", "md5$1$1$1$a$b", "scrypt$15$8$1$!!$!!", "scrypt$40$8$1$YQ==$YQ=="):
+            self.assertFalse(passwords.verify_password("x", broken), broken)
+
+    def test_username_rule(self):
+        self.assertEqual(passwords.normalize_username("Alice.B_c-1"), "alice.b_c-1")
+        for bad in ("ab", "a" * 33, "has space", "naïve", "semi;colon", "", None):
+            self.assertIsNone(passwords.normalize_username(bad), bad)
+
+    def test_password_rule(self):
+        self.assertIsNone(passwords.password_problem("x" * 12, "alice"))
+        self.assertIsNone(passwords.password_problem("x" * 256, "alice"))
+        self.assertIn("12", passwords.password_problem("x" * 11, "alice"))
+        self.assertIn("256", passwords.password_problem("x" * 257, "alice"))
+        self.assertIn("username", passwords.password_problem("Alice.Builder", "alice.builder"))
+
+    def test_generated_passwords(self):
+        generated = {passwords.generate_password() for _ in range(50)}
+        self.assertEqual(len(generated), 50)
+        self.assertTrue(all(len(p) >= 20 and passwords.password_problem(p, "alice") is None for p in generated))
+
+
+class SettingTests(unittest.TestCase):
+    def test_cookie_secure_accepts_only_true_or_false(self):
+        self.assertTrue(config.Settings(auth_cookie_secure="true").auth_cookie_secure)
+        self.assertFalse(config.Settings(auth_cookie_secure="false").auth_cookie_secure)
+        for bad in ("1", "yes", "on", "True", ""):
+            with self.subTest(value=bad), self.assertRaises(ValidationError):
+                config.Settings(auth_cookie_secure=bad)
+        with patch.dict(os.environ, {"AUTH_COOKIE_SECURE": "yes"}), self.assertRaises(ValidationError):
+            config.Settings()
+
+
+class StoreTests(StoreTestCase):
+    def test_file_and_folder_are_private(self):
+        nested = Path(self.dir) / "nested"
+        with patch.object(settings, "auth_dir", str(nested)):
+            self.assertFalse(store.is_set_up())
+            self.assertEqual(nested.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((nested / "auth.db").stat().st_mode & 0o777, 0o600)
+
+    def test_bootstrap_only_once_and_create_only_after(self):
+        with self.assertRaises(store.Refused):
+            store.create_user("dev", "developer", "x" * 12)
+        store.create_user("eng", "engineer", "x" * 12, bootstrap=True)
+        with self.assertRaises(store.Refused):
+            store.create_user("eng2", "engineer", "x" * 12, bootstrap=True)
+        with self.assertRaises(store.Refused):
+            store.create_user("eng", "developer", "x" * 12)
+        self.assertTrue(store.get_user("eng").must_change_password)
+
+    def test_only_hashes_and_token_hashes_are_stored(self):
+        password = self.make("eng", "engineer")
+        token = store.create_session(store.get_user("eng").id)
+        raw = Path(self.dir, "auth.db").read_bytes()
+        self.assertNotIn(password.encode(), raw)
+        self.assertNotIn(token.encode(), raw)
+        rows = sqlite3.connect(Path(self.dir, "auth.db")).execute("SELECT token_hash FROM sessions").fetchall()
+        self.assertEqual(rows, [(hashlib.sha256(token.encode()).hexdigest(),)])
+
+    def test_idle_and_absolute_expiry(self):
+        self.make("eng", "engineer")
+        user = store.get_user("eng")
+        start = 1000.0
+        with patch.object(store, "_now", return_value=start):
+            idle = store.create_session(user.id)
+            busy = store.create_session(user.id)
+        # Used every 30 minutes, a session lasts until the absolute limit and no longer.
+        at = start
+        while at + 1800 < start + store.ABSOLUTE_S:
+            at += 1800
+            with patch.object(store, "_now", return_value=at):
+                self.assertIsNotNone(store.authenticate(busy), f"ended after {(at - start) / 3600} h")
+        with patch.object(store, "_now", return_value=start + store.ABSOLUTE_S + 1):
+            self.assertIsNone(store.authenticate(busy))
+        # Unused, it lasts 12 hours.
+        with patch.object(store, "_now", return_value=start + store.IDLE_S - 1):
+            self.assertIsNotNone(store.authenticate(idle))
+        with patch.object(store, "_now", return_value=start + store.IDLE_S - 1 + store.IDLE_S + 1):
+            self.assertIsNone(store.authenticate(idle))
+        with patch.object(store, "_now", return_value=start + 1):
+            self.assertIsNone(store.authenticate(idle), "an ended session is deleted, not revived")
+
+    def test_revalidation_of_role_and_disabled_state(self):
+        self.make("eng", "engineer")
+        self.make("dev", "developer")
+        token = store.create_session(store.get_user("dev").id)
+        store.set_role("dev", "end_user")
+        self.assertEqual(store.authenticate(token).role, "end_user")
+        store.set_enabled("dev", False)
+        self.assertIsNone(store.authenticate(token))
+        store.set_enabled("dev", True)
+        self.assertIsNone(store.authenticate(token), "disabling deleted the session")
+
+    def test_reset_ends_sessions_and_forces_a_change(self):
+        self.make("eng", "engineer")
+        self.make("dev", "developer")
+        token = store.create_session(store.get_user("dev").id)
+        store.reset_password("dev", "n" * 20)
+        self.assertIsNone(store.authenticate(token))
+        self.assertTrue(store.get_user("dev").must_change_password)
+
+    def test_last_enabled_engineer_is_protected(self):
+        self.make("eng", "engineer")
+        for action in (lambda: store.set_enabled("eng", False), lambda: store.set_role("eng", "developer")):
+            with self.assertRaises(store.Refused):
+                action()
+        self.make("eng2", "engineer")
+        store.set_enabled("eng2", False)
+        with self.assertRaises(store.Refused, msg="a disabled engineer doesn't count"):
+            store.set_role("eng", "end_user")
+        store.set_enabled("eng2", True)
+        store.set_role("eng", "developer")
+        with self.assertRaises(store.Refused):
+            store.set_enabled("eng2", False)
+
+    def test_refusals_carry_a_code(self):
+        # The admin routes answer by these codes (PR 2 of #25).
+        self.make("eng", "engineer")
+        cases = ((lambda: store.create_user("eng", "developer", "x" * 12), "USER_EXISTS"),
+                 (lambda: store.reset_password("nobody", "x" * 12), "USER_NOT_FOUND"),
+                 (lambda: store.set_role("nobody", "developer"), "USER_NOT_FOUND"),
+                 (lambda: store.set_enabled("nobody", True), "USER_NOT_FOUND"),
+                 (lambda: store.set_role("eng", "developer"), "LAST_ENGINEER"),
+                 (lambda: store.set_enabled("eng", False), "LAST_ENGINEER"),
+                 (lambda: store.create_user("eng2", "engineer", "x" * 12, bootstrap=True), "REFUSED"))
+        for action, code in cases:
+            with self.subTest(code=code), self.assertRaises(store.Refused) as caught:
+                action()
+            self.assertEqual(caught.exception.code, code)
+
+    def test_throttle_locks_a_pair_and_survives_a_new_handle(self):
+        for attempt in range(4):
+            self.assertFalse(store.record_failure("alice", "10.0.0.1"))
+        self.assertTrue(store.record_failure("alice", "10.0.0.1"))
+        store._ready.clear()                            # as after an API restart
+        self.assertTrue(store.locked("alice", "10.0.0.1"))
+        self.assertFalse(store.locked("alice", "10.0.0.2"))
+        self.assertFalse(store.locked("bob", "10.0.0.1"))
+        with patch.object(store, "_now", return_value=store._now() + store.LOCKOUT_S + 1):
+            self.assertFalse(store.locked("alice", "10.0.0.1"))
+
+    def test_failures_outside_the_window_do_not_count(self):
+        start = 5000.0
+        for minute in (0, 4, 8, 12):
+            with patch.object(store, "_now", return_value=start + minute * 60):
+                store.record_failure("alice", "a")
+        with patch.object(store, "_now", return_value=start + 16 * 60):
+            self.assertFalse(store.record_failure("alice", "a"), "the first failure left the 15-minute window")
+        store.clear_failures("alice", "a")
+        for _ in range(4):
+            store.record_failure("alice", "a")
+        self.assertFalse(store.locked("alice", "a"))
+
+
+    def test_attempts_are_counted_before_they_are_checked(self):
+        # Five attempts still being checked fill the window: a sixth, in
+        # parallel, is refused before its password is looked at.
+        for _ in range(store.THROTTLE_FAILURES):
+            self.assertTrue(store.reserve_attempt("alice", "a"))
+        self.assertFalse(store.reserve_attempt("alice", "a"))
+        self.assertTrue(store.reserve_attempt("alice", "b"))
+        # They fail: with five counted in the window, the pair is locked.
+        locks = [store.finish_attempt("alice", "a", False) for _ in range(store.THROTTLE_FAILURES)]
+        self.assertTrue(any(locks))
+        self.assertTrue(store.locked("alice", "a"))
+        # A success clears the pair's count.
+        store.finish_attempt("alice", "b", True)
+        for _ in range(store.THROTTLE_FAILURES):
+            self.assertTrue(store.reserve_attempt("alice", "b"))
+
+
+class PolicyTests(unittest.TestCase):
+    def app_routes(self):
+        keys = set()
+        for path, item in app.openapi()["paths"].items():
+            keys |= {(method.upper(), path) for method in item}
+        for route in app.routes:      # FastAPI's own docs routes aren't in the schema
+            if getattr(route, "include_in_schema", True) is False or type(route).__name__ == "Route":
+                keys |= {(m, route.path) for m in route.methods if m != "HEAD"}
+        return keys
+
+    def test_every_route_has_exactly_one_entry_and_every_entry_a_route(self):
+        routes = self.app_routes()
+        self.assertEqual(sorted(routes - set(policy.ACCESS)), [], "routes with no policy entry")
+        self.assertEqual(sorted(set(policy.ACCESS) - routes), [], "policy entries with no route")
+
+    def test_the_matrix_is_the_agreed_one(self):
+        counts = {}
+        for access in policy.ACCESS.values():
+            counts[access] = counts.get(access, 0) + 1
+        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 19, "engineer": 24})
+        self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
+        self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
+        self.assertEqual(policy.ACCESS[("POST", "/collections")], "developer")
+        self.assertEqual(policy.ACCESS[("GET", "/tune/{collection}")], "developer")
+        self.assertEqual(policy.ACCESS[("GET", "/tune/job/{job_id}")], "engineer")
+        # Account administration is the Engineer's, and nothing deletes an account (R1).
+        admin = {key: access for key, access in policy.ACCESS.items() if key[1].startswith("/auth/users")}
+        self.assertEqual(set(admin), {("GET", "/auth/users"), ("POST", "/auth/users"),
+                                      ("POST", "/auth/users/{username}/reset-password"),
+                                      ("POST", "/auth/users/{username}/role"),
+                                      ("POST", "/auth/users/{username}/disable"),
+                                      ("POST", "/auth/users/{username}/enable")})
+        self.assertEqual(set(admin.values()), {"engineer"})
+        self.assertFalse([key for key in policy.ACCESS if key[0] == "DELETE" and key[1].startswith("/auth")])
+        # Service principals and keys (PR 3): the Engineer's, and nothing deletes a principal.
+        principals = {key: access for key, access in policy.ACCESS.items()
+                      if key[1].startswith("/auth/service-principals")}
+        self.assertEqual(set(principals), {
+            ("GET", "/auth/service-principals"), ("POST", "/auth/service-principals"),
+            ("POST", "/auth/service-principals/{name}/role"), ("POST", "/auth/service-principals/{name}/disable"),
+            ("POST", "/auth/service-principals/{name}/enable"), ("POST", "/auth/service-principals/{name}/keys"),
+            ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke")})
+        self.assertEqual(set(principals.values()), {"engineer"})
+
+    def test_keys_cannot_reach_administration_or_the_session_routes(self):
+        # S5 of PR 3: every account, principal and key route, logout and the
+        # password change; GET /auth/me stays open to a key.
+        admin = {path for _, path in policy.ACCESS if path.startswith(("/auth/users", "/auth/service-principals"))}
+        self.assertEqual(policy.HUMAN_ONLY, admin | {"/auth/logout", "/auth/password"})
+        self.assertNotIn("/auth/me", policy.HUMAN_ONLY)
+
+    def test_each_template_resolves_to_itself(self):
+        for method, template in policy.ACCESS:
+            sample = template.replace("{", "x").replace("}", "")
+            with self.subTest(route=f"{method} {template}"):
+                self.assertEqual(policy.match(method, sample), template)
+        self.assertEqual(policy.match("GET", "/tune/job/abc"), "/tune/job/{job_id}")
+        self.assertEqual(policy.match("GET", "/tune/abc"), "/tune/{collection}")
+        self.assertEqual(policy.match("HEAD", "/collections"), "/collections")
+        self.assertIsNone(policy.match("PUT", "/collections"))
+        self.assertIsNone(policy.match("GET", "/collections/a/b"))
+
+    def test_an_unlisted_route_is_refused_for_everyone(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with patch.object(settings, "auth_dir", temp.name):
+            store.create_user("eng", "engineer", "x" * 12, bootstrap=True, must_change_password=False)
+            token = store.create_session(store.get_user("eng").id)
+
+            @app.get("/vfy-unlisted")
+            async def unlisted():
+                return {"reached": True}
+            self.addCleanup(lambda: app.router.routes.pop())
+            client = TestClient(app, headers={"Cookie": f"{store.COOKIE}={token}", "Origin": ORIGIN})
+            for headers in ({}, {"Cookie": ""}):
+                response = client.get("/vfy-unlisted", headers=headers)
+                self.assertEqual(response.status_code, 403, response.text)
+                self.assertEqual(response.json()["error"]["code"], "FORBIDDEN")
+
+
+class OriginTests(unittest.TestCase):
+    def scope(self, **headers):
+        return {"headers": [(k.replace("_", "-").encode(), v.encode()) for k, v in headers.items()]}
+
+    def test_same_origin_rules(self):
+        allowed = (dict(host="localhost:8080", origin="http://localhost:8080"),
+                   dict(host="localhost", origin="http://localhost:80"),
+                   dict(host="example.test", origin="https://example.test:443"),
+                   dict(host="localhost:8080", sec_fetch_site="same-origin"))
+        refused = (dict(host="localhost:8080"),
+                   dict(host="localhost:8080", origin="http://localhost:8081"),
+                   dict(host="localhost:8080", origin="http://evil.test:8080"),
+                   dict(host="localhost:8080", origin="null"),
+                   dict(host="localhost:8080", origin="file://"),
+                   dict(origin="http://localhost:8080"),
+                   dict(host="localhost:8080", sec_fetch_site="same-site"),
+                   dict(host="localhost:8080", sec_fetch_site="cross-site"))
+        for headers in allowed:
+            with self.subTest(allowed=headers):
+                self.assertTrue(same_origin(self.scope(**headers)))
+        for headers in refused:
+            with self.subTest(refused=headers):
+                self.assertFalse(same_origin(self.scope(**headers)))
+
+
+class MiddlewareTests(StoreTestCase):
+    def test_setup_required_before_bootstrap(self):
+        for method, path in (("GET", "/collections"), ("GET", "/auth/me"), ("POST", "/auth/login")):
+            response = self.client.request(method, path, json={"username": "a", "password": "b"} if method == "POST" else None)
+            self.assertEqual(response.status_code, 503, path)
+            self.assertEqual(response.json()["error"]["code"], "SETUP_REQUIRED")
+        self.assertEqual(self.client.get("/auth/status").json(), {"setup_required": True})
+        self.make("eng", "engineer")
+        self.assertEqual(self.client.get("/auth/status").json(), {"setup_required": False})
+
+    def test_role_matrix_through_the_app(self):
+        self.setup_roles()
+        need = {("GET", "/packages"): "developer", ("GET", "/metrics/latency"): "engineer",
+                ("GET", "/goldstandard/diagnostics"): "engineer", ("GET", "/openapi.json"): "engineer"}
+        names = {"engineer": "eng", "developer": "dev", "end_user": "user"}
+        for role, name in names.items():
+            headers, _ = self.session(name)
+            for (method, path), required in need.items():
+                with self.subTest(role=role, route=path):
+                    response = self.client.request(method, path, headers=headers)
+                    if policy.rank(role) < policy.rank(required):
+                        self.assertEqual(response.status_code, 403)
+                        self.assertEqual(response.json()["error"],
+                                         {"code": "FORBIDDEN", "message": "Your role can't do this.",
+                                          "detail": {"required_role": required}})
+                    else:
+                        self.assertNotIn(response.status_code, (401, 403), response.text[:200])
+
+    def test_refusal_order(self):
+        self.setup_roles()
+        headers, _ = self.session("user")
+        # Cross-origin wins over the role: an end user's cross-origin delete.
+        response = self.client.delete("/collections/X?confirm=true",
+                                      headers={**headers, "Origin": "http://evil.test"})
+        self.assertEqual(response.json()["error"]["code"], "CROSS_ORIGIN_REFUSED")
+        # A due password change wins over the role.
+        store.reset_password("user", "n" * 20)
+        user = store.get_user("user")
+        token = store.create_session(user.id)
+        response = self.client.delete("/collections/X?confirm=true",
+                                      headers={"Cookie": f"{store.COOKIE}={token}", "Origin": ORIGIN})
+        self.assertEqual(response.json()["error"]["code"], "PASSWORD_CHANGE_REQUIRED")
+        self.assertEqual(self.client.get("/auth/me", headers={"Cookie": f"{store.COOKIE}={token}"}).status_code, 200)
+        # No session at all: 401, whatever the origin.
+        response = self.client.delete("/collections/X?confirm=true", headers={"Origin": "http://evil.test"})
+        self.assertEqual(response.json()["error"]["code"], "AUTH_REQUIRED")
+
+    def test_a_refused_upload_never_reads_its_body(self):
+        self.make("eng", "engineer")
+        reads = []
+
+        async def receive():
+            reads.append(1)
+            return {"type": "http.request", "body": b"x" * 1024, "more_body": False}
+
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {"type": "http", "method": "POST", "path": "/ingest/upload", "raw_path": b"/ingest/upload",
+                 "root_path": "", "query_string": b"", "scheme": "http", "server": ("testserver", 80),
+                 "headers": [(b"host", b"testserver"), (b"content-type", b"multipart/form-data; boundary=x")]}
+
+        async def never(scope, receive, send):
+            raise AssertionError("the app was called")
+
+        asyncio.run(AuthMiddleware(never)(scope, receive, send))
+        self.assertEqual(reads, [])
+        self.assertEqual(sent[0]["status"], 401)
+
+    def test_a_control_character_in_the_path_is_refused_before_the_body(self):
+        # Starlette routes `/ingest/upload\n` (%0A) to the upload handler; the
+        # policy must not let it through unchecked, or the body would be read.
+        self.make("eng", "engineer")
+        reads, sent = [], []
+
+        async def receive():
+            reads.append(1)
+            return {"type": "http.request", "body": b"x" * 1024, "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        async def never(scope, receive, send):
+            raise AssertionError("the app was called")
+
+        for path in ("/ingest/upload\n", "/collections\r", "/collections/A\x00"):
+            with self.subTest(path=path):
+                reads.clear(); sent.clear()
+                scope = {"type": "http", "method": "POST", "path": path, "headers": [(b"host", b"testserver")]}
+                asyncio.run(AuthMiddleware(never)(scope, receive, send))
+                self.assertEqual(reads, [])
+                self.assertEqual(sent[0]["status"], 404)
+        response = self.client.post("/ingest/upload%0A", files={"files": ("a.txt", b"x" * 4096)},
+                                    data={"collection": "C"})
+        self.assertEqual((response.status_code, response.json()["error"]["code"]), (404, "NOT_FOUND"))
+        headers, _ = self.session("eng")
+        self.assertEqual(self.client.get("/collections%0A", headers=headers).status_code, 404)
+
+    def test_a_refused_request_keeps_its_route_label(self):
+        self.make("eng", "engineer")
+        scope = {"type": "http", "method": "DELETE", "path": "/collections/Abc", "headers": []}
+
+        async def send(message):
+            pass
+
+        asyncio.run(AuthMiddleware(None)(scope, None, send))
+        self.assertEqual(scope["route"].path, "/collections/{name}")
+
+    def test_no_cors_headers(self):
+        self.setup_roles()
+        headers, _ = self.session("eng")
+        response = self.client.get("/collections", headers={**headers, "Origin": "http://evil.test"})
+        self.assertFalse([k for k in response.headers if k.lower().startswith("access-control-")])
+        response = self.client.options("/collections", headers={"Origin": "http://evil.test",
+                                                                "Access-Control-Request-Method": "DELETE"})
+        self.assertFalse([k for k in response.headers if k.lower().startswith("access-control-")])
+
+
+class RouteTests(StoreTestCase):
+    def test_login_success_cookie_and_me(self):
+        password = self.make("eng", "engineer", must_change=True)
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.login("ENG", password)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"username": "eng", "role": "engineer", "must_change_password": True})
+        cookie = response.headers["set-cookie"]
+        attributes = [a.strip().lower() for a in cookie.split(";")[1:]]
+        for want in ("httponly", "samesite=strict", "path=/", f"max-age={store.ABSOLUTE_S}"):
+            self.assertIn(want, attributes)
+        self.assertNotIn("secure", attributes)
+        self.assertIn("Login succeeded for 'eng'", logged(logs))
+        self.assertNotIn(password, logged(logs))
+        token = cookie.split(";")[0].split("=", 1)[1]
+        self.assertNotIn(token, logged(logs))
+        me = self.client.get("/auth/me", headers={"Cookie": f"{store.COOKIE}={token}"})
+        self.assertEqual(me.json()["username"], "eng")
+
+    def test_secure_cookie_under_the_setting(self):
+        password = self.make("eng", "engineer")
+        with patch.object(settings, "auth_cookie_secure", True):
+            response = self.login("eng", password)
+        self.assertIn("secure", [a.strip().lower() for a in response.headers["set-cookie"].split(";")])
+
+    def test_failures_are_generic(self):
+        password = self.make("eng", "engineer")
+        self.make("off", "developer")
+        store.set_enabled("off", False)
+        off_password = passwords.generate_password()
+        store.reset_password("off", off_password)
+        answers = [self.login("eng", password + "x"), self.login("nobody", password),
+                   self.login("x", password), self.login("off", off_password)]
+        bodies = {(r.status_code, r.text) for r in answers}
+        self.assertEqual(len(bodies), 1, bodies)
+        self.assertEqual(answers[0].status_code, 401)
+        self.assertEqual(answers[0].json()["error"]["code"], "LOGIN_FAILED")
+        self.assertNotIn("set-cookie", answers[0].headers)
+
+    def test_unknown_user_is_checked_against_a_hash_too(self):
+        self.make("eng", "engineer")
+        with patch.object(passwords, "verify_password", wraps=passwords.verify_password) as verify:
+            self.login("nobody", "x" * 12)
+        verify.assert_called_once()
+        self.assertEqual(verify.call_args.args[1], passwords.dummy_hash())
+
+    def test_throttle(self):
+        password = self.make("eng", "engineer")
+        with self.assertLogs("auth", "WARNING") as logs:
+            for _ in range(5):
+                self.assertEqual(self.login("eng", "wrong" * 3).status_code, 401)
+            response = self.login("eng", password)
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.json()["error"]["code"], "LOGIN_THROTTLED")
+        self.assertIn("too many failed attempts", logged(logs))
+        # Another address isn't locked; the proxy's X-Real-IP is the address.
+        self.assertEqual(self.login("eng", password, **{"X-Real-IP": "10.9.9.9"}).status_code, 200)
+        # The same for a user that doesn't exist: throttling reveals nothing.
+        for _ in range(5):
+            self.login("ghost", "wrong" * 3)
+        self.assertEqual(self.login("ghost", "wrong" * 3).status_code, 429)
+
+    def test_success_clears_the_count(self):
+        password = self.make("eng", "engineer")
+        for _ in range(4):
+            self.login("eng", "wrong" * 3)
+        self.assertEqual(self.login("eng", password).status_code, 200)
+        for _ in range(4):
+            self.login("eng", "wrong" * 3)
+        self.assertEqual(self.login("eng", password).status_code, 200)
+
+    def test_logout(self):
+        self.setup_roles()
+        headers, token = self.session("dev")
+        response = self.client.post("/auth/logout", headers=headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("max-age=0", response.headers["set-cookie"].lower())
+        self.assertEqual(self.client.get("/auth/me", headers=headers).status_code, 401)
+        self.assertEqual(self.client.post("/auth/logout", headers=headers).status_code, 401)
+
+    def test_logout_is_origin_checked(self):
+        self.setup_roles()
+        headers, token = self.session("dev")
+        response = self.client.post("/auth/logout", headers={**headers, "Origin": "http://evil.test"})
+        self.assertEqual(response.json()["error"]["code"], "CROSS_ORIGIN_REFUSED")
+        self.assertIsNotNone(store.authenticate(token))
+
+    def test_password_change(self):
+        self.setup_roles()
+        password = self.passwords["end_user"]
+        headers, token = self.session("user")
+        other_headers, other = self.session("user")
+        wrong = self.client.post("/auth/password", headers=headers,
+                                 json={"current_password": "nope" * 3, "new_password": "n" * 14})
+        self.assertEqual((wrong.status_code, wrong.json()["error"]["code"]), (403, "PASSWORD_INCORRECT"))
+        for new in ("short", "u" * 257):
+            response = self.client.post("/auth/password", headers=headers,
+                                        json={"current_password": password, "new_password": new})
+            self.assertEqual((response.status_code, response.json()["error"]["code"]), (422, "INVALID_PASSWORD"))
+        response = self.client.post("/auth/password", headers=headers,
+                                    json={"current_password": password, "new_password": "a-new-password"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIsNotNone(store.authenticate(token))
+        self.assertIsNone(store.authenticate(other))
+        self.assertEqual(self.login("user", "a-new-password").status_code, 200)
+        self.assertEqual(self.login("user", password).status_code, 401)
+
+    def test_password_equal_to_username_is_refused(self):
+        self.make("eng", "engineer")
+        self.make("long-username", "developer")
+        store.reset_password("long-username", "temporary-pass-1")
+        headers, _ = self.session("long-username")
+        response = self.client.post("/auth/password", headers=headers,
+                                    json={"current_password": "temporary-pass-1", "new_password": "LONG-USERNAME"})
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("username", response.json()["error"]["message"])
+
+    def test_the_new_password_must_differ_from_the_current_one(self):
+        self.make("eng", "engineer")
+        generated = passwords.generate_password()
+        store.create_user("dev", "developer", generated)
+        token = self.login("dev", generated).headers["set-cookie"].split(";")[0].split("=", 1)[1]
+        headers = {"Cookie": f"{store.COOKIE}={token}", "Origin": ORIGIN}
+        same = self.client.post("/auth/password", headers=headers,
+                                json={"current_password": generated, "new_password": generated})
+        self.assertEqual((same.status_code, same.json()["error"]["code"]), (422, "INVALID_PASSWORD"))
+        self.assertIn("differ", same.json()["error"]["message"])
+        self.assertTrue(store.get_user("dev").must_change_password, "the generated password is still due")
+        self.assertTrue(passwords.verify_password(generated, store.get_user("dev").password_hash))
+
+    def test_wrong_current_passwords_are_throttled(self):
+        self.setup_roles()
+        headers, token = self.session("user")
+        for _ in range(store.THROTTLE_FAILURES):
+            wrong = self.client.post("/auth/password", headers=headers,
+                                     json={"current_password": "nope" * 3, "new_password": "n" * 14})
+            self.assertEqual(wrong.json()["error"]["code"], "PASSWORD_INCORRECT")
+        with self.assertLogs("auth", "WARNING") as logs:
+            right = self.client.post("/auth/password", headers=headers,
+                                     json={"current_password": self.passwords["end_user"], "new_password": "n" * 14})
+        self.assertEqual((right.status_code, right.json()["error"]["code"]), (429, "LOGIN_THROTTLED"))
+        self.assertNotIn(self.passwords["end_user"], logged(logs))
+        # The same pair as the login: the login is locked too.
+        self.assertEqual(self.login("user", self.passwords["end_user"]).status_code, 429)
+
+    def test_forced_change_allows_only_session_routes(self):
+        self.make("eng", "engineer")
+        generated = passwords.generate_password()
+        store.create_user("dev", "developer", generated)
+        response = self.login("dev", generated)
+        self.assertTrue(response.json()["must_change_password"])
+        token = response.headers["set-cookie"].split(";")[0].split("=", 1)[1]
+        headers = {"Cookie": f"{store.COOKIE}={token}", "Origin": ORIGIN}
+        self.assertEqual(self.client.get("/collections", headers=headers).json()["error"]["code"],
+                         "PASSWORD_CHANGE_REQUIRED")
+        self.assertEqual(self.client.get("/auth/me", headers=headers).status_code, 200)
+        changed = self.client.post("/auth/password", headers=headers,
+                                   json={"current_password": generated, "new_password": "chosen-by-dev"})
+        self.assertEqual(changed.json()["must_change_password"], False)
+        self.assertNotEqual(self.client.get("/collections", headers=headers).status_code, 403)
+    def test_a_failed_login_is_logged_without_the_password(self):
+        # Q30: one API log line per login, failures included, never a password.
+        password = self.make("eng", "engineer")
+        typed = "a-wrong-password-" + passwords.generate_password()
+        with self.assertLogs("auth", "WARNING") as logs:
+            self.assertEqual(self.login("eng", typed).status_code, 401)
+            self.assertEqual(self.login("nobody", typed).status_code, 401)
+        text = logged(logs)
+        self.assertEqual(len(logs.records), 2, text)
+        self.assertIn("Login failed for 'eng'", text)
+        self.assertIn("Login failed for 'nobody'", text)
+        self.assertNotIn(typed, text)
+        self.assertNotIn(password, text)
+
+    def test_a_due_change_still_allows_logout(self):
+        self.make("eng", "engineer")
+        generated = passwords.generate_password()
+        store.create_user("dev", "developer", generated)
+        token = self.login("dev", generated).headers["set-cookie"].split(";")[0].split("=", 1)[1]
+        headers = {"Cookie": f"{store.COOKIE}={token}", "Origin": ORIGIN}
+        self.assertEqual(self.client.post("/auth/logout", headers=headers).status_code, 200)
+        self.assertIsNone(store.authenticate(token))
+
+    def test_head_is_enforced_like_get(self):
+        self.setup_roles()
+        self.assertEqual(self.client.head("/collections").status_code, 401)
+        headers, _ = self.session("user")
+        self.assertEqual(self.client.head("/packages", headers=headers).status_code, 403)
+
+    def test_oversized_login_is_refused_before_any_hashing(self):
+        self.make("eng", "engineer")
+        with patch.object(passwords, "verify_password", wraps=passwords.verify_password) as verify:
+            for body in ({"username": "u" * 257, "password": "x" * 12},
+                         {"username": "eng", "password": "x" * 1025}):
+                with self.subTest(body={k: len(v) for k, v in body.items()}):
+                    self.assertEqual(self.client.post("/auth/login", json=body).status_code, 422)
+        verify.assert_not_called()
+
+
+class AdminRouteTests(StoreTestCase):
+    """The Engineer-only account routes (PR 2 of #25): S1-S6 of its specifications."""
+
+    ROUTES = (("GET", "/auth/users", None), ("POST", "/auth/users", {"username": "newbie", "role": "end_user"}),
+              ("POST", "/auth/users/dev/reset-password", None), ("POST", "/auth/users/dev/role", {"role": "end_user"}),
+              ("POST", "/auth/users/dev/disable", None), ("POST", "/auth/users/dev/enable", None))
+
+    def setUp(self):
+        super().setUp()
+        self.setup_roles()
+        self.eng, _ = self.session("eng")
+
+    def admin(self, method, path, body=None, headers=None):
+        return self.client.request(method, path, json=body, headers=headers or self.eng)
+
+    def code(self, response):
+        return response.json()["error"]["code"]
+
+    def test_only_engineers_reach_the_admin_routes(self):
+        for name in ("dev", "user"):
+            headers, _ = self.session(name)
+            for method, path, body in self.ROUTES:
+                with self.subTest(user=name, route=f"{method} {path}"):
+                    response = self.admin(method, path, body, headers)
+                    self.assertEqual((response.status_code, self.code(response)), (403, "FORBIDDEN"))
+                    self.assertEqual(response.json()["error"]["detail"], {"required_role": "engineer"})
+        for method, path, body in self.ROUTES:
+            with self.subTest(anonymous=f"{method} {path}"):
+                response = self.client.request(method, path, json=body)
+                self.assertEqual((response.status_code, self.code(response)), (401, "AUTH_REQUIRED"))
+        # Nothing was changed by the refused requests.
+        self.assertIsNone(store.get_user("newbie"))
+        self.assertEqual(store.get_user("dev").role, "developer")
+        self.assertTrue(store.get_user("dev").enabled)
+
+    def test_changes_are_origin_checked(self):
+        response = self.admin("POST", "/auth/users/dev/disable", headers={**self.eng, "Origin": "http://evil.test"})
+        self.assertEqual(self.code(response), "CROSS_ORIGIN_REFUSED")
+        self.assertTrue(store.get_user("dev").enabled)
+
+    def test_list(self):
+        response = self.admin("GET", "/auth/users")
+        self.assertEqual(response.status_code, 200)
+        users = response.json()["users"]
+        self.assertEqual([u["username"] for u in users], ["dev", "eng", "user"])
+        self.assertEqual(set(users[0]), {"username", "role", "enabled", "must_change_password", "created_at"})
+        self.assertEqual((users[0]["role"], users[0]["enabled"], users[0]["must_change_password"]),
+                         ("developer", True, False))
+        self.assertRegex(users[0]["created_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertNotIn("scrypt", response.text)
+
+    def test_create_gives_a_generated_password_once(self):
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users", {"username": "New.Person", "role": "developer"})
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        body = response.json()
+        password = body["password"]
+        self.assertGreaterEqual(len(password), 20)
+        self.assertEqual(body["user"]["username"], "new.person")
+        self.assertEqual((body["user"]["role"], body["user"]["enabled"], body["user"]["must_change_password"]),
+                         ("developer", True, True))
+        stored = store.get_user("new.person")
+        self.assertTrue(passwords.verify_password(password, stored.password_hash))
+        self.assertTrue(stored.must_change_password)
+        self.assertEqual(len(logs.records), 1, logged(logs))
+        self.assertIn("Admin 'eng' created developer 'new.person'", logged(logs))
+        self.assertNotIn(password, logged(logs))
+        self.assertNotIn(password, self.admin("GET", "/auth/users").text)
+        login = self.login("new.person", password)
+        self.assertEqual((login.status_code, login.json()["must_change_password"]), (200, True))
+
+    def test_create_refusals(self):
+        for username in ("ab", "x" * 33, "has space", "semi;colon", ""):
+            with self.subTest(username=username), self.assertLogs("auth", "WARNING") as logs:
+                response = self.admin("POST", "/auth/users", {"username": username, "role": "end_user"})
+                self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_USERNAME"))
+                self.assertIn("3-32 characters", response.json()["error"]["message"])
+                self.assertEqual(len(logs.records), 1)
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users", {"username": "DEV", "role": "end_user"})
+        self.assertEqual((response.status_code, self.code(response)), (409, "USER_EXISTS"))
+        self.assertIn("create of 'dev' refused", logged(logs))
+        self.assertEqual(store.get_user("dev").role, "developer")
+        for body in ({"username": "newbie", "role": "admin"}, {"username": "newbie"}, {"role": "end_user"},
+                     {"username": "u" * 257, "role": "end_user"}):
+            with self.subTest(body=body):
+                response = self.admin("POST", "/auth/users", body)
+                self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_PARAMETER"))
+        self.assertIsNone(store.get_user("newbie"))
+
+    def test_reset_ends_sessions_and_shows_the_password_once(self):
+        _, dev_token = self.session("dev")
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users/DEV/reset-password")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        password = response.json()["password"]
+        self.assertEqual(response.json()["user"]["must_change_password"], True)
+        self.assertIsNone(store.authenticate(dev_token))
+        self.assertEqual(self.login("dev", self.passwords["developer"]).status_code, 401)
+        self.assertEqual(self.login("dev", password).json()["must_change_password"], True)
+        self.assertIn("Admin 'eng' reset the password of 'dev'; their sessions ended", logged(logs))
+        self.assertNotIn(password, logged(logs))
+
+    def test_an_engineer_cannot_reset_their_own_password_here(self):
+        before = store.get_user("eng").password_hash
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users/Eng/reset-password")
+        self.assertEqual((response.status_code, self.code(response)), (409, "SELF_RESET_REFUSED"))
+        self.assertIn("Change password", response.json()["error"]["message"])
+        self.assertNotIn("password", {k for k in response.json() if k != "error"})
+        self.assertEqual(store.get_user("eng").password_hash, before)
+        self.assertEqual(self.admin("GET", "/auth/me").status_code, 200, "the session stays")
+        self.assertIn("refused", logged(logs))
+        # Another Engineer may reset it.
+        self.make("eng2", "engineer")
+        other, _ = self.session("eng2")
+        self.assertEqual(self.admin("POST", "/auth/users/eng/reset-password", headers=other).status_code, 200)
+
+    def test_unknown_users(self):
+        for path, body in (("/auth/users/nobody/reset-password", None), ("/auth/users/nobody/role", {"role": "engineer"}),
+                           ("/auth/users/nobody/disable", None), ("/auth/users/nobody/enable", None),
+                           ("/auth/users/x/disable", None), ("/auth/users/has%20space/enable", None)):
+            with self.subTest(path=path):
+                response = self.admin("POST", path, body)
+                self.assertEqual((response.status_code, self.code(response)), (404, "USER_NOT_FOUND"))
+
+    def test_role_change_applies_to_an_existing_session(self):
+        dev, _ = self.session("dev")
+        self.assertNotIn(self.client.get("/packages", headers=dev).status_code, (401, 403))
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users/dev/role", {"role": "end_user"})
+        self.assertEqual(response.json(), {"user": {**response.json()["user"], "role": "end_user"}})
+        self.assertNotIn("password", response.json())
+        self.assertIn("Admin 'eng' set the role of 'dev' to end_user", logged(logs))
+        self.assertEqual(self.code(self.client.get("/packages", headers=dev)), "FORBIDDEN")
+        self.admin("POST", "/auth/users/dev/role", {"role": "engineer"})
+        self.assertNotIn(self.client.get("/metrics/latency", headers=dev).status_code, (401, 403))
+        response = self.admin("POST", "/auth/users/dev/role", {"role": "engineer"})
+        self.assertEqual((response.status_code, response.json()["user"]["role"]), (200, "engineer"))
+
+    def test_disable_and_enable(self):
+        dev, token = self.session("dev")
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users/dev/disable")
+            self.assertEqual(response.json()["user"]["enabled"], False)
+            self.assertIsNone(store.authenticate(token))
+            self.assertEqual(self.code(self.login("dev", self.passwords["developer"])), "LOGIN_FAILED")
+            self.assertEqual(self.admin("POST", "/auth/users/dev/disable").status_code, 200, "already disabled")
+            response = self.admin("POST", "/auth/users/dev/enable")
+        self.assertEqual(response.json()["user"]["enabled"], True)
+        self.assertEqual(self.login("dev", self.passwords["developer"]).status_code, 200)
+        self.assertIn("Admin 'eng' disabled 'dev'; their sessions ended", logged(logs))
+        self.assertIn("Admin 'eng' enabled 'dev'", logged(logs))
+
+    def test_the_last_enabled_engineer_is_protected(self):
+        for path, body in (("/auth/users/eng/disable", None), ("/auth/users/eng/role", {"role": "developer"})):
+            with self.subTest(path=path), self.assertLogs("auth", "WARNING") as logs:
+                response = self.admin("POST", path, body)
+                self.assertEqual((response.status_code, self.code(response)), (409, "LAST_ENGINEER"))
+                self.assertIn("last enabled engineer", response.json()["error"]["message"])
+                self.assertIn("refused", logged(logs))
+        self.assertEqual((store.get_user("eng").role, store.get_user("eng").enabled), ("engineer", True))
+        self.assertEqual(self.admin("GET", "/auth/me").status_code, 200)
+        # With another enabled Engineer, an Engineer may demote or disable themselves.
+        self.make("eng2", "engineer")
+        response = self.admin("POST", "/auth/users/eng/role", {"role": "developer"})
+        self.assertEqual(response.json()["user"]["role"], "developer")
+        self.assertEqual(self.code(self.admin("GET", "/auth/users")), "FORBIDDEN", "the demotion applies at once")
+        other, _ = self.session("eng2")
+        self.admin("POST", "/auth/users/eng/role", {"role": "engineer"}, headers=other)
+        self.assertEqual(self.admin("POST", "/auth/users/eng/disable").status_code, 200)
+        self.assertEqual(self.admin("GET", "/auth/me").status_code, 401, "disabling oneself ends the session")
+        response = self.admin("POST", "/auth/users/eng2/disable", headers=other)
+        self.assertEqual(self.code(response), "LAST_ENGINEER")
+
+    def test_admin_actions_are_logged_one_line_each_without_secrets(self):
+        with self.assertLogs("auth", "WARNING") as logs:
+            created = self.admin("POST", "/auth/users", {"username": "temp", "role": "end_user"}).json()["password"]
+            reset = self.admin("POST", "/auth/users/temp/reset-password").json()["password"]
+            self.admin("POST", "/auth/users/temp/role", {"role": "developer"})
+            self.admin("POST", "/auth/users/temp/disable")
+            self.admin("POST", "/auth/users/temp/enable")
+            self.admin("GET", "/auth/users")
+        self.assertEqual(len(logs.records), 5, logged(logs))
+        self.assertTrue(all(r.getMessage().startswith("Admin 'eng' ") for r in logs.records), logged(logs))
+        cookie_token = self.eng["Cookie"].split("=", 1)[1]
+        for secret in (created, reset, cookie_token):
+            self.assertNotIn(secret, logged(logs))
+
+
+class KeyTestCase(StoreTestCase):
+    """A store with an engineer, a developer and an end user, plus helpers for principals and keys."""
+
+    def setUp(self):
+        super().setUp()
+        self.setup_roles()
+
+    def principal(self, name, role, days=90, label=""):
+        store.create_principal(name, role)
+        key_row, key = store.issue_key(name, days, label)
+        return key_row, key
+
+    def bearer(self, key):
+        return {"Authorization": f"Bearer {key}"}
+
+
+class KeyFormatTests(unittest.TestCase):
+    def test_format(self):
+        seen = set()
+        for _ in range(50):
+            key_id, key = keys.generate()
+            self.assertRegex(key, r"^rag_[a-z0-9]{12}_[A-Za-z0-9_-]{43}$")
+            self.assertEqual(len(key), 60)
+            self.assertEqual(keys.key_id(key), key_id)
+            seen.add(key)
+        self.assertEqual(len(seen), 50)
+
+    def test_bearer_parsing(self):
+        _, key = keys.generate()
+        self.assertEqual(keys.bearer("Bearer " + key), key)
+        self.assertEqual(keys.bearer("bearer " + key), key)
+        for value in (None, "", key, "Basic " + key, "Bearer  " + key, "Bearer " + key + " ", "Bearer " + key[:-1],
+                      "Bearer rag_ABCDEFGHIJKL_" + "a" * 43, "Token " + key):
+            with self.subTest(value=value):
+                self.assertIsNone(keys.bearer(value))
+
+
+class KeyStoreTests(KeyTestCase):
+    def test_a_version_1_store_gains_the_kind_column(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        conn = sqlite3.connect(Path(temp.name, "auth.db"))
+        conn.executescript("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, "
+                           "role TEXT NOT NULL, password_hash TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, "
+                           "must_change_password INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL, "
+                           "updated_at REAL NOT NULL);"
+                           "INSERT INTO users VALUES (1, 'old', 'engineer', 'x', 1, 0, 1.0, 1.0);"
+                           "PRAGMA user_version = 1;")
+        conn.commit()
+        conn.close()
+        with patch.object(settings, "auth_dir", temp.name):
+            self.assertEqual(store.get_user("old").kind, "user")
+            version = sqlite3.connect(Path(temp.name, "auth.db")).execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(version, 2)
+            store.create_principal("svc", "developer")
+            self.assertEqual([p.name for p in store.list_principals()], ["svc"])
+
+    def test_only_the_key_hash_is_stored(self):
+        key_row, key = self.principal("svc", "developer")
+        raw = Path(self.dir, "auth.db").read_bytes()
+        self.assertNotIn(key.encode(), raw)
+        self.assertNotIn(key.split("_", 2)[2].encode(), raw)
+        rows = sqlite3.connect(Path(self.dir, "auth.db")).execute("SELECT id, key_hash FROM api_keys").fetchall()
+        self.assertEqual(rows, [(key_row.id, hashlib.sha256(key.encode()).hexdigest())])
+
+    def test_a_valid_key_is_its_principal_as_it_is_now(self):
+        _, key = self.principal("svc", "developer")
+        principal = store.authenticate_key(key)
+        self.assertEqual((principal.username, principal.role, principal.kind, principal.must_change_password),
+                         ("svc", "developer", "service", False))
+        store.set_role("svc", "end_user")
+        self.assertEqual(store.authenticate_key(key).role, "end_user")
+        for wrong in (None, "", key[:-1] + ("A" if key[-1] != "A" else "B"), "rag_" + "a" * 12 + "_" + "b" * 43,
+                      key + "x"):
+            with self.subTest(wrong=wrong):
+                self.assertIsNone(store.authenticate_key(wrong))
+
+    def test_expiry_boundary(self):
+        start = 10_000.0
+        with patch.object(store, "_now", return_value=start):
+            key_row, key = self.principal("svc", "developer", days=1)
+        self.assertEqual(key_row.expires_at, start + 86400)
+        with patch.object(store, "_now", return_value=start + 86399):
+            self.assertIsNotNone(store.authenticate_key(key))
+        with patch.object(store, "_now", return_value=start + 86400):
+            self.assertIsNone(store.authenticate_key(key))
+            self.assertEqual(store.get_principal("svc").keys[0].status(start + 86400), "expired")
+
+    def test_lifetimes(self):
+        store.create_principal("svc", "developer")
+        for days in (0, 366, -1, 1.5, "90"):
+            with self.subTest(days=days), self.assertRaises(ValueError):
+                store.issue_key("svc", days)
+        key_row, _ = store.issue_key("svc")
+        self.assertAlmostEqual(key_row.expires_at - key_row.created_at, 90 * 86400)
+        key_row, _ = store.issue_key("svc", 365)
+        self.assertAlmostEqual(key_row.expires_at - key_row.created_at, 365 * 86400)
+
+    def test_revocation_and_rotation(self):
+        old_row, old = self.principal("svc", "developer")
+        new_row, new = store.issue_key("svc", 30, "rotated")
+        self.assertIsNotNone(store.authenticate_key(old), "the old key stays valid after rotation (Q24)")
+        self.assertIsNotNone(store.authenticate_key(new))
+        first = store.revoke_key("svc", old_row.id)
+        self.assertIsNone(store.authenticate_key(old))
+        self.assertIsNotNone(store.authenticate_key(new))
+        with patch.object(store, "_now", return_value=first.revoked_at + 100):
+            again = store.revoke_key("svc", old_row.id)
+        self.assertEqual(again.revoked_at, first.revoked_at, "a second revoke keeps the first time")
+        listed = store.get_principal("svc").keys
+        self.assertEqual([k.id for k in listed], [new_row.id, old_row.id])
+        self.assertEqual([k.status() for k in listed], ["active", "revoked"])
+        with self.assertRaises(store.Refused) as refused:
+            store.revoke_key("svc", "nosuchkey123")
+        self.assertEqual(refused.exception.code, "KEY_NOT_FOUND")
+        store.create_principal("other", "developer")
+        with self.assertRaises(store.Refused) as refused:
+            store.revoke_key("other", new_row.id)
+        self.assertEqual(refused.exception.code, "KEY_NOT_FOUND")
+
+    def test_a_disabled_principal_has_no_valid_key(self):
+        _, key = self.principal("svc", "developer")
+        store.set_enabled("svc", False)
+        self.assertIsNone(store.authenticate_key(key))
+        _, issued_while_disabled = store.issue_key("svc")
+        self.assertIsNone(store.authenticate_key(issued_while_disabled))
+        store.set_enabled("svc", True)
+        self.assertIsNotNone(store.authenticate_key(key))
+        self.assertIsNotNone(store.authenticate_key(issued_while_disabled))
+
+    def test_last_used_is_written_at_most_once_a_minute(self):
+        key_row, key = self.principal("svc", "developer")
+        self.assertIsNone(key_row.last_used)
+        with patch.object(store, "_now", return_value=key_row.created_at + 10):
+            store.authenticate_key(key)
+        self.assertEqual(store.get_principal("svc").keys[0].last_used, key_row.created_at + 10)
+        with patch.object(store, "_now", return_value=key_row.created_at + 50):
+            store.authenticate_key(key)
+        self.assertEqual(store.get_principal("svc").keys[0].last_used, key_row.created_at + 10)
+        with patch.object(store, "_now", return_value=key_row.created_at + 80):
+            store.authenticate_key(key)
+        self.assertEqual(store.get_principal("svc").keys[0].last_used, key_row.created_at + 80)
+
+    def test_one_name_pool(self):
+        store.create_principal("svc", "developer")
+        with self.assertRaises(store.Refused) as refused:
+            store.create_principal("dev", "developer")
+        self.assertEqual(refused.exception.code, "PRINCIPAL_EXISTS")
+        with self.assertRaises(store.Refused) as refused:
+            store.create_principal("svc", "end_user")
+        self.assertEqual(refused.exception.code, "PRINCIPAL_EXISTS")
+        with self.assertRaises(store.Refused) as refused:
+            store.create_user("svc", "developer", passwords.generate_password())
+        self.assertEqual(refused.exception.code, "USER_EXISTS")
+        self.assertEqual([u.username for u in store.list_users()], ["dev", "eng", "user"])
+        self.assertEqual([u.username for u in store.list_users(kind=None)], ["dev", "eng", "svc", "user"])
+
+    def test_principals_have_no_password_and_are_kind_checked(self):
+        store.create_principal("svc", "engineer")
+        user = store.get_user("svc")
+        self.assertEqual((user.kind, user.must_change_password), ("service", False))
+        self.assertFalse(passwords.verify_password("", user.password_hash))
+        self.assertFalse(passwords.verify_password(store.NO_PASSWORD, user.password_hash))
+        with self.assertRaises(store.Refused) as refused:
+            store.reset_password("svc", passwords.generate_password())
+        self.assertEqual(refused.exception.code, "NOT_A_USER")
+        with self.assertRaises(store.Refused) as refused:
+            store.set_role("svc", "developer", "user")
+        self.assertEqual(refused.exception.code, "USER_NOT_FOUND")
+        with self.assertRaises(store.Refused) as refused:
+            store.issue_key("dev")
+        self.assertEqual(refused.exception.code, "PRINCIPAL_NOT_FOUND")
+        with self.assertRaises(store.Refused) as refused:
+            store.get_principal("eng")
+        self.assertEqual(refused.exception.code, "PRINCIPAL_NOT_FOUND")
+
+    def test_an_engineer_principal_does_not_count_as_an_engineer(self):
+        store.create_principal("svc", "engineer")
+        with self.assertRaises(store.Refused) as refused:
+            store.set_enabled("eng", False)
+        self.assertEqual(refused.exception.code, "LAST_ENGINEER")
+        store.set_enabled("svc", False)
+        store.set_role("svc", "end_user")
+
+
+class KeyMiddlewareTests(KeyTestCase):
+    """Authenticating with a key through main.app (S3 of PR 3's specifications)."""
+
+    def code(self, response):
+        return response.json()["error"]["code"]
+
+    def test_a_key_follows_its_role_without_an_origin(self):
+        _, key = self.principal("svc", "developer")
+        headers = self.bearer(key)
+        self.assertEqual(self.client.get("/collections", headers=headers).status_code != 401, True)
+        response = self.client.get("/packages", headers=headers)
+        self.assertNotIn(response.status_code, (401, 403), response.text)
+        # A change with no Origin and no Sec-Fetch-Site: the key skips the origin check (Q26).
+        response = self.client.post("/collections", json={"name": "VfyKey", "index_type": 7}, headers=headers)
+        self.assertEqual(response.status_code, 422, response.text)
+        response = self.client.post("/tune/rechunk", json={}, headers=headers)
+        self.assertEqual((response.status_code, self.code(response)), (403, "FORBIDDEN"))
+        self.assertEqual(response.json()["error"]["detail"], {"required_role": "engineer"})
+
+    def test_keys_are_refused_on_administration_and_session_routes(self):
+        _, key = self.principal("svc", "engineer")
+        headers = self.bearer(key)
+        for method, path, body in (("GET", "/auth/users", None),
+                                   ("POST", "/auth/users", {"username": "minted", "role": "engineer"}),
+                                   ("POST", "/auth/users/dev/reset-password", None),
+                                   ("POST", "/auth/users/dev/role", {"role": "engineer"}),
+                                   ("POST", "/auth/users/dev/disable", None),
+                                   ("POST", "/auth/users/dev/enable", None),
+                                   ("GET", "/auth/service-principals", None),
+                                   ("POST", "/auth/service-principals", {"name": "minted", "role": "engineer"}),
+                                   ("POST", "/auth/service-principals/svc/role", {"role": "engineer"}),
+                                   ("POST", "/auth/service-principals/svc/disable", None),
+                                   ("POST", "/auth/service-principals/svc/enable", None),
+                                   ("POST", "/auth/service-principals/svc/keys", {}),
+                                   ("POST", "/auth/service-principals/svc/keys/abc/revoke", None),
+                                   ("POST", "/auth/logout", None),
+                                   ("POST", "/auth/password", {"current_password": "x", "new_password": "y" * 12})):
+            with self.subTest(route=f"{method} {path}"):
+                response = self.client.request(method, path, json=body, headers=headers)
+                self.assertEqual((response.status_code, self.code(response)), (403, "KEY_NOT_ALLOWED"))
+        self.assertIsNone(store.get_user("minted"))
+        self.assertEqual(len(store.get_principal("svc").keys), 1)
+        # Engineer-level data routes stay open to an engineer key.
+        self.assertNotIn(self.client.get("/metrics/latency", headers=headers).status_code, (401, 403))
+
+    def test_me_names_the_principal(self):
+        _, key = self.principal("svc", "end_user")
+        response = self.client.get("/auth/me", headers=self.bearer(key))
+        self.assertEqual(response.json(), {"username": "svc", "role": "end_user", "must_change_password": False,
+                                           "kind": "service"})
+        headers, _ = self.session("dev")
+        self.assertEqual(self.client.get("/auth/me", headers=headers).json()["kind"], "user")
+
+    def test_invalid_keys_get_one_answer(self):
+        key_row, key = self.principal("svc", "developer")
+        revoked_row, revoked = store.issue_key("svc")
+        store.revoke_key("svc", revoked_row.id)
+        with patch.object(store, "_now", return_value=key_row.created_at - 2 * 86400):
+            _, expired = store.issue_key("svc", 1)
+        store.create_principal("off", "developer")
+        _, disabled = store.issue_key("off")
+        store.set_enabled("off", False)
+        answers = set()
+        for value in ("Bearer " + revoked, "Bearer " + expired, "Bearer " + disabled, "Bearer " + key[:-2] + "zz",
+                      "Bearer rag_aaaaaaaaaaaa_" + "b" * 43, "Bearer nonsense", "Basic dXNlcjpwYXNz", "", key,
+                      "Bearer"):
+            with self.subTest(value=value):
+                response = self.client.get("/collections", headers={"Authorization": value})
+                self.assertEqual((response.status_code, self.code(response)), (401, "KEY_INVALID"))
+                answers.add(response.text)
+        self.assertEqual(len(answers), 1, "every failure gets the same answer")
+
+    def test_two_authorization_headers_are_refused(self):
+        _, key = self.principal("svc", "developer")
+        response = self.client.get("/collections", headers=[("Authorization", "Bearer " + key),
+                                                            ("Authorization", "Bearer " + key)])
+        self.assertEqual((response.status_code, self.code(response)), (401, "KEY_INVALID"))
+
+    def test_the_header_decides_and_never_falls_back_to_the_cookie(self):
+        _, key = self.principal("svc", "end_user")
+        session, _ = self.session("eng")
+        response = self.client.get("/metrics/latency", headers={**session, "Authorization": "Bearer nonsense"})
+        self.assertEqual((response.status_code, self.code(response)), (401, "KEY_INVALID"))
+        response = self.client.get("/metrics/latency", headers={**session, **self.bearer(key)})
+        self.assertEqual((response.status_code, self.code(response)), (403, "FORBIDDEN"))
+        self.assertEqual(self.client.get("/auth/me", headers={**session, **self.bearer(key)}).json()["username"], "svc")
+
+    def test_a_key_anywhere_but_the_header_is_no_credential(self):
+        _, key = self.principal("svc", "developer")
+        for path, headers in ((f"/collections?api_key={key}", {}), (f"/collections?key={key}", {}),
+                              (f"/collections?access_token={key}", {}),
+                              ("/collections", {"X-Api-Key": key}),
+                              ("/collections", {"Cookie": f"{store.COOKIE}={key}"}),
+                              ("/collections", {"Cookie": f"api_key={key}"})):
+            with self.subTest(path=path, headers=list(headers)):
+                response = self.client.get(path, headers=headers)
+                self.assertEqual((response.status_code, self.code(response)), (401, "AUTH_REQUIRED"))
+
+    def test_public_routes_ignore_the_header(self):
+        response = self.client.get("/auth/status", headers={"Authorization": "Bearer nonsense"})
+        self.assertEqual(response.status_code, 200)
+        response = self.login("dev", self.passwords["developer"], Authorization="Bearer nonsense")
+        self.assertEqual(response.status_code, 200)
+
+    def test_a_principal_cannot_log_in(self):
+        store.create_principal("svc", "engineer")
+        with patch.object(passwords, "verify_password", wraps=passwords.verify_password) as verify:
+            for password in ("", store.NO_PASSWORD, "anything at all"):
+                response = self.login("svc", password)
+                self.assertEqual((response.status_code, self.code(response)), (401, "LOGIN_FAILED"))
+        self.assertTrue(all(call.args[1] == passwords.dummy_hash() for call in verify.call_args_list),
+                        "a principal's login is checked against the dummy hash")
+
+    def test_failed_key_requests_are_not_logged(self):
+        logger = logging.getLogger("auth")
+        with patch.object(logger, "warning") as warning:
+            for _ in range(3):
+                self.client.get("/collections", headers={"Authorization": "Bearer nonsense"})
+        warning.assert_not_called()
+
+
+class PrincipalRouteTests(KeyTestCase):
+    """The Engineer-only principal and key routes (S4, S5 of PR 3's specifications)."""
+
+    BASE = "/auth/service-principals"
+
+    def setUp(self):
+        super().setUp()
+        self.eng, _ = self.session("eng")
+
+    def admin(self, method, path, body=None, headers=None):
+        return self.client.request(method, self.BASE + path, json=body, headers=headers or self.eng)
+
+    def code(self, response):
+        return response.json()["error"]["code"]
+
+    def routes(self):
+        return (("GET", "", None), ("POST", "", {"name": "newsvc", "role": "end_user"}),
+                ("POST", "/svc/role", {"role": "engineer"}), ("POST", "/svc/disable", None),
+                ("POST", "/svc/enable", None), ("POST", "/svc/keys", {}),
+                ("POST", f"/svc/keys/{self.key_id}/revoke", None))
+
+    def test_only_engineers_reach_them(self):
+        key_row, _ = self.principal("svc", "developer")
+        self.key_id = key_row.id
+        for name in ("dev", "user"):
+            headers, _ = self.session(name)
+            for method, path, body in self.routes():
+                with self.subTest(user=name, route=f"{method} {path}"):
+                    response = self.admin(method, path, body, headers)
+                    self.assertEqual((response.status_code, self.code(response)), (403, "FORBIDDEN"))
+        for method, path, body in self.routes():
+            with self.subTest(anonymous=f"{method} {path}"):
+                response = self.client.request(method, self.BASE + path, json=body)
+                self.assertEqual((response.status_code, self.code(response)), (401, "AUTH_REQUIRED"))
+        principal = store.get_principal("svc")
+        self.assertEqual((principal.role, principal.enabled, len(principal.keys)), ("developer", True, 1))
+        self.assertIsNone(principal.keys[0].revoked_at)
+        response = self.admin("POST", "/svc/disable", headers={**self.eng, "Origin": "http://evil.test"})
+        self.assertEqual(self.code(response), "CROSS_ORIGIN_REFUSED")
+
+    def test_create_list_and_shapes(self):
+        response = self.admin("POST", "", {"name": "Nightly.Import", "role": "developer"})
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json(), {"principal": {
+            "name": "nightly.import", "role": "developer", "enabled": True,
+            "created_at": response.json()["principal"]["created_at"], "keys": []}})
+        response = self.admin("GET", "")
+        self.assertEqual([p["name"] for p in response.json()["principals"]], ["nightly.import"])
+        self.assertNotIn("dev", [p["name"] for p in response.json()["principals"]])
+        users = self.client.get("/auth/users", headers=self.eng).json()["users"]
+        self.assertNotIn("nightly.import", [u["username"] for u in users])
+
+    def test_issue_shows_the_key_once(self):
+        self.admin("POST", "", {"name": "svc", "role": "developer"})
+        response = self.admin("POST", "/svc/keys", {"label": "nightly import", "days": 30})
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        body = response.json()
+        secret = body["secret"]
+        self.assertEqual(keys.key_id(secret), body["key"]["id"])
+        self.assertEqual(set(body["key"]), {"id", "label", "created_at", "expires_at", "revoked_at", "last_used_at",
+                                            "status"})
+        self.assertEqual((body["key"]["label"], body["key"]["status"], body["key"]["revoked_at"],
+                          body["key"]["last_used_at"]), ("nightly import", "active", None, None))
+        self.assertEqual(body["principal"]["keys"], [body["key"]])
+        # The key works, and is in no later answer.
+        self.assertEqual(self.client.get("/auth/me", headers=self.bearer(secret)).json()["username"], "svc")
+        for later in (self.admin("GET", ""), self.admin("POST", "/svc/keys", {}),
+                      self.admin("POST", f"/svc/keys/{body['key']['id']}/revoke")):
+            self.assertNotIn(secret, later.text)
+        self.assertIsNotNone(self.admin("GET", "").json()["principals"][0]["keys"][1]["revoked_at"])
+        default = self.admin("POST", "/svc/keys", {}).json()["key"]
+        self.assertEqual(default["label"], "")
+
+    def test_refusals(self):
+        self.admin("POST", "", {"name": "svc", "role": "developer"})
+        for name in ("ab", "x" * 33, "has space", ""):
+            with self.subTest(name=name), self.assertLogs("auth", "WARNING") as logs:
+                response = self.admin("POST", "", {"name": name, "role": "end_user"})
+                self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_USERNAME"))
+                self.assertEqual(len(logs.records), 1)
+        for name in ("SVC", "dev"):
+            with self.subTest(taken=name), self.assertLogs("auth", "WARNING") as logs:
+                response = self.admin("POST", "", {"name": name, "role": "end_user"})
+                self.assertEqual((response.status_code, self.code(response)), (409, "PRINCIPAL_EXISTS"))
+                self.assertEqual(len(logs.records), 1)
+        for path, body in (("/nobody/role", {"role": "developer"}), ("/dev/disable", None), ("/eng/enable", None),
+                           ("/dev/keys", {}), ("/a/keys", {}), ("/dev/keys/abc/revoke", None)):
+            with self.subTest(path=path), self.assertLogs("auth", "WARNING") as logs:
+                response = self.admin("POST", path, body)
+                self.assertEqual((response.status_code, self.code(response)), (404, "PRINCIPAL_NOT_FOUND"))
+                self.assertEqual(len(logs.records), 1)
+        self.assertTrue(store.get_user("dev").enabled)
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/svc/keys/nosuchkey123/revoke")
+        self.assertEqual((response.status_code, self.code(response)), (404, "KEY_NOT_FOUND"))
+        self.assertEqual(len(logs.records), 1)
+        for body in ({"days": 0}, {"days": 366}, {"days": 1.5}, {"days": "90"}, {"days": True},
+                     {"label": "l" * 65}, {"label": None}):
+            with self.subTest(body=body):
+                response = self.admin("POST", "/svc/keys", body)
+                self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_PARAMETER"))
+        for body in ({"name": "newsvc", "role": "admin"}, {"name": "newsvc"}, {"role": "end_user"}):
+            with self.subTest(body=body):
+                response = self.admin("POST", "", body)
+                self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_PARAMETER"))
+        self.assertEqual(store.get_principal("svc").keys, ())
+        self.assertIsNone(store.get_user("newsvc"))
+
+    def test_role_disable_enable(self):
+        self.admin("POST", "", {"name": "svc", "role": "developer"})
+        secret = self.admin("POST", "/svc/keys", {}).json()["secret"]
+        response = self.admin("POST", "/svc/role", {"role": "end_user"})
+        self.assertEqual(response.json()["principal"]["role"], "end_user")
+        self.assertEqual(self.client.get("/packages", headers=self.bearer(secret)).status_code, 403)
+        self.assertEqual(self.admin("POST", "/svc/role", {"role": "end_user"}).status_code, 200)
+        response = self.admin("POST", "/svc/disable")
+        self.assertFalse(response.json()["principal"]["enabled"])
+        self.assertEqual(self.code(self.client.get("/collections", headers=self.bearer(secret))), "KEY_INVALID")
+        self.assertEqual(self.admin("POST", "/svc/disable").status_code, 200)
+        self.assertTrue(self.admin("POST", "/svc/enable").json()["principal"]["enabled"])
+        self.assertNotIn(self.client.get("/collections", headers=self.bearer(secret)).status_code, (401, 403))
+
+    def test_human_routes_stay_human(self):
+        self.admin("POST", "", {"name": "svc", "role": "engineer"})
+        for path, body in (("/svc/reset-password", None), ("/svc/role", {"role": "developer"}),
+                           ("/svc/disable", None), ("/svc/enable", None)):
+            with self.subTest(path=path):
+                response = self.client.post("/auth/users" + path, json=body, headers=self.eng)
+                self.assertEqual((response.status_code, self.code(response)), (404, "USER_NOT_FOUND"))
+        response = self.client.post("/auth/users", json={"username": "svc", "role": "developer"}, headers=self.eng)
+        self.assertEqual((response.status_code, self.code(response)), (409, "USER_EXISTS"))
+        self.assertEqual(store.get_principal("svc").role, "engineer")
+        # An engineer principal doesn't stand in for the last enabled Engineer.
+        response = self.client.post("/auth/users/eng/disable", headers=self.eng)
+        self.assertEqual((response.status_code, self.code(response)), (409, "LAST_ENGINEER"))
+
+    def test_changes_are_logged_one_line_each_without_secrets(self):
+        with self.assertLogs("auth", "WARNING") as logs:
+            self.admin("POST", "", {"name": "svc", "role": "developer"})
+            issued = self.admin("POST", "/svc/keys", {"days": 7}).json()
+            self.admin("POST", "/svc/role", {"role": "end_user"})
+            self.admin("POST", "/svc/disable")
+            self.admin("POST", "/svc/enable")
+            self.admin("POST", f"/svc/keys/{issued['key']['id']}/revoke")
+            self.admin("GET", "")
+        text = logged(logs)
+        self.assertEqual(len(logs.records), 6, text)
+        self.assertTrue(all(r.getMessage().startswith("Admin 'eng' ") for r in logs.records), text)
+        for line in ("created service principal 'svc' (developer)",
+                     f"issued key {issued['key']['id']} for service principal 'svc', expiring "
+                     f"{issued['key']['expires_at']}",
+                     "set the role of service principal 'svc' to end_user", "disabled service principal 'svc'",
+                     "enabled service principal 'svc'", f"revoked key {issued['key']['id']} of service principal 'svc'"):
+            self.assertIn(line, text)
+        self.assertNotIn(issued["secret"], text)
+        self.assertNotIn(issued["secret"].split("_", 2)[2], text)
+        self.assertNotIn(keys.digest(issued["secret"]), text)
+
+
+class CommandTests(unittest.TestCase):
+    """`python -m auth` in a subprocess, as an operator runs it."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.env = {**os.environ, "AUTH_DIR": temp.name}
+        self.dir = temp.name
+
+    def run_auth(self, *args):
+        return subprocess.run([sys.executable, "-m", "auth", *args], cwd=API_DIR, env=self.env,
+                              capture_output=True, text=True, timeout=120)
+
+    def users(self):
+        with patch.object(settings, "auth_dir", self.dir):
+            store._ready.discard(str(store.db_path()))
+            return {u.username: u for u in store.list_users()}
+
+    def test_bootstrap_create_and_reset_print_only_the_password(self):
+        result = self.run_auth("bootstrap", "Admin")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        password = result.stdout.strip()
+        self.assertEqual(result.stdout, password + "\n")
+        self.assertGreaterEqual(len(password), 20)
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+        self.assertNotIn(password, result.stderr)
+        admin = self.users()["admin"]
+        self.assertEqual((admin.role, admin.must_change_password), ("engineer", True))
+        self.assertTrue(passwords.verify_password(password, admin.password_hash))
+
+        refused = self.run_auth("bootstrap", "second")
+        self.assertEqual((refused.returncode, refused.stdout), (1, ""))
+        self.assertIn("already set up", refused.stderr)
+
+        created = self.run_auth("create-user", "dev", "developer")
+        self.assertEqual(created.returncode, 0, created.stderr)
+        self.assertTrue(self.users()["dev"].must_change_password)
+        reset = self.run_auth("reset-password", "dev")
+        self.assertEqual(reset.returncode, 0)
+        self.assertNotEqual(reset.stdout, created.stdout)
+        self.assertTrue(passwords.verify_password(reset.stdout.strip(), self.users()["dev"].password_hash))
+
+    def test_create_before_bootstrap_is_refused(self):
+        result = self.run_auth("create-user", "dev", "developer")
+        self.assertEqual((result.returncode, result.stdout), (1, ""))
+        self.assertIn("bootstrap", result.stderr)
+
+    def test_usage_errors(self):
+        for args in (("create-user", "x", "developer"), ("create-user", "dev", "admin"), ("frobnicate",), ()):
+            with self.subTest(args=args):
+                result = self.run_auth(*args)
+                self.assertEqual((result.returncode, result.stdout), (2, ""))
+
+    def test_last_engineer_and_recovery(self):
+        self.run_auth("bootstrap", "admin")
+        for args in (("disable", "admin"), ("set-role", "admin", "developer")):
+            result = self.run_auth(*args)
+            self.assertEqual(result.returncode, 1, args)
+            self.assertIn("last enabled engineer", result.stderr)
+        self.run_auth("create-user", "eng2", "engineer")
+        self.assertEqual(self.run_auth("disable", "admin").returncode, 0)
+        self.assertFalse(self.users()["admin"].enabled)
+        self.assertEqual(self.run_auth("enable", "admin").returncode, 0)
+        self.assertEqual(self.run_auth("set-role", "eng2", "end_user").returncode, 0)
+        self.assertEqual(self.users()["eng2"].role, "end_user")
+        self.assertEqual(self.run_auth("disable", "nobody").returncode, 1)
+
+    def test_list_shows_no_secret(self):
+        password = self.run_auth("bootstrap", "admin").stdout.strip()
+        result = self.run_auth("list")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("admin\tengineer\tenabled\tpassword change due\t", result.stdout)
+        self.assertNotIn(password, result.stdout)
+        self.assertNotIn("scrypt", result.stdout)
+    def test_service_principals(self):
+        # S2 of PR 3: list marks principals; set-role, disable and enable work on
+        # them; reset-password refuses one; create-user can't take its name.
+        self.run_auth("bootstrap", "admin")
+        with patch.object(settings, "auth_dir", self.dir):
+            store._ready.discard(str(store.db_path()))
+            store.create_principal("svc", "developer")
+            _, key = store.issue_key("svc")
+        listed = self.run_auth("list")
+        self.assertIn("svc\tdeveloper\tenabled\tservice account\t", listed.stdout)
+        self.assertNotIn(key, listed.stdout)
+        reset = self.run_auth("reset-password", "svc")
+        self.assertEqual((reset.returncode, reset.stdout), (1, ""))
+        self.assertIn("service principal", reset.stderr)
+        self.assertEqual(len(reset.stderr.strip().splitlines()), 1)
+        self.assertEqual(self.run_auth("create-user", "svc", "end_user").returncode, 1)
+        self.assertEqual(self.run_auth("set-role", "svc", "end_user").returncode, 0)
+        self.assertEqual(self.run_auth("disable", "svc").returncode, 0)
+        with patch.object(settings, "auth_dir", self.dir):
+            self.assertIsNone(store.authenticate_key(key))
+            self.assertEqual(store.get_user("svc").role, "end_user")
+        self.assertEqual(self.run_auth("enable", "svc").returncode, 0)
+        with patch.object(settings, "auth_dir", self.dir):
+            self.assertIsNotNone(store.authenticate_key(key))
+        self.assertNotIn("key", self.run_auth("--help").stdout.lower().replace("keys", ""))
+
+    def test_every_action_writes_one_stderr_line(self):
+        # N4: one line per action on standard error, naming no password.
+        password = self.run_auth("bootstrap", "admin").stdout.strip()
+        created = self.run_auth("create-user", "dev", "developer")
+        for args in (("reset-password", "dev"), ("set-role", "dev", "end_user"), ("disable", "dev"),
+                     ("enable", "dev"), ("disable", "admin")):
+            with self.subTest(args=args):
+                result = self.run_auth(*args)
+                lines = result.stderr.strip().splitlines()
+                self.assertEqual(len(lines), 1, result.stderr)
+                self.assertTrue(lines[0].startswith("auth: " + args[0]), lines[0])
+                for secret in (password, created.stdout.strip(), result.stdout.strip()):
+                    if secret:
+                        self.assertNotIn(secret, result.stderr)
+
+
+class TestingHelperTests(unittest.TestCase):
+    def test_headers_are_a_real_session(self):
+        from auth import testing
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with patch.object(testing, "_folder", temp.name), patch.object(testing, "_accounts", {}), \
+                patch.object(settings, "auth_dir", settings.auth_dir):
+            headers = testing.headers("developer", base_url="http://owned/")
+            self.assertEqual(headers["Origin"], "http://owned")
+            token = headers["Cookie"].split("=", 1)[1]
+            self.assertEqual(store.authenticate(token).role, "developer")
+
+
+class ImplementationCopyTests(unittest.TestCase):
+    def test_embedded_copies_match(self):
+        root = Path(API_DIR).parent
+        document = (root / "IMPLEMENTATION.md").read_text()
+        for name in ("api/auth/__init__.py", "api/auth/passwords.py", "api/auth/store.py", "api/auth/policy.py",
+                     "api/auth/middleware.py", "api/auth/__main__.py", "api/auth/testing.py",
+                     "api/routers/auth.py", "api/main.py", "ui/src/pages/UsersPage.tsx",
+                     "api/auth/keys.py", "ui/src/pages/ServiceKeysPage.tsx", "api/config.py", "proxy/nginx.conf",
+                     "scripts/verify/17_auth.sh", "scripts/verify/auth_setup.py", "scripts/verify/auth_stack.py",
+                     "scripts/verify/auth_headers.py"):
+            with self.subTest(name=name):
+                header = "### " + name + "\n\n```"
+                start = document.index("\n", document.index(header) + len(header)) + 1
+                end = document.index("\n```\n", start)
+                self.assertEqual(document[start:end], (root / name).read_text().rstrip("\n"))
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.CRITICAL)
+    unittest.main(verbosity=2)
+```
+
+### scripts/tests/test_auth_enforcement.py
+
+```python
+"""Every protected API route refuses a request without a session (#25).
+
+Before #25 the API had no authentication: any client could list, create and
+delete collections, ingest, export and poll jobs. This sends plain HTTP through
+`main.app`, so it runs unchanged on a checkout without the `auth` package and
+fails there. With it, the store is pointed at a temporary folder holding one
+account, so a refusal is 401 AUTH_REQUIRED rather than 503 SETUP_REQUIRED.
+
+Runs in the built API image with no network (`17_auth.sh`):
+
+    docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
+      "$(docker compose images -q api)" python scripts/tests/test_auth_enforcement.py
+"""
+import os
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+sys.path.insert(0, os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api"))
+
+from fastapi.testclient import TestClient
+
+from main import app
+from services import ollama_client
+from services import weaviate_client as wc
+
+try:
+    from auth import testing as auth_testing
+except ImportError:          # a checkout from before #25
+    auth_testing = None
+
+X = "VfyAuthNoSuch"
+# Every route but GET /health, with a request that would reach it.
+PROTECTED = (
+    ("GET", "/collections"), ("POST", "/collections"), ("DELETE", f"/collections/{X}?confirm=true"),
+    ("POST", "/query"), ("GET", f"/retrieval/config/{X}"), ("POST", "/retrieval/config"),
+    ("POST", "/ingest/upload"), ("GET", "/ingest/job/nope"), ("GET", f"/ingest/config/{X}"),
+    ("POST", "/ingest/config"),
+    ("POST", "/goldstandard/generate"), ("GET", "/goldstandard/session/gs_nope"),
+    ("PATCH", "/goldstandard/session/gs_nope/pair/p"), ("POST", "/goldstandard/regenerate"),
+    ("POST", "/goldstandard/save"), ("GET", "/goldstandard/download/nope.json"),
+    ("GET", "/goldstandard/diagnostics"),
+    ("POST", "/export"), ("GET", "/export/job/nope"), ("POST", "/import"), ("GET", "/import/job/nope"),
+    ("GET", "/packages"), ("GET", "/help/transfer"),
+    ("POST", "/tune/rechunk"), ("POST", "/tune/reembed"), ("POST", "/tune/reindex"),
+    ("GET", "/tune/job/nope"), ("GET", f"/tune/{X}"),
+    ("GET", "/metrics/latency"),
+    ("GET", "/docs"), ("GET", "/docs/oauth2-redirect"), ("GET", "/redoc"), ("GET", "/openapi.json"),
+    ("GET", "/auth/users"), ("POST", "/auth/users"), ("POST", "/auth/users/nobody/reset-password"),
+    ("POST", "/auth/users/nobody/role"), ("POST", "/auth/users/nobody/disable"),
+    ("POST", "/auth/users/nobody/enable"),
+    ("GET", "/auth/service-principals"), ("POST", "/auth/service-principals"),
+    ("POST", "/auth/service-principals/nobody/role"), ("POST", "/auth/service-principals/nobody/disable"),
+    ("POST", "/auth/service-principals/nobody/enable"), ("POST", "/auth/service-principals/nobody/keys"),
+    ("POST", "/auth/service-principals/nobody/keys/nokey/revoke"),
+)
+
+
+class UnauthenticatedTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if auth_testing is not None:
+            auth_testing.account("end_user")      # set up, so the answer is 401, not 503
+        cls.client = TestClient(app, raise_server_exceptions=False)
+
+    def test_every_protected_route_answers_401_without_a_session(self):
+        for method, path in PROTECTED:
+            with self.subTest(route=f"{method} {path}"):
+                response = self.client.request(method, path, json={} if method != "GET" else None)
+                self.assertEqual(response.status_code, 401, response.text[:200])
+                self.assertEqual(response.json()["error"]["code"], "AUTH_REQUIRED")
+
+    def test_health_stays_open(self):
+        # Backends mocked: nothing reaches a stack.
+        with patch.object(wc, "check_health", AsyncMock(return_value=True)), \
+                patch.object(ollama_client, "check_health", AsyncMock(return_value={})):
+            self.assertNotIn(self.client.get("/health").status_code, (401, 403))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+### scripts/tests/test_verify_auth.py
+
+```python
+"""Host-only checks that the verify harness keeps its test credentials private (#25).
+
+auth_setup.py keeps the test accounts' passwords in a 0600 file in a 0700
+folder of this user's own, refuses a folder someone could have planted, and
+never runs the operator command without --operator. auth_headers.py reads the
+session from curl's cookie jar. lib.sh passes --operator only on the verify
+project, and every curl a suite makes carries the session. Standard library
+only; no Docker or stack needed.
+
+Run: python3 scripts/tests/test_verify_auth.py
+"""
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[2]
+VERIFY = ROOT / "scripts" / "verify"
+sys.path.insert(0, str(VERIFY))
+
+import auth_headers  # noqa: E402
+import auth_setup    # noqa: E402
+
+
+class FolderTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+
+    def use(self, path):
+        return patch.dict(os.environ, {"RAG_AUTH_DIR": str(path)})
+
+    def test_folder_is_created_private_and_credentials_file_0600(self):
+        folder = self.base / "auth"
+        with self.use(folder):
+            made = auth_setup.private_dir()
+            auth_setup.write_credentials(made, {"engineer": ("vfy-engineer", "p" * 20)})
+        self.assertEqual(stat.S_IMODE(folder.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((folder / "credentials").stat().st_mode), 0o600)
+        self.assertEqual(auth_setup.read_credentials(folder), {"engineer": ("vfy-engineer", "p" * 20)})
+        self.assertEqual([p.name for p in folder.iterdir()], ["credentials"], "no temporary file left behind")
+
+    def test_a_loose_folder_is_tightened(self):
+        folder = self.base / "auth"
+        folder.mkdir(mode=0o755)
+        with self.use(folder):
+            auth_setup.private_dir()
+        self.assertEqual(stat.S_IMODE(folder.stat().st_mode), 0o700)
+
+    def test_a_symlink_or_file_is_refused(self):
+        target = self.base / "elsewhere"
+        target.mkdir()
+        link = self.base / "auth"
+        link.symlink_to(target)
+        with self.use(link), self.assertRaises(auth_setup.SetupError):
+            auth_setup.private_dir()
+        plain = self.base / "plain"
+        plain.write_text("")
+        with self.use(plain), self.assertRaises(auth_setup.SetupError):
+            auth_setup.private_dir()
+
+    def test_a_symlinked_credentials_file_is_refused(self):
+        folder = self.base / "auth"
+        folder.mkdir(mode=0o700)
+        (folder / "credentials").symlink_to(self.base / "planted")
+        (self.base / "planted").write_text("engineer vfy-engineer planted\n")
+        with self.assertRaises(auth_setup.SetupError):
+            auth_setup.read_credentials(folder)
+
+    def test_default_folder_is_outside_the_checkout(self):
+        with patch.dict(os.environ, {"TMPDIR": "/tmp/x/"}, clear=False):
+            os.environ.pop("RAG_AUTH_DIR", None)
+            self.assertEqual(auth_setup.auth_dir(), Path("/tmp/x/rag-verify-auth-{}".format(os.getuid())))
+
+    def test_jar_is_0600_and_readable_by_auth_headers(self):
+        jar = self.base / "engineer.jar"
+        auth_setup.write_jar(jar, "tok-123", api="http://localhost:8081/api")
+        self.assertEqual(stat.S_IMODE(jar.stat().st_mode), 0o600)
+        self.assertEqual(auth_headers.session_token(str(jar)), "tok-123")
+        with patch.dict(os.environ, {"RAG_AUTH_JAR": str(jar), "RAG_AUTH_ORIGIN": "http://localhost:8081"}):
+            self.assertEqual(auth_headers.headers(),
+                             {"Cookie": "rag_session=tok-123", "Origin": "http://localhost:8081"})
+
+    def test_auth_headers_reads_curls_own_jar_format(self):
+        jar = self.base / "curl.jar"
+        jar.write_text("# Netscape HTTP Cookie File\n# https://curl.se/docs/http-cookies.html\n\n"
+                       "#HttpOnly_localhost\tFALSE\t/\tFALSE\t1893456000\trag_session\tabc\n"
+                       "localhost\tFALSE\t/\tFALSE\t0\tother\tzzz\n")
+        self.assertEqual(auth_headers.session_token(str(jar)), "abc")
+        self.assertIsNone(auth_headers.session_token(str(self.base / "missing")))
+
+
+class OperatorTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        env = patch.dict(os.environ, {"RAG_AUTH_DIR": temp.name + "/auth"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_without_operator_nothing_is_reset_or_bootstrapped(self):
+        with patch.object(auth_setup, "operator") as operator, \
+                patch.object(auth_setup, "request", return_value=(200, {"setup_required": True}, None)):
+            with self.assertRaises(auth_setup.SetupError):
+                auth_setup.ensure(False)
+        operator.assert_not_called()
+        with patch.object(auth_setup, "operator") as operator, \
+                patch.object(auth_setup, "request", side_effect=[(200, {"setup_required": False}, None),
+                                                                 (401, None, None)]):
+            with self.assertRaises(auth_setup.SetupError):
+                auth_setup.ensure(False)
+        operator.assert_not_called()
+
+    def test_a_generated_password_is_replaced_and_stored_never_printed(self):
+        calls = []
+
+        def operator(*args):
+            calls.append(args)
+            return 0, "generated-" + args[1]
+
+        def request(method, path, body=None, token=None, api=None):
+            if path == "/auth/status":
+                return 200, {"setup_required": True}, None
+            if path == "/auth/login":
+                return 200, {"must_change_password": body["password"].startswith("generated-")}, "tok"
+            return 200, {}, None
+
+        with patch.object(auth_setup, "operator", side_effect=operator), \
+                patch.object(auth_setup, "request", side_effect=request), \
+                patch("sys.stdout") as out:
+            auth_setup.ensure(True)
+        self.assertEqual(calls[0], ("bootstrap", "vfy-engineer"))
+        stored = auth_setup.read_credentials(auth_setup.private_dir())
+        self.assertEqual(set(stored), {"engineer", "developer", "end_user"})
+        self.assertTrue(all(not p.startswith("generated-") for _, p in stored.values()))
+        self.assertFalse(out.write.called, "ensure printed something")
+
+
+class PasswordPipeTests(unittest.TestCase):
+    def test_the_password_goes_only_into_a_pipe(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        folder = Path(temp.name) / "auth"
+        env = {**os.environ, "RAG_AUTH_DIR": str(folder)}
+        with patch.dict(os.environ, {"RAG_AUTH_DIR": str(folder)}):
+            auth_setup.write_credentials(auth_setup.private_dir(), {"end_user": ("vfy-end-user", "s3cret pass word")})
+        piped = subprocess.run([sys.executable, str(VERIFY / "auth_setup.py"), "password", "end_user"],
+                               capture_output=True, text=True, env=env)
+        self.assertEqual((piped.returncode, piped.stdout, piped.stderr), (0, "s3cret pass word\n", ""))
+        with patch.dict(os.environ, {"RAG_AUTH_DIR": str(folder)}), patch.object(auth_setup.os, "isatty", return_value=True), \
+                self.assertRaises(auth_setup.SetupError):
+            auth_setup.password_to_pipe("end_user")
+
+
+class LibraryTests(unittest.TestCase):
+    def test_operator_only_on_the_verify_project_and_curl_carries_the_session(self):
+        text = (VERIFY / "lib.sh").read_text()
+        ensure = text[text.index("auth_ensure() {"):]
+        ensure = ensure[:ensure.index("\n}\n")]
+        self.assertIn('[ -n "$(volume_removal_refusal_reason)" ] || operator=--operator', ensure)
+        function = text[text.index("curl() {"):]
+        function = function[:function.index("\n}\n")]
+        self.assertIn('command curl -b "$RAG_AUTH_JAR" -H "Origin: $RAG_AUTH_ORIGIN" "$@"', function)
+        self.assertIn("auth_ensure", text[text.index("require_stack() {"):text.index("# ── test accounts")])
+
+    def test_no_password_on_a_command_line(self):
+        for name in ("lib.sh", "17_auth.sh", "06_ui.sh"):
+            text = (VERIFY / name).read_text()
+            with self.subTest(file=name):
+                self.assertNotIn("password", " ".join(line for line in text.splitlines()
+                                                      if "curl" in line and not line.lstrip().startswith("#")))
+
+    def test_the_suites_pass_the_shell_check(self):
+        for name in ("lib.sh", "17_auth.sh", "06_ui.sh", "all.sh"):
+            with self.subTest(file=name):
+                self.assertEqual(subprocess.run(["bash", "-n", str(VERIFY / name)]).returncode, 0)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
 ```
 
 ### scripts/verify/lock.sh
@@ -16777,22 +24307,30 @@ if __name__ == "__main__":
 
     python3 validate_package.py <path-to-ragpkg-*.tar.gz>
 
+An encrypted package (`*.tar.gz.age`, #27) is checked the same way after
+decryption. That needs the API's age module and its `cryptography`, so it runs
+in the API container with the passphrase in RAG_PACKAGE_PASSPHRASE:
+
+    docker compose exec -T -e RAG_PACKAGE_PASSPHRASE=... api \
+      python - /app/exports/<package> < scripts/verify/validate_package.py
+
 Exits non-zero if any clause fails. Checks the filename convention, that <id8>
 really is the manifest digest, every listed digest, that nothing in the archive
 is unlisted, the chunks.jsonl record shape, source content-addressing, and the
 generated README and retrieve.py.
 """
-import ast, hashlib, json, re, sys, tarfile, tempfile
+import ast, hashlib, json, os, re, sys, tarfile, tempfile
 from pathlib import Path
 
 archive = Path(sys.argv[1])
+SUFFIX = ".tar.gz.age" if archive.name.endswith(".tar.gz.age") else ".tar.gz"
 fails = []
 def check(name, ok, detail=""):
     print(f"  {'PASS' if ok else 'FAIL'}  {name}" + (f"  — {detail}" if detail else ""))
     if not ok: fails.append(name)
 
 # E5 — filename (§4.1)
-NAME_RE = re.compile(r"^ragpkg-([a-z0-9]+(?:-[a-z0-9]+)*)-(\d{8}T\d{6}Z)-([0-9a-f]{8})\.tar\.gz$")
+NAME_RE = re.compile(r"^ragpkg-([a-z0-9]+(?:-[a-z0-9]+)*)-(\d{8}T\d{6}Z)-([0-9a-f]{8})\.tar\.gz(?:\.age)?$")
 m = NAME_RE.match(archive.name)
 check("E5 filename matches the §4.1 pattern", m is not None, archive.name)
 if not m:
@@ -16800,18 +24338,30 @@ if not m:
 slug, ts, id8 = m.groups()
 
 with tempfile.TemporaryDirectory() as td:
-    with tarfile.open(archive, "r:gz") as tar:
+    source = archive
+    if SUFFIX == ".tar.gz.age":
+        # A decrypted copy in the temporary folder is fine for a check; import
+        # itself never writes one (#27).
+        sys.path.insert(0, os.environ.get("RAG_TEST_API_DIR") or "/app")
+        from services import age_stream
+        source = Path(td) / "decrypted.tar.gz"
+        with archive.open("rb") as fh, source.open("wb") as out:
+            decryptor = age_stream.open_decrypt(fh, os.environ["RAG_PACKAGE_PASSPHRASE"])
+            while block := decryptor.read(1024 * 1024):
+                out.write(block)
+        check("#27 the encrypted package decrypts with its passphrase", True)
+    with tarfile.open(source, "r:gz") as tar:
         names = tar.getnames()
-        tar.extractall(td)
-    root = Path(td)
+        tar.extractall(Path(td) / "x")
+    root = Path(td) / "x"
+    stem = archive.name[:-len(SUFFIX)]
     tops = {n.split("/")[0] for n in names}
     check("archive expands to a single directory", len(tops) == 1, str(tops))
-    check("that directory is the filename minus .tar.gz",
-          tops == {archive.name[:-len(".tar.gz")]}, str(tops))
+    check(f"that directory is the filename minus {SUFFIX}", tops == {stem}, str(tops))
     # §4.2 — the manifest comes right after the directory entry (#383)
     check("§4.2 manifest.json is the archive's first file",
-          names[1:2] == [archive.name[:-len(".tar.gz")] + "/manifest.json"], str(names[:3]))
-    pkg = root / archive.name[:-len(".tar.gz")]
+          names[1:2] == [stem + "/manifest.json"], str(names[:3]))
+    pkg = root / stem
 
     manifest = json.loads((pkg / "manifest.json").read_text())
 
@@ -16906,7 +24456,11 @@ with tempfile.TemporaryDirectory() as td:
           str(set(re.findall(r"@@[A-Z_0-9]+@@", readme))))
     check("E19 README states the collection name", name in readme)
     check("E19 README states the fidelity", fid in readme)
-    check("E19 README carries the encryption warning", "not encrypted" in readme.lower())
+    # The encryption section is shared with /help/transfer, so it describes
+    # both forms; the README also names the file as delivered (#27).
+    check("E19 README carries the encryption section",
+          "## Encryption" in readme and "is not encrypted" in readme and ".tar.gz.age" in readme)
+    check("E19 README names the package file as delivered", archive.name in readme)
 
     if manifest.get("retrieve_script"):
         rp = pkg / "retrieve.py"
@@ -16926,7 +24480,7 @@ with tempfile.TemporaryDirectory() as td:
                    if isinstance(node, (ast.Import, ast.ImportFrom))
                    for n in ([a.name for a in node.names] if isinstance(node, ast.Import)
                              else [node.module or ""])}
-        STDLIB = {"argparse","json","sys","urllib","os","re"}
+        STDLIB = {"argparse","getpass","json","sys","urllib","os","re"}  # getpass: the login (#25)
         check("retrieve.py imports stdlib only", imports <= STDLIB, str(sorted(imports)))
     else:
         check("retrieve.py absent when retrieve_script is false",
@@ -17033,13 +24587,13 @@ ENDPY
 check "resolved Compose publishes only the proxy on host loopback" $?
 
 # ── cross-origin access, as SECURITY.md describes it ─────────────────────────
-# SECURITY.md says a web page open in a browser on this machine can call the
-# API, because CORS allows any origin (#25 tracks tightening it). Check that
-# this is still true, so the policy and the code can't drift apart silently:
-# when #25 changes CORS, this check and SECURITY.md change together.
-cors=$(curl -s -D - -o /dev/null -m 10 -H "Origin: http://other.example" "$API/health" \
+# SECURITY.md says the API has no CORS (#25): a page from another origin can't
+# read its answers, and a cookie-authenticated change from one is refused (see
+# 17_auth.sh). Check that no answer carries Access-Control-Allow-Origin, so the
+# policy and the code can't drift apart silently.
+cors=$(command curl -s -D - -o /dev/null -m 10 -H "Origin: http://other.example" "$API/health" \
   | tr -d '\r' | awk -F': ' 'tolower($1)=="access-control-allow-origin"{print $2}')
-check_eq "the API allows any origin, as SECURITY.md describes (#25)" "$cors" "*"
+check_eq "the API sends no Access-Control-Allow-Origin, as SECURITY.md describes (#25)" "$cors" ""
 
 (cd "$REPO_ROOT" && python3 - <<'ENDPY'
 import json, subprocess
@@ -17696,6 +25250,8 @@ ENDPY
       check "a first start from empty volumes brings every service healthy within 300s (took ${took}s)" $? \
         "$([ "$up_ok" = 0 ] || printf 'not healthy after 600s')"
       wait_healthy_timed "$(python3 -c "import time;print(time.time())")" 60 > /dev/null
+      # The accounts went with their volume too (#25): set the project up again.
+      auth_ensure
       # It started from nothing: the collection made above is gone with its volume.
       check_eq "that first start began with no collections" \
         "$(api_get "/collections" | jfield "['collections']")" "[]"
@@ -18666,6 +26222,7 @@ from unittest.mock import AsyncMock,patch
 from fastapi.testclient import TestClient
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import weaviate_client as wc,rag_pipeline as rag
 
 prefix=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Controls'+uuid.uuid4().hex[:10]
@@ -18677,7 +26234,7 @@ if importlib.util.find_spec('services.collection_recovery'):
 else:
     recovery=None  # The pre-recovery baseline sweeps legacy staging markers.
 
-client=TestClient(app)
+client=TestClient(app, headers=auth_testing.headers())
 with tempfile.TemporaryDirectory(prefix='retrieval-controls-') as directory,patch.object(settings,'upload_dir',directory):
     try:
         for index in ('hnsw','flat'):
@@ -18916,6 +26473,7 @@ from fastapi.testclient import TestClient
 
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import weaviate_client as wc
 
 prefix = os.environ.get("RAG_TEST_PREFIX", "Vfy") + "Score" + uuid.uuid4().hex[:8]
@@ -18933,7 +26491,7 @@ CASES = {
     "l2-squared": ([[1.0, t, 0.0, 0.0] for t in (0.0, 0.5, 1.0, math.sqrt(3))], [1.0, 0.8, 0.5, 0.25]),
 }
 
-client = TestClient(app)
+client = TestClient(app, headers=auth_testing.headers())
 created = []
 failures = []
 
@@ -19034,6 +26592,7 @@ from unittest.mock import patch
 import httpx
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs,weaviate_client as wc
 
 collection=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Persistence'+uuid.uuid4().hex[:10]
@@ -19041,7 +26600,7 @@ created=False
 with tempfile.TemporaryDirectory(prefix='session-persistence-live-') as directory,patch.object(settings,'upload_dir',directory):
     async def run():
         global created
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-fixture') as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned-fixture'), base_url='http://owned-fixture') as client:
             created=True
             response=await client.post('/collections',json={'name':collection});assert response.status_code==201,response.text
             coll=wc.get_client().collections.get(collection)
@@ -19370,8 +26929,10 @@ fi
 # ── export filtering, schema and filename ────────────────────────────────────
 python3 - "$SID" "$API" <<'ENDPY'
 import json, sys, urllib.request
+import auth_headers  # the suite's session (#25); this runs from scripts/verify
 sid, api = sys.argv[1], sys.argv[2]
-pairs = json.load(urllib.request.urlopen(f"{api}/goldstandard/session/{sid}"))['pairs']
+pairs = json.load(urllib.request.urlopen(urllib.request.Request(
+    f"{api}/goldstandard/session/{sid}", headers=auth_headers.headers())))['pairs']
 plan = ["approved", "edited", "rejected", "pending", "approved"]
 for pair, status in zip(pairs, plan):
     body = {"status": status}
@@ -19380,7 +26941,7 @@ for pair, status in zip(pairs, plan):
     req = urllib.request.Request(
         f"{api}/goldstandard/session/{sid}/pair/{pair['pair_id']}",
         data=json.dumps(body).encode(), method="PATCH",
-        headers={"Content-Type": "application/json"})
+        headers={"Content-Type": "application/json", **auth_headers.headers()})
     urllib.request.urlopen(req)
 ENDPY
 api_post "/goldstandard/save" "{\"session_id\":\"$SID\"}" > /tmp/vfy_save.json
@@ -19535,7 +27096,7 @@ summary
 
 ```bash
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E36)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E40)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -19576,6 +27137,10 @@ check "real embedding model exported, installed and refused when mismatched" $?
 # The package listing reads each manifest without decompressing the package (#383).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_package_listing.py)
 check "the package listing reads only up to each manifest (#383)" $?
+# Passphrase encryption (#27): the age module against the CCTV vectors, export,
+# import, listing and refusals, with no backend.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_export_encryption.py)
+check "export encryption: age format, encrypted export and import, refusals (#27)" $?
 
 python3 "$REPO_ROOT/scripts/tests/test_batch_implementation.py"
 check "test_batch_implementation.py registered regression checks" $?
@@ -19621,6 +27186,102 @@ sys.exit(0 if entry and entry["readable"] is True and entry["collection"] == col
          and entry["chunk_count"] == chunks and entry["fidelity"] == "with-sources" and entry["created_at"] else 1)
 ENDPY
 check "GET /packages lists the new export as readable with its manifest metadata (#383)" $? "$(tail -1 /tmp/vfy_pkglist.txt)"
+
+# ── encrypted packages (#27) ─────────────────────────────────────────────────
+# An encrypted export of the same collection, validated after decryption; a
+# wrong passphrase fails DECRYPT_FAILED with nothing touched; the passphrase
+# refusals; the right passphrase imports it. The passphrase is test data.
+PASS27="vfy-27 correct horse battery"
+post_code() {   # path body outfile -> the HTTP status
+  _rag_require_lock_owner
+  curl -s -m 600 -o "$3" -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"
+}
+code=$(post_code "/export" "{\"collection\":\"$C\",\"passphrase\":\"short-pass\"}" /tmp/vfy_enc_short.json)
+python3 - "$code" > /tmp/vfy_enc_short.txt 2>&1 <<'ENDPY'
+import json, sys
+body = open("/tmp/vfy_enc_short.json").read()
+print(sys.argv[1], body[:300])
+sys.exit(0 if sys.argv[1] == "422" and json.loads(body)["error"]["code"] == "INVALID_PARAMETER"
+         and "short-pass" not in body else 1)
+ENDPY
+check "#27 an 11-character passphrase is refused 422 INVALID_PARAMETER without being echoed" $? "$(tail -1 /tmp/vfy_enc_short.txt)"
+
+api_post "/export" "{\"collection\":\"$C\",\"passphrase\":\"$PASS27\"}" > /tmp/vfy_enc_exp.json
+encjob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_enc_exp.json'))['job_id'])")
+encstatus=$(wait_for_job "/export/job/$encjob" 1800)
+check_eq "#27 an encrypted export completes" "$encstatus" "completed"
+api_get "/export/job/$encjob" > /tmp/vfy_enc_expjob.json
+ENCPKG=$(python3 -c "import json;print(json.load(open('/tmp/vfy_enc_expjob.json'))['filename'])")
+python3 - "$EXPORTS/$ENCPKG" "$PASS27" > /tmp/vfy_enc_file.txt 2>&1 <<'ENDPY'
+import json, pathlib, sys
+path, phrase = pathlib.Path(sys.argv[1]), sys.argv[2]
+job = json.load(open("/tmp/vfy_enc_expjob.json"))
+head = path.read_bytes()[:200] if path.is_file() else b""
+lines = head.split(b"\n")
+print(path.name, job.get("encrypted"), lines[:2])
+sys.exit(0 if path.name.endswith(".tar.gz.age") and job.get("encrypted") is True
+         and lines[0] == b"age-encryption.org/v1" and lines[1].startswith(b"-> scrypt ")
+         and lines[1].endswith(b" 18") and phrase.encode() not in path.read_bytes()
+         and phrase not in json.dumps(job) else 1)
+ENDPY
+check "#27 the job reports encrypted and the file is an age scrypt file (work factor 18) named .tar.gz.age" $? "$(tail -1 /tmp/vfy_enc_file.txt)"
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_PACKAGE_PASSPHRASE="$PASS27" api \
+  python - "/app/exports/$ENCPKG" < scripts/verify/validate_package.py) > /tmp/vfy_enc_val.txt 2>&1
+check "#27 the decrypted package satisfies every §4 clause" $? "$(tail -2 /tmp/vfy_enc_val.txt | head -1)"
+api_get "/packages" > /tmp/vfy_enc_list.json
+python3 - "$ENCPKG" > /tmp/vfy_enc_list.txt 2>&1 <<'ENDPY'
+import json, sys
+entry = next((p for p in json.load(open("/tmp/vfy_enc_list.json"))["packages"] if p["filename"] == sys.argv[1]), None)
+print(entry)
+sys.exit(0 if entry and entry["encrypted"] is True and entry["readable"] is True
+         and all(entry[k] is None for k in ("collection", "chunk_count", "fidelity", "created_at")) else 1)
+ENDPY
+check "#27 GET /packages lists the encrypted package with encrypted: true and no metadata" $? "$(tail -1 /tmp/vfy_enc_list.txt)"
+
+# Wrong passphrase, on_conflict=replace against the existing collection: nothing touched.
+enc_sum() { python3 -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$EXPORTS/$ENCPKG"; }
+enc_state() { api_get "/collections" | python3 -c "
+import json,sys; c=json.load(sys.stdin)['collections']; print(sorted((x['name'], x['object_count']) for x in c))"; }
+enc_workdirs() { (cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/uploads/import-* 2>/dev/null | wc -l') | tr -d ' \r'; }
+sum_before=$(enc_sum); state_before=$(enc_state); workdirs_before=$(enc_workdirs)
+api_post "/import" "{\"filename\":\"$ENCPKG\",\"on_conflict\":\"replace\",\"passphrase\":\"not the passphrase\"}" > /tmp/vfy_enc_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_enc_imp.json'))['job_id'])")
+wait_for_job "/import/job/$ijob" 900 >/dev/null
+api_get "/import/job/$ijob" > /tmp/vfy_enc_impjob.json
+python3 > /tmp/vfy_enc_wrong.txt 2>&1 <<'ENDPY'
+import json, sys
+d = json.load(open("/tmp/vfy_enc_impjob.json"))
+print(d["status"], d["error_code"], d["error_detail"], d.get("encrypted"))
+sys.exit(0 if d["status"] == "failed" and d["error_code"] == "DECRYPT_FAILED"
+         and d["error_detail"] == {"reason": "passphrase"} and d.get("encrypted") is True
+         and "not the passphrase" not in json.dumps(d) else 1)
+ENDPY
+check "#27 a wrong passphrase fails the import DECRYPT_FAILED (reason passphrase)" $? "$(tail -1 /tmp/vfy_enc_wrong.txt)"
+[ "$(enc_state)" = "$state_before" ] && [ "$(enc_sum)" = "$sum_before" ]
+check "#27 ... and touches nothing: collections, their counts and the package file unchanged" $?
+check_eq "#27 ... and leaves no import work directory behind" "$(enc_workdirs)" "$workdirs_before"
+
+code=$(post_code "/import" "{\"filename\":\"$ENCPKG\",\"on_conflict\":\"rename\"}" /tmp/vfy_enc_req.json)
+check_eq "#27 an encrypted package without a passphrase is refused 400" "$code" "400"
+check_eq "#27 ... with PASSPHRASE_REQUIRED" "$(jfield "['error']['code']" < /tmp/vfy_enc_req.json)" "PASSPHRASE_REQUIRED"
+code=$(post_code "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"rename\",\"passphrase\":\"$PASS27\"}" /tmp/vfy_enc_nexp.json)
+check_eq "#27 a passphrase for an unencrypted package is refused 400" "$code" "400"
+check_eq "#27 ... with PASSPHRASE_NOT_EXPECTED" "$(jfield "['error']['code']" < /tmp/vfy_enc_nexp.json)" "PASSPHRASE_NOT_EXPECTED"
+[ "$(enc_state)" = "$state_before" ]
+check "#27 ... and neither refusal changed any collection" $?
+
+api_post "/import" "{\"filename\":\"$ENCPKG\",\"on_conflict\":\"rename\",\"passphrase\":\"$PASS27\"}" > /tmp/vfy_enc_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_enc_imp.json'))['job_id'])")
+wait_for_job "/import/job/$ijob" 1800 >/dev/null
+api_get "/import/job/$ijob" > /tmp/vfy_enc_impjob.json
+read -r encstat encname encwritten encflag <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_enc_impjob.json'))
+print(d['status'], d['collection'], d['chunks_written'], d.get('encrypted'))")"
+check_eq "#27 the right passphrase imports the encrypted package" "$encstat" "completed"
+[ "$encname" != "$C" ] && [ "$encwritten" = "$chunks_before" ] && [ "$encflag" = "True" ]
+check "#27 ... under a new name with every chunk, and the job reports encrypted" $? "$encname $encwritten/$chunks_before $encflag"
+[ -n "$encname" ] && [ "$encname" != "$C" ] && [ "$encname" != "None" ] && drop_collection "$encname"
+rm -f "$EXPORTS/$ENCPKG"
 
 # ── E30: vectors are attributed to the collection's stored model (#196) ──────
 EMBED_MODEL=$(cd "$REPO_ROOT" && docker compose exec -T api python -c 'from config import settings; print(settings.embed_model)' | tr -d '\r')
@@ -21035,7 +28696,11 @@ else
     name=${run%%:*}; want=${run#*:}
     args=(--api-url "$API" --json --citations)
     [ "$name" = top2 ] && args+=(--top-k 2)
-    python3 -I -S "$RTMP/retrieve.py" "${args[@]}" "$QUESTION" > /tmp/vfy_p_r.json 2> /tmp/vfy_p_r.err
+    # As the End User test account (#25): the password goes in on stdin.
+    _rag_require_lock_owner
+    python3 ./auth_setup.py password end_user \
+      | python3 -I -S "$RTMP/retrieve.py" --username vfy-end-user --password-stdin "${args[@]}" "$QUESTION" \
+        > /tmp/vfy_p_r.json 2> /tmp/vfy_p_r.err
     rc=$?
     python3 - "$want" <<'ENDPY'
 import json, sys
@@ -21050,8 +28715,9 @@ ENDPY
     check "E8/E9: retrieve.py ($name) answers with $want citation(s)" $? \
       "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
   done
-  python3 -I -S "$RTMP/retrieve.py" --api-url "$API" --collection "$IMP" "$QUESTION" \
-    > /tmp/vfy_p_r.out 2> /tmp/vfy_p_r.err
+  python3 ./auth_setup.py password end_user \
+    | python3 -I -S "$RTMP/retrieve.py" --username vfy-end-user --password-stdin --api-url "$API" \
+        --collection "$IMP" "$QUESTION" > /tmp/vfy_p_r.out 2> /tmp/vfy_p_r.err
   rc=$?
   [ "$rc" = 0 ] && [ -n "$(tr -d '[:space:]' < /tmp/vfy_p_r.out)" ]
   check "E11: retrieve.py answers from the imported collection" $? "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
@@ -21560,10 +29226,13 @@ fi
 C="${PREFIX}Ui"
 drop_collection "$C"; make_collection "$C"
 
-docker run --rm --network "$NETWORK" \
+# The test accounts' credentials go in on standard input (#25), never on a
+# command line or in the environment; browser/lib.js reads them once.
+_rag_require_lock_owner
+docker run --rm -i --network "$NETWORK" \
   -e RAG_UI_BASE="${RAG_UI_BASE:-http://proxy}" \
-  -e RAG_SKIP_SLOW="$SKIP_SLOW" \
-  -v "$PWD/browser":/w:ro -w /w "$IMAGE" node ui_criteria.js
+  -e RAG_SKIP_SLOW="$SKIP_SLOW" -e RAG_AUTH_STDIN=1 \
+  -v "$PWD/browser":/w:ro -w /w "$IMAGE" node ui_criteria.js < "$RAG_AUTH_DIR/credentials"
 rc=$?
 
 drop_collection "$C"
@@ -21588,11 +29257,12 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs, weaviate_client as wc, tuning
 
 collection=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Validity'+uuid.uuid4().hex[:12]
 session_id='gs_'+uuid.uuid4().hex[:8]
-client=TestClient(app)  # Do not run global startup sweeps alongside other tests.
+client=TestClient(app, headers=auth_testing.headers())  # Do not run global startup sweeps alongside other tests.
 creation_attempted=False
 with tempfile.TemporaryDirectory(prefix='validity-live-') as directory, patch.object(settings,'upload_dir',directory):
     try:
@@ -21819,9 +29489,62 @@ async function launch() {
   });
 }
 
+// The test accounts' credentials (#25), read once from standard input:
+// 06_ui.sh runs this container with the harness's credentials file as stdin
+// (RAG_AUTH_STDIN=1), so no password is on a command line or in the
+// environment. Lines are `role username password`.
+let credentials = null;
+function credentialsFor(role) {
+  if (credentials === null) {
+    credentials = {};
+    if (process.env.RAG_AUTH_STDIN === '1') {
+      for (const line of require('fs').readFileSync(0, 'utf8').split('\n')) {
+        const [r, username, ...rest] = line.split(' ');
+        if (r && username && rest.length) credentials[r] = { username, password: rest.join(' ') };
+      }
+    }
+  }
+  if (!credentials[role]) throw new Error(`no test credentials for ${role}; run through 06_ui.sh`);
+  return credentials[role];
+}
+
+// Logs the page's browser context in as the role's test account, through the
+// API, as the login page does. The session is the HttpOnly cookie the answer sets.
+async function login(page, base, role) {
+  const { username, password } = credentialsFor(role);
+  // Any same-origin page will do; /api/health is not the UI, so nothing asks
+  // GET /api/auth/me before the login and logs its 401 as a console error.
+  if (!page.url().startsWith(base)) await page.goto(base + '/api/health', { waitUntil: 'domcontentloaded' });
+  const status = await page.evaluate(async (u, p) => (await fetch('/api/auth/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: u, password: p }),
+  })).status, username, password);
+  if (status !== 200) throw new Error(`login as ${role} answered ${status}`);
+}
+
+// For fixtures that answer every /api/ request themselves: answers
+// GET /api/auth/status and GET /api/auth/me for `role` (null: logged out) and
+// passes everything else on. Registered after a fixture's own fetch stub, it
+// wraps that stub.
+async function stubAuth(page, role) {
+  await page.evaluateOnNewDocument(r => {
+    const inner = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+      const path = new URL(typeof input === 'string' ? input : input.url, location.href).pathname;
+      const reply = (status, body) => Promise.resolve(new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }));
+      if (path === '/api/auth/status') return reply(200, { setup_required: false });
+      if (path === '/api/auth/me') {
+        return r ? reply(200, { username: 'vfy-' + r.replace('_', '-'), role: r, must_change_password: false })
+                 : reply(401, { error: { code: 'AUTH_REQUIRED', message: 'Log in to use this.', detail: null } });
+      }
+      return inner(input, init);
+    };
+  }, role);
+}
+
 // A fresh browser context per role, with console errors and API calls recorded.
 // Console errors matter: a React component that throws unmounts the whole app,
 // which once turned every page blank after visiting /health.
+// With a role, the context is logged in as that role's test account.
 async function session(browser, base, role) {
   const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
@@ -21832,8 +29555,8 @@ async function session(browser, base, role) {
     const u = r.url();
     if (u.includes('/api/')) api.push({ method: r.method(), url: u.replace(/^https?:\/\/[^/]+/, ''), at: Date.now() });
   });
+  if (role) await login(page, base, role);
   await page.goto(base + '/', { waitUntil: 'networkidle2' });
-  if (role) await page.evaluate(r => sessionStorage.setItem('rag_role', JSON.stringify({ role: r })), role);
   return { ctx, page, errors, api };
 }
 
@@ -21856,7 +29579,7 @@ const clickByText = (page, text) => page.evaluate(t => {
   if (!el) return false; el.click(); return true;
 }, text);
 
-module.exports = { sleep, makeReporter, launch, session, bodyText, setValue, clickByText };
+module.exports = { sleep, makeReporter, launch, session, login, stubAuth, credentialsFor, bodyText, setValue, clickByText };
 ```
 
 ### scripts/verify/browser/query_config.js
@@ -21865,7 +29588,7 @@ module.exports = { sleep, makeReporter, launch, session, bodyText, setValue, cli
 // Deferred responses exercise the real provider, Retrieval page, and Q&A page.
 // All API calls are intercepted before application startup; no backend is used.
 const assert = require('node:assert/strict');
-const { sleep, makeReporter, setValue, clickByText } = require('./lib');
+const { sleep, makeReporter, setValue, clickByText, stubAuth } = require('./lib');
 
 const A = { collection: 'FixtureA', retrieval_mode: 'hybrid', top_k: 11, alpha: 0.25, ef: null, response_format: 'engineer', is_default: false };
 const B = { ...A, collection: 'FixtureB', retrieval_mode: 'semantic', top_k: 23, alpha: 0.6 };
@@ -21877,7 +29600,6 @@ async function fixture(browser, base) {
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.evaluateOnNewDocument((a, b) => {
-    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
     const realFetch = window.fetch.bind(window);
     const requests = [];
     window.queryConfigFixture = { requests };
@@ -21907,6 +29629,8 @@ async function fixture(browser, base) {
       return Promise.reject(new Error('Unexpected fixture API call: ' + method + ' ' + path));
     };
   }, A, B);
+  // The engineer, as GET /api/auth/me answers it, without a backend (#25).
+  await stubAuth(page, 'engineer');
   await page.goto(base + '/retrieval', { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => document.body.innerText.includes('Top-K Results: 11') && !document.body.innerText.includes('Loading saved settings'));
   return { ctx, page, errors };
@@ -22181,7 +29905,7 @@ if (require.main === module) {
 // chunking-strategy selector, `input[type=text]` missed an input with no type
 // attribute, and a row's delete link matched a class test meant for the modal's
 // confirm button.
-const { sleep, makeReporter, launch, session, bodyText, setValue, clickByText } = require('./lib');
+const { sleep, makeReporter, launch, session, credentialsFor, bodyText, setValue, clickByText } = require('./lib');
 
 const BASE = process.env.RAG_UI_BASE || 'http://proxy';
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic'];
@@ -22203,25 +29927,33 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
 
   await require('./ui_pages').runUiPageTests(browser, BASE, r);
 
-  // ── role persistence ───────────────────────────────────────────────────────
-  r.section('§10.4 role selection');
+  // ── login, persistence and logout against the real API (#25) ─────────────
+  r.section('§10.4 login and session');
   {
     const s = await session(browser, BASE, null);
-    await s.page.goto(BASE + '/', { waitUntil: 'networkidle2' });
-    await sleep(1200);
-    const picked = await s.page.evaluate(() => {
-      const b = [...document.querySelectorAll('button')].find(x => /Engineer/i.test(x.textContent));
-      if (!b) return false; b.click(); return true;
-    });
-    r.check('a role can be chosen on the landing page', picked);
-    const stored = await s.page.evaluate(() => sessionStorage.getItem('rag_role'));
-    r.check('the choice is persisted', !!stored, String(stored));
+    await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' });
+    r.check('logged out, the UI shows the login page', /Log in to continue/.test(await bodyText(s.page)) && new URL(s.page.url()).pathname === '/login');
+    const { username, password } = credentialsFor('engineer');
+    await setValue(s.page, "() => document.querySelector('#login-username')", username);
+    await setValue(s.page, "() => document.querySelector('#login-password')", password);
+    await clickByText(s.page, 'Log in');
+    await s.page.waitForFunction(() => location.pathname === '/qa' && document.querySelectorAll('nav a').length > 0, { timeout: 10000 }).catch(() => {});
+    const badge = await s.page.evaluate(() => document.querySelector('nav span.bg-blue-100')?.textContent.trim());
+    r.check('logging in through the form opens /qa as the account\'s role', badge === 'AI Engineer', String(badge));
+    const cookies = await s.page.cookies();
+    const cookie = cookies.find(c => c.name === 'rag_session');
+    r.check('the session is an HttpOnly, SameSite=Strict cookie, not script-readable',
+      !!cookie && cookie.httpOnly && cookie.sameSite === 'Strict' && !(await s.page.evaluate(() => document.cookie)).includes('rag_session'));
+    r.check('nothing about the user or role is kept in browser storage',
+      await s.page.evaluate(() => sessionStorage.length === 0 && localStorage.length === 0));
     for (const p of ['/qa', '/collections', '/health', '/qa']) {
-      await s.page.goto(BASE + p, { waitUntil: 'networkidle2' }); await sleep(700);
+      await s.page.goto(BASE + p, { waitUntil: 'networkidle2' }); await sleep(500);
     }
-    const after = await s.page.evaluate(() => sessionStorage.getItem('rag_role'));
-    const navPresent = await s.page.evaluate(() => document.querySelectorAll('nav a').length > 0);
-    r.check('the role survives navigation', after === stored && navPresent);
+    r.check('the session survives navigation and reloads', await s.page.evaluate(() => document.querySelectorAll('nav a').length === 10));  // the Engineer's links, Users and Service keys included
+    await clickByText(s.page, 'Log out');
+    await s.page.waitForFunction(() => location.pathname === '/login', { timeout: 10000 }).catch(() => {});
+    const me = await s.page.evaluate(async () => (await fetch('/api/auth/me')).status);
+    r.check('Log out ends the session at the API and returns to the login page', me === 401 && new URL(s.page.url()).pathname === '/login', `me=${me}`);
     await s.ctx.close();
   }
 
@@ -22318,7 +30050,7 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     const s = await session(browser, BASE, 'engineer');
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(1500);
     const links = await s.page.evaluate(() => [...document.querySelectorAll('nav a')].map(a => a.textContent.trim()));
-    for (const want of ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health']) {
+    for (const want of ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys']) {
       r.check(`Engineer nav includes ${want}`, links.includes(want), JSON.stringify(links));
     }
     await s.ctx.close();
@@ -23676,6 +31408,8 @@ ENV/
 # Runtime data. UPLOAD_DIR is the named volume ingest_uploads mounted at
 # /app/uploads, so anything here would be baked in and then hidden by the mount.
 uploads/
+# The auth_data volume (accounts and sessions, #25) is mounted the same way.
+auth_data/
 
 # OS and editor noise
 .DS_Store
@@ -24217,6 +31951,7 @@ sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).reso
 import httpx
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs
 
 
@@ -24227,7 +31962,7 @@ def child_env():
     return {**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
 
 def client():
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app,raise_app_exceptions=False),base_url='http://owned-review')
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app,raise_app_exceptions=False),headers=auth_testing.headers(base_url='http://owned-review'), base_url='http://owned-review')
 
 class PersistenceTests(unittest.TestCase):
     def setUp(self):
@@ -24251,6 +31986,7 @@ from unittest.mock import patch, AsyncMock
 from config import settings
 settings.upload_dir = sys.argv[1]
 from main import app, lifespan
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs, weaviate_client as wc, importer, packager
 async def run():
     with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), patch.object(importer, 'sweep_interrupted_imports', return_value=[]), patch.object(importer, 'sweep_stale_workdirs', return_value=[]), patch.object(packager, 'sweep_build_leftovers', return_value=[]):
@@ -24598,7 +32334,7 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         with patch.object(gs,'_save_session_sync',side_effect=OSError('Owned marker write fault')):
             self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned completed deletion'),0)
         async def request():
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as client:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned-review'), base_url='http://owned-review') as client:
                 return await client.post('/goldstandard/save',json={'session_id':self.data['session_id'],'filename':'owned-review.json'})
         response=asyncio.run(request())
         self.assertEqual(response.status_code,409,response.text)
@@ -24648,7 +32384,7 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         return sid
 
     async def fetch(self,sid):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned-review'), base_url='http://owned-review') as client:
             return await client.get('/goldstandard/session/'+sid)
 
     def test_persistent_replace_failure_ends_generation_failed(self):
@@ -24839,11 +32575,12 @@ with patch.object(gs,'_save_session_sync',side_effect=OSError('Owned marker writ
         second="""import sys,asyncio,json,httpx
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs
 settings.upload_dir=sys.argv[1]
 gs.load_sessions_from_disk()
 async def run():
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as c:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned-review'), base_url='http://owned-review') as c:
         r=await c.post('/goldstandard/save',json={'session_id':'gs_450abcde','filename':'owned-restart.json'})
         return r.status_code,r.json()
 print(json.dumps({'export':list(asyncio.run(run())),'diagnostics':gs.session_diagnostics()}))
@@ -25033,7 +32770,12 @@ import json
 import os
 import uuid
 import urllib.error
+import sys
 import urllib.request
+
+# The suite's session (#25); found beside this file however the file is loaded.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import auth_headers  # noqa: E402
 
 api = os.environ.get('RAG_API', 'http://localhost:8080/api').rstrip('/')
 collection = 'VfySettings' + uuid.uuid4().hex[:12]
@@ -25042,7 +32784,7 @@ collection = 'VfySettings' + uuid.uuid4().hex[:12]
 def request(path, body=None, method=None, raw=None, content_type='application/json'):
     data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
     req = urllib.request.Request(api + path, data=data, method=method,
-                                 headers={'Content-Type': content_type})
+                                 headers={'Content-Type': content_type, **auth_headers.headers()})
     try:
         with urllib.request.urlopen(req, timeout=60) as response:
             return response.status, json.load(response)
@@ -25442,6 +33184,7 @@ from unittest.mock import patch
 import httpx
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import exporter,goldstandard as gs,importer,weaviate_client as wc
 
 
@@ -25514,7 +33257,7 @@ with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
     with patch.object(settings,'upload_dir',str(root/'uploads')),patch.object(settings,'sources_dir',str(root/'sources')),patch.object(settings,'exports_dir',str(root/'exports')),patch.object(gs,'_sessions',{}),patch.object(wc,'_create_collection_sync',side_effect=record_create):
         async def run():
             global neighbor_created
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-fixture') as client:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned-fixture'), base_url='http://owned-fixture') as client:
                 await bounded_poll_cases()
                 assert not await asyncio.to_thread(wc._collection_exists_sync,collection),'Owned name already exists'
                 assert not await asyncio.to_thread(wc._collection_exists_sync,protected_neighbor),'Protected fixture name already exists'
@@ -25910,6 +33653,7 @@ from unittest.mock import patch
 import httpx
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs, tuning, ingest_pipeline as ingest
 from services import weaviate_client as wc
 
@@ -26024,6 +33768,7 @@ async def retained_cutover_checks(api,client,name,temp,record_create,jobs,check)
     child="""import asyncio,json,sys
 from services import weaviate_client as wc,goldstandard as gs,tuning
 from main import app,lifespan
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 expected=json.load(sys.stdin)
 async def proof():
     async with lifespan(app):
@@ -26147,7 +33892,7 @@ async def main():
             def check(condition,label):
                 nonlocal checks
                 assert condition,label; checks+=1; print('PASS '+label,flush=True)
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned') as api:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned'), base_url='http://owned') as api:
                 try:
                     await asyncio.to_thread(wc._create_collection_sync,probe,'hnsw','cosine',{})
                     try:
@@ -26711,7 +34456,7 @@ class LifecycleTests(unittest.TestCase):
         client=SimpleNamespace(collections=SimpleNamespace(get=collection,exists=lambda name:canonical(name) in backend,delete=lambda name:backend.pop(canonical(name))))
         def check(condition,label):self.assertTrue(condition,label);checks.append(label)
         async def run(directory):
-            async with ns['httpx'].AsyncClient(transport=ns['httpx'].ASGITransport(app=ns['app']),base_url='http://owned') as api:
+            async with ns['httpx'].AsyncClient(transport=ns['httpx'].ASGITransport(app=ns['app']),headers=ns['auth_testing'].headers(base_url='http://owned'), base_url='http://owned') as api:
                 await ns['collection_deletion_checks'](api,client,'OwnedVerifier',directory,check)
         from routers import collections as collections_router
         with tempfile.TemporaryDirectory() as directory,patch.object(ns['settings'],'upload_dir',directory),patch.object(ns['settings'],'sources_dir',str(Path(directory)/'sources')),patch.object(ns['gs'],'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None),patch.object(collections_router,'_REGISTRY_FILE',None),patch.object(ns['wc'],'get_client',return_value=client),patch.object(ns['wc'],'_create_collection_sync',side_effect=create):
@@ -28466,15 +36211,20 @@ import sys
 import tarfile
 import tempfile
 import time
+import os
 import urllib.request
 import uuid
+
+# The suite's session (#25); found beside this file however the file is loaded.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import auth_headers  # noqa: E402
 
 
 def run(api, collection, package):
     def request(path, body=None):
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(api.rstrip('/') + path, data=data,
-                                     headers={'Content-Type': 'application/json'})
+                                     headers={'Content-Type': 'application/json', **auth_headers.headers()})
         with urllib.request.urlopen(req, timeout=60) as response:
             return json.load(response)
 
@@ -28546,7 +36296,7 @@ if __name__ == '__main__':
 ```javascript
 // Deferred API responses against the rendered Chunking page; no backend writes.
 const assert = require('node:assert/strict');
-const { makeReporter, clickByText, setValue } = require('./lib');
+const { makeReporter, clickByText, setValue, stubAuth } = require('./lib');
 const A = { collection: 'FixtureA', chunking_strategy: 'fixed', chunk_size: 100, chunk_overlap: 0, min_chunk_size: 0, similarity_threshold: null, is_default: false };
 const B = { ...A, collection: 'FixtureB', chunk_size: 2000 };
 const path = name => '/api/ingest/config/' + name;
@@ -28556,7 +36306,6 @@ async function fixture(browser, base, { collectionsFail = false } = {}) {
   const errors = [];
   page.on('pageerror', e => errors.push(e.message));
   await page.evaluateOnNewDocument((a, b, failCollections) => {
-    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
     const realFetch = window.fetch.bind(window);
     window.chunkingFixture = { requests: [] };
     window.fetch = (input, init = {}) => {
@@ -28572,6 +36321,8 @@ async function fixture(browser, base, { collectionsFail = false } = {}) {
       return Promise.reject(new Error('Unexpected fixture request ' + path));
     };
   }, A, B, collectionsFail);
+  // The engineer, as GET /api/auth/me answers it, without a backend (#25).
+  await stubAuth(page, 'engineer');
   await page.goto(base + '/chunking', { waitUntil: 'domcontentloaded' });
   if (!collectionsFail) await pending(page, path(A.collection));
   return { ctx, page, errors };
@@ -28726,7 +36477,7 @@ if (require.main === module) (async () => {
 // Health page refreshes with every API call stubbed and held in the page (#415);
 // no backend state. Each load is driven by hand through the captured 30s refresh.
 const assert = require('node:assert/strict');
-const { makeReporter } = require('./lib');
+const { makeReporter, stubAuth } = require('./lib');
 
 const HEALTH = '/api/health', METRICS = '/api/metrics/latency';
 const UNREADABLE = 'Service health could not be read: The server sent a response the UI could not read.';
@@ -28756,7 +36507,6 @@ async function fixture(browser, base) {
   const errors = [];
   page.on('pageerror', e => errors.push(e.message));
   await page.evaluateOnNewDocument((health, metrics) => {
-    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
     const original = window.setInterval;
     window.setInterval = (fn, delay, ...args) => {
       if (delay === 30000) { window.__healthRefresh = fn; return 45003; }
@@ -28782,6 +36532,8 @@ async function fixture(browser, base) {
       return Promise.reject(new Error('Unexpected fixture request ' + path));
     };
   }, HEALTH, METRICS);
+  // The engineer, as GET /api/auth/me answers it, without a backend (#25).
+  await stubAuth(page, 'engineer');
   await page.goto(base + '/health', { waitUntil: 'domcontentloaded' });
   await requested(page, 1);
   return { ctx, page, errors };
@@ -28925,12 +36677,17 @@ if (require.main === module) (async () => {
 // page's 2 s poll delay is cut to 20 ms, so 30 failed polls take well under a
 // second.
 const assert = require('node:assert/strict');
-const { makeReporter, setValue } = require('./lib');
+const { makeReporter, setValue, stubAuth } = require('./lib');
 
 const A = 'VfyTransferA', B = 'VfyTransferB';
 const PACKAGE = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz';
 const collectionsBody = { collections: [A, B].map(name => ({ name, object_count: 3, index_type: 'hnsw', distance_metric: 'cosine', created_at: null })) };
-const packagesBody = { packages: [{ filename: PACKAGE, size_bytes: 2048, collection: A, chunk_count: 3, fidelity: 'with-sources', created_at: null, readable: true }] };
+// An encrypted package lists no metadata (#27).
+const SEALED = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz.age';
+const packagesBody = { packages: [
+  { filename: PACKAGE, size_bytes: 2048, collection: A, chunk_count: 3, fidelity: 'with-sources', created_at: null, readable: true, encrypted: false },
+  { filename: SEALED, size_bytes: 2100, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: true, encrypted: true },
+] };
 const tuneBody = name => ({ collection: name, fidelity: 'with-sources', source_document_count: 2, can_rechunk: true, can_reembed: true, can_reindex: true, note: '' });
 const json = (status, body) => ({ status, body: JSON.stringify(body) });
 const apiError = (status, code, msg) => json(status, { error: { code, message: msg, detail: null } });
@@ -28960,7 +36717,6 @@ async function fixture(browser, base, { hold = [] } = {}) {
   };
   for (const key of hold) delete fixed[key];
   await page.evaluateOnNewDocument(answers => {
-    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
     const realTimeout = window.setTimeout.bind(window);
     window.setTimeout = (fn, ms, ...args) => realTimeout(fn, ms === 2000 ? 20 : ms, ...args);
     const realFetch = window.fetch.bind(window);
@@ -28969,13 +36725,15 @@ async function fixture(browser, base, { hold = [] } = {}) {
       const path = new URL(input, location.href).pathname;
       if (!path.startsWith('/api/')) return realFetch(input, init);
       const method = init.method || 'GET';
-      const entry = { path, method, done: false };
+      const entry = { path, method, done: false, body: init.body || null };
       window.transferFixture.requests.push(entry);
       const answer = answers[method + ' ' + path];
       if (answer) { entry.done = true; return Promise.resolve(new Response(answer.body, { status: answer.status })); }
       return new Promise(resolve => { entry.resolve = (status, body) => { entry.done = true; resolve(new Response(body, { status })); }; });
     };
   }, fixed);
+  // The engineer, as GET /api/auth/me answers it, without a backend (#25).
+  await stubAuth(page, 'engineer');
   await page.goto(base + '/transfer', { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => document.querySelectorAll('select option').length > 0 && document.body.innerText.includes('Export a collection'));
   return { ctx, page, errors };
@@ -29031,6 +36789,19 @@ const retrying = half => `Could not check ${HALVES[half].progress}, retrying: ${
 const stopped = half => `Stopped checking ${HALVES[half].progress} after 30 failed attempts; the ${half} may still be running. Last error: ${DOWN}`;
 
 async function sleep(ms) { await new Promise(r => setTimeout(r, ms)); }
+
+// Encryption controls (#27).
+const passwords = page => page.evaluate(() => [...document.querySelectorAll('input[type=password]')].map(i => i.value));
+const typePassword = (page, index, value) => setValue(page, `() => document.querySelectorAll('input[type=password]')[${index}]`, value);
+const checkEncrypt = page => page.evaluate(() => {
+  const label = [...document.querySelectorAll('label')].find(l => l.textContent.includes('Encrypt with a passphrase'));
+  if (!label) return false; label.querySelector('input[type=checkbox]').click(); return true;
+});
+const sentBody = (page, path) => page.evaluate(p => {
+  const r = window.transferFixture.requests.filter(x => x.path === p && x.method === 'POST').pop();
+  return r && r.body ? JSON.parse(r.body) : null;
+}, path);
+const selectPackage = (page, name) => setValue(page, `() => [...document.querySelectorAll('select')].find(s => [...s.options].some(o => o.value === ${JSON.stringify(name)}))`, name);
 
 async function runTransferPageTests(browser, base, reporter) {
   reporter.section('Transfer page polling and failures (#382)');
@@ -29127,6 +36898,58 @@ async function runTransferPageTests(browser, base, reporter) {
     assert.equal(listed, true, 'the package is not listed after a good Refresh');
   }, { hold: ['GET /api/packages'] }]);
 
+  cases.push(['export encryption: the passphrase rules hold Export, a valid matching pair sends it, and the fields clear (#27)', async page => {
+    assert.deepEqual(await passwords(page), [], 'passphrase fields shown before the box is checked');
+    assert.equal(await checkEncrypt(page), true, 'no "Encrypt with a passphrase" checkbox');
+    await page.waitForFunction(() => document.querySelectorAll('input[type=password]').length === 2);
+    await waitText(page, 'The passphrase needs at least 12 characters.');
+    assert.equal((await button(page, 'export')).disabled, true, 'Export enabled with no passphrase');
+    await typePassword(page, 0, 'eleven-char');
+    await typePassword(page, 1, 'eleven-char');
+    await waitText(page, 'The passphrase needs at least 12 characters.');
+    assert.equal((await button(page, 'export')).disabled, true, 'Export enabled with 11 characters');
+    await typePassword(page, 0, 'correct horse battery');
+    await waitText(page, 'The two passphrases do not match.');
+    assert.equal((await button(page, 'export')).disabled, true, 'Export enabled with a mismatch');
+    await typePassword(page, 1, 'correct horse battery');
+    await waitText(page, 'The two passphrases do not match.', true);
+    await expectButton(page, 'export', false);
+    assert.equal(await click(page, 'Export'), true, 'no Export button');
+    await pending(page, '/api/export', 'POST');
+    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false, passphrase: 'correct horse battery' });
+    await release(page, '/api/export', HALVES.export.started, 'POST');
+    await page.waitForFunction(() => [...document.querySelectorAll('input[type=password]')].every(i => i.value === ''));
+    await release(page, HALVES.export.poll, exportJob('completed', { chunks_written: 3, filename: 'ragpkg-vfy.tar.gz.age', size_bytes: 4096, fidelity: 'with-sources', models_bundled: false, retrieve_script: true, encrypted: true }));
+    await waitText(page, 'with-sources, encrypted');
+  }]);
+  cases.push(['export encryption: an unchecked box sends no passphrase (#27)', async page => {
+    await start(page, 'export');
+    assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false });
+  }]);
+  cases.push(['import encryption: an encrypted package is labelled, asks for its passphrase and sends it; a plain one sends none (#27)', async page => {
+    const label = await page.evaluate(n => [...document.querySelectorAll('option')].find(o => o.value === n)?.textContent || '', SEALED);
+    assert.ok(label.includes('encrypted') && !label.includes('null'), label);
+    await selectPackage(page, SEALED);
+    await waitText(page, 'This package is encrypted. Enter the passphrase it was exported with.');
+    assert.equal((await button(page, 'import')).disabled, true, 'Import enabled without a passphrase');
+    await typePassword(page, 0, 'correct horse battery');
+    await expectButton(page, 'import', false);
+    assert.equal(await click(page, 'Import'), true, 'no Import button');
+    await pending(page, '/api/import', 'POST');
+    assert.deepEqual(await sentBody(page, '/api/import'), { filename: SEALED, on_conflict: 'abort', passphrase: 'correct horse battery' });
+    await release(page, '/api/import', json(202, { job_id: 'vfyimp', status: 'queued', filename: SEALED }), 'POST');
+    await page.waitForFunction(() => [...document.querySelectorAll('input[type=password]')].every(i => i.value === ''));
+    await release(page, HALVES.import.poll, importJob('failed', { filename: SEALED, error_code: 'DECRYPT_FAILED', error: "'x' could not be decrypted: the passphrase is wrong or the file is damaged." }));
+    await waitText(page, 'the passphrase is wrong or the file is damaged');
+    await selectPackage(page, PACKAGE);
+    await waitText(page, 'This package is encrypted.', true);
+    assert.deepEqual(await passwords(page), [], 'a passphrase field for a plain package');
+    await expectButton(page, 'import', false);
+    assert.equal(await click(page, 'Import'), true, 'no Import button');
+    await pending(page, '/api/import', 'POST');
+    assert.deepEqual(await sentBody(page, '/api/import'), { filename: PACKAGE, on_conflict: 'abort' });
+  }]);
+
   for (const [name, test, opts] of cases) {
     let s;
     try { s = await fixture(browser, base, opts); await test(s.page); assert.deepEqual(s.errors, []); reporter.check(name, true); }
@@ -29154,7 +36977,7 @@ if (require.main === module) (async () => {
 // the final status, failed pairs and reasons, a stopped poll, Generate and
 // Regenerate while they run, and a refused edit. Every /api/ call from the page
 // is answered here; no backend writes.
-const { sleep, setValue, clickByText, bodyText, makeReporter } = require('./lib');
+const { sleep, setValue, clickByText, bodyText, makeReporter, stubAuth } = require('./lib');
 
 const SESSION = 'gs_0393abcd';
 const NAME_RE = /^FixtureGold_\d{8}_\d{6}\.json$/;
@@ -29182,7 +37005,6 @@ async function fixture(browser, base, opts = {}) {
   page.on('pageerror', e => errors.push(e.message));
   page.on('dialog', async d => { dialogs.push(d.message()); await d.dismiss(); });
   await page.evaluateOnNewDocument(realOpen => {
-    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
     window.__opened = [];
     if (!realOpen) window.open = url => { window.__opened.push(String(url)); return null; };
   }, !!opts.realOpen);
@@ -29243,6 +37065,8 @@ async function fixture(browser, base, opts = {}) {
     }
     return json(request, 404, { error: { code: 'NOT_FOUND', message: 'Not stubbed by the fixture.' } });
   });
+  // The engineer, as GET /api/auth/me answers it, without a backend (#25).
+  await stubAuth(page, 'engineer');
   await page.goto(base + '/goldstandard', { waitUntil: 'networkidle2' });
   await sleep(300);
   return { ctx, page, activation, errors, generates, polls, patches, regenerates, dialogs };
@@ -29570,7 +37394,15 @@ async function openPage(browser, base, { role = 'engineer', routes = {}, path = 
   const errors = [], unstubbed = [], calls = [];
   page.on('pageerror', e => errors.push(e.message));
   page.on('dialog', async d => { if (onDialog) await onDialog(d); else await d.dismiss(); });
-  await page.evaluateOnNewDocument((r, fast) => {
+  // Who is logged in, as the API would say (#25): `role`, or nobody for null. A
+  // case's own routes for these paths win.
+  routes = {
+    'GET /api/auth/status': json(200, { setup_required: false }),
+    'GET /api/auth/me': role ? json(200, { username: 'vfy-' + role.replace('_', '-'), role, must_change_password: false })
+                             : apiError(401, 'AUTH_REQUIRED', 'Log in to use this.'),
+    ...routes,
+  };
+  await page.evaluateOnNewDocument(fast => {
     // FormData bodies, which the request interception cannot read back reliably.
     window.__forms = [];
     const realFetch = window.fetch.bind(window);
@@ -29578,14 +37410,12 @@ async function openPage(browser, base, { role = 'engineer', routes = {}, path = 
       if (init && init.body instanceof FormData) window.__forms.push([...init.body.entries()].map(([k, v]) => [k, typeof v === 'string' ? v : 'file:' + v.name]));
       return realFetch(input, init);
     };
-    // Seeded once: a case that signs out must stay signed out on the next load.
-    if (r && !sessionStorage.getItem('vfy_seeded')) { sessionStorage.setItem('vfy_seeded', '1'); sessionStorage.setItem('rag_role', JSON.stringify({ role: r })); }
     if (fast) {
       const si = window.setInterval.bind(window), st = window.setTimeout.bind(window);
       window.setInterval = (fn, ms, ...a) => si(fn, ms === 2000 ? 20 : ms, ...a);
       window.setTimeout = (fn, ms, ...a) => st(fn, ms === 2000 ? 20 : ms, ...a);
     }
-  }, role, fastPolls);
+  }, fastPolls);
   await page.setRequestInterception(true);
   page.on('request', async request => {
     const url = new URL(request.url());
@@ -29925,7 +37755,6 @@ function importCases() {
 
 function navigationCases() {
   const gated = ['/import', '/chunking', '/retrieval', '/goldstandard', '/transfer', '/help/transfer'];
-  const badge = { engineer: 'AI Engineer', developer: 'Developer', end_user: 'End User' };
   const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
   return [
     { name: 'Developer nav has Q&A, Import, Chunking, Retrieval, Gold Standard and Transfer, and no Collections or Health', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
@@ -29945,34 +37774,364 @@ function navigationCases() {
       await waitText(s.page, 'Export and Import');
       await waitPath(s.page, '/help/transfer');
     } },
-    { name: 'End User opening a Developer page directly is sent to Q&A (gating is client-side only until #25)', open: { role: 'end_user', path: '/qa', routes: base() }, async run(s) {
+    { name: 'End User opening a Developer page directly is sent to Q&A (the API refuses those requests too, #25)', open: { role: 'end_user', path: '/qa', routes: base() }, async run(s) {
       for (const p of [...gated, '/collections', '/health']) {
         await goto(s.page, p);
         await waitText(s.page, 'Ask a Question');
         await waitPath(s.page, '/qa');
       }
     } },
-    ...['engineer', 'developer', 'end_user'].map(role => ({ name: `Choosing ${badge[role]} on the landing page opens /qa with that role badge and stores the role`, open: { role: null, path: '/', routes: base() }, async run(s) {
-      await waitText(s.page, 'Select your role to continue');
-      assert.equal(await s.page.evaluate(label => {
-        const b = [...document.querySelectorAll('button')].find(x => x.querySelector('h2')?.textContent.trim() === label);
-        if (!b) return false; b.click(); return true;
-      }, badge[role]), true);
+  ];
+}
+
+// Login, logout, setup, password changes (#25). The API is stubbed; the real
+// login and the API's own refusals are checked in ui_criteria.js and 17_auth.sh.
+function authCases() {
+  const badge = { engineer: 'AI Engineer', developer: 'Developer', end_user: 'End User' };
+  const user = (role, over = {}) => ({ username: 'vfy-' + role.replace('_', '-'), role, must_change_password: false, ...over });
+  const loginForm = async (page, username, password) => {
+    await fill(page, '#login-username', username);
+    await fill(page, '#login-password', password);
+    await press(page, 'Log in');
+  };
+  const submit = page => press(page, 'Change password', 'form button[type=submit]');
+  return [
+    { name: 'Logged out, any page shows the login page at /login with no nav and no role picker', open: { role: null, path: '/collections', routes: base() }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await waitPath(s.page, '/login');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav').length), 0);
+      assert.equal(await bodyHas(s.page, 'Select your role'), false);
+    } },
+    ...['engineer', 'developer', 'end_user'].map(role => ({ name: `Logging in as ${badge[role]} opens /qa with the role badge and username from the API, stored nowhere in the browser`, open: { role: null, path: '/login', routes: base({ 'POST /api/auth/login': json(200, user(role)) }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await loginForm(s.page, 'VFY-User', 'a password of twelve');
       await waitPath(s.page, '/qa');
       await waitText(s.page, 'Ask a Question');
       assert.equal(await s.page.evaluate(() => document.querySelector('nav span.bg-blue-100')?.textContent.trim()), badge[role]);
-      assert.deepEqual(JSON.parse(await s.page.evaluate(() => sessionStorage.getItem('rag_role'))), { role });
+      assert.equal(await s.page.evaluate(() => document.querySelector('[data-testid=nav-username]')?.textContent.trim()), user(role).username);
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/login').map(c => c.body), [{ username: 'VFY-User', password: 'a password of twelve' }]);
+      assert.deepEqual(await s.page.evaluate(() => [Object.keys(sessionStorage), Object.keys(localStorage)]), [[], []]);
     } })),
-    { name: 'Switch Role returns to the role chooser, forgets the role, and a later /qa visit goes back to it', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
+    { name: 'A failed login shows the API\'s generic message, clears the password and stays on /login', open: { role: null, path: '/login', routes: base({ 'POST /api/auth/login': apiError(401, 'LOGIN_FAILED', 'The username or password is incorrect.') }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await loginForm(s.page, 'someone', 'wrong password!');
+      await waitText(s.page, 'The username or password is incorrect.');
+      assert.equal(await s.page.evaluate(() => document.querySelector('#login-password').value), '');
+      await waitPath(s.page, '/login');
+    } },
+    { name: 'A throttled login says to wait', open: { role: null, path: '/login', routes: base({ 'POST /api/auth/login': apiError(429, 'LOGIN_THROTTLED', 'Too many failed logins. Wait 15 minutes and try again.') }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await loginForm(s.page, 'someone', 'wrong password!');
+      await waitText(s.page, 'Wait 15 minutes');
+    } },
+    { name: 'Log out calls the API and returns to the login page', open: { role: 'developer', path: '/qa', routes: base({ 'POST /api/auth/logout': json(200, { status: 'logged_out' }) }) }, async run(s) {
       await waitText(s.page, 'Ask a Question');
-      await press(s.page, 'Switch Role');
-      await waitPath(s.page, '/');
-      await waitText(s.page, 'Select your role to continue');
-      assert.equal(await s.page.evaluate(() => sessionStorage.getItem('rag_role')), null);
+      await press(s.page, 'Log out');
+      await waitText(s.page, 'Log in to continue');
+      await waitPath(s.page, '/login');
+      assert.equal(callsTo(s, 'POST', '/api/auth/logout').length, 1);
       assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav').length), 0);
-      await goto(s.page, '/qa');
-      await waitText(s.page, 'Select your role to continue');
-      await waitPath(s.page, '/');
+    } },
+    { name: 'Before setup, every page shows how to create the first Engineer and nothing else', open: { role: null, path: '/qa', routes: base({ 'GET /api/auth/status': json(200, { setup_required: true }) }) }, async run(s) {
+      await waitText(s.page, 'Not set up yet');
+      await waitText(s.page, 'docker compose exec api python -m auth bootstrap <username>');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav, form').length), 0);
+      assert.equal(callsTo(s, 'GET', '/api/auth/me').length, 0);
+    } },
+    { name: 'A due password change shows only the password page; a mismatch is caught before sending; the change opens /qa', open: { role: null, path: '/collections', routes: base({
+      'GET /api/auth/me': json(200, user('developer', { must_change_password: true })),
+      'POST /api/auth/password': json(200, { status: 'changed', ...user('developer') }),
+    }) }, async run(s) {
+      await waitPath(s.page, '/account/password');
+      await waitText(s.page, 'password was generated for you');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav').length), 0);
+      await fill(s.page, '#current-password', 'generated-one');
+      await fill(s.page, '#new-password', 'my new password');
+      await fill(s.page, '#confirm-password', 'my new passwor');
+      await submit(s.page);
+      await waitText(s.page, 'The new passwords do not match.');
+      assert.equal(callsTo(s, 'POST', '/api/auth/password').length, 0);
+      await fill(s.page, '#confirm-password', 'my new password');
+      await submit(s.page);
+      await waitPath(s.page, '/qa');
+      await waitText(s.page, 'Ask a Question');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/password').map(c => c.body), [{ current_password: 'generated-one', new_password: 'my new password' }]);
+    } },
+    { name: 'Change password in the nav opens the form; the API\'s rule message is shown; success says other sessions ended', open: { role: 'end_user', path: '/qa', routes: base({
+      'POST /api/auth/password': call => call.body.new_password === 'short' ? apiError(422, 'INVALID_PASSWORD', 'The password must be at least 12 characters.') : json(200, { status: 'changed', ...user('end_user') }),
+    }) }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      await press(s.page, 'Change password');
+      await waitPath(s.page, '/account/password');
+      for (const [id, v] of [['#current-password', 'the old one!'], ['#new-password', 'short'], ['#confirm-password', 'short']]) await fill(s.page, id, v);
+      await submit(s.page);
+      await waitText(s.page, 'at least 12 characters');
+      for (const [id, v] of [['#new-password', 'long enough now'], ['#confirm-password', 'long enough now']]) await fill(s.page, id, v);
+      await submit(s.page);
+      await waitText(s.page, 'Your other sessions were logged out.');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav').length), 1);
+    } },
+    { name: 'An API answer 401 AUTH_REQUIRED on any page returns to the login page', open: { role: 'engineer', path: '/collections', routes: base({ 'GET /api/collections': apiError(401, 'AUTH_REQUIRED', 'Log in to use this.') }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await waitPath(s.page, '/login');
+    } },
+    { name: 'An API answer 403 PASSWORD_CHANGE_REQUIRED returns to the password page', open: { role: 'engineer', path: '/collections', routes: base({ 'GET /api/collections': apiError(403, 'PASSWORD_CHANGE_REQUIRED', 'Change your password before doing anything else.') }) }, async run(s) {
+      await waitPath(s.page, '/account/password');
+      await waitText(s.page, 'password was generated for you');
+    } },
+  ];
+}
+
+// The Users page (PR 2 of #25): Engineers manage accounts. The API is stubbed
+// with a small in-memory list; the real routes are checked in 17_auth.sh.
+function usersCases() {
+  const ME = 'vfy-engineer';
+  const row = (username, role, over = {}) => ({ username, role, enabled: true, must_change_password: false, created_at: '2026-10-01T12:00:00Z', ...over });
+  const usersApi = (extra = {}) => {
+    const list = [row('vfy-developer', 'developer'), row(ME, 'engineer'), row('vfy-off', 'end_user', { enabled: false, must_change_password: true })];
+    const find = call => list.find(u => u.username === decodeURIComponent(call.path.split('/')[4]));
+    return base({
+      'GET /api/auth/users': () => json(200, { users: list.map(u => ({ ...u })) }),
+      'POST /api/auth/users': call => {
+        const user = row(call.body.username.toLowerCase(), call.body.role, { must_change_password: true });
+        list.push(user);
+        return json(201, { user, password: 'GeneratedOnce-1234567890' });
+      },
+      'POST /api/auth/users/*': call => {
+        const user = find(call), action = call.path.split('/')[5];
+        if (!user) return apiError(404, 'USER_NOT_FOUND', 'There is no user.');
+        if (action === 'reset-password') { user.must_change_password = true; return json(200, { user, password: 'ResetOnce-0987654321ab' }); }
+        if (action === 'role') user.role = call.body.role;
+        if (action === 'disable') user.enabled = false;
+        if (action === 'enable') user.enabled = true;
+        return json(200, { user });
+      },
+      ...extra,
+    });
+  };
+  const open = (extra = {}) => ({ role: 'engineer', path: '/users', routes: usersApi(extra) });
+  const rowTexts = page => page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => [...r.querySelectorAll('td')].map(c => c.textContent.trim())));
+  const rowPress = async (page, username, label) => {
+    const done = await page.evaluate((u, t) => {
+      const b = [...document.querySelectorAll(`tr[data-username="${u}"] button`)].find(x => x.textContent.trim() === t);
+      if (!b) return false; b.click(); return true;
+    }, username, label);
+    if (!done) throw new Error(`no "${label}" button in the row of ${username}`);
+  };
+  const rowButtons = (page, username) => page.evaluate(u => [...document.querySelectorAll(`tr[data-username="${u}"] button`)].map(b => b.textContent.trim()), username);
+  const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
+  return [
+    { name: 'Engineer nav has Users, which opens the Users page', open: { role: 'engineer', path: '/qa', routes: usersApi() }, async run(s) {
+      await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys']);
+      await press(s.page, 'Users', 'nav a');
+      await waitPath(s.page, '/users');
+      await waitText(s.page, 'vfy-developer');
+    } },
+    ...['developer', 'end_user'].map(role => ({ name: `${role === 'developer' ? 'Developer' : 'End User'} has no Users link and is sent from /users to Q&A`, open: { role, path: '/qa', routes: base() }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      assert.equal((await nav(s.page)).includes('Users'), false);
+      await goto(s.page, '/users');
+      await waitText(s.page, 'Ask a Question');
+      await waitPath(s.page, '/qa');
+      assert.equal(callsTo(s, 'GET', '/api/auth/users').length, 0);
+    } })),
+    { name: 'The list shows each account; the own row has no Reset password', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      const heads = await s.page.evaluate(() => [...document.querySelectorAll('thead th')].map(t => t.textContent.trim()));
+      assert.deepEqual(heads, ['Username', 'Role', 'Status', 'Password', 'Created', '']);
+      const date = await s.page.evaluate(v => new Date(v).toLocaleDateString(), '2026-10-01T12:00:00Z');
+      const rows = await rowTexts(s.page);
+      assert.deepEqual(rows.map(r => [r[0], r[2], r[3], r[4]]), [['vfy-developer', 'Enabled', 'Set', date], [ME + ' (you)', 'Enabled', 'Set', date], ['vfy-off', 'Disabled', 'Change due', date]]);
+      assert.deepEqual(await s.page.evaluate(() => [...document.querySelectorAll('tbody select')].map(x => x.value)), ['developer', 'engineer', 'end_user']);
+      assert.deepEqual(await rowButtons(s.page, 'vfy-developer'), ['Reset password', 'Disable']);
+      assert.deepEqual(await rowButtons(s.page, ME), ['Disable']);
+      assert.ok(await bodyHas(s.page, 'Use Change password for your own'));
+      assert.deepEqual(await rowButtons(s.page, 'vfy-off'), ['Reset password', 'Enable']);
+    } },
+    { name: 'Create user sends the name and role, shows the generated password once, and Done removes it', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await fill(s.page, '#new-username', 'New.Person');
+      await fill(s.page, '#new-role', 'developer');
+      await press(s.page, 'Create user');
+      await waitText(s.page, 'GeneratedOnce-1234567890');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/users').map(c => c.body), [{ username: 'New.Person', role: 'developer' }]);
+      await waitText(s.page, 'shown only once');
+      await waitFor(s.page, () => !!document.querySelector('tr[data-username="new.person"]'), 'the new row');
+      assert.equal(await s.page.evaluate(() => document.querySelector('#new-username').value), '');
+      assert.deepEqual(await s.page.evaluate(() => [Object.keys(sessionStorage), Object.keys(localStorage)]), [[], []]);
+      await press(s.page, 'Done');
+      await waitText(s.page, 'GeneratedOnce-1234567890', true);
+    } },
+    { name: 'Reset password of another account shows its new password once', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await rowPress(s.page, 'vfy-developer', 'Reset password');
+      await waitText(s.page, 'ResetOnce-0987654321ab');
+      assert.equal(callsTo(s, 'POST', '/api/auth/users/vfy-developer/reset-password').length, 1);
+      await waitFor(s.page, () => document.querySelector('tr[data-username="vfy-developer"] td:nth-child(4)').textContent.trim() === 'Change due', 'the change-due mark');
+    } },
+    { name: 'Changing a role, Disable and Enable call the API for that account', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await fill(s.page, 'select[aria-label="Role of vfy-developer"]', 'end_user');
+      await waitFor(s.page, () => document.querySelector('select[aria-label="Role of vfy-developer"]').value === 'end_user', 'the new role');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/users/vfy-developer/role').map(c => c.body), [{ role: 'end_user' }]);
+      await rowPress(s.page, 'vfy-developer', 'Disable');
+      await waitFor(s.page, () => document.querySelector('tr[data-username="vfy-developer"] td:nth-child(3)').textContent.trim() === 'Disabled', 'Disabled');
+      await rowPress(s.page, 'vfy-off', 'Enable');
+      await waitFor(s.page, () => document.querySelector('tr[data-username="vfy-off"] td:nth-child(3)').textContent.trim() === 'Enabled', 'Enabled');
+      assert.equal(callsTo(s, 'POST', '/api/auth/users/vfy-developer/disable').length, 1);
+      assert.equal(callsTo(s, 'POST', '/api/auth/users/vfy-off/enable').length, 1);
+    } },
+    { name: 'A refusal (the last Engineer) shows the API\'s message and reloads the list', open: open({
+      'POST /api/auth/users/vfy-engineer/disable': apiError(409, 'LAST_ENGINEER', "'vfy-engineer' is the last enabled engineer; make another engineer first."),
+    }), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      const before = callsTo(s, 'GET', '/api/auth/users').length;
+      await rowPress(s.page, ME, 'Disable');
+      await waitText(s.page, 'is the last enabled engineer');
+      await waitFor(s.page, () => document.querySelector('[role=alert]') !== null, 'the alert');
+      assert.ok(callsTo(s, 'GET', '/api/auth/users').length > before, 'the list was reloaded');
+      assert.equal(await s.page.evaluate(() => document.querySelector('tr[data-username="vfy-engineer"] td:nth-child(3)').textContent.trim()), 'Enabled');
+    } },
+    { name: 'A list that cannot be loaded says so', open: open({ 'GET /api/auth/users': apiError(500, 'INTERNAL_ERROR', 'Synthetic failure.') }), async run(s) {
+      await waitText(s.page, 'Could not load the users: Synthetic failure.');
+    } },
+  ];
+}
+
+// The Service keys page (PR 3 of #25): Engineers manage service principals and
+// their API keys. The API is stubbed with a small in-memory list; the real
+// routes are checked in 17_auth.sh.
+function serviceKeysCases() {
+  const SECRET = 'rag_newkey00000a_' + 'S'.repeat(43);
+  const key = (id, over = {}) => ({ id, label: '', created_at: '2026-10-01T12:00:00Z', expires_at: '2026-12-30T12:00:00Z', revoked_at: null, last_used_at: null, status: 'active', ...over });
+  const principal = (name, role, over = {}) => ({ name, role, enabled: true, created_at: '2026-10-01T12:00:00Z', keys: [], ...over });
+  const keysApi = (extra = {}) => {
+    const list = [
+      principal('vfy-svc', 'developer', { keys: [key('activekey0001', { label: 'nightly', last_used_at: '2026-10-20T08:00:00Z' }), key('expiredkey001', { status: 'expired' }), key('revokedkey01', { status: 'revoked', revoked_at: '2026-10-05T00:00:00Z' })] }),
+      principal('vfy-off', 'end_user', { enabled: false }),
+    ];
+    const find = call => list.find(p => p.name === decodeURIComponent(call.path.split('/')[4]));
+    return base({
+      'GET /api/auth/service-principals': () => json(200, { principals: JSON.parse(JSON.stringify(list)) }),
+      'POST /api/auth/service-principals': call => {
+        const p = principal(call.body.name.toLowerCase(), call.body.role);
+        list.push(p);
+        return json(201, { principal: p });
+      },
+      'POST /api/auth/service-principals/*': call => {
+        const p = find(call), parts = call.path.split('/');
+        if (!p) return apiError(404, 'PRINCIPAL_NOT_FOUND', 'There is no service principal.');
+        if (parts[5] === 'keys' && parts.length === 6) {
+          const k = key('newkey00000a', { label: call.body.label });
+          p.keys.unshift(k);
+          return json(201, { principal: p, key: k, secret: SECRET });
+        }
+        if (parts[5] === 'keys' && parts[7] === 'revoke') {
+          const k = p.keys.find(x => x.id === parts[6]);
+          if (!k) return apiError(404, 'KEY_NOT_FOUND', 'No such key.');
+          k.status = 'revoked'; k.revoked_at = '2026-10-28T00:00:00Z';
+        }
+        if (parts[5] === 'role') p.role = call.body.role;
+        if (parts[5] === 'disable') p.enabled = false;
+        if (parts[5] === 'enable') p.enabled = true;
+        return json(200, { principal: p });
+      },
+      ...extra,
+    });
+  };
+  const open = (extra = {}) => ({ role: 'engineer', path: '/service-keys', routes: keysApi(extra) });
+  const keyRows = (page, name) => page.evaluate(n => [...document.querySelectorAll(`section[data-principal="${n}"] tbody tr`)].map(r => [...r.querySelectorAll('td')].map(c => c.textContent.trim())), name);
+  const sectionPress = async (page, name, label) => {
+    const done = await page.evaluate((n, t) => {
+      const b = [...document.querySelectorAll(`section[data-principal="${n}"] button`)].find(x => x.textContent.trim() === t);
+      if (!b) return false; b.click(); return true;
+    }, name, label);
+    if (!done) throw new Error(`no "${label}" button for ${name}`);
+  };
+  const status = (page, name) => page.evaluate(n => document.querySelector(`section[data-principal="${n}"] [data-testid=principal-status]`)?.textContent.trim(), name);
+  const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
+  return [
+    { name: 'Engineer nav ends with Service keys, which opens the page', open: { role: 'engineer', path: '/qa', routes: keysApi() }, async run(s) {
+      await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
+      assert.equal((await nav(s.page)).at(-1), 'Service keys');
+      await press(s.page, 'Service keys', 'nav a');
+      await waitPath(s.page, '/service-keys');
+      await waitText(s.page, 'vfy-svc');
+    } },
+    ...['developer', 'end_user'].map(role => ({ name: `${role === 'developer' ? 'Developer' : 'End User'} has no Service keys link and is sent from /service-keys to Q&A`, open: { role, path: '/qa', routes: base() }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      assert.equal((await nav(s.page)).includes('Service keys'), false);
+      await goto(s.page, '/service-keys');
+      await waitText(s.page, 'Ask a Question');
+      await waitPath(s.page, '/qa');
+      assert.equal(callsTo(s, 'GET', '/api/auth/service-principals').length, 0);
+    } })),
+    { name: 'The list shows each principal and its keys; only active keys can be revoked; rotation is explained', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      const day = v => s.page.evaluate(x => new Date(x).toLocaleDateString(), v);
+      assert.deepEqual(await keyRows(s.page, 'vfy-svc'), [
+        ['activekey0001', 'nightly', await day('2026-10-01T12:00:00Z'), await day('2026-12-30T12:00:00Z'), await day('2026-10-20T08:00:00Z'), 'Active', 'Revoke'],
+        ['expiredkey001', '', await day('2026-10-01T12:00:00Z'), await day('2026-12-30T12:00:00Z'), 'never', 'Expired', ''],
+        ['revokedkey01', '', await day('2026-10-01T12:00:00Z'), await day('2026-12-30T12:00:00Z'), 'never', 'Revoked', ''],
+      ]);
+      assert.deepEqual([await status(s.page, 'vfy-svc'), await status(s.page, 'vfy-off')], ['Enabled', 'Disabled']);
+      assert.equal(await s.page.evaluate(() => document.querySelector('select[aria-label="Role of vfy-svc"]').value), 'developer');
+      assert.ok(await bodyHas(s.page, 'To rotate a key, issue a new one, switch the service over to it, then revoke the old one'));
+      assert.ok(await bodyHas(s.page, 'Authorization: Bearer <key>'));
+      assert.equal(await s.page.evaluate(() => document.querySelector('input[aria-label="Lifetime in days for a new key of vfy-svc"]').value), '90');
+    } },
+    { name: 'Create principal sends the name and role', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await fill(s.page, '#new-principal-name', 'Nightly.Import');
+      await fill(s.page, '#new-principal-role', 'developer');
+      await press(s.page, 'Create principal');
+      await waitFor(s.page, () => !!document.querySelector('section[data-principal="nightly.import"]'), 'the new principal');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/service-principals').map(c => c.body), [{ name: 'Nightly.Import', role: 'developer' }]);
+      assert.equal(await s.page.evaluate(() => document.querySelector('#new-principal-name').value), '');
+    } },
+    { name: 'Issue key sends the label and lifetime, shows the key once, and Done removes it', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await fill(s.page, 'input[aria-label="Label for a new key of vfy-svc"]', 'rotated');
+      await fill(s.page, 'input[aria-label="Lifetime in days for a new key of vfy-svc"]', '30');
+      await sectionPress(s.page, 'vfy-svc', 'Issue key');
+      await waitText(s.page, SECRET);
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/service-principals/vfy-svc/keys').map(c => c.body), [{ label: 'rotated', days: 30 }]);
+      await waitText(s.page, 'shown only once');
+      await waitFor(s.page, () => !!document.querySelector('tr[data-key="newkey00000a"]'), 'the new key row');
+      assert.deepEqual(await s.page.evaluate(() => [Object.keys(sessionStorage), Object.keys(localStorage)]), [[], []]);
+      await press(s.page, 'Done');
+      await waitText(s.page, SECRET, true);
+      assert.equal(await bodyHas(s.page, SECRET), false);
+    } },
+    { name: 'Revoke, a role change, Disable and Enable call the API for that principal', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await sectionPress(s.page, 'vfy-svc', 'Revoke');
+      await waitFor(s.page, () => document.querySelector('tr[data-key="activekey0001"] td:nth-child(6)').textContent.trim() === 'Revoked', 'Revoked');
+      assert.equal(callsTo(s, 'POST', '/api/auth/service-principals/vfy-svc/keys/activekey0001/revoke').length, 1);
+      await fill(s.page, 'select[aria-label="Role of vfy-svc"]', 'end_user');
+      await waitFor(s.page, () => document.querySelector('select[aria-label="Role of vfy-svc"]').value === 'end_user', 'the new role');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/service-principals/vfy-svc/role').map(c => c.body), [{ role: 'end_user' }]);
+      await sectionPress(s.page, 'vfy-svc', 'Disable');
+      await waitFor(s.page, () => document.querySelector('section[data-principal="vfy-svc"] [data-testid=principal-status]').textContent.trim() === 'Disabled', 'Disabled');
+      await sectionPress(s.page, 'vfy-off', 'Enable');
+      await waitFor(s.page, () => document.querySelector('section[data-principal="vfy-off"] [data-testid=principal-status]').textContent.trim() === 'Enabled', 'Enabled');
+      assert.equal(callsTo(s, 'POST', '/api/auth/service-principals/vfy-svc/disable').length, 1);
+      assert.equal(callsTo(s, 'POST', '/api/auth/service-principals/vfy-off/enable').length, 1);
+    } },
+    { name: 'A refusal shows the API\'s message and reloads the list', open: open({
+      'POST /api/auth/service-principals': apiError(409, 'PRINCIPAL_EXISTS', "The name 'vfy-svc' is already taken."),
+    }), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      const before = callsTo(s, 'GET', '/api/auth/service-principals').length;
+      await fill(s.page, '#new-principal-name', 'vfy-svc');
+      await press(s.page, 'Create principal');
+      await waitText(s.page, 'is already taken');
+      await waitFor(s.page, () => document.querySelector('[role=alert]') !== null, 'the alert');
+      assert.ok(callsTo(s, 'GET', '/api/auth/service-principals').length > before, 'the list was reloaded');
+    } },
+    { name: 'A list that cannot be loaded says so', open: open({ 'GET /api/auth/service-principals': apiError(500, 'INTERNAL_ERROR', 'Synthetic failure.') }), async run(s) {
+      await waitText(s.page, 'Could not load the service principals: Synthetic failure.');
     } },
   ];
 }
@@ -30169,7 +38328,10 @@ async function runUiControlTests(browser, baseUrl, reporter) {
   const run = (section, cases) => S.runCases(browser, baseUrl, reporter, section, cases);
   await run('Collections table and create modal (#400)', collectionsCases());
   await run('Import queue, sliders and "+ New" modal (#400)', importCases());
-  await run('Navigation, roles and redirects; gating is client-side only until #25 (#400)', navigationCases());
+  await run('Navigation, roles and redirects (#400); the API enforces the roles (#25)', navigationCases());
+  await run('Login, logout, setup and password changes (#25)', authCases());
+  await run('Users page: Engineers manage accounts (#25)', usersCases());
+  await run('Service keys page: Engineers manage service principals and keys (#25)', serviceKeysCases());
   await run('Q&A input, citations toggle, answer display and End User view (#400)', qaCases());
   await run('Retrieval page status text, alpha slider and save (#400)', retrievalCases());
   await run('Client handling of the proxy error pages (#400)', proxyCases());
@@ -30465,7 +38627,9 @@ function packageCases() {
   const xfer = (routes = {}) => ({ role: 'developer', path: '/transfer', fastPolls: true, routes: common(routes) });
   const withPkgs = (routes = {}) => xfer({ 'GET /api/packages': json(200, { packages: PACKAGES }), ...routes });
   const pick = (page, name) => fillNth(page, 'select', 1, name);
-  const start = async (page, name = PKG_OK) => { await waitFor(page, n => [...document.querySelectorAll('select')[1].options].length > 1, 'the packages'); await pick(page, name); await press(page, 'Import'); };
+  // The page renders only once GET /api/auth/me has answered (#25), so the
+  // select may not exist yet on the first poll.
+  const start = async (page, name = PKG_OK) => { await waitFor(page, () => document.querySelectorAll('select')[1]?.options.length > 1, 'the packages'); await pick(page, name); await press(page, 'Import'); };
   return [
     { name: 'A readable package shows its collection, chunks, fidelity and size; an unreadable one says so', open: withPkgs(), async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('select')[1]?.options.length > 1, 'the packages');
@@ -30797,7 +38961,12 @@ import sys
 import tarfile
 import tempfile
 import time
+import os
 import urllib.request
+
+# The suite's session (#25); found beside this file however the file is loaded.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import auth_headers  # noqa: E402
 
 WARNING = ("saved retrieval setting ef={} is outside 16-512 and was exported as null; "
            "ef is no longer used. Save this collection's settings on the Retrieval "
@@ -30813,7 +38982,7 @@ def run(api, collection, exports, repo_root):
     def request(path, body=None):
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(api.rstrip('/') + path, data=data,
-                                     headers={'Content-Type': 'application/json'})
+                                     headers={'Content-Type': 'application/json', **auth_headers.headers()})
         with urllib.request.urlopen(req, timeout=60) as response:
             return json.load(response)
 
@@ -30926,7 +39095,8 @@ def run(api, collection, exports, repo_root):
     finally:
         if renamed:
             urllib.request.urlopen(urllib.request.Request(
-                api.rstrip('/') + f'/collections/{renamed}?confirm=true', method='DELETE'),
+                api.rstrip('/') + f'/collections/{renamed}?confirm=true', method='DELETE',
+                headers=auth_headers.headers()),
                 timeout=120).read()
         request('/retrieval/config', saved)
     print(f'{len(failures)} legacy/invalid retrieval settings check(s) failed')
@@ -31167,7 +39337,7 @@ ENUMS = {
 SPAN_NAMES = frozenset("rag." + v for v in ENUMS["rag.operation"])
 
 # Explicit code-owned vocabulary. Raw URL/path values never enter this schema.
-ROUTES = frozenset(('DELETE /collections/{name}', 'GET /collections', 'GET /export/job/{job_id}', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /metrics/latency', 'GET /packages', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
+ROUTES = frozenset(('DELETE /collections/{name}', 'GET /auth/me', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /export/job/{job_id}', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /metrics/latency', 'GET /packages', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/logout', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
 ENUMS.update({"http.route": ROUTES | {"unmatched"},
               "rag.tuning_operation": frozenset(("rechunk", "reembed", "reindex")),
               "http.status_class": frozenset(("1xx", "2xx", "3xx", "4xx", "5xx"))})
@@ -34895,8 +43065,13 @@ import runpy
 import threading
 import subprocess
 import time
+import sys
 import urllib.request
 import uuid
+
+# The suite's session (#25); found beside this file however the file is loaded.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import auth_headers  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 API = os.environ.get('RAG_API', '')
@@ -35021,8 +43196,11 @@ def sink(path, post=False):
 def request(path, body=None, headers=None, method=None):
     owner()
     data = json.dumps(body).encode() if body is not None else None
+    session = auth_headers.headers()
+    # The sentinel cookie beside the real session: neither may be exported.
+    cookie = '; '.join(c for c in ('session='+SENTINELS[0], session.get('Cookie')) if c)
     h = {'Content-Type': 'application/json', 'Authorization': 'Bearer '+SENTINELS[0],
-         'Cookie': 'session='+SENTINELS[0], **(headers or {})}
+         **session, 'Cookie': cookie, **(headers or {})}
     with urllib.request.urlopen(urllib.request.Request(API+path, data=data, headers=h, method=method),
                                 timeout=600) as response:
         return json.load(response)
@@ -35045,7 +43223,7 @@ def upload(collection):
     chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="files"; filename="{SENTINELS[2]}.txt"\r\nContent-Type: text/plain\r\n\r\nManagers approve overtime. {SENTINELS[1]}. Synthetic path /private/{SENTINELS[3]}. The policy requires approval before work.\r\n--{boundary}--\r\n')
     data = ''.join(chunks).encode()
     with urllib.request.urlopen(urllib.request.Request(API+'/ingest/upload', data=data,
-            headers={**h, 'Content-Type': 'multipart/form-data; boundary='+boundary,
+            headers={**h, **auth_headers.headers(), 'Content-Type': 'multipart/form-data; boundary='+boundary,
                      'Authorization': 'Bearer '+SENTINELS[0]}), timeout=120) as r:
         job = json.load(r)['job_id']
     wait_job('/ingest/job/'+job)
@@ -35119,6 +43297,8 @@ def inspect_records(snapshot, requests):
     assert snapshot['overflow'] == 0, 'capture overflow: inspection incomplete'
     wire = json.dumps(snapshot)
     assert all(s not in wire for s in SENTINELS), 'content/credential sentinel exported'
+    token = auth_headers.session_token(os.environ.get('RAG_AUTH_JAR', ''))
+    assert not token or token not in wire, 'the session cookie was exported'
     spans, logs, metrics = (records(snapshot, s) for s in ('traces', 'logs', 'metrics'))
     identities = [(span['trace_id'], span['span_id']) for span in spans]
     assert len(set(identities)) == len(identities), 'duplicate received span identity'

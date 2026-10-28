@@ -1,7 +1,7 @@
 // Deferred responses exercise the real provider, Retrieval page, and Q&A page.
 // All API calls are intercepted before application startup; no backend is used.
 const assert = require('node:assert/strict');
-const { sleep, makeReporter, setValue, clickByText } = require('./lib');
+const { sleep, makeReporter, setValue, clickByText, stubAuth } = require('./lib');
 
 const A = { collection: 'FixtureA', retrieval_mode: 'hybrid', top_k: 11, alpha: 0.25, ef: null, response_format: 'engineer', is_default: false };
 const B = { ...A, collection: 'FixtureB', retrieval_mode: 'semantic', top_k: 23, alpha: 0.6 };
@@ -13,7 +13,6 @@ async function fixture(browser, base) {
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.evaluateOnNewDocument((a, b) => {
-    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
     const realFetch = window.fetch.bind(window);
     const requests = [];
     window.queryConfigFixture = { requests };
@@ -43,6 +42,8 @@ async function fixture(browser, base) {
       return Promise.reject(new Error('Unexpected fixture API call: ' + method + ' ' + path));
     };
   }, A, B);
+  // The engineer, as GET /api/auth/me answers it, without a backend (#25).
+  await stubAuth(page, 'engineer');
   await page.goto(base + '/retrieval', { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => document.body.innerText.includes('Top-K Results: 11') && !document.body.innerText.includes('Loading saved settings'));
   return { ctx, page, errors };

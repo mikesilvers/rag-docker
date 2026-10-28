@@ -34,6 +34,7 @@ from fastapi.testclient import TestClient
 
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import collection_writes, exporter, importer, metrics, ollama_client, packager
 from services import rag_pipeline, sources, tuning
 from services import weaviate_client as wc
@@ -43,7 +44,7 @@ WAIT = 10.0
 
 
 def asgi_client():
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://owned")
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), headers=auth_testing.headers(base_url="http://owned"), base_url="http://owned")
 
 
 async def until(condition, what):
@@ -70,7 +71,7 @@ class RouteTestCase(unittest.TestCase):
             stack.enter_context(change)
         (self.root / "uploads").mkdir()
         self.stack = stack
-        self.client = TestClient(app, raise_server_exceptions=False)    # no lifespan
+        self.client = TestClient(app, headers=auth_testing.headers(), raise_server_exceptions=False)    # no lifespan
         self.addCleanup(self.client.close)
 
     def assert_error(self, response, status, code, message=None, detail=None):
@@ -104,7 +105,7 @@ class ImportRequestTests(RouteTestCase):
         release = threading.Event()
         ran = []
 
-        def run(job_id, filename, on_conflict):
+        def run(job_id, filename, on_conflict, passphrase=None):
             # Stands in for the worker; frees the filename as the real one does.
             ran.append(job_id)
             release.wait(WAIT)
@@ -152,7 +153,7 @@ class ExportOffLoopTests(RouteTestCase):
         release, started = threading.Event(), threading.Event()
         threads = {}
 
-        def build(collection, include_models=False, progress=None):
+        def build(collection, include_models=False, progress=None, passphrase=None):
             threads["build"] = threading.get_ident()
             started.set()
             if not release.wait(WAIT):
@@ -216,9 +217,10 @@ class PackageListTests(RouteTestCase):
         self.assertEqual(response.json()["packages"], [
             {"filename": good.name, "size_bytes": good.stat().st_size, "collection": "Corpus",
              "chunk_count": 12, "fidelity": "with-sources",
-             "created_at": "2026-10-21T08:00:00Z", "readable": True},
+             "created_at": "2026-10-21T08:00:00Z", "readable": True, "encrypted": False},
             {"filename": junk.name, "size_bytes": junk.stat().st_size, "collection": None,
-             "chunk_count": None, "fidelity": None, "created_at": None, "readable": False},
+             "chunk_count": None, "fidelity": None, "created_at": None, "readable": False,
+             "encrypted": False},
         ])
 
 

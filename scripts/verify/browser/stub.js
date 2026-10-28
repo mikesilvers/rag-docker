@@ -25,7 +25,15 @@ async function openPage(browser, base, { role = 'engineer', routes = {}, path = 
   const errors = [], unstubbed = [], calls = [];
   page.on('pageerror', e => errors.push(e.message));
   page.on('dialog', async d => { if (onDialog) await onDialog(d); else await d.dismiss(); });
-  await page.evaluateOnNewDocument((r, fast) => {
+  // Who is logged in, as the API would say (#25): `role`, or nobody for null. A
+  // case's own routes for these paths win.
+  routes = {
+    'GET /api/auth/status': json(200, { setup_required: false }),
+    'GET /api/auth/me': role ? json(200, { username: 'vfy-' + role.replace('_', '-'), role, must_change_password: false })
+                             : apiError(401, 'AUTH_REQUIRED', 'Log in to use this.'),
+    ...routes,
+  };
+  await page.evaluateOnNewDocument(fast => {
     // FormData bodies, which the request interception cannot read back reliably.
     window.__forms = [];
     const realFetch = window.fetch.bind(window);
@@ -33,14 +41,12 @@ async function openPage(browser, base, { role = 'engineer', routes = {}, path = 
       if (init && init.body instanceof FormData) window.__forms.push([...init.body.entries()].map(([k, v]) => [k, typeof v === 'string' ? v : 'file:' + v.name]));
       return realFetch(input, init);
     };
-    // Seeded once: a case that signs out must stay signed out on the next load.
-    if (r && !sessionStorage.getItem('vfy_seeded')) { sessionStorage.setItem('vfy_seeded', '1'); sessionStorage.setItem('rag_role', JSON.stringify({ role: r })); }
     if (fast) {
       const si = window.setInterval.bind(window), st = window.setTimeout.bind(window);
       window.setInterval = (fn, ms, ...a) => si(fn, ms === 2000 ? 20 : ms, ...a);
       window.setTimeout = (fn, ms, ...a) => st(fn, ms === 2000 ? 20 : ms, ...a);
     }
-  }, role, fastPolls);
+  }, fastPolls);
   await page.setRequestInterception(true);
   page.on('request', async request => {
     const url = new URL(request.url());

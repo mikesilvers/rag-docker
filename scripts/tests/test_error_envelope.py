@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import metrics, ollama_client, packager
 from services import weaviate_client as wc
 
@@ -50,7 +51,7 @@ class EnvelopeTestCase(unittest.TestCase):
         upload_dir.start()
         self.addCleanup(upload_dir.stop)
         # An unhandled error must come back as a response, as a real client sees it.
-        self.client = TestClient(app, raise_server_exceptions=False)
+        self.client = TestClient(app, headers=auth_testing.headers(), raise_server_exceptions=False)
         self.addCleanup(self.client.close)
 
     def assert_error(self, response, status, code, message=None, detail=None):

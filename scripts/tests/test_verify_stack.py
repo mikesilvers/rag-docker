@@ -43,7 +43,14 @@ STUB = textwrap.dedent(r'''
             print(text)
     if args[:1] == ['compose']:
         if 'config' in args:
-            print(open(os.environ['STUB_CONFIG']).read())
+            # LAN mode's configuration once stack.sh has switched to it (#26).
+            lan = os.environ.get('STUB_CONFIG_LAN')
+            if lan and 'docker-compose.lan.yml' in os.environ.get('COMPOSE_FILE', ''):
+                print(open(lan).read())
+            else:
+                print(open(os.environ['STUB_CONFIG']).read())
+        elif 'exec' in args and 'cat' in args:
+            print('-----BEGIN CERTIFICATE-----')
         elif 'up' in args:
             sys.exit(0 if os.environ.get('STUB_UP_OK') else 1)
         elif 'ps' in args:
@@ -134,6 +141,32 @@ def passing_config(checkout, exports, port='8081'):
             'rag_sources': {'name': 'rag-verify_rag_sources'},
         },
     }
+
+
+def lan_config(checkout, exports, port='8081'):
+    """passing_config switched to LAN mode as stack.sh --lan resolves it (#26):
+    TLS on loopback at the verify port, the tls-init step and its volume."""
+    config = passing_config(checkout, exports, port)
+    checkout = str(checkout)
+    services = config['services']
+    proxy = services['proxy']
+    proxy['ports'][0]['target'] = 443
+    proxy['depends_on']['tls-init'] = {'condition': 'service_completed_successfully', 'required': True}
+    proxy['volumes'] = [
+        {'type': 'bind', 'source': checkout + '/proxy/nginx.lan.conf', 'target': '/etc/nginx/nginx.conf',
+         'read_only': True, 'bind': {}},
+        {'type': 'bind', 'source': checkout + '/proxy/locations.conf', 'target': '/etc/nginx/rag/locations.conf',
+         'read_only': True, 'bind': {}},
+        {'type': 'volume', 'source': 'lan_certs', 'target': '/etc/nginx/certs', 'read_only': True, 'volume': {}}]
+    services['api']['environment'].update(RAG_LAN_MODE='true', AUTH_COOKIE_SECURE='true')
+    services['tls-init'] = {
+        'image': 'rag-verify-api:latest', 'command': ['python', '-m', 'tls_cert'], 'entrypoint': None,
+        'environment': {'RAG_LAN_HOSTNAMES': 'vfy-lan.invalid,192.0.2.10'}, 'networks': {'rag-internal': None},
+        'volumes': [{'type': 'bind', 'source': checkout + '/proxy/certs', 'target': '/byo', 'read_only': True,
+                     'bind': {}},
+                    {'type': 'volume', 'source': 'lan_certs', 'target': '/certs', 'volume': {}}]}
+    config['volumes']['lan_certs'] = {'name': 'rag-verify_lan_certs'}
+    return config
 
 
 class Sandbox:
@@ -308,6 +341,51 @@ class ConfigGuardTests(unittest.TestCase):
         result = self.guard(passing_config(self.checkout, self.exports, port='8082'))
         self.assertEqual(result.returncode, 2)
 
+    def guard_lan(self, config, port='8081'):
+        path = self.dir / 'config.json'
+        path.write_text(json.dumps(config))
+        return subprocess.run(['python3', '-c', self.block, str(self.checkout), str(self.exports), port, str(path),
+                               str(self.checkout), 'lan'], capture_output=True, text=True)
+
+    def test_lan_mode_wants_tls_on_loopback(self):
+        # #26: in LAN mode rule (c) wants exactly proxy:127.0.0.1:<port>->443/tcp;
+        # every other rule still applies, tls-init included.
+        result = self.guard_lan(lan_config(self.checkout, self.exports))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.guard_lan(passing_config(self.checkout, self.exports))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('->443/tcp', result.stdout)
+        result = self.guard(lan_config(self.checkout, self.exports))
+        self.assertEqual(result.returncode, 2, 'the default rule (c) must refuse the LAN publication')
+
+    def test_lan_mode_refuses_other_publications(self):
+        def mutate(change):
+            config = lan_config(self.checkout, self.exports)
+            change(config)
+            return config
+        P = lambda c: c['services']['proxy']['ports']
+        variants = [
+            ('all interfaces', mutate(lambda c: P(c)[0].update(host_ip='0.0.0.0'))),
+            ('no host address', mutate(lambda c: P(c)[0].pop('host_ip'))),
+            ('port 80 beside it', mutate(lambda c: P(c).append({'host_ip': '127.0.0.1', 'target': 80,
+                                                                'published': '8082', 'protocol': 'tcp'}))),
+            ('a second port', mutate(lambda c: P(c).append({'host_ip': '127.0.0.1', 'target': 443,
+                                                            'published': '8443', 'protocol': 'tcp'}))),
+            ('the live port', mutate(lambda c: P(c)[0].update(published='8080'))),
+            ('the override port', mutate(lambda c: P(c)[0].update(published='443'))),
+            ('tls-init publishes', mutate(lambda c: c['services']['tls-init'].update(
+                ports=[{'host_ip': '127.0.0.1', 'target': 443, 'published': '8081', 'protocol': 'tcp'}]))),
+        ]
+        for name, config in variants:
+            with self.subTest(variant=name):
+                result = self.guard_lan(config)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn('(c)', result.stdout)
+        live = mutate(lambda c: c['services']['tls-init'].update(image='rag-docker-api:latest'))
+        result = self.guard_lan(live)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('(b)', result.stdout)
+
 
 class LiveGuardTests(unittest.TestCase):
     """S18 and S36: suites and all.sh refuse the live stack unless RAG_VERIFY_LIVE=1."""
@@ -398,7 +476,7 @@ class RestartGuardTests(unittest.TestCase):
 
     def test_every_restart_section_asks_first(self):
         for name in ('01_infrastructure.sh', '02_ingest.sh', '03_query.sh', '04_goldstandard.sh', '05_transfer.sh',
-                     '16_api_paths.sh'):
+                     '16_api_paths.sh', '17_auth.sh'):
             with self.subTest(suite=name):
                 text = (VERIFY / name).read_text()
                 block = text[text.index('if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]'):]
@@ -474,18 +552,28 @@ class ApiPathsFirstStartTests(unittest.TestCase):
 
     def run_suite(self, **env):
         box = Sandbox(self)
+        # The test accounts (#25): a stand-in that logs every call and logs in no one.
+        setup = box.root / 'auth_setup.py'
+        (box.root / 'auth').mkdir()
+        setup.write_text('import json, os, sys\n'
+                         'open(os.environ["STUB_LOG"], "a").write(json.dumps(["auth_setup"] + sys.argv[1:]) + "\\n")\n'
+                         'if sys.argv[1] == "login": open(sys.argv[3], "w").close()\n')
         result = box.run(['bash', str(VERIFY / '16_api_paths.sh')], STUB_CURL_CODE='200',
                          RAG_API='http://localhost:9/api', RAG_ALLOW_RESTART='1', RAG_SKIP_SLOW='1',
-                         RAG_RESTART_LIMIT_S='5', **env)
+                         RAG_RESTART_LIMIT_S='5', RAG_AUTH_SETUP=str(setup),
+                         RAG_AUTH_DIR=str(box.root / 'auth'), **env)
         compose = [call for call in box.calls() if call[:2] == ['docker', 'compose']]
         removed = [call for call in compose if 'down' in call and '-v' in call]
         restarted = [call for call in compose if 'down' in call and '-v' not in call]
+        self.setups = [call for call in box.calls() if call[:1] == ['auth_setup']]
         self.assertTrue(restarted, 'the suite did not reach its restart check: ' + result.stdout + result.stderr)
         return result, removed
 
     def test_another_project_keeps_its_volumes(self):
         result, removed = self.run_suite(COMPOSE_PROJECT_NAME='my-rag', COMPOSE_FILE=self.BOTH)
         self.assertEqual(removed, [])
+        # Not the verify project: the operator command is never allowed (#25).
+        self.assertNotIn('--operator', [arg for call in self.setups for arg in call])
         self.assertRegex(result.stdout, r'FAIL\s+a first start from empty volumes[^\n]*rag-verify')
 
     def test_verify_project_without_the_overlay_keeps_its_volumes(self):
@@ -496,6 +584,9 @@ class ApiPathsFirstStartTests(unittest.TestCase):
     def test_verify_project_with_the_overlay_removes_them(self):
         result, removed = self.run_suite(COMPOSE_PROJECT_NAME='rag-verify', COMPOSE_FILE=self.BOTH)
         self.assertEqual([call[-2:] for call in removed], [['down', '-v']])
+        # The accounts went with the volumes: the suite sets them up again (#25).
+        self.assertEqual(self.setups[-2:], [['auth_setup', 'ensure', '--operator'],
+                                            ['auth_setup', 'login', 'engineer', self.setups[-1][-1]]])
         self.assertIn('-p', removed[0])
         self.assertEqual(removed[0][removed[0].index('-p') + 1], 'rag-verify')
 
@@ -612,6 +703,9 @@ class StackArgumentTests(unittest.TestCase):
             (['up', '--checkout'], {}),
             (['down', '--pull'], {}),
             (['run', '--pull'], {}),
+            (['down', '--lan'], {}),
+            (['run', '--lan', '--telemetry'], {}),
+            (['up', '--telemetry', '--lan'], {}),
             (['bogus'], {}),
             ([], {}),
         ]
@@ -687,6 +781,51 @@ class StackDockerCallTests(unittest.TestCase):
         self.assertEqual(order, sorted(order), 'seed, guard, build, up must run in that order')
         self.assertIn('logs', [a for c in compose for a in c])
         self.assert_no_live_object(box.calls())
+
+    def test_up_lan_bootstraps_then_switches_to_lan_mode(self):
+        # #26: default up, the first Engineer, the LAN guard, the LAN up without a
+        # build, then the certificate copied for the suites, in that order.
+        box = Sandbox(self)
+        (box.root / 'config.json').write_text(json.dumps(passing_config(ROOT, box.exports)))
+        (box.root / 'config-lan.json').write_text(json.dumps(lan_config(ROOT, box.exports)))
+        result = box.run(['bash', str(STACK), 'up', '--lan'], STUB_UP_OK='1', STUB_CURL_CODE='200',
+                         STUB_CONFIG_LAN=str(box.root / 'config-lan.json'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        compose = [c[1:] for c in box.calls() if c[0] == 'docker' and c[1:2] == ['compose']]
+        for call in compose:
+            self.assertEqual(call[1:3], ['-p', 'rag-verify'], call)
+        steps = [c[3:] for c in compose if c[3:4] in (['config'], ['build'], ['up'], ['exec'])]
+        self.assertEqual(steps, [
+            ['config', '--format', 'json'],
+            ['build'],
+            ['up', '-d', '--wait', '--wait-timeout', '900'],
+            ['exec', '-T', 'api', 'python', '-m', 'auth', 'bootstrap', 'vfy-engineer'],
+            ['config', '--format', 'json'],
+            ['up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300'],
+            ['exec', '-T', 'proxy', 'cat', '/etc/nginx/certs/live/cert.pem'],
+        ])
+        cert = box.private / 'lan-cert.pem'
+        self.assertEqual(cert.stat().st_mode & 0o777, 0o600)
+        self.assertIn('export RAG_API=https://localhost:8081/api', result.stdout)
+        self.assertIn(f'export CURL_CA_BUNDLE={cert}', result.stdout)
+        self.assertIn('export RAG_VERIFY_LAN=1', result.stdout)
+        self.assertIn('docker-compose.lan.verify.yml', result.stdout)
+        curls = [c for c in box.calls() if c[0] == 'curl']
+        self.assertIn('https://localhost:8081/api/health', curls[-1])
+        self.assert_no_live_object(box.calls())
+
+    def test_up_lan_stops_when_the_lan_guard_refuses(self):
+        box = Sandbox(self)
+        (box.root / 'config.json').write_text(json.dumps(passing_config(ROOT, box.exports)))
+        bad = lan_config(ROOT, box.exports)
+        bad['services']['proxy']['ports'][0]['host_ip'] = '0.0.0.0'
+        (box.root / 'config-lan.json').write_text(json.dumps(bad))
+        result = box.run(['bash', str(STACK), 'up', '--lan'], STUB_UP_OK='1', STUB_CURL_CODE='200',
+                         STUB_CONFIG_LAN=str(box.root / 'config-lan.json'))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('(c)', result.stdout + result.stderr)
+        compose = [c[1:] for c in box.calls() if c[0] == 'docker' and c[1:2] == ['compose']]
+        self.assertEqual(len([c for c in compose if 'up' in c]), 1, 'only the default up may run')
 
     def test_guard_refusal_stops_before_build(self):
         box = Sandbox(self)

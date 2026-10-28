@@ -28,6 +28,7 @@ from fastapi import UploadFile
 
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from routers import collections as collection_routes
 from services import collection_writes as writes
 from services import exporter, goldstandard, importer, ingest_pipeline, tuning
@@ -95,7 +96,7 @@ class BusyTestCase(unittest.TestCase):
     def delete(self, name="OwnedBusy"):
         async def run():
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
-                                         base_url="http://owned") as api:
+                                         headers=auth_testing.headers(base_url="http://owned"), base_url="http://owned") as api:
                 return await api.delete(f"/collections/{name}?confirm=true")
         return asyncio.run(run())
 
@@ -494,7 +495,7 @@ class ConfirmationTests(BusyTestCase):
     def delete_query(self, query, name="OwnedBusy"):
         async def run():
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
-                                         base_url="http://owned") as api:
+                                         headers=auth_testing.headers(base_url="http://owned"), base_url="http://owned") as api:
                 return await api.delete(f"/collections/{name}{query}")
         return asyncio.run(run())
 
@@ -557,7 +558,7 @@ class DeletingTests(BusyTestCase):
     def call(self, method, path, **kwargs):
         async def run():
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
-                                         base_url="http://owned") as api:
+                                         headers=auth_testing.headers(base_url="http://owned"), base_url="http://owned") as api:
                 return await api.request(method, path, **kwargs)
         return asyncio.run(run())
 

@@ -1,6 +1,6 @@
 // Deferred API responses against the rendered Chunking page; no backend writes.
 const assert = require('node:assert/strict');
-const { makeReporter, clickByText, setValue } = require('./lib');
+const { makeReporter, clickByText, setValue, stubAuth } = require('./lib');
 const A = { collection: 'FixtureA', chunking_strategy: 'fixed', chunk_size: 100, chunk_overlap: 0, min_chunk_size: 0, similarity_threshold: null, is_default: false };
 const B = { ...A, collection: 'FixtureB', chunk_size: 2000 };
 const path = name => '/api/ingest/config/' + name;
@@ -10,7 +10,6 @@ async function fixture(browser, base, { collectionsFail = false } = {}) {
   const errors = [];
   page.on('pageerror', e => errors.push(e.message));
   await page.evaluateOnNewDocument((a, b, failCollections) => {
-    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
     const realFetch = window.fetch.bind(window);
     window.chunkingFixture = { requests: [] };
     window.fetch = (input, init = {}) => {
@@ -26,6 +25,8 @@ async function fixture(browser, base, { collectionsFail = false } = {}) {
       return Promise.reject(new Error('Unexpected fixture request ' + path));
     };
   }, A, B, collectionsFail);
+  // The engineer, as GET /api/auth/me answers it, without a backend (#25).
+  await stubAuth(page, 'engineer');
   await page.goto(base + '/chunking', { waitUntil: 'domcontentloaded' });
   if (!collectionsFail) await pending(page, path(A.collection));
   return { ctx, page, errors };

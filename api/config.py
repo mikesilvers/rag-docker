@@ -1,3 +1,4 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -31,6 +32,28 @@ class Settings(BaseSettings):
     # declared and as actually read. Members under 1 MiB are exempt from the ratio.
     max_zip_members: int = 5000
     max_zip_member_ratio: int = 200
+    # Accounts, sessions and the login throttle (#25): one SQLite file in the
+    # auth_data volume. Not /app/auth, which would hide the `auth` package that
+    # `python -m auth` runs.
+    auth_dir: str = "/app/auth_data"
+    # Marks the session cookie Secure. Off for the loopback HTTP profile, where a
+    # Secure cookie would never be sent back; LAN mode serves TLS and turns it on (#26).
+    auth_cookie_secure: bool = False
+    # LAN mode (#26), set only by docker-compose.lan.yml. When true the API
+    # refuses to start unless the cookie is Secure and an enabled Engineer
+    # exists (lan_mode.py).
+    rag_lan_mode: bool = False
+
+    @field_validator("auth_cookie_secure", "rag_lan_mode", mode="before")
+    @classmethod
+    def _exact_boolean(cls, value, info):
+        # pydantic would read "1", "yes" or "on" as true. A typo in a security
+        # setting must stop the API instead of silently meaning something.
+        if isinstance(value, bool):
+            return value
+        if value in ("true", "false"):
+            return value == "true"
+        raise ValueError(f"{info.field_name.upper()} must be exactly true or false")
 
     class Config:
         env_file = ".env"

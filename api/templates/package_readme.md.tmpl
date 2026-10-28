@@ -26,13 +26,13 @@ This package is **`@@FIDELITY@@`**. @@FIDELITY_NOTE@@
 
 ## Importing
 
-1. Copy this `.tar.gz` into the target instance's `./exports/` directory.
+1. Copy this package file into the target instance's `./exports/` directory.
 2. Open the web UI and go to **Transfer → Import**, or call the API directly:
 
 ```bash
 curl -X POST http://localhost:8080/api/import \
   -H 'Content-Type: application/json' \
-  -d '{"filename": "@@PACKAGE_FILENAME@@", "on_conflict": "abort"}'
+  -d '{"filename": "@@PACKAGE_FILENAME@@", "on_conflict": "abort"@@IMPORT_PASSPHRASE@@}'
 ```
 
 3. Poll the returned `job_id` at `GET /api/import/job/{job_id}`.

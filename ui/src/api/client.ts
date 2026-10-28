@@ -1,6 +1,6 @@
 const BASE = '/api'
 
-// The proxy's request-body limit: `client_max_body_size` in proxy/nginx.conf.
+// The proxy's request-body limit: `client_max_body_size` in proxy/locations.conf.
 // It covers a whole request, so a multi-file upload counts every file. Kept
 // here only so the Import page can warn before sending; nginx enforces it.
 // Change both together.
@@ -15,6 +15,24 @@ const PROXY_ERRORS: Record<number, string> = {
   504: 'The API took too long to respond.',
 }
 
+// An API error, with the API's error code when the answer carried one.
+export class ApiError extends Error {
+  status: number
+  code: string | null
+  constructor(message: string, status: number, code: string | null) {
+    super(message)
+    this.status = status
+    this.code = code
+  }
+}
+
+// The session ended (401 AUTH_REQUIRED) or a generated password must be changed
+// first (403 PASSWORD_CHANGE_REQUIRED), whichever call noticed it (#25). The
+// auth context listens and shows the login or password page.
+type AuthListener = (code: 'AUTH_REQUIRED' | 'PASSWORD_CHANGE_REQUIRED') => void
+let authListener: AuthListener | null = null
+export function onAuthProblem(listener: AuthListener | null) { authListener = listener }
+
 async function request<T>(method: string, path: string, body?: unknown, isFormData = false): Promise<T> {
   const headers: Record<string, string> = isFormData ? {} : { 'Content-Type': 'application/json' }
   const res = await fetch(`${BASE}${path}`, {
@@ -28,7 +46,9 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
   let data: any = null
   try { data = text ? JSON.parse(text) : null } catch { /* not JSON; handled below */ }
   if (!res.ok) {
-    throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
+    const code: string | null = typeof data?.error?.code === 'string' ? data.error.code : null
+    if (code === 'AUTH_REQUIRED' || code === 'PASSWORD_CHANGE_REQUIRED') authListener?.(code)
+    throw new ApiError(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`, res.status, code)
   }
   if (data === null && text) throw new Error('The server sent a response the UI could not read.')
   return data as T
@@ -65,6 +85,40 @@ async function getHealthResult(): Promise<HealthResult> {
 }
 
 export const api = {
+  // Accounts and sessions (#25). The session is an HttpOnly cookie the browser
+  // sends with every same-origin request; the UI never sees or stores it.
+  authStatus: () => request<{ setup_required: boolean }>('GET', '/auth/status'),
+  me: () => request<AuthUser>('GET', '/auth/me'),
+  login: (username: string, password: string) => request<AuthUser>('POST', '/auth/login', { username, password }),
+  logout: () => request<{ status: string }>('POST', '/auth/logout'),
+  changePassword: (current_password: string, new_password: string) =>
+    request<{ status: string } & AuthUser>('POST', '/auth/password', { current_password, new_password }),
+  // Account administration, Engineers only (#25). A generated password is in
+  // the answer to a create or a reset, once; the page shows it and keeps it nowhere.
+  listUsers: () => request<{ users: AdminUser[] }>('GET', '/auth/users'),
+  createUser: (username: string, role: Role) =>
+    request<{ user: AdminUser; password: string }>('POST', '/auth/users', { username, role }),
+  resetUserPassword: (username: string) =>
+    request<{ user: AdminUser; password: string }>('POST', `/auth/users/${encodeURIComponent(username)}/reset-password`),
+  setUserRole: (username: string, role: Role) =>
+    request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/role`, { role }),
+  disableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/disable`),
+  enableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/enable`),
+  // Service principals and their API keys (Engineers only, #25 PR 3).
+  listPrincipals: () => request<{ principals: ServicePrincipal[] }>('GET', '/auth/service-principals'),
+  createPrincipal: (name: string, role: Role) =>
+    request<{ principal: ServicePrincipal }>('POST', '/auth/service-principals', { name, role }),
+  setPrincipalRole: (name: string, role: Role) =>
+    request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/role`, { role }),
+  disablePrincipal: (name: string) =>
+    request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/disable`),
+  enablePrincipal: (name: string) =>
+    request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/enable`),
+  issueKey: (name: string, label: string, days: number) =>
+    request<{ principal: ServicePrincipal; key: ServiceKey; secret: string }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/keys`, { label, days }),
+  revokeKey: (name: string, keyId: string) =>
+    request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/keys/${encodeURIComponent(keyId)}/revoke`),
+
   getCollections: () => request<{ collections: CollectionInfo[] }>('GET', '/collections'),
   // Answers with the name as stored, first letter capitalised (#372).
   createCollection: (body: CreateCollectionBody) => request<{ name: string; status: string }>('POST', '/collections', body),
@@ -104,6 +158,14 @@ export const api = {
 }
 
 // Types
+export type Role = 'engineer' | 'developer' | 'end_user'
+export interface AuthUser { username: string; role: Role; must_change_password: boolean; kind?: 'user' | 'service' }
+export interface AdminUser { username: string; role: Role; enabled: boolean; must_change_password: boolean; created_at: string }
+export interface ServiceKey {
+  id: string; label: string; created_at: string; expires_at: string
+  revoked_at: string | null; last_used_at: string | null; status: 'active' | 'expired' | 'revoked'
+}
+export interface ServicePrincipal { name: string; role: Role; enabled: boolean; created_at: string; keys: ServiceKey[] }
 export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
   hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null
@@ -177,15 +239,18 @@ export interface MetricsResult {
   total_latency: LatencyStats
   history: LatencyRecord[]
 }
-export interface ExportBody { collection: string; include_models: boolean }
+// passphrase: only for an encrypted export (#27), 12 to 1024 characters.
+export interface ExportBody { collection: string; include_models: boolean; passphrase?: string }
 export interface ExportStart { job_id: string; status: string; collection: string }
 export interface ExportJob {
   job_id: string; status: string; collection: string; chunks_written: number
   filename: string | null; size_bytes: number | null; source_document_count: number | null
   fidelity: string | null; models_bundled: boolean | null; retrieve_script: boolean | null
   warnings: string[]; error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
+  encrypted?: boolean
 }
-export interface ImportBody { filename: string; on_conflict: string }
+// passphrase: required for a .tar.gz.age package and refused for any other (#27).
+export interface ImportBody { filename: string; on_conflict: string; passphrase?: string }
 export interface ImportStart { job_id: string; status: string; filename: string }
 export interface ImportJob {
   job_id: string; status: string; filename: string; on_conflict: string
@@ -193,10 +258,12 @@ export interface ImportJob {
   fidelity: string | null; renamed: boolean; notes: string[]
   restored_sessions?: { source_session_id: string; session_id: string; collection: string }[]
   error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
+  encrypted?: boolean
 }
 export interface PackageSummary {
   filename: string; size_bytes: number; collection: string | null
   chunk_count: number | null; fidelity: string | null; created_at: string | null; readable: boolean
+  encrypted?: boolean
 }
 export interface TuneOptions {
   collection: string; fidelity: string; source_document_count: number

@@ -1,4 +1,10 @@
 from __future__ import annotations
+# LAN mode (#26) refuses to start without a Secure cookie and an enabled
+# Engineer. First, so uvicorn's import of this module stops before any other
+# import, any startup work and any request.
+import lan_mode
+lan_mode.enforce()
+
 import logging
 from contextlib import asynccontextmanager
 
@@ -7,7 +13,6 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from utils import api_error
-from fastapi.middleware.cors import CORSMiddleware
 
 
 @asynccontextmanager
@@ -85,7 +90,17 @@ async def lifespan(app: FastAPI):
             await asyncio.to_thread(runtime.shutdown)
 
 
-app = FastAPI(title="RAG API", lifespan=lifespan)
+from fastapi import Depends
+from auth.middleware import AuthMiddleware, Unlisted, require_listed
+
+# require_listed refuses any route that has no entry in auth/policy.py, so a new
+# route is closed until it is given one (#25).
+app = FastAPI(title="RAG API", lifespan=lifespan, dependencies=[Depends(require_listed)])
+
+
+@app.exception_handler(Unlisted)
+async def unlisted_route(request, exc):
+    return api_error(403, "FORBIDDEN", "This route is not open to any role.")
 
 
 @app.exception_handler(RequestValidationError)
@@ -127,17 +142,17 @@ async def unhandled_error(request, exc):
     return api_error(500, "INTERNAL_ERROR",
                      "The API hit an unexpected error. The cause is in the API log.")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Every route needs the role auth/policy.py gives it (#25). Added first, so it
+# runs inside request tracing and a refused request is still traced. No CORS
+# middleware: the UI is served from the same origin through nginx, so no other
+# origin needs to read the API's answers.
+app.add_middleware(AuthMiddleware)
 app.add_middleware(RequestTracing)
 
-from routers import help as help_router, health, collections, ingest, query, goldstandard, metrics, retrieval_config, transfer, tuning
+from routers import auth as auth_router, help as help_router, health, collections, ingest, query, goldstandard, metrics, retrieval_config, transfer, tuning
 
 app.include_router(health.router)
+app.include_router(auth_router.router)
 app.include_router(help_router.router)
 app.include_router(collections.router)
 app.include_router(ingest.router)

@@ -15,6 +15,7 @@ from uuid import UUID
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2]/'api'))
 from fastapi.testclient import TestClient
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from models.schemas import GenerateRequest
 from services import chunk_sampling as sample, goldstandard as gs, weaviate_client as wc
 
@@ -388,7 +389,7 @@ class RequestTests(unittest.TestCase):
             self.assertEqual(GenerateRequest(collection='Inert',sample_size=value,seed='-7').seed,-7)
 
     def test_invalid_requests_return_422_before_collection_lookup_or_generation(self):
-        client=TestClient(app)  # No context manager: do not run startup sweeps.
+        client=TestClient(app, headers=auth_testing.headers())  # No context manager: do not run startup sweeps.
         with patch.object(wc,'collection_exists',new=AsyncMock(side_effect=AssertionError('backend contacted'))) as lookup, \
              patch.object(gs,'start_generation',new=AsyncMock()) as generation:
             for update in ({'sample_size':0},{'sample_size':101},{'sample_size':True},

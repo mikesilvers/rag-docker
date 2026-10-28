@@ -20,6 +20,7 @@ REGISTERED = (
     ('scripts/tests/test_chunk_limits.py', '02_ingest.sh', True),
     ('scripts/tests/test_insert_chunks.py', '02_ingest.sh', True),
     ('scripts/tests/test_retrieval_controls.py', '11_retrieval.sh', True),
+    ('scripts/tests/test_export_encryption.py', '05_transfer.sh', True),
 )
 
 

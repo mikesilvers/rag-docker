@@ -4,7 +4,7 @@
 // the final status, failed pairs and reasons, a stopped poll, Generate and
 // Regenerate while they run, and a refused edit. Every /api/ call from the page
 // is answered here; no backend writes.
-const { sleep, setValue, clickByText, bodyText, makeReporter } = require('./lib');
+const { sleep, setValue, clickByText, bodyText, makeReporter, stubAuth } = require('./lib');
 
 const SESSION = 'gs_0393abcd';
 const NAME_RE = /^FixtureGold_\d{8}_\d{6}\.json$/;
@@ -32,7 +32,6 @@ async function fixture(browser, base, opts = {}) {
   page.on('pageerror', e => errors.push(e.message));
   page.on('dialog', async d => { dialogs.push(d.message()); await d.dismiss(); });
   await page.evaluateOnNewDocument(realOpen => {
-    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
     window.__opened = [];
     if (!realOpen) window.open = url => { window.__opened.push(String(url)); return null; };
   }, !!opts.realOpen);
@@ -93,6 +92,8 @@ async function fixture(browser, base, opts = {}) {
     }
     return json(request, 404, { error: { code: 'NOT_FOUND', message: 'Not stubbed by the fixture.' } });
   });
+  // The engineer, as GET /api/auth/me answers it, without a backend (#25).
+  await stubAuth(page, 'engineer');
   await page.goto(base + '/goldstandard', { waitUntil: 'networkidle2' });
   await sleep(300);
   return { ctx, page, activation, errors, generates, polls, patches, regenerates, dialogs };

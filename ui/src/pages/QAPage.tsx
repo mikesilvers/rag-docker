@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { api, CollectionInfo, Citation } from '../api/client'
-import { useRole } from '../context/RoleContext'
+import { useRole } from '../context/AuthContext'
 import { useQueryConfig } from '../context/QueryConfigContext'
 import CitationsPanel from '../components/CitationsPanel'
 

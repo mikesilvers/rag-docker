@@ -125,8 +125,15 @@ services:
       # upload is refused (#28).
       MAX_ZIP_MEMBERS: 5000
       MAX_ZIP_MEMBER_RATIO: 200
+      # Marks the session cookie Secure (#25). false for this loopback HTTP
+      # profile, where a Secure cookie would never be sent back. LAN mode's
+      # docker-compose.lan.yml serves TLS and sets it true (#26). Exactly true
+      # or false.
+      AUTH_COOKIE_SECURE: "false"
     volumes:
       - ingest_uploads:/app/uploads
+      # Accounts, sessions and the login throttle (#25), one SQLite file.
+      - auth_data:/app/auth_data
       # Retained source documents; grows with the corpus.
       - rag_sources:/app/sources
       # Bind mount, deliberately: an export is only useful if the user can
@@ -158,10 +165,13 @@ services:
   proxy:
     image: nginx:1.29-alpine
     ports:
-      # This unauthenticated workbench is local to the host by default.
+      # The workbench is local to the host by default. LAN mode (#26) is the
+      # opt-in docker-compose.lan.yml, which replaces this with TLS on port 443.
       - "127.0.0.1:8080:80"
     volumes:
       - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+      # The routes, shared with LAN mode's nginx.lan.conf (#26).
+      - ./proxy/locations.conf:/etc/nginx/rag/locations.conf:ro
     networks: [rag-internal]
     depends_on: [ui, api]
 
@@ -180,6 +190,7 @@ volumes:
   ollama_models:
   ingest_uploads:
   rag_sources:
+  auth_data:
 
 networks:
   rag-internal:
@@ -188,11 +199,13 @@ networks:
 
 ### 2.2 Nginx Routing
 
-**File:** `proxy/nginx.conf`
+**Files:** `proxy/nginx.conf` (the default server, HTTP on container port 80) and `proxy/nginx.lan.conf` (LAN mode's
+TLS server on container port 443, §2.5) both include `proxy/locations.conf`, which holds the routes, so the two
+servers route identically.
 
 | Path prefix | Routes to | Notes |
 |---|---|---|
-| `/api/` | `http://api:8000/` | Strip `/api` prefix |
+| `/api/` | `http://api:8000/` | Strip `/api` prefix. Forwards the browser's `Host` with its port (`$http_host`), which the API compares with `Origin` (§3.1.8), and the client address as `X-Real-IP` |
 | `/` | `http://ui:3000/` | SPA fallback to `index.html` |
 
 ### 2.3 Model Initialization
@@ -231,6 +244,53 @@ healthcheck:
 3. API starts → verifies both downstream connections → healthcheck passes
 4. UI starts (static build, no runtime deps)
 5. Nginx proxy starts
+
+### 2.5 LAN Mode (#26)
+
+LAN mode shares the workbench on the local network over TLS. It is opt-in: only
+`docker compose -f docker-compose.yml -f docker-compose.lan.yml ...` turns it on, and without the override the stack
+is exactly as in §2.1.
+
+**File:** `docker-compose.lan.yml`. Over the base file it:
+
+- replaces the proxy's publication with exactly one, `0.0.0.0:${RAG_LAN_PORT:-443}->443/tcp`: TLS on every host
+  interface, nothing on port 80 and no redirect;
+- sets `RAG_LAN_MODE: "true"` and `AUTH_COOKIE_SECURE: "true"` on the api;
+- mounts `proxy/nginx.lan.conf` over `nginx.conf` and the `lan_certs` volume at `/etc/nginx/certs`, both read-only,
+  and starts the proxy only after `tls-init` has completed successfully;
+- adds `tls-init`, a one-shot service in the API image (`rag-docker-api:latest`, `python -m tls_cert`), with
+  `RAG_LAN_HOSTNAMES` from the shell or `.env`, `proxy/certs` mounted read-only at `/byo` and `lan_certs` at
+  `/certs`.
+
+**Startup refusal** (`api/lan_mode.py`, called first by `api/main.py`). With `RAG_LAN_MODE=true` the API checks,
+before any other import, startup work or request, that `AUTH_COOKIE_SECURE` is `true` and then that an enabled human
+(not service principal) AI Engineer exists. On the first failure it writes one line, starting `LAN mode refused:`, to
+standard error and exits 1. The ui waits for a healthy api and the proxy for the ui, so nothing is published. The
+check runs once; LAN mode changes nothing else in the API. The operator command is unaffected, and the first
+Engineer is created in the default mode before switching.
+
+**TLS server** (`proxy/nginx.lan.conf`): one server, `listen 443 ssl`, `http2 on`, TLS 1.2 and 1.3 only, Mozilla's
+intermediate cipher list for TLS 1.2, `ssl_prefer_server_ciphers off`, session tickets off, no
+`Strict-Transport-Security` header, the pair at `/etc/nginx/certs/live/{cert,key}.pem`, and the shared routes.
+
+**Certificate step** (`api/tls_cert.py`, run by `tls-init` on every start in LAN mode):
+
+| Case | Result |
+|---|---|
+| `proxy/certs/cert.pem` and `key.pem` both present | Used as given (a chain allowed, server certificate first). Refused, exit 1, when either doesn't parse or the key doesn't match; an expired certificate is used with a warning |
+| Only one of the two present | Refused, exit 1 |
+| Neither present | A self-signed certificate for `RAG_LAN_HOSTNAMES` (comma-separated DNS names and IP addresses) plus `localhost`: ECDSA P-256, CN the first name, valid 825 days, `CA:FALSE`, server-authentication EKU. An empty value or an entry that is neither a DNS name nor an IP address is refused, exit 1 |
+| A self-signed pair already active | Reused, unless it is unreadable, its key doesn't match, it has expired, its names differ from the ones wanted now, or the active pair came from bring-your-own files that are gone |
+
+The active pair lives in `lan_certs` as `live`, a symlink to a `pair-<random>` folder (`cert.pem`, `key.pem` mode
+0600, `source`), switched with one rename, so a failed step never leaves a certificate beside a key that doesn't match
+it. The step prints one line with the source, names, expiry and SHA-256 fingerprint, or one line on standard error
+when it refuses; then the proxy doesn't start. `proxy/certs/` is tracked through `.gitkeep`; everything else in it is
+ignored by git.
+
+**Client address.** nginx passes `$remote_addr` to the API as `X-Real-IP`, which keys the login throttle. Measured
+on Docker Desktop for Mac: a request through the host's LAN address arrives from `192.168.65.1` and one through
+`localhost` from the Docker network's gateway, not from the client's own address.
 
 ---
 
@@ -499,7 +559,7 @@ Content-Type: multipart/form-data
 
 Accepts one or more files. For ZIP uploads, extracts and processes all supported files within the archive. For folder-equivalent uploads (multiple files in one request), processes all submitted files.
 
-**Size limit:** one request may be at most **512 MB**, all files together. The proxy enforces this (`client_max_body_size` in `proxy/nginx.conf`) and answers an oversize request itself with **HTTP 413**, an nginx HTML page rather than the API's JSON error shape, before the API sees it. The proxy streams accepted uploads to the API without buffering them, and the API writes each file to disk in blocks rather than holding it in memory. The Import page refuses a selection over the limit before sending it.
+**Size limit:** one request may be at most **512 MB**, all files together. The proxy enforces this (`client_max_body_size` in `proxy/locations.conf`) and answers an oversize request itself with **HTTP 413**, an nginx HTML page rather than the API's JSON error shape, before the API sees it. The proxy streams accepted uploads to the API without buffering them, and the API writes each file to disk in blocks rather than holding it in memory. The Import page refuses a selection over the limit before sending it.
 
 **Form fields:**
 
@@ -1323,6 +1383,169 @@ objects as the aggregate stat row.
 
 ---
 
+#### 3.1.8 Authentication and the endpoint/role matrix (#25)
+
+Every route needs an account, except `GET /health` (unchanged, for container healthchecks), `GET /auth/status`
+and `POST /auth/login`. Roles are ordered `end_user` < `developer` < `engineer`; a role may do everything a lower
+one may. The role of a request is the one stored for its user at that moment, never anything the client sends.
+
+| Needs | Routes |
+|---|---|
+| nothing | `GET /health`, `GET /auth/status`, `POST /auth/login` |
+| any session (also one with a password change due) | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password` |
+| `end_user` | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
+| `developer` | `POST /collections`; `POST /ingest/upload`, `GET /ingest/job/{job_id}`, `GET /ingest/config/{collection}`, `POST /ingest/config`; `POST /retrieval/config`; `POST /goldstandard/generate`, `GET /goldstandard/session/{session_id}`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST /goldstandard/save`, `GET /goldstandard/download/{filename}`; `POST /export`, `GET /export/job/{job_id}`, `POST /import`, `GET /import/job/{job_id}`, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
+| `engineer` | `DELETE /collections/{name}`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json`; account administration: `GET /auth/users`, `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `POST /auth/users/{username}/role`, `POST /auth/users/{username}/disable`, `POST /auth/users/{username}/enable`; service principals and keys: `GET /auth/service-principals`, `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `POST /auth/service-principals/{name}/disable`, `POST /auth/service-principals/{name}/enable`, `POST /auth/service-principals/{name}/keys`, `POST /auth/service-principals/{name}/keys/{key_id}/revoke` |
+
+The matrix is one table in `api/auth/policy.py`. A route without an entry is refused for everyone (`403
+FORBIDDEN`), and a registered check fails when a route lacks an entry or an entry names no route. Jobs and
+gold-standard sessions have no owner: any user with the route's role may poll or open them. A path that matches
+no route keeps `404 NOT_FOUND`, and a wrong method `405 METHOD_NOT_ALLOWED`. A path holding a control character
+(for example a trailing newline, `%0A`, which Starlette's `$`-anchored routes would still match) answers
+`404 NOT_FOUND` before anything else. The check runs before the route reads the request body, so a refused upload
+is never received.
+
+**Refusals**, the first that applies answering: `503 SETUP_REQUIRED` (no account exists yet); `401
+AUTH_REQUIRED` (no valid session); `403 CROSS_ORIGIN_REFUSED` (a cookie-authenticated `POST`, `PUT`, `PATCH` or
+`DELETE` whose `Origin` names another host or port than its `Host`, or that has no `Origin` and no `Sec-Fetch-Site:
+same-origin`); `403 PASSWORD_CHANGE_REQUIRED` (a generated password is due for change; only the session routes
+answer); `403 FORBIDDEN` (the role is too low; `detail: {"required_role": ...}`). The API has no CORS middleware
+and sends no `Access-Control-*` headers. A request with an `Authorization` header is a service key request and
+has its own refusals (**Service keys**, below).
+
+**Accounts.** Usernames are 3-32 characters of lowercase letters, digits, `.`, `_` and `-`; input is lowercased,
+so they are case-insensitive. Passwords are 12-256 characters and not the username (ignoring case); no
+composition rules. They are stored only as `scrypt$<log2 n>$<r>$<p>$<salt>$<hash>` with n = 2^15, r = 8, p = 1
+and a random 16-byte salt. The operator command (below) creates the first engineer and recovers lockouts; after
+that engineers manage accounts through the account administration routes (below) and the Users page (§7.12).
+No route deletes an account: accounts are disabled, so a username is never reused.
+
+**Sessions.** Server-side, in the SQLite file `auth.db` in `AUTH_DIR` (the `auth_data` volume), with accounts
+and the login throttle, so all survive an API restart. The cookie `rag_session` holds a random 256-bit token; the
+store keeps its SHA-256. Cookie attributes: `HttpOnly`, `SameSite=Strict`, `Path=/`, `Max-Age=604800` (it
+survives closing the browser), and `Secure` when `AUTH_COOKIE_SECURE=true`. A session ends after 12 hours without
+a request or 7 days after login, whichever is first; an ended session is deleted. Every request re-reads the
+user: a role change applies to the next request; disabling an account, resetting its password and logging out
+delete its sessions.
+
+**Login throttling.** Failed logins are counted per (username as typed, lowercased; client address, `X-Real-IP`
+from nginx). Five within 15 minutes throttle the pair for 15 minutes: its logins answer `429 LOGIN_THROTTLED`
+without checking the password. The same applies to unknown usernames. An attempt is counted before its password
+is checked, in the same transaction as the throttle check, so parallel attempts can't exceed five. A successful
+login clears the pair's count. A wrong current password on `POST /auth/password` counts against the same pair, and
+a throttled pair's password change answers `429 LOGIN_THROTTLED`. Behind Docker's port publishing every client on
+the host may share one address, so in practice the throttle is per username.
+
+| Route | Request | Success |
+|---|---|---|
+| `GET /auth/status` | | `200 {"setup_required": bool}` |
+| `POST /auth/login` | `{"username", "password"}` | `200 {"username", "role", "must_change_password"}` and the cookie. Every failure (unknown user, wrong password, disabled account, malformed username) is the same `401 LOGIN_FAILED` "The username or password is incorrect.", checked against a hash either way so the time doesn't differ |
+| `GET /auth/me` | | `200 {"username", "role", "must_change_password", "kind"}`; `kind` is `user` for a session and `service` for an API key (whose `must_change_password` is `false`) |
+| `POST /auth/logout` | | `200 {"status": "logged_out"}`; the session is deleted and the cookie expired |
+| `POST /auth/password` | `{"current_password", "new_password"}` | `200 {"status": "changed", "username", "role", "must_change_password": false}`; the user's other sessions end, this one stays. A wrong current password is `403 PASSWORD_INCORRECT`; a new one breaking the rules, or equal to the current one (so a generated password can't be kept), is `422 INVALID_PASSWORD` naming the rule |
+
+**Account administration** (engineers only). `User` is `{"username", "role", "enabled", "must_change_password",
+"created_at"}` (`created_at` in ISO 8601 UTC); it never holds a password, hash or session. A `{username}` in a path
+is lowercased; one that doesn't exist, or breaks the username rule, is `404 USER_NOT_FOUND`. A role other than
+`end_user`, `developer` or `engineer`, or a missing field, is `422 INVALID_PARAMETER`.
+
+| Route | Request | Success |
+|---|---|---|
+| `GET /auth/users` | | `200 {"users": [User, ...]}`, by username |
+| `POST /auth/users` | `{"username", "role"}` | `201 {"user": User, "password"}`: an enabled account with a generated password, to be changed at first login. A username breaking the rule is `422 INVALID_USERNAME`; one that exists (ignoring case) is `409 USER_EXISTS` |
+| `POST /auth/users/{username}/reset-password` | | `200 {"user": User, "password"}`: a new generated password, to be changed at next login; the user's sessions end. The engineer's own account is `409 SELF_RESET_REFUSED` (use `POST /auth/password`, which needs the current password) |
+| `POST /auth/users/{username}/role` | `{"role"}` | `200 {"user": User}`; existing sessions take the role on their next request |
+| `POST /auth/users/{username}/disable` | | `200 {"user": User}`; the user's sessions end and their logins fail with `LOGIN_FAILED` |
+| `POST /auth/users/{username}/enable` | | `200 {"user": User}`; the user can log in again with their current password |
+
+A generated password (as the operator command's) is in its `201` or `200` answer only, sent with
+`Cache-Control: no-store`, and nowhere else. Demoting or disabling the last enabled engineer is `409
+LAST_ENGINEER`, for the engineer's own account too; the check and the change are one transaction. Otherwise an
+engineer may demote or disable themselves (disabling ends their own session). Setting the current role, or
+disabling a disabled account, succeeds and changes nothing.
+
+**Service keys** (PR 3 of #25). A *service principal* is an account with `kind = 'service'` in the same `users`
+table (an existing store gains the `kind` column on first open, every existing row `user`; schema version 2). It
+has a name under the username rule, sharing one name pool with people, and one role; it has no usable password
+and no session, so a login with its name is the generic `401 LOGIN_FAILED` (checked against the dummy hash). It is
+disabled, never deleted. Keys are issued only to principals. The last-enabled-engineer rule counts people only.
+
+A key is `rag_` + a 12-character id (lowercase letters and digits) + `_` + 43 characters of
+`secrets.token_urlsafe(32)` (256 bits), 60 characters. The `api_keys` table keeps the id, the principal, the
+key's SHA-256, a label (0-64 characters), created, expires, revoked and last used (written at most once a minute);
+never the key. A key expires a whole number of days after issuance, 1-365, default 90, and can't be extended;
+revoking is immediate; revoked and expired keys stay listed and never work again. There is no rotate operation:
+issuing another key rotates, and the old key works until it is revoked or expires. A principal may hold any
+number of keys.
+
+A request with an `Authorization` header is authenticated by it alone; a session cookie on it is ignored, with no
+fallback. The header must be exactly one `Bearer <key>` (scheme case-insensitive) with a key of that form; a key in
+a query parameter, a cookie or another header is no credential (`401 AUTH_REQUIRED`). A valid key (known, hash
+matching, not revoked, not expired, its principal enabled) runs as its principal with the principal's role at that
+moment, so a role change applies at once, disabling stops all the principal's keys and enabling restores the
+unrevoked, unexpired ones. Refusals, first that applies: `503 SETUP_REQUIRED`; `401 KEY_INVALID` "The API key is
+invalid, expired or revoked." for every reason; `403 KEY_NOT_ALLOWED` on every `/auth/users...` and
+`/auth/service-principals...` route, `POST /auth/logout` and `POST /auth/password`, whatever the role; `403
+FORBIDDEN` when the role is too low. A key request has no origin check and no password-change check. Public
+routes ignore the header. Failed key requests are neither logged one by one nor throttled.
+
+**Service principal and key administration** (engineers' sessions only). `Principal` is `{"name", "role",
+"enabled", "created_at", "keys": [Key, ...]}`, keys newest first; `Key` is `{"id", "label", "created_at",
+"expires_at", "revoked_at", "last_used_at", "status"}`, times ISO 8601 UTC or `null`, `status` `revoked`, else
+`expired`, else `active`. Neither holds a key, hash or password.
+
+| Route | Request | Success |
+|---|---|---|
+| `GET /auth/service-principals` | | `200 {"principals": [Principal, ...]}`, by name |
+| `POST /auth/service-principals` | `{"name", "role"}` | `201 {"principal"}`. A name breaking the rule is `422 INVALID_USERNAME`; one a person or principal holds is `409 PRINCIPAL_EXISTS` |
+| `POST /auth/service-principals/{name}/role` | `{"role"}` | `200 {"principal"}`; its keys take the role on their next request |
+| `POST /auth/service-principals/{name}/disable` | | `200 {"principal"}`; its keys fail until it is enabled |
+| `POST /auth/service-principals/{name}/enable` | | `200 {"principal"}` |
+| `POST /auth/service-principals/{name}/keys` | `{"label"?, "days"?}` | `201 {"principal", "key", "secret"}`, with `Cache-Control: no-store`; `secret` is the key, in this answer only |
+| `POST /auth/service-principals/{name}/keys/{key_id}/revoke` | | `200 {"principal"}`; revoking again keeps the first revoked time |
+
+A `{name}` that isn't a principal (unknown, a person's account, or breaking the rule) is `404 PRINCIPAL_NOT_FOUND`;
+a `{key_id}` not of that principal is `404 KEY_NOT_FOUND`; a bad role, `days` outside 1-365 or not a whole number,
+a label over 64 characters, or a missing field is `422 INVALID_PARAMETER`. Setting the current role, or disabling a
+disabled principal, changes nothing. A key may be issued to a disabled principal; it works once the principal is
+enabled. The account routes stay for people: `GET /auth/users` lists no principal, a principal's name in a
+`/auth/users/{username}/...` path is `404 USER_NOT_FOUND`, and `POST /auth/users` with a principal's name is
+`409 USER_EXISTS`.
+
+**Operator command**, inside the api container: `docker compose exec api python -m auth <subcommand>`.
+
+| Subcommand | Effect |
+|---|---|
+| `bootstrap USERNAME` | Only when no account exists: creates USERNAME as an engineer |
+| `create-user USERNAME ROLE` | Only after bootstrap; refused if the name exists |
+| `reset-password USERNAME` | New generated password; the user's sessions end |
+| `set-role USERNAME ROLE` | Applies to existing sessions on their next request |
+| `disable USERNAME` / `enable USERNAME` | Disabling ends the user's sessions |
+| `list` | Username, role, enabled, password change due (`service account` for a service principal), created; never a password, hash or key |
+
+`bootstrap`, `create-user` and `reset-password` print a generated password (24 characters, 144 random bits)
+alone on standard output and nowhere else, and mark it to be changed at first login. Each change writes one line
+to standard error; exit status 0 done, 1 refused, 2 usage error. The last enabled engineer can't be disabled or
+demoted; an account a user is locked out of (lost password, disabled) is recovered with `create-user`, `enable` or
+`reset-password`, which don't lift a login throttle (it ends by itself after 15 minutes). No account or password comes
+from the environment, and none exists by default. The command issues no keys; `set-role`, `disable` and `enable`
+work on service principals too (disabling one stops its keys), `reset-password` refuses one (exit 1), and
+`create-user` is refused for a principal's name.
+
+**Upgrading.** An existing install answers `503 SETUP_REQUIRED` everywhere but `/health` until `bootstrap`. The
+proxy must be recreated (`docker compose up -d --force-recreate proxy`, or the whole stack): `proxy/nginx.conf`
+is a single-file bind mount, and a proxy still running the old copy sends `Host` without the port, so every
+cookie-authenticated change fails the origin check with `403 CROSS_ORIGIN_REFUSED`.
+
+**Logging.** One `WARNING` line per login attempt (success, failure, throttled) on logger `auth`, with the
+username and client address; never a password, token or cookie. One `WARNING` line per account administration
+change (create, reset, role, disable, enable) naming the engineer, the change and the account, and one per refusal
+(`INVALID_USERNAME`, `USER_EXISTS`, `USER_NOT_FOUND`, `LAST_ENGINEER`, `SELF_RESET_REFUSED`) saying why; never a
+password. One `WARNING` line per service principal or key change (create, role, disable, enable, key issued, key
+revoked) naming the engineer, the principal and the key id (and the role or expiry), and one per refusal
+(`INVALID_USERNAME`, `PRINCIPAL_EXISTS`, `PRINCIPAL_NOT_FOUND`, `KEY_NOT_FOUND`); never a key or its hash.
+Successful key requests aren't logged one by one (`last_used_at` records them). The telemetry route vocabulary gains the eighteen `/auth` routes as labels.
+
 ### 3.2 Error Response Format
 
 All errors use a consistent envelope, including the ones no route raises itself (#373): a
@@ -1369,6 +1592,25 @@ Standard error codes:
 | `PAIR_NOT_FOUND` | 404 | pair_id not found within the given session |
 | `SESSION_BUSY` | 409 | Operation not allowed while session is still generating |
 | `HISTORICAL_SESSION` | 409 | Explicit historical export choice required for stale/orphaned session |
+| `SETUP_REQUIRED` | 503 | No account exists yet; run `python -m auth bootstrap` (§3.1.8) |
+| `AUTH_REQUIRED` | 401 | No valid session: none, unknown, ended or of a disabled user |
+| `FORBIDDEN` | 403 | The user's role is too low (`detail.required_role`), or the route has no policy entry |
+| `CROSS_ORIGIN_REFUSED` | 403 | A cookie-authenticated change from another origin |
+| `PASSWORD_CHANGE_REQUIRED` | 403 | A generated password must be changed first; only `/auth/me`, `/auth/logout` and `/auth/password` answer |
+| `LOGIN_FAILED` | 401 | Login refused; the same answer for every cause |
+| `LOGIN_THROTTLED` | 429 | Five failed logins for this username and address within 15 minutes; wait 15 minutes |
+| `PASSWORD_INCORRECT` | 403 | The current password given to `POST /auth/password` is wrong |
+| `INVALID_PASSWORD` | 422 | The new password breaks a rule; the message names it |
+| `INVALID_USERNAME` | 422 | `POST /auth/users`: the username breaks the rule; the message states it |
+| `USER_EXISTS` | 409 | `POST /auth/users`: an account with this username exists |
+| `USER_NOT_FOUND` | 404 | No account has the username in the path |
+| `LAST_ENGINEER` | 409 | The change would demote or disable the last enabled engineer |
+| `SELF_RESET_REFUSED` | 409 | An engineer's reset of their own password; they use `POST /auth/password` |
+| `KEY_INVALID` | 401 | An `Authorization` header that isn't one valid `Bearer` key: unknown, malformed, expired, revoked or of a disabled principal |
+| `KEY_NOT_ALLOWED` | 403 | An API key on account, principal or key administration, logout or password change |
+| `PRINCIPAL_EXISTS` | 409 | `POST /auth/service-principals`: a person or principal already has the name |
+| `PRINCIPAL_NOT_FOUND` | 404 | No service principal has the name in the path |
+| `KEY_NOT_FOUND` | 404 | The principal has no key with the id in the path |
 
 ---
 
@@ -1449,6 +1691,18 @@ Long-running, so it follows the same job-and-poll shape as `/ingest/upload`.
 The job reports `models_bundled` — what the package actually carries, which is
 `false` with an explanation in `warnings` if the request could not be honoured.
 
+An optional `passphrase` (12 to 1024 characters, any characters) writes the
+package encrypted, as `<stem>.tar.gz.age`: an age v1 file with one scrypt
+(passphrase) recipient, work factor 18, streamed in 64 KiB chunks so no
+unencrypted archive is written and the package is never held in memory
+(`RAG_EXPORT_SPECIFICATIONS.md` §4.6; #27). Without it the export is unencrypted,
+as before. The passphrase is never stored in the job record, logged, attached to
+telemetry or returned; the job reports `encrypted`.
+
+- **422 `INVALID_PARAMETER`** for a `passphrase` shorter than 12 or longer than
+  1024 characters, or one with no UTF-8 form (a lone surrogate). No job is created, and the response does not contain the
+  passphrase.
+
 **Response 202:**
 ```json
 { "job_id": "0c5fd445", "status": "queued", "collection": "Policies" }
@@ -1503,6 +1757,7 @@ GET /export/job/{job_id}
   "fidelity": "with-sources",
   "models_bundled": false,
   "retrieve_script": true,
+  "encrypted": false,
   "warnings": [],
   "error": null
 }
@@ -1517,7 +1772,7 @@ across an API restart like ingest's (§3.1.3); a job the restart interrupted rea
 with `error_code` `INTERRUPTED` and an `error` saying the API restarted while it was running. A failed build leaves nothing
 behind: the staging directory and the partial archive are both removed, and the
 collection's export slot is released. A build interrupted by a restart leaves them in
-`EXPORTS_DIR` (`.build-*` and `.<stem>.tar.gz.partial`) until the next startup removes them,
+`EXPORTS_DIR` (`.build-*`, and `.<stem>.tar.gz.partial` or, encrypted, `.<stem>.tar.gz.age.partial`) until the next startup removes them,
 before the first request; completed packages are never touched (#377).
 
 `warnings` is non-fatal. It records, for example, chunks whose `source_sha256`
@@ -1544,13 +1799,28 @@ follows the job-and-poll pattern.
 could destroy a collection the caller did not mean to touch. It is one of
 `abort`, `rename` or `replace` (spec §6.4).
 
+`passphrase` is required for an encrypted package, one whose name ends in
+`.tar.gz.age`, and refused for any other (#27). It is not checked for length
+here; one with no UTF-8 form (a lone surrogate) is refused `422
+INVALID_PARAMETER`, as on export. The job decrypts the package as a stream while unpacking it, and every
+check from the manifest on reads the decrypted files; it is never stored in the
+job record, logged, attached to telemetry or returned. The job reports
+`encrypted`.
+
 **Response 202:** `{ "job_id": "...", "status": "queued", "filename": "..." }`
+
+- **400 `PASSPHRASE_REQUIRED`** for a `.tar.gz.age` package sent without a
+  passphrase, and **400 `PASSPHRASE_NOT_EXPECTED`** for a passphrase sent with any
+  other package. Both are decided by the filename, before any job exists, and
+  change nothing; `detail` is `{"filename": "<as sent>"}`.
 
 **409 `IMPORT_IN_PROGRESS`** if the same package file is already being imported:
 the file's name in `./exports` is compared, so `x.tar.gz`, `./x.tar.gz` and
 `a/../x.tar.gz` are one file (#391).
 
-Everything else — unreadable archive, bad digest, embedding mismatch, name
+Everything else — unreadable archive, a wrong passphrase or a damaged encrypted
+package (`DECRYPT_FAILED`, with `error_detail.reason` `passphrase`, `header`,
+`payload` or `work_factor`, the last for a scrypt work factor above 20 or not written as one or two decimal digits, refused before any key derivation; a file cut inside the payload nonce is `payload`; nothing is touched), bad digest, embedding mismatch, name
 collision, a target being deleted (`COLLECTION_DELETING`, §3.1.2), another import
 into the same target collection (`IMPORT_IN_PROGRESS`) — is reported through the
 job rather than this response, because none of it is knowable without reading the
@@ -1596,7 +1866,8 @@ GET /import/job/{job_id}
   "notes": ["3 gold-standard session(s) restored"],
   "error": null,
   "error_code": null,
-  "error_detail": null
+  "error_detail": null,
+  "encrypted": false
 }
 ```
 
@@ -1745,11 +2016,20 @@ dropped in to be imported.
       "chunk_count": 1842,
       "fidelity": "with-sources",
       "created_at": "2026-09-18T15:31:27Z",
-      "readable": true
+      "readable": true,
+      "encrypted": false
     }
   ]
 }
 ```
+
+Encrypted packages (`ragpkg-*.tar.gz.age`, #27) are listed too, with
+`encrypted: true` and `collection`, `chunk_count`, `fidelity` and `created_at`
+null: their manifest can't be read without the passphrase, and no plaintext
+metadata is kept beside them. Their `readable` says whether the file starts with a
+valid age passphrase header; the listing never needs the passphrase and never runs
+scrypt. A file that can't be read or parsed is listed `readable: false` and never
+fails the listing of the others.
 
 A file that cannot be read as a package is still listed, with `readable: false`
 and null metadata, so it does not silently disappear from the UI. Import reports
@@ -2002,25 +2282,31 @@ If the model output is not valid JSON, the API retries once with an explicit rem
 **State management:** React Context + useReducer (no external state library)  
 **Routing:** React Router v6
 
-### 7.1 Role Selection
+### 7.1 Login (#25)
 
-**Route:** `/`
+The role picker is gone. The UI takes the user and role only from `GET /api/auth/me` and keeps nothing about
+them in browser storage; the session is the HttpOnly cookie. On load it asks `GET /api/auth/status`:
 
-On first load (or when no role in session storage), the landing page displays three role cards:
+| State | Shown |
+|---|---|
+| Setup required | "Not set up yet" with the command `docker compose exec api python -m auth bootstrap <username>`, and nothing else |
+| No valid session | The login page at `/login` (any other path redirects there): username, password, "Log in". A failure shows the API's message (the generic `LOGIN_FAILED`, or "wait" when throttled) and clears the password. Success opens `/qa` |
+| Password change due | Only the password page at `/account/password`: current password, new password, the new one again, "Change password" and "Log out". A mismatch is caught before sending; the API's rule message is shown; success opens `/qa` |
+| Logged in | The pages of the user's role (§7.2) and `/account/password`, where a change says the other sessions were logged out |
 
-| Role | Label | Description shown to user |
-|---|---|---|
-| `engineer` | AI Engineer | Full access: ingest, chunking, retrieval, gold standard, collection management, health |
-| `developer` | Developer | Ingest, simplified configuration, Q&A, gold standard |
-| `end_user` | End User | Q&A only |
+Any API answer `401 AUTH_REQUIRED` returns the UI to the login page, and `403 PASSWORD_CHANGE_REQUIRED` to the
+password page.
 
-Selecting a role stores `{ role: "<selected_role>" }` (e.g. `{ role: "engineer" }`, `{ role: "developer" }`, or `{ role: "end_user" }`) in `sessionStorage` under key `rag_role` and navigates to `/qa`.
-
-A "Switch Role" button is always visible in the navigation bar, which returns to this page.
+| Role | Label |
+|---|---|
+| `engineer` | AI Engineer |
+| `developer` | Developer |
+| `end_user` | End User |
 
 ### 7.2 Navigation Bar
 
-Visible on all pages post-role-selection. Contents vary by role:
+Visible on all pages after login. Contents vary by role; hiding a page is a convenience, and the API refuses
+what the role can't do (§3.1.8):
 
 | Nav Item | Engineer | Developer | End User |
 |---|---|---|---|
@@ -2029,9 +2315,14 @@ Visible on all pages post-role-selection. Contents vary by role:
 | Chunking Config | ✓ | ✓ | — |
 | Retrieval Config | ✓ | ✓ | — |
 | Gold Standard | ✓ | ✓ | — |
+| Transfer | ✓ | ✓ | — |
 | Collections | ✓ | — | — |
 | Health | ✓ | — | — |
-| Switch Role | ✓ | ✓ | ✓ |
+| Users | ✓ | — | — |
+| Service keys | ✓ | — | — |
+| Username and role badge | ✓ | ✓ | ✓ |
+| Change password (button) | ✓ | ✓ | ✓ |
+| Log out (button) | ✓ | ✓ | ✓ |
 
 ### 7.3 Q&A Page
 
@@ -2247,16 +2538,25 @@ A retained session can be loaded/refreshed by its session ID, including when its
   to the selected collection; a late answer for another one is ignored.
 - "Include the models" checkbox, labelled with the ~2.3 GB cost and when it is
   needed.
-- Progress while the job runs, then the filename, size, fidelity, whether models
-  were bundled and whether `retrieve.py` was generated. Warnings from the job are
+- "Encrypt with a passphrase" checkbox (#27). Checked, it shows a passphrase field
+  and a confirmation field; Export stays disabled, with a hint naming the unmet
+  rule, until the passphrase has 12 to 1024 characters and both fields match. The
+  passphrase is sent only when the box is checked, is kept only in the page's
+  state, and both fields are cleared once the export has started.
+- Progress while the job runs, then the filename, size, fidelity, whether it is
+  encrypted, whether models were bundled and whether `retrieve.py` was generated. Warnings from the job are
   shown in full. A failed export shows its `error_code` (for example
   `EMBEDDING_MISMATCH`) before the error, as the import half does.
 
 **Import elements:**
 
 - Package selector listing `GET /packages`, each entry showing the collection,
-  chunk count, fidelity and size. Unreadable files are listed too, marked as
-  such, so nothing silently disappears. A failed `GET /packages` shows "Could not
+  chunk count, fidelity and size, or "encrypted" and the size for an encrypted
+  package. Unreadable files are listed too, marked as such, so nothing silently
+  disappears.
+- A passphrase field when the selected package is encrypted (#27); Import stays
+  disabled until it is filled. The passphrase is sent only for an encrypted
+  package and the field is cleared once the import has started. A failed `GET /packages` shows "Could not
   list the packages in ./exports:" with the reason, instead of the empty-folder
   hint; the last list loaded stays, and the next good load clears the message.
 - `on_conflict` radio group — `abort`, `rename`, `replace` — each with its
@@ -2290,6 +2590,40 @@ nothing and Tailwind's preflight has already stripped heading styling, so the
 page renders as one undifferentiated block.
 
 ---
+
+### 7.12 Users Page (#25)
+
+**Route:** `/users`  
+**Roles:** Engineer only (others are sent to `/qa`)
+
+- A table of every account from `GET /auth/users`: username (the engineer's own marked "(you)"), a role selector,
+  Enabled or Disabled, the password state ("Change due" or "Set"), and the creation date. If the list can't be
+  loaded the page says "Could not load the users:" with the reason, as an alert.
+- A form with username, role (End User by default) and "Create user". The username rule is shown under it.
+- Each row: changing the role selector sends the role change; "Disable" or "Enable"; and "Reset password", except
+  on the engineer's own row, which says to use Change password instead.
+- After a create or a reset, a panel shows the username and the generated password, says it is shown only once and
+  must be changed at first login, and has "Done", which removes it. The password is kept only in the page's memory.
+- A refused change shows the API's message as an alert and reloads the list. After a change to the engineer's own
+  account the UI re-reads `GET /auth/me`: a demoted engineer leaves the page, a disabled one is logged out.
+
+### 7.13 Service Keys Page (#25)
+
+**Route:** `/service-keys`  
+**Roles:** Engineer only (others are sent to `/qa`)
+
+- A short explanation: a principal is an account for a program that can't log in; its keys are sent as
+  `Authorization: Bearer <key>` and can do what its role allows, except manage accounts or keys; rotating is
+  issuing a new key, switching the service over, then revoking the old one.
+- A form with name, role (End User by default) and "Create principal". The name rule is shown under it.
+- Each principal from `GET /auth/service-principals` in its own section: its name, a role selector that sends the
+  role change, Enabled or Disabled, and "Disable" or "Enable"; a form to issue a key (label, optional; lifetime in
+  days, 90 by default, 1-365; "Issue key"); and a table of its keys: id, label, created, expires, last used
+  ("never" when empty), status (Active, Expired, Revoked), and "Revoke" on active keys only.
+- After issuance a panel shows the principal's name and the key, says it is shown only once and is sent as
+  `Authorization: Bearer <key>`, and has "Done", which removes it. The key is kept only in the page's memory.
+- A refused change shows the API's message as an alert and reloads the list; a list that can't be loaded says
+  "Could not load the service principals:" with the reason.
 
 ## 8. Configuration Defaults and Constraints
 
@@ -2333,6 +2667,22 @@ Optional telemetry (#282) is configured by API container environment settings, n
 | `RAG_OTEL_INTERVAL_MS` | `5000` | Integer 1000–60000 |
 | `RAG_OTEL_SHUTDOWN_MS` | `3000` | Integer 100–30000 |
 
+Authentication (#25) has two API container settings:
+
+| Setting | Default | Accepted values |
+|---|---|---|
+| `AUTH_COOKIE_SECURE` | `false` | Exactly `true` or `false`; anything else fails API startup. `true` marks the session cookie `Secure`, for a stack served over TLS (LAN mode sets it, #26); leave `false` on the loopback HTTP profile |
+| `AUTH_DIR` | `/app/auth_data` | The folder of `auth.db`, the `auth_data` volume |
+
+LAN mode (#26, §2.5) adds one API container setting and two read by `docker-compose.lan.yml` from the shell or
+`.env`:
+
+| Setting | Default | Accepted values |
+|---|---|---|
+| `RAG_LAN_MODE` | `false` | Exactly `true` or `false`; anything else fails API startup. `true` only through `docker-compose.lan.yml`; then the API refuses to start unless `AUTH_COOKIE_SECURE` is `true` and an enabled human AI Engineer exists |
+| `RAG_LAN_HOSTNAMES` | empty | Comma-separated DNS names and IP addresses for the self-signed certificate; required unless `proxy/certs` holds `cert.pem` and `key.pem` |
+| `RAG_LAN_PORT` | `443` | The host port of LAN mode's TLS publication, on every interface |
+
 ---
 
 ## 9. File and Directory Structure
@@ -2359,8 +2709,12 @@ rag-docker/
 ├── package.sh                  # Source-only zip (~1.3 MB; target needs internet)
 ├── package-offline.sh          # Self-contained bundle (~4.6 GB; no network needed)
 ├── install-offline.sh          # Installs from that bundle on an air-gapped Mac
+├── docker-compose.lan.yml      # LAN mode, opt-in (#26)
 ├── proxy/
-│   └── nginx.conf
+│   ├── nginx.conf              # Default server: HTTP, container port 80
+│   ├── nginx.lan.conf          # LAN mode: TLS, container port 443
+│   ├── locations.conf          # The routes, included by both
+│   └── certs/                  # Bring-your-own LAN certificate (ignored by git but .gitkeep)
 ├── ollama/
 │   └── entrypoint.sh            # Starts server, pulls models, waits
 ├── api/
@@ -2370,7 +2724,16 @@ rag-docker/
 │   ├── requirements.txt        # Generated lock (pinned); installed by the build
 │   ├── main.py                  # FastAPI app entry point
 │   ├── utils.py                 # Shared helpers (api_error response factory)
+│   ├── auth/                    # Accounts, sessions, service keys, the role matrix (#25)
+│   │   ├── __main__.py          # The operator command, python -m auth
+│   │   ├── passwords.py         # Username/password rules, scrypt hashing
+│   │   ├── keys.py              # Service API key format (rag_<id>_<secret>)
+│   │   ├── store.py             # SQLite accounts, principals, keys, sessions, login throttle
+│   │   ├── policy.py            # The endpoint/role matrix
+│   │   ├── middleware.py        # Enforces it before a route runs
+│   │   └── testing.py           # Real sessions for in-process tests
 │   ├── routers/
+│   │   ├── auth.py              # /auth/status, login, logout, me, password, users, service principals
 │   │   ├── health.py
 │   │   ├── collections.py
 │   │   ├── ingest.py
@@ -2391,6 +2754,7 @@ rag-docker/
 │   │   ├── retrieval_config.py  # Per-collection retrieval settings (atomic JSON)
 │   │   ├── settings_store.py    # Shared serialized settings publication
 │   │   ├── packager.py          # Package format: naming, digests, manifest, reader
+│   │   ├── age_stream.py        # Streaming age passphrase encryption of packages (#27)
 │   │   ├── exporter.py          # Export job lifecycle and the per-collection guard
 │   │   ├── jobstore.py          # Job records that survive an API restart
 │   │   ├── importer.py          # Import job: validation order, conflicts, atomicity
@@ -2411,6 +2775,8 @@ rag-docker/
 │   │       ├── fidelity_table.md
 │   │       ├── naming.md
 │   │       └── retrieve_usage.md
+│   ├── lan_mode.py              # LAN mode's startup refusal (#26)
+│   ├── tls_cert.py              # LAN mode's certificate step, `python -m tls_cert` (#26)
 │   └── config.py                # Environment variable config
 ├── ui/
 │   ├── Dockerfile
@@ -2423,10 +2789,12 @@ rag-docker/
 │   │   ├── App.tsx
 │   │   ├── router.tsx
 │   │   ├── context/
-│   │   │   ├── RoleContext.tsx
+│   │   │   ├── AuthContext.tsx      # The user and role, from GET /api/auth/me
 │   │   │   └── QueryConfigContext.tsx
 │   │   ├── pages/
-│   │   │   ├── LandingPage.tsx
+│   │   │   ├── LoginPage.tsx
+│   │   │   ├── SetupRequiredPage.tsx
+│   │   │   ├── ChangePasswordPage.tsx
 │   │   │   ├── QAPage.tsx
 │   │   │   ├── ImportPage.tsx
 │   │   │   ├── ChunkingPage.tsx
@@ -2435,10 +2803,11 @@ rag-docker/
 │   │   │   ├── TransferPage.tsx
 │   │   │   ├── HelpTransferPage.tsx
 │   │   │   ├── CollectionsPage.tsx
-│   │   │   └── HealthPage.tsx
+│   │   │   ├── HealthPage.tsx
+│   │   │   ├── UsersPage.tsx          # Engineers manage accounts (#25)
+│   │   │   └── ServiceKeysPage.tsx    # Engineers manage service principals and keys (#25)
 │   │   ├── components/
 │   │   │   ├── NavBar.tsx
-│   │   │   ├── RoleGate.tsx
 │   │   │   ├── CitationsPanel.tsx
 │   │   │   ├── ProgressPanel.tsx
 │   │   │   ├── StrategyExplainer.tsx
@@ -2861,9 +3230,12 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       released after A→B→A, two queries in flight released latest first, a second Ctrl+Enter
       while loading, an answer and an error on screen when the collection changes, and Ask
       used on B while A is still in flight. All eight checks fail on the code before #511.*
-- [x] Role selection persists across page navigation within same browser session.
+- [x] Logging in through the login page opens `/qa` as the account's role; the session is an HttpOnly, `SameSite=Strict` cookie that page scripts can't read, nothing about the user is kept in browser storage, the session persists across navigation and reloads, and Log out ends it at the API and returns to the login page (#25).
+      *Evidence: `scripts/verify/browser/ui_criteria.js` (suite 06) logs in with the harness's engineer through the form against the real API, and checks the cookie, storage, navigation and logout.*
+- [x] Login page, setup-required page, forced and voluntary password change, the API's messages for a failed or throttled login, and the return to the login or password page on `401 AUTH_REQUIRED` or `403 PASSWORD_CHANGE_REQUIRED` (#25).
+      *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request interception.*
 - [x] End User role shows only the Q&A page in navigation.
-      *Nav shows only Q&A, and `/collections` redirects to `/qa`.*
+      *Nav shows only Q&A, and `/collections` redirects to `/qa`; the API refuses those pages' requests too (§10.6).*
 - [x] Citations toggle correctly hides/shows citation panel.
       *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06) answers `POST /query` by request
       interception and checks that the box starts unchecked and the query sends
@@ -2951,7 +3323,7 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Job records persist under `{UPLOAD_DIR}/jobs/{kind}/`: status changes and terminal records are written at once and atomically, progress at most once a second but never left unwritten, a failed write never fails the job, startup marks jobs left `queued` or `running` as interrupted, unreadable records are kept and logged, and the newest 200 per kind are kept, at startup and while the API runs, never removing an unfinished job (#23, #309). The first record is written off the event loop, and a start cancelled during it leaves no record or guard (#309).
   *Evidence: `test_jobstore.py` (35 cases in the API image, run by `02_ingest.sh`), including a real lifespan run over a stored running job, the four job starts and their cancellation, retention ordered by real writes, an abandoned first write that fails, a second export start waiting for the first one's record (#326), and that wait's error paths and its bound with `EXPORT_STARTING` (#338); with `RAG_ALLOW_RESTART=1`, live restarts of ingest (`partial` and `failed`), export and import jobs.*
 
-- [x] At startup, before the first request, what a killed job left behind is removed (#377): an interrupted ingest's upload staging (`{UPLOAD_DIR}/ingest-*`), and an interrupted export's `.build-*` directory and `.<stem>.tar.gz.partial` archive in `EXPORTS_DIR`. Only those names at the top of each folder, and only a real directory or regular file as the name says, are removed: completed packages, look-alike names and anything in a sub-folder are kept, and a symlink is never followed. What is removed is logged by name and size; a removal that fails is logged and not reported as removed. An export sweep that fails is logged and startup carries on, with the ingest staging still swept (#423).
+- [x] At startup, before the first request, what a killed job left behind is removed (#377): an interrupted ingest's upload staging (`{UPLOAD_DIR}/ingest-*`), and an interrupted export's `.build-*` directory and `.<stem>.tar.gz.partial` archive (`.<stem>.tar.gz.age.partial` for an encrypted export, #27) in `EXPORTS_DIR`. Only those names at the top of each folder, and only a real directory or regular file as the name says, are removed: completed packages, look-alike names and anything in a sub-folder are kept, and a symlink is never followed. What is removed is logged by name and size; a removal that fails is logged and not reported as removed. An export sweep that fails is logged and startup carries on, with the ingest staging still swept (#423).
   *Evidence: `test_startup_sweep.py` (13 cases in the API image, run by `02_ingest.sh`), including a real lifespan run that removes both kinds and logs them, and one whose export sweep raises: the error is logged, the API still starts and the ingest staging is removed (#423). With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` checks that its two killed ingests' `ingest-*` staging existed before the restart and is gone after it (#423), and `05_transfer.sh` that the killed export's build directory and temporary archive are gone after its restart, with the completed package kept.*
 
 
@@ -2978,6 +3350,10 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *Evidence: `scripts/tests/test_package_listing.py` in the built API image with `--network none` (suite 05): a package cut off after its manifest still lists, listing reads under 1 MiB of a package carrying 8 MiB after its manifest, an oversized manifest is refused unread, a manifest of exactly 16 MiB lists while one byte more is refused, and seven kinds of unreadable file are each listed `readable: false`; its cut-off, bytes-read, oversized-manifest, JSON-array and archive-order checks fail on the code before #383. `validate_package.py` checks a real export puts the manifest first, and suite 05 checks that `GET /packages` lists that export as readable with its collection, chunk count, fidelity and creation time.*
 - [x] `GET /packages` lists a package whose manifest has a wrongly typed listed value (`collection` not an object, `name`, `fidelity` or `created_at` not a string, `chunk_count` not an integer) as `readable: false` with null metadata, never coercing it, and still answers 200; a `null` or absent value is listed as `null` (#451).
       *Evidence: `scripts/tests/test_package_listing.py` in the built API image with `--network none` (suite 05): eight wrongly typed manifests are each listed `readable: false` beside a readable package, and `collection: null` and absent values list as `null`; both checks fail on the code before #451 (the listing answered 500).*
+- [x] Export with a `passphrase` writes `<stem>.tar.gz.age`, an age v1 scrypt (passphrase) file at work factor 18 that the same passphrase decrypts to the package an unencrypted export would write, with no unencrypted archive written and the package streamed in 64 KiB chunks; the README and `retrieve.py` name the `.age` file; a passphrase outside 12 to 1024 characters is refused 422 without being echoed; export and import jobs report `encrypted` and never hold the passphrase; `GET /packages` lists an encrypted package with `encrypted: true` and null metadata, without scrypt (#27).
+      *Evidence: `scripts/tests/test_export_encryption.py` in the built API image with `--network none` (suite 05): the age module passes every applicable C2SP CCTV age vector (vendored in `scripts/tests/fixtures/age-testkit`) and an independent decryption written from the age specification, and runs an encrypted export and two imports through the router with tracing on to check no span or telemetry log record holds the passphrase; suite 05 exports the transfer collection encrypted, checks the file header and work factor, validates the decrypted package with `validate_package.py` and checks the listing entry; `browser/transfer_page.js` (suite 06) checks the passphrase rules, what the page sends and that it clears the fields.*
+- [x] Import of a `.tar.gz.age` package decrypts it as a stream while unpacking it, checking each member before extraction and authenticating the file to its end; a wrong passphrase, a damaged or truncated file or a scrypt work factor above 20 (refused before any key derivation) fails the job `DECRYPT_FAILED` (with `error_detail.reason`) and a file without a valid age passphrase header `PACKAGE_UNREADABLE`, before any collection, marker, setting or session is touched and with the package file unchanged; an encrypted package without a passphrase is refused 400 `PASSPHRASE_REQUIRED` and a passphrase for any other package 400 `PASSPHRASE_NOT_EXPECTED`, before any job (#27).
+      *Evidence: `scripts/tests/test_export_encryption.py` (suite 05) through `packager.open_package`, `importer._run` and the API; suite 05 imports the encrypted export with a wrong passphrase against the existing collection (`replace`) and checks the collections, their counts, the package file and the import work directories are unchanged, checks both 400 refusals, then imports it with the right passphrase (`rename`) with every chunk.*
 - [x] `GET /ingest/config` returns `is_default: true` for a collection with no saved config; `is_default: false` after saving one.
 - [x] `GET /retrieval/config/{collection}` answers 200 with the defaults and `is_default: true`, and logs a warning naming the collection, when the saved file can't be read, isn't JSON, holds JSON that isn't an object, has a field the response can't carry (a wrong type, a fractional or nested `top_k`, a `NaN` or infinite `alpha`) or holds the response-only key `is_default`; missing fields are filled from the defaults, and coercible and out-of-range values are still served as saved (#439, #477).
       *Evidence: `RetrievalConfigFileTests` in `scripts/tests/test_api_paths.py`, in the built API image with `--network none` (suite 01, through `16_api_paths.sh`), sends each saved file through the app; its non-object, wrong-type and fractional or nested checks fail on the code before #439, and its non-finite `alpha` and `is_default` checks fail on the code before #477.*
@@ -2986,6 +3362,18 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       weaviate publish nothing; ollama and ui expose container ports only.*
 - [x] Docker Engine is 28.0.0 or newer; older engines are outside the supported localhost-isolation profile. The infrastructure suite checks the daemon version.
 - [x] Resolved Compose configuration and live Docker bindings contain exactly one published TCP port, on the proxy at host address `127.0.0.1`, targeting container port 80. A missing or all-interface host address fails verification. A different free host port preserves loopback and matches `RAG_EXPECTED_PROXY_PORT` (default `8080`); verified at `18080` on a disposable deployment.
+- [x] LAN mode is opt-in (#26, §2.5): only `docker-compose.lan.yml` turns it on; with it the proxy publishes exactly one port, `0.0.0.0:443->443/tcp` (`RAG_LAN_PORT` changes the host port), nothing on port 80; the api runs with `RAG_LAN_MODE=true` and `AUTH_COOKIE_SECURE=true`; `tls-init` runs in the API image and the proxy waits for it to complete successfully; nginx's LAN configuration and the certificate volume are mounted read-only. Without the override the default publication and routes are unchanged.
+  *Evidence: `scripts/verify/lan_config.py` (suite 18, every run) resolves the real override with `docker compose config`, starting nothing, at the default port and at `RAG_LAN_PORT=8443`; suite 01's binding checks still pass on the base file.*
+- [x] With `RAG_LAN_MODE=true` the API exits 1 before any other import, startup work or request, with exactly one `LAN mode refused:` line on standard error and no traceback, when `AUTH_COOKIE_SECURE` isn't `true` (checked first) or no enabled human AI Engineer exists (an End User, a Developer, a disabled Engineer or an engineer-role service principal doesn't count); `RAG_LAN_MODE` accepts exactly `true` or `false` (#26).
+  *Evidence: `scripts/tests/test_lan_mode.py` in the built API image with `--network none` (suite 18), including `import main` in a subprocess for each refusal and an AST check that `lan_mode.enforce()` is `main.py`'s first statement; in a `stack.sh run --lan`, one-off api containers of the LAN configuration refuse with `AUTH_COOKIE_SECURE=false` and with an empty account store while the running project stays healthy.*
+- [x] LAN mode's nginx serves one TLS server on container port 443 with HTTP/2, TLS 1.2 and 1.3 only, Mozilla's intermediate ciphers, no session tickets and no HSTS header, routing exactly as the default server through the shared `locations.conf` (#26).
+  *Evidence: `test_lan_mode.py` checks both configurations; in a `stack.sh run --lan`, suite 18 checks that TLS 1.2 and 1.3 connect, TLS 1.1 is refused and ALPN picks `h2`, that the only live binding is `127.0.0.1:<verify port>->443/tcp` and plain HTTP to it gets no API answer, and that a cookie-authenticated change over HTTPS from `https://localhost:<port>` is accepted and from another origin refused `403 CROSS_ORIGIN_REFUSED`.*
+- [x] The certificate step uses `proxy/certs/cert.pem` and `key.pem` when both are present, refuses one alone, an unparsable file or a non-matching key, and warns on an expired certificate; otherwise it generates a self-signed certificate for `RAG_LAN_HOSTNAMES` plus `localhost` (refusing an empty value or an invalid entry), valid 825 days, reused until it is unreadable, mismatched, expired, names other hosts or replaces removed bring-your-own files; the pair is switched atomically with the key at mode 0600 (#26).
+  *Evidence: `test_lan_mode.py` (suite 18) covers each case and a failed write; in a `stack.sh run --lan`, suite 18 verifies `/api/health` over HTTPS against the generated certificate with the name `localhost` and checks its names and 825-day validity.*
+- [x] In LAN mode a login over HTTPS sets the session cookie `Secure`, `HttpOnly` and `SameSite=Strict` (#26, #25 Q12).
+  *Evidence: `lan_stack.py cookie` in a `stack.sh run --lan` (suite 18).*
+- [x] The verify project runs LAN mode only on loopback: `stack.sh run --lan` comes up in the default configuration, creates the first Engineer, then switches to `docker-compose.lan.yml` plus the harness's `docker-compose.lan.verify.yml` (TLS on `127.0.0.1:<verify port>`), whose guard rule (c) wants exactly `proxy:127.0.0.1:<port>->443/tcp` (#26).
+  *Evidence: `scripts/tests/test_verify_stack.py` (the LAN guard rule and its refused variants, the `--lan` argument refusals and the Docker calls of `up --lan` in order); the `stack.sh run --lan` on the #26 pull request.*
 - [x] Optional OpenTelemetry foundation (#282, #356): disabled by default with no providers, exporters or file reads; an invalid enabled configuration (§8), including a `RAG_OTEL_HEADERS_FILE` or `RAG_OTEL_CA_FILE` that is not a regular file, fails startup with field-only errors, its bounds accepted at their edges and refused beyond them; private providers leave the global OTel providers and root logging unchanged; only schema-approved fields reach OTLP; bounded queues, one-attempt export and bounded lifecycle waits keep a collector that answers with an error, refuses the connection or hangs from holding application work; an optional `RAG_OTEL_CA_FILE` is validated at startup and is the only trust store for HTTPS export when set.
   *Evidence: `scripts/tests/test_telemetry.py` in the built API image with `--network none` (suite 01) against loopback OTLP receivers, including an HTTPS receiver signed by a test-generated private CA; `scripts/tests/test_telemetry_implementation.py` keeps the embedded copies in step.*
 - [x] Every API error answers in the JSON envelope (#373): an unknown route `404 NOT_FOUND`, a wrong method `405 METHOD_NOT_ALLOWED` with its `Allow` header, and an unhandled error `500 INTERNAL_ERROR`. `GET /collections` answers 503 `SERVICE_UNAVAILABLE` when Weaviate can't be read, a missing or unreadable help template answers 500 `HELP_RENDER_FAILED`, and `CREATE_FAILED` and `DELETE_FAILED` send a fixed message with `detail` `null`. In each case the cause is logged, not returned. A help template that fails to render (`RuntimeError`) answers 500 `HELP_RENDER_FAILED` with its own message, and other HTTP errors (FastAPI's 400 for a body it can't parse) keep FastAPI's own `{"detail": ...}` answer (#411).
@@ -2994,6 +3382,51 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   *Evidence: `scripts/tests/test_package_archives.py`, run on the host by suite 01 as the check `Distribution archives hold only the tracked files of HEAD (#384)`, runs both scripts in a scratch git repository with `docker` stubbed: untracked and ignored files and an uncommitted edit stay out of the zip and the offline bundle, executable bits are kept, both scripts refuse in an extracted copy and in a subdirectory of a checkout before calling docker, and a checkout reached through a symlink is not refused. The scratch repository and both scripts read no system or global git config, checked with a global config whose failing hook and `export-ignore` attributes would otherwise break or change the result (#447).*
 - [x] Every pull request to `develop` or `main` runs the verification suite in CI (#24): `.github/workflows/verify.yml` on `ubuntu-latest`, with `RAG_SKIP_SLOW=1`, on the disposable verify project (`stack.sh up`, `all.sh`, `stack.sh down`, never `RAG_VERIFY_LIVE`). It always uploads the compose logs as an artifact and caches the Ollama models under a key built from the model names `ollama/entrypoint.sh` pulls. It runs with `contents: read` only and no secrets, and pins every action, all GitHub's own, to a full commit SHA. The README shows its status badge.
   *Evidence: `scripts/tests/test_ci_workflow.py`, run on the host by suite 01 as the check `the CI workflow runs the verify suite on every pull request (#24)`, checks the trigger, permissions, pins, step order, the always-run logs, upload and teardown, the cache key and save conditions, the badge and the embedded copies; it fails on the code before #24. The workflow's own run on the #24 pull request is its first execution.*
+
+### 10.6 Authentication (#25)
+
+- [x] Every route but `GET /health`, `GET /auth/status` and `POST /auth/login` answers `401 AUTH_REQUIRED` without a session, downloads and job polling included, and each role gets `403 FORBIDDEN` exactly on the routes above it in the §3.1.8 matrix, whatever the UI shows.
+  *Evidence: `scripts/tests/test_auth_enforcement.py` in the API image (suite 17), which fails on the code before #25; `auth_stack.py matrix` for no session and each harness role on the running stack (suite 17), against the matrix written out in the check, not read from the API; `test_auth.py` checks that every app route has exactly one policy entry and every entry a route, and that a route without one is refused.*
+- [x] Before bootstrap every protected route and the login answer `503 SETUP_REQUIRED`; `bootstrap` works once and is then refused; `create-user` is refused before it; generated passwords are printed alone on standard output and must be changed at first login, when only the session routes answer; the last enabled engineer can't be disabled or demoted; usage errors exit 2.
+  *Evidence: `test_auth.py` (store and `python -m auth` in a subprocess); suite 17 on the stack: `bootstrap` refused, forced change on created accounts.*
+- [x] Login, `GET /auth/me` and logout; the cookie's attributes; a session survives an API restart (with `RAG_ALLOW_RESTART=1`) and ends after 12 hours idle or 7 days; a password reset or disable ends the user's sessions at once, and a role change applies to an existing session's next request; the own password change needs the current password, follows the rules, and ends the user's other sessions.
+  *Evidence: `test_auth.py` (expiry with a patched clock); suite 17 on the stack, with throwaway `vfy-t-*` accounts and a session aged in the store.*
+- [x] A cookie-authenticated change from another origin, or with neither `Origin` nor `Sec-Fetch-Site: same-origin`, is refused `403 CROSS_ORIGIN_REFUSED`; the API sends no `Access-Control-*` headers; every login failure is the same `401 LOGIN_FAILED`; five failures for a username and address within 15 minutes throttle the pair for 15 minutes, for unknown usernames too, attempts are counted before they are checked, a wrong current password on `POST /auth/password` counts too, and the throttle survives a restart; a path with a control character (`%0A`) is refused `404` before its body is read; a password change to the current password is refused; the API log has one line per login and no password or session token.
+  *Evidence: `test_auth.py`; suite 17 on the stack; suite 01's CORS check.*
+- [x] The verify harness gets its test credentials without committing, printing or passing them on a command line or in the environment: one account per role, generated passwords replaced at first login, kept in a 0600 file in a 0700 folder of the user's own outside the checkout, with the operator command run only on the verify project.
+  *Evidence: `scripts/tests/test_verify_auth.py` on the host (suite 17); `auth_stack.py no-secrets-logged`.*
+- [x] Only engineers reach the account administration routes. Creating an account checks the username rule and
+  uniqueness and gives a generated password, shown once (`Cache-Control: no-store`) and to be changed at first
+  login; a reset does the same, ends the user's sessions, and is refused for the engineer's own account; a role
+  change applies to an existing session's next request; disabling ends the user's sessions and refuses their login,
+  and enabling restores it; the last enabled engineer can't be demoted or disabled, also by themselves; no route
+  deletes an account; each change and refusal is one API log line with no password.
+  *Evidence: `test_auth.py` `AdminRouteTests` and the policy checks (suite 17); `auth_stack.py matrix` with the six
+  routes for every role and `auth_stack.py admin-accounts` on the running stack, with a throwaway `vfy-t-*`
+  account and the API log searched for the generated passwords (suite 17). These checks fail on the code before
+  PR 2 of #25, which has no such routes.*
+- [x] The Users page: an engineer-only nav link and route; the account list; create and reset show the generated
+  password once until "Done"; no reset on the own row; role change, disable and enable; a refusal's message.
+  *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request
+  interception; `ui_criteria.js` checks the real engineer's nav includes Users.*
+- [x] Service keys: only engineers' sessions reach the principal and key routes; a key is issued only to a service
+  principal, shown once (`Cache-Control: no-store`) and stored only as its SHA-256; a principal can't log in; a key
+  works only as `Authorization: Bearer`, with its principal's current role and no `Origin`, and never on account,
+  principal or key administration, logout or password change; a header decides even with a cookie; rotation keeps
+  the old key until it is revoked or expires; revoked, expired, unknown and malformed keys and keys of a disabled
+  principal get `401 KEY_INVALID`; a key in a URL is no credential; expiry is 1-365 days, 90 by default; principals
+  share the name pool and don't count for the last-engineer rule; the operator command lists principals, refuses
+  their password reset and issues no key; each change and refusal is one API log line, and no key reaches the log.
+  *Evidence: `test_auth.py` `KeyFormatTests`, `KeyStoreTests`, `KeyMiddlewareTests`, `PrincipalRouteTests`, the
+  `CommandTests` principal case and the policy checks (suite 17); `test_auth_enforcement.py` with the seven routes;
+  `auth_stack.py matrix` with the seven routes for every role, `auth_stack.py key-matrix` with a key of each role,
+  and `auth_stack.py service-keys` on the running stack with throwaway `vfy-s-*` principals and the API log
+  searched for the keys (suite 17). These checks fail on the code before PR 3 of #25, which has no keys.*
+- [x] The Service keys page: an engineer-only nav link and route; the principals and their keys; create, role
+  change, disable and enable; issuance shows the key once until "Done"; revoke only on active keys; a refusal's
+  message.
+  *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request
+  interception; `ui_criteria.js` checks the real engineer's nav includes Service keys.*
 
 ---
 

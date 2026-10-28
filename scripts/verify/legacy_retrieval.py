@@ -17,7 +17,12 @@ import sys
 import tarfile
 import tempfile
 import time
+import os
 import urllib.request
+
+# The suite's session (#25); found beside this file however the file is loaded.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import auth_headers  # noqa: E402
 
 WARNING = ("saved retrieval setting ef={} is outside 16-512 and was exported as null; "
            "ef is no longer used. Save this collection's settings on the Retrieval "
@@ -33,7 +38,7 @@ def run(api, collection, exports, repo_root):
     def request(path, body=None):
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(api.rstrip('/') + path, data=data,
-                                     headers={'Content-Type': 'application/json'})
+                                     headers={'Content-Type': 'application/json', **auth_headers.headers()})
         with urllib.request.urlopen(req, timeout=60) as response:
             return json.load(response)
 
@@ -146,7 +151,8 @@ def run(api, collection, exports, repo_root):
     finally:
         if renamed:
             urllib.request.urlopen(urllib.request.Request(
-                api.rstrip('/') + f'/collections/{renamed}?confirm=true', method='DELETE'),
+                api.rstrip('/') + f'/collections/{renamed}?confirm=true', method='DELETE',
+                headers=auth_headers.headers()),
                 timeout=120).read()
         request('/retrieval/config', saved)
     print(f'{len(failures)} legacy/invalid retrieval settings check(s) failed')

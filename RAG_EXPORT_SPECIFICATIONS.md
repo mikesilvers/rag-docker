@@ -26,10 +26,11 @@ tune it there.
 | Gold-standard sessions | exported; invalidated on re-chunk | confirmed |
 | Duplicate documents | content-addressed, stored once per collection | **decided here** (§2.2) |
 | Sessions of a replaced collection | retained, marked orphaned, count reported | **decided here** (§8, rule 4) |
+| Encryption | optional, by passphrase, age v1 format (§4.6) | maintainer decision on #27 |
 
 ### Out of scope
 
-Incremental export, encryption, signing, merging two corpora into one
+Incremental export, signing, merging two corpora into one
 collection, migration to another vector store, and cross-version vector
 portability guarantees beyond those in §7.2.
 
@@ -181,6 +182,7 @@ saved settings are defaults, not a constraint.
 
 ```
 ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz
+ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz.age    (encrypted, §4.6)
 ```
 
 - `<collection-slug>`: stored collection name, lowercased, each run of characters
@@ -188,7 +190,8 @@ ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz
 - `<YYYYMMDDTHHMMSSZ>`: UTC, basic ISO 8601, no separators.
 - `<id8>`: first 8 lowercase hex of the manifest digest (§4.4).
 
-The archive MUST expand to a single directory of the same name minus `.tar.gz`.
+The archive MUST expand to a single directory of the same name minus `.tar.gz`
+(minus `.tar.gz.age` for an encrypted package, once decrypted).
 
 **The filename is a label, never an input.** The slug is lossy: it lowercases a
 name Weaviate capitalised, and two distinct collections can slug identically.
@@ -309,6 +312,48 @@ One JSON object per line:
 - Vectors are JSON numbers. A packed float32 sidecar was measured at only ~12%
   smaller after gzip and is rejected (`RAG_EXPORT_ANALYSIS.md` §6).
 
+### 4.6 Encryption (#27)
+
+A package exported with a passphrase is encrypted. Its plaintext is exactly the
+`.tar.gz` byte stream §4.1 to §4.5 describe; the file is an age v1 file
+(https://c2sp.org/age), binary (not armored), with exactly one `scrypt`
+(passphrase) recipient stanza, named `<stem>.tar.gz.age`. `age -d` opens it with
+the same passphrase.
+
+- **Encryption.** A random 16-byte file key, a random 16-byte scrypt salt, work
+  factor (log2 N) 18 with r=8 and p=1 (age's default), the file key wrapped with
+  ChaCha20-Poly1305, the header MAC, a random 16-byte payload nonce and the STREAM
+  payload in 64 KiB plaintext chunks with ChaCha20-Poly1305, all as the age
+  specification defines. The tar.gz writer streams through the encryptor into the
+  temporary file: no unencrypted archive is written, and only one chunk is held in
+  memory. The package's files are still staged unencrypted in
+  `./exports/.build-*` while the export runs (§6.1), removed when it ends or by
+  the next start-up's sweep; moving that staging out of the bind mount is a
+  follow-up.
+- **Decryption** accepts only a header that parses under the age grammar and
+  holds one stanza, of type `scrypt`, with a canonical 16-byte salt, a work
+  factor, and a 32-byte body. A work factor that is not one or two decimal digits
+  without a sign or leading zero is refused `DECRYPT_FAILED` (`reason`
+  `work_factor`) before it is converted, so no field length can cause an
+  unhandled error; a work factor
+  above 20 (about 1 GiB of scrypt memory; a maintainer decision on #27, below
+  age's own limit of 22, about 4 GiB) is refused `DECRYPT_FAILED` without
+  deriving anything, and at most one scrypt derivation runs at a time in the API.
+  The header MAC is checked before any plaintext is released, and every payload
+  chunk is authenticated before it is; a file that ends inside the payload nonce,
+  a truncated payload, a missing or
+  misplaced final chunk, or data after it fails.
+- **Passphrase.** 12 to 1024 characters, any characters, checked at export. It is
+  encoded as UTF-8; a passphrase that has no UTF-8 form (a lone surrogate, which
+  JSON can carry) is refused `422 INVALID_PARAMETER` by `POST /export` and
+  `POST /import` alike. It is never stored, logged, attached to telemetry or returned.
+- **Implementation.** `api/services/age_stream.py`, on `cryptography` (a direct
+  dependency since #27, at its locked version). It passes every applicable vector
+  of the C2SP CCTV age testkit, vendored in `scripts/tests/fixtures/age-testkit`.
+- **Listing.** No metadata is kept beside an encrypted package; `GET /packages`
+  lists it with `encrypted: true` and null metadata. A file that can't be read or
+  parsed is listed `readable: false`; it never fails the listing of the others.
+
 ---
 
 ## 5. The Retrieval Script
@@ -326,8 +371,9 @@ literals, and substitution MUST NOT interpret tokens inside inserted data.
 
 ### 5.1 Requirements
 
-1. **Standard library only.** `urllib.request`, `json`, `argparse`. Anything
-   needing `pip install` fails in the air-gapped case this project targets.
+1. **Standard library only.** `urllib.request`, `json`, `argparse` (and, for the
+   login, `getpass`, `os` and `urllib.parse`). Anything needing `pip install` fails
+   in the air-gapped case this project targets.
 2. **Targets the RAG API** (`POST /query`), not Weaviate and Ollama directly.
    Reimplementing the pipeline would drift from `rag_pipeline.py`.
 3. **Baked defaults, overridable by flags:**
@@ -342,6 +388,18 @@ python retrieve.py --timeout 900 "..."
    Defaults: collection and parameters from the package; `--api-url` defaults to
    `http://localhost:8080/api`; `--timeout` defaults to 600 seconds, because
    generation runs on CPU and a single answer was measured at 236 s.
+3a. **Logs in (#25).** The API needs an account. `--username` (default
+   `$RAG_USERNAME`) names it; the password is asked for with `getpass`, or read
+   from the first line of standard input with `--password-stdin`, and is never a
+   flag or an environment variable. The script logs in (`POST /auth/login`),
+   sends the query with the session cookie and an `Origin` matching
+   `--api-url`, and logs out. A refused login is exit `5`, quoting the API; so is
+   a query refused for want of a login (`AUTH_REQUIRED`, whose hint names
+   `--username`) or a password change due (`PASSWORD_CHANGE_REQUIRED`, whose
+   hint says to log in to the web UI once). `--password-stdin` without
+   `--username`, or an empty password, is `2`. Scripts in packages exported
+   before #25 send no login and get `AUTH_REQUIRED`; export again for one that
+   logs in.
 4. **Records its provenance** — the source manifest's `id8` and `created_at` in the
    script's `PACKAGE_METADATA` literal, beside `package_filename`, `embed_model` and
    `embed_dimensions`, so a script separated from its package can still be traced.
@@ -378,11 +436,22 @@ because nothing signals the discrepancy.
 Both are long-running and both follow the existing job-and-poll pattern used by
 `/ingest/upload`.
 
+**Who may call them (#25).** `POST /export`, `GET /export/job/{job_id}`, `POST /import`,
+`GET /import/job/{job_id}`, `GET /packages` and `GET /help/transfer` need the Developer role or
+higher; without a session they answer `401 AUTH_REQUIRED`, and for an End User `403 FORBIDDEN`
+(SPECIFICATIONS.md §3.1.8). A `with-sources` package carries the original documents, so any
+Developer can take every document out of a collection.
+
 ### 6.1 Export
 
 `POST /export` with `{"collection": "<name>", "include_models": false}` → `202`
 and `{"job_id": "..."}`. `GET /export/job/{job_id}` reports progress and, on
 completion, the written filename.
+
+- An optional `passphrase` (12 to 1024 characters) writes the package encrypted
+  (§4.6); one outside those bounds is refused `422 INVALID_PARAMETER` before any
+  job, without being echoed. The job reports `encrypted` and never holds the
+  passphrase (#27).
 
 - Export of a collection that does not exist fails immediately with
   `COLLECTION_NOT_FOUND`, before any job is created.
@@ -435,11 +504,17 @@ completion, the written filename.
 `POST /import` with `{"filename": "<name in ./exports>", "on_conflict": "..."}`
 → `202` + `job_id`.
 
+A package whose filename ends in `.tar.gz.age` is encrypted and needs
+`"passphrase"`: without one, the request is refused `400 PASSPHRASE_REQUIRED`;
+a passphrase sent for any other package is refused `400
+PASSPHRASE_NOT_EXPECTED`. Both are decided by the filename before any job is
+created (#27). The job reports `encrypted` and never holds the passphrase.
+
 Checks run in this order and stop at the first failure:
 
 | # | Check | On failure |
 |---|---|---|
-| 1 | File exists and is a readable `.tar.gz` | `PACKAGE_UNREADABLE` |
+| 1 | File exists and is a readable `.tar.gz`; for a `.tar.gz.age` package, it has a valid age passphrase header and decrypts with the passphrase (§4.6) | `PACKAGE_UNREADABLE`; `DECRYPT_FAILED` for a wrong passphrase, damaged or truncated encrypted data, or a work factor above 20 |
 | 2 | `manifest.json` present, `package_format` understood | `PACKAGE_FORMAT_UNSUPPORTED` |
 | 3 | Every `files` key is a normalised relative path inside the package, and every `files` digest matches | `PACKAGE_CORRUPT`, naming the file (`manifest.json` for a key outside the package) |
 | 3a | Retained-source index names only valid digest identities and matching regular blobs; every chunk's `source_sha256` is `null` or a digest of that index (#509) | `PACKAGE_CORRUPT`, naming `sources/index.json`, or `chunks.jsonl` and the line for a chunk's digest |
@@ -448,6 +523,17 @@ Checks run in this order and stop at the first failure:
 | 4b | Optional retrieval settings are a JSON object satisfying the API save schema, normalized with its defaults and numeric conversion | `PACKAGE_CORRUPT`, naming `retrieval_config.json` |
 | 4c | Optional ingest settings are a JSON object satisfying the API save schema, except the chunk bounds, normalized with its defaults and numeric conversion | `PACKAGE_CORRUPT`, naming `ingest_config.json` |
 | 5 | Collection name collision | resolved per `on_conflict` |
+
+Check 1 for an encrypted package decrypts it as a stream into the tar reader:
+each member is checked (no links, only files and directories, nothing outside
+the work directory) just before it is extracted, and once the archive ends the
+rest of the file is read and authenticated to its final chunk. No decrypted copy
+of the archive is written. A file that is not an age passphrase file is
+`PACKAGE_UNREADABLE`; a failure to decrypt is `DECRYPT_FAILED` with
+`error_detail.reason` `passphrase`, `header` (the header MAC), `payload` or
+`work_factor`. Either way nothing outside the job's work directory is touched,
+and every later check reads the decrypted files exactly as for an unencrypted
+package (#27).
 
 Check 3 checks every `files` key before it hashes anything (#371). A key that is
 empty, absolute, has a `..` component, isn't in normalised form (`./a`, `a//b`,
@@ -734,6 +820,10 @@ longer needed. Import never modifies or deletes the original package in `./expor
 
 ### 7.1 Available operations
 
+`POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex` and `GET /tune/job/{job_id}` need
+the AI Engineer role; `GET /tune/{collection}`, which the Transfer page reads, needs Developer (#25,
+SPECIFICATIONS.md §3.1.8).
+
 | Goal | Requires | Mechanism |
 |---|---|---|
 | Change mode / `top_k` / `alpha` | nothing | per-request on `POST /query`; persist via §3.2 |
@@ -840,8 +930,13 @@ Every package contains one, generated from the manifest so it cannot drift:
 - exact import steps for this package
 - how to run `retrieve.py`, or why it is absent
 - the embedding-model requirement, stated as a prerequisite
-- a plain statement that the package is **not encrypted** and may contain
-  sensitive documents
+- the encryption section (`partials/encryption.md`, #27): a package is encrypted
+  only when exported with a passphrase, as `.tar.gz.age`, which import and
+  `age -d` open with it; the passphrase can't be recovered and should travel
+  separately; a `.tar.gz` package is **not encrypted** and may contain sensitive
+  documents; decrypted or imported contents are plaintext again
+- the file as delivered, and for an encrypted package the `passphrase` in the
+  import request
 
 ---
 
@@ -876,7 +971,10 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 
 | Code | Meaning |
 |---|---|
-| `PACKAGE_UNREADABLE` | missing or not a readable archive |
+| `PACKAGE_UNREADABLE` | missing or not a readable archive, or a `.tar.gz.age` file that is not an age passphrase file |
+| `DECRYPT_FAILED` | an encrypted package could not be decrypted: wrong passphrase, damaged or truncated data, or a work factor above 20; `error_detail.reason` is `passphrase`, `header`, `payload` or `work_factor`; nothing is touched (#27) |
+| `PASSPHRASE_REQUIRED` | HTTP 400 from `POST /import`: a `.tar.gz.age` package without a passphrase; no job (#27) |
+| `PASSPHRASE_NOT_EXPECTED` | HTTP 400 from `POST /import`: a passphrase for a package that is not encrypted; no job (#27) |
 | `PACKAGE_FORMAT_UNSUPPORTED` | `package_format` newer than this instance |
 | `PACKAGE_CORRUPT` | digest mismatch, a manifest `files` key outside the package (check 3), invalid retained sources or a chunk naming a source the package lacks (check 3a), or invalid evaluation-session metadata (check 4a); names the file |
 | `EMBEDDING_MISMATCH` | model or dimensions differ; names both |
@@ -932,7 +1030,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E16 | Re-chunking and failed destructive cutover mark sessions under both supported first-character collection aliases `stale`; the reported count includes both spellings, and stored provenance is unchanged |
 | E17 | Re-chunking a `chunks-only`, partially retained or ambiguously retained collection (a name retained under more than one digest, or a name with more than one chunk set) fails `SOURCES_REQUIRED` before staging; re-embed with new chunking parameters uses the same coverage guard. A second name for the same retained content is covered: re-chunking emits one chunk set per (digest, name) pair, under the full logical name (#22). Only pairs whose name has stored chunks are rebuilt: a name the index lists without stored chunks is skipped, and the index keeps it (#311). When no listed name has stored chunks there is nothing to rebuild: the tuning options don't offer re-chunking and say why, and the request is refused up front, HTTP 409 `SOURCES_REQUIRED`, with no job (#328); a Weaviate error during that check answers HTTP 503 `SERVICE_UNAVAILABLE`, with no job (#340) |
 | E18 | `replace` reports the number of orphaned sessions |
-| E19 | Package `README.md` states the collection name, fidelity and encryption warning |
+| E19 | Package `README.md` states the collection name, fidelity and file name as delivered, and carries the encryption section (the "Encryption" heading, the `.tar.gz.age` form and that a `.tar.gz` package is not encrypted) (#27) |
 | E20 | `docker compose up -d` still starts five services, with `./exports` mounted |
 | E21 | Importing a `with-models` package into an instance lacking the embedding model installs it and it appears in `ollama list` |
 | E22 | Importing a package without bundled models into such an instance fails `EMBEDDING_MODEL_MISSING` |
@@ -950,11 +1048,16 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E34 | A model is bundled whole or not at all: when any of its files can't be copied, none of its files stay in the package or its `files` map, it is left out of `bundled_models`, and a warning names it, while another model before or after it is still bundled whole; when every model fails, the package has no `models/` folder and `models_bundled` is false. A model named for both embedding and the LLM, compared by name and tag (`x` and `x:latest`), is copied once (#449, #494), by `test_retrieval_import.py` |
 | E35 | Digest-valid malformed ingest settings (invalid JSON, a non-object, a wrong type or an invalid value) are refused `PACKAGE_CORRUPT`, naming `ingest_config.json`, before live mutation in all conflict modes, leaving the existing collection's settings unchanged; valid settings, including ones with missing or unknown fields, numeric strings and a `chunk_size`/`min_chunk_size` from before the chunk bounds, import and `GET /ingest/config/{collection}` returns them for the import target (#510), by `test_retrieval_import.py` |
 | E36 | An export holds its collection's writer guard for its whole run: a re-ingest that tries to commit mid-export waits, and the package holds the old chunks with the old source bytes, every non-null `source_sha256` naming a blob in it; gold-standard generation is refused `COLLECTION_BUSY` and guarded writers wait meanwhile; an export started while another writer holds the guard reads `queued`; the guard is released when the export completes, fails or is cancelled (#509); a cancelled export ends `failed` with an `error` saying so, and the cancellation still propagates (#521), by `test_export_snapshot.py` |
+| E37 | An export with a `passphrase` writes `<stem>.tar.gz.age`, an age v1 scrypt file at work factor 18 whose decryption satisfies §4.1 to §4.5 and that the listing shows `encrypted: true` with null metadata; the export and import jobs report `encrypted` and hold no passphrase (#27), by `test_export_encryption.py` and suite 05 |
+| E38 | Importing an encrypted package with a wrong passphrase fails `DECRYPT_FAILED` (`reason` `passphrase`), and a damaged or truncated file fails `DECRYPT_FAILED` or `PACKAGE_UNREADABLE` and a scrypt work factor above 20 (21 included) or not one or two decimal digits (thousands of digits included) fails `DECRYPT_FAILED` before any key derivation; a file cut inside the payload nonce fails `DECRYPT_FAILED`, with no collection, marker, setting, session or package file changed and no work directory left; the right passphrase imports it with every chunk (#27), by `test_export_encryption.py` and suite 05 |
+| E39 | `POST /import` refuses an encrypted package without a passphrase `400 PASSPHRASE_REQUIRED` and a passphrase for any other package `400 PASSPHRASE_NOT_EXPECTED`, before any job; `POST /export` refuses a passphrase outside 12 to 1024 characters, and both refuse one with no UTF-8 form (a lone surrogate), `422 INVALID_PARAMETER` without echoing it; one bad encrypted file never fails `GET /packages` (#27) |
+| E40 | The age implementation passes every applicable C2SP CCTV age testkit vector, and its output decrypts with an independent decryption written from the age specification (#27), by `test_export_encryption.py` |
 
 ---
 
 ## 14. Deferred
 
-Incremental export, encryption and signing, corpus merging, cross-vector-store
+Incremental export, signing, key-pair (non-passphrase) encryption, encryption on
+by default (a follow-up for LAN access, #26), corpus merging, cross-vector-store
 migration, gold-standard remapping after re-chunk, and HTTP transport as an
 alternative to the mounted directory.

@@ -1,0 +1,12 @@
+age test vectors for api/services/age_stream.py (#27), used by
+scripts/tests/test_export_encryption.py.
+
+Copied unchanged from the C2SP Community Cryptography Test Vectors (CCTV),
+directory age/testdata, at commit 50a8ecf2a220f4c8bdc4f085789b8e85c26829e7:
+https://github.com/C2SP/CCTV/tree/50a8ecf2a220f4c8bdc4f085789b8e85c26829e7/age
+Each file's git blob hash was checked against that commit's tree. The age
+testkit README there says its licence allows copying the vectors without
+attribution; the testkit's code is under age/internal/LICENSE (BSD 3-clause).
+
+Left out: the ASCII-armored vectors (`armored: yes`, `expect: armor failure`),
+because packages are written and read unarmored only.

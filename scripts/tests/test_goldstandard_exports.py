@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from routers import goldstandard as route
 from services import goldstandard as gs
 
@@ -60,7 +61,7 @@ class ExportFileTests(unittest.TestCase):
         (self.root / "metrics.jsonl").write_bytes(METRICS)
         gs.store_session(session())          # also creates goldstandard_sessions/
         self.exports = self.root / gs.EXPORT_DIRNAME
-        self.client = TestClient(app)        # no startup sweeps
+        self.client = TestClient(app, headers=auth_testing.headers())        # no startup sweeps
 
     def snapshot(self):
         """Every entry under UPLOAD_DIR: file bytes, link targets, directories."""

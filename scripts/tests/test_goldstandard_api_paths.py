@@ -30,6 +30,7 @@ import httpx
 
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs
 from services import weaviate_client as wc
 
@@ -68,7 +69,7 @@ class ApiCase(unittest.IsolatedAsyncioTestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
-                                        base_url="http://test")
+                                        headers=auth_testing.headers(base_url="http://test"), base_url="http://test")
 
     async def asyncTearDown(self):
         for task in list(gs._tasks):

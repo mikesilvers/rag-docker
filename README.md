@@ -11,7 +11,7 @@ A self-contained, Dockerized Retrieval-Augmented Generation (RAG) platform. Uplo
 | Vector store | Weaviate 1.40.2 | Stores and retrieves document chunks |
 | LLM + embeddings | Ollama 0.3.14 | Runs phi3.5 (chat) and nomic-embed-text (embeddings) locally |
 | API | FastAPI + Python 3.11 | RAG pipeline, ingest, gold standard generation |
-| UI | React 18 + Vite + Tailwind | Three-role web interface |
+| UI | React 18 + Vite + Tailwind | Web interface with login and three roles |
 | Proxy | nginx 1.29 | Routes traffic; listens on port 80 in-container, published on host port 8080 |
 
 ## Prerequisites
@@ -21,7 +21,7 @@ A self-contained, Dockerized Retrieval-Augmented Generation (RAG) platform. Uplo
 - **20 GB disk minimum allocated to Docker, 32 GB recommended** — see [Storage requirements](#storage-requirements) below. Check your current limit before building — a small virtual disk (8 GB or so) cannot hold this stack, and the build fails partway through with a confusing error.
 - Port **8080** free on the host — `docker-compose.yml` publishes the proxy as `127.0.0.1:8080:80`, bound to host loopback on supported engines
 
-Check the daemon version with `docker version --format '{{.Server.Version}}'`. Docker documents that engines older than 28.0.0 allow same-network hosts to reach localhost-published ports; upgrade the engine before using this unauthenticated workbench. See [Docker port publishing](https://docs.docker.com/engine/network/port-publishing/#publishing-ports). This default assumes Docker's standard bridge/NAT configuration; custom direct-routing settings are outside this local profile.
+Check the daemon version with `docker version --format '{{.Server.Version}}'`. Docker documents that engines older than 28.0.0 allow same-network hosts to reach localhost-published ports; upgrade the engine before using this local workbench. See [Docker port publishing](https://docs.docker.com/engine/network/port-publishing/#publishing-ports). This default assumes Docker's standard bridge/NAT configuration; custom direct-routing settings are outside this local profile.
 
 No API keys, no cloud accounts, no Python or Node installs required on your machine.
 
@@ -71,7 +71,10 @@ docker compose up -d
 # 3. Watch Ollama download the models (first run only — ~5 minutes)
 docker compose logs -f ollama
 
-# 4. Open the UI once all services are healthy
+# 4. Create the first AI Engineer (first start only); it prints a one-time password
+docker compose exec api python -m auth bootstrap <username>
+
+# 5. Open the UI once all services are healthy, log in and choose a new password
 open http://localhost:8080       # macOS
 # or visit http://localhost:8080 in your browser
 ```
@@ -98,21 +101,304 @@ so the model wait begins several minutes in — the stack is not stuck.
 
 On subsequent starts everything is immediate: the images are built and the model weights are cached in the `ollama_models` Docker volume.
 
-## Roles
+## Accounts and roles
 
-The landing page asks you to choose a role. Role is stored in `sessionStorage` and persists across page refreshes within the same browser tab.
+Everyone logs in with their own account, and each account has one role (#25).
+The API enforces the role on every request; the UI only hides what the role
+can't use.
 
 | Role | Access |
 |---|---|
 | **End User** | Q&A only |
-| **Developer** | Q&A, Import, Chunking, Retrieval, Gold Standard |
-| **AI Engineer** | All of the above + Collections management + Health dashboard |
+| **Developer** | Q&A, Import, Chunking, Retrieval, Gold Standard, Transfer |
+| **AI Engineer** | All of the above + Collections management (deleting collections) + Health dashboard + tuning + Users (account management) + Service keys (API keys for programs) |
+
+Endpoint by endpoint (paths under `/api`):
+
+| Needs | Endpoints |
+|---|---|
+| nothing | `GET /health`, `GET /auth/status`, `POST /auth/login` |
+| any logged-in user | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password` |
+| End User | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
+| Developer | creating a collection; ingest (upload, job status, settings); saving retrieval settings; gold standard (generate, sessions, pairs, regenerate, save, download); export, import, their job status, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
+| AI Engineer | `DELETE /collections/{name}`; `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/job/{id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; the API docs (`/docs`, `/redoc`, `/openapi.json`); account management (`GET` and `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `/role`, `/disable`, `/enable`); service keys (`GET` and `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `/disable`, `/enable`, `/keys`, `/keys/{key_id}/revoke`) |
+
+Without a session the API answers `401 AUTH_REQUIRED`; with a role that is too
+low, `403 FORBIDDEN`. Programs use service API keys instead of a session
+([Service keys](#service-keys)). Jobs and gold-standard sessions belong to no particular
+user: anyone with the role may poll or open them.
+
+### Managing accounts
+
+An operator creates the first AI Engineer on the machine running the stack,
+with the `python -m auth` command in the api container. After that, AI
+Engineers manage accounts on the **Users** page: create an account, reset a
+password, change a role, disable and enable. The operator command stays
+available for the same changes and for recovery. There is no
+self-registration and no email recovery.
+
+```bash
+docker compose exec api python -m auth bootstrap <username>          # the first AI Engineer, once
+docker compose exec api python -m auth create-user <username> <role> # end_user, developer or engineer
+docker compose exec api python -m auth reset-password <username>
+docker compose exec api python -m auth set-role <username> <role>
+docker compose exec api python -m auth disable <username>
+docker compose exec api python -m auth enable <username>
+docker compose exec api python -m auth list
+```
+
+`bootstrap`, `create-user` and `reset-password` print a generated password once,
+on the terminal only; it is never logged. The user must change it at their
+first login, from the page the UI shows them. Usernames are 3-32 characters of
+lowercase letters, digits, `.`, `_` and `-` (case doesn't matter); passwords are
+12-256 characters, not the username, and a change must pick a password other
+than the current one. Passwords are stored only as scrypt hashes. The last
+enabled AI Engineer can't be disabled or demoted. If you are locked out of your
+account (a lost password, a disabled account), `create-user`, `enable` or
+`reset-password` gets you back in; these don't lift a login throttle (below),
+which ends by itself after 15 minutes.
+Disabling a user or resetting their password ends their sessions at once; a
+role change applies to their next request.
+
+On the Users page, creating an account or resetting a password shows the
+generated password once, to the AI Engineer, who passes it on; the user
+changes it at first login. An AI Engineer's own password is changed with
+"Change password" (it needs the current one), not reset on the Users page.
+Accounts are disabled, never deleted, so a username always means the same
+person. The last enabled AI Engineer can't be demoted or disabled here either.
+Each change made on the Users page is one line in `docker compose logs api`,
+naming the AI Engineer, the change and the account, never a password.
+
+### Sessions
+
+The browser keeps the session in an HttpOnly, `SameSite=Strict` cookie, which
+page scripts can't read. A session ends after 12 hours without a request or 7
+days after login, and survives an API restart and closing the browser. Five
+failed logins for a username from one address within 15 minutes throttle that
+pair for 15 minutes (`429 LOGIN_THROTTLED`); a wrong current password on the
+password-change page counts the same way. Every failure answers the same
+`LOGIN_FAILED`, whether or not the account exists. Behind Docker's port
+publishing every browser on the host may reach the API from the same address,
+so in practice the throttle is per username. A change (POST, PATCH, DELETE) sent with the cookie must
+come from this same origin, or it is refused `403 CROSS_ORIGIN_REFUSED`. Each
+login, success or failure, is one line in `docker compose logs api`, with the
+username and address and never the password.
+
+### Service keys
+
+Programs (a nightly import, a script, later the MCP server) call the API with a
+service API key instead of logging in. A key belongs to a **service
+principal**: an account for a program, with a name and one role (End User,
+Developer or AI Engineer), that can't log in to the browser. Keys are issued
+only to service principals, never to people.
+
+AI Engineers manage them on the **Service keys** page: create a principal,
+change its role, disable or enable it, issue keys and revoke them. A new key
+is shown once, on that page; the API stores only its SHA-256, so a lost key
+can't be shown again, only replaced. A key looks like `rag_<12-character id>_<43
+characters>`; the id names it in the list and in the log. Send it in the
+`Authorization` header, never in a URL:
+
+```bash
+curl -H "Authorization: Bearer $RAG_KEY" http://localhost:8080/api/collections
+```
+
+- A key can do what its principal's role allows at the time of each request: a
+  role change applies at once. It can't manage accounts, principals or keys,
+  log out or change a password, whatever the role (`403 KEY_NOT_ALLOWED`), so a
+  leaked key can't mint new credentials. `GET /auth/me` tells a program which
+  principal and role its key has.
+- Every key expires. Choose its lifetime in whole days when issuing it, 1 to
+  365, 90 by default. It can't be extended.
+- **Rotating** a key: issue a new key for the same principal, switch the
+  service over to it, then revoke the old one. Both keys work until then.
+- **Revoking** a key stops it at once. Revoked and expired keys stay listed and
+  never work again.
+- **Disabling** a principal stops all its keys until it is enabled again;
+  enabling makes its unrevoked, unexpired keys work again, so after a leak,
+  revoke the leaked key too. If no AI Engineer can log in, the operator command
+  can disable a principal: `docker compose exec api python -m auth disable <name>`.
+- An invalid, expired or revoked key, or one of a disabled principal, gets
+  `401 KEY_INVALID`. A request with an `Authorization` header is judged by that
+  header only, even if it also carries a session cookie. Key requests need no
+  `Origin` header.
+- Principals share the username rule and the name pool with people, and are
+  disabled, never deleted, so a name always means the same account. They don't
+  appear on the Users page. The operator command's `list` shows them as
+  `service account`; `set-role`, `disable` and `enable` work on them, and
+  `reset-password` refuses them (they have no password). The command can't
+  issue keys.
+- Each change on the Service keys page is one line in `docker compose logs api`,
+  naming the AI Engineer, the principal and the key id, never the key.
+
+### Calling the API from the command line
+
+Log in once with a cookie jar only you can read, then send the jar, and an
+`Origin` header for changes, with every request:
+
+```bash
+umask 077
+read -rs -p 'Password: ' RAG_PW; echo
+# printf is a shell builtin, so the password never appears in the process list.
+# (A password containing " or \ needs JSON escaping.)
+printf '{"username": "alice", "password": "%s"}' "$RAG_PW" \
+  | curl -s -c ~/.rag-session -H 'Content-Type: application/json' --data-binary @- \
+      http://localhost:8080/api/auth/login
+unset RAG_PW
+
+curl -b ~/.rag-session http://localhost:8080/api/collections
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/auth/logout
+```
+
+The curl examples below assume you are logged in this way. `GET /health` needs
+no session.
+
+### Upgrading from the role picker
+
+Before #25 the landing page let anyone pick a role and the API checked nothing.
+After upgrading, the API refuses everything but `/health` until an operator
+runs `docker compose exec api python -m auth bootstrap <username>`; until then
+the UI shows that command. Then create an account for each person with
+`create-user`. The role picker and the "Switch Role" button are gone, and
+nothing about the role is kept in the browser. Accounts live in the new
+`auth_data` volume.
+
+**Recreate the proxy when you upgrade.** `proxy/nginx.conf` now forwards the
+browser's `Host` with its port, which the API's same-origin check compares with
+`Origin`. The file is a single-file bind mount, so a running proxy keeps the old
+copy: until it is recreated, every change the UI sends (a query, an upload,
+logout, a password change) is refused `403 CROSS_ORIGIN_REFUSED`, although the
+login itself works. After pulling, run
+`docker compose up -d --build --force-recreate` (or at least
+`docker compose up -d --force-recreate proxy`).
+
+A package's `retrieve.py` now logs in: `python3 retrieve.py --username alice
+"question"` asks for the password (or reads it with `--password-stdin`). A
+`retrieve.py` from a package exported before this change sends no login, so the
+API refuses it with `AUTH_REQUIRED`; export the collection again for one that
+logs in.
+
+## Sharing with your office
+
+By default the workbench answers only on the machine running Docker: the proxy
+is published on `127.0.0.1:8080`, over plain HTTP. LAN mode (#26) lets other
+machines on your network use it, over TLS. It is opt-in: without
+`docker-compose.lan.yml` nothing changes.
+
+In LAN mode:
+
+- the proxy publishes HTTPS on every network interface of this machine, port
+  443, and nothing else. `http://localhost:8080` stops answering, and there is
+  no plain-HTTP port or redirect;
+- the session cookie is marked `Secure`, so browsers send it only over TLS;
+- the API refuses to start unless an enabled AI Engineer account exists and the
+  cookie is `Secure`. It then exits with one line in `docker compose logs api`
+  saying why, and the proxy doesn't start, so nothing is published.
+
+### 1. Create the first AI Engineer in the default mode
+
+LAN mode won't start without one, so set the system up first, as in the
+[Quick start](#quick-start):
+
+```bash
+docker compose up -d
+docker compose exec api python -m auth bootstrap <your-username>
+```
+
+Log in at `http://localhost:8080` and choose your new password. Create the
+other accounts now or later from the Users page.
+
+### 2. Choose a certificate
+
+Browsers check that the certificate names the address they typed. Pick one of:
+
+- **A self-signed certificate (the default).** Name every way clients will
+  reach this machine in `RAG_LAN_HOSTNAMES`, comma-separated, in your shell or
+  in a `.env` file next to `docker-compose.yml`:
+
+  ```bash
+  RAG_LAN_HOSTNAMES=office-mac.local,192.168.1.20
+  ```
+
+  On first start the `tls-init` step generates a certificate for those names
+  plus `localhost`, valid for 825 days, and keeps it in the `lan_certs` volume.
+  It is reused on later starts, and replaced when it expires or the names
+  change. Browsers warn that it isn't trusted: compare the SHA-256 fingerprint
+  the browser shows with the one `docker compose logs tls-init` prints before
+  you accept it, once per browser.
+- **Your own certificate.** Put the certificate (with its chain, server
+  certificate first) and its unencrypted key in `proxy/certs/cert.pem` and
+  `proxy/certs/key.pem`. git ignores everything in that folder. When both files
+  are there they are used, and `RAG_LAN_HOSTNAMES` isn't needed. A key that
+  doesn't match the certificate stops the start; an expired certificate is used,
+  with a warning in `docker compose logs tls-init`.
+- **mkcert, for a small office.** [mkcert](https://github.com/FiloSottile/mkcert)
+  makes a local certificate authority and certificates signed by it, so
+  browsers that trust that authority show no warning:
+
+  ```bash
+  mkcert -install                  # creates the local authority on this machine
+  mkcert -cert-file proxy/certs/cert.pem -key-file proxy/certs/key.pem \
+    office-mac.local 192.168.1.20 localhost
+  mkcert -CAROOT                   # the folder holding rootCA.pem
+  ```
+
+  Install `rootCA.pem` (never `rootCA-key.pem`, which can sign certificates for
+  any site) as a trusted root on each client machine: on a Mac, open it in
+  Keychain Access, then set it to "Always Trust".
+
+After changing the certificate files or `RAG_LAN_HOSTNAMES` on a running LAN
+stack, run the `up` command below again, then restart the proxy so nginx loads
+the new pair:
+`docker compose -f docker-compose.yml -f docker-compose.lan.yml restart proxy`.
+
+### 3. Start in LAN mode
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.lan.yml up -d
+```
+
+Use the same two `-f` options for every `docker compose` command while in LAN
+mode (or `export COMPOSE_FILE=docker-compose.yml:docker-compose.lan.yml`).
+Clients open `https://office-mac.local/` (one of your names). Port 443 taken?
+Set `RAG_LAN_PORT=8443` the same way as the names and open
+`https://office-mac.local:8443/`.
+
+Allow incoming connections to Docker in the host firewall if it asks; the
+firewall, not this project, decides which networks can reach the port.
+
+### Going back to the default
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.lan.yml down
+docker compose up -d
+```
+
+Accounts, collections and everything else are kept (`down` without `-v`).
+The `tls-init` container and the `lan_certs` volume stay unused until you
+switch again.
+
+### Things to know
+
+- **No HSTS.** The proxy doesn't send `Strict-Transport-Security`. With a
+  self-signed or mkcert certificate, HSTS would turn a later certificate change
+  into a browser error with no way past it.
+- **Client addresses on Docker Desktop.** The login throttle locks a username
+  for 15 minutes after 5 failures from one client address. Measured on Docker
+  Desktop for Mac (#26): nginx doesn't see the client's own address. A request
+  to the port through this Mac's LAN address arrived from `192.168.65.1`
+  (Docker Desktop's address for the host) and one through `localhost` from the
+  Docker network's gateway. Other machines' connections take the same port
+  forwarding, so expect them to share one address: then 5 wrong passwords for a
+  username, from anyone on the network, lock that username for everyone for 15
+  minutes. Docker Engine on Linux normally keeps the real client address.
+- **Engine 28.0.0 or newer** is still required, as for the default mode.
 
 ## Workflow
 
 ### 1. Create a collection
 
-**AI Engineers** can manage collections from the dedicated **Collections** page. **Developers** can create a collection inline from the Import page using the **+ New** button next to the collection selector.
+**AI Engineers** can manage collections, including deleting them, from the dedicated **Collections** page. **Developers** can create a collection inline from the Import page using the **+ New** button next to the collection selector.
 
 A collection is a named vector index that holds chunks from one or more documents. Choose HNSW (approximate, fast) or Flat (exact, slower at scale).
 
@@ -245,21 +531,31 @@ All API settings are environment variables in `docker-compose.yml`:
 | `MAX_ZIP_EXPANDED_BYTES` | `2147483648` (2 GiB) | The most one upload's ZIPs may expand to in all, gzipped members' output included. Over it the upload is refused with `ARCHIVE_TOO_LARGE` |
 | `MAX_ZIP_MEMBERS` | `5000` | The most entries one ZIP may hold, folders included. Over it the upload is refused with `ARCHIVE_TOO_MANY_MEMBERS` |
 | `MAX_ZIP_MEMBER_RATIO` | `200` | The most a ZIP member of 1 MiB or more may expand relative to its compressed size. Over it the upload is refused with `ARCHIVE_RATIO_TOO_HIGH` |
+| `AUTH_COOKIE_SECURE` | `false` | Marks the session cookie `Secure`. Exactly `true` or `false`; anything else stops the API. Leave it `false` for the loopback HTTP profile, where a Secure cookie would never be sent back. `docker-compose.lan.yml` sets it `true` for LAN mode's TLS (#26) |
+| `RAG_LAN_MODE` | `false` | LAN mode (#26), set `true` only by `docker-compose.lan.yml`. Exactly `true` or `false`; anything else stops the API. When `true` the API refuses to start unless `AUTH_COOKIE_SECURE` is `true` and an enabled AI Engineer exists. See [Sharing with your office](#sharing-with-your-office) |
+| `AUTH_DIR` | `/app/auth_data` | Container path of the accounts store, the `auth_data` volume |
+
+LAN mode reads two more settings from your shell or a `.env` file next to `docker-compose.yml`, used by `docker-compose.lan.yml`:
+
+| Variable | Default | Description |
+|---|---|---|
+| `RAG_LAN_HOSTNAMES` | empty | The names and IP addresses clients use to reach this machine, comma-separated. The self-signed certificate names them plus `localhost`. Required unless `proxy/certs/` holds your own `cert.pem` and `key.pem` |
+| `RAG_LAN_PORT` | `443` | The host port LAN mode publishes HTTPS on, on every interface |
 
 To swap the LLM (e.g. to `llama3.2`), update `LLM_MODEL` in `docker-compose.yml` and add the model name to `ollama/entrypoint.sh`.
 
-**Upload size limit.** One upload (all files in it together, or one ZIP) can be at most **512 MB**. The proxy enforces it with `client_max_body_size` in `proxy/nginx.conf`. To change it, edit that value and `MAX_UPLOAD_MB` in `ui/src/api/client.ts` (the Import page uses it to warn before sending), then rebuild the UI and recreate the proxy:
+**Upload size limit.** One upload (all files in it together, or one ZIP) can be at most **512 MB**. The proxy enforces it with `client_max_body_size` in `proxy/locations.conf`. To change it, edit that value and `MAX_UPLOAD_MB` in `ui/src/api/client.ts` (the Import page uses it to warn before sending), then rebuild the UI and recreate the proxy:
 
 ```bash
 docker compose build ui
 docker compose up -d --force-recreate ui proxy
 ```
 
-`--force-recreate` matters for the proxy. `nginx.conf` is mounted as a single file, and most editors save by replacing the file, so a running container keeps reading the old copy until it is recreated.
+`--force-recreate` matters for the proxy. `locations.conf` is mounted as a single file, and most editors save by replacing the file, so a running container keeps reading the old copy until it is recreated.
 
 ## Data persistence
 
-Four named Docker volumes persist data across restarts:
+Five named Docker volumes persist data across restarts:
 
 | Volume | Contents |
 |---|---|
@@ -267,6 +563,7 @@ Four named Docker volumes persist data across restarts:
 | `ollama_models` | Downloaded model weights |
 | `ingest_uploads` | Ingest configs, gold standard sessions, exported gold-standard JSON files (`goldstandard_exports/`), metrics ring buffer (`metrics.jsonl`, bounded to 1,000 lines) |
 | `rag_sources` | Original uploaded documents, content-addressed per collection. Grows with your corpus |
+| `auth_data` | Accounts, password hashes, sessions and the login throttle (`auth.db`, SQLite, #25) |
 
 Run `docker compose down -v` to delete all volumes and start fresh.
 
@@ -302,9 +599,13 @@ rag-docker/
 ├── ollama/
 │   └── entrypoint.sh     # Pulls models on first start
 ├── proxy/
-│   └── nginx.conf        # Routes /api/ to API, / to UI
+│   ├── nginx.conf        # The default server: HTTP on port 80
+│   ├── nginx.lan.conf    # LAN mode's server: TLS on port 443 (#26)
+│   ├── locations.conf    # Routes /api/ to API, / to UI; shared by both
+│   └── certs/            # Your own LAN mode certificate, if any (ignored by git)
 ├── exports/              # Export packages land here (bind mount)
-└── docker-compose.yml
+├── docker-compose.yml
+└── docker-compose.lan.yml # LAN mode, opt-in (#26)
 ```
 
 ## Exporting and importing a RAG
@@ -321,15 +622,15 @@ the originals were retained) the source documents themselves.
 
 ```bash
 # start an export
-curl -X POST http://localhost:8080/api/export \
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/export \
   -H 'Content-Type: application/json' \
   -d '{"collection": "Policies"}'
 
 # poll it
-curl http://localhost:8080/api/export/job/<job_id>
+curl -b ~/.rag-session http://localhost:8080/api/export/job/<job_id>
 
 # list what is in ./exports
-curl http://localhost:8080/api/packages
+curl -b ~/.rag-session http://localhost:8080/api/packages
 ```
 
 The package lands in `./exports/` on the host, named
@@ -339,8 +640,9 @@ The package lands in `./exports/` on the host, named
 
 Three things worth knowing before you move one:
 
-- **Packages are not encrypted.** A `with-sources` package contains the original
-  documents byte for byte. Treat the file as you would the corpus.
+- **Packages are not encrypted unless you give a passphrase.** A `with-sources`
+  package contains the original documents byte for byte. Treat a plain `.tar.gz`
+  as you would the corpus, or encrypt it (below).
 - **An export holds its collection's writer guard.** Chunks and original
   documents come from one point in time, so ingest, re-chunking and other writes to
   that collection wait until the export finishes, and gold-standard generation for
@@ -355,15 +657,48 @@ Three things worth knowing before you move one:
 are never included when you package the project with `package.sh` or
 `package-offline.sh` — the directory ships, the corpus does not.
 
-To import one, drop the `.tar.gz` into `./exports/` on the target machine and:
+### Encrypting a package
+
+Add a `passphrase` (12 to 1024 characters) to the export, or tick **Encrypt with a
+passphrase** on the Transfer page:
 
 ```bash
-curl -X POST http://localhost:8080/api/import \
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/export \
+  -H 'Content-Type: application/json' \
+  -d '{"collection": "Policies", "passphrase": "<a long passphrase>"}'
+```
+
+The package is then written as `ragpkg-...tar.gz.age`: an
+[age](https://age-encryption.org) file encrypted with that passphrase (scrypt).
+The archive is encrypted as it is written, so it is never held in memory and no
+unencrypted archive is written. While the export runs, though, the package's
+files are staged unencrypted in a hidden `./exports/.build-*` folder, which is
+removed when the export ends (or at the next start-up if the API was killed).
+Since `./exports/` is a host folder, anyone who can read it during an export can
+read those files; moving the staging out of it is a follow-up.
+Import needs the same passphrase, and `age -d` opens the file as well. Import
+accepts a scrypt work factor of at most 20 (about 1 GiB of memory to derive the
+key) and refuses a higher one as `DECRYPT_FAILED` before deriving anything; age's
+own default, 18, which export uses, is well within it. The
+passphrase is never stored, logged or returned, and it can't be recovered: send it
+by a different channel than the file. Once a package is decrypted or imported, its
+contents are plaintext again on that machine.
+
+To import one, drop the package into `./exports/` on the target machine and:
+
+```bash
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/import \
   -H 'Content-Type: application/json' \
   -d '{"filename": "ragpkg-policies-...tar.gz", "on_conflict": "abort"}'
 
-curl http://localhost:8080/api/import/job/<job_id>
+curl -b ~/.rag-session http://localhost:8080/api/import/job/<job_id>
 ```
+
+An encrypted package needs its passphrase in the same request
+(`"passphrase": "..."`); without it the import is refused `400
+PASSPHRASE_REQUIRED`, and a passphrase sent for an unencrypted package is refused
+`400 PASSPHRASE_NOT_EXPECTED`. A wrong passphrase, or a damaged encrypted file,
+fails the import job with `DECRYPT_FAILED` before anything is touched.
 
 `on_conflict` is required and has no default, because the wrong choice can
 delete a collection:
@@ -400,7 +735,7 @@ meaningless rather than merely different. For a machine that has never pulled
 anything, export with the models included:
 
 ```bash
-curl -X POST http://localhost:8080/api/export \
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/export \
   -H 'Content-Type: application/json' \
   -d '{"collection": "Policies", "include_models": true}'
 ```
@@ -420,16 +755,16 @@ Once a collection is in, it can be rebuilt in place:
 
 ```bash
 # re-split the original documents differently (needs with-sources)
-curl -X POST http://localhost:8080/api/tune/rechunk \
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/tune/rechunk \
   -H 'Content-Type: application/json' \
   -d '{"collection": "Policies", "chunking_strategy": "fixed", "chunk_size": 600}'
 
 # regenerate vectors, leaving chunk boundaries alone
-curl -X POST http://localhost:8080/api/tune/reembed -d '{"collection": "Policies"}' \
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/tune/reembed -d '{"collection": "Policies"}' \
   -H 'Content-Type: application/json'
 
 # switch index type or distance metric, reusing the existing vectors
-curl -X POST http://localhost:8080/api/tune/reindex \
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/tune/reindex \
   -H 'Content-Type: application/json' \
   -d '{"collection": "Policies", "index_type": "flat", "distance_metric": "cosine"}'
 ```
@@ -674,10 +1009,12 @@ If this fails after Docker restarts, Docker's internal networking is broken — 
 
 **LLM answers are garbage or time out** — Answers come back in mixed scripts or as fragments of unrelated instructions, run to thousands of characters, or time out, while `/api/health` still reports the LLM as ok. Ollama's model runner has degraded; it does not recover on its own. Restart it with `docker compose restart ollama`. `scripts/verify/all.sh` checks for this before its LLM suites and stops with the same advice.
 
-**Port 8080 already in use** — The proxy publishes on host loopback port 8080 (`docker-compose.yml`, the `proxy` service: `"127.0.0.1:8080:80"`). Change the middle number to any free port, for example `"127.0.0.1:9090:80"`, then access the UI at `http://localhost:9090`. Keep the `127.0.0.1` host address and container port 80.
+**Port 8080 already in use** — The proxy publishes on host loopback port 8080 (`docker-compose.yml`, the `proxy` service: `"127.0.0.1:8080:80"`). Change the middle number to any free port, for example `"127.0.0.1:9090:80"`, then access the UI at `http://localhost:9090`. Keep the `127.0.0.1` host address and container port 80. In LAN mode the port is 443 on every interface instead; set `RAG_LAN_PORT` to use another (see [Sharing with your office](#sharing-with-your-office)).
 
-**Sharing with your office** — The default binding is now local to the Docker host. An existing installation accessed from another computer will stop accepting those connections after its proxy is recreated. This workbench currently has no API authentication; authenticated LAN access with TLS is tracked in issue #26 and is not yet provided. Keep the loopback binding for the current local setup.
-**Upload fails with "larger than the 512 MB limit" or HTTP 413** — The upload is over the proxy's limit (see [Configuration](#configuration)). The limit covers the whole request, so split a large batch into several uploads, or raise the limit. Before issue #21 the proxy used nginx's 1 MB default, so a 413 on an ordinary PDF means the proxy is running an old `nginx.conf`: run `docker compose up -d --force-recreate proxy`.
+**Other computers can't reach the workbench** — By default it answers only on the Docker host (`127.0.0.1`). To share it on your network, use LAN mode: see [Sharing with your office](#sharing-with-your-office).
+
+**LAN mode doesn't start** — `docker compose -f docker-compose.yml -f docker-compose.lan.yml logs api tls-init` says why in one line: no enabled AI Engineer yet (create one in the default mode first), `AUTH_COOKIE_SECURE` not `true`, `RAG_LAN_HOSTNAMES` empty or holding something that isn't a name or address, or a `proxy/certs` key that doesn't match its certificate.
+**Upload fails with "larger than the 512 MB limit" or HTTP 413** — The upload is over the proxy's limit (see [Configuration](#configuration)). The limit covers the whole request, so split a large batch into several uploads, or raise the limit. Before issue #21 the proxy used nginx's 1 MB default, so a 413 on an ordinary PDF means the proxy is running an old configuration: run `docker compose up -d --force-recreate proxy`.
 
 **Build fails with `ERROR: Could not install packages due to an OSError: [Errno 28] No space left on device`** — Docker's virtual disk is full, not your host disk — the two are reported separately, and `df -h` on the host will look fine. A virtual disk of 8 GB or so cannot hold ~6.5 GB of images plus build cache, so the build runs out of room partway through `pip install`. Check the real numbers with:
 
@@ -735,15 +1072,15 @@ Raise it in **Docker Desktop → Settings → Resources → Memory**, then resta
 | reference `mydocs` | **404 `COLLECTION_NOT_FOUND`** — interior case must match |
 | reference `MYDOCS` | **404 `COLLECTION_NOT_FOUND`** |
 
-So a lowercase first letter is fine, but `mydocs` will not find `MyDocs`. The API applies the same rule to every collection name it receives, so the collection's settings, retained originals, gold-standard sessions and query metrics are all kept under `MyDocs` whichever of the two spellings you use (#372). State saved under a lowercase-first spelling before that change is not migrated: re-ingest the documents and save the settings again to put them under the stored name. If you get a 404 for a collection you are sure exists, run `curl http://localhost:8080/api/collections` and copy the name exactly as listed.
+So a lowercase first letter is fine, but `mydocs` will not find `MyDocs`. The API applies the same rule to every collection name it receives, so the collection's settings, retained originals, gold-standard sessions and query metrics are all kept under `MyDocs` whichever of the two spellings you use (#372). State saved under a lowercase-first spelling before that change is not migrated: re-ingest the documents and save the settings again to put them under the stored name. If you get a 404 for a collection you are sure exists, run `curl -b ~/.rag-session http://localhost:8080/api/collections` (logged in as in "Calling the API from the command line") and copy the name exactly as listed.
 
 To check the behaviour yourself without waiting on the LLM, use the ingest endpoint — it validates the collection name and returns immediately:
 
 ```bash
-curl -s -X POST http://localhost:8080/api/collections \
+curl -s -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/collections \
   -H 'Content-Type: application/json' -d '{"name":"myDocs"}'
-curl -s http://localhost:8080/api/collections      # -> "MyDocs"
-curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/api/ingest/upload \
+curl -s -b ~/.rag-session http://localhost:8080/api/collections      # -> "MyDocs"
+curl -s -b ~/.rag-session -H 'Origin: http://localhost:8080' -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/api/ingest/upload \
   -F 'collection=mydocs' -F 'files=@/dev/null;type=text/plain'   # -> 404
 ```
 

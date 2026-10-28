@@ -3,8 +3,8 @@
 # Run the verification suite on a disposable compose project, never on the
 # live stack (#152).
 #
-#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry] [suite ...]
-#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull]
+#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry | --lan] [suite ...]
+#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull] [--lan]
 #   bash scripts/verify/stack.sh down
 #
 # `run` brings the verify project up, runs that checkout's all.sh against it
@@ -40,6 +40,16 @@
 # exports folder), apart from the api's own exports folder; the Docker socket.
 # It can't see env_file, which compose merges into the environment.
 #
+# --lan (#26) runs the verify project in LAN mode. It comes up in its default
+# configuration first, where the first Engineer (vfy-engineer) is created, as
+# the README tells users to do, and then switches to the LAN configuration:
+# the checkout's docker-compose.lan.yml plus this checkout's
+# docker-compose.lan.verify.yml, which publishes TLS on loopback only, at the
+# verify port. The guard checks that configuration too, with rule (c) wanting
+# exactly proxy:127.0.0.1:<verify port>->443/tcp. The suites then reach it at
+# https://localhost:<port>/api and trust the certificate it generated, copied
+# into the private folder. Without suite names, a --lan run runs 18_lan.
+#
 # What this does not do: the suites, and anything else the checkout runs on the
 # host, still have full access to Docker. It keeps verification away from the
 # live stack by accident, not from hostile code; that is the security review's.
@@ -56,6 +66,10 @@ SCRATCH="${SCRATCH%/}"
 # local user can't pre-create it or plant a symlink there (#154).
 PRIVATE="$SCRATCH/rag-verify-$(id -u)"
 EXPORTS="$PRIVATE/exports"
+# LAN mode's certificate, copied from the proxy so the suites can verify it (#26).
+LAN_CERT="$PRIVATE/lan-cert.pem"
+# Which rule (c) the guard applies: default (port 80) or lan (port 443).
+GUARD_MODE=default
 
 usage() {
   sed -n '6,8p' "${BASH_SOURCE[0]}" | sed 's/^#  //' >&2
@@ -88,6 +102,7 @@ fi
 CHECKOUT="$HARNESS"
 PULL=""
 TELEMETRY=0
+LAN=0
 OTEL_ENABLED=true
 ARGS=()
 while [ "$#" -gt 0 ]; do
@@ -98,6 +113,9 @@ while [ "$#" -gt 0 ]; do
     --telemetry)
       [ "$CMD" != down ] || usage
       TELEMETRY=1; shift ;;
+    --lan)
+      { [ "$CMD" = up ] || [ "$CMD" = run ]; } || usage
+      LAN=1; shift ;;
     --disabled)
       [ "$CMD" = telemetry-mode ] || usage
       OTEL_ENABLED=false; shift ;;
@@ -110,6 +128,8 @@ while [ "$#" -gt 0 ]; do
       ARGS+=("$1"); shift ;;
   esac
 done
+
+[ "$TELEMETRY" = 0 ] || [ "$LAN" = 0 ] || fail "--lan and --telemetry can't be combined."
 
 PORT="${RAG_VERIFY_PORT:-8081}"
 case "$PORT" in
@@ -186,6 +206,9 @@ if [ "$TELEMETRY" = 1 ]; then
   export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.telemetry.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.telemetry.verify.yml"
   export COMPOSE_PROFILES=telemetry
 fi
+# LAN mode's configuration, switched to once the default one is up and set up.
+LAN_COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.lan.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.lan.verify.yml"
+export RAG_VERIFY_LAN="$LAN"
 export RAG_VERIFY_PORT="$PORT"
 export RAG_API="http://localhost:$PORT/api"
 export RAG_EXPECTED_PROXY_PORT="$PORT"
@@ -224,6 +247,7 @@ do_down() {
     return 2
   fi
   [ ! -d "$EXPORTS" ] || rm -rf "$EXPORTS"
+  rm -f "$LAN_CERT"
   left="$(docker ps -aq --filter "$filter")$(docker network ls -q --filter "$filter")$(docker volume ls -q --filter "$filter" | grep -vx "$MODELS")$(labelled_images)"
   if [ -e "$EXPORTS" ] || [ -L "$EXPORTS" ]; then
     left="$left $EXPORTS"
@@ -311,10 +335,13 @@ do_guard() {
     rm -f "$config"
     fail "docker compose config failed for $CHECKOUT."
   fi
-  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" "$HARNESS" <<'GUARDPY'
+  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" "$HARNESS" "$GUARD_MODE" <<'GUARDPY'
 import json, os, sys
 
 checkout, exports, port, path = sys.argv[1:5]
+# default, or lan (#26): LAN mode's proxy serves TLS on container port 443.
+mode = sys.argv[6] if len(sys.argv) > 6 else 'default'
+target = 443 if mode == 'lan' else 80
 config = json.load(open(path))
 services = config.get('services') or {}
 volumes = config.get('volumes') or {}
@@ -445,16 +472,17 @@ for svc, service in services.items():
         if options:
             problems.append(f"(j) service {svc!r} sets options on network {name!r}")
 
-# (c) exactly one published port: the proxy, on loopback, the verify port
+# (c) exactly one published port: the proxy, on loopback, the verify port,
+# container port 80 (443 in LAN mode)
 ports = [(svc, p) for svc, service in services.items() for p in service.get('ports') or []]
 if not (len(ports) == 1 and ports[0][0] == 'proxy'
         and ports[0][1].get('host_ip') == '127.0.0.1'
         and str(ports[0][1].get('published')) == port
-        and ports[0][1].get('target') == 80
+        and ports[0][1].get('target') == target
         and ports[0][1].get('protocol', 'tcp') == 'tcp'):
     shown = ', '.join(f"{svc}:{p.get('host_ip', '')}:{p.get('published')}->{p.get('target')}/{p.get('protocol', 'tcp')}"
                       for svc, p in ports) or 'none'
-    problems.append(f"(c) published ports must be exactly proxy:127.0.0.1:{port}->80/tcp, not {shown}")
+    problems.append(f"(c) published ports must be exactly proxy:127.0.0.1:{port}->{target}/tcp, not {shown}")
 
 # (d) mounts: volumes and binds only, with no options; binds read-only, from
 # inside the checkout but not its exports folder; (e) never the socket
@@ -504,6 +532,45 @@ GUARDPY
   [ "$rc" -eq 0 ] || fail "the verify project's configuration is refused (see above); nothing was built or started."
 }
 
+# ── LAN mode (#26) ───────────────────────────────────────────────────────────
+# From the default configuration, up and healthy, to LAN mode, as the README
+# tells users: create the first Engineer, then switch. do_up always clears the
+# project first, so it is never set up here. The generated password is
+# discarded unseen; the suites' account setup resets it like any password it
+# doesn't know.
+lan_switch() {
+  local i code=000 service state health
+  printf 'creating the first Engineer, then switching to LAN mode...\n'
+  docker compose -p "$PROJECT" exec -T api python -m auth bootstrap vfy-engineer >/dev/null \
+    || fail "could not create the first Engineer for LAN mode."
+  export COMPOSE_FILE="$LAN_COMPOSE_FILE"
+  GUARD_MODE=lan
+  do_guard
+  if ! docker compose -p "$PROJECT" up -d --no-build --pull never --wait --wait-timeout 300; then
+    docker compose -p "$PROJECT" ps -a --format '{{.Service}} {{.State}} {{.Health}}' \
+      | while read -r service state health; do
+          case "$state/${health:-}" in
+            running/healthy|running/) ;;
+            *) printf '\n── %s (%s %s) ──\n' "$service" "$state" "${health:-}"
+               docker compose -p "$PROJECT" logs --tail 50 "$service" ;;
+          esac
+        done
+    fail "the verify project did not come up in LAN mode."
+  fi
+  rm -f "$LAN_CERT"
+  (umask 077 && docker compose -p "$PROJECT" exec -T proxy cat /etc/nginx/certs/live/cert.pem > "$LAN_CERT") \
+    && [ -s "$LAN_CERT" ] || fail "could not copy LAN mode's certificate from the proxy."
+  export RAG_API="https://localhost:$PORT/api"
+  # curl and Python's ssl trust only this certificate for the run.
+  export CURL_CA_BUNDLE="$LAN_CERT" SSL_CERT_FILE="$LAN_CERT" RAG_VERIFY_LAN_CERT="$LAN_CERT"
+  for i in $(seq 1 60); do
+    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' --cacert "$LAN_CERT" "$RAG_API/health" 2>/dev/null)
+    [ "$code" = 200 ] && break
+    sleep 1
+  done
+  [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 over TLS within 60 seconds (last: $code)."
+}
+
 # ── up ───────────────────────────────────────────────────────────────────────
 do_up() {
   local i code=000 service state health
@@ -536,10 +603,16 @@ do_up() {
     sleep 1
   done
   [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 within 60 seconds (last: $code)."
-  printf '\nThe verify project is up at http://localhost:%s. To point commands at it:\n\n' "$PORT"
-  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT RAG_VERIFY_TELEMETRY; do
+  [ "$LAN" = 0 ] || lan_switch
+  printf '\nThe verify project is up at %s. To point commands at it:\n\n' "${RAG_API%/api}"
+  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT RAG_VERIFY_TELEMETRY RAG_VERIFY_LAN; do
     printf 'export %s=%q\n' "$var" "${!var}"
   done
+  if [ "$LAN" = 1 ]; then
+    for var in CURL_CA_BUNDLE SSL_CERT_FILE RAG_VERIFY_LAN_CERT; do
+      printf 'export %s=%q\n' "$var" "${!var}"
+    done
+  fi
   if [ "$TELEMETRY" = 1 ]; then
     for var in COMPOSE_PROFILES RAG_VERIFY_HARNESS RAG_VERIFY_CHECKOUT RAG_VERIFY_OTEL_ENABLED; do
       printf 'export %s=%q\n' "$var" "${!var}"
@@ -562,6 +635,8 @@ case "$CMD" in
     TEARDOWN=1
     do_up
     rc=0
+    # A LAN run checks LAN mode; other suites assume the default configuration.
+    [ "$LAN" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(18_lan)
     # In the background with job control on, all.sh leads a process group of
     # its own (pgid $!), which stop_suite ends; and `wait`, unlike a foreground
     # command, returns as soon as INT or TERM arrives, so the traps act at once.

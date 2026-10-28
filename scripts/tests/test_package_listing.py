@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient
 
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import packager
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -120,7 +121,7 @@ class ListingTestCase(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
 
     def listing(self):
-        response = TestClient(app, raise_server_exceptions=False).get("/packages")
+        response = TestClient(app, headers=auth_testing.headers(), raise_server_exceptions=False).get("/packages")
         self.assertEqual(response.status_code, 200, response.text)
         return {p["filename"]: p for p in response.json()["packages"]}
 
@@ -155,7 +156,7 @@ class ListingTestCase(unittest.TestCase):
                 packager.read_manifest(path)
         self.assertLess(opened[0].bytes_read, READ_BOUND)
         self.assertEqual(self.listing()[path.name], dict(
-            filename=path.name, size_bytes=path.stat().st_size, readable=False, **NULLS))
+            filename=path.name, size_bytes=path.stat().st_size, readable=False, encrypted=False, **NULLS))
 
     def test_manifest_size_bound_is_inclusive(self):
         # Boundary of the bound: exactly MANIFEST_LIMIT bytes lists, one byte more does not.
@@ -192,7 +193,7 @@ class ListingTestCase(unittest.TestCase):
             path = self.exports / f"ragpkg-{name}.tar.gz"
             with self.subTest(file=name):
                 self.assertEqual(listed[path.name], dict(
-                    filename=path.name, size_bytes=path.stat().st_size, readable=False, **NULLS))
+                    filename=path.name, size_bytes=path.stat().st_size, readable=False, encrypted=False, **NULLS))
 
     def test_wrongly_typed_manifest_fields_are_listed_unreadable(self):
         # Each case replaces one listed value with a wrong JSON type (#451).
@@ -217,7 +218,7 @@ class ListingTestCase(unittest.TestCase):
             path = self.exports / f"ragpkg-{name}.tar.gz"
             with self.subTest(file=name):
                 self.assertEqual(listed[path.name], dict(
-                    filename=path.name, size_bytes=path.stat().st_size, readable=False, **NULLS))
+                    filename=path.name, size_bytes=path.stat().st_size, readable=False, encrypted=False, **NULLS))
 
     def test_null_or_absent_fields_list_as_null(self):
         cases = {
@@ -231,7 +232,7 @@ class ListingTestCase(unittest.TestCase):
             path = self.exports / f"ragpkg-{name}.tar.gz"
             with self.subTest(file=name):
                 self.assertEqual(listed[path.name], dict(
-                    filename=path.name, size_bytes=path.stat().st_size, readable=True, **NULLS))
+                    filename=path.name, size_bytes=path.stat().st_size, readable=True, encrypted=False, **NULLS))
 
     def test_new_archives_put_the_manifest_first(self):
         stage = Path(self.tmp.name) / "stage"

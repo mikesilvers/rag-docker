@@ -8,9 +8,50 @@ verify project, never the live stack (#152).
 bash scripts/verify/stack.sh run                    # everything, ~20 min plus start-up
 RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run    # skip LLM work, ~8 min, start-up included
 bash scripts/verify/stack.sh run 02 04              # only the named suites
+bash scripts/verify/stack.sh run --lan              # LAN mode, TLS on loopback only (#26)
 ```
 
 Exits non-zero if any check fails.
+
+## Test accounts (#25)
+
+Every API route but `/health` and the login needs a session, so the suites log in.
+`require_stack` (in `lib.sh`) runs `auth_setup.py ensure`, which makes sure the verify project
+has one account per role, `vfy-engineer`, `vfy-developer` and `vfy-end-user`, whose passwords it
+knows:
+
+- On a project that isn't set up yet it runs `python -m auth bootstrap vfy-engineer` in the api
+  container; a missing account is created with `create-user`, and one whose stored password no
+  longer works (a new verify project, say) gets `reset-password`. Each generated password is
+  replaced at first login with a fresh random one, as the API requires.
+- The operator command runs only when the target is the verify project as `stack.sh` sets it up
+  (`COMPOSE_PROJECT_NAME=rag-verify` and the overlay in `COMPOSE_FILE`, the same condition as
+  removing its volumes). Anywhere else a password that doesn't work is a failure, never a reset.
+- The passwords live only in `$RAG_AUTH_DIR/credentials` (default
+  `${TMPDIR:-/tmp}/rag-verify-auth-<uid>`): mode 0600, in a folder of mode 0700 that is the user's
+  own (a symlink, a file or someone else's folder there is refused), outside the checkout. They
+  are never printed, put on a command line or in the environment, or written to the `export`
+  lines `stack.sh up` prints (which CI copies into its job environment). They reach the API only
+  in request bodies, and the browser checks on standard input.
+
+`require_stack` then logs `vfy-engineer` in, into the curl cookie jar
+`$RAG_AUTH_DIR/engineer.jar` (0600), exported as `RAG_AUTH_JAR`. `lib.sh` defines `curl` as a
+function that adds that jar and an `Origin` matching `RAG_API` (the API refuses a
+cookie-authenticated change without one), so every curl in a suite, and the `api_*` helpers,
+send the session. A check that needs no session, another role or another origin calls `command
+curl`. `auth_jar <role>` logs another role in. The host-side Python helpers that call the API
+read the jar through `auth_headers.py`; in-process checks in the API image use
+`auth.testing.headers()`, a real account and session in a temporary store, never a bypass.
+
+`17_auth.sh` checks authentication itself: the endpoint/role matrix for no session and each
+role (written out in `auth_stack.py`, not read from the API), login, logout, cookies, origin
+rules, throttling, the operator command's effect on existing sessions (on throwaway `vfy-t-*`
+accounts), an Engineer's account administration through the API (on a throwaway account; the
+generated passwords must not reach the API log), service API keys (throwaway `vfy-s-*`
+principals created through the API by the harness Engineer: the matrix with a key of each role
+and no `Origin`, rotation, revocation, expiry, a disabled principal, invalid keys; the keys stay in
+memory, are never printed and must not reach the API log), idle expiry, and that the API log holds
+no harness secret.
 
 ## Entry point and verify project
 
@@ -22,8 +63,8 @@ against" below).
 
 | Command | What it does |
 |---|---|
-| `stack.sh run [--checkout DIR] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
-| `stack.sh up [--checkout DIR] [--pull]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. |
+| `stack.sh run [--checkout DIR] [--telemetry \| --lan] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
+| `stack.sh up [--checkout DIR] [--pull] [--lan]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. |
 | `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
 
 `--checkout` is the checkout to build and test; the default is the one holding
@@ -88,6 +129,45 @@ What makes it separate from the live stack:
   suite, exit 3, when it fails. Not re-checked: direct `curl` and
   `docker compose exec` calls in the suites, and the Python helpers, which
   end on their own timeouts (up to 900 s).
+
+### LAN mode (#26)
+
+`stack.sh run --lan` (and `up --lan`) runs the verify project in LAN mode
+without exposing the host:
+
+1. It comes up in its default configuration, checked by the guard as usual.
+2. It creates the first Engineer, `vfy-engineer`, with the operator command,
+   as the README tells users to before switching (the project is always new
+   here). The generated password is discarded unseen; `auth_setup.py` resets
+   it later like any password it doesn't know.
+3. It switches `COMPOSE_FILE` to the base file, the checkout's
+   `docker-compose.lan.yml`, this checkout's `docker-compose.verify.yml` and
+   `docker-compose.lan.verify.yml`. That harness-only overlay replaces the
+   override's `0.0.0.0:443` with `127.0.0.1:<verify port>:443`, gives `tls-init`
+   the verify image and sets `RAG_LAN_HOSTNAMES` to reserved test names
+   (`vfy-lan.invalid`, `192.0.2.10`).
+4. The guard checks that configuration, with rule (c) wanting exactly
+   `proxy:127.0.0.1:<verify port>->443/tcp`; every other rule is unchanged, for
+   `tls-init` too. Then `up --no-build --wait` recreates what changed.
+5. It copies the certificate `tls-init` generated from the proxy to
+   `${TMPDIR:-/tmp}/rag-verify-<uid>/lan-cert.pem` (0600) and exports
+   `RAG_API=https://localhost:<port>/api`, and that file as `CURL_CA_BUNDLE`,
+   `SSL_CERT_FILE` and `RAG_VERIFY_LAN_CERT`, so curl and Python trust it, and
+   only it, with the name `localhost`. `RAG_VERIFY_LAN=1` tells the suites.
+
+Without suite names a `--lan` run runs `18_lan` only: the other suites expect
+the default configuration (suite 01's binding and service-inventory checks
+would fail by design). `--lan` can't be combined with `--telemetry`.
+
+`18_lan.sh` runs in every run. It always checks the real override with
+`lan_config.py` (`docker compose config` of the base file plus
+`docker-compose.lan.yml`, under the project name `rag-lan-config`, with no
+`.env`; nothing is created) and runs `../tests/test_lan_mode.py` in the API
+image. Only in a `--lan` run does it check the running LAN project through
+`lan_stack.py`: HTTPS with the generated certificate, TLS versions and HTTP/2,
+the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
+and the API's refusal in one-off containers (`docker compose run --rm
+--no-deps`, no ports); it also prints the client address nginx recorded.
 
 **Memory.** The verify project runs next to the live stack on the same Docker
 VM. With 12 GB allocated, both fit while one LLM is loaded; when both stacks
@@ -187,7 +267,7 @@ retrieval route. The persistence cases cover failed import-config publication.
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
 
-`05_transfer.sh` registers the eight controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py` and `test_package_listing.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work.
+`05_transfer.sh` registers the nine controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py`, `test_package_listing.py` and `test_export_encryption.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work.
 
 `scripts/tests/test_export_snapshot.py` (#509, API container) drives `exporter._run` with the real `packager.build` and retained-source store and a mocked Weaviate backend whose iterator reads the stored chunks one at a time. A re-ingest that tries to commit new chunks and a new `doc.txt` source after the first chunk is streamed waits for the export: the package holds the old chunk text and the old source bytes and index, every chunk's `source_sha256` names a blob in `sources/`, and the re-ingest lands after the build. During an export, gold-standard generation preparation answers `COLLECTION_BUSY` (409) and a guarded chunk insert waits; an export started while another writer holds the guard reads `queued` until it is released; and the guard is free again after an export that succeeds, is refused (`PackageError`), fails or is cancelled. An export whose build is cancelled, or ended by another non-`Exception`, reads `failed` with an `error` naming the exception and saying it was cancelled, and the exception still propagates (#521). Orderings use events and the guard's waiter count. On the code before #509 the re-ingest, generation, insert, queued and guard-held checks fail; on the code before #521 the cancelled-status checks fail.
 
@@ -662,6 +742,15 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
 | `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health` reports, so the status flips to `below_recommended` on any host (#536) |
 | `../tests/test_memory_override.py` | host-side, standard library: the derived override makes `system_info.memory_info` report `below_recommended` with a note for allocations below and above the 12.35 GB a fixed 13 GB could flip, and no override without a usable allocation (#536); embedded copies; registered by suite 01 |
+| `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command, account administration, service API keys; registers `../tests/test_auth.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
+| `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
+| `auth_stack.py` | the stack checks of `17_auth.sh`, one per subcommand (#25) |
+| `auth_headers.py` | the suite's session as `Cookie` and `Origin` headers, for the host-side Python helpers (#25) |
+| `18_lan.sh` | §2.5 and §10.5 — LAN mode (#26): the real override resolved without starting it; registers `../tests/test_lan_mode.py`; with `stack.sh run --lan`, the running LAN project on loopback |
+| `lan_config.py` | host-side, standard library: `docker-compose.lan.yml` as `docker compose config` resolves it, at the default port and `RAG_LAN_PORT=8443` (#26) |
+| `lan_stack.py` | the stack checks of `18_lan.sh` in a `--lan` run, one per subcommand (#26) |
+| `../tests/test_lan_mode.py` | API image, no network: `RAG_LAN_MODE` parsing, the startup refusal (also through `import main`), the certificate step, both nginx configurations, embedded copies (#26) |
+| `docker-compose.lan.verify.yml` | the harness overlay of a `--lan` run: TLS on loopback at the verify port, the verify image for `tls-init`, reserved test names (#26) |
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
 | `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
 | `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
@@ -676,7 +765,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, review 404 codes and empty-edit refusal (#381), export schema, export name refusals (#370) |
 | `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E36; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E40, encrypted packages (#27); destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
 | `../tests/test_zip_limits.py` | controlled ZIP member-count (cap of 20 from env), ratio, escaping-member and `detail` bound regressions (#28), registered by ingest |
@@ -732,11 +821,12 @@ through the proxy that download refuses other upload state with 400 (#370).
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the query metrics reload in `03_query.sh`, the batch recovery acceptance in `05_transfer.sh`, and retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`); never the `rag-docker` project |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the query metrics reload in `03_query.sh`, the batch recovery acceptance in `05_transfer.sh`, retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`, and a session and a login lockout across a restart in `17_auth.sh`); never the `rag-docker` project |
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
 | `RAG_NETWORK` | detected | compose network for the browser container |
+| `RAG_AUTH_DIR` | `${TMPDIR:-/tmp}/rag-verify-auth-<uid>` | the folder of the test accounts' credentials and cookie jars (#25) |
 
 ## Writing a check
 
@@ -878,18 +968,44 @@ a UI with no backend:
 RAG_UI_BASE=http://127.0.0.1:3000 RAG_CHROMIUM_PATH=/path/to/chromium node scripts/verify/browser/qa_page.js
 ```
 
+## Export encryption (#27)
+
+`api/services/age_stream.py` writes and reads the age v1 passphrase format on the locked
+`cryptography`: `Encryptor` is the writable file `packager._write_archive` streams the tar.gz
+into (`tarfile` mode `w|gz`), holding back each full chunk until it knows whether it is the
+last; `open_decrypt` parses the header, refuses a work factor above 20 before scrypt, unwraps
+the file key under a process-wide lock, checks the header MAC and returns `Decryptor`, the
+readable file `packager.open_package` unpacks in `tarfile` mode `r|gz`, checking each member
+before extracting it, then drains to authenticate the rest. A `.tar.gz.age` name selects the
+encrypted path everywhere: the listing (header check only), the import refusals in
+`importer.start_import_job` (`PassphraseError`, mapped to 400 by the router) and check 1. The
+passphrase travels as a function argument to the worker thread and is never put in a job
+record; the request models hold it as `SecretStr`.
+
+`scripts/tests/test_export_encryption.py`, run by `05_transfer.sh` in the API image with no
+network, checks the module against the vendored C2SP CCTV vectors
+(`scripts/tests/fixtures/age-testkit`, with their source in `SOURCE`) and an independent
+decryption written from the specification, and the export, import, listing, refusals and
+secrecy rules above. Suite 05 then exports the transfer collection encrypted, validates it
+with `validate_package.py` in the API container (`RAG_PACKAGE_PASSPHRASE`), and checks a wrong
+passphrase, both refusals and a round trip on the live verify stack.
+
 ## Transfer page polling and failure checks
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
 Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
-20 ms (#382). Fourteen cases: for each half, a failed poll (a proxy 502) is shown and retried
+20 ms (#382). Seventeen cases: for each half, a failed poll (a proxy 502) is shown and retried
 with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
 show the last error and enable the button again, and a new start clears the message; a poll in
 flight when the page is left schedules no further poll. An export start answered after the page
 is left starts no polling. A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune` is labelled
 "Fidelity: unknown", a good lookup shows the fidelity, and a late answer for a collection no
 longer selected is ignored. A failed export shows its `error_code`, and a failed package list
-is shown without the empty-folder hint until a good Refresh. Like `query_config.js`, it can run
+is shown without the empty-folder hint until a good Refresh. Three cases cover encryption (#27):
+an export passphrase holds Export until it has 12 characters and matches its confirmation, is
+sent only when the box is checked, and both fields clear once the export starts; an encrypted
+package is labelled, asks for its passphrase, sends it and clears it, and a plain package sends
+none. Like `query_config.js`, it can run
 on its own against a UI with no backend (`RAG_UI_BASE`, `RAG_CHROMIUM_PATH`):
 
 ```bash
@@ -945,7 +1061,8 @@ nothing reaches the backend or a model. 67 cases:
   modal (HNSW slider defaults, bounds and labels, Flat hiding them, the create payload); the Import
   queue, slider visibility per strategy and role, Chunk Size pulling Overlap down, the upload
   form fields and the "+ New" modal; the Developer nav and the redirects of a Developer and an End
-  User (gating is client-side only until #25); the landing page and Switch Role; the Q&A box
+  User; the login page, logout, the setup-required page, the forced and voluntary password change
+  and the return to login on a 401 (#25), with `GET /api/auth/me` answered from the case's role; the Q&A box
   (Ctrl+Enter, plain Enter, Ask disabled while empty or loading), the citations toggle, markdown,
   the latency and error lines and the End User view with `response_format`; the Retrieval page's
   saved and default texts, alpha slider and Save while loading; and the client's handling of
