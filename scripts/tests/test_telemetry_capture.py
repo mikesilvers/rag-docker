@@ -158,6 +158,15 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, 'sentinel'):
             m.inspect({'overflow': 0, 'batches': [{'data':m.SENTINELS[0]}]}, [])
 
+    def test_service_key_prevents_acceptance(self):
+        m = load('e2e', 'scripts/verify/telemetry_e2e.py')
+        secret = 'A_' + 'c-1'*13 + 'Zz'
+        m.KEY = 'rag_' + 'k'*12 + '_' + secret
+        for leaked in (m.KEY, secret):
+            with self.subTest(leaked=leaked == m.KEY):
+                with self.assertRaisesRegex(AssertionError, 'sentinel'):
+                    m.inspect({'overflow': 0, 'batches': [{'data':leaked}]}, [])
+
     def test_capture_overflow_prevents_acceptance(self):
         m = load('e2e', 'scripts/verify/telemetry_e2e.py')
         with self.assertRaisesRegex(AssertionError, 'overflow'):
