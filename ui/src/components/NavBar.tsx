@@ -30,6 +30,7 @@ export default function NavBar() {
         <>
           <Link to="/collections" className="text-sm text-gray-700 hover:text-blue-600">Collections</Link>
           <Link to="/health" className="text-sm text-gray-700 hover:text-blue-600">Health</Link>
+          <Link to="/users" className="text-sm text-gray-700 hover:text-blue-600">Users</Link>
         </>
       )}
       <div className="ml-auto flex items-center gap-3">

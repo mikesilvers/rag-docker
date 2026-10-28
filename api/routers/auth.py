@@ -1,20 +1,24 @@
-"""Login, logout, the current user and their own password change (#25).
+"""Login, logout, the current user, their own password change, and account
+administration for Engineers (#25).
 
 Which role every other route needs is in auth/policy.py, enforced by
-auth/middleware.py before a route runs. Accounts are created and recovered by
-the operator command, `python -m auth`.
+auth/middleware.py before a route runs; the /auth/users routes need an
+Engineer. The first account is created by the operator command, `python -m
+auth`, which also recovers lockouts.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from auth import passwords, store
 from config import settings
-from models.schemas import AuthStatus, AuthUser, LoginRequest, PasswordChangeRequest
+from models.schemas import (AdminUserList, AdminUserResult, AuthStatus, AuthUser, LoginRequest,
+                            PasswordChangeRequest, RoleChangeRequest, UserCreateRequest)
 from utils import api_error
 
 router = APIRouter(prefix="/auth")
@@ -136,3 +140,133 @@ async def change_password(body: PasswordChangeRequest, request: Request):
         return api_error(422, "INVALID_PASSWORD", problem)
     _log.warning("Password changed by %r; their other sessions ended", principal.username)
     return {"status": "changed", **_user_body(principal.username, principal.role, False)}
+
+
+# ── account administration (Engineers only, in auth/policy.py) ───────────────
+# Each change and each refusal is one WARNING line naming the Engineer, the
+# action and the account (Q30); a generated password is in its answer only.
+
+_REFUSED_STATUS = {"USER_NOT_FOUND": 404, "USER_EXISTS": 409, "LAST_ENGINEER": 409}
+_NO_STORE = {"Cache-Control": "no-store"}
+
+
+def _admin_user(user: store.User) -> dict:
+    return {"username": user.username, "role": user.role, "enabled": user.enabled,
+            "must_change_password": user.must_change_password,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(user.created_at))}
+
+
+def _target(username: str) -> str | None:
+    """The stored form of a username in a path, or None when no account can have it."""
+    return passwords.normalize_username(username)
+
+
+def _refusal(actor: str, action: str, target: str, code: str, message: str):
+    _log.warning("Admin %r: %s of %r refused: %s", actor, action, target, message)
+    return api_error(_REFUSED_STATUS.get(code, 409), code, message)
+
+
+def _not_found(actor: str, action: str, typed: str):
+    return _refusal(actor, action, typed, "USER_NOT_FOUND", f"There is no user {typed!r}.")
+
+
+def _refused(actor: str, action: str, target: str, exc: store.Refused):
+    message = str(exc)
+    return _refusal(actor, action, target, exc.code, message[:1].upper() + message[1:] + ".")
+
+
+@router.get("/users", response_model=AdminUserList)
+async def list_users():
+    users = await asyncio.to_thread(store.list_users)
+    return {"users": [_admin_user(user) for user in users]}
+
+
+def _create(username: str, role: str):
+    password = passwords.new_password(username)
+    store.create_user(username, role, password)
+    return store.get_user(username), password
+
+
+@router.post("/users", status_code=201, response_model=AdminUserResult)
+async def create_user(body: UserCreateRequest, request: Request):
+    actor = request.state.auth.username
+    username = passwords.normalize_username(body.username)
+    if username is None:
+        _log.warning("Admin %r: create of %r refused: invalid username", actor, body.username)
+        return api_error(422, "INVALID_USERNAME", f"The username must be {passwords.USERNAME_RULE}.")
+    try:
+        user, password = await asyncio.to_thread(_create, username, body.role)
+    except store.Refused as exc:
+        return _refused(actor, "create", username, exc)
+    _log.warning("Admin %r created %s %r; a generated password is due for change", actor, user.role, user.username)
+    return JSONResponse({"user": _admin_user(user), "password": password}, status_code=201, headers=_NO_STORE)
+
+
+def _reset(username: str):
+    password = passwords.new_password(username)
+    store.reset_password(username, password)
+    return store.get_user(username), password
+
+
+@router.post("/users/{username}/reset-password", response_model=AdminUserResult)
+async def reset_user_password(username: str, request: Request):
+    actor = request.state.auth.username
+    target = _target(username)
+    if target is None:
+        return _not_found(actor, "reset-password", username)
+    if target == actor:
+        # R3: an Engineer's own password is changed with the current one (Q19);
+        # the operator command can still reset it, for recovery.
+        _log.warning("Admin %r: reset-password of their own account refused", actor)
+        return api_error(409, "SELF_RESET_REFUSED",
+                         "You can't reset your own password here. Use Change password, which needs your "
+                         "current password.")
+    try:
+        user, password = await asyncio.to_thread(_reset, target)
+    except store.Refused as exc:
+        return _refused(actor, "reset-password", target, exc)
+    _log.warning("Admin %r reset the password of %r; their sessions ended", actor, target)
+    return JSONResponse({"user": _admin_user(user), "password": password}, headers=_NO_STORE)
+
+
+def _apply(action, target: str, *args):
+    action(target, *args)
+    return store.get_user(target)
+
+
+@router.post("/users/{username}/role", response_model=AdminUserResult, response_model_exclude_none=True)
+async def set_user_role(username: str, body: RoleChangeRequest, request: Request):
+    actor = request.state.auth.username
+    target = _target(username)
+    if target is None:
+        return _not_found(actor, "set-role", username)
+    try:
+        user = await asyncio.to_thread(_apply, store.set_role, target, body.role)
+    except store.Refused as exc:
+        return _refused(actor, "set-role", target, exc)
+    _log.warning("Admin %r set the role of %r to %s", actor, target, body.role)
+    return {"user": _admin_user(user)}
+
+
+async def _set_enabled(username: str, request: Request, enabled: bool):
+    actor = request.state.auth.username
+    action = "enable" if enabled else "disable"
+    target = _target(username)
+    if target is None:
+        return _not_found(actor, action, username)
+    try:
+        user = await asyncio.to_thread(_apply, store.set_enabled, target, enabled)
+    except store.Refused as exc:
+        return _refused(actor, action, target, exc)
+    _log.warning("Admin %r %sd %r%s", actor, action, target, "" if enabled else "; their sessions ended")
+    return {"user": _admin_user(user)}
+
+
+@router.post("/users/{username}/disable", response_model=AdminUserResult, response_model_exclude_none=True)
+async def disable_user(username: str, request: Request):
+    return await _set_enabled(username, request, False)
+
+
+@router.post("/users/{username}/enable", response_model=AdminUserResult, response_model_exclude_none=True)
+async def enable_user(username: str, request: Request):
+    return await _set_enabled(username, request, True)

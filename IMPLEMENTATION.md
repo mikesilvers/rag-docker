@@ -1397,6 +1397,32 @@ class AuthUser(BaseModel):
     must_change_password: bool
 
 
+class AdminUser(BaseModel):
+    username: str
+    role: Literal["end_user", "developer", "engineer"]
+    enabled: bool
+    must_change_password: bool
+    created_at: str
+
+
+class AdminUserList(BaseModel):
+    users: list[AdminUser]
+
+
+class AdminUserResult(BaseModel):
+    user: AdminUser
+    password: Optional[str] = None   # a generated password, in this answer only
+
+
+class UserCreateRequest(BaseModel):
+    username: str = Field(max_length=256)
+    role: Literal["end_user", "developer", "engineer"]
+
+
+class RoleChangeRequest(BaseModel):
+    role: Literal["end_user", "developer", "engineer"]
+
+
 # ── Error ─────────────────────────────────────────────────────────────────────
 
 class ErrorDetail(BaseModel):
@@ -11874,8 +11900,9 @@ alone.
 - `store`: the SQLite file in AUTH_DIR holding accounts, sessions and the login throttle.
 - `policy`: which role each route needs.
 - `middleware`: enforces the policy on every request, before the route sees its body.
-- `__main__`: the operator command, `python -m auth`, the only way to create or
-  recover accounts until in-app administration arrives.
+- `__main__`: the operator command, `python -m auth`, which creates the first
+  Engineer and recovers lockouts; Engineers manage accounts in the app too
+  (routers/auth.py, the Users page).
 - `testing`: a real account and session in a temporary store, for in-process tests.
 """
 ```
@@ -11974,6 +12001,14 @@ def generate_password() -> str:
     return secrets.token_urlsafe(18)
 
 
+def new_password(username: str) -> str:
+    """A generated password that meets the password rule for `username`."""
+    while True:
+        password = generate_password()
+        if password_problem(password, username) is None:
+            return password
+
+
 _dummy_hash: str | None = None
 
 
@@ -12045,6 +12080,13 @@ ACCESS: dict[tuple[str, str], str] = {
     ("GET", "/tune/job/{job_id}"): ENGINEER,
     ("GET", "/metrics/latency"): ENGINEER,
     ("GET", "/goldstandard/diagnostics"): ENGINEER,
+    # Account administration (Q20, PR 2 of #25). No route deletes an account.
+    ("GET", "/auth/users"): ENGINEER,
+    ("POST", "/auth/users"): ENGINEER,
+    ("POST", "/auth/users/{username}/reset-password"): ENGINEER,
+    ("POST", "/auth/users/{username}/role"): ENGINEER,
+    ("POST", "/auth/users/{username}/disable"): ENGINEER,
+    ("POST", "/auth/users/{username}/enable"): ENGINEER,
     # FastAPI's own API docs (N5).
     ("GET", "/docs"): ENGINEER,
     ("GET", "/docs/oauth2-redirect"): ENGINEER,
@@ -12160,7 +12202,13 @@ _set_up: set[str] = set()
 
 
 class Refused(Exception):
-    """An account change the rules don't allow; the message says why, in one line."""
+    """An account change the rules don't allow; the message says why, in one line.
+    `code` names the reason for the API: USER_EXISTS, USER_NOT_FOUND,
+    LAST_ENGINEER, or REFUSED for the bootstrap rules."""
+
+    def __init__(self, message: str, code: str = "REFUSED"):
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -12251,7 +12299,7 @@ def is_set_up() -> bool:
     return found
 
 
-# ── accounts (the operator command) ──────────────────────────────────────────
+# ── accounts (the operator command and the admin routes) ─────────────────────
 
 def get_user(username: str) -> User | None:
     with _connect() as conn:
@@ -12281,7 +12329,7 @@ def create_user(username: str, role: str, password: str, *, bootstrap: bool = Fa
         if not bootstrap and not exists:
             raise Refused("the system is not set up yet; run bootstrap first")
         if conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
-            raise Refused(f"the user {username!r} already exists")
+            raise Refused(f"the user {username!r} already exists", "USER_EXISTS")
         conn.execute("INSERT INTO users (username, role, password_hash, enabled, must_change_password, "
                      "created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?)",
                      (username, role, password_hash, int(must_change_password), now, now))
@@ -12292,7 +12340,7 @@ def create_user(username: str, role: str, password: str, *, bootstrap: bool = Fa
 def _existing(conn, username: str):
     row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
     if row is None:
-        raise Refused(f"there is no user {username!r}")
+        raise Refused(f"there is no user {username!r}", "USER_NOT_FOUND")
     return row
 
 
@@ -12320,7 +12368,8 @@ def set_role(username: str, role: str) -> None:
     with _connect(write=True) as conn:
         row = _existing(conn, username)
         if role != "engineer" and _is_last_engineer(conn, row):
-            raise Refused(f"{username!r} is the last enabled engineer; make another engineer first")
+            raise Refused(f"{username!r} is the last enabled engineer; make another engineer first",
+                          "LAST_ENGINEER")
         conn.execute("UPDATE users SET role = ?, updated_at = ? WHERE id = ?", (role, _now(), row["id"]))
 
 
@@ -12329,7 +12378,8 @@ def set_enabled(username: str, enabled: bool) -> None:
     with _connect(write=True) as conn:
         row = _existing(conn, username)
         if not enabled and _is_last_engineer(conn, row):
-            raise Refused(f"{username!r} is the last enabled engineer; make another engineer first")
+            raise Refused(f"{username!r} is the last enabled engineer; make another engineer first",
+                          "LAST_ENGINEER")
         conn.execute("UPDATE users SET enabled = ?, updated_at = ? WHERE id = ?",
                      (int(enabled), _now(), row["id"]))
         if not enabled:
@@ -12662,13 +12712,6 @@ def _role(parser, value: str) -> str:
     return value
 
 
-def _new_password(username: str) -> str:
-    while True:
-        password = passwords.generate_password()
-        if passwords.password_problem(password, username) is None:
-            return password
-
-
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m auth", description="Manage RAG platform accounts.")
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
@@ -12693,13 +12736,13 @@ def main(argv=None) -> int:
     role = _role(parser, args.role) if hasattr(args, "role") else None
     try:
         if args.command in ("bootstrap", "create-user"):
-            password = _new_password(username)
+            password = passwords.new_password(username)
             role = "engineer" if args.command == "bootstrap" else role
             store.create_user(username, role, password, bootstrap=args.command == "bootstrap")
             print(password, flush=True)
             _say(f"{args.command}: created {role} {username!r}; the password above must be changed at first login")
         elif args.command == "reset-password":
-            password = _new_password(username)
+            password = passwords.new_password(username)
             store.reset_password(username, password)
             print(password, flush=True)
             _say(f"reset-password: new password for {username!r}, to be changed at next login; "
@@ -12795,23 +12838,27 @@ def headers(role: str = "engineer", base_url: str = "http://testserver") -> dict
 ### api/routers/auth.py
 
 ```python
-"""Login, logout, the current user and their own password change (#25).
+"""Login, logout, the current user, their own password change, and account
+administration for Engineers (#25).
 
 Which role every other route needs is in auth/policy.py, enforced by
-auth/middleware.py before a route runs. Accounts are created and recovered by
-the operator command, `python -m auth`.
+auth/middleware.py before a route runs; the /auth/users routes need an
+Engineer. The first account is created by the operator command, `python -m
+auth`, which also recovers lockouts.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from auth import passwords, store
 from config import settings
-from models.schemas import AuthStatus, AuthUser, LoginRequest, PasswordChangeRequest
+from models.schemas import (AdminUserList, AdminUserResult, AuthStatus, AuthUser, LoginRequest,
+                            PasswordChangeRequest, RoleChangeRequest, UserCreateRequest)
 from utils import api_error
 
 router = APIRouter(prefix="/auth")
@@ -12933,6 +12980,136 @@ async def change_password(body: PasswordChangeRequest, request: Request):
         return api_error(422, "INVALID_PASSWORD", problem)
     _log.warning("Password changed by %r; their other sessions ended", principal.username)
     return {"status": "changed", **_user_body(principal.username, principal.role, False)}
+
+
+# ── account administration (Engineers only, in auth/policy.py) ───────────────
+# Each change and each refusal is one WARNING line naming the Engineer, the
+# action and the account (Q30); a generated password is in its answer only.
+
+_REFUSED_STATUS = {"USER_NOT_FOUND": 404, "USER_EXISTS": 409, "LAST_ENGINEER": 409}
+_NO_STORE = {"Cache-Control": "no-store"}
+
+
+def _admin_user(user: store.User) -> dict:
+    return {"username": user.username, "role": user.role, "enabled": user.enabled,
+            "must_change_password": user.must_change_password,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(user.created_at))}
+
+
+def _target(username: str) -> str | None:
+    """The stored form of a username in a path, or None when no account can have it."""
+    return passwords.normalize_username(username)
+
+
+def _refusal(actor: str, action: str, target: str, code: str, message: str):
+    _log.warning("Admin %r: %s of %r refused: %s", actor, action, target, message)
+    return api_error(_REFUSED_STATUS.get(code, 409), code, message)
+
+
+def _not_found(actor: str, action: str, typed: str):
+    return _refusal(actor, action, typed, "USER_NOT_FOUND", f"There is no user {typed!r}.")
+
+
+def _refused(actor: str, action: str, target: str, exc: store.Refused):
+    message = str(exc)
+    return _refusal(actor, action, target, exc.code, message[:1].upper() + message[1:] + ".")
+
+
+@router.get("/users", response_model=AdminUserList)
+async def list_users():
+    users = await asyncio.to_thread(store.list_users)
+    return {"users": [_admin_user(user) for user in users]}
+
+
+def _create(username: str, role: str):
+    password = passwords.new_password(username)
+    store.create_user(username, role, password)
+    return store.get_user(username), password
+
+
+@router.post("/users", status_code=201, response_model=AdminUserResult)
+async def create_user(body: UserCreateRequest, request: Request):
+    actor = request.state.auth.username
+    username = passwords.normalize_username(body.username)
+    if username is None:
+        _log.warning("Admin %r: create of %r refused: invalid username", actor, body.username)
+        return api_error(422, "INVALID_USERNAME", f"The username must be {passwords.USERNAME_RULE}.")
+    try:
+        user, password = await asyncio.to_thread(_create, username, body.role)
+    except store.Refused as exc:
+        return _refused(actor, "create", username, exc)
+    _log.warning("Admin %r created %s %r; a generated password is due for change", actor, user.role, user.username)
+    return JSONResponse({"user": _admin_user(user), "password": password}, status_code=201, headers=_NO_STORE)
+
+
+def _reset(username: str):
+    password = passwords.new_password(username)
+    store.reset_password(username, password)
+    return store.get_user(username), password
+
+
+@router.post("/users/{username}/reset-password", response_model=AdminUserResult)
+async def reset_user_password(username: str, request: Request):
+    actor = request.state.auth.username
+    target = _target(username)
+    if target is None:
+        return _not_found(actor, "reset-password", username)
+    if target == actor:
+        # R3: an Engineer's own password is changed with the current one (Q19);
+        # the operator command can still reset it, for recovery.
+        _log.warning("Admin %r: reset-password of their own account refused", actor)
+        return api_error(409, "SELF_RESET_REFUSED",
+                         "You can't reset your own password here. Use Change password, which needs your "
+                         "current password.")
+    try:
+        user, password = await asyncio.to_thread(_reset, target)
+    except store.Refused as exc:
+        return _refused(actor, "reset-password", target, exc)
+    _log.warning("Admin %r reset the password of %r; their sessions ended", actor, target)
+    return JSONResponse({"user": _admin_user(user), "password": password}, headers=_NO_STORE)
+
+
+def _apply(action, target: str, *args):
+    action(target, *args)
+    return store.get_user(target)
+
+
+@router.post("/users/{username}/role", response_model=AdminUserResult, response_model_exclude_none=True)
+async def set_user_role(username: str, body: RoleChangeRequest, request: Request):
+    actor = request.state.auth.username
+    target = _target(username)
+    if target is None:
+        return _not_found(actor, "set-role", username)
+    try:
+        user = await asyncio.to_thread(_apply, store.set_role, target, body.role)
+    except store.Refused as exc:
+        return _refused(actor, "set-role", target, exc)
+    _log.warning("Admin %r set the role of %r to %s", actor, target, body.role)
+    return {"user": _admin_user(user)}
+
+
+async def _set_enabled(username: str, request: Request, enabled: bool):
+    actor = request.state.auth.username
+    action = "enable" if enabled else "disable"
+    target = _target(username)
+    if target is None:
+        return _not_found(actor, action, username)
+    try:
+        user = await asyncio.to_thread(_apply, store.set_enabled, target, enabled)
+    except store.Refused as exc:
+        return _refused(actor, action, target, exc)
+    _log.warning("Admin %r %sd %r%s", actor, action, target, "" if enabled else "; their sessions ended")
+    return {"user": _admin_user(user)}
+
+
+@router.post("/users/{username}/disable", response_model=AdminUserResult, response_model_exclude_none=True)
+async def disable_user(username: str, request: Request):
+    return await _set_enabled(username, request, False)
+
+
+@router.post("/users/{username}/enable", response_model=AdminUserResult, response_model_exclude_none=True)
+async def enable_user(username: str, request: Request):
+    return await _set_enabled(username, request, True)
 ```
 
 ### api/main.py
@@ -13308,6 +13485,7 @@ import RetrievalPage from './pages/RetrievalPage'
 import GoldStandardPage from './pages/GoldStandardPage'
 import CollectionsPage from './pages/CollectionsPage'
 import HealthPage from './pages/HealthPage'
+import UsersPage from './pages/UsersPage'
 import TransferPage from './pages/TransferPage'
 import HelpTransferPage from './pages/HelpTransferPage'
 
@@ -13365,6 +13543,7 @@ export default function AppRouter() {
             <>
               <Route path="/collections" element={<CollectionsPage />} />
               <Route path="/health" element={<HealthPage />} />
+              <Route path="/users" element={<UsersPage />} />
             </>
           )}
           <Route path="*" element={<Navigate to="/qa" replace />} />
@@ -13731,6 +13910,17 @@ export const api = {
   logout: () => request<{ status: string }>('POST', '/auth/logout'),
   changePassword: (current_password: string, new_password: string) =>
     request<{ status: string } & AuthUser>('POST', '/auth/password', { current_password, new_password }),
+  // Account administration, Engineers only (#25). A generated password is in
+  // the answer to a create or a reset, once; the page shows it and keeps it nowhere.
+  listUsers: () => request<{ users: AdminUser[] }>('GET', '/auth/users'),
+  createUser: (username: string, role: Role) =>
+    request<{ user: AdminUser; password: string }>('POST', '/auth/users', { username, role }),
+  resetUserPassword: (username: string) =>
+    request<{ user: AdminUser; password: string }>('POST', `/auth/users/${encodeURIComponent(username)}/reset-password`),
+  setUserRole: (username: string, role: Role) =>
+    request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/role`, { role }),
+  disableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/disable`),
+  enableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/enable`),
 
   getCollections: () => request<{ collections: CollectionInfo[] }>('GET', '/collections'),
   // Answers with the name as stored, first letter capitalised (#372).
@@ -13773,6 +13963,7 @@ export const api = {
 // Types
 export type Role = 'engineer' | 'developer' | 'end_user'
 export interface AuthUser { username: string; role: Role; must_change_password: boolean }
+export interface AdminUser { username: string; role: Role; enabled: boolean; must_change_password: boolean; created_at: string }
 export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
   hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null
@@ -13934,6 +14125,7 @@ export default function NavBar() {
         <>
           <Link to="/collections" className="text-sm text-gray-700 hover:text-blue-600">Collections</Link>
           <Link to="/health" className="text-sm text-gray-700 hover:text-blue-600">Health</Link>
+          <Link to="/users" className="text-sm text-gray-700 hover:text-blue-600">Users</Link>
         </>
       )}
       <div className="ml-auto flex items-center gap-3">
@@ -16127,6 +16319,151 @@ export default function HealthPage() {
 }
 ```
 
+### ui/src/pages/UsersPage.tsx
+
+```typescript
+import { FormEvent, useEffect, useState } from 'react'
+import { api, AdminUser, Role } from '../api/client'
+import { useAuth } from '../context/AuthContext'
+
+const ROLES: Role[] = ['end_user', 'developer', 'engineer']
+const ROLE_LABELS: Record<Role, string> = { end_user: 'End User', developer: 'Developer', engineer: 'AI Engineer' }
+
+// Account administration for Engineers (#25). The API decides what is allowed:
+// the last enabled Engineer can't be demoted or disabled, and an Engineer's own
+// password is changed on the Change password page, not reset here. Accounts are
+// disabled, never deleted. A generated password is shown once, from the answer
+// that carried it, and kept only in this page's memory until "Done".
+export default function UsersPage() {
+  const { user: me, refresh } = useAuth()
+  const [users, setUsers] = useState<AdminUser[]>([])
+  const [listError, setListError] = useState('')
+  const [actionError, setActionError] = useState('')
+  const [username, setUsername] = useState('')
+  const [role, setRole] = useState<Role>('end_user')
+  const [busy, setBusy] = useState(false)
+  const [shown, setShown] = useState<{ username: string; password: string } | null>(null)
+
+  async function load() {
+    try {
+      setUsers((await api.listUsers()).users)
+      setListError('')
+    } catch (e: unknown) {
+      setListError(`Could not load the users: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  useEffect(() => { load() }, [])
+
+  async function act(target: string, run: () => Promise<{ user: AdminUser; password?: string }>) {
+    setActionError('')
+    setBusy(true)
+    try {
+      const result = await run()
+      if (result.password) setShown({ username: result.user.username, password: result.password })
+      await load()
+      // A demoted Engineer leaves this page, a disabled one is logged out.
+      if (target === me?.username) await refresh()
+      return true
+    } catch (e: unknown) {
+      setActionError(e instanceof Error ? e.message : String(e))
+      await load()
+      return false
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function create(e: FormEvent) {
+    e.preventDefault()
+    if (await act('', () => api.createUser(username, role))) setUsername('')
+  }
+
+  return (
+    <div className="max-w-5xl mx-auto">
+      <h1 className="text-2xl font-bold mb-6">Users</h1>
+      {listError && <p role="alert" className="text-red-600 text-sm mb-4">{listError}</p>}
+
+      {shown && (
+        <div data-testid="one-time-password" className="mb-6 border border-amber-300 bg-amber-50 rounded p-4 text-sm">
+          <p className="mb-2">
+            Password for <strong>{shown.username}</strong>: <code className="bg-white border border-gray-200 rounded px-2 py-1 select-all">{shown.password}</code>
+          </p>
+          <p className="text-gray-700 mb-3">
+            It is shown only once. Give it to the user; they must change it when they first log in.
+          </p>
+          <button onClick={() => setShown(null)} className="bg-blue-600 text-white px-3 py-1 rounded text-sm hover:bg-blue-700">Done</button>
+        </div>
+      )}
+
+      <form onSubmit={create} className="flex flex-wrap items-end gap-3 mb-6">
+        <label className="text-sm text-gray-700">
+          Username
+          <input id="new-username" value={username} onChange={e => setUsername(e.target.value)} autoComplete="off"
+            className="mt-1 block border border-gray-300 rounded px-3 py-2 text-sm" required />
+        </label>
+        <label className="text-sm text-gray-700">
+          Role
+          <select id="new-role" value={role} onChange={e => setRole(e.target.value as Role)}
+            className="mt-1 block border border-gray-300 rounded px-3 py-2 text-sm">
+            {ROLES.map(r => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
+          </select>
+        </label>
+        <button type="submit" disabled={busy || !username}
+          className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50">Create user</button>
+        <p className="text-xs text-gray-500 basis-full">
+          3-32 characters: lowercase letters, digits, '.', '_' or '-'. The account gets a generated password.
+        </p>
+      </form>
+
+      {actionError && <p role="alert" className="text-red-600 text-sm mb-4">{actionError}</p>}
+
+      <table className="w-full text-sm border-collapse">
+        <thead>
+          <tr className="border-b border-gray-200 text-left text-gray-600">
+            <th className="py-2 pr-4">Username</th>
+            <th className="py-2 pr-4">Role</th>
+            <th className="py-2 pr-4">Status</th>
+            <th className="py-2 pr-4">Password</th>
+            <th className="py-2 pr-4">Created</th>
+            <th className="py-2"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {users.map(u => {
+            const own = u.username === me?.username
+            return (
+              <tr key={u.username} className="border-b border-gray-100" data-username={u.username}>
+                <td className="py-2 pr-4 font-medium">{u.username}{own && <span className="text-gray-500 font-normal"> (you)</span>}</td>
+                <td className="py-2 pr-4">
+                  <select aria-label={`Role of ${u.username}`} value={u.role} disabled={busy}
+                    onChange={e => { const next = e.target.value as Role; act(u.username, () => api.setUserRole(u.username, next)) }}
+                    className="border border-gray-300 rounded px-2 py-1 text-sm">
+                    {ROLES.map(r => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
+                  </select>
+                </td>
+                <td className="py-2 pr-4">{u.enabled ? 'Enabled' : 'Disabled'}</td>
+                <td className="py-2 pr-4">{u.must_change_password ? 'Change due' : 'Set'}</td>
+                <td className="py-2 pr-4">{new Date(u.created_at).toLocaleDateString()}</td>
+                <td className="py-2 space-x-3 whitespace-nowrap">
+                  {own
+                    ? <span className="text-xs text-gray-500">Use Change password for your own</span>
+                    : <button disabled={busy} onClick={() => act(u.username, () => api.resetUserPassword(u.username))}
+                        className="text-blue-600 hover:underline disabled:opacity-50">Reset password</button>}
+                  <button disabled={busy}
+                    onClick={() => act(u.username, () => u.enabled ? api.disableUser(u.username) : api.enableUser(u.username))}
+                    className="text-blue-600 hover:underline disabled:opacity-50">{u.enabled ? 'Disable' : 'Enable'}</button>
+                </td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+```
+
 ---
 
 *End of Implementation — Version 1.0*
@@ -16248,7 +16585,9 @@ read the jar through `auth_headers.py`; in-process checks in the API image use
 `17_auth.sh` checks authentication itself: the endpoint/role matrix for no session and each
 role (written out in `auth_stack.py`, not read from the API), login, logout, cookies, origin
 rules, throttling, the operator command's effect on existing sessions (on throwaway `vfy-t-*`
-accounts), idle expiry, and that the API log holds no harness secret.
+accounts), an Engineer's account administration through the API (on a throwaway account; the
+generated passwords must not reach the API log), idle expiry, and that the API log holds no
+harness secret.
 
 ## Entry point and verify project
 
@@ -16900,7 +17239,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
 | `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health` reports, so the status flips to `below_recommended` on any host (#536) |
 | `../tests/test_memory_override.py` | host-side, standard library: the derived override makes `system_info.memory_info` report `below_recommended` with a note for allocations below and above the 12.35 GB a fixed 13 GB could flip, and no override without a usable allocation (#536); embedded copies; registered by suite 01 |
-| `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command; registers `../tests/test_auth.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
+| `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command, account administration; registers `../tests/test_auth.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
 | `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
 | `auth_stack.py` | the stack checks of `17_auth.sh`, one per subcommand (#25) |
 | `auth_headers.py` | the suite's session as `Cookie` and `Origin` headers, for the host-side Python helpers (#25) |
@@ -18828,6 +19167,10 @@ check "the own password change: rules, current password, not the same password, 
 stack idle-expiry
 check "a session idle for more than 12 hours answers 401" $?
 
+section "Account administration by Engineers (PR 2)"
+stack admin-accounts
+check "an Engineer creates, resets, re-roles, disables and enables an account through the API; own reset refused; no password logged" $?
+
 section "Request protection and login throttling (H4)"
 stack control-path
 check "a path ending in %0A is refused before its body is read, not routed past the check" $?
@@ -18933,6 +19276,14 @@ MATRIX = (
     ("GET", "/docs/oauth2-redirect", None, "engineer"),
     ("GET", "/redoc", None, "engineer"),
     ("GET", "/openapi.json", None, "engineer"),
+    # Account administration (PR 2 of #25): an allowed request lists, or is a
+    # 422 or a 404 for an account that doesn't exist; it changes nothing.
+    ("GET", "/auth/users", None, "engineer"),
+    ("POST", "/auth/users", {}, "engineer"),
+    ("POST", "/auth/users/vfy-no-such-user/reset-password", None, "engineer"),
+    ("POST", "/auth/users/vfy-no-such-user/role", {}, "engineer"),
+    ("POST", "/auth/users/vfy-no-such-user/disable", None, "engineer"),
+    ("POST", "/auth/users/vfy-no-such-user/enable", None, "engineer"),
 )
 SESSION_ROUTES = (("GET", "/auth/me", None), ("POST", "/auth/logout", None), ("POST", "/auth/password", {}))
 
@@ -19203,6 +19554,70 @@ def check_own_password(operator_ok):
     expect(status == 200, "the change answered {}".format(status))
     expect(code("GET", "/auth/me", token=token)[0] == 200, "the change ended the session that made it")
     expect(code("GET", "/auth/me", token=other)[0] == 401, "the change left another session working")
+
+
+def check_admin_accounts(operator_ok):
+    """The Engineer's account administration through the API (PR 2 of #25), on a
+    throwaway vfy-t-<random> account."""
+    expect(operator_ok, "creates accounts, so it runs only on the verify project")
+    admin = role_token("engineer")
+    username = "vfy-t-" + secrets.token_hex(4)
+    generated = []
+
+    def call(path, body=None, method="POST"):
+        status, raw, headers = code(method, "/auth/users" + path, body, token=admin)
+        return status, (json.loads(raw) if raw else {}), headers
+
+    status, body, headers = call("", {"username": username.upper(), "role": "developer"})
+    expect(status == 201 and body["user"]["username"] == username and body["user"]["must_change_password"] is True,
+           "create answered {} {}".format(status, error_code(json.dumps(body).encode())))
+    expect(headers.get("Cache-Control") == "no-store", "the created password's answer may be cached")
+    generated.append(body["password"])
+    status, listed, _ = call("", method="GET")
+    expect(status == 200 and username in [u["username"] for u in listed["users"]], "the new account isn't listed")
+    expect(generated[0] not in json.dumps(listed), "the list holds the generated password")
+    status, body, token = request("POST", "/auth/login", {"username": username, "password": generated[0]})
+    expect(status == 200 and body.get("must_change_password") is True, "the generated password must be changed first")
+    new = secrets.token_urlsafe(18)
+    status, _, _ = code("POST", "/auth/password", {"current_password": generated[0], "new_password": new}, token=token)
+    expect(status == 200, "the forced change answered {}".format(status))
+
+    status, body, _ = call("/{}/role".format(username), {"role": "end_user"})
+    expect(status == 200 and body["user"]["role"] == "end_user", "the role change answered {}".format(status))
+    status, raw, _ = code("GET", "/packages", token=token)
+    expect(status == 403 and error_code(raw) == "FORBIDDEN", "the demoted session answered {}".format(status))
+
+    status, body, _ = call("/{}/reset-password".format(username))
+    expect(status == 200 and body["user"]["must_change_password"] is True, "the reset answered {}".format(status))
+    generated.append(body["password"])
+    expect(code("GET", "/auth/me", token=token)[0] == 401, "a reset left the user's session working")
+    status, _, token = request("POST", "/auth/login", {"username": username, "password": generated[1]})
+    expect(status == 200 and token, "the reset password doesn't log in ({})".format(status))
+
+    status, body, _ = call("/{}/disable".format(username))
+    expect(status == 200 and body["user"]["enabled"] is False, "disable answered {}".format(status))
+    expect(code("GET", "/auth/me", token=token)[0] == 401, "a disabled user's session still works")
+    status, raw, _ = code("POST", "/auth/login", {"username": username, "password": generated[1]})
+    expect(status == 401 and error_code(raw) == "LOGIN_FAILED", "a disabled user can log in ({})".format(status))
+    status, body, _ = call("/{}/enable".format(username))
+    expect(status == 200 and body["user"]["enabled"] is True, "enable answered {}".format(status))
+    status, _, _ = code("POST", "/auth/login", {"username": username, "password": generated[1]})
+    expect(status == 200, "enable did not restore the login ({})".format(status))
+
+    me = auth_setup.read_credentials(auth_setup.private_dir())["engineer"][0]
+    status, body, _ = call("/{}/reset-password".format(me))
+    expect(status == 409 and body["error"]["code"] == "SELF_RESET_REFUSED",
+           "the Engineer's own reset answered {}".format(status))
+    expect(code("GET", "/auth/me", token=admin)[0] == 200, "the refused own reset ended the session")
+    request("POST", "/auth/logout", token=admin)
+
+    result = compose("logs", "--no-color", "api")
+    log = result.stdout + result.stderr
+    expect(result.returncode == 0, "docker compose logs failed")
+    expect(not [p for p in generated if p in log], "a generated password appears in the API log")
+    for line in ("created developer '{}'".format(username), "reset the password of '{}'".format(username),
+                 "disabled '{}'".format(username), "enabled '{}'".format(username)):
+        expect("Admin '{}' {}".format(me, line) in log, "the API log has no line \"Admin ... {}\"".format(line))
 
 
 def check_bootstrap_refused(operator_ok):
@@ -19498,6 +19913,21 @@ class StoreTests(StoreTestCase):
         with self.assertRaises(store.Refused):
             store.set_enabled("eng2", False)
 
+    def test_refusals_carry_a_code(self):
+        # The admin routes answer by these codes (PR 2 of #25).
+        self.make("eng", "engineer")
+        cases = ((lambda: store.create_user("eng", "developer", "x" * 12), "USER_EXISTS"),
+                 (lambda: store.reset_password("nobody", "x" * 12), "USER_NOT_FOUND"),
+                 (lambda: store.set_role("nobody", "developer"), "USER_NOT_FOUND"),
+                 (lambda: store.set_enabled("nobody", True), "USER_NOT_FOUND"),
+                 (lambda: store.set_role("eng", "developer"), "LAST_ENGINEER"),
+                 (lambda: store.set_enabled("eng", False), "LAST_ENGINEER"),
+                 (lambda: store.create_user("eng2", "engineer", "x" * 12, bootstrap=True), "REFUSED"))
+        for action, code in cases:
+            with self.subTest(code=code), self.assertRaises(store.Refused) as caught:
+                action()
+            self.assertEqual(caught.exception.code, code)
+
     def test_throttle_locks_a_pair_and_survives_a_new_handle(self):
         for attempt in range(4):
             self.assertFalse(store.record_failure("alice", "10.0.0.1"))
@@ -19558,12 +19988,21 @@ class PolicyTests(unittest.TestCase):
         counts = {}
         for access in policy.ACCESS.values():
             counts[access] = counts.get(access, 0) + 1
-        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 19, "engineer": 11})
+        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 19, "engineer": 17})
         self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
         self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
         self.assertEqual(policy.ACCESS[("POST", "/collections")], "developer")
         self.assertEqual(policy.ACCESS[("GET", "/tune/{collection}")], "developer")
         self.assertEqual(policy.ACCESS[("GET", "/tune/job/{job_id}")], "engineer")
+        # Account administration is the Engineer's, and nothing deletes an account (R1).
+        admin = {key: access for key, access in policy.ACCESS.items() if key[1].startswith("/auth/users")}
+        self.assertEqual(set(admin), {("GET", "/auth/users"), ("POST", "/auth/users"),
+                                      ("POST", "/auth/users/{username}/reset-password"),
+                                      ("POST", "/auth/users/{username}/role"),
+                                      ("POST", "/auth/users/{username}/disable"),
+                                      ("POST", "/auth/users/{username}/enable")})
+        self.assertEqual(set(admin.values()), {"engineer"})
+        self.assertFalse([key for key in policy.ACCESS if key[0] == "DELETE" and key[1].startswith("/auth")])
 
     def test_each_template_resolves_to_itself(self):
         for method, template in policy.ACCESS:
@@ -19938,6 +20377,198 @@ class RouteTests(StoreTestCase):
         verify.assert_not_called()
 
 
+class AdminRouteTests(StoreTestCase):
+    """The Engineer-only account routes (PR 2 of #25): S1-S6 of its specifications."""
+
+    ROUTES = (("GET", "/auth/users", None), ("POST", "/auth/users", {"username": "newbie", "role": "end_user"}),
+              ("POST", "/auth/users/dev/reset-password", None), ("POST", "/auth/users/dev/role", {"role": "end_user"}),
+              ("POST", "/auth/users/dev/disable", None), ("POST", "/auth/users/dev/enable", None))
+
+    def setUp(self):
+        super().setUp()
+        self.setup_roles()
+        self.eng, _ = self.session("eng")
+
+    def admin(self, method, path, body=None, headers=None):
+        return self.client.request(method, path, json=body, headers=headers or self.eng)
+
+    def code(self, response):
+        return response.json()["error"]["code"]
+
+    def test_only_engineers_reach_the_admin_routes(self):
+        for name in ("dev", "user"):
+            headers, _ = self.session(name)
+            for method, path, body in self.ROUTES:
+                with self.subTest(user=name, route=f"{method} {path}"):
+                    response = self.admin(method, path, body, headers)
+                    self.assertEqual((response.status_code, self.code(response)), (403, "FORBIDDEN"))
+                    self.assertEqual(response.json()["error"]["detail"], {"required_role": "engineer"})
+        for method, path, body in self.ROUTES:
+            with self.subTest(anonymous=f"{method} {path}"):
+                response = self.client.request(method, path, json=body)
+                self.assertEqual((response.status_code, self.code(response)), (401, "AUTH_REQUIRED"))
+        # Nothing was changed by the refused requests.
+        self.assertIsNone(store.get_user("newbie"))
+        self.assertEqual(store.get_user("dev").role, "developer")
+        self.assertTrue(store.get_user("dev").enabled)
+
+    def test_changes_are_origin_checked(self):
+        response = self.admin("POST", "/auth/users/dev/disable", headers={**self.eng, "Origin": "http://evil.test"})
+        self.assertEqual(self.code(response), "CROSS_ORIGIN_REFUSED")
+        self.assertTrue(store.get_user("dev").enabled)
+
+    def test_list(self):
+        response = self.admin("GET", "/auth/users")
+        self.assertEqual(response.status_code, 200)
+        users = response.json()["users"]
+        self.assertEqual([u["username"] for u in users], ["dev", "eng", "user"])
+        self.assertEqual(set(users[0]), {"username", "role", "enabled", "must_change_password", "created_at"})
+        self.assertEqual((users[0]["role"], users[0]["enabled"], users[0]["must_change_password"]),
+                         ("developer", True, False))
+        self.assertRegex(users[0]["created_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertNotIn("scrypt", response.text)
+
+    def test_create_gives_a_generated_password_once(self):
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users", {"username": "New.Person", "role": "developer"})
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        body = response.json()
+        password = body["password"]
+        self.assertGreaterEqual(len(password), 20)
+        self.assertEqual(body["user"]["username"], "new.person")
+        self.assertEqual((body["user"]["role"], body["user"]["enabled"], body["user"]["must_change_password"]),
+                         ("developer", True, True))
+        stored = store.get_user("new.person")
+        self.assertTrue(passwords.verify_password(password, stored.password_hash))
+        self.assertTrue(stored.must_change_password)
+        self.assertEqual(len(logs.records), 1, logged(logs))
+        self.assertIn("Admin 'eng' created developer 'new.person'", logged(logs))
+        self.assertNotIn(password, logged(logs))
+        self.assertNotIn(password, self.admin("GET", "/auth/users").text)
+        login = self.login("new.person", password)
+        self.assertEqual((login.status_code, login.json()["must_change_password"]), (200, True))
+
+    def test_create_refusals(self):
+        for username in ("ab", "x" * 33, "has space", "semi;colon", ""):
+            with self.subTest(username=username), self.assertLogs("auth", "WARNING") as logs:
+                response = self.admin("POST", "/auth/users", {"username": username, "role": "end_user"})
+                self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_USERNAME"))
+                self.assertIn("3-32 characters", response.json()["error"]["message"])
+                self.assertEqual(len(logs.records), 1)
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users", {"username": "DEV", "role": "end_user"})
+        self.assertEqual((response.status_code, self.code(response)), (409, "USER_EXISTS"))
+        self.assertIn("create of 'dev' refused", logged(logs))
+        self.assertEqual(store.get_user("dev").role, "developer")
+        for body in ({"username": "newbie", "role": "admin"}, {"username": "newbie"}, {"role": "end_user"},
+                     {"username": "u" * 257, "role": "end_user"}):
+            with self.subTest(body=body):
+                response = self.admin("POST", "/auth/users", body)
+                self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_PARAMETER"))
+        self.assertIsNone(store.get_user("newbie"))
+
+    def test_reset_ends_sessions_and_shows_the_password_once(self):
+        _, dev_token = self.session("dev")
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users/DEV/reset-password")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        password = response.json()["password"]
+        self.assertEqual(response.json()["user"]["must_change_password"], True)
+        self.assertIsNone(store.authenticate(dev_token))
+        self.assertEqual(self.login("dev", self.passwords["developer"]).status_code, 401)
+        self.assertEqual(self.login("dev", password).json()["must_change_password"], True)
+        self.assertIn("Admin 'eng' reset the password of 'dev'; their sessions ended", logged(logs))
+        self.assertNotIn(password, logged(logs))
+
+    def test_an_engineer_cannot_reset_their_own_password_here(self):
+        before = store.get_user("eng").password_hash
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users/Eng/reset-password")
+        self.assertEqual((response.status_code, self.code(response)), (409, "SELF_RESET_REFUSED"))
+        self.assertIn("Change password", response.json()["error"]["message"])
+        self.assertNotIn("password", {k for k in response.json() if k != "error"})
+        self.assertEqual(store.get_user("eng").password_hash, before)
+        self.assertEqual(self.admin("GET", "/auth/me").status_code, 200, "the session stays")
+        self.assertIn("refused", logged(logs))
+        # Another Engineer may reset it.
+        self.make("eng2", "engineer")
+        other, _ = self.session("eng2")
+        self.assertEqual(self.admin("POST", "/auth/users/eng/reset-password", headers=other).status_code, 200)
+
+    def test_unknown_users(self):
+        for path, body in (("/auth/users/nobody/reset-password", None), ("/auth/users/nobody/role", {"role": "engineer"}),
+                           ("/auth/users/nobody/disable", None), ("/auth/users/nobody/enable", None),
+                           ("/auth/users/x/disable", None), ("/auth/users/has%20space/enable", None)):
+            with self.subTest(path=path):
+                response = self.admin("POST", path, body)
+                self.assertEqual((response.status_code, self.code(response)), (404, "USER_NOT_FOUND"))
+
+    def test_role_change_applies_to_an_existing_session(self):
+        dev, _ = self.session("dev")
+        self.assertNotIn(self.client.get("/packages", headers=dev).status_code, (401, 403))
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users/dev/role", {"role": "end_user"})
+        self.assertEqual(response.json(), {"user": {**response.json()["user"], "role": "end_user"}})
+        self.assertNotIn("password", response.json())
+        self.assertIn("Admin 'eng' set the role of 'dev' to end_user", logged(logs))
+        self.assertEqual(self.code(self.client.get("/packages", headers=dev)), "FORBIDDEN")
+        self.admin("POST", "/auth/users/dev/role", {"role": "engineer"})
+        self.assertNotIn(self.client.get("/metrics/latency", headers=dev).status_code, (401, 403))
+        response = self.admin("POST", "/auth/users/dev/role", {"role": "engineer"})
+        self.assertEqual((response.status_code, response.json()["user"]["role"]), (200, "engineer"))
+
+    def test_disable_and_enable(self):
+        dev, token = self.session("dev")
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users/dev/disable")
+            self.assertEqual(response.json()["user"]["enabled"], False)
+            self.assertIsNone(store.authenticate(token))
+            self.assertEqual(self.code(self.login("dev", self.passwords["developer"])), "LOGIN_FAILED")
+            self.assertEqual(self.admin("POST", "/auth/users/dev/disable").status_code, 200, "already disabled")
+            response = self.admin("POST", "/auth/users/dev/enable")
+        self.assertEqual(response.json()["user"]["enabled"], True)
+        self.assertEqual(self.login("dev", self.passwords["developer"]).status_code, 200)
+        self.assertIn("Admin 'eng' disabled 'dev'; their sessions ended", logged(logs))
+        self.assertIn("Admin 'eng' enabled 'dev'", logged(logs))
+
+    def test_the_last_enabled_engineer_is_protected(self):
+        for path, body in (("/auth/users/eng/disable", None), ("/auth/users/eng/role", {"role": "developer"})):
+            with self.subTest(path=path), self.assertLogs("auth", "WARNING") as logs:
+                response = self.admin("POST", path, body)
+                self.assertEqual((response.status_code, self.code(response)), (409, "LAST_ENGINEER"))
+                self.assertIn("last enabled engineer", response.json()["error"]["message"])
+                self.assertIn("refused", logged(logs))
+        self.assertEqual((store.get_user("eng").role, store.get_user("eng").enabled), ("engineer", True))
+        self.assertEqual(self.admin("GET", "/auth/me").status_code, 200)
+        # With another enabled Engineer, an Engineer may demote or disable themselves.
+        self.make("eng2", "engineer")
+        response = self.admin("POST", "/auth/users/eng/role", {"role": "developer"})
+        self.assertEqual(response.json()["user"]["role"], "developer")
+        self.assertEqual(self.code(self.admin("GET", "/auth/users")), "FORBIDDEN", "the demotion applies at once")
+        other, _ = self.session("eng2")
+        self.admin("POST", "/auth/users/eng/role", {"role": "engineer"}, headers=other)
+        self.assertEqual(self.admin("POST", "/auth/users/eng/disable").status_code, 200)
+        self.assertEqual(self.admin("GET", "/auth/me").status_code, 401, "disabling oneself ends the session")
+        response = self.admin("POST", "/auth/users/eng2/disable", headers=other)
+        self.assertEqual(self.code(response), "LAST_ENGINEER")
+
+    def test_admin_actions_are_logged_one_line_each_without_secrets(self):
+        with self.assertLogs("auth", "WARNING") as logs:
+            created = self.admin("POST", "/auth/users", {"username": "temp", "role": "end_user"}).json()["password"]
+            reset = self.admin("POST", "/auth/users/temp/reset-password").json()["password"]
+            self.admin("POST", "/auth/users/temp/role", {"role": "developer"})
+            self.admin("POST", "/auth/users/temp/disable")
+            self.admin("POST", "/auth/users/temp/enable")
+            self.admin("GET", "/auth/users")
+        self.assertEqual(len(logs.records), 5, logged(logs))
+        self.assertTrue(all(r.getMessage().startswith("Admin 'eng' ") for r in logs.records), logged(logs))
+        cookie_token = self.eng["Cookie"].split("=", 1)[1]
+        for secret in (created, reset, cookie_token):
+            self.assertNotIn(secret, logged(logs))
+
+
 class CommandTests(unittest.TestCase):
     """`python -m auth` in a subprocess, as an operator runs it."""
 
@@ -20047,7 +20678,7 @@ class ImplementationCopyTests(unittest.TestCase):
         document = (root / "IMPLEMENTATION.md").read_text()
         for name in ("api/auth/__init__.py", "api/auth/passwords.py", "api/auth/store.py", "api/auth/policy.py",
                      "api/auth/middleware.py", "api/auth/__main__.py", "api/auth/testing.py",
-                     "api/routers/auth.py", "api/main.py", "api/config.py", "proxy/nginx.conf",
+                     "api/routers/auth.py", "api/main.py", "ui/src/pages/UsersPage.tsx", "api/config.py", "proxy/nginx.conf",
                      "scripts/verify/17_auth.sh", "scripts/verify/auth_setup.py", "scripts/verify/auth_stack.py",
                      "scripts/verify/auth_headers.py"):
             with self.subTest(name=name):
@@ -20114,6 +20745,9 @@ PROTECTED = (
     ("GET", "/tune/job/nope"), ("GET", f"/tune/{X}"),
     ("GET", "/metrics/latency"),
     ("GET", "/docs"), ("GET", "/docs/oauth2-redirect"), ("GET", "/redoc"), ("GET", "/openapi.json"),
+    ("GET", "/auth/users"), ("POST", "/auth/users"), ("POST", "/auth/users/nobody/reset-password"),
+    ("POST", "/auth/users/nobody/role"), ("POST", "/auth/users/nobody/disable"),
+    ("POST", "/auth/users/nobody/enable"),
 )
 
 
@@ -26496,7 +27130,7 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     for (const p of ['/qa', '/collections', '/health', '/qa']) {
       await s.page.goto(BASE + p, { waitUntil: 'networkidle2' }); await sleep(500);
     }
-    r.check('the session survives navigation and reloads', await s.page.evaluate(() => document.querySelectorAll('nav a').length === 8));
+    r.check('the session survives navigation and reloads', await s.page.evaluate(() => document.querySelectorAll('nav a').length === 9));  // the Engineer's links, Users included
     await clickByText(s.page, 'Log out');
     await s.page.waitForFunction(() => location.pathname === '/login', { timeout: 10000 }).catch(() => {});
     const me = await s.page.evaluate(async () => (await fetch('/api/auth/me')).status);
@@ -26597,7 +27231,7 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     const s = await session(browser, BASE, 'engineer');
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(1500);
     const links = await s.page.evaluate(() => [...document.querySelectorAll('nav a')].map(a => a.textContent.trim()));
-    for (const want of ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health']) {
+    for (const want of ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users']) {
       r.check(`Engineer nav includes ${want}`, links.includes(want), JSON.stringify(links));
     }
     await s.ctx.close();
@@ -34429,6 +35063,123 @@ function authCases() {
   ];
 }
 
+// The Users page (PR 2 of #25): Engineers manage accounts. The API is stubbed
+// with a small in-memory list; the real routes are checked in 17_auth.sh.
+function usersCases() {
+  const ME = 'vfy-engineer';
+  const row = (username, role, over = {}) => ({ username, role, enabled: true, must_change_password: false, created_at: '2026-10-01T12:00:00Z', ...over });
+  const usersApi = (extra = {}) => {
+    const list = [row('vfy-developer', 'developer'), row(ME, 'engineer'), row('vfy-off', 'end_user', { enabled: false, must_change_password: true })];
+    const find = call => list.find(u => u.username === decodeURIComponent(call.path.split('/')[4]));
+    return base({
+      'GET /api/auth/users': () => json(200, { users: list.map(u => ({ ...u })) }),
+      'POST /api/auth/users': call => {
+        const user = row(call.body.username.toLowerCase(), call.body.role, { must_change_password: true });
+        list.push(user);
+        return json(201, { user, password: 'GeneratedOnce-1234567890' });
+      },
+      'POST /api/auth/users/*': call => {
+        const user = find(call), action = call.path.split('/')[5];
+        if (!user) return apiError(404, 'USER_NOT_FOUND', 'There is no user.');
+        if (action === 'reset-password') { user.must_change_password = true; return json(200, { user, password: 'ResetOnce-0987654321ab' }); }
+        if (action === 'role') user.role = call.body.role;
+        if (action === 'disable') user.enabled = false;
+        if (action === 'enable') user.enabled = true;
+        return json(200, { user });
+      },
+      ...extra,
+    });
+  };
+  const open = (extra = {}) => ({ role: 'engineer', path: '/users', routes: usersApi(extra) });
+  const rowTexts = page => page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => [...r.querySelectorAll('td')].map(c => c.textContent.trim())));
+  const rowPress = async (page, username, label) => {
+    const done = await page.evaluate((u, t) => {
+      const b = [...document.querySelectorAll(`tr[data-username="${u}"] button`)].find(x => x.textContent.trim() === t);
+      if (!b) return false; b.click(); return true;
+    }, username, label);
+    if (!done) throw new Error(`no "${label}" button in the row of ${username}`);
+  };
+  const rowButtons = (page, username) => page.evaluate(u => [...document.querySelectorAll(`tr[data-username="${u}"] button`)].map(b => b.textContent.trim()), username);
+  const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
+  return [
+    { name: 'Engineer nav ends with Users, which opens the Users page', open: { role: 'engineer', path: '/qa', routes: usersApi() }, async run(s) {
+      await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users']);
+      await press(s.page, 'Users', 'nav a');
+      await waitPath(s.page, '/users');
+      await waitText(s.page, 'vfy-developer');
+    } },
+    ...['developer', 'end_user'].map(role => ({ name: `${role === 'developer' ? 'Developer' : 'End User'} has no Users link and is sent from /users to Q&A`, open: { role, path: '/qa', routes: base() }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      assert.equal((await nav(s.page)).includes('Users'), false);
+      await goto(s.page, '/users');
+      await waitText(s.page, 'Ask a Question');
+      await waitPath(s.page, '/qa');
+      assert.equal(callsTo(s, 'GET', '/api/auth/users').length, 0);
+    } })),
+    { name: 'The list shows each account; the own row has no Reset password', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      const heads = await s.page.evaluate(() => [...document.querySelectorAll('thead th')].map(t => t.textContent.trim()));
+      assert.deepEqual(heads, ['Username', 'Role', 'Status', 'Password', 'Created', '']);
+      const date = await s.page.evaluate(v => new Date(v).toLocaleDateString(), '2026-10-01T12:00:00Z');
+      const rows = await rowTexts(s.page);
+      assert.deepEqual(rows.map(r => [r[0], r[2], r[3], r[4]]), [['vfy-developer', 'Enabled', 'Set', date], [ME + ' (you)', 'Enabled', 'Set', date], ['vfy-off', 'Disabled', 'Change due', date]]);
+      assert.deepEqual(await s.page.evaluate(() => [...document.querySelectorAll('tbody select')].map(x => x.value)), ['developer', 'engineer', 'end_user']);
+      assert.deepEqual(await rowButtons(s.page, 'vfy-developer'), ['Reset password', 'Disable']);
+      assert.deepEqual(await rowButtons(s.page, ME), ['Disable']);
+      assert.ok(await bodyHas(s.page, 'Use Change password for your own'));
+      assert.deepEqual(await rowButtons(s.page, 'vfy-off'), ['Reset password', 'Enable']);
+    } },
+    { name: 'Create user sends the name and role, shows the generated password once, and Done removes it', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await fill(s.page, '#new-username', 'New.Person');
+      await fill(s.page, '#new-role', 'developer');
+      await press(s.page, 'Create user');
+      await waitText(s.page, 'GeneratedOnce-1234567890');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/users').map(c => c.body), [{ username: 'New.Person', role: 'developer' }]);
+      await waitText(s.page, 'shown only once');
+      await waitFor(s.page, () => !!document.querySelector('tr[data-username="new.person"]'), 'the new row');
+      assert.equal(await s.page.evaluate(() => document.querySelector('#new-username').value), '');
+      assert.deepEqual(await s.page.evaluate(() => [Object.keys(sessionStorage), Object.keys(localStorage)]), [[], []]);
+      await press(s.page, 'Done');
+      await waitText(s.page, 'GeneratedOnce-1234567890', true);
+    } },
+    { name: 'Reset password of another account shows its new password once', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await rowPress(s.page, 'vfy-developer', 'Reset password');
+      await waitText(s.page, 'ResetOnce-0987654321ab');
+      assert.equal(callsTo(s, 'POST', '/api/auth/users/vfy-developer/reset-password').length, 1);
+      await waitFor(s.page, () => document.querySelector('tr[data-username="vfy-developer"] td:nth-child(4)').textContent.trim() === 'Change due', 'the change-due mark');
+    } },
+    { name: 'Changing a role, Disable and Enable call the API for that account', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await fill(s.page, 'select[aria-label="Role of vfy-developer"]', 'end_user');
+      await waitFor(s.page, () => document.querySelector('select[aria-label="Role of vfy-developer"]').value === 'end_user', 'the new role');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/users/vfy-developer/role').map(c => c.body), [{ role: 'end_user' }]);
+      await rowPress(s.page, 'vfy-developer', 'Disable');
+      await waitFor(s.page, () => document.querySelector('tr[data-username="vfy-developer"] td:nth-child(3)').textContent.trim() === 'Disabled', 'Disabled');
+      await rowPress(s.page, 'vfy-off', 'Enable');
+      await waitFor(s.page, () => document.querySelector('tr[data-username="vfy-off"] td:nth-child(3)').textContent.trim() === 'Enabled', 'Enabled');
+      assert.equal(callsTo(s, 'POST', '/api/auth/users/vfy-developer/disable').length, 1);
+      assert.equal(callsTo(s, 'POST', '/api/auth/users/vfy-off/enable').length, 1);
+    } },
+    { name: 'A refusal (the last Engineer) shows the API\'s message and reloads the list', open: open({
+      'POST /api/auth/users/vfy-engineer/disable': apiError(409, 'LAST_ENGINEER', "'vfy-engineer' is the last enabled engineer; make another engineer first."),
+    }), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      const before = callsTo(s, 'GET', '/api/auth/users').length;
+      await rowPress(s.page, ME, 'Disable');
+      await waitText(s.page, 'is the last enabled engineer');
+      await waitFor(s.page, () => document.querySelector('[role=alert]') !== null, 'the alert');
+      assert.ok(callsTo(s, 'GET', '/api/auth/users').length > before, 'the list was reloaded');
+      assert.equal(await s.page.evaluate(() => document.querySelector('tr[data-username="vfy-engineer"] td:nth-child(3)').textContent.trim()), 'Enabled');
+    } },
+    { name: 'A list that cannot be loaded says so', open: open({ 'GET /api/auth/users': apiError(500, 'INTERNAL_ERROR', 'Synthetic failure.') }), async run(s) {
+      await waitText(s.page, 'Could not load the users: Synthetic failure.');
+    } },
+  ];
+}
+
 function qaCases() {
   return [
     { name: 'Ask is disabled for empty and blank questions and enabled for text', open: qaOpen('engineer'), async run(s) {
@@ -34623,6 +35374,7 @@ async function runUiControlTests(browser, baseUrl, reporter) {
   await run('Import queue, sliders and "+ New" modal (#400)', importCases());
   await run('Navigation, roles and redirects (#400); the API enforces the roles (#25)', navigationCases());
   await run('Login, logout, setup and password changes (#25)', authCases());
+  await run('Users page: Engineers manage accounts (#25)', usersCases());
   await run('Q&A input, citations toggle, answer display and End User view (#400)', qaCases());
   await run('Retrieval page status text, alpha slider and save (#400)', retrievalCases());
   await run('Client handling of the proxy error pages (#400)', proxyCases());
@@ -35628,7 +36380,7 @@ ENUMS = {
 SPAN_NAMES = frozenset("rag." + v for v in ENUMS["rag.operation"])
 
 # Explicit code-owned vocabulary. Raw URL/path values never enter this schema.
-ROUTES = frozenset(('DELETE /collections/{name}', 'GET /auth/me', 'GET /auth/status', 'GET /collections', 'GET /export/job/{job_id}', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /metrics/latency', 'GET /packages', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/logout', 'POST /auth/password', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
+ROUTES = frozenset(('DELETE /collections/{name}', 'GET /auth/me', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /export/job/{job_id}', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /metrics/latency', 'GET /packages', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/logout', 'POST /auth/password', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
 ENUMS.update({"http.route": ROUTES | {"unmatched"},
               "rag.tuning_operation": frozenset(("rechunk", "reembed", "reindex")),
               "http.status_class": frozenset(("1xx", "2xx", "3xx", "4xx", "5xx"))})

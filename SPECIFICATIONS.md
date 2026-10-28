@@ -1342,7 +1342,7 @@ one may. The role of a request is the one stored for its user at that moment, ne
 | any session (also one with a password change due) | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password` |
 | `end_user` | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
 | `developer` | `POST /collections`; `POST /ingest/upload`, `GET /ingest/job/{job_id}`, `GET /ingest/config/{collection}`, `POST /ingest/config`; `POST /retrieval/config`; `POST /goldstandard/generate`, `GET /goldstandard/session/{session_id}`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST /goldstandard/save`, `GET /goldstandard/download/{filename}`; `POST /export`, `GET /export/job/{job_id}`, `POST /import`, `GET /import/job/{job_id}`, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
-| `engineer` | `DELETE /collections/{name}`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json` |
+| `engineer` | `DELETE /collections/{name}`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json`; account administration: `GET /auth/users`, `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `POST /auth/users/{username}/role`, `POST /auth/users/{username}/disable`, `POST /auth/users/{username}/enable` |
 
 The matrix is one table in `api/auth/policy.py`. A route without an entry is refused for everyone (`403
 FORBIDDEN`), and a registered check fails when a route lacks an entry or an entry names no route. Jobs and
@@ -1362,7 +1362,9 @@ and sends no `Access-Control-*` headers.
 **Accounts.** Usernames are 3-32 characters of lowercase letters, digits, `.`, `_` and `-`; input is lowercased,
 so they are case-insensitive. Passwords are 12-256 characters and not the username (ignoring case); no
 composition rules. They are stored only as `scrypt$<log2 n>$<r>$<p>$<salt>$<hash>` with n = 2^15, r = 8, p = 1
-and a random 16-byte salt. Accounts are created and changed only by the operator command (below).
+and a random 16-byte salt. The operator command (below) creates the first engineer and recovers lockouts; after
+that engineers manage accounts through the account administration routes (below) and the Users page (§7.12).
+No route deletes an account: accounts are disabled, so a username is never reused.
 
 **Sessions.** Server-side, in the SQLite file `auth.db` in `AUTH_DIR` (the `auth_data` volume), with accounts
 and the login throttle, so all survive an API restart. The cookie `rag_session` holds a random 256-bit token; the
@@ -1388,6 +1390,26 @@ the host may share one address, so in practice the throttle is per username.
 | `POST /auth/logout` | | `200 {"status": "logged_out"}`; the session is deleted and the cookie expired |
 | `POST /auth/password` | `{"current_password", "new_password"}` | `200 {"status": "changed", "username", "role", "must_change_password": false}`; the user's other sessions end, this one stays. A wrong current password is `403 PASSWORD_INCORRECT`; a new one breaking the rules, or equal to the current one (so a generated password can't be kept), is `422 INVALID_PASSWORD` naming the rule |
 
+**Account administration** (engineers only). `User` is `{"username", "role", "enabled", "must_change_password",
+"created_at"}` (`created_at` in ISO 8601 UTC); it never holds a password, hash or session. A `{username}` in a path
+is lowercased; one that doesn't exist, or breaks the username rule, is `404 USER_NOT_FOUND`. A role other than
+`end_user`, `developer` or `engineer`, or a missing field, is `422 INVALID_PARAMETER`.
+
+| Route | Request | Success |
+|---|---|---|
+| `GET /auth/users` | | `200 {"users": [User, ...]}`, by username |
+| `POST /auth/users` | `{"username", "role"}` | `201 {"user": User, "password"}`: an enabled account with a generated password, to be changed at first login. A username breaking the rule is `422 INVALID_USERNAME`; one that exists (ignoring case) is `409 USER_EXISTS` |
+| `POST /auth/users/{username}/reset-password` | | `200 {"user": User, "password"}`: a new generated password, to be changed at next login; the user's sessions end. The engineer's own account is `409 SELF_RESET_REFUSED` (use `POST /auth/password`, which needs the current password) |
+| `POST /auth/users/{username}/role` | `{"role"}` | `200 {"user": User}`; existing sessions take the role on their next request |
+| `POST /auth/users/{username}/disable` | | `200 {"user": User}`; the user's sessions end and their logins fail with `LOGIN_FAILED` |
+| `POST /auth/users/{username}/enable` | | `200 {"user": User}`; the user can log in again with their current password |
+
+A generated password (as the operator command's) is in its `201` or `200` answer only, sent with
+`Cache-Control: no-store`, and nowhere else. Demoting or disabling the last enabled engineer is `409
+LAST_ENGINEER`, for the engineer's own account too; the check and the change are one transaction. Otherwise an
+engineer may demote or disable themselves (disabling ends their own session). Setting the current role, or
+disabling a disabled account, succeeds and changes nothing.
+
 **Operator command**, inside the api container: `docker compose exec api python -m auth <subcommand>`.
 
 | Subcommand | Effect |
@@ -1412,8 +1434,10 @@ is a single-file bind mount, and a proxy still running the old copy sends `Host`
 cookie-authenticated change fails the origin check with `403 CROSS_ORIGIN_REFUSED`.
 
 **Logging.** One `WARNING` line per login attempt (success, failure, throttled) on logger `auth`, with the
-username and client address; never a password, token or cookie. The telemetry route vocabulary gains the five
-`/auth` routes as labels.
+username and client address; never a password, token or cookie. One `WARNING` line per account administration
+change (create, reset, role, disable, enable) naming the engineer, the change and the account, and one per refusal
+(`INVALID_USERNAME`, `USER_EXISTS`, `USER_NOT_FOUND`, `LAST_ENGINEER`, `SELF_RESET_REFUSED`) saying why; never a
+password. The telemetry route vocabulary gains the eleven `/auth` routes as labels.
 
 ### 3.2 Error Response Format
 
@@ -1470,6 +1494,11 @@ Standard error codes:
 | `LOGIN_THROTTLED` | 429 | Five failed logins for this username and address within 15 minutes; wait 15 minutes |
 | `PASSWORD_INCORRECT` | 403 | The current password given to `POST /auth/password` is wrong |
 | `INVALID_PASSWORD` | 422 | The new password breaks a rule; the message names it |
+| `INVALID_USERNAME` | 422 | `POST /auth/users`: the username breaks the rule; the message states it |
+| `USER_EXISTS` | 409 | `POST /auth/users`: an account with this username exists |
+| `USER_NOT_FOUND` | 404 | No account has the username in the path |
+| `LAST_ENGINEER` | 409 | The change would demote or disable the last enabled engineer |
+| `SELF_RESET_REFUSED` | 409 | An engineer's reset of their own password; they use `POST /auth/password` |
 
 ---
 
@@ -2177,6 +2206,7 @@ what the role can't do (§3.1.8):
 | Transfer | ✓ | ✓ | — |
 | Collections | ✓ | — | — |
 | Health | ✓ | — | — |
+| Users | ✓ | — | — |
 | Username and role badge | ✓ | ✓ | ✓ |
 | Change password (button) | ✓ | ✓ | ✓ |
 | Log out (button) | ✓ | ✓ | ✓ |
@@ -2448,6 +2478,22 @@ page renders as one undifferentiated block.
 
 ---
 
+### 7.12 Users Page (#25)
+
+**Route:** `/users`  
+**Roles:** Engineer only (others are sent to `/qa`)
+
+- A table of every account from `GET /auth/users`: username (the engineer's own marked "(you)"), a role selector,
+  Enabled or Disabled, the password state ("Change due" or "Set"), and the creation date. If the list can't be
+  loaded the page says "Could not load the users:" with the reason, as an alert.
+- A form with username, role (End User by default) and "Create user". The username rule is shown under it.
+- Each row: changing the role selector sends the role change; "Disable" or "Enable"; and "Reset password", except
+  on the engineer's own row, which says to use Change password instead.
+- After a create or a reset, a panel shows the username and the generated password, says it is shown only once and
+  must be changed at first login, and has "Done", which removes it. The password is kept only in the page's memory.
+- A refused change shows the API's message as an alert and reloads the list. After a change to the engineer's own
+  account the UI re-reads `GET /auth/me`: a demoted engineer leaves the page, a disabled one is logged out.
+
 ## 8. Configuration Defaults and Constraints
 
 The table gives API request bounds; narrower UI sliders are presentation choices. Internal import/rebuild preserves positive stored HNSW construction/connections settings and stored `ef=-1` (dynamic) or positive values beyond new-request limits. Index/distance enums and numeric type validation still apply; no clamping or migration is performed.
@@ -2610,7 +2656,8 @@ rag-docker/
 │   │   │   ├── TransferPage.tsx
 │   │   │   ├── HelpTransferPage.tsx
 │   │   │   ├── CollectionsPage.tsx
-│   │   │   └── HealthPage.tsx
+│   │   │   ├── HealthPage.tsx
+│   │   │   └── UsersPage.tsx          # Engineers manage accounts (#25)
 │   │   ├── components/
 │   │   │   ├── NavBar.tsx
 │   │   │   ├── CitationsPanel.tsx
@@ -3188,6 +3235,20 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   *Evidence: `test_auth.py`; suite 17 on the stack; suite 01's CORS check.*
 - [x] The verify harness gets its test credentials without committing, printing or passing them on a command line or in the environment: one account per role, generated passwords replaced at first login, kept in a 0600 file in a 0700 folder of the user's own outside the checkout, with the operator command run only on the verify project.
   *Evidence: `scripts/tests/test_verify_auth.py` on the host (suite 17); `auth_stack.py no-secrets-logged`.*
+- [x] Only engineers reach the account administration routes. Creating an account checks the username rule and
+  uniqueness and gives a generated password, shown once (`Cache-Control: no-store`) and to be changed at first
+  login; a reset does the same, ends the user's sessions, and is refused for the engineer's own account; a role
+  change applies to an existing session's next request; disabling ends the user's sessions and refuses their login,
+  and enabling restores it; the last enabled engineer can't be demoted or disabled, also by themselves; no route
+  deletes an account; each change and refusal is one API log line with no password.
+  *Evidence: `test_auth.py` `AdminRouteTests` and the policy checks (suite 17); `auth_stack.py matrix` with the six
+  routes for every role and `auth_stack.py admin-accounts` on the running stack, with a throwaway `vfy-t-*`
+  account and the API log searched for the generated passwords (suite 17). These checks fail on the code before
+  PR 2 of #25, which has no such routes.*
+- [x] The Users page: an engineer-only nav link and route; the account list; create and reset show the generated
+  password once until "Done"; no reset on the own row; role change, disable and enable; a refusal's message.
+  *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request
+  interception; `ui_criteria.js` checks the real engineer's nav includes Users.*
 
 ---
 

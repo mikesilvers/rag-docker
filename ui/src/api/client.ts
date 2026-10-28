@@ -93,6 +93,17 @@ export const api = {
   logout: () => request<{ status: string }>('POST', '/auth/logout'),
   changePassword: (current_password: string, new_password: string) =>
     request<{ status: string } & AuthUser>('POST', '/auth/password', { current_password, new_password }),
+  // Account administration, Engineers only (#25). A generated password is in
+  // the answer to a create or a reset, once; the page shows it and keeps it nowhere.
+  listUsers: () => request<{ users: AdminUser[] }>('GET', '/auth/users'),
+  createUser: (username: string, role: Role) =>
+    request<{ user: AdminUser; password: string }>('POST', '/auth/users', { username, role }),
+  resetUserPassword: (username: string) =>
+    request<{ user: AdminUser; password: string }>('POST', `/auth/users/${encodeURIComponent(username)}/reset-password`),
+  setUserRole: (username: string, role: Role) =>
+    request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/role`, { role }),
+  disableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/disable`),
+  enableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/enable`),
 
   getCollections: () => request<{ collections: CollectionInfo[] }>('GET', '/collections'),
   // Answers with the name as stored, first letter capitalised (#372).
@@ -135,6 +146,7 @@ export const api = {
 // Types
 export type Role = 'engineer' | 'developer' | 'end_user'
 export interface AuthUser { username: string; role: Role; must_change_password: boolean }
+export interface AdminUser { username: string; role: Role; enabled: boolean; must_change_password: boolean; created_at: string }
 export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
   hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null

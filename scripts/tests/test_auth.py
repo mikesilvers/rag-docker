@@ -203,6 +203,21 @@ class StoreTests(StoreTestCase):
         with self.assertRaises(store.Refused):
             store.set_enabled("eng2", False)
 
+    def test_refusals_carry_a_code(self):
+        # The admin routes answer by these codes (PR 2 of #25).
+        self.make("eng", "engineer")
+        cases = ((lambda: store.create_user("eng", "developer", "x" * 12), "USER_EXISTS"),
+                 (lambda: store.reset_password("nobody", "x" * 12), "USER_NOT_FOUND"),
+                 (lambda: store.set_role("nobody", "developer"), "USER_NOT_FOUND"),
+                 (lambda: store.set_enabled("nobody", True), "USER_NOT_FOUND"),
+                 (lambda: store.set_role("eng", "developer"), "LAST_ENGINEER"),
+                 (lambda: store.set_enabled("eng", False), "LAST_ENGINEER"),
+                 (lambda: store.create_user("eng2", "engineer", "x" * 12, bootstrap=True), "REFUSED"))
+        for action, code in cases:
+            with self.subTest(code=code), self.assertRaises(store.Refused) as caught:
+                action()
+            self.assertEqual(caught.exception.code, code)
+
     def test_throttle_locks_a_pair_and_survives_a_new_handle(self):
         for attempt in range(4):
             self.assertFalse(store.record_failure("alice", "10.0.0.1"))
@@ -263,12 +278,21 @@ class PolicyTests(unittest.TestCase):
         counts = {}
         for access in policy.ACCESS.values():
             counts[access] = counts.get(access, 0) + 1
-        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 19, "engineer": 11})
+        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 19, "engineer": 17})
         self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
         self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
         self.assertEqual(policy.ACCESS[("POST", "/collections")], "developer")
         self.assertEqual(policy.ACCESS[("GET", "/tune/{collection}")], "developer")
         self.assertEqual(policy.ACCESS[("GET", "/tune/job/{job_id}")], "engineer")
+        # Account administration is the Engineer's, and nothing deletes an account (R1).
+        admin = {key: access for key, access in policy.ACCESS.items() if key[1].startswith("/auth/users")}
+        self.assertEqual(set(admin), {("GET", "/auth/users"), ("POST", "/auth/users"),
+                                      ("POST", "/auth/users/{username}/reset-password"),
+                                      ("POST", "/auth/users/{username}/role"),
+                                      ("POST", "/auth/users/{username}/disable"),
+                                      ("POST", "/auth/users/{username}/enable")})
+        self.assertEqual(set(admin.values()), {"engineer"})
+        self.assertFalse([key for key in policy.ACCESS if key[0] == "DELETE" and key[1].startswith("/auth")])
 
     def test_each_template_resolves_to_itself(self):
         for method, template in policy.ACCESS:
@@ -643,6 +667,198 @@ class RouteTests(StoreTestCase):
         verify.assert_not_called()
 
 
+class AdminRouteTests(StoreTestCase):
+    """The Engineer-only account routes (PR 2 of #25): S1-S6 of its specifications."""
+
+    ROUTES = (("GET", "/auth/users", None), ("POST", "/auth/users", {"username": "newbie", "role": "end_user"}),
+              ("POST", "/auth/users/dev/reset-password", None), ("POST", "/auth/users/dev/role", {"role": "end_user"}),
+              ("POST", "/auth/users/dev/disable", None), ("POST", "/auth/users/dev/enable", None))
+
+    def setUp(self):
+        super().setUp()
+        self.setup_roles()
+        self.eng, _ = self.session("eng")
+
+    def admin(self, method, path, body=None, headers=None):
+        return self.client.request(method, path, json=body, headers=headers or self.eng)
+
+    def code(self, response):
+        return response.json()["error"]["code"]
+
+    def test_only_engineers_reach_the_admin_routes(self):
+        for name in ("dev", "user"):
+            headers, _ = self.session(name)
+            for method, path, body in self.ROUTES:
+                with self.subTest(user=name, route=f"{method} {path}"):
+                    response = self.admin(method, path, body, headers)
+                    self.assertEqual((response.status_code, self.code(response)), (403, "FORBIDDEN"))
+                    self.assertEqual(response.json()["error"]["detail"], {"required_role": "engineer"})
+        for method, path, body in self.ROUTES:
+            with self.subTest(anonymous=f"{method} {path}"):
+                response = self.client.request(method, path, json=body)
+                self.assertEqual((response.status_code, self.code(response)), (401, "AUTH_REQUIRED"))
+        # Nothing was changed by the refused requests.
+        self.assertIsNone(store.get_user("newbie"))
+        self.assertEqual(store.get_user("dev").role, "developer")
+        self.assertTrue(store.get_user("dev").enabled)
+
+    def test_changes_are_origin_checked(self):
+        response = self.admin("POST", "/auth/users/dev/disable", headers={**self.eng, "Origin": "http://evil.test"})
+        self.assertEqual(self.code(response), "CROSS_ORIGIN_REFUSED")
+        self.assertTrue(store.get_user("dev").enabled)
+
+    def test_list(self):
+        response = self.admin("GET", "/auth/users")
+        self.assertEqual(response.status_code, 200)
+        users = response.json()["users"]
+        self.assertEqual([u["username"] for u in users], ["dev", "eng", "user"])
+        self.assertEqual(set(users[0]), {"username", "role", "enabled", "must_change_password", "created_at"})
+        self.assertEqual((users[0]["role"], users[0]["enabled"], users[0]["must_change_password"]),
+                         ("developer", True, False))
+        self.assertRegex(users[0]["created_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertNotIn("scrypt", response.text)
+
+    def test_create_gives_a_generated_password_once(self):
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users", {"username": "New.Person", "role": "developer"})
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        body = response.json()
+        password = body["password"]
+        self.assertGreaterEqual(len(password), 20)
+        self.assertEqual(body["user"]["username"], "new.person")
+        self.assertEqual((body["user"]["role"], body["user"]["enabled"], body["user"]["must_change_password"]),
+                         ("developer", True, True))
+        stored = store.get_user("new.person")
+        self.assertTrue(passwords.verify_password(password, stored.password_hash))
+        self.assertTrue(stored.must_change_password)
+        self.assertEqual(len(logs.records), 1, logged(logs))
+        self.assertIn("Admin 'eng' created developer 'new.person'", logged(logs))
+        self.assertNotIn(password, logged(logs))
+        self.assertNotIn(password, self.admin("GET", "/auth/users").text)
+        login = self.login("new.person", password)
+        self.assertEqual((login.status_code, login.json()["must_change_password"]), (200, True))
+
+    def test_create_refusals(self):
+        for username in ("ab", "x" * 33, "has space", "semi;colon", ""):
+            with self.subTest(username=username), self.assertLogs("auth", "WARNING") as logs:
+                response = self.admin("POST", "/auth/users", {"username": username, "role": "end_user"})
+                self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_USERNAME"))
+                self.assertIn("3-32 characters", response.json()["error"]["message"])
+                self.assertEqual(len(logs.records), 1)
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users", {"username": "DEV", "role": "end_user"})
+        self.assertEqual((response.status_code, self.code(response)), (409, "USER_EXISTS"))
+        self.assertIn("create of 'dev' refused", logged(logs))
+        self.assertEqual(store.get_user("dev").role, "developer")
+        for body in ({"username": "newbie", "role": "admin"}, {"username": "newbie"}, {"role": "end_user"},
+                     {"username": "u" * 257, "role": "end_user"}):
+            with self.subTest(body=body):
+                response = self.admin("POST", "/auth/users", body)
+                self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_PARAMETER"))
+        self.assertIsNone(store.get_user("newbie"))
+
+    def test_reset_ends_sessions_and_shows_the_password_once(self):
+        _, dev_token = self.session("dev")
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users/DEV/reset-password")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        password = response.json()["password"]
+        self.assertEqual(response.json()["user"]["must_change_password"], True)
+        self.assertIsNone(store.authenticate(dev_token))
+        self.assertEqual(self.login("dev", self.passwords["developer"]).status_code, 401)
+        self.assertEqual(self.login("dev", password).json()["must_change_password"], True)
+        self.assertIn("Admin 'eng' reset the password of 'dev'; their sessions ended", logged(logs))
+        self.assertNotIn(password, logged(logs))
+
+    def test_an_engineer_cannot_reset_their_own_password_here(self):
+        before = store.get_user("eng").password_hash
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users/Eng/reset-password")
+        self.assertEqual((response.status_code, self.code(response)), (409, "SELF_RESET_REFUSED"))
+        self.assertIn("Change password", response.json()["error"]["message"])
+        self.assertNotIn("password", {k for k in response.json() if k != "error"})
+        self.assertEqual(store.get_user("eng").password_hash, before)
+        self.assertEqual(self.admin("GET", "/auth/me").status_code, 200, "the session stays")
+        self.assertIn("refused", logged(logs))
+        # Another Engineer may reset it.
+        self.make("eng2", "engineer")
+        other, _ = self.session("eng2")
+        self.assertEqual(self.admin("POST", "/auth/users/eng/reset-password", headers=other).status_code, 200)
+
+    def test_unknown_users(self):
+        for path, body in (("/auth/users/nobody/reset-password", None), ("/auth/users/nobody/role", {"role": "engineer"}),
+                           ("/auth/users/nobody/disable", None), ("/auth/users/nobody/enable", None),
+                           ("/auth/users/x/disable", None), ("/auth/users/has%20space/enable", None)):
+            with self.subTest(path=path):
+                response = self.admin("POST", path, body)
+                self.assertEqual((response.status_code, self.code(response)), (404, "USER_NOT_FOUND"))
+
+    def test_role_change_applies_to_an_existing_session(self):
+        dev, _ = self.session("dev")
+        self.assertNotIn(self.client.get("/packages", headers=dev).status_code, (401, 403))
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users/dev/role", {"role": "end_user"})
+        self.assertEqual(response.json(), {"user": {**response.json()["user"], "role": "end_user"}})
+        self.assertNotIn("password", response.json())
+        self.assertIn("Admin 'eng' set the role of 'dev' to end_user", logged(logs))
+        self.assertEqual(self.code(self.client.get("/packages", headers=dev)), "FORBIDDEN")
+        self.admin("POST", "/auth/users/dev/role", {"role": "engineer"})
+        self.assertNotIn(self.client.get("/metrics/latency", headers=dev).status_code, (401, 403))
+        response = self.admin("POST", "/auth/users/dev/role", {"role": "engineer"})
+        self.assertEqual((response.status_code, response.json()["user"]["role"]), (200, "engineer"))
+
+    def test_disable_and_enable(self):
+        dev, token = self.session("dev")
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users/dev/disable")
+            self.assertEqual(response.json()["user"]["enabled"], False)
+            self.assertIsNone(store.authenticate(token))
+            self.assertEqual(self.code(self.login("dev", self.passwords["developer"])), "LOGIN_FAILED")
+            self.assertEqual(self.admin("POST", "/auth/users/dev/disable").status_code, 200, "already disabled")
+            response = self.admin("POST", "/auth/users/dev/enable")
+        self.assertEqual(response.json()["user"]["enabled"], True)
+        self.assertEqual(self.login("dev", self.passwords["developer"]).status_code, 200)
+        self.assertIn("Admin 'eng' disabled 'dev'; their sessions ended", logged(logs))
+        self.assertIn("Admin 'eng' enabled 'dev'", logged(logs))
+
+    def test_the_last_enabled_engineer_is_protected(self):
+        for path, body in (("/auth/users/eng/disable", None), ("/auth/users/eng/role", {"role": "developer"})):
+            with self.subTest(path=path), self.assertLogs("auth", "WARNING") as logs:
+                response = self.admin("POST", path, body)
+                self.assertEqual((response.status_code, self.code(response)), (409, "LAST_ENGINEER"))
+                self.assertIn("last enabled engineer", response.json()["error"]["message"])
+                self.assertIn("refused", logged(logs))
+        self.assertEqual((store.get_user("eng").role, store.get_user("eng").enabled), ("engineer", True))
+        self.assertEqual(self.admin("GET", "/auth/me").status_code, 200)
+        # With another enabled Engineer, an Engineer may demote or disable themselves.
+        self.make("eng2", "engineer")
+        response = self.admin("POST", "/auth/users/eng/role", {"role": "developer"})
+        self.assertEqual(response.json()["user"]["role"], "developer")
+        self.assertEqual(self.code(self.admin("GET", "/auth/users")), "FORBIDDEN", "the demotion applies at once")
+        other, _ = self.session("eng2")
+        self.admin("POST", "/auth/users/eng/role", {"role": "engineer"}, headers=other)
+        self.assertEqual(self.admin("POST", "/auth/users/eng/disable").status_code, 200)
+        self.assertEqual(self.admin("GET", "/auth/me").status_code, 401, "disabling oneself ends the session")
+        response = self.admin("POST", "/auth/users/eng2/disable", headers=other)
+        self.assertEqual(self.code(response), "LAST_ENGINEER")
+
+    def test_admin_actions_are_logged_one_line_each_without_secrets(self):
+        with self.assertLogs("auth", "WARNING") as logs:
+            created = self.admin("POST", "/auth/users", {"username": "temp", "role": "end_user"}).json()["password"]
+            reset = self.admin("POST", "/auth/users/temp/reset-password").json()["password"]
+            self.admin("POST", "/auth/users/temp/role", {"role": "developer"})
+            self.admin("POST", "/auth/users/temp/disable")
+            self.admin("POST", "/auth/users/temp/enable")
+            self.admin("GET", "/auth/users")
+        self.assertEqual(len(logs.records), 5, logged(logs))
+        self.assertTrue(all(r.getMessage().startswith("Admin 'eng' ") for r in logs.records), logged(logs))
+        cookie_token = self.eng["Cookie"].split("=", 1)[1]
+        for secret in (created, reset, cookie_token):
+            self.assertNotIn(secret, logged(logs))
+
+
 class CommandTests(unittest.TestCase):
     """`python -m auth` in a subprocess, as an operator runs it."""
 
@@ -752,7 +968,7 @@ class ImplementationCopyTests(unittest.TestCase):
         document = (root / "IMPLEMENTATION.md").read_text()
         for name in ("api/auth/__init__.py", "api/auth/passwords.py", "api/auth/store.py", "api/auth/policy.py",
                      "api/auth/middleware.py", "api/auth/__main__.py", "api/auth/testing.py",
-                     "api/routers/auth.py", "api/main.py", "api/config.py", "proxy/nginx.conf",
+                     "api/routers/auth.py", "api/main.py", "ui/src/pages/UsersPage.tsx", "api/config.py", "proxy/nginx.conf",
                      "scripts/verify/17_auth.sh", "scripts/verify/auth_setup.py", "scripts/verify/auth_stack.py",
                      "scripts/verify/auth_headers.py"):
             with self.subTest(name=name):

@@ -89,6 +89,14 @@ def generate_password() -> str:
     return secrets.token_urlsafe(18)
 
 
+def new_password(username: str) -> str:
+    """A generated password that meets the password rule for `username`."""
+    while True:
+        password = generate_password()
+        if password_problem(password, username) is None:
+            return password
+
+
 _dummy_hash: str | None = None
 
 

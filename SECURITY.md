@@ -28,9 +28,11 @@ request but `/health` and the login (#25).
 
 - **Accounts and roles.** Each person has their own account with one role
   (End User, Developer, AI Engineer), and the API enforces the role on every
-  request. Accounts are created and recovered only with the operator command
-  `python -m auth` inside the api container; there is no self-registration,
-  email recovery, SSO or MFA. Passwords are stored as scrypt hashes, generated
+  request. The first AI Engineer is created with the operator command
+  `python -m auth` inside the api container, which also recovers lockouts;
+  after that AI Engineers manage accounts on the Users page. Accounts are
+  disabled, never deleted. There is no self-registration, email recovery, SSO
+  or MFA. Passwords are stored as scrypt hashes, generated
   passwords must be changed at first login, and failed logins are throttled.
   See README "Accounts and roles".
 - **Sessions.** The browser holds an HttpOnly, `SameSite=Strict` cookie; the
@@ -48,8 +50,7 @@ request but `/health` and the login (#25).
   set it to `true` only when the stack is served over TLS. LAN exposure and TLS
   are tracked in #26.
 - **Not covered yet.** Service API keys for automation (and the MCP server,
-  #39) and in-app account administration are later parts of #25; a durable
-  audit trail is #29. `GET /health` is open, for container healthchecks, and
+  #39) are a later part of #25; a durable audit trail is #29. `GET /health` is open, for container healthchecks, and
   reports service status and host resources.
 
 Exposing the workbench to an untrusted network is outside the supported

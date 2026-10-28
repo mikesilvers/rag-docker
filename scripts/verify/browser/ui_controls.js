@@ -364,6 +364,123 @@ function authCases() {
   ];
 }
 
+// The Users page (PR 2 of #25): Engineers manage accounts. The API is stubbed
+// with a small in-memory list; the real routes are checked in 17_auth.sh.
+function usersCases() {
+  const ME = 'vfy-engineer';
+  const row = (username, role, over = {}) => ({ username, role, enabled: true, must_change_password: false, created_at: '2026-10-01T12:00:00Z', ...over });
+  const usersApi = (extra = {}) => {
+    const list = [row('vfy-developer', 'developer'), row(ME, 'engineer'), row('vfy-off', 'end_user', { enabled: false, must_change_password: true })];
+    const find = call => list.find(u => u.username === decodeURIComponent(call.path.split('/')[4]));
+    return base({
+      'GET /api/auth/users': () => json(200, { users: list.map(u => ({ ...u })) }),
+      'POST /api/auth/users': call => {
+        const user = row(call.body.username.toLowerCase(), call.body.role, { must_change_password: true });
+        list.push(user);
+        return json(201, { user, password: 'GeneratedOnce-1234567890' });
+      },
+      'POST /api/auth/users/*': call => {
+        const user = find(call), action = call.path.split('/')[5];
+        if (!user) return apiError(404, 'USER_NOT_FOUND', 'There is no user.');
+        if (action === 'reset-password') { user.must_change_password = true; return json(200, { user, password: 'ResetOnce-0987654321ab' }); }
+        if (action === 'role') user.role = call.body.role;
+        if (action === 'disable') user.enabled = false;
+        if (action === 'enable') user.enabled = true;
+        return json(200, { user });
+      },
+      ...extra,
+    });
+  };
+  const open = (extra = {}) => ({ role: 'engineer', path: '/users', routes: usersApi(extra) });
+  const rowTexts = page => page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => [...r.querySelectorAll('td')].map(c => c.textContent.trim())));
+  const rowPress = async (page, username, label) => {
+    const done = await page.evaluate((u, t) => {
+      const b = [...document.querySelectorAll(`tr[data-username="${u}"] button`)].find(x => x.textContent.trim() === t);
+      if (!b) return false; b.click(); return true;
+    }, username, label);
+    if (!done) throw new Error(`no "${label}" button in the row of ${username}`);
+  };
+  const rowButtons = (page, username) => page.evaluate(u => [...document.querySelectorAll(`tr[data-username="${u}"] button`)].map(b => b.textContent.trim()), username);
+  const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
+  return [
+    { name: 'Engineer nav ends with Users, which opens the Users page', open: { role: 'engineer', path: '/qa', routes: usersApi() }, async run(s) {
+      await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users']);
+      await press(s.page, 'Users', 'nav a');
+      await waitPath(s.page, '/users');
+      await waitText(s.page, 'vfy-developer');
+    } },
+    ...['developer', 'end_user'].map(role => ({ name: `${role === 'developer' ? 'Developer' : 'End User'} has no Users link and is sent from /users to Q&A`, open: { role, path: '/qa', routes: base() }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      assert.equal((await nav(s.page)).includes('Users'), false);
+      await goto(s.page, '/users');
+      await waitText(s.page, 'Ask a Question');
+      await waitPath(s.page, '/qa');
+      assert.equal(callsTo(s, 'GET', '/api/auth/users').length, 0);
+    } })),
+    { name: 'The list shows each account; the own row has no Reset password', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      const heads = await s.page.evaluate(() => [...document.querySelectorAll('thead th')].map(t => t.textContent.trim()));
+      assert.deepEqual(heads, ['Username', 'Role', 'Status', 'Password', 'Created', '']);
+      const date = await s.page.evaluate(v => new Date(v).toLocaleDateString(), '2026-10-01T12:00:00Z');
+      const rows = await rowTexts(s.page);
+      assert.deepEqual(rows.map(r => [r[0], r[2], r[3], r[4]]), [['vfy-developer', 'Enabled', 'Set', date], [ME + ' (you)', 'Enabled', 'Set', date], ['vfy-off', 'Disabled', 'Change due', date]]);
+      assert.deepEqual(await s.page.evaluate(() => [...document.querySelectorAll('tbody select')].map(x => x.value)), ['developer', 'engineer', 'end_user']);
+      assert.deepEqual(await rowButtons(s.page, 'vfy-developer'), ['Reset password', 'Disable']);
+      assert.deepEqual(await rowButtons(s.page, ME), ['Disable']);
+      assert.ok(await bodyHas(s.page, 'Use Change password for your own'));
+      assert.deepEqual(await rowButtons(s.page, 'vfy-off'), ['Reset password', 'Enable']);
+    } },
+    { name: 'Create user sends the name and role, shows the generated password once, and Done removes it', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await fill(s.page, '#new-username', 'New.Person');
+      await fill(s.page, '#new-role', 'developer');
+      await press(s.page, 'Create user');
+      await waitText(s.page, 'GeneratedOnce-1234567890');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/users').map(c => c.body), [{ username: 'New.Person', role: 'developer' }]);
+      await waitText(s.page, 'shown only once');
+      await waitFor(s.page, () => !!document.querySelector('tr[data-username="new.person"]'), 'the new row');
+      assert.equal(await s.page.evaluate(() => document.querySelector('#new-username').value), '');
+      assert.deepEqual(await s.page.evaluate(() => [Object.keys(sessionStorage), Object.keys(localStorage)]), [[], []]);
+      await press(s.page, 'Done');
+      await waitText(s.page, 'GeneratedOnce-1234567890', true);
+    } },
+    { name: 'Reset password of another account shows its new password once', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await rowPress(s.page, 'vfy-developer', 'Reset password');
+      await waitText(s.page, 'ResetOnce-0987654321ab');
+      assert.equal(callsTo(s, 'POST', '/api/auth/users/vfy-developer/reset-password').length, 1);
+      await waitFor(s.page, () => document.querySelector('tr[data-username="vfy-developer"] td:nth-child(4)').textContent.trim() === 'Change due', 'the change-due mark');
+    } },
+    { name: 'Changing a role, Disable and Enable call the API for that account', open: open(), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await fill(s.page, 'select[aria-label="Role of vfy-developer"]', 'end_user');
+      await waitFor(s.page, () => document.querySelector('select[aria-label="Role of vfy-developer"]').value === 'end_user', 'the new role');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/users/vfy-developer/role').map(c => c.body), [{ role: 'end_user' }]);
+      await rowPress(s.page, 'vfy-developer', 'Disable');
+      await waitFor(s.page, () => document.querySelector('tr[data-username="vfy-developer"] td:nth-child(3)').textContent.trim() === 'Disabled', 'Disabled');
+      await rowPress(s.page, 'vfy-off', 'Enable');
+      await waitFor(s.page, () => document.querySelector('tr[data-username="vfy-off"] td:nth-child(3)').textContent.trim() === 'Enabled', 'Enabled');
+      assert.equal(callsTo(s, 'POST', '/api/auth/users/vfy-developer/disable').length, 1);
+      assert.equal(callsTo(s, 'POST', '/api/auth/users/vfy-off/enable').length, 1);
+    } },
+    { name: 'A refusal (the last Engineer) shows the API\'s message and reloads the list', open: open({
+      'POST /api/auth/users/vfy-engineer/disable': apiError(409, 'LAST_ENGINEER', "'vfy-engineer' is the last enabled engineer; make another engineer first."),
+    }), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      const before = callsTo(s, 'GET', '/api/auth/users').length;
+      await rowPress(s.page, ME, 'Disable');
+      await waitText(s.page, 'is the last enabled engineer');
+      await waitFor(s.page, () => document.querySelector('[role=alert]') !== null, 'the alert');
+      assert.ok(callsTo(s, 'GET', '/api/auth/users').length > before, 'the list was reloaded');
+      assert.equal(await s.page.evaluate(() => document.querySelector('tr[data-username="vfy-engineer"] td:nth-child(3)').textContent.trim()), 'Enabled');
+    } },
+    { name: 'A list that cannot be loaded says so', open: open({ 'GET /api/auth/users': apiError(500, 'INTERNAL_ERROR', 'Synthetic failure.') }), async run(s) {
+      await waitText(s.page, 'Could not load the users: Synthetic failure.');
+    } },
+  ];
+}
+
 function qaCases() {
   return [
     { name: 'Ask is disabled for empty and blank questions and enabled for text', open: qaOpen('engineer'), async run(s) {
@@ -558,6 +675,7 @@ async function runUiControlTests(browser, baseUrl, reporter) {
   await run('Import queue, sliders and "+ New" modal (#400)', importCases());
   await run('Navigation, roles and redirects (#400); the API enforces the roles (#25)', navigationCases());
   await run('Login, logout, setup and password changes (#25)', authCases());
+  await run('Users page: Engineers manage accounts (#25)', usersCases());
   await run('Q&A input, citations toggle, answer display and End User view (#400)', qaCases());
   await run('Retrieval page status text, alpha slider and save (#400)', retrievalCases());
   await run('Client handling of the proxy error pages (#400)', proxyCases());

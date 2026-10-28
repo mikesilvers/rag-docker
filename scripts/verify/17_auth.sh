@@ -51,6 +51,10 @@ check "the own password change: rules, current password, not the same password, 
 stack idle-expiry
 check "a session idle for more than 12 hours answers 401" $?
 
+section "Account administration by Engineers (PR 2)"
+stack admin-accounts
+check "an Engineer creates, resets, re-roles, disables and enables an account through the API; own reset refused; no password logged" $?
+
 section "Request protection and login throttling (H4)"
 stack control-path
 check "a path ending in %0A is refused before its body is read, not routed past the check" $?

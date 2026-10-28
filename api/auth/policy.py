@@ -54,6 +54,13 @@ ACCESS: dict[tuple[str, str], str] = {
     ("GET", "/tune/job/{job_id}"): ENGINEER,
     ("GET", "/metrics/latency"): ENGINEER,
     ("GET", "/goldstandard/diagnostics"): ENGINEER,
+    # Account administration (Q20, PR 2 of #25). No route deletes an account.
+    ("GET", "/auth/users"): ENGINEER,
+    ("POST", "/auth/users"): ENGINEER,
+    ("POST", "/auth/users/{username}/reset-password"): ENGINEER,
+    ("POST", "/auth/users/{username}/role"): ENGINEER,
+    ("POST", "/auth/users/{username}/disable"): ENGINEER,
+    ("POST", "/auth/users/{username}/enable"): ENGINEER,
     # FastAPI's own API docs (N5).
     ("GET", "/docs"): ENGINEER,
     ("GET", "/docs/oauth2-redirect"): ENGINEER,
