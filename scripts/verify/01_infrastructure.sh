@@ -48,8 +48,14 @@ check_eq "an unknown API route answers 404 through the proxy (#373)" \
   "$(api_code "$API/no-such-route-373")" "404"
 check_eq "  ... in the envelope, code NOT_FOUND" \
   "$(api_get /no-such-route-373 | jfield "['error']['code']")" "NOT_FOUND"
-check_eq "a wrong method answers 405 METHOD_NOT_ALLOWED through the proxy (#373)" \
-  "$(curl -s -m 120 -X PUT "$API/query" | jfield "['error']['code']")" "METHOD_NOT_ALLOWED"
+# One PUT, read for its status, its Allow header and its envelope code (#456).
+wrong_method=$(api_curl -i -X PUT "$API/query" | tr -d '\r')
+check_eq "a wrong method answers 405 through the proxy (#373)" \
+  "$(printf '%s\n' "$wrong_method" | awk 'NR==1 {print $2}')" "405"
+check_eq "  ... with its Allow header, POST" \
+  "$(printf '%s\n' "$wrong_method" | awk 'tolower($1)=="allow:" {print $2}')" "POST"
+check_eq "  ... in the envelope, code METHOD_NOT_ALLOWED" \
+  "$(printf '%s\n' "$wrong_method" | sed '1,/^$/d' | jfield "['error']['code']")" "METHOD_NOT_ALLOWED"
 # /health's 503 body for a missing model or an unreachable dependency, which the
 # Health page reads to show the failing services (#375).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_health.py)

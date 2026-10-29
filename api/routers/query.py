@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter
+from fastapi.responses import JSONResponse
 
 from models.schemas import QueryRequest, QueryResponse
 from config import settings
@@ -15,7 +16,7 @@ router = APIRouter(prefix="/query")
 _log = logging.getLogger(__name__)
 
 
-def _unavailable(collection: str, exc: rag_pipeline.ServiceUnavailable):
+def _unavailable(collection: str, exc: rag_pipeline.ServiceUnavailable) -> JSONResponse:
     """The 503 for a dependency failure, naming the embedder too when there is one (#411)."""
     service, embedder = exc.service, exc.embedder
     if embedder is None:
