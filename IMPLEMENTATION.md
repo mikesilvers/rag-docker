@@ -18895,7 +18895,7 @@ What makes it separate from the live stack:
   stops the orphaned suite instead: `lock.sh` trusts an inherited
   `RAG_VERIFY_LOCK_HELD` only while the lock's pid is that shell or one of its
   ancestors, and `lib.sh`'s API helpers (`api_get`, `api_post`, `api_code`,
-  `api_post_code`, `api_curl`, `drop_collection`, `make_collection` and every
+  `api_post_code`, `api_request`, `drop_collection`, `make_collection` and every
   `wait_for_job` poll) repeat that check before each request and end the
   suite, exit 3, when it fails. Not re-checked: direct `curl` and
   `docker compose exec` calls in the suites, and the Python helpers, which
@@ -19883,7 +19883,7 @@ modes names Ollama too (Weaviate embeds the question through it there), and that
 template `RuntimeError` answers `HELP_RENDER_FAILED` with its own message. Suite 01 then
 checks the envelope through the proxy on the running stack: an unknown route answers 404
 `NOT_FOUND`, and `PUT /query` answers 405 with `Allow: POST` and the code
-`METHOD_NOT_ALLOWED` (#456), the request going through the lock-checked `api_curl` helper.
+`METHOD_NOT_ALLOWED` (#456), the request going through the lock-checked `api_request` helper.
 
 Suite 02 runs `scripts/tests/test_collection_spelling.py` the same way (#372). With Weaviate
 and the job workers mocked, it sends each route that takes a collection name a lowercase-first
@@ -20930,7 +20930,7 @@ api_code() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -w '%{http_cod
 api_post() { _rag_require_lock_owner; curl -s -m 600 -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
 api_post_code() { _rag_require_lock_owner; curl -s -o /dev/null -m 600 -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
 # Any other request, headers and body included: pass curl's own arguments and a full URL.
-api_curl() { _rag_require_lock_owner; curl -s -m 120 "$@"; }
+api_request() { _rag_require_lock_owner; curl -s -m 120 "$@"; }
 
 require_stack() {
   local code
@@ -26163,7 +26163,7 @@ check_eq "an unknown API route answers 404 through the proxy (#373)" \
 check_eq "  ... in the envelope, code NOT_FOUND" \
   "$(api_get /no-such-route-373 | jfield "['error']['code']")" "NOT_FOUND"
 # One PUT, read for its status, its Allow header and its envelope code (#456).
-wrong_method=$(api_curl -i -X PUT "$API/query" | tr -d '\r')
+wrong_method=$(api_request -i -X PUT "$API/query" | tr -d '\r')
 check_eq "a wrong method answers 405 through the proxy (#373)" \
   "$(printf '%s\n' "$wrong_method" | awk 'NR==1 {print $2}')" "405"
 check_eq "  ... with its Allow header, POST" \

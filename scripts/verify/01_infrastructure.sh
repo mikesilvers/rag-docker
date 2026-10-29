@@ -49,7 +49,7 @@ check_eq "an unknown API route answers 404 through the proxy (#373)" \
 check_eq "  ... in the envelope, code NOT_FOUND" \
   "$(api_get /no-such-route-373 | jfield "['error']['code']")" "NOT_FOUND"
 # One PUT, read for its status, its Allow header and its envelope code (#456).
-wrong_method=$(api_curl -i -X PUT "$API/query" | tr -d '\r')
+wrong_method=$(api_request -i -X PUT "$API/query" | tr -d '\r')
 check_eq "a wrong method answers 405 through the proxy (#373)" \
   "$(printf '%s\n' "$wrong_method" | awk 'NR==1 {print $2}')" "405"
 check_eq "  ... with its Allow header, POST" \
