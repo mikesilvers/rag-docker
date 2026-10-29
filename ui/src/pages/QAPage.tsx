@@ -27,12 +27,13 @@ export default function QAPage() {
 
   // Loads the collection list, on opening the page and from the failed-list
   // alert's Retry (#575). A collection already chosen, here or on the Retrieval
-  // page, is kept; the first one is selected only when none is.
+  // page, is kept; the first one is selected only when none is. The choice is
+  // read when the list arrives, not when the load started (#593).
   function loadCollections() {
     api.getCollections().then(r => {
       setCollections(r.collections)
       setListError('')
-      if (!collection && r.collections.length > 0) setCollection(r.collections[0].name)
+      if (r.collections.length > 0) setCollection(c => c || r.collections[0].name)
     }).catch((e: unknown) => setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`))
   }
 

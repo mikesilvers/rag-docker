@@ -3438,7 +3438,9 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       collections, by request interception, and checks the Retry button in the alert, one more
       `GET` per Retry, the message and the button gone, the first collection selected on a freshly
       opened Q&A page and on Gold Standard, and on Q&A reached from the Retrieval page, the second
-      collection chosen there still selected. The checks fail on the code before #575.*
+      collection chosen there still selected. The checks fail on the code before #575. On the freshly
+      opened pages, a first Retry is answered with a second failure: the alert then shows that
+      failure's reason with its Retry button, before the next Retry succeeds (#593).*
 - [x] The Gold Standard page pre-fills the export filename as `{collection}_{YYYYMMDD_HHMMSS}.json`, made safe and at most 128 characters, after a generation and after a lookup; opens the download with the filename encoded; refuses a sample size outside 1-100 before calling the API; and shows each pair as an expandable row with a 300-character context preview (#393).
       *Evidence: `scripts/verify/browser/goldstandard_page.js` (suite 06) answers every Gold Standard
       API call by request interception. Its filename, encoded-URL and sample-size checks fail on the
