@@ -66,12 +66,20 @@ export default function GoldStandardPage() {
   const [editError, setEditError] = useState('')
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  useEffect(() => {
+  // Loads the collection list, on opening the page and from the failed-list
+  // alert's Retry (#575). The first collection is selected only when none is.
+  function loadCollections() {
     api.getCollections().then(r => {
       setCollections(r.collections)
       setListError('')
-      if (r.collections.length > 0) setCollection(r.collections[0].name)
+      if (r.collections.length > 0) setCollection(c => c || r.collections[0].name)
     }).catch((e: unknown) => setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`))
+  }
+
+  useEffect(() => {
+    loadCollections()
+    // Runs once on opening; Retry calls loadCollections again.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
@@ -233,7 +241,12 @@ export default function GoldStandardPage() {
           </button>
         </div>
         {!sampleSizeValid && <p role="alert" className="text-red-600 text-sm mt-3">Sample size must be a whole number from 1 to 100.</p>}
-        {listError && <p role="alert" className="text-red-600 text-sm mt-3">{listError}</p>}
+        {listError && (
+          <p role="alert" className="text-red-600 text-sm mt-3">
+            {listError}
+            <button type="button" onClick={() => loadCollections()} className="ml-2 underline hover:text-red-800">Retry</button>
+          </p>
+        )}
 
         {session && session.status === 'generating' && !pollError && (
           <div className="mt-3">

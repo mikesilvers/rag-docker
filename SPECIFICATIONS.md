@@ -2438,7 +2438,7 @@ what the role can't do (§3.1.8):
 
 **Elements:**
 
-- Collection selector dropdown (populated from `GET /collections`). Defaults to first available collection. If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379).
+- Collection selector dropdown (populated from `GET /collections`). Defaults to first available collection. If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379). The alert has a **Retry** button that loads the list again; on success the message goes and the first collection is selected only if none is chosen yet, so a collection already chosen on the Retrieval page is kept (#575).
 - Question text input (multi-line, submit via "Ask" button or Ctrl+Enter; plain Enter inserts a newline).
 - Citations toggle (checkbox, off by default, labeled "Show source citations").
 - Answer display area (markdown-rendered).
@@ -2577,7 +2577,7 @@ A retained session can be loaded/refreshed by its session ID, including when its
 **Roles:** Engineer, Developer
 
 **Phase 1 — Generate:**
-- Collection selector. If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379).
+- Collection selector. If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379). The alert has a **Retry** button that loads the list again; on success the message goes and the first collection is selected only if none is chosen yet (#575).
 - Sample size input (1–100, default 20). While the value is empty, not a whole number, below 1 or above 100, "Generate Pairs" is disabled and the page says "Sample size must be a whole number from 1 to 100."; no request is sent (#393).
 - "Generate Pairs" button → calls `POST /goldstandard/generate`, receives `session_id`. Shows progress bar during generation.
 - "Generate Pairs" is disabled while its start request is in flight, while a generation runs and between the start being accepted and the first poll answer (so a second click cannot start another session or skip the confirmation below); a retained session that is still `generating` disables it too (#380).
@@ -3416,6 +3416,13 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       answers `GET /collections` with a synthetic `503` on each page, and checks the Collections
       page clears the message on its next successful load. The checks fail on the code before
       #379.*
+- [x] The failed collection-list alert on the Q&A and Gold Standard pages has a Retry button that loads the list again. A successful Retry clears the message and selects the first collection only if none is chosen yet, so on Q&A a collection chosen on the Retrieval page stays selected (#575).
+      *Before, those pages loaded the list once, so the message stayed until the page was opened
+      again. `ui_criteria.js` answers `GET /collections` with a synthetic `503`, then a list of two
+      collections, by request interception, and checks the Retry button in the alert, one more
+      `GET` per Retry, the message and the button gone, the first collection selected on a freshly
+      opened Q&A page and on Gold Standard, and on Q&A reached from the Retrieval page, the second
+      collection chosen there still selected. The checks fail on the code before #575.*
 - [x] The Gold Standard page pre-fills the export filename as `{collection}_{YYYYMMDD_HHMMSS}.json`, made safe and at most 128 characters, after a generation and after a lookup; opens the download with the filename encoded; refuses a sample size outside 1-100 before calling the API; and shows each pair as an expandable row with a 300-character context preview (#393).
       *Evidence: `scripts/verify/browser/goldstandard_page.js` (suite 06) answers every Gold Standard
       API call by request interception. Its filename, encoded-URL and sample-size checks fail on the
