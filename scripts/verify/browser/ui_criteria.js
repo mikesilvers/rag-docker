@@ -773,6 +773,62 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
           r.check('the no-collection fixture causes no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
         } finally { await s.ctx.close(); }
       }
+      // The job ID lifecycle of SPECIFICATIONS.md §7.4 (#458): it stays shown
+      // after the job ends, an upload the API refuses leaves it as it was, and a
+      // later accepted upload replaces it. Uploads answer job A, a refusal, then
+      // job B; A's polls answer a completed job.
+      {
+        const JOB_A = 'vfyjob458a', JOB_B = 'vfyjob458b';
+        const REFUSAL = 'Synthetic upload refusal.';
+        const pollsA = s => s.api.filter(x => x.method === 'GET' && x.url === '/api/ingest/job/' + JOB_A).length;
+        const s = await session(browser, BASE, 'developer');
+        try {
+          let sent = 0;
+          const list = [{ name: 'VfyJob458', object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', created_at: null }];
+          const job = (id, status, done, stored) => JSON.stringify({ job_id: id, status, files_total: 1, files_completed: done, files_failed: 0, chunks_stored: stored, errors: [], skipped: [] });
+          await s.page.setRequestInterception(true);
+          s.page.on('request', request => {
+            const path = new URL(request.url()).pathname;
+            if (path === '/api/collections' && request.method() === 'GET')
+              return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: list }) });
+            if (path === '/api/ingest/upload' && request.method() === 'POST') {
+              sent += 1;
+              if (sent === 2)
+                return request.respond({ status: 400, contentType: 'application/json', body: JSON.stringify({ error: { code: 'X', message: REFUSAL, detail: null } }) });
+              return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: sent === 1 ? JOB_A : JOB_B, status: 'queued', files_queued: 1, collection: 'VfyJob458' }) });
+            }
+            if (path === '/api/ingest/job/' + JOB_A)
+              return request.respond({ status: 200, contentType: 'application/json', body: job(JOB_A, 'completed', 1, 2) });
+            if (path === '/api/ingest/job/' + JOB_B)
+              return request.respond({ status: 200, contentType: 'application/json', body: job(JOB_B, 'running', 0, 0) });
+            return request.continue();
+          });
+          await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+          const input = await s.page.$('#file-input');
+          await input.uploadFile(small);
+          await sleep(300);
+          const first = await clickByText(s.page, 'Start Ingest');
+          await sleep(4500);                     // A's first poll has answered completed
+          const ended = await bodyText(s.page);
+          r.check('the job ID stays shown after the job ends',
+                  first && uploads(s) === 1 && pollsA(s) >= 1 && ended.includes('Files: 1/1') && ended.includes('completed') &&
+                  ended.includes('Job ID: ' + JOB_A),
+                  `clicked=${first} uploads=${uploads(s)} polls=${pollsA(s)} text: ${ended.slice(0, 300)}`);
+          const second = await clickByText(s.page, 'Start Ingest');
+          await sleep(1000);                     // the upload has been refused
+          const refused = await bodyText(s.page);
+          r.check('an upload the API refuses leaves the job ID unchanged',
+                  second && uploads(s) === 2 && refused.includes(REFUSAL) && refused.includes('Job ID: ' + JOB_A),
+                  `clicked=${second} uploads=${uploads(s)} text: ${refused.slice(0, 300)}`);
+          const third = await clickByText(s.page, 'Start Ingest');
+          await sleep(1000);                     // job B accepted, not yet polled
+          const replaced = await bodyText(s.page);
+          r.check('a later accepted upload replaces the job ID',
+                  third && uploads(s) === 3 && replaced.includes('Job ID: ' + JOB_B) && !replaced.includes(JOB_A),
+                  `clicked=${third} uploads=${uploads(s)} text: ${replaced.slice(0, 300)}`);
+          r.check('the job ID lifecycle fixture causes no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+        } finally { await s.ctx.close(); }
+      }
     } finally {
       fs.unlinkSync(small);
     }

@@ -421,7 +421,9 @@ failing status poll, and that a new ingest and the next successful poll clear th
 Since #394 it also checks, with the list, upload and polls stubbed, that the job ID and a
 queued panel show as soon as an upload is accepted, before the first poll, and stay through a
 failed poll; that the first answered poll replaces the panel while the job ID stays; and that
-"Start Ingest" with no collection selected says so and sends nothing.
+"Start Ingest" with no collection selected says so and sends nothing. Since #458 it also checks
+that the job ID stays shown after the job ends, is left as it was by an upload the API refuses,
+and is replaced by a later accepted upload.
 
 `scripts/tests/test_zip_expansion.py` (#298) checks the total expanded-size cap on an
 upload's ZIPs with a 1 MiB cap set through `MAX_ZIP_EXPANDED_BYTES` (`02_ingest.sh` passes it
