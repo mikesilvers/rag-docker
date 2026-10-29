@@ -404,11 +404,15 @@ def load_sessions_from_disk() -> None:
     _scan_sessions()
 
 
+class _GenerationInterrupted(RuntimeError):
+    """The restart interruption startup settlement records; its reason is written plain."""
+
+
 def reconcile_interrupted_generations() -> None:
     """Startup only: no generation worker survives a process restart."""
     if _tasks:
         raise RuntimeError("Generation recovery must run before workers start")
-    interruption = RuntimeError("Generation interrupted by API restart. Retained pairs are available for review; start a new generation for missing pairs.")
+    interruption = _GenerationInterrupted("Generation interrupted by API restart. Retained pairs are available for review; start a new generation for missing pairs.")
     with _state_lock:
         interrupted = [sid for sid, value in _sessions.items() if value.get("status") == "generating"]
     for session_id in interrupted:
@@ -842,8 +846,12 @@ async def _generate_pair(chunk: dict) -> dict:
 
 def _failed_generation(current: dict, exc: Exception) -> None:
     current["status"] = "failed"
-    reason = (f"{exc.code}: {exc.message}" if isinstance(exc, GoldStandardError)
-              else str(exc) or type(exc).__name__)
+    if isinstance(exc, GoldStandardError):
+        reason = f"{exc.code}: {exc.message}"
+    elif isinstance(exc, _GenerationInterrupted):
+        reason = str(exc)
+    else:
+        reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
     errors = current.setdefault("errors", [])
     if reason not in errors:
         errors.append(reason)

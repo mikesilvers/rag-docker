@@ -5895,11 +5895,15 @@ def load_sessions_from_disk() -> None:
     _scan_sessions()
 
 
+class _GenerationInterrupted(RuntimeError):
+    """The restart interruption startup settlement records; its reason is written plain."""
+
+
 def reconcile_interrupted_generations() -> None:
     """Startup only: no generation worker survives a process restart."""
     if _tasks:
         raise RuntimeError("Generation recovery must run before workers start")
-    interruption = RuntimeError("Generation interrupted by API restart. Retained pairs are available for review; start a new generation for missing pairs.")
+    interruption = _GenerationInterrupted("Generation interrupted by API restart. Retained pairs are available for review; start a new generation for missing pairs.")
     with _state_lock:
         interrupted = [sid for sid, value in _sessions.items() if value.get("status") == "generating"]
     for session_id in interrupted:
@@ -6333,8 +6337,12 @@ async def _generate_pair(chunk: dict) -> dict:
 
 def _failed_generation(current: dict, exc: Exception) -> None:
     current["status"] = "failed"
-    reason = (f"{exc.code}: {exc.message}" if isinstance(exc, GoldStandardError)
-              else str(exc) or type(exc).__name__)
+    if isinstance(exc, GoldStandardError):
+        reason = f"{exc.code}: {exc.message}"
+    elif isinstance(exc, _GenerationInterrupted):
+        reason = str(exc)
+    else:
+        reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
     errors = current.setdefault("errors", [])
     if reason not in errors:
         errors.append(reason)
@@ -26925,6 +26933,23 @@ code=$(curl -s -o /tmp/vfy_gs404.json -m 120 -w '%{http_code}' -X POST \
 check_eq "regenerate on an unknown session returns 404 SESSION_NOT_FOUND" \
   "$code $(jfield "['error']['code']" < /tmp/vfy_gs404.json)" "404 SESSION_NOT_FOUND"
 
+# ── the proxy outlasts the regeneration deadline (#278) ──────────────────────
+# Regeneration is synchronous; nginx's generic 300 s read timeout cut it off
+# with a 504 under load. The exact route must wait longer than the API's own
+# model deadline, so the API's typed answer reaches the client.
+proxy_timeout=$( (cd ../.. && docker compose exec -T proxy nginx -T 2>/dev/null) | python3 -c "
+import re,sys
+t=sys.stdin.read()
+m=re.search(r'location\s*=\s*/api/goldstandard/regenerate\s*\{([^}]*)\}', t)
+r=re.search(r'proxy_read_timeout\s+(\d+)s?\s*;', m.group(1)) if m else None
+print(r.group(1) if r else 0)")
+api_deadline=$( (cd ../.. && docker compose exec -T api python -c "
+from services import goldstandard as gs
+print(int(getattr(gs, '_REGENERATION_TIMEOUT_SECONDS', 0)))") 2>/dev/null | tail -1)
+[ "${api_deadline:-0}" -gt 300 ] 2>/dev/null && [ "${proxy_timeout:-0}" -gt "${api_deadline:-0}" ] 2>/dev/null
+check "the proxy's regenerate timeout outlasts the API's regeneration deadline" $? \
+  "proxy=${proxy_timeout:-?}s api=${api_deadline:-?}s"
+
 if [ "$SKIP_SLOW" = "1" ]; then
   skip "LLM generation/review/export" "set RAG_SKIP_SLOW=0 to include them"
   summary; exit $?
@@ -27027,6 +27052,7 @@ if [ "$actual" -ge 2 ]; then
   check_eq "regeneration target edit is accepted" "$code" "200"
   # Snapshot after edits, so every non-target pair must remain byte-for-byte equal.
   api_get "/goldstandard/session/$SID" > /tmp/vfy_regen_before.json
+  _rag_require_lock_owner
   code=$(curl -s -m 1920 -o /tmp/vfy_regen.json -w '%{http_code}' -X POST \
     "$API/goldstandard/regenerate" -H 'Content-Type: application/json' \
     -d "{\"session_id\":\"$SID\",\"pair_id\":\"$TARGET\"}")
@@ -27159,6 +27185,7 @@ sys.exit(0 if ok else 1)
 ENDPY
       check "hard stop settles generation with a plain reason and retained pairs" $?
       pid2=$(python3 -c "import json;print(json.load(open('/tmp/vfy_gen2_post.json'))['pairs'][0]['pair_id'])")
+      _rag_require_lock_owner
       code=$(curl -s -m 1920 -o /tmp/vfy_gen2_regen.json -w '%{http_code}' -X POST \
         "$API/goldstandard/regenerate" -H 'Content-Type: application/json' \
         -d "{\"session_id\":\"$SID2\",\"pair_id\":\"$pid2\"}")
@@ -32494,6 +32521,10 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
                 finally:release.set()
                 await task
         asyncio.run(run());self.assertEqual(self.restart()['status'],'failed')
+
+    def test_unexpected_generation_failure_reason_names_its_type(self):
+        asyncio.run(gs._record_generation_failure(self.data['session_id'], KeyError('pairs')))
+        self.assertIn("KeyError: 'pairs'", self.restart()['errors'])
 
     async def generate(self,pair):
         # The real task, done-callback and reporter run; only the model and sampling are owned.

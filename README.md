@@ -500,6 +500,14 @@ docker compose up -d
 docker compose ps
 ```
 
+**Recreate the proxy after pulling a change to it.** The proxy's configuration files, `proxy/nginx.conf`,
+`proxy/locations.conf` and LAN mode's `proxy/nginx.lan.conf`, are each mounted as a single file. `git pull`
+replaces a changed file instead of rewriting it, so a running proxy keeps reading the old copy, and
+`docker compose up -d` alone doesn't recreate it. After pulling a change to any of them, run
+`docker compose up -d --force-recreate proxy` (in LAN mode with its two `-f` options). Until then, for example,
+`POST /api/goldstandard/regenerate` (regenerating a gold-standard pair) keeps the old configuration's generic
+300 s read timeout and can end in a 504 from the proxy (#278).
+
 ## GPU acceleration (optional)
 
 To use a CUDA GPU for Ollama, uncomment the `deploy` block in `docker-compose.yml`:
