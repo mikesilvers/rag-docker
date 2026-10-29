@@ -2271,7 +2271,21 @@ Chunk:
 { "question": "...", "answer": "...", "ground_truth": "..." }
 ```
 
-If the model output is not valid JSON, the API retries once with an explicit reminder to return only JSON.
+Each chunk gets at most three attempts. A reply is usable when it holds a JSON object whose `question` and `answer` are nonempty strings and whose `ground_truth` is a nonempty string or left out; a left-out `ground_truth` defaults to the validated `answer`. A missing `question` or `answer`, or a null, list, object, number, boolean or blank value in any of the three, makes the reply unusable, and such a value is never stored as its Python representation. After an unusable reply the API asks again with the same user message, up to two more times, adding one of these texts to the end of the system prompt. Each starts with a space.
+
+After a reply with no JSON object:
+
+```
+ Your previous response was not valid JSON. Return ONLY the JSON object with keys: question, answer, ground_truth. No markdown, no explanation.
+```
+
+After a JSON object with an unusable field:
+
+```
+ Your previous response did not give question, answer and ground_truth as nonempty strings. Return ONLY the JSON object with keys: question, answer, ground_truth, each a nonempty string. No markdown, no explanation.
+```
+
+After a third unusable reply the pair fails; §3.1.5 describes how failures are reported. A chunk whose source filename is null gives a pair with an empty `source_file`.
 
 ---
 
@@ -3142,6 +3156,7 @@ now lives once, in `api/services/ingest_config.py`.
       is one attempt plus two reprompts; the failures are independent between
       attempts.*
 - [x] Each pair has non-empty question, answer, ground_truth, and contexts fields.
+      *Evidence: `test_session_import.py` (#103, #273): null, list, object, numeric, boolean, blank and left-out model fields fail the pair within the three-attempt budget rather than being stored; a left-out `ground_truth` defaults to the answer; valid strings are stored unchanged.*
 - [x] Regenerate call replaces exactly one pair without affecting others; returns 409 if session is still generating.
       *Both halves originally failed. Regenerating mid-generation returned **500**,
       not 409 — there was no guard at all, and an unparseable model reply escaped
@@ -3538,8 +3553,6 @@ A rebuild from these documents is correct when:
 
 - [x] A tuning or ingest replacement makes each pre-replacement stale marker durable, in the session file or a pending marker. If both writes fail for a session, the replacement aborts before the target is touched, and the markers that call already wrote, under both first-character spellings, are rolled back: each session's `stale`, `stale_reason` and `stale_at` and its pending marker return to their earlier state. A marker that can't be rolled back stays, so its session stays historical; this is logged and reported as a `SESSION_WRITE_FAILED` diagnostic. Stale marking after cutover stays best-effort: if both writes fail there, the session is historical only until restart (#93, #275).
       *Registered by `10_validity.sh`, which runs `scripts/tests/test_session_validity.py` in the API container: `test_cutover_requires_a_durable_session_or_pending_marker`, `test_unpersistable_marker_aborts_real_rebuild_before_live_delete`, `test_pending_marker_alone_lets_real_rebuild_replace_and_survives_restart`, `test_post_cutover_marking_stays_best_effort`, `test_aborted_marking_rolls_back_written_sessions_across_spellings`, `test_aborted_marking_restores_pending_markers` and `test_unrollbackable_marker_stays_and_is_reported`.*
-
-Generated model questions, answers and ground truths must be nonempty strings. Invalid field types consume the same bounded reprompt budget as malformed JSON; exhausted attempts fail the pair rather than publishing Python representations. An omitted ground truth defaults to the validated answer, and null source filenames normalize to an empty string.
 
 Overlap retains internal whitespace-only windows to preserve exact character coverage and overlap; wholly blank input yields no chunks. Hard character boundaries and fixed per-file limits remain the existing contract, rather than changing retrieval behavior in this follow-up.
 
