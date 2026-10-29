@@ -904,6 +904,13 @@ containment, interrupted publication and concurrent blob publication:
 python -m unittest discover -s scripts/tests -p 'test_model_bundle.py'
 ```
 
+`05_transfer.sh` also checks that a model installed from a bundle is reported
+by Ollama's real `/api/tags` (#452): only when the api and ollama containers
+both mount `rag-verify-ollama-models`, it installs the embedding model's own
+files under the throwaway name `vfy-install-alias:latest`, which writes one
+manifest into the verify model copy, and removes that manifest whether the
+check passes or fails.
+
 ## Cleaning up
 
 Suites create collections prefixed `Vfy` (`RAG_TEST_PREFIX`) and remove them at
