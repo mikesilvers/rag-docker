@@ -45,7 +45,9 @@ check "no harness password, session token, API key or password typed in a change
 
 section "Concurrent writers"
 stack concurrent
-check "parallel failed logins and the operator command append together: each recorded once, every line whole" $?
+check "parallel failed logins (nginx's burst of 5) and the operator command append together: each recorded once, every line whole" $?
+stack coalesced-logins
+check "repeated failed logins for one username: one record at once, then one with the count and last attempt (#577)" $?
 
 section "Restart persistence (opt-in: it restarts the api)"
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then

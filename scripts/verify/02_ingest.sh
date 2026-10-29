@@ -878,6 +878,21 @@ sys.exit(0 if ok else 1)
 ENDPY
     check "an ingest interrupted before storing a file reads back 200 'failed' with the message" $? \
       "before: $(head -c 200 /tmp/vfy_restart_none_before.json); after: $(head -c 300 /tmp/vfy_restart_none_after.json)"
+    # The audit log (#29, #577): the restart's marking wrote each interrupted
+    # job's end record. The shell's curl is the harness Engineer's.
+    api_get "/audit?action=ingest&result=interrupted&limit=1000" > /tmp/vfy_restart_audit.json
+    python3 - "$slow_job" "$none_job" <<'ENDPY'
+import json, sys
+try:
+    records = json.load(open('/tmp/vfy_restart_audit.json'))["records"]
+except (OSError, ValueError, KeyError):
+    sys.exit(1)
+counts = {job: sum(1 for r in records if r.get("job_id") == job) for job in sys.argv[1:]}
+print(counts)
+sys.exit(0 if all(n == 1 for n in counts.values()) else 1)
+ENDPY
+    check "each interrupted ingest has one 'interrupted' audit record with its job id (#577)" $? \
+      "$(head -c 300 /tmp/vfy_restart_audit.json)"
   fi
   drop_collection "$JR"
   drop_collection "$JN"

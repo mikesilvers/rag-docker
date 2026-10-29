@@ -267,15 +267,17 @@ def check_admin(operator_ok):
 
 
 def check_filters(operator_ok):
+    # Two usernames: repeated failures for one would be counted in one record (#577).
     typed = "=vfy" + secrets.token_hex(4)
+    newer = "=vfy" + secrets.token_hex(4)
     request("POST", "/auth/login", {"username": typed, "password": "not-a-password-" + secrets.token_hex(4)})
-    request("POST", "/auth/login", {"username": typed, "password": "not-a-password-" + secrets.token_hex(4)})
+    request("POST", "/auth/login", {"username": newer, "password": "not-a-password-" + secrets.token_hex(4)})
     admin = role_token("engineer")
     try:
         page = records(admin, action="auth.login", result="refused", limit=1)
         expect(len(page["records"]) == 1 and page["next_before"], "a one-record page has no cursor: {}".format(page))
         first = page["records"][0]
-        expect(first["target"] == typed, "the newest refused login is {}".format(first["target"]))
+        expect(first["target"] == newer, "the newest refused login is {}".format(first["target"]))
         older = records(admin, action="auth.login", result="refused", limit=1, before=page["next_before"])
         expect(older["records"] and older["records"][0]["id"] < first["id"] and older["records"][0]["target"] == typed,
                "the next page doesn't hold the next older record")
@@ -361,11 +363,12 @@ def check_concurrent(operator_ok):
     """The testing reviewer's addition: parallel failed logins through nginx
     while the operator command appends in the same container (D7's shared file
     lock). Each request is recorded exactly once, the operator's record is
-    there, and every line of every audit file is one whole JSON object."""
+    there, and every line of every audit file is one whole JSON object. Five
+    logins, nginx's login burst (#577); a refused one is sent again."""
     expect(operator_ok, "runs the operator command, so it runs only on the verify project")
     import threading
     end_user = auth_setup.read_credentials(auth_setup.private_dir())["end_user"][0]
-    typed = ["vfy-conc-{}-{}".format(n, secrets.token_hex(3)) for n in range(24)]
+    typed = ["vfy-conc-{}-{}".format(n, secrets.token_hex(3)) for n in range(5)]
     errors = []
 
     def attempt(name):
@@ -408,6 +411,38 @@ def check_concurrent(operator_ok):
             except ValueError:
                 bad += 1
         expect(bad == 0, "{} audit line(s) aren't whole JSON records".format(bad))
+    finally:
+        request("POST", "/auth/logout", token=admin)
+
+
+def check_coalesced_logins(operator_ok):
+    """#577: failed logins for one username from one address within a minute
+    are one record at once and, when the window closes, one with the count."""
+    typed = "vfy-again-" + secrets.token_hex(4)
+    started = time.monotonic()
+    for _ in range(3):
+        status, _, _ = request("POST", "/auth/login",
+                               {"username": typed, "password": "not-a-password-" + secrets.token_hex(4)})
+        expect(status == 401, "a failed login answered {}".format(status))
+    took = time.monotonic() - started
+    admin = role_token("engineer")
+    try:
+        mine = lambda: [r for r in records(admin, action="auth.login", limit=1000)["records"] if r["target"] == typed]
+        if took < 50:                                 # pacing didn't stretch them past the window
+            now = mine()
+            expect(len(now) == 1 and "count" not in now[0]["details"],
+                   "three failures inside the window wrote {} record(s)".format(len(now)))
+        deadline = time.monotonic() + 90
+        while not any("count" in r["details"] for r in mine()):
+            expect(time.monotonic() < deadline, "no count record within 90 s of the failures")
+            time.sleep(3)
+        items = mine()
+        counted = [r for r in items if "count" in r["details"]]
+        expect(all(r["details"].get("last_attempt") and r["details"].get("code") == "LOGIN_FAILED"
+                   and r["status_code"] == 401 and r["actor"] is None for r in counted),
+               "a count record is {}".format(counted))
+        total = sum(r["details"].get("count", 1) for r in items)
+        expect(total == 3, "the records stand for {} attempts, not 3: {}".format(total, items))
     finally:
         request("POST", "/auth/logout", token=admin)
 

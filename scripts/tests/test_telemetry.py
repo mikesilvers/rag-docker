@@ -752,7 +752,9 @@ class TelemetryTests(unittest.TestCase):
                                     packager=SimpleNamespace(sweep_build_leftovers=lambda:[]),
                                     weaviate_client=wc,importer=importer,exporter=job_module('export'),
                                     ingest_pipeline=job_module('ingest'),tuning=job_module('tune'),
-                                    audit=SimpleNamespace(record=lambda *args,**kwargs:order.append('audit')))
+                                    audit=SimpleNamespace(record=lambda *args,**kwargs:order.append('audit'),
+                                                          login_flusher=lambda:asyncio.sleep(3600),
+                                                          flush_logins=lambda:order.append('flush')))
             modules={'services':service,'services.telemetry':SimpleNamespace(bootstrap=lambda:(order.append('bootstrap') or runtime))}
             async def exercise():
                 async with namespace['lifespan'](SimpleNamespace(state=SimpleNamespace())):
@@ -765,9 +767,10 @@ class TelemetryTests(unittest.TestCase):
             self.assertEqual(order[-2:],['close','shutdown'])
             self.assertEqual('yield' in order,not fail)
             if not fail:
-                # 'audit': the start's audit record (#29), after the job records load.
+                # 'audit': the start's audit record (#29), after the job records load;
+                # 'flush': the open failed-login counts at shutdown (#577).
                 self.assertEqual(order, ['bootstrap', 'load', 'ingest', 'export', 'import', 'tune', 'audit',
-                                         'yield', 'close', 'shutdown'])
+                                         'yield', 'flush', 'close', 'shutdown'])
 
     def test_lifecycle_deadline_single_worker_and_eventual_shutdown(self):
         release=threading.Event()

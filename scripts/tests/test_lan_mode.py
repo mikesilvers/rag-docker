@@ -14,6 +14,7 @@ import ast
 import datetime
 import io
 import ipaddress
+import json
 import os
 import re
 import subprocess
@@ -409,8 +410,33 @@ class NginxTests(unittest.TestCase):
         self.assertEqual(upstreams(self.lan), upstreams(self.default))
         lines = directives(self.locations)
         self.assertEqual([l for l in lines if l.startswith("location")],
-                         ["location = /api/goldstandard/regenerate {", "location /api/ {", "location / {"])
-        self.assertEqual(lines.count("proxy_set_header Host $http_host;"), 2)
+                         ["location = /api/goldstandard/regenerate {", "location = /api/auth/login {",
+                          "location @login_rate_limited {", "location /api/ {", "location / {"])
+        self.assertEqual(lines.count("proxy_set_header Host $http_host;"), 3)
+
+    def test_logins_are_rate_limited_per_address(self):
+        # #577: both servers define the zone; the login location uses it and
+        # answers nginx's own refusals in the API's error envelope.
+        zone = "limit_req_zone $binary_remote_addr zone=login:1m rate=10r/m;"
+        for text in (self.lan, self.default):
+            self.assertEqual(directives(text).count(zone), 1)
+        block = self.locations[self.locations.index("location = /api/auth/login {"):]
+        block = block[:block.index("\n}\n")]
+        lines = directives(block)
+        for line in ("limit_req zone=login burst=5 nodelay;", "limit_req_status 429;",
+                     "error_page 429 = @login_rate_limited;", "proxy_pass http://api/auth/login;",
+                     "proxy_set_header X-Real-IP $remote_addr;"):
+            self.assertIn(line, lines)
+        api = self.locations[self.locations.index("location /api/ {"):]
+        api = directives(api[:api.index("\n}\n")])
+        self.assertEqual([l for l in lines if not l.startswith(("location", "limit_req", "error_page", "proxy_pass"))],
+                         [l for l in api if not l.startswith(("location", "proxy_pass"))],
+                         "the login location proxies differently from /api/")
+        named = self.locations[self.locations.index("location @login_rate_limited {"):]
+        body = re.search(r"return 429 '([^']*)';", named).group(1)
+        message = "Too many login attempts. Wait a minute and try again."
+        self.assertEqual(json.loads(body), {"error": {"code": "LOGIN_RATE_LIMITED", "message": message, "detail": None}})
+        self.assertIn("default_type application/json;", directives(named[:named.index("\n}\n")]))
 
 
 # ── embedded copies ──────────────────────────────────────────────────────────

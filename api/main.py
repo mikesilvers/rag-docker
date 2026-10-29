@@ -21,6 +21,7 @@ async def lifespan(app: FastAPI):
     from services.telemetry import bootstrap
     runtime = bootstrap()
     app.state.telemetry = runtime
+    flusher = None
     try:
         import logging
         from services import goldstandard, metrics
@@ -90,9 +91,16 @@ async def lifespan(app: FastAPI):
                                 details={"question_text_logged": settings.audit_log_questions,
                                          "max_bytes": settings.audit_log_max_bytes,
                                          "keep": settings.audit_log_keep})
+        # Writes the count records of repeated failed logins as their windows
+        # close; the open ones are written at shutdown, below (#577).
+        flusher = asyncio.create_task(audit.login_flusher())
         yield
     finally:
         try:
+            if flusher is not None:
+                flusher.cancel()
+                from services import audit
+                await asyncio.to_thread(audit.flush_logins)
             from services import weaviate_client as wc
             wc.close_client()
         finally:

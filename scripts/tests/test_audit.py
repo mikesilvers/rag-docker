@@ -58,6 +58,10 @@ class AuditTestCase(unittest.TestCase):
             target.start()
             self.addCleanup(target.stop)
         (self.root / "auth").mkdir()
+        # Failed-login windows (#577) are process-wide: none carries over.
+        with audit._logins_lock:
+            audit._logins.clear()
+        self.addCleanup(audit._logins.clear)
         self.client = TestClient(app, raise_server_exceptions=False)
         self.addCleanup(self.client.close)
 
@@ -743,6 +747,319 @@ class EvaluationFixTests(AuditTestCase):
         self.assertEqual(targets, ["'\t=cmd", "'\r=cmd"])
         self.assertEqual(audit._cell("plain"), "plain")
         self.assertEqual(audit._cell(" =cmd"), " =cmd")
+
+
+class ReviewerConcurrencyTests(AuditTestCase):
+    """The testing reviewer's checks on 46f9280's read fix under real
+    concurrency: reads, pages and CSV downloads that run while threads and a
+    second process append and rotate. Each runs several rounds
+    (RAG_AUDIT_ROUNDS, default 3), since a race shows only some of the time."""
+
+    ROUNDS = int(os.environ.get("RAG_AUDIT_ROUNDS", "3"))
+    MAX, KEEP = 4096, 1000                            # rotate every ~20 records; delete nothing
+
+    def writers(self, records_per_thread=150, threads=4, child_records=150):
+        """Start 4 threads and a second process appending padded, numbered
+        records; returns a function that waits for them all."""
+        script = ("import sys; sys.path.insert(0, sys.argv[1]);"
+                  "from services import audit\n"
+                  f"for n in range({child_records}): audit.record('query', result='success',"
+                  " details={'t': 'p', 'n': n, 'pad': 'q' * 150})")
+        env = {**os.environ, "AUDIT_DIR": str(self.audit_dir), "AUTH_DIR": str(self.root / "auth"),
+               "AUDIT_LOG_MAX_BYTES": str(self.MAX), "AUDIT_LOG_KEEP": str(self.KEEP)}
+        child = subprocess.Popen([sys.executable, "-c", script, API_DIR], env=env, cwd=API_DIR)
+
+        def write(t):
+            for n in range(records_per_thread):
+                audit.record("query", result="success", details={"t": t, "n": n, "pad": "w" * 150})
+
+        pool = [threading.Thread(target=write, args=(t,)) for t in range(threads)]
+        for thread in pool:
+            thread.start()
+
+        def wait():
+            for thread in pool:
+                thread.join()
+            self.assertEqual(child.wait(timeout=180), 0)
+        return wait
+
+    def settings_patch(self):
+        return patch.multiple(settings, audit_log_max_bytes=self.MAX, audit_log_keep=self.KEEP)
+
+    def seed(self):
+        # Enough rotated files before the race starts that every read spans several.
+        for n in range(60):
+            audit.record("query", result="success", details={"t": "seed", "n": n, "pad": "s" * 150})
+
+    def test_full_reads_while_writers_rotate_are_whole_prefixes(self):
+        # A read holds every record up to some point, each once, newest first:
+        # exactly the oldest-first prefix of the final log, reversed.
+        partial = 0                                   # reads made while the writers ran
+        for round_ in range(self.ROUNDS):
+            with self.subTest(round=round_), self.settings_patch():
+                for path in self.audit_dir.glob("audit.jsonl*"):
+                    path.unlink()
+                self.seed()
+                reads, done = [], threading.Event()
+
+                def reader():
+                    while not done.is_set() or len(reads) < 3:
+                        reads.append([item["id"] for item in audit.newest_first()])
+
+                watcher = threading.Thread(target=reader)
+                wait = self.writers()
+                watcher.start()
+                wait()
+                done.set()
+                watcher.join()
+                final = [r["id"] for r in self.records()]                 # oldest first
+                self.assertEqual(len(final), 60 + 4 * 150 + 150)
+                self.assertEqual(len(set(final)), len(final))
+                self.assertGreater(len(list(self.audit_dir.glob("audit.jsonl.*"))), 20)   # it rotated a lot
+                partial += sum(1 for ids in reads if len(ids) < len(final))
+                for n, ids in enumerate(reads):
+                    self.assertEqual(list(reversed(ids)), final[:len(ids)],
+                                     f"read {n} of {len(reads)} ({len(ids)} records) isn't a whole prefix: "
+                                     f"{len(ids) - len(set(ids))} duplicate(s)")
+        self.assertGreater(partial, 0, "no read overlapped the writers, so the race wasn't exercised")
+
+    def test_paging_with_the_cursor_while_writers_rotate(self):
+        # Paging back from the first page with `before` while records are added
+        # and files rotate returns every older query record exactly once.
+        self.make("eng", "engineer")
+        headers = self.session("eng")
+        for round_ in range(self.ROUNDS):
+            with self.subTest(round=round_), self.settings_patch():
+                for path in self.audit_dir.glob("audit.jsonl*"):
+                    path.unlink()
+                self.seed()
+                wait = self.writers()
+                pages, before = [], None
+                while True:
+                    query = "/audit?action=query&limit=17" + (f"&before={before}" if before else "")
+                    answer = self.client.get(query, headers=headers)
+                    self.assertEqual(answer.status_code, 200, answer.text)
+                    body = answer.json()
+                    pages += [r["id"] for r in body["records"]]
+                    before = body["next_before"]
+                    if before is None:
+                        break
+                wait()
+                self.assertEqual(len(pages), len(set(pages)), "a record appeared on two pages")
+                self.assertEqual(pages, sorted(pages, reverse=True))
+                everything = [r["id"] for r in self.records() if r["action"] == "query"]
+                self.assertEqual(sorted(pages), [i for i in everything if i <= pages[0]],
+                                 "paging missed a record older than the first page")
+
+    def test_csv_while_writers_rotate_has_each_record_once(self):
+        # The CSV has no id column: each writer's numbered records must appear
+        # once each, as an unbroken run from its first record.
+        self.make("eng", "engineer")
+        headers = self.session("eng")
+        for round_ in range(self.ROUNDS):
+            with self.subTest(round=round_), self.settings_patch():
+                for path in self.audit_dir.glob("audit.jsonl*"):
+                    path.unlink()
+                self.seed()
+                wait = self.writers()
+                downloads = []
+                for _ in range(3):
+                    answer = self.client.get("/audit.csv?action=query", headers=headers)
+                    self.assertEqual(answer.status_code, 200)
+                    downloads.append(list(csv.DictReader(io.StringIO(answer.text))))
+                wait()
+                for n, rows in enumerate(downloads):
+                    keys = [(d["t"], d["n"]) for d in (json.loads(row["details"]) for row in rows)]
+                    self.assertEqual(len(keys), len(set(keys)), f"download {n}: a record appears twice")
+                    by_writer = {}
+                    for t, k in keys:
+                        by_writer.setdefault(t, []).append(k)
+                    self.assertEqual(sorted(by_writer["seed"]), list(range(60)), f"download {n} lost a seed record")
+                    for t, ks in by_writer.items():
+                        self.assertEqual(sorted(ks), list(range(len(ks))), f"download {n}: writer {t} has a gap")
+
+    def test_the_rotation_read_test_holds_repeatedly(self):
+        # The earlier evaluation's rotation-read test, ten more times.
+        for round_ in range(10):
+            with self.subTest(round=round_):
+                for path in self.audit_dir.glob("audit.jsonl*"):
+                    path.unlink()
+                ReviewerEdgeTests.test_a_read_that_spans_a_rotation_has_no_duplicates(self)
+
+
+class LoginCoalescingTests(AuditTestCase):
+    """#577: repeated failed logins for one key (typed username lowercased,
+    address, status) within 60 seconds are one record at once and one count
+    record when the window closes."""
+
+    def setUp(self):
+        super().setUp()
+        self.setup_roles()
+        self.now = 1000.0
+        clock = patch.object(audit, "_clock", lambda: self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def fail(self, username, ip="10.0.0.5"):
+        return self.client.post("/auth/login", json={"username": username, "password": "wrong-password-1"},
+                                headers={"X-Real-IP": ip})
+
+    def logins(self):
+        return [r for r in self.records() if r["action"] == "auth.login"]
+
+    def test_a_lone_failure_is_written_at_once_as_before(self):
+        self.assertEqual(self.fail("Nobody").status_code, 401)
+        (item,) = self.logins()
+        self.assertEqual((item["target"], item["status_code"], item["client_ip"], item["details"]),
+                         ("Nobody", 401, "10.0.0.5", {"code": "LOGIN_FAILED"}))
+        self.now += 61
+        audit.flush_logins(due_only=True)
+        self.assertEqual(len(self.logins()), 1, "a window with nothing counted writes nothing")
+        self.assertEqual(audit._logins, {})
+
+    def test_repeats_are_counted_and_written_once_the_window_closes(self):
+        self.fail("Nobody")
+        for name in ("nobody", "NOBODY", "Nobody"):           # case doesn't matter
+            self.now += 10
+            self.assertEqual(self.fail(name).status_code, 401)
+        self.assertEqual(len(self.logins()), 1, "repeats inside the window wrote records")
+        self.now += 25                                        # 55 s: still open
+        audit.flush_logins(due_only=True)
+        self.assertEqual(len(self.logins()), 1)
+        self.now += 5                                         # 60 s: closed
+        audit.flush_logins(due_only=True)
+        first, counted = self.logins()
+        self.assertEqual((counted["actor"], counted["actor_kind"], counted["target"], counted["result"],
+                          counted["status_code"], counted["client_ip"]),
+                         (None, "anonymous", "Nobody", "refused", 401, "10.0.0.5"))
+        self.assertEqual(set(counted["details"]), {"code", "count", "last_attempt"})
+        self.assertEqual((counted["details"]["code"], counted["details"]["count"]), ("LOGIN_FAILED", 3))
+        self.assertRegex(counted["details"]["last_attempt"], TIME)
+        self.assertGreater(counted["id"], first["id"])
+
+    def test_a_failure_after_the_window_follows_its_count(self):
+        self.fail("Nobody")
+        self.now += 5
+        self.fail("Nobody")
+        self.now += 60
+        self.fail("Nobody")                                   # the closed window's count goes first
+        items = self.logins()
+        self.assertEqual([r["details"].get("count") for r in items], [None, 1, None])
+        self.assertEqual(len(audit._logins), 1)
+
+    def test_address_and_status_are_part_of_the_key(self):
+        self.fail("Nobody", ip="10.0.0.5")
+        self.fail("Nobody", ip="10.0.0.6")
+        self.assertEqual([r["client_ip"] for r in self.logins()], ["10.0.0.5", "10.0.0.6"])
+        for _ in range(5):                                    # the 5th failure from .5 locks; 4 counted
+            self.fail("user", ip="10.0.0.7")
+        self.assertEqual(self.fail("user", ip="10.0.0.7").status_code, 429)
+        self.assertEqual([r["status_code"] for r in self.logins() if r["target"] == "user"], [401, 429])
+        audit.flush_logins()                                  # shutdown: open counts too
+        counts = {(r["target"], r["client_ip"], r["status_code"]): r["details"]["count"]
+                  for r in self.logins() if "count" in r["details"]}
+        self.assertEqual(counts, {("user", "10.0.0.7", 401): 4})
+        self.assertEqual(audit._logins, {})
+
+    def test_past_the_cap_failures_are_written_one_by_one(self):
+        with patch.object(audit, "LOGIN_WINDOWS_MAX", 2):
+            for name in ("a1", "a2", "a3", "a3", "a1"):
+                self.fail(name)
+        self.assertEqual([r["target"] for r in self.logins()], ["a1", "a2", "a3", "a3"])
+        self.assertEqual(sorted(k[0] for k in audit._logins), ["a1", "a2"])
+
+    def test_successful_logins_and_other_records_are_never_coalesced(self):
+        for _ in range(3):
+            self.client.post("/auth/login", json={"username": "dev", "password": self.passwords["developer"]})
+        self.assertEqual([r["result"] for r in self.logins()], ["success"] * 3)
+        self.assertEqual(audit._logins, {})
+
+    def test_a_write_failure_never_changes_the_answer(self):
+        with patch.object(audit, "record", side_effect=RuntimeError("boom")), \
+                self.assertLogs("audit", level="ERROR"):
+            self.assertEqual(self.fail("Nobody").status_code, 401)
+
+    def test_the_api_writes_closed_windows_and_its_shutdown_the_open_ones(self):
+        # The real lifespan, in another process (as test_jobstore's lifespan
+        # test): its background task writes a closed window's count; its
+        # shutdown writes the still open one's.
+        script = """
+import asyncio, sys
+from unittest.mock import AsyncMock, patch
+sys.path.insert(0, sys.argv[1])
+from main import app, lifespan
+from services import audit, importer, packager, weaviate_client as wc
+audit.LOGIN_WINDOW_S = 1
+def fail(name):
+    audit._login_failure({"action": "auth.login", "result": "refused", "status_code": 401, "collection": None,
+                          "target": name, "details": {"code": "LOGIN_FAILED"}, "actor": None,
+                          "actor_kind": "anonymous", "role": None, "key_id": None, "client_ip": "10.0.0.9"})
+async def run():
+    with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), \\
+         patch.object(importer, 'sweep_interrupted_imports', return_value=[]), \\
+         patch.object(importer, 'sweep_stale_workdirs', return_value=[]), \\
+         patch.object(packager, 'sweep_build_leftovers', return_value=[]), \\
+         patch.object(wc, 'close_client'):
+        async with lifespan(app):
+            for _ in range(3):
+                fail("closed")
+            await asyncio.sleep(3)
+            audit.LOGIN_WINDOW_S = 600
+            for _ in range(2):
+                fail("open")
+asyncio.run(run())
+"""
+        env = {**os.environ, "AUDIT_DIR": str(self.audit_dir), "AUTH_DIR": str(self.root / "auth"),
+               "UPLOAD_DIR": str(self.root / "uploads"), "EXPORTS_DIR": str(self.root / "exports")}
+        result = subprocess.run([sys.executable, "-c", script, API_DIR], capture_output=True, text=True,
+                                timeout=120, cwd=API_DIR, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        found = [(r["target"], r["details"].get("count")) for r in self.logins()]
+        self.assertEqual(found, [("closed", None), ("closed", 2), ("open", None), ("open", 1)])
+
+
+class IdOrderTests(AuditTestCase):
+    """#577 item 3: a new id is above the last one in the log, even from a
+    process with no memory of it and a clock that stepped back."""
+
+    def test_a_clock_step_back_across_processes_keeps_id_order(self):
+        audit.record("query", result="success", details={"n": 1})
+        later = int(self.records()[-1]["id"][:19])
+        with patch.object(audit, "_last_ns", 0), \
+                patch.object(audit.time, "time_ns", return_value=later - 3600 * 10**9):
+            audit.record("query", result="success", details={"n": 2})
+        first, second = self.records()
+        self.assertGreater(second["id"], first["id"])
+        self.assertGreaterEqual(second["time"], first["time"])
+        newest = list(audit.matching({"from": audit.parse_time(first["time"])}))
+        self.assertEqual([r["details"]["n"] for r in newest], [2, 1])
+        self.assertEqual([r["details"]["n"] for r in audit.matching({}, before=second["id"])], [1])
+
+    def test_a_torn_last_line_and_a_fresh_rotation_are_read_past(self):
+        audit.record("query", result="success", details={"pad": "x" * 9000})   # longer than one read
+        last = int(self.records()[-1]["id"][:19])
+        with open(self.audit_dir / "audit.jsonl", "ab") as handle:
+            handle.write(b'{"torn":')
+        self.assertEqual(audit._last_logged_ns(self.audit_dir), last)
+        os.replace(self.audit_dir / "audit.jsonl", self.audit_dir / "audit.jsonl.1")
+        (self.audit_dir / "audit.jsonl").write_bytes(b"")
+        self.assertEqual(audit._last_logged_ns(self.audit_dir), last)
+        self.assertEqual(audit._last_logged_ns(self.root / "nothing"), 0)
+
+
+class VocabularyTests(unittest.TestCase):
+    def test_every_audited_route_is_in_the_telemetry_route_vocabulary(self):
+        # #577 item 2: a missing route is labelled "unmatched" in spans and metrics.
+        from services import telemetry
+        missing = sorted(f"{m} {p}" for m, p in audit.ACTIONS if f"{m} {p}" not in telemetry.ROUTES)
+        self.assertEqual(missing, [])
+
+    def test_the_audit_page_lists_every_action(self):
+        # #577 item 4: the page's filter list is a copy of ALL_ACTIONS.
+        page = (Path(API_DIR).parent / "ui" / "src" / "pages" / "AuditPage.tsx").read_text()
+        block = re.search(r"const ACTIONS = \[(.*?)\]", page, re.S)
+        self.assertIsNotNone(block, "no ACTIONS array in AuditPage.tsx")
+        self.assertEqual(re.findall(r"'([^']+)'", block.group(1)), list(audit.ALL_ACTIONS))
 
 
 class ImplementationCopyTests(unittest.TestCase):

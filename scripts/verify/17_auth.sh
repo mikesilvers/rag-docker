@@ -77,6 +77,8 @@ stack generic-failure
 check "a wrong password and an unknown user get the same 401 LOGIN_FAILED" $?
 stack throttle
 check "five failed logins lock the username and address for 15 minutes" $?
+stack login-rate-limit
+check "nginx refuses logins beyond 10 a minute per address (burst 5) with 429 LOGIN_RATE_LIMITED; the API never sees them" $?
 stack bootstrap-refused
 check "bootstrap is refused once set up; an invalid username is a usage error" $?
 stack no-secrets-logged

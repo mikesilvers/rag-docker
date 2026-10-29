@@ -54,10 +54,24 @@ async function login(page, base, role) {
   // Any same-origin page will do; /api/health is not the UI, so nothing asks
   // GET /api/auth/me before the login and logs its 401 as a console error.
   if (!page.url().startsWith(base)) await page.goto(base + '/api/health', { waitUntil: 'domcontentloaded' });
-  const status = await page.evaluate(async (u, p) => (await fetch('/api/auth/login', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: u, password: p }),
-  })).status, username, password);
-  if (status !== 200) throw new Error(`login as ${role} answered ${status}`);
+  // nginx allows 10 logins a minute per address, a burst of 5 (#577): a login
+  // it refuses (429 LOGIN_RATE_LIMITED) is sent again once a slot has refilled.
+  const deadline = Date.now() + 300000;
+  for (;;) {
+    const { status, code } = await page.evaluate(async (u, p) => {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: u, password: p }),
+      });
+      let code = null;
+      try { code = (await res.json()).error.code; } catch { /* not an error envelope */ }
+      return { status: res.status, code };
+    }, username, password);
+    if (status === 200) return;
+    if (status !== 429 || code !== 'LOGIN_RATE_LIMITED' || Date.now() >= deadline) {
+      throw new Error(`login as ${role} answered ${status}`);
+    }
+    await new Promise(resolve => setTimeout(resolve, 6500));
+  }
 }
 
 // For fixtures that answer every /api/ request themselves: answers

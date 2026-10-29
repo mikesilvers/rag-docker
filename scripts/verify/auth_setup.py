@@ -29,6 +29,7 @@ import secrets
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -37,6 +38,12 @@ from urllib.parse import urlsplit
 ROLES = {"engineer": "vfy-engineer", "developer": "vfy-developer", "end_user": "vfy-end-user"}
 REPO = Path(__file__).resolve().parents[2]
 COOKIE = "rag_session"
+# nginx allows 10 logins a minute per client address, a burst of 5 (#577), and
+# every harness request comes from one address. A login it refuses is sent
+# again once a slot has refilled (one per 6 s), for up to LOGIN_WAIT_S.
+LOGIN_PATH = "/auth/login"
+LOGIN_RETRY_S = 6.5
+LOGIN_WAIT_S = 300
 
 
 class SetupError(Exception):
@@ -107,6 +114,31 @@ def write_credentials(folder, credentials):
         raise
 
 
+def rate_limited(status, body):
+    """True for nginx's refusal of a login sent faster than its limit (#577),
+    not the API's own 429 LOGIN_THROTTLED. `body` is the raw answer or its
+    parsed JSON."""
+    if status != 429:
+        return False
+    try:
+        parsed = json.loads(body) if isinstance(body, (bytes, str)) else body
+        return parsed["error"]["code"] == "LOGIN_RATE_LIMITED"
+    except (ValueError, KeyError, TypeError):
+        return False
+
+
+def paced(path, send):
+    """send() -> a tuple starting (status, raw body); a login nginx refused for
+    its rate is sent again after LOGIN_RETRY_S, until LOGIN_WAIT_S has passed.
+    Any other request or answer is returned as it is."""
+    deadline = time.monotonic() + LOGIN_WAIT_S
+    while True:
+        answer = send()
+        if path != LOGIN_PATH or not rate_limited(answer[0], answer[1]) or time.monotonic() >= deadline:
+            return answer
+        time.sleep(LOGIN_RETRY_S)
+
+
 def request(method, path, body=None, token=None, api=None):
     """(status, parsed JSON or None, session token from Set-Cookie or None)."""
     api = api or api_base()
@@ -116,12 +148,16 @@ def request(method, path, body=None, token=None, api=None):
         headers["Content-Type"] = "application/json"
     if token:
         headers["Cookie"] = "{}={}".format(COOKIE, token)
-    req = urllib.request.Request(api + path, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            status, raw, cookies = response.status, response.read(), response.headers.get_all("Set-Cookie") or []
-    except urllib.error.HTTPError as error:
-        status, raw, cookies = error.code, error.read(), error.headers.get_all("Set-Cookie") or []
+
+    def send():
+        req = urllib.request.Request(api + path, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return response.status, response.read(), response.headers.get_all("Set-Cookie") or []
+        except urllib.error.HTTPError as error:
+            return error.code, error.read(), error.headers.get_all("Set-Cookie") or []
+
+    status, raw, cookies = paced(path, send)
     try:
         parsed = json.loads(raw) if raw else None
     except ValueError:
