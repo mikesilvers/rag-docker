@@ -33,6 +33,23 @@ code=$(curl -s -o /tmp/vfy_gs404.json -m 120 -w '%{http_code}' -X POST \
 check_eq "regenerate on an unknown session returns 404 SESSION_NOT_FOUND" \
   "$code $(jfield "['error']['code']" < /tmp/vfy_gs404.json)" "404 SESSION_NOT_FOUND"
 
+# ── the proxy outlasts the regeneration deadline (#278) ──────────────────────
+# Regeneration is synchronous; nginx's generic 300 s read timeout cut it off
+# with a 504 under load. The exact route must wait longer than the API's own
+# model deadline, so the API's typed answer reaches the client.
+proxy_timeout=$( (cd ../.. && docker compose exec -T proxy nginx -T 2>/dev/null) | python3 -c "
+import re,sys
+t=sys.stdin.read()
+m=re.search(r'location\s*=\s*/api/goldstandard/regenerate\s*\{([^}]*)\}', t)
+r=re.search(r'proxy_read_timeout\s+(\d+)s?\s*;', m.group(1)) if m else None
+print(r.group(1) if r else 0)")
+api_deadline=$( (cd ../.. && docker compose exec -T api python -c "
+from services import goldstandard as gs
+print(int(getattr(gs, '_REGENERATION_TIMEOUT_SECONDS', 0)))") 2>/dev/null | tail -1)
+[ "${api_deadline:-0}" -gt 300 ] 2>/dev/null && [ "${proxy_timeout:-0}" -gt "${api_deadline:-0}" ] 2>/dev/null
+check "the proxy's regenerate timeout outlasts the API's regeneration deadline" $? \
+  "proxy=${proxy_timeout:-?}s api=${api_deadline:-?}s"
+
 if [ "$SKIP_SLOW" = "1" ]; then
   skip "LLM generation/review/export" "set RAG_SKIP_SLOW=0 to include them"
   summary; exit $?
@@ -135,6 +152,7 @@ if [ "$actual" -ge 2 ]; then
   check_eq "regeneration target edit is accepted" "$code" "200"
   # Snapshot after edits, so every non-target pair must remain byte-for-byte equal.
   api_get "/goldstandard/session/$SID" > /tmp/vfy_regen_before.json
+  _rag_require_lock_owner
   code=$(curl -s -m 1920 -o /tmp/vfy_regen.json -w '%{http_code}' -X POST \
     "$API/goldstandard/regenerate" -H 'Content-Type: application/json' \
     -d "{\"session_id\":\"$SID\",\"pair_id\":\"$TARGET\"}")
@@ -267,6 +285,7 @@ sys.exit(0 if ok else 1)
 ENDPY
       check "hard stop settles generation with a plain reason and retained pairs" $?
       pid2=$(python3 -c "import json;print(json.load(open('/tmp/vfy_gen2_post.json'))['pairs'][0]['pair_id'])")
+      _rag_require_lock_owner
       code=$(curl -s -m 1920 -o /tmp/vfy_gen2_regen.json -w '%{http_code}' -X POST \
         "$API/goldstandard/regenerate" -H 'Content-Type: application/json' \
         -d "{\"session_id\":\"$SID2\",\"pair_id\":\"$pid2\"}")

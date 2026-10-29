@@ -205,6 +205,7 @@ servers route identically.
 
 | Path prefix | Routes to | Notes |
 |---|---|---|
+| `/api/goldstandard/regenerate` (exact) | `http://api:8000/goldstandard/regenerate` | The same headers as `/api/`. Read timeout 1860 s, longer than the API's 1800 s regeneration deadline (§3.1.5), so the API's own answer, its 504 `PAIR_GENERATION_TIMEOUT` included, reaches the client |
 | `/api/` | `http://api:8000/` | Strip `/api` prefix. Forwards the browser's `Host` with its port (`$http_host`), which the API compares with `Origin` (§3.1.8), and the client address as `X-Real-IP` |
 | `/` | `http://ui:3000/` | SPA fallback to `index.html` |
 
@@ -1242,6 +1243,8 @@ Regenerates one specific pair. Preserves all other pairs in the session.
 **Response 404** if the session or pair ID does not exist (same error format as PATCH above): `SESSION_NOT_FOUND` for an unknown session, `PAIR_NOT_FOUND` for an unknown pair in an existing session. Neither calls the model.
 
 **Response 409** (`SESSION_BUSY`) if called while the session's `status` is still `"generating"`.
+
+**Response 504** (`PAIR_GENERATION_TIMEOUT`) if model work passes the 1800-second regeneration deadline. The existing pair is unchanged.
 
 ---
 
@@ -3266,7 +3269,8 @@ now lives once, in `api/services/ingest_config.py`.
       attempts.*
 - [x] Each pair has non-empty question, answer, ground_truth, and contexts fields.
       *Evidence: `test_session_import.py` (#103, #273): null, list, object, numeric, boolean, blank and left-out model fields fail the pair within the three-attempt budget rather than being stored; a left-out `ground_truth` defaults to the answer; valid strings are stored unchanged.*
-- [x] Regenerate call replaces exactly one pair without affecting others; returns 409 if session is still generating.
+- [x] Regenerate call replaces exactly one pair without affecting others; returns 409 if session is still generating, and 504 `PAIR_GENERATION_TIMEOUT`, leaving the pair unchanged, when model work passes the 1800-second deadline.
+      *Evidence: `session_persistence_cases.py` `test_regeneration_deadline_returns_typed_error_and_preserves_pair` (504, pair and session file unchanged); suite 04 checks that the proxy's regenerate read timeout outlasts the API's deadline and that the deadline is over 300 s (#280).*
       *Both halves originally failed. Regenerating mid-generation returned **500**,
       not 409 — there was no guard at all, and an unparseable model reply escaped
       as an unhandled exception. **Fixed**: 409 `GENERATION_IN_PROGRESS` while

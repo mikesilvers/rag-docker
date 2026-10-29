@@ -429,6 +429,10 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
                 await task
         asyncio.run(run());self.assertEqual(self.restart()['status'],'failed')
 
+    def test_unexpected_generation_failure_reason_names_its_type(self):
+        asyncio.run(gs._record_generation_failure(self.data['session_id'], KeyError('pairs')))
+        self.assertIn("KeyError: 'pairs'", self.restart()['errors'])
+
     async def generate(self,pair):
         # The real task, done-callback and reporter run; only the model and sampling are owned.
         chunk={'content':'Inert','source_file':'inert.txt','chunk_index':0}
