@@ -69,6 +69,9 @@ ACCESS: dict[tuple[str, str], str] = {
     ("POST", "/auth/service-principals/{name}/enable"): ENGINEER,
     ("POST", "/auth/service-principals/{name}/keys"): ENGINEER,
     ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke"): ENGINEER,
+    # The audit log (#29): Engineers, in a browser session only (HUMAN_ONLY).
+    ("GET", "/audit"): ENGINEER,
+    ("GET", "/audit.csv"): ENGINEER,
     # FastAPI's own API docs (N5).
     ("GET", "/docs"): ENGINEER,
     ("GET", "/docs/oauth2-redirect"): ENGINEER,
@@ -80,10 +83,11 @@ ACCESS: dict[tuple[str, str], str] = {
 # Routes an API key can't use, whatever its principal's role (S5 of PR 3):
 # account, principal and key administration, so a leaked key can't mint further
 # keys or accounts that outlive its revocation, and the session's own routes.
-# GET /auth/me answers for a key.
+# GET /auth/me answers for a key. The audit log too (#29): a leaked key can't
+# read who did what, or question text when that is recorded.
 HUMAN_ONLY = frozenset(path for _, path in ACCESS
                        if path.startswith(("/auth/users", "/auth/service-principals"))) | {
-    "/auth/logout", "/auth/password"}
+    "/auth/logout", "/auth/password", "/audit", "/audit.csv"}
 
 
 def required(method: str, path: str) -> str | None:

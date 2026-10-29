@@ -118,6 +118,9 @@ export const api = {
     request<{ principal: ServicePrincipal; key: ServiceKey; secret: string }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/keys`, { label, days }),
   revokeKey: (name: string, keyId: string) =>
     request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/keys/${encodeURIComponent(keyId)}/revoke`),
+  // The audit log (#29), for Engineers: a page of records, newest first.
+  listAudit: (filters: AuditFilters, before?: string) =>
+    request<AuditPage>('GET', `/audit${auditQuery(filters, before ? { before } : {})}`),
 
   getCollections: () => request<{ collections: CollectionInfo[] }>('GET', '/collections'),
   // Answers with the name as stored, first letter capitalised (#372).
@@ -260,6 +263,28 @@ export interface ImportJob {
   error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
   encrypted?: boolean
 }
+export type AuditResult = 'success' | 'refused' | 'error' | 'accepted' | 'succeeded' | 'failed' | 'interrupted'
+export interface AuditRecord {
+  id: string; time: string; actor: string | null; actor_kind: string; role: Role | null; key_id: string | null
+  client_ip: string | null; action: string; collection: string | null; target: string | null
+  result: AuditResult; status_code: number | null; job_id: string | null; details: Record<string, unknown>
+}
+export interface AuditPage { records: AuditRecord[]; next_before: string | null; failed_writes: number; question_text_logged: boolean }
+// Empty strings mean "any"; from and to are ISO 8601 times (UTC).
+export interface AuditFilters { from: string; to: string; actor: string; action: string; collection: string; result: string }
+
+function auditQuery(filters: AuditFilters, extra: Record<string, string>): string {
+  const params = new URLSearchParams()
+  for (const [name, value] of Object.entries({ ...filters, ...extra })) if (value) params.set(name, value)
+  const text = params.toString()
+  return text ? `?${text}` : ''
+}
+
+// The CSV of every record matching the filters; a plain link, sent with the session cookie.
+export function auditCsvUrl(filters: AuditFilters): string {
+  return `${BASE}/audit.csv${auditQuery(filters, {})}`
+}
+
 export interface PackageSummary {
   filename: string; size_bytes: number; collection: string | null
   chunk_count: number | null; fidelity: string | null; created_at: string | null; readable: boolean

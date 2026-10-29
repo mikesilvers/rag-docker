@@ -53,6 +53,16 @@ and no `Origin`, rotation, revocation, expiry, a disabled principal, invalid key
 memory, are never printed and must not reach the API log), idle expiry, and that the API log holds
 no harness secret.
 
+`19_audit.sh` checks the audit log (#29), reading it through `GET /audit` as the harness
+Engineer: who may read it (End User, Developer and an engineer-role key refused), the records of
+the API's start, a login, a failed login and a logout, a query (without its question text), a
+collection created, ingested into, exported with a passphrase and deleted (a throwaway
+`VfyAudit*` collection; the ingest and export each recorded as accepted and ended with the same
+job id; the package is removed afterwards), a Developer's refused delete, an Engineer's principal
+and key administration (a throwaway `vfy-s-*` principal), filters, paging and the CSV, and that no
+harness password, session token, key, typed password or passphrase reaches the audit files, which
+it reads in the api container. `../tests/test_audit.py` covers the rest in the API image.
+
 ## Entry point and verify project
 
 `stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
@@ -746,6 +756,9 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
 | `auth_stack.py` | the stack checks of `17_auth.sh`, one per subcommand (#25) |
 | `auth_headers.py` | the suite's session as `Cookie` and `Origin` headers, for the host-side Python helpers (#25) |
+| `19_audit.sh` | §10.7 — the audit log (#29): who may read it, the records of logins, queries, collections, jobs, refusals and administration, filters, paging and the CSV, no secrets in the files; registers `../tests/test_audit.py`; opt-in restart check |
+| `audit_stack.py` | the stack checks of `19_audit.sh`, one per subcommand (#29) |
+| `../tests/test_audit.py` | API image, no network: record shape, rotation and retention, concurrent writers (threads and a second process), the three settings, write failures, job records, the middleware's rules, `GET /audit` and the CSV, the operator command's records, embedded copies (#29) |
 | `18_lan.sh` | §2.5 and §10.5 — LAN mode (#26): the real override resolved without starting it; registers `../tests/test_lan_mode.py`; with `stack.sh run --lan`, the running LAN project on loopback |
 | `lan_config.py` | host-side, standard library: `docker-compose.lan.yml` as `docker compose config` resolves it, at the default port and `RAG_LAN_PORT=8443` (#26) |
 | `lan_stack.py` | the stack checks of `18_lan.sh` in a `--lan` run, one per subcommand (#26) |
@@ -821,7 +834,7 @@ through the proxy that download refuses other upload state with 400 (#370).
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the query metrics reload in `03_query.sh`, the batch recovery acceptance in `05_transfer.sh`, retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`, and a session and a login lockout across a restart in `17_auth.sh`); never the `rag-docker` project |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the query metrics reload in `03_query.sh`, the batch recovery acceptance in `05_transfer.sh`, retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`, a session and a login lockout across a restart in `17_auth.sh`, and audit records across a restart in `19_audit.sh`); never the `rag-docker` project |
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |

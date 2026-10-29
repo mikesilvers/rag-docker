@@ -10,7 +10,7 @@ from pydantic import ValidationError
 from config import settings
 from models.schemas import (CollectionName, IngestConfig, IngestConfigResponse,
                             IngestUploadResponse, JobStatusResponse)
-from services import ingest_config
+from services import audit, ingest_config
 from services import ingest_pipeline
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError, canonical
@@ -38,6 +38,10 @@ async def ingest_upload(
     # A form field's default is not validated through CollectionName, so the
     # stored-name rule is applied here (#372).
     collection = canonical(collection)
+    # The audit record's parameters (#29): the uploaded files' names and sizes,
+    # never their content.
+    audit.note(collection=collection, files=[f.filename for f in files], file_count=len(files),
+               total_bytes=sum(f.size or 0 for f in files))
     try:
         return await _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
                                     similarity_threshold, min_chunk_size, files)
@@ -111,6 +115,7 @@ async def get_ingest_config(collection: CollectionName):
 
 @router.post("/config", response_model=IngestConfigResponse, status_code=201)
 async def save_ingest_config(body: SaveIngestConfigBody):
+    audit.note(collection=body.collection)        # the audit record's collection (#29)
     cfg = body.model_dump()
     await asyncio.to_thread(ingest_config.save, cfg)
     return IngestConfigResponse(is_default=False, **cfg)

@@ -5,7 +5,8 @@ import logging
 from fastapi import APIRouter
 
 from models.schemas import QueryRequest, QueryResponse
-from services import metrics
+from config import settings
+from services import audit, metrics
 from services import rag_pipeline
 from services import weaviate_client as wc
 from utils import api_error, collection_check_unavailable
@@ -32,6 +33,11 @@ def _unavailable(collection: str, exc: rag_pipeline.ServiceUnavailable):
 
 @router.post("", response_model=QueryResponse)
 async def run_query(body: QueryRequest):
+    # The audit record's parameters (#29); the question only when the operator
+    # turned AUDIT_LOG_QUESTIONS on, and never the answer.
+    audit.note(collection=body.collection, retrieval_mode=body.retrieval_mode, top_k=body.top_k,
+               alpha=body.alpha, response_format=body.response_format, include_citations=body.include_citations,
+               **({"question": body.question} if settings.audit_log_questions else {}))
     try:
         exists = await wc.collection_exists(body.collection)
     except Exception:                                 # noqa: BLE001

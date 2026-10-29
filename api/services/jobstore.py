@@ -41,6 +41,12 @@ the finished records saved longest ago, from memory and from disk; a removed
 job reads 404, as it would after a restart. A `queued` or `running` record is
 never removed, so a store can briefly hold more while that many jobs run (#309).
 
+**Audit (#29).** A job started by an audited request gets its `accepted`
+audit record when its record is first stored, and one end record when it first
+reaches a terminal status, or is marked interrupted at startup. What the end
+record needs is kept in the job record as `_audit` (the status answers ignore
+it), with `ended` set once that record is written.
+
 A job record is never recovery authority: retained import and tuning data is
 owned by `collection_recovery` and the import markers (#43, #44), never by
 anything in `jobs/`.
@@ -59,6 +65,7 @@ from collections.abc import MutableMapping
 from pathlib import Path
 
 from config import settings
+from services import audit
 
 _log = logging.getLogger(__name__)
 
@@ -158,6 +165,13 @@ class JobStore(MutableMapping):
             old = self._records.get(job_id)
             if isinstance(old, _Job):
                 self._cancel(old)
+            if old is None:
+                # Inside an audited request this writes the job's `accepted`
+                # record (#29), before the job can end, and returns what its
+                # end record needs; kept in the record, so a restart has it.
+                snapshot = audit.job_started(job_id)
+                if snapshot is not None:
+                    dict.__setitem__(record, "_audit", snapshot)
             self._records[job_id] = record
             self._write(record, durable=True)
             if old is None:
@@ -245,7 +259,12 @@ class JobStore(MutableMapping):
         with self._lock:
             if status_changed or record.get("status") in TERMINAL:
                 self._cancel(record)
+                ended = status_changed and record.get("status") in TERMINAL and _audit_open(record)
+                if ended:
+                    record["_audit"]["ended"] = True    # saved by the write below
                 self._write(record, durable=True)
+                if ended:
+                    audit.job_ended(record, interrupted=False)
                 return
             now = time.monotonic()
             if now - record._last >= THROTTLE_S:
@@ -350,7 +369,12 @@ class JobStore(MutableMapping):
                 self._records[path.stem] = record
                 if record.get("status") not in TERMINAL:
                     self._mark_interrupted(record)
+                    ended = _audit_open(record)
+                    if ended:
+                        record["_audit"]["ended"] = True
                     self._write(record, durable=True)
+                    if ended:
+                        audit.job_ended(record, interrupted=True)
                     marked.append(path.stem)
             return marked
 
@@ -371,6 +395,12 @@ class JobStore(MutableMapping):
             dict.__setitem__(record, "status", "failed")
             dict.__setitem__(record, "error_code", "INTERRUPTED")
             dict.__setitem__(record, "error", f"{INTERRUPTED_MESSAGE} {_REMEDY[self.kind]}")
+
+
+def _audit_open(record: dict) -> bool:
+    """The job's start was audited and its end not yet (#29): one end record per job."""
+    snapshot = dict.get(record, "_audit")
+    return isinstance(snapshot, dict) and not snapshot.get("ended")
 
 
 def _mtime(path: Path) -> float:
