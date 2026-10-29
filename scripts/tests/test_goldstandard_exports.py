@@ -215,7 +215,7 @@ class ExportFileTests(unittest.TestCase):
         self.assertFalse((self.root / "missing").exists())
 
     def test_download_refuses_a_dangling_exports_link_and_temporary_names(self):
-        # Reviewer addition: download meets the same folder check as save for a
+        # Download meets the same folder check as save for a
         # dangling link, and a save's temporary file name is never served (#402).
         self.exports.symlink_to(self.root / "missing")
         self.assert_folder_invalid(self.client.get("/goldstandard/download/a.json"))
