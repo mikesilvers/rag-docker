@@ -76,7 +76,7 @@ Name the check's path in your finding, and show from the diff that none of the P
 
 **2. A check inside the PR** is High, and is never re-run or downgraded, whatever `develop` does: a bug-fix test is meant to fail on the base.
 
-**3. A check outside the PR gets one re-run, in this evaluation.** Re-run only that check, or the smallest suite that contains it; never the whole of `all.sh`. For the answer-length check in `03_query.sh`, re-run with `RAG_FORMAT_TRIALS=9` (documented in `scripts/verify/README.md`): more trials make the mean steadier.
+**3. A check outside the PR gets one re-run, in this evaluation.** Re-run only that check, or the smallest suite that contains it; never the whole of `all.sh`. For the answer-length check in `03_query.sh`, re-run with `RAG_FORMAT_TRIALS=9` (documented in `scripts/verify/README.md`): more trials make the median steadier.
 - **Passes on the re-run:** Medium (flaky). Name both runs' results, and put `(flaky)` in the finding's first line, so the coordinator shows it next to the verdict.
 - **Fails again:** run `develop`'s own copy of that suite on the base (the develop SHA the coordinator gave you, from a `base/` worktree as in step 4).
   - **Fails on the base too:** it isn't the PR's. Report it as a Medium on `develop`.

@@ -41,6 +41,7 @@ from cryptography.hazmat.primitives import hashes, hmac as crypto_hmac
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+import anyio.from_thread
 from fastapi.testclient import TestClient
 
 from config import settings
@@ -688,6 +689,13 @@ class Api(Fixture):
         self.client = TestClient(app, headers=auth_testing.headers(), raise_server_exceptions=False)
         self.stack.enter_context(patch.object(importer, "_active", set()))
 
+    def one_event_loop(self):
+        """Send this test's requests on one event loop (#567, as #389 did in test_reingest.py).
+
+        TestClient otherwise opens a loop per request and closes it with the response,
+        which can cancel a started import's task before it reaches `_run`."""
+        self.client.portal = self.stack.enter_context(anyio.from_thread.start_blocking_portal())
+
     def test_import_refuses_a_missing_or_unexpected_passphrase_before_any_job(self):
         cases = ((STEM + ".tar.gz.age", None, "PASSPHRASE_REQUIRED"),
                  (STEM + ".tar.gz", PASSPHRASE, "PASSPHRASE_NOT_EXPECTED"),
@@ -708,34 +716,38 @@ class Api(Fixture):
     def test_an_empty_passphrase_counts_as_given(self):
         """`""` is a passphrase, not an absent one: it is refused for a plain
         package, and for an encrypted one it starts a job that will fail."""
+        self.one_event_loop()
         with patch.object(importer, "_run", side_effect=AssertionError("a job ran")):
             response = self.client.post("/import", json={"filename": STEM + ".tar.gz",
                                                          "on_conflict": "abort", "passphrase": ""})
         self.assertEqual(response.status_code, 400, response.text)
         self.assertEqual(response.json()["error"]["code"], "PASSPHRASE_NOT_EXPECTED")
         self.assertEqual(dict(importer._jobs), {})
-        seen = []
-        with patch.object(importer, "_run", side_effect=lambda *args: seen.append(args)):
+        seen, ran = [], threading.Event()
+
+        def run(*args):
+            seen.append(args)
+            ran.set()
+        with patch.object(importer, "_run", side_effect=run):
             response = self.client.post("/import", json={"filename": STEM + ".tar.gz.age",
                                                          "on_conflict": "abort", "passphrase": ""})
             self.assertEqual(response.status_code, 202, response.text)
-            for _ in range(100):
-                if seen:
-                    break
-                time.sleep(0.02)
+            self.assertTrue(ran.wait(30), "the import worker did not run within 30 s")
         self.assertEqual(seen[0][1:], (STEM + ".tar.gz.age", "abort", ""))
 
     def test_import_with_a_passphrase_starts_a_job_that_records_only_encrypted(self):
-        seen = []
-        with patch.object(importer, "_run", side_effect=lambda *args: seen.append(args)):
+        self.one_event_loop()
+        seen, ran = [], threading.Event()
+
+        def run(*args):
+            seen.append(args)
+            ran.set()
+        with patch.object(importer, "_run", side_effect=run):
             response = self.client.post("/import", json={"filename": STEM + ".tar.gz.age",
                                                          "on_conflict": "abort", "passphrase": PASSPHRASE})
             self.assertEqual(response.status_code, 202, response.text)
             job_id = response.json()["job_id"]
-            for _ in range(100):
-                if seen:
-                    break
-                time.sleep(0.02)
+            self.assertTrue(ran.wait(30), "the import worker did not run within 30 s")
         self.assertEqual(seen[0][1:], (STEM + ".tar.gz.age", "abort", PASSPHRASE))
         job = self.client.get(f"/import/job/{job_id}").json()
         self.assertTrue(job["encrypted"])

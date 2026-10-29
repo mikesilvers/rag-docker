@@ -27623,7 +27623,14 @@ check "DELETE during a running ingest job is refused with 409 COLLECTION_BUSY na
 check "the refused DELETE leaves the collection and its objects in place" $? \
   "objects before=$before after=$after"
 final=$(wait_for_job "/ingest/job/$busy_job" 900)
-check_eq "the ingest job still completes" "$final" "completed"
+api_get "/ingest/job/$busy_job" > /tmp/vfy_busy_job.json
+[ "$final" = completed ]
+check "the ingest job still completes" $? \
+  "got '$final', wanted 'completed'; $(python3 -c "
+import json
+try: j=json.load(open('/tmp/vfy_busy_job.json'))
+except Exception: print('job record unreadable'); raise SystemExit
+print('files_failed=%s errors=%s' % (j.get('files_failed'), json.dumps(j.get('errors'))[:300]))")"
 code=$(curl -s -m 120 -o /dev/null -w '%{http_code}' -X DELETE "$API/collections/$DC?confirm=true")
 check_eq "DELETE after the job completes succeeds" "$code" "200"
 sleep 10
@@ -28028,19 +28035,25 @@ done
 
 # ── end_user is shorter than engineer ────────────────────────────────────────
 # The end_user prompt asks for a short answer (#109), but a CPU model still
-# varies answer to answer, so a single pair is noise. Compare the mean length
-# across trials.
+# varies answer to answer, so a single pair is noise. Compare the median length
+# across trials: one long answer can swing a mean over a few trials (#567).
 trials="${RAG_FORMAT_TRIALS:-3}"
-eu_total=0; en_total=0; eu_wins=0
+eu_lens=""; en_lens=""; eu_wins=0
 for _ in $(seq 1 "$trials"); do
   ask flat end_user false;  eu=$(python3 -c "import json;print(len(json.load(open('/tmp/vfy_ans.json'))['answer']))")
   ask flat engineer false;  en=$(python3 -c "import json;print(len(json.load(open('/tmp/vfy_ans.json'))['answer']))")
-  eu_total=$((eu_total+eu)); en_total=$((en_total+en))
+  eu_lens="$eu_lens $eu"; en_lens="$en_lens $en"
   [ "$eu" -lt "$en" ] && eu_wins=$((eu_wins+1))
 done
-[ "$eu_total" -lt "$en_total" ]
-check "end_user answers are shorter than engineer on average" $? \
-  "mean end_user=$((eu_total/trials)) engineer=$((en_total/trials)); end_user shorter in $eu_wins/$trials trials"
+read -r eu_median en_median shorter <<<"$(python3 -c "
+import statistics,sys
+eu=[int(x) for x in sys.argv[1].split()]; en=[int(x) for x in sys.argv[2].split()]
+if len(eu) != int(sys.argv[3]) or len(en) != int(sys.argv[3]): print('- - 0'); sys.exit()
+print(statistics.median(eu), statistics.median(en), int(statistics.median(eu) < statistics.median(en)))" \
+  "$eu_lens" "$en_lens" "$trials")"
+[ "$shorter" = 1 ]
+check "end_user answers are shorter than engineer by median length" $? \
+  "median end_user=$eu_median engineer=$en_median; end_user shorter in $eu_wins/$trials trials"
 
 # ── the query metrics reload after an API restart (#374; opt-in: it restarts the api) ──
 # The queries above wrote metrics records; a restart goes through the
