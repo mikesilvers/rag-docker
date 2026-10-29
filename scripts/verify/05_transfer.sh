@@ -707,6 +707,15 @@ for mode in abs link; do
       "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "completed"
     check_eq "E29: ... and keeps the chunk count (abs)" "$(count_of "$C")" "$chunks_before"
     leak=$(no_sentinel_in_exports); check "E29: ... and nothing in exports holds outside bytes after it (abs)" $? "$leak"
+    # Re-embedding from stored chunk text never reads the sources either, so
+    # without chunking fields it still starts a job (#389).
+    api_post "/tune/reembed" "{\"collection\":\"$C\"}" > /tmp/vfy_tj.json
+    e29rejob=$(jfield "['job_id']" < /tmp/vfy_tj.json)
+    check_eq "E29: re-embedding without chunking fields still starts a job with an on-disk abs entry" \
+      "$(jfield "['status']" < /tmp/vfy_tj.json) $([ -n "$e29rejob" ] && echo job)" "queued job"
+    check_eq "E29: ... and completes (re-embed, abs)" \
+      "$(wait_for_job "/tune/job/$e29rejob" 1800)" "completed"
+    check_eq "E29: ... and keeps the chunk count (re-embed, abs)" "$(count_of "$C")" "$chunks_before"
   else
     echo "    (info) GET /tune/$C with the $mode entry planted: HTTP $(api_code "$API/tune/$C")"
   fi

@@ -625,8 +625,12 @@ stored and a digest with none (only the stored name is parsed). A collection who
 names have no stored chunks is refused as having nothing to rebuild, before staging and, for
 a rechunk or a re-embed with chunking parameters, before any job is created, with the route
 answering 409 (#328). That check runs only for those two, after the `TUNE_IN_PROGRESS` and
-`COLLECTION_DELETING` guards; a re-index, an invalid index and a collection with a stored
-listed name still start a job. A Weaviate error during the check answers 503
+`COLLECTION_DELETING` guards; a re-index and a collection with a stored listed name still
+start a job. An invalid retained source index (a non-digest key, a non-object document or a
+linked index) refuses those two before any job is created, with 409 `SOURCE_INDEX_INVALID`,
+the guards released and Weaviate never read, while a re-index and a re-embed without chunking
+parameters still start; the guards answer first, leaving the other tune's guard held. These
+are checked over HTTP through the app (#389). A Weaviate error during the check answers 503
 `SERVICE_UNAVAILABLE` with no job, the guards released and the cause logged, not sent (#340),
 also when the connection itself fails and for a re-embed with chunking parameters through its
 route, while a re-embed without them still starts. A Weaviate error checking that the
