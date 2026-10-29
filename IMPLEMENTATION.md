@@ -18500,7 +18500,7 @@ Run the controlled regressions with the API dependencies installed:
 python -m unittest discover -s scripts/tests -p 'test_batch*.py'
 ```
 
-`05_transfer.sh` runs `test_batch_recovery.py` in the API container and `test_batch_implementation.py` on the host, so `all.sh` covers both.
+`05_transfer.sh` runs `test_batch_recovery.py` in the API container, `test_batch_recovery_fixture.py` in a new container from the API image, and `test_batch_implementation.py` on the host, so `all.sh` covers all three. The fixture test runs with `docker run --rm --network none` on the API image, with the repository mounted read-only, rather than `docker compose exec`, because it loads `scripts/verify/batch_recovery.py`, which it finds from its own `__file__`: the API container has no `scripts/` tree, and a script piped to `python -` has `<stdin>` as its `__file__`, not a path.
 
 `batch_recovery.py` is the fault acceptance. It uses real Weaviate, synthetic
 collections and the real embedding model. It injects final-create failures into
@@ -18592,6 +18592,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_export_snapshot.py` | controlled export writer-guard regressions: a mid-export re-ingest can't change the package, busy and waiting writers, guard release (#509), a cancelled export's status (#521), registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
+| `../tests/test_batch_recovery_fixture.py` | controlled check that the import package `batch_recovery.py`'s `write_import_package` writes passes the importer's real digest and source checks; run in the API image with no network and the repository mounted read-only, registered by transfer |
 | `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`, and so is a manifest with a wrongly typed listed value (#451); run in the API image with no network, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `../tests/test_batch_implementation.py` | host-side: exact embedded source checks for `api/main.py`, the Weaviate client, the batch-write, recovery, import and tuning services and their verify scripts, and the restart-recovery block of `05_transfer.sh` with stubbed commands (refused-prefix skip, `RAG_ALLOW_RESTART`, the #152 refusal), registered by transfer |
