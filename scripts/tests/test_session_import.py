@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 api_dir = os.environ.get('RAG_TEST_API_DIR')
 sys.path.insert(0, api_dir or str(Path(__file__).resolve().parents[2] / 'api'))
@@ -345,6 +345,16 @@ class SessionImportTests(unittest.TestCase):
         self.assertEqual(chat.call_count, 2)
         self.assertEqual(pair['source_file'], '')
         self.assertEqual(pair['ground_truth'], 'A')
+
+    def test_reply_missing_question_or_answer_fails_after_three_attempts(self):
+        for missing in ('question', 'answer'):
+            reply = {'question': 'Q?', 'answer': 'A', 'ground_truth': 'A'}
+            del reply[missing]
+            with self.subTest(missing=missing), \
+                 patch.object(gs.ollama, 'chat', new=AsyncMock(return_value=json.dumps(reply))) as chat:
+                with self.assertRaisesRegex(ValueError, missing):
+                    asyncio.run(gs._generate_pair({'content': 'Context', 'source_file': 'source.txt'}))
+                self.assertEqual(chat.await_count, 3)
 
     def test_generated_chunk_index_is_normalized(self):
         sid = self._generate('{"question": "Q?", "answer": "A"}', chunk_index='7')

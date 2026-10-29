@@ -2271,7 +2271,13 @@ Chunk:
 { "question": "...", "answer": "...", "ground_truth": "..." }
 ```
 
-If the model output is not valid JSON, the API retries once with an explicit reminder to return only JSON.
+Each chunk gets at most three attempts. If a reply has no JSON object, or its `question` or `answer` isn't a nonempty string (a missing key included), the API asks again with the same user message, up to two more times, and adds this to the end of the system prompt, starting with a space:
+
+```
+ Your previous response was not valid JSON. Return ONLY the JSON object with keys: question, answer, ground_truth. No markdown, no explanation.
+```
+
+After a third unusable reply the pair fails; §3.1.5 describes how failures are reported.
 
 ---
 
