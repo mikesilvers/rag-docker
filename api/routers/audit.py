@@ -15,6 +15,7 @@ record. SPECIFICATIONS.md §3.1.9.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 
 from fastapi import APIRouter, Request
@@ -61,7 +62,9 @@ async def audit_page(request: Request):
         filters = _filters(given)
         limit = 100
         if given["limit"] is not None:
-            if not given["limit"].isdigit() or not 1 <= int(given["limit"]) <= 1000:
+            # ASCII digits only: str.isdigit() also accepts characters such as
+            # "²" that int() rejects, which would answer 500.
+            if not re.fullmatch(r"[0-9]+", given["limit"]) or not 1 <= int(given["limit"]) <= 1000:
                 raise _Invalid("limit must be a whole number from 1 to 1000.")
             limit = int(given["limit"])
         before = given["before"]

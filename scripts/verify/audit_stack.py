@@ -357,6 +357,61 @@ def check_restart_verify(operator_ok):
         request("POST", "/auth/logout", token=admin)
 
 
+def check_concurrent(operator_ok):
+    """The testing reviewer's addition: parallel failed logins through nginx
+    while the operator command appends in the same container (D7's shared file
+    lock). Each request is recorded exactly once, the operator's record is
+    there, and every line of every audit file is one whole JSON object."""
+    expect(operator_ok, "runs the operator command, so it runs only on the verify project")
+    import threading
+    end_user = auth_setup.read_credentials(auth_setup.private_dir())["end_user"][0]
+    typed = ["vfy-conc-{}-{}".format(n, secrets.token_hex(3)) for n in range(24)]
+    errors = []
+
+    def attempt(name):
+        try:
+            status, _, _ = request("POST", "/auth/login",
+                                   {"username": name, "password": "not-a-password-" + secrets.token_hex(4)})
+            if status != 401:
+                errors.append("{} answered {}".format(name, status))
+        except Exception as exc:                                  # noqa: BLE001 - reported below
+            errors.append("{}: {}".format(name, type(exc).__name__))
+
+    def operator():
+        for _ in range(3):
+            result = compose("exec", "-T", "api", "python", "-m", "auth", "enable", end_user)
+            if result.returncode != 0:
+                errors.append("operator enable exited {}".format(result.returncode))
+
+    threads = [threading.Thread(target=attempt, args=(name,)) for name in typed]
+    threads.append(threading.Thread(target=operator))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    expect(not errors, "; ".join(errors))
+    admin = role_token("engineer")
+    try:
+        found = [r["target"] for r in records(admin, action="auth.login", result="refused", limit=1000)["records"]]
+        counts = {name: found.count(name) for name in typed}
+        expect(all(c == 1 for c in counts.values()),
+               "parallel failed logins recorded {} times, not once each".format(
+                   sorted(set(counts.values()))))
+        ops = [r for r in records(admin, action="operator.enable", limit=1000)["records"]
+               if r["target"] == end_user and r["actor"] == "operator" and r["actor_kind"] == "operator"]
+        expect(len(ops) >= 3, "{} operator.enable record(s) for {}, not 3".format(len(ops), end_user))
+        bad = 0
+        for line in audit_files().splitlines():
+            try:
+                item = json.loads(line)
+                bad += not (isinstance(item, dict) and isinstance(item.get("id"), str))
+            except ValueError:
+                bad += 1
+        expect(bad == 0, "{} audit line(s) aren't whole JSON records".format(bad))
+    finally:
+        request("POST", "/auth/logout", token=admin)
+
+
 CHECKS = {name[len("check_"):].replace("_", "-"): fn for name, fn in globals().items() if name.startswith("check_")}
 
 

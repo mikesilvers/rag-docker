@@ -14441,23 +14441,53 @@ def _files() -> list[Path]:
     return [p for p in names if p.is_file()]
 
 
-def newest_first():
-    """Every record, newest first. A line that isn't a JSON object (a torn last
-    line after a crash) is skipped."""
-    for path in _files():
+def _open_all() -> list:
+    """Every file of the log, opened for reading, newest first: one consistent
+    set. Opened under the writers' locks, so no rotation runs meanwhile; read
+    after they are released, which is safe because a rename doesn't change
+    what an open file holds. Without this a read that spans a rotation would
+    read one file twice and miss another."""
+    folder = Path(settings.audit_dir)
+    if not folder.is_dir():
+        return []
+    handles = []
+    with _lock:
+        lock_fd = os.open(folder / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            data = path.read_bytes()
-        except FileNotFoundError:
-            continue                                  # rotated away meanwhile
-        for raw in reversed(data.split(b"\n")):
-            if not raw.strip():
-                continue
+            fcntl.flock(lock_fd, fcntl.LOCK_SH)
             try:
-                item = json.loads(raw)
-            except ValueError:
-                continue
-            if isinstance(item, dict) and isinstance(item.get("id"), str):
-                yield item
+                for path in _files():
+                    handles.append(open(path, "rb"))
+            except BaseException:
+                for handle in handles:
+                    handle.close()
+                raise
+        finally:
+            os.close(lock_fd)                        # releases the flock too
+    return handles
+
+
+def newest_first():
+    """Every record, newest first, from the files as they were when the read
+    started (_open_all). A line that isn't a JSON object (a torn last line
+    after a crash) is skipped."""
+    handles = _open_all()
+    try:
+        for handle in handles:
+            data = handle.read()
+            handle.close()
+            for raw in reversed(data.split(b"\n")):
+                if not raw.strip():
+                    continue
+                try:
+                    item = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(item, dict) and isinstance(item.get("id"), str):
+                    yield item
+    finally:
+        for handle in handles:
+            handle.close()
 
 
 def parse_time(value: str) -> datetime:
@@ -14509,7 +14539,7 @@ def _cell(value) -> str:
         return ""
     text = json.dumps(value, ensure_ascii=False, separators=(",", ":")) if isinstance(value, dict) else str(value)
     # A spreadsheet runs a cell that starts with one of these as a formula.
-    return "'" + text if text[:1] in ("=", "+", "-", "@") else text
+    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
 
 
 def csv_lines(filters: dict):
@@ -14654,6 +14684,7 @@ record. SPECIFICATIONS.md §3.1.9.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 
 from fastapi import APIRouter, Request
@@ -14700,7 +14731,9 @@ async def audit_page(request: Request):
         filters = _filters(given)
         limit = 100
         if given["limit"] is not None:
-            if not given["limit"].isdigit() or not 1 <= int(given["limit"]) <= 1000:
+            # ASCII digits only: str.isdigit() also accepts characters such as
+            # "²" that int() rejects, which would answer 500.
+            if not re.fullmatch(r"[0-9]+", given["limit"]) or not 1 <= int(given["limit"]) <= 1000:
                 raise _Invalid("limit must be a whole number from 1 to 1000.")
             limit = int(given["limit"])
         before = given["before"]
@@ -18382,14 +18415,19 @@ export default function AuditPage() {
   const [cursors, setCursors] = useState<(string | undefined)[]>([undefined])
   const [data, setData] = useState<AuditPageData | null>(null)
   const [error, setError] = useState('')
+  // A page is on its way: shown, and Older is disabled, so a quick second
+  // click can't add the same cursor twice.
+  const [loading, setLoading] = useState(true)
 
   const before = cursors[cursors.length - 1]
 
   useEffect(() => {
     let current = true
+    setLoading(true)
     api.listAudit(filters, before)
       .then(page => { if (current) { setData(page); setError('') } })
       .catch((e: unknown) => { if (current) setError(e instanceof Error ? e.message : String(e)) })
+      .finally(() => { if (current) setLoading(false) })
     return () => { current = false }
   }, [filters, before])
 
@@ -18449,6 +18487,7 @@ export default function AuditPage() {
       </form>
 
       {error && <p role="alert" className="text-red-600 text-sm mb-4">{error}</p>}
+      {loading && <p data-testid="audit-loading" className="text-sm text-gray-500 mb-4">Loading…</p>}
       {data && data.records.length === 0 && !error && <p className="text-sm text-gray-500">No records match.</p>}
 
       {data && data.records.length > 0 && (
@@ -18491,7 +18530,12 @@ export default function AuditPage() {
       <div className="flex gap-3 mt-4">
         <button disabled={cursors.length === 1} onClick={() => setCursors([undefined])}
           className="text-sm text-blue-600 hover:underline disabled:opacity-50 disabled:no-underline">Newest</button>
-        <button disabled={!data?.next_before} onClick={() => data?.next_before && setCursors(c => [...c, data.next_before as string])}
+        <button disabled={loading || !data?.next_before} onClick={() => {
+          const next = data?.next_before
+          // Only a cursor not asked for yet: a second click before the page
+          // renders sees the same next_before.
+          if (next && !loading) setCursors(c => (c[c.length - 1] === next ? c : [...c, next]))
+        }}
           className="text-sm text-blue-600 hover:underline disabled:opacity-50 disabled:no-underline">Older</button>
       </div>
     </div>
@@ -18636,7 +18680,8 @@ collection created, ingested into, exported with a passphrase and deleted (a thr
 job id; the package is removed afterwards), a Developer's refused delete, an Engineer's principal
 and key administration (a throwaway `vfy-s-*` principal), filters, paging and the CSV, and that no
 harness password, session token, key, typed password or passphrase reaches the audit files, which
-it reads in the api container. `../tests/test_audit.py` covers the rest in the API image.
+it reads in the api container, and that parallel failed logins appended alongside the operator command are each
+recorded once on whole lines. `../tests/test_audit.py` covers the rest in the API image.
 
 ## Entry point and verify project
 
@@ -19331,7 +19376,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
 | `auth_stack.py` | the stack checks of `17_auth.sh`, one per subcommand (#25) |
 | `auth_headers.py` | the suite's session as `Cookie` and `Origin` headers, for the host-side Python helpers (#25) |
-| `19_audit.sh` | §10.7 — the audit log (#29): who may read it, the records of logins, queries, collections, jobs, refusals and administration, filters, paging and the CSV, no secrets in the files; registers `../tests/test_audit.py`; opt-in restart check |
+| `19_audit.sh` | §10.7 — the audit log (#29): who may read it, the records of logins, queries, collections, jobs, refusals and administration, filters, paging and the CSV, no secrets in the files, concurrent writers; registers `../tests/test_audit.py`; opt-in restart check |
 | `audit_stack.py` | the stack checks of `19_audit.sh`, one per subcommand (#29) |
 | `../tests/test_audit.py` | API image, no network: record shape, rotation and retention, concurrent writers (threads and a second process), the three settings, write failures, job records, the middleware's rules, `GET /audit` and the CSV, the operator command's records, embedded copies (#29) |
 | `18_lan.sh` | §2.5 and §10.5 — LAN mode (#26): the real override resolved without starting it; registers `../tests/test_lan_mode.py`; with `stack.sh run --lan`, the running LAN project on loopback |
@@ -22106,6 +22151,10 @@ check "filters, a one-record page and its cursor, and the CSV (header, a row, an
 stack no-secrets
 check "no harness password, session token, API key or password typed in a change appears in the audit files" $?
 
+section "Concurrent writers"
+stack concurrent
+check "parallel failed logins and the operator command append together: each recorded once, every line whole" $?
+
 section "Restart persistence (opt-in: it restarts the api)"
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   restart_refusal=$(restart_refusal_reason)
@@ -22486,6 +22535,61 @@ def check_restart_verify(operator_ok):
         expect(item["id"] == state["id"], "the record written before the restart changed")
         start = records(admin, action="system.start", limit=1)["records"]
         expect(start and start[0]["id"] > state["start"], "the restart wrote no new system.start record")
+    finally:
+        request("POST", "/auth/logout", token=admin)
+
+
+def check_concurrent(operator_ok):
+    """The testing reviewer's addition: parallel failed logins through nginx
+    while the operator command appends in the same container (D7's shared file
+    lock). Each request is recorded exactly once, the operator's record is
+    there, and every line of every audit file is one whole JSON object."""
+    expect(operator_ok, "runs the operator command, so it runs only on the verify project")
+    import threading
+    end_user = auth_setup.read_credentials(auth_setup.private_dir())["end_user"][0]
+    typed = ["vfy-conc-{}-{}".format(n, secrets.token_hex(3)) for n in range(24)]
+    errors = []
+
+    def attempt(name):
+        try:
+            status, _, _ = request("POST", "/auth/login",
+                                   {"username": name, "password": "not-a-password-" + secrets.token_hex(4)})
+            if status != 401:
+                errors.append("{} answered {}".format(name, status))
+        except Exception as exc:                                  # noqa: BLE001 - reported below
+            errors.append("{}: {}".format(name, type(exc).__name__))
+
+    def operator():
+        for _ in range(3):
+            result = compose("exec", "-T", "api", "python", "-m", "auth", "enable", end_user)
+            if result.returncode != 0:
+                errors.append("operator enable exited {}".format(result.returncode))
+
+    threads = [threading.Thread(target=attempt, args=(name,)) for name in typed]
+    threads.append(threading.Thread(target=operator))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    expect(not errors, "; ".join(errors))
+    admin = role_token("engineer")
+    try:
+        found = [r["target"] for r in records(admin, action="auth.login", result="refused", limit=1000)["records"]]
+        counts = {name: found.count(name) for name in typed}
+        expect(all(c == 1 for c in counts.values()),
+               "parallel failed logins recorded {} times, not once each".format(
+                   sorted(set(counts.values()))))
+        ops = [r for r in records(admin, action="operator.enable", limit=1000)["records"]
+               if r["target"] == end_user and r["actor"] == "operator" and r["actor_kind"] == "operator"]
+        expect(len(ops) >= 3, "{} operator.enable record(s) for {}, not 3".format(len(ops), end_user))
+        bad = 0
+        for line in audit_files().splitlines():
+            try:
+                item = json.loads(line)
+                bad += not (isinstance(item, dict) and isinstance(item.get("id"), str))
+            except ValueError:
+                bad += 1
+        expect(bad == 0, "{} audit line(s) aren't whole JSON records".format(bad))
     finally:
         request("POST", "/auth/logout", token=admin)
 
@@ -39702,6 +39806,16 @@ function auditCases() {
   });
   const rows = page => page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => [...r.querySelectorAll('td')].map(c => c.textContent.trim())));
   const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
+  // The older page's answer waits for olderGate, so the page stays loading.
+  const olderGate = hold();
+  const heldOlder = () => {
+    const routes = auditApi(), answer = routes['GET /api/audit'];
+    routes['GET /api/audit'] = async call => {
+      if (new URLSearchParams(call.query).get('before')) await olderGate.promise;
+      return answer(call);
+    };
+    return routes;
+  };
   return [
     { name: 'Engineer nav ends with Audit, which opens the page', open: { role: 'engineer', path: '/qa', routes: auditApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
@@ -39743,6 +39857,15 @@ function auditCases() {
       assert.deepEqual([q.get('actor'), q.get('action'), q.get('result'), q.get('from')], ['vfy-developer', 'export', 'accepted', '2026-10-29T08:30Z']);
       const href = await s.page.$eval('[data-testid=audit-csv]', a => a.getAttribute('href'));
       assert.equal(href, '/api/audit.csv?from=2026-10-29T08%3A30Z&actor=vfy-developer&action=export&result=accepted');
+    } },
+    { name: 'A double click on Older asks for the older page once, and Older waits while it loads', open: { role: 'engineer', path: '/audit', routes: heldOlder() }, async run(s) {
+      await waitText(s.page, 'nightly (key keyid0000001)');
+      await s.page.evaluate(() => { const b = [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Older'); b.click(); b.click(); });
+      await waitFor(s.page, () => !!document.querySelector('[data-testid=audit-loading]'), 'the loading note');
+      assert.deepEqual(await buttonState(s.page, 'Older'), { disabled: true });
+      olderGate.release();
+      await waitText(s.page, 'Nobody');
+      assert.equal(callsTo(s, 'GET', '/api/audit').filter(c => /before=/.test(c.query)).length, 1);
     } },
     { name: 'The page says whether question text is logged and warns about failed writes', open: { role: 'engineer', path: '/audit', routes: auditApi({ failed: 2, questions: true }) }, async run(s) {
       await waitText(s.page, 'Question text is being recorded');

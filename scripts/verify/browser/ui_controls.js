@@ -820,6 +820,16 @@ function auditCases() {
   });
   const rows = page => page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => [...r.querySelectorAll('td')].map(c => c.textContent.trim())));
   const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
+  // The older page's answer waits for olderGate, so the page stays loading.
+  const olderGate = hold();
+  const heldOlder = () => {
+    const routes = auditApi(), answer = routes['GET /api/audit'];
+    routes['GET /api/audit'] = async call => {
+      if (new URLSearchParams(call.query).get('before')) await olderGate.promise;
+      return answer(call);
+    };
+    return routes;
+  };
   return [
     { name: 'Engineer nav ends with Audit, which opens the page', open: { role: 'engineer', path: '/qa', routes: auditApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
@@ -861,6 +871,15 @@ function auditCases() {
       assert.deepEqual([q.get('actor'), q.get('action'), q.get('result'), q.get('from')], ['vfy-developer', 'export', 'accepted', '2026-10-29T08:30Z']);
       const href = await s.page.$eval('[data-testid=audit-csv]', a => a.getAttribute('href'));
       assert.equal(href, '/api/audit.csv?from=2026-10-29T08%3A30Z&actor=vfy-developer&action=export&result=accepted');
+    } },
+    { name: 'A double click on Older asks for the older page once, and Older waits while it loads', open: { role: 'engineer', path: '/audit', routes: heldOlder() }, async run(s) {
+      await waitText(s.page, 'nightly (key keyid0000001)');
+      await s.page.evaluate(() => { const b = [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Older'); b.click(); b.click(); });
+      await waitFor(s.page, () => !!document.querySelector('[data-testid=audit-loading]'), 'the loading note');
+      assert.deepEqual(await buttonState(s.page, 'Older'), { disabled: true });
+      olderGate.release();
+      await waitText(s.page, 'Nobody');
+      assert.equal(callsTo(s, 'GET', '/api/audit').filter(c => /before=/.test(c.query)).length, 1);
     } },
     { name: 'The page says whether question text is logged and warns about failed writes', open: { role: 'engineer', path: '/audit', routes: auditApi({ failed: 2, questions: true }) }, async run(s) {
       await waitText(s.page, 'Question text is being recorded');

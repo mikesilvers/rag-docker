@@ -61,7 +61,8 @@ collection created, ingested into, exported with a passphrase and deleted (a thr
 job id; the package is removed afterwards), a Developer's refused delete, an Engineer's principal
 and key administration (a throwaway `vfy-s-*` principal), filters, paging and the CSV, and that no
 harness password, session token, key, typed password or passphrase reaches the audit files, which
-it reads in the api container. `../tests/test_audit.py` covers the rest in the API image.
+it reads in the api container, and that parallel failed logins appended alongside the operator command are each
+recorded once on whole lines. `../tests/test_audit.py` covers the rest in the API image.
 
 ## Entry point and verify project
 
@@ -756,7 +757,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
 | `auth_stack.py` | the stack checks of `17_auth.sh`, one per subcommand (#25) |
 | `auth_headers.py` | the suite's session as `Cookie` and `Origin` headers, for the host-side Python helpers (#25) |
-| `19_audit.sh` | §10.7 — the audit log (#29): who may read it, the records of logins, queries, collections, jobs, refusals and administration, filters, paging and the CSV, no secrets in the files; registers `../tests/test_audit.py`; opt-in restart check |
+| `19_audit.sh` | §10.7 — the audit log (#29): who may read it, the records of logins, queries, collections, jobs, refusals and administration, filters, paging and the CSV, no secrets in the files, concurrent writers; registers `../tests/test_audit.py`; opt-in restart check |
 | `audit_stack.py` | the stack checks of `19_audit.sh`, one per subcommand (#29) |
 | `../tests/test_audit.py` | API image, no network: record shape, rotation and retention, concurrent writers (threads and a second process), the three settings, write failures, job records, the middleware's rules, `GET /audit` and the CSV, the operator command's records, embedded copies (#29) |
 | `18_lan.sh` | §2.5 and §10.5 — LAN mode (#26): the real override resolved without starting it; registers `../tests/test_lan_mode.py`; with `stack.sh run --lan`, the running LAN project on loopback |

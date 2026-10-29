@@ -374,7 +374,10 @@ class ApiTests(AuditTestCase):
                          ("eng", {"action": "query"}, "success"))
 
     def test_invalid_parameters(self):
-        for query in ("limit=0", "limit=1001", "limit=x", "before=abc", "result=maybe", "from=yesterday"):
+        # "²" passes str.isdigit() but int() rejects it; "٣" is a digit int() reads
+        # as 3. Only ASCII digits are a limit: both are 422, never a 500.
+        for query in ("limit=0", "limit=1001", "limit=x", "before=abc", "result=maybe", "from=yesterday",
+                      "limit=%C2%B2", "limit=%D9%A3"):
             with self.subTest(query=query):
                 answer = self.get("/audit?" + query)
                 self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (422, "INVALID_PARAMETER"))
@@ -494,6 +497,252 @@ class CommandTests(AuditTestCase):
                                 capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("the audit record could not be written", result.stderr)
+
+
+class ReviewerEdgeTests(AuditTestCase):
+    """The testing reviewer's additions: concurrent appends across a rotation,
+    the smallest keep, write failures in an existing folder and in a job, the
+    failed-write count on the API, and a read that spans a rotation."""
+
+    def all_lines(self):
+        """Every line of every file, oldest file first."""
+        names = sorted(self.audit_dir.glob("audit.jsonl.*"), key=lambda p: -int(p.suffix[1:]))
+        current = self.audit_dir / "audit.jsonl"
+        if current.exists():                  # absent right after a rotation
+            names.append(current)
+        return [line for path in names for line in path.read_text().splitlines()]
+
+    def test_concurrent_appends_across_rotations_lose_nothing(self):
+        # 6 threads and a second process, with rotation every few dozen records
+        # and enough files kept to hold them all: every record is kept exactly
+        # once, every line is whole, and ids follow the order of the files.
+        script = ("import sys; sys.path.insert(0, sys.argv[1]);"
+                  "from services import audit\n"
+                  "for n in range(200): audit.record('operator.enable', result='success', details={'n': n})")
+        env = {**os.environ, "AUDIT_DIR": str(self.audit_dir), "AUTH_DIR": str(self.root / "auth"),
+               "AUDIT_LOG_MAX_BYTES": "8192", "AUDIT_LOG_KEEP": "1000"}
+        with patch.object(settings, "audit_log_max_bytes", 8192), patch.object(settings, "audit_log_keep", 1000):
+            child = subprocess.Popen([sys.executable, "-c", script, API_DIR], env=env, cwd=API_DIR)
+
+            def write(t):
+                for n in range(100):
+                    audit.record("query", result="success", details={"t": t, "n": n, "pad": "z" * 200})
+
+            threads = [threading.Thread(target=write, args=(t,)) for t in range(6)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(child.wait(timeout=120), 0)
+            self.assertGreater(len(list(self.audit_dir.glob("audit.jsonl.*"))), 5)   # it did rotate
+            items = [json.loads(line) for line in self.all_lines()]                  # every line whole
+            ids = [i["id"] for i in items]
+            self.assertEqual(len(ids), 800)
+            self.assertEqual(len(set(ids)), 800)
+            self.assertEqual(ids, sorted(ids))
+            mine = sorted((i["details"]["t"], i["details"]["n"]) for i in items if i["action"] == "query")
+            self.assertEqual(mine, [(t, n) for t in range(6) for n in range(100)])
+            self.assertEqual(sorted(i["details"]["n"] for i in items if i["action"] == "operator.enable"),
+                             list(range(200)))
+
+    def test_keep_one(self):
+        with patch.object(settings, "audit_log_max_bytes", 4096), patch.object(settings, "audit_log_keep", 1):
+            for n in range(200):
+                audit.record("query", result="success", details={"n": n, "pad": "x" * 100})
+            names = sorted(p.name for p in self.audit_dir.glob("audit.jsonl*"))
+            self.assertEqual(names, ["audit.jsonl", "audit.jsonl.1"])
+            kept = [r["details"]["n"] for r in self.records()]
+            self.assertEqual(kept, list(range(kept[0], 200)))
+
+    def test_rotation_at_exactly_the_limit(self):
+        # A file that reaches the limit exactly is rotated; one byte under isn't.
+        audit.record("query", result="success")
+        size = (self.audit_dir / "audit.jsonl").stat().st_size
+        with patch.object(settings, "audit_log_max_bytes", 2 * size):
+            audit.record("query", result="success")
+        self.assertTrue((self.audit_dir / "audit.jsonl.1").is_file())
+        self.assertFalse((self.audit_dir / "audit.jsonl").exists())
+        audit.record("query", result="success")
+        with patch.object(settings, "audit_log_max_bytes", 2 * size + 1):
+            audit.record("query", result="success")
+        self.assertFalse((self.audit_dir / "audit.jsonl.2").exists())
+        self.assertEqual(len(self.records()), 4)
+
+    def test_write_failure_in_an_existing_folder(self):
+        # The folder exists but the file can't be opened (a directory in its
+        # place, which fails even as root): counted, logged, never raised, and
+        # the next record after the cause is gone is written.
+        audit.record("query", result="success")
+        (self.audit_dir / "audit.jsonl").rename(self.audit_dir / "audit.jsonl.1")
+        (self.audit_dir / "audit.jsonl").mkdir()
+        before = audit.failed_writes()
+        with self.assertLogs("audit", level="ERROR"):
+            self.assertFalse(audit.record("query", result="refused"))
+        self.assertEqual(audit.failed_writes(), before + 1)
+        (self.audit_dir / "audit.jsonl").rmdir()
+        self.assertTrue(audit.record("query", result="error"))
+        self.assertEqual([r["result"] for r in self.records()], ["success", "error"])
+
+    def test_failed_writes_reach_the_api(self):
+        self.make("eng", "engineer")
+        headers = self.session("eng")
+        before = self.client.get("/audit", headers=headers).json()["failed_writes"]
+        blocker = self.root / "file"
+        blocker.write_text("not a folder")
+        with patch.object(settings, "audit_dir", str(blocker / "audit")), self.assertLogs("audit", level="ERROR"):
+            answer = self.client.post("/collections", headers=headers, json={})
+        self.assertEqual(answer.status_code, 422)                 # the answer is the route's own
+        body = self.client.get("/audit", headers=headers).json()
+        # The failed collection.create plus the audit.view of the first read.
+        self.assertGreaterEqual(body["failed_writes"], before + 1)
+        self.assertEqual(body["failed_writes"], audit.failed_writes())
+
+    def test_write_failure_never_stops_a_job(self):
+        principal = store.Principal(1, "dev", "developer", False, "")
+        jobs = jobstore.JobStore("export")
+        jobs.load()
+        ctx = {"scope": {"state": {"auth": principal}}, "action": "export", "actor": None,
+               "actor_kind": "anonymous", "role": None, "key_id": None, "client_ip": "10.1.1.1",
+               "collection": "Docs", "target": None, "details": {}, "job_recorded": False}
+        blocker = self.root / "file"
+        blocker.write_text("not a folder")
+        before = audit.failed_writes()
+        with patch.object(settings, "audit_dir", str(blocker / "audit")), self.assertLogs("audit", level="ERROR"):
+            token = audit._current.set(ctx)
+            try:
+                jobs["exp1"] = {"job_id": "exp1", "status": "queued", "collection": "Docs"}
+            finally:
+                audit._current.reset(token)
+            jobs["exp1"]["status"] = "completed"
+        self.assertEqual(jobs["exp1"]["status"], "completed")
+        self.assertEqual(audit.failed_writes(), before + 2)       # accepted and ended, both counted
+        self.assertEqual(self.records(), [])
+
+    def test_a_read_that_spans_a_rotation_has_no_duplicates(self):
+        # GET /audit and /audit.csv read the files without the write lock. A
+        # rotation between reading audit.jsonl and audit.jsonl.1 must not make
+        # one record appear twice.
+        with patch.object(settings, "audit_log_max_bytes", 4096), patch.object(settings, "audit_log_keep", 50):
+            n = 0
+            while not (self.audit_dir / "audit.jsonl.1").exists():
+                audit.record("query", result="success", details={"n": n, "pad": "x" * 100})
+                n += 1
+            audit.record("query", result="success", details={"n": n, "pad": "x" * 100})
+            present = {item["id"] for item in audit.newest_first()}   # every record when the read starts
+            reader = audit.newest_first()
+            seen = [next(reader)["id"]]                           # audit.jsonl has been read
+            while not (self.audit_dir / "audit.jsonl.2").exists():
+                audit.record("query", result="success", details={"pad": "x" * 100})
+            seen += [item["id"] for item in reader]
+            missed = present - set(seen)                          # all still kept: keep is 50
+            self.assertEqual((len(seen) - len(set(seen)), len(missed)), (0, 0),
+                             f"across a rotation, {len(seen) - len(set(seen))} record(s) were read twice and "
+                             f"{len(missed)} of the {len(present)} records present were missed")
+
+
+class ReviewerCoverageTests(AuditTestCase):
+    """The testing reviewer's additions for D3, D4, D9 and D15 cases the PR's
+    tests don't reach: the decided action list, successful config saves and
+    password change, gold-standard save/download, import and tune records, an
+    invalid key and the not-recorded routes, and the other formula prefixes."""
+
+    def setUp(self):
+        super().setUp()
+        self.setup_roles()
+
+    def test_the_action_list_is_the_decided_one(self):
+        self.assertEqual(set(audit.ACTIONS.values()), {
+            "auth.login", "auth.logout", "auth.password", "query", "collection.create", "collection.delete",
+            "ingest", "ingest.config", "retrieval.config", "export", "import", "tune.rechunk", "tune.reembed",
+            "tune.reindex", "goldstandard.save", "goldstandard.download", "admin.user.create",
+            "admin.user.reset-password", "admin.user.set-role", "admin.user.disable", "admin.user.enable",
+            "admin.principal.create", "admin.principal.set-role", "admin.principal.disable",
+            "admin.principal.enable", "admin.key.issue", "admin.key.revoke", "audit.view", "audit.download"})
+        # Not recorded (D3): other GETs, job polling, gold-standard generate/edit/regenerate.
+        for method, path in audit.ACTIONS:
+            self.assertFalse(method == "GET" and path not in ("/goldstandard/download/{filename}", "/audit",
+                                                              "/audit.csv"), path)
+            self.assertNotIn("/job/", path)
+            self.assertFalse(path.startswith("/goldstandard/") and path not in (
+                "/goldstandard/save", "/goldstandard/download/{filename}"), path)
+
+    def test_successful_config_saves_and_password_change(self):
+        with patch("services.ingest_config.save", lambda cfg: cfg), \
+                patch("services.retrieval_config.save", lambda cfg: cfg):
+            self.assertEqual(self.client.post("/ingest/config", headers=self.session("dev"),
+                                              json={"collection": "Docs"}).status_code, 201)
+            self.assertEqual(self.client.post("/retrieval/config", headers=self.session("dev"),
+                                              json={"collection": "Docs"}).status_code, 201)
+        for action in ("ingest.config", "retrieval.config"):
+            record = self.last(action)
+            self.assertEqual((record["actor"], record["role"], record["collection"], record["result"],
+                              record["status_code"]), ("dev", "developer", "Docs", "success", 201))
+        new = "a-brand-new-password-42"
+        answer = self.client.post("/auth/password", headers=self.session("user"),
+                                  json={"current_password": self.passwords["end_user"], "new_password": new})
+        self.assertEqual(answer.status_code, 200, answer.text)
+        record = self.last("auth.password")
+        self.assertEqual((record["actor"], record["result"]), ("user", "success"))
+        for secret in (self.passwords["end_user"], new):
+            self.assertNotIn(secret, self.raw())
+
+    def test_goldstandard_save_and_download_are_recorded(self):
+        self.client.post("/goldstandard/save", headers=self.session("dev"),
+                         json={"session_id": "nosuchsession", "filename": "gold.json"})
+        saved = self.last("goldstandard.save")
+        self.assertEqual((saved["actor"], saved["result"], saved["details"]["session_id"], saved["details"]["file"]),
+                         ("dev", "refused", "nosuchsession", "gold.json"))
+        self.client.get("/goldstandard/download/nosuch.json", headers=self.session("dev"))
+        got = self.last("goldstandard.download")
+        self.assertEqual((got["actor"], got["result"], got["details"]["file"]), ("dev", "refused", "nosuch.json"))
+
+    def test_import_and_tune_requests_carry_their_parameters(self):
+        self.client.post("/import", headers=self.session("eng"),
+                         json={"filename": "pkg.tar.gz.age", "on_conflict": "rename"})
+        imported = self.last("import")
+        self.assertEqual((imported["result"], imported["details"]["package"], imported["details"]["encrypted"]),
+                         ("refused", "pkg.tar.gz.age", False))
+        with patch("services.weaviate_client.collection_exists", AsyncMock(return_value=False)):
+            self.client.post("/tune/rechunk", headers=self.session("eng"), json={"collection": "Docs"})
+        tuned = self.last("tune.rechunk")
+        self.assertEqual((tuned["collection"], tuned["details"]["operation"], tuned["result"]),
+                         ("Docs", "rechunk", "refused"))
+
+    def test_invalid_key_and_unaudited_routes_write_nothing(self):
+        count = len(self.records())
+        self.client.get("/audit", headers={"Authorization": "Bearer rag_nosuchkey_nosuchsecret"})   # 401 KEY_INVALID
+        self.client.get("/ingest/job/nosuchjob", headers=self.session("dev"))                   # job polling
+        with patch("services.weaviate_client.collection_exists", AsyncMock(return_value=False)):
+            self.client.post("/goldstandard/generate", headers=self.session("dev"), json={"collection": "Docs"})
+        self.assertEqual([r["action"] for r in self.records()[count:]], [])
+
+    def test_every_formula_prefix_is_escaped_and_csv_spans_rotated_files(self):
+        with patch.object(settings, "audit_log_max_bytes", 4096):
+            for prefix in ("=", "+", "-", "@"):
+                audit.record("auth.login", result="refused", target=prefix + "cmd", status_code=401)
+            for n in range(60):
+                audit.record("query", result="success", details={"n": n, "pad": "x" * 100})
+        self.assertTrue((self.audit_dir / "audit.jsonl.1").exists())
+        rows = list(csv.reader(io.StringIO(self.client.get("/audit.csv", headers=self.session("eng")).text)))
+        targets = [dict(zip(rows[0], row))["target"] for row in rows[1:]]
+        self.assertEqual(sorted(t for t in targets if t), ["'+cmd", "'-cmd", "'=cmd", "'@cmd"])
+        self.assertEqual(sum(1 for row in rows[1:] if dict(zip(rows[0], row))["action"] == "query"), 60)
+
+
+class EvaluationFixTests(AuditTestCase):
+    """The PR #570 evaluation's Lows: a tab or carriage return also leads a
+    formula in a spreadsheet, so those cells are escaped too."""
+
+    def test_tab_and_carriage_return_are_escaped(self):
+        self.make("eng", "engineer")
+        for prefix in ("\t", "\r"):
+            audit.record("auth.login", result="refused", target=prefix + "=cmd", status_code=401)
+        rows = list(csv.reader(io.StringIO(self.client.get("/audit.csv?action=auth.login",
+                                                           headers=self.session("eng")).text)))
+        targets = sorted(dict(zip(rows[0], row))["target"] for row in rows[1:])
+        self.assertEqual(targets, ["'\t=cmd", "'\r=cmd"])
+        self.assertEqual(audit._cell("plain"), "plain")
+        self.assertEqual(audit._cell(" =cmd"), " =cmd")
 
 
 class ImplementationCopyTests(unittest.TestCase):

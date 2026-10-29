@@ -268,23 +268,53 @@ def _files() -> list[Path]:
     return [p for p in names if p.is_file()]
 
 
-def newest_first():
-    """Every record, newest first. A line that isn't a JSON object (a torn last
-    line after a crash) is skipped."""
-    for path in _files():
+def _open_all() -> list:
+    """Every file of the log, opened for reading, newest first: one consistent
+    set. Opened under the writers' locks, so no rotation runs meanwhile; read
+    after they are released, which is safe because a rename doesn't change
+    what an open file holds. Without this a read that spans a rotation would
+    read one file twice and miss another."""
+    folder = Path(settings.audit_dir)
+    if not folder.is_dir():
+        return []
+    handles = []
+    with _lock:
+        lock_fd = os.open(folder / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            data = path.read_bytes()
-        except FileNotFoundError:
-            continue                                  # rotated away meanwhile
-        for raw in reversed(data.split(b"\n")):
-            if not raw.strip():
-                continue
+            fcntl.flock(lock_fd, fcntl.LOCK_SH)
             try:
-                item = json.loads(raw)
-            except ValueError:
-                continue
-            if isinstance(item, dict) and isinstance(item.get("id"), str):
-                yield item
+                for path in _files():
+                    handles.append(open(path, "rb"))
+            except BaseException:
+                for handle in handles:
+                    handle.close()
+                raise
+        finally:
+            os.close(lock_fd)                        # releases the flock too
+    return handles
+
+
+def newest_first():
+    """Every record, newest first, from the files as they were when the read
+    started (_open_all). A line that isn't a JSON object (a torn last line
+    after a crash) is skipped."""
+    handles = _open_all()
+    try:
+        for handle in handles:
+            data = handle.read()
+            handle.close()
+            for raw in reversed(data.split(b"\n")):
+                if not raw.strip():
+                    continue
+                try:
+                    item = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(item, dict) and isinstance(item.get("id"), str):
+                    yield item
+    finally:
+        for handle in handles:
+            handle.close()
 
 
 def parse_time(value: str) -> datetime:
@@ -336,7 +366,7 @@ def _cell(value) -> str:
         return ""
     text = json.dumps(value, ensure_ascii=False, separators=(",", ":")) if isinstance(value, dict) else str(value)
     # A spreadsheet runs a cell that starts with one of these as a formula.
-    return "'" + text if text[:1] in ("=", "+", "-", "@") else text
+    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
 
 
 def csv_lines(filters: dict):

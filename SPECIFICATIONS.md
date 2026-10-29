@@ -1615,8 +1615,8 @@ operator command append under a thread lock and an `flock` on `.lock`, so record
 
 **`GET /audit`** (engineer sessions; every API key `403 KEY_NOT_ALLOWED`). Query parameters, all optional: `from`
 (inclusive) and `to` (exclusive), ISO 8601, UTC when no offset is given; `actor`, `action`, `collection`, `result`
-(exact matches; `result` one of the values above); `limit` 1-1000, default 100; `before`, a record `id`. Any invalid
-value: `422 INVALID_PARAMETER`. Answer (`Cache-Control: no-store`):
+(exact matches; `result` one of the values above); `limit` 1-1000 in ASCII digits, default 100; `before`, a record
+`id`. Any invalid value: `422 INVALID_PARAMETER`. Answer (`Cache-Control: no-store`):
 
 ```json
 {"records": [{"id": "...", "time": "...", "...": "..."}], "next_before": "<id or null>",
@@ -1626,13 +1626,14 @@ value: `422 INVALID_PARAMETER`. Answer (`Cache-Control: no-store`):
 Records are newest first across every file; `next_before` is the last record's id when older matches exist.
 `before` returns the records whose id sorts below it, so pages don't shift as records arrive and a cursor whose
 record was rotated away still works. A line that isn't a JSON object (a torn last line) is skipped; the next append
-starts a new line.
+starts a new line. A read opens every file under the writers' lock and then reads the open files, so a rotation
+during it can't make it repeat or miss a record that existed when it started.
 
 **`GET /audit.csv`** (same access and filters, no `limit` or `before`): `200`, `text/csv; charset=utf-8`,
 `Content-Disposition: attachment; filename="audit-<yyyymmddThhmmssZ>.csv"`, `Cache-Control: no-store`, streamed.
 Header `time,actor,actor_kind,role,key_id,client_ip,action,collection,target,result,status_code,job_id,details`,
 then every matching record newest first, `details` as compact JSON, empty cells for `null`; a cell starting with
-`=`, `+`, `-` or `@` gets a leading `'`.
+`=`, `+`, `-`, `@`, a tab or a carriage return gets a leading `'`.
 
 ### 3.2 Error Response Format
 
@@ -2725,7 +2726,8 @@ page renders as one undifferentiated block.
   Collection, Result (Any or one of the results); "Apply".
 - A table of `GET /audit`'s records, 100 a page, newest first: time (UTC), actor (with the key id for a service
   key, or the kind when it isn't a user), role, address, action, collection, target, result with status code, job,
-  details (JSON). "Older" loads the page `next_before` names; "Newest" returns to the first.
+  details (JSON). "Older" loads the page `next_before` names; "Newest" returns to the first. While a page loads the
+  page says "Loading…" and "Older" is disabled, so a double click asks for the older page once.
 - "Download CSV" links to `/api/audit.csv` with the applied filters.
 - An API error shows its message.
 
@@ -3557,14 +3559,18 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   writers (API threads and the operator command); rotation keeps `AUDIT_LOG_KEEP` files; a torn last line is
   skipped; the three settings are validated at start; a failed write is logged and counted and never changes the
   answer.
-  *Evidence: `test_audit.py` `RecordTests`, `SettingsTests` (suite 19).*
+  *Evidence: `test_audit.py` `RecordTests`, `SettingsTests`, `ReviewerEdgeTests` (suite 19); `audit_stack.py
+  concurrent`: parallel failed logins with the operator command appending, each recorded once (suite 19).*
 - [x] `GET /audit` filters, pages newest first with a stable `before` cursor and refuses invalid parameters with
-  `422`; `GET /audit.csv` has the §3.1.9 header, every matching row and escaped formula cells.
+  `422` (a non-ASCII digit in `limit` included); `GET /audit.csv` has the §3.1.9 header, every matching row and
+  escaped formula cells (tab and carriage return included); a read that spans a rotation neither repeats nor misses
+  a record.
   *Evidence: `test_audit.py` `ApiTests` (suite 19); `audit_stack.py filters` (suite 19).*
 - [x] Records survive an API restart, which writes a new `system.start` (with `RAG_ALLOW_RESTART=1`).
   *Evidence: `audit_stack.py restart-prepare` and `restart-verify` (suite 19).*
 - [x] The Audit page: an engineer-only nav link (last) and route; the records and paging; filters applied and
-  carried into the CSV link; the question-text note and the failed-writes warning.
+  carried into the CSV link; the question-text note and the failed-writes warning; a double click on Older while a
+  page loads asks for it once.
   *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request
   interception; `ui_criteria.js` checks the real engineer's nav includes Audit.*
 

@@ -33,14 +33,19 @@ export default function AuditPage() {
   const [cursors, setCursors] = useState<(string | undefined)[]>([undefined])
   const [data, setData] = useState<AuditPageData | null>(null)
   const [error, setError] = useState('')
+  // A page is on its way: shown, and Older is disabled, so a quick second
+  // click can't add the same cursor twice.
+  const [loading, setLoading] = useState(true)
 
   const before = cursors[cursors.length - 1]
 
   useEffect(() => {
     let current = true
+    setLoading(true)
     api.listAudit(filters, before)
       .then(page => { if (current) { setData(page); setError('') } })
       .catch((e: unknown) => { if (current) setError(e instanceof Error ? e.message : String(e)) })
+      .finally(() => { if (current) setLoading(false) })
     return () => { current = false }
   }, [filters, before])
 
@@ -100,6 +105,7 @@ export default function AuditPage() {
       </form>
 
       {error && <p role="alert" className="text-red-600 text-sm mb-4">{error}</p>}
+      {loading && <p data-testid="audit-loading" className="text-sm text-gray-500 mb-4">Loading…</p>}
       {data && data.records.length === 0 && !error && <p className="text-sm text-gray-500">No records match.</p>}
 
       {data && data.records.length > 0 && (
@@ -142,7 +148,12 @@ export default function AuditPage() {
       <div className="flex gap-3 mt-4">
         <button disabled={cursors.length === 1} onClick={() => setCursors([undefined])}
           className="text-sm text-blue-600 hover:underline disabled:opacity-50 disabled:no-underline">Newest</button>
-        <button disabled={!data?.next_before} onClick={() => data?.next_before && setCursors(c => [...c, data.next_before as string])}
+        <button disabled={loading || !data?.next_before} onClick={() => {
+          const next = data?.next_before
+          // Only a cursor not asked for yet: a second click before the page
+          // renders sees the same next_before.
+          if (next && !loading) setCursors(c => (c[c.length - 1] === next ? c : [...c, next]))
+        }}
           className="text-sm text-blue-600 hover:underline disabled:opacity-50 disabled:no-underline">Older</button>
       </div>
     </div>

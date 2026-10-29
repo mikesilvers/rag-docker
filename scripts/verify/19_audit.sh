@@ -43,6 +43,10 @@ check "filters, a one-record page and its cursor, and the CSV (header, a row, an
 stack no-secrets
 check "no harness password, session token, API key or password typed in a change appears in the audit files" $?
 
+section "Concurrent writers"
+stack concurrent
+check "parallel failed logins and the operator command append together: each recorded once, every line whole" $?
+
 section "Restart persistence (opt-in: it restarts the api)"
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   restart_refusal=$(restart_refusal_reason)
