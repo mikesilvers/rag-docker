@@ -239,6 +239,157 @@ class ValidityServiceTests(unittest.TestCase):
                 self.data = session()
                 gs.store_session(self.data)
 
+    def _run_real_rebuild(self, jobid):
+        # Real _run -> real _rebuild, with only the backend mocked, so develop's
+        # pre-cutover abort branch is exercised with the real durable marker.
+        from services import tuning
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        client = MagicMock(); stage = MagicMock(); target = MagicMock()
+        stage.aggregate.over_all.return_value = SimpleNamespace(total_count=1)
+        stage.iterator.return_value = [SimpleNamespace(uuid='00000000-0000-0000-0000-000000000001',
+                                                       vector={'default': [0.1]}, properties={'content': 'Inert'})]
+        client.collections.get.side_effect = lambda name: target if name == 'ValidityFixture' else stage
+        events = []
+        marker = gs._pending_path(self.data['session_id'])
+        client.collections.delete.side_effect = lambda name: events.append(('delete', name, marker.exists()))
+        ownership = {'staging': 'ValidityFixture__tuning_test', 'state': 'scratch', 'operation_id': 'test'}
+        job = {'status': 'queued'}
+        with patch.dict(tuning._jobs, {jobid: job}), \
+             patch.object(tuning.sources, 'has_sources', return_value=False), \
+             patch.object(tuning, '_existing_chunks', return_value=[{'content': 'Inert'}]), \
+             patch.object(tuning.wc, 'get_client', return_value=client), \
+             patch.object(tuning.wc, '_collection_config_sync', return_value={'index_type': 'hnsw', 'distance_metric': 'cosine', 'hnsw_config': {}}), \
+             patch.object(tuning.wc, '_create_collection_sync'), \
+             patch.object(tuning.wc, '_insert_chunks_sync'), \
+             patch.object(tuning.collection_recovery, 'begin', return_value=ownership), \
+             patch.object(tuning.collection_recovery, 'retain', side_effect=lambda owner, **kw: owner.update(state='recovery')), \
+             patch.object(tuning.collection_recovery, 'begin_cutover', side_effect=lambda owner: events.append(('cutover',))), \
+             patch.object(tuning.collection_recovery, 'sidecar_reference', return_value=None), \
+             patch.object(tuning.collection_recovery, 'discard', side_effect=lambda owner, c: events.append(('discard', owner['staging']))), \
+             patch.object(tuning.batch_write, 'insert', return_value=1), \
+             patch.object(gs, '_save_session_sync', side_effect=OSError('Owned disk fault')):
+            yield job, events
+
+    def test_unpersistable_marker_aborts_real_rebuild_before_live_delete(self):
+        # Reviewer (#93): both writes fail -> develop's pre-cutover branch must
+        # report the original as unchanged, never delete it, and drop staging.
+        with patch.object(gs, '_write_pending_marker', return_value=False):
+            for job, events in self._run_real_rebuild('abort'):
+                from services import tuning
+                tuning._run('abort', 'ValidityFixture', 'reembed', {})
+        self.assertEqual(job['status'], 'failed', job)
+        self.assertEqual(job['error_code'], 'TUNE_FAILED')
+        self.assertIn('historical marker could not be persisted', job['error'])
+        self.assertIn('original collection is unchanged', job['error'])
+        self.assertNotIn('recovered_as', job.get('error_detail') or {})
+        self.assertEqual(job.get('chunks_written', 0), 0)
+        self.assertEqual(events, [('discard', 'ValidityFixture__tuning_test')])
+        gs._sessions = {}; gs.load_sessions_from_disk()
+        self.assertFalse(gs.get_session(self.data['session_id']).get('stale', False))
+
+    def test_pending_marker_alone_lets_real_rebuild_replace_and_survives_restart(self):
+        # Reviewer (#93): session write fails but the pending marker is durable
+        # before delete; after a restart the session still loads historical.
+        for job, events in self._run_real_rebuild('pending'):
+            from services import tuning
+            tuning._run('pending', 'ValidityFixture', 'reembed', {})
+        self.assertEqual(job['status'], 'completed', job)
+        self.assertEqual(events[:2], [('cutover',), ('delete', 'ValidityFixture', True)])
+        gs._sessions = {}; gs.load_sessions_from_disk()
+        reloaded = gs.get_session(self.data['session_id'])
+        self.assertTrue(reloaded['stale']); self.assertIn('re-embedded', reloaded['stale_reason'])
+        with self.assertRaises(gs.GoldStandardError) as error:
+            asyncio.run(gs.save_session(self.data['session_id'], 'guard.json'))
+        self.assertEqual(error.exception.code, 'HISTORICAL_SESSION')
+
+    def test_post_cutover_marking_stays_best_effort(self):
+        # Reviewer (#93): only the pre-replacement call is strict; a failed
+        # cutover still reports the original failure when markers cannot persist.
+        with patch.object(gs, '_save_session_sync', side_effect=OSError('Owned disk fault')), \
+             patch.object(gs, '_write_pending_marker', return_value=False):
+            self.assertEqual(gs.mark_stale('ValidityFixture', 'Synthetic after cutover'), 0)
+            with self.assertRaises(gs.GoldStandardError):
+                gs.mark_stale('ValidityFixture', 'Synthetic before cutover', require_durable=True)
+
+    # #275: an aborted durable marking rolls back what it already wrote. The
+    # canonical spelling is marked first, so gs_11111111 (and setUp's session)
+    # are written before gs_22222222, under the lowercase-first spelling, fails.
+    def _two_spellings(self, earlier=None):
+        first = session(); first.update(session_id='gs_11111111', collection='ValidityFixture', **(earlier or {}))
+        second = session(); second.update(session_id='gs_22222222', collection='validityFixture')
+        gs.store_session(first); gs.store_session(second)
+
+    def _failing_writes(self, save_fails, marker_fails):
+        real_save, real_marker = gs._save_session_sync, gs._write_pending_marker
+        def save(snapshot):
+            if save_fails(snapshot):
+                raise gs.GoldStandardError('SESSION_WRITE_FAILED', 'Synthetic write fault', 503)
+            return real_save(snapshot)
+        def marker(session_id, fields):
+            return False if session_id in marker_fails else real_marker(session_id, fields)
+        return patch.object(gs, '_save_session_sync', side_effect=save), patch.object(gs, '_write_pending_marker', side_effect=marker)
+
+    @staticmethod
+    def _stale_fields(data):
+        return {key: data.get(key) for key in ('stale', 'stale_reason', 'stale_at')}
+
+    def test_aborted_marking_rolls_back_written_sessions_across_spellings(self):
+        older = {'stale': True, 'stale_reason': 'Synthetic older reason', 'stale_at': '2026-01-01T00:00:00+00:00'}
+        for earlier in ({}, older):
+            with self.subTest(earlier=bool(earlier)):
+                gs._sessions = {}; self.data = session(); gs.store_session(self.data)
+                self._two_spellings(earlier)
+                before = {sid: self._stale_fields(gs.get_session(sid)) for sid in ('gs_47abcdef', 'gs_11111111', 'gs_22222222')}
+                save, marker = self._failing_writes(lambda s: s['session_id'] == 'gs_22222222', {'gs_22222222'})
+                with save, marker, self.assertRaises(gs.GoldStandardError) as error:
+                    gs.mark_stale('ValidityFixture', 'Synthetic replacement', require_durable=True)
+                self.assertEqual(error.exception.code, 'SESSION_WRITE_FAILED')
+                for reload in (False, True):
+                    if reload:
+                        gs._sessions = {}; gs.load_sessions_from_disk()
+                    for sid, fields in before.items():
+                        with self.subTest(session=sid, reload=reload):
+                            self.assertEqual(self._stale_fields(gs.get_session(sid)), fields)
+
+    def test_aborted_marking_restores_pending_markers(self):
+        earlier_marker = json.dumps({'session_id': 'gs_11111111', 'orphaned': True,
+                                     'orphaned_reason': 'Synthetic deletion', 'orphaned_at': '2026-01-01T00:00:00+00:00'}, indent=2)
+        for existing in (None, earlier_marker):
+            with self.subTest(existing=bool(existing)):
+                gs._sessions = {}; self.data = session(); gs.store_session(self.data)
+                self._two_spellings()
+                path = gs._pending_path('gs_11111111')
+                if existing:
+                    path.parent.mkdir(exist_ok=True); path.write_text(existing)
+                elif path.exists():
+                    path.unlink()
+                save, marker = self._failing_writes(lambda s: s['session_id'] in ('gs_11111111', 'gs_22222222'), {'gs_22222222'})
+                with save, marker, self.assertRaises(gs.GoldStandardError):
+                    gs.mark_stale('ValidityFixture', 'Synthetic replacement', require_durable=True)
+                if existing:
+                    self.assertEqual(path.read_text(), existing)
+                else:
+                    self.assertFalse(path.exists())
+                for sid in ('gs_11111111', 'gs_22222222'):
+                    self.assertFalse(gs.get_session(sid).get('stale', False), sid)
+                message = gs._diagnostics[str(gs._session_key('gs_11111111'))]['message']
+                self.assertIn('previous snapshot remains authoritative', message)
+                self.assertNotIn('pending marker', message)
+
+    def test_unrollbackable_marker_stays_and_is_reported(self):
+        self._two_spellings()
+        # gs_11111111's marking write succeeds; the write that restores it fails.
+        fails = lambda s: s['session_id'] == 'gs_22222222' or (s['session_id'] == 'gs_11111111' and not s.get('stale'))
+        save, marker = self._failing_writes(fails, {'gs_22222222'})
+        with save, marker, self.assertRaises(gs.GoldStandardError) as error:
+            gs.mark_stale('ValidityFixture', 'Synthetic replacement', require_durable=True)
+        self.assertIn('historical marker could not be persisted', str(error.exception))
+        self.assertEqual(gs._diagnostics[str(gs._session_key('gs_11111111'))]['message'], gs._ROLLBACK_FAILED_MESSAGE)
+        gs._sessions = {}; gs.load_sessions_from_disk()
+        current = gs.get_session('gs_11111111')
+        self.assertTrue(current['stale']); self.assertEqual(current['stale_reason'], 'Synthetic replacement')
+
     def test_request_validation_errors_use_project_envelope_without_input(self):
         from fastapi.testclient import TestClient
         from main import app

@@ -62,6 +62,14 @@ _MARKER_MESSAGES = {
     False: "History marker could not be saved. The session is treated as historical and current export is refused only until restart. Check local storage, then edit this session to save the marker.",
 }
 
+_ROLLBACK_FAILED_MESSAGE = "A stale marker from an aborted collection replacement could not be removed, so the session stays historical. Check local storage."
+# Rollback bookkeeping for an aborted durable marking (#275): a field the
+# session didn't have, a pending marker the call didn't touch, and a pending
+# marker whose earlier content couldn't be read.
+_ABSENT = object()
+_UNTOUCHED = object()
+_UNKNOWN = object()
+
 
 def validate_session_id(session_id: str) -> None:
     """Imported identities use the same grammar as locally generated ones."""
@@ -562,7 +570,74 @@ def _update_session_sync(session_id: str, change):
         return copy.deepcopy(result)
 
 
-def _flag_sessions(collection: str, flag: str, reason: str, *, require_durable: bool = False) -> int:
+def _restore_fields(current: dict, previous: dict) -> None:
+    for key, value in previous.items():
+        if value is _ABSENT:
+            current.pop(key, None)
+        else:
+            current[key] = value
+
+
+def _pending_marker_text(session_id: str) -> str | None:
+    """The pending marker's current text, or None when there is none."""
+    with _state_lock:
+        path = _pending_path(session_id)
+        return path.read_text() if path.exists() else None
+
+
+def _restore_pending_marker(session_id: str, text: str | None) -> None:
+    with _state_lock:
+        path = _pending_path(session_id)
+        if text is None:
+            if path.exists():
+                path.unlink()
+                _sync_directory(path.parent)
+        else:
+            _replace_durably(path, text)
+            _sync_directory(path.parent)
+
+
+def _roll_back_markers(undo: list[dict]) -> None:
+    """Undo the markers an aborted durable marking wrote (#275).
+
+    Only the flag fields and the pending marker go back to their earlier state.
+    Whatever can't be restored stays marked, which keeps the session historical.
+    """
+    global _store_revision
+    with _state_lock:
+        for entry in reversed(undo):
+            session_id = entry["session_id"]
+            previous = entry["previous"]
+            key = _session_key(session_id)
+            try:
+                if entry["marker"] is _UNKNOWN:
+                    raise ValueError("The pending marker's earlier content could not be read.")
+                if entry["marker"] is not _UNTOUCHED:
+                    _restore_pending_marker(session_id, entry["marker"])
+                if entry["file_written"]:
+                    _update_session_sync(session_id, lambda current, p=previous: _restore_fields(current, p))
+                else:
+                    current = _sessions.get(session_id)
+                    if current is not None:
+                        snapshot = copy.deepcopy(current)
+                        _restore_fields(snapshot, previous)
+                        _sessions[session_id] = snapshot
+                        _store_revision += 1
+                    # The session file write failed, but no marker is pending now.
+                    if _diagnostics.get(str(key), {}).get("code", "SESSION_WRITE_FAILED") == "SESSION_WRITE_FAILED":
+                        _record_issue(key, "SESSION_WRITE_FAILED")
+            except (GoldStandardError, OSError, ValueError, RuntimeError) as exc:
+                if isinstance(exc, GoldStandardError) and exc.code == "SESSION_DURABILITY_UNCERTAIN":
+                    # The restoring write replaced the file; its diagnostic stays.
+                    log.warning("Rolled back the stale marker of session %s with uncertain durability", session_id)
+                    continue
+                log.exception("Could not roll back the stale marker of session %s", session_id)
+                if _diagnostics.get(str(key), {}).get("code", "SESSION_WRITE_FAILED") == "SESSION_WRITE_FAILED":
+                    _record_issue(key, "SESSION_WRITE_FAILED", _ROLLBACK_FAILED_MESSAGE)
+
+
+def _flag_sessions(collection: str, flag: str, reason: str, *, require_durable: bool = False,
+                   undo: list[dict] | None = None) -> int:
     """Mark every session for a collection, on disk and in memory.
 
     Sessions are never deleted and never remapped. A remap that guesses which
@@ -572,26 +647,50 @@ def _flag_sessions(collection: str, flag: str, reason: str, *, require_durable: 
     If a completed mutation cannot persist a marker to the session file, the
     historical guard is kept in memory and in a pending marker that survives
     restart.
+
+    With `undo`, each session's earlier flag fields and pending marker are
+    recorded there, so `mark_stale` can roll the call back if it aborts.
     """
     global _store_revision
     sessions = sessions_for(collection)
     now = datetime.now(timezone.utc).isoformat()
+    fields = (flag, f"{flag}_reason", f"{flag}_at")
     marked = 0
     for session in sessions:
+        previous = {}
         def change(current):
+            # Only the first call sees the earlier values: an uncertain-durability
+            # write has already published the marker when the fallback runs.
+            if not previous:
+                previous.update({key: current.get(key, _ABSENT) for key in fields})
             current[flag] = True
             current[f"{flag}_reason"] = reason
             current[f"{flag}_at"] = now
         try:
             _update_session_sync(session["session_id"], change)
             marked += 1
-        except (GoldStandardError, OSError, ValueError, RuntimeError):
-            # The primary collection mutation already happened. Preserve the
-            # failed-write diagnostic. Publish the marker in the process cache
-            # even when disk still holds the prior snapshot, so a completed
-            # delete/rebuild cannot export this session as a current baseline.
-            # A pending marker carries it across restart; a later successful
-            # session write persists it and removes the pending marker.
+            if undo is not None:
+                undo.append({"session_id": session["session_id"], "previous": previous,
+                             "file_written": True, "marker": _UNTOUCHED})
+        except (GoldStandardError, OSError, ValueError, RuntimeError) as exc:
+            # Without require_durable the caller's primary collection mutation
+            # already happened. With it, the caller hasn't mutated anything yet:
+            # a pending marker that can't be written aborts the call, and
+            # mark_stale rolls back the markers this call wrote. Either way,
+            # preserve the failed-write diagnostic. Publish the marker in the
+            # process cache even when disk still holds the prior snapshot, so a
+            # completed delete/rebuild cannot export this session as a current
+            # baseline. A pending marker carries it across restart; a later
+            # successful session write persists it and removes the pending marker.
+            if undo is not None:
+                try:
+                    earlier_marker = _pending_marker_text(session["session_id"])
+                except (OSError, ValueError):
+                    earlier_marker = _UNKNOWN
+                # An uncertain-durability write did replace the session file.
+                replaced = isinstance(exc, GoldStandardError) and exc.code == "SESSION_DURABILITY_UNCERTAIN"
+                undo.append({"session_id": session["session_id"], "previous": previous,
+                             "file_written": replaced, "marker": earlier_marker})
             with _state_lock:
                 current = _sessions.get(session["session_id"])
                 if current is not None:
@@ -616,7 +715,20 @@ def mark_stale(collection: str, reason: str, *, require_durable: bool = False) -
     """Chunk identity changed, so the pairs no longer describe what is stored."""
     # Backend aliases address the same corpus, but retained provenance keeps
     # the spelling supplied when a session was created or imported.
-    return sum(_flag_sessions(alias, "stale", reason, require_durable=require_durable) for alias in aliases(collection))
+    if not require_durable:
+        return sum(_flag_sessions(alias, "stale", reason) for alias in aliases(collection))
+    # Before a replacement nothing has changed yet, so an abort under either
+    # spelling undoes every marker this call wrote (#275).
+    undo: list[dict] = []
+    try:
+        return sum(_flag_sessions(alias, "stale", reason, require_durable=True, undo=undo)
+                   for alias in aliases(collection))
+    except Exception:
+        try:
+            _roll_back_markers(undo)
+        except Exception:                             # noqa: BLE001
+            log.exception("Could not roll back stale markers for %s", collection)
+        raise
 
 
 def mark_orphaned(collection: str, reason: str) -> int:

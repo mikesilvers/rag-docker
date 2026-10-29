@@ -6,6 +6,8 @@ require_stack
 section "Retained evaluation validity and historical export"
 (cd ../.. && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/session_validity.py)
 check "legacy defaults, real stale/orphan markers, export guard and historical file" $?
+(cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_session_validity.py)
+check "test_session_validity.py controlled validity, durable-marker and rollback regressions" $?
 
 section "Gold-standard export files (#370)"
 # Controlled: save and download reach only UPLOAD_DIR/goldstandard_exports; bad
