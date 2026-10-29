@@ -47,7 +47,8 @@ async def _start(collection: str, operation: str, params: dict):
     except CollectionDeletingError:
         return collection_deleting_error(collection)
     except tuning.PackageError as exc:
-        # Nothing to rebuild: refused before a job is created (#328).
+        # An invalid source index (#389) or nothing to rebuild (#328): refused
+        # before a job is created.
         return api_error(409, exc.code, exc.message, detail=exc.detail)
     except tuning.ServiceUnavailableError:
         # Weaviate couldn't be read for that check; the cause is logged (#340).

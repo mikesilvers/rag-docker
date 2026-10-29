@@ -11530,7 +11530,8 @@ async def _start(collection: str, operation: str, params: dict):
     except CollectionDeletingError:
         return collection_deleting_error(collection)
     except tuning.PackageError as exc:
-        # Nothing to rebuild: refused before a job is created (#328).
+        # An invalid source index (#389) or nothing to rebuild (#328): refused
+        # before a job is created.
         return api_error(409, exc.code, exc.message, detail=exc.detail)
     except tuning.ServiceUnavailableError:
         # Weaviate couldn't be read for that check; the cause is logged (#340).
@@ -19369,8 +19370,12 @@ stored and a digest with none (only the stored name is parsed). A collection who
 names have no stored chunks is refused as having nothing to rebuild, before staging and, for
 a rechunk or a re-embed with chunking parameters, before any job is created, with the route
 answering 409 (#328). That check runs only for those two, after the `TUNE_IN_PROGRESS` and
-`COLLECTION_DELETING` guards; a re-index, an invalid index and a collection with a stored
-listed name still start a job. A Weaviate error during the check answers 503
+`COLLECTION_DELETING` guards; a re-index and a collection with a stored listed name still
+start a job. An invalid retained source index (a non-digest key, a non-object document or a
+linked index) refuses those two before any job is created, with 409 `SOURCE_INDEX_INVALID`,
+the guards released and Weaviate never read, while a re-index and a re-embed without chunking
+parameters still start; the guards answer first, leaving the other tune's guard held. These
+are checked over HTTP through the app (#389). A Weaviate error during the check answers 503
 `SERVICE_UNAVAILABLE` with no job, the guards released and the cause logged, not sent (#340),
 also when the connection itself fails and for a re-embed with chunking parameters through its
 route, while a re-embed without them still starts. A Weaviate error checking that the
@@ -29404,6 +29409,15 @@ for mode in abs link; do
       "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "completed"
     check_eq "E29: ... and keeps the chunk count (abs)" "$(count_of "$C")" "$chunks_before"
     leak=$(no_sentinel_in_exports); check "E29: ... and nothing in exports holds outside bytes after it (abs)" $? "$leak"
+    # Re-embedding from stored chunk text never reads the sources either, so
+    # without chunking fields it still starts a job (#389).
+    api_post "/tune/reembed" "{\"collection\":\"$C\"}" > /tmp/vfy_tj.json
+    e29rejob=$(jfield "['job_id']" < /tmp/vfy_tj.json)
+    check_eq "E29: re-embedding without chunking fields still starts a job with an on-disk abs entry" \
+      "$(jfield "['status']" < /tmp/vfy_tj.json) $([ -n "$e29rejob" ] && echo job)" "queued job"
+    check_eq "E29: ... and completes (re-embed, abs)" \
+      "$(wait_for_job "/tune/job/$e29rejob" 1800)" "completed"
+    check_eq "E29: ... and keeps the chunk count (re-embed, abs)" "$(count_of "$C")" "$chunks_before"
   else
     echo "    (info) GET /tune/$C with the $mode entry planted: HTTP $(api_code "$API/tune/$C")"
   fi
