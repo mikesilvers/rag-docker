@@ -377,7 +377,13 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     const listFailure = { status: 503, contentType: 'application/json', body: JSON.stringify({ error: { code: 'SERVICE_UNAVAILABLE', message: LIST_FAIL, detail: null } }) };
     const refusal = { status: 409, contentType: 'application/json', body: JSON.stringify({ error: { code: 'COLLECTION_EXISTS', message: EXISTS, detail: null } }) };
     const accepted = { status: 201, contentType: 'application/json', body: JSON.stringify({ name: 'VfyRefused379', status: 'created' }) };
-    const alerts = page => page.evaluate(() => [...document.querySelectorAll('[role=alert]')].map(a => a.textContent.trim()));
+    // Each alert's text without its buttons: the Q&A and Gold Standard alerts
+    // hold a Retry button (#575), and the message is what is checked here.
+    const alerts = page => page.evaluate(() => [...document.querySelectorAll('[role=alert]')].map(a => {
+      const c = a.cloneNode(true);
+      c.querySelectorAll('button').forEach(b => b.remove());
+      return c.textContent.trim();
+    }));
     // The New Collection modal, and the alert inside it, if any.
     const modal = page => page.evaluate(() => {
       const h = [...document.querySelectorAll('h2')].find(x => x.textContent.trim() === 'New Collection');
@@ -485,6 +491,105 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
         const fresh = await modal(s.page);
         r.check('Import: a successful create clears the message for the next attempt', fresh.open && fresh.alert === null, JSON.stringify(fresh));
         r.check('Import create fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+  }
+
+  // ── retrying a failed collection list (#575) ─────────────────────────────
+  // The Q&A and Gold Standard pages load the collection list once on opening;
+  // the failed-list alert's Retry loads it again. A successful Retry clears the
+  // message and selects the first collection only if none is chosen, so a
+  // collection chosen on the Retrieval page stays selected on Q&A. The list and
+  // the retrieval settings are answered here, so the cases don't depend on the
+  // stack's collections and create nothing.
+  r.section('retrying a failed collection list (#575)');
+  {
+    const FAIL = 'Synthetic list failure (#575).';
+    const MESSAGE = 'Could not load the collections: ' + FAIL;
+    const FIRST = 'VfyRetry575A', SECOND = 'VfyRetry575B';
+    const info = name => ({ name, object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', created_at: null, hnsw_config: null });
+    const failure = { status: 503, contentType: 'application/json', body: JSON.stringify({ error: { code: 'SERVICE_UNAVAILABLE', message: FAIL, detail: null } }) };
+    const listed = { status: 200, contentType: 'application/json', body: JSON.stringify({ collections: [info(FIRST), info(SECOND)] }) };
+    // Answers GET /api/collections as mode.list says, and the retrieval settings.
+    async function stub(s) {
+      const mode = { list: 'pass' };
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        const path = new URL(request.url()).pathname;
+        if (request.method() === 'GET' && path === '/api/collections') return request.respond(mode.list === 'fail' ? failure : listed);
+        if (request.method() === 'GET' && path.startsWith('/api/retrieval/config/')) {
+          const name = decodeURIComponent(path.split('/').pop());
+          return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collection: name, retrieval_mode: 'hnsw', top_k: 5, alpha: 0.75, ef: null, response_format: 'engineer', is_default: true }) });
+        }
+        return request.continue();
+      });
+      return mode;
+    }
+    const lists = s => s.api.filter(x => x.method === 'GET' && x.url === '/api/collections').length;
+    // The failed-list alert, if shown, and whether it holds a Retry button.
+    const listAlert = page => page.evaluate(m => {
+      for (const a of document.querySelectorAll('[role=alert]')) {
+        const c = a.cloneNode(true);
+        c.querySelectorAll('button').forEach(b => b.remove());
+        if (c.textContent.trim() === m) return { retry: [...a.querySelectorAll('button')].some(b => b.textContent.trim() === 'Retry') };
+      }
+      return null;
+    }, MESSAGE);
+    const retryShown = page => page.evaluate(() => [...document.querySelectorAll('button')].some(b => b.textContent.trim() === 'Retry'));
+    // The collection selector: on Q&A (and Retrieval) the first select, on Gold
+    // Standard the one next to the Collection label.
+    const selection = (page, gold) => page.evaluate(g => {
+      let select = document.querySelector('select');
+      if (g) {
+        const label = [...document.querySelectorAll('label')].find(x => x.textContent.trim() === 'Collection');
+        select = label && label.parentElement.querySelector('select');
+      }
+      return select ? { value: select.value, options: [...select.options].map(o => o.value) } : null;
+    }, gold);
+    const noPageErrors = (s, name) => r.check(`${name}: the Retry cases cause no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+
+    // A fresh page with nothing chosen: Retry selects the first collection.
+    for (const [name, path, gold] of [['Q&A', '/qa', false], ['Gold Standard', '/goldstandard', true]]) {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const mode = await stub(s);
+        mode.list = 'fail';
+        await s.page.goto(BASE + path, { waitUntil: 'networkidle2' }); await sleep(1500);
+        const failed = await listAlert(s.page);
+        r.check(`${name}: the failed-list alert has a Retry button (#575)`, !!failed && failed.retry, JSON.stringify(failed));
+        const before = lists(s);
+        mode.list = 'pass';
+        await clickByText(s.page, 'Retry'); await sleep(1200);
+        r.check(`${name}: Retry loads the collection list again`, lists(s) === before + 1, `${lists(s) - before} more`);
+        const after = await listAlert(s.page);
+        r.check(`${name}: a successful Retry clears the message and the Retry button`, after === null && !(await retryShown(s.page)), JSON.stringify(after));
+        const sel = await selection(s.page, gold);
+        r.check(`${name}: a successful Retry with nothing chosen selects the first collection`,
+                !!sel && sel.value === FIRST && sel.options.join() === [FIRST, SECOND].join(), JSON.stringify(sel));
+        noPageErrors(s, name);
+      } finally { await s.ctx.close(); }
+    }
+
+    // Q&A with a collection chosen on the Retrieval page: the client-side
+    // navigation keeps the choice, and a successful Retry keeps it selected.
+    {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const mode = await stub(s);
+        await s.page.goto(BASE + '/retrieval', { waitUntil: 'networkidle2' }); await sleep(1500);
+        await setValue(s.page, "() => document.querySelector('select')", SECOND); await sleep(500);
+        mode.list = 'fail';
+        await clickByText(s.page, 'Q&A'); await sleep(1500);
+        const failed = await listAlert(s.page);
+        r.check('Q&A after Retrieval: the failed-list alert has a Retry button (#575)', !!failed && failed.retry, JSON.stringify(failed));
+        mode.list = 'pass';
+        await clickByText(s.page, 'Retry'); await sleep(1200);
+        const after = await listAlert(s.page);
+        r.check('Q&A after Retrieval: a successful Retry clears the message', after === null, JSON.stringify(after));
+        const sel = await selection(s.page, false);
+        r.check('Q&A after Retrieval: a successful Retry keeps the collection chosen on the Retrieval page',
+                !!sel && sel.value === SECOND, JSON.stringify(sel));
+        noPageErrors(s, 'Q&A after Retrieval');
       } finally { await s.ctx.close(); }
     }
   }

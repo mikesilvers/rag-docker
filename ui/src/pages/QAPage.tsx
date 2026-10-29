@@ -25,12 +25,19 @@ export default function QAPage() {
   // may show its answer or error, or end the loading state.
   const generation = useRef(0)
 
-  useEffect(() => {
+  // Loads the collection list, on opening the page and from the failed-list
+  // alert's Retry (#575). A collection already chosen, here or on the Retrieval
+  // page, is kept; the first one is selected only when none is.
+  function loadCollections() {
     api.getCollections().then(r => {
       setCollections(r.collections)
       setListError('')
       if (!collection && r.collections.length > 0) setCollection(r.collections[0].name)
     }).catch((e: unknown) => setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`))
+  }
+
+  useEffect(() => {
+    loadCollections()
     // Runs once; a collection already chosen on the Retrieval page is kept.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -99,7 +106,12 @@ export default function QAPage() {
           </select>
         )}
       </div>
-      {listError && <p role="alert" className="text-red-600 text-sm mb-3">{listError}</p>}
+      {listError && (
+        <p role="alert" className="text-red-600 text-sm mb-3">
+          {listError}
+          <button type="button" onClick={() => loadCollections()} className="ml-2 underline hover:text-red-800">Retry</button>
+        </p>
+      )}
       <textarea
         value={question}
         onChange={e => setQuestion(e.target.value)}
