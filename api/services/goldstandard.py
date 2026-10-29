@@ -31,6 +31,11 @@ GS_RETRY_SUFFIX = (
     " Your previous response was not valid JSON. Return ONLY the JSON object with keys: "
     "question, answer, ground_truth. No markdown, no explanation."
 )
+GS_FIELD_RETRY_SUFFIX = (
+    " Your previous response did not give question, answer and ground_truth as nonempty strings. "
+    "Return ONLY the JSON object with keys: question, answer, ground_truth, each a nonempty string. "
+    "No markdown, no explanation."
+)
 
 log = logging.getLogger(__name__)
 
@@ -697,22 +702,30 @@ async def _generate_pair(chunk: dict) -> dict:
     user_msg = f"Chunk:\n{chunk['content']}"
     data = None
     last_error: Exception | None = None
+    # Each reprompt names what was wrong with the reply before it (#273).
+    suffix = ""
     for attempt in range(_GENERATION_ATTEMPTS):
-        system = GS_SYSTEM if attempt == 0 else GS_SYSTEM + GS_RETRY_SUFFIX
-        raw = await _chat_once(system, user_msg)
+        raw = await _chat_once(GS_SYSTEM + suffix, user_msg)
         try:
             candidate = _parse_gs_json(raw)
+        except Exception as exc:                      # noqa: BLE001
+            last_error, suffix = exc, GS_RETRY_SUFFIX
+            log.info("Pair generation attempt %d/%d did not yield valid JSON: %s",
+                     attempt + 1, _GENERATION_ATTEMPTS, exc)
+            continue
+        try:
             for field in ("question", "answer", "ground_truth"):
                 value = candidate.get(field, candidate.get("answer") if field == "ground_truth" else None)
                 if not isinstance(value, str) or not value.strip():
                     raise ValueError(f"Model {field} must be a nonempty string")
                 candidate[field] = value
-            data = candidate
-            break
-        except Exception as exc:                      # noqa: BLE001
-            last_error = exc
-            log.info("Pair generation attempt %d/%d did not yield valid JSON: %s",
+        except ValueError as exc:
+            last_error, suffix = exc, GS_FIELD_RETRY_SUFFIX
+            log.info("Pair generation attempt %d/%d returned an unusable field: %s",
                      attempt + 1, _GENERATION_ATTEMPTS, exc)
+            continue
+        data = candidate
+        break
     if data is None:
         raise last_error or ValueError("no usable reply from the model")
 

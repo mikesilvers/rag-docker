@@ -2271,13 +2271,21 @@ Chunk:
 { "question": "...", "answer": "...", "ground_truth": "..." }
 ```
 
-Each chunk gets at most three attempts. If a reply has no JSON object, or its `question` or `answer` isn't a nonempty string (a missing key included), the API asks again with the same user message, up to two more times, and adds this to the end of the system prompt, starting with a space:
+Each chunk gets at most three attempts. A reply is usable when it holds a JSON object whose `question` and `answer` are nonempty strings and whose `ground_truth` is a nonempty string or left out; a left-out `ground_truth` defaults to the validated `answer`. A missing `question` or `answer`, or a null, list, object, number, boolean or blank value in any of the three, makes the reply unusable, and such a value is never stored as its Python representation. After an unusable reply the API asks again with the same user message, up to two more times, adding one of these texts to the end of the system prompt. Each starts with a space.
+
+After a reply with no JSON object:
 
 ```
  Your previous response was not valid JSON. Return ONLY the JSON object with keys: question, answer, ground_truth. No markdown, no explanation.
 ```
 
-After a third unusable reply the pair fails; §3.1.5 describes how failures are reported.
+After a JSON object with an unusable field:
+
+```
+ Your previous response did not give question, answer and ground_truth as nonempty strings. Return ONLY the JSON object with keys: question, answer, ground_truth, each a nonempty string. No markdown, no explanation.
+```
+
+After a third unusable reply the pair fails; §3.1.5 describes how failures are reported. A chunk whose source filename is null gives a pair with an empty `source_file`.
 
 ---
 
@@ -3148,6 +3156,7 @@ now lives once, in `api/services/ingest_config.py`.
       is one attempt plus two reprompts; the failures are independent between
       attempts.*
 - [x] Each pair has non-empty question, answer, ground_truth, and contexts fields.
+      *Evidence: `test_session_import.py` (#103, #273): null, list, object, numeric, boolean, blank and left-out model fields fail the pair within the three-attempt budget rather than being stored; a left-out `ground_truth` defaults to the answer; valid strings are stored unchanged.*
 - [x] Regenerate call replaces exactly one pair without affecting others; returns 409 if session is still generating.
       *Both halves originally failed. Regenerating mid-generation returned **500**,
       not 409 — there was no guard at all, and an unparseable model reply escaped
@@ -3543,8 +3552,6 @@ A rebuild from these documents is correct when:
       *Registered `14_reindex.sh`: 24 runtime cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling cases and 44 real backend/ASGI/restart checks pass on Python3.11 (4 shell groups, 0 failures). The actual API upload remains queued through cutover; its later supplied-vector write and original exact records both survive. A refused vectorizer mismatch leaves records/config/session bytes intact, and a forced final-create failure preserves recovery through an independent API lifespan.*
 
 Tuning requires each pre-cutover historical marker to be durable, either in its session or a pending marker. If both writes fail, replacement aborts before deleting the target. Post-mutation marker reporting retains its best-effort diagnostic contract.
-
-Generated model questions, answers and ground truths must be nonempty strings. Invalid field types consume the same bounded reprompt budget as malformed JSON; exhausted attempts fail the pair rather than publishing Python representations. An omitted ground truth defaults to the validated answer, and null source filenames normalize to an empty string.
 
 Overlap retains internal whitespace-only windows to preserve exact character coverage and overlap; wholly blank input yields no chunks. Hard character boundaries and fixed per-file limits remain the existing contract, rather than changing retrieval behavior in this follow-up.
 
