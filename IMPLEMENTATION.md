@@ -15786,6 +15786,13 @@ export default function ImportPage() {
     setNewColName('')
     setNewColError('')
     await loadCollections()
+    // A failed reload keeps the options already shown, which lack the new
+    // collection; the selector would then show another one while uploads go to
+    // the new one. Add it, so the selector shows it (#430). The next successful
+    // load replaces the options.
+    setCollections(prev => prev.some(c => c.name === created) ? prev : [...prev, {
+      name: created, object_count: 0, index_type: newColIndexType, distance_metric: 'cosine', created_at: null,
+    }])
     setCollection(created)
   }
 
@@ -30484,7 +30491,8 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     }
 
     // Import page "+ New": a refused create, then a successful one whose list
-    // reload fails, which is a list error, not a refused create.
+    // reload fails, which is a list error, not a refused create. The new
+    // collection stays selected and shown in the selector (#430).
     {
       const s = await session(browser, BASE, 'engineer');
       try {
@@ -30510,6 +30518,13 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
         const after = await alerts(s.page);
         r.check('Import: a successful create closes the modal even when the list reload fails', !done.open, JSON.stringify(done));
         r.check('Import: a failed reload after a create is shown as a failed list', after.includes(LIST_MESSAGE), JSON.stringify(after));
+        const selected = await s.page.evaluate(() => {
+          const label = [...document.querySelectorAll('label')].find(x => x.textContent.trim() === 'Collection');
+          const select = label && label.parentElement.querySelector('select');
+          return select ? { value: select.value, shown: select.selectedIndex >= 0 ? select.options[select.selectedIndex].text : null } : null;
+        });
+        r.check('Import: a create whose list reload fails leaves the new collection selected and shown (#430)',
+                !!selected && selected.value === 'VfyRefused379' && selected.shown === 'VfyRefused379', JSON.stringify(selected));
         await clickByText(s.page, '+ New'); await sleep(300);
         const fresh = await modal(s.page);
         r.check('Import: a successful create clears the message for the next attempt', fresh.open && fresh.alert === null, JSON.stringify(fresh));
