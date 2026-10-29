@@ -1,10 +1,12 @@
-"""Host-only check that the pinned dependencies are at or above their patched versions (#522).
+"""Host-only check that the pinned dependencies are at or above their patched versions (#522, #562).
 
-Reads the Python locks, api/requirements.in and ui/package-lock.json. The
-floors are the first patched versions of the Dependabot alerts #522 closed.
-filelock (3.x, no patched release that unstructured accepts) and
-postcss-selector-parser (6.x, required by tailwindcss 3) are left out on
-purpose; the #522 PR explains those alerts.
+Reads the Python locks, api/requirements.in, ui/package.json and
+ui/package-lock.json. The floors are the first patched versions of the
+Dependabot alerts #522 and #562 closed. filelock (3.x, no patched release that
+unstructured accepts) is left out on purpose; the #522 PR explains its alerts.
+postcss-selector-parser stays on 6.x (tailwindcss 3). Its nested copy under
+@tailwindcss/typography, which pins 6.0.10 exactly, is lifted by a scoped npm
+override in ui/package.json (#562).
 
 Standard library only; no Docker or stack needed.
 Run: python3 scripts/tests/test_dependency_floors.py
@@ -22,12 +24,14 @@ FLOORS = {
         'opentelemetry-api': '1.45.1', 'opentelemetry-sdk': '1.45.1', 'opentelemetry-proto': '1.45.1',
         'opentelemetry-exporter-otlp-proto-common': '1.45.1',
         'opentelemetry-exporter-otlp-proto-http': '1.45.1',
+        'authlib': '1.9.1',
     },
     'mcp/requirements.txt': {
         'certifi': '2026.10.19', 'pyjwt': '2.15.0', 'opentelemetry-api': '1.45.1',
     },
 }
-NPM_FLOORS = {'vite': '6.4.4', 'source-map-js': '1.2.2'}
+NPM_FLOORS = {'vite': '6.4.4', 'source-map-js': '1.2.2', 'postcss-selector-parser': '6.1.5'}
+TYPOGRAPHY_OVERRIDE = {'@tailwindcss/typography': {'postcss-selector-parser': '^6.1.5'}}
 OTEL_FAMILY = ('opentelemetry-api', 'opentelemetry-sdk', 'opentelemetry-proto',
                'opentelemetry-exporter-otlp-proto-common', 'opentelemetry-exporter-otlp-proto-http')
 
@@ -84,6 +88,22 @@ class DependencyFloorTests(unittest.TestCase):
                 for key, version in entries.items():
                     self.assertGreaterEqual(release(version), release(floor),
                                             '{} resolves {}, below {}'.format(key, version, floor))
+
+    def test_ui_postcss_selector_parser_stays_on_6x(self):
+        # tailwindcss 3 needs 6.x (Decision on #522); 6.1.5 is the patched 6.x release (#562).
+        packages = json.loads((ROOT / 'ui/package-lock.json').read_text())['packages']
+        entries = {key: value['version'] for key, value in packages.items()
+                   if key.endswith('node_modules/postcss-selector-parser')}
+        self.assertTrue(entries)
+        for key, version in entries.items():
+            with self.subTest(entry=key):
+                self.assertEqual(release(version)[0], 6, '{} resolves {}, not 6.x'.format(key, version))
+
+    def test_ui_typography_override(self):
+        # @tailwindcss/typography pins postcss-selector-parser 6.0.10 exactly; the
+        # scoped override lifts it to the patched 6.x line (#562).
+        manifest = json.loads((ROOT / 'ui/package.json').read_text())
+        self.assertEqual(manifest.get('overrides'), TYPOGRAPHY_OVERRIDE)
 
 
 if __name__ == '__main__':
