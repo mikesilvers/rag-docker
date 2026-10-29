@@ -476,7 +476,7 @@ class RestartGuardTests(unittest.TestCase):
 
     def test_every_restart_section_asks_first(self):
         for name in ('01_infrastructure.sh', '02_ingest.sh', '03_query.sh', '04_goldstandard.sh', '05_transfer.sh',
-                     '16_api_paths.sh', '17_auth.sh'):
+                     '16_api_paths.sh', '17_auth.sh', '19_audit.sh'):
             with self.subTest(suite=name):
                 text = (VERIFY / name).read_text()
                 block = text[text.index('if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]'):]

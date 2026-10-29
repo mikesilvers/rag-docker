@@ -17,6 +17,7 @@ from models.schemas import (
     CollectionsResponse,
     CreateCollectionRequest,
 )
+from services import audit
 from services import weaviate_client as wc
 from services.collection_writes import CollectionInUseError, aliases
 from utils import api_error, collection_check_unavailable
@@ -140,6 +141,7 @@ async def list_collections():
 
 @router.post("", status_code=201)
 async def create_collection(body: CreateCollectionRequest):
+    audit.note(collection=body.name)              # the audit record's collection (#29)
     try:
         exists = await wc.collection_exists(body.name)
     except Exception:                                 # noqa: BLE001

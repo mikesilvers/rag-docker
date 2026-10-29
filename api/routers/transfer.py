@@ -21,7 +21,7 @@ from models.schemas import (
     PackageListResponse,
     PackageSummary,
 )
-from services import age_stream, exporter, importer, packager
+from services import age_stream, audit, exporter, importer, packager
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError
 from utils import api_error, collection_check_unavailable, collection_deleting_error
@@ -32,6 +32,8 @@ _log = logging.getLogger(__name__)
 
 @router.post("/export", response_model=ExportStartResponse, status_code=202)
 async def start_export(body: ExportRequest):
+    # The audit record's parameters (#29): whether it is encrypted, never the passphrase.
+    audit.note(collection=body.collection, include_models=body.include_models, encrypted=body.passphrase is not None)
     try:
         exists = await wc.collection_exists(body.collection)
     except Exception:                                 # noqa: BLE001
@@ -73,6 +75,8 @@ async def export_job_status(job_id: str):
 
 @router.post("/import", response_model=ImportStartResponse, status_code=202)
 async def start_import(body: ImportRequest):
+    # The audit record's parameters (#29); the collection is added when the job ends.
+    audit.note(package=body.filename, on_conflict=body.on_conflict, encrypted=body.passphrase is not None)
     # Everything else — unreadable archive, bad digest, embedding mismatch,
     # name collision — is reported through the job, because it is only knowable
     # after reading the package, which takes long enough to need a job.

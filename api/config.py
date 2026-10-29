@@ -43,8 +43,19 @@ class Settings(BaseSettings):
     # refuses to start unless the cookie is Secure and an enabled Engineer
     # exists (lan_mode.py).
     rag_lan_mode: bool = False
+    # The audit log (#29): append-only JSON Lines in the ingest_uploads volume,
+    # rotated by size (services/audit.py). The folder is its own setting so
+    # tests that point upload_dir elsewhere don't find an audit/ folder there.
+    audit_dir: str = "/app/uploads/audit"
+    # Whether a query's question text is recorded. Off by default; an operator
+    # setting only, no route or page changes it.
+    audit_log_questions: bool = False
+    # audit.jsonl is rotated once it reaches this size; this many rotated files
+    # are kept (audit.jsonl.1 newest), the oldest beyond them deleted.
+    audit_log_max_bytes: int = 10 * 1024 * 1024
+    audit_log_keep: int = 10
 
-    @field_validator("auth_cookie_secure", "rag_lan_mode", mode="before")
+    @field_validator("auth_cookie_secure", "rag_lan_mode", "audit_log_questions", mode="before")
     @classmethod
     def _exact_boolean(cls, value, info):
         # pydantic would read "1", "yes" or "on" as true. A typo in a security
@@ -54,6 +65,21 @@ class Settings(BaseSettings):
         if value in ("true", "false"):
             return value == "true"
         raise ValueError(f"{info.field_name.upper()} must be exactly true or false")
+
+    @field_validator("audit_log_max_bytes")
+    @classmethod
+    def _rotation_size(cls, value):
+        # One record must fit; a smaller limit would rotate on every write.
+        if value < 4096:
+            raise ValueError("AUDIT_LOG_MAX_BYTES must be at least 4096")
+        return value
+
+    @field_validator("audit_log_keep")
+    @classmethod
+    def _rotation_keep(cls, value):
+        if not 1 <= value <= 1000:
+            raise ValueError("AUDIT_LOG_KEEP must be 1 to 1000")
+        return value
 
     class Config:
         env_file = ".env"

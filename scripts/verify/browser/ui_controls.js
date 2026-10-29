@@ -405,7 +405,7 @@ function usersCases() {
   return [
     { name: 'Engineer nav has Users, which opens the Users page', open: { role: 'engineer', path: '/qa', routes: usersApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
-      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys']);
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys', 'Audit']);
       await press(s.page, 'Users', 'nav a');
       await waitPath(s.page, '/users');
       await waitText(s.page, 'vfy-developer');
@@ -534,9 +534,9 @@ function serviceKeysCases() {
   const status = (page, name) => page.evaluate(n => document.querySelector(`section[data-principal="${n}"] [data-testid=principal-status]`)?.textContent.trim(), name);
   const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
   return [
-    { name: 'Engineer nav ends with Service keys, which opens the page', open: { role: 'engineer', path: '/qa', routes: keysApi() }, async run(s) {
+    { name: 'Engineer nav has Service keys after Users, which opens the page', open: { role: 'engineer', path: '/qa', routes: keysApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
-      assert.equal((await nav(s.page)).at(-1), 'Service keys');
+      assert.deepEqual((await nav(s.page)).slice(-3, -1), ['Users', 'Service keys']);
       await press(s.page, 'Service keys', 'nav a');
       await waitPath(s.page, '/service-keys');
       await waitText(s.page, 'vfy-svc');
@@ -805,6 +805,89 @@ function proxyCases() {
   ];
 }
 
+// The Audit page (#29): Engineers filter and page through the audit log and
+// download its CSV. The API is stubbed; the real routes are checked in 19_audit.sh.
+function auditCases() {
+  const rec = (id, over = {}) => ({ id, time: '2026-10-29T12:00:00.123Z', actor: 'vfy-developer', actor_kind: 'user', role: 'developer', key_id: null, client_ip: '192.168.65.1', action: 'export', collection: 'VfyUiA', target: null, result: 'accepted', status_code: 202, job_id: 'job12345', details: { encrypted: true }, ...over });
+  const FIRST = [rec('1761739200123000000-aaaaaa'), rec('1761739200000000000-bbbbbb', { actor: 'nightly', actor_kind: 'service', key_id: 'keyid0000001', action: 'query', result: 'refused', status_code: 403, job_id: null, details: { code: 'FORBIDDEN' } })];
+  const OLDER = [rec('1761739100000000000-cccccc', { actor: null, actor_kind: 'anonymous', role: null, action: 'auth.login', collection: null, target: 'Nobody', result: 'refused', status_code: 401, job_id: null, details: { code: 'LOGIN_FAILED' } })];
+  const auditApi = (over = {}) => base({
+    'GET /api/audit': call => {
+      const q = new URLSearchParams(call.query);
+      if (q.get('before')) return json(200, { records: OLDER, next_before: null, failed_writes: 0, question_text_logged: false });
+      return json(200, { records: FIRST, next_before: FIRST[1].id, failed_writes: over.failed || 0, question_text_logged: !!over.questions });
+    },
+  });
+  const rows = page => page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => [...r.querySelectorAll('td')].map(c => c.textContent.trim())));
+  const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
+  // The older page's answer waits for olderGate, so the page stays loading.
+  const olderGate = hold();
+  const heldOlder = () => {
+    const routes = auditApi(), answer = routes['GET /api/audit'];
+    routes['GET /api/audit'] = async call => {
+      if (new URLSearchParams(call.query).get('before')) await olderGate.promise;
+      return answer(call);
+    };
+    return routes;
+  };
+  return [
+    { name: 'Engineer nav ends with Audit, which opens the page', open: { role: 'engineer', path: '/qa', routes: auditApi() }, async run(s) {
+      await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
+      assert.equal((await nav(s.page)).at(-1), 'Audit');
+      await press(s.page, 'Audit', 'nav a');
+      await waitPath(s.page, '/audit');
+      await waitText(s.page, 'nightly (key keyid0000001)');
+    } },
+    ...['developer', 'end_user'].map(role => ({ name: `${role === 'developer' ? 'Developer' : 'End User'} has no Audit link and is sent from /audit to Q&A`, open: { role, path: '/qa', routes: base() }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      assert.equal((await nav(s.page)).includes('Audit'), false);
+      await goto(s.page, '/audit');
+      await waitText(s.page, 'Ask a Question');
+      await waitPath(s.page, '/qa');
+      assert.equal(callsTo(s, 'GET', '/api/audit').length, 0);
+    } })),
+    { name: 'The table lists the records, newest first; Older and Newest page through them', open: { role: 'engineer', path: '/audit', routes: auditApi() }, async run(s) {
+      await waitText(s.page, 'nightly (key keyid0000001)');
+      const shown = await rows(s.page);
+      assert.deepEqual(shown[0], ['2026-10-29 12:00:00.123', 'vfy-developer', 'developer', '192.168.65.1', 'export', 'VfyUiA', '', 'accepted (202)', 'job12345', '{"encrypted":true}']);
+      assert.equal(shown[1][7], 'refused (403)');
+      await press(s.page, 'Older');
+      await waitText(s.page, 'Nobody');
+      assert.equal((await rows(s.page))[0][1], 'anonymous');
+      assert.match(callsTo(s, 'GET', '/api/audit').at(-1).query, /before=1761739200000000000-bbbbbb/);
+      await press(s.page, 'Newest');
+      await waitText(s.page, 'vfy-developer');
+      assert.doesNotMatch(callsTo(s, 'GET', '/api/audit').at(-1).query, /before=/);
+    } },
+    { name: 'Apply sends the filters (times as UTC) and the CSV link carries the same filters', open: { role: 'engineer', path: '/audit', routes: auditApi() }, async run(s) {
+      await waitText(s.page, 'vfy-developer');
+      await fill(s.page, '#audit-actor', 'vfy-developer');
+      await fill(s.page, '#audit-action', 'export');
+      await fill(s.page, '#audit-result', 'accepted');
+      await fill(s.page, '#audit-from', '2026-10-29T08:30');
+      await press(s.page, 'Apply');
+      await waitFor(s.page, () => document.querySelector('[data-testid=audit-csv]').getAttribute('href').includes('actor='), 'the CSV link to carry the filters');
+      const q = new URLSearchParams(callsTo(s, 'GET', '/api/audit').at(-1).query);
+      assert.deepEqual([q.get('actor'), q.get('action'), q.get('result'), q.get('from')], ['vfy-developer', 'export', 'accepted', '2026-10-29T08:30Z']);
+      const href = await s.page.$eval('[data-testid=audit-csv]', a => a.getAttribute('href'));
+      assert.equal(href, '/api/audit.csv?from=2026-10-29T08%3A30Z&actor=vfy-developer&action=export&result=accepted');
+    } },
+    { name: 'A double click on Older asks for the older page once, and Older waits while it loads', open: { role: 'engineer', path: '/audit', routes: heldOlder() }, async run(s) {
+      await waitText(s.page, 'nightly (key keyid0000001)');
+      await s.page.evaluate(() => { const b = [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Older'); b.click(); b.click(); });
+      await waitFor(s.page, () => !!document.querySelector('[data-testid=audit-loading]'), 'the loading note');
+      assert.deepEqual(await buttonState(s.page, 'Older'), { disabled: true });
+      olderGate.release();
+      await waitText(s.page, 'Nobody');
+      assert.equal(callsTo(s, 'GET', '/api/audit').filter(c => /before=/.test(c.query)).length, 1);
+    } },
+    { name: 'The page says whether question text is logged and warns about failed writes', open: { role: 'engineer', path: '/audit', routes: auditApi({ failed: 2, questions: true }) }, async run(s) {
+      await waitText(s.page, 'Question text is being recorded');
+      await waitText(s.page, '2 audit record(s) could not be written');
+    } },
+  ];
+}
+
 async function runUiControlTests(browser, baseUrl, reporter) {
   S.BASE = baseUrl;
   const run = (section, cases) => S.runCases(browser, baseUrl, reporter, section, cases);
@@ -814,6 +897,7 @@ async function runUiControlTests(browser, baseUrl, reporter) {
   await run('Login, logout, setup and password changes (#25)', authCases());
   await run('Users page: Engineers manage accounts (#25)', usersCases());
   await run('Service keys page: Engineers manage service principals and keys (#25)', serviceKeysCases());
+  await run('Audit page: Engineers read the audit log (#29)', auditCases());
   await run('Q&A input, citations toggle, answer display and End User view (#400)', qaCases());
   await run('Retrieval page status text, alpha slider and save (#400)', retrievalCases());
   await run('Client handling of the proxy error pages (#400)', proxyCases());

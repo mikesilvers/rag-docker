@@ -10,7 +10,7 @@ import asyncio
 from fastapi import APIRouter
 
 from models.schemas import CollectionName, RetrievalConfigResponse, SaveRetrievalConfigBody
-from services import retrieval_config
+from services import audit, retrieval_config
 
 router = APIRouter(prefix="/retrieval")
 
@@ -23,6 +23,7 @@ async def get_retrieval_config(collection: CollectionName):
 
 @router.post("/config", response_model=RetrievalConfigResponse, status_code=201)
 async def save_retrieval_config(body: SaveRetrievalConfigBody):
+    audit.note(collection=body.collection)        # the audit record's collection (#29)
     cfg = body.model_dump()
     await asyncio.to_thread(retrieval_config.save, cfg)
     return RetrievalConfigResponse(is_default=False, **cfg)

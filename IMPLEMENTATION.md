@@ -151,6 +151,14 @@ services:
       # docker-compose.lan.yml serves TLS and sets it true (#26). Exactly true
       # or false.
       AUTH_COOKIE_SECURE: "false"
+      # The audit log (#29), in the ingest_uploads volume under audit/ and read
+      # on the AI Engineer's Audit page. Whether a query's question text is
+      # recorded: exactly true or false, off by default. audit.jsonl is rotated
+      # at AUDIT_LOG_MAX_BYTES (at least 4096) and AUDIT_LOG_KEEP rotated files
+      # (1-1000) are kept, the oldest deleted. LAN mode keeps these settings.
+      AUDIT_LOG_QUESTIONS: "false"
+      AUDIT_LOG_MAX_BYTES: "10485760"
+      AUDIT_LOG_KEEP: "10"
     volumes:
       - ingest_uploads:/app/uploads
       # Accounts, sessions and the login throttle (#25), one SQLite file.
@@ -899,8 +907,19 @@ class Settings(BaseSettings):
     # refuses to start unless the cookie is Secure and an enabled Engineer
     # exists (lan_mode.py).
     rag_lan_mode: bool = False
+    # The audit log (#29): append-only JSON Lines in the ingest_uploads volume,
+    # rotated by size (services/audit.py). The folder is its own setting so
+    # tests that point upload_dir elsewhere don't find an audit/ folder there.
+    audit_dir: str = "/app/uploads/audit"
+    # Whether a query's question text is recorded. Off by default; an operator
+    # setting only, no route or page changes it.
+    audit_log_questions: bool = False
+    # audit.jsonl is rotated once it reaches this size; this many rotated files
+    # are kept (audit.jsonl.1 newest), the oldest beyond them deleted.
+    audit_log_max_bytes: int = 10 * 1024 * 1024
+    audit_log_keep: int = 10
 
-    @field_validator("auth_cookie_secure", "rag_lan_mode", mode="before")
+    @field_validator("auth_cookie_secure", "rag_lan_mode", "audit_log_questions", mode="before")
     @classmethod
     def _exact_boolean(cls, value, info):
         # pydantic would read "1", "yes" or "on" as true. A typo in a security
@@ -910,6 +929,21 @@ class Settings(BaseSettings):
         if value in ("true", "false"):
             return value == "true"
         raise ValueError(f"{info.field_name.upper()} must be exactly true or false")
+
+    @field_validator("audit_log_max_bytes")
+    @classmethod
+    def _rotation_size(cls, value):
+        # One record must fit; a smaller limit would rotate on every write.
+        if value < 4096:
+            raise ValueError("AUDIT_LOG_MAX_BYTES must be at least 4096")
+        return value
+
+    @field_validator("audit_log_keep")
+    @classmethod
+    def _rotation_keep(cls, value):
+        if not 1 <= value <= 1000:
+            raise ValueError("AUDIT_LOG_KEEP must be 1 to 1000")
+        return value
 
     class Config:
         env_file = ".env"
@@ -8104,6 +8138,12 @@ the finished records saved longest ago, from memory and from disk; a removed
 job reads 404, as it would after a restart. A `queued` or `running` record is
 never removed, so a store can briefly hold more while that many jobs run (#309).
 
+**Audit (#29).** A job started by an audited request gets its `accepted`
+audit record when its record is first stored, and one end record when it first
+reaches a terminal status, or is marked interrupted at startup. What the end
+record needs is kept in the job record as `_audit` (the status answers ignore
+it), with `ended` set once that record is written.
+
 A job record is never recovery authority: retained import and tuning data is
 owned by `collection_recovery` and the import markers (#43, #44), never by
 anything in `jobs/`.
@@ -8122,6 +8162,7 @@ from collections.abc import MutableMapping
 from pathlib import Path
 
 from config import settings
+from services import audit
 
 _log = logging.getLogger(__name__)
 
@@ -8221,6 +8262,13 @@ class JobStore(MutableMapping):
             old = self._records.get(job_id)
             if isinstance(old, _Job):
                 self._cancel(old)
+            if old is None:
+                # Inside an audited request this writes the job's `accepted`
+                # record (#29), before the job can end, and returns what its
+                # end record needs; kept in the record, so a restart has it.
+                snapshot = audit.job_started(job_id)
+                if snapshot is not None:
+                    dict.__setitem__(record, "_audit", snapshot)
             self._records[job_id] = record
             self._write(record, durable=True)
             if old is None:
@@ -8308,7 +8356,12 @@ class JobStore(MutableMapping):
         with self._lock:
             if status_changed or record.get("status") in TERMINAL:
                 self._cancel(record)
+                ended = status_changed and record.get("status") in TERMINAL and _audit_open(record)
+                if ended:
+                    record["_audit"]["ended"] = True    # saved by the write below
                 self._write(record, durable=True)
+                if ended:
+                    audit.job_ended(record, interrupted=False)
                 return
             now = time.monotonic()
             if now - record._last >= THROTTLE_S:
@@ -8413,7 +8466,12 @@ class JobStore(MutableMapping):
                 self._records[path.stem] = record
                 if record.get("status") not in TERMINAL:
                     self._mark_interrupted(record)
+                    ended = _audit_open(record)
+                    if ended:
+                        record["_audit"]["ended"] = True
                     self._write(record, durable=True)
+                    if ended:
+                        audit.job_ended(record, interrupted=True)
                     marked.append(path.stem)
             return marked
 
@@ -8434,6 +8492,12 @@ class JobStore(MutableMapping):
             dict.__setitem__(record, "status", "failed")
             dict.__setitem__(record, "error_code", "INTERRUPTED")
             dict.__setitem__(record, "error", f"{INTERRUPTED_MESSAGE} {_REMEDY[self.kind]}")
+
+
+def _audit_open(record: dict) -> bool:
+    """The job's start was audited and its end not yet (#29): one end record per job."""
+    snapshot = dict.get(record, "_audit")
+    return isinstance(snapshot, dict) and not snapshot.get("ended")
 
 
 def _mtime(path: Path) -> float:
@@ -10803,6 +10867,7 @@ from models.schemas import (
     CollectionsResponse,
     CreateCollectionRequest,
 )
+from services import audit
 from services import weaviate_client as wc
 from services.collection_writes import CollectionInUseError, aliases
 from utils import api_error, collection_check_unavailable
@@ -10926,6 +10991,7 @@ async def list_collections():
 
 @router.post("", status_code=201)
 async def create_collection(body: CreateCollectionRequest):
+    audit.note(collection=body.name)              # the audit record's collection (#29)
     try:
         exists = await wc.collection_exists(body.name)
     except Exception:                                 # noqa: BLE001
@@ -11041,7 +11107,7 @@ from pydantic import ValidationError
 from config import settings
 from models.schemas import (CollectionName, IngestConfig, IngestConfigResponse,
                             IngestUploadResponse, JobStatusResponse)
-from services import ingest_config
+from services import audit, ingest_config
 from services import ingest_pipeline
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError, canonical
@@ -11069,6 +11135,10 @@ async def ingest_upload(
     # A form field's default is not validated through CollectionName, so the
     # stored-name rule is applied here (#372).
     collection = canonical(collection)
+    # The audit record's parameters (#29): the uploaded files' names and sizes,
+    # never their content.
+    audit.note(collection=collection, files=[f.filename for f in files], file_count=len(files),
+               total_bytes=sum(f.size or 0 for f in files))
     try:
         return await _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
                                     similarity_threshold, min_chunk_size, files)
@@ -11142,6 +11212,7 @@ async def get_ingest_config(collection: CollectionName):
 
 @router.post("/config", response_model=IngestConfigResponse, status_code=201)
 async def save_ingest_config(body: SaveIngestConfigBody):
+    audit.note(collection=body.collection)        # the audit record's collection (#29)
     cfg = body.model_dump()
     await asyncio.to_thread(ingest_config.save, cfg)
     return IngestConfigResponse(is_default=False, **cfg)
@@ -11157,7 +11228,8 @@ import logging
 from fastapi import APIRouter
 
 from models.schemas import QueryRequest, QueryResponse
-from services import metrics
+from config import settings
+from services import audit, metrics
 from services import rag_pipeline
 from services import weaviate_client as wc
 from utils import api_error, collection_check_unavailable
@@ -11184,6 +11256,11 @@ def _unavailable(collection: str, exc: rag_pipeline.ServiceUnavailable):
 
 @router.post("", response_model=QueryResponse)
 async def run_query(body: QueryRequest):
+    # The audit record's parameters (#29); the question only when the operator
+    # turned AUDIT_LOG_QUESTIONS on, and never the answer.
+    audit.note(collection=body.collection, retrieval_mode=body.retrieval_mode, top_k=body.top_k,
+               alpha=body.alpha, response_format=body.response_format, include_citations=body.include_citations,
+               **({"question": body.question} if settings.audit_log_questions else {}))
     try:
         exists = await wc.collection_exists(body.collection)
     except Exception:                                 # noqa: BLE001
@@ -11233,7 +11310,7 @@ import asyncio
 from fastapi import APIRouter
 
 from models.schemas import CollectionName, RetrievalConfigResponse, SaveRetrievalConfigBody
-from services import retrieval_config
+from services import audit, retrieval_config
 
 router = APIRouter(prefix="/retrieval")
 
@@ -11246,6 +11323,7 @@ async def get_retrieval_config(collection: CollectionName):
 
 @router.post("/config", response_model=RetrievalConfigResponse, status_code=201)
 async def save_retrieval_config(body: SaveRetrievalConfigBody):
+    audit.note(collection=body.collection)        # the audit record's collection (#29)
     cfg = body.model_dump()
     await asyncio.to_thread(retrieval_config.save, cfg)
     return RetrievalConfigResponse(is_default=False, **cfg)
@@ -11277,7 +11355,7 @@ from models.schemas import (
     PackageListResponse,
     PackageSummary,
 )
-from services import age_stream, exporter, importer, packager
+from services import age_stream, audit, exporter, importer, packager
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError
 from utils import api_error, collection_check_unavailable, collection_deleting_error
@@ -11288,6 +11366,8 @@ _log = logging.getLogger(__name__)
 
 @router.post("/export", response_model=ExportStartResponse, status_code=202)
 async def start_export(body: ExportRequest):
+    # The audit record's parameters (#29): whether it is encrypted, never the passphrase.
+    audit.note(collection=body.collection, include_models=body.include_models, encrypted=body.passphrase is not None)
     try:
         exists = await wc.collection_exists(body.collection)
     except Exception:                                 # noqa: BLE001
@@ -11329,6 +11409,8 @@ async def export_job_status(job_id: str):
 
 @router.post("/import", response_model=ImportStartResponse, status_code=202)
 async def start_import(body: ImportRequest):
+    # The audit record's parameters (#29); the collection is added when the job ends.
+    audit.note(package=body.filename, on_conflict=body.on_conflict, encrypted=body.passphrase is not None)
     # Everything else — unreadable archive, bad digest, embedding mismatch,
     # name collision — is reported through the job, because it is only knowable
     # after reading the package, which takes long enough to need a job.
@@ -11420,7 +11502,7 @@ from models.schemas import (
     TuneOptionsResponse,
     TuneStartResponse,
 )
-from services import sources, tuning
+from services import audit, sources, tuning
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError
 from utils import api_error, collection_deleting_error
@@ -11430,6 +11512,7 @@ _log = logging.getLogger(__name__)
 
 
 async def _start(collection: str, operation: str, params: dict):
+    audit.note(collection=collection, operation=operation)   # the audit record's parameters (#29)
     try:
         exists = await wc.collection_exists(collection)
     except Exception:                                 # noqa: BLE001
@@ -11575,6 +11658,7 @@ from models.schemas import (
     SessionResponse,
     SessionValidity,
 )
+from services import audit
 from services import goldstandard as gs
 from services import weaviate_client as wc
 from utils import api_error, collection_check_unavailable
@@ -11657,12 +11741,14 @@ async def regenerate(body: RegenerateRequest):
 
 @router.post("/save", response_model=SaveResponse)
 async def save(body: SaveRequest):
+    audit.note(session_id=body.session_id, file=body.filename)   # the audit record's parameters (#29)
     try:
         result = await gs.save_session(body.session_id, body.filename, body.allow_historical)
     except gs.GoldStandardError as exc:
         return api_error(exc.status, exc.code, exc.message)
     if result is None:
         return api_error(404, "SESSION_NOT_FOUND", f"Session '{body.session_id}' not found.")
+    audit.note(file=result.get("filename"))
     return SaveResponse(**result)
 
 
@@ -12772,6 +12858,9 @@ ACCESS: dict[tuple[str, str], str] = {
     ("POST", "/auth/service-principals/{name}/enable"): ENGINEER,
     ("POST", "/auth/service-principals/{name}/keys"): ENGINEER,
     ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke"): ENGINEER,
+    # The audit log (#29): Engineers, in a browser session only (HUMAN_ONLY).
+    ("GET", "/audit"): ENGINEER,
+    ("GET", "/audit.csv"): ENGINEER,
     # FastAPI's own API docs (N5).
     ("GET", "/docs"): ENGINEER,
     ("GET", "/docs/oauth2-redirect"): ENGINEER,
@@ -12783,10 +12872,11 @@ ACCESS: dict[tuple[str, str], str] = {
 # Routes an API key can't use, whatever its principal's role (S5 of PR 3):
 # account, principal and key administration, so a leaked key can't mint further
 # keys or accounts that outlive its revocation, and the session's own routes.
-# GET /auth/me answers for a key.
+# GET /auth/me answers for a key. The audit log too (#29): a leaked key can't
+# read who did what, or question text when that is recorded.
 HUMAN_ONLY = frozenset(path for _, path in ACCESS
                        if path.startswith(("/auth/users", "/auth/service-principals"))) | {
-    "/auth/logout", "/auth/password"}
+    "/auth/logout", "/auth/password", "/audit", "/audit.csv"}
 
 
 def required(method: str, path: str) -> str | None:
@@ -13394,6 +13484,9 @@ header alone decides and any cookie is ignored, with no fallback to it.
   403 FORBIDDEN               the principal's role is too low
 It has no origin check (it carries no cookie, Q26) and no password change.
 
+Each 403 comes back with the principal it refused, which the audit log
+(#29) records; a 401 or 503 comes back with none.
+
 A route with no policy entry is never matched here, so it falls through to the
 app; test_auth.py fails when any route lacks an entry.
 """
@@ -13495,6 +13588,10 @@ class AuthMiddleware:
             # Request tracing labels a request by the route it reached (its
             # `path`); give a refused request the same label the router would.
             scope["route"] = SimpleNamespace(path=template)
+            if principal is not None:
+                # A 403 for an identified principal, for the audit log (#29).
+                # Never `auth`: nothing may treat this request as allowed.
+                scope.setdefault("state", {})["audit_refused"] = principal
             return await refusal(scope, receive, send)
         scope.setdefault("state", {})["auth"] = principal
         return await self.app(scope, receive, send)
@@ -13512,13 +13609,13 @@ class AuthMiddleware:
             return api_error(401, "AUTH_REQUIRED", "Log in to use this."), None
         if scope["method"] in UNSAFE and not same_origin(scope):
             return api_error(403, "CROSS_ORIGIN_REFUSED",
-                             "This request came from another site and was refused."), None
+                             "This request came from another site and was refused."), principal
         if principal.must_change_password and access != policy.SESSION:
             return api_error(403, "PASSWORD_CHANGE_REQUIRED",
-                             "Change your password before doing anything else."), None
+                             "Change your password before doing anything else."), principal
         if access != policy.SESSION and policy.rank(principal.role) < policy.rank(access):
             return api_error(403, "FORBIDDEN", "Your role can't do this.",
-                             detail={"required_role": access}), None
+                             detail={"required_role": access}), principal
         return None, principal
 
     async def _check_key(self, access, template, authorization):
@@ -13527,10 +13624,10 @@ class AuthMiddleware:
         if principal is None:
             return api_error(401, "KEY_INVALID", "The API key is invalid, expired or revoked."), None
         if template in policy.HUMAN_ONLY:
-            return api_error(403, "KEY_NOT_ALLOWED", "API keys can't be used for this."), None
+            return api_error(403, "KEY_NOT_ALLOWED", "API keys can't be used for this."), principal
         if access != policy.SESSION and policy.rank(principal.role) < policy.rank(access):
             return api_error(403, "FORBIDDEN", "Your role can't do this.",
-                             detail={"required_role": access}), None
+                             detail={"required_role": access}), principal
         return None, principal
 
 
@@ -13581,6 +13678,10 @@ the app; this command issues no key. `list` shows principals too, marked
 "service account"; set-role, disable and enable work on them (disabling one
 stops its keys, an escape hatch for a leaked key when no Engineer can log in);
 reset-password refuses one, since it has no password.
+
+Every action but `list` that reaches the store, done or refused, is also an
+audit record (#29) with actor `operator`; the generated password never is. A
+record that can't be written is one more line on standard error.
 """
 from __future__ import annotations
 
@@ -13590,6 +13691,16 @@ import time
 
 from . import passwords, store
 from .policy import ROLES
+
+
+def _audit(command: str, username: str, role: str | None, code: str | None = None) -> None:
+    from services import audit
+    details = {"role": role} if role and command in ("bootstrap", "create-user", "set-role") else {}
+    if code:
+        details["code"] = code
+    if not audit.record("operator." + command, result="refused" if code else "success", actor="operator",
+                        actor_kind="operator", target=username, details=details):
+        _say(f"{command}: the audit record could not be written")
 
 
 def _say(line: str) -> None:
@@ -13660,7 +13771,11 @@ def main(argv=None) -> int:
                       f"{password}\t{created}")
     except store.Refused as exc:
         _say(f"{args.command} refused: {exc}")
+        if args.command != "list":
+            _audit(args.command, username, role, exc.code)
         return 1
+    if args.command != "list":
+        _audit(args.command, username, role)
     return 0
 
 
@@ -13745,6 +13860,11 @@ auth/middleware.py before a route runs; the /auth/users and
 /auth/service-principals routes need an Engineer's session (an API key can't
 use them). The first account is created by the operator command, `python -m
 auth`, which also recovers lockouts.
+
+Each of these requests that logs in, changes something or is refused is also an
+audit record (#29), written by services/audit.py's middleware with what the
+handlers note here (a typed username, a new role, a key's id; never a password
+or a key). The WARNING log lines are unchanged.
 """
 from __future__ import annotations
 
@@ -13757,6 +13877,7 @@ from fastapi.responses import JSONResponse
 
 from auth import passwords, store
 from config import settings
+from services import audit
 from models.schemas import (AdminUserList, AdminUserResult, AuthStatus, AuthUser, KeyIssueRequest, LoginRequest,
                             PasswordChangeRequest, PrincipalCreateRequest, RoleChangeRequest,
                             ServicePrincipalList, ServicePrincipalResult, UserCreateRequest)
@@ -13819,6 +13940,12 @@ async def login(body: LoginRequest, request: Request):
                          "`docker compose exec api python -m auth bootstrap <username>`.")
     address = _address(request)
     outcome, user, token = await asyncio.to_thread(_login, body.username, body.password, address)
+    # The audit record (#29): a success names the account, a failure the
+    # username as typed; never the password.
+    if outcome == "ok":
+        audit.identify(user.username, user.role)
+    else:
+        audit.note(target=body.username)
     if outcome == "throttled":
         _log.warning("Login refused for %r from %s: too many failed attempts", body.username, address)
         return api_error(429, "LOGIN_THROTTLED", "Too many failed logins. Wait 15 minutes and try again.")
@@ -13936,6 +14063,7 @@ def _create(username: str, role: str):
 async def create_user(body: UserCreateRequest, request: Request):
     actor = request.state.auth.username
     username = passwords.normalize_username(body.username)
+    audit.note(target=username or body.username, role=body.role)
     if username is None:
         _log.warning("Admin %r: create of %r refused: invalid username", actor, body.username)
         return api_error(422, "INVALID_USERNAME", f"The username must be {passwords.USERNAME_RULE}.")
@@ -13986,6 +14114,7 @@ async def set_user_role(username: str, body: RoleChangeRequest, request: Request
     if target is None:
         return _not_found(actor, "set-role", username)
     try:
+        audit.note(role=body.role)
         user = await asyncio.to_thread(_apply, store.set_role, target, body.role, "user")
     except store.Refused as exc:
         return _refused(actor, "set-role", target, exc)
@@ -14064,6 +14193,7 @@ async def list_principals():
 async def create_principal(body: PrincipalCreateRequest, request: Request):
     actor = request.state.auth.username
     name = passwords.normalize_username(body.name)
+    audit.note(target=name or body.name, role=body.role)
     if name is None:
         _log.warning("Admin %r: create of service principal %r refused: invalid name", actor, body.name)
         return api_error(422, "INVALID_USERNAME", f"The name must be {passwords.USERNAME_RULE}.")
@@ -14087,6 +14217,7 @@ async def set_principal_role(name: str, body: RoleChangeRequest, request: Reques
     if target is None:
         return _principal_not_found(actor, "set-role", name)
     try:
+        audit.note(role=body.role)
         principal = await asyncio.to_thread(_change_principal, store.set_role, target, body.role)
     except store.Refused as exc:
         return _principal_refused(actor, "set-role", target, exc)
@@ -14134,6 +14265,7 @@ async def issue_key(name: str, body: KeyIssueRequest, request: Request):
         principal, key, secret = await asyncio.to_thread(_issue, target, body.days, body.label)
     except store.Refused as exc:
         return _principal_refused(actor, "issue-key", target, exc)
+    audit.note(key_id=key.id, expires_at=_iso(key.expires_at))   # the id, never the key (#29)
     _log.warning("Admin %r issued key %s for service principal %r, expiring %s", actor, key.id, target,
                  _iso(key.expires_at))
     return JSONResponse({"principal": _principal_body(principal), "key": _key_body(key, time.time()),
@@ -14157,6 +14289,599 @@ async def revoke_key(name: str, key_id: str, request: Request):
         return _principal_refused(actor, "revoke-key", target, exc)
     _log.warning("Admin %r revoked key %s of service principal %r", actor, key_id, target)
     return JSONResponse({"principal": _principal_body(principal)})
+```
+
+The audit log (#29). `api/services/audit.py` writes, rotates and reads the log and records each audited request in its middleware; `api/routers/audit.py` serves it to AI Engineers. See SPECIFICATIONS.md §3.1.9.
+
+### api/services/audit.py
+
+```python
+"""The audit log (#29): who did what, to which data, with what result.
+
+Append-only JSON Lines in `settings.audit_dir` (`/app/uploads/audit/` on the
+ingest_uploads volume): `audit.jsonl`, rotated by size to `audit.jsonl.1`
+(newest) ... `audit.jsonl.<keep>` (oldest), the oldest beyond that deleted.
+Nothing edits or deletes a record otherwise. SPECIFICATIONS.md §3.1.9.
+
+**What writes a record.** `AuditMiddleware` records each request to a route in
+ACTIONS once its answer has been sent: the actor from the server-side
+principal (never the client), the address nginx saw (X-Real-IP), the result
+from the status and the error envelope's code. Handlers add what only they
+know with `note()` (a collection named in a body, file names, a typed
+username). A refusal by the auth middleware is recorded only when it is a 403
+for an identified principal; 401s and 503s write nothing. Jobs get one record
+when they are stored (`job_started`, called by the job store) and one when they
+end (`job_ended`). The operator command and the API's start write their own.
+
+**What never does.** No password, session token, API key, passphrase, answer
+or document text reaches a record: handlers note named parameters only, and a
+query's question text only when AUDIT_LOG_QUESTIONS is true.
+
+**Writing never blocks an action.** A record that can't be written is one
+ERROR line on the `audit` logger and one more in `failed_writes()`; the action
+answers as it would have. The API (threads) and the operator command (another
+process in the same container) append under a thread lock and an flock on
+`.lock`, so each record is one whole line and rotation never races an append.
+`id` and `time` are assigned under that lock, so the files' line order is the
+order of ids, which is what makes `before` a stable cursor.
+"""
+from __future__ import annotations
+
+import asyncio
+import contextvars
+import csv
+import fcntl
+import io
+import json
+import logging
+import os
+import re
+import secrets
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from config import settings
+
+_log = logging.getLogger("audit")
+
+FILE = "audit.jsonl"
+# Every request route that is audited, by policy template, and its action name.
+ACTIONS: dict[tuple[str, str], str] = {
+    ("POST", "/auth/login"): "auth.login",
+    ("POST", "/auth/logout"): "auth.logout",
+    ("POST", "/auth/password"): "auth.password",
+    ("POST", "/query"): "query",
+    ("POST", "/collections"): "collection.create",
+    ("DELETE", "/collections/{name}"): "collection.delete",
+    ("POST", "/ingest/upload"): "ingest",
+    ("POST", "/ingest/config"): "ingest.config",
+    ("POST", "/retrieval/config"): "retrieval.config",
+    ("POST", "/export"): "export",
+    ("POST", "/import"): "import",
+    ("POST", "/tune/rechunk"): "tune.rechunk",
+    ("POST", "/tune/reembed"): "tune.reembed",
+    ("POST", "/tune/reindex"): "tune.reindex",
+    ("POST", "/goldstandard/save"): "goldstandard.save",
+    ("GET", "/goldstandard/download/{filename}"): "goldstandard.download",
+    ("POST", "/auth/users"): "admin.user.create",
+    ("POST", "/auth/users/{username}/reset-password"): "admin.user.reset-password",
+    ("POST", "/auth/users/{username}/role"): "admin.user.set-role",
+    ("POST", "/auth/users/{username}/disable"): "admin.user.disable",
+    ("POST", "/auth/users/{username}/enable"): "admin.user.enable",
+    ("POST", "/auth/service-principals"): "admin.principal.create",
+    ("POST", "/auth/service-principals/{name}/role"): "admin.principal.set-role",
+    ("POST", "/auth/service-principals/{name}/disable"): "admin.principal.disable",
+    ("POST", "/auth/service-principals/{name}/enable"): "admin.principal.enable",
+    ("POST", "/auth/service-principals/{name}/keys"): "admin.key.issue",
+    ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke"): "admin.key.revoke",
+    ("GET", "/audit"): "audit.view",
+    ("GET", "/audit.csv"): "audit.download",
+}
+OPERATOR_ACTIONS = ("bootstrap", "create-user", "reset-password", "set-role", "disable", "enable")
+# Every action name, for the API's filter and the UI's list.
+ALL_ACTIONS = tuple(sorted(set(ACTIONS.values()) | {"operator." + a for a in OPERATOR_ACTIONS}
+                          | {"system.start"}))
+RESULTS = ("success", "refused", "error", "accepted", "succeeded", "failed", "interrupted")
+# A job's final status and the result its end record carries.
+JOB_RESULT = {"completed": "succeeded", "failed": "failed", "partial": "failed", "cancelled": "failed"}
+KEYS = ("id", "time", "actor", "actor_kind", "role", "key_id", "client_ip", "action", "collection", "target",
+        "result", "status_code", "job_id", "details")
+CSV_COLUMNS = KEYS[1:]
+ID = re.compile(r"\d{19}-[0-9a-f]{6}")
+# Enough of an error answer to read its envelope's code.
+_BODY_LIMIT = 64 * 1024
+
+_current: contextvars.ContextVar[dict | None] = contextvars.ContextVar("audit_request", default=None)
+_lock = threading.Lock()
+_last_ns = 0
+_failed = 0
+
+
+# ── handlers' notes ──────────────────────────────────────────────────────────
+
+def note(collection: str | None = None, target: str | None = None, **details) -> None:
+    """Add what only the handler knows to the current request's record. Does
+    nothing outside an audited request. Never pass a secret."""
+    ctx = _current.get()
+    if ctx is None:
+        return
+    if collection is not None:
+        ctx["collection"] = collection
+    if target is not None:
+        ctx["target"] = target
+    ctx["details"].update(details)
+
+
+def add_details(values: dict) -> None:
+    """Add `values` to the current record's details only (their names may be
+    ones note() would put in a column, such as an audit filter's collection)."""
+    ctx = _current.get()
+    if ctx is not None:
+        ctx["details"].update(values)
+
+
+def identify(username: str, role: str) -> None:
+    """The actor of a public route that identifies one (a successful login)."""
+    ctx = _current.get()
+    if ctx is not None:
+        ctx.update(actor=username, actor_kind="user", role=role)
+
+
+# ── writing ──────────────────────────────────────────────────────────────────
+
+def failed_writes() -> int:
+    """Records this process couldn't write since it started."""
+    return _failed
+
+
+def question_text_logged() -> bool:
+    return settings.audit_log_questions
+
+
+def _next_id() -> tuple[str, str]:
+    """(id, time). Called under the lock, so ids follow the files' line order;
+    bumped past the last one so a coarse clock can't repeat or reverse."""
+    global _last_ns
+    now = max(time.time_ns(), _last_ns + 1)
+    _last_ns = now
+    stamp = datetime.fromtimestamp(now / 1e9, timezone.utc)
+    return f"{now:019d}-{secrets.token_hex(3)}", stamp.strftime("%Y-%m-%dT%H:%M:%S.") + f"{stamp.microsecond // 1000:03d}Z"
+
+
+def _rotate(folder: Path) -> None:
+    keep = settings.audit_log_keep
+    (folder / f"{FILE}.{keep}").unlink(missing_ok=True)
+    for n in range(keep - 1, 0, -1):
+        older = folder / f"{FILE}.{n}"
+        if older.exists():
+            os.replace(older, folder / f"{FILE}.{n + 1}")
+    os.replace(folder / FILE, folder / f"{FILE}.1")
+
+
+def _append(fields: dict) -> None:
+    folder = Path(settings.audit_dir)
+    with _lock:
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_fd = os.open(folder / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            record_id, stamp = _next_id()
+            record = {key: None for key in KEYS}
+            record.update(fields, id=record_id, time=stamp)
+            line = (json.dumps(record, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n").encode()
+            fd = os.open(folder / FILE, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                end = os.fstat(fd).st_size
+                if end and os.pread(fd, 1, end - 1) != b"\n":
+                    line = b"\n" + line              # after a torn last line, start a new one
+                os.write(fd, line)
+                size = os.fstat(fd).st_size
+            finally:
+                os.close(fd)
+            if size >= settings.audit_log_max_bytes:
+                _rotate(folder)
+        finally:
+            os.close(lock_fd)                        # releases the flock too
+
+
+def record(action: str, *, result: str, actor: str | None = None, actor_kind: str = "anonymous",
+           role: str | None = None, key_id: str | None = None, client_ip: str | None = None,
+           collection: str | None = None, target: str | None = None, status_code: int | None = None,
+           job_id: str | None = None, details: dict | None = None) -> bool:
+    """Append one record. Never raises: a failure is logged and counted, and
+    the caller's action goes on as if the record had been written."""
+    global _failed
+    try:
+        _append({"action": action, "result": result, "actor": actor, "actor_kind": actor_kind, "role": role,
+                 "key_id": key_id, "client_ip": client_ip, "collection": collection, "target": target,
+                 "status_code": status_code, "job_id": job_id, "details": dict(details or {})})
+        return True
+    except Exception as exc:                          # noqa: BLE001 - logged and counted, never raised
+        with _lock:
+            _failed += 1
+        _log.error("Could not write the audit record of %s: %s", action, type(exc).__name__)
+        return False
+
+
+def _identify(ctx: dict) -> bool:
+    """Take the actor from the request's principal: the one the auth middleware
+    let through, or the one it refused with a 403. True when there is one."""
+    state = ctx["scope"].get("state") or {}
+    principal = state.get("auth") or state.get("audit_refused")
+    if principal is None:
+        return False
+    ctx.update(actor=principal.username, role=principal.role, key_id=principal.key_id,
+               actor_kind="service" if principal.kind == "service" else "user")
+    return True
+
+
+def _actor(ctx: dict) -> dict:
+    return {k: ctx.get(k) for k in ("actor", "actor_kind", "role", "key_id", "client_ip")}
+
+
+def _result(status: int) -> str:
+    return "success" if status < 400 else "refused" if status < 500 else "error"
+
+
+# ── jobs ─────────────────────────────────────────────────────────────────────
+
+def job_started(job_id: str) -> dict | None:
+    """Called by the job store when a new job is stored. Inside an audited
+    request, writes the `accepted` record, before the job can end, and returns
+    what its end record needs; otherwise None."""
+    ctx = _current.get()
+    if ctx is None or not _identify(ctx):
+        return None
+    ctx["job_recorded"] = True
+    snapshot = {**_actor(ctx), "action": ctx["action"], "collection": ctx.get("collection"),
+                "target": ctx.get("target"), "details": dict(ctx["details"])}
+    record(snapshot["action"], result="accepted", status_code=202, job_id=job_id,
+           **{k: v for k, v in snapshot.items() if k != "action"})
+    return snapshot
+
+
+def job_ended(job: dict, interrupted: bool) -> None:
+    """The end record of a job whose start was recorded (job["_audit"])."""
+    snapshot = job.get("_audit") or {}
+    status = job.get("status")
+    details = {**snapshot.get("details", {}), "job_status": status}
+    collection = snapshot.get("collection")
+    if snapshot.get("action") == "export":
+        details.update(package=job.get("filename"), fidelity=job.get("fidelity"))
+    elif snapshot.get("action") == "import":
+        collection = job.get("collection") or collection
+    record(snapshot.get("action", "unknown"), result="interrupted" if interrupted else JOB_RESULT.get(status, "failed"),
+           job_id=job.get("job_id") or getattr(job, "_id", None), collection=collection, target=snapshot.get("target"),
+           details=details, **{k: snapshot.get(k) for k in ("actor", "actor_kind", "role", "key_id", "client_ip")})
+
+
+# ── reading ──────────────────────────────────────────────────────────────────
+
+def _files() -> list[Path]:
+    """The log's files, newest first."""
+    folder = Path(settings.audit_dir)
+    names = [folder / FILE] + [folder / f"{FILE}.{n}" for n in range(1, settings.audit_log_keep + 1)]
+    return [p for p in names if p.is_file()]
+
+
+def _open_all() -> list:
+    """Every file of the log, opened for reading, newest first: one consistent
+    set. Opened under the writers' locks, so no rotation runs meanwhile; read
+    after they are released, which is safe because a rename doesn't change
+    what an open file holds. Without this a read that spans a rotation would
+    read one file twice and miss another."""
+    folder = Path(settings.audit_dir)
+    if not folder.is_dir():
+        return []
+    handles = []
+    with _lock:
+        lock_fd = os.open(folder / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_SH)
+            try:
+                for path in _files():
+                    handles.append(open(path, "rb"))
+            except BaseException:
+                for handle in handles:
+                    handle.close()
+                raise
+        finally:
+            os.close(lock_fd)                        # releases the flock too
+    return handles
+
+
+def newest_first():
+    """Every record, newest first, from the files as they were when the read
+    started (_open_all). A line that isn't a JSON object (a torn last line
+    after a crash) is skipped."""
+    handles = _open_all()
+    try:
+        for handle in handles:
+            data = handle.read()
+            handle.close()
+            for raw in reversed(data.split(b"\n")):
+                if not raw.strip():
+                    continue
+                try:
+                    item = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(item, dict) and isinstance(item.get("id"), str):
+                    yield item
+    finally:
+        for handle in handles:
+            handle.close()
+
+
+def parse_time(value: str) -> datetime:
+    """ISO 8601; without an offset it is UTC. ValueError when it isn't one."""
+    parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00").replace("z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _record_time(item: dict) -> datetime | None:
+    try:
+        return parse_time(item["time"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def matching(filters: dict, before: str | None = None):
+    """Records matching `filters` (from, to, actor, action, collection, result),
+    newest first, with ids below `before` if given."""
+    start, end = filters.get("from"), filters.get("to")
+    exact = {k: filters[k] for k in ("actor", "action", "collection", "result") if filters.get(k) is not None}
+    for item in newest_first():
+        if before is not None and item["id"] >= before:
+            continue
+        at = _record_time(item)
+        if start is not None and (at is None or at < start):
+            if at is not None:
+                return                                # older from here on
+            continue
+        if end is not None and (at is None or at >= end):
+            continue
+        if all(item.get(k) == v for k, v in exact.items()):
+            yield item
+
+
+def page(filters: dict, limit: int, before: str | None) -> tuple[list[dict], str | None]:
+    """Up to `limit` records and the cursor of the next page (None at the end)."""
+    found = []
+    for item in matching(filters, before):
+        found.append({key: item.get(key) for key in KEYS})
+        if len(found) > limit:
+            break
+    more = len(found) > limit
+    found = found[:limit]
+    return found, (found[-1]["id"] if more and found else None)
+
+
+def _cell(value) -> str:
+    if value is None:
+        return ""
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":")) if isinstance(value, dict) else str(value)
+    # A spreadsheet runs a cell that starts with one of these as a formula.
+    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
+
+
+def csv_lines(filters: dict):
+    """The CSV: the header, then every matching record, newest first."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+
+    def line(row) -> str:
+        buffer.seek(0)
+        buffer.truncate()
+        writer.writerow(row)
+        return buffer.getvalue()
+
+    yield line(CSV_COLUMNS)
+    for item in matching(filters):
+        yield line([_cell(item.get(key)) for key in CSV_COLUMNS])
+
+
+# ── the request middleware ───────────────────────────────────────────────────
+
+def _compile(template: str):
+    pattern = re.sub(r"\\\{([a-z_]+)\\\}", r"(?P<\1>[^/]+)", re.escape(template))
+    return re.compile(pattern + r"\Z")
+
+
+_PATTERNS = {key: _compile(key[1]) for key in ACTIONS}
+
+
+def _from_path(method: str, template: str, path: str, ctx: dict) -> None:
+    found = _PATTERNS[(method, template)].match(path)
+    params = found.groupdict() if found else {}
+    if template.startswith("/collections/") and "name" in params:
+        ctx["collection"] = params["name"]
+    elif template.startswith("/auth/"):
+        if "username" in params or "name" in params:
+            ctx["target"] = params.get("username") or params.get("name")
+        if "key_id" in params:
+            ctx["details"]["key_id"] = params["key_id"]
+    if "filename" in params:
+        ctx["details"]["file"] = params["filename"]
+
+
+def _header(scope, name: bytes) -> str | None:
+    for key, value in scope.get("headers") or ():
+        if key == name:
+            return value.decode("latin-1")
+    return None
+
+
+def _error_code(body: bytes) -> str | None:
+    try:
+        code = json.loads(body)["error"]["code"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    return code if isinstance(code, str) else None
+
+
+class AuditMiddleware:
+    """Records each audited request once its answer is sent. Runs outside the
+    auth middleware, so it sees that middleware's refusals too."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        from auth import policy
+        method = "GET" if scope["method"] == "HEAD" else scope["method"]
+        template = policy.match(scope["method"], scope["path"])
+        action = ACTIONS.get((method, template)) if template else None
+        if action is None:
+            return await self.app(scope, receive, send)
+        client = scope.get("client")
+        ctx = {"scope": scope, "action": action, "actor": None, "actor_kind": "anonymous", "role": None, "key_id": None,
+               "client_ip": _header(scope, b"x-real-ip") or (client[0] if client else None),
+               "collection": None, "target": None, "details": {}, "job_recorded": False}
+        _from_path(method, template, scope["path"], ctx)
+        seen = {"status": None, "body": b""}
+
+        async def watched(message):
+            if message["type"] == "http.response.start":
+                seen["status"] = message["status"]
+            elif (message["type"] == "http.response.body" and (seen["status"] or 0) >= 400
+                  and len(seen["body"]) < _BODY_LIMIT):
+                seen["body"] += message.get("body", b"")[:_BODY_LIMIT - len(seen["body"])]
+            await send(message)
+
+        token = _current.set(ctx)
+        try:
+            await self.app(scope, receive, watched)
+        except BaseException:
+            if seen["status"] is None:
+                seen["status"] = 500
+            raise
+        finally:
+            _current.reset(token)
+            try:
+                await self._write(scope, ctx, seen)
+            except Exception:                         # noqa: BLE001 - never breaks the answer
+                _log.exception("Could not build the audit record of %s", action)
+
+    @staticmethod
+    async def _write(scope, ctx, seen):
+        if not _identify(ctx):
+            # Nobody identified: a 401 or 503 from the auth middleware writes
+            # nothing (D4). Only a login, which is public, is recorded without
+            # a principal: a success names its account, a failure the username
+            # as typed.
+            if ctx["action"] != "auth.login" or (ctx["actor"] is None and ctx["target"] is None):
+                return
+        status = seen["status"] or 500
+        if ctx["job_recorded"] and status == 202:
+            return                                    # job_started wrote the accepted record
+        details = dict(ctx["details"])
+        if status >= 400:
+            code = _error_code(seen["body"])
+            if code:
+                details["code"] = code
+        await asyncio.to_thread(record, ctx["action"], result=_result(status), status_code=status,
+                                collection=ctx["collection"], target=ctx["target"], details=details,
+                                **_actor(ctx))
+```
+
+### api/routers/audit.py
+
+```python
+"""The audit log's API (#29): AI Engineers, browser sessions only (auth/policy.py
+puts both routes in HUMAN_ONLY, so every API key gets 403 KEY_NOT_ALLOWED).
+
+    GET /audit       a page of records, newest first, with a cursor
+    GET /audit.csv   every matching record as CSV
+
+Both take the filters from, to (ISO 8601; without an offset, UTC; from
+inclusive, to exclusive), actor, action, collection and result (exact matches);
+/audit also limit (1-1000, default 100) and before (a record id: the records
+older than it). Parameters are read from the query string by name, since
+`from` can't be a Python parameter. Each route is itself recorded (audit.view,
+audit.download) once it has answered, so a page or a file never holds its own
+record. SPECIFICATIONS.md §3.1.9.
+"""
+from __future__ import annotations
+
+import asyncio
+import re
+import time
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import iterate_in_threadpool
+
+from services import audit
+from utils import api_error
+
+router = APIRouter()
+_NO_STORE = {"Cache-Control": "no-store"}
+FILTERS = ("from", "to", "actor", "action", "collection", "result")
+
+
+class _Invalid(ValueError):
+    pass
+
+
+def _read(request: Request, names) -> dict:
+    """The named parameters as given, and a note of those that were set."""
+    given = {name: request.query_params.get(name) for name in names}
+    audit.add_details({name: value for name, value in given.items() if value not in (None, "")})
+    return given
+
+
+def _filters(given: dict) -> dict:
+    filters = {name: given[name] or None for name in ("actor", "action", "collection", "result")}
+    if filters["result"] is not None and filters["result"] not in audit.RESULTS:
+        raise _Invalid("result must be one of " + ", ".join(audit.RESULTS) + ".")
+    for name in ("from", "to"):
+        filters[name] = None
+        if given[name]:
+            try:
+                filters[name] = audit.parse_time(given[name])
+            except ValueError:
+                raise _Invalid(f"{name} must be an ISO 8601 date and time.") from None
+    return filters
+
+
+@router.get("/audit")
+async def audit_page(request: Request):
+    given = _read(request, FILTERS + ("limit", "before"))
+    try:
+        filters = _filters(given)
+        limit = 100
+        if given["limit"] is not None:
+            # ASCII digits only: str.isdigit() also accepts characters such as
+            # "²" that int() rejects, which would answer 500.
+            if not re.fullmatch(r"[0-9]+", given["limit"]) or not 1 <= int(given["limit"]) <= 1000:
+                raise _Invalid("limit must be a whole number from 1 to 1000.")
+            limit = int(given["limit"])
+        before = given["before"]
+        if before is not None and not audit.ID.fullmatch(before):
+            raise _Invalid("before must be a record id.")
+    except _Invalid as exc:
+        return api_error(422, "INVALID_PARAMETER", str(exc))
+    records, next_before = await asyncio.to_thread(audit.page, filters, limit, before)
+    return JSONResponse({"records": records, "next_before": next_before,
+                         "failed_writes": audit.failed_writes(),
+                         "question_text_logged": audit.question_text_logged()}, headers=_NO_STORE)
+
+
+@router.get("/audit.csv")
+async def audit_csv(request: Request):
+    given = _read(request, FILTERS)
+    try:
+        filters = _filters(given)
+    except _Invalid as exc:
+        return api_error(422, "INVALID_PARAMETER", str(exc))
+    name = time.strftime("audit-%Y%m%dT%H%M%SZ.csv", time.gmtime())
+    return StreamingResponse(iterate_in_threadpool(audit.csv_lines(filters)), media_type="text/csv; charset=utf-8",
+                             headers={**_NO_STORE, "Content-Disposition": f'attachment; filename="{name}"'})
 ```
 
 ### api/main.py
@@ -14245,6 +14970,15 @@ async def lifespan(app: FastAPI):
         if interrupted:
             log.warning("Marked %d job(s) interrupted by the restart: %s. Their status now "
                         "says so; start them again.", len(interrupted), ", ".join(interrupted))
+        # One audit record per start, saying whether question text is recorded,
+        # so a reader can tell why some query records carry it (#29).
+        from config import settings
+        from services import audit
+        await asyncio.to_thread(audit.record, "system.start", result="success", actor="system",
+                                actor_kind="system",
+                                details={"question_text_logged": settings.audit_log_questions,
+                                         "max_bytes": settings.audit_log_max_bytes,
+                                         "keep": settings.audit_log_keep})
         yield
     finally:
         try:
@@ -14311,8 +15045,13 @@ async def unhandled_error(request, exc):
 # middleware: the UI is served from the same origin through nginx, so no other
 # origin needs to read the API's answers.
 app.add_middleware(AuthMiddleware)
+# The audit log (#29): outside the auth middleware, so it sees that middleware's
+# 403 refusals as well as the routes' own answers.
+from services.audit import AuditMiddleware
+app.add_middleware(AuditMiddleware)
 app.add_middleware(RequestTracing)
 
+from routers import audit as audit_router
 from routers import auth as auth_router, help as help_router, health, collections, ingest, query, goldstandard, metrics, retrieval_config, transfer, tuning
 
 app.include_router(health.router)
@@ -14326,6 +15065,7 @@ app.include_router(metrics.router)
 app.include_router(retrieval_config.router)
 app.include_router(transfer.router)
 app.include_router(tuning.router)
+app.include_router(audit_router.router)
 ```
 
 ---
@@ -14545,6 +15285,7 @@ import CollectionsPage from './pages/CollectionsPage'
 import HealthPage from './pages/HealthPage'
 import UsersPage from './pages/UsersPage'
 import ServiceKeysPage from './pages/ServiceKeysPage'
+import AuditPage from './pages/AuditPage'
 import TransferPage from './pages/TransferPage'
 import HelpTransferPage from './pages/HelpTransferPage'
 
@@ -14604,6 +15345,7 @@ export default function AppRouter() {
               <Route path="/health" element={<HealthPage />} />
               <Route path="/users" element={<UsersPage />} />
               <Route path="/service-keys" element={<ServiceKeysPage />} />
+              <Route path="/audit" element={<AuditPage />} />
             </>
           )}
           <Route path="*" element={<Navigate to="/qa" replace />} />
@@ -14995,6 +15737,9 @@ export const api = {
     request<{ principal: ServicePrincipal; key: ServiceKey; secret: string }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/keys`, { label, days }),
   revokeKey: (name: string, keyId: string) =>
     request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/keys/${encodeURIComponent(keyId)}/revoke`),
+  // The audit log (#29), for Engineers: a page of records, newest first.
+  listAudit: (filters: AuditFilters, before?: string) =>
+    request<AuditPage>('GET', `/audit${auditQuery(filters, before ? { before } : {})}`),
 
   getCollections: () => request<{ collections: CollectionInfo[] }>('GET', '/collections'),
   // Answers with the name as stored, first letter capitalised (#372).
@@ -15137,6 +15882,28 @@ export interface ImportJob {
   error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
   encrypted?: boolean
 }
+export type AuditResult = 'success' | 'refused' | 'error' | 'accepted' | 'succeeded' | 'failed' | 'interrupted'
+export interface AuditRecord {
+  id: string; time: string; actor: string | null; actor_kind: string; role: Role | null; key_id: string | null
+  client_ip: string | null; action: string; collection: string | null; target: string | null
+  result: AuditResult; status_code: number | null; job_id: string | null; details: Record<string, unknown>
+}
+export interface AuditPage { records: AuditRecord[]; next_before: string | null; failed_writes: number; question_text_logged: boolean }
+// Empty strings mean "any"; from and to are ISO 8601 times (UTC).
+export interface AuditFilters { from: string; to: string; actor: string; action: string; collection: string; result: string }
+
+function auditQuery(filters: AuditFilters, extra: Record<string, string>): string {
+  const params = new URLSearchParams()
+  for (const [name, value] of Object.entries({ ...filters, ...extra })) if (value) params.set(name, value)
+  const text = params.toString()
+  return text ? `?${text}` : ''
+}
+
+// The CSV of every record matching the filters; a plain link, sent with the session cookie.
+export function auditCsvUrl(filters: AuditFilters): string {
+  return `${BASE}/audit.csv${auditQuery(filters, {})}`
+}
+
 export interface PackageSummary {
   filename: string; size_bytes: number; collection: string | null
   chunk_count: number | null; fidelity: string | null; created_at: string | null; readable: boolean
@@ -15206,6 +15973,7 @@ export default function NavBar() {
           <Link to="/health" className="text-sm text-gray-700 hover:text-blue-600">Health</Link>
           <Link to="/users" className="text-sm text-gray-700 hover:text-blue-600">Users</Link>
           <Link to="/service-keys" className="text-sm text-gray-700 hover:text-blue-600">Service keys</Link>
+          <Link to="/audit" className="text-sm text-gray-700 hover:text-blue-600">Audit</Link>
         </>
       )}
       <div className="ml-auto flex items-center gap-3">
@@ -17734,6 +18502,172 @@ export default function ServiceKeysPage() {
 }
 ```
 
+### ui/src/pages/AuditPage.tsx
+
+```typescript
+import { FormEvent, useEffect, useState } from 'react'
+import { api, AuditFilters, AuditPage as AuditPageData, AuditRecord, auditCsvUrl } from '../api/client'
+
+// The names the API records (api/services/audit.py ALL_ACTIONS), for the filter.
+const ACTIONS = [
+  'admin.key.issue', 'admin.key.revoke', 'admin.principal.create', 'admin.principal.disable',
+  'admin.principal.enable', 'admin.principal.set-role', 'admin.user.create', 'admin.user.disable',
+  'admin.user.enable', 'admin.user.reset-password', 'admin.user.set-role', 'audit.download', 'audit.view',
+  'auth.login', 'auth.logout', 'auth.password', 'collection.create', 'collection.delete', 'export',
+  'goldstandard.download', 'goldstandard.save', 'import', 'ingest', 'ingest.config', 'operator.bootstrap',
+  'operator.create-user', 'operator.disable', 'operator.enable', 'operator.reset-password', 'operator.set-role',
+  'query', 'retrieval.config', 'system.start', 'tune.rechunk', 'tune.reembed', 'tune.reindex',
+]
+const RESULTS = ['success', 'refused', 'error', 'accepted', 'succeeded', 'failed', 'interrupted']
+const EMPTY: AuditFilters = { from: '', to: '', actor: '', action: '', collection: '', result: '' }
+
+// A datetime-local value (no zone) read as UTC, as the labels say.
+const utc = (local: string) => (local ? `${local}Z` : '')
+
+function actorText(r: AuditRecord): string {
+  if (r.actor === null) return r.actor_kind
+  return r.key_id ? `${r.actor} (key ${r.key_id})` : r.actor_kind === 'user' ? r.actor : `${r.actor} (${r.actor_kind})`
+}
+
+// The audit log, for Engineers (#29): who did what, to which data, with what
+// result, newest first. The API decides what is recorded and who may read it;
+// this page only filters and pages through it, and links the CSV of the same
+// filters. Opening a page and downloading the CSV are recorded too.
+export default function AuditPage() {
+  const [form, setForm] = useState<AuditFilters>(EMPTY)
+  const [filters, setFilters] = useState<AuditFilters>(EMPTY)
+  // The cursors of the pages shown so far: [undefined] is the newest page.
+  const [cursors, setCursors] = useState<(string | undefined)[]>([undefined])
+  const [data, setData] = useState<AuditPageData | null>(null)
+  const [error, setError] = useState('')
+  // A page is on its way: shown, and Older is disabled, so a quick second
+  // click can't add the same cursor twice.
+  const [loading, setLoading] = useState(true)
+
+  const before = cursors[cursors.length - 1]
+
+  useEffect(() => {
+    let current = true
+    setLoading(true)
+    api.listAudit(filters, before)
+      .then(page => { if (current) { setData(page); setError('') } })
+      .catch((e: unknown) => { if (current) setError(e instanceof Error ? e.message : String(e)) })
+      .finally(() => { if (current) setLoading(false) })
+    return () => { current = false }
+  }, [filters, before])
+
+  function apply(e: FormEvent) {
+    e.preventDefault()
+    setFilters({ ...form, from: utc(form.from), to: utc(form.to) })
+    setCursors([undefined])
+  }
+
+  const set = (name: keyof AuditFilters) => (e: { target: { value: string } }) =>
+    setForm(f => ({ ...f, [name]: e.target.value }))
+  const field = 'mt-1 block border border-gray-300 rounded px-3 py-2 text-sm'
+
+  return (
+    <div className="max-w-6xl mx-auto">
+      <h1 className="text-2xl font-bold mb-2">Audit log</h1>
+      <p className="text-sm text-gray-600 mb-4">
+        Logins, queries, imports, exports, deletions, tuning, account and key administration, and the operator
+        command, newest first. Passwords, keys, passphrases and answers are never recorded.
+        {data && (data.question_text_logged
+          ? ' Question text is being recorded (AUDIT_LOG_QUESTIONS=true).'
+          : ' Question text is not recorded (AUDIT_LOG_QUESTIONS=false).')}
+      </p>
+      {data && data.failed_writes > 0 && (
+        <p role="alert" data-testid="audit-failed-writes" className="text-amber-700 bg-amber-50 border border-amber-300 rounded p-2 text-sm mb-4">
+          {data.failed_writes} audit record(s) could not be written since the API started. The API log names them.
+        </p>
+      )}
+
+      <form onSubmit={apply} className="flex flex-wrap items-end gap-3 mb-4">
+        <label className="text-sm text-gray-700">From (UTC)
+          <input id="audit-from" type="datetime-local" value={form.from} onChange={set('from')} className={field} />
+        </label>
+        <label className="text-sm text-gray-700">To (UTC)
+          <input id="audit-to" type="datetime-local" value={form.to} onChange={set('to')} className={field} />
+        </label>
+        <label className="text-sm text-gray-700">Actor
+          <input id="audit-actor" value={form.actor} onChange={set('actor')} autoComplete="off" className={field} />
+        </label>
+        <label className="text-sm text-gray-700">Action
+          <select id="audit-action" value={form.action} onChange={set('action')} className={field}>
+            <option value="">Any</option>
+            {ACTIONS.map(a => <option key={a} value={a}>{a}</option>)}
+          </select>
+        </label>
+        <label className="text-sm text-gray-700">Collection
+          <input id="audit-collection" value={form.collection} onChange={set('collection')} autoComplete="off" className={field} />
+        </label>
+        <label className="text-sm text-gray-700">Result
+          <select id="audit-result" value={form.result} onChange={set('result')} className={field}>
+            <option value="">Any</option>
+            {RESULTS.map(r => <option key={r} value={r}>{r}</option>)}
+          </select>
+        </label>
+        <button type="submit" className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">Apply</button>
+        <a data-testid="audit-csv" href={auditCsvUrl(filters)} className="text-sm text-blue-600 hover:underline py-2">Download CSV</a>
+      </form>
+
+      {error && <p role="alert" className="text-red-600 text-sm mb-4">{error}</p>}
+      {loading && <p data-testid="audit-loading" className="text-sm text-gray-500 mb-4">Loading…</p>}
+      {data && data.records.length === 0 && !error && <p className="text-sm text-gray-500">No records match.</p>}
+
+      {data && data.records.length > 0 && (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm border-collapse">
+            <thead>
+              <tr className="border-b border-gray-200 text-left text-gray-600">
+                <th className="py-2 pr-3">Time (UTC)</th>
+                <th className="py-2 pr-3">Actor</th>
+                <th className="py-2 pr-3">Role</th>
+                <th className="py-2 pr-3">Address</th>
+                <th className="py-2 pr-3">Action</th>
+                <th className="py-2 pr-3">Collection</th>
+                <th className="py-2 pr-3">Target</th>
+                <th className="py-2 pr-3">Result</th>
+                <th className="py-2 pr-3">Job</th>
+                <th className="py-2">Details</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.records.map(r => (
+                <tr key={r.id} data-record={r.id} className="border-b border-gray-100 align-top">
+                  <td className="py-2 pr-3 whitespace-nowrap">{r.time.replace('T', ' ').replace('Z', '')}</td>
+                  <td className="py-2 pr-3">{actorText(r)}</td>
+                  <td className="py-2 pr-3">{r.role ?? ''}</td>
+                  <td className="py-2 pr-3 font-mono">{r.client_ip ?? ''}</td>
+                  <td className="py-2 pr-3 font-mono">{r.action}</td>
+                  <td className="py-2 pr-3">{r.collection ?? ''}</td>
+                  <td className="py-2 pr-3">{r.target ?? ''}</td>
+                  <td className="py-2 pr-3">{r.result}{r.status_code !== null ? ` (${r.status_code})` : ''}</td>
+                  <td className="py-2 pr-3 font-mono">{r.job_id ?? ''}</td>
+                  <td className="py-2 font-mono text-xs break-all">{Object.keys(r.details).length ? JSON.stringify(r.details) : ''}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div className="flex gap-3 mt-4">
+        <button disabled={cursors.length === 1} onClick={() => setCursors([undefined])}
+          className="text-sm text-blue-600 hover:underline disabled:opacity-50 disabled:no-underline">Newest</button>
+        <button disabled={loading || !data?.next_before} onClick={() => {
+          const next = data?.next_before
+          // Only a cursor not asked for yet: a second click before the page
+          // renders sees the same next_before.
+          if (next && !loading) setCursors(c => (c[c.length - 1] === next ? c : [...c, next]))
+        }}
+          className="text-sm text-blue-600 hover:underline disabled:opacity-50 disabled:no-underline">Older</button>
+      </div>
+    </div>
+  )
+}
+```
+
 ---
 
 *End of Implementation — Version 1.0*
@@ -17862,6 +18796,17 @@ principals created through the API by the harness Engineer: the matrix with a ke
 and no `Origin`, rotation, revocation, expiry, a disabled principal, invalid keys; the keys stay in
 memory, are never printed and must not reach the API log), idle expiry, and that the API log holds
 no harness secret.
+
+`19_audit.sh` checks the audit log (#29), reading it through `GET /audit` as the harness
+Engineer: who may read it (End User, Developer and an engineer-role key refused), the records of
+the API's start, a login, a failed login and a logout, a query (without its question text), a
+collection created, ingested into, exported with a passphrase and deleted (a throwaway
+`VfyAudit*` collection; the ingest and export each recorded as accepted and ended with the same
+job id; the package is removed afterwards), a Developer's refused delete, an Engineer's principal
+and key administration (a throwaway `vfy-s-*` principal), filters, paging and the CSV, and that no
+harness password, session token, key, typed password or passphrase reaches the audit files, which
+it reads in the api container, and that parallel failed logins appended alongside the operator command are each
+recorded once on whole lines. `../tests/test_audit.py` covers the rest in the API image.
 
 ## Entry point and verify project
 
@@ -18558,6 +19503,9 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
 | `auth_stack.py` | the stack checks of `17_auth.sh`, one per subcommand (#25) |
 | `auth_headers.py` | the suite's session as `Cookie` and `Origin` headers, for the host-side Python helpers (#25) |
+| `19_audit.sh` | §10.7 — the audit log (#29): who may read it, the records of logins, queries, collections, jobs, refusals and administration, filters, paging and the CSV, no secrets in the files, concurrent writers; registers `../tests/test_audit.py`; opt-in restart check |
+| `audit_stack.py` | the stack checks of `19_audit.sh`, one per subcommand (#29) |
+| `../tests/test_audit.py` | API image, no network: record shape, rotation and retention, concurrent writers (threads and a second process), the three settings, write failures, job records, the middleware's rules, `GET /audit` and the CSV, the operator command's records, embedded copies (#29) |
 | `18_lan.sh` | §2.5 and §10.5 — LAN mode (#26): the real override resolved without starting it; registers `../tests/test_lan_mode.py`; with `stack.sh run --lan`, the running LAN project on loopback |
 | `lan_config.py` | host-side, standard library: `docker-compose.lan.yml` as `docker compose config` resolves it, at the default port and `RAG_LAN_PORT=8443` (#26) |
 | `lan_stack.py` | the stack checks of `18_lan.sh` in a `--lan` run, one per subcommand (#26) |
@@ -18638,7 +19586,7 @@ through the proxy that download refuses other upload state with 400 (#370).
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the query metrics reload in `03_query.sh`, the batch recovery acceptance in `05_transfer.sh`, retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`, and a session and a login lockout across a restart in `17_auth.sh`); never the `rag-docker` project |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the query metrics reload in `03_query.sh`, the batch recovery acceptance in `05_transfer.sh`, retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`, a session and a login lockout across a restart in `17_auth.sh`, and audit records across a restart in `19_audit.sh`); never the `rag-docker` project |
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
@@ -19176,7 +20124,7 @@ printf '\nBuilding fixtures in %s\n' "$FIX"
 rm -rf "$FIX"; python3 ./fixtures.py "$FIX" >/dev/null
 export RAG_FIXTURES="$FIX"
 
-ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan)
+ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit)
 if [ "$#" -gt 0 ]; then
   SUITES=()
   for want in "$@"; do
@@ -20687,6 +21635,9 @@ MATRIX = (
     ("GET", "/docs/oauth2-redirect", None, "engineer"),
     ("GET", "/redoc", None, "engineer"),
     ("GET", "/openapi.json", None, "engineer"),
+    # The audit log (#29): an allowed request reads a page or the CSV.
+    ("GET", "/audit?limit=1", None, "engineer"),
+    ("GET", "/audit.csv?action=system.start", None, "engineer"),
     # Account administration (PR 2 of #25): an allowed request lists, or is a
     # 422 or a 404 for an account that doesn't exist; it changes nothing.
     ("GET", "/auth/users", None, "engineer"),
@@ -20705,8 +21656,8 @@ MATRIX = (
     ("POST", "/auth/service-principals/vfy-no-such-svc/keys/nosuchkey123/revoke", None, "engineer"),
 )
 # Routes an API key can't use whatever its role (S5 of PR 3): every account,
-# principal and key route, logout and the password change.
-KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password")
+# principal and key route, logout and the password change; and the audit log (#29).
+KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password", "/audit")
 SESSION_ROUTES = (("GET", "/auth/me", None), ("POST", "/auth/logout", None), ("POST", "/auth/password", {}))
 
 
@@ -21272,6 +22223,518 @@ def main(argv):
         return 2
     try:
         run()
+    except (CheckFailed, auth_setup.SetupError) as failure:
+        print("    " + str(failure), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+```
+
+### scripts/verify/19_audit.sh
+
+```bash
+#!/usr/bin/env bash
+# The audit log (#29): SPECIFICATIONS.md §3.1.9 and §10.7.
+#
+# The unit checks run in the API image with no network. The stack checks run
+# on the verify project through audit_stack.py, one check each, reading the
+# records through GET /audit as the harness Engineer; those that create a
+# throwaway VfyAudit<random> collection or vfy-s-<random> service principal run
+# only on the verify project as stack.sh sets it up. The restart check is
+# opt-in (RAG_ALLOW_RESTART=1) like the other restart checks.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+require_stack
+
+operator=""
+[ -n "$(volume_removal_refusal_reason)" ] || operator=--operator
+stack() { _rag_require_lock_owner; python3 ./audit_stack.py "$@" $operator; }
+
+section "Audit units: records, rotation, writers, settings, jobs, middleware, API, CSV, operator command"
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_audit.py)
+check "test_audit.py registered regression checks" $?
+
+section "Who may read it"
+stack access
+check "End User and Developer get 403 on /audit and /audit.csv; an engineer-role key gets KEY_NOT_ALLOWED (and is recorded)" $?
+
+section "What is recorded"
+stack start-record
+check "the API's start wrote system.start, saying question text isn't logged" $?
+stack sessions
+check "a login, a failed login (anonymous, the typed username) and a logout, each with actor, role and address" $?
+stack query
+check "a query is recorded with its parameters and without its question text" $?
+stack jobs
+check "collection create and delete; an ingest and an encrypted export, each accepted and ended with the same job id" $?
+stack refused
+check "a Developer's refused delete is recorded: 403 FORBIDDEN, actor and role" $?
+stack admin
+check "an Engineer's principal and key administration is recorded with the target, never the key" $?
+
+section "Reading it"
+stack filters
+check "filters, a one-record page and its cursor, and the CSV (header, a row, an escaped formula cell)" $?
+stack no-secrets
+check "no harness password, session token, API key or password typed in a change appears in the audit files" $?
+
+section "Concurrent writers"
+stack concurrent
+check "parallel failed logins and the operator command append together: each recorded once, every line whole" $?
+
+section "Restart persistence (opt-in: it restarts the api)"
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  restart_refusal=$(restart_refusal_reason)
+  if [ -n "$restart_refusal" ]; then
+    check "records survive an API restart" 1 "$restart_refusal"
+  else
+    stack restart-prepare
+    prepared=$?
+    project="$COMPOSE_PROJECT_NAME"
+    started=$(python3 -c "import time;print(time.time())")
+    (cd "$REPO_ROOT" && docker compose -p "$project" restart api >/dev/null 2>&1)
+    elapsed=$(wait_healthy_timed "$started" 300)
+    [ "$prepared" = 0 ] && stack restart-verify
+    check "records survive an API restart, which writes a new system.start" $? "healthy after ${elapsed:-never}s"
+  fi
+else
+  skip "records survive an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+fi
+
+summary
+```
+
+### scripts/verify/audit_stack.py
+
+```python
+"""Audit log checks on the verify project (#29), one per subcommand. Host-side,
+standard library, Python 3.9+. Run by 19_audit.sh, which turns each exit status
+into a check:
+
+    python3 audit_stack.py CHECK [--operator]
+
+Exit 0 when the check holds, 1 when it doesn't (the reason on stderr). Records
+are read through GET /audit as the harness Engineer. Checks that create
+throwaway collections (VfyAudit<random>) or service principals (vfy-s-<random>)
+need --operator, which 19_audit.sh passes only on the verify project as
+stack.sh sets it up. No password, session token, API key or passphrase is
+printed; keys and passphrases are held in memory only.
+"""
+import csv
+import io
+import ipaddress
+import json
+import os
+import secrets
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+import auth_setup
+from auth_setup import request
+from auth_stack import CheckFailed, bearer, code, compose, error_code, expect, new_principal, role_token
+
+ENGINEER = auth_setup.ROLES["engineer"]
+DEVELOPER = auth_setup.ROLES["developer"]
+END_USER = auth_setup.ROLES["end_user"]
+STATE = "audit-restart-state.json"
+TERMINAL = ("completed", "failed", "partial", "cancelled")
+
+
+def records(admin, **filters):
+    """A page of records through GET /audit, newest first."""
+    query = urllib.parse.urlencode({k: v for k, v in filters.items() if v is not None})
+    status, raw, _ = code("GET", "/audit" + ("?" + query if query else ""), token=admin)
+    expect(status == 200, "GET /audit answered {} {}".format(status, error_code(raw)))
+    return json.loads(raw)
+
+
+def find(admin, action, **match):
+    """The newest record of ACTION whose fields equal MATCH."""
+    for item in records(admin, action=action, limit=1000)["records"]:
+        if all(item.get(k) == v for k, v in match.items()):
+            return item
+    raise CheckFailed("no {} record with {}".format(action, match))
+
+
+def valid_address(item):
+    try:
+        ipaddress.ip_address(item.get("client_ip") or "")
+        return True
+    except ValueError:
+        return False
+
+
+def expect_actor(item, actor, role):
+    expect((item["actor"], item["role"], item["actor_kind"]) == (actor, role, "user"),
+           "{} names {} {} {}, not {} {}".format(item["action"], item["actor"], item["role"], item["actor_kind"],
+                                                 actor, role))
+    expect(valid_address(item), "{} has no valid client address ({!r})".format(item["action"], item["client_ip"]))
+
+
+def audit_files():
+    """The raw text of every audit file in the verify project's api container."""
+    result = compose("exec", "-T", "api", "sh", "-c", "cat /app/uploads/audit/audit.jsonl*")
+    expect(result.returncode == 0, "could not read the audit files")
+    return result.stdout
+
+
+def upload(token, collection, name, content):
+    """POST /ingest/upload of one small text file, as a same-origin browser."""
+    boundary = "vfy" + secrets.token_hex(8)
+    parts = []
+    for field, value in (("collection", collection), ("chunk_size", "500"), ("chunk_overlap", "50")):
+        parts.append('--{}\r\nContent-Disposition: form-data; name="{}"\r\n\r\n{}\r\n'.format(boundary, field, value)
+                     .encode())
+    parts.append('--{}\r\nContent-Disposition: form-data; name="files"; filename="{}"\r\nContent-Type: text/plain'
+                 '\r\n\r\n'.format(boundary, name).encode() + content + b"\r\n")
+    parts.append("--{}--\r\n".format(boundary).encode())
+    req = urllib.request.Request(auth_setup.api_base() + "/ingest/upload", data=b"".join(parts), method="POST",
+                                 headers={"Origin": auth_setup.origin(), "Cookie": "rag_session=" + token,
+                                          "Content-Type": "multipart/form-data; boundary=" + boundary})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        return error.code, error.read()
+
+
+def wait_job(token, path, timeout=900):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status, raw, _ = code("GET", path, token=token)
+        expect(status == 200, "{} answered {}".format(path, status))
+        job = json.loads(raw)
+        if job["status"] in TERMINAL:
+            return job
+        time.sleep(1)
+    raise CheckFailed("{} didn't end within {}s".format(path, timeout))
+
+
+# ── checks ───────────────────────────────────────────────────────────────────
+
+def check_access(operator_ok):
+    expect(operator_ok, "creates a service principal, so it runs only on the verify project")
+    wrong = []
+    for role in ("end_user", "developer"):
+        token = role_token(role)
+        for path in ("/audit", "/audit.csv"):
+            status, raw, _ = code("GET", path, token=token)
+            if (status, error_code(raw)) != (403, "FORBIDDEN"):
+                wrong.append("{} {} -> {} {}".format(role, path, status, error_code(raw)))
+        request("POST", "/auth/logout", token=token)
+    admin = role_token("engineer")
+    name, key_id, key = new_principal(admin, "engineer")
+    try:
+        for path in ("/audit", "/audit.csv"):
+            status, raw, _ = code("GET", path, headers=bearer(key))
+            if (status, error_code(raw)) != (403, "KEY_NOT_ALLOWED"):
+                wrong.append("engineer key {} -> {} {}".format(path, status, error_code(raw)))
+        refused = find(admin, "audit.view", actor=name)
+        if (refused["actor_kind"], refused["key_id"], refused["result"]) != ("service", key_id, "refused"):
+            wrong.append("the key's refusal was recorded as {}".format(refused))
+        status, raw, _ = code("GET", "/audit?limit=1", token=admin)
+        if status != 200:
+            wrong.append("engineer session /audit -> {}".format(status))
+    finally:
+        code("POST", "/auth/service-principals/{}/keys/{}/revoke".format(name, key_id), token=admin)
+        code("POST", "/auth/service-principals/{}/disable".format(name), token=admin)
+        request("POST", "/auth/logout", token=admin)
+    expect(not wrong, "; ".join(wrong))
+
+
+def check_sessions(operator_ok):
+    token = role_token("end_user")
+    request("POST", "/auth/logout", token=token)
+    typed = "vfy-nobody-" + secrets.token_hex(4)
+    request("POST", "/auth/login", {"username": typed, "password": "not-a-password-" + secrets.token_hex(4)})
+    admin = role_token("engineer")
+    try:
+        login = find(admin, "auth.login", actor=END_USER)
+        expect_actor(login, END_USER, "end_user")
+        expect((login["result"], login["status_code"]) == ("success", 200), "login recorded as {}".format(login))
+        logout = find(admin, "auth.logout", actor=END_USER)
+        expect_actor(logout, END_USER, "end_user")
+        failed = find(admin, "auth.login", target=typed)
+        expect((failed["actor"], failed["actor_kind"], failed["result"], failed["status_code"],
+                failed["details"].get("code")) == (None, "anonymous", "refused", 401, "LOGIN_FAILED"),
+               "the failed login was recorded as {}".format(failed))
+        expect(valid_address(failed), "the failed login has no valid address")
+    finally:
+        request("POST", "/auth/logout", token=admin)
+
+
+def check_query(operator_ok):
+    token = role_token("end_user")
+    question = "VfyAuditQuestion " + secrets.token_hex(6)
+    missing = "VfyAuditNoSuch" + secrets.token_hex(3)
+    status, raw, _ = code("POST", "/query", {"question": question, "collection": missing, "top_k": 2}, token=token)
+    request("POST", "/auth/logout", token=token)
+    expect(status == 404, "the query answered {} {}".format(status, error_code(raw)))
+    admin = role_token("engineer")
+    try:
+        item = find(admin, "query", collection=missing)
+        expect_actor(item, END_USER, "end_user")
+        expect(item["details"].get("top_k") == 2 and "question" not in item["details"],
+               "the query's details are {}".format(item["details"]))
+        expect(question not in audit_files(), "the question text is in the audit files")
+        expect(records(admin, limit=1)["question_text_logged"] is False, "question text is said to be logged")
+    finally:
+        request("POST", "/auth/logout", token=admin)
+
+
+def check_jobs(operator_ok):
+    """A collection created, ingested into, exported (encrypted) and deleted."""
+    expect(operator_ok, "creates a collection, so it runs only on the verify project")
+    dev = role_token("developer")
+    admin = role_token("engineer")
+    name = "VfyAudit" + secrets.token_hex(4)
+    passphrase = "vfy audit " + secrets.token_hex(12)
+    package = None
+    try:
+        status, raw, _ = code("POST", "/collections", {"name": name}, token=dev)
+        expect(status == 201, "creating {} answered {} {}".format(name, status, error_code(raw)))
+        name = json.loads(raw)["name"]
+        status, started = upload(dev, name, "vfy-audit-note.txt",
+                                 b"The audit log records who imported this note and when.\n" * 20)
+        expect(status == 202, "the upload answered {} {}".format(status, started))
+        ingest = wait_job(dev, "/ingest/job/" + started["job_id"])
+        expect(ingest["status"] == "completed", "the ingest ended {}".format(ingest["status"]))
+        status, raw, _ = code("POST", "/export", {"collection": name, "passphrase": passphrase}, token=dev)
+        expect(status == 202, "the export answered {} {}".format(status, error_code(raw)))
+        export_id = json.loads(raw)["job_id"]
+        export = wait_job(dev, "/export/job/" + export_id)
+        package = export.get("filename")
+        expect(export["status"] == "completed", "the export ended {}".format(export["status"]))
+        status, raw, _ = code("DELETE", "/collections/{}?confirm=true".format(name), token=admin)
+        expect(status == 200, "deleting {} answered {} {}".format(name, status, error_code(raw)))
+
+        created = find(admin, "collection.create", collection=name)
+        expect_actor(created, DEVELOPER, "developer")
+        for action, job_id, ended in (("ingest", started["job_id"], "succeeded"), ("export", export_id, "succeeded")):
+            pair = [r for r in records(admin, action=action, limit=1000)["records"] if r["job_id"] == job_id]
+            results = sorted(r["result"] for r in pair)
+            expect(results == sorted(["accepted", ended]), "{} {} has records {}".format(action, job_id, results))
+            for item in pair:
+                expect_actor(item, DEVELOPER, "developer")
+                expect(item["collection"] == name, "{} record names collection {}".format(action, item["collection"]))
+        accepted = find(admin, "ingest", job_id=started["job_id"], result="accepted")
+        expect(accepted["details"].get("files") == ["vfy-audit-note.txt"] and accepted["status_code"] == 202,
+               "the ingest record's details are {}".format(accepted["details"]))
+        exported = find(admin, "export", job_id=export_id, result="succeeded")
+        expect(exported["details"].get("encrypted") is True and exported["details"].get("package") == package,
+               "the export's end details are {}".format(exported["details"]))
+        deleted = find(admin, "collection.delete", collection=name)
+        expect_actor(deleted, ENGINEER, "engineer")
+        expect(deleted["result"] == "success", "the delete was recorded as {}".format(deleted["result"]))
+        expect(passphrase not in audit_files(), "the export passphrase is in the audit files")
+    finally:
+        code("DELETE", "/collections/{}?confirm=true".format(name), token=admin)
+        if package:
+            exports = Path(os.environ.get("RAG_EXPORTS_DIR") or auth_setup.REPO / "exports")
+            (exports / package).unlink(missing_ok=True)
+        request("POST", "/auth/logout", token=dev)
+        request("POST", "/auth/logout", token=admin)
+
+
+def check_refused(operator_ok):
+    dev = role_token("developer")
+    missing = "VfyAuditRefused" + secrets.token_hex(3)
+    status, raw, _ = code("DELETE", "/collections/{}?confirm=true".format(missing), token=dev)
+    request("POST", "/auth/logout", token=dev)
+    expect((status, error_code(raw)) == (403, "FORBIDDEN"), "the delete answered {} {}".format(status, error_code(raw)))
+    admin = role_token("engineer")
+    try:
+        item = find(admin, "collection.delete", collection=missing)
+        expect_actor(item, DEVELOPER, "developer")
+        expect((item["result"], item["status_code"], item["details"].get("code")) == ("refused", 403, "FORBIDDEN"),
+               "the refusal was recorded as {}".format(item))
+    finally:
+        request("POST", "/auth/logout", token=admin)
+
+
+def check_admin(operator_ok):
+    expect(operator_ok, "creates a service principal, so it runs only on the verify project")
+    admin = role_token("engineer")
+    try:
+        name, key_id, key = new_principal(admin, "end_user")
+        code("POST", "/auth/service-principals/{}/keys/{}/revoke".format(name, key_id), token=admin)
+        code("POST", "/auth/service-principals/{}/disable".format(name), token=admin)
+        created = find(admin, "admin.principal.create", target=name)
+        expect_actor(created, ENGINEER, "engineer")
+        expect(created["details"].get("role") == "end_user", "the create's details are {}".format(created["details"]))
+        issued = find(admin, "admin.key.issue", target=name)
+        expect(issued["details"].get("key_id") == key_id, "the issue names key {}".format(issued["details"]))
+        find(admin, "admin.key.revoke", target=name)
+        find(admin, "admin.principal.disable", target=name)
+        expect(key not in audit_files(), "an issued key is in the audit files")
+    finally:
+        request("POST", "/auth/logout", token=admin)
+
+
+def check_filters(operator_ok):
+    typed = "=vfy" + secrets.token_hex(4)
+    request("POST", "/auth/login", {"username": typed, "password": "not-a-password-" + secrets.token_hex(4)})
+    request("POST", "/auth/login", {"username": typed, "password": "not-a-password-" + secrets.token_hex(4)})
+    admin = role_token("engineer")
+    try:
+        page = records(admin, action="auth.login", result="refused", limit=1)
+        expect(len(page["records"]) == 1 and page["next_before"], "a one-record page has no cursor: {}".format(page))
+        first = page["records"][0]
+        expect(first["target"] == typed, "the newest refused login is {}".format(first["target"]))
+        older = records(admin, action="auth.login", result="refused", limit=1, before=page["next_before"])
+        expect(older["records"] and older["records"][0]["id"] < first["id"] and older["records"][0]["target"] == typed,
+               "the next page doesn't hold the next older record")
+        expect(all(r["action"] == "audit.view" for r in records(admin, action="audit.view", limit=50)["records"]),
+               "the action filter let other actions through")
+        status, raw, headers = code("GET", "/audit.csv?" + urllib.parse.urlencode({"action": "auth.login"}),
+                                    token=admin)
+        expect(status == 200 and headers.get("Content-Type", "").startswith("text/csv"),
+               "GET /audit.csv answered {} {}".format(status, headers.get("Content-Type")))
+        expect("attachment" in headers.get("Content-Disposition", ""), "the CSV isn't an attachment")
+        rows = list(csv.reader(io.StringIO(raw.decode("utf-8"))))
+        expect(rows[0] == ["time", "actor", "actor_kind", "role", "key_id", "client_ip", "action", "collection",
+                           "target", "result", "status_code", "job_id", "details"],
+               "the CSV header is {}".format(rows[0]))
+        targets = [dict(zip(rows[0], row)).get("target") for row in rows[1:]]
+        expect("'" + typed in targets, "the CSV has no row with the escaped target")
+        expect(typed not in targets, "a formula cell is not escaped")
+    finally:
+        request("POST", "/auth/logout", token=admin)
+
+
+def check_start_record(operator_ok):
+    admin = role_token("engineer")
+    try:
+        item = records(admin, action="system.start", limit=1)["records"]
+        expect(item, "no system.start record")
+        expect(item[0]["details"].get("question_text_logged") is False and item[0]["actor"] == "system",
+               "the start record is {}".format(item[0]))
+    finally:
+        request("POST", "/auth/logout", token=admin)
+
+
+def check_no_secrets(operator_ok):
+    expect(operator_ok, "creates a service principal, so it runs only on the verify project")
+    known = [password for _, password in auth_setup.read_credentials(auth_setup.private_dir()).values()]
+    tokens = [role_token(role) for role in ("end_user", "developer", "engineer")]
+    admin = tokens[-1]
+    name, key_id, key = new_principal(admin, "end_user")
+    try:
+        code("GET", "/collections", headers=bearer(key))
+        wrong = "vfy-wrong-" + secrets.token_hex(8)
+        code("POST", "/auth/password", {"current_password": wrong, "new_password": wrong + "-new"}, token=tokens[0])
+        text = audit_files()
+        leaked = sum(1 for s in known + tokens + [key, key.split("_", 2)[2], wrong] if s and s in text)
+        expect(leaked == 0, "{} secret(s) appear in the audit files".format(leaked))
+    finally:
+        code("POST", "/auth/service-principals/{}/keys/{}/revoke".format(name, key_id), token=admin)
+        code("POST", "/auth/service-principals/{}/disable".format(name), token=admin)
+        for token in tokens:
+            request("POST", "/auth/logout", token=token)
+
+
+def check_restart_prepare(operator_ok):
+    typed = "vfy-restart-" + secrets.token_hex(4)
+    request("POST", "/auth/login", {"username": typed, "password": "not-a-password-" + secrets.token_hex(4)})
+    admin = role_token("engineer")
+    try:
+        item = find(admin, "auth.login", target=typed)
+        start = records(admin, action="system.start", limit=1)["records"]
+    finally:
+        request("POST", "/auth/logout", token=admin)
+    path = auth_setup.private_dir() / STATE
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        json.dump({"id": item["id"], "target": typed, "start": start[0]["id"] if start else ""}, handle)
+
+
+def check_restart_verify(operator_ok):
+    path = auth_setup.private_dir() / STATE
+    state = json.loads(path.read_text())
+    path.unlink()
+    admin = role_token("engineer")
+    try:
+        item = find(admin, "auth.login", target=state["target"])
+        expect(item["id"] == state["id"], "the record written before the restart changed")
+        start = records(admin, action="system.start", limit=1)["records"]
+        expect(start and start[0]["id"] > state["start"], "the restart wrote no new system.start record")
+    finally:
+        request("POST", "/auth/logout", token=admin)
+
+
+def check_concurrent(operator_ok):
+    """The testing reviewer's addition: parallel failed logins through nginx
+    while the operator command appends in the same container (D7's shared file
+    lock). Each request is recorded exactly once, the operator's record is
+    there, and every line of every audit file is one whole JSON object."""
+    expect(operator_ok, "runs the operator command, so it runs only on the verify project")
+    import threading
+    end_user = auth_setup.read_credentials(auth_setup.private_dir())["end_user"][0]
+    typed = ["vfy-conc-{}-{}".format(n, secrets.token_hex(3)) for n in range(24)]
+    errors = []
+
+    def attempt(name):
+        try:
+            status, _, _ = request("POST", "/auth/login",
+                                   {"username": name, "password": "not-a-password-" + secrets.token_hex(4)})
+            if status != 401:
+                errors.append("{} answered {}".format(name, status))
+        except Exception as exc:                                  # noqa: BLE001 - reported below
+            errors.append("{}: {}".format(name, type(exc).__name__))
+
+    def operator():
+        for _ in range(3):
+            result = compose("exec", "-T", "api", "python", "-m", "auth", "enable", end_user)
+            if result.returncode != 0:
+                errors.append("operator enable exited {}".format(result.returncode))
+
+    threads = [threading.Thread(target=attempt, args=(name,)) for name in typed]
+    threads.append(threading.Thread(target=operator))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    expect(not errors, "; ".join(errors))
+    admin = role_token("engineer")
+    try:
+        found = [r["target"] for r in records(admin, action="auth.login", result="refused", limit=1000)["records"]]
+        counts = {name: found.count(name) for name in typed}
+        expect(all(c == 1 for c in counts.values()),
+               "parallel failed logins recorded {} times, not once each".format(
+                   sorted(set(counts.values()))))
+        ops = [r for r in records(admin, action="operator.enable", limit=1000)["records"]
+               if r["target"] == end_user and r["actor"] == "operator" and r["actor_kind"] == "operator"]
+        expect(len(ops) >= 3, "{} operator.enable record(s) for {}, not 3".format(len(ops), end_user))
+        bad = 0
+        for line in audit_files().splitlines():
+            try:
+                item = json.loads(line)
+                bad += not (isinstance(item, dict) and isinstance(item.get("id"), str))
+            except ValueError:
+                bad += 1
+        expect(bad == 0, "{} audit line(s) aren't whole JSON records".format(bad))
+    finally:
+        request("POST", "/auth/logout", token=admin)
+
+
+CHECKS = {name[len("check_"):].replace("_", "-"): fn for name, fn in globals().items() if name.startswith("check_")}
+
+
+def main(argv):
+    operator_ok = "--operator" in argv
+    names = [a for a in argv if a != "--operator"]
+    if len(names) != 1 or names[0] not in CHECKS:
+        print("usage: audit_stack.py {" + ", ".join(sorted(CHECKS)) + "} [--operator]", file=sys.stderr)
+        return 2
+    try:
+        CHECKS[names[0]](operator_ok)
     except (CheckFailed, auth_setup.SetupError) as failure:
         print("    " + str(failure), file=sys.stderr)
         return 1
@@ -22429,7 +23892,7 @@ class PolicyTests(unittest.TestCase):
         counts = {}
         for access in policy.ACCESS.values():
             counts[access] = counts.get(access, 0) + 1
-        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 19, "engineer": 24})
+        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 19, "engineer": 26})
         self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
         self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
         self.assertEqual(policy.ACCESS[("POST", "/collections")], "developer")
@@ -22456,9 +23919,9 @@ class PolicyTests(unittest.TestCase):
 
     def test_keys_cannot_reach_administration_or_the_session_routes(self):
         # S5 of PR 3: every account, principal and key route, logout and the
-        # password change; GET /auth/me stays open to a key.
+        # password change, and the audit log (#29); GET /auth/me stays open to a key.
         admin = {path for _, path in policy.ACCESS if path.startswith(("/auth/users", "/auth/service-principals"))}
-        self.assertEqual(policy.HUMAN_ONLY, admin | {"/auth/logout", "/auth/password"})
+        self.assertEqual(policy.HUMAN_ONLY, admin | {"/auth/logout", "/auth/password", "/audit", "/audit.csv"})
         self.assertNotIn("/auth/me", policy.HUMAN_ONLY)
 
     def test_each_template_resolves_to_itself(self):
@@ -30086,7 +31549,7 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     for (const p of ['/qa', '/collections', '/health', '/qa']) {
       await s.page.goto(BASE + p, { waitUntil: 'networkidle2' }); await sleep(500);
     }
-    r.check('the session survives navigation and reloads', await s.page.evaluate(() => document.querySelectorAll('nav a').length === 10));  // the Engineer's links, Users and Service keys included
+    r.check('the session survives navigation and reloads', await s.page.evaluate(() => document.querySelectorAll('nav a').length === 11));  // the Engineer's links, Users, Service keys and Audit included
     await clickByText(s.page, 'Log out');
     await s.page.waitForFunction(() => location.pathname === '/login', { timeout: 10000 }).catch(() => {});
     const me = await s.page.evaluate(async () => (await fetch('/api/auth/me')).status);
@@ -30187,7 +31650,7 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     const s = await session(browser, BASE, 'engineer');
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(1500);
     const links = await s.page.evaluate(() => [...document.querySelectorAll('nav a')].map(a => a.textContent.trim()));
-    for (const want of ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys']) {
+    for (const want of ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys', 'Audit']) {
       r.check(`Engineer nav includes ${want}`, links.includes(want), JSON.stringify(links));
     }
     await s.ctx.close();
@@ -38060,7 +39523,7 @@ function usersCases() {
   return [
     { name: 'Engineer nav has Users, which opens the Users page', open: { role: 'engineer', path: '/qa', routes: usersApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
-      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys']);
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys', 'Audit']);
       await press(s.page, 'Users', 'nav a');
       await waitPath(s.page, '/users');
       await waitText(s.page, 'vfy-developer');
@@ -38189,9 +39652,9 @@ function serviceKeysCases() {
   const status = (page, name) => page.evaluate(n => document.querySelector(`section[data-principal="${n}"] [data-testid=principal-status]`)?.textContent.trim(), name);
   const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
   return [
-    { name: 'Engineer nav ends with Service keys, which opens the page', open: { role: 'engineer', path: '/qa', routes: keysApi() }, async run(s) {
+    { name: 'Engineer nav has Service keys after Users, which opens the page', open: { role: 'engineer', path: '/qa', routes: keysApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
-      assert.equal((await nav(s.page)).at(-1), 'Service keys');
+      assert.deepEqual((await nav(s.page)).slice(-3, -1), ['Users', 'Service keys']);
       await press(s.page, 'Service keys', 'nav a');
       await waitPath(s.page, '/service-keys');
       await waitText(s.page, 'vfy-svc');
@@ -38460,6 +39923,89 @@ function proxyCases() {
   ];
 }
 
+// The Audit page (#29): Engineers filter and page through the audit log and
+// download its CSV. The API is stubbed; the real routes are checked in 19_audit.sh.
+function auditCases() {
+  const rec = (id, over = {}) => ({ id, time: '2026-10-29T12:00:00.123Z', actor: 'vfy-developer', actor_kind: 'user', role: 'developer', key_id: null, client_ip: '192.168.65.1', action: 'export', collection: 'VfyUiA', target: null, result: 'accepted', status_code: 202, job_id: 'job12345', details: { encrypted: true }, ...over });
+  const FIRST = [rec('1761739200123000000-aaaaaa'), rec('1761739200000000000-bbbbbb', { actor: 'nightly', actor_kind: 'service', key_id: 'keyid0000001', action: 'query', result: 'refused', status_code: 403, job_id: null, details: { code: 'FORBIDDEN' } })];
+  const OLDER = [rec('1761739100000000000-cccccc', { actor: null, actor_kind: 'anonymous', role: null, action: 'auth.login', collection: null, target: 'Nobody', result: 'refused', status_code: 401, job_id: null, details: { code: 'LOGIN_FAILED' } })];
+  const auditApi = (over = {}) => base({
+    'GET /api/audit': call => {
+      const q = new URLSearchParams(call.query);
+      if (q.get('before')) return json(200, { records: OLDER, next_before: null, failed_writes: 0, question_text_logged: false });
+      return json(200, { records: FIRST, next_before: FIRST[1].id, failed_writes: over.failed || 0, question_text_logged: !!over.questions });
+    },
+  });
+  const rows = page => page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => [...r.querySelectorAll('td')].map(c => c.textContent.trim())));
+  const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
+  // The older page's answer waits for olderGate, so the page stays loading.
+  const olderGate = hold();
+  const heldOlder = () => {
+    const routes = auditApi(), answer = routes['GET /api/audit'];
+    routes['GET /api/audit'] = async call => {
+      if (new URLSearchParams(call.query).get('before')) await olderGate.promise;
+      return answer(call);
+    };
+    return routes;
+  };
+  return [
+    { name: 'Engineer nav ends with Audit, which opens the page', open: { role: 'engineer', path: '/qa', routes: auditApi() }, async run(s) {
+      await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
+      assert.equal((await nav(s.page)).at(-1), 'Audit');
+      await press(s.page, 'Audit', 'nav a');
+      await waitPath(s.page, '/audit');
+      await waitText(s.page, 'nightly (key keyid0000001)');
+    } },
+    ...['developer', 'end_user'].map(role => ({ name: `${role === 'developer' ? 'Developer' : 'End User'} has no Audit link and is sent from /audit to Q&A`, open: { role, path: '/qa', routes: base() }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      assert.equal((await nav(s.page)).includes('Audit'), false);
+      await goto(s.page, '/audit');
+      await waitText(s.page, 'Ask a Question');
+      await waitPath(s.page, '/qa');
+      assert.equal(callsTo(s, 'GET', '/api/audit').length, 0);
+    } })),
+    { name: 'The table lists the records, newest first; Older and Newest page through them', open: { role: 'engineer', path: '/audit', routes: auditApi() }, async run(s) {
+      await waitText(s.page, 'nightly (key keyid0000001)');
+      const shown = await rows(s.page);
+      assert.deepEqual(shown[0], ['2026-10-29 12:00:00.123', 'vfy-developer', 'developer', '192.168.65.1', 'export', 'VfyUiA', '', 'accepted (202)', 'job12345', '{"encrypted":true}']);
+      assert.equal(shown[1][7], 'refused (403)');
+      await press(s.page, 'Older');
+      await waitText(s.page, 'Nobody');
+      assert.equal((await rows(s.page))[0][1], 'anonymous');
+      assert.match(callsTo(s, 'GET', '/api/audit').at(-1).query, /before=1761739200000000000-bbbbbb/);
+      await press(s.page, 'Newest');
+      await waitText(s.page, 'vfy-developer');
+      assert.doesNotMatch(callsTo(s, 'GET', '/api/audit').at(-1).query, /before=/);
+    } },
+    { name: 'Apply sends the filters (times as UTC) and the CSV link carries the same filters', open: { role: 'engineer', path: '/audit', routes: auditApi() }, async run(s) {
+      await waitText(s.page, 'vfy-developer');
+      await fill(s.page, '#audit-actor', 'vfy-developer');
+      await fill(s.page, '#audit-action', 'export');
+      await fill(s.page, '#audit-result', 'accepted');
+      await fill(s.page, '#audit-from', '2026-10-29T08:30');
+      await press(s.page, 'Apply');
+      await waitFor(s.page, () => document.querySelector('[data-testid=audit-csv]').getAttribute('href').includes('actor='), 'the CSV link to carry the filters');
+      const q = new URLSearchParams(callsTo(s, 'GET', '/api/audit').at(-1).query);
+      assert.deepEqual([q.get('actor'), q.get('action'), q.get('result'), q.get('from')], ['vfy-developer', 'export', 'accepted', '2026-10-29T08:30Z']);
+      const href = await s.page.$eval('[data-testid=audit-csv]', a => a.getAttribute('href'));
+      assert.equal(href, '/api/audit.csv?from=2026-10-29T08%3A30Z&actor=vfy-developer&action=export&result=accepted');
+    } },
+    { name: 'A double click on Older asks for the older page once, and Older waits while it loads', open: { role: 'engineer', path: '/audit', routes: heldOlder() }, async run(s) {
+      await waitText(s.page, 'nightly (key keyid0000001)');
+      await s.page.evaluate(() => { const b = [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Older'); b.click(); b.click(); });
+      await waitFor(s.page, () => !!document.querySelector('[data-testid=audit-loading]'), 'the loading note');
+      assert.deepEqual(await buttonState(s.page, 'Older'), { disabled: true });
+      olderGate.release();
+      await waitText(s.page, 'Nobody');
+      assert.equal(callsTo(s, 'GET', '/api/audit').filter(c => /before=/.test(c.query)).length, 1);
+    } },
+    { name: 'The page says whether question text is logged and warns about failed writes', open: { role: 'engineer', path: '/audit', routes: auditApi({ failed: 2, questions: true }) }, async run(s) {
+      await waitText(s.page, 'Question text is being recorded');
+      await waitText(s.page, '2 audit record(s) could not be written');
+    } },
+  ];
+}
+
 async function runUiControlTests(browser, baseUrl, reporter) {
   S.BASE = baseUrl;
   const run = (section, cases) => S.runCases(browser, baseUrl, reporter, section, cases);
@@ -38469,6 +40015,7 @@ async function runUiControlTests(browser, baseUrl, reporter) {
   await run('Login, logout, setup and password changes (#25)', authCases());
   await run('Users page: Engineers manage accounts (#25)', usersCases());
   await run('Service keys page: Engineers manage service principals and keys (#25)', serviceKeysCases());
+  await run('Audit page: Engineers read the audit log (#29)', auditCases());
   await run('Q&A input, citations toggle, answer display and End User view (#400)', qaCases());
   await run('Retrieval page status text, alpha slider and save (#400)', retrievalCases());
   await run('Client handling of the proxy error pages (#400)', proxyCases());
@@ -41170,7 +42717,8 @@ class TelemetryTests(unittest.TestCase):
             service=SimpleNamespace(goldstandard=gold,metrics=SimpleNamespace(load_from_disk=Mock()),
                                     packager=SimpleNamespace(sweep_build_leftovers=lambda:[]),
                                     weaviate_client=wc,importer=importer,exporter=job_module('export'),
-                                    ingest_pipeline=job_module('ingest'),tuning=job_module('tune'))
+                                    ingest_pipeline=job_module('ingest'),tuning=job_module('tune'),
+                                    audit=SimpleNamespace(record=lambda *args,**kwargs:order.append('audit')))
             modules={'services':service,'services.telemetry':SimpleNamespace(bootstrap=lambda:(order.append('bootstrap') or runtime))}
             async def exercise():
                 async with namespace['lifespan'](SimpleNamespace(state=SimpleNamespace())):
@@ -41183,7 +42731,8 @@ class TelemetryTests(unittest.TestCase):
             self.assertEqual(order[-2:],['close','shutdown'])
             self.assertEqual('yield' in order,not fail)
             if not fail:
-                self.assertEqual(order, ['bootstrap', 'load', 'ingest', 'export', 'import', 'tune',
+                # 'audit': the start's audit record (#29), after the job records load.
+                self.assertEqual(order, ['bootstrap', 'load', 'ingest', 'export', 'import', 'tune', 'audit',
                                          'yield', 'close', 'shutdown'])
 
     def test_lifecycle_deadline_single_worker_and_eventual_shutdown(self):

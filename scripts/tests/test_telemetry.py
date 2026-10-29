@@ -751,7 +751,8 @@ class TelemetryTests(unittest.TestCase):
             service=SimpleNamespace(goldstandard=gold,metrics=SimpleNamespace(load_from_disk=Mock()),
                                     packager=SimpleNamespace(sweep_build_leftovers=lambda:[]),
                                     weaviate_client=wc,importer=importer,exporter=job_module('export'),
-                                    ingest_pipeline=job_module('ingest'),tuning=job_module('tune'))
+                                    ingest_pipeline=job_module('ingest'),tuning=job_module('tune'),
+                                    audit=SimpleNamespace(record=lambda *args,**kwargs:order.append('audit')))
             modules={'services':service,'services.telemetry':SimpleNamespace(bootstrap=lambda:(order.append('bootstrap') or runtime))}
             async def exercise():
                 async with namespace['lifespan'](SimpleNamespace(state=SimpleNamespace())):
@@ -764,7 +765,8 @@ class TelemetryTests(unittest.TestCase):
             self.assertEqual(order[-2:],['close','shutdown'])
             self.assertEqual('yield' in order,not fail)
             if not fail:
-                self.assertEqual(order, ['bootstrap', 'load', 'ingest', 'export', 'import', 'tune',
+                # 'audit': the start's audit record (#29), after the job records load.
+                self.assertEqual(order, ['bootstrap', 'load', 'ingest', 'export', 'import', 'tune', 'audit',
                                          'yield', 'close', 'shutdown'])
 
     def test_lifecycle_deadline_single_worker_and_eventual_shutdown(self):

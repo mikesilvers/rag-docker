@@ -6,6 +6,11 @@ auth/middleware.py before a route runs; the /auth/users and
 /auth/service-principals routes need an Engineer's session (an API key can't
 use them). The first account is created by the operator command, `python -m
 auth`, which also recovers lockouts.
+
+Each of these requests that logs in, changes something or is refused is also an
+audit record (#29), written by services/audit.py's middleware with what the
+handlers note here (a typed username, a new role, a key's id; never a password
+or a key). The WARNING log lines are unchanged.
 """
 from __future__ import annotations
 
@@ -18,6 +23,7 @@ from fastapi.responses import JSONResponse
 
 from auth import passwords, store
 from config import settings
+from services import audit
 from models.schemas import (AdminUserList, AdminUserResult, AuthStatus, AuthUser, KeyIssueRequest, LoginRequest,
                             PasswordChangeRequest, PrincipalCreateRequest, RoleChangeRequest,
                             ServicePrincipalList, ServicePrincipalResult, UserCreateRequest)
@@ -80,6 +86,12 @@ async def login(body: LoginRequest, request: Request):
                          "`docker compose exec api python -m auth bootstrap <username>`.")
     address = _address(request)
     outcome, user, token = await asyncio.to_thread(_login, body.username, body.password, address)
+    # The audit record (#29): a success names the account, a failure the
+    # username as typed; never the password.
+    if outcome == "ok":
+        audit.identify(user.username, user.role)
+    else:
+        audit.note(target=body.username)
     if outcome == "throttled":
         _log.warning("Login refused for %r from %s: too many failed attempts", body.username, address)
         return api_error(429, "LOGIN_THROTTLED", "Too many failed logins. Wait 15 minutes and try again.")
@@ -197,6 +209,7 @@ def _create(username: str, role: str):
 async def create_user(body: UserCreateRequest, request: Request):
     actor = request.state.auth.username
     username = passwords.normalize_username(body.username)
+    audit.note(target=username or body.username, role=body.role)
     if username is None:
         _log.warning("Admin %r: create of %r refused: invalid username", actor, body.username)
         return api_error(422, "INVALID_USERNAME", f"The username must be {passwords.USERNAME_RULE}.")
@@ -247,6 +260,7 @@ async def set_user_role(username: str, body: RoleChangeRequest, request: Request
     if target is None:
         return _not_found(actor, "set-role", username)
     try:
+        audit.note(role=body.role)
         user = await asyncio.to_thread(_apply, store.set_role, target, body.role, "user")
     except store.Refused as exc:
         return _refused(actor, "set-role", target, exc)
@@ -325,6 +339,7 @@ async def list_principals():
 async def create_principal(body: PrincipalCreateRequest, request: Request):
     actor = request.state.auth.username
     name = passwords.normalize_username(body.name)
+    audit.note(target=name or body.name, role=body.role)
     if name is None:
         _log.warning("Admin %r: create of service principal %r refused: invalid name", actor, body.name)
         return api_error(422, "INVALID_USERNAME", f"The name must be {passwords.USERNAME_RULE}.")
@@ -348,6 +363,7 @@ async def set_principal_role(name: str, body: RoleChangeRequest, request: Reques
     if target is None:
         return _principal_not_found(actor, "set-role", name)
     try:
+        audit.note(role=body.role)
         principal = await asyncio.to_thread(_change_principal, store.set_role, target, body.role)
     except store.Refused as exc:
         return _principal_refused(actor, "set-role", target, exc)
@@ -395,6 +411,7 @@ async def issue_key(name: str, body: KeyIssueRequest, request: Request):
         principal, key, secret = await asyncio.to_thread(_issue, target, body.days, body.label)
     except store.Refused as exc:
         return _principal_refused(actor, "issue-key", target, exc)
+    audit.note(key_id=key.id, expires_at=_iso(key.expires_at))   # the id, never the key (#29)
     _log.warning("Admin %r issued key %s for service principal %r, expiring %s", actor, key.id, target,
                  _iso(key.expires_at))
     return JSONResponse({"principal": _principal_body(principal), "key": _key_body(key, time.time()),
