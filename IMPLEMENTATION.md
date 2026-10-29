@@ -19652,6 +19652,13 @@ containment, interrupted publication and concurrent blob publication:
 python -m unittest discover -s scripts/tests -p 'test_model_bundle.py'
 ```
 
+`05_transfer.sh` also checks that a model installed from a bundle is reported
+by Ollama's real `/api/tags` (#452): only when the api and ollama containers
+both mount `rag-verify-ollama-models`, it installs the embedding model's own
+files under the throwaway name `vfy-install-alias:latest`, which writes one
+manifest into the verify model copy, and removes that manifest whether the
+check passes or fails.
+
 ## Cleaning up
 
 Suites create collections prefixed `Vfy` (`RAG_TEST_PREFIX`) and remove them at
@@ -29657,6 +29664,67 @@ check_eq "E27 the import notes the namespaced model" "$(m e27_note)" "True"
 check_eq "the live model store was only read" "$(m live_untouched)" "True"
 [ -s /tmp/vfy_models.json ] || sed 's/^/      /' /tmp/vfy_models.err | tail -5
 e27c=$(m e27_collection); [ -n "$e27c" ] && [ "$e27c" != "None" ] && [ "$e27c" != "$C" ] && drop_collection "$e27c"
+
+# ── a model installed from a bundle is reported by Ollama (#452) ─────────────
+# The only suite step that writes to the verify model copy. It installs the
+# embedding model's own manifest and blobs under a throwaway name, asks
+# Ollama's real /api/tags for that name, and removes the manifest in a
+# `finally`, before any result is read. The blobs are already there, so only
+# that one manifest is written. It runs only when both the api and ollama
+# containers mount rag-verify-ollama-models, never the live volume; stack.sh's
+# copy sync removes anything left behind on the next `up`.
+alias_mounts=$(cd "$REPO_ROOT" && for mount in api:/ollama ollama:/root/.ollama; do
+  docker inspect -f "{{range .Mounts}}{{if eq .Destination \"${mount#*:}\"}}{{.Name}}{{end}}{{end}}" \
+    "$(docker compose ps -q "${mount%%:*}")" 2>/dev/null
+done | tr '\n' ' ')
+if [ "$alias_mounts" = "rag-verify-ollama-models rag-verify-ollama-models " ]; then
+  (cd "$REPO_ROOT" && docker compose exec -T api python -) > /tmp/vfy_alias.json 2>/tmp/vfy_alias.err <<'ENDPY'
+import json, shutil, tempfile
+from pathlib import Path
+from config import settings
+from services import importer, model_bundle as models
+alias, name = "vfy-install-alias:latest", "vfy-install-alias"
+out = {"error": None}
+target = models.manifest_path(alias)
+try:
+    own = models.manifest_path(settings.embed_model)
+    digests = models._digests(json.loads(own.read_bytes()))
+    stamps = {p: p.stat().st_mtime_ns for p in [own, *map(models.blob_path, digests)]}
+    target.unlink(missing_ok=True)                   # left by an interrupted run
+    out["reported_before"] = importer._ollama_reports(name)
+    with tempfile.TemporaryDirectory(prefix="vfy-alias-", dir=settings.upload_dir) as td:
+        bundle = Path(td) / "models" / name / "latest"
+        (bundle / "blobs").mkdir(parents=True)
+        shutil.copyfile(own, bundle / "manifest.json")
+        for digest in digests:
+            shutil.copyfile(models.blob_path(digest), bundle / "blobs" / digest.replace(":", "-"))
+        models.install_model(Path(td), alias)
+        out["reported_after"] = importer._ollama_reports(name)
+    out["bundle_removed"] = not Path(td).exists()
+    out["embed_untouched"] = all(p.stat().st_mtime_ns == s for p, s in stamps.items())
+except Exception as exc:                             # noqa: BLE001
+    out["error"] = f"{type(exc).__name__}: {exc}"
+finally:
+    target.unlink(missing_ok=True)
+    try:
+        target.parent.rmdir()                        # the alias folder, when empty
+    except OSError:
+        pass
+    out["removed"] = not target.exists()
+print(json.dumps(out))
+ENDPY
+  al() { python3 -c "import json,sys;print(json.load(open('/tmp/vfy_alias.json')).get(sys.argv[1]))" "$1" 2>/dev/null; }
+  check_eq "the throwaway model name isn't reported before it is installed" "$(al reported_before)" "False"
+  check_eq "a model installed from a bundle into the verify model copy is reported by Ollama's /api/tags" "$(al reported_after)" "True"
+  check_eq "the throwaway model's manifest is removed afterwards" "$(al removed)" "True"
+  check_eq "the embedding model's own files are left unchanged" "$(al embed_untouched)" "True"
+  check_eq "the temporary bundle folder is removed" "$(al bundle_removed)" "True"
+  [ -s /tmp/vfy_alias.json ] || sed 's/^/      /' /tmp/vfy_alias.err | tail -5
+  [ "$(al error)" = None ] || printf '      %s\n' "$(al error)"
+else
+  check "the install-then-report check runs only on the verify model copy" 1 \
+    "api and ollama must both mount rag-verify-ollama-models; found: '${alias_mounts}'"
+fi
 
 # ── tuning ───────────────────────────────────────────────────────────────────
 api_get "/tune/$C" > /tmp/vfy_tune.json

@@ -370,7 +370,8 @@ failure) is the one most likely to be skipped and most likely to matter.
   second import of the same package: identical files, UUIDs and distances to six
   decimal places.
 - **E12** — a package claiming `bge-large-en`/1024 was refused `EMBEDDING_MISMATCH`,
-  naming both models and stating the re-embedding remedy.
+  naming both models. The refusal then also offered re-embedding as the remedy;
+  #390 removed that, since a refused package is never re-embedded.
 - **E13** — a truncated package failed `PACKAGE_CORRUPT` naming `chunks.jsonl`
   and carrying both digests.
 - **E14** — `abort` failed `COLLECTION_EXISTS`; `rename` imported as
