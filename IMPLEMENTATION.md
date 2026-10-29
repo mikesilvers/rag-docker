@@ -146,6 +146,11 @@ services:
       # upload is refused (#28).
       MAX_ZIP_MEMBERS: 5000
       MAX_ZIP_MEMBER_RATIO: 200
+      # The most an imported package's members may add up to (16 GiB) and the
+      # most entries it may hold, folders included; over either the import
+      # fails (#317).
+      MAX_PACKAGE_EXPANDED_BYTES: 17179869184
+      MAX_PACKAGE_MEMBERS: 100000
       # Marks the session cookie Secure (#25). false for this loopback HTTP
       # profile, where a Secure cookie would never be sent back. LAN mode's
       # docker-compose.lan.yml serves TLS and sets it true (#26). Exactly true
@@ -896,6 +901,12 @@ class Settings(BaseSettings):
     # declared and as actually read. Members under 1 MiB are exempt from the ratio.
     max_zip_members: int = 5000
     max_zip_member_ratio: int = 200
+    # The caps on an imported package's TAR (#317): the most its members' sizes
+    # may add up to, and the most entries it may hold, folders included. A
+    # package carrying models is several GB, so these are not the ZIP caps.
+    # Checked as each header is read, before the member is extracted.
+    max_package_expanded_bytes: int = 16 * 1024 * 1024 * 1024
+    max_package_members: int = 100000
     # Accounts, sessions and the login throttle (#25): one SQLite file in the
     # auth_data volume. Not /app/auth, which would hide the `auth` package that
     # `python -m auth` runs.
@@ -7512,29 +7523,87 @@ def _check_member(member: tarfile.TarInfo, dest: Path, root: Path) -> None:
             {"member": member.name})
 
 
-def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
-    """Extract, refusing any member that would land outside dest.
+def _limit_text(limit: int) -> str:
+    """A cap for a message: whole MiB as MB, anything else in bytes."""
+    mib = 1024 * 1024
+    if limit >= mib and limit % mib == 0:
+        return f"{limit // mib:,} MB"
+    return f"{limit:,} bytes"
+
+
+class _Budget:
+    """The member-count and expanded-size caps on one package's TAR (#317).
+
+    A small .tar.gz can expand enough to fill the disk the work directory is
+    on, so every member is counted as its header is read, folders included,
+    and its header size is added to a running total. In a TAR the bytes
+    written for a member are exactly its header size, so the total bounds
+    what extraction writes. Equal to a cap is within it.
+    """
+
+    def __init__(self, archive_name: str):
+        self.archive_name = archive_name
+        self.max_members = settings.max_package_members
+        self.max_bytes = settings.max_package_expanded_bytes
+        self.members = 0
+        self.size = 0
+
+    def count(self, member: tarfile.TarInfo) -> None:
+        self.members += 1
+        if self.members > self.max_members:
+            raise PackageError(
+                "PACKAGE_TOO_MANY_MEMBERS",
+                f"'{self.archive_name}' holds more than {self.max_members:,} entries, the "
+                f"most a package may hold (MAX_PACKAGE_MEMBERS), so nothing from it was "
+                f"imported.",
+                {"limit": self.max_members})
+
+    def add(self, member: tarfile.TarInfo) -> None:
+        self.size += member.size
+        if self.size > self.max_bytes:
+            raise PackageError(
+                "PACKAGE_TOO_LARGE",
+                f"'{self.archive_name}' expands to more than {_limit_text(self.max_bytes)} "
+                f"when unpacked, the most a package may expand to "
+                f"(MAX_PACKAGE_EXPANDED_BYTES), so nothing from it was imported.",
+                {"limit": self.max_bytes, "member": member.name})
+
+
+def _admit(member: tarfile.TarInfo, dest: Path, root: Path, budget: _Budget) -> None:
+    """Count the member, check it, then add its size, refusing at the first failure."""
+    budget.count(member)
+    _check_member(member, dest, root)
+    budget.add(member)
+
+
+def _safe_extract(tar: tarfile.TarFile, dest: Path, name: str) -> None:
+    """Extract, refusing a package over the caps or any member that would land outside dest.
 
     A package is a file someone was handed, so it is untrusted input. Python
     3.12 has `filter="data"` for this; doing it explicitly keeps the guarantee
-    on 3.11 and makes the refusal auditable.
+    on 3.11 and makes the refusal auditable. Headers are read one at a time and
+    each is checked as it is read, so a refusal stops reading there, holds at
+    most the caps' worth of headers, and leaves dest empty (#317).
     """
     root = dest.resolve()
-    for member in tar.getmembers():
-        _check_member(member, dest, root)
+    budget = _Budget(name)
+    for member in tar:
+        _admit(member, dest, root, budget)
     tar.extractall(dest)
 
 
-def _safe_extract_stream(tar: tarfile.TarFile, dest: Path) -> None:
+def _safe_extract_stream(tar: tarfile.TarFile, dest: Path, name: str) -> None:
     """The same checks for a tar read as a stream, one member at a time (#27).
 
-    A stream can't be read twice, so each member is checked just before it is
-    extracted. A refusal part-way leaves only the job's own work directory
-    holding the members before it, and the job removes that directory.
+    A stream can't be read twice, so each member is checked, and counted
+    against the caps (#317), just before it is extracted. A refusal part-way
+    leaves only the job's own work directory holding the members before it,
+    within the caps, and the job removes that directory.
     """
     root = dest.resolve()
+    budget = _Budget(name)
     for member in tar:
-        _check_member(member, dest, root)
+        _admit(member, dest, root, budget)
         tar.extract(member, dest)
 
 
@@ -7554,7 +7623,7 @@ def _extract_encrypted(archive: Path, dest: Path, passphrase: str) -> None:
         with archive.open("rb") as fh:
             decryptor = age_stream.open_decrypt(fh, passphrase)
             with tarfile.open(fileobj=decryptor, mode="r|gz") as tar:
-                _safe_extract_stream(tar, dest)
+                _safe_extract_stream(tar, dest, archive.name)
             # tarfile stops at the end-of-archive blocks; the final chunk, and
             # anything after it, still has to be authenticated.
             decryptor.drain()
@@ -7588,7 +7657,7 @@ def open_package(archive: Path, dest: Path, passphrase: str | None = None) -> tu
             _extract_encrypted(archive, dest, passphrase or "")
         else:
             with tarfile.open(archive, "r:gz") as tar:
-                _safe_extract(tar, dest)
+                _safe_extract(tar, dest, archive.name)
     except PackageError:
         raise
     except (tarfile.TarError, OSError, EOFError) as exc:
@@ -19091,7 +19160,7 @@ Docker Desktop the API can read a freshly written bind-mounted file as empty. Co
 and do not replace, this live acceptance.
 
 `15_transfer_paths.sh` (#387), run by `05_transfer.sh`, covers transfer and tuning paths that
-had no check. It runs four controlled tests, then live checks on a collection of its own.
+had no check. It runs five controlled tests, then live checks on a collection of its own.
 `scripts/tests/test_package_refusals.py` (API container) checks that `open_package` refuses a
 missing file, a file that isn't gzip and a truncated archive (`PACKAGE_UNREADABLE`), a symlink,
 a hardlink and a `../` member, naming the member and extracting nothing, an archive with two
@@ -19101,7 +19170,15 @@ model checks mocked, a digest-valid package naming a collection Weaviate can't u
 `PACKAGE_FORMAT_UNSUPPORTED` before any lookup, and one with a `chunks.jsonl` line that isn't
 JSON, a bad UUID, properties that aren't an object, a missing or short vector, or a chunk count
 above or below the manifest's is `PACKAGE_CORRUPT` before any collection is created, with
-`abort` and `rename`. `scripts/tests/test_transfer_paths.py` (API container, through the app)
+`abort` and `rename`. `scripts/tests/test_package_limits.py` (API container, with caps of
+1 MiB and 20 entries set through `MAX_PACKAGE_EXPANDED_BYTES` and `MAX_PACKAGE_MEMBERS`, #317)
+checks that a `.tar.gz` and a `.tar.gz.age` package exactly at each cap open, and that one entry
+or one byte over is refused `PACKAGE_TOO_MANY_MEMBERS` or `PACKAGE_TOO_LARGE` with the exact
+message and `detail`; a `.tar.gz` refusal extracts nothing and reads no header past the refusing
+entry, a `.tar.gz.age` refusal leaves at most the cap's bytes, and through `importer._run` each
+refusal fails the job with no collection created and no work directory left. The suite then
+checks that `docker-compose.yml`'s values (16 GiB, 100,000) reach the API.
+`scripts/tests/test_transfer_paths.py` (API container, through the app)
 checks that a missing, `null` or unknown `on_conflict` is 422 `INVALID_PARAMETER`, a second
 import of a running file 409 `IMPORT_IN_PROGRESS`, unknown export, import and tune job ids 404
 `JOB_NOT_FOUND`, that a query is answered while an export build is held in its worker thread,
@@ -30182,10 +30259,10 @@ summary
 
 ```bash
 #!/usr/bin/env bash
-# Transfer and tuning paths with no check before (#387): import refusals, on_conflict,
-# unknown job ids, /packages, the package file left alone, export without the model store,
-# retrieve.py (E8-E10), equivalent retrieval after import (E11) and a re-chunk that produces
-# no chunks. Run by 05_transfer.sh.
+# Transfer and tuning paths with no check before (#387): import refusals, the package
+# expansion caps (#317), on_conflict, unknown job ids, /packages, the package file left
+# alone, export without the model store, retrieve.py (E8-E10), equivalent retrieval after
+# import (E11) and a re-chunk that produces no chunks. Run by 05_transfer.sh.
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -30201,6 +30278,17 @@ section "Transfer and tuning paths (#387)"
 
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_package_refusals.py)
 check "package refusal regressions (checks 1 and 2, collection name, chunk records)" $?
+# The caps on an imported package's TAR (#317), with small caps set through the
+# environment: at each cap, one entry or byte over, both package kinds, the import job.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app -e MAX_PACKAGE_EXPANDED_BYTES=1048576 \
+  -e MAX_PACKAGE_MEMBERS=20 api python - < scripts/tests/test_package_limits.py)
+check "package expansion-cap regressions (1 MiB and 20 entries from env)" $?
+# docker-compose.yml sets both caps, and the API reads those values.
+caps_env=$(cd "$REPO_ROOT" && docker compose exec -T api python -c \
+  'import os; from config import settings as s; print(os.environ.get("MAX_PACKAGE_EXPANDED_BYTES"), s.max_package_expanded_bytes, os.environ.get("MAX_PACKAGE_MEMBERS"), s.max_package_members)' | tr -d '\r')
+[ "$caps_env" = "17179869184 17179869184 100000 100000" ]
+check "docker-compose.yml sets MAX_PACKAGE_EXPANDED_BYTES 16 GiB and MAX_PACKAGE_MEMBERS 100000 and the API uses them" $? \
+  "env and settings: $caps_env"
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_transfer_paths.py)
 check "transfer and tuning route regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_retrieve_script.py)

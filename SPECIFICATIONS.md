@@ -125,6 +125,11 @@ services:
       # upload is refused (#28).
       MAX_ZIP_MEMBERS: 5000
       MAX_ZIP_MEMBER_RATIO: 200
+      # The most an imported package's members may add up to (16 GiB) and the
+      # most entries it may hold, folders included; over either the import
+      # fails (#317).
+      MAX_PACKAGE_EXPANDED_BYTES: 17179869184
+      MAX_PACKAGE_MEMBERS: 100000
       # Marks the session cookie Secure (#25). false for this loopback HTTP
       # profile, where a Secure cookie would never be sent back. LAN mode's
       # docker-compose.lan.yml serves TLS and sets it true (#26). Exactly true
@@ -2769,6 +2774,8 @@ The `chunk_size` and `min_chunk_size` bounds apply whenever chunk settings are s
 | `max_zip_expanded_bytes` | 2147483648 | — | — | API setting (env `MAX_ZIP_EXPANDED_BYTES`), not a request parameter: the most one upload's ZIPs may expand to in all, gzipped members' output included (§3.1.3, #298) |
 | `max_zip_members` | 5000 | — | — | API setting (env `MAX_ZIP_MEMBERS`), not a request parameter: the most entries one ZIP may hold, folders included (§3.1.3, #28) |
 | `max_zip_member_ratio` | 200 | — | — | API setting (env `MAX_ZIP_MEMBER_RATIO`), not a request parameter: the most a ZIP member of 1 MiB or more may expand relative to its compressed size, declared and as read (§3.1.3, #28) |
+| `max_package_expanded_bytes` | 17179869184 | — | — | API setting (env `MAX_PACKAGE_EXPANDED_BYTES`), not a request parameter: the most an imported package's members may add up to when unpacked; over it the import fails `PACKAGE_TOO_LARGE` (RAG_EXPORT_SPECIFICATIONS.md §6.2, #317) |
+| `max_package_members` | 100000 | — | — | API setting (env `MAX_PACKAGE_MEMBERS`), not a request parameter: the most entries an imported package may hold, folders included; over it the import fails `PACKAGE_TOO_MANY_MEMBERS` (RAG_EXPORT_SPECIFICATIONS.md §6.2, #317) |
 
 Optional telemetry (#282) is configured by API container environment settings, not request parameters. They are read only when `RAG_OTEL_ENABLED` is `true`; an invalid value fails API startup with an error naming the field only. See "Optional telemetry foundation (#282)" below and README "Optional backend telemetry".
 

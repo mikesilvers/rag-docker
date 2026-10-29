@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     # declared and as actually read. Members under 1 MiB are exempt from the ratio.
     max_zip_members: int = 5000
     max_zip_member_ratio: int = 200
+    # The caps on an imported package's TAR (#317): the most its members' sizes
+    # may add up to, and the most entries it may hold, folders included. A
+    # package carrying models is several GB, so these are not the ZIP caps.
+    # Checked as each header is read, before the member is extracted.
+    max_package_expanded_bytes: int = 16 * 1024 * 1024 * 1024
+    max_package_members: int = 100000
     # Accounts, sessions and the login throttle (#25): one SQLite file in the
     # auth_data volume. Not /app/auth, which would hide the `auth` package that
     # `python -m auth` runs.

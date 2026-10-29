@@ -609,6 +609,8 @@ All API settings are environment variables in `docker-compose.yml`:
 | `MAX_ZIP_EXPANDED_BYTES` | `2147483648` (2 GiB) | The most one upload's ZIPs may expand to in all, gzipped members' output included. Over it the upload is refused with `ARCHIVE_TOO_LARGE` |
 | `MAX_ZIP_MEMBERS` | `5000` | The most entries one ZIP may hold, folders included. Over it the upload is refused with `ARCHIVE_TOO_MANY_MEMBERS` |
 | `MAX_ZIP_MEMBER_RATIO` | `200` | The most a ZIP member of 1 MiB or more may expand relative to its compressed size. Over it the upload is refused with `ARCHIVE_RATIO_TOO_HIGH` |
+| `MAX_PACKAGE_EXPANDED_BYTES` | `17179869184` (16 GiB) | The most an imported package's files may add up to when unpacked. Over it the import fails with `PACKAGE_TOO_LARGE` |
+| `MAX_PACKAGE_MEMBERS` | `100000` | The most entries an imported package may hold, folders included. Over it the import fails with `PACKAGE_TOO_MANY_MEMBERS` |
 | `AUTH_COOKIE_SECURE` | `false` | Marks the session cookie `Secure`. Exactly `true` or `false`; anything else stops the API. Leave it `false` for the loopback HTTP profile, where a Secure cookie would never be sent back. `docker-compose.lan.yml` sets it `true` for LAN mode's TLS (#26) |
 | `RAG_LAN_MODE` | `false` | LAN mode (#26), set `true` only by `docker-compose.lan.yml`. Exactly `true` or `false`; anything else stops the API. When `true` the API refuses to start unless `AUTH_COOKIE_SECURE` is `true` and an enabled AI Engineer exists. See [Sharing with your office](#sharing-with-your-office) |
 | `AUTH_DIR` | `/app/auth_data` | Container path of the accounts store, the `auth_data` volume |

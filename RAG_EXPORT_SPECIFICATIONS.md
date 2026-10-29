@@ -514,7 +514,7 @@ Checks run in this order and stop at the first failure:
 
 | # | Check | On failure |
 |---|---|---|
-| 1 | File exists and is a readable `.tar.gz`; for a `.tar.gz.age` package, it has a valid age passphrase header and decrypts with the passphrase (§4.6) | `PACKAGE_UNREADABLE`; `DECRYPT_FAILED` for a wrong passphrase, damaged or truncated encrypted data, or a work factor above 20 |
+| 1 | File exists and is a readable `.tar.gz`; for a `.tar.gz.age` package, it has a valid age passphrase header and decrypts with the passphrase (§4.6) | `PACKAGE_UNREADABLE`; `DECRYPT_FAILED` for a wrong passphrase, damaged or truncated encrypted data, or a work factor above 20; `PACKAGE_TOO_MANY_MEMBERS` or `PACKAGE_TOO_LARGE` over the extraction caps below (#317) |
 | 2 | `manifest.json` present, `package_format` understood | `PACKAGE_FORMAT_UNSUPPORTED` |
 | 3 | Every `files` key is a normalised relative path inside the package, and every `files` digest matches | `PACKAGE_CORRUPT`, naming the file (`manifest.json` for a key outside the package) |
 | 3a | Retained-source index names only valid digest identities and matching regular blobs; every chunk's `source_sha256` is `null` or a digest of that index (#509) | `PACKAGE_CORRUPT`, naming `sources/index.json`, or `chunks.jsonl` and the line for a chunk's digest |
@@ -534,6 +534,30 @@ of the archive is written. A file that is not an age passphrase file is
 `work_factor`. Either way nothing outside the job's work directory is touched,
 and every later check reads the decrypted files exactly as for an unencrypted
 package (#27).
+
+Check 1 also caps what a package may expand to (#317), because a small `.tar.gz`
+can otherwise fill the disk the job's work directory is on. Every member counts
+as one entry, directories included, and its header size is added to a running
+total; in a TAR that size is exactly what extraction writes for it. The caps are
+API settings: `max_package_members` (env `MAX_PACKAGE_MEMBERS`, default 100,000
+entries) and `max_package_expanded_bytes` (env `MAX_PACKAGE_EXPANDED_BYTES`,
+default 17,179,869,184 bytes = 16 GiB), set in `docker-compose.yml`. Exactly at a
+cap is within it. Members are taken one at a time as their headers are read,
+never collected first, and for each one: it is counted (over the member cap:
+`PACKAGE_TOO_MANY_MEMBERS`), checked for links, type and path as above
+(`PACKAGE_UNREADABLE`), then its size is added (over the size cap:
+`PACKAGE_TOO_LARGE`). The first member to fail decides, and no header after it is
+read. For a `.tar.gz` every header is checked this way before anything is
+extracted, so a refusal extracts nothing; for a `.tar.gz.age` each member is
+checked just before it is extracted, so a refusal leaves at most the cap's bytes
+in the job's work directory, which the job removes. The messages are
+`'<file>' holds more than 100,000 entries, the most a package may hold
+(MAX_PACKAGE_MEMBERS), so nothing from it was imported.` with `detail`
+`{"limit": 100000}`, and `'<file>' expands to more than 16,384 MB when unpacked,
+the most a package may expand to (MAX_PACKAGE_EXPANDED_BYTES), so nothing from it
+was imported.` with `detail` `{"limit": 17179869184, "member": "<member that went
+over>"}` (each with the configured cap; a cap that isn't a whole number of MiB is
+given in bytes). There is no per-member cap: the total bounds every member.
 
 Check 3 checks every `files` key before it hashes anything (#371). A key that is
 empty, absolute, has a `..` component, isn't in normalised form (`./a`, `a//b`,
@@ -973,6 +997,8 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 |---|---|
 | `PACKAGE_UNREADABLE` | missing or not a readable archive, or a `.tar.gz.age` file that is not an age passphrase file |
 | `DECRYPT_FAILED` | an encrypted package could not be decrypted: wrong passphrase, damaged or truncated data, or a work factor above 20; `error_detail.reason` is `passphrase`, `header`, `payload` or `work_factor`; nothing is touched (#27) |
+| `PACKAGE_TOO_MANY_MEMBERS` | the package holds more than `max_package_members` entries (100,000 by default), directories included; `detail` `{"limit": <cap>}`; nothing is imported (§6.2 check 1, #317) |
+| `PACKAGE_TOO_LARGE` | the package's members add up to more than `max_package_expanded_bytes` (16 GiB by default); `detail` `{"limit": <cap>, "member": <name>}`; nothing is imported (§6.2 check 1, #317) |
 | `PASSPHRASE_REQUIRED` | HTTP 400 from `POST /import`: a `.tar.gz.age` package without a passphrase; no job (#27) |
 | `PASSPHRASE_NOT_EXPECTED` | HTTP 400 from `POST /import`: a passphrase for a package that is not encrypted; no job (#27) |
 | `PACKAGE_FORMAT_UNSUPPORTED` | `package_format` newer than this instance |
@@ -1052,6 +1078,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E38 | Importing an encrypted package with a wrong passphrase fails `DECRYPT_FAILED` (`reason` `passphrase`), and a damaged or truncated file fails `DECRYPT_FAILED` or `PACKAGE_UNREADABLE` and a scrypt work factor above 20 (21 included) or not one or two decimal digits (thousands of digits included) fails `DECRYPT_FAILED` before any key derivation; a file cut inside the payload nonce fails `DECRYPT_FAILED`, with no collection, marker, setting, session or package file changed and no work directory left; the right passphrase imports it with every chunk (#27), by `test_export_encryption.py` and suite 05 |
 | E39 | `POST /import` refuses an encrypted package without a passphrase `400 PASSPHRASE_REQUIRED` and a passphrase for any other package `400 PASSPHRASE_NOT_EXPECTED`, before any job; `POST /export` refuses a passphrase outside 12 to 1024 characters, and both refuse one with no UTF-8 form (a lone surrogate), `422 INVALID_PARAMETER` without echoing it; one bad encrypted file never fails `GET /packages` (#27) |
 | E40 | The age implementation passes every applicable C2SP CCTV age testkit vector, and its output decrypts with an independent decryption written from the age specification (#27), by `test_export_encryption.py` |
+| E41 | A package of more than `max_package_members` entries, directories included, fails `PACKAGE_TOO_MANY_MEMBERS`, and one whose members add up to more than `max_package_expanded_bytes` fails `PACKAGE_TOO_LARGE`, each with its message and `detail`, for `.tar.gz` and `.tar.gz.age` packages alike; a package exactly at a cap imports; a `.tar.gz` refusal extracts nothing and reads no header after the refusing member, a `.tar.gz.age` refusal leaves at most the cap's bytes, and the job creates no collection and leaves no work directory (#317), by `test_package_limits.py` with caps of 1 MiB and 20 entries set through the environment |
 
 ---
 
