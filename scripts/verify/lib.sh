@@ -76,6 +76,8 @@ api_get()  { _rag_require_lock_owner; curl -s -m 120 "$API$1"; }
 api_code() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -w '%{http_code}' "$@"; }
 api_post() { _rag_require_lock_owner; curl -s -m 600 -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
 api_post_code() { _rag_require_lock_owner; curl -s -o /dev/null -m 600 -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
+# Any other request, headers and body included: pass curl's own arguments and a full URL.
+api_request() { _rag_require_lock_owner; curl -s -m 120 "$@"; }
 
 require_stack() {
   local code

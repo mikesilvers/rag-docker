@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 from config import settings
 from main import app
 from auth import testing as auth_testing  # a real session in a temporary store (#25)
-from services import metrics, ollama_client, packager
+from services import metrics, ollama_client, packager, rag_pipeline
 from services import weaviate_client as wc
 
 # Text that stands for a backend's own error message: it must be logged, never sent.
@@ -218,7 +218,23 @@ class QueryPipelineTests(EnvelopeTestCase):
             response = self.client.post("/query", json={**QUESTION,
                                                          "response_format": "engineer"})
         self.assertEqual(chat.await_count, 2)
+        self.assertEqual(chat.await_args.args[0], rag_pipeline.SYNTHESIS_ENGINEER_SYSTEM)
         self.assert_unavailable(response, "Ollama", logs)
+
+    def test_an_ollama_call_failing_in_hybrid_or_semantic_mode_names_only_ollama(self):
+        # The question's own Ollama calls (reformulation, synthesis) fail outside Weaviate,
+        # so they keep the Ollama-only message in every mode (#411, #456).
+        down = httpx.ConnectError(CAUSE, request=ollama_request())
+        for mode in ("hybrid", "semantic"):
+            for case, chat in {"reformulation": AsyncMock(side_effect=down),
+                               "answer synthesis": AsyncMock(side_effect=["a search query",
+                                                                          down])}.items():
+                with self.subTest(mode=mode, case=case), \
+                        self.assertLogs("routers.query", "ERROR") as logs:
+                    response = self.ask(mode, chat=chat)
+                    self.assert_unavailable(response, "Ollama", logs)
+                    self.assertIn("Ollama did not answer", logged(logs))
+                    self.assertNotIn("embedding the question", logged(logs))
 
     def test_a_weaviate_query_failing_is_503_in_every_retrieval_mode(self):
         # In hybrid and semantic modes Weaviate embeds the question through Ollama, so

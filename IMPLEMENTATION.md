@@ -11234,6 +11234,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter
+from fastapi.responses import JSONResponse
 
 from models.schemas import QueryRequest, QueryResponse
 from config import settings
@@ -11246,7 +11247,7 @@ router = APIRouter(prefix="/query")
 _log = logging.getLogger(__name__)
 
 
-def _unavailable(collection: str, exc: rag_pipeline.ServiceUnavailable):
+def _unavailable(collection: str, exc: rag_pipeline.ServiceUnavailable) -> JSONResponse:
     """The 503 for a dependency failure, naming the embedder too when there is one (#411)."""
     service, embedder = exc.service, exc.embedder
     if embedder is None:
@@ -18895,7 +18896,7 @@ What makes it separate from the live stack:
   stops the orphaned suite instead: `lock.sh` trusts an inherited
   `RAG_VERIFY_LOCK_HELD` only while the lock's pid is that shell or one of its
   ancestors, and `lib.sh`'s API helpers (`api_get`, `api_post`, `api_code`,
-  `api_post_code`, `drop_collection`, `make_collection` and every
+  `api_post_code`, `api_request`, `drop_collection`, `make_collection` and every
   `wait_for_job` poll) repeat that check before each request and end the
   suite, exit 3, when it fails. Not re-checked: direct `curl` and
   `docker compose exec` calls in the suites, and the Python helpers, which
@@ -19887,11 +19888,14 @@ metrics record; that a missing help template answers 500 `HELP_RENDER_FAILED`; a
 `CREATE_FAILED` and `DELETE_FAILED` send a fixed message. Each cause is logged, not sent.
 It also checks (#411) that other HTTP errors keep FastAPI's own answer (a malformed
 multipart upload is FastAPI's 400 with `detail`, not the envelope), that the engineer-format
-synthesis failing is the Ollama 503, that a Weaviate failure in `hybrid` and `semantic`
+synthesis failing is the Ollama 503 (and that it used the engineer system prompt), that an
+Ollama failure in the reformulation or the synthesis in `hybrid` and `semantic` modes still
+names Ollama only (#456), that a Weaviate failure in `hybrid` and `semantic`
 modes names Ollama too (Weaviate embeds the question through it there), and that a help
 template `RuntimeError` answers `HELP_RENDER_FAILED` with its own message. Suite 01 then
 checks the envelope through the proxy on the running stack: an unknown route answers 404
-`NOT_FOUND` and `PUT /query` answers `METHOD_NOT_ALLOWED`.
+`NOT_FOUND`, and `PUT /query` answers 405 with `Allow: POST` and the code
+`METHOD_NOT_ALLOWED` (#456), the request going through the lock-checked `api_request` helper.
 
 Suite 02 runs `scripts/tests/test_collection_spelling.py` the same way (#372). With Weaviate
 and the job workers mocked, it sends each route that takes a collection name a lowercase-first
@@ -20937,6 +20941,8 @@ api_get()  { _rag_require_lock_owner; curl -s -m 120 "$API$1"; }
 api_code() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -w '%{http_code}' "$@"; }
 api_post() { _rag_require_lock_owner; curl -s -m 600 -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
 api_post_code() { _rag_require_lock_owner; curl -s -o /dev/null -m 600 -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
+# Any other request, headers and body included: pass curl's own arguments and a full URL.
+api_request() { _rag_require_lock_owner; curl -s -m 120 "$@"; }
 
 require_stack() {
   local code
@@ -26168,8 +26174,14 @@ check_eq "an unknown API route answers 404 through the proxy (#373)" \
   "$(api_code "$API/no-such-route-373")" "404"
 check_eq "  ... in the envelope, code NOT_FOUND" \
   "$(api_get /no-such-route-373 | jfield "['error']['code']")" "NOT_FOUND"
-check_eq "a wrong method answers 405 METHOD_NOT_ALLOWED through the proxy (#373)" \
-  "$(curl -s -m 120 -X PUT "$API/query" | jfield "['error']['code']")" "METHOD_NOT_ALLOWED"
+# One PUT, read for its status, its Allow header and its envelope code (#456).
+wrong_method=$(api_request -i -X PUT "$API/query" | tr -d '\r')
+check_eq "a wrong method answers 405 through the proxy (#373)" \
+  "$(printf '%s\n' "$wrong_method" | awk 'NR==1 {print $2}')" "405"
+check_eq "  ... with its Allow header, POST" \
+  "$(printf '%s\n' "$wrong_method" | awk 'tolower($1)=="allow:" {print $2}')" "POST"
+check_eq "  ... in the envelope, code METHOD_NOT_ALLOWED" \
+  "$(printf '%s\n' "$wrong_method" | sed '1,/^$/d' | jfield "['error']['code']")" "METHOD_NOT_ALLOWED"
 # /health's 503 body for a missing model or an unreachable dependency, which the
 # Health page reads to show the failing services (#375).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_health.py)
