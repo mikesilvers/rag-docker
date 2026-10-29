@@ -98,6 +98,13 @@ export default function ImportPage() {
     setNewColName('')
     setNewColError('')
     await loadCollections()
+    // A failed reload keeps the options already shown, which lack the new
+    // collection; the selector would then show another one while uploads go to
+    // the new one. Add it, so the selector shows it (#430). The next successful
+    // load replaces the options.
+    setCollections(prev => prev.some(c => c.name === created) ? prev : [...prev, {
+      name: created, object_count: 0, index_type: newColIndexType, distance_metric: 'cosine', created_at: null,
+    }])
     setCollection(created)
   }
 

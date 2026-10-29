@@ -2485,7 +2485,7 @@ The question and the citations toggle are kept.
 
 - Drag-and-drop file upload zone. Accepts: `.pdf`, `.docx`, `.txt`, `.md`, `.csv`, `.json`, `.zip`.
 - File list showing queued files with remove buttons.
-- Collection selector (populated from `GET /collections`). Includes a "Create new collection" option that opens a modal with a name field and index type selector (defaults: HNSW, cosine). On confirm, calls `POST /collections` before submitting ingest. A refused create keeps the modal open and shows the API's message inside it, as an alert; the message clears on Cancel, when the modal is opened again, or when a create succeeds (#379). If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379). A create that succeeds closes the modal even if the list reload after it fails; that failure is shown as a failed list. After a create, the selector selects the new collection under the name the API answered with, which is the name the list shows (`myDocs` selects `MyDocs`, #372).
+- Collection selector (populated from `GET /collections`). Includes a "Create new collection" option that opens a modal with a name field and index type selector (defaults: HNSW, cosine). On confirm, calls `POST /collections` before submitting ingest. A refused create keeps the modal open and shows the API's message inside it, as an alert; the message clears on Cancel, when the modal is opened again, or when a create succeeds (#379). If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379). A create that succeeds closes the modal even if the list reload after it fails; that failure is shown as a failed list. After a create, the selector selects the new collection under the name the API answered with, which is the name the list shows (`myDocs` selects `MyDocs`, #372). If the list reload after a create fails, the new collection is added to the options already shown, so the selector still selects and shows it; the next successful load replaces the options (#430).
 - Chunking strategy selector (dropdown). On selection, displays the plain-language explanation for the chosen strategy.
 - Strategy parameters form (shown below strategy selector):
   - Engineer and Developer both see: chunk size slider, overlap slider (hidden for `semantic` and `context_aware`), minimum chunk size.
@@ -3409,7 +3409,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       request interception, so no collection is created, and checks one `POST`, the alert inside
       the open modal, and no alert after Cancel or a success. On the Import page, a create whose
       list reload fails closes the modal and shows a failed list. The checks fail on the code
-      before #379.*
+      before #379. That create also leaves the new collection selected and shown in the selector,
+      which fails on the code before #430.*
 - [x] A failed collection list is shown as an alert, "Could not load the collections:" with the reason, on the Collections, Import, Q&A and Gold Standard pages (#379).
       *Before, the error was swallowed, so an outage looked like "no collections". `ui_criteria.js`
       answers `GET /collections` with a synthetic `503` on each page, and checks the Collections
