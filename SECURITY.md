@@ -73,9 +73,23 @@ request but `/health` and the login (#25).
   (at most 365 days, 90 by default) and can be revoked; disabling the principal
   stops all its keys. Key requests carry no cookie, so they skip the origin
   check. See README "Service keys".
-- **Not covered yet.** The MCP server's use of keys is #39; a durable audit
-  trail is #29. `GET /health` is open, for container healthchecks, and
-  reports service status and host resources.
+- **Audit log (#29).** Logins and failed logins, queries, imports, exports,
+  deletions, tuning, settings saves, account, principal and key
+  administration, the operator command and reads of the log itself are
+  appended to `audit/audit.jsonl` in the `ingest_uploads` volume (mode 0600,
+  rotated by size, nothing edits or deletes a record), with the server-side
+  actor, role, key id, client address and result. It never records a
+  password, session cookie, API key, passphrase, answer or document text, and
+  records a query's question text only when the operator sets
+  `AUDIT_LOG_QUESTIONS=true`. Only AI Engineers' browser sessions can read it;
+  API keys can't. A record that can't be written doesn't stop the action; it
+  is logged and counted. On Docker Desktop the client address doesn't tell
+  clients apart (see LAN mode above). It guards against mistakes and
+  after-the-fact questions, not against someone with access to the Docker
+  host, who can edit the files. See README "Audit log".
+- **Not covered yet.** The MCP server's use of keys is #39. `GET /health` is
+  open, for container healthchecks, and reports service status and host
+  resources.
 
 Exposing the workbench to an untrusted network is outside the supported
 configuration, but reports of issues that make that riskier than expected are

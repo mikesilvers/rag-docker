@@ -22,6 +22,10 @@ the app; this command issues no key. `list` shows principals too, marked
 "service account"; set-role, disable and enable work on them (disabling one
 stops its keys, an escape hatch for a leaked key when no Engineer can log in);
 reset-password refuses one, since it has no password.
+
+Every action but `list` that reaches the store, done or refused, is also an
+audit record (#29) with actor `operator`; the generated password never is. A
+record that can't be written is one more line on standard error.
 """
 from __future__ import annotations
 
@@ -31,6 +35,16 @@ import time
 
 from . import passwords, store
 from .policy import ROLES
+
+
+def _audit(command: str, username: str, role: str | None, code: str | None = None) -> None:
+    from services import audit
+    details = {"role": role} if role and command in ("bootstrap", "create-user", "set-role") else {}
+    if code:
+        details["code"] = code
+    if not audit.record("operator." + command, result="refused" if code else "success", actor="operator",
+                        actor_kind="operator", target=username, details=details):
+        _say(f"{command}: the audit record could not be written")
 
 
 def _say(line: str) -> None:
@@ -101,7 +115,11 @@ def main(argv=None) -> int:
                       f"{password}\t{created}")
     except store.Refused as exc:
         _say(f"{args.command} refused: {exc}")
+        if args.command != "list":
+            _audit(args.command, username, role, exc.code)
         return 1
+    if args.command != "list":
+        _audit(args.command, username, role)
     return 0
 
 

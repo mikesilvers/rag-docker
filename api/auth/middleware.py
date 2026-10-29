@@ -20,6 +20,9 @@ header alone decides and any cookie is ignored, with no fallback to it.
   403 FORBIDDEN               the principal's role is too low
 It has no origin check (it carries no cookie, Q26) and no password change.
 
+Each 403 comes back with the principal it refused, which the audit log
+(#29) records; a 401 or 503 comes back with none.
+
 A route with no policy entry is never matched here, so it falls through to the
 app; test_auth.py fails when any route lacks an entry.
 """
@@ -121,6 +124,10 @@ class AuthMiddleware:
             # Request tracing labels a request by the route it reached (its
             # `path`); give a refused request the same label the router would.
             scope["route"] = SimpleNamespace(path=template)
+            if principal is not None:
+                # A 403 for an identified principal, for the audit log (#29).
+                # Never `auth`: nothing may treat this request as allowed.
+                scope.setdefault("state", {})["audit_refused"] = principal
             return await refusal(scope, receive, send)
         scope.setdefault("state", {})["auth"] = principal
         return await self.app(scope, receive, send)
@@ -138,13 +145,13 @@ class AuthMiddleware:
             return api_error(401, "AUTH_REQUIRED", "Log in to use this."), None
         if scope["method"] in UNSAFE and not same_origin(scope):
             return api_error(403, "CROSS_ORIGIN_REFUSED",
-                             "This request came from another site and was refused."), None
+                             "This request came from another site and was refused."), principal
         if principal.must_change_password and access != policy.SESSION:
             return api_error(403, "PASSWORD_CHANGE_REQUIRED",
-                             "Change your password before doing anything else."), None
+                             "Change your password before doing anything else."), principal
         if access != policy.SESSION and policy.rank(principal.role) < policy.rank(access):
             return api_error(403, "FORBIDDEN", "Your role can't do this.",
-                             detail={"required_role": access}), None
+                             detail={"required_role": access}), principal
         return None, principal
 
     async def _check_key(self, access, template, authorization):
@@ -153,10 +160,10 @@ class AuthMiddleware:
         if principal is None:
             return api_error(401, "KEY_INVALID", "The API key is invalid, expired or revoked."), None
         if template in policy.HUMAN_ONLY:
-            return api_error(403, "KEY_NOT_ALLOWED", "API keys can't be used for this."), None
+            return api_error(403, "KEY_NOT_ALLOWED", "API keys can't be used for this."), principal
         if access != policy.SESSION and policy.rank(principal.role) < policy.rank(access):
             return api_error(403, "FORBIDDEN", "Your role can't do this.",
-                             detail={"required_role": access}), None
+                             detail={"required_role": access}), principal
         return None, principal
 
 

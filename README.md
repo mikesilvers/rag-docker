@@ -111,7 +111,7 @@ can't use.
 |---|---|
 | **End User** | Q&A only |
 | **Developer** | Q&A, Import, Chunking, Retrieval, Gold Standard, Transfer |
-| **AI Engineer** | All of the above + Collections management (deleting collections) + Health dashboard + tuning + Users (account management) + Service keys (API keys for programs) |
+| **AI Engineer** | All of the above + Collections management (deleting collections) + Health dashboard + tuning + Users (account management) + Service keys (API keys for programs) + Audit (the audit log) |
 
 Endpoint by endpoint (paths under `/api`):
 
@@ -121,7 +121,7 @@ Endpoint by endpoint (paths under `/api`):
 | any logged-in user | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password` |
 | End User | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
 | Developer | creating a collection; ingest (upload, job status, settings); saving retrieval settings; gold standard (generate, sessions, pairs, regenerate, save, download); export, import, their job status, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
-| AI Engineer | `DELETE /collections/{name}`; `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/job/{id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; the API docs (`/docs`, `/redoc`, `/openapi.json`); account management (`GET` and `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `/role`, `/disable`, `/enable`); service keys (`GET` and `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `/disable`, `/enable`, `/keys`, `/keys/{key_id}/revoke`) |
+| AI Engineer | `DELETE /collections/{name}`; `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/job/{id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; the API docs (`/docs`, `/redoc`, `/openapi.json`); account management (`GET` and `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `/role`, `/disable`, `/enable`); service keys (`GET` and `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `/disable`, `/enable`, `/keys`, `/keys/{key_id}/revoke`); the audit log (`GET /audit`, `GET /audit.csv`), in a browser session only |
 
 Without a session the API answers `401 AUTH_REQUIRED`; with a role that is too
 low, `403 FORBIDDEN`. Programs use service API keys instead of a session
@@ -167,7 +167,8 @@ changes it at first login. An AI Engineer's own password is changed with
 Accounts are disabled, never deleted, so a username always means the same
 person. The last enabled AI Engineer can't be demoted or disabled here either.
 Each change made on the Users page is one line in `docker compose logs api`,
-naming the AI Engineer, the change and the account, never a password.
+naming the AI Engineer, the change and the account, never a password, and one
+[audit log](#audit-log) record.
 
 ### Sessions
 
@@ -230,6 +231,72 @@ curl -H "Authorization: Bearer $RAG_KEY" http://localhost:8080/api/collections
   issue keys.
 - Each change on the Service keys page is one line in `docker compose logs api`,
   naming the AI Engineer, the principal and the key id, never the key.
+  It is also an [audit log](#audit-log) record.
+
+### Audit log
+
+The audit log records who did what, to which data, and with what result (#29).
+AI Engineers read it on the **Audit** page: filter by time (UTC), actor,
+action, collection and result, page back through older records, and download
+the matching records as CSV. Opening the page and downloading the CSV are
+recorded too.
+
+**What is recorded.** Logins (successful, failed and throttled), logouts and
+password changes; queries; creating and deleting collections; saving ingest
+and retrieval settings; ingest, export, import and tuning jobs, once when
+started and once when they end (succeeded, failed or interrupted by a
+restart); saving and downloading gold-standard files; every change and
+refusal on the Users and Service keys pages; every `python -m auth` action
+but `list` (actor `operator`); reads of the audit log; and each API start.
+Each record names the actor (a username, a service principal with the key id,
+`operator` or `system`), their role at the time, the client address, the
+collection or account acted on, the result with the HTTP status, and the
+action's parameters: a query's settings, the names, count and total size of
+uploaded files, whether an export is encrypted and its package name, a new
+role, a key id. A refusal is recorded when the API knows who was refused (a
+`403`); requests without a valid session or key aren't. Browsing (other `GET`
+requests and job polling) isn't recorded.
+
+**What never is.** Passwords (typed, current, new or generated), session
+cookies, API keys, export passphrases, answers and document text. A query's
+question text is left out unless the operator sets `AUDIT_LOG_QUESTIONS` to
+`true` in `docker-compose.yml` (exactly `true` or `false`; the default is
+`false`). Some clients want questions logged and others don't; the Audit page
+says which applies, and each API start records it. There is no switch in the
+UI.
+
+**Where it is.** `audit.jsonl` (JSON Lines, one record per line) in the
+`ingest_uploads` volume, under `audit/`, readable only inside the api
+container. When it reaches `AUDIT_LOG_MAX_BYTES` (10 MiB) it is renamed
+`audit.jsonl.1`, older files move up by one, and the oldest beyond
+`AUDIT_LOG_KEEP` (10) is deleted; nothing else removes or edits a record.
+At a few hundred bytes a record that is tens of thousands of actions; copy the
+CSV, or the folder, to keep more. Whole-instance backup (#38) isn't built yet;
+when it is, it is to include this folder. To read the files directly:
+
+```bash
+docker compose exec api sh -c 'cat /app/uploads/audit/audit.jsonl'
+```
+
+**From a script.** `GET /api/audit` answers a page of records, newest first
+(`limit`, at most 1000, default 100), with `next_before` to pass as `before`
+for the next page; `GET /api/audit.csv` answers every match. Both take
+`from`, `to` (ISO 8601), `actor`, `action`, `collection` and `result`, and
+need an AI Engineer's browser session: an API key gets `403 KEY_NOT_ALLOWED`,
+so a leaked key can't read the log.
+
+**If a record can't be written** (a full disk, say), the action still
+happens: the API writes an `ERROR` line to `docker compose logs api`, and the
+Audit page shows how many records were lost since the API started.
+
+**Addresses.** The client address is the one nginx saw. On Docker Desktop
+that isn't the client's own: every browser, on this Mac or, in LAN mode, on
+other machines, shows the same Docker address (see [Things to
+know](#things-to-know)). The actor tells people apart; on Docker Engine on
+Linux the address normally does too.
+
+The `docker compose logs api` lines for logins and account changes are
+unchanged; the audit log is the durable record.
 
 ### Calling the API from the command line
 
@@ -392,6 +459,9 @@ switch again.
   forwarding, so expect them to share one address: then 5 wrong passwords for a
   username, from anyone on the network, lock that username for everyone for 15
   minutes. Docker Engine on Linux normally keeps the real client address.
+- **The audit log's addresses.** For the same reason, every record of the
+  [audit log](#audit-log) from another machine shows that one address; its
+  actor names who acted.
 - **Engine 28.0.0 or newer** is still required, as for the default mode.
 
 ## Workflow
@@ -542,6 +612,9 @@ All API settings are environment variables in `docker-compose.yml`:
 | `AUTH_COOKIE_SECURE` | `false` | Marks the session cookie `Secure`. Exactly `true` or `false`; anything else stops the API. Leave it `false` for the loopback HTTP profile, where a Secure cookie would never be sent back. `docker-compose.lan.yml` sets it `true` for LAN mode's TLS (#26) |
 | `RAG_LAN_MODE` | `false` | LAN mode (#26), set `true` only by `docker-compose.lan.yml`. Exactly `true` or `false`; anything else stops the API. When `true` the API refuses to start unless `AUTH_COOKIE_SECURE` is `true` and an enabled AI Engineer exists. See [Sharing with your office](#sharing-with-your-office) |
 | `AUTH_DIR` | `/app/auth_data` | Container path of the accounts store, the `auth_data` volume |
+| `AUDIT_LOG_QUESTIONS` | `false` | Whether the [audit log](#audit-log) records a query's question text. Exactly `true` or `false`; anything else stops the API |
+| `AUDIT_LOG_MAX_BYTES` | `10485760` (10 MiB) | The size at which `audit.jsonl` is rotated; at least 4096 |
+| `AUDIT_LOG_KEEP` | `10` | How many rotated audit files are kept (1-1000); the oldest beyond them is deleted |
 
 LAN mode reads two more settings from your shell or a `.env` file next to `docker-compose.yml`, used by `docker-compose.lan.yml`:
 
@@ -569,7 +642,7 @@ Five named Docker volumes persist data across restarts:
 |---|---|
 | `weaviate_data` | Vector index and all ingested chunks |
 | `ollama_models` | Downloaded model weights |
-| `ingest_uploads` | Ingest configs, gold standard sessions, exported gold-standard JSON files (`goldstandard_exports/`), metrics ring buffer (`metrics.jsonl`, bounded to 1,000 lines) |
+| `ingest_uploads` | Ingest configs, gold standard sessions, exported gold-standard JSON files (`goldstandard_exports/`), metrics ring buffer (`metrics.jsonl`, bounded to 1,000 lines), the audit log (`audit/`, #29) |
 | `rag_sources` | Original uploaded documents, content-addressed per collection. Grows with your corpus |
 | `auth_data` | Accounts, password hashes, sessions and the login throttle (`auth.db`, SQLite, #25) |
 

@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 api_dir = os.environ.get('RAG_TEST_API_DIR')
 sys.path.insert(0, api_dir or str(Path(__file__).resolve().parents[2] / 'api'))
@@ -345,6 +345,51 @@ class SessionImportTests(unittest.TestCase):
         self.assertEqual(chat.call_count, 2)
         self.assertEqual(pair['source_file'], '')
         self.assertEqual(pair['ground_truth'], 'A')
+
+    def test_reply_missing_question_or_answer_fails_after_three_attempts(self):
+        for missing in ('question', 'answer'):
+            reply = {'question': 'Q?', 'answer': 'A', 'ground_truth': 'A'}
+            del reply[missing]
+            with self.subTest(missing=missing), \
+                 patch.object(gs.ollama, 'chat', new=AsyncMock(return_value=json.dumps(reply))) as chat:
+                with self.assertRaisesRegex(ValueError, missing):
+                    asyncio.run(gs._generate_pair({'content': 'Context', 'source_file': 'source.txt'}))
+                self.assertEqual(chat.await_count, 3)
+
+    def test_omitted_question_or_answer_does_not_publish_pairs(self):
+        for reply in ({"answer": "A", "ground_truth": "A"}, {"question": "Q?", "ground_truth": "A"}, {}):
+            with self.subTest(reply=reply):
+                sid = self._generate(json.dumps(reply))
+                current = gs.get_session(sid)
+                self.assertEqual(current['status'], 'failed')
+                self.assertEqual(current['pairs'], [])
+                self.assertEqual(current['pairs_failed'], 1)
+
+    def test_invalid_fields_exhaust_the_bounded_budget(self):
+        with patch.object(gs, '_chat_once', return_value='{"question": null, "answer": "A"}') as chat:
+            with self.assertRaisesRegex(ValueError, 'question must be a nonempty string'):
+                asyncio.run(gs._generate_pair({'content': 'Context', 'source_file': 'source.txt'}))
+        self.assertEqual(chat.call_count, gs._GENERATION_ATTEMPTS)
+
+    def test_valid_model_strings_are_stored_unchanged(self):
+        with patch.object(gs, '_chat_once', return_value='{"question": "Which year?", "answer": "1999", "ground_truth": "In 1999."}'):
+            pair = asyncio.run(gs._generate_pair({'content': 'Context', 'source_file': 'source.txt'}))
+        self.assertEqual((pair['question'], pair['answer'], pair['ground_truth'], pair['source_file']),
+                         ('Which year?', '1999', 'In 1999.', 'source.txt'))
+
+    def test_each_kind_of_unusable_reply_gets_its_own_reprompt(self):
+        chat = AsyncMock(side_effect=['not json', '{"question": null, "answer": "A"}',
+                                      '{"question": "Q?", "answer": "A"}'])
+        with patch.object(gs.ollama, 'chat', new=chat), self.assertLogs(gs.log, 'INFO') as logs:
+            pair = asyncio.run(gs._generate_pair({'content': 'Context', 'source_file': 'source.txt'}))
+        self.assertEqual(pair['question'], 'Q?')
+        self.assertEqual([call.args[0] for call in chat.await_args_list],
+                         [gs.GS_SYSTEM, gs.GS_SYSTEM + gs.GS_RETRY_SUFFIX,
+                          gs.GS_SYSTEM + gs.GS_FIELD_RETRY_SUFFIX])
+        self.assertNotIn('not valid JSON', gs.GS_FIELD_RETRY_SUFFIX)
+        output = '\n'.join(logs.output)
+        self.assertIn('attempt 1/3 did not yield valid JSON', output)
+        self.assertIn('attempt 2/3 returned an unusable field', output)
 
     def test_generated_chunk_index_is_normalized(self):
         sid = self._generate('{"question": "Q?", "answer": "A"}', chunk_index='7')

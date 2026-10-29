@@ -81,6 +81,15 @@ async def lifespan(app: FastAPI):
         if interrupted:
             log.warning("Marked %d job(s) interrupted by the restart: %s. Their status now "
                         "says so; start them again.", len(interrupted), ", ".join(interrupted))
+        # One audit record per start, saying whether question text is recorded,
+        # so a reader can tell why some query records carry it (#29).
+        from config import settings
+        from services import audit
+        await asyncio.to_thread(audit.record, "system.start", result="success", actor="system",
+                                actor_kind="system",
+                                details={"question_text_logged": settings.audit_log_questions,
+                                         "max_bytes": settings.audit_log_max_bytes,
+                                         "keep": settings.audit_log_keep})
         yield
     finally:
         try:
@@ -147,8 +156,13 @@ async def unhandled_error(request, exc):
 # middleware: the UI is served from the same origin through nginx, so no other
 # origin needs to read the API's answers.
 app.add_middleware(AuthMiddleware)
+# The audit log (#29): outside the auth middleware, so it sees that middleware's
+# 403 refusals as well as the routes' own answers.
+from services.audit import AuditMiddleware
+app.add_middleware(AuditMiddleware)
 app.add_middleware(RequestTracing)
 
+from routers import audit as audit_router
 from routers import auth as auth_router, help as help_router, health, collections, ingest, query, goldstandard, metrics, retrieval_config, transfer, tuning
 
 app.include_router(health.router)
@@ -162,3 +176,4 @@ app.include_router(metrics.router)
 app.include_router(retrieval_config.router)
 app.include_router(transfer.router)
 app.include_router(tuning.router)
+app.include_router(audit_router.router)

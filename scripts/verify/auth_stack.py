@@ -64,6 +64,9 @@ MATRIX = (
     ("GET", "/docs/oauth2-redirect", None, "engineer"),
     ("GET", "/redoc", None, "engineer"),
     ("GET", "/openapi.json", None, "engineer"),
+    # The audit log (#29): an allowed request reads a page or the CSV.
+    ("GET", "/audit?limit=1", None, "engineer"),
+    ("GET", "/audit.csv?action=system.start", None, "engineer"),
     # Account administration (PR 2 of #25): an allowed request lists, or is a
     # 422 or a 404 for an account that doesn't exist; it changes nothing.
     ("GET", "/auth/users", None, "engineer"),
@@ -82,8 +85,8 @@ MATRIX = (
     ("POST", "/auth/service-principals/vfy-no-such-svc/keys/nosuchkey123/revoke", None, "engineer"),
 )
 # Routes an API key can't use whatever its role (S5 of PR 3): every account,
-# principal and key route, logout and the password change.
-KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password")
+# principal and key route, logout and the password change; and the audit log (#29).
+KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password", "/audit")
 SESSION_ROUTES = (("GET", "/auth/me", None), ("POST", "/auth/logout", None), ("POST", "/auth/password", {}))
 
 

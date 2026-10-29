@@ -1398,7 +1398,7 @@ one may. The role of a request is the one stored for its user at that moment, ne
 | any session (also one with a password change due) | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password` |
 | `end_user` | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
 | `developer` | `POST /collections`; `POST /ingest/upload`, `GET /ingest/job/{job_id}`, `GET /ingest/config/{collection}`, `POST /ingest/config`; `POST /retrieval/config`; `POST /goldstandard/generate`, `GET /goldstandard/session/{session_id}`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST /goldstandard/save`, `GET /goldstandard/download/{filename}`; `POST /export`, `GET /export/job/{job_id}`, `POST /import`, `GET /import/job/{job_id}`, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
-| `engineer` | `DELETE /collections/{name}`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json`; account administration: `GET /auth/users`, `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `POST /auth/users/{username}/role`, `POST /auth/users/{username}/disable`, `POST /auth/users/{username}/enable`; service principals and keys: `GET /auth/service-principals`, `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `POST /auth/service-principals/{name}/disable`, `POST /auth/service-principals/{name}/enable`, `POST /auth/service-principals/{name}/keys`, `POST /auth/service-principals/{name}/keys/{key_id}/revoke` |
+| `engineer` | `DELETE /collections/{name}`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json`; account administration: `GET /auth/users`, `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `POST /auth/users/{username}/role`, `POST /auth/users/{username}/disable`, `POST /auth/users/{username}/enable`; service principals and keys: `GET /auth/service-principals`, `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `POST /auth/service-principals/{name}/disable`, `POST /auth/service-principals/{name}/enable`, `POST /auth/service-principals/{name}/keys`, `POST /auth/service-principals/{name}/keys/{key_id}/revoke`; the audit log (§3.1.9): `GET /audit`, `GET /audit.csv` |
 
 The matrix is one table in `api/auth/policy.py`. A route without an entry is refused for everyone (`403
 FORBIDDEN`), and a registered check fails when a route lacks an entry or an entry names no route. Jobs and
@@ -1488,7 +1488,8 @@ matching, not revoked, not expired, its principal enabled) runs as its principal
 moment, so a role change applies at once, disabling stops all the principal's keys and enabling restores the
 unrevoked, unexpired ones. Refusals, first that applies: `503 SETUP_REQUIRED`; `401 KEY_INVALID` "The API key is
 invalid, expired or revoked." for every reason; `403 KEY_NOT_ALLOWED` on every `/auth/users...` and
-`/auth/service-principals...` route, `POST /auth/logout` and `POST /auth/password`, whatever the role; `403
+`/auth/service-principals...` route, `POST /auth/logout`, `POST /auth/password`, `GET /audit` and `GET
+/audit.csv`, whatever the role; `403
 FORBIDDEN` when the role is too low. A key request has no origin check and no password-change check. Public
 routes ignore the header. Failed key requests are neither logged one by one nor throttled.
 
@@ -1548,6 +1549,94 @@ password. One `WARNING` line per service principal or key change (create, role, 
 revoked) naming the engineer, the principal and the key id (and the role or expiry), and one per refusal
 (`INVALID_USERNAME`, `PRINCIPAL_EXISTS`, `PRINCIPAL_NOT_FOUND`, `KEY_NOT_FOUND`); never a key or its hash.
 Successful key requests aren't logged one by one (`last_used_at` records them). The telemetry route vocabulary gains the eighteen `/auth` routes as labels.
+These lines are unchanged by the audit log (§3.1.9), which records the same events durably.
+
+#### 3.1.9 Audit log (#29)
+
+An append-only record of who did what, to which data, with what result, for AI Engineers to review and export.
+It is separate from OpenTelemetry, which is operational and never durable audit storage.
+
+**Storage.** JSON Lines in `/app/uploads/audit/` on the `ingest_uploads` volume (`AUDIT_DIR`): `audit.jsonl`, and
+after rotation `audit.jsonl.1` (newest) to `audit.jsonl.<AUDIT_LOG_KEEP>` (oldest). Folder mode 0700, files 0600.
+After an append leaves `audit.jsonl` at `AUDIT_LOG_MAX_BYTES` or more (default 10485760, at least 4096) the files
+shift by one and the one beyond `AUDIT_LOG_KEEP` (default 10, 1-1000) is deleted. No time-based retention; no
+route edits or deletes a record. Records survive restarts and `docker compose down` without `-v`. Backup (#38) isn't
+built yet; it is to include this folder.
+
+**Record.** One JSON object per line with exactly these keys, `null` where a value doesn't apply:
+
+| Key | Value |
+|---|---|
+| `id` | Write time in nanoseconds (19 digits), `-`, 6 hex characters. Assigned under the log's lock, so line order is id order |
+| `time` | UTC, ISO 8601 with milliseconds and `Z` |
+| `actor` | Username, service principal name, `operator`, `system`, or `null` (nobody identified) |
+| `actor_kind` | `user`, `service`, `operator`, `system` or `anonymous` |
+| `role` | The actor's role at that request, from the server-side principal |
+| `key_id` | The public id of the API key used |
+| `client_ip` | `X-Real-IP` (the address nginx saw), else the connection's address. On Docker Desktop all clients share one address (README "Sharing with your office") |
+| `action` | See below |
+| `collection` | The collection acted on |
+| `target` | The account or principal acted on, or a failed login's typed username |
+| `result` | `success` (2xx), `refused` (4xx), `error` (5xx); for jobs `accepted`, then `succeeded`, `failed` or `interrupted` |
+| `status_code` | The HTTP status; `null` for job ends, operator and system records |
+| `job_id` | The job's id |
+| `details` | The action's other parameters (below); `code`: the error envelope's code on a non-2xx answer |
+
+**Actions.** `auth.login` (success, failure, throttled), `auth.logout`, `auth.password`; `query`;
+`collection.create`, `collection.delete`; `ingest`, `ingest.config`; `retrieval.config`; `export`, `import`;
+`tune.rechunk`, `tune.reembed`, `tune.reindex`; `goldstandard.save`, `goldstandard.download`; `admin.user.create`,
+`admin.user.reset-password`, `admin.user.set-role`, `admin.user.disable`, `admin.user.enable`;
+`admin.principal.create`, `admin.principal.set-role`, `admin.principal.disable`, `admin.principal.enable`,
+`admin.key.issue`, `admin.key.revoke`; `audit.view`, `audit.download`; `operator.bootstrap`, `operator.create-user`,
+`operator.reset-password`, `operator.set-role`, `operator.disable`, `operator.enable` (`python -m auth`; not `list`,
+not usage errors); `system.start` (each API start, after the job records are loaded, with `question_text_logged`,
+`max_bytes` and `keep`). Nothing else: no other GET, no job polling, no gold-standard generate, edit or regenerate.
+
+**When.** A request to an audited route writes one record once its answer has been sent, so a page or CSV never
+holds its own `audit.view` or `audit.download`. A refusal by the authentication middleware is recorded only when it
+is a 403 for an identified principal (`FORBIDDEN`, `KEY_NOT_ALLOWED`, `CROSS_ORIGIN_REFUSED`,
+`PASSWORD_CHANGE_REQUIRED`); `401 AUTH_REQUIRED`, `401 KEY_INVALID` and `503 SETUP_REQUIRED` write nothing. A
+failed or throttled login has actor `null`, kind `anonymous` and the typed username as `target`. A job (ingest,
+export, import, tune) gets an `accepted` record (status 202) when it is stored, before it can end, and one end
+record with the same actor and job id: `succeeded` for `completed`, `failed` for `failed`, `partial` or
+`cancelled` (`details.job_status` says which), `interrupted` when the API's start marks it so. Jobs started before
+this feature get no end record.
+
+**Details.** `query`: `retrieval_mode`, `top_k`, `alpha`, `response_format`, `include_citations`, and `question`
+only when `AUDIT_LOG_QUESTIONS=true` (exactly `true` or `false`, default `false`; anything else stops the API);
+never the answer. `ingest`: `files` (names), `file_count`, `total_bytes`. `export`: `include_models`, `encrypted`,
+and at the end `package` and `fidelity`. `import`: `package`, `on_conflict`, `encrypted`; the end record's
+`collection` is the one imported into. `tune.*`: `operation`. `goldstandard.save` and `goldstandard.download`:
+`file` (and `session_id` for save). Admin actions: `role` for creates and role changes, `key_id` (and `expires_at`
+on issue) for keys. Audit reads: the filters given. Operator actions: `role` where given, `code` when refused.
+Never recorded: a password (typed, current, new or generated), session cookie or token, API key, passphrase, answer
+or document text.
+
+**Write failures** don't change the action's answer: one `ERROR` line on logger `audit` naming the action, and the
+API counts it (`failed_writes`). The operator command prints one more `auth:` line instead. The API and the
+operator command append under a thread lock and an `flock` on `.lock`, so records are whole lines.
+
+**`GET /audit`** (engineer sessions; every API key `403 KEY_NOT_ALLOWED`). Query parameters, all optional: `from`
+(inclusive) and `to` (exclusive), ISO 8601, UTC when no offset is given; `actor`, `action`, `collection`, `result`
+(exact matches; `result` one of the values above); `limit` 1-1000 in ASCII digits, default 100; `before`, a record
+`id`. Any invalid value: `422 INVALID_PARAMETER`. Answer (`Cache-Control: no-store`):
+
+```json
+{"records": [{"id": "...", "time": "...", "...": "..."}], "next_before": "<id or null>",
+ "failed_writes": 0, "question_text_logged": false}
+```
+
+Records are newest first across every file; `next_before` is the last record's id when older matches exist.
+`before` returns the records whose id sorts below it, so pages don't shift as records arrive and a cursor whose
+record was rotated away still works. A line that isn't a JSON object (a torn last line) is skipped; the next append
+starts a new line. A read opens every file under the writers' lock and then reads the open files, so a rotation
+during it can't make it repeat or miss a record that existed when it started.
+
+**`GET /audit.csv`** (same access and filters, no `limit` or `before`): `200`, `text/csv; charset=utf-8`,
+`Content-Disposition: attachment; filename="audit-<yyyymmddThhmmssZ>.csv"`, `Cache-Control: no-store`, streamed.
+Header `time,actor,actor_kind,role,key_id,client_ip,action,collection,target,result,status_code,job_id,details`,
+then every matching record newest first, `details` as compact JSON, empty cells for `null`; a cell starting with
+`=`, `+`, `-`, `@`, a tab or a carriage return gets a leading `'`.
 
 ### 3.2 Error Response Format
 
@@ -1610,7 +1699,7 @@ Standard error codes:
 | `LAST_ENGINEER` | 409 | The change would demote or disable the last enabled engineer |
 | `SELF_RESET_REFUSED` | 409 | An engineer's reset of their own password; they use `POST /auth/password` |
 | `KEY_INVALID` | 401 | An `Authorization` header that isn't one valid `Bearer` key: unknown, malformed, expired, revoked or of a disabled principal |
-| `KEY_NOT_ALLOWED` | 403 | An API key on account, principal or key administration, logout or password change |
+| `KEY_NOT_ALLOWED` | 403 | An API key on account, principal or key administration, logout, password change or the audit log |
 | `PRINCIPAL_EXISTS` | 409 | `POST /auth/service-principals`: a person or principal already has the name |
 | `PRINCIPAL_NOT_FOUND` | 404 | No service principal has the name in the path |
 | `KEY_NOT_FOUND` | 404 | The principal has no key with the id in the path |
@@ -2274,7 +2363,21 @@ Chunk:
 { "question": "...", "answer": "...", "ground_truth": "..." }
 ```
 
-If the model output is not valid JSON, the API retries once with an explicit reminder to return only JSON.
+Each chunk gets at most three attempts. A reply is usable when it holds a JSON object whose `question` and `answer` are nonempty strings and whose `ground_truth` is a nonempty string or left out; a left-out `ground_truth` defaults to the validated `answer`. A missing `question` or `answer`, or a null, list, object, number, boolean or blank value in any of the three, makes the reply unusable, and such a value is never stored as its Python representation. After an unusable reply the API asks again with the same user message, up to two more times, adding one of these texts to the end of the system prompt. Each starts with a space.
+
+After a reply with no JSON object:
+
+```
+ Your previous response was not valid JSON. Return ONLY the JSON object with keys: question, answer, ground_truth. No markdown, no explanation.
+```
+
+After a JSON object with an unusable field:
+
+```
+ Your previous response did not give question, answer and ground_truth as nonempty strings. Return ONLY the JSON object with keys: question, answer, ground_truth, each a nonempty string. No markdown, no explanation.
+```
+
+After a third unusable reply the pair fails; §3.1.5 describes how failures are reported. A chunk whose source filename is null gives a pair with an empty `source_file`.
 
 ---
 
@@ -2323,6 +2426,7 @@ what the role can't do (§3.1.8):
 | Health | ✓ | — | — |
 | Users | ✓ | — | — |
 | Service keys | ✓ | — | — |
+| Audit | ✓ | — | — |
 | Username and role badge | ✓ | ✓ | ✓ |
 | Change password (button) | ✓ | ✓ | ✓ |
 | Log out (button) | ✓ | ✓ | ✓ |
@@ -2628,6 +2732,22 @@ page renders as one undifferentiated block.
 - A refused change shows the API's message as an alert and reloads the list; a list that can't be loaded says
   "Could not load the service principals:" with the reason.
 
+### 7.14 Audit Page (#29)
+
+**Route:** `/audit`  
+**Roles:** Engineer only (others are sent to `/qa`)
+
+- A short explanation of what is recorded and that passwords, keys, passphrases and answers never are, and whether
+  question text is being recorded (`question_text_logged`). A warning when `failed_writes` is above zero.
+- Filters: From and To (date and time, UTC, sent with `Z`), Actor, Action (Any or one of §3.1.9's actions),
+  Collection, Result (Any or one of the results); "Apply".
+- A table of `GET /audit`'s records, 100 a page, newest first: time (UTC), actor (with the key id for a service
+  key, or the kind when it isn't a user), role, address, action, collection, target, result with status code, job,
+  details (JSON). "Older" loads the page `next_before` names; "Newest" returns to the first. While a page loads the
+  page says "Loading…" and "Older" is disabled, so a double click asks for the older page once.
+- "Download CSV" links to `/api/audit.csv` with the applied filters.
+- An API error shows its message.
+
 ## 8. Configuration Defaults and Constraints
 
 The table gives API request bounds; narrower UI sliders are presentation choices. Internal import/rebuild preserves positive stored HNSW construction/connections settings and stored `ef=-1` (dynamic) or positive values beyond new-request limits. Index/distance enums and numeric type validation still apply; no clamping or migration is performed.
@@ -2737,6 +2857,7 @@ rag-docker/
 │   │   └── testing.py           # Real sessions for in-process tests
 │   ├── routers/
 │   │   ├── auth.py              # /auth/status, login, logout, me, password, users, service principals
+│   │   ├── audit.py             # /audit and /audit.csv, for Engineers (#29)
 │   │   ├── health.py
 │   │   ├── collections.py
 │   │   ├── ingest.py
@@ -2760,6 +2881,7 @@ rag-docker/
 │   │   ├── age_stream.py        # Streaming age passphrase encryption of packages (#27)
 │   │   ├── exporter.py          # Export job lifecycle and the per-collection guard
 │   │   ├── jobstore.py          # Job records that survive an API restart
+│   │   ├── audit.py             # The audit log: records, rotation, reading, the request middleware (#29)
 │   │   ├── importer.py          # Import job: validation order, conflicts, atomicity
 │   │   ├── model_bundle.py      # Ollama manifest + blob copy, both directions
 │   │   ├── tuning.py            # Re-chunk / re-embed / re-index, staged rebuilds
@@ -2808,7 +2930,8 @@ rag-docker/
 │   │   │   ├── CollectionsPage.tsx
 │   │   │   ├── HealthPage.tsx
 │   │   │   ├── UsersPage.tsx          # Engineers manage accounts (#25)
-│   │   │   └── ServiceKeysPage.tsx    # Engineers manage service principals and keys (#25)
+│   │   │   ├── ServiceKeysPage.tsx    # Engineers manage service principals and keys (#25)
+│   │   │   └── AuditPage.tsx          # Engineers read the audit log (#29)
 │   │   ├── components/
 │   │   │   ├── NavBar.tsx
 │   │   │   ├── CitationsPanel.tsx
@@ -3145,6 +3268,7 @@ now lives once, in `api/services/ingest_config.py`.
       is one attempt plus two reprompts; the failures are independent between
       attempts.*
 - [x] Each pair has non-empty question, answer, ground_truth, and contexts fields.
+      *Evidence: `test_session_import.py` (#103, #273): null, list, object, numeric, boolean, blank and left-out model fields fail the pair within the three-attempt budget rather than being stored; a left-out `ground_truth` defaults to the answer; valid strings are stored unchanged.*
 - [x] Regenerate call replaces exactly one pair without affecting others; returns 409 if session is still generating, and 504 `PAIR_GENERATION_TIMEOUT`, leaving the pair unchanged, when model work passes the 1800-second deadline.
       *Evidence: `session_persistence_cases.py` `test_regeneration_deadline_returns_typed_error_and_preserves_pair` (504, pair and session file unchanged); suite 04 checks that the proxy's regenerate read timeout outlasts the API's deadline and that the deadline is over 300 s (#280).*
       *Both halves originally failed. Regenerating mid-generation returned **500**,
@@ -3432,6 +3556,43 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request
   interception; `ui_criteria.js` checks the real engineer's nav includes Service keys.*
 
+### 10.7 Audit log (#29)
+
+- [x] Only engineers' sessions read the audit log: End Users and Developers get `403 FORBIDDEN` on `GET /audit` and
+  `GET /audit.csv`, every API key `403 KEY_NOT_ALLOWED`.
+  *Evidence: `test_audit.py` `PolicyTests`, `ApiTests`, `MiddlewareTests` (suite 19); `audit_stack.py access` and
+  the two routes in `auth_stack.py matrix` and `key-matrix` (suites 17 and 19).*
+- [x] Each audited action writes one record with the server-side actor, role, key id and address, the result and
+  status, and its details: logins (success, failure as `anonymous` with the typed username, throttled), logout,
+  password changes, queries (no question text unless `AUDIT_LOG_QUESTIONS=true`), collection create and delete,
+  configuration saves, ingest, export, import and tune jobs (`accepted`, then one end record with the same job id,
+  `interrupted` after a restart), gold-standard save and download, every account, principal and key administration
+  action and refusal, operator-command actions, audit reads, and each API start. An identified principal's 403 is
+  recorded; 401s and 503s aren't; other GETs aren't.
+  *Evidence: `test_audit.py` `MiddlewareTests`, `JobTests`, `CommandTests` (suite 19); `audit_stack.py
+  start-record`, `sessions`, `query`, `jobs`, `refused` and `admin` on the running stack (suite 19).*
+- [x] No password, session token, API key or passphrase reaches the audit files.
+  *Evidence: `test_audit.py`; `audit_stack.py no-secrets`, `jobs` and `admin`, which search the files in the API
+  container (suite 19).*
+- [x] Records are append-only JSON Lines with exactly the §3.1.9 keys; ids follow line order under concurrent
+  writers (API threads and the operator command); rotation keeps `AUDIT_LOG_KEEP` files; a torn last line is
+  skipped; the three settings are validated at start; a failed write is logged and counted and never changes the
+  answer.
+  *Evidence: `test_audit.py` `RecordTests`, `SettingsTests`, `ReviewerEdgeTests` (suite 19); `audit_stack.py
+  concurrent`: parallel failed logins with the operator command appending, each recorded once (suite 19).*
+- [x] `GET /audit` filters, pages newest first with a stable `before` cursor and refuses invalid parameters with
+  `422` (a non-ASCII digit in `limit` included); `GET /audit.csv` has the §3.1.9 header, every matching row and
+  escaped formula cells (tab and carriage return included); a read that spans a rotation neither repeats nor misses
+  a record.
+  *Evidence: `test_audit.py` `ApiTests` (suite 19); `audit_stack.py filters` (suite 19).*
+- [x] Records survive an API restart, which writes a new `system.start` (with `RAG_ALLOW_RESTART=1`).
+  *Evidence: `audit_stack.py restart-prepare` and `restart-verify` (suite 19).*
+- [x] The Audit page: an engineer-only nav link (last) and route; the records and paging; filters applied and
+  carried into the CSV link; the question-text note and the failed-writes warning; a double click on Older while a
+  page loads asks for it once.
+  *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request
+  interception; `ui_criteria.js` checks the real engineer's nav includes Audit.*
+
 ---
 
 *End of Specifications — Version 1.4*
@@ -3542,8 +3703,6 @@ A rebuild from these documents is correct when:
 
 - [x] A tuning or ingest replacement makes each pre-replacement stale marker durable, in the session file or a pending marker. If both writes fail for a session, the replacement aborts before the target is touched, and the markers that call already wrote, under both first-character spellings, are rolled back: each session's `stale`, `stale_reason` and `stale_at` and its pending marker return to their earlier state. A marker that can't be rolled back stays, so its session stays historical; this is logged and reported as a `SESSION_WRITE_FAILED` diagnostic. Stale marking after cutover stays best-effort: if both writes fail there, the session is historical only until restart (#93, #275).
       *Registered by `10_validity.sh`, which runs `scripts/tests/test_session_validity.py` in the API container: `test_cutover_requires_a_durable_session_or_pending_marker`, `test_unpersistable_marker_aborts_real_rebuild_before_live_delete`, `test_pending_marker_alone_lets_real_rebuild_replace_and_survives_restart`, `test_post_cutover_marking_stays_best_effort`, `test_aborted_marking_rolls_back_written_sessions_across_spellings`, `test_aborted_marking_restores_pending_markers` and `test_unrollbackable_marker_stays_and_is_reported`.*
-
-Generated model questions, answers and ground truths must be nonempty strings. Invalid field types consume the same bounded reprompt budget as malformed JSON; exhausted attempts fail the pair rather than publishing Python representations. An omitted ground truth defaults to the validated answer, and null source filenames normalize to an empty string.
 
 Overlap retains internal whitespace-only windows to preserve exact character coverage and overlap; wholly blank input yields no chunks. Hard character boundaries and fixed per-file limits remain the existing contract, rather than changing retrieval behavior in this follow-up.
 

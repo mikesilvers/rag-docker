@@ -53,6 +53,17 @@ and no `Origin`, rotation, revocation, expiry, a disabled principal, invalid key
 memory, are never printed and must not reach the API log), idle expiry, and that the API log holds
 no harness secret.
 
+`19_audit.sh` checks the audit log (#29), reading it through `GET /audit` as the harness
+Engineer: who may read it (End User, Developer and an engineer-role key refused), the records of
+the API's start, a login, a failed login and a logout, a query (without its question text), a
+collection created, ingested into, exported with a passphrase and deleted (a throwaway
+`VfyAudit*` collection; the ingest and export each recorded as accepted and ended with the same
+job id; the package is removed afterwards), a Developer's refused delete, an Engineer's principal
+and key administration (a throwaway `vfy-s-*` principal), filters, paging and the CSV, and that no
+harness password, session token, key, typed password or passphrase reaches the audit files, which
+it reads in the api container, and that parallel failed logins appended alongside the operator command are each
+recorded once on whole lines. `../tests/test_audit.py` covers the rest in the API image.
+
 ## Entry point and verify project
 
 `stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
@@ -690,7 +701,7 @@ Run the controlled regressions with the API dependencies installed:
 python -m unittest discover -s scripts/tests -p 'test_batch*.py'
 ```
 
-`05_transfer.sh` runs `test_batch_recovery.py` in the API container and `test_batch_implementation.py` on the host, so `all.sh` covers both.
+`05_transfer.sh` runs `test_batch_recovery.py` in the API container, `test_batch_recovery_fixture.py` in a new container from the API image, and `test_batch_implementation.py` on the host, so `all.sh` covers all three. The fixture test runs with `docker run --rm --network none` on the API image, with the repository mounted read-only, rather than `docker compose exec`, because it loads `scripts/verify/batch_recovery.py`, which it finds from its own `__file__`: the API container has no `scripts/` tree, and a script piped to `python -` has `<stdin>` as its `__file__`, not a path.
 
 `batch_recovery.py` is the fault acceptance. It uses real Weaviate, synthetic
 collections and the real embedding model. It injects final-create failures into
@@ -748,6 +759,9 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
 | `auth_stack.py` | the stack checks of `17_auth.sh`, one per subcommand (#25) |
 | `auth_headers.py` | the suite's session as `Cookie` and `Origin` headers, for the host-side Python helpers (#25) |
+| `19_audit.sh` | §10.7 — the audit log (#29): who may read it, the records of logins, queries, collections, jobs, refusals and administration, filters, paging and the CSV, no secrets in the files, concurrent writers; registers `../tests/test_audit.py`; opt-in restart check |
+| `audit_stack.py` | the stack checks of `19_audit.sh`, one per subcommand (#29) |
+| `../tests/test_audit.py` | API image, no network: record shape, rotation and retention, concurrent writers (threads and a second process), the three settings, write failures, job records, the middleware's rules, `GET /audit` and the CSV, the operator command's records, embedded copies (#29) |
 | `18_lan.sh` | §2.5 and §10.5 — LAN mode (#26): the real override resolved without starting it; registers `../tests/test_lan_mode.py`; with `stack.sh run --lan`, the running LAN project on loopback |
 | `lan_config.py` | host-side, standard library: `docker-compose.lan.yml` as `docker compose config` resolves it, at the default port and `RAG_LAN_PORT=8443` (#26) |
 | `lan_stack.py` | the stack checks of `18_lan.sh` in a `--lan` run, one per subcommand (#26) |
@@ -782,6 +796,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, registered by transfer |
 | `../tests/test_export_snapshot.py` | controlled export writer-guard regressions: a mid-export re-ingest can't change the package, busy and waiting writers, guard release (#509), a cancelled export's status (#521), registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
+| `../tests/test_batch_recovery_fixture.py` | controlled check that the import package `batch_recovery.py`'s `write_import_package` writes passes the importer's real digest and source checks; run in the API image with no network and the repository mounted read-only, registered by transfer |
 | `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`, and so is a manifest with a wrongly typed listed value (#451); run in the API image with no network, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `../tests/test_batch_implementation.py` | host-side: exact embedded source checks for `api/main.py`, the Weaviate client, the batch-write, recovery, import and tuning services and their verify scripts, and the restart-recovery block of `05_transfer.sh` with stubbed commands (refused-prefix skip, `RAG_ALLOW_RESTART`, the #152 refusal), registered by transfer |
@@ -827,7 +842,7 @@ through the proxy that download refuses other upload state with 400 (#370).
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the query metrics reload in `03_query.sh`, the batch recovery acceptance in `05_transfer.sh`, retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`, and a session and a login lockout across a restart in `17_auth.sh`); never the `rag-docker` project |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the query metrics reload in `03_query.sh`, the batch recovery acceptance in `05_transfer.sh`, retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`, a session and a login lockout across a restart in `17_auth.sh`, and audit records across a restart in `19_audit.sh`); never the `rag-docker` project |
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |

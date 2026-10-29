@@ -19,7 +19,7 @@ from models.schemas import (
     TuneOptionsResponse,
     TuneStartResponse,
 )
-from services import sources, tuning
+from services import audit, sources, tuning
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError
 from utils import api_error, collection_deleting_error
@@ -29,6 +29,7 @@ _log = logging.getLogger(__name__)
 
 
 async def _start(collection: str, operation: str, params: dict):
+    audit.note(collection=collection, operation=operation)   # the audit record's parameters (#29)
     try:
         exists = await wc.collection_exists(collection)
     except Exception:                                 # noqa: BLE001

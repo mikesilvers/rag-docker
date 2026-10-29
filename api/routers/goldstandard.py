@@ -16,6 +16,7 @@ from models.schemas import (
     SessionResponse,
     SessionValidity,
 )
+from services import audit
 from services import goldstandard as gs
 from services import weaviate_client as wc
 from utils import api_error, collection_check_unavailable
@@ -98,12 +99,14 @@ async def regenerate(body: RegenerateRequest):
 
 @router.post("/save", response_model=SaveResponse)
 async def save(body: SaveRequest):
+    audit.note(session_id=body.session_id, file=body.filename)   # the audit record's parameters (#29)
     try:
         result = await gs.save_session(body.session_id, body.filename, body.allow_historical)
     except gs.GoldStandardError as exc:
         return api_error(exc.status, exc.code, exc.message)
     if result is None:
         return api_error(404, "SESSION_NOT_FOUND", f"Session '{body.session_id}' not found.")
+    audit.note(file=result.get("filename"))
     return SaveResponse(**result)
 
 
