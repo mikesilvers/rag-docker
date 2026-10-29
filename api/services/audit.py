@@ -311,7 +311,8 @@ def flush_logins(due_only: bool = False) -> None:
 
 def _login_failure(fields: dict) -> None:
     """A failed or throttled login: written at once and opening its key's
-    window, or counted in the window already open."""
+    window (only when that record was written: after a lost one, the next
+    failure is written, not counted), or counted in the window already open."""
     try:
         with _logins_lock:
             _flush(True)                              # a key's earlier count goes before its new record
@@ -321,8 +322,7 @@ def _login_failure(fields: dict) -> None:
                 window["count"] += 1
                 window["last"] = _stamp(time.time_ns())
                 return
-            record(**fields)
-            if len(_logins) < LOGIN_WINDOWS_MAX:
+            if record(**fields) and len(_logins) < LOGIN_WINDOWS_MAX:
                 _logins[key] = {"fields": fields, "opened": _clock(), "count": 0, "last": None}
     except Exception:                                 # noqa: BLE001 - never breaks the login's answer
         _log.exception("Could not record a failed login")

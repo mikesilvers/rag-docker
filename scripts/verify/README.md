@@ -38,8 +38,10 @@ nginx allows 10 logins a minute per client address with a burst of 5 (#577), and
 request comes from one address, so the harness waits for a slot instead of failing: a login nginx
 refuses with `429 LOGIN_RATE_LIMITED` is sent again every 6.5 s for up to 5 minutes, by
 `auth_setup.request` and `paced` (used by `auth_stack.py`'s `code`, `audit_stack.py` and
-`lan_stack.py`) and by `browser/lib.js`'s `login`. The API's own `429 LOGIN_THROTTLED` and every
-other answer reach the check at once. Suites that log in often take longer for it.
+`lan_stack.py`) and by `browser/lib.js`'s `login`; `browser/ui_criteria.js`'s §10.4 login through
+the login form is submitted once more after 6.5 s when the page shows nginx's refusal. The API's
+own `429 LOGIN_THROTTLED` and every other answer reach the check at once. Suites that log in often
+take longer for it.
 
 `require_stack` then logs `vfy-engineer` in, into the curl cookie jar
 `$RAG_AUTH_DIR/engineer.jar` (0600), exported as `RAG_AUTH_JAR`. `lib.sh` defines `curl` as a
@@ -190,8 +192,10 @@ would fail by design). `--lan` can't be combined with `--telemetry`.
 image. Only in a `--lan` run does it check the running LAN project through
 `lan_stack.py`: HTTPS with the generated certificate, TLS versions and HTTP/2,
 the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
-and the API's refusal in one-off containers (`docker compose run --rm
---no-deps`, no ports); it also prints the client address nginx recorded.
+the API's refusal in one-off containers (`docker compose run --rm
+--no-deps`, no ports) and nginx's login rate limit (logins sent without
+waiting until one is refused `429 LOGIN_RATE_LIMITED`, #577); it also prints
+the client address nginx recorded.
 
 **Memory.** The verify project runs next to the live stack on the same Docker
 VM. With 12 GB allocated, both fit while one LLM is loaded; when both stacks
@@ -833,7 +837,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |
 | `../tests/test_retrieve_script.py` | controlled `retrieve.py` defaults, flags and exit codes against a stub API, registered by suite 15 |
 | `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15 |
-| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, and the page controls of #400 (see "UI control browser checks") |
+| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, the page controls of #400 (see "UI control browser checks") and, last, the login page against nginx's real login rate limit (#577) |
 | `14_reindex.sh` | exact-record reindex: a host check that the embedded sources match the real files (`../tests/test_reindex_preservation.py`), 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |

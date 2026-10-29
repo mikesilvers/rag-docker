@@ -14656,7 +14656,8 @@ def flush_logins(due_only: bool = False) -> None:
 
 def _login_failure(fields: dict) -> None:
     """A failed or throttled login: written at once and opening its key's
-    window, or counted in the window already open."""
+    window (only when that record was written: after a lost one, the next
+    failure is written, not counted), or counted in the window already open."""
     try:
         with _logins_lock:
             _flush(True)                              # a key's earlier count goes before its new record
@@ -14666,8 +14667,7 @@ def _login_failure(fields: dict) -> None:
                 window["count"] += 1
                 window["last"] = _stamp(time.time_ns())
                 return
-            record(**fields)
-            if len(_logins) < LOGIN_WINDOWS_MAX:
+            if record(**fields) and len(_logins) < LOGIN_WINDOWS_MAX:
                 _logins[key] = {"fields": fields, "opened": _clock(), "count": 0, "last": None}
     except Exception:                                 # noqa: BLE001 - never breaks the login's answer
         _log.exception("Could not record a failed login")
@@ -18958,8 +18958,10 @@ nginx allows 10 logins a minute per client address with a burst of 5 (#577), and
 request comes from one address, so the harness waits for a slot instead of failing: a login nginx
 refuses with `429 LOGIN_RATE_LIMITED` is sent again every 6.5 s for up to 5 minutes, by
 `auth_setup.request` and `paced` (used by `auth_stack.py`'s `code`, `audit_stack.py` and
-`lan_stack.py`) and by `browser/lib.js`'s `login`. The API's own `429 LOGIN_THROTTLED` and every
-other answer reach the check at once. Suites that log in often take longer for it.
+`lan_stack.py`) and by `browser/lib.js`'s `login`; `browser/ui_criteria.js`'s §10.4 login through
+the login form is submitted once more after 6.5 s when the page shows nginx's refusal. The API's
+own `429 LOGIN_THROTTLED` and every other answer reach the check at once. Suites that log in often
+take longer for it.
 
 `require_stack` then logs `vfy-engineer` in, into the curl cookie jar
 `$RAG_AUTH_DIR/engineer.jar` (0600), exported as `RAG_AUTH_JAR`. `lib.sh` defines `curl` as a
@@ -19110,8 +19112,10 @@ would fail by design). `--lan` can't be combined with `--telemetry`.
 image. Only in a `--lan` run does it check the running LAN project through
 `lan_stack.py`: HTTPS with the generated certificate, TLS versions and HTTP/2,
 the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
-and the API's refusal in one-off containers (`docker compose run --rm
---no-deps`, no ports); it also prints the client address nginx recorded.
+the API's refusal in one-off containers (`docker compose run --rm
+--no-deps`, no ports) and nginx's login rate limit (logins sent without
+waiting until one is refused `429 LOGIN_RATE_LIMITED`, #577); it also prints
+the client address nginx recorded.
 
 **Memory.** The verify project runs next to the live stack on the same Docker
 VM. With 12 GB allocated, both fit while one LLM is loaded; when both stacks
@@ -19753,7 +19757,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |
 | `../tests/test_retrieve_script.py` | controlled `retrieve.py` defaults, flags and exit codes against a stub API, registered by suite 15 |
 | `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15 |
-| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, and the page controls of #400 (see "UI control browser checks") |
+| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, the page controls of #400 (see "UI control browser checks") and, last, the login page against nginx's real login rate limit (#577) |
 | `14_reindex.sh` | exact-record reindex: a host check that the embedded sources match the real files (`../tests/test_reindex_preservation.py`), 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
@@ -23113,6 +23117,8 @@ lan origin
 check "a same-origin change over HTTPS is accepted, another origin's refused 403 CROSS_ORIGIN_REFUSED" $?
 lan refusals
 check "the API refuses LAN mode with one line when AUTH_COOKIE_SECURE is false or no Engineer exists" $?
+lan rate-limit
+check "nginx refuses logins beyond its rate over HTTPS with 429 LOGIN_RATE_LIMITED" $?
 lan address
 
 summary
@@ -23236,7 +23242,7 @@ if __name__ == "__main__":
 ```python
 """LAN mode on the verify project (#26). Host-side, standard library, Python 3.9+.
 
-    python3 lan_stack.py https|tls|bindings|cookie|origin|refusals|address
+    python3 lan_stack.py https|tls|bindings|cookie|origin|refusals|rate-limit|address
 
 Run by 18_lan.sh in a `stack.sh run --lan`, which brings the verify project up
 in LAN mode with TLS on 127.0.0.1:<verify port> only, copies the certificate
@@ -23257,6 +23263,9 @@ printing what failed:
   refusals  a one-off api container of the LAN configuration (no ports, the
             running project untouched) refuses to start, with one line, when
             AUTH_COOKIE_SECURE is false and when its account store is empty
+  rate-limit
+            logins for unknown usernames, sent without waiting for a slot,
+            until nginx refuses one with 429 LOGIN_RATE_LIMITED (#577)
   address   prints the client address nginx recorded for these requests
             (always exits 0; information for the README)
 
@@ -23463,6 +23472,21 @@ def check_refusals():
     assert status == 200, "the running API isn't healthy after the one-off containers ({})".format(status)
 
 
+def check_rate_limit():
+    """#577: nginx's login rate limit on the LAN project. The attempts are sent
+    without waiting for a slot (no auth_setup.paced) until one is refused."""
+    seen = []
+    for n in range(12):
+        name = "vfy-lan-rate-{}-{}".format(n, secrets.token_hex(3))
+        status, body, _ = request("POST", "/auth/login", {"username": name, "password": "x" * 12}, {"Origin": origin()})
+        code = ((body or {}).get("error") or {}).get("code")
+        seen.append("{} {}".format(status, code))
+        if status == 429:
+            assert code == "LOGIN_RATE_LIMITED", "the refusal was {} {}, not nginx's".format(status, code)
+            return
+    raise AssertionError("12 logins in a row were all let through: {}".format(", ".join(seen)))
+
+
 def check_address():
     logs = subprocess.run(["docker", "compose", "logs", "--no-color", "--tail", "500", "proxy"],
                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -23473,7 +23497,8 @@ def check_address():
 
 
 CHECKS = {"https": check_https, "tls": check_tls, "bindings": check_bindings, "cookie": check_cookie,
-          "origin": check_origin, "refusals": check_refusals, "address": check_address}
+          "origin": check_origin, "refusals": check_refusals, "rate-limit": check_rate_limit,
+          "address": check_address}
 
 
 def main(argv):
@@ -32030,6 +32055,8 @@ const { sleep, makeReporter, launch, session, credentialsFor, bodyText, setValue
 
 const BASE = process.env.RAG_UI_BASE || 'http://proxy';
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic'];
+// nginx's refusal of a login beyond its rate (#577), as the login page shows it.
+const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again.';
 
 (async () => {
   const browser = await launch();
@@ -32055,9 +32082,20 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' });
     r.check('logged out, the UI shows the login page', /Log in to continue/.test(await bodyText(s.page)) && new URL(s.page.url()).pathname === '/login');
     const { username, password } = credentialsFor('engineer');
-    await setValue(s.page, "() => document.querySelector('#login-username')", username);
-    await setValue(s.page, "() => document.querySelector('#login-password')", password);
-    await clickByText(s.page, 'Log in');
+    const submit = async () => {                    // a failed login clears the password: both are set each time
+      await setValue(s.page, "() => document.querySelector('#login-username')", username);
+      await setValue(s.page, "() => document.querySelector('#login-password')", password);
+      await clickByText(s.page, 'Log in');
+      await s.page.waitForFunction(() => (location.pathname === '/qa' && document.querySelectorAll('nav a').length > 0)
+        || document.querySelector('p[role=alert]'), { timeout: 10000 }).catch(() => {});
+    };
+    await submit();
+    // nginx allows 10 logins a minute per address, a burst of 5 (#577), and refills a slot every 6 s:
+    // a form login it refuses is submitted once more after 6.5 s, as browser/lib.js's login waits.
+    if (await s.page.evaluate(() => document.querySelector('p[role=alert]')?.textContent.trim()) === LOGIN_RATE_LIMITED) {
+      await sleep(6500);
+      await submit();
+    }
     await s.page.waitForFunction(() => location.pathname === '/qa' && document.querySelectorAll('nav a').length > 0, { timeout: 10000 }).catch(() => {});
     const badge = await s.page.evaluate(() => document.querySelector('nav span.bg-blue-100')?.textContent.trim());
     r.check('logging in through the form opens /qa as the account\'s role', badge === 'AI Engineer', String(badge));
@@ -33233,6 +33271,37 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     }
     r.check('no console errors on the help page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
     await s.ctx.close();
+  }
+
+  // ── nginx's login rate limit on the login page (#577) ─────────────────────
+  // Last in suite 06: it uses up the browser address's burst, so any login
+  // after it would wait for a slot.
+  r.section('login rate limit on the login page (#577)');
+  {
+    const s = await session(browser, BASE, null);
+    try {
+      await s.page.goto(BASE + '/login', { waitUntil: 'networkidle2' });
+      const suffix = require('crypto').randomBytes(3).toString('hex');
+      const seen = [];
+      for (let n = 0; n < 12; n++) {
+        await setValue(s.page, "() => document.querySelector('#login-username')", `vfy-ui-rate-${n}-${suffix}`);
+        await setValue(s.page, "() => document.querySelector('#login-password')", 'not-a-password-' + suffix);
+        const answer = s.page.waitForResponse(res => new URL(res.url()).pathname === '/api/auth/login', { timeout: 15000 });
+        await clickByText(s.page, 'Log in');
+        const res = await answer;
+        await s.page.waitForFunction(() => document.querySelector('button[type=submit]')?.textContent.trim() === 'Log in'
+          && document.querySelector('p[role=alert]'), { timeout: 10000 }).catch(() => {});
+        const alert = await s.page.evaluate(() => document.querySelector('p[role=alert]')?.textContent.trim() || '');
+        seen.push(`${res.status()}:${alert.slice(0, 30)}`);
+        if (res.status() === 429) {
+          r.check('a login nginx refuses shows its LOGIN_RATE_LIMITED message on the login page',
+            alert === LOGIN_RATE_LIMITED && new URL(s.page.url()).pathname === '/login', seen.join(' | '));
+          break;
+        }
+        if (n === 11) r.check('a login nginx refuses shows its LOGIN_RATE_LIMITED message on the login page', false,
+          '12 failed logins were never refused: ' + seen.join(' | '));
+      }
+    } finally { await s.ctx.close(); }
   }
 
   await browser.close();

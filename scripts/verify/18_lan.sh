@@ -39,6 +39,8 @@ lan origin
 check "a same-origin change over HTTPS is accepted, another origin's refused 403 CROSS_ORIGIN_REFUSED" $?
 lan refusals
 check "the API refuses LAN mode with one line when AUTH_COOKIE_SECURE is false or no Engineer exists" $?
+lan rate-limit
+check "nginx refuses logins beyond its rate over HTTPS with 429 LOGIN_RATE_LIMITED" $?
 lan address
 
 summary

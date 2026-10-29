@@ -955,10 +955,11 @@ class LoginCoalescingTests(AuditTestCase):
             self.fail("user", ip="10.0.0.7")
         self.assertEqual(self.fail("user", ip="10.0.0.7").status_code, 429)
         self.assertEqual([r["status_code"] for r in self.logins() if r["target"] == "user"], [401, 429])
+        self.assertEqual(self.fail("user", ip="10.0.0.7").status_code, 429)   # counted in the 429 window
         audit.flush_logins()                                  # shutdown: open counts too
         counts = {(r["target"], r["client_ip"], r["status_code"]): r["details"]["count"]
                   for r in self.logins() if "count" in r["details"]}
-        self.assertEqual(counts, {("user", "10.0.0.7", 401): 4})
+        self.assertEqual(counts, {("user", "10.0.0.7", 401): 4, ("user", "10.0.0.7", 429): 1})
         self.assertEqual(audit._logins, {})
 
     def test_past_the_cap_failures_are_written_one_by_one(self):
@@ -978,6 +979,25 @@ class LoginCoalescingTests(AuditTestCase):
         with patch.object(audit, "record", side_effect=RuntimeError("boom")), \
                 self.assertLogs("audit", level="ERROR"):
             self.assertEqual(self.fail("Nobody").status_code, 401)
+
+    def test_a_lost_first_record_opens_no_window(self):
+        # #591: a first record that wasn't written opens no window, so the
+        # next failure is written instead of counted.
+        real, lost = audit._append, []
+
+        def append(fields):
+            if fields["action"] == "auth.login" and not lost:
+                lost.append(fields)
+                raise OSError("disk full")
+            return real(fields)
+
+        with patch.object(audit, "_append", side_effect=append), self.assertLogs("audit", level="ERROR"):
+            self.assertEqual(self.fail("Nobody").status_code, 401)
+        self.assertEqual(len(lost), 1)
+        self.assertEqual(audit._logins, {})
+        self.assertEqual(self.fail("Nobody").status_code, 401)
+        self.assertEqual([(r["target"], r["details"]) for r in self.logins()], [("Nobody", {"code": "LOGIN_FAILED"})])
+        self.assertEqual(len(audit._logins), 1)
 
     def test_the_api_writes_closed_windows_and_its_shutdown_the_open_ones(self):
         # The real lifespan, in another process (as test_jobstore's lifespan

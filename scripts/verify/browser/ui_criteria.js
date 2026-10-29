@@ -9,6 +9,8 @@ const { sleep, makeReporter, launch, session, credentialsFor, bodyText, setValue
 
 const BASE = process.env.RAG_UI_BASE || 'http://proxy';
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic'];
+// nginx's refusal of a login beyond its rate (#577), as the login page shows it.
+const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again.';
 
 (async () => {
   const browser = await launch();
@@ -34,9 +36,20 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' });
     r.check('logged out, the UI shows the login page', /Log in to continue/.test(await bodyText(s.page)) && new URL(s.page.url()).pathname === '/login');
     const { username, password } = credentialsFor('engineer');
-    await setValue(s.page, "() => document.querySelector('#login-username')", username);
-    await setValue(s.page, "() => document.querySelector('#login-password')", password);
-    await clickByText(s.page, 'Log in');
+    const submit = async () => {                    // a failed login clears the password: both are set each time
+      await setValue(s.page, "() => document.querySelector('#login-username')", username);
+      await setValue(s.page, "() => document.querySelector('#login-password')", password);
+      await clickByText(s.page, 'Log in');
+      await s.page.waitForFunction(() => (location.pathname === '/qa' && document.querySelectorAll('nav a').length > 0)
+        || document.querySelector('p[role=alert]'), { timeout: 10000 }).catch(() => {});
+    };
+    await submit();
+    // nginx allows 10 logins a minute per address, a burst of 5 (#577), and refills a slot every 6 s:
+    // a form login it refuses is submitted once more after 6.5 s, as browser/lib.js's login waits.
+    if (await s.page.evaluate(() => document.querySelector('p[role=alert]')?.textContent.trim()) === LOGIN_RATE_LIMITED) {
+      await sleep(6500);
+      await submit();
+    }
     await s.page.waitForFunction(() => location.pathname === '/qa' && document.querySelectorAll('nav a').length > 0, { timeout: 10000 }).catch(() => {});
     const badge = await s.page.evaluate(() => document.querySelector('nav span.bg-blue-100')?.textContent.trim());
     r.check('logging in through the form opens /qa as the account\'s role', badge === 'AI Engineer', String(badge));
@@ -1212,6 +1225,37 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     }
     r.check('no console errors on the help page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
     await s.ctx.close();
+  }
+
+  // ── nginx's login rate limit on the login page (#577) ─────────────────────
+  // Last in suite 06: it uses up the browser address's burst, so any login
+  // after it would wait for a slot.
+  r.section('login rate limit on the login page (#577)');
+  {
+    const s = await session(browser, BASE, null);
+    try {
+      await s.page.goto(BASE + '/login', { waitUntil: 'networkidle2' });
+      const suffix = require('crypto').randomBytes(3).toString('hex');
+      const seen = [];
+      for (let n = 0; n < 12; n++) {
+        await setValue(s.page, "() => document.querySelector('#login-username')", `vfy-ui-rate-${n}-${suffix}`);
+        await setValue(s.page, "() => document.querySelector('#login-password')", 'not-a-password-' + suffix);
+        const answer = s.page.waitForResponse(res => new URL(res.url()).pathname === '/api/auth/login', { timeout: 15000 });
+        await clickByText(s.page, 'Log in');
+        const res = await answer;
+        await s.page.waitForFunction(() => document.querySelector('button[type=submit]')?.textContent.trim() === 'Log in'
+          && document.querySelector('p[role=alert]'), { timeout: 10000 }).catch(() => {});
+        const alert = await s.page.evaluate(() => document.querySelector('p[role=alert]')?.textContent.trim() || '');
+        seen.push(`${res.status()}:${alert.slice(0, 30)}`);
+        if (res.status() === 429) {
+          r.check('a login nginx refuses shows its LOGIN_RATE_LIMITED message on the login page',
+            alert === LOGIN_RATE_LIMITED && new URL(s.page.url()).pathname === '/login', seen.join(' | '));
+          break;
+        }
+        if (n === 11) r.check('a login nginx refuses shows its LOGIN_RATE_LIMITED message on the login page', false,
+          '12 failed logins were never refused: ' + seen.join(' | '));
+      }
+    } finally { await s.ctx.close(); }
   }
 
   await browser.close();
