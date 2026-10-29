@@ -776,7 +776,15 @@ retained original (a file uploaded more than once under the same name, or the
 same content uploaded under a second name), or where a retained original is
 missing from disk.
 
-Each rebuild verifies a staging copy before cutover. Failures before cutover leave the original intact; a failure during final replacement can leave its name missing or partial, with a retained recovery copy and historical sessions. Retained sessions can be loaded by ID. Historical export returns `409 HISTORICAL_SESSION` until the user explicitly opts in.
+Each rebuild verifies a staging copy before cutover. A failure before cutover
+leaves the original collection, and the stale markers of its gold-standard
+sessions, as they were; a marker that can't be rolled back leaves its session
+historical, and Health reports it. A failure during final replacement can leave
+its name missing or partial, with a retained recovery copy and historical
+sessions. After cutover, stale marking is best-effort: a session whose file and
+pending marker both can't be written is historical only until the API restarts.
+Retained sessions can be loaded by ID. Historical export returns
+`409 HISTORICAL_SESSION` until the user explicitly opts in.
 
 **Gold-standard sessions are flagged, never deleted.** Re-chunking or re-embedding
 changes which chunks exist, so any evaluation pairs built against the old ones no

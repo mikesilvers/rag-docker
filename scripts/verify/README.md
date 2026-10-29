@@ -765,6 +765,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, review 404 codes and empty-edit refusal (#381), export schema, export name refusals (#370) |
 | `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
+| `../tests/test_session_validity.py` | controlled retained-session validity, historical export guard, durable pre-replacement stale markers, their rollback on abort and the real tuning abort branch (#93, #275), registered by `10_validity.sh` |
 | `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E40, encrypted packages (#27); destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
@@ -808,7 +809,9 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 `session_validity.py` inside the disposable API, using an owned real collection,
 synthetic retained pairs and in-process HTTP without startup sweeps or model calls.
 It checks warning metadata, actual deletion marking and explicit historical export.
-It then runs `../tests/test_goldstandard_exports.py` in the API container and checks
+It then runs `../tests/test_session_validity.py` in the API container: controlled
+validity, durable stale-marker and rollback regressions (#275). Last, it runs
+`../tests/test_goldstandard_exports.py` in the API container and checks
 through the proxy that download refuses other upload state with 400 (#370).
 
 ## Environment
