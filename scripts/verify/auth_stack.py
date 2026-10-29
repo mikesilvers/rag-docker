@@ -112,8 +112,9 @@ def role_token(role):
     return token
 
 
-def code(method, path, body=None, token=None, headers=None):
-    """The status of a request sent as a same-origin browser would, or with `headers` instead."""
+def code(method, path, body=None, token=None, headers=None, paced=True):
+    """The status of a request sent as a same-origin browser would, or with `headers` instead.
+    A login nginx refuses for its rate is sent again (auth_setup.paced) unless `paced` is False."""
     api = auth_setup.api_base()
     data = json.dumps(body).encode() if body is not None else None
     sent = {"Origin": auth_setup.origin()} if headers is None else dict(headers)
@@ -121,12 +122,16 @@ def code(method, path, body=None, token=None, headers=None):
         sent["Content-Type"] = "application/json"
     if token:
         sent["Cookie"] = "rag_session=" + token
-    req = urllib.request.Request(api + path, data=data, method=method, headers=sent)
-    try:
-        with urllib.request.urlopen(req, timeout=120) as response:
-            return response.status, response.read(), response.headers
-    except urllib.error.HTTPError as error:
-        return error.code, error.read(), error.headers
+
+    def send():
+        req = urllib.request.Request(api + path, data=data, method=method, headers=sent)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as response:
+                return response.status, response.read(), response.headers
+        except urllib.error.HTTPError as error:
+            return error.code, error.read(), error.headers
+
+    return auth_setup.paced(path, send) if paced else send()
 
 
 def error_code(raw):
@@ -427,6 +432,42 @@ def check_generic_failure(operator_ok):
     expect(answers[0] == answers[1] and answers[0][0] == 401 and error_code(answers[0][1]) == "LOGIN_FAILED",
            "wrong password and unknown user answered differently: {}".format(
                [(s, error_code(r)) for s, r in answers]))
+
+
+def check_login_rate_limit(operator_ok):
+    """#577: nginx refuses logins beyond 10 a minute per address (a burst of 5)
+    with 429 LOGIN_RATE_LIMITED in the error envelope, before the API: a
+    refused attempt writes no audit record."""
+    answered, refused, refusal = [], [], None
+    for n in range(12):
+        name = "vfy-rate-{}-{}".format(n, secrets.token_hex(3))
+        status, raw, headers = code("POST", "/auth/login", {"username": name, "password": "x" * 12}, paced=False)
+        if status == 429:
+            refused.append(name)
+            refusal = refusal or (raw, headers)
+            if len(refused) == 2:
+                break
+        else:
+            expect(status == 401, "{} answered {} {}".format(name, status, error_code(raw)))
+            answered.append(name)
+    expect(refusal is not None, "12 logins in a row were all let through")
+    raw, headers = refusal
+    expect(headers.get("Content-Type", "").startswith("application/json"),
+           "the refusal's Content-Type is {}".format(headers.get("Content-Type")))
+    body = json.loads(raw)
+    expect(body == {"error": {"code": "LOGIN_RATE_LIMITED", "detail": None,
+                              "message": "Too many login attempts. Wait a minute and try again."}},
+           "the refusal is {}".format(body))
+    admin = role_token("engineer")                   # waits for a slot
+    try:
+        status, raw, _ = code("GET", "/audit?action=auth.login&limit=1000", token=admin)
+        expect(status == 200, "GET /audit answered {}".format(status))
+        targets = [r["target"] for r in json.loads(raw)["records"]]
+        expect(not any(name in targets for name in refused), "a login nginx refused was recorded")
+        expect(all(targets.count(name) == 1 for name in answered),
+               "a login the API answered wasn't recorded once")
+    finally:
+        request("POST", "/auth/logout", token=admin)
 
 
 def check_throttle(operator_ok):

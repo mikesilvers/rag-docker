@@ -24,8 +24,20 @@ ERROR line on the `audit` logger and one more in `failed_writes()`; the action
 answers as it would have. The API (threads) and the operator command (another
 process in the same container) append under a thread lock and an flock on
 `.lock`, so each record is one whole line and rotation never races an append.
-`id` and `time` are assigned under that lock, so the files' line order is the
-order of ids, which is what makes `before` a stable cursor.
+`id` and `time` are assigned under that lock, above both the clock and the
+last id already in the log, so the files' line order is the order of ids
+across processes, restarts and a clock that steps back, which is what makes
+`before` a stable cursor and lets `from` stop at the first older record.
+
+**Repeated failed logins are counted, not each written (#577).** A failed or
+throttled login (no actor, 401 or 429) is written at once and opens a
+60-second window for its key: the typed username lowercased, the client
+address and the status. Further failures with that key inside the window are
+counted; when it closes, one more record carries `details.count` (how many)
+and `details.last_attempt` (the last one's time). The API's background task
+writes closed windows and its shutdown writes open ones; a kill loses the
+open counts. At most LOGIN_WINDOWS_MAX windows are open; past that, failures
+are written one by one. nginx also limits logins per address (locations.conf).
 """
 from __future__ import annotations
 
@@ -99,6 +111,17 @@ _current: contextvars.ContextVar[dict | None] = contextvars.ContextVar("audit_re
 _lock = threading.Lock()
 _last_ns = 0
 _failed = 0
+# A record line starts with its id: `id` is the first key.
+_LINE_ID = re.compile(rb'\{"id":"(\d{19})-')
+
+# Failed-login windows (#577): key -> the first record's fields, when the
+# window opened, how many attempts it counted since and the last one's time.
+# _logins_lock is taken before _lock, never after it.
+LOGIN_WINDOW_S = 60
+LOGIN_WINDOWS_MAX = 1000
+_logins: dict[tuple, dict] = {}
+_logins_lock = threading.Lock()
+_clock = time.monotonic
 
 
 # ── handlers' notes ──────────────────────────────────────────────────────────
@@ -142,14 +165,48 @@ def question_text_logged() -> bool:
     return settings.audit_log_questions
 
 
-def _next_id() -> tuple[str, str]:
-    """(id, time). Called under the lock, so ids follow the files' line order;
-    bumped past the last one so a coarse clock can't repeat or reverse."""
+def _stamp(ns: int) -> str:
+    """A record's `time`: UTC, ISO 8601 with milliseconds and Z."""
+    stamp = datetime.fromtimestamp(ns / 1e9, timezone.utc)
+    return stamp.strftime("%Y-%m-%dT%H:%M:%S.") + f"{stamp.microsecond // 1000:03d}Z"
+
+
+def _last_logged_ns(folder: Path) -> int:
+    """The nanoseconds of the last record id in the log (audit.jsonl, or
+    audit.jsonl.1 just after a rotation), 0 when there is none. Reads back from
+    the end, so it costs one small read when the last line is short."""
+    for path in (folder / FILE, folder / f"{FILE}.1"):
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except FileNotFoundError:
+            continue
+        try:
+            size = os.fstat(fd).st_size
+            chunk = 4096
+            while size:
+                start = max(0, size - chunk)
+                lines = os.pread(fd, size - start, start).split(b"\n")
+                for raw in reversed(lines[1:] if start else lines):   # the first may be cut
+                    found = _LINE_ID.match(raw)
+                    if found:
+                        return int(found.group(1))
+                if not start:
+                    break
+                chunk *= 4
+        finally:
+            os.close(fd)
+    return 0
+
+
+def _next_id(folder: Path) -> tuple[str, str]:
+    """(id, time). Called under the locks, so ids follow the files' line order:
+    bumped past this process's last id and the last one in the log (another
+    process's, or one written before a restart), so a coarse clock or one that
+    steps back can't repeat or reverse them."""
     global _last_ns
-    now = max(time.time_ns(), _last_ns + 1)
+    now = max(time.time_ns(), _last_ns + 1, _last_logged_ns(folder) + 1)
     _last_ns = now
-    stamp = datetime.fromtimestamp(now / 1e9, timezone.utc)
-    return f"{now:019d}-{secrets.token_hex(3)}", stamp.strftime("%Y-%m-%dT%H:%M:%S.") + f"{stamp.microsecond // 1000:03d}Z"
+    return f"{now:019d}-{secrets.token_hex(3)}", _stamp(now)
 
 
 def _rotate(folder: Path) -> None:
@@ -169,7 +226,7 @@ def _append(fields: dict) -> None:
         lock_fd = os.open(folder / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            record_id, stamp = _next_id()
+            record_id, stamp = _next_id(folder)
             record = {key: None for key in KEYS}
             record.update(fields, id=record_id, time=stamp)
             line = (json.dumps(record, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n").encode()
@@ -225,6 +282,59 @@ def _actor(ctx: dict) -> dict:
 
 def _result(status: int) -> str:
     return "success" if status < 400 else "refused" if status < 500 else "error"
+
+
+# ── repeated failed logins (#577) ────────────────────────────────────────────
+
+def _flush(due_only: bool) -> None:
+    """Close the windows that have run LOGIN_WINDOW_S (every window when not
+    due_only) and write one record for each that counted an attempt. Called
+    under _logins_lock."""
+    now = _clock()
+    for key in [k for k, w in _logins.items() if not due_only or now - w["opened"] >= LOGIN_WINDOW_S]:
+        window = _logins.pop(key)
+        if window["count"]:
+            fields = dict(window["fields"])
+            fields["details"] = {**fields["details"], "count": window["count"], "last_attempt": window["last"]}
+            record(**fields)
+
+
+def flush_logins(due_only: bool = False) -> None:
+    """Write the count records of closed failed-login windows (all open ones
+    too unless due_only, as at shutdown). Never raises."""
+    try:
+        with _logins_lock:
+            _flush(due_only)
+    except Exception:                                 # noqa: BLE001 - never breaks the caller
+        _log.exception("Could not write the failed-login counts")
+
+
+def _login_failure(fields: dict) -> None:
+    """A failed or throttled login: written at once and opening its key's
+    window, or counted in the window already open."""
+    try:
+        with _logins_lock:
+            _flush(True)                              # a key's earlier count goes before its new record
+            key = (fields["target"].lower(), fields["client_ip"], fields["status_code"])
+            window = _logins.get(key)
+            if window is not None:
+                window["count"] += 1
+                window["last"] = _stamp(time.time_ns())
+                return
+            record(**fields)
+            if len(_logins) < LOGIN_WINDOWS_MAX:
+                _logins[key] = {"fields": fields, "opened": _clock(), "count": 0, "last": None}
+    except Exception:                                 # noqa: BLE001 - never breaks the login's answer
+        _log.exception("Could not record a failed login")
+
+
+async def login_flusher() -> None:
+    """The API's background task: writes each closed window's count record
+    within about a second of its end."""
+    while True:
+        await asyncio.sleep(1)
+        if _logins:
+            await asyncio.to_thread(flush_logins, True)
 
 
 # ── jobs ─────────────────────────────────────────────────────────────────────
@@ -486,6 +596,10 @@ class AuditMiddleware:
             code = _error_code(seen["body"])
             if code:
                 details["code"] = code
-        await asyncio.to_thread(record, ctx["action"], result=_result(status), status_code=status,
-                                collection=ctx["collection"], target=ctx["target"], details=details,
-                                **_actor(ctx))
+        fields = {"action": ctx["action"], "result": _result(status), "status_code": status,
+                  "collection": ctx["collection"], "target": ctx["target"], "details": details, **_actor(ctx)}
+        if (ctx["action"] == "auth.login" and ctx["actor"] is None and status in (401, 429)
+                and isinstance(ctx["target"], str)):
+            await asyncio.to_thread(_login_failure, fields)
+        else:
+            await asyncio.to_thread(record, **fields)

@@ -180,7 +180,9 @@ pair for 15 minutes (`429 LOGIN_THROTTLED`); a wrong current password on the
 password-change page counts the same way. Every failure answers the same
 `LOGIN_FAILED`, whether or not the account exists. Behind Docker's port
 publishing every browser on the host may reach the API from the same address,
-so in practice the throttle is per username. A change (POST, PATCH, DELETE) sent with the cookie must
+so in practice the throttle is per username. The proxy also allows at most 10 logins a minute from one
+address, with a burst of 5 (`429 LOGIN_RATE_LIMITED`, "Too many login attempts. Wait a minute and try
+again."). A change (POST, PATCH, DELETE) sent with the cookie must
 come from this same origin, or it is refused `403 CROSS_ORIGIN_REFUSED`. Each
 login, success or failure, is one line in `docker compose logs api`, with the
 username and address and never the password.
@@ -241,7 +243,9 @@ action, collection and result, page back through older records, and download
 the matching records as CSV. Opening the page and downloading the CSV are
 recorded too.
 
-**What is recorded.** Logins (successful, failed and throttled), logouts and
+**What is recorded.** Logins (successful, failed and throttled; repeated
+failures for one username from one address within a minute are one record and
+then one more with their count), logouts and
 password changes; queries; creating and deleting collections; saving ingest
 and retrieval settings; ingest, export, import and tuning jobs, once when
 started and once when they end (succeeded, failed or interrupted by a
@@ -458,7 +462,9 @@ switch again.
   Docker network's gateway. Other machines' connections take the same port
   forwarding, so expect them to share one address: then 5 wrong passwords for a
   username, from anyone on the network, lock that username for everyone for 15
-  minutes. Docker Engine on Linux normally keeps the real client address.
+  minutes. The proxy's login rate limit, 10 a minute per client address with a
+  burst of 5, is then one limit shared by the whole network. Docker Engine on
+  Linux normally keeps the real client address.
 - **The audit log's addresses.** For the same reason, every record of the
   [audit log](#audit-log) from another machine shows that one address; its
   actor names who acted.

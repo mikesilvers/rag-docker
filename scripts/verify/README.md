@@ -34,6 +34,13 @@ knows:
   lines `stack.sh up` prints (which CI copies into its job environment). They reach the API only
   in request bodies, and the browser checks on standard input.
 
+nginx allows 10 logins a minute per client address with a burst of 5 (#577), and every harness
+request comes from one address, so the harness waits for a slot instead of failing: a login nginx
+refuses with `429 LOGIN_RATE_LIMITED` is sent again every 6.5 s for up to 5 minutes, by
+`auth_setup.request` and `paced` (used by `auth_stack.py`'s `code`, `audit_stack.py` and
+`lan_stack.py`) and by `browser/lib.js`'s `login`. The API's own `429 LOGIN_THROTTLED` and every
+other answer reach the check at once. Suites that log in often take longer for it.
+
 `require_stack` then logs `vfy-engineer` in, into the curl cookie jar
 `$RAG_AUTH_DIR/engineer.jar` (0600), exported as `RAG_AUTH_JAR`. `lib.sh` defines `curl` as a
 function that adds that jar and an `Origin` matching `RAG_API` (the API refuses a
@@ -45,7 +52,9 @@ read the jar through `auth_headers.py`; in-process checks in the API image use
 
 `17_auth.sh` checks authentication itself: the endpoint/role matrix for no session and each
 role (written out in `auth_stack.py`, not read from the API), login, logout, cookies, origin
-rules, throttling, the operator command's effect on existing sessions (on throwaway `vfy-t-*`
+rules, throttling, nginx's login rate limit (logins sent without waiting until one is refused
+`429 LOGIN_RATE_LIMITED` in the error envelope, and no audit record for the refused ones), the
+operator command's effect on existing sessions (on throwaway `vfy-t-*`
 accounts), an Engineer's account administration through the API (on a throwaway account; the
 generated passwords must not reach the API log), service API keys (throwaway `vfy-s-*`
 principals created through the API by the harness Engineer: the matrix with a key of each role
@@ -61,8 +70,12 @@ collection created, ingested into, exported with a passphrase and deleted (a thr
 job id; the package is removed afterwards), a Developer's refused delete, an Engineer's principal
 and key administration (a throwaway `vfy-s-*` principal), filters, paging and the CSV, and that no
 harness password, session token, key, typed password or passphrase reaches the audit files, which
-it reads in the api container, and that parallel failed logins appended alongside the operator command are each
-recorded once on whole lines. `../tests/test_audit.py` covers the rest in the API image.
+it reads in the api container, that parallel failed logins (5, nginx's login burst) appended alongside the operator
+command are each recorded once on whole lines, and that three failed logins for one username are one record at once
+and, when the 60-second window closes, one record with `details.count` and `last_attempt` (#577).
+`../tests/test_audit.py` covers the rest in the API image, among it the counting of repeated failed logins, ids
+that stay in order across processes and a clock that steps back, the telemetry route list and the Audit page's
+action list (#577).
 
 ## Entry point and verify project
 
@@ -575,7 +588,8 @@ and another start takes the slot, waiting again on that one doesn't restart it (
 `RAG_ALLOW_RESTART=1`, `02_ingest.sh` also restarts the API
 (`docker compose restart --timeout 0 api`) while two uploads are part-way and checks that a
 completed job reads back unchanged, the one that stored a file reads `partial` and the one
-that stored none reads `failed`, both with the interruption message; `05_transfer.sh` does the
+that stored none reads `failed`, both with the interruption message, and that each of those two has
+one `interrupted` audit record with its job id (#577); `05_transfer.sh` does the
 same for a completed export, an export interrupted part-way through a synthetic 30,000-chunk
 collection (`failed`, `INTERRUPTED`, `chunks_written` kept) and an import of that collection
 interrupted part-way (`failed`, `INTERRUPTED`). Tune has no live restart check: no tune

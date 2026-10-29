@@ -293,6 +293,14 @@ ignored by git.
 on Docker Desktop for Mac: a request through the host's LAN address arrives from `192.168.65.1` and one through
 `localhost` from the Docker network's gateway, not from the client's own address.
 
+**Login rate limit (#577).** Both servers define `limit_req_zone $binary_remote_addr zone=login:1m rate=10r/m;`,
+and `locations.conf` limits `POST /api/auth/login` (an exact location, otherwise proxied as `/api/`) with
+`limit_req zone=login burst=5 nodelay;`. Beyond it nginx answers `429` itself, `application/json`,
+`{"error":{"code":"LOGIN_RATE_LIMITED","message":"Too many login attempts. Wait a minute and try again.","detail":null}}`,
+which the login page shows; the API never sees the attempt, so it writes no audit record. The API's own answers
+pass through. Where every client shares one address (Docker Desktop, LAN mode included; above), the limit is
+shared by all of them.
+
 ---
 
 ## 3. API Service Specification
@@ -1437,7 +1445,8 @@ without checking the password. The same applies to unknown usernames. An attempt
 is checked, in the same transaction as the throttle check, so parallel attempts can't exceed five. A successful
 login clears the pair's count. A wrong current password on `POST /auth/password` counts against the same pair, and
 a throttled pair's password change answers `429 LOGIN_THROTTLED`. Behind Docker's port publishing every client on
-the host may share one address, so in practice the throttle is per username.
+the host may share one address, so in practice the throttle is per username. Before the API, nginx limits logins
+to 10 a minute per client address with a burst of 5 (`429 LOGIN_RATE_LIMITED`, §2 "Login rate limit").
 
 | Route | Request | Success |
 |---|---|---|
@@ -1567,7 +1576,7 @@ built yet; it is to include this folder.
 
 | Key | Value |
 |---|---|
-| `id` | Write time in nanoseconds (19 digits), `-`, 6 hex characters. Assigned under the log's lock, so line order is id order |
+| `id` | Write time in nanoseconds (19 digits), `-`, 6 hex characters. Assigned under the log's lock, above the clock and the last id in the log (another process's, or one from before a restart), so line order is id order even if the clock steps back; `time` is the same instant |
 | `time` | UTC, ISO 8601 with milliseconds and `Z` |
 | `actor` | Username, service principal name, `operator`, `system`, or `null` (nobody identified) |
 | `actor_kind` | `user`, `service`, `operator`, `system` or `anonymous` |
@@ -1596,7 +1605,13 @@ not usage errors); `system.start` (each API start, after the job records are loa
 holds its own `audit.view` or `audit.download`. A refusal by the authentication middleware is recorded only when it
 is a 403 for an identified principal (`FORBIDDEN`, `KEY_NOT_ALLOWED`, `CROSS_ORIGIN_REFUSED`,
 `PASSWORD_CHANGE_REQUIRED`); `401 AUTH_REQUIRED`, `401 KEY_INVALID` and `503 SETUP_REQUIRED` write nothing. A
-failed or throttled login has actor `null`, kind `anonymous` and the typed username as `target`. A job (ingest,
+failed or throttled login has actor `null`, kind `anonymous` and the typed username as `target`. Repeated ones are
+counted (#577): a failure is written at once and opens a 60-second window for its key (the typed username
+lowercased, the client address and the status, 401 or 429); further failures with that key in the window aren't
+written; when it closes, one more record with the first one's fields carries `details.count` (how many) and
+`details.last_attempt` (the last one's time, as `time`). The API writes closed windows within about a second and
+open ones at shutdown; a kill loses the open counts. At most 1,000 windows are open; past that, failures are
+written one by one. A job (ingest,
 export, import, tune) gets an `accepted` record (status 202) when it is stored, before it can end, and one end
 record with the same actor and job id: `succeeded` for `completed`, `failed` for `failed`, `partial` or
 `cancelled` (`details.job_status` says which), `interrupted` when the API's start marks it so. Jobs started before
@@ -1691,6 +1706,7 @@ Standard error codes:
 | `PASSWORD_CHANGE_REQUIRED` | 403 | A generated password must be changed first; only `/auth/me`, `/auth/logout` and `/auth/password` answer |
 | `LOGIN_FAILED` | 401 | Login refused; the same answer for every cause |
 | `LOGIN_THROTTLED` | 429 | Five failed logins for this username and address within 15 minutes; wait 15 minutes |
+| `LOGIN_RATE_LIMITED` | 429 | From nginx, not the API: more than 10 logins a minute (burst 5) from this client address; wait a minute (#577) |
 | `PASSWORD_INCORRECT` | 403 | The current password given to `POST /auth/password` is wrong |
 | `INVALID_PASSWORD` | 422 | The new password breaks a rule; the message names it |
 | `INVALID_USERNAME` | 422 | `POST /auth/users`: the username breaks the rule; the message states it |

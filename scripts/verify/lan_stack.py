@@ -87,8 +87,9 @@ def login():
     stored = auth_setup.read_credentials(auth_setup.private_dir()).get("engineer")
     if not stored:
         raise AssertionError("no stored credentials for the harness Engineer")
-    status, body, cookies = request("POST", "/auth/login", {"username": stored[0], "password": stored[1]},
-                                    {"Origin": origin()})
+    # nginx's login rate limit (#577): wait for a slot as auth_setup.paced does.
+    status, body, cookies = auth_setup.paced(auth_setup.LOGIN_PATH, lambda: request(
+        "POST", "/auth/login", {"username": stored[0], "password": stored[1]}, {"Origin": origin()}))
     session = [c for c in cookies if c.split("=", 1)[0].strip() == auth_setup.COOKIE]
     if status != 200 or len(session) != 1:
         raise AssertionError("login answered HTTP {} with {} session cookie(s)".format(status, len(session)))

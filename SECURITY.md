@@ -63,7 +63,9 @@ request but `/health` and the login (#25).
   doesn't see clients' own addresses (measured: `192.168.65.1` for a request
   through the host's LAN address), so the per-username-and-address login
   throttle works per username there: anyone on the network can lock a username
-  for 15 minutes with 5 wrong passwords. See README "Sharing with your office".
+  for 15 minutes with 5 wrong passwords, and the proxy's login rate limit (10
+  a minute per client address, a burst of 5) is one limit for everyone there.
+  See README "Sharing with your office".
 - **Service API keys.** Programs authenticate with keys issued by AI Engineers
   to service principals, accounts that can't log in to the browser; keys are
   never issued to people. A key is 256 random bits, shown once at issuance;
@@ -83,7 +85,11 @@ request but `/health` and the login (#25).
   records a query's question text only when the operator sets
   `AUDIT_LOG_QUESTIONS=true`. Only AI Engineers' browser sessions can read it;
   API keys can't. A record that can't be written doesn't stop the action; it
-  is logged and counted. On Docker Desktop the client address doesn't tell
+  is logged and counted. The proxy limits logins to 10 a minute per client
+  address (a burst of 5), and repeated failed logins for one username from
+  one address within a minute are one record plus one with their count, so
+  failed logins can't quickly rotate the history away (#577). On Docker
+  Desktop the client address doesn't tell
   clients apart (see LAN mode above). It guards against mistakes and
   after-the-fact questions, not against someone with access to the Docker
   host, who can edit the files. See README "Audit log".

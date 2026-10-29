@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 from unittest.mock import patch
 
@@ -179,6 +180,51 @@ class LibraryTests(unittest.TestCase):
         for name in ("lib.sh", "17_auth.sh", "06_ui.sh", "all.sh"):
             with self.subTest(file=name):
                 self.assertEqual(subprocess.run(["bash", "-n", str(VERIFY / name)]).returncode, 0)
+
+
+class LoginPacingTests(unittest.TestCase):
+    """#577: nginx refuses logins beyond 10 a minute per address; the harness
+    waits for a slot instead of failing, and only for that refusal."""
+
+    LIMITED = (b'{"error":{"code":"LOGIN_RATE_LIMITED","message":"Too many login attempts. Wait a minute and try '
+               b'again.","detail":null}}')
+
+    def answer(self, status, body):
+        import email.message
+        import io
+        import urllib.error
+        headers = email.message.Message()
+        if status == 200:
+            headers["Set-Cookie"] = auth_setup.COOKIE + "=tok; Path=/"
+            response = unittest.mock.MagicMock(status=200, headers=headers)
+            response.read.return_value = body
+            response.__enter__.return_value = response
+            return response
+        return urllib.error.HTTPError("http://x/auth/login", status, "refused", headers, io.BytesIO(body))
+
+    def send(self, answers, path="/auth/login"):
+        with patch.object(auth_setup, "api_base", return_value="http://127.0.0.1:8081/api"), \
+                patch.object(auth_setup.urllib.request, "urlopen", side_effect=answers) as urlopen, \
+                patch.object(auth_setup.time, "sleep") as sleep:
+            result = auth_setup.request("POST", path, {"username": "u", "password": "p"})
+        return result, urlopen.call_count, sleep.call_count
+
+    def test_a_rate_limited_login_is_sent_again(self):
+        answers = [self.answer(429, self.LIMITED), self.answer(429, self.LIMITED), self.answer(200, b'{"ok":1}')]
+        (status, body, token), calls, sleeps = self.send(answers)
+        self.assertEqual((status, body, token, calls, sleeps), (200, {"ok": 1}, "tok", 3, 2))
+
+    def test_the_apis_own_throttle_and_other_paths_are_returned_at_once(self):
+        throttled = b'{"error":{"code":"LOGIN_THROTTLED","message":"wait","detail":null}}'
+        (status, body, _), calls, sleeps = self.send([self.answer(429, throttled)])
+        self.assertEqual((status, body["error"]["code"], calls, sleeps), (429, "LOGIN_THROTTLED", 1, 0))
+        (status, _, _), calls, sleeps = self.send([self.answer(429, self.LIMITED)], path="/auth/password")
+        self.assertEqual((status, calls, sleeps), (429, 1, 0))
+
+    def test_it_gives_up_after_the_wait(self):
+        with patch.object(auth_setup, "LOGIN_WAIT_S", 0):
+            (status, body, _), calls, sleeps = self.send([self.answer(429, self.LIMITED)])
+        self.assertEqual((status, body["error"]["code"], calls, sleeps), (429, "LOGIN_RATE_LIMITED", 1, 0))
 
 
 if __name__ == "__main__":

@@ -403,6 +403,12 @@ http {
     include       /etc/nginx/mime.types;
     default_type  application/octet-stream;
 
+    # Logins per client address (#577): 10 a minute, a burst of 5, so failed
+    # logins can't flood the audit log. Used by locations.conf's
+    # /api/auth/login. On Docker Desktop every client may share one address
+    # (README "Sharing with your office"), and then this limit is shared too.
+    limit_req_zone $binary_remote_addr zone=login:1m rate=10r/m;
+
     upstream api {
         server api:8000;
     }
@@ -438,6 +444,31 @@ location = /api/goldstandard/regenerate {
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_read_timeout 1860s;
     proxy_connect_timeout 10s;
+}
+
+# Logins are rate-limited per client address (#577; the zone is in nginx.conf
+# and nginx.lan.conf): beyond 10 a minute and a burst of 5, nginx answers 429
+# LOGIN_RATE_LIMITED itself, in the API's error envelope so the login page
+# shows the message, and the API never sees the attempt. The API's own 429
+# LOGIN_THROTTLED passes through: error_page applies only to nginx's answers.
+# Otherwise proxied exactly as /api/ below.
+location = /api/auth/login {
+    limit_req zone=login burst=5 nodelay;
+    limit_req_status 429;
+    error_page 429 = @login_rate_limited;
+    client_max_body_size 512m;
+    proxy_request_buffering off;
+    proxy_pass http://api/auth/login;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 300s;
+    proxy_connect_timeout 10s;
+}
+
+location @login_rate_limited {
+    default_type application/json;
+    return 429 '{"error":{"code":"LOGIN_RATE_LIMITED","message":"Too many login attempts. Wait a minute and try again.","detail":null}}';
 }
 
 location /api/ {
@@ -488,6 +519,12 @@ events {
 http {
     include       /etc/nginx/mime.types;
     default_type  application/octet-stream;
+
+    # Logins per client address (#577): 10 a minute, a burst of 5, so failed
+    # logins can't flood the audit log. Used by locations.conf's
+    # /api/auth/login. On Docker Desktop every client may share one address
+    # (README "Sharing with your office"), and then this limit is shared too.
+    limit_req_zone $binary_remote_addr zone=login:1m rate=10r/m;
 
     upstream api {
         server api:8000;
@@ -14331,8 +14368,20 @@ ERROR line on the `audit` logger and one more in `failed_writes()`; the action
 answers as it would have. The API (threads) and the operator command (another
 process in the same container) append under a thread lock and an flock on
 `.lock`, so each record is one whole line and rotation never races an append.
-`id` and `time` are assigned under that lock, so the files' line order is the
-order of ids, which is what makes `before` a stable cursor.
+`id` and `time` are assigned under that lock, above both the clock and the
+last id already in the log, so the files' line order is the order of ids
+across processes, restarts and a clock that steps back, which is what makes
+`before` a stable cursor and lets `from` stop at the first older record.
+
+**Repeated failed logins are counted, not each written (#577).** A failed or
+throttled login (no actor, 401 or 429) is written at once and opens a
+60-second window for its key: the typed username lowercased, the client
+address and the status. Further failures with that key inside the window are
+counted; when it closes, one more record carries `details.count` (how many)
+and `details.last_attempt` (the last one's time). The API's background task
+writes closed windows and its shutdown writes open ones; a kill loses the
+open counts. At most LOGIN_WINDOWS_MAX windows are open; past that, failures
+are written one by one. nginx also limits logins per address (locations.conf).
 """
 from __future__ import annotations
 
@@ -14406,6 +14455,17 @@ _current: contextvars.ContextVar[dict | None] = contextvars.ContextVar("audit_re
 _lock = threading.Lock()
 _last_ns = 0
 _failed = 0
+# A record line starts with its id: `id` is the first key.
+_LINE_ID = re.compile(rb'\{"id":"(\d{19})-')
+
+# Failed-login windows (#577): key -> the first record's fields, when the
+# window opened, how many attempts it counted since and the last one's time.
+# _logins_lock is taken before _lock, never after it.
+LOGIN_WINDOW_S = 60
+LOGIN_WINDOWS_MAX = 1000
+_logins: dict[tuple, dict] = {}
+_logins_lock = threading.Lock()
+_clock = time.monotonic
 
 
 # ── handlers' notes ──────────────────────────────────────────────────────────
@@ -14449,14 +14509,48 @@ def question_text_logged() -> bool:
     return settings.audit_log_questions
 
 
-def _next_id() -> tuple[str, str]:
-    """(id, time). Called under the lock, so ids follow the files' line order;
-    bumped past the last one so a coarse clock can't repeat or reverse."""
+def _stamp(ns: int) -> str:
+    """A record's `time`: UTC, ISO 8601 with milliseconds and Z."""
+    stamp = datetime.fromtimestamp(ns / 1e9, timezone.utc)
+    return stamp.strftime("%Y-%m-%dT%H:%M:%S.") + f"{stamp.microsecond // 1000:03d}Z"
+
+
+def _last_logged_ns(folder: Path) -> int:
+    """The nanoseconds of the last record id in the log (audit.jsonl, or
+    audit.jsonl.1 just after a rotation), 0 when there is none. Reads back from
+    the end, so it costs one small read when the last line is short."""
+    for path in (folder / FILE, folder / f"{FILE}.1"):
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except FileNotFoundError:
+            continue
+        try:
+            size = os.fstat(fd).st_size
+            chunk = 4096
+            while size:
+                start = max(0, size - chunk)
+                lines = os.pread(fd, size - start, start).split(b"\n")
+                for raw in reversed(lines[1:] if start else lines):   # the first may be cut
+                    found = _LINE_ID.match(raw)
+                    if found:
+                        return int(found.group(1))
+                if not start:
+                    break
+                chunk *= 4
+        finally:
+            os.close(fd)
+    return 0
+
+
+def _next_id(folder: Path) -> tuple[str, str]:
+    """(id, time). Called under the locks, so ids follow the files' line order:
+    bumped past this process's last id and the last one in the log (another
+    process's, or one written before a restart), so a coarse clock or one that
+    steps back can't repeat or reverse them."""
     global _last_ns
-    now = max(time.time_ns(), _last_ns + 1)
+    now = max(time.time_ns(), _last_ns + 1, _last_logged_ns(folder) + 1)
     _last_ns = now
-    stamp = datetime.fromtimestamp(now / 1e9, timezone.utc)
-    return f"{now:019d}-{secrets.token_hex(3)}", stamp.strftime("%Y-%m-%dT%H:%M:%S.") + f"{stamp.microsecond // 1000:03d}Z"
+    return f"{now:019d}-{secrets.token_hex(3)}", _stamp(now)
 
 
 def _rotate(folder: Path) -> None:
@@ -14476,7 +14570,7 @@ def _append(fields: dict) -> None:
         lock_fd = os.open(folder / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            record_id, stamp = _next_id()
+            record_id, stamp = _next_id(folder)
             record = {key: None for key in KEYS}
             record.update(fields, id=record_id, time=stamp)
             line = (json.dumps(record, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n").encode()
@@ -14532,6 +14626,59 @@ def _actor(ctx: dict) -> dict:
 
 def _result(status: int) -> str:
     return "success" if status < 400 else "refused" if status < 500 else "error"
+
+
+# ── repeated failed logins (#577) ────────────────────────────────────────────
+
+def _flush(due_only: bool) -> None:
+    """Close the windows that have run LOGIN_WINDOW_S (every window when not
+    due_only) and write one record for each that counted an attempt. Called
+    under _logins_lock."""
+    now = _clock()
+    for key in [k for k, w in _logins.items() if not due_only or now - w["opened"] >= LOGIN_WINDOW_S]:
+        window = _logins.pop(key)
+        if window["count"]:
+            fields = dict(window["fields"])
+            fields["details"] = {**fields["details"], "count": window["count"], "last_attempt": window["last"]}
+            record(**fields)
+
+
+def flush_logins(due_only: bool = False) -> None:
+    """Write the count records of closed failed-login windows (all open ones
+    too unless due_only, as at shutdown). Never raises."""
+    try:
+        with _logins_lock:
+            _flush(due_only)
+    except Exception:                                 # noqa: BLE001 - never breaks the caller
+        _log.exception("Could not write the failed-login counts")
+
+
+def _login_failure(fields: dict) -> None:
+    """A failed or throttled login: written at once and opening its key's
+    window, or counted in the window already open."""
+    try:
+        with _logins_lock:
+            _flush(True)                              # a key's earlier count goes before its new record
+            key = (fields["target"].lower(), fields["client_ip"], fields["status_code"])
+            window = _logins.get(key)
+            if window is not None:
+                window["count"] += 1
+                window["last"] = _stamp(time.time_ns())
+                return
+            record(**fields)
+            if len(_logins) < LOGIN_WINDOWS_MAX:
+                _logins[key] = {"fields": fields, "opened": _clock(), "count": 0, "last": None}
+    except Exception:                                 # noqa: BLE001 - never breaks the login's answer
+        _log.exception("Could not record a failed login")
+
+
+async def login_flusher() -> None:
+    """The API's background task: writes each closed window's count record
+    within about a second of its end."""
+    while True:
+        await asyncio.sleep(1)
+        if _logins:
+            await asyncio.to_thread(flush_logins, True)
 
 
 # ── jobs ─────────────────────────────────────────────────────────────────────
@@ -14793,9 +14940,13 @@ class AuditMiddleware:
             code = _error_code(seen["body"])
             if code:
                 details["code"] = code
-        await asyncio.to_thread(record, ctx["action"], result=_result(status), status_code=status,
-                                collection=ctx["collection"], target=ctx["target"], details=details,
-                                **_actor(ctx))
+        fields = {"action": ctx["action"], "result": _result(status), "status_code": status,
+                  "collection": ctx["collection"], "target": ctx["target"], "details": details, **_actor(ctx)}
+        if (ctx["action"] == "auth.login" and ctx["actor"] is None and status in (401, 429)
+                and isinstance(ctx["target"], str)):
+            await asyncio.to_thread(_login_failure, fields)
+        else:
+            await asyncio.to_thread(record, **fields)
 ```
 
 ### api/routers/audit.py
@@ -14919,6 +15070,7 @@ async def lifespan(app: FastAPI):
     from services.telemetry import bootstrap
     runtime = bootstrap()
     app.state.telemetry = runtime
+    flusher = None
     try:
         import logging
         from services import goldstandard, metrics
@@ -14988,9 +15140,16 @@ async def lifespan(app: FastAPI):
                                 details={"question_text_logged": settings.audit_log_questions,
                                          "max_bytes": settings.audit_log_max_bytes,
                                          "keep": settings.audit_log_keep})
+        # Writes the count records of repeated failed logins as their windows
+        # close; the open ones are written at shutdown, below (#577).
+        flusher = asyncio.create_task(audit.login_flusher())
         yield
     finally:
         try:
+            if flusher is not None:
+                flusher.cancel()
+                from services import audit
+                await asyncio.to_thread(audit.flush_logins)
             from services import weaviate_client as wc
             wc.close_client()
         finally:
@@ -18794,6 +18953,13 @@ knows:
   lines `stack.sh up` prints (which CI copies into its job environment). They reach the API only
   in request bodies, and the browser checks on standard input.
 
+nginx allows 10 logins a minute per client address with a burst of 5 (#577), and every harness
+request comes from one address, so the harness waits for a slot instead of failing: a login nginx
+refuses with `429 LOGIN_RATE_LIMITED` is sent again every 6.5 s for up to 5 minutes, by
+`auth_setup.request` and `paced` (used by `auth_stack.py`'s `code`, `audit_stack.py` and
+`lan_stack.py`) and by `browser/lib.js`'s `login`. The API's own `429 LOGIN_THROTTLED` and every
+other answer reach the check at once. Suites that log in often take longer for it.
+
 `require_stack` then logs `vfy-engineer` in, into the curl cookie jar
 `$RAG_AUTH_DIR/engineer.jar` (0600), exported as `RAG_AUTH_JAR`. `lib.sh` defines `curl` as a
 function that adds that jar and an `Origin` matching `RAG_API` (the API refuses a
@@ -18805,7 +18971,9 @@ read the jar through `auth_headers.py`; in-process checks in the API image use
 
 `17_auth.sh` checks authentication itself: the endpoint/role matrix for no session and each
 role (written out in `auth_stack.py`, not read from the API), login, logout, cookies, origin
-rules, throttling, the operator command's effect on existing sessions (on throwaway `vfy-t-*`
+rules, throttling, nginx's login rate limit (logins sent without waiting until one is refused
+`429 LOGIN_RATE_LIMITED` in the error envelope, and no audit record for the refused ones), the
+operator command's effect on existing sessions (on throwaway `vfy-t-*`
 accounts), an Engineer's account administration through the API (on a throwaway account; the
 generated passwords must not reach the API log), service API keys (throwaway `vfy-s-*`
 principals created through the API by the harness Engineer: the matrix with a key of each role
@@ -18821,8 +18989,12 @@ collection created, ingested into, exported with a passphrase and deleted (a thr
 job id; the package is removed afterwards), a Developer's refused delete, an Engineer's principal
 and key administration (a throwaway `vfy-s-*` principal), filters, paging and the CSV, and that no
 harness password, session token, key, typed password or passphrase reaches the audit files, which
-it reads in the api container, and that parallel failed logins appended alongside the operator command are each
-recorded once on whole lines. `../tests/test_audit.py` covers the rest in the API image.
+it reads in the api container, that parallel failed logins (5, nginx's login burst) appended alongside the operator
+command are each recorded once on whole lines, and that three failed logins for one username are one record at once
+and, when the 60-second window closes, one record with `details.count` and `last_attempt` (#577).
+`../tests/test_audit.py` covers the rest in the API image, among it the counting of repeated failed logins, ids
+that stay in order across processes and a clock that steps back, the telemetry route list and the Audit page's
+action list (#577).
 
 ## Entry point and verify project
 
@@ -19335,7 +19507,8 @@ and another start takes the slot, waiting again on that one doesn't restart it (
 `RAG_ALLOW_RESTART=1`, `02_ingest.sh` also restarts the API
 (`docker compose restart --timeout 0 api`) while two uploads are part-way and checks that a
 completed job reads back unchanged, the one that stored a file reads `partial` and the one
-that stored none reads `failed`, both with the interruption message; `05_transfer.sh` does the
+that stored none reads `failed`, both with the interruption message, and that each of those two has
+one `interrupted` audit record with its job id (#577); `05_transfer.sh` does the
 same for a completed export, an export interrupted part-way through a synthetic 30,000-chunk
 collection (`failed`, `INTERRUPTED`, `chunks_written` kept) and an import of that collection
 interrupted part-way (`failed`, `INTERRUPTED`). Tune has no live restart check: no tune
@@ -21215,6 +21388,7 @@ import secrets
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -21223,6 +21397,12 @@ from urllib.parse import urlsplit
 ROLES = {"engineer": "vfy-engineer", "developer": "vfy-developer", "end_user": "vfy-end-user"}
 REPO = Path(__file__).resolve().parents[2]
 COOKIE = "rag_session"
+# nginx allows 10 logins a minute per client address, a burst of 5 (#577), and
+# every harness request comes from one address. A login it refuses is sent
+# again once a slot has refilled (one per 6 s), for up to LOGIN_WAIT_S.
+LOGIN_PATH = "/auth/login"
+LOGIN_RETRY_S = 6.5
+LOGIN_WAIT_S = 300
 
 
 class SetupError(Exception):
@@ -21293,6 +21473,31 @@ def write_credentials(folder, credentials):
         raise
 
 
+def rate_limited(status, body):
+    """True for nginx's refusal of a login sent faster than its limit (#577),
+    not the API's own 429 LOGIN_THROTTLED. `body` is the raw answer or its
+    parsed JSON."""
+    if status != 429:
+        return False
+    try:
+        parsed = json.loads(body) if isinstance(body, (bytes, str)) else body
+        return parsed["error"]["code"] == "LOGIN_RATE_LIMITED"
+    except (ValueError, KeyError, TypeError):
+        return False
+
+
+def paced(path, send):
+    """send() -> a tuple starting (status, raw body); a login nginx refused for
+    its rate is sent again after LOGIN_RETRY_S, until LOGIN_WAIT_S has passed.
+    Any other request or answer is returned as it is."""
+    deadline = time.monotonic() + LOGIN_WAIT_S
+    while True:
+        answer = send()
+        if path != LOGIN_PATH or not rate_limited(answer[0], answer[1]) or time.monotonic() >= deadline:
+            return answer
+        time.sleep(LOGIN_RETRY_S)
+
+
 def request(method, path, body=None, token=None, api=None):
     """(status, parsed JSON or None, session token from Set-Cookie or None)."""
     api = api or api_base()
@@ -21302,12 +21507,16 @@ def request(method, path, body=None, token=None, api=None):
         headers["Content-Type"] = "application/json"
     if token:
         headers["Cookie"] = "{}={}".format(COOKIE, token)
-    req = urllib.request.Request(api + path, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            status, raw, cookies = response.status, response.read(), response.headers.get_all("Set-Cookie") or []
-    except urllib.error.HTTPError as error:
-        status, raw, cookies = error.code, error.read(), error.headers.get_all("Set-Cookie") or []
+
+    def send():
+        req = urllib.request.Request(api + path, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return response.status, response.read(), response.headers.get_all("Set-Cookie") or []
+        except urllib.error.HTTPError as error:
+            return error.code, error.read(), error.headers.get_all("Set-Cookie") or []
+
+    status, raw, cookies = paced(path, send)
     try:
         parsed = json.loads(raw) if raw else None
     except ValueError:
@@ -21566,6 +21775,8 @@ stack generic-failure
 check "a wrong password and an unknown user get the same 401 LOGIN_FAILED" $?
 stack throttle
 check "five failed logins lock the username and address for 15 minutes" $?
+stack login-rate-limit
+check "nginx refuses logins beyond 10 a minute per address (burst 5) with 429 LOGIN_RATE_LIMITED; the API never sees them" $?
 stack bootstrap-refused
 check "bootstrap is refused once set up; an invalid username is a usage error" $?
 stack no-secrets-logged
@@ -21710,8 +21921,9 @@ def role_token(role):
     return token
 
 
-def code(method, path, body=None, token=None, headers=None):
-    """The status of a request sent as a same-origin browser would, or with `headers` instead."""
+def code(method, path, body=None, token=None, headers=None, paced=True):
+    """The status of a request sent as a same-origin browser would, or with `headers` instead.
+    A login nginx refuses for its rate is sent again (auth_setup.paced) unless `paced` is False."""
     api = auth_setup.api_base()
     data = json.dumps(body).encode() if body is not None else None
     sent = {"Origin": auth_setup.origin()} if headers is None else dict(headers)
@@ -21719,12 +21931,16 @@ def code(method, path, body=None, token=None, headers=None):
         sent["Content-Type"] = "application/json"
     if token:
         sent["Cookie"] = "rag_session=" + token
-    req = urllib.request.Request(api + path, data=data, method=method, headers=sent)
-    try:
-        with urllib.request.urlopen(req, timeout=120) as response:
-            return response.status, response.read(), response.headers
-    except urllib.error.HTTPError as error:
-        return error.code, error.read(), error.headers
+
+    def send():
+        req = urllib.request.Request(api + path, data=data, method=method, headers=sent)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as response:
+                return response.status, response.read(), response.headers
+        except urllib.error.HTTPError as error:
+            return error.code, error.read(), error.headers
+
+    return auth_setup.paced(path, send) if paced else send()
 
 
 def error_code(raw):
@@ -22027,6 +22243,42 @@ def check_generic_failure(operator_ok):
                [(s, error_code(r)) for s, r in answers]))
 
 
+def check_login_rate_limit(operator_ok):
+    """#577: nginx refuses logins beyond 10 a minute per address (a burst of 5)
+    with 429 LOGIN_RATE_LIMITED in the error envelope, before the API: a
+    refused attempt writes no audit record."""
+    answered, refused, refusal = [], [], None
+    for n in range(12):
+        name = "vfy-rate-{}-{}".format(n, secrets.token_hex(3))
+        status, raw, headers = code("POST", "/auth/login", {"username": name, "password": "x" * 12}, paced=False)
+        if status == 429:
+            refused.append(name)
+            refusal = refusal or (raw, headers)
+            if len(refused) == 2:
+                break
+        else:
+            expect(status == 401, "{} answered {} {}".format(name, status, error_code(raw)))
+            answered.append(name)
+    expect(refusal is not None, "12 logins in a row were all let through")
+    raw, headers = refusal
+    expect(headers.get("Content-Type", "").startswith("application/json"),
+           "the refusal's Content-Type is {}".format(headers.get("Content-Type")))
+    body = json.loads(raw)
+    expect(body == {"error": {"code": "LOGIN_RATE_LIMITED", "detail": None,
+                              "message": "Too many login attempts. Wait a minute and try again."}},
+           "the refusal is {}".format(body))
+    admin = role_token("engineer")                   # waits for a slot
+    try:
+        status, raw, _ = code("GET", "/audit?action=auth.login&limit=1000", token=admin)
+        expect(status == 200, "GET /audit answered {}".format(status))
+        targets = [r["target"] for r in json.loads(raw)["records"]]
+        expect(not any(name in targets for name in refused), "a login nginx refused was recorded")
+        expect(all(targets.count(name) == 1 for name in answered),
+               "a login the API answered wasn't recorded once")
+    finally:
+        request("POST", "/auth/logout", token=admin)
+
+
 def check_throttle(operator_ok):
     name = "vfy-throttle-" + secrets.token_hex(4)
     seen = []
@@ -22310,7 +22562,9 @@ check "no harness password, session token, API key or password typed in a change
 
 section "Concurrent writers"
 stack concurrent
-check "parallel failed logins and the operator command append together: each recorded once, every line whole" $?
+check "parallel failed logins (nginx's burst of 5) and the operator command append together: each recorded once, every line whole" $?
+stack coalesced-logins
+check "repeated failed logins for one username: one record at once, then one with the count and last attempt (#577)" $?
 
 section "Restart persistence (opt-in: it restarts the api)"
 if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
@@ -22606,15 +22860,17 @@ def check_admin(operator_ok):
 
 
 def check_filters(operator_ok):
+    # Two usernames: repeated failures for one would be counted in one record (#577).
     typed = "=vfy" + secrets.token_hex(4)
+    newer = "=vfy" + secrets.token_hex(4)
     request("POST", "/auth/login", {"username": typed, "password": "not-a-password-" + secrets.token_hex(4)})
-    request("POST", "/auth/login", {"username": typed, "password": "not-a-password-" + secrets.token_hex(4)})
+    request("POST", "/auth/login", {"username": newer, "password": "not-a-password-" + secrets.token_hex(4)})
     admin = role_token("engineer")
     try:
         page = records(admin, action="auth.login", result="refused", limit=1)
         expect(len(page["records"]) == 1 and page["next_before"], "a one-record page has no cursor: {}".format(page))
         first = page["records"][0]
-        expect(first["target"] == typed, "the newest refused login is {}".format(first["target"]))
+        expect(first["target"] == newer, "the newest refused login is {}".format(first["target"]))
         older = records(admin, action="auth.login", result="refused", limit=1, before=page["next_before"])
         expect(older["records"] and older["records"][0]["id"] < first["id"] and older["records"][0]["target"] == typed,
                "the next page doesn't hold the next older record")
@@ -22700,11 +22956,12 @@ def check_concurrent(operator_ok):
     """The testing reviewer's addition: parallel failed logins through nginx
     while the operator command appends in the same container (D7's shared file
     lock). Each request is recorded exactly once, the operator's record is
-    there, and every line of every audit file is one whole JSON object."""
+    there, and every line of every audit file is one whole JSON object. Five
+    logins, nginx's login burst (#577); a refused one is sent again."""
     expect(operator_ok, "runs the operator command, so it runs only on the verify project")
     import threading
     end_user = auth_setup.read_credentials(auth_setup.private_dir())["end_user"][0]
-    typed = ["vfy-conc-{}-{}".format(n, secrets.token_hex(3)) for n in range(24)]
+    typed = ["vfy-conc-{}-{}".format(n, secrets.token_hex(3)) for n in range(5)]
     errors = []
 
     def attempt(name):
@@ -22747,6 +23004,38 @@ def check_concurrent(operator_ok):
             except ValueError:
                 bad += 1
         expect(bad == 0, "{} audit line(s) aren't whole JSON records".format(bad))
+    finally:
+        request("POST", "/auth/logout", token=admin)
+
+
+def check_coalesced_logins(operator_ok):
+    """#577: failed logins for one username from one address within a minute
+    are one record at once and, when the window closes, one with the count."""
+    typed = "vfy-again-" + secrets.token_hex(4)
+    started = time.monotonic()
+    for _ in range(3):
+        status, _, _ = request("POST", "/auth/login",
+                               {"username": typed, "password": "not-a-password-" + secrets.token_hex(4)})
+        expect(status == 401, "a failed login answered {}".format(status))
+    took = time.monotonic() - started
+    admin = role_token("engineer")
+    try:
+        mine = lambda: [r for r in records(admin, action="auth.login", limit=1000)["records"] if r["target"] == typed]
+        if took < 50:                                 # pacing didn't stretch them past the window
+            now = mine()
+            expect(len(now) == 1 and "count" not in now[0]["details"],
+                   "three failures inside the window wrote {} record(s)".format(len(now)))
+        deadline = time.monotonic() + 90
+        while not any("count" in r["details"] for r in mine()):
+            expect(time.monotonic() < deadline, "no count record within 90 s of the failures")
+            time.sleep(3)
+        items = mine()
+        counted = [r for r in items if "count" in r["details"]]
+        expect(all(r["details"].get("last_attempt") and r["details"].get("code") == "LOGIN_FAILED"
+                   and r["status_code"] == 401 and r["actor"] is None for r in counted),
+               "a count record is {}".format(counted))
+        total = sum(r["details"].get("count", 1) for r in items)
+        expect(total == 3, "the records stand for {} attempts, not 3: {}".format(total, items))
     finally:
         request("POST", "/auth/logout", token=admin)
 
@@ -23026,8 +23315,9 @@ def login():
     stored = auth_setup.read_credentials(auth_setup.private_dir()).get("engineer")
     if not stored:
         raise AssertionError("no stored credentials for the harness Engineer")
-    status, body, cookies = request("POST", "/auth/login", {"username": stored[0], "password": stored[1]},
-                                    {"Origin": origin()})
+    # nginx's login rate limit (#577): wait for a slot as auth_setup.paced does.
+    status, body, cookies = auth_setup.paced(auth_setup.LOGIN_PATH, lambda: request(
+        "POST", "/auth/login", {"username": stored[0], "password": stored[1]}, {"Origin": origin()}))
     session = [c for c in cookies if c.split("=", 1)[0].strip() == auth_setup.COOKIE]
     if status != 200 or len(session) != 1:
         raise AssertionError("login answered HTTP {} with {} session cookie(s)".format(status, len(session)))
@@ -23213,6 +23503,7 @@ import ast
 import datetime
 import io
 import ipaddress
+import json
 import os
 import re
 import subprocess
@@ -23608,8 +23899,33 @@ class NginxTests(unittest.TestCase):
         self.assertEqual(upstreams(self.lan), upstreams(self.default))
         lines = directives(self.locations)
         self.assertEqual([l for l in lines if l.startswith("location")],
-                         ["location = /api/goldstandard/regenerate {", "location /api/ {", "location / {"])
-        self.assertEqual(lines.count("proxy_set_header Host $http_host;"), 2)
+                         ["location = /api/goldstandard/regenerate {", "location = /api/auth/login {",
+                          "location @login_rate_limited {", "location /api/ {", "location / {"])
+        self.assertEqual(lines.count("proxy_set_header Host $http_host;"), 3)
+
+    def test_logins_are_rate_limited_per_address(self):
+        # #577: both servers define the zone; the login location uses it and
+        # answers nginx's own refusals in the API's error envelope.
+        zone = "limit_req_zone $binary_remote_addr zone=login:1m rate=10r/m;"
+        for text in (self.lan, self.default):
+            self.assertEqual(directives(text).count(zone), 1)
+        block = self.locations[self.locations.index("location = /api/auth/login {"):]
+        block = block[:block.index("\n}\n")]
+        lines = directives(block)
+        for line in ("limit_req zone=login burst=5 nodelay;", "limit_req_status 429;",
+                     "error_page 429 = @login_rate_limited;", "proxy_pass http://api/auth/login;",
+                     "proxy_set_header X-Real-IP $remote_addr;"):
+            self.assertIn(line, lines)
+        api = self.locations[self.locations.index("location /api/ {"):]
+        api = directives(api[:api.index("\n}\n")])
+        self.assertEqual([l for l in lines if not l.startswith(("location", "limit_req", "error_page", "proxy_pass"))],
+                         [l for l in api if not l.startswith(("location", "proxy_pass"))],
+                         "the login location proxies differently from /api/")
+        named = self.locations[self.locations.index("location @login_rate_limited {"):]
+        body = re.search(r"return 429 '([^']*)';", named).group(1)
+        message = "Too many login attempts. Wait a minute and try again."
+        self.assertEqual(json.loads(body), {"error": {"code": "LOGIN_RATE_LIMITED", "message": message, "detail": None}})
+        self.assertIn("default_type application/json;", directives(named[:named.index("\n}\n")]))
 
 
 # ── embedded copies ──────────────────────────────────────────────────────────
@@ -25240,6 +25556,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 from unittest.mock import patch
 
@@ -25404,6 +25721,51 @@ class LibraryTests(unittest.TestCase):
         for name in ("lib.sh", "17_auth.sh", "06_ui.sh", "all.sh"):
             with self.subTest(file=name):
                 self.assertEqual(subprocess.run(["bash", "-n", str(VERIFY / name)]).returncode, 0)
+
+
+class LoginPacingTests(unittest.TestCase):
+    """#577: nginx refuses logins beyond 10 a minute per address; the harness
+    waits for a slot instead of failing, and only for that refusal."""
+
+    LIMITED = (b'{"error":{"code":"LOGIN_RATE_LIMITED","message":"Too many login attempts. Wait a minute and try '
+               b'again.","detail":null}}')
+
+    def answer(self, status, body):
+        import email.message
+        import io
+        import urllib.error
+        headers = email.message.Message()
+        if status == 200:
+            headers["Set-Cookie"] = auth_setup.COOKIE + "=tok; Path=/"
+            response = unittest.mock.MagicMock(status=200, headers=headers)
+            response.read.return_value = body
+            response.__enter__.return_value = response
+            return response
+        return urllib.error.HTTPError("http://x/auth/login", status, "refused", headers, io.BytesIO(body))
+
+    def send(self, answers, path="/auth/login"):
+        with patch.object(auth_setup, "api_base", return_value="http://127.0.0.1:8081/api"), \
+                patch.object(auth_setup.urllib.request, "urlopen", side_effect=answers) as urlopen, \
+                patch.object(auth_setup.time, "sleep") as sleep:
+            result = auth_setup.request("POST", path, {"username": "u", "password": "p"})
+        return result, urlopen.call_count, sleep.call_count
+
+    def test_a_rate_limited_login_is_sent_again(self):
+        answers = [self.answer(429, self.LIMITED), self.answer(429, self.LIMITED), self.answer(200, b'{"ok":1}')]
+        (status, body, token), calls, sleeps = self.send(answers)
+        self.assertEqual((status, body, token, calls, sleeps), (200, {"ok": 1}, "tok", 3, 2))
+
+    def test_the_apis_own_throttle_and_other_paths_are_returned_at_once(self):
+        throttled = b'{"error":{"code":"LOGIN_THROTTLED","message":"wait","detail":null}}'
+        (status, body, _), calls, sleeps = self.send([self.answer(429, throttled)])
+        self.assertEqual((status, body["error"]["code"], calls, sleeps), (429, "LOGIN_THROTTLED", 1, 0))
+        (status, _, _), calls, sleeps = self.send([self.answer(429, self.LIMITED)], path="/auth/password")
+        self.assertEqual((status, calls, sleeps), (429, 1, 0))
+
+    def test_it_gives_up_after_the_wait(self):
+        with patch.object(auth_setup, "LOGIN_WAIT_S", 0):
+            (status, body, _), calls, sleeps = self.send([self.answer(429, self.LIMITED)])
+        self.assertEqual((status, body["error"]["code"], calls, sleeps), (429, "LOGIN_RATE_LIMITED", 1, 0))
 
 
 if __name__ == "__main__":
@@ -27771,6 +28133,21 @@ sys.exit(0 if ok else 1)
 ENDPY
     check "an ingest interrupted before storing a file reads back 200 'failed' with the message" $? \
       "before: $(head -c 200 /tmp/vfy_restart_none_before.json); after: $(head -c 300 /tmp/vfy_restart_none_after.json)"
+    # The audit log (#29, #577): the restart's marking wrote each interrupted
+    # job's end record. The shell's curl is the harness Engineer's.
+    api_get "/audit?action=ingest&result=interrupted&limit=1000" > /tmp/vfy_restart_audit.json
+    python3 - "$slow_job" "$none_job" <<'ENDPY'
+import json, sys
+try:
+    records = json.load(open('/tmp/vfy_restart_audit.json'))["records"]
+except (OSError, ValueError, KeyError):
+    sys.exit(1)
+counts = {job: sum(1 for r in records if r.get("job_id") == job) for job in sys.argv[1:]}
+print(counts)
+sys.exit(0 if all(n == 1 for n in counts.values()) else 1)
+ENDPY
+    check "each interrupted ingest has one 'interrupted' audit record with its job id (#577)" $? \
+      "$(head -c 300 /tmp/vfy_restart_audit.json)"
   fi
   drop_collection "$JR"
   drop_collection "$JN"
@@ -31231,10 +31608,24 @@ async function login(page, base, role) {
   // Any same-origin page will do; /api/health is not the UI, so nothing asks
   // GET /api/auth/me before the login and logs its 401 as a console error.
   if (!page.url().startsWith(base)) await page.goto(base + '/api/health', { waitUntil: 'domcontentloaded' });
-  const status = await page.evaluate(async (u, p) => (await fetch('/api/auth/login', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: u, password: p }),
-  })).status, username, password);
-  if (status !== 200) throw new Error(`login as ${role} answered ${status}`);
+  // nginx allows 10 logins a minute per address, a burst of 5 (#577): a login
+  // it refuses (429 LOGIN_RATE_LIMITED) is sent again once a slot has refilled.
+  const deadline = Date.now() + 300000;
+  for (;;) {
+    const { status, code } = await page.evaluate(async (u, p) => {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: u, password: p }),
+      });
+      let code = null;
+      try { code = (await res.json()).error.code; } catch { /* not an error envelope */ }
+      return { status: res.status, code };
+    }, username, password);
+    if (status === 200) return;
+    if (status !== 429 || code !== 'LOGIN_RATE_LIMITED' || Date.now() >= deadline) {
+      throw new Error(`login as ${role} answered ${status}`);
+    }
+    await new Promise(resolve => setTimeout(resolve, 6500));
+  }
 }
 
 // For fixtures that answer every /api/ request themselves: answers
@@ -41149,7 +41540,7 @@ ENUMS = {
 SPAN_NAMES = frozenset("rag." + v for v in ENUMS["rag.operation"])
 
 # Explicit code-owned vocabulary. Raw URL/path values never enter this schema.
-ROUTES = frozenset(('DELETE /collections/{name}', 'GET /auth/me', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /export/job/{job_id}', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /metrics/latency', 'GET /packages', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/logout', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
+ROUTES = frozenset(('DELETE /collections/{name}', 'GET /audit', 'GET /audit.csv', 'GET /auth/me', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /export/job/{job_id}', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /metrics/latency', 'GET /packages', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/logout', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
 ENUMS.update({"http.route": ROUTES | {"unmatched"},
               "rag.tuning_operation": frozenset(("rechunk", "reembed", "reindex")),
               "http.status_class": frozenset(("1xx", "2xx", "3xx", "4xx", "5xx"))})
@@ -42846,7 +43237,9 @@ class TelemetryTests(unittest.TestCase):
                                     packager=SimpleNamespace(sweep_build_leftovers=lambda:[]),
                                     weaviate_client=wc,importer=importer,exporter=job_module('export'),
                                     ingest_pipeline=job_module('ingest'),tuning=job_module('tune'),
-                                    audit=SimpleNamespace(record=lambda *args,**kwargs:order.append('audit')))
+                                    audit=SimpleNamespace(record=lambda *args,**kwargs:order.append('audit'),
+                                                          login_flusher=lambda:asyncio.sleep(3600),
+                                                          flush_logins=lambda:order.append('flush')))
             modules={'services':service,'services.telemetry':SimpleNamespace(bootstrap=lambda:(order.append('bootstrap') or runtime))}
             async def exercise():
                 async with namespace['lifespan'](SimpleNamespace(state=SimpleNamespace())):
@@ -42859,9 +43252,10 @@ class TelemetryTests(unittest.TestCase):
             self.assertEqual(order[-2:],['close','shutdown'])
             self.assertEqual('yield' in order,not fail)
             if not fail:
-                # 'audit': the start's audit record (#29), after the job records load.
+                # 'audit': the start's audit record (#29), after the job records load;
+                # 'flush': the open failed-login counts at shutdown (#577).
                 self.assertEqual(order, ['bootstrap', 'load', 'ingest', 'export', 'import', 'tune', 'audit',
-                                         'yield', 'close', 'shutdown'])
+                                         'yield', 'flush', 'close', 'shutdown'])
 
     def test_lifecycle_deadline_single_worker_and_eventual_shutdown(self):
         release=threading.Event()
