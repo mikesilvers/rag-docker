@@ -594,7 +594,7 @@ CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 # identifiers are not published on PyPI.
 # ---------------------------------------------------------------------------
 
-Authlib==1.8.0
+Authlib==1.9.1
 Jinja2==3.1.6
 Markdown==3.10.3
 MarkupSafe==3.0.3
@@ -14256,6 +14256,11 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
     "tailwindcss": "^3.4.11",
     "typescript": "^7.0.2",
     "vite": "^6.4.4"
+  },
+  "overrides": {
+    "@tailwindcss/typography": {
+      "postcss-selector-parser": "^6.1.5"
+    }
   }
 }
 ```
