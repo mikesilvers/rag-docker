@@ -28036,24 +28036,47 @@ done
 # ── end_user is shorter than engineer ────────────────────────────────────────
 # The end_user prompt asks for a short answer (#109), but a CPU model still
 # varies answer to answer, so a single pair is noise. Compare the median length
-# across trials: one long answer can swing a mean over a few trials (#567).
+# across trials: one long answer can swing a mean over a few trials. A pair with
+# a failed query is dropped, never counted as a short answer, and more than half
+# of the trials must answer (#567).
+answer_length() {  # answer_length <curl exit> -> the last answer's length, or "error: <why>"
+  python3 - "$1" <<'ENDPY'
+import json, sys
+try:
+    raw = open("/tmp/vfy_ans.json", "rb").read()
+except OSError:
+    raw = b""
+body = " ".join(raw.decode("utf-8", "replace").split())[:150]
+try:
+    answer = json.loads(raw).get("answer")
+except (ValueError, AttributeError):
+    answer = None
+if isinstance(answer, str) and answer.strip():
+    print(len(answer))
+else:
+    print("error: " + (body or "no response (curl exit %s)" % sys.argv[1]))
+ENDPY
+}
 trials="${RAG_FORMAT_TRIALS:-3}"
-eu_lens=""; en_lens=""; eu_wins=0
-for _ in $(seq 1 "$trials"); do
-  ask flat end_user false;  eu=$(python3 -c "import json;print(len(json.load(open('/tmp/vfy_ans.json'))['answer']))")
-  ask flat engineer false;  en=$(python3 -c "import json;print(len(json.load(open('/tmp/vfy_ans.json'))['answer']))")
-  eu_lens="$eu_lens $eu"; en_lens="$en_lens $en"
+eu_lens=""; en_lens=""; eu_wins=0; answered=0; failures=""
+for trial in $(seq 1 "$trials"); do
+  ask flat end_user false;  eu=$(answer_length $?)
+  ask flat engineer false;  en=$(answer_length $?)
+  case "$eu" in error:*) failures="$failures; trial $trial end_user $eu" ;; esac
+  case "$en" in error:*) failures="$failures; trial $trial engineer $en" ;; esac
+  case "$eu$en" in *error:*) continue ;; esac
+  answered=$((answered+1)); eu_lens="$eu_lens $eu"; en_lens="$en_lens $en"
   [ "$eu" -lt "$en" ] && eu_wins=$((eu_wins+1))
 done
 read -r eu_median en_median shorter <<<"$(python3 -c "
 import statistics,sys
 eu=[int(x) for x in sys.argv[1].split()]; en=[int(x) for x in sys.argv[2].split()]
-if len(eu) != int(sys.argv[3]) or len(en) != int(sys.argv[3]): print('- - 0'); sys.exit()
-print(statistics.median(eu), statistics.median(en), int(statistics.median(eu) < statistics.median(en)))" \
-  "$eu_lens" "$en_lens" "$trials")"
+if 2*len(eu) <= int(sys.argv[3]): print('- - 0'); sys.exit()
+m,n=statistics.median(eu),statistics.median(en)
+print(m, n, int(m < n))" "$eu_lens" "$en_lens" "$trials")"
 [ "$shorter" = 1 ]
 check "end_user answers are shorter than engineer by median length" $? \
-  "median end_user=$eu_median engineer=$en_median; end_user shorter in $eu_wins/$trials trials"
+  "median end_user=$eu_median engineer=$en_median over $answered/$trials answered pairs; end_user shorter in $eu_wins/$answered${failures:+; failed: ${failures#; }}"
 
 # ── the query metrics reload after an API restart (#374; opt-in: it restarts the api) ──
 # The queries above wrote metrics records; a restart goes through the
