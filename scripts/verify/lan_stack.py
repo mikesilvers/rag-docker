@@ -1,6 +1,6 @@
 """LAN mode on the verify project (#26). Host-side, standard library, Python 3.9+.
 
-    python3 lan_stack.py https|tls|bindings|cookie|origin|refusals|address
+    python3 lan_stack.py https|tls|bindings|cookie|origin|refusals|rate-limit|address
 
 Run by 18_lan.sh in a `stack.sh run --lan`, which brings the verify project up
 in LAN mode with TLS on 127.0.0.1:<verify port> only, copies the certificate
@@ -21,6 +21,9 @@ printing what failed:
   refusals  a one-off api container of the LAN configuration (no ports, the
             running project untouched) refuses to start, with one line, when
             AUTH_COOKIE_SECURE is false and when its account store is empty
+  rate-limit
+            logins for unknown usernames, sent without waiting for a slot,
+            until nginx refuses one with 429 LOGIN_RATE_LIMITED (#577)
   address   prints the client address nginx recorded for these requests
             (always exits 0; information for the README)
 
@@ -227,6 +230,21 @@ def check_refusals():
     assert status == 200, "the running API isn't healthy after the one-off containers ({})".format(status)
 
 
+def check_rate_limit():
+    """#577: nginx's login rate limit on the LAN project. The attempts are sent
+    without waiting for a slot (no auth_setup.paced) until one is refused."""
+    seen = []
+    for n in range(12):
+        name = "vfy-lan-rate-{}-{}".format(n, secrets.token_hex(3))
+        status, body, _ = request("POST", "/auth/login", {"username": name, "password": "x" * 12}, {"Origin": origin()})
+        code = ((body or {}).get("error") or {}).get("code")
+        seen.append("{} {}".format(status, code))
+        if status == 429:
+            assert code == "LOGIN_RATE_LIMITED", "the refusal was {} {}, not nginx's".format(status, code)
+            return
+    raise AssertionError("12 logins in a row were all let through: {}".format(", ".join(seen)))
+
+
 def check_address():
     logs = subprocess.run(["docker", "compose", "logs", "--no-color", "--tail", "500", "proxy"],
                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -237,7 +255,8 @@ def check_address():
 
 
 CHECKS = {"https": check_https, "tls": check_tls, "bindings": check_bindings, "cookie": check_cookie,
-          "origin": check_origin, "refusals": check_refusals, "address": check_address}
+          "origin": check_origin, "refusals": check_refusals, "rate-limit": check_rate_limit,
+          "address": check_address}
 
 
 def main(argv):

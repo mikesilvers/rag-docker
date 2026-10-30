@@ -3597,6 +3597,12 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   recorded; 401s and 503s aren't; other GETs aren't.
   *Evidence: `test_audit.py` `MiddlewareTests`, `JobTests`, `CommandTests` (suite 19); `audit_stack.py
   start-record`, `sessions`, `query`, `jobs`, `refused` and `admin` on the running stack (suite 19).*
+- [x] Logins beyond 10 a minute per address (burst 5) are refused by nginx with 429 `LOGIN_RATE_LIMITED`, and the
+  refusal isn't recorded.
+  *Evidence: `auth_stack.py` login-rate-limit (suite 17); `test_lan_mode.py` `NginxTests`.*
+- [x] Repeated failed logins for one key within 60 s write one record, then one record with `details.count`. Open
+  counts are written at shutdown, and at most 1,000 windows are tracked.
+  *Evidence: `test_audit.py` `LoginCoalescingTests`; `audit_stack.py` coalesced-logins (suite 19).*
 - [x] No password, session token, API key or passphrase reaches the audit files.
   *Evidence: `test_audit.py`; `audit_stack.py no-secrets`, `jobs` and `admin`, which search the files in the API
   container (suite 19).*
@@ -3604,8 +3610,9 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   writers (API threads and the operator command); rotation keeps `AUDIT_LOG_KEEP` files; a torn last line is
   skipped; the three settings are validated at start; a failed write is logged and counted and never changes the
   answer.
-  *Evidence: `test_audit.py` `RecordTests`, `SettingsTests`, `ReviewerEdgeTests` (suite 19); `audit_stack.py
-  concurrent`: parallel failed logins with the operator command appending, each recorded once (suite 19).*
+  *Evidence: `test_audit.py` `RecordTests`, `SettingsTests`, `ReviewerEdgeTests`, `IdOrderTests` (suite 19);
+  `audit_stack.py concurrent`: parallel failed logins with the operator command appending, each recorded once
+  (suite 19).*
 - [x] `GET /audit` filters, pages newest first with a stable `before` cursor and refuses invalid parameters with
   `422` (a non-ASCII digit in `limit` included); `GET /audit.csv` has the §3.1.9 header, every matching row and
   escaped formula cells (tab and carriage return included); a read that spans a rotation neither repeats nor misses
