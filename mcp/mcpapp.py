@@ -10,7 +10,7 @@ from mcp.server.mcpserver import MCPServer
 
 server = MCPServer(
     name="rag",
-    version="1.1.0",
+    version="1.2.0",
     instructions=(
         "Tools for a local retrieval-augmented generation stack running in "
         "Docker. Query a document corpus, manage collections, ingest documents, "
