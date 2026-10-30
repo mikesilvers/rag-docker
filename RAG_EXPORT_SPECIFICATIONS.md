@@ -526,8 +526,9 @@ Checks run in this order and stop at the first failure:
 
 Check 1 for an encrypted package decrypts it as a stream into the tar reader:
 each member is checked (no links, only files and directories, nothing outside
-the work directory) just before it is extracted, and once the archive ends the
-rest of the file is read and authenticated to its final chunk. No decrypted copy
+the work directory and no `..` component in its path) just before it is
+extracted, and once the archive ends the rest of the file is read and
+authenticated to its final chunk. No decrypted copy
 of the archive is written. A file that is not an age passphrase file is
 `PACKAGE_UNREADABLE`; a failure to decrypt is `DECRYPT_FAILED` with
 `error_detail.reason` `passphrase`, `header` (the header MAC), `payload` or
@@ -539,8 +540,8 @@ Check 1 also caps what a package may expand to (#317), because a small `.tar.gz`
 can otherwise fill the disk the job's work directory is on. Every member counts
 as one entry, directories included, and so does every folder extraction would
 make for it that no earlier member made: the missing parent folders of its path,
-read as written, so a folder named before a `..` counts too. Each folder counts
-once; a directory member's own folder is its entry. A member's header size is
+read as written. Each folder counts once; a directory member's own folder is its
+entry. A member's header size is
 added to a running total; for a member that isn't sparse that size is exactly
 what extraction writes. A sparse file isn't allowed: extraction writes every
 chunk of its map before truncating it to its size, so its size doesn't bound
@@ -549,7 +550,10 @@ what is written. The caps are API settings: `max_package_members` (env
 default 17,179,869,184 bytes = 16 GiB), set in `docker-compose.yml`. Exactly at a
 cap is within it. Members are taken one at a time as their headers are read,
 never collected first, and for each one: it is counted (over the member cap:
-`PACKAGE_TOO_MANY_MEMBERS`), checked for links, type and path as above, for a
+`PACKAGE_TOO_MANY_MEMBERS`), checked for links, type and path as above (a path
+with a `..` component is refused even when it resolves inside the work directory:
+tarfile makes the folders a path names as written, so a `..` could name folders
+outside the work directory that are made and never removed, #597), for a
 negative header size, which would otherwise lower the total, and for a sparse file
 (`PACKAGE_UNREADABLE`), then its new folders are counted (over the member cap:
 `PACKAGE_TOO_MANY_MEMBERS`), then its size is added (over the size cap:
@@ -1085,7 +1089,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E38 | Importing an encrypted package with a wrong passphrase fails `DECRYPT_FAILED` (`reason` `passphrase`), and a damaged or truncated file fails `DECRYPT_FAILED` or `PACKAGE_UNREADABLE` and a scrypt work factor above 20 (21 included) or not one or two decimal digits (thousands of digits included) fails `DECRYPT_FAILED` before any key derivation; a file cut inside the payload nonce fails `DECRYPT_FAILED`, with no collection, marker, setting, session or package file changed and no work directory left; the right passphrase imports it with every chunk (#27), by `test_export_encryption.py` and suite 05 |
 | E39 | `POST /import` refuses an encrypted package without a passphrase `400 PASSPHRASE_REQUIRED` and a passphrase for any other package `400 PASSPHRASE_NOT_EXPECTED`, before any job; `POST /export` refuses a passphrase outside 12 to 1024 characters, and both refuse one with no UTF-8 form (a lone surrogate), `422 INVALID_PARAMETER` without echoing it; one bad encrypted file never fails `GET /packages` (#27) |
 | E40 | The age implementation passes every applicable C2SP CCTV age testkit vector, and its output decrypts with an independent decryption written from the age specification (#27), by `test_export_encryption.py` |
-| E41 | A package of more than `max_package_members` entries, directories included, fails `PACKAGE_TOO_MANY_MEMBERS`, folders implied by member paths counting once each (a folder named before a `..` too, a directory member's own folder as its entry), and one whose members add up to more than `max_package_expanded_bytes` fails `PACKAGE_TOO_LARGE`, each with its message and `detail`, for `.tar.gz` and `.tar.gz.age` packages alike; a package exactly at a cap imports; a member with a negative size is refused `PACKAGE_UNREADABLE` before its size is counted, and a sparse file (old GNU type `S`, PAX sparse 0.0, 0.1 or 1.0) is refused `PACKAGE_UNREADABLE`; a `.tar.gz` refusal extracts nothing and reads no header after the refusing member, a `.tar.gz.age` refusal leaves at most the cap's bytes, and the job creates no collection and leaves no work directory (#317), by `test_package_limits.py` with caps of 1 MiB and 20 entries set through the environment |
+| E41 | A package of more than `max_package_members` entries, directories included, fails `PACKAGE_TOO_MANY_MEMBERS`, folders implied by member paths counting once each (a directory member's own folder as its entry; a name with a `..` component is refused `PACKAGE_UNREADABLE` before its folders are counted), and one whose members add up to more than `max_package_expanded_bytes` fails `PACKAGE_TOO_LARGE`, each with its message and `detail`, for `.tar.gz` and `.tar.gz.age` packages alike; a package exactly at a cap imports; a member with a negative size is refused `PACKAGE_UNREADABLE` before its size is counted, and a sparse file (old GNU type `S`, PAX sparse 0.0, 0.1 or 1.0) is refused `PACKAGE_UNREADABLE`; a `.tar.gz` refusal extracts nothing and reads no header after the refusing member, a `.tar.gz.age` refusal leaves at most the cap's bytes, and the job creates no collection and leaves no work directory (#317), by `test_package_limits.py` with caps of 1 MiB and 20 entries set through the environment |
 
 ---
 

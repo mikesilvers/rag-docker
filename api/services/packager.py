@@ -706,8 +706,12 @@ def listing_fields(manifest: dict) -> dict:
 
 
 def _check_member(member: tarfile.TarInfo, dest: Path, root: Path) -> None:
-    """Refuse a link, anything but a file or directory, a path outside dest, a negative size,
-    or a sparse file.
+    """Refuse a link, anything but a file or directory, a path outside dest, a path with a
+    `..` component, a negative size, or a sparse file.
+
+    tarfile makes a member's missing parent folders from its path as written, so a
+    `..` lets a path that resolves inside dest name folders outside it, which would
+    be made and never removed (#597). No package this project writes has a `..`.
 
     tarfile writes every chunk of a sparse file's map before it truncates the
     file to its size, so a sparse file's size doesn't bound what extracting it
@@ -728,6 +732,12 @@ def _check_member(member: tarfile.TarInfo, dest: Path, root: Path) -> None:
         raise PackageError(
             "PACKAGE_UNREADABLE",
             f"Package contains a path outside the archive ('{member.name}').",
+            {"member": member.name})
+    if ".." in member.name.split("/"):
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            f"Package contains a path with a '..' component ('{member.name}'), which is not "
+            f"allowed.",
             {"member": member.name})
     if member.size < 0:
         raise PackageError(
@@ -756,11 +766,11 @@ class _Budget:
     on. Every member is counted as its header is read, and so is every folder
     extraction would make for it that no earlier member made: tarfile makes
     the missing parent folders of each path, which no header counts. Folders
-    are read from the name lexically, as os.makedirs makes them, so one named
-    before a `..` counts too. A member's header size is added to a running
-    total; for a member that isn't sparse (sparse files are refused) it is
-    exactly what extraction writes, so the total bounds what is written.
-    Equal to a cap is within it.
+    are read from the name as written, as os.makedirs makes them; a name with a
+    `..` component is refused before its folders are counted (#597). A member's
+    header size is added to a running total; for a member that isn't sparse
+    (sparse files are refused) it is exactly what extraction writes, so the
+    total bounds what is written. Equal to a cap is within it.
     """
 
     def __init__(self, archive_name: str, dest: Path):
@@ -791,10 +801,6 @@ class _Budget:
         last = len(parts) - 1
         for i, part in enumerate(parts if member.isdir() else parts[:-1]):
             if part in ("", "."):
-                continue
-            if part == "..":
-                if len(stack) > 1:
-                    stack.pop()
                 continue
             child = stack[-1].get(part)
             if child is None:

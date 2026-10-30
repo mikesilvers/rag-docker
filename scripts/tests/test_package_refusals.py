@@ -27,10 +27,13 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api"))
 
 from config import settings
-from services import importer, packager
+from services import age_stream, importer, packager
 from services import weaviate_client as wc
 
 WIDTH = 4
+TOP = "ragpkg-corpus"
+PASSPHRASE = "correct horse battery staple"
+LOW = 10            # scrypt work factor for tests: 1 MiB of memory
 
 
 def records(count=3):
@@ -42,6 +45,14 @@ def records(count=3):
 
 def lines(items):
     return "".join(json.dumps(item) + "\n" for item in items)
+
+
+def encrypt(data):
+    out = io.BytesIO()
+    enc = age_stream.Encryptor(out, PASSPHRASE, LOW)
+    enc.write(data)
+    enc.close()
+    return out.getvalue()
 
 
 def add_bytes(tar, name, data, **fields):
@@ -96,11 +107,11 @@ class Fixture(unittest.TestCase):
 class OpenPackageTests(Fixture):
     """Checks 1 and 2: nothing is extracted from a package that fails them."""
 
-    def refused(self, archive, code):
-        dest = self.root / "work" / "dest"
+    def refused(self, archive, code, passphrase=None, work="work"):
+        dest = self.root / work / "dest"
         dest.mkdir(parents=True)
         with self.assertRaises(packager.PackageError) as caught:
-            packager.open_package(archive, dest)
+            packager.open_package(archive, dest, passphrase)
         self.assertEqual(caught.exception.code, code, caught.exception.message)
         return caught.exception, dest
 
@@ -170,6 +181,55 @@ class OpenPackageTests(Fixture):
         self.assertEqual(error.detail, {"member": "../escape-387.txt"})
         self.assert_nothing_extracted(dest)
         self.assertFalse((dest.parent / "escape-387.txt").exists())
+
+    def dotdot_case(self, name, encrypted):
+        """A valid package with an extra member `name`, and the passphrase to open it."""
+        archive = self.with_member(name)
+        if not encrypted:
+            return archive, None
+        sealed = archive.with_name(archive.name + ".age")
+        sealed.write_bytes(encrypt(archive.read_bytes()))
+        return sealed, PASSPHRASE
+
+    def dotdot_refused(self, name, encrypted):
+        archive, passphrase = self.dotdot_case(name, encrypted)
+        error, dest = self.refused(archive, "PACKAGE_UNREADABLE", passphrase,
+                                   work=f"work-{encrypted}")
+        self.assertEqual(error.message, f"Package contains a path with a '..' component "
+                                        f"('{name}'), which is not allowed.")
+        self.assertEqual(error.detail, {"member": name})
+        if not encrypted:
+            self.assert_nothing_extracted(dest)
+        return dest
+
+    def test_a_dotdot_member_naming_a_folder_outside_is_refused(self):
+        # Resolved, the path is inside the work directory, but extraction would make `evil`
+        # beside it, where the job's cleanup never looks (#597).
+        name = f"../evil/../dest/{TOP}/f-597.txt"
+        for encrypted in (False, True):
+            with self.subTest(encrypted=encrypted):
+                dest = self.dotdot_refused(name, encrypted)
+                self.assertEqual(sorted(p.name for p in dest.parent.iterdir()), ["dest"])
+                self.assertFalse((dest / TOP / "f-597.txt").exists())
+
+    def test_a_dotdot_member_inside_the_package_is_refused(self):
+        # Resolved, the path is TOP/f-597.txt; extraction would still make x1 and x2.
+        name = f"{TOP}/x1/x2/../../f-597.txt"
+        for encrypted in (False, True):
+            with self.subTest(encrypted=encrypted):
+                dest = self.dotdot_refused(name, encrypted)
+                self.assertFalse((dest / TOP / "x1").exists())
+
+    def test_dots_within_a_component_are_allowed(self):
+        name = f"{TOP}/a..b/..c.../f..txt"
+        for encrypted in (False, True):
+            with self.subTest(encrypted=encrypted):
+                archive, passphrase = self.dotdot_case(name, encrypted)
+                dest = self.root / f"ok-{encrypted}"
+                dest.mkdir()
+                pkg, _manifest = packager.open_package(archive, dest, passphrase)
+                self.assertEqual(pkg.name, TOP)
+                self.assertTrue((dest / name).is_file())
 
     def test_two_top_level_directories_are_refused(self):
         archive = self.with_member("second/extra.txt")
