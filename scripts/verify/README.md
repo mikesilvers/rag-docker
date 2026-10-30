@@ -348,7 +348,7 @@ Docker Desktop the API can read a freshly written bind-mounted file as empty. Co
 and do not replace, this live acceptance.
 
 `15_transfer_paths.sh` (#387), run by `05_transfer.sh`, covers transfer and tuning paths that
-had no check. It runs four controlled tests, then live checks on a collection of its own.
+had no check. It runs five controlled tests, then live checks on a collection of its own.
 `scripts/tests/test_package_refusals.py` (API container) checks that `open_package` refuses a
 missing file, a file that isn't gzip and a truncated archive (`PACKAGE_UNREADABLE`), a symlink,
 a hardlink and a `../` member, naming the member and extracting nothing, an archive with two
@@ -358,7 +358,19 @@ model checks mocked, a digest-valid package naming a collection Weaviate can't u
 `PACKAGE_FORMAT_UNSUPPORTED` before any lookup, and one with a `chunks.jsonl` line that isn't
 JSON, a bad UUID, properties that aren't an object, a missing or short vector, or a chunk count
 above or below the manifest's is `PACKAGE_CORRUPT` before any collection is created, with
-`abort` and `rename`. `scripts/tests/test_transfer_paths.py` (API container, through the app)
+`abort` and `rename`. `scripts/tests/test_package_limits.py` (API container, with caps of
+1 MiB and 20 entries set through `MAX_PACKAGE_EXPANDED_BYTES` and `MAX_PACKAGE_MEMBERS`, #317)
+checks that a `.tar.gz` and a `.tar.gz.age` package exactly at each cap open, and that one entry
+or one byte over is refused `PACKAGE_TOO_MANY_MEMBERS` or `PACKAGE_TOO_LARGE` with the exact
+message and `detail`; a negative-size entry before an over-cap file is refused
+`PACKAGE_UNREADABLE`; a sparse file in each of the four formats (old GNU `S`, PAX 0.0, 0.1,
+1.0) is refused `PACKAGE_UNREADABLE`; folders implied by a file's path count as entries
+(at the cap it opens, one folder over is refused `PACKAGE_TOO_MANY_MEMBERS`), including folders
+named before a `..`, while a folder with its own entry counts once; a `.tar.gz` refusal extracts nothing and reads no header past the refusing
+entry, a `.tar.gz.age` refusal leaves at most the cap's bytes, and through `importer._run` each
+refusal fails the job with no collection created and no work directory left. The suite then
+checks that `docker-compose.yml`'s values (16 GiB, 100,000) reach the API.
+`scripts/tests/test_transfer_paths.py` (API container, through the app)
 checks that a missing, `null` or unknown `on_conflict` is 422 `INVALID_PARAMETER`, a second
 import of a running file 409 `IMPORT_IN_PROGRESS`, unknown export, import and tune job ids 404
 `JOB_NOT_FOUND`, that a query is answered while an export build is held in its worker thread,

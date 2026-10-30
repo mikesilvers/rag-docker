@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Transfer and tuning paths with no check before (#387): import refusals, on_conflict,
-# unknown job ids, /packages, the package file left alone, export without the model store,
-# retrieve.py (E8-E10), equivalent retrieval after import (E11) and a re-chunk that produces
-# no chunks. Run by 05_transfer.sh.
+# Transfer and tuning paths with no check before (#387): import refusals, the package
+# expansion caps (#317), on_conflict, unknown job ids, /packages, the package file left
+# alone, export without the model store, retrieve.py (E8-E10), equivalent retrieval after
+# import (E11) and a re-chunk that produces no chunks. Run by 05_transfer.sh.
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -18,6 +18,17 @@ section "Transfer and tuning paths (#387)"
 
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_package_refusals.py)
 check "package refusal regressions (checks 1 and 2, collection name, chunk records)" $?
+# The caps on an imported package's TAR (#317), with small caps set through the
+# environment: at each cap, one entry or byte over, both package kinds, the import job.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app -e MAX_PACKAGE_EXPANDED_BYTES=1048576 \
+  -e MAX_PACKAGE_MEMBERS=20 api python - < scripts/tests/test_package_limits.py)
+check "package expansion-cap regressions (1 MiB and 20 entries from env)" $?
+# docker-compose.yml sets both caps, and the API reads those values.
+caps_env=$(cd "$REPO_ROOT" && docker compose exec -T api python -c \
+  'import os; from config import settings as s; print(os.environ.get("MAX_PACKAGE_EXPANDED_BYTES"), s.max_package_expanded_bytes, os.environ.get("MAX_PACKAGE_MEMBERS"), s.max_package_members)' | tr -d '\r')
+[ "$caps_env" = "17179869184 17179869184 100000 100000" ]
+check "docker-compose.yml sets MAX_PACKAGE_EXPANDED_BYTES 16 GiB and MAX_PACKAGE_MEMBERS 100000 and the API uses them" $? \
+  "env and settings: $caps_env"
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_transfer_paths.py)
 check "transfer and tuning route regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_retrieve_script.py)

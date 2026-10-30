@@ -103,6 +103,11 @@ services:
       # upload is refused (#28).
       MAX_ZIP_MEMBERS: 5000
       MAX_ZIP_MEMBER_RATIO: 200
+      # The most an imported package's members may add up to (16 GiB) and the
+      # most entries it may hold, folders included; over either the import
+      # fails (#317).
+      MAX_PACKAGE_EXPANDED_BYTES: 17179869184
+      MAX_PACKAGE_MEMBERS: 100000
       # Marks the session cookie Secure (#25). false for this loopback HTTP
       # profile, where a Secure cookie would never be sent back. LAN mode's
       # docker-compose.lan.yml serves TLS and sets it true (#26). Exactly true

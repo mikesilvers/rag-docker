@@ -706,7 +706,13 @@ def listing_fields(manifest: dict) -> dict:
 
 
 def _check_member(member: tarfile.TarInfo, dest: Path, root: Path) -> None:
-    """Refuse a link, anything but a file or directory, or a path outside dest."""
+    """Refuse a link, anything but a file or directory, a path outside dest, a negative size,
+    or a sparse file.
+
+    tarfile writes every chunk of a sparse file's map before it truncates the
+    file to its size, so a sparse file's size doesn't bound what extracting it
+    writes (#317). No package this project writes is sparse.
+    """
     if member.issym() or member.islnk():
         raise PackageError(
             "PACKAGE_UNREADABLE",
@@ -723,31 +729,140 @@ def _check_member(member: tarfile.TarInfo, dest: Path, root: Path) -> None:
             "PACKAGE_UNREADABLE",
             f"Package contains a path outside the archive ('{member.name}').",
             {"member": member.name})
+    if member.size < 0:
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            f"Package contains an entry with a negative size ('{member.name}').",
+            {"member": member.name})
+    if member.sparse is not None:
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            f"Package contains a sparse file ('{member.name}'), which is not allowed.",
+            {"member": member.name})
 
 
-def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
-    """Extract, refusing any member that would land outside dest.
+def _limit_text(limit: int) -> str:
+    """A cap for a message: whole MiB as MB, anything else in bytes."""
+    mib = 1024 * 1024
+    if limit >= mib and limit % mib == 0:
+        return f"{limit // mib:,} MB"
+    return f"{limit:,} bytes"
+
+
+class _Budget:
+    """The member-count and expanded-size caps on one package's TAR (#317).
+
+    A small .tar.gz can expand enough to fill the disk the work directory is
+    on. Every member is counted as its header is read, and so is every folder
+    extraction would make for it that no earlier member made: tarfile makes
+    the missing parent folders of each path, which no header counts. Folders
+    are read from the name lexically, as os.makedirs makes them, so one named
+    before a `..` counts too. A member's header size is added to a running
+    total; for a member that isn't sparse (sparse files are refused) it is
+    exactly what extraction writes, so the total bounds what is written.
+    Equal to a cap is within it.
+    """
+
+    def __init__(self, archive_name: str, dest: Path):
+        self.archive_name = archive_name
+        self.max_members = settings.max_package_members
+        self.max_bytes = settings.max_package_expanded_bytes
+        self.members = 0
+        self.size = 0
+        # Folders as nested dicts, from the filesystem root. The work directory
+        # and its ancestors exist; every node added later has been counted, so
+        # the tree holds no more than the cap's entries.
+        self._root: dict = {}
+        self._work = [self._root]
+        for part in os.path.abspath(dest).split("/"):
+            if part:
+                self._work.append(self._work[-1].setdefault(part, {}))
+
+    def count(self, member: tarfile.TarInfo) -> None:
+        self._entry()
+
+    def folders(self, member: tarfile.TarInfo) -> None:
+        """Count each folder extracting the member would make that is not made yet.
+
+        A directory member's own folder is its entry, already counted.
+        """
+        parts = member.name.split("/")
+        stack = [self._root] if member.name.startswith("/") else list(self._work)
+        last = len(parts) - 1
+        for i, part in enumerate(parts if member.isdir() else parts[:-1]):
+            if part in ("", "."):
+                continue
+            if part == "..":
+                if len(stack) > 1:
+                    stack.pop()
+                continue
+            child = stack[-1].get(part)
+            if child is None:
+                child = stack[-1][part] = {}
+                if not (i == last and member.isdir()):
+                    self._entry()
+            stack.append(child)
+
+    def _entry(self) -> None:
+        self.members += 1
+        if self.members > self.max_members:
+            raise PackageError(
+                "PACKAGE_TOO_MANY_MEMBERS",
+                f"'{self.archive_name}' holds more than {self.max_members:,} entries, the "
+                f"most a package may hold (MAX_PACKAGE_MEMBERS), so nothing from it was "
+                f"imported.",
+                {"limit": self.max_members})
+
+    def add(self, member: tarfile.TarInfo) -> None:
+        self.size += member.size
+        if self.size > self.max_bytes:
+            raise PackageError(
+                "PACKAGE_TOO_LARGE",
+                f"'{self.archive_name}' expands to more than {_limit_text(self.max_bytes)} "
+                f"when unpacked, the most a package may expand to "
+                f"(MAX_PACKAGE_EXPANDED_BYTES), so nothing from it was imported.",
+                {"limit": self.max_bytes, "member": member.name})
+
+
+def _admit(member: tarfile.TarInfo, dest: Path, root: Path, budget: _Budget) -> None:
+    """Count the member, check it, count its new folders, then add its size.
+
+    The first failure refuses the package.
+    """
+    budget.count(member)
+    _check_member(member, dest, root)
+    budget.folders(member)
+    budget.add(member)
+
+
+def _safe_extract(tar: tarfile.TarFile, dest: Path, name: str) -> None:
+    """Extract, refusing a package over the caps or any member that would land outside dest.
 
     A package is a file someone was handed, so it is untrusted input. Python
     3.12 has `filter="data"` for this; doing it explicitly keeps the guarantee
-    on 3.11 and makes the refusal auditable.
+    on 3.11 and makes the refusal auditable. Headers are read one at a time and
+    each is checked as it is read, so a refusal stops reading there, holds at
+    most the caps' worth of headers, and leaves dest empty (#317).
     """
     root = dest.resolve()
-    for member in tar.getmembers():
-        _check_member(member, dest, root)
+    budget = _Budget(name, dest)
+    for member in tar:
+        _admit(member, dest, root, budget)
     tar.extractall(dest)
 
 
-def _safe_extract_stream(tar: tarfile.TarFile, dest: Path) -> None:
+def _safe_extract_stream(tar: tarfile.TarFile, dest: Path, name: str) -> None:
     """The same checks for a tar read as a stream, one member at a time (#27).
 
-    A stream can't be read twice, so each member is checked just before it is
-    extracted. A refusal part-way leaves only the job's own work directory
-    holding the members before it, and the job removes that directory.
+    A stream can't be read twice, so each member is checked, and counted
+    against the caps (#317), just before it is extracted. A refusal part-way
+    leaves only the job's own work directory holding the members before it,
+    within the caps, and the job removes that directory.
     """
     root = dest.resolve()
+    budget = _Budget(name, dest)
     for member in tar:
-        _check_member(member, dest, root)
+        _admit(member, dest, root, budget)
         tar.extract(member, dest)
 
 
@@ -767,7 +882,7 @@ def _extract_encrypted(archive: Path, dest: Path, passphrase: str) -> None:
         with archive.open("rb") as fh:
             decryptor = age_stream.open_decrypt(fh, passphrase)
             with tarfile.open(fileobj=decryptor, mode="r|gz") as tar:
-                _safe_extract_stream(tar, dest)
+                _safe_extract_stream(tar, dest, archive.name)
             # tarfile stops at the end-of-archive blocks; the final chunk, and
             # anything after it, still has to be authenticated.
             decryptor.drain()
@@ -801,7 +916,7 @@ def open_package(archive: Path, dest: Path, passphrase: str | None = None) -> tu
             _extract_encrypted(archive, dest, passphrase or "")
         else:
             with tarfile.open(archive, "r:gz") as tar:
-                _safe_extract(tar, dest)
+                _safe_extract(tar, dest, archive.name)
     except PackageError:
         raise
     except (tarfile.TarError, OSError, EOFError) as exc:
