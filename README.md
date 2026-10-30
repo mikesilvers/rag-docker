@@ -1202,7 +1202,7 @@ host variables through. No destination or secret is supplied by this repository.
 | `RAG_OTEL_HEADERS_FILE` | Optional mounted UTF-8 JSON regular file containing `Authorization` and/or `X-Api-Key`; max 8 KiB, max 2 KiB per value |
 | `RAG_OTEL_CA_FILE` | Optional mounted PEM CA bundle (a regular file) for an HTTPS endpoint; max 1 MiB; replaces the bundled roots |
 | `RAG_OTEL_SERVICE_NAME` | `rag-api` |
-| `RAG_OTEL_SERVICE_VERSION` | `1.1.0` |
+| `RAG_OTEL_SERVICE_VERSION` | `1.2.0` |
 | `RAG_OTEL_ENVIRONMENT` | `development` |
 | `RAG_OTEL_TRACES`, `RAG_OTEL_LOGS`, `RAG_OTEL_METRICS` | Each `true`; exact booleans |
 | `RAG_OTEL_SAMPLE_RATIO` | `1.0`; finite 0–1, root-independent ratio sampling |

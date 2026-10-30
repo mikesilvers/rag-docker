@@ -52,7 +52,7 @@ class Config:
     endpoint: str = field(default="", repr=False)
     headers: dict = field(default_factory=dict, repr=False)
     service: str = "rag-api"
-    version: str = "1.1.0"
+    version: str = "1.2.0"
     environment: str = "development"
     traces: bool = True
     logs: bool = True
@@ -153,7 +153,7 @@ class Config:
         if batch > queue:
             raise TelemetryConfigError("RAG_OTEL_BATCH_SIZE exceeds RAG_OTEL_QUEUE_SIZE")
         return cls(True, endpoint.rstrip("/"), headers,
-                   identifier("SERVICE_NAME", "rag-api"), identifier("SERVICE_VERSION", "1.1.0"),
+                   identifier("SERVICE_NAME", "rag-api"), identifier("SERVICE_VERSION", "1.2.0"),
                    identifier("ENVIRONMENT", "development"),
                    boolean("TRACES", True), boolean("LOGS", True), boolean("METRICS", True),
                    number("SAMPLE_RATIO", 1, 0, 1, False), queue, batch,

@@ -240,7 +240,7 @@ outside-pointing symlink all rejected with the contract message.
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
-server = MCPServer(name="rag", version="1.1.0")
+server = MCPServer(name="rag", version="1.2.0")
 
 @server.tool(
     name="rag_query",
@@ -281,7 +281,7 @@ from logging_setup import configure_logging
 configure_logging(config.LOG_LEVEL)          # 1. FIRST, before anything logs
 
 from mcp.server.mcpserver import MCPServer    # 2. then the SDK
-server = MCPServer(name="rag", version="1.1.0",
+server = MCPServer(name="rag", version="1.2.0",
                    instructions="Tools for a local retrieval-augmented "
                                 "generation stack: query, manage collections, "
                                 "ingest documents and build evaluation sets.")
