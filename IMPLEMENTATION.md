@@ -7504,7 +7504,13 @@ def listing_fields(manifest: dict) -> dict:
 
 
 def _check_member(member: tarfile.TarInfo, dest: Path, root: Path) -> None:
-    """Refuse a link, anything but a file or directory, a path outside dest, or a negative size."""
+    """Refuse a link, anything but a file or directory, a path outside dest, a negative size,
+    or a sparse file.
+
+    tarfile writes every chunk of a sparse file's map before it truncates the
+    file to its size, so a sparse file's size doesn't bound what extracting it
+    writes (#317). No package this project writes is sparse.
+    """
     if member.issym() or member.islnk():
         raise PackageError(
             "PACKAGE_UNREADABLE",
@@ -7526,6 +7532,11 @@ def _check_member(member: tarfile.TarInfo, dest: Path, root: Path) -> None:
             "PACKAGE_UNREADABLE",
             f"Package contains an entry with a negative size ('{member.name}').",
             {"member": member.name})
+    if member.sparse is not None:
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            f"Package contains a sparse file ('{member.name}'), which is not allowed.",
+            {"member": member.name})
 
 
 def _limit_text(limit: int) -> str:
@@ -7540,20 +7551,57 @@ class _Budget:
     """The member-count and expanded-size caps on one package's TAR (#317).
 
     A small .tar.gz can expand enough to fill the disk the work directory is
-    on, so every member is counted as its header is read, folders included,
-    and its header size is added to a running total. In a TAR the bytes
-    written for a member are exactly its header size, so the total bounds
-    what extraction writes. Equal to a cap is within it.
+    on. Every member is counted as its header is read, and so is every folder
+    extraction would make for it that no earlier member made: tarfile makes
+    the missing parent folders of each path, which no header counts. Folders
+    are read from the name lexically, as os.makedirs makes them, so one named
+    before a `..` counts too. A member's header size is added to a running
+    total; for a member that isn't sparse (sparse files are refused) it is
+    exactly what extraction writes, so the total bounds what is written.
+    Equal to a cap is within it.
     """
 
-    def __init__(self, archive_name: str):
+    def __init__(self, archive_name: str, dest: Path):
         self.archive_name = archive_name
         self.max_members = settings.max_package_members
         self.max_bytes = settings.max_package_expanded_bytes
         self.members = 0
         self.size = 0
+        # Folders as nested dicts, from the filesystem root. The work directory
+        # and its ancestors exist; every node added later has been counted, so
+        # the tree holds no more than the cap's entries.
+        self._root: dict = {}
+        self._work = [self._root]
+        for part in os.path.abspath(dest).split("/"):
+            if part:
+                self._work.append(self._work[-1].setdefault(part, {}))
 
     def count(self, member: tarfile.TarInfo) -> None:
+        self._entry()
+
+    def folders(self, member: tarfile.TarInfo) -> None:
+        """Count each folder extracting the member would make that is not made yet.
+
+        A directory member's own folder is its entry, already counted.
+        """
+        parts = member.name.split("/")
+        stack = [self._root] if member.name.startswith("/") else list(self._work)
+        last = len(parts) - 1
+        for i, part in enumerate(parts if member.isdir() else parts[:-1]):
+            if part in ("", "."):
+                continue
+            if part == "..":
+                if len(stack) > 1:
+                    stack.pop()
+                continue
+            child = stack[-1].get(part)
+            if child is None:
+                child = stack[-1][part] = {}
+                if not (i == last and member.isdir()):
+                    self._entry()
+            stack.append(child)
+
+    def _entry(self) -> None:
         self.members += 1
         if self.members > self.max_members:
             raise PackageError(
@@ -7575,9 +7623,13 @@ class _Budget:
 
 
 def _admit(member: tarfile.TarInfo, dest: Path, root: Path, budget: _Budget) -> None:
-    """Count the member, check it, then add its size, refusing at the first failure."""
+    """Count the member, check it, count its new folders, then add its size.
+
+    The first failure refuses the package.
+    """
     budget.count(member)
     _check_member(member, dest, root)
+    budget.folders(member)
     budget.add(member)
 
 
@@ -7591,7 +7643,7 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path, name: str) -> None:
     most the caps' worth of headers, and leaves dest empty (#317).
     """
     root = dest.resolve()
-    budget = _Budget(name)
+    budget = _Budget(name, dest)
     for member in tar:
         _admit(member, dest, root, budget)
     tar.extractall(dest)
@@ -7606,7 +7658,7 @@ def _safe_extract_stream(tar: tarfile.TarFile, dest: Path, name: str) -> None:
     within the caps, and the job removes that directory.
     """
     root = dest.resolve()
-    budget = _Budget(name)
+    budget = _Budget(name, dest)
     for member in tar:
         _admit(member, dest, root, budget)
         tar.extract(member, dest)
@@ -19180,7 +19232,10 @@ above or below the manifest's is `PACKAGE_CORRUPT` before any collection is crea
 checks that a `.tar.gz` and a `.tar.gz.age` package exactly at each cap open, and that one entry
 or one byte over is refused `PACKAGE_TOO_MANY_MEMBERS` or `PACKAGE_TOO_LARGE` with the exact
 message and `detail`; a negative-size entry before an over-cap file is refused
-`PACKAGE_UNREADABLE`; a `.tar.gz` refusal extracts nothing and reads no header past the refusing
+`PACKAGE_UNREADABLE`; a sparse file in each of the four formats (old GNU `S`, PAX 0.0, 0.1,
+1.0) is refused `PACKAGE_UNREADABLE`; folders implied by a file's path count as entries
+(at the cap it opens, one folder over is refused `PACKAGE_TOO_MANY_MEMBERS`), including folders
+named before a `..`, while a folder with its own entry counts once; a `.tar.gz` refusal extracts nothing and reads no header past the refusing
 entry, a `.tar.gz.age` refusal leaves at most the cap's bytes, and through `importer._run` each
 refusal fails the job with no collection created and no work directory left. The suite then
 checks that `docker-compose.yml`'s values (16 GiB, 100,000) reach the API.

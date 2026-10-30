@@ -95,6 +95,106 @@ def negative_size_tar():
     return gzip.compress(raw)
 
 
+def block(data):
+    """Data padded to whole 512-byte TAR blocks."""
+    return data + b"\0" * (-len(data) % 512)
+
+
+def gnu_header(name, size, kind=tarfile.REGTYPE):
+    info = tarfile.TarInfo(name)
+    info.size = size
+    info.type = kind
+    info.mode = 0o755 if kind == tarfile.DIRTYPE else 0o644
+    return info.tobuf(format=tarfile.GNU_FORMAT)
+
+
+def pax_header(records):
+    """A PAX extended header holding `records` in order, repeated keywords kept."""
+    body = b""
+    for key, value in records:
+        record = f" {key}={value}\n".encode()
+        length = len(record) + 1
+        while len(str(length)) + len(record) != length:
+            length = len(str(length)) + len(record)
+        body += str(length).encode() + record
+    info = tarfile.TarInfo("././@PaxHeader")
+    info.size = len(body)
+    info.type = tarfile.XHDTYPE
+    return info.tobuf(format=tarfile.USTAR_FORMAT) + block(body)
+
+
+def old_gnu_sparse_header(name, realsize, chunks, data_size):
+    """An old GNU type 'S' header: chunks at offset 386, the real size at 483."""
+    raw = bytearray(gnu_header(name, data_size))
+    raw[156:157] = tarfile.GNUTYPE_SPARSE
+    for i, (offset, numbytes) in enumerate(chunks):
+        at = 386 + 24 * i
+        raw[at:at + 12] = b"%011o\0" % offset
+        raw[at + 12:at + 24] = b"%011o\0" % numbytes
+    raw[482] = 0
+    raw[483:495] = b"%011o\0" % realsize
+    raw[148:156] = b" " * 8
+    raw[148:156] = b"%06o\0 " % sum(raw)
+    return bytes(raw)
+
+
+SPARSE = f"{TOP}/sparse.bin"
+SPARSE_KINDS = ("GNU S", "PAX 0.0", "PAX 0.1", "PAX 1.0")
+
+
+def sparse_tar(kind):
+    """The top directory, the manifest and a sparse file of real size 0 whose map writes 4 MiB.
+
+    tarfile counts such a file at its real size, 0, and writes the whole map before
+    truncating it to that size (#317).
+    """
+    data = b"\0" * (4 * CAP_BYTES)
+    if kind == "GNU S":
+        member = old_gnu_sparse_header(SPARSE, 0, [(0, len(data))], len(data)) + block(data)
+    elif kind == "PAX 0.0":
+        member = (pax_header([("GNU.sparse.size", 0), ("GNU.sparse.numblocks", 1),
+                              ("GNU.sparse.offset", 0), ("GNU.sparse.numbytes", len(data))])
+                  + gnu_header(SPARSE, len(data)) + block(data))
+    elif kind == "PAX 0.1":
+        member = (pax_header([("GNU.sparse.size", 0), ("GNU.sparse.map", f"0,{len(data)}")])
+                  + gnu_header(SPARSE, len(data)) + block(data))
+    else:
+        sparse_map = block(b"1\n0\n%d\n" % len(data))
+        member = (pax_header([("GNU.sparse.major", 1), ("GNU.sparse.minor", 0),
+                              ("GNU.sparse.realsize", 0), ("GNU.sparse.name", SPARSE)])
+                  + gnu_header(f"{TOP}/GNUSparseFile.0/sparse.bin", len(sparse_map) + len(data))
+                  + sparse_map + block(data))
+    return gzip.compress(gnu_header(TOP, 0, tarfile.DIRTYPE)
+                         + gnu_header(f"{TOP}/manifest.json", len(MANIFEST)) + block(MANIFEST)
+                         + member + b"\0" * 1024)
+
+
+def folder_tar(names):
+    """The top directory, the manifest, then an empty file per name (a directory for a name
+    ending in '/'), in order, written in PAX format so long paths keep every component."""
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w:gz", format=tarfile.PAX_FORMAT) as tar:
+        top = tarfile.TarInfo(TOP)
+        top.type = tarfile.DIRTYPE
+        top.mode = 0o755
+        tar.addfile(top)
+        info = tarfile.TarInfo(f"{TOP}/manifest.json")
+        info.size = len(MANIFEST)
+        tar.addfile(info, io.BytesIO(MANIFEST))
+        for name in names:
+            info = tarfile.TarInfo(name.rstrip("/"))
+            if name.endswith("/"):
+                info.type = tarfile.DIRTYPE
+                info.mode = 0o755
+            tar.addfile(info)
+    return out.getvalue()
+
+
+def under(folders):
+    """A file under `folders` new nested folders inside the top directory."""
+    return f"{TOP}/" + "".join(f"d{i:02d}/" for i in range(folders)) + "f"
+
+
 def encrypt(data):
     out = io.BytesIO()
     enc = age_stream.Encryptor(out, PASSPHRASE, LOW)
@@ -130,8 +230,8 @@ class Fixture(unittest.TestCase):
         stack.enter_context(patch.dict(importer._jobs, {}, clear=True))
         self.stack = stack
 
-    def package(self, fillers, encrypted=False):
-        data = tar_bytes(fillers)
+    def package(self, fillers, encrypted=False, data=None):
+        data = tar_bytes(fillers) if data is None else data
         name = f"ragpkg-{uuid.uuid4().hex[:8]}.tar.gz" + (".age" if encrypted else "")
         archive = self.exports / name
         archive.write_bytes(encrypt(data) if encrypted else data)
@@ -242,6 +342,63 @@ class OpenPackageTests(Fixture):
                                                 f"('{TOP}/hole').")
                 self.assertEqual(error.detail, {"member": f"{TOP}/hole"})
                 self.assertFalse((dest / TOP / "hole" / "big.bin").exists())
+                if not encrypted:
+                    self.assertEqual(list(dest.iterdir()), [])
+
+    def test_a_sparse_file_is_refused(self):
+        # Counted at its real size, 0, a sparse file's map would write 4 MiB under the 1 MiB cap.
+        for kind in SPARSE_KINDS:
+            for encrypted in (False, True):
+                with self.subTest(kind=kind, encrypted=encrypted):
+                    archive = self.package(None, encrypted, sparse_tar(kind))
+                    error, dest = self.refused(archive, "PACKAGE_UNREADABLE")
+                    self.assertEqual(error.message, f"Package contains a sparse file ('{SPARSE}'), "
+                                                    f"which is not allowed.")
+                    self.assertEqual(error.detail, {"member": SPARSE})
+                    self.assertFalse((dest / SPARSE).exists())
+                    self.assertLessEqual(self.written(dest), len(MANIFEST))
+                    if not encrypted:
+                        self.assertEqual(list(dest.iterdir()), [])
+
+    def test_implied_folders_over_the_cap_are_refused(self):
+        # The top directory, the manifest and the file are 3 entries; 18 new folders make 21.
+        for encrypted in (False, True):
+            with self.subTest(encrypted=encrypted):
+                archive = self.package(None, encrypted, folder_tar([under(18)]))
+                error, dest = self.refused(archive, "PACKAGE_TOO_MANY_MEMBERS")
+                self.assertEqual(error.message, self.too_many_message(archive))
+                self.assertEqual(error.detail, {"limit": CAP_MEMBERS})
+                self.assertFalse((dest / TOP / "d00").exists())
+                if not encrypted:
+                    self.assertEqual(list(dest.iterdir()), [])
+
+    def test_implied_folders_at_the_cap_open(self):
+        for encrypted in (False, True):
+            with self.subTest(encrypted=encrypted):
+                dest, run = self.open(self.package(None, encrypted, folder_tar([under(17)])))
+                run()
+                self.assertTrue((dest / under(17)).is_file())
+                self.assertEqual(len(list(dest.rglob("*"))), CAP_MEMBERS)
+
+    def test_a_named_folder_counts_once(self):
+        # A directory entry and 17 files in it: 20 entries, the folder counted by its entry.
+        names = [f"{TOP}/d/"] + [f"{TOP}/d/f{i:02d}" for i in range(17)]
+        for encrypted in (False, True):
+            with self.subTest(encrypted=encrypted):
+                dest, run = self.open(self.package(None, encrypted, folder_tar(names)))
+                run()
+                self.assertEqual(len(list(dest.rglob("*"))), CAP_MEMBERS)
+
+    def test_folders_named_before_dotdot_count(self):
+        # Resolved, the path is TOP/new/f: one folder. os.makedirs still makes x00 to x16
+        # on the way, so 17 + 1 folders and 3 entries are 21.
+        name = (f"{TOP}/" + "".join(f"x{i:02d}/" for i in range(17)) + "../" * 17 + "new/f")
+        for encrypted in (False, True):
+            with self.subTest(encrypted=encrypted):
+                archive = self.package(None, encrypted, folder_tar([name]))
+                error, dest = self.refused(archive, "PACKAGE_TOO_MANY_MEMBERS")
+                self.assertEqual(error.detail, {"limit": CAP_MEMBERS})
+                self.assertFalse((dest / TOP / "x00").exists())
                 if not encrypted:
                     self.assertEqual(list(dest.iterdir()), [])
 

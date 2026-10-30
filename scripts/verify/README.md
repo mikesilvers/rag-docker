@@ -346,7 +346,10 @@ above or below the manifest's is `PACKAGE_CORRUPT` before any collection is crea
 checks that a `.tar.gz` and a `.tar.gz.age` package exactly at each cap open, and that one entry
 or one byte over is refused `PACKAGE_TOO_MANY_MEMBERS` or `PACKAGE_TOO_LARGE` with the exact
 message and `detail`; a negative-size entry before an over-cap file is refused
-`PACKAGE_UNREADABLE`; a `.tar.gz` refusal extracts nothing and reads no header past the refusing
+`PACKAGE_UNREADABLE`; a sparse file in each of the four formats (old GNU `S`, PAX 0.0, 0.1,
+1.0) is refused `PACKAGE_UNREADABLE`; folders implied by a file's path count as entries
+(at the cap it opens, one folder over is refused `PACKAGE_TOO_MANY_MEMBERS`), including folders
+named before a `..`, while a folder with its own entry counts once; a `.tar.gz` refusal extracts nothing and reads no header past the refusing
 entry, a `.tar.gz.age` refusal leaves at most the cap's bytes, and through `importer._run` each
 refusal fails the job with no collection created and no work directory left. The suite then
 checks that `docker-compose.yml`'s values (16 GiB, 100,000) reach the API.
