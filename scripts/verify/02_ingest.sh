@@ -730,7 +730,14 @@ check "DELETE during a running ingest job is refused with 409 COLLECTION_BUSY na
 check "the refused DELETE leaves the collection and its objects in place" $? \
   "objects before=$before after=$after"
 final=$(wait_for_job "/ingest/job/$busy_job" 900)
-check_eq "the ingest job still completes" "$final" "completed"
+api_get "/ingest/job/$busy_job" > /tmp/vfy_busy_job.json
+[ "$final" = completed ]
+check "the ingest job still completes" $? \
+  "got '$final', wanted 'completed'; $(python3 -c "
+import json
+try: j=json.load(open('/tmp/vfy_busy_job.json'))
+except Exception: print('job record unreadable'); raise SystemExit
+print('files_failed=%s errors=%s' % (j.get('files_failed'), json.dumps(j.get('errors'))[:300]))")"
 code=$(curl -s -m 120 -o /dev/null -w '%{http_code}' -X DELETE "$API/collections/$DC?confirm=true")
 check_eq "DELETE after the job completes succeeds" "$code" "200"
 sleep 10
