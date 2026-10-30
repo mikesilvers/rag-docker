@@ -900,7 +900,7 @@ class LoginCoalescingTests(AuditTestCase):
         clock.start()
         self.addCleanup(clock.stop)
 
-    def fail(self, username, ip="10.0.0.5"):
+    def failed_login(self, username, ip="10.0.0.5"):
         return self.client.post("/auth/login", json={"username": username, "password": "wrong-password-1"},
                                 headers={"X-Real-IP": ip})
 
@@ -908,7 +908,7 @@ class LoginCoalescingTests(AuditTestCase):
         return [r for r in self.records() if r["action"] == "auth.login"]
 
     def test_a_lone_failure_is_written_at_once_as_before(self):
-        self.assertEqual(self.fail("Nobody").status_code, 401)
+        self.assertEqual(self.failed_login("Nobody").status_code, 401)
         (item,) = self.logins()
         self.assertEqual((item["target"], item["status_code"], item["client_ip"], item["details"]),
                          ("Nobody", 401, "10.0.0.5", {"code": "LOGIN_FAILED"}))
@@ -918,10 +918,10 @@ class LoginCoalescingTests(AuditTestCase):
         self.assertEqual(audit._logins, {})
 
     def test_repeats_are_counted_and_written_once_the_window_closes(self):
-        self.fail("Nobody")
+        self.failed_login("Nobody")
         for name in ("nobody", "NOBODY", "Nobody"):           # case doesn't matter
             self.now += 10
-            self.assertEqual(self.fail(name).status_code, 401)
+            self.assertEqual(self.failed_login(name).status_code, 401)
         self.assertEqual(len(self.logins()), 1, "repeats inside the window wrote records")
         self.now += 25                                        # 55 s: still open
         audit.flush_logins(due_only=True)
@@ -938,24 +938,24 @@ class LoginCoalescingTests(AuditTestCase):
         self.assertGreater(counted["id"], first["id"])
 
     def test_a_failure_after_the_window_follows_its_count(self):
-        self.fail("Nobody")
+        self.failed_login("Nobody")
         self.now += 5
-        self.fail("Nobody")
+        self.failed_login("Nobody")
         self.now += 60
-        self.fail("Nobody")                                   # the closed window's count goes first
+        self.failed_login("Nobody")                                   # the closed window's count goes first
         items = self.logins()
         self.assertEqual([r["details"].get("count") for r in items], [None, 1, None])
         self.assertEqual(len(audit._logins), 1)
 
     def test_address_and_status_are_part_of_the_key(self):
-        self.fail("Nobody", ip="10.0.0.5")
-        self.fail("Nobody", ip="10.0.0.6")
+        self.failed_login("Nobody", ip="10.0.0.5")
+        self.failed_login("Nobody", ip="10.0.0.6")
         self.assertEqual([r["client_ip"] for r in self.logins()], ["10.0.0.5", "10.0.0.6"])
         for _ in range(5):                                    # the 5th failure from .5 locks; 4 counted
-            self.fail("user", ip="10.0.0.7")
-        self.assertEqual(self.fail("user", ip="10.0.0.7").status_code, 429)
+            self.failed_login("user", ip="10.0.0.7")
+        self.assertEqual(self.failed_login("user", ip="10.0.0.7").status_code, 429)
         self.assertEqual([r["status_code"] for r in self.logins() if r["target"] == "user"], [401, 429])
-        self.assertEqual(self.fail("user", ip="10.0.0.7").status_code, 429)   # counted in the 429 window
+        self.assertEqual(self.failed_login("user", ip="10.0.0.7").status_code, 429)   # counted in the 429 window
         audit.flush_logins()                                  # shutdown: open counts too
         counts = {(r["target"], r["client_ip"], r["status_code"]): r["details"]["count"]
                   for r in self.logins() if "count" in r["details"]}
@@ -965,7 +965,7 @@ class LoginCoalescingTests(AuditTestCase):
     def test_past_the_cap_failures_are_written_one_by_one(self):
         with patch.object(audit, "LOGIN_WINDOWS_MAX", 2):
             for name in ("a1", "a2", "a3", "a3", "a1"):
-                self.fail(name)
+                self.failed_login(name)
         self.assertEqual([r["target"] for r in self.logins()], ["a1", "a2", "a3", "a3"])
         self.assertEqual(sorted(k[0] for k in audit._logins), ["a1", "a2"])
 
@@ -978,7 +978,7 @@ class LoginCoalescingTests(AuditTestCase):
     def test_a_write_failure_never_changes_the_answer(self):
         with patch.object(audit, "record", side_effect=RuntimeError("boom")), \
                 self.assertLogs("audit", level="ERROR"):
-            self.assertEqual(self.fail("Nobody").status_code, 401)
+            self.assertEqual(self.failed_login("Nobody").status_code, 401)
 
     def test_a_lost_first_record_opens_no_window(self):
         # #591: a first record that wasn't written opens no window, so the
@@ -992,10 +992,10 @@ class LoginCoalescingTests(AuditTestCase):
             return real(fields)
 
         with patch.object(audit, "_append", side_effect=append), self.assertLogs("audit", level="ERROR"):
-            self.assertEqual(self.fail("Nobody").status_code, 401)
+            self.assertEqual(self.failed_login("Nobody").status_code, 401)
         self.assertEqual(len(lost), 1)
         self.assertEqual(audit._logins, {})
-        self.assertEqual(self.fail("Nobody").status_code, 401)
+        self.assertEqual(self.failed_login("Nobody").status_code, 401)
         self.assertEqual([(r["target"], r["details"]) for r in self.logins()], [("Nobody", {"code": "LOGIN_FAILED"})])
         self.assertEqual(len(audit._logins), 1)
 
