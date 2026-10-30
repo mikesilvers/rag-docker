@@ -389,15 +389,18 @@ class OpenPackageTests(Fixture):
                 run()
                 self.assertEqual(len(list(dest.rglob("*"))), CAP_MEMBERS)
 
-    def test_folders_named_before_dotdot_count(self):
-        # Resolved, the path is TOP/new/f: one folder. os.makedirs still makes x00 to x16
-        # on the way, so 17 + 1 folders and 3 entries are 21.
+    def test_a_dotdot_name_is_refused_before_its_folders_count(self):
+        # Counted, x00 to x16, made by os.makedirs on the way to TOP/new/f, and new would be
+        # 18 folders, which with 3 entries go over the cap; but a name with a '..' component
+        # is refused first (#597).
         name = (f"{TOP}/" + "".join(f"x{i:02d}/" for i in range(17)) + "../" * 17 + "new/f")
         for encrypted in (False, True):
             with self.subTest(encrypted=encrypted):
                 archive = self.package(None, encrypted, folder_tar([name]))
-                error, dest = self.refused(archive, "PACKAGE_TOO_MANY_MEMBERS")
-                self.assertEqual(error.detail, {"limit": CAP_MEMBERS})
+                error, dest = self.refused(archive, "PACKAGE_UNREADABLE")
+                self.assertEqual(error.message, f"Package contains a path with a '..' component "
+                                                f"('{name}'), which is not allowed.")
+                self.assertEqual(error.detail, {"member": name})
                 self.assertFalse((dest / TOP / "x00").exists())
                 if not encrypted:
                     self.assertEqual(list(dest.iterdir()), [])

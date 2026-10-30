@@ -353,7 +353,11 @@ had no check. It runs five controlled tests, then live checks on a collection of
 missing file, a file that isn't gzip and a truncated archive (`PACKAGE_UNREADABLE`), a symlink,
 a hardlink and a `../` member, naming the member and extracting nothing, an archive with two
 top-level directories, and a package with no manifest, a manifest that isn't JSON or a newer
-`package_format` (`PACKAGE_FORMAT_UNSUPPORTED`). Through `importer._run`, with Weaviate and the
+`package_format` (`PACKAGE_FORMAT_UNSUPPORTED`). It also checks that a member with a `..`
+component that resolves inside the package, whether or not it names a folder outside the work
+directory, is refused `PACKAGE_UNREADABLE` for a `.tar.gz` and a `.tar.gz.age` package without
+any of its folders being made, and that dots within a component are allowed (#597). Through
+`importer._run`, with Weaviate and the
 model checks mocked, a digest-valid package naming a collection Weaviate can't use is
 `PACKAGE_FORMAT_UNSUPPORTED` before any lookup, and one with a `chunks.jsonl` line that isn't
 JSON, a bad UUID, properties that aren't an object, a missing or short vector, or a chunk count
@@ -365,8 +369,9 @@ or one byte over is refused `PACKAGE_TOO_MANY_MEMBERS` or `PACKAGE_TOO_LARGE` wi
 message and `detail`; a negative-size entry before an over-cap file is refused
 `PACKAGE_UNREADABLE`; a sparse file in each of the four formats (old GNU `S`, PAX 0.0, 0.1,
 1.0) is refused `PACKAGE_UNREADABLE`; folders implied by a file's path count as entries
-(at the cap it opens, one folder over is refused `PACKAGE_TOO_MANY_MEMBERS`), including folders
-named before a `..`, while a folder with its own entry counts once; a `.tar.gz` refusal extracts nothing and reads no header past the refusing
+(at the cap it opens, one folder over is refused `PACKAGE_TOO_MANY_MEMBERS`), while a name with
+a `..` component is refused `PACKAGE_UNREADABLE` before its folders are counted and a folder with
+its own entry counts once; a `.tar.gz` refusal extracts nothing and reads no header past the refusing
 entry, a `.tar.gz.age` refusal leaves at most the cap's bytes, and through `importer._run` each
 refusal fails the job with no collection created and no work directory left. The suite then
 checks that `docker-compose.yml`'s values (16 GiB, 100,000) reach the API.
