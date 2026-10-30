@@ -544,8 +544,9 @@ entries) and `max_package_expanded_bytes` (env `MAX_PACKAGE_EXPANDED_BYTES`,
 default 17,179,869,184 bytes = 16 GiB), set in `docker-compose.yml`. Exactly at a
 cap is within it. Members are taken one at a time as their headers are read,
 never collected first, and for each one: it is counted (over the member cap:
-`PACKAGE_TOO_MANY_MEMBERS`), checked for links, type and path as above
-(`PACKAGE_UNREADABLE`), then its size is added (over the size cap:
+`PACKAGE_TOO_MANY_MEMBERS`), checked for links, type and path as above, and for a
+negative header size, which would otherwise lower the total (`PACKAGE_UNREADABLE`),
+then its size is added (over the size cap:
 `PACKAGE_TOO_LARGE`). The first member to fail decides, and no header after it is
 read. For a `.tar.gz` every header is checked this way before anything is
 extracted, so a refusal extracts nothing; for a `.tar.gz.age` each member is
@@ -1078,7 +1079,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E38 | Importing an encrypted package with a wrong passphrase fails `DECRYPT_FAILED` (`reason` `passphrase`), and a damaged or truncated file fails `DECRYPT_FAILED` or `PACKAGE_UNREADABLE` and a scrypt work factor above 20 (21 included) or not one or two decimal digits (thousands of digits included) fails `DECRYPT_FAILED` before any key derivation; a file cut inside the payload nonce fails `DECRYPT_FAILED`, with no collection, marker, setting, session or package file changed and no work directory left; the right passphrase imports it with every chunk (#27), by `test_export_encryption.py` and suite 05 |
 | E39 | `POST /import` refuses an encrypted package without a passphrase `400 PASSPHRASE_REQUIRED` and a passphrase for any other package `400 PASSPHRASE_NOT_EXPECTED`, before any job; `POST /export` refuses a passphrase outside 12 to 1024 characters, and both refuse one with no UTF-8 form (a lone surrogate), `422 INVALID_PARAMETER` without echoing it; one bad encrypted file never fails `GET /packages` (#27) |
 | E40 | The age implementation passes every applicable C2SP CCTV age testkit vector, and its output decrypts with an independent decryption written from the age specification (#27), by `test_export_encryption.py` |
-| E41 | A package of more than `max_package_members` entries, directories included, fails `PACKAGE_TOO_MANY_MEMBERS`, and one whose members add up to more than `max_package_expanded_bytes` fails `PACKAGE_TOO_LARGE`, each with its message and `detail`, for `.tar.gz` and `.tar.gz.age` packages alike; a package exactly at a cap imports; a `.tar.gz` refusal extracts nothing and reads no header after the refusing member, a `.tar.gz.age` refusal leaves at most the cap's bytes, and the job creates no collection and leaves no work directory (#317), by `test_package_limits.py` with caps of 1 MiB and 20 entries set through the environment |
+| E41 | A package of more than `max_package_members` entries, directories included, fails `PACKAGE_TOO_MANY_MEMBERS`, and one whose members add up to more than `max_package_expanded_bytes` fails `PACKAGE_TOO_LARGE`, each with its message and `detail`, for `.tar.gz` and `.tar.gz.age` packages alike; a package exactly at a cap imports; a member with a negative size is refused `PACKAGE_UNREADABLE` before its size is counted; a `.tar.gz` refusal extracts nothing and reads no header after the refusing member, a `.tar.gz.age` refusal leaves at most the cap's bytes, and the job creates no collection and leaves no work directory (#317), by `test_package_limits.py` with caps of 1 MiB and 20 entries set through the environment |
 
 ---
 

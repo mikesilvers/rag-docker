@@ -7504,7 +7504,7 @@ def listing_fields(manifest: dict) -> dict:
 
 
 def _check_member(member: tarfile.TarInfo, dest: Path, root: Path) -> None:
-    """Refuse a link, anything but a file or directory, or a path outside dest."""
+    """Refuse a link, anything but a file or directory, a path outside dest, or a negative size."""
     if member.issym() or member.islnk():
         raise PackageError(
             "PACKAGE_UNREADABLE",
@@ -7520,6 +7520,11 @@ def _check_member(member: tarfile.TarInfo, dest: Path, root: Path) -> None:
         raise PackageError(
             "PACKAGE_UNREADABLE",
             f"Package contains a path outside the archive ('{member.name}').",
+            {"member": member.name})
+    if member.size < 0:
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            f"Package contains an entry with a negative size ('{member.name}').",
             {"member": member.name})
 
 
@@ -19174,7 +19179,8 @@ above or below the manifest's is `PACKAGE_CORRUPT` before any collection is crea
 1 MiB and 20 entries set through `MAX_PACKAGE_EXPANDED_BYTES` and `MAX_PACKAGE_MEMBERS`, #317)
 checks that a `.tar.gz` and a `.tar.gz.age` package exactly at each cap open, and that one entry
 or one byte over is refused `PACKAGE_TOO_MANY_MEMBERS` or `PACKAGE_TOO_LARGE` with the exact
-message and `detail`; a `.tar.gz` refusal extracts nothing and reads no header past the refusing
+message and `detail`; a negative-size entry before an over-cap file is refused
+`PACKAGE_UNREADABLE`; a `.tar.gz` refusal extracts nothing and reads no header past the refusing
 entry, a `.tar.gz.age` refusal leaves at most the cap's bytes, and through `importer._run` each
 refusal fails the job with no collection created and no work directory left. The suite then
 checks that `docker-compose.yml`'s values (16 GiB, 100,000) reach the API.

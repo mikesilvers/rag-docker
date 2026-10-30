@@ -11,6 +11,7 @@ environment. Runs with the API's dependencies, inside the verify project's API c
 Without those variables the test sets the same caps (1 MiB, 20 entries) itself. Weaviate,
 Ollama and the model store are mocked; nothing reaches a backend.
 """
+import gzip
 import io
 import json
 import os
@@ -59,6 +60,39 @@ def tar_bytes(fillers):
             info.size = len(data)
             tar.addfile(info, io.BytesIO(data))
     return out.getvalue()
+
+
+def negative_dir_header(name, size):
+    """A directory header whose size field holds `size` < 0 in base-256 (first byte 0xff).
+
+    tarfile decodes such a field as a negative number; written by hand because tarfile
+    won't write a directory with a size.
+    """
+    info = tarfile.TarInfo(name)
+    info.type = tarfile.DIRTYPE
+    info.mode = 0o755
+    block = bytearray(info.tobuf(format=tarfile.GNU_FORMAT))
+    block[124:136] = bytes([0xff]) + (256 ** 11 + size).to_bytes(11, "big")
+    block[148:156] = b" " * 8
+    block[148:156] = b"%06o\0 " % sum(block)
+    return bytes(block)
+
+
+def negative_size_tar():
+    """The top directory and manifest, a directory of size -10 MiB, then a 2 MiB file in it."""
+    def member(name, data):
+        info = tarfile.TarInfo(name)
+        info.size = len(data)
+        return info.tobuf(format=tarfile.GNU_FORMAT) + data + b"\0" * (-len(data) % 512)
+    top = tarfile.TarInfo(TOP)
+    top.type = tarfile.DIRTYPE
+    top.mode = 0o755
+    raw = (top.tobuf(format=tarfile.GNU_FORMAT)
+           + member(f"{TOP}/manifest.json", MANIFEST)
+           + negative_dir_header(f"{TOP}/hole", -10 * CAP_BYTES)
+           + member(f"{TOP}/hole/big.bin", b"\0" * (2 * CAP_BYTES))
+           + b"\0" * 1024)
+    return gzip.compress(raw)
 
 
 def encrypt(data):
@@ -195,6 +229,21 @@ class OpenPackageTests(Fixture):
             self.refused(archive, "PACKAGE_TOO_MANY_MEMBERS")
         # fromtarfile reads one header per call; the 21st is the one refused.
         self.assertEqual(headers.call_count, CAP_MEMBERS + 1)
+
+    def test_a_negative_size_is_refused_before_it_is_counted(self):
+        # Counted, a size of -10 MiB would let the 2 MiB file after it pass the 1 MiB cap.
+        for encrypted in (False, True):
+            with self.subTest(encrypted=encrypted):
+                data = negative_size_tar()
+                archive = self.exports / ("ragpkg-negative.tar.gz" + (".age" if encrypted else ""))
+                archive.write_bytes(encrypt(data) if encrypted else data)
+                error, dest = self.refused(archive, "PACKAGE_UNREADABLE")
+                self.assertEqual(error.message, f"Package contains an entry with a negative size "
+                                                f"('{TOP}/hole').")
+                self.assertEqual(error.detail, {"member": f"{TOP}/hole"})
+                self.assertFalse((dest / TOP / "hole" / "big.bin").exists())
+                if not encrypted:
+                    self.assertEqual(list(dest.iterdir()), [])
 
     def test_a_link_before_the_caps_still_refuses_as_unreadable(self):
         out = io.BytesIO()

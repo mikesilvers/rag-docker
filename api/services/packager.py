@@ -706,7 +706,7 @@ def listing_fields(manifest: dict) -> dict:
 
 
 def _check_member(member: tarfile.TarInfo, dest: Path, root: Path) -> None:
-    """Refuse a link, anything but a file or directory, or a path outside dest."""
+    """Refuse a link, anything but a file or directory, a path outside dest, or a negative size."""
     if member.issym() or member.islnk():
         raise PackageError(
             "PACKAGE_UNREADABLE",
@@ -722,6 +722,11 @@ def _check_member(member: tarfile.TarInfo, dest: Path, root: Path) -> None:
         raise PackageError(
             "PACKAGE_UNREADABLE",
             f"Package contains a path outside the archive ('{member.name}').",
+            {"member": member.name})
+    if member.size < 0:
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            f"Package contains an entry with a negative size ('{member.name}').",
             {"member": member.name})
 
 
