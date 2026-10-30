@@ -21,7 +21,8 @@ export const DEFAULT_CONFIG: QueryConfig = {
 
 interface QueryConfigValue {
   collection: string
-  setCollection: (name: string) => void
+  /** Takes a name, or an updater that gets the selection current at the call (#593). */
+  setCollection: (next: string | ((current: string) => string)) => void
   config: QueryConfig
   /** True while the collection has no saved settings and is using DEFAULT_CONFIG. */
   isDefault: boolean
@@ -60,7 +61,8 @@ export function QueryConfigProvider({ children }: { children: ReactNode }) {
   const latestFailed = useRef(false)
   const lastSuccess = useRef<{ id: number; value: RetrievalConfig } | null>(null)
 
-  const setCollection = useCallback((name: string) => {
+  const setCollection = useCallback((next: string | ((current: string) => string)) => {
+    const name = typeof next === 'function' ? next(selectedCollection.current) : next
     if (name === selectedCollection.current) return
     selectedCollection.current = name
     selectionId.current++

@@ -499,16 +499,23 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
   // The Q&A and Gold Standard pages load the collection list once on opening;
   // the failed-list alert's Retry loads it again. A successful Retry clears the
   // message and selects the first collection only if none is chosen, so a
-  // collection chosen on the Retrieval page stays selected on Q&A. The list and
-  // the retrieval settings are answered here, so the cases don't depend on the
-  // stack's collections and create nothing.
+  // collection chosen on the Retrieval page stays selected on Q&A. On a freshly
+  // opened page the first Retry fails again, with another reason, so the alert
+  // must show that reason with its Retry button before the next Retry succeeds
+  // (#593). The list and the retrieval settings are answered here, so the cases
+  // don't depend on the stack's collections and create nothing.
   r.section('retrying a failed collection list (#575)');
   {
     const FAIL = 'Synthetic list failure (#575).';
     const MESSAGE = 'Could not load the collections: ' + FAIL;
+    // A Retry that fails again shows its own reason, which only that Retry's
+    // error handler can put in the alert (#593).
+    const FAIL_AGAIN = 'Synthetic list failure on Retry (#593).';
+    const MESSAGE_AGAIN = 'Could not load the collections: ' + FAIL_AGAIN;
     const FIRST = 'VfyRetry575A', SECOND = 'VfyRetry575B';
     const info = name => ({ name, object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', created_at: null, hnsw_config: null });
-    const failure = { status: 503, contentType: 'application/json', body: JSON.stringify({ error: { code: 'SERVICE_UNAVAILABLE', message: FAIL, detail: null } }) };
+    const failed503 = message => ({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: { code: 'SERVICE_UNAVAILABLE', message, detail: null } }) });
+    const failure = failed503(FAIL), failureAgain = failed503(FAIL_AGAIN);
     const listed = { status: 200, contentType: 'application/json', body: JSON.stringify({ collections: [info(FIRST), info(SECOND)] }) };
     // Answers GET /api/collections as mode.list says, and the retrieval settings.
     async function stub(s) {
@@ -516,7 +523,7 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
       await s.page.setRequestInterception(true);
       s.page.on('request', request => {
         const path = new URL(request.url()).pathname;
-        if (request.method() === 'GET' && path === '/api/collections') return request.respond(mode.list === 'fail' ? failure : listed);
+        if (request.method() === 'GET' && path === '/api/collections') return request.respond(mode.list === 'fail' ? failure : mode.list === 'fail-again' ? failureAgain : listed);
         if (request.method() === 'GET' && path.startsWith('/api/retrieval/config/')) {
           const name = decodeURIComponent(path.split('/').pop());
           return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collection: name, retrieval_mode: 'hnsw', top_k: 5, alpha: 0.75, ef: null, response_format: 'engineer', is_default: true }) });
@@ -527,14 +534,14 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     }
     const lists = s => s.api.filter(x => x.method === 'GET' && x.url === '/api/collections').length;
     // The failed-list alert, if shown, and whether it holds a Retry button.
-    const listAlert = page => page.evaluate(m => {
+    const listAlert = (page, message = MESSAGE) => page.evaluate(m => {
       for (const a of document.querySelectorAll('[role=alert]')) {
         const c = a.cloneNode(true);
         c.querySelectorAll('button').forEach(b => b.remove());
         if (c.textContent.trim() === m) return { retry: [...a.querySelectorAll('button')].some(b => b.textContent.trim() === 'Retry') };
       }
       return null;
-    }, MESSAGE);
+    }, message);
     const retryShown = page => page.evaluate(() => [...document.querySelectorAll('button')].some(b => b.textContent.trim() === 'Retry'));
     // The collection selector: on Q&A (and Retrieval) the first select, on Gold
     // Standard the one next to the Collection label.
@@ -548,7 +555,12 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     }, gold);
     const noPageErrors = (s, name) => r.check(`${name}: the Retry cases cause no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
 
-    // A fresh page with nothing chosen: Retry selects the first collection.
+    // A fresh page with nothing chosen: a Retry that fails again keeps the alert
+    // and its Retry button (#593), and a later Retry selects the first collection.
+    // No case checks that Gold Standard keeps a collection already chosen before
+    // a Retry (#593): its collection is page-local, starts empty and is set only
+    // by this list load and by the selector, which has no options while the list
+    // has failed, so that state can't be reached through the page.
     for (const [name, path, gold] of [['Q&A', '/qa', false], ['Gold Standard', '/goldstandard', true]]) {
       const s = await session(browser, BASE, 'engineer');
       try {
@@ -557,6 +569,10 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
         await s.page.goto(BASE + path, { waitUntil: 'networkidle2' }); await sleep(1500);
         const failed = await listAlert(s.page);
         r.check(`${name}: the failed-list alert has a Retry button (#575)`, !!failed && failed.retry, JSON.stringify(failed));
+        mode.list = 'fail-again';
+        await clickByText(s.page, 'Retry'); await sleep(1200);
+        const again = await listAlert(s.page, MESSAGE_AGAIN);
+        r.check(`${name}: a Retry that fails again shows the new reason and keeps the Retry button (#593)`, !!again && again.retry, JSON.stringify(again));
         const before = lists(s);
         mode.list = 'pass';
         await clickByText(s.page, 'Retry'); await sleep(1200);
