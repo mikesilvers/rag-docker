@@ -248,7 +248,7 @@ The checks listed above as flaky or environmental are for your information: they
 - …
 </details>
 
-_One evaluation per commit. A new commit gets its own evaluation. Ready to merge only when Coding, Security, Tests and Build all pass; merging is the maintainer's decision._
+_One evaluation per commit. A new commit gets its own evaluation. Ready to merge only when Coding, Security, Tests and Build all pass; merging is the maintainer's decision, except an agent's own tier-1 bug fix that passes every check in `CLAUDE.md` "Merging into `develop`"._
 ```
 
 The status is `READY TO MERGE` only when all four checks passed and no High is open. It's `NOT READY` for any other outcome.

@@ -40,8 +40,9 @@ documentation improvements are all welcome.
 - Say which verification run you did (full or `RAG_SKIP_SLOW=1`) and whether it
   passed.
 
-Only the maintainer can merge. Workflows on pull requests from forks run after
-the maintainer approves them.
+The maintainer merges pull requests. The one exception, for the maintainer's own
+agents' tier-1 bug fixes, is in [CLAUDE.md](CLAUDE.md#merging-into-develop).
+Workflows on pull requests from forks run after the maintainer approves them.
 
 ## License
 
