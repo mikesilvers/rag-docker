@@ -92,6 +92,14 @@ services:
       SOURCES_DIR: /app/sources
       EXPORTS_DIR: /app/exports
       OLLAMA_MODELS_DIR: /ollama
+      # The sentence-transformers model is pre-cached in the api image at
+      # build time (api/Dockerfile). Without these flags the Hugging Face
+      # libraries still try to reach huggingface.co on first load and, when
+      # the site is unreachable, retry each model file five times -- stalling
+      # the first semantic ingest for minutes (issue #618). Pin them to the
+      # local cache so offline installs and air-gapped hosts load instantly.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
       # Shown by /health and compared against the memory Docker actually
       # provides. Raise this if you allocate more to Docker Desktop.
       RECOMMENDED_MEMORY_GB: 12
