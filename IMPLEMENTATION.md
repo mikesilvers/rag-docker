@@ -16942,6 +16942,14 @@ export default function ImportPage() {
         <input id="file-input" type="file" multiple className="hidden" accept=".pdf,.docx,.txt,.md,.csv,.json,.jsonl,.jsonl.gz,.zip"
           onChange={e => setFiles(prev => [...prev, ...Array.from(e.target.files || [])])} />
       </div>
+      {/* A static file of the UI build (ui/public), so it is in every install,
+          offline ones included. scripts/tests/test_corpus_rules.py checks its
+          limits against the app's (#615). */}
+      <p className="text-xs text-gray-500 mb-4">
+        Preparing a large corpus? Read the limits and how to stay under them first:{' '}
+        <a href="/corpus-preparation-rules.md" download="corpus-preparation-rules.md"
+          className="text-blue-600 hover:underline">Download corpus preparation rules (.md)</a>
+      </p>
 
       {files.length > 0 && (
         <ul className="mb-4 space-y-1">
@@ -19922,6 +19930,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `../tests/test_batch_implementation.py` | host-side: exact embedded source checks for `api/main.py`, the Weaviate client, the batch-write, recovery, import and tuning services and their verify scripts, and the restart-recovery block of `05_transfer.sh` with stubbed commands (refused-prefix skip, `RAG_ALLOW_RESTART`, the #152 refusal), registered by transfer |
 | `../tests/test_chunk_limits.py` / `../tests/test_insert_chunks.py` | controlled chunker per-file limits, chunk ceiling and semantic floor (#111) / insert batching and the "index not ready" retry, registered by ingest in the API image with the repository mounted (#386) |
+| `../tests/test_corpus_rules.py` | controlled: the corpus preparation rules the Import page offers (`ui/public/corpus-preparation-rules.md`) state every ingest limit as the chunker, the ingest pipeline, the settings defaults, the chunk-setting bounds, `docker-compose.yml` and the proxy define it, and no other number (#615), registered by ingest in the API image with the repository mounted |
 | `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
 | `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
@@ -19934,7 +19943,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |
 | `../tests/test_retrieve_script.py` | controlled `retrieve.py` defaults, flags and exit codes against a stub API, registered by suite 15 |
 | `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15 |
-| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, the page controls of #400 (see "UI control browser checks") and, last, the login page against nginx's real login rate limit (#577) |
+| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, the Import page's corpus preparation rules download (#615), the page controls of #400 (see "UI control browser checks") and, last, the login page against nginx's real login rate limit (#577) |
 | `14_reindex.sh` | exact-record reindex: a host check that the embedded sources match the real files (`../tests/test_reindex_preservation.py`), 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
@@ -27874,6 +27883,10 @@ check "chunks below min_chunk_size are merged" $? "stored $(python3 -c "import j
 check "chunker per-file limits, 6,000-character ceiling and semantic floor (#111)" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_insert_chunks.py)
 check "chunk inserts are batched and retried while the index isn't ready" $?
+# The corpus preparation rules the Import page offers state the app's own
+# ingest limits, read from the same constants, settings and proxy (#615).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_corpus_rules.py)
+check "the corpus preparation rules state the app's ingest limits (#615)" $?
 
 # ── one bad file must not fail the batch ─────────────────────────────────────
 drop_collection "$C"; make_collection "$C"
@@ -32979,6 +32992,34 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
       r.check('the drop zone hint names JSONL among the types',
               hint.includes('PDF, DOCX, TXT, MD, CSV, JSON, JSONL, ZIP · up to 512 MB per upload'),
               hint.slice(0, 200));
+    } finally {
+      await s.ctx.close();
+    }
+  }
+
+  // ── corpus preparation rules (#615) ────────────────────────────────────────
+  // The Import page offers the rules as a download: a static file of the UI
+  // build, served through the proxy. test_corpus_rules.py checks its limits.
+  r.section('corpus preparation rules');
+  {
+    const s = await session(browser, BASE, 'developer');
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const link = await s.page.evaluate(() => {
+        const a = [...document.querySelectorAll('a')]
+          .find(x => x.textContent.trim() === 'Download corpus preparation rules (.md)');
+        return a ? { path: new URL(a.href).pathname, download: a.getAttribute('download') } : null;
+      });
+      r.check('the Import page links to the corpus preparation rules as a download',
+              !!link && link.path === '/corpus-preparation-rules.md'
+                && link.download === 'corpus-preparation-rules.md', JSON.stringify(link));
+      const served = await s.page.evaluate(async () => {
+        const response = await fetch('/corpus-preparation-rules.md');
+        return { status: response.status, start: (await response.text()).slice(0, 60) };
+      });
+      r.check('the rules file is served as markdown through the proxy',
+              served.status === 200 && served.start.startsWith('# Preparing files for rag-docker ingest\n'),
+              JSON.stringify(served));
     } finally {
       await s.ctx.close();
     }

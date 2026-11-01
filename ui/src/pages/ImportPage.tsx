@@ -170,6 +170,14 @@ export default function ImportPage() {
         <input id="file-input" type="file" multiple className="hidden" accept=".pdf,.docx,.txt,.md,.csv,.json,.jsonl,.jsonl.gz,.zip"
           onChange={e => setFiles(prev => [...prev, ...Array.from(e.target.files || [])])} />
       </div>
+      {/* A static file of the UI build (ui/public), so it is in every install,
+          offline ones included. scripts/tests/test_corpus_rules.py checks its
+          limits against the app's (#615). */}
+      <p className="text-xs text-gray-500 mb-4">
+        Preparing a large corpus? Read the limits and how to stay under them first:{' '}
+        <a href="/corpus-preparation-rules.md" download="corpus-preparation-rules.md"
+          className="text-blue-600 hover:underline">Download corpus preparation rules (.md)</a>
+      </p>
 
       {files.length > 0 && (
         <ul className="mb-4 space-y-1">
