@@ -2006,6 +2006,71 @@ class ErrorDetail(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: ErrorDetail
+
+
+# ── Running and recent jobs (#617) ────────────────────────────────────────────
+# What GET /ingest/jobs, /export/jobs, /import/jobs and /goldstandard/sessions
+# answer: the fields of the lookup by ID, plus who started the job and when it
+# started and finished. The lookups by ID answer as before.
+
+class JobOwner(BaseModel):
+    name: str
+    kind: Literal["user", "service"]
+
+
+class ListedTimes(BaseModel):
+    # None: a record from before #617, shown to Engineers as "owner unknown".
+    owner: Optional[JobOwner] = None
+    created_at: Optional[str] = None
+    # The finish time the list used; None while the job runs.
+    finished_at: Optional[str] = None
+
+
+class IngestJobEntry(JobStatusResponse, ListedTimes):
+    collection: Optional[str] = None
+    files: list[str] = []
+
+
+class ExportJobEntry(ExportJobStatusResponse, ListedTimes):
+    pass
+
+
+class ImportJobEntry(ImportJobStatusResponse, ListedTimes):
+    pass
+
+
+class GenerationEntry(ListedTimes):
+    session_id: str
+    collection: str = ""
+    status: str
+    pairs_total: int
+    pairs_attempted: Optional[int] = None
+    pairs_completed: int
+    pairs_failed: int = 0
+    errors: list[str] = []
+
+    @model_validator(mode="after")
+    def _attempted_defaults_to_completed(self):
+        # As GET /goldstandard/session/{id} answers a session without it.
+        if self.pairs_attempted is None:
+            self.pairs_attempted = self.pairs_completed
+        return self
+
+
+class IngestJobList(BaseModel):
+    jobs: list[IngestJobEntry]
+
+
+class ExportJobList(BaseModel):
+    jobs: list[ExportJobEntry]
+
+
+class ImportJobList(BaseModel):
+    jobs: list[ImportJobEntry]
+
+
+class GenerationList(BaseModel):
+    sessions: list[GenerationEntry]
 ```
 
 ### api/services/__init__.py
@@ -4090,6 +4155,11 @@ def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
 
 
+def job_records() -> list[tuple[str, dict, float | None]]:
+    """Copies of every ingest record, for GET /ingest/jobs (#617)."""
+    return _jobs.snapshot()
+
+
 def _is_json_gz(name: str) -> bool:
     return name.lower().endswith(GZIP_JSON_SUFFIX)
 
@@ -5232,7 +5302,9 @@ async def start_ingest_job(
     chunk_overlap: int,
     similarity_threshold: float,
     min_chunk_size: int,
+    owner: dict | None = None,
 ) -> str:
+    """`owner` is who started the job (#617), recorded for the job lists."""
     config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
                           chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
                           min_chunk_size=min_chunk_size)
@@ -5247,7 +5319,8 @@ async def start_ingest_job(
     collection_writes.register_job(collection, "ingest", job_id)
     try:
         return await _admit_ingest_job(job_id, files, collection, strategy, chunk_size,
-                                       chunk_overlap, similarity_threshold, min_chunk_size)
+                                       chunk_overlap, similarity_threshold, min_chunk_size,
+                                       owner)
     except BaseException:
         collection_writes.end_job("ingest", job_id)
         raise
@@ -5255,7 +5328,8 @@ async def start_ingest_job(
 
 async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, strategy: str,
                             chunk_size: int, chunk_overlap: int,
-                            similarity_threshold: float, min_chunk_size: int) -> str:
+                            similarity_threshold: float, min_chunk_size: int,
+                            owner: dict | None = None) -> str:
     # The prefix is how the startup sweep finds a killed job's staging (#377).
     tmp_dir = Path(tempfile.mkdtemp(prefix="ingest-", dir=settings.upload_dir))
     # Files the caller sent that this build cannot parse, and inputs replaced by
@@ -5331,6 +5405,11 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
             "chunks_replaced": 0,
             "errors": [],
             "skipped": skipped,
+            # For the job lists (#617): where, what and who, as the client sent
+            # the names. created_at and finished_at are the store's.
+            "collection": collection,
+            "files": [upload.filename or "" for upload in files],
+            "owner": owner,
         })
     except BaseException:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -5639,6 +5718,16 @@ _MARKER_MESSAGES = {
     True: "History marker could not be saved in the session file. A pending marker keeps the session historical after restart, and current export is refused. Check local storage; the next successful write of this session saves the marker.",
     False: "History marker could not be saved. The session is treated as historical and current export is refused only until restart. Check local storage, then edit this session to save the marker.",
 }
+
+# What a generated session records about this install only (#617): who started
+# it and when it started and finished. Packages leave these out, and an import
+# drops them, so an imported session is never listed as a generation here.
+LOCAL_FIELDS = ("owner", "created_at", "finished_at")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 _ROLLBACK_FAILED_MESSAGE = "A stale marker from an aborted collection replacement could not be removed, so the session stays historical. Check local storage."
 # Rollback bookkeeping for an aborted durable marking (#275): a field the
@@ -6067,6 +6156,15 @@ def sessions_for(collection: str) -> list[dict]:
         return copy.deepcopy(found)
 
 
+def generation_sessions() -> list[dict]:
+    """Copies of the sessions generated on this install, for
+    GET /goldstandard/sessions (#617); an imported session is never one."""
+    _scan_sessions()
+    with _state_lock:
+        return copy.deepcopy([session for session in _sessions.values()
+                              if isinstance(session, dict) and not session.get("imported_from")])
+
+
 def store_session(session: dict) -> None:
     """Write through the durable store so the cache cannot undo an import.
 
@@ -6125,6 +6223,9 @@ def _store_generated_session(session: dict) -> dict:
 def store_imported_session(session: dict, source_collection: str) -> dict:
     """Serialize source-ID collision handling with generation and other imports."""
     snapshot = copy.deepcopy(session)
+    # Who generated it and when belong to the source install (#617).
+    for key in LOCAL_FIELDS:
+        snapshot.pop(key, None)
     # Import preflight (check 4a) has already refused noncanonical source IDs.
     # Allocation keeps the source ID only when it is free; it stays provenance.
     SessionResponse.model_validate(snapshot, strict=True)
@@ -6432,6 +6533,8 @@ async def _generate_pair(chunk: dict) -> dict:
 
 def _failed_generation(current: dict, exc: Exception) -> None:
     current["status"] = "failed"
+    # Every caller ends a generation; a later failure report keeps the first time (#617).
+    current.setdefault("finished_at", _now_iso())
     if isinstance(exc, GoldStandardError):
         reason = f"{exc.code}: {exc.message}"
     elif isinstance(exc, _GenerationInterrupted):
@@ -6525,6 +6628,7 @@ async def _settle_generation(session_id: str, cancelled: bool,
         if current.get("status") == "generating":
             current["status"] = ("cancelled" if cancelled else
                 "failed" if not current["pairs"] and current.get("errors") else "completed")
+            current.setdefault("finished_at", _now_iso())       # #617
         if current.get("status") == "failed":
             telemetry.outcome("error")
     await asyncio.to_thread(_update_session_sync, session_id, finish)
@@ -6558,7 +6662,8 @@ def _settle_abandoned_start(prepare: asyncio.Future) -> None:
 _GENERATION_GUARD_TIMEOUT_SECONDS = 1.0
 
 
-def _prepare_generation_sync(collection: str, sample_size: int, seed: int | None):
+def _prepare_generation_sync(collection: str, sample_size: int, seed: int | None,
+                             owner: dict | None = None):
     """Publish the sampled corpus identity before a writer can invalidate it."""
     from services.collection_writes import (CollectionBusyError, delete_in_progress,
                                             deleting_message, guard)
@@ -6584,6 +6689,9 @@ def _prepare_generation_sync(collection: str, sample_size: int, seed: int | None
                 "pairs_completed": 0,
                 "pairs_failed": 0,
                 "pairs": [],
+                # For the generation list (#617); finished_at when it settles.
+                "owner": owner,
+                "created_at": _now_iso(),
             }
             session = _store_generated_session(session)
             # Still inside the guard, so no delete can pass between publication
@@ -6602,14 +6710,16 @@ async def start_generation(
     collection: str,
     sample_size: int,
     seed: int | None,
+    owner: dict | None = None,
 ) -> dict:
+    """`owner` is who started it (#617), recorded for the generation list."""
     from models.schemas import GenerateRequest
     request = GenerateRequest(collection=collection, sample_size=sample_size, seed=seed)
     # Shielded: cancelling a plain to_thread await loses the thread's result, and
     # with it the registration it made, which then refused DELETE until a
     # restart (#302). A cancelled caller hands the result to a settle step.
     prepare = asyncio.ensure_future(asyncio.to_thread(
-        _prepare_generation_sync, collection, request.sample_size, request.seed))
+        _prepare_generation_sync, collection, request.sample_size, request.seed, owner))
     try:
         session, all_chunks = await asyncio.shield(prepare)
     except asyncio.CancelledError:
@@ -7150,7 +7260,9 @@ def _goldstandard_sessions(collection: str) -> list[dict]:
     # Preserve export's detached on-disk snapshots. The cache contains live
     # generation/edit objects, which must not change during JSON serialization.
     # Disk reads still share schema, identity and regular-file validation.
-    return [session for session in goldstandard._sessions_on_disk()
+    # Who generated a session and when stay on this install (#617).
+    return [{key: value for key, value in session.items() if key not in goldstandard.LOCAL_FIELDS}
+            for session in goldstandard._sessions_on_disk()
             if session["collection"] == collection]
 
 
@@ -8321,6 +8433,12 @@ reaches a terminal status, or is marked interrupted at startup. What the end
 record needs is kept in the job record as `_audit` (the status answers ignore
 it), with `ended` set once that record is written.
 
+**Timestamps (#617).** A bound store stamps `created_at` on a new record and
+`finished_at` when a record first reaches a terminal status, or is marked
+interrupted at startup; neither is changed afterwards. `snapshot()` hands the
+job lists copies of the records and the time each was last saved, which stands
+in for `finished_at` on a record from before #617.
+
 A job record is never recovery authority: retained import and tuning data is
 owned by `collection_recovery` and the import markers (#43, #44), never by
 anything in `jobs/`.
@@ -8336,6 +8454,7 @@ import tempfile
 import threading
 import time
 from collections.abc import MutableMapping
+from datetime import datetime, timezone
 from pathlib import Path
 
 from config import settings
@@ -8365,6 +8484,17 @@ _REMEDY = {
     "import": "Start the import again.",
     "tune": "Start the operation again.",
 }
+
+
+def now_iso() -> str:
+    """The current time as the API writes timestamps: ISO 8601 in UTC."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _stamp_finished(record: dict) -> None:
+    """Set `finished_at` once, with plain dict methods (no write of its own)."""
+    if dict.get(record, "status") in TERMINAL and "finished_at" not in record:
+        dict.__setitem__(record, "finished_at", now_iso())
 
 
 class _Job(dict):
@@ -8439,6 +8569,10 @@ class JobStore(MutableMapping):
             old = self._records.get(job_id)
             if isinstance(old, _Job):
                 self._cancel(old)
+                # A replaced record keeps its timestamps (#617).
+                for key in ("created_at", "finished_at"):
+                    if key in old and key not in record:
+                        dict.__setitem__(record, key, dict.__getitem__(old, key))
             if old is None:
                 # Inside an audited request this writes the job's `accepted`
                 # record (#29), before the job can end, and returns what its
@@ -8446,6 +8580,9 @@ class JobStore(MutableMapping):
                 snapshot = audit.job_started(job_id)
                 if snapshot is not None:
                     dict.__setitem__(record, "_audit", snapshot)
+                if "created_at" not in record:
+                    dict.__setitem__(record, "created_at", now_iso())
+            _stamp_finished(record)
             self._records[job_id] = record
             self._write(record, durable=True)
             if old is None:
@@ -8492,6 +8629,19 @@ class JobStore(MutableMapping):
         except Exception:                       # noqa: BLE001 - logged, never raised
             _log.exception("Could not remove abandoned %s job %s", self.kind, job_id)
 
+    def snapshot(self) -> list[tuple[str, dict, float | None]]:
+        """Copies of every record for the job lists (#617): `(job_id, record,
+        saved)`, where `saved` is when the record was last saved (its file's
+        modification time for one loaded at startup), or None for a record of
+        an unbound store. The audit snapshot is left out."""
+        with self._lock:
+            rows = []
+            for job_id, record in self._records.items():
+                copy = {key: value for key, value in dict.items(record) if key != "_audit"}
+                saved = record._saved if isinstance(record, _Job) and record._saved else None
+                rows.append((job_id, json.loads(json.dumps(copy, default=str)), saved))
+            return rows
+
     # ── persistence ─────────────────────────────────────────────────────────
 
     def _bind(self, job_id: str, doc) -> _Job:
@@ -8533,6 +8683,8 @@ class JobStore(MutableMapping):
         with self._lock:
             if status_changed or record.get("status") in TERMINAL:
                 self._cancel(record)
+                if status_changed:
+                    _stamp_finished(record)     # saved by the write below (#617)
                 ended = status_changed and record.get("status") in TERMINAL and _audit_open(record)
                 if ended:
                     record["_audit"]["ended"] = True    # saved by the write below
@@ -8655,6 +8807,8 @@ class JobStore(MutableMapping):
     def _mark_interrupted(self, record: _Job) -> None:
         # Plain dict methods only: one durable write afterwards, so no record
         # reaches the disk terminal but without its message.
+        if "finished_at" not in record:
+            dict.__setitem__(record, "finished_at", now_iso())      # #617
         if self.kind == "ingest":
             completed = dict.get(record, "files_completed")
             dict.__setitem__(record, "status", "partial"
@@ -8708,6 +8862,146 @@ def _sync_dir(path: Path) -> None:
         os.close(fd)
 ```
 
+### api/services/job_lists.py
+
+The running and recent job lists (#617, `SPECIFICATIONS.md` §3.1.10): who sees which job, the 24-hour window and the cap of 20 finished jobs, the order, and the entries the four list routes answer. The routes read `JobStore.snapshot()` (ingest, export, import) and `goldstandard.generation_sessions()`.
+
+```python
+"""The running and recent jobs a caller may list (#617).
+
+`GET /ingest/jobs`, `/export/jobs`, `/import/jobs` and `/goldstandard/sessions`
+let a page find its jobs again after the user left it. What they list:
+
+- **Whose.** An Engineer sees every job, including those recorded before
+  #617 with no owner ("owner unknown"). Anyone else sees only jobs whose
+  `owner` names them: the same name and kind, so a user's own jobs, or an API
+  key's principal's. The lookups by ID are not scoped; only these lists are.
+- **Which.** Every running job, and the finished ones whose finish time lies in
+  the last 24 hours, at most the newest 20 of those per list and caller.
+- **Finish time.** A record's `finished_at`; for a job record from before #617,
+  the time its record was last saved. A finished session without
+  `finished_at` is not listed.
+- **Order.** Newest first by `created_at`, else by finish time; neither, last.
+"""
+from __future__ import annotations
+
+import logging
+import time
+from datetime import datetime, timezone
+
+from pydantic import ValidationError
+
+from services import jobstore
+
+_log = logging.getLogger(__name__)
+
+WINDOW_S = 24 * 3600
+FINISHED_CAP = 20
+
+
+def job_owner(request) -> dict | None:
+    """Who is making this request, as a job records it: name and kind. None
+    for no request (a handler called directly, as some tests do)."""
+    principal = getattr(getattr(request, "state", None), "auth", None)
+    if principal is None:
+        return None
+    return {"name": principal.username,
+            "kind": "service" if principal.kind == "service" else "user"}
+
+
+def visible(owner, principal) -> bool:
+    if principal.role == "engineer":
+        return True
+    if not isinstance(owner, dict):
+        return False
+    kind = "service" if principal.kind == "service" else "user"
+    return owner.get("name") == principal.username and owner.get("kind") == kind
+
+
+def _parse(value) -> float | None:
+    """Epoch seconds for an ISO 8601 timestamp, or None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.timestamp()
+
+
+def _iso(seconds: float) -> str:
+    return datetime.fromtimestamp(seconds, timezone.utc).isoformat()
+
+
+def select(items, principal, now: float) -> list[dict]:
+    """The records to list, in order, each with `finished_at` as listed.
+
+    `items` are `(record, running, finish)`, where `finish` is the finish time
+    in epoch seconds of a finished record, or None when it has none.
+    """
+    running, finished = [], []
+    for record, is_running, finish in items:
+        if not visible(record.get("owner"), principal):
+            continue
+        if is_running:
+            running.append((record, None))
+        elif finish is not None and now - WINDOW_S <= finish <= now:
+            finished.append((record, finish))
+    finished.sort(key=lambda pair: pair[1], reverse=True)
+    kept = running + finished[:FINISHED_CAP]
+
+    def order(pair):
+        record, finish = pair
+        started = _parse(record.get("created_at"))
+        moment = started if started is not None else finish
+        return (moment is not None, moment or 0.0)
+
+    kept.sort(key=order, reverse=True)
+    out = []
+    for record, finish in kept:
+        entry = dict(record)
+        entry["finished_at"] = _iso(finish) if finish is not None else None
+        out.append(entry)
+    return out
+
+
+def job_items(rows) -> list[tuple[dict, bool, float | None]]:
+    """`JobStore.snapshot()` rows as `select` items."""
+    items = []
+    for _, record, saved in rows:
+        is_running = record.get("status") not in jobstore.TERMINAL
+        finish = None if is_running else _parse(record.get("finished_at"))
+        if not is_running and finish is None:
+            finish = saved                      # a record from before #617
+        items.append((record, is_running, finish))
+    return items
+
+
+def session_items(sessions) -> list[tuple[dict, bool, float | None]]:
+    """Generated sessions as `select` items."""
+    items = []
+    for session in sessions:
+        is_running = session.get("status") == "generating"
+        finish = None if is_running else _parse(session.get("finished_at"))
+        items.append((session, is_running, finish))
+    return items
+
+
+def entries(model, items, principal, id_key: str = "job_id") -> list:
+    """The listed records as `model` entries. A record the model can't
+    represent is left out and logged, so one bad record never fails the list."""
+    out = []
+    for record in select(items, principal, time.time()):
+        try:
+            out.append(model.model_validate(record))
+        except ValidationError as exc:
+            _log.warning("Left %r out of the job list: %d invalid field(s)",
+                         record.get(id_key), exc.error_count())
+    return out
+```
+
 ### api/services/exporter.py
 
 ```python
@@ -8751,6 +9045,11 @@ class ExportStartingError(Exception):
 
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
+
+
+def job_records() -> list[tuple[str, dict, float | None]]:
+    """Copies of every export record, for GET /export/jobs (#617)."""
+    return _jobs.snapshot()
 
 
 def active_job_for(collection: str) -> str | None:
@@ -8822,7 +9121,7 @@ def _run(job_id: str, collection: str, include_models: bool,
 
 
 async def start_export_job(collection: str, include_models: bool = False,
-                           passphrase: str | None = None) -> str:
+                           passphrase: str | None = None, owner: dict | None = None) -> str:
     """Register the job and run the build off the event loop.
 
     A passphrase makes the package encrypted (#27). It is handed to the worker
@@ -8885,6 +9184,7 @@ async def start_export_job(collection: str, include_models: bool = False,
                 "error": None,
                 "error_code": None,
                 "error_detail": None,
+                "owner": owner,                 # who started it, for the job lists (#617)
             })
         except BaseException:
             collection_writes.end_job("export", job_id)
@@ -8991,6 +9291,11 @@ class PassphraseError(Exception):
 
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
+
+
+def job_records() -> list[tuple[str, dict, float | None]]:
+    """Copies of every import record, for GET /import/jobs (#617)."""
+    return _jobs.snapshot()
 
 
 # ── Surviving a hard kill ─────────────────────────────────────────────────────
@@ -9870,7 +10175,8 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
         _release_targets(job_id)
 
 
-async def start_import_job(filename: str, on_conflict: str, passphrase: str | None = None) -> str:
+async def start_import_job(filename: str, on_conflict: str, passphrase: str | None = None,
+                           owner: dict | None = None) -> str:
     """Register the job and run the import off the event loop.
 
     An encrypted package is known by its name (`.tar.gz.age`, #27), so a missing
@@ -9911,6 +10217,7 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
             "error_code": None,
             "error_detail": None,
             "encrypted": encrypted,
+            "owner": owner,                     # who started it, for the job lists (#617)
         })
     except BaseException:
         with _lock:
@@ -11278,13 +11585,14 @@ import json
 import logging
 import re
 from pathlib import Path
-from fastapi import APIRouter, Form, UploadFile, File
+from fastapi import APIRouter, Form, Request, UploadFile, File
 from pydantic import ValidationError
 
 from config import settings
 from models.schemas import (CollectionName, IngestConfig, IngestConfigResponse,
-                            IngestUploadResponse, JobStatusResponse)
-from services import audit, ingest_config
+                            IngestJobEntry, IngestJobList, IngestUploadResponse,
+                            JobStatusResponse)
+from services import audit, ingest_config, job_lists
 from services import ingest_pipeline
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError, canonical
@@ -11308,6 +11616,8 @@ async def ingest_upload(
     similarity_threshold: str = Form("0.85"),
     min_chunk_size: str = Form("100"),
     files: list[UploadFile] = File(...),
+    # Injected by FastAPI; None only when a test calls the handler directly.
+    request: Request = None,
 ):
     # A form field's default is not validated through CollectionName, so the
     # stored-name rule is applied here (#372).
@@ -11318,7 +11628,8 @@ async def ingest_upload(
                total_bytes=sum(f.size or 0 for f in files))
     try:
         return await _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
-                                    similarity_threshold, min_chunk_size, files)
+                                    similarity_threshold, min_chunk_size, files,
+                                    job_lists.job_owner(request))
     except Exception:
         # Anything not handled below used to reach the client as a plain-text
         # 500, which the Import page could only show as "HTTP 500" (#290).
@@ -11331,7 +11642,7 @@ async def ingest_upload(
 
 
 async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
-                         similarity_threshold, min_chunk_size, files):
+                         similarity_threshold, min_chunk_size, files, owner=None):
     try:
         config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
                               chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
@@ -11357,6 +11668,7 @@ async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
             chunk_overlap=config.chunk_overlap,
             similarity_threshold=config.similarity_threshold,
             min_chunk_size=config.min_chunk_size,
+            owner=owner,
         )
     except CollectionDeletingError:
         return collection_deleting_error(collection)
@@ -11371,6 +11683,16 @@ async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
         files_queued=len(files),
         collection=collection,
     )
+
+
+@router.get("/jobs", response_model=IngestJobList)
+async def list_jobs(request: Request):
+    """The caller's running and recent ingest jobs (#617; see services/job_lists)."""
+    principal = request.state.auth
+    def build():
+        items = job_lists.job_items(ingest_pipeline.job_records())
+        return job_lists.entries(IngestJobEntry, items, principal)
+    return IngestJobList(jobs=await asyncio.to_thread(build))
 
 
 @router.get("/job/{job_id}", response_model=JobStatusResponse)
@@ -11521,10 +11843,14 @@ import asyncio
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from models.schemas import (
+    ExportJobEntry,
+    ExportJobList,
     ExportJobStatusResponse,
+    ImportJobEntry,
+    ImportJobList,
     ExportRequest,
     ExportStartResponse,
     ImportJobStatusResponse,
@@ -11533,7 +11859,7 @@ from models.schemas import (
     PackageListResponse,
     PackageSummary,
 )
-from services import age_stream, audit, exporter, importer, packager
+from services import age_stream, audit, exporter, importer, job_lists, packager
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError
 from utils import api_error, collection_check_unavailable, collection_deleting_error
@@ -11543,7 +11869,7 @@ _log = logging.getLogger(__name__)
 
 
 @router.post("/export", response_model=ExportStartResponse, status_code=202)
-async def start_export(body: ExportRequest):
+async def start_export(body: ExportRequest, request: Request = None):
     # The audit record's parameters (#29): whether it is encrypted, never the passphrase.
     audit.note(collection=body.collection, include_models=body.include_models, encrypted=body.passphrase is not None)
     try:
@@ -11560,7 +11886,8 @@ async def start_export(body: ExportRequest):
     try:
         job_id = await exporter.start_export_job(
             body.collection, body.include_models,
-            body.passphrase.get_secret_value() if body.passphrase is not None else None)
+            body.passphrase.get_secret_value() if body.passphrase is not None else None,
+            owner=job_lists.job_owner(request))
     except CollectionDeletingError:
         return collection_deleting_error(body.collection)
     except exporter.ExportStartingError:
@@ -11577,6 +11904,15 @@ async def start_export(body: ExportRequest):
     return ExportStartResponse(job_id=job_id, status="queued", collection=body.collection)
 
 
+@router.get("/export/jobs", response_model=ExportJobList)
+async def list_export_jobs(request: Request):
+    """The caller's running and recent exports (#617; see services/job_lists)."""
+    principal = request.state.auth
+    def build():
+        return job_lists.entries(ExportJobEntry, job_lists.job_items(exporter.job_records()), principal)
+    return ExportJobList(jobs=await asyncio.to_thread(build))
+
+
 @router.get("/export/job/{job_id}", response_model=ExportJobStatusResponse)
 async def export_job_status(job_id: str):
     job = exporter.get_job(job_id)
@@ -11586,7 +11922,7 @@ async def export_job_status(job_id: str):
 
 
 @router.post("/import", response_model=ImportStartResponse, status_code=202)
-async def start_import(body: ImportRequest):
+async def start_import(body: ImportRequest, request: Request = None):
     # The audit record's parameters (#29); the collection is added when the job ends.
     audit.note(package=body.filename, on_conflict=body.on_conflict, encrypted=body.passphrase is not None)
     # Everything else — unreadable archive, bad digest, embedding mismatch,
@@ -11594,7 +11930,8 @@ async def start_import(body: ImportRequest):
     # after reading the package, which takes long enough to need a job.
     passphrase = body.passphrase.get_secret_value() if body.passphrase is not None else None
     try:
-        job_id = await importer.start_import_job(body.filename, body.on_conflict, passphrase)
+        job_id = await importer.start_import_job(body.filename, body.on_conflict, passphrase,
+                                                 owner=job_lists.job_owner(request))
     except importer.PassphraseError as exc:
         # Decided by the filename before any job exists (#27).
         return api_error(400, exc.code, str(exc), detail={"filename": body.filename})
@@ -11603,6 +11940,15 @@ async def start_import(body: ImportRequest):
                          f"An import of '{exc}' is already running.",
                          detail={"filename": str(exc)})
     return ImportStartResponse(job_id=job_id, status="queued", filename=body.filename)
+
+
+@router.get("/import/jobs", response_model=ImportJobList)
+async def list_import_jobs(request: Request):
+    """The caller's running and recent imports (#617; see services/job_lists)."""
+    principal = request.state.auth
+    def build():
+        return job_lists.entries(ImportJobEntry, job_lists.job_items(importer.job_records()), principal)
+    return ImportJobList(jobs=await asyncio.to_thread(build))
 
 
 @router.get("/import/job/{job_id}", response_model=ImportJobStatusResponse)
@@ -11823,12 +12169,14 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse
 
 from models.schemas import (
     GenerateRequest,
     GenerateResponse,
+    GenerationEntry,
+    GenerationList,
     GoldPair,
     PatchPairRequest,
     RegenerateRequest,
@@ -11837,7 +12185,7 @@ from models.schemas import (
     SessionResponse,
     SessionValidity,
 )
-from services import audit
+from services import audit, job_lists
 from services import goldstandard as gs
 from services import weaviate_client as wc
 from utils import api_error, collection_check_unavailable
@@ -11847,7 +12195,7 @@ _log = logging.getLogger(__name__)
 
 
 @router.post("/generate", response_model=GenerateResponse, status_code=202)
-async def generate(body: GenerateRequest):
+async def generate(body: GenerateRequest, request: Request = None):
     try:
         exists = await wc.collection_exists(body.collection)
     except Exception:                                 # noqa: BLE001
@@ -11863,10 +12211,21 @@ async def generate(body: GenerateRequest):
             collection=body.collection,
             sample_size=body.sample_size,
             seed=body.seed,
+            owner=job_lists.job_owner(request),
         )
     except gs.GoldStandardError as exc:
         return api_error(exc.status, exc.code, exc.message, detail=exc.detail)
     return GenerateResponse(**result)
+
+
+@router.get("/sessions", response_model=GenerationList)
+async def list_generations(request: Request):
+    """The caller's running and recent generations (#617; see services/job_lists)."""
+    principal = request.state.auth
+    def build():
+        items = job_lists.session_items(gs.generation_sessions())
+        return job_lists.entries(GenerationEntry, items, principal, id_key="session_id")
+    return GenerationList(sessions=await asyncio.to_thread(build))
 
 
 @router.get("/session/{session_id}", response_model=SessionResponse)
@@ -12998,19 +13357,23 @@ ACCESS: dict[tuple[str, str], str] = {
     ("POST", "/collections"): DEVELOPER,
     ("POST", "/ingest/upload"): DEVELOPER,
     ("GET", "/ingest/job/{job_id}"): DEVELOPER,
+    ("GET", "/ingest/jobs"): DEVELOPER,                 # the caller's jobs only (#617)
     ("GET", "/ingest/config/{collection}"): DEVELOPER,
     ("POST", "/ingest/config"): DEVELOPER,
     ("POST", "/retrieval/config"): DEVELOPER,
     ("POST", "/goldstandard/generate"): DEVELOPER,
     ("GET", "/goldstandard/session/{session_id}"): DEVELOPER,
+    ("GET", "/goldstandard/sessions"): DEVELOPER,       # the caller's generations only (#617)
     ("PATCH", "/goldstandard/session/{session_id}/pair/{pair_id}"): DEVELOPER,
     ("POST", "/goldstandard/regenerate"): DEVELOPER,
     ("POST", "/goldstandard/save"): DEVELOPER,
     ("GET", "/goldstandard/download/{filename}"): DEVELOPER,
     ("POST", "/export"): DEVELOPER,
     ("GET", "/export/job/{job_id}"): DEVELOPER,
+    ("GET", "/export/jobs"): DEVELOPER,                 # the caller's jobs only (#617)
     ("POST", "/import"): DEVELOPER,
     ("GET", "/import/job/{job_id}"): DEVELOPER,
+    ("GET", "/import/jobs"): DEVELOPER,                 # the caller's jobs only (#617)
     ("GET", "/packages"): DEVELOPER,
     ("GET", "/help/transfer"): DEVELOPER,
     ("GET", "/tune/{collection}"): DEVELOPER,          # read by the Transfer page (Q3)
@@ -16052,6 +16415,8 @@ export const api = {
   // Ingest — form field is "strategy"; job status URL is /ingest/job/{id}; config POST is /ingest/config
   uploadFiles: (form: FormData) => request<{ job_id: string; status: string; files_queued: number; collection: string }>('POST', '/ingest/upload', form, true),
   getJobStatus: (jobId: string) => request<JobStatus>('GET', `/ingest/job/${jobId}`),
+  // The caller's running and recent jobs (#617); an Engineer gets everyone's.
+  listIngestJobs: () => request<{ jobs: IngestJobEntry[] }>('GET', '/ingest/jobs'),
   getIngestConfig: (collection: string) => request<IngestConfig>('GET', `/ingest/config/${collection}`),
   saveIngestConfig: (body: SaveIngestConfigBody) => request<IngestConfig>('POST', '/ingest/config', body),
 
@@ -16063,6 +16428,7 @@ export const api = {
 
   generateGoldStandard: (body: GenerateBody) => request<GenerateResult>('POST', '/goldstandard/generate', body),
   getSession: (sessionId: string) => request<Session>('GET', `/goldstandard/session/${encodeURIComponent(sessionId)}`),
+  listGenerations: () => request<{ sessions: GenerationEntry[] }>('GET', '/goldstandard/sessions'),
   patchPair: (sessionId: string, pairId: string, body: PatchPairBody) => request<GoldPair>('PATCH', `/goldstandard/session/${encodeURIComponent(sessionId)}/pair/${encodeURIComponent(pairId)}`, body),
   regeneratePair: (body: { session_id: string; pair_id: string }) => request<GoldPair>('POST', '/goldstandard/regenerate', body),
   saveSession: (body: { session_id: string; filename?: string; allow_historical?: boolean }) => request<SaveResult>('POST', '/goldstandard/save', body),
@@ -16073,6 +16439,8 @@ export const api = {
   getExportJob: (jobId: string) => request<ExportJob>('GET', `/export/job/${jobId}`),
   startImport: (body: ImportBody) => request<ImportStart>('POST', '/import', body),
   getImportJob: (jobId: string) => request<ImportJob>('GET', `/import/job/${jobId}`),
+  listExportJobs: () => request<{ jobs: ExportJobEntry[] }>('GET', '/export/jobs'),
+  listImportJobs: () => request<{ jobs: ImportJobEntry[] }>('GET', '/import/jobs'),
   getPackages: () => request<{ packages: PackageSummary[] }>('GET', '/packages'),
   getTuneOptions: (collection: string) => request<TuneOptions>('GET', `/tune/${collection}`),
   getTransferHelp: () => request<{ topic: string; markdown: string }>('GET', '/help/transfer'),
@@ -16184,6 +16552,17 @@ export interface ImportJob {
   restored_sessions?: { source_session_id: string; session_id: string; collection: string }[]
   error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
   encrypted?: boolean
+}
+// Running and recent jobs (#617). owner is null for a job recorded before
+// owners were, which only an Engineer sees ("owner unknown").
+export interface JobOwner { name: string; kind: 'user' | 'service' }
+export interface ListedTimes { owner: JobOwner | null; created_at: string | null; finished_at: string | null }
+export interface IngestJobEntry extends JobStatus, ListedTimes { collection: string | null; files: string[] }
+export interface ExportJobEntry extends ExportJob, ListedTimes {}
+export interface ImportJobEntry extends ImportJob, ListedTimes {}
+export interface GenerationEntry extends ListedTimes {
+  session_id: string; collection: string; status: string; pairs_total: number; pairs_attempted: number
+  pairs_completed: number; pairs_failed: number; errors: string[]
 }
 export type AuditResult = 'success' | 'refused' | 'error' | 'accepted' | 'succeeded' | 'failed' | 'interrupted'
 export interface AuditRecord {
@@ -16371,6 +16750,127 @@ export default function ProgressPanel({ job }: { job: JobStatus }) {
         </div>
       )}
     </div>
+  )
+}
+```
+
+### ui/src/components/JobList.tsx
+
+The Running and recent jobs list the Import, Gold Standard and Transfer pages show (#617, `SPECIFICATIONS.md` §7.15): `useJobList` reads a list on opening, after `reload()` and every 10 s while it holds a running job; `newestToOpen` picks the job a page opens by itself.
+
+```typescript
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { JobOwner } from '../api/client'
+
+// The running and recent jobs a page lists (#617). The list is read from the
+// API whenever the page opens, so a job started earlier, in another tab or
+// before a reload is found again. Nothing is kept in browser storage (#25).
+
+// While the last answer held a running job, the list is read again this often.
+const RELOAD_MS = 10000
+
+export interface JobRow {
+  key: string
+  kind: string
+  target: string
+  status: string
+  progress: string
+  createdAt: string | null
+  owner: JobOwner | null
+  open: boolean
+  onOpen: () => void
+}
+
+function message(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
+
+// Reads a list once on mount, again on reload(), and every RELOAD_MS while it
+// holds a running entry; nothing after the page is left. `loaded` turns true
+// with the first answer, successful or not.
+export function useJobList<T>(load: () => Promise<T[]>, isRunning: (entry: T) => boolean) {
+  const [entries, setEntries] = useState<T[]>([])
+  const [error, setError] = useState('')
+  const [loaded, setLoaded] = useState(false)
+  const alive = useRef(true)
+  const timer = useRef<number | null>(null)
+  const loadRef = useRef(load)
+  const runningRef = useRef(isRunning)
+  loadRef.current = load
+  runningRef.current = isRunning
+
+  const reload = useCallback(() => {
+    if (timer.current) { window.clearTimeout(timer.current); timer.current = null }
+    loadRef.current().then(list => {
+      if (!alive.current) return
+      setEntries(list)
+      setError('')
+      setLoaded(true)
+      if (list.some(e => runningRef.current(e))) timer.current = window.setTimeout(reload, RELOAD_MS)
+    }, (e: unknown) => {
+      if (!alive.current) return
+      setError(`Could not load the running and recent jobs: ${message(e)}`)
+      setLoaded(true)
+    })
+  }, [])
+
+  useEffect(() => {
+    alive.current = true
+    reload()
+    return () => {
+      alive.current = false
+      if (timer.current) window.clearTimeout(timer.current)
+    }
+  }, [reload])
+
+  return { entries, error, loaded, reload }
+}
+
+// The entry a page opens by itself: the newest running one, else the newest.
+// `entries` are newest first, as the API orders them.
+export function newestToOpen<T>(entries: T[], isRunning: (entry: T) => boolean): T | null {
+  return entries.find(isRunning) ?? entries[0] ?? null
+}
+
+export function startedLabel(createdAt: string | null): string {
+  if (!createdAt) return '-'
+  const when = new Date(createdAt)
+  return Number.isNaN(when.getTime()) ? '-' : when.toLocaleString()
+}
+
+export function ownerLabel(owner: JobOwner | null): string {
+  if (!owner) return 'owner unknown'
+  return owner.kind === 'service' ? `${owner.name} (API key)` : owner.name
+}
+
+export default function JobList({ rows, error, loaded, showOwner }: {
+  rows: JobRow[]; error: string; loaded: boolean; showOwner: boolean
+}) {
+  return (
+    <section aria-label="Running and recent jobs" className="bg-white border rounded p-4 mb-6">
+      <h2 className="font-semibold mb-2">Running and recent jobs</h2>
+      {error && <p role="alert" className="text-red-600 text-sm mb-2">{error}</p>}
+      {loaded && !error && rows.length === 0 && (
+        <p className="text-sm text-gray-500">No running or recent jobs.</p>
+      )}
+      {rows.length > 0 && (
+        <ul className="space-y-1">
+          {rows.map(row => (
+            <li key={row.key}>
+              <button type="button" onClick={row.onOpen} aria-current={row.open ? 'true' : undefined}
+                className={`job-row w-full text-left text-sm border rounded px-3 py-2 flex flex-wrap gap-x-3 ${row.open ? 'border-blue-500 bg-blue-50' : 'hover:bg-gray-50'}`}>
+                <span className="font-medium">{row.kind}</span>
+                <span className="flex-1 break-all">{row.target}</span>
+                <span className={row.status === 'completed' ? 'text-green-600' : row.status === 'failed' ? 'text-red-600' : 'text-blue-600'}>{row.status}</span>
+                <span className="text-gray-600">{row.progress}</span>
+                <span className="text-gray-500 text-xs self-center">Started {startedLabel(row.createdAt)}</span>
+                {showOwner && <span className="job-owner text-gray-500 text-xs self-center">{ownerLabel(row.owner)}</span>}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   )
 }
 ```
@@ -16770,11 +17270,17 @@ export default function QAPage() {
 ### ui/src/pages/ImportPage.tsx
 
 ```typescript
-import { useState, useEffect } from 'react'
-import { api, CollectionInfo, JobStatus, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB } from '../api/client'
+import { useState, useEffect, useRef } from 'react'
+import { api, CollectionInfo, IngestJobEntry, JobStatus, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB } from '../api/client'
 import { useRole } from '../context/AuthContext'
 import StrategyExplainer from '../components/StrategyExplainer'
 import ProgressPanel from '../components/ProgressPanel'
+import JobList, { newestToOpen, useJobList } from '../components/JobList'
+
+// Statuses an ingest job never leaves; polling stops at any of them.
+const TERMINAL = ['completed', 'failed', 'partial', 'cancelled']
+const ingestRunning = (j: { status: string }) => !TERMINAL.includes(j.status)
+const loadIngestJobs = () => api.listIngestJobs().then(r => r.jobs)
 
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
 
@@ -16790,6 +17296,12 @@ export default function ImportPage() {
   const [similarityThreshold, setSimilarityThreshold] = useState(0.85)
   const [jobId, setJobId] = useState('')
   const [job, setJob] = useState<JobStatus | null>(null)
+  // The job being polled: the one shown, while it runs (#617).
+  const [pollId, setPollId] = useState('')
+  // Set once the page has opened or started a job itself, so the job list's
+  // first answer no longer opens one (#617).
+  const touched = useRef(false)
+  const jobs = useJobList<IngestJobEntry>(loadIngestJobs, ingestRunning)
   // The status the upload was accepted with, shown with the job ID until the
   // first poll answers, so the page responds at once rather than 3 s later (#394).
   const [queuedStatus, setQueuedStatus] = useState('')
@@ -16830,19 +17342,44 @@ export default function ImportPage() {
   }, [])
 
   useEffect(() => {
-    if (!jobId) return
+    if (!pollId) return
     const interval = setInterval(async () => {
       try {
-        const j = await api.getJobStatus(jobId)
+        const j = await api.getJobStatus(pollId)
         setJob(j)
         setPollError('')
-        if (j.status === 'completed' || j.status === 'failed' || j.status === 'partial') clearInterval(interval)
+        if (!ingestRunning(j)) {
+          clearInterval(interval)
+          jobs.reload()
+        }
       } catch (e: unknown) {
         setPollError(`Could not check the import's progress: ${e instanceof Error ? e.message : String(e)}`)
       }
     }, 3000)
     return () => clearInterval(interval)
-  }, [jobId])
+    // jobs.reload is stable
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pollId])
+
+  // Shows a listed job as a started one is shown, polling it while it runs (#617).
+  function openJob(entry: IngestJobEntry) {
+    touched.current = true
+    setJobId(entry.job_id)
+    setJob(entry)
+    setQueuedStatus('')
+    setPollError('')
+    setPollId(ingestRunning(entry) ? entry.job_id : '')
+  }
+
+  // On the list's first answer, the newest running job, else the newest one,
+  // opens by itself, unless the page has already opened or started one.
+  useEffect(() => {
+    if (!jobs.loaded || touched.current) return
+    touched.current = true
+    const entry = newestToOpen(jobs.entries, ingestRunning)
+    if (entry) openJob(entry)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobs.loaded])
 
   function handleDrop(e: React.DragEvent) {
     e.preventDefault()
@@ -16919,9 +17456,12 @@ export default function ImportPage() {
     form.append('min_chunk_size', String(minChunkSize))
     try {
       const res = await api.uploadFiles(form)
+      touched.current = true
       setJobId(res.job_id)
       setQueuedStatus(res.status)
       setJob(null)
+      setPollId(res.job_id)
+      jobs.reload()
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -17009,6 +17549,15 @@ export default function ImportPage() {
       )}
       {job && <ProgressPanel job={job} />}
       {pollError && <p className="text-red-600 text-sm mt-2">{pollError}</p>}
+
+      <div className="mt-6">
+        <JobList error={jobs.error} loaded={jobs.loaded} showOwner={role === 'engineer'}
+          rows={jobs.entries.map(entry => ({
+            key: entry.job_id, kind: 'Ingest', target: entry.collection ?? '-', status: entry.status,
+            progress: `${entry.files_completed}/${entry.files_total} files`, createdAt: entry.created_at,
+            owner: entry.owner, open: entry.job_id === jobId, onOpen: () => openJob(entry),
+          }))} />
+      </div>
 
       {showNewColModal && (
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
@@ -17373,7 +17922,12 @@ export default function RetrievalPage() {
 
 ```typescript
 import { useState, useEffect, useRef } from 'react'
-import { api, CollectionInfo, Session, GoldPair } from '../api/client'
+import { api, CollectionInfo, GenerationEntry, Session, GoldPair } from '../api/client'
+import { useRole } from '../context/AuthContext'
+import JobList, { newestToOpen, useJobList } from '../components/JobList'
+
+const generating = (s: { status: string }) => s.status === 'generating'
+const loadGenerations = () => api.listGenerations().then(r => r.sessions)
 
 // The API's own default export name (#393): {collection}_{YYYYMMDD_HHMMSS}.json in
 // UTC, spaces in the collection name as '_', other characters outside A-Z, a-z,
@@ -17411,6 +17965,11 @@ function outcomeOf(s: Session): Outcome | null {
 }
 
 export default function GoldStandardPage() {
+  const { role } = useRole()
+  // Running and recent generations (#617); the first answer opens the newest
+  // generating one, else the newest, unless the page already opened one.
+  const generations = useJobList<GenerationEntry>(loadGenerations, generating)
+  const touched = useRef(false)
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   const [collection, setCollection] = useState('')
   const [sampleSize, setSampleSize] = useState(20)
@@ -17466,6 +18025,7 @@ export default function GoldStandardPage() {
         setSession(s)
         if (s.status !== 'generating') {
           clearInterval(pollRef.current!)
+          generations.reload()
         }
       } catch (e: unknown) {
         if (!active || activeSessionRef.current !== sessionId) return
@@ -17480,9 +18040,13 @@ export default function GoldStandardPage() {
     setAllowHistorical(false)
   }, [sessionId, session?.stale, session?.orphaned, session?.stale_at, session?.orphaned_at])
 
-  async function loadSession() {
-    const id = sessionLookup.trim()
+  // Loads the typed session ID, or `chosen` when a listed generation is opened
+  // (#617), which also puts its ID in the field.
+  async function loadSession(chosen?: string) {
+    const id = (chosen ?? sessionLookup).trim()
     if (!id || exportPendingRef.current) return
+    touched.current = true
+    if (chosen !== undefined) setSessionLookup(chosen)
     activeSessionRef.current = ''
     setSessionId(''); setSession(null); setAllowHistorical(false); setFilename(''); setEditingPair(null)
     setError(''); setPollError(''); setSaveResult(''); setLoading(true)
@@ -17505,6 +18069,8 @@ export default function GoldStandardPage() {
     setSaveResult('')
     try {
       const res = await api.generateGoldStandard({ collection, sample_size: sampleSize })
+      touched.current = true
+      generations.reload()
       activeSessionRef.current = res.session_id
       setSessionId(res.session_id)
       setSessionLookup(res.session_id)
@@ -17516,6 +18082,14 @@ export default function GoldStandardPage() {
       setLoading(false)
     }
   }
+
+  useEffect(() => {
+    if (!generations.loaded || touched.current) return
+    touched.current = true
+    const entry = newestToOpen(generations.entries, generating)
+    if (entry) loadSession(entry.session_id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [generations.loaded])
 
   function applyPair(pairId: string, updated: GoldPair) {
     setSession(prev => prev ? { ...prev, pairs: prev.pairs.map(p => p.pair_id === pairId ? updated : p) } : prev)
@@ -17647,10 +18221,17 @@ export default function GoldStandardPage() {
         <label htmlFor="retained-session" className="block text-sm font-semibold mb-2">Inspect a retained session</label>
         <div className="flex gap-3">
           <input id="retained-session" disabled={exportPending} value={sessionLookup} onChange={e => setSessionLookup(e.target.value)} placeholder="Session ID" className="border rounded px-3 py-2 text-sm flex-1" />
-          <button onClick={loadSession} disabled={loading || exportPending || !sessionLookup.trim()} className="border rounded px-3 py-2 text-sm disabled:opacity-50">Load / refresh session</button>
+          <button onClick={() => loadSession()} disabled={loading || exportPending || !sessionLookup.trim()} className="border rounded px-3 py-2 text-sm disabled:opacity-50">Load / refresh session</button>
         </div>
         {session && <p className="text-xs text-gray-500 mt-2">Session {session.session_id} · Collection {session.collection}</p>}
       </div>
+
+      <JobList error={generations.error} loaded={generations.loaded} showOwner={role === 'engineer'}
+        rows={generations.entries.map(entry => ({
+          key: entry.session_id, kind: 'Generation', target: entry.collection, status: entry.status,
+          progress: `${entry.pairs_attempted}/${entry.pairs_total} pairs`, createdAt: entry.created_at,
+          owner: entry.owner, open: entry.session_id === sessionId, onOpen: () => loadSession(entry.session_id),
+        }))} />
 
       {error && <p className="text-red-600 text-sm mb-4">{error}</p>}
       {session && historical && (
@@ -17919,8 +18500,22 @@ export default function CollectionsPage() {
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
-  api, CollectionInfo, ExportJob, ImportJob, PackageSummary, TuneOptions,
+  api, CollectionInfo, ExportJob, ExportJobEntry, ImportJob, ImportJobEntry, PackageSummary, TuneOptions,
 } from '../api/client'
+import { useRole } from '../context/AuthContext'
+import JobList, { JobRow, newestToOpen, useJobList } from '../components/JobList'
+
+// A transfer job is running until it completes or fails (#617).
+const transferRunning = (j: { status: string }) => j.status !== 'completed' && j.status !== 'failed'
+const loadExportJobs = () => api.listExportJobs().then(r => r.jobs)
+const loadImportJobs = () => api.listImportJobs().then(r => r.jobs)
+
+// Newest first by start time, else by finish time, as the API orders each list.
+function newestFirst(a: { created_at: string | null; finished_at: string | null },
+                     b: { created_at: string | null; finished_at: string | null }): number {
+  const at = (j: typeof a) => Date.parse(j.created_at ?? j.finished_at ?? '') || 0
+  return at(b) - at(a)
+}
 
 function sizeLabel(bytes: number | null): string {
   if (bytes === null) return ''
@@ -17957,6 +18552,13 @@ function message(e: unknown): string {
 }
 
 export default function TransferPage() {
+  const { role } = useRole()
+  // Running and recent exports and imports, in one list (#617). Each panel
+  // opens its own newest job on the first answer, unless it already has one.
+  const exportJobs = useJobList<ExportJobEntry>(loadExportJobs, transferRunning)
+  const importJobs = useJobList<ImportJobEntry>(loadImportJobs, transferRunning)
+  const exportTouched = useRef(false)
+  const importTouched = useRef(false)
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   const [collection, setCollection] = useState('')
   const [tune, setTune] = useState<TuneOptions | null>(null)
@@ -18040,6 +18642,7 @@ export default function TransferPage() {
         exportPoll.current = null
         setExportWatching(false)
         loadPackages()
+        exportJobs.reload()
       } else {
         exportTimer.current = window.setTimeout(() => pollExport(jobId), POLL_MS)
       }
@@ -18067,6 +18670,7 @@ export default function TransferPage() {
       }
       importPoll.current = null
       setImportWatching(false)
+      importJobs.reload()
       if (job.status === 'completed') {
         api.getCollections().then(r => setCollections(r.collections)).catch(() => {})
       }
@@ -18083,6 +18687,53 @@ export default function TransferPage() {
     })
   }
 
+  // Opens a listed job in its own panel, as a started one is shown (#617).
+  function openExport(entry: ExportJobEntry) {
+    exportTouched.current = true
+    if (exportTimer.current) window.clearTimeout(exportTimer.current)
+    setExportError(''); setExportPollError('')
+    setExportJob(entry)
+    if (transferRunning(entry)) {
+      exportPoll.current = entry.job_id
+      setExportWatching(true)
+      pollExport(entry.job_id)
+    } else {
+      exportPoll.current = null
+      setExportWatching(false)
+    }
+  }
+
+  function openImport(entry: ImportJobEntry) {
+    importTouched.current = true
+    if (importTimer.current) window.clearTimeout(importTimer.current)
+    setImportError(''); setImportPollError('')
+    setImportJob(entry)
+    if (transferRunning(entry)) {
+      importPoll.current = entry.job_id
+      setImportWatching(true)
+      pollImport(entry.job_id)
+    } else {
+      importPoll.current = null
+      setImportWatching(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!exportJobs.loaded || exportTouched.current) return
+    exportTouched.current = true
+    const entry = newestToOpen(exportJobs.entries, transferRunning)
+    if (entry) openExport(entry)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [exportJobs.loaded])
+
+  useEffect(() => {
+    if (!importJobs.loaded || importTouched.current) return
+    importTouched.current = true
+    const entry = newestToOpen(importJobs.entries, transferRunning)
+    if (entry) openImport(entry)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [importJobs.loaded])
+
   async function startExport() {
     setExportError(''); setExportPollError(''); setExportJob(null)
     try {
@@ -18091,6 +18742,9 @@ export default function TransferPage() {
         : { collection, include_models: includeModels })
       setPassphrase(''); setConfirmPassphrase('')
       if (!alive.current) return
+      exportTouched.current = true
+      exportJobs.reload()
+      if (exportTimer.current) window.clearTimeout(exportTimer.current)
       exportPoll.current = r.job_id
       setExportWatching(true)
       pollExport(r.job_id)
@@ -18107,6 +18761,9 @@ export default function TransferPage() {
         : { filename, on_conflict: onConflict })
       setImportPassphrase('')
       if (!alive.current) return
+      importTouched.current = true
+      importJobs.reload()
+      if (importTimer.current) window.clearTimeout(importTimer.current)
       importPoll.current = r.job_id
       setImportWatching(true)
       pollImport(r.job_id)
@@ -18127,6 +18784,19 @@ export default function TransferPage() {
     : ''
   const selectedEncrypted = packages.some(p => p.filename === filename && p.encrypted)
 
+  const jobRows: (JobRow & { sort: { created_at: string | null; finished_at: string | null } })[] = [
+    ...exportJobs.entries.map(entry => ({
+      key: 'export:' + entry.job_id, kind: 'Export', target: entry.collection, status: entry.status,
+      progress: `${entry.chunks_written} chunks`, createdAt: entry.created_at, owner: entry.owner,
+      open: exportJob?.job_id === entry.job_id, onOpen: () => openExport(entry), sort: entry,
+    })),
+    ...importJobs.entries.map(entry => ({
+      key: 'import:' + entry.job_id, kind: 'Import', target: entry.filename, status: entry.status,
+      progress: `${entry.chunks_written} chunks`, createdAt: entry.created_at, owner: entry.owner,
+      open: importJob?.job_id === entry.job_id, onOpen: () => openImport(entry), sort: entry,
+    })),
+  ].sort((a, b) => newestFirst(a.sort, b.sort))
+
   return (
     <div className="max-w-3xl mx-auto">
       <div className="flex items-baseline justify-between mb-2">
@@ -18138,6 +18808,10 @@ export default function TransferPage() {
       <p className="text-sm text-gray-500 mb-6">
         Packages are written to and read from <code>./exports</code> in the project directory.
       </p>
+
+      <JobList rows={jobRows} showOwner={role === 'engineer'}
+        loaded={exportJobs.loaded && importJobs.loaded}
+        error={[exportJobs.error, importJobs.error].filter(Boolean).join(' ')} />
 
       {/* ── Export ─────────────────────────────────────────────────────── */}
       <section className="bg-white border rounded p-4 mb-6">
@@ -19666,6 +20340,23 @@ job's three counts agree.
 `browser/ui_criteria.js` (suite 06) stubs job responses to check the Import page's
 "Submitted N · accepted N · stored N" line appears only when the counts differ, and an upload
 answered `409 COLLECTION_DELETING` to check its message is shown.
+
+`scripts/tests/test_job_lists.py` (#617, API image, no network) checks the running and recent job
+lists: new records get `created_at`, `finished_at` on their first terminal status or when marked
+interrupted, and ingest records `collection`, `files` and `owner`; who sees which job (a Developer
+its own, a key its principal's, an Engineer everyone's including owner-less records); running jobs
+always listed, finished ones from the last 24 hours, the newest 20; a pre-#617 record's last-saved
+time standing in for `finished_at`; the order; sessions (generating, finished, without
+`finished_at`, imported); the routes, their role, a malformed record left out, the lookups by ID
+unchanged, the owner each start route hands its service; and no session `owner` or times in a
+package or after an import. `02_ingest.sh` runs it, then `job_lists.py --operator` on the verify
+project: the harness Developer and a throwaway `vfy-s-*` Developer-role key each ingest a file into
+a throwaway `VfyJobs*` collection and see only their own job, with owner, collection, files and
+times; the Engineer sees both; the Developer's export and import are listed for it and the
+Engineer, not the key. `browser/ui_criteria.js` (suite 06) checks the pages' Running and recent
+jobs lists: a real ingest found again after leaving the Import page, then stubbed lists for a
+running ingest, generation and export that open by themselves, survive leaving the page and show
+their result, row switching, one job per Transfer panel, and the Engineer's owner column.
 
 `scripts/tests/test_jobstore.py` (#23) checks the job store that keeps ingest, export, import
 and tune job records across an API restart: an unbound store (no lifespan) is a plain dict
@@ -22035,19 +22726,23 @@ MATRIX = (
     ("POST", "/collections", {}, "developer"),
     ("POST", "/ingest/upload", {}, "developer"),
     ("GET", "/ingest/job/vfy-no-such-job", None, "developer"),
+    ("GET", "/ingest/jobs", None, "developer"),            # the caller's jobs (#617)
     ("GET", "/ingest/config/" + X, None, "developer"),
     ("POST", "/ingest/config", {}, "developer"),
     ("POST", "/retrieval/config", {}, "developer"),
     ("POST", "/goldstandard/generate", {}, "developer"),
     ("GET", "/goldstandard/session/gs_vfynosuch", None, "developer"),
+    ("GET", "/goldstandard/sessions", None, "developer"),
     ("PATCH", "/goldstandard/session/gs_vfynosuch/pair/p", {}, "developer"),
     ("POST", "/goldstandard/regenerate", {}, "developer"),
     ("POST", "/goldstandard/save", {}, "developer"),
     ("GET", "/goldstandard/download/vfy_no_such.json", None, "developer"),
     ("POST", "/export", {}, "developer"),
     ("GET", "/export/job/vfy-no-such-job", None, "developer"),
+    ("GET", "/export/jobs", None, "developer"),
     ("POST", "/import", {}, "developer"),
     ("GET", "/import/job/vfy-no-such-job", None, "developer"),
+    ("GET", "/import/jobs", None, "developer"),
     ("GET", "/packages", None, "developer"),
     ("GET", "/help/transfer", None, "developer"),
     ("GET", "/tune/" + X, None, "developer"),
@@ -23250,6 +23945,168 @@ if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
 ```
 
+### scripts/verify/job_lists.py
+
+The job lists on the verify project (#617), run by `02_ingest.sh` with `--operator`.
+
+```python
+"""Running and recent job lists on the verify project (#617). Host-side,
+standard library, Python 3.9+. Run by 02_ingest.sh:
+
+    python3 job_lists.py --operator
+
+Exit 0 when every check holds, 1 when one doesn't (the reason on stderr).
+The harness Developer and a throwaway vfy-s-<random> Developer-role service
+principal each ingest a small file into a throwaway VfyJobs<random>
+collection; the Developer then exports it and imports the package under a new
+name. GET /ingest/jobs, /export/jobs and /import/jobs must show each caller
+only its own jobs, and the harness Engineer everyone's with their owners.
+Needs --operator (02_ingest.sh passes it only on the verify project as
+stack.sh sets it up). The key is held in memory only and never printed.
+"""
+import json
+import os
+import secrets
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+import auth_setup
+from auth_setup import request
+from auth_stack import CheckFailed, bearer, code, error_code, expect, new_principal, role_token
+
+TERMINAL = ("completed", "failed", "partial", "cancelled")
+DEVELOPER = auth_setup.ROLES["developer"]
+
+
+def upload(collection, name, content, token=None, headers=None):
+    """POST /ingest/upload of one text file, with a session or a key's headers."""
+    boundary = "vfy" + secrets.token_hex(8)
+    body = ('--{b}\r\nContent-Disposition: form-data; name="collection"\r\n\r\n{c}\r\n'
+            '--{b}\r\nContent-Disposition: form-data; name="files"; filename="{n}"\r\n'
+            'Content-Type: text/plain\r\n\r\n').format(b=boundary, c=collection, n=name).encode()
+    body += content + "\r\n--{}--\r\n".format(boundary).encode()
+    sent = dict(headers) if headers else {"Origin": auth_setup.origin(), "Cookie": "rag_session=" + token}
+    sent["Content-Type"] = "multipart/form-data; boundary=" + boundary
+    req = urllib.request.Request(auth_setup.api_base() + "/ingest/upload", data=body, method="POST", headers=sent)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        return error.code, error.read()
+
+
+def get(path, token=None, headers=None):
+    status, raw, _ = code("GET", path, token=token, headers=headers)
+    expect(status == 200, "GET {} answered {} {}".format(path, status, error_code(raw)))
+    return json.loads(raw)
+
+
+def wait_job(path, token=None, headers=None, timeout=900):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        job = get(path, token, headers)
+        if job["status"] in TERMINAL:
+            return job
+        time.sleep(1)
+    raise CheckFailed("{} didn't end within {}s".format(path, timeout))
+
+
+def listed(path, token=None, headers=None):
+    """The entries of a job list, by job ID."""
+    return {job["job_id"]: job for job in get(path, token, headers)["jobs"]}
+
+
+def main(argv):
+    if "--operator" not in argv:
+        print("creates a collection and a service principal, so it runs only on the verify project",
+              file=sys.stderr)
+        return 1
+    dev = role_token("developer")
+    admin = role_token("engineer")
+    name = "VfyJobs" + secrets.token_hex(4)
+    imported = package = principal = None
+    try:
+        principal, _, key = new_principal(admin, "developer")
+        as_key = bearer(key)
+        status, raw, _ = code("POST", "/collections", {"name": name}, token=dev)
+        expect(status == 201, "creating {} answered {} {}".format(name, status, error_code(raw)))
+        name = json.loads(raw)["name"]
+
+        status, mine = upload(name, "vfy-jobs-dev.txt", b"A note the Developer imports.\n" * 20, token=dev)
+        expect(status == 202, "the Developer's upload answered {} {}".format(status, mine))
+        status, keys = upload(name, "vfy-jobs-key.txt", b"A note the key imports.\n" * 20, headers=as_key)
+        expect(status == 202, "the key's upload answered {} {}".format(status, keys))
+        dev_id, key_id = mine["job_id"], keys["job_id"]
+
+        # While they run, or once they have ended: each sees its own job only.
+        seen = listed("/ingest/jobs", token=dev)
+        expect(dev_id in seen and key_id not in seen, "the Developer's list holds {}".format(sorted(seen)))
+        entry = seen[dev_id]
+        expect(entry["owner"] == {"name": DEVELOPER, "kind": "user"}, "the owner is {}".format(entry["owner"]))
+        expect(entry["collection"] == name and entry["files"] == ["vfy-jobs-dev.txt"],
+               "the entry names {} {}".format(entry["collection"], entry["files"]))
+        expect(entry["created_at"], "the entry has no created_at")
+        seen = listed("/ingest/jobs", headers=as_key)
+        expect(key_id in seen and dev_id not in seen, "the key's list holds {}".format(sorted(seen)))
+        expect(seen[key_id]["owner"] == {"name": principal, "kind": "service"},
+               "the key's job owner is {}".format(seen[key_id]["owner"]))
+
+        for job_id, who in ((dev_id, {"token": dev}), (key_id, {"headers": as_key})):
+            job = wait_job("/ingest/job/" + job_id, **who)
+            expect(job["status"] == "completed", "ingest {} ended {}".format(job_id, job["status"]))
+            expect("owner" not in job and "created_at" not in job, "the lookup by ID gained the new fields")
+        seen = listed("/ingest/jobs", token=dev)
+        expect(seen.get(dev_id, {}).get("finished_at"), "the finished job has no finished_at in the list")
+        everyone = listed("/ingest/jobs", token=admin)
+        expect(dev_id in everyone and key_id in everyone, "the Engineer's list lacks a job")
+        expect(everyone[key_id]["owner"] == {"name": principal, "kind": "service"},
+               "the Engineer sees the key's job owned by {}".format(everyone[key_id]["owner"]))
+
+        status, raw, _ = code("POST", "/export", {"collection": name}, token=dev)
+        expect(status == 202, "the export answered {} {}".format(status, error_code(raw)))
+        export_id = json.loads(raw)["job_id"]
+        expect(export_id in listed("/export/jobs", token=dev), "the running or ended export isn't listed")
+        export = wait_job("/export/job/" + export_id, token=dev)
+        package = export.get("filename")
+        expect(export["status"] == "completed", "the export ended {}".format(export["status"]))
+        status, raw, _ = code("POST", "/import", {"filename": package, "on_conflict": "rename"}, token=dev)
+        expect(status == 202, "the import answered {} {}".format(status, error_code(raw)))
+        import_id = json.loads(raw)["job_id"]
+        job = wait_job("/import/job/" + import_id, token=dev)
+        imported = job.get("collection")
+        expect(job["status"] == "completed", "the import ended {} {}".format(job["status"], job.get("error")))
+
+        for path, job_id in (("/export/jobs", export_id), ("/import/jobs", import_id)):
+            seen = listed(path, token=dev)
+            expect(job_id in seen and seen[job_id]["owner"] == {"name": DEVELOPER, "kind": "user"}
+                   and seen[job_id]["created_at"] and seen[job_id]["finished_at"],
+                   "{} for the Developer: {}".format(path, seen.get(job_id)))
+            expect(job_id in listed(path, token=admin), "{} for the Engineer lacks {}".format(path, job_id))
+            expect(job_id not in listed(path, headers=as_key), "{} for the key holds {}".format(path, job_id))
+        return 0
+    except CheckFailed as failure:
+        print(str(failure), file=sys.stderr)
+        return 1
+    finally:
+        for collection in (name, imported):
+            if collection:
+                code("DELETE", "/collections/{}?confirm=true".format(collection), token=admin)
+        if package:
+            exports = Path(os.environ.get("RAG_EXPORTS_DIR") or auth_setup.REPO / "exports")
+            (exports / package).unlink(missing_ok=True)
+        if principal:
+            code("POST", "/auth/service-principals/{}/disable".format(principal), token=admin)
+        request("POST", "/auth/logout", token=dev)
+        request("POST", "/auth/logout", token=admin)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+```
+
 ### scripts/verify/18_lan.sh
 
 ```bash
@@ -24445,7 +25302,7 @@ class PolicyTests(unittest.TestCase):
         counts = {}
         for access in policy.ACCESS.values():
             counts[access] = counts.get(access, 0) + 1
-        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 19, "engineer": 26})
+        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 23, "engineer": 26})
         self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
         self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
         self.assertEqual(policy.ACCESS[("POST", "/collections")], "developer")
@@ -25699,13 +26556,14 @@ X = "VfyAuthNoSuch"
 PROTECTED = (
     ("GET", "/collections"), ("POST", "/collections"), ("DELETE", f"/collections/{X}?confirm=true"),
     ("POST", "/query"), ("GET", f"/retrieval/config/{X}"), ("POST", "/retrieval/config"),
-    ("POST", "/ingest/upload"), ("GET", "/ingest/job/nope"), ("GET", f"/ingest/config/{X}"),
+    ("POST", "/ingest/upload"), ("GET", "/ingest/job/nope"), ("GET", "/ingest/jobs"), ("GET", f"/ingest/config/{X}"),
     ("POST", "/ingest/config"),
-    ("POST", "/goldstandard/generate"), ("GET", "/goldstandard/session/gs_nope"),
+    ("POST", "/goldstandard/generate"), ("GET", "/goldstandard/session/gs_nope"), ("GET", "/goldstandard/sessions"),
     ("PATCH", "/goldstandard/session/gs_nope/pair/p"), ("POST", "/goldstandard/regenerate"),
     ("POST", "/goldstandard/save"), ("GET", "/goldstandard/download/nope.json"),
     ("GET", "/goldstandard/diagnostics"),
-    ("POST", "/export"), ("GET", "/export/job/nope"), ("POST", "/import"), ("GET", "/import/job/nope"),
+    ("POST", "/export"), ("GET", "/export/job/nope"), ("GET", "/export/jobs"), ("POST", "/import"),
+    ("GET", "/import/job/nope"), ("GET", "/import/jobs"),
     ("GET", "/packages"), ("GET", "/help/transfer"),
     ("POST", "/tune/rechunk"), ("POST", "/tune/reembed"), ("POST", "/tune/reindex"),
     ("GET", "/tune/job/nope"), ("GET", f"/tune/{X}"),
@@ -28219,6 +29077,22 @@ check_eq "the deleted collection is still gone 10 s later" "$(object_count "$DC"
 # writes, startup marking of interrupted jobs, corrupt files and retention.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_jobstore.py)
 check "job store: persistence, throttling, startup marking and retention" $?
+
+# ── running and recent jobs (#617) ───────────────────────────────────────────
+# Units in the API image with no network: owners and timestamps recorded, who
+# sees what, the 24-hour window and the cap, sessions, packages. Then the lists
+# on the stack: a Developer's and a Developer-role key's ingests, the
+# Developer's export and import, each listed for its owner and the Engineer
+# only. The stack check creates a principal, so it runs only on the verify project.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_job_lists.py)
+check "job lists: owners and timestamps, visibility, window, cap, sessions, packages" $?
+if [ -z "$(volume_removal_refusal_reason)" ]; then
+  _rag_require_lock_owner
+  python3 ./job_lists.py --operator
+  check "GET /ingest/jobs, /export/jobs, /import/jobs list each caller's own jobs, and everyone's for the Engineer" $?
+else
+  skip "job lists on the stack: not the verify project"
+fi
 # A killed job's leftovers (#377): ingest staging in UPLOAD_DIR, and an export's
 # `.build-*` directory and `.*.tar.gz.partial` archive in EXPORTS_DIR.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_startup_sweep.py)
@@ -33616,6 +34490,236 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     }
     r.check('no console errors on the help page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
     await s.ctx.close();
+  }
+
+  // ── running and recent jobs (#617) ────────────────────────────────────────
+  // Each page lists the caller's running and recent jobs, read from the API when
+  // the page opens, and opens the newest by itself; leaving the page and coming
+  // back finds the job again. The first check uses the real API; the rest stub
+  // the lists and lookups so states and timing are fixed.
+  r.section('running and recent jobs (#617)');
+  {
+    const fs = require('fs');
+    const crypto = require('crypto');
+    const json = body => ({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+    const now = Date.now();
+    const at = secondsAgo => new Date(now - secondsAgo * 1000).toISOString();
+    const opened = page => page.evaluate(() =>
+      [...document.querySelectorAll('section[aria-label="Running and recent jobs"] button[aria-current="true"]')]
+        .map(b => b.innerText.replace(/\s+/g, ' ').trim()));
+    const rows = page => page.evaluate(() =>
+      [...document.querySelectorAll('section[aria-label="Running and recent jobs"] li button')]
+        .map(b => b.innerText.replace(/\s+/g, ' ').trim()));
+    const clickRow = (page, text) => page.evaluate(t => {
+      const b = [...document.querySelectorAll('section[aria-label="Running and recent jobs"] li button')]
+        .find(x => x.innerText.includes(t));
+      if (!b) return false; b.click(); return true;
+    }, text);
+    const leaveAndReturn = async (page, path) => {
+      await page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(500);
+      await page.goto(BASE + path, { waitUntil: 'networkidle2' }); await sleep(1500);
+    };
+
+    // Import, real API: start an ingest, leave at once, come back.
+    {
+      const small = '/tmp/vfy-jobs-617.txt';
+      fs.writeFileSync(small, 'A note for the running and recent jobs check.\n'.repeat(20));
+      const s = await session(browser, BASE, 'developer');
+      try {
+        const name = await s.page.evaluate(async n => {
+          const res = await fetch('/api/collections', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: n, index_type: 'hnsw', distance_metric: 'cosine' }) });
+          return res.ok ? (await res.json()).name : null;
+        }, 'VfyUiJobs' + crypto.randomBytes(3).toString('hex'));
+        await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+        await setValue(s.page, `() => [...document.querySelectorAll('select')].find(x => [...x.options].some(o => o.value === ${JSON.stringify(name)}))`, name);
+        const input = await s.page.$('#file-input');
+        await input.uploadFile(small);
+        await sleep(300);
+        const clicked = await clickByText(s.page, 'Start Ingest');
+        await s.page.waitForFunction(() => /Job ID: \S+/.test(document.body.innerText), { timeout: 15000 }).catch(() => {});
+        const jobId = ((await bodyText(s.page)).match(/Job ID: (\S+)/) || [])[1];
+        await leaveAndReturn(s.page, '/import');
+        const back = await bodyText(s.page);
+        const open = await opened(s.page);
+        r.check('Import: an ingest started, the page left and opened again, is listed and opened by itself',
+          !!name && clicked && !!jobId && back.includes('Job ID: ' + jobId) && open.length === 1 && open[0].includes(name)
+            && open[0].startsWith('Ingest'),
+          `name=${name} clicked=${clicked} job=${jobId} open=${JSON.stringify(open)} text: ${back.slice(0, 200)}`);
+        await s.page.waitForFunction(() => /Files: 1\/1/.test(document.body.innerText) &&
+          [...document.querySelectorAll('span')].some(x => x.textContent.trim() === 'completed'), { timeout: 180000 }).catch(() => {});
+        const done = await bodyText(s.page);
+        r.check('Import: the job found again shows its result once it has finished',
+          done.includes('Job ID: ' + jobId) && done.includes('Files: 1/1') && /completed/.test(done), done.slice(0, 300));
+        r.check('Import: nothing about jobs is kept in browser storage',
+          await s.page.evaluate(() => sessionStorage.length === 0 && localStorage.length === 0));
+      } finally { await s.ctx.close(); fs.unlinkSync(small); }
+    }
+
+    // Import, stubbed: a running job and a finished one; the running one opens,
+    // survives leaving the page, then ends; clicking the other switches.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        let finished = false;
+        const job = (id, status, done) => ({ job_id: id, status, files_total: 2, files_completed: done, files_failed: 0,
+          chunks_stored: done * 3, errors: [], skipped: [] });
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (path === '/api/ingest/jobs') return request.respond(json({ jobs: [
+            { ...job('vfy617a', finished ? 'completed' : 'running', finished ? 2 : 1), collection: 'StubRunning617', files: ['a.txt', 'b.txt'],
+              owner: { name: 'vfy-developer', kind: 'user' }, created_at: at(60), finished_at: finished ? at(1) : null },
+            { ...job('vfy617b', 'completed', 2), collection: 'StubFinished617', files: ['c.txt'],
+              owner: { name: 'vfy-developer', kind: 'user' }, created_at: at(3600), finished_at: at(3500) }] }));
+          if (path === '/api/ingest/job/vfy617a') return request.respond(json(job('vfy617a', finished ? 'completed' : 'running', finished ? 2 : 1)));
+          if (path === '/api/ingest/job/vfy617b') return request.respond(json(job('vfy617b', 'completed', 2)));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+        const listed = await rows(s.page);
+        r.check('Import: the list shows kind, collection, status, progress and start time for each job',
+          listed.length === 2 && /^Ingest StubRunning617 running 1\/2 files Started /.test(listed[0])
+            && /^Ingest StubFinished617 completed 2\/2 files Started /.test(listed[1]), JSON.stringify(listed));
+        r.check('Import: the newest running job opens by itself',
+          (await opened(s.page)).join() .includes('StubRunning617') && (await bodyText(s.page)).includes('Job ID: vfy617a'));
+        r.check('Import: a Developer sees no owner column',
+          await s.page.evaluate(() => document.querySelectorAll('.job-owner').length === 0));
+        await leaveAndReturn(s.page, '/import');
+        r.check('Import: after leaving and coming back the running job is open again',
+          (await bodyText(s.page)).includes('Job ID: vfy617a') && (await opened(s.page)).join().includes('StubRunning617'));
+        finished = true;
+        await sleep(4000);
+        const ended = await bodyText(s.page);
+        r.check('Import: its result shows once it has finished', ended.includes('Files: 2/2') && ended.includes('Job ID: vfy617a'), ended.slice(0, 300));
+        const clicked = await clickRow(s.page, 'StubFinished617');
+        await sleep(300);
+        r.check('Import: clicking another row switches to that job',
+          clicked && (await bodyText(s.page)).includes('Job ID: vfy617b') && (await opened(s.page)).join().includes('StubFinished617'));
+        r.check('Import list fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // Gold Standard, stubbed: a generating session opens, survives leaving the
+    // page, then completes; clicking another row loads it.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        let finished = false;
+        const pair = n => ({ pair_id: 'p' + n, question: `Stub question ${n}?`, answer: 'Inert', contexts: ['Inert'],
+          ground_truth: 'Inert', source_file: 'inert.txt', chunk_index: n, status: 'pending' });
+        const G1 = 'gs_617a0001', G2 = 'gs_617a0002';
+        const one = () => ({ session_id: G1, collection: 'StubGenerating617', status: finished ? 'completed' : 'generating',
+          pairs_total: 2, pairs_attempted: finished ? 2 : 1, pairs_completed: finished ? 2 : 1, pairs_failed: 0, errors: [],
+          pairs: finished ? [pair(1), pair(2)] : [pair(1)] });
+        const two = { session_id: G2, collection: 'StubGenerated617', status: 'completed', pairs_total: 1, pairs_attempted: 1,
+          pairs_completed: 1, pairs_failed: 0, errors: [], pairs: [pair(3)] };
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          const listed = ({ pairs, ...rest }) => ({ ...rest, owner: { name: 'vfy-developer', kind: 'user' } });
+          if (path === '/api/goldstandard/sessions') return request.respond(json({ sessions: [
+            { ...listed(one()), created_at: at(60), finished_at: finished ? at(1) : null },
+            { ...listed(two), created_at: at(7200), finished_at: at(7000) }] }));
+          if (path === '/api/goldstandard/session/' + G1) return request.respond(json(one()));
+          if (path === '/api/goldstandard/session/' + G2) return request.respond(json(two));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/goldstandard', { waitUntil: 'networkidle2' }); await sleep(1500);
+        const first = await bodyText(s.page);
+        r.check('Gold Standard: the generating session is listed and opens by itself',
+          first.includes('Generating… 1/2 pairs') && first.includes('Session ' + G1) && (await opened(s.page)).join().includes('StubGenerating617')
+            && (await rows(s.page)).length === 2, first.slice(0, 300));
+        await leaveAndReturn(s.page, '/goldstandard');
+        r.check('Gold Standard: after leaving and coming back the generation is open again',
+          (await bodyText(s.page)).includes('Generating… 1/2 pairs'));
+        finished = true;
+        await sleep(3000);
+        const ended = await bodyText(s.page);
+        r.check('Gold Standard: its outcome shows once the generation has finished',
+          ended.includes('Generation completed: 2 of 2 pairs generated.') && ended.includes('Stub question 2?'), ended.slice(0, 300));
+        const clicked = await clickRow(s.page, 'StubGenerated617');
+        await sleep(800);
+        const other = await bodyText(s.page);
+        r.check('Gold Standard: clicking another row loads that session',
+          clicked && other.includes('Session ' + G2) && other.includes('Stub question 3?')
+            && await s.page.evaluate(id => document.getElementById('retained-session').value === id, G2), other.slice(0, 300));
+        r.check('Gold Standard list fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // Transfer, stubbed: one list for both kinds; each panel opens its own
+    // newest job; a running export survives leaving the page, then ends.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        let finished = false;
+        const exportJob = (id, done) => ({ job_id: id, status: done ? 'completed' : 'running', collection: 'StubExport617',
+          chunks_written: done ? 9 : 5, filename: done ? `ragpkg-${id}.tar.gz` : null, size_bytes: done ? 2048 : null,
+          source_document_count: done ? 1 : null, fidelity: done ? 'with-sources' : null, models_bundled: done ? false : null,
+          retrieve_script: done ? true : null, warnings: [], error: null, error_code: null, error_detail: null });
+        const importJob = { job_id: 'vfy617i', status: 'completed', filename: 'ragpkg-stub617.tar.gz', on_conflict: 'rename',
+          collection: 'StubImported617', original_collection: 'StubImported617', chunks_written: 4, fidelity: 'with-sources',
+          renamed: false, notes: [], restored_sessions: [], error: null, error_code: null, error_detail: null };
+        const mine = { name: 'vfy-developer', kind: 'user' };
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (path === '/api/export/jobs') return request.respond(json({ jobs: [
+            { ...exportJob('vfy617e', finished), owner: mine, created_at: at(30), finished_at: finished ? at(1) : null },
+            { ...exportJob('vfy617d', true), owner: mine, created_at: at(9000), finished_at: at(8900) }] }));
+          if (path === '/api/import/jobs') return request.respond(json({ jobs: [
+            { ...importJob, owner: mine, created_at: at(600), finished_at: at(500) }] }));
+          if (path === '/api/export/job/vfy617e') return request.respond(json(exportJob('vfy617e', finished)));
+          if (path === '/api/import/job/vfy617i') return request.respond(json(importJob));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' }); await sleep(1500);
+        const listed = await rows(s.page);
+        const text = await bodyText(s.page);
+        r.check('Transfer: one list holds exports and imports, newest first, with their kind',
+          listed.length === 3 && listed[0].startsWith('Export StubExport617 running') && listed[1].startsWith('Import ragpkg-stub617.tar.gz completed')
+            && listed[2].startsWith('Export StubExport617 completed'), JSON.stringify(listed));
+        r.check('Transfer: the newest export opens in the export panel and the newest import in the import panel',
+          text.includes('Writing… 5 chunks so far.') && text.includes('Imported as StubImported617') && (await opened(s.page)).length === 2,
+          text.slice(0, 400));
+        await leaveAndReturn(s.page, '/transfer');
+        r.check('Transfer: after leaving and coming back the running export is open again',
+          (await bodyText(s.page)).includes('Writing… 5 chunks so far.'));
+        finished = true;
+        await sleep(3000);
+        const ended = await bodyText(s.page);
+        r.check('Transfer: the export\'s result shows once it has finished',
+          ended.includes('ragpkg-vfy617e.tar.gz') && ended.includes('Imported as StubImported617'), ended.slice(0, 400));
+        const clicked = await clickRow(s.page, 'StubExport617 completed 9 chunks');
+        await sleep(300);
+        r.check('Transfer: clicking an export row opens it in the export panel, leaving the import panel as it was',
+          clicked && (await bodyText(s.page)).includes('ragpkg-vfy617d.tar.gz') && (await bodyText(s.page)).includes('Imported as StubImported617'));
+        r.check('Transfer list fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // An Engineer sees the owner of each job: a user, an API key, or unknown.
+    {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const job = (id, owner) => ({ job_id: id, status: 'completed', files_total: 1, files_completed: 1, files_failed: 0,
+          chunks_stored: 1, errors: [], skipped: [], collection: 'StubOwners617', files: ['a.txt'], owner,
+          created_at: at(Number(id.slice(-1)) * 10), finished_at: at(1) });
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          if (new URL(request.url()).pathname === '/api/ingest/jobs') return request.respond(json({ jobs: [
+            job('own1', { name: 'vfy-developer', kind: 'user' }), job('own2', { name: 'vfy-s-svc', kind: 'service' }), job('own3', null)] }));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+        const owners = await s.page.evaluate(() => [...document.querySelectorAll('.job-owner')].map(x => x.textContent.trim()));
+        r.check('Import as an Engineer: each row shows its owner, an API key\'s marked, an unknown one as "owner unknown"',
+          JSON.stringify(owners) === JSON.stringify(['vfy-developer', 'vfy-s-svc (API key)', 'owner unknown']), JSON.stringify(owners));
+        r.check('nothing about jobs is kept in browser storage after the list checks',
+          await s.page.evaluate(() => sessionStorage.length === 0 && localStorage.length === 0));
+      } finally { await s.ctx.close(); }
+    }
   }
 
   // ── nginx's login rate limit on the login page (#577) ─────────────────────
@@ -42024,7 +43128,7 @@ ENUMS = {
 SPAN_NAMES = frozenset("rag." + v for v in ENUMS["rag.operation"])
 
 # Explicit code-owned vocabulary. Raw URL/path values never enter this schema.
-ROUTES = frozenset(('DELETE /collections/{name}', 'GET /audit', 'GET /audit.csv', 'GET /auth/me', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /export/job/{job_id}', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /metrics/latency', 'GET /packages', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/logout', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
+ROUTES = frozenset(('DELETE /collections/{name}', 'GET /audit', 'GET /audit.csv', 'GET /auth/me', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /export/job/{job_id}', 'GET /export/jobs', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /goldstandard/sessions', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /import/jobs', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /ingest/jobs', 'GET /metrics/latency', 'GET /packages', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/logout', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
 ENUMS.update({"http.route": ROUTES | {"unmatched"},
               "rag.tuning_operation": frozenset(("rechunk", "reembed", "reindex")),
               "http.status_class": frozenset(("1xx", "2xx", "3xx", "4xx", "5xx"))})
@@ -47239,11 +48343,13 @@ Disposable directories only; nothing reaches a backend. The lifespan case runs
 in a child process, so the module stores of this process stay unbound.
 """
 import asyncio
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -47253,7 +48359,7 @@ API_DIR = os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().par
 sys.path.insert(0, API_DIR)
 
 from config import settings
-from services import ingest_pipeline, jobstore
+from services import collection_writes, exporter, importer, ingest_pipeline, jobstore, tuning
 
 INGEST_MESSAGE = ("Interrupted: the API restarted while this job was running. "
                   "Re-upload the files to try again.")
@@ -47325,9 +48431,10 @@ class BoundTests(StoreTestCase):
         store["0c5fd445"] = doc
         job = store["0c5fd445"]
         self.assertIsNot(job, doc)
-        self.assertEqual(job, doc)
+        # The store adds the time it was created (#617), nothing else.
+        self.assertEqual(job, {**doc, "created_at": job["created_at"]})
         path = self.root / "jobs" / "export" / "0c5fd445.json"
-        self.assertEqual(json.loads(path.read_text()), doc)
+        self.assertEqual(json.loads(path.read_text()), {**doc, "created_at": job["created_at"]})
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_status_changes_and_changes_after_a_terminal_status_are_written_at_once(self):
@@ -47496,11 +48603,12 @@ sys.path.insert(0, sys.argv[2])
 from config import settings
 settings.upload_dir = sys.argv[1]
 from main import app, lifespan
-from services import exporter, importer, weaviate_client as wc
+from services import exporter, importer, packager, weaviate_client as wc
 async def run():
     with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), \\
          patch.object(importer, 'sweep_interrupted_imports', return_value=[]), \\
          patch.object(importer, 'sweep_stale_workdirs', return_value=[]), \\
+         patch.object(packager, 'sweep_build_leftovers', return_value=[]), \\
          patch.object(wc, 'close_client'):
         async with lifespan(app):
             print(json.dumps(exporter.get_job('abcd1234')))
@@ -47512,6 +48620,598 @@ asyncio.run(run())
         job = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertEqual((job["status"], job["error_code"]), ("failed", "INTERRUPTED"))
         self.assertIn("Marked 1 job(s) interrupted by the restart: export abcd1234", result.stderr)
+
+
+class PruneTests(StoreTestCase):
+    """Retention while the API runs (#309)."""
+
+    def setUp(self):
+        super().setUp()
+        change = patch.object(jobstore, "RETENTION", 3)
+        change.start()
+        self.addCleanup(change.stop)
+
+    def path(self, kind, job_id):
+        return self.root / "jobs" / kind / f"{job_id}.json"
+
+    def add(self, store, job_id, status, saved=None):
+        store[job_id] = {"job_id": job_id, "status": status}
+        if saved is not None:
+            store[job_id]._saved = saved
+        return store[job_id]
+
+    def test_the_finished_records_saved_longest_ago_go_from_memory_and_disk(self):
+        store = self.bound()
+        for n, job_id in enumerate(("r2", "r1", "r3")):
+            self.add(store, job_id, "completed", saved=[200.0, 100.0, 300.0][n])
+        with self.assertLogs("services.jobstore", "INFO") as logs:
+            self.add(store, "r4", "queued")
+        self.assertEqual(set(store), {"r2", "r3", "r4"})
+        self.assertFalse(self.path("export", "r1").exists())
+        self.assertTrue(all(self.path("export", i).exists() for i in ("r2", "r3", "r4")))
+        self.assertTrue(any("Removed old export job record r1" in line for line in logs.output))
+        self.assertIsNone(store.get("r1"))                    # the endpoint's 404
+
+    def test_queued_and_running_records_are_never_removed(self):
+        store = self.bound("import")
+        self.add(store, "a1", "running", saved=1.0)
+        self.add(store, "a2", "queued", saved=2.0)
+        self.add(store, "a3", "running", saved=3.0)
+        self.add(store, "a4", "queued")
+        self.add(store, "a5", "failed")                       # the record just stored stays
+        self.assertEqual(len(store), 5)
+        store["a1"]["status"] = "completed"
+        store["a1"]._saved = 1.0
+        store["a5"]._saved = 5.0
+        self.add(store, "a6", "partial")
+        self.assertEqual(set(store), {"a2", "a3", "a4", "a6"})
+        self.assertFalse(self.path("import", "a1").exists())
+        self.assertFalse(self.path("import", "a5").exists())
+
+    def test_records_from_startup_are_ordered_by_their_file_time(self):
+        self.put("tune", "l1", {"job_id": "l1", "status": "completed"}, age=200)
+        self.put("tune", "l2", {"job_id": "l2", "status": "failed"}, age=300)
+        self.put("tune", "l3", {"job_id": "l3", "status": "completed"}, age=100)
+        store = jobstore.JobStore("tune")
+        store.load()
+        self.add(store, "n1", "queued")
+        self.assertEqual(set(store), {"l1", "l3", "n1"})
+        self.assertFalse(self.path("tune", "l2").exists())
+
+    def test_a_removed_record_cancels_its_pending_write(self):
+        store = self.bound()
+        for job_id, saved in (("t1", 1.0), ("t2", 2.0), ("t3", 3.0)):
+            self.add(store, job_id, "completed", saved=saved)
+        timer = threading.Timer(60, lambda: None)
+        store["t1"]._timer = timer
+        timer.start()
+        self.add(store, "t4", "running")
+        self.assertNotIn("t1", store)
+        self.assertFalse(timer.is_alive() and not timer.finished.is_set())
+
+    def test_an_unbound_store_never_prunes(self):
+        store = jobstore.JobStore("export")
+        for n in range(5):
+            store[f"u{n}"] = {"status": "completed"}
+        self.assertEqual(len(store), 5)
+
+    def test_a_failed_file_removal_is_logged_and_the_record_still_dropped(self):
+        store = self.bound()
+        for job_id, saved in (("e1", 1.0), ("e2", 2.0), ("e3", 3.0)):
+            self.add(store, job_id, "completed", saved=saved)
+        with patch.object(Path, "unlink", side_effect=OSError("read-only")), \
+             self.assertLogs("services.jobstore", "ERROR"):
+            self.add(store, "e4", "queued")                  # no exception
+        self.assertEqual(set(store), {"e2", "e3", "e4"})
+        self.assertTrue(self.path("export", "e1").exists())   # startup retention removes it
+
+    def test_the_order_follows_each_record_s_own_last_write(self):
+        # No stamps set by hand: the order comes from the writes themselves.
+        store = self.bound()
+        for job_id in ("w1", "w2", "w3"):
+            self.add(store, job_id, "running")
+        for job_id in ("w2", "w1", "w3"):
+            time.sleep(0.02)
+            store[job_id]["status"] = "completed"     # a status change is written at once
+        self.add(store, "w4", "queued")
+        self.assertEqual(set(store), {"w1", "w3", "w4"})
+        self.assertFalse(self.path("export", "w2").exists())
+
+    def test_replacing_a_record_prunes_nothing(self):
+        store = self.bound()
+        for job_id in ("p1", "p2", "p3", "p4"):
+            self.add(store, job_id, "running")
+        store["p1"]["status"] = "completed"
+        store["p2"] = {"job_id": "p2", "status": "running"}
+        self.assertEqual(set(store), {"p1", "p2", "p3", "p4"})
+
+
+class Recording(jobstore.JobStore):
+    """A bound store that notes which thread stores each record, and can hold
+    that write until released."""
+
+    def __init__(self, kind, hold=False):
+        super().__init__(kind)
+        self.threads, self.ids = [], []
+        self.entered, self.release = threading.Event(), threading.Event()
+        self.stored = threading.Event()
+        if not hold:
+            self.release.set()
+
+    def __setitem__(self, job_id, doc):
+        self.threads.append(threading.get_ident())
+        self.ids.append(job_id)
+        self.entered.set()
+        self.release.wait(10)
+        super().__setitem__(job_id, doc)
+        self.stored.set()
+
+
+class Failing(Recording):
+    """A Recording whose held write raises instead of storing."""
+
+    def __setitem__(self, job_id, doc):
+        self.ids.append(job_id)
+        self.entered.set()
+        self.release.wait(10)
+        raise OSError("disk gone")
+
+
+class FirstHeld(Recording):
+    """A Recording that holds only its first write, which then stores, or raises
+    if fail is set; later writes go straight through."""
+
+    def __init__(self, kind, fail=False):
+        super().__init__(kind, hold=True)
+        self.fail = fail
+
+    def __setitem__(self, job_id, doc):
+        if self.ids:
+            self.ids.append(job_id)
+            jobstore.JobStore.__setitem__(self, job_id, doc)
+            return
+        self.ids.append(job_id)
+        self.entered.set()
+        self.release.wait(10)
+        if self.fail:
+            raise OSError("disk gone")
+        jobstore.JobStore.__setitem__(self, job_id, doc)
+        self.stored.set()
+
+
+class FailThenHold(Recording):
+    """A Recording whose first write is held and then raises, and whose second
+    write is held until second_release, then stores."""
+
+    def __init__(self, kind):
+        super().__init__(kind, hold=True)
+        self.second_release = threading.Event()
+
+    def __setitem__(self, job_id, doc):
+        first = not self.ids
+        self.ids.append(job_id)
+        if first:
+            self.entered.set()
+            self.release.wait(10)
+            raise OSError("disk gone")
+        self.second_release.wait(10)
+        jobstore.JobStore.__setitem__(self, job_id, doc)
+        self.stored.set()
+
+
+class StartTests(StoreTestCase):
+    """The four job starts store their first record off the event loop, and a
+    start cancelled during that write leaves nothing behind (#309). A second
+    export of a collection waits for that write before it names the first (#326),
+    for at most START_WAIT (#338)."""
+
+    KINDS = {"export": (exporter, "_run"), "import": (importer, "_run"),
+             "tune": (tuning, "_run"), "ingest": (ingest_pipeline, "_process_job_sync")}
+
+    def harness(self, kind, hold=False):
+        module, worker = self.KINDS[kind]
+        store = Recording(kind, hold)
+        self.assertEqual(store.load(), [])
+        calls = []
+        for change in (patch.object(module, "_jobs", store),
+                       patch.object(module, worker, side_effect=lambda *a, **k: calls.append(a))):
+            change.start()
+            self.addCleanup(change.stop)
+        return module, store, calls
+
+    @staticmethod
+    def start(kind, name):
+        if kind == "export":
+            return exporter.start_export_job(name)
+        if kind == "import":
+            return importer.start_import_job(name, "abort")
+        if kind == "tune":
+            return tuning.start_tune_job(name, "reindex", {})
+        upload = type("Upload", (), {"filename": "a.txt", "file": io.BytesIO(b"hello world")})()
+        return ingest_pipeline.start_ingest_job([upload], name, "fixed", 300, 0, 0.85, 50)
+
+    def guards_free(self, kind, module, name):
+        key = collection_writes.canonical(name) if kind == "tune" else name
+        active = key in module._active if kind != "ingest" else False
+        return not active and collection_writes.active_jobs(name) == []
+
+    def test_each_start_stores_its_record_off_the_event_loop(self):
+        for kind in self.KINDS:
+            with self.subTest(kind=kind):
+                module, store, calls = self.harness(kind)
+                name = f"Vfy309{kind.capitalize()}"
+
+                async def run():
+                    loop_thread = threading.get_ident()
+                    job_id = await self.start(kind, name)
+                    stored = job_id in store and self.path_exists(kind, job_id)
+                    for _ in range(500):
+                        if calls:
+                            break
+                        await asyncio.sleep(0.01)
+                    return loop_thread, job_id, stored
+
+                loop_thread, job_id, stored = asyncio.run(run())
+                self.assertEqual(store.ids, [job_id])
+                self.assertNotEqual(store.threads, [loop_thread])
+                self.assertTrue(stored)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(store[job_id]["status"], "queued")
+                # the stub worker never ran, so release what it would have
+                collection_writes.end_job(kind, job_id)
+                if kind == "export":
+                    module._active.pop(name, None)
+                elif kind == "tune":
+                    module._active.discard(collection_writes.canonical(name))
+                elif kind == "import":
+                    module._active.discard(name)
+
+    def path_exists(self, kind, job_id):
+        return (self.root / "jobs" / kind / f"{job_id}.json").exists()
+
+    def test_a_start_cancelled_during_its_write_leaves_nothing_behind(self):
+        for kind in self.KINDS:
+            with self.subTest(kind=kind):
+                module, store, calls = self.harness(kind, hold=True)
+                name = f"Vfy309Cancel{kind.capitalize()}"
+
+                async def run():
+                    task = asyncio.ensure_future(self.start(kind, name))
+                    entered = await asyncio.get_running_loop().run_in_executor(
+                        None, store.entered.wait, 10)
+                    self.assertTrue(entered)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                    freed = self.guards_free(kind, module, name)
+                    store.release.set()
+                    job_id = store.ids[0]
+                    # the abandoned write still stores the record; then it goes
+                    self.assertTrue(await asyncio.get_running_loop().run_in_executor(
+                        None, store.stored.wait, 10))
+                    for _ in range(500):
+                        if job_id not in store and not self.path_exists(kind, job_id):
+                            break
+                        await asyncio.sleep(0.01)
+                    return freed, job_id
+
+                freed, job_id = asyncio.run(run())
+                self.assertTrue(freed)
+                self.assertNotIn(job_id, store)
+                self.assertFalse(self.path_exists(kind, job_id))
+                self.assertEqual(calls, [])
+                if kind == "ingest":
+                    self.assertEqual([p.name for p in self.root.iterdir()], ["jobs"])
+
+
+    def release_export(self, name, job_id):
+        # the stub worker never ran, so release what it would have
+        collection_writes.end_job("export", job_id)
+        exporter._active.pop(name, None)
+
+    @staticmethod
+    async def second_start(name):
+        """The second start's job id, or the id its RuntimeError (the 409) names
+        and whether that job could be read when it was raised."""
+        try:
+            return await exporter.start_export_job(name), None
+        except RuntimeError as exc:
+            return str(exc), exporter.get_job(str(exc)) is not None
+
+    def test_a_second_export_waits_until_the_first_has_stored_its_record(self):
+        module, store, calls = self.harness("export", hold=True)
+        name = "Vfy326Wait"
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job(name))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            second = asyncio.ensure_future(self.second_start(name))
+            await asyncio.sleep(0.2)
+            pending = not second.done()
+            store.release.set()
+            return pending, await first, await second
+
+        pending, job_id, (named, readable) = asyncio.run(run())
+        self.release_export(name, job_id)
+        self.assertTrue(pending)                      # it waited for the write
+        self.assertEqual(named, job_id)               # then answered the 409
+        self.assertTrue(readable)                     # naming a job that reads 200
+        self.assertEqual(store.ids, [job_id])
+
+    def test_an_export_waiting_on_a_cancelled_start_starts_its_own(self):
+        module, store, calls = self.harness("export", hold=True)
+        name = "Vfy326Cancel"
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job(name))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            second = asyncio.ensure_future(self.second_start(name))
+            await asyncio.sleep(0.2)
+            first.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await first
+            store.release.set()
+            outcome = await second
+            for _ in range(500):      # the abandoned record goes; the second's worker runs
+                if store.ids[0] not in store and calls:
+                    break
+                await asyncio.sleep(0.01)
+            return outcome
+
+        second_id, refused = asyncio.run(run())
+        first_id = store.ids[0]
+        self.assertIsNone(refused)                    # no 409 naming the cancelled job
+        self.assertNotEqual(second_id, first_id)
+        self.assertEqual(exporter._active.get(name), second_id)
+        self.assertEqual(store[second_id]["status"], "queued")
+        self.assertNotIn(first_id, store)
+        self.assertEqual(len(calls), 1)
+        self.release_export(name, second_id)
+
+    def test_an_abandoned_write_that_raises_is_logged_and_leaves_nothing(self):
+        store = Failing("export", hold=True)
+        self.assertEqual(store.load(), [])
+
+        async def run(logs):
+            loop = asyncio.get_running_loop()
+            task = asyncio.ensure_future(store.create("abcd0326", {"status": "queued"}))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            store.release.set()
+            for _ in range(500):
+                if any("abandoned" in line for line in logs.output):
+                    break
+                await asyncio.sleep(0.01)
+
+        with self.assertLogs("services.jobstore", "ERROR") as logs:
+            asyncio.run(run(logs))
+        self.assertIn("Could not store abandoned export job abcd0326: disk gone",
+                      "\n".join(logs.output))
+        self.assertNotIn("abcd0326", store)
+        self.assertFalse(self.path_exists("export", "abcd0326"))
+
+    # Added by the testing reviewer (#326): the 409 at once, a failed first
+    # write, a cancelled waiter and other collections.
+    def first_held(self, fail=False):
+        store = FirstHeld("export", fail)
+        self.assertEqual(store.load(), [])
+        calls = []
+        for change in (patch.object(exporter, "_jobs", store),
+                       patch.object(exporter, "_run", side_effect=lambda *a, **k: calls.append(a))):
+            change.start()
+            self.addCleanup(change.stop)
+        return store, calls
+
+    def test_a_second_export_answers_409_at_once_once_the_record_is_stored(self):
+        module, store, calls = self.harness("export")
+        name = "Vfy326Stored"
+
+        async def run():
+            first = await exporter.start_export_job(name)
+            self.assertNotIn(first, exporter._starting)
+            return first, await asyncio.wait_for(self.second_start(name), 1)
+
+        job_id, (named, readable) = asyncio.run(run())
+        self.release_export(name, job_id)
+        self.assertEqual((named, readable), (job_id, True))
+        self.assertEqual(store.ids, [job_id])
+        self.assertEqual(exporter._starting, {})
+
+    def test_an_export_waiting_on_a_start_whose_write_fails_starts_its_own(self):
+        store, calls = self.first_held(fail=True)
+        name = "Vfy326Failed"
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job(name))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            second = asyncio.ensure_future(self.second_start(name))
+            await asyncio.sleep(0.2)
+            pending = not second.done()
+            store.release.set()
+            with self.assertRaises(OSError):
+                await first
+            outcome = await second
+            for _ in range(500):
+                if calls:
+                    break
+                await asyncio.sleep(0.01)
+            return pending, outcome
+
+        pending, (second_id, refused) = asyncio.run(run())
+        first_id = store.ids[0]
+        self.assertTrue(pending)                      # it waited for the write
+        self.assertIsNone(refused)                    # no 409 naming the failed job
+        self.assertNotEqual(second_id, first_id)
+        self.assertEqual(exporter._active.get(name), second_id)
+        self.assertNotIn(first_id, store)
+        self.assertEqual(store[second_id]["status"], "queued")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(exporter._starting, {})
+        self.release_export(name, second_id)
+
+    def test_a_waiting_export_cancelled_holds_nothing_and_the_first_goes_on(self):
+        module, store, calls = self.harness("export", hold=True)
+        name = "Vfy326Waiter"
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job(name))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            second = asyncio.ensure_future(exporter.start_export_job(name))
+            await asyncio.sleep(0.2)
+            second.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await second
+            starting = list(exporter._starting)
+            store.release.set()
+            job_id = await first
+            for _ in range(500):
+                if calls:
+                    break
+                await asyncio.sleep(0.01)
+            return starting, job_id
+
+        starting, job_id = asyncio.run(run())
+        self.assertEqual(starting, [job_id])          # the waiter added nothing
+        self.assertEqual(store.ids, [job_id])         # and never wrote
+        self.assertEqual(exporter._active.get(name), job_id)
+        self.assertEqual(store[job_id]["status"], "queued")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(exporter._starting, {})
+        self.release_export(name, job_id)
+
+    def test_exports_of_different_collections_never_wait_on_each_other(self):
+        store, calls = self.first_held()
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job("Vfy326A"))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            other = await asyncio.wait_for(exporter.start_export_job("Vfy326B"), 5)
+            first_done = first.done()
+            store.release.set()
+            return first_done, await first, other
+
+        first_done, first_id, other_id = asyncio.run(run())
+        self.release_export("Vfy326A", first_id)
+        self.release_export("Vfy326B", other_id)
+        self.assertFalse(first_done)                  # B finished while A was held
+        self.assertNotEqual(first_id, other_id)
+        self.assertEqual(store[other_id]["status"], "queued")
+        self.assertEqual(exporter._starting, {})
+
+    def test_a_second_export_gives_up_after_the_bound_and_holds_nothing(self):
+        module, store, calls = self.harness("export", hold=True)
+        name = "Vfy338Bound"
+        change = patch.object(exporter, "START_WAIT", 0.2)
+        change.start()
+        self.addCleanup(change.stop)
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job(name))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            with self.assertRaises(exporter.ExportStartingError):
+                await asyncio.wait_for(exporter.start_export_job(name), 5)
+            first_done, starting = first.done(), list(exporter._starting)
+            store.release.set()
+            job_id = await first
+            for _ in range(500):
+                if calls:
+                    break
+                await asyncio.sleep(0.01)
+            return first_done, starting, job_id
+
+        first_done, starting, job_id = asyncio.run(run())
+        self.release_export(name, job_id)
+        self.assertFalse(first_done)                  # it gave up while the write was held
+        self.assertEqual(starting, [job_id])          # and added nothing
+        self.assertEqual(store.ids, [job_id])         # nor wrote
+        self.assertEqual(store[job_id]["status"], "queued")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(exporter._starting, {})
+
+    # Added by the testing reviewer (#338): the bound covers all of a start's
+    # waits together, counted from its first wait, not each wait afresh.
+    def test_the_bound_counts_from_the_first_wait_across_later_waits(self):
+        store = FailThenHold("export")
+        self.assertEqual(store.load(), [])
+        calls = []
+        for change in (patch.object(exporter, "_jobs", store),
+                       patch.object(exporter, "_run", side_effect=lambda *a, **k: calls.append(a)),
+                       patch.object(exporter, "START_WAIT", 2.0)):
+            change.start()
+            self.addCleanup(change.stop)
+        self.addCleanup(store.release.set)
+        self.addCleanup(store.second_release.set)
+        name = "Vfy338Total"
+
+        async def timed():
+            began = asyncio.get_running_loop().time()
+            try:
+                return await exporter.start_export_job(name), None
+            except exporter.ExportStartingError as exc:
+                return exc, asyncio.get_running_loop().time() - began
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job(name))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            waiters = [asyncio.ensure_future(timed()) for _ in range(2)]
+            await asyncio.sleep(1.5)             # both wait on the first start
+            store.release.set()                  # its write fails; one waiter takes the slot
+            with self.assertRaises(OSError):
+                await first
+            # the other waits again, on the winner, whose write is held
+            done, _ = await asyncio.wait(waiters, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+            gave_up = [w.result() for w in done]
+            store.second_release.set()
+            results = [await w for w in waiters]
+            for _ in range(500):
+                if calls:
+                    break
+                await asyncio.sleep(0.01)
+            return gave_up, results
+
+        gave_up, results = asyncio.run(run())
+        refused = [elapsed for value, elapsed in results if elapsed is not None]
+        started = [value for value, elapsed in results if elapsed is None]
+        self.assertEqual(len(refused), 1, results)
+        self.assertEqual(len(started), 1, results)
+        # 2.0 s from its first wait, not 1.5 + 2.0 s from its second
+        self.assertGreaterEqual(refused[0], 1.9)
+        self.assertLess(refused[0], 3.0)
+        # the waiter done while the winner's write was held is the one that gave up
+        self.assertEqual(gave_up, [(value, elapsed) for value, elapsed in results
+                                   if elapsed is not None])
+        self.assertIsInstance(gave_up[0][0], exporter.ExportStartingError)
+        self.assertEqual(len(store.ids), 2)           # the first start's failed write, the winner's
+        self.assertEqual(store.ids[1], started[0])    # the waiter that gave up never wrote
+        self.assertEqual(len(calls), 1)               # only the winner's worker ran
+        self.assertEqual(exporter._active.get(name), started[0])
+        self.assertEqual(store[started[0]]["status"], "queued")
+        self.assertEqual(exporter._starting, {})
+        self.release_export(name, started[0])
+
+    def test_the_route_answers_export_starting_with_no_job_id(self):
+        from unittest.mock import AsyncMock
+        from models.schemas import ExportRequest
+        from routers import transfer as route
+        with patch.object(route.wc, "collection_exists", new=AsyncMock(return_value=True)), \
+             patch.object(exporter, "start_export_job",
+                          new=AsyncMock(side_effect=exporter.ExportStartingError("Vfy338"))):
+            response = asyncio.run(route.start_export(ExportRequest(collection="Vfy338")))
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(json.loads(response.body)["error"], {
+            "code": "EXPORT_STARTING",
+            "message": "An export of 'Vfy338' is starting; retry shortly.",
+            "detail": None,
+        })
 
 
 class IngestFallbackTests(StoreTestCase):
@@ -47541,5 +49241,430 @@ if __name__ == "__main__":
     if not os.environ.get("RAG_TEST_LOG_LEVEL"):
         import logging
         logging.getLogger().setLevel(logging.CRITICAL)
+    unittest.main()
+```
+
+### scripts/tests/test_job_lists.py
+
+Run by `02_ingest.sh` in the API image with no network (#617).
+
+```python
+"""Running and recent jobs (#617): what job records carry, and what the lists show.
+
+Runs with the API's dependencies, in the built API image with no network
+(`02_ingest.sh`):
+
+    docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
+      "$(docker compose images -q api)" python scripts/tests/test_job_lists.py
+
+Requests go through `main.app` with FastAPI's TestClient and real sessions in a
+temporary account store (`auth.testing`), without the lifespan. Job stores are
+bound to a temporary folder; nothing reaches a backend.
+"""
+import asyncio
+import io
+import json
+import os
+import sys
+import tempfile
+import time
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+sys.path.insert(0, os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api"))
+
+from fastapi.testclient import TestClient
+
+from config import settings
+from main import app
+from auth import store as auth_store
+from auth import testing as auth_testing
+from services import exporter, goldstandard, importer, ingest_pipeline, job_lists, jobstore, packager
+from services import weaviate_client as wc
+
+DEV = SimpleNamespace(username="dev", kind="user", role="developer")
+OTHER = SimpleNamespace(username="other", kind="user", role="developer")
+KEY = SimpleNamespace(username="dev", kind="service", role="developer")
+ENG = SimpleNamespace(username="eng", kind="user", role="engineer")
+NOW = time.time()
+
+
+def iso(seconds_ago: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).isoformat()
+
+
+def owner(name="dev", kind="user"):
+    return {"name": name, "kind": kind}
+
+
+def ingest_record(job_id, status="completed", **extra):
+    record = {"job_id": job_id, "status": status, "files_total": 1, "files_completed": 1,
+              "files_failed": 0, "chunks_stored": 2, "errors": [], "skipped": []}
+    record.update(extra)
+    return record
+
+
+class TempUploadCase(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        change = patch.object(settings, "upload_dir", temp.name)
+        change.start()
+        self.addCleanup(change.stop)
+
+    def bound(self, kind):
+        store = jobstore.JobStore(kind)
+        self.assertEqual(store.load(), [])
+        return store
+
+
+class RecordTimestampTests(TempUploadCase):
+    def test_new_record_gets_created_at_and_no_finished_at(self):
+        store = self.bound("ingest")
+        store["a1"] = ingest_record("a1", status="queued")
+        self.assertIsNotNone(job_lists._parse(store["a1"]["created_at"]))
+        self.assertNotIn("finished_at", store["a1"])
+        on_disk = json.loads((self.root / "jobs" / "ingest" / "a1.json").read_text())
+        self.assertEqual(on_disk["created_at"], store["a1"]["created_at"])
+
+    def test_finished_at_on_first_terminal_status_and_never_moved(self):
+        store = self.bound("export")
+        store["e1"] = {"job_id": "e1", "status": "queued"}
+        store["e1"]["status"] = "running"
+        self.assertNotIn("finished_at", store["e1"])
+        store["e1"]["status"] = "completed"
+        first = store["e1"]["finished_at"]
+        on_disk = json.loads((self.root / "jobs" / "export" / "e1.json").read_text())
+        self.assertEqual(on_disk["finished_at"], first)
+        time.sleep(0.01)
+        store["e1"].update(status="failed", error="later")
+        self.assertEqual(store["e1"]["finished_at"], first)
+
+    def test_interrupted_at_startup_gets_finished_at(self):
+        directory = self.root / "jobs" / "import"
+        directory.mkdir(parents=True)
+        (directory / "i1.json").write_text(json.dumps({"job_id": "i1", "status": "running"}))
+        store = jobstore.JobStore("import")
+        self.assertEqual(store.load(), ["i1"])
+        on_disk = json.loads((directory / "i1.json").read_text())
+        self.assertEqual(on_disk["error_code"], "INTERRUPTED")
+        self.assertIsNotNone(job_lists._parse(on_disk["finished_at"]))
+
+    def test_snapshot_copies_and_saved_time(self):
+        directory = self.root / "jobs" / "ingest"
+        directory.mkdir(parents=True)
+        path = directory / "old1.json"
+        path.write_text(json.dumps({**ingest_record("old1"), "_audit": {"actor": "x"}}))
+        stamp = NOW - 3600
+        os.utime(path, (stamp, stamp))
+        store = jobstore.JobStore("ingest")
+        store.load()
+        [(job_id, record, saved)] = store.snapshot()
+        self.assertEqual(job_id, "old1")
+        self.assertNotIn("_audit", record)
+        self.assertAlmostEqual(saved, stamp, delta=1)
+        record["status"] = "changed"
+        self.assertEqual(store["old1"]["status"], "completed")
+
+    def test_unbound_store_is_unchanged(self):
+        store = jobstore.JobStore("ingest")
+        doc = {"status": "queued"}
+        store["u1"] = doc
+        self.assertIs(store["u1"], doc)
+        self.assertEqual(doc, {"status": "queued"})
+        self.assertEqual(store.snapshot(), [("u1", {"status": "queued"}, None)])
+
+
+class SelectTests(unittest.TestCase):
+    def items(self, *records):
+        return [(r, r["status"] == "running", job_lists._parse(r.get("finished_at"))) for r in records]
+
+    def ids(self, items, principal):
+        return [r["job_id"] for r in job_lists.select(items, principal, time.time())]
+
+    def test_developer_sees_only_own_jobs_and_engineer_sees_all(self):
+        items = self.items(
+            {"job_id": "mine", "status": "running", "owner": owner(), "created_at": iso(10)},
+            {"job_id": "theirs", "status": "running", "owner": owner("other"), "created_at": iso(20)},
+            {"job_id": "keys", "status": "running", "owner": owner("dev", "service"), "created_at": iso(30)},
+            {"job_id": "unknown", "status": "running", "created_at": iso(40)},
+            {"job_id": "nullowner", "status": "running", "owner": None, "created_at": iso(50)})
+        self.assertEqual(self.ids(items, DEV), ["mine"])
+        self.assertEqual(self.ids(items, OTHER), ["theirs"])
+        self.assertEqual(self.ids(items, KEY), ["keys"])
+        self.assertEqual(self.ids(items, ENG), ["mine", "theirs", "keys", "unknown", "nullowner"])
+
+    def test_running_always_listed_and_finished_capped_to_newest_twenty(self):
+        running = [{"job_id": f"r{i}", "status": "running", "owner": owner(), "created_at": iso(i)}
+                   for i in range(25)]
+        finished = [{"job_id": f"f{i}", "status": "completed", "owner": owner(),
+                     "created_at": iso(1000 + i), "finished_at": iso(500 + i)} for i in range(25)]
+        listed = self.ids(self.items(*running, *finished), DEV)
+        self.assertEqual(len([i for i in listed if i.startswith("r")]), 25)
+        self.assertEqual([i for i in listed if i.startswith("f")], [f"f{i}" for i in range(20)])
+
+    def test_finished_outside_the_window_is_dropped(self):
+        items = self.items(
+            {"job_id": "recent", "status": "failed", "owner": owner(), "finished_at": iso(23 * 3600)},
+            {"job_id": "old", "status": "failed", "owner": owner(), "finished_at": iso(25 * 3600)})
+        self.assertEqual(self.ids(items, DEV), ["recent"])
+
+    def test_order_newest_first_by_created_at_else_finish(self):
+        items = self.items(
+            {"job_id": "a", "status": "completed", "owner": owner(), "created_at": iso(300), "finished_at": iso(10)},
+            {"job_id": "b", "status": "running", "owner": owner(), "created_at": iso(100)},
+            {"job_id": "c", "status": "completed", "owner": owner(), "finished_at": iso(200)})
+        self.assertEqual(self.ids(items, DEV), ["b", "c", "a"])
+
+    def test_listed_finished_at_is_the_finish_time_and_none_while_running(self):
+        listed = job_lists.select([({"job_id": "x", "status": "completed", "owner": owner()}, False, NOW - 60),
+                                   ({"job_id": "y", "status": "running", "owner": owner()}, True, None)],
+                                  DEV, NOW)
+        by_id = {r["job_id"]: r for r in listed}
+        self.assertAlmostEqual(job_lists._parse(by_id["x"]["finished_at"]), NOW - 60, delta=1)
+        self.assertIsNone(by_id["y"]["finished_at"])
+
+    def test_job_items_fall_back_to_saved_time_for_old_records(self):
+        rows = [("old", {"status": "completed"}, NOW - 60),
+                ("new", {"status": "completed", "finished_at": iso(120)}, NOW),
+                ("run", {"status": "queued"}, NOW),
+                ("lost", {"status": "partial"}, None)]
+        items = {r_id: item for (r_id, _, _), item in zip(rows, job_lists.job_items(rows))}
+        self.assertEqual(items["old"][2], NOW - 60)
+        self.assertAlmostEqual(items["new"][2], NOW - 120, delta=1)
+        self.assertEqual(items["run"][1:], (True, None))
+        self.assertIsNone(items["lost"][2])         # never listed
+
+    def test_session_items(self):
+        sessions = [{"session_id": "gen", "status": "generating"},
+                    {"session_id": "done", "status": "completed", "finished_at": iso(60)},
+                    {"session_id": "legacy", "status": "completed"}]
+        items = job_lists.session_items(sessions)
+        self.assertEqual([(i[1], i[2] is not None) for i in items], [(True, False), (False, True), (False, False)])
+        listed = job_lists.select([(dict(s, owner=owner()), r, f) for s, r, f in items], DEV, time.time())
+        # "gen" has neither a start nor a finish time, so it sorts last (S3.6).
+        self.assertEqual([s["session_id"] for s in listed], ["done", "gen"])
+
+
+def session(session_id, **extra):
+    record = {"session_id": session_id, "collection": "OwnedLists", "status": "completed",
+              "pairs_total": 0, "pairs_completed": 0, "pairs": []}
+    record.update(extra)
+    return record
+
+
+class GoldStandardTests(TempUploadCase):
+    def setUp(self):
+        super().setUp()
+        for attribute, value in (("_sessions", {}), ("_diagnostics", {}), ("_scan_cache", {})):
+            patcher = patch.object(goldstandard, attribute, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_generation_sessions_leave_out_imported_ones(self):
+        goldstandard.store_session(session("gs_0000000a", owner=owner(), created_at=iso(5)))
+        goldstandard.store_session(session("gs_0000000b", imported_from={
+            "session_id": "gs_0000000c", "collection": "X", "imported_at": iso(1)}))
+        self.assertEqual([s["session_id"] for s in goldstandard.generation_sessions()], ["gs_0000000a"])
+
+    def test_settling_a_generation_sets_finished_at_once(self):
+        goldstandard.store_session(session("gs_0000000d", status="generating", pairs_total=1,
+                                           owner=owner(), created_at=iso(5)))
+        asyncio.run(goldstandard._settle_generation("gs_0000000d", cancelled=False))
+        settled = goldstandard.get_session("gs_0000000d")
+        self.assertEqual(settled["status"], "completed")
+        first = settled["finished_at"]
+        self.assertIsNotNone(job_lists._parse(first))
+        goldstandard._failed_generation(settled, RuntimeError("later"))
+        self.assertEqual(settled["finished_at"], first)
+
+    def test_failed_generation_sets_finished_at(self):
+        current = {"status": "generating"}
+        goldstandard._failed_generation(current, RuntimeError("boom"))
+        self.assertEqual(current["status"], "failed")
+        self.assertIsNotNone(job_lists._parse(current["finished_at"]))
+
+    def test_restart_settlement_sets_finished_at(self):
+        goldstandard.store_session(session("gs_0000000e", status="generating", pairs_total=1))
+        with patch.object(goldstandard, "_tasks", set()):
+            goldstandard.reconcile_interrupted_generations()
+        self.assertIsNotNone(job_lists._parse(goldstandard.get_session("gs_0000000e")["finished_at"]))
+
+    def test_import_drops_local_fields(self):
+        saved = goldstandard.store_imported_session(
+            session("gs_0000000f", owner=owner(), created_at=iso(5), finished_at=iso(1)), "Source")
+        for key in goldstandard.LOCAL_FIELDS:
+            self.assertNotIn(key, saved)
+            self.assertNotIn(key, goldstandard.get_session(saved["session_id"]))
+        self.assertEqual(goldstandard.generation_sessions(), [])
+
+    def test_packages_leave_out_local_fields(self):
+        with patch.object(goldstandard, "_sessions_on_disk", return_value=[
+                session("gs_00000010", owner=owner(), created_at=iso(5), finished_at=iso(1))]):
+            [packed] = packager._goldstandard_sessions("OwnedLists")
+        for key in goldstandard.LOCAL_FIELDS:
+            self.assertNotIn(key, packed)
+        self.assertEqual(packed["session_id"], "gs_00000010")
+
+
+class RouteTests(TempUploadCase):
+    def setUp(self):
+        super().setUp()
+        self.stores = {}
+        for module, kind in ((ingest_pipeline, "ingest"), (exporter, "export"), (importer, "import")):
+            store = self.bound(kind)
+            self.stores[kind] = store
+            patcher = patch.object(module, "_jobs", store)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for attribute, value in (("_sessions", {}), ("_diagnostics", {}), ("_scan_cache", {})):
+            patcher = patch.object(goldstandard, attribute, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.dev_headers = auth_testing.headers("developer")
+        self.eng_headers = auth_testing.headers("engineer")
+        self.dev = auth_testing._accounts["developer"].username
+        name = f"vfy-s-lists-{time.time_ns()}"
+        auth_store.create_principal(name, "developer")
+        _, secret = auth_store.issue_key(name)
+        self.key_name = name
+        self.key_headers = {"Authorization": f"Bearer {secret}"}
+        self.client = TestClient(app, raise_server_exceptions=False)
+        self.addCleanup(self.client.close)
+
+    def get(self, path, headers):
+        response = self.client.get(path, headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def test_lists_are_scoped_and_carry_the_new_fields(self):
+        ingest = self.stores["ingest"]
+        ingest["d1"] = ingest_record("d1", status="running", owner=owner(self.dev),
+                                     collection="OwnedLists", files=["a.txt", "b.md"])
+        ingest["k1"] = ingest_record("k1", owner=owner(self.key_name, "service"), collection="OwnedLists",
+                                     files=["c.txt"])
+        ingest["o1"] = ingest_record("o1")                          # from before #617
+        mine = self.get("/ingest/jobs", self.dev_headers)["jobs"]
+        self.assertEqual([j["job_id"] for j in mine], ["d1"])
+        self.assertEqual(mine[0]["owner"], owner(self.dev))
+        self.assertEqual((mine[0]["collection"], mine[0]["files"]), ("OwnedLists", ["a.txt", "b.md"]))
+        self.assertIsNotNone(mine[0]["created_at"])
+        self.assertIsNone(mine[0]["finished_at"])
+        keys = self.get("/ingest/jobs", self.key_headers)["jobs"]
+        self.assertEqual([j["job_id"] for j in keys], ["k1"])
+        self.assertIsNotNone(keys[0]["finished_at"])
+        everyone = self.get("/ingest/jobs", self.eng_headers)["jobs"]
+        self.assertEqual(sorted(j["job_id"] for j in everyone), ["d1", "k1", "o1"])
+        self.assertIsNone(next(j for j in everyone if j["job_id"] == "o1")["owner"])
+
+    def test_export_import_and_session_lists(self):
+        self.stores["export"]["e1"] = {
+            "job_id": "e1", "status": "completed", "collection": "OwnedLists", "chunks_written": 3,
+            "filename": "ragpkg-x.tar.gz", "size_bytes": 10, "source_document_count": 1,
+            "fidelity": "with-sources", "models_bundled": False, "retrieve_script": True,
+            "warnings": [], "error": None, "error_code": None, "error_detail": None,
+            "owner": owner(self.dev)}
+        self.stores["import"]["i1"] = {
+            "job_id": "i1", "status": "failed", "filename": "ragpkg-x.tar.gz", "on_conflict": "abort",
+            "collection": None, "original_collection": None, "chunks_written": 0, "fidelity": None,
+            "renamed": False, "notes": [], "error": "Interrupted", "error_code": "INTERRUPTED",
+            "error_detail": None, "owner": owner(self.dev)}
+        goldstandard.store_session(session("gs_00000011", status="generating", pairs_total=4,
+                                           pairs_attempted=1, owner=owner(self.dev), created_at=iso(5),
+                                           pairs=[]))
+        goldstandard.store_session(session("gs_00000012", owner=owner(self.dev)))   # no finished_at
+        exports = self.get("/export/jobs", self.dev_headers)["jobs"]
+        self.assertEqual([(j["job_id"], j["filename"]) for j in exports], [("e1", "ragpkg-x.tar.gz")])
+        imports = self.get("/import/jobs", self.dev_headers)["jobs"]
+        self.assertEqual([(j["job_id"], j["error_code"]) for j in imports], [("i1", "INTERRUPTED")])
+        self.assertEqual(self.get("/export/jobs", self.key_headers)["jobs"], [])
+        sessions = self.get("/goldstandard/sessions", self.dev_headers)["sessions"]
+        self.assertEqual([(s["session_id"], s["pairs_attempted"]) for s in sessions], [("gs_00000011", 1)])
+        self.assertNotIn("pairs", sessions[0])
+        self.assertEqual(self.get("/goldstandard/sessions", self.key_headers)["sessions"], [])
+
+    def test_a_malformed_record_is_left_out(self):
+        self.stores["ingest"]["bad"] = {"job_id": "bad", "status": "completed", "owner": owner(self.dev)}
+        self.stores["ingest"]["good"] = ingest_record("good", owner=owner(self.dev))
+        self.assertEqual([j["job_id"] for j in self.get("/ingest/jobs", self.dev_headers)["jobs"]], ["good"])
+
+    def test_lookups_by_id_answer_without_the_new_fields(self):
+        self.stores["ingest"]["d2"] = ingest_record("d2", owner=owner(self.dev), collection="C", files=["a"])
+        answer = self.get("/ingest/job/d2", self.dev_headers)
+        for key in ("owner", "created_at", "finished_at", "collection", "files"):
+            self.assertNotIn(key, answer)
+        goldstandard.store_session(session("gs_00000013", owner=owner(self.dev), created_at=iso(5),
+                                           finished_at=iso(1)))
+        answer = self.get("/goldstandard/session/gs_00000013", self.dev_headers)
+        for key in goldstandard.LOCAL_FIELDS:
+            self.assertNotIn(key, answer)
+
+    def test_lists_need_the_developer_role(self):
+        user_headers = auth_testing.headers("end_user")
+        for path in ("/ingest/jobs", "/export/jobs", "/import/jobs", "/goldstandard/sessions"):
+            with self.subTest(path=path):
+                self.assertEqual(self.client.get(path).status_code, 401)
+                self.assertEqual(self.client.get(path, headers=user_headers).status_code, 403)
+
+    def test_starts_record_the_owner(self):
+        with patch.object(wc, "collection_exists", AsyncMock(return_value=True)), \
+                patch.object(ingest_pipeline, "start_ingest_job", AsyncMock(return_value="j1")) as ingest, \
+                patch.object(exporter, "start_export_job", AsyncMock(return_value="j2")) as export, \
+                patch.object(importer, "start_import_job", AsyncMock(return_value="j3")) as imp, \
+                patch.object(goldstandard, "start_generation", AsyncMock(return_value={
+                    "session_id": "gs_00000014", "status": "generating", "pairs_total": 1,
+                    "pairs_completed": 0})) as gen:
+            response = self.client.post("/ingest/upload", headers=self.dev_headers,
+                                        data={"collection": "OwnedLists"},
+                                        files=[("files", ("a.txt", io.BytesIO(b"x"), "text/plain"))])
+            self.assertEqual(response.status_code, 202, response.text)
+            response = self.client.post("/export", headers=self.key_headers, json={"collection": "OwnedLists"})
+            self.assertEqual(response.status_code, 202, response.text)
+            response = self.client.post("/import", headers=self.dev_headers,
+                                        json={"filename": "ragpkg-x.tar.gz", "on_conflict": "abort"})
+            self.assertEqual(response.status_code, 202, response.text)
+            response = self.client.post("/goldstandard/generate", headers=self.eng_headers,
+                                        json={"collection": "OwnedLists", "sample_size": 1})
+            self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(ingest.call_args.kwargs["owner"], owner(self.dev))
+        self.assertEqual(export.call_args.kwargs["owner"], owner(self.key_name, "service"))
+        self.assertEqual(imp.call_args.kwargs["owner"], owner(self.dev))
+        self.assertEqual(gen.call_args.kwargs["owner"],
+                         owner(auth_testing._accounts["engineer"].username))
+
+
+class IngestRecordTests(TempUploadCase):
+    def test_ingest_record_carries_collection_files_and_owner(self):
+        store = self.bound("ingest")
+
+        class Upload:
+            def __init__(self, name, data):
+                self.filename = name
+                self.file = io.BytesIO(data)
+                self.size = len(data)
+
+        async def start():
+            # The worker is replaced: only the record the admission stores is checked.
+            with patch.object(ingest_pipeline, "_jobs", store), \
+                    patch.object(ingest_pipeline, "_process_job_sync", lambda *args: None):
+                job_id = await ingest_pipeline._admit_ingest_job(
+                    "rec1", [Upload("notes.txt", b"hello"), Upload("skip.exe", b"x")], "OwnedLists",
+                    "fixed", 300, 0, 0.85, 0, owner=owner())
+                await asyncio.sleep(0.1)
+                return job_id
+        self.assertEqual(asyncio.run(start()), "rec1")
+        record = store.get("rec1")
+        self.assertIsNotNone(record)
+        self.assertEqual(record["collection"], "OwnedLists")
+        self.assertEqual(record["files"], ["notes.txt", "skip.exe"])
+        self.assertEqual(record["owner"], owner())
+        self.assertIsNotNone(record["created_at"])
+
+
+if __name__ == "__main__":
     unittest.main()
 ```

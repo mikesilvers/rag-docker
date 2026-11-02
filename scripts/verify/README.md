@@ -587,6 +587,23 @@ job's three counts agree.
 "Submitted N · accepted N · stored N" line appears only when the counts differ, and an upload
 answered `409 COLLECTION_DELETING` to check its message is shown.
 
+`scripts/tests/test_job_lists.py` (#617, API image, no network) checks the running and recent job
+lists: new records get `created_at`, `finished_at` on their first terminal status or when marked
+interrupted, and ingest records `collection`, `files` and `owner`; who sees which job (a Developer
+its own, a key its principal's, an Engineer everyone's including owner-less records); running jobs
+always listed, finished ones from the last 24 hours, the newest 20; a pre-#617 record's last-saved
+time standing in for `finished_at`; the order; sessions (generating, finished, without
+`finished_at`, imported); the routes, their role, a malformed record left out, the lookups by ID
+unchanged, the owner each start route hands its service; and no session `owner` or times in a
+package or after an import. `02_ingest.sh` runs it, then `job_lists.py --operator` on the verify
+project: the harness Developer and a throwaway `vfy-s-*` Developer-role key each ingest a file into
+a throwaway `VfyJobs*` collection and see only their own job, with owner, collection, files and
+times; the Engineer sees both; the Developer's export and import are listed for it and the
+Engineer, not the key. `browser/ui_criteria.js` (suite 06) checks the pages' Running and recent
+jobs lists: a real ingest found again after leaving the Import page, then stubbed lists for a
+running ingest, generation and export that open by themselves, survive leaving the page and show
+their result, row switching, one job per Transfer panel, and the Engineer's owner column.
+
 `scripts/tests/test_jobstore.py` (#23) checks the job store that keeps ingest, export, import
 and tune job records across an API restart: an unbound store (no lifespan) is a plain dict
 that writes nothing; status changes and terminal records are written at once, owner-only;

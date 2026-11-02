@@ -1,5 +1,10 @@
 import { useState, useEffect, useRef } from 'react'
-import { api, CollectionInfo, Session, GoldPair } from '../api/client'
+import { api, CollectionInfo, GenerationEntry, Session, GoldPair } from '../api/client'
+import { useRole } from '../context/AuthContext'
+import JobList, { newestToOpen, useJobList } from '../components/JobList'
+
+const generating = (s: { status: string }) => s.status === 'generating'
+const loadGenerations = () => api.listGenerations().then(r => r.sessions)
 
 // The API's own default export name (#393): {collection}_{YYYYMMDD_HHMMSS}.json in
 // UTC, spaces in the collection name as '_', other characters outside A-Z, a-z,
@@ -37,6 +42,11 @@ function outcomeOf(s: Session): Outcome | null {
 }
 
 export default function GoldStandardPage() {
+  const { role } = useRole()
+  // Running and recent generations (#617); the first answer opens the newest
+  // generating one, else the newest, unless the page already opened one.
+  const generations = useJobList<GenerationEntry>(loadGenerations, generating)
+  const touched = useRef(false)
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   const [collection, setCollection] = useState('')
   const [sampleSize, setSampleSize] = useState(20)
@@ -92,6 +102,7 @@ export default function GoldStandardPage() {
         setSession(s)
         if (s.status !== 'generating') {
           clearInterval(pollRef.current!)
+          generations.reload()
         }
       } catch (e: unknown) {
         if (!active || activeSessionRef.current !== sessionId) return
@@ -106,9 +117,13 @@ export default function GoldStandardPage() {
     setAllowHistorical(false)
   }, [sessionId, session?.stale, session?.orphaned, session?.stale_at, session?.orphaned_at])
 
-  async function loadSession() {
-    const id = sessionLookup.trim()
+  // Loads the typed session ID, or `chosen` when a listed generation is opened
+  // (#617), which also puts its ID in the field.
+  async function loadSession(chosen?: string) {
+    const id = (chosen ?? sessionLookup).trim()
     if (!id || exportPendingRef.current) return
+    touched.current = true
+    if (chosen !== undefined) setSessionLookup(chosen)
     activeSessionRef.current = ''
     setSessionId(''); setSession(null); setAllowHistorical(false); setFilename(''); setEditingPair(null)
     setError(''); setPollError(''); setSaveResult(''); setLoading(true)
@@ -131,6 +146,8 @@ export default function GoldStandardPage() {
     setSaveResult('')
     try {
       const res = await api.generateGoldStandard({ collection, sample_size: sampleSize })
+      touched.current = true
+      generations.reload()
       activeSessionRef.current = res.session_id
       setSessionId(res.session_id)
       setSessionLookup(res.session_id)
@@ -142,6 +159,14 @@ export default function GoldStandardPage() {
       setLoading(false)
     }
   }
+
+  useEffect(() => {
+    if (!generations.loaded || touched.current) return
+    touched.current = true
+    const entry = newestToOpen(generations.entries, generating)
+    if (entry) loadSession(entry.session_id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [generations.loaded])
 
   function applyPair(pairId: string, updated: GoldPair) {
     setSession(prev => prev ? { ...prev, pairs: prev.pairs.map(p => p.pair_id === pairId ? updated : p) } : prev)
@@ -273,10 +298,17 @@ export default function GoldStandardPage() {
         <label htmlFor="retained-session" className="block text-sm font-semibold mb-2">Inspect a retained session</label>
         <div className="flex gap-3">
           <input id="retained-session" disabled={exportPending} value={sessionLookup} onChange={e => setSessionLookup(e.target.value)} placeholder="Session ID" className="border rounded px-3 py-2 text-sm flex-1" />
-          <button onClick={loadSession} disabled={loading || exportPending || !sessionLookup.trim()} className="border rounded px-3 py-2 text-sm disabled:opacity-50">Load / refresh session</button>
+          <button onClick={() => loadSession()} disabled={loading || exportPending || !sessionLookup.trim()} className="border rounded px-3 py-2 text-sm disabled:opacity-50">Load / refresh session</button>
         </div>
         {session && <p className="text-xs text-gray-500 mt-2">Session {session.session_id} · Collection {session.collection}</p>}
       </div>
+
+      <JobList error={generations.error} loaded={generations.loaded} showOwner={role === 'engineer'}
+        rows={generations.entries.map(entry => ({
+          key: entry.session_id, kind: 'Generation', target: entry.collection, status: entry.status,
+          progress: `${entry.pairs_attempted}/${entry.pairs_total} pairs`, createdAt: entry.created_at,
+          owner: entry.owner, open: entry.session_id === sessionId, onOpen: () => loadSession(entry.session_id),
+        }))} />
 
       {error && <p className="text-red-600 text-sm mb-4">{error}</p>}
       {session && historical && (

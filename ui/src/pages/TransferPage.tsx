@@ -1,8 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
-  api, CollectionInfo, ExportJob, ImportJob, PackageSummary, TuneOptions,
+  api, CollectionInfo, ExportJob, ExportJobEntry, ImportJob, ImportJobEntry, PackageSummary, TuneOptions,
 } from '../api/client'
+import { useRole } from '../context/AuthContext'
+import JobList, { JobRow, newestToOpen, useJobList } from '../components/JobList'
+
+// A transfer job is running until it completes or fails (#617).
+const transferRunning = (j: { status: string }) => j.status !== 'completed' && j.status !== 'failed'
+const loadExportJobs = () => api.listExportJobs().then(r => r.jobs)
+const loadImportJobs = () => api.listImportJobs().then(r => r.jobs)
+
+// Newest first by start time, else by finish time, as the API orders each list.
+function newestFirst(a: { created_at: string | null; finished_at: string | null },
+                     b: { created_at: string | null; finished_at: string | null }): number {
+  const at = (j: typeof a) => Date.parse(j.created_at ?? j.finished_at ?? '') || 0
+  return at(b) - at(a)
+}
 
 function sizeLabel(bytes: number | null): string {
   if (bytes === null) return ''
@@ -39,6 +53,13 @@ function message(e: unknown): string {
 }
 
 export default function TransferPage() {
+  const { role } = useRole()
+  // Running and recent exports and imports, in one list (#617). Each panel
+  // opens its own newest job on the first answer, unless it already has one.
+  const exportJobs = useJobList<ExportJobEntry>(loadExportJobs, transferRunning)
+  const importJobs = useJobList<ImportJobEntry>(loadImportJobs, transferRunning)
+  const exportTouched = useRef(false)
+  const importTouched = useRef(false)
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   const [collection, setCollection] = useState('')
   const [tune, setTune] = useState<TuneOptions | null>(null)
@@ -122,6 +143,7 @@ export default function TransferPage() {
         exportPoll.current = null
         setExportWatching(false)
         loadPackages()
+        exportJobs.reload()
       } else {
         exportTimer.current = window.setTimeout(() => pollExport(jobId), POLL_MS)
       }
@@ -149,6 +171,7 @@ export default function TransferPage() {
       }
       importPoll.current = null
       setImportWatching(false)
+      importJobs.reload()
       if (job.status === 'completed') {
         api.getCollections().then(r => setCollections(r.collections)).catch(() => {})
       }
@@ -165,6 +188,53 @@ export default function TransferPage() {
     })
   }
 
+  // Opens a listed job in its own panel, as a started one is shown (#617).
+  function openExport(entry: ExportJobEntry) {
+    exportTouched.current = true
+    if (exportTimer.current) window.clearTimeout(exportTimer.current)
+    setExportError(''); setExportPollError('')
+    setExportJob(entry)
+    if (transferRunning(entry)) {
+      exportPoll.current = entry.job_id
+      setExportWatching(true)
+      pollExport(entry.job_id)
+    } else {
+      exportPoll.current = null
+      setExportWatching(false)
+    }
+  }
+
+  function openImport(entry: ImportJobEntry) {
+    importTouched.current = true
+    if (importTimer.current) window.clearTimeout(importTimer.current)
+    setImportError(''); setImportPollError('')
+    setImportJob(entry)
+    if (transferRunning(entry)) {
+      importPoll.current = entry.job_id
+      setImportWatching(true)
+      pollImport(entry.job_id)
+    } else {
+      importPoll.current = null
+      setImportWatching(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!exportJobs.loaded || exportTouched.current) return
+    exportTouched.current = true
+    const entry = newestToOpen(exportJobs.entries, transferRunning)
+    if (entry) openExport(entry)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [exportJobs.loaded])
+
+  useEffect(() => {
+    if (!importJobs.loaded || importTouched.current) return
+    importTouched.current = true
+    const entry = newestToOpen(importJobs.entries, transferRunning)
+    if (entry) openImport(entry)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [importJobs.loaded])
+
   async function startExport() {
     setExportError(''); setExportPollError(''); setExportJob(null)
     try {
@@ -173,6 +243,9 @@ export default function TransferPage() {
         : { collection, include_models: includeModels })
       setPassphrase(''); setConfirmPassphrase('')
       if (!alive.current) return
+      exportTouched.current = true
+      exportJobs.reload()
+      if (exportTimer.current) window.clearTimeout(exportTimer.current)
       exportPoll.current = r.job_id
       setExportWatching(true)
       pollExport(r.job_id)
@@ -189,6 +262,9 @@ export default function TransferPage() {
         : { filename, on_conflict: onConflict })
       setImportPassphrase('')
       if (!alive.current) return
+      importTouched.current = true
+      importJobs.reload()
+      if (importTimer.current) window.clearTimeout(importTimer.current)
       importPoll.current = r.job_id
       setImportWatching(true)
       pollImport(r.job_id)
@@ -209,6 +285,19 @@ export default function TransferPage() {
     : ''
   const selectedEncrypted = packages.some(p => p.filename === filename && p.encrypted)
 
+  const jobRows: (JobRow & { sort: { created_at: string | null; finished_at: string | null } })[] = [
+    ...exportJobs.entries.map(entry => ({
+      key: 'export:' + entry.job_id, kind: 'Export', target: entry.collection, status: entry.status,
+      progress: `${entry.chunks_written} chunks`, createdAt: entry.created_at, owner: entry.owner,
+      open: exportJob?.job_id === entry.job_id, onOpen: () => openExport(entry), sort: entry,
+    })),
+    ...importJobs.entries.map(entry => ({
+      key: 'import:' + entry.job_id, kind: 'Import', target: entry.filename, status: entry.status,
+      progress: `${entry.chunks_written} chunks`, createdAt: entry.created_at, owner: entry.owner,
+      open: importJob?.job_id === entry.job_id, onOpen: () => openImport(entry), sort: entry,
+    })),
+  ].sort((a, b) => newestFirst(a.sort, b.sort))
+
   return (
     <div className="max-w-3xl mx-auto">
       <div className="flex items-baseline justify-between mb-2">
@@ -220,6 +309,10 @@ export default function TransferPage() {
       <p className="text-sm text-gray-500 mb-6">
         Packages are written to and read from <code>./exports</code> in the project directory.
       </p>
+
+      <JobList rows={jobRows} showOwner={role === 'engineer'}
+        loaded={exportJobs.loaded && importJobs.loaded}
+        error={[exportJobs.error, importJobs.error].filter(Boolean).join(' ')} />
 
       {/* ── Export ─────────────────────────────────────────────────────── */}
       <section className="bg-white border rounded p-4 mb-6">

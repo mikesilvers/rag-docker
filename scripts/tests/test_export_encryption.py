@@ -799,7 +799,7 @@ class Api(Fixture):
     def test_export_bounds_count_characters(self):
         seen = []
 
-        async def start(collection, include_models, passphrase):
+        async def start(collection, include_models, passphrase, owner=None):   # owner: #617
             seen.append(passphrase)
             return "job12345"
         with patch.object(wc, "collection_exists", return_value=True), \

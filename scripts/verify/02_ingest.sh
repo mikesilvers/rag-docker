@@ -748,6 +748,22 @@ check_eq "the deleted collection is still gone 10 s later" "$(object_count "$DC"
 # writes, startup marking of interrupted jobs, corrupt files and retention.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_jobstore.py)
 check "job store: persistence, throttling, startup marking and retention" $?
+
+# ── running and recent jobs (#617) ───────────────────────────────────────────
+# Units in the API image with no network: owners and timestamps recorded, who
+# sees what, the 24-hour window and the cap, sessions, packages. Then the lists
+# on the stack: a Developer's and a Developer-role key's ingests, the
+# Developer's export and import, each listed for its owner and the Engineer
+# only. The stack check creates a principal, so it runs only on the verify project.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_job_lists.py)
+check "job lists: owners and timestamps, visibility, window, cap, sessions, packages" $?
+if [ -z "$(volume_removal_refusal_reason)" ]; then
+  _rag_require_lock_owner
+  python3 ./job_lists.py --operator
+  check "GET /ingest/jobs, /export/jobs, /import/jobs list each caller's own jobs, and everyone's for the Engineer" $?
+else
+  skip "job lists on the stack: not the verify project"
+fi
 # A killed job's leftovers (#377): ingest staging in UPLOAD_DIR, and an export's
 # `.build-*` directory and `.*.tar.gz.partial` archive in EXPORTS_DIR.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_startup_sweep.py)
