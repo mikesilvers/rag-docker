@@ -654,7 +654,12 @@ the replaced files, before any insert, and deletes earlier chunks only after the
 marking failure fails only that file and changes nothing; a failed lookup of the later files
 is reported as the lookup, not the marking, and also changes nothing (#311); a failed insert keeps the earlier
 version; a removal failure keeps the new chunks and reports `partial`; a deleted collection is
-reported at the first lookup (#40). Also the delete rounds, precondition and final count,
+reported at the first lookup (#40). Also exact-name selection (#622): only the name's own
+chunks are deleted or counted among word matches such as `a/report.pdf`, `Report.PDF` and
+`report.pdf (part 1)`, over 10,000 word matches the collection is walked instead of queried,
+a name has chunks only when stored exactly, and a non-default rule selects what it accepts;
+the deletion by ID in batches of at most 10,000, never empty, and its bound, refused before
+deleting; the precondition and final count,
 retention releasing the name (also when the blob write fails, keeping shared digests), and
 rechunk coverage and per-(digest, name) rebuilds, rebuilding only names with stored chunks
 while a missing blob is still refused (#311), also for one blob under 50 names with one
@@ -690,7 +695,12 @@ ZIP (it completes with no errors, stores only its file and lists the AppleDouble
 that ingesting a new name leaves the session current and a replacing re-ingest marks it
 stale, naming the file. Two concurrent uploads of one name must leave exactly one job's
 version, whole: its chunk set, its digest, and `chunks_replaced` equal to the other job's
-chunks. `browser/ui_criteria.js` (suite 06) stubs the job response and checks that the Import
+chunks. Replacing a name touches only that name (#622): with `a/report.pdf` (in a ZIP) and
+`Report.PDF` stored, uploading `report.pdf` replaces nothing and uploading it again replaces
+only its first set, and the other two keep exactly their chunks. `exact_source.py` then checks
+the same selection in real Weaviate on a scratch collection without a vectorizer, on both
+paths: a few word matches read in one query, and over 10,000 walked.
+`browser/ui_criteria.js` (suite 06) stubs the job response and checks that the Import
 page shows "Replaced N chunk(s) from a previous version" only when `chunks_replaced` is above
 0, and the plain "N file(s) skipped:" heading with each entry's own reason.
 `05_transfer.sh` (E32) replaces a file, adds a second name for the new content, re-chunks,
@@ -831,7 +841,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_jsonl_ingest.py` | controlled JSON Lines reading, conversion, limit and gzip regressions, registered by ingest |
 | `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
 | `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
-| `../tests/test_reingest.py` | controlled re-ingest replacement, same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
+| `../tests/test_reingest.py` | controlled re-ingest replacement, exact-name selection (#622), same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
+| `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`) and over 10,000 (`walk`); the collection is removed afterwards |
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, registered by transfer |
