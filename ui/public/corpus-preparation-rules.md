@@ -57,7 +57,7 @@ A file over any of these fails, and the other files in the job carry on.
 | Limit | Value | What happens |
 |---|---|---|
 | One JSON Lines line, not counting its line ending | 10,000,000 bytes | The file fails at that line |
-| One chunk | 6,000 characters | A longer chunk is cut, at whitespace where possible; nothing fails |
+| One chunk | 6,000 characters | A longer chunk is split into pieces of at most 6,000 characters, at whitespace where possible, and every piece counts toward the 10,000-chunk limit |
 
 ### Chunk settings
 
@@ -119,18 +119,51 @@ it to JSON Lines, one record per line.
 ## 4. Chunk count
 
 The 10,000-chunk limit can be reached before the text limit. How many chunks a file gives
-depends on the collection's chunking strategy and its chunk settings:
+depends on the collection's chunking strategy and its chunk settings. Count them with the
+rule for the strategy. Each rule counts the worst case, so most files give fewer chunks than
+it says, and a file whose count stays under the target in section 5 doesn't fail on it. Below,
+"text" is the file's converted text in characters (section 3), and a record is one JSON
+record or JSON Lines line once converted.
 
-- **`overlap`** (the default) **and `language`**: about one chunk for every
-  `chunk_size − chunk_overlap` characters. With the defaults (1,000 − 200), a file reaches
-  10,000 chunks at **about 8,000,000 characters**, below the 10,000,000-character limit.
-- **`fixed` and `context_aware`**: about one chunk for every `chunk_size` characters. With
-  the default `chunk_size`, the 10,000,000-character limit is reached first.
+- **`fixed`**: one chunk for every `chunk_size` characters. With the default `chunk_size`,
+  that is 8,000 chunks at about 8,000,000 characters, so the 7,000,000-character target is
+  reached first.
+- **`overlap`** (the default): one chunk for every `chunk_size − chunk_overlap` characters.
+  With the defaults (1,000 − 200), one chunk per 800 characters: 8,000 chunks at about
+  6,400,000 characters. The chunks repeat the overlap, so this strategy has a second count,
+  the text across its chunks: the text plus `chunk_overlap` for every chunk, limited to
+  10,000,000 characters (section 2).
+- **`language`** splits at the blank line between records or paragraphs first, then at line
+  breaks, sentences and words, and keeps each piece whole, so a chunk can be only a little
+  over half full. Count one chunk for every `(chunk_size − chunk_overlap) ÷ 2` characters,
+  plus two for every record or paragraph longer than `chunk_size`. With the defaults, one
+  chunk per 400 characters: 8,000 chunks at about 3,200,000 characters. For JSON and JSON
+  Lines, one of these counts may be smaller, and you can use it instead:
+  - if no record is longer than `chunk_size`: one chunk per record, but never fewer than one
+    for every `chunk_size − chunk_overlap` characters;
+  - if every record is shorter than `(chunk_size − chunk_overlap) ÷ 2`: one chunk for every
+    `chunk_size − chunk_overlap − L` characters, where `L` is the longest record's length.
+- **`context_aware`** puts JSON and JSON Lines records, and the paragraphs, titles and
+  tables of other files, into chunks whole: short ones are joined up to `chunk_size`, and a
+  longer one is a chunk of its own, split into pieces if it is over 6,000 characters
+  (section 2). So a chunk can be only a little over half full. Count one chunk for every
+  `chunk_size ÷ 2` characters, plus two for every table, plus one for every 3,000
+  characters, rounded up, of each record or paragraph longer than 6,000 characters. With
+  the default `chunk_size`, one chunk per 500 characters: 8,000 chunks at about 4,000,000
+  characters. For JSON and JSON Lines, one of these counts may be smaller, and you can use
+  it instead:
+  - one chunk per record, a record longer than 6,000 characters counting as one for every
+    3,000 characters, rounded up; but never fewer than one for every `chunk_size` characters;
+  - if every record is shorter than `chunk_size ÷ 2`: one chunk for every `chunk_size − L`
+    characters, where `L` is the longest record's length.
 - **`semantic`**: one chunk per run of sentences on the same topic, so the count depends on
-  the text; it is limited to 100,000 sentences per file as well.
-- `context_aware` splits JSON and JSON Lines only between records, and joins short records
-  into one chunk up to `chunk_size`; a record longer than `chunk_size` is one chunk, cut at
-  6,000 characters. `language` prefers to split at the blank line between records.
+  the text and isn't known before the import. Count one chunk per sentence (a sentence ends
+  at a full stop followed by a space; line breaks don't end one), a sentence longer than
+  6,000 characters counting as one for every 3,000 characters, rounded up. The strategy is
+  limited to 100,000 sentences per file as well.
+- The app refuses a file early when the text alone is over 10,000 chunks at one chunk for
+  every `chunk_size` characters (`fixed`, `context_aware`) or `chunk_size − chunk_overlap`
+  characters (`language`). That's why the record counts above never go below those.
 - A larger `chunk_size` gives fewer chunks, at some cost to retrieval precision. A smaller
   `chunk_overlap` gives fewer chunks with `overlap` and `language`.
 
@@ -141,7 +174,8 @@ Aim below the limits, not at them:
 | Per file | Target | Limit |
 |---|---|---|
 | Converted text | at most 7,000,000 characters (70 % of the limit) | 10,000,000 characters |
-| Chunks, estimated as in section 4 | at most 8,000 chunks (80 % of the limit) | 10,000 chunks |
+| Chunks, counted as in section 4 | at most 8,000 chunks (80 % of the limit) | 10,000 chunks |
+| `overlap` only: text across the chunks, counted as in section 4 | at most 8,000,000 characters (80 % of the limit) | 10,000,000 characters |
 | Records or lines | under the limit | 1,000,000 records |
 
 When a file is over a target, split it:

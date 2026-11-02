@@ -2511,10 +2511,13 @@ The question and the citations toggle are kept.
   proxy's `location /`, so every install has it, offline ones included. Written for someone
   preparing a corpus, it states how the app reads an upload, every ingest limit of §5 and
   §3.1.3 (per upload, per ZIP, per file, per line, per chunk, and the chunk settings' bounds
-  and defaults), how JSON and JSON Lines become text, how the chunk count depends on the
-  strategy and settings, safe targets (70 % of the text limit, 80 % of the chunk cap), how to
-  split, and a checklist. It says the upload and ZIP limits are the shipped values an
-  administrator can change. It states nothing about a host's speed or disk.
+  and defaults), how JSON and JSON Lines become text, a worst-case chunk count for each
+  strategy and its settings (`language` and `context_aware` keep records and paragraphs
+  whole, so a chunk can be only a little over half full; a piece cut at the 6,000-character
+  chunk ceiling counts as a chunk), safe targets (70 % of the text limit, 80 % of the chunk
+  cap, and for `overlap` 80 % of the limit on the text across its chunks), how to split, and
+  a checklist. A file at the targets doesn't fail on the text or chunk limits. It says the
+  upload and ZIP limits are the shipped values an administrator can change. It states nothing about a host's speed or disk.
   `scripts/tests/test_corpus_rules.py` derives each limit from the code, the settings
   defaults, `docker-compose.yml` and the proxy, and fails when the file doesn't state it or
   states a number none of them accounts for.

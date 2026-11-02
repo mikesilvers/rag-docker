@@ -75,11 +75,18 @@ def expected():
     minimum = fields['min_chunk_size'].default
     chunks = chunker.MAX_CHUNKS_PER_FILE
     text = chunker.MAX_TEXT_CHARACTERS
-    # The text at which the overlap and language strategies reach the chunk cap
-    # with the default settings: one chunk per (size - overlap) characters.
-    at_cap = round(size + (chunks - 1) * (size - overlap), -6)
     text_target = int(text * 0.7)
     chunk_target = int(chunks * 0.8)
+    output_target = int(chunker.MAX_OVERLAP_OUTPUT_CHARACTERS * 0.8)
+    # Section 4's worst-case counts with the default settings: characters per
+    # chunk, and the text at which a file reaches the chunk target. fixed and
+    # overlap cut by size; language and context_aware keep pieces whole, so a
+    # chunk can be only a little over half full.
+    per_chunk = {'fixed': size, 'overlap': size - overlap,
+                 'language': (size - overlap) // 2, 'context_aware': size // 2}
+    # _cap_chunk_length cuts an over-long chunk at whitespace no earlier than
+    # half the cap, so a piece holds at least this many characters.
+    cap_piece = chunker.MAX_CHUNK_CHARACTERS // 2
     for name, value in (('expanded', expanded % GIB), ('exempt', exempt % MIB)):
         assert value == 0, f'{name} is no longer a whole number of GiB/MiB; reword the file'
     phrases = {
@@ -103,12 +110,20 @@ def expected():
         f'default {size:,}': [size],
         f'default {overlap:,}': [overlap],
         f'default {minimum:,}': [minimum],
-        f'about {at_cap:,} characters': [at_cap],
         f'{text_target:,} characters': [text_target],
         f'{chunk_target:,} chunks': [chunk_target],
+        f'{output_target:,} characters (80 %': [output_target],
+        f'one for every {cap_piece:,} characters': [cap_piece],
+    }
+    for strategy in ('overlap', 'language', 'context_aware'):
+        phrases[f'one chunk per {per_chunk[strategy]:,} characters'] = [per_chunk[strategy]]
+    for strategy in per_chunk:
+        at_target = chunk_target * per_chunk[strategy]
+        phrases[f'{chunk_target:,} chunks at about {at_target:,} characters'] = [at_target]
+    phrases.update({
         '70 %': [70],
         '80 %': [80],
-    }
+    })
     return phrases
 
 
@@ -123,7 +138,8 @@ class CorpusRulesTests(unittest.TestCase):
         self.phrases = expected()
 
     def test_every_limit_is_stated(self):
-        text = prose(self.text)
+        # Whitespace collapsed, so a phrase may wrap across lines.
+        text = ' '.join(prose(self.text).split())
         for phrase in self.phrases:
             with self.subTest(phrase=phrase):
                 # Whole numbers only: "10,000 chunks" must not match "110,000 chunks".
