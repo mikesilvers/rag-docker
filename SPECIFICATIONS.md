@@ -755,6 +755,15 @@ member that will be skipped. A ZIP holding nothing else is refused with `NO_SUPP
   removes (1000000), so none were removed`. Deletion proceeds only if exactly the new chunks
   of the name carry their own `created_at`, and afterwards exactly they must remain, both
   counted over the exact name. The job's `chunks_replaced` counts the deleted chunks.
+- **A name stored as parts is replaced whole (#621).** A file over the per-file limits is
+  stored as parts `<name> (part N)` (§5.1.1); the name and every one of its parts are its
+  family, matched exactly (a name, then ` (part `, a number from 1 without leading zeros,
+  `)`). Re-ingesting the name replaces its whole family, whether the earlier or the new
+  version was split: a smaller re-upload, a file no longer split and a file newly split all
+  leave exactly the new chunks. `a/data.jsonl`, `Data.jsonl` and `data.jsonl.bak (part 1)`
+  are not in `data.jsonl`'s family. Whether the name already has chunks, the deletion
+  precondition and the final count are all over the family, and gold-standard stale
+  marking uses the same check.
 - If the earlier chunks can't all be deleted, the new chunks stay, the file counts as
   failed (so the job is `partial`, or `failed` if every file failed) and `errors` gets
   `<file>: its new chunks were stored, but earlier chunks could not all be removed
@@ -796,7 +805,8 @@ GET /ingest/job/{job_id}
   "chunks_accepted": 142,
   "chunks_replaced": 0,
   "errors": [],
-  "skipped": []
+  "skipped": [],
+  "split": []
 }
 ```
 
@@ -812,7 +822,11 @@ these two fields existed read back with both `null`, not `0`, which would be unt
 `chunks_replaced` is how many earlier chunks of the same names the job deleted (#22); job
 records written before it existed read back as `0`. `skipped` lists inputs that were not
 ingested, each with its reason: an unsupported type, macOS metadata in a ZIP (#378), or a
-later input with the same name.
+later input with the same name. `split` lists the files stored as parts (§5.1.1, #621), one
+entry per such file that completed, in order: `<file>: split into N parts, stored as
+'<name> (part 1)' to '<name> (part N)'`, `<file>` as in `errors` and `<name>` its logical
+name. A split file is not a failure: it counts once in `files_completed`. Job records written
+before the field existed read back with `[]`.
 
 `status` values: `"queued"`, `"running"`, `"completed"`, `"partial"` (some files failed),
 `"failed"`.
@@ -841,10 +855,11 @@ On failure, `errors` contains per-file error messages, each `"<file>: <reason>"`
 convert it to JSON Lines` (decompression stops there; #300); or JSON that can't be parsed after
 decompression. A `.json` file over 30,000,000 bytes fails, before it is read, with `is larger than
 30,000,000 bytes, the most one JSON file can hold; split the file or convert it to JSON Lines`. A `.json` file
-that isn't valid JSON fails with `is not valid JSON: <reason>`, giving the parser's line and column; one whose
-converted text would exceed 10,000,000 characters fails with `converts to more than 10,000,000 characters of
-text, the per-file limit for every chunking strategy; split the file` (a `.json.gz` member: `was decompressed,
-but it converts to more than …`); one with more than 1,000,000 records fails with `has more than 1,000,000
+that isn't valid JSON fails with `is not valid JSON: <reason>`, giving the parser's line and column; one with a
+record whose converted text would exceed 10,000,000 characters fails with `record N converts to more than
+10,000,000 characters of text, the most one record can hold; a record is never split` (N the record's position
+in the file, from 1; a `.json.gz` member: `was decompressed, but record N converts to more than …`); one with
+more than 1,000,000 records fails with `has more than 1,000,000
 records, the most one file can hold; split the file` (a `.json.gz` member: `was decompressed, but it has more
 than …`).
 
@@ -852,13 +867,22 @@ A `.jsonl` or `.jsonl.gz` file fails as a whole, with nothing stored, at its fir
 (§5.1): `line N is blank` (a blank line followed by another record), `line N is not valid JSON:
 <reason> at column C`, `line N is not UTF-8 text (<reason> at byte B)`, `line N is longer than
 10,000,000 bytes, the most one line can hold; split the record across lines or files`,
-`converts to more than 10,000,000 characters of text by line N, the per-file limit for every
-chunking strategy; split the file`, or, past 1,000,000 lines, `has more than 1,000,000 records,
+`line N converts to more than 10,000,000 characters of text, the most one record can hold; a
+record is never split` (#621), or, past 1,000,000 lines, `has more than 1,000,000 records,
 the most one file can hold; split the file` (#314). For a `.jsonl.gz` these read `was
-decompressed, but line N …` (and `was decompressed, but it converts to more than …`, `was
-decompressed, but it has more than …`); a corrupt or truncated gzip gives the
+decompressed, but line N …` (and `was decompressed, but it has more than …`); a corrupt or truncated gzip gives the
 `.json.gz` message above, and passing the 512 MB limit gives `decompresses to more than 512 MB,
 the limit for one compressed file; nothing from it was stored`.
+
+A file stored as parts (§5.1.1, #621) is stored whole or not at all. If any part fails (reading
+a later line, a bad line, a record over a limit, chunking, the `semantic` sentence limit,
+storing), every chunk this ingest stored for the file is removed, the earlier version stays
+whole, `chunks_stored` drops by what was removed, and the error is `<file>: part N: <reason>;
+nothing from it was stored`. If that removal fails too, it ends instead `; K new chunks could
+not be removed (<reason>); upload it again to retry`. A record that gives more than 10,000
+chunks on its own fails the file with `record N gives more than 10,000 chunks with these chunk
+settings, the most one part can hold; a record is never split, so use a larger chunk size`
+(`line N` for JSON Lines), as `part N: …` when other parts came before it.
 
 **Response 404** if the job ID does not exist:
 ```json
@@ -2226,10 +2250,53 @@ Flat (KNN) index has no tunable parameters.
 | Plain text | `.txt` | Unstructured (`partition_text`) | UTF-8 encoding assumed |
 | Markdown | `.md` | Unstructured (`partition_md`) | Heading structure preserved |
 | CSV | `.csv` | Unstructured (`partition_csv`) | Each row treated as a text chunk candidate |
-| JSON | `.json` | Own converter; Unstructured (`partition_json`) for element files | Converted to readable `key: value` lines, keys in the file's order, non-ASCII text as is, strings unquoted, numbers as written, `true`/`false`/`null` as is. Nested keys are dotted paths (`meta.author: A`); an array of scalars is one line (`tags: a, b, c`); other arrays use indexed paths (`items[0].name: x`). A top-level array holding any object or array gives one element per item (scalar items included), separated by a blank line, so `language` and `context_aware` chunking split between records. Empty objects and arrays write nothing: `{}`, `[]` or an empty file completes with 0 chunks. Invalid JSON (including `NaN`/`Infinity` and non-UTF-8 text; a UTF-8 byte-order mark is accepted) fails that file with "is not valid JSON: <reason>". Because every line repeats its key path, the converted text is bounded: a file whose records, with the blank lines between them, would hold more than 10,000,000 characters (`MAX_TEXT_CHARACTERS`, the chunker's per-file limit for every strategy) fails with "converts to more than 10,000,000 characters of text …" before that text is built. A file keeps at most 1,000,000 records (records with no text don't count); more fails with "has more than 1,000,000 records …", before any element is built (#300). An element file's items count the same way, every item included, and are counted before `partition_json` builds them (#321). A file is parsed whole, so a `.json` file over 30,000,000 bytes (`MAX_JSON_INPUT_BYTES`, an element file included) fails before it is read with "is larger than 30,000,000 bytes, the most one JSON file can hold; split the file or convert it to JSON Lines", and a `.json.gz` member stops decompressing there ("decompresses to more than 30,000,000 bytes …"); the rest of the job carries on (#300). A non-empty array of serialized Unstructured elements is rehydrated by `partition_json` (#295) |
-| JSON Lines | `.jsonl`, `.jsonl.gz` | Own reader and the JSON converter above (#291) | One file is one document. Read one line at a time (lines end at `\n` or `\r\n`, so CRLF and LF files read the same; the last line needs no newline); a `.jsonl.gz` is decompressed as it is read, at most 512 MB. Each non-blank line is one record: its JSON value (any value, not only an object) converted by the JSON rules above from the root, so an array line is one record with indexed paths (`[0].a: 1`). Records are separated by a blank line and each is one element, so `language` and `context_aware` chunking split between lines; lines are never treated as Unstructured element files. A line with no text (`{}`, `[]`, `""`) adds nothing; an empty or blank-only file completes with 0 chunks. A UTF-8 byte-order mark on line 1 is accepted. The file fails as a whole, with nothing stored, at its first bad line: a blank line followed by another record (`line N is blank`; blank lines after the last record are accepted), invalid JSON (`line N is not valid JSON: <reason> at column C`), non-UTF-8 text, or a line over 10,000,000 bytes, not counting its line ending or line 1's byte-order mark (`line N is longer than 10,000,000 bytes …`; at most that much of one line is read, so one record's parse stays bounded; #314). A file holds at most 1,000,000 lines, the JSON record cap: every line counts, blank lines and lines with no text included, and reading stops at line 1,000,001, which fails the file (`has more than 1,000,000 records, the most one file can hold; split the file`; #314). The whole file's text, blank lines between records included, is bounded by the same 10,000,000 characters as JSON: reading stops at the line that passes it (`converts to more than 10,000,000 characters of text by line N …`). Larger corpora are #312. `source_type` is `jsonl` |
+| JSON | `.json` | Own converter; Unstructured (`partition_json`) for element files | Converted to readable `key: value` lines, keys in the file's order, non-ASCII text as is, strings unquoted, numbers as written, `true`/`false`/`null` as is. Nested keys are dotted paths (`meta.author: A`); an array of scalars is one line (`tags: a, b, c`); other arrays use indexed paths (`items[0].name: x`). A top-level array holding any object or array gives one element per item (scalar items included), separated by a blank line, so `language` and `context_aware` chunking split between records. Empty objects and arrays write nothing: `{}`, `[]` or an empty file completes with 0 chunks. Invalid JSON (including `NaN`/`Infinity` and non-UTF-8 text; a UTF-8 byte-order mark is accepted) fails that file with "is not valid JSON: <reason>". Because every line repeats its key path, each record's converted text is bounded: a record that would hold more than 10,000,000 characters (`MAX_TEXT_CHARACTERS`, the chunker's per-file limit for every strategy) fails the file with "record N converts to more than 10,000,000 characters of text …" before that text is built. A file whose records together hold more is split into parts (§5.1.1, #621). A file keeps at most 1,000,000 records (records with no text don't count); more fails with "has more than 1,000,000 records …", before any element is built (#300). An element file's items count the same way, every item included, and are counted before `partition_json` builds them (#321). A file is parsed whole, so a `.json` file over 30,000,000 bytes (`MAX_JSON_INPUT_BYTES`, an element file included) fails before it is read with "is larger than 30,000,000 bytes, the most one JSON file can hold; split the file or convert it to JSON Lines", and a `.json.gz` member stops decompressing there ("decompresses to more than 30,000,000 bytes …"); the rest of the job carries on (#300). A non-empty array of serialized Unstructured elements is rehydrated by `partition_json` (#295) |
+| JSON Lines | `.jsonl`, `.jsonl.gz` | Own reader and the JSON converter above (#291) | One file is one document. Read one line at a time (lines end at `\n` or `\r\n`, so CRLF and LF files read the same; the last line needs no newline); a `.jsonl.gz` is decompressed as it is read, at most 512 MB. Each non-blank line is one record: its JSON value (any value, not only an object) converted by the JSON rules above from the root, so an array line is one record with indexed paths (`[0].a: 1`). Records are separated by a blank line and each is one element, so `language` and `context_aware` chunking split between lines; lines are never treated as Unstructured element files. A line with no text (`{}`, `[]`, `""`) adds nothing; an empty or blank-only file completes with 0 chunks. A UTF-8 byte-order mark on line 1 is accepted. The file fails as a whole, with nothing stored, at its first bad line: a blank line followed by another record (`line N is blank`; blank lines after the last record are accepted), invalid JSON (`line N is not valid JSON: <reason> at column C`), non-UTF-8 text, or a line over 10,000,000 bytes, not counting its line ending or line 1's byte-order mark (`line N is longer than 10,000,000 bytes …`; at most that much of one line is read, so one record's parse stays bounded; #314). A file holds at most 1,000,000 lines, the JSON record cap: every line counts, blank lines and lines with no text included, and reading stops at line 1,000,001, which fails the file (`has more than 1,000,000 records, the most one file can hold; split the file`; #314). Each record's text is bounded by the same 10,000,000 characters as JSON: reading stops at a line that passes it (`line N converts to more than 10,000,000 characters of text …`). A file whose records together hold more is read and stored part by part (§5.1.1, #621). `source_type` is `jsonl` |
 
 For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings) and macOS metadata (`__MACOSX/` members and `._*` AppleDouble files, listed in `skipped`, #378). `.json.gz` members are also extracted; each is decompressed (at most 30,000,000 bytes, #300) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. `.jsonl` and `.jsonl.gz` members are extracted and read as JSON Lines (#291), like direct uploads. Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3). An upload's ZIPs may expand to at most `max_zip_expanded_bytes` (2 GiB) in all, gzipped members' output included; over it, the upload is refused with `ARCHIVE_TOO_LARGE` (§3.1.3, #298). One ZIP may hold at most `max_zip_members` (5,000) entries, and a member of 1 MiB or more may expand to at most `max_zip_member_ratio` (200) times its compressed size, or the upload is refused with `ARCHIVE_TOO_MANY_MEMBERS` or `ARCHIVE_RATIO_TOO_HIGH`. Members whose path leaves the archive are validated and counted but never extracted, and are listed in `skipped` (§3.1.3, #28). This work runs in a worker thread, off the event loop.
+
+### 5.1.1 Files over the per-file limits (#621)
+
+A file whose text or chunking would go over the per-file limits, for the collection's strategy
+and chunk settings, is not refused: it is split into parts that each stay under them, stored as
+`<name> (part 1)` to `<name> (part N)` (N at least 2), each chunked on its own as a file of its
+own would be (`chunk_index` from 0 in every part; one `created_at` for all of a file's parts).
+No chunk is stored under `<name>` itself, and a file within the limits is stored exactly as
+before. The limits are the 10,000,000-character text limit, the 10,000-chunk limit, and for
+`overlap` its 10,000 windows and 10,000,000 window characters (§5.2). Every other limit stays
+as it is: the upload, ZIP, `.json` size, JSON Lines line and record count limits, and the
+`semantic` 100,000-sentence limit, which applies to each part.
+
+| Type | Read | Split at | A part's text |
+|---|---|---|---|
+| `.jsonl`, `.jsonl.gz` | a line at a time | records (lines), never inside one | its records, as one file's |
+| `.json`, `.json.gz` member | whole, as before | records (an element file's items), never inside one | its records, as one file's |
+| `.txt`, `.md` | in blocks | paragraphs: blank lines (in Markdown, not inside a fenced code block) | `partition_text` / `partition_md` of its paragraphs |
+| `.csv` | by rows | rows; the header row is repeated at the start of every part | `partition_csv` of the header and its rows |
+| `.pdf`, `.docx` | whole, as before | elements | its elements |
+
+- Parts are formed in file order, as large as an estimate of the strategy's chunking allows:
+  the text at most 10,000,000 characters; for `fixed` and `language` at most
+  `10,000 × (chunk_size − overlap)` characters (`language`'s overlap), for `context_aware` at
+  most `10,000 × chunk_size` characters and 10,000 records or elements, for `overlap` the most
+  text whose windows stay within both window limits, for `semantic` the text limit alone. A
+  part that still goes over when chunked is split in half and each half chunked again.
+- A record is never split: one over 10,000,000 characters, or giving more than 10,000 chunks
+  on its own, fails the file (§3.1.3). A paragraph, element or CSV row over a part on its own
+  is cut at line breaks, then at whitespace, then hard at the limit; pieces of an element keep
+  its category, and a CSV row's pieces are rows of one cell. Text therefore always fits.
+- JSON Lines, `.txt`, `.md` and `.csv` are read part by part, so memory is bounded by one part
+  whatever the file's size; a large file just takes longer. A streamed `.txt`, `.md` or `.csv`
+  is read as UTF-8 when the whole file is, otherwise in the encoding Unstructured detects from
+  its first MiB; the whole file is checked before anything is stored, and one no encoding
+  reads fails with `is not in an encoding that can be read in parts`.
+- The original is retained once, under `<name>`. A part maps back to it: export links a part's
+  chunks to it (`source_sha256`, `RAG_EXPORT_SPECIFICATIONS.md` §4.5), re-chunking rebuilds it
+  and splits it again (so the number of parts follows the new settings), and a part counts for
+  it in re-chunk coverage when no retained original is listed under the part's own name.
+  Re-embedding and re-indexing keep the stored parts.
+- Replacement covers the whole family (§3.1.3), the job lists each split file in `split`, and
+  a failed part fails the file with nothing stored (§3.1.3).
 
 ### 5.2 Chunking Strategy Specifications
 
@@ -2241,7 +2308,7 @@ For ZIP uploads: extract to temp directory, process all files with supported ext
 #### Fixed Size with Overlap (`overlap`)
 - Splitter: explicit character windows, independent of paragraph/word separators
 - Parameters: `chunk_size`, `chunk_overlap`, `min_chunk_size`
-- Per-file pre-merge output limits: at most 10,000 windows and 10,000,000 total window characters, including repeated overlap. Count and total payload are computed before allocating windows. Excess fails that file with a clear ingest-job error; other files can continue. These are candidate/payload character bounds, not parser or encoded-byte limits. The optional final-tail merge does not relax the pre-allocation limits.
+- Per-file pre-merge output limits: at most 10,000 windows and 10,000,000 total window characters, including repeated overlap. Count and total payload are computed before allocating windows. A file over them is split into parts that each stay under them (§5.1.1, #621). These are candidate/payload character bounds, not parser or encoded-byte limits. The optional final-tail merge does not relax the pre-allocation limits.
 - Behavior: consecutive windows share exactly `chunk_overlap` characters. Nonblank
   text is covered in order, including internal and boundary whitespace; blank-only
   input yields no chunks. Python character counts, rather than encoded byte counts,
@@ -2561,7 +2628,7 @@ The question and the citations toggle are kept.
   - Engineer and Developer both see: chunk size slider, overlap slider (hidden for `semantic` and `context_aware`), minimum chunk size.
   - Engineer additionally sees: similarity threshold slider (visible only when `semantic` is selected).
 - "Start Ingest" button → calls `POST /ingest/upload`, displays job ID. The line "Job ID: <job_id>" appears as soon as the upload is accepted and stays while the job runs and after it ends, until a later upload is accepted. Until the first successful poll, a panel in the progress panel's place shows the status the upload was accepted with (`queued`) and "Waiting for the first progress update". With files chosen and no collection selected (none exist, or the list failed to load), the button sends nothing and the page says "Choose a collection to import into first. Use + New to create one." (#394).
-- Progress panel: polls `GET /ingest/job/{job_id}` every 3 seconds. Shows files completed/total, chunks stored, errors, "Submitted N · accepted N · stored N" when `chunks_submitted` and `chunks_accepted` are numbers and the three counts are not all equal (#302), "Replaced N chunks from a previous version" when `chunks_replaced` is above 0, and the skipped list under "N files skipped:" (each entry gives its reason).
+- Progress panel: polls `GET /ingest/job/{job_id}` every 3 seconds. Shows files completed/total, chunks stored, errors, "Submitted N · accepted N · stored N" when `chunks_submitted` and `chunks_accepted` are numbers and the three counts are not all equal (#302), "Replaced N chunks from a previous version" when `chunks_replaced` is above 0, the files stored as parts under "N files split into parts:" (each entry names its parts, #621), and the skipped list under "N files skipped:" (each entry gives its reason).
 
 **Chunking strategy explanations** (shown in an info box when a strategy is selected):
 
@@ -3107,6 +3174,29 @@ now lives once, in `api/services/ingest_config.py`.
       the file and storing nothing, `context_aware` one chunk per record); `02_ingest.sh`
       checks that a gzipped file of 1,000,001 `{}` lines fails with the exact message and
       stores nothing.*
+- [x] A file over the per-file limits (10,000 chunks, 10,000,000 characters, and `overlap`'s window limits) is ingested as parts `<name> (part N)` instead of failing: JSON and JSON Lines at record boundaries, text at paragraphs, a CSV by rows with its header in every part; re-uploading the name replaces every part; a failed part stores nothing; the job lists the file in `split`; export, re-chunking and gold-standard stale marking map parts back to the original (#621).
+      *Before #621 such a file failed with "exceeds the per-file limit", and record-structured
+      JSON Lines under `context_aware` passed the pre-check and failed after chunking (13,000
+      records of 600 characters gave 13,000 chunks). The whole-file JSON and JSON Lines text
+      bound from #295 and #291 is now per record: a file whose records together pass it is
+      split, a single record over it still fails. `test_split_parts.py` (API image, Weaviate
+      replaced by an in-memory collection keeping the replacement helpers' contract) covers the
+      13,000-record case, a `.jsonl`, a `.txt` and a `.json` over 10,000,000 characters (each
+      failing on the code before #621), a file within the limits stored as before, family
+      replacement (smaller, unsplit and newly split re-uploads; neighbours such as
+      `a/data.jsonl` and `Data.jsonl` untouched), a bad line, a failed insert and a failed
+      removal after part 1, a record over the chunk cap, the cuts, CSV headers, Markdown fences,
+      a streamed Latin-1 file and one no encoding reads, `overlap` sizing, the halving
+      re-split, the `semantic` sentence limit failing a part, re-chunk coverage and rebuild,
+      export links and `ChunkLimitError`. `test_overlap_chunks.py`, `test_json_ingest.py` and
+      `test_jsonl_ingest.py` now check splitting and the per-record bound where they checked
+      the old failures, and `test_reingest.py`'s fake backend takes the `accept` rule.
+      `02_ingest.sh` uploads the 13,000-record file (`context_aware`) and a 10,500,000-character
+      `.txt` (`fixed` 6,000) through the proxy and reads the stored part names and counts back
+      from Weaviate, re-uploads the `.txt` within the limits and checks no part is left, and
+      `overlap_chunks.py` stores a 20,000-character file at 1,000/999 as two parts that
+      restore it exactly. `browser/ui_criteria.js` (suite 06) checks the progress panel's
+      "1 file split into parts:" list and that an empty one shows nothing.*
 - [x] ZIP batch upload extracts and processes all supported files; unsupported files are skipped with a warning.
       *A ZIP of 8 files yielded 6 processed, 2 skipped — but silently, with
       nothing naming what was dropped. **Fixed**: the job now carries a `skipped`

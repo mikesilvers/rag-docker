@@ -1,6 +1,6 @@
 # Preparing files for rag-docker ingest
 
-How to prepare files so rag-docker ingests them in one pass. Every limit below is the
+How to prepare files so rag-docker ingests each of them as you intend. Every limit below is the
 app's own, as shipped. The upload and ZIP limits are settings an administrator can change
 for an installation; the others are fixed in the app.
 
@@ -9,16 +9,24 @@ for an installation; the others are fixed in the app.
 - **One file is one document.** Each file is parsed, converted to text, split into chunks,
   embedded and stored. The per-file limits below apply to each file on its own, including
   each file inside a ZIP.
-- **A file fails whole.** A file that breaks a limit, or can't be read, stores nothing. The
-  other files in the job carry on: the job ends `partial` when some files failed, and
+- **A file too big for one document is split, not refused.** A file whose text or chunks go
+  over the text or chunk limit (section 2) is stored as parts named `<name> (part 1)`,
+  `<name> (part 2)` and so on, each part a document of its own: JSON and JSON Lines between
+  records, text between paragraphs, a CSV between rows with its header row at the start of
+  every part. The job lists such files under "split into parts". The file you uploaded is
+  kept once, under its own name.
+- **Otherwise a file fails whole.** A file that breaks any other limit, or can't be read,
+  stores nothing, and so does a split file one of whose parts fails. The other files in the
+  job carry on: the job ends `partial` when some files failed, and
   `failed` when all of them did. If storing a file's chunks fails, what that attempt stored
   is removed and an earlier version under the same name stays as it was; only if that
   clean-up fails too does the job's error say accepted chunks may remain.
 - **The same name replaces.** Uploading a file under a name the collection already holds
-  replaces that name's earlier chunks. A file uploaded directly is named by its file name; a
-  file inside a ZIP by its path inside the archive (`a/report.pdf` and `b/report.pdf` are two
-  documents). Give every part of a split file its own name, for example
-  `bills-part-a.jsonl.gz`, `bills-part-b.jsonl.gz`.
+  replaces that name's earlier chunks, and those of every `<name> (part N)` the app stored for
+  it. A file uploaded directly is named by its file name; a file inside a ZIP by its path
+  inside the archive (`a/report.pdf` and `b/report.pdf` are two documents). If you split a
+  file yourself, give every part its own name, for example `bills-part-a.jsonl.gz`,
+  `bills-part-b.jsonl.gz`.
 - **Supported types:** PDF (`.pdf`), Word (`.docx`), plain text (`.txt`), Markdown (`.md`),
   CSV (`.csv`), JSON (`.json`, and `.json.gz` inside a ZIP only), JSON Lines (`.jsonl`,
   `.jsonl.gz`) and ZIP (`.zip`). Other files inside a ZIP are skipped and listed, as are
@@ -40,17 +48,19 @@ change them.
 
 ### Per file
 
-A file over any of these fails, and the other files in the job carry on.
+A file over the text limit, the chunk limit or, for `overlap`, the text across the windows is
+stored as parts that each stay under them (section 1). A file over any of the others fails,
+and the other files in the job carry on.
 
 | Limit | Value | Applies to |
 |---|---|---|
-| **Text** | **10,000,000 characters** | Every file and every chunking strategy. JSON and JSON Lines are measured after conversion to text (section 3). |
-| **Chunks** | **10,000 chunks** | Every chunking strategy (section 4) |
+| **Text** | **10,000,000 characters** | Every file and every chunking strategy; over it, the file is split. JSON and JSON Lines are measured after conversion to text (section 3), and one record over it fails the file. |
+| **Chunks** | **10,000 chunks** | Every chunking strategy (section 4); over it, the file is split, and one record over it fails the file |
 | Records | 1,000,000 records | A JSON file's records; a JSON Lines file's lines, blank lines included |
 | One `.json` file, or one `.json.gz` once decompressed | 30,000,000 bytes | JSON is read whole; anything bigger should be JSON Lines |
 | One `.jsonl.gz` once decompressed | 512 MB | `.jsonl.gz` |
 | Sentences | 100,000 sentences | The `semantic` strategy only |
-| Text across the windows, the overlap counted each time | 10,000,000 characters | The `overlap` strategy only |
+| Text across the windows, the overlap counted each time | 10,000,000 characters | The `overlap` strategy only; over it, the file is split |
 
 ### Per line and per chunk
 
@@ -90,14 +100,16 @@ actions[0].date: 2025-01-03
   as written. Empty objects and arrays write nothing.
 - A JSON file whose top level is an array of objects or arrays gives one record per item.
   In a JSON Lines file, each line is one record. Records are separated by a blank line, and
-  the text limit counts all of it, the blank lines included.
+  the text limit counts all of it, the blank lines included. A file over it is split into
+  parts between records; a record is never split.
 - **Every line repeats its full key path**, so deep nesting and arrays of objects make the
   text grow (`actions[3].committee.name: ...` on every line).
-- **Gzip doesn't help with the limit.** The limit is on the converted text, after
-  decompression. A small `.jsonl.gz` can convert to far more than 10,000,000 characters.
-- A JSON Lines file fails at the line that crosses the limit, and the error names it:
-  "converts to more than 10,000,000 characters of text by line N, the per-file limit for
-  every chunking strategy; split the file".
+- **Gzip doesn't change the count.** The limit is on the converted text, after
+  decompression. A small `.jsonl.gz` can convert to far more than 10,000,000 characters, and
+  is then stored as parts.
+- One record whose own text is over the limit fails the file, and the error names it:
+  "line N converts to more than 10,000,000 characters of text, the most one record can hold;
+  a record is never split" (`record N` in a `.json` file).
 
 To keep the text small:
 
@@ -118,10 +130,11 @@ it to JSON Lines, one record per line.
 
 ## 4. Chunk count
 
-The 10,000-chunk limit can be reached before the text limit. How many chunks a file gives
-depends on the collection's chunking strategy and its chunk settings. Count them with the
-rule for the strategy. Each rule counts the worst case, so most files give fewer chunks than
-it says, and a file whose count stays under the target in section 5 doesn't fail on it. Below,
+The 10,000-chunk limit can be reached before the text limit; a file over it is stored as
+parts. How many chunks a file gives depends on the collection's chunking strategy and its
+chunk settings. Count them with the rule for the strategy. Each rule counts the worst case, so
+most files give fewer chunks than it says, and a file whose count stays under the target in
+section 5 stays one document. Below,
 "text" is the file's converted text in characters (section 3), and a record is one JSON
 record or JSON Lines line once converted.
 
@@ -173,16 +186,17 @@ record or JSON Lines line once converted.
   sentence (a sentence ends at a full stop followed by a space or a line break), plus one
   for every 3,000 characters of text, plus one. The strategy is limited to 100,000
   sentences per file as well.
-- The app refuses a file early when the text alone is over 10,000 chunks at one chunk for
-  every `chunk_size` characters (`fixed`, `context_aware`) or `chunk_size − chunk_overlap`
-  characters (`language`). That's why the record and paragraph counts above never go below
-  those.
+- The app splits a file without chunking it first when the text alone is over 10,000 chunks
+  at one chunk for every `chunk_size` characters (`fixed`, `context_aware`) or
+  `chunk_size − chunk_overlap` characters (`language`). That's why the record and paragraph
+  counts above never go below those.
 - A larger `chunk_size` gives fewer chunks, at some cost to retrieval precision. A smaller
   `chunk_overlap` gives fewer chunks with `overlap` and `language`.
 
-## 5. Safe targets and splitting
+## 5. Keeping a file one document
 
-Aim below the limits, not at them:
+The app splits a file over the limits by itself, so you don't have to. A file under these
+targets stays one document under its own name:
 
 | Per file | Target | Limit |
 |---|---|---|
@@ -191,7 +205,8 @@ Aim below the limits, not at them:
 | `overlap` only: text across the chunks, counted as in section 4 | at most 8,000,000 characters (80 % of the limit) | 10,000,000 characters |
 | Records or lines | under the limit | 1,000,000 records |
 
-When a file is over a target, split it:
+The app's parts are cut where the limits fall. Split a file yourself when you want to choose
+where it is cut, or what the parts are called:
 
 - **JSON Lines:** split at line boundaries, never inside a line, into parts that each stay
   under the targets. Every part is a valid JSON Lines file of its own.
@@ -205,9 +220,11 @@ When a file is over a target, split it:
 1. Choose the collection's chunking strategy and chunk settings first: the chunk estimate
    depends on them.
 2. Trim the fields you don't need (section 3).
-3. Split every file over the targets (section 5).
+3. Decide whether a file over the targets (section 5) may be split by the app, or split it
+   yourself.
 4. Give every file a distinct name.
 5. Keep each upload under 512 MB, and its ZIPs under 2 GiB once expanded and 5,000 entries
    each.
 6. After the job ends, check whether it is `partial` or `failed`, read the errors, fix the
-   files named and upload them again under the same names.
+   files named and upload them again under the same names. Files listed under "split into
+   parts" were stored as `<name> (part N)`.
