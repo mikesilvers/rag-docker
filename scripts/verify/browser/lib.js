@@ -132,4 +132,56 @@ const clickByText = (page, text) => page.evaluate(t => {
   if (!el) return false; el.click(); return true;
 }, text);
 
-module.exports = { sleep, makeReporter, launch, session, login, stubAuth, credentialsFor, bodyText, setValue, clickByText };
+// The nav's menus (#616). A menu button is `nav button[data-menu=<key>]` (data,
+// tune, admin, account); while its menu is open, its aria-controls names the
+// role="menu" element. A closed menu's entries aren't in the page.
+async function openMenu(page, key) {
+  const found = await page.evaluate(k => {
+    const b = document.querySelector(`nav button[data-menu="${k}"]`);
+    if (!b) return false;
+    if (b.getAttribute('aria-expanded') !== 'true') b.click();
+    return true;
+  }, key);
+  if (!found) throw new Error(`no ${key} menu in the nav`);
+  await page.waitForFunction(k => {
+    const b = document.querySelector(`nav button[data-menu="${k}"]`);
+    return b && b.getAttribute('aria-expanded') === 'true' && !!document.getElementById(b.getAttribute('aria-controls') || '');
+  }, { timeout: 5000 }, key);
+}
+
+async function chooseFromMenu(page, key, label) {
+  await openMenu(page, key);
+  const chosen = await page.evaluate((k, t) => {
+    const b = document.querySelector(`nav button[data-menu="${k}"]`);
+    const m = document.getElementById(b.getAttribute('aria-controls'));
+    const e = [...m.querySelectorAll('[role=menuitem]')].find(x => x.textContent.trim() === t);
+    if (!e) return false; e.click(); return true;
+  }, key, label);
+  if (!chosen) throw new Error(`no "${label}" in the ${key} menu`);
+}
+
+// The nav as the user sees it: the top-level links, then each menu in order
+// with its label and the entries it shows when opened. Each menu is opened and
+// closed again. `pages` is the links and every menu's entries but the account's.
+async function readNav(page) {
+  const { links, keys } = await page.evaluate(() => ({
+    links: [...document.querySelectorAll('nav a')].filter(a => !a.closest('[role=menu]')).map(a => a.textContent.trim()),
+    keys: [...document.querySelectorAll('nav button[aria-haspopup=menu]')].map(b => b.dataset.menu),
+  }));
+  const menus = [];
+  for (const key of keys) {
+    await openMenu(page, key);
+    menus.push(await page.evaluate(k => {
+      const b = document.querySelector(`nav button[data-menu="${k}"]`);
+      const shown = b.cloneNode(true);
+      shown.querySelectorAll('[aria-hidden=true]').forEach(x => x.remove());
+      const m = document.getElementById(b.getAttribute('aria-controls'));
+      return { key: k, label: shown.textContent.replace(/\s+/g, ' ').trim(), entries: [...m.querySelectorAll('[role=menuitem]')].map(x => x.textContent.trim()) };
+    }, key));
+    await page.evaluate(k => document.querySelector(`nav button[data-menu="${k}"]`).click(), key);
+    await page.waitForFunction(k => document.querySelector(`nav button[data-menu="${k}"]`)?.getAttribute('aria-expanded') === 'false', { timeout: 5000 }, key);
+  }
+  return { links, menus, pages: [...links, ...menus.filter(m => m.key !== 'account').flatMap(m => m.entries)] };
+}
+
+module.exports = { sleep, makeReporter, launch, session, login, stubAuth, credentialsFor, bodyText, setValue, clickByText, openMenu, chooseFromMenu, readNav };

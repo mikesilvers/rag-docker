@@ -2432,25 +2432,43 @@ password page.
 
 ### 7.2 Navigation Bar
 
-Visible on all pages after login. Contents vary by role; hiding a page is a convenience, and the API refuses
-what the role can't do (§3.1.8):
+Visible on all pages after login. The pages are grouped into menus (#616):
 
-| Nav Item | Engineer | Developer | End User |
-|---|---|---|---|
-| Q&A | ✓ | ✓ | ✓ |
-| Import Documents | ✓ | ✓ | — |
-| Chunking Config | ✓ | ✓ | — |
-| Retrieval Config | ✓ | ✓ | — |
-| Gold Standard | ✓ | ✓ | — |
-| Transfer | ✓ | ✓ | — |
-| Collections | ✓ | — | — |
-| Health | ✓ | — | — |
-| Users | ✓ | — | — |
-| Service keys | ✓ | — | — |
-| Audit | ✓ | — | — |
-| Username and role badge | ✓ | ✓ | ✓ |
-| Change password (button) | ✓ | ✓ | ✓ |
-| Log out (button) | ✓ | ✓ | ✓ |
+```
+RAG Platform   Q&A   Data ▾   Tune ▾   Admin ▾        <username> <role> ▾
+```
+
+Contents vary by role; hiding a page is a convenience, and the API refuses what the role can't do
+(§3.1.8). A menu with no page for the role isn't shown: an End User sees Q&A and the account menu, a
+Developer also Data and Tune, an Engineer also Admin.
+
+| Menu | Entry | Engineer | Developer | End User |
+|---|---|---|---|---|
+| (top level) | Q&A | ✓ | ✓ | ✓ |
+| Data | Import | ✓ | ✓ | — |
+| Data | Transfer | ✓ | ✓ | — |
+| Tune | Chunking | ✓ | ✓ | — |
+| Tune | Retrieval | ✓ | ✓ | — |
+| Tune | Gold Standard | ✓ | ✓ | — |
+| Admin | Collections | ✓ | — | — |
+| Admin | Users | ✓ | — | — |
+| Admin | Service keys | ✓ | — | — |
+| Admin | Audit | ✓ | — | — |
+| Admin | Health | ✓ | — | — |
+| Account (labelled with the username and role badge) | Change password | ✓ | ✓ | ✓ |
+| Account | Log out | ✓ | ✓ | ✓ |
+
+- **Current page.** The current page's entry has `aria-current="page"` and is highlighted, and so is
+  the button of the menu that holds it (`/account/password` highlights the account menu). A page with
+  no entry, such as `/help/transfer`, highlights nothing.
+- **Menus.** Each menu follows the WAI-ARIA menu button pattern: a button with `aria-haspopup="menu"`,
+  `aria-expanded` and, while open, `aria-controls` naming a `role="menu"` element labelled by the
+  button, whose entries are `role="menuitem"`. A closed menu's entries aren't in the page, and only one
+  menu is open at a time.
+- **Keyboard.** On a menu button, Enter, Space or ArrowDown opens it on the first entry and ArrowUp on
+  the last. In the menu, ArrowDown and ArrowUp move (wrapping), Home and End go to the first and last
+  entry, Enter chooses, Escape closes it and returns focus to its button, and Tab closes it.
+- **Closing.** A menu closes when an entry is chosen, on a click outside it, and on a change of page.
 
 ### 7.3 Q&A Page
 
@@ -3407,11 +3425,20 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       while loading, an answer and an error on screen when the collection changes, and Ask
       used on B while A is still in flight. All eight checks fail on the code before #511.*
 - [x] Logging in through the login page opens `/qa` as the account's role; the session is an HttpOnly, `SameSite=Strict` cookie that page scripts can't read, nothing about the user is kept in browser storage, the session persists across navigation and reloads, and Log out ends it at the API and returns to the login page (#25).
-      *Evidence: `scripts/verify/browser/ui_criteria.js` (suite 06) logs in with the harness's engineer through the form against the real API, and checks the cookie, storage, navigation and logout.*
+      *Evidence: `scripts/verify/browser/ui_criteria.js` (suite 06) logs in with the harness's engineer through the form against the real API, and checks the cookie, storage, navigation and logout (chosen from the account menu).*
 - [x] Login page, setup-required page, forced and voluntary password change, the API's messages for a failed or throttled login, and the return to the login or password page on `401 AUTH_REQUIRED` or `403 PASSWORD_CHANGE_REQUIRED` (#25).
       *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request interception.*
 - [x] End User role shows only the Q&A page in navigation.
       *Nav shows only Q&A, and `/collections` redirects to `/qa`; the API refuses those pages' requests too (§10.6).*
+- [x] The navigation groups the pages into Data, Tune and Admin menus and an account menu (§7.2, #616): each
+      role sees the pages it had before, a menu with none isn't shown, the current page and its menu are
+      highlighted, and the menus work with the keyboard and a screen reader and close on a choice or a
+      click outside.
+      *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request
+      interception, checks each role's menus and entries, the ARIA attributes closed and open, Enter, Space,
+      the arrows, Home, End, Escape and Tab, the pointer, and the highlight on `/qa`, `/retrieval`,
+      `/account/password` and `/help/transfer`; `ui_criteria.js` reads the real End User's and Engineer's
+      pages through the menus.*
 - [x] Citations toggle correctly hides/shows citation panel.
       *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06) answers `POST /query` by request
       interception and checks that the box starts unchecked and the query sends
@@ -3601,7 +3628,7 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   routes for every role and `auth_stack.py admin-accounts` on the running stack, with a throwaway `vfy-t-*`
   account and the API log searched for the generated passwords (suite 17). These checks fail on the code before
   PR 2 of #25, which has no such routes.*
-- [x] The Users page: an engineer-only nav link and route; the account list; create and reset show the generated
+- [x] The Users page: an engineer-only entry in the nav's Admin menu and route; the account list; create and reset show the generated
   password once until "Done"; no reset on the own row; role change, disable and enable; a refusal's message.
   *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request
   interception; `ui_criteria.js` checks the real engineer's nav includes Users.*
@@ -3618,7 +3645,7 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   `auth_stack.py matrix` with the seven routes for every role, `auth_stack.py key-matrix` with a key of each role,
   and `auth_stack.py service-keys` on the running stack with throwaway `vfy-s-*` principals and the API log
   searched for the keys (suite 17). These checks fail on the code before PR 3 of #25, which has no keys.*
-- [x] The Service keys page: an engineer-only nav link and route; the principals and their keys; create, role
+- [x] The Service keys page: an engineer-only entry in the nav's Admin menu and route; the principals and their keys; create, role
   change, disable and enable; issuance shows the key once until "Done"; revoke only on active keys; a refusal's
   message.
   *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request
@@ -3662,7 +3689,7 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   *Evidence: `test_audit.py` `ApiTests` (suite 19); `audit_stack.py filters` (suite 19).*
 - [x] Records survive an API restart, which writes a new `system.start` (with `RAG_ALLOW_RESTART=1`).
   *Evidence: `audit_stack.py restart-prepare` and `restart-verify` (suite 19).*
-- [x] The Audit page: an engineer-only nav link (last) and route; the records and paging; filters applied and
+- [x] The Audit page: an engineer-only entry in the nav's Admin menu (after Service keys) and route; the records and paging; filters applied and
   carried into the CSV link; the question-text note and the failed-writes warning; a double click on Older while a
   page loads asks for it once.
   *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request

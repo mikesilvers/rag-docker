@@ -1131,7 +1131,8 @@ nothing reaches the backend or a model. 67 cases:
 - `ui_controls.js`: the Collections table (columns, a dash for a null created date) and create
   modal (HNSW slider defaults, bounds and labels, Flat hiding them, the create payload); the Import
   queue, slider visibility per strategy and role, Chunk Size pulling Overlap down, the upload
-  form fields and the "+ New" modal; the Developer nav and the redirects of a Developer and an End
+  form fields and the "+ New" modal; the nav's menus per role, their keyboard and screen-reader
+  behaviour and the current-page highlight (#616), and the redirects of a Developer and an End
   User; the login page, logout, the setup-required page, the forced and voluntary password change
   and the return to login on a 401 (#25), with `GET /api/auth/me` answered from the case's role; the Q&A box
   (Ctrl+Enter, plain Enter, Ask disabled while empty or loading), the citations toggle, markdown,
