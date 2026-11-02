@@ -587,6 +587,23 @@ job's three counts agree.
 "Submitted N · accepted N · stored N" line appears only when the counts differ, and an upload
 answered `409 COLLECTION_DELETING` to check its message is shown.
 
+`scripts/tests/test_job_lists.py` (#617, API image, no network) checks the running and recent job
+lists: new records get `created_at`, `finished_at` on their first terminal status or when marked
+interrupted, and ingest records `collection`, `files` and `owner`; who sees which job (a Developer
+its own, a key its principal's, an Engineer everyone's including owner-less records); running jobs
+always listed, finished ones from the last 24 hours, the newest 20; a pre-#617 record's last-saved
+time standing in for `finished_at`; the order; sessions (generating, finished, without
+`finished_at`, imported); the routes, their role, a malformed record left out, the lookups by ID
+unchanged, the owner each start route hands its service; and no session `owner` or times in a
+package or after an import. `02_ingest.sh` runs it, then `job_lists.py --operator` on the verify
+project: the harness Developer and a throwaway `vfy-s-*` Developer-role key each ingest a file into
+a throwaway `VfyJobs*` collection and see only their own job, with owner, collection, files and
+times; the Engineer sees both; the Developer's export and import are listed for it and the
+Engineer, not the key. `browser/ui_criteria.js` (suite 06) checks the pages' Running and recent
+jobs lists: a real ingest found again after leaving the Import page, then stubbed lists for a
+running ingest, generation and export that open by themselves, survive leaving the page and show
+their result, row switching, one job per Transfer panel, and the Engineer's owner column.
+
 `scripts/tests/test_jobstore.py` (#23) checks the job store that keeps ingest, export, import
 and tune job records across an API restart: an unbound store (no lifespan) is a plain dict
 that writes nothing; status changes and terminal records are written at once, owner-only;
@@ -714,11 +731,13 @@ re-upload) with neighbours such as `a/data.jsonl` and `Data.jsonl` untouched; a 
 failed insert and a failed removal after part 1 (nothing stored, the earlier version whole);
 a record over the chunk cap; the cuts, CSV headers, Markdown fences, a streamed Latin-1 file
 and one no encoding reads, `overlap` sizing, the halving re-split and the `semantic` sentence
-limit; re-chunk coverage and rebuild, export links, and `ChunkLimitError`. `02_ingest.sh` then
-uploads the 13,000-record file (`context_aware`) and a 10,519,499-character `.txt` (`fixed`
-6,000) through the proxy, reads the stored part names and counts back from Weaviate, checks
-the job's `split` entry, and re-uploads the `.txt` within the limits: every part is replaced
-and the `.jsonl`'s parts are untouched. `overlap_chunks.py` (suite 08) stores a
+limit; re-chunk coverage and rebuild, export links, and `ChunkLimitError`. `split_parts.py` then
+runs the same in the real ingest worker and Weaviate, on a scratch collection without a
+vectorizer (embedding 13,000 chunks through Ollama takes this project about an hour): the
+13,000-record file (`context_aware`) and a 10,519,499-character `.txt` (`fixed` 6,000) are
+stored as numbered parts with the job's `split` entry, re-uploading the `.txt` within the
+limits replaces every part and leaves the `.jsonl`'s parts untouched, and a bad line after
+part 1 fails the file and stores nothing. `overlap_chunks.py` (suite 08) stores a
 20,000-character file at 1,000/999 as two parts, each inside both window limits, that restore
 it exactly, and `browser/ui_criteria.js` checks the progress panel's "1 file split into
 parts:" list.
@@ -862,6 +881,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
 | `../tests/test_reingest.py` | controlled re-ingest replacement, exact-name selection (#622), same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
 | `../tests/test_split_parts.py` | controlled regressions for files over the per-file limits stored as parts (#621): the reviewer's 13,000 records, files over 10,000,000 characters, family replacement, all or nothing, cuts, CSV, Markdown, encoding, `overlap` sizing, re-chunk and export links, registered by ingest |
+| `split_parts.py` | helper for ingest (#621), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, files over the per-file limits are stored as parts, a smaller re-upload replaces every part, and a bad line after part 1 stores nothing; the collection is removed afterwards |
 | `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`) and over 10,000 (`walk`); the collection is removed afterwards |
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |

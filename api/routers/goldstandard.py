@@ -2,12 +2,14 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse
 
 from models.schemas import (
     GenerateRequest,
     GenerateResponse,
+    GenerationEntry,
+    GenerationList,
     GoldPair,
     PatchPairRequest,
     RegenerateRequest,
@@ -16,7 +18,7 @@ from models.schemas import (
     SessionResponse,
     SessionValidity,
 )
-from services import audit
+from services import audit, job_lists
 from services import goldstandard as gs
 from services import weaviate_client as wc
 from utils import api_error, collection_check_unavailable
@@ -26,7 +28,7 @@ _log = logging.getLogger(__name__)
 
 
 @router.post("/generate", response_model=GenerateResponse, status_code=202)
-async def generate(body: GenerateRequest):
+async def generate(body: GenerateRequest, request: Request = None):
     try:
         exists = await wc.collection_exists(body.collection)
     except Exception:                                 # noqa: BLE001
@@ -42,10 +44,21 @@ async def generate(body: GenerateRequest):
             collection=body.collection,
             sample_size=body.sample_size,
             seed=body.seed,
+            owner=job_lists.job_owner(request),
         )
     except gs.GoldStandardError as exc:
         return api_error(exc.status, exc.code, exc.message, detail=exc.detail)
     return GenerateResponse(**result)
+
+
+@router.get("/sessions", response_model=GenerationList)
+async def list_generations(request: Request):
+    """The caller's running and recent generations (#617; see services/job_lists)."""
+    principal = request.state.auth
+    def build():
+        items = job_lists.session_items(gs.generation_sessions())
+        return job_lists.entries(GenerationEntry, items, principal, id_key="session_id")
+    return GenerationList(sessions=await asyncio.to_thread(build))
 
 
 @router.get("/session/{session_id}", response_model=SessionResponse)

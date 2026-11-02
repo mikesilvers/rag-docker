@@ -319,7 +319,9 @@ def _goldstandard_sessions(collection: str) -> list[dict]:
     # Preserve export's detached on-disk snapshots. The cache contains live
     # generation/edit objects, which must not change during JSON serialization.
     # Disk reads still share schema, identity and regular-file validation.
-    return [session for session in goldstandard._sessions_on_disk()
+    # Who generated a session and when stay on this install (#617).
+    return [{key: value for key, value in session.items() if key not in goldstandard.LOCAL_FIELDS}
+            for session in goldstandard._sessions_on_disk()
             if session["collection"] == collection]
 
 

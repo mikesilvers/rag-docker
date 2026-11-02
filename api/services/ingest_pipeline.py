@@ -74,6 +74,11 @@ def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
 
 
+def job_records() -> list[tuple[str, dict, float | None]]:
+    """Copies of every ingest record, for GET /ingest/jobs (#617)."""
+    return _jobs.snapshot()
+
+
 def _is_json_gz(name: str) -> bool:
     return name.lower().endswith(GZIP_JSON_SUFFIX)
 
@@ -1329,7 +1334,9 @@ async def start_ingest_job(
     chunk_overlap: int,
     similarity_threshold: float,
     min_chunk_size: int,
+    owner: dict | None = None,
 ) -> str:
+    """`owner` is who started the job (#617), recorded for the job lists."""
     config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
                           chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
                           min_chunk_size=min_chunk_size)
@@ -1344,7 +1351,8 @@ async def start_ingest_job(
     collection_writes.register_job(collection, "ingest", job_id)
     try:
         return await _admit_ingest_job(job_id, files, collection, strategy, chunk_size,
-                                       chunk_overlap, similarity_threshold, min_chunk_size)
+                                       chunk_overlap, similarity_threshold, min_chunk_size,
+                                       owner)
     except BaseException:
         collection_writes.end_job("ingest", job_id)
         raise
@@ -1352,7 +1360,8 @@ async def start_ingest_job(
 
 async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, strategy: str,
                             chunk_size: int, chunk_overlap: int,
-                            similarity_threshold: float, min_chunk_size: int) -> str:
+                            similarity_threshold: float, min_chunk_size: int,
+                            owner: dict | None = None) -> str:
     # The prefix is how the startup sweep finds a killed job's staging (#377).
     tmp_dir = Path(tempfile.mkdtemp(prefix="ingest-", dir=settings.upload_dir))
     # Files the caller sent that this build cannot parse, and inputs replaced by
@@ -1430,6 +1439,11 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
             "split": [],
             "errors": [],
             "skipped": skipped,
+            # For the job lists (#617): where, what and who, as the client sent
+            # the names. created_at and finished_at are the store's.
+            "collection": collection,
+            "files": [upload.filename or "" for upload in files],
+            "owner": owner,
         })
     except BaseException:
         shutil.rmtree(tmp_dir, ignore_errors=True)

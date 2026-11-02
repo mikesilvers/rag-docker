@@ -81,6 +81,11 @@ def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
 
 
+def job_records() -> list[tuple[str, dict, float | None]]:
+    """Copies of every import record, for GET /import/jobs (#617)."""
+    return _jobs.snapshot()
+
+
 # ── Surviving a hard kill ─────────────────────────────────────────────────────
 #
 # `abort` and `rename` build straight into the target collection, so there is no
@@ -958,7 +963,8 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
         _release_targets(job_id)
 
 
-async def start_import_job(filename: str, on_conflict: str, passphrase: str | None = None) -> str:
+async def start_import_job(filename: str, on_conflict: str, passphrase: str | None = None,
+                           owner: dict | None = None) -> str:
     """Register the job and run the import off the event loop.
 
     An encrypted package is known by its name (`.tar.gz.age`, #27), so a missing
@@ -999,6 +1005,7 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
             "error_code": None,
             "error_detail": None,
             "encrypted": encrypted,
+            "owner": owner,                     # who started it, for the job lists (#617)
         })
     except BaseException:
         with _lock:

@@ -44,6 +44,9 @@ async function fixture(browser, base, { hold = [] } = {}) {
     'GET /api/packages': json(200, packagesBody),
     ['GET /api/tune/' + A]: json(200, tuneBody(A)),
     ['GET /api/tune/' + B]: json(200, tuneBody(B)),
+    // No running or recent jobs (#617), so neither panel opens one by itself.
+    'GET /api/export/jobs': json(200, { jobs: [] }),
+    'GET /api/import/jobs': json(200, { jobs: [] }),
   };
   for (const key of hold) delete fixed[key];
   await page.evaluateOnNewDocument(answers => {

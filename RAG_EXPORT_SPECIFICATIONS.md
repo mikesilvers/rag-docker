@@ -232,7 +232,7 @@ files (`ingest_config.json`, `retrieval_config.json`) and the evaluation session
 are written by routes that don't take it, so each of those files in a package is
 coherent on its own but may be newer than the chunks.
 
-Exported evaluation sessions are validated, detached snapshots read from the persisted session files. The exporter MUST NOT serialize the live generation/edit cache; later cached pair or counter updates must not change a selected export snapshot. Atomic and serialized session persistence remains separate work.
+Exported evaluation sessions are validated, detached snapshots read from the persisted session files. They leave out `owner`, `created_at` and `finished_at`, which name who generated a session on this install and when (#617); an import drops those fields from every session it restores, so a restored session never appears in `GET /goldstandard/sessions` (`SPECIFICATIONS.md` §3.1.10). The exporter MUST NOT serialize the live generation/edit cache; later cached pair or counter updates must not change a selected export snapshot. Atomic and serialized session persistence remains separate work.
 
 ### 4.3 Fidelity
 

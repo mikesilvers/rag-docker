@@ -9,10 +9,14 @@ import asyncio
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from models.schemas import (
+    ExportJobEntry,
+    ExportJobList,
     ExportJobStatusResponse,
+    ImportJobEntry,
+    ImportJobList,
     ExportRequest,
     ExportStartResponse,
     ImportJobStatusResponse,
@@ -21,7 +25,7 @@ from models.schemas import (
     PackageListResponse,
     PackageSummary,
 )
-from services import age_stream, audit, exporter, importer, packager
+from services import age_stream, audit, exporter, importer, job_lists, packager
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError
 from utils import api_error, collection_check_unavailable, collection_deleting_error
@@ -31,7 +35,7 @@ _log = logging.getLogger(__name__)
 
 
 @router.post("/export", response_model=ExportStartResponse, status_code=202)
-async def start_export(body: ExportRequest):
+async def start_export(body: ExportRequest, request: Request = None):
     # The audit record's parameters (#29): whether it is encrypted, never the passphrase.
     audit.note(collection=body.collection, include_models=body.include_models, encrypted=body.passphrase is not None)
     try:
@@ -48,7 +52,8 @@ async def start_export(body: ExportRequest):
     try:
         job_id = await exporter.start_export_job(
             body.collection, body.include_models,
-            body.passphrase.get_secret_value() if body.passphrase is not None else None)
+            body.passphrase.get_secret_value() if body.passphrase is not None else None,
+            owner=job_lists.job_owner(request))
     except CollectionDeletingError:
         return collection_deleting_error(body.collection)
     except exporter.ExportStartingError:
@@ -65,6 +70,15 @@ async def start_export(body: ExportRequest):
     return ExportStartResponse(job_id=job_id, status="queued", collection=body.collection)
 
 
+@router.get("/export/jobs", response_model=ExportJobList)
+async def list_export_jobs(request: Request):
+    """The caller's running and recent exports (#617; see services/job_lists)."""
+    principal = request.state.auth
+    def build():
+        return job_lists.entries(ExportJobEntry, job_lists.job_items(exporter.job_records()), principal)
+    return ExportJobList(jobs=await asyncio.to_thread(build))
+
+
 @router.get("/export/job/{job_id}", response_model=ExportJobStatusResponse)
 async def export_job_status(job_id: str):
     job = exporter.get_job(job_id)
@@ -74,7 +88,7 @@ async def export_job_status(job_id: str):
 
 
 @router.post("/import", response_model=ImportStartResponse, status_code=202)
-async def start_import(body: ImportRequest):
+async def start_import(body: ImportRequest, request: Request = None):
     # The audit record's parameters (#29); the collection is added when the job ends.
     audit.note(package=body.filename, on_conflict=body.on_conflict, encrypted=body.passphrase is not None)
     # Everything else — unreadable archive, bad digest, embedding mismatch,
@@ -82,7 +96,8 @@ async def start_import(body: ImportRequest):
     # after reading the package, which takes long enough to need a job.
     passphrase = body.passphrase.get_secret_value() if body.passphrase is not None else None
     try:
-        job_id = await importer.start_import_job(body.filename, body.on_conflict, passphrase)
+        job_id = await importer.start_import_job(body.filename, body.on_conflict, passphrase,
+                                                 owner=job_lists.job_owner(request))
     except importer.PassphraseError as exc:
         # Decided by the filename before any job exists (#27).
         return api_error(400, exc.code, str(exc), detail={"filename": body.filename})
@@ -91,6 +106,15 @@ async def start_import(body: ImportRequest):
                          f"An import of '{exc}' is already running.",
                          detail={"filename": str(exc)})
     return ImportStartResponse(job_id=job_id, status="queued", filename=body.filename)
+
+
+@router.get("/import/jobs", response_model=ImportJobList)
+async def list_import_jobs(request: Request):
+    """The caller's running and recent imports (#617; see services/job_lists)."""
+    principal = request.state.auth
+    def build():
+        return job_lists.entries(ImportJobEntry, job_lists.job_items(importer.job_records()), principal)
+    return ImportJobList(jobs=await asyncio.to_thread(build))
 
 
 @router.get("/import/job/{job_id}", response_model=ImportJobStatusResponse)

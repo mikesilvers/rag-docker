@@ -40,6 +40,11 @@ def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
 
 
+def job_records() -> list[tuple[str, dict, float | None]]:
+    """Copies of every export record, for GET /export/jobs (#617)."""
+    return _jobs.snapshot()
+
+
 def active_job_for(collection: str) -> str | None:
     with _lock:
         return _active.get(collection)
@@ -109,7 +114,7 @@ def _run(job_id: str, collection: str, include_models: bool,
 
 
 async def start_export_job(collection: str, include_models: bool = False,
-                           passphrase: str | None = None) -> str:
+                           passphrase: str | None = None, owner: dict | None = None) -> str:
     """Register the job and run the build off the event loop.
 
     A passphrase makes the package encrypted (#27). It is handed to the worker
@@ -172,6 +177,7 @@ async def start_export_job(collection: str, include_models: bool = False,
                 "error": None,
                 "error_code": None,
                 "error_detail": None,
+                "owner": owner,                 # who started it, for the job lists (#617)
             })
         except BaseException:
             collection_writes.end_job("export", job_id)

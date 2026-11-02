@@ -47,6 +47,12 @@ reaches a terminal status, or is marked interrupted at startup. What the end
 record needs is kept in the job record as `_audit` (the status answers ignore
 it), with `ended` set once that record is written.
 
+**Timestamps (#617).** A bound store stamps `created_at` on a new record and
+`finished_at` when a record first reaches a terminal status, or is marked
+interrupted at startup; neither is changed afterwards. `snapshot()` hands the
+job lists copies of the records and the time each was last saved, which stands
+in for `finished_at` on a record from before #617.
+
 A job record is never recovery authority: retained import and tuning data is
 owned by `collection_recovery` and the import markers (#43, #44), never by
 anything in `jobs/`.
@@ -62,6 +68,7 @@ import tempfile
 import threading
 import time
 from collections.abc import MutableMapping
+from datetime import datetime, timezone
 from pathlib import Path
 
 from config import settings
@@ -91,6 +98,17 @@ _REMEDY = {
     "import": "Start the import again.",
     "tune": "Start the operation again.",
 }
+
+
+def now_iso() -> str:
+    """The current time as the API writes timestamps: ISO 8601 in UTC."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _stamp_finished(record: dict) -> None:
+    """Set `finished_at` once, with plain dict methods (no write of its own)."""
+    if dict.get(record, "status") in TERMINAL and "finished_at" not in record:
+        dict.__setitem__(record, "finished_at", now_iso())
 
 
 class _Job(dict):
@@ -165,6 +183,10 @@ class JobStore(MutableMapping):
             old = self._records.get(job_id)
             if isinstance(old, _Job):
                 self._cancel(old)
+                # A replaced record keeps its timestamps (#617).
+                for key in ("created_at", "finished_at"):
+                    if key in old and key not in record:
+                        dict.__setitem__(record, key, dict.__getitem__(old, key))
             if old is None:
                 # Inside an audited request this writes the job's `accepted`
                 # record (#29), before the job can end, and returns what its
@@ -172,6 +194,9 @@ class JobStore(MutableMapping):
                 snapshot = audit.job_started(job_id)
                 if snapshot is not None:
                     dict.__setitem__(record, "_audit", snapshot)
+                if "created_at" not in record:
+                    dict.__setitem__(record, "created_at", now_iso())
+            _stamp_finished(record)
             self._records[job_id] = record
             self._write(record, durable=True)
             if old is None:
@@ -218,6 +243,19 @@ class JobStore(MutableMapping):
         except Exception:                       # noqa: BLE001 - logged, never raised
             _log.exception("Could not remove abandoned %s job %s", self.kind, job_id)
 
+    def snapshot(self) -> list[tuple[str, dict, float | None]]:
+        """Copies of every record for the job lists (#617): `(job_id, record,
+        saved)`, where `saved` is when the record was last saved (its file's
+        modification time for one loaded at startup), or None for a record of
+        an unbound store. The audit snapshot is left out."""
+        with self._lock:
+            rows = []
+            for job_id, record in self._records.items():
+                copy = {key: value for key, value in dict.items(record) if key != "_audit"}
+                saved = record._saved if isinstance(record, _Job) and record._saved else None
+                rows.append((job_id, json.loads(json.dumps(copy, default=str)), saved))
+            return rows
+
     # ── persistence ─────────────────────────────────────────────────────────
 
     def _bind(self, job_id: str, doc) -> _Job:
@@ -259,6 +297,8 @@ class JobStore(MutableMapping):
         with self._lock:
             if status_changed or record.get("status") in TERMINAL:
                 self._cancel(record)
+                if status_changed:
+                    _stamp_finished(record)     # saved by the write below (#617)
                 ended = status_changed and record.get("status") in TERMINAL and _audit_open(record)
                 if ended:
                     record["_audit"]["ended"] = True    # saved by the write below
@@ -381,6 +421,8 @@ class JobStore(MutableMapping):
     def _mark_interrupted(self, record: _Job) -> None:
         # Plain dict methods only: one durable write afterwards, so no record
         # reaches the disk terminal but without its message.
+        if "finished_at" not in record:
+            dict.__setitem__(record, "finished_at", now_iso())      # #617
         if self.kind == "ingest":
             completed = dict.get(record, "files_completed")
             dict.__setitem__(record, "status", "partial"
