@@ -709,75 +709,12 @@ rm -rf "$EXFIX"
 # overlap sizing, re-chunk, export links.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_split_parts.py)
 check "files over the per-file limits are split into parts: regressions (#621)" $?
-SP="${PREFIX}Split"
-SPFIX=$(mktemp -d)
-python3 - "$SPFIX" <<'ENDPY'
-import json, os, sys
-root = sys.argv[1]
-with open(os.path.join(root, "big.jsonl"), "w") as fh:
-    for i in range(13_000):
-        fh.write(json.dumps({"t": f"{i:07d} " + "x" * 589}) + "\n")  # 600 characters a record
-os.mkdir(os.path.join(root, "short"))
-paragraph = "word " * 199 + "end."
-with open(os.path.join(root, "long.txt"), "w") as fh:
-    fh.write("\n\n".join([paragraph] * 10_500))  # 10,519,499 characters
-with open(os.path.join(root, "short", "long.txt"), "w") as fh:
-    fh.write("\n\n".join([paragraph] * 3))
-ENDPY
-# Each stored name's chunk count.
-sp_state() {
-  (cd "$REPO_ROOT" && docker compose exec -T api python - "$SP") <<'ENDPY'
-import json, sys
-from services import weaviate_client as wc
-try:
-    names = {}
-    for o in wc.get_client().collections.get(sys.argv[1]).iterator():
-        names[o.properties["source_file"]] = names.get(o.properties["source_file"], 0) + 1
-    print(json.dumps(names))
-finally:
-    wc.close_client()
-ENDPY
-}
-drop_collection "$SP"; make_collection "$SP"
-ingest "$SP" context_aware 1000 0 "$SPFIX/big.jsonl"
-cp /tmp/vfy_job.json /tmp/vfy_sp_jsonl.json
-sp_state > /tmp/vfy_sp_after_jsonl.json
-ingest "$SP" fixed 6000 0 "$SPFIX/long.txt"
-cp /tmp/vfy_job.json /tmp/vfy_sp_txt.json
-sp_state > /tmp/vfy_sp_after_txt.json
-ingest "$SP" fixed 6000 0 "$SPFIX/short/long.txt"
-cp /tmp/vfy_job.json /tmp/vfy_sp_short.json
-sp_state > /tmp/vfy_sp_after_short.json
-python3 - <<'ENDPY'
-import json, sys
-load = lambda name: json.load(open(f"/tmp/vfy_sp_{name}.json"))
-jsonl, txt, short = load("jsonl"), load("txt"), load("short")
-after_jsonl, after_txt, after_short = load("after_jsonl"), load("after_txt"), load("after_short")
-parts = lambda state, name: sorted(n for n in state if n.startswith(name + " (part "))
-jparts, tparts = parts(after_jsonl, "big.jsonl"), parts(after_txt, "long.txt")
-checks = {
-    "the 13,000-record upload completed": jsonl["status"] == "completed" and not jsonl["errors"],
-    "it is stored as parts, every record": len(jparts) >= 2 and "big.jsonl" not in after_jsonl
-        and sum(after_jsonl[n] for n in jparts) == 13_000 == jsonl["chunks_stored"],
-    "each part within 10,000 chunks": all(after_jsonl[n] <= 10_000 for n in jparts),
-    "the job lists it in split": jsonl.get("split") == [
-        f"big.jsonl: split into {len(jparts)} parts, stored as 'big.jsonl (part 1)' to "
-        f"'big.jsonl (part {len(jparts)})'"],
-    "the 10,519,499-character .txt completed as parts": txt["status"] == "completed"
-        and len(tparts) >= 2 and "long.txt" not in after_txt,
-    "re-uploading long.txt within the limits completed": short["status"] == "completed"
-        and short.get("split") == [],
-    "it replaced every part": short.get("chunks_replaced") == sum(after_txt[n] for n in tparts)
-        and not parts(after_short, "long.txt") and after_short.get("long.txt") == short["chunks_stored"],
-    "big.jsonl's parts were untouched": all(after_short.get(n) == after_jsonl[n] for n in jparts),
-}
-print({k: v for k, v in checks.items() if not v} or "ok", after_short, jsonl.get("split"), txt.get("split"))
-sys.exit(0 if all(checks.values()) else 1)
-ENDPY
-check "the 13,000-record file and a 10,519,499-character .txt import as parts, and a smaller re-upload replaces every part (#621)" $? \
-  "$(head -c 400 /tmp/vfy_sp_jsonl.json)"
-drop_collection "$SP"
-rm -rf "$SPFIX"
+# The same in the real Weaviate and ingest worker, on a scratch collection
+# without a vectorizer (embedding 13,000 chunks takes this project about an
+# hour): the reviewer's 13,000 records, a 10,519,499-character .txt, a smaller
+# re-upload replacing every part, and a bad line after part 1 storing nothing.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" < scripts/verify/split_parts.py)
+check "files over the per-file limits are stored as parts in the real Weaviate, replaced whole, all or nothing (#621)" $?
 
 # ── job status transitions ───────────────────────────────────────────────────
 # `queued` is only observable when the executor is saturated, so this asserts
