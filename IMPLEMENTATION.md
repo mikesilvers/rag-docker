@@ -34510,6 +34510,10 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     const rows = page => page.evaluate(() =>
       [...document.querySelectorAll('section[aria-label="Running and recent jobs"] li button')]
         .map(b => b.innerText.replace(/\s+/g, ' ').trim()));
+    const clickRowAt = (page, n) => page.evaluate(i => {
+      const b = document.querySelectorAll('section[aria-label="Running and recent jobs"] li button')[i];
+      if (!b) return false; b.click(); return true;
+    }, n);
     const clickRow = (page, text) => page.evaluate(t => {
       const b = [...document.querySelectorAll('section[aria-label="Running and recent jobs"] li button')]
         .find(x => x.innerText.includes(t));
@@ -34536,9 +34540,12 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
         const input = await s.page.$('#file-input');
         await input.uploadFile(small);
         await sleep(300);
+        // The job ID from the upload's answer: the page may already show an
+        // earlier job it opened by itself.
+        const accepted = s.page.waitForResponse(res => new URL(res.url()).pathname === '/api/ingest/upload', { timeout: 30000 })
+          .then(res => res.json()).catch(() => ({}));
         const clicked = await clickByText(s.page, 'Start Ingest');
-        await s.page.waitForFunction(() => /Job ID: \S+/.test(document.body.innerText), { timeout: 15000 }).catch(() => {});
-        const jobId = ((await bodyText(s.page)).match(/Job ID: (\S+)/) || [])[1];
+        const jobId = (await accepted).job_id;
         await leaveAndReturn(s.page, '/import');
         const back = await bodyText(s.page);
         const open = await opened(s.page);
@@ -34691,7 +34698,8 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
         const ended = await bodyText(s.page);
         r.check('Transfer: the export\'s result shows once it has finished',
           ended.includes('ragpkg-vfy617e.tar.gz') && ended.includes('Imported as StubImported617'), ended.slice(0, 400));
-        const clicked = await clickRow(s.page, 'StubExport617 completed 9 chunks');
+        // Rows: the export that just ended, the import, then the older export.
+        const clicked = await clickRowAt(s.page, 2);
         await sleep(300);
         r.check('Transfer: clicking an export row opens it in the export panel, leaving the import panel as it was',
           clicked && (await bodyText(s.page)).includes('ragpkg-vfy617d.tar.gz') && (await bodyText(s.page)).includes('Imported as StubImported617'));
@@ -40421,6 +40429,9 @@ async function fixture(browser, base, { hold = [] } = {}) {
     'GET /api/packages': json(200, packagesBody),
     ['GET /api/tune/' + A]: json(200, tuneBody(A)),
     ['GET /api/tune/' + B]: json(200, tuneBody(B)),
+    // No running or recent jobs (#617), so neither panel opens one by itself.
+    'GET /api/export/jobs': json(200, { jobs: [] }),
+    'GET /api/import/jobs': json(200, { jobs: [] }),
   };
   for (const key of hold) delete fixed[key];
   await page.evaluateOnNewDocument(answers => {
@@ -40726,6 +40737,8 @@ async function fixture(browser, base, opts = {}) {
   page.on('request', async request => {
     const path = new URL(request.url()).pathname;
     if (!path.startsWith('/api/')) return request.continue();
+    // No running or recent generations (#617), so nothing opens by itself.
+    if (path === '/api/goldstandard/sessions') return json(request, 200, { sessions: [] });
     if (path === '/api/collections') {
       return json(request, 200, { collections: ['FixtureGold', 'Other'].map(name => ({ name, object_count: 1, index_type: 'hnsw', distance_metric: 'cosine' })) });
     }
@@ -41107,6 +41120,12 @@ async function openPage(browser, base, { role = 'engineer', routes = {}, path = 
     'GET /api/auth/status': json(200, { setup_required: false }),
     'GET /api/auth/me': role ? json(200, { username: 'vfy-' + role.replace('_', '-'), role, must_change_password: false })
                              : apiError(401, 'AUTH_REQUIRED', 'Log in to use this.'),
+    // The running and recent job lists the Import, Gold Standard and Transfer
+    // pages read on opening (#617): empty, so no job opens by itself.
+    'GET /api/ingest/jobs': json(200, { jobs: [] }),
+    'GET /api/export/jobs': json(200, { jobs: [] }),
+    'GET /api/import/jobs': json(200, { jobs: [] }),
+    'GET /api/goldstandard/sessions': json(200, { sessions: [] }),
     ...routes,
   };
   await page.evaluateOnNewDocument(fast => {

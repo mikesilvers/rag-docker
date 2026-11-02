@@ -31,6 +31,12 @@ async function openPage(browser, base, { role = 'engineer', routes = {}, path = 
     'GET /api/auth/status': json(200, { setup_required: false }),
     'GET /api/auth/me': role ? json(200, { username: 'vfy-' + role.replace('_', '-'), role, must_change_password: false })
                              : apiError(401, 'AUTH_REQUIRED', 'Log in to use this.'),
+    // The running and recent job lists the Import, Gold Standard and Transfer
+    // pages read on opening (#617): empty, so no job opens by itself.
+    'GET /api/ingest/jobs': json(200, { jobs: [] }),
+    'GET /api/export/jobs': json(200, { jobs: [] }),
+    'GET /api/import/jobs': json(200, { jobs: [] }),
+    'GET /api/goldstandard/sessions': json(200, { sessions: [] }),
     ...routes,
   };
   await page.evaluateOnNewDocument(fast => {

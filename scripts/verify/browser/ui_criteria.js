@@ -1366,6 +1366,10 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     const rows = page => page.evaluate(() =>
       [...document.querySelectorAll('section[aria-label="Running and recent jobs"] li button')]
         .map(b => b.innerText.replace(/\s+/g, ' ').trim()));
+    const clickRowAt = (page, n) => page.evaluate(i => {
+      const b = document.querySelectorAll('section[aria-label="Running and recent jobs"] li button')[i];
+      if (!b) return false; b.click(); return true;
+    }, n);
     const clickRow = (page, text) => page.evaluate(t => {
       const b = [...document.querySelectorAll('section[aria-label="Running and recent jobs"] li button')]
         .find(x => x.innerText.includes(t));
@@ -1392,9 +1396,12 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
         const input = await s.page.$('#file-input');
         await input.uploadFile(small);
         await sleep(300);
+        // The job ID from the upload's answer: the page may already show an
+        // earlier job it opened by itself.
+        const accepted = s.page.waitForResponse(res => new URL(res.url()).pathname === '/api/ingest/upload', { timeout: 30000 })
+          .then(res => res.json()).catch(() => ({}));
         const clicked = await clickByText(s.page, 'Start Ingest');
-        await s.page.waitForFunction(() => /Job ID: \S+/.test(document.body.innerText), { timeout: 15000 }).catch(() => {});
-        const jobId = ((await bodyText(s.page)).match(/Job ID: (\S+)/) || [])[1];
+        const jobId = (await accepted).job_id;
         await leaveAndReturn(s.page, '/import');
         const back = await bodyText(s.page);
         const open = await opened(s.page);
@@ -1547,7 +1554,8 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
         const ended = await bodyText(s.page);
         r.check('Transfer: the export\'s result shows once it has finished',
           ended.includes('ragpkg-vfy617e.tar.gz') && ended.includes('Imported as StubImported617'), ended.slice(0, 400));
-        const clicked = await clickRow(s.page, 'StubExport617 completed 9 chunks');
+        // Rows: the export that just ended, the import, then the older export.
+        const clicked = await clickRowAt(s.page, 2);
         await sleep(300);
         r.check('Transfer: clicking an export row opens it in the export panel, leaving the import panel as it was',
           clicked && (await bodyText(s.page)).includes('ragpkg-vfy617d.tar.gz') && (await bodyText(s.page)).includes('Imported as StubImported617'));
