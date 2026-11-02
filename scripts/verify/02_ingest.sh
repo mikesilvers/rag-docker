@@ -633,6 +633,69 @@ check "two concurrent uploads of one name leave exactly one job's version, whole
 drop_collection "$RI"
 rm -rf "$RIFIX"
 
+# ── replacing a name touches only that name (#622) ───────────────────────────
+# source_file is word-tokenized, so Weaviate's equal("report.pdf") also matches
+# a/report.pdf and Report.PDF, and uploading report.pdf deleted their chunks.
+EX="${PREFIX}Exact"
+EXFIX=$(mktemp -d)
+python3 - "$FIX/policies.pdf" "$EXFIX/folder.zip" <<'ENDPY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[2], "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("a/report.pdf", open(sys.argv[1], "rb").read())
+ENDPY
+# Each stored name's chunk contents, sorted.
+ex_state() {
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$EX") <<'ENDPY'
+import json, sys
+from services import weaviate_client as wc
+try:
+    names = {}
+    for o in wc.get_client().collections.get(sys.argv[1]).iterator():
+        names.setdefault(o.properties["source_file"], []).append(o.properties["content"])
+    print(json.dumps({n: sorted(c) for n, c in names.items()}))
+finally:
+    wc.close_client()
+ENDPY
+}
+drop_collection "$EX"; make_collection "$EX"
+ingest "$EX" fixed 200 40 "$EXFIX/folder.zip"
+ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=Report.PDF"
+ex_state > /tmp/vfy_ex_before.json
+ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=report.pdf"
+cp /tmp/vfy_job.json /tmp/vfy_ex_job1.json
+ex_state > /tmp/vfy_ex_first.json
+ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=report.pdf"
+cp /tmp/vfy_job.json /tmp/vfy_ex_job2.json
+ex_state > /tmp/vfy_ex_second.json
+python3 - <<'ENDPY'
+import json, sys
+load = lambda name: json.load(open(f"/tmp/vfy_ex_{name}.json"))
+before, first, second = load("before"), load("first"), load("second")
+job1, job2 = load("job1"), load("job2")
+others = ("a/report.pdf", "Report.PDF")
+checks = {
+    "both uploads completed": job1["status"] == job2["status"] == "completed",
+    "the first report.pdf replaced nothing": job1.get("chunks_replaced") == 0,
+    "a/report.pdf and Report.PDF were stored": all(before.get(n) for n in others),
+    "the first report.pdf upload kept them": all(first.get(n) == before.get(n) for n in others),
+    "the re-upload kept them": all(second.get(n) == before.get(n) for n in others),
+    "the re-upload replaced the first report.pdf set":
+        bool(first.get("report.pdf")) and job2.get("chunks_replaced") == len(first["report.pdf"]),
+    "one report.pdf set remains": len(second.get("report.pdf", [])) == job2.get("chunks_stored"),
+}
+print({k: v for k, v in checks.items() if not v} or "ok",
+      {n: len(c) for n, c in second.items()}, job1.get("chunks_replaced"), job2.get("chunks_replaced"))
+sys.exit(0 if all(checks.values()) else 1)
+ENDPY
+check "re-uploading report.pdf replaces only report.pdf: a/report.pdf and Report.PDF keep all their chunks (#622)" $? \
+  "$(head -c 300 /tmp/vfy_ex_job1.json)"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" page < scripts/verify/exact_source.py)
+check "replacing a name on the page path selects exactly that name in real Weaviate (#622)" $?
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" walk < scripts/verify/exact_source.py)
+check "replacing a name on the walk path, past 10,000 word matches, selects exactly that name (#622)" $?
+drop_collection "$EX"
+rm -rf "$EXFIX"
+
 # ── job status transitions ───────────────────────────────────────────────────
 # `queued` is only observable when the executor is saturated, so this asserts
 # the terminal transition and that the POST reports the initial state.
