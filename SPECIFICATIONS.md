@@ -3496,7 +3496,9 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       chunker, the ingest pipeline, the settings defaults, the chunk-setting bounds,
       `docker-compose.yml` and `proxy/locations.conf`, and fails when the file leaves one out,
       states a number none of them accounts for, or the compose and proxy values disagree with
-      the code's.*
+      the code's. `test_corpus_rules_estimates.py` (suite 02, the same way) runs the chunker on
+      files built at the rules' targets for every strategy, and fails if one is refused or gives
+      more chunks than the rules count.*
 - [x] The Import page states the 512 MB upload limit and refuses a larger selection without sending it.
       *A 513 MB sparse file: the page names the limit and no `POST /ingest/upload`
       is made. A 413 or other proxy error page is shown as a readable message
