@@ -371,13 +371,19 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_replacement_dependency_calls_keep_safe_lineage(self):
         from datetime import datetime, timezone
-        coll = NS(query=NS(fetch_objects=lambda **kw: NS(objects=[object()])),
-                  aggregate=NS(over_all=lambda **kw: NS(total_count=1)),
-                  data=NS(delete_many=lambda **kw: NS(successful=0, failed=0, matches=0)))
+        import uuid
+        when = datetime.now(timezone.utc)
+        new = NS(uuid=uuid.uuid4(), properties={'source_file': SECRET, 'created_at': when})
+        earlier = NS(uuid=uuid.uuid4(), properties={'source_file': SECRET, 'created_at': datetime(2026, 1, 1, tzinfo=timezone.utc)})
+        # The lookup and the replacement's selection see both; the after check only the new one (#622).
+        pages = [[earlier, new], [earlier, new], [new]]
+        coll = NS(query=NS(fetch_objects=lambda **kw: NS(objects=pages.pop(0))),
+                  aggregate=NS(over_all=lambda **kw: NS(total_count=2)),
+                  data=NS(delete_many=lambda **kw: NS(successful=1, failed=0, matches=1)))
         with patch.object(wc, 'get_client', return_value=NS(collections=NS(get=lambda name: coll))), ot.bind((self.runtime, None)), ot.span('rag.ingest') as parent:
             self.assertTrue(wc._source_has_chunks_sync('TraceReplace', SECRET))
-            self.assertEqual(wc._delete_earlier_chunks_sync('TraceReplace', SECRET, datetime.now(timezone.utc), 1), 0)
-        for name, count in (('weaviate.query', 1), ('weaviate.aggregate', 2), ('weaviate.delete', 1)):
+            self.assertEqual(wc._delete_earlier_chunks_sync('TraceReplace', SECRET, when, 1), 1)
+        for name, count in (('weaviate.query', 3), ('weaviate.aggregate', 3), ('weaviate.delete', 1)):
             self.assertEqual(len(self.spans(name)), count)
             self.assertTrue(all(span.parent.span_id == parent.get_span_context().span_id for span in self.spans(name)))
         self.wire()
