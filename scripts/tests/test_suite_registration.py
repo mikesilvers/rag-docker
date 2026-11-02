@@ -1,7 +1,7 @@
 """Host-only check that the verify suites run the test files #386 registered.
 
-Each file below used to exist with no suite running it, or (test_corpus_rules.py,
-#615) is run the same way. This reads the suite
+Each file below used to exist with no suite running it, or (test_corpus_rules.py
+and test_corpus_rules_estimates.py, #615) is run the same way. This reads the suite
 scripts and checks that a command line runs the file and that its exit status
 goes straight to `check`. Standard library only; no Docker or stack needed.
 
@@ -21,6 +21,7 @@ REGISTERED = (
     ('scripts/tests/test_chunk_limits.py', '02_ingest.sh', True),
     ('scripts/tests/test_insert_chunks.py', '02_ingest.sh', True),
     ('scripts/tests/test_corpus_rules.py', '02_ingest.sh', True),
+    ('scripts/tests/test_corpus_rules_estimates.py', '02_ingest.sh', True),
     ('scripts/tests/test_retrieval_controls.py', '11_retrieval.sh', True),
     ('scripts/tests/test_export_encryption.py', '05_transfer.sh', True),
 )

@@ -407,6 +407,9 @@ check "chunk inserts are batched and retried while the index isn't ready" $?
 # ingest limits, read from the same constants, settings and proxy (#615).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_corpus_rules.py)
 check "the corpus preparation rules state the app's ingest limits (#615)" $?
+# Their chunk counts hold for the real chunker, for every strategy (#615).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_corpus_rules_estimates.py)
+check "the corpus preparation rules' chunk counts hold for every strategy (#615)" $?
 
 # ── one bad file must not fail the batch ─────────────────────────────────────
 drop_collection "$C"; make_collection "$C"
