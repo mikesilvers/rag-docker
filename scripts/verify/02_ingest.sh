@@ -403,6 +403,13 @@ check "chunks below min_chunk_size are merged" $? "stored $(python3 -c "import j
 check "chunker per-file limits, 6,000-character ceiling and semantic floor (#111)" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_insert_chunks.py)
 check "chunk inserts are batched and retried while the index isn't ready" $?
+# The corpus preparation rules the Import page offers state the app's own
+# ingest limits, read from the same constants, settings and proxy (#615).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_corpus_rules.py)
+check "the corpus preparation rules state the app's ingest limits (#615)" $?
+# Their chunk counts hold for the real chunker, for every strategy (#615).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_corpus_rules_estimates.py)
+check "the corpus preparation rules' chunk counts hold for every strategy (#615)" $?
 
 # ── one bad file must not fail the batch ─────────────────────────────────────
 drop_collection "$C"; make_collection "$C"
