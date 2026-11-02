@@ -7,7 +7,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const S = require('./stub');
-const { json, apiError, html, hold, callsTo, text, waitFor, waitText, press, fill, fillNth, forms, buttonState, nav, waitPath } = S;
+const { json, apiError, html, hold, callsTo, text, waitFor, waitText, press, fill, fillNth, forms, buttonState, nav, readNav, openMenu, chooseFromMenu, waitPath } = S;
 
 const A = 'VfyUiA', B = 'VfyUiB';
 const DASH = '\u2014', DOT = '\u00b7', ELLIPSIS = '\u2026', CROSS = '\u2715';
@@ -239,10 +239,7 @@ function navigationCases() {
   const gated = ['/import', '/chunking', '/retrieval', '/goldstandard', '/transfer', '/help/transfer'];
   const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
   return [
-    { name: 'Developer nav has Q&A, Import, Chunking, Retrieval, Gold Standard and Transfer, and no Collections or Health', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
-      await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
-      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer']);
-    } },
+    ...navMenuCases(),
     { name: 'Developer is sent back to Q&A from /collections and /health, but can open /transfer and /help/transfer', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
       for (const p of ['/collections', '/health']) {
         await goto(s.page, p);
@@ -262,6 +259,133 @@ function navigationCases() {
         await waitText(s.page, 'Ask a Question');
         await waitPath(s.page, '/qa');
       }
+    } },
+  ];
+}
+
+// The nav's menus (#616): Q&A, then Data, Tune and Admin, then the account
+// menu; each role keeps its pages, and a menu with none isn't shown. The menus
+// follow the WAI-ARIA menu button pattern for the keyboard and screen readers.
+function navMenuCases() {
+  const DATA = { key: 'data', label: 'Data', entries: ['Import', 'Transfer'] };
+  const TUNE = { key: 'tune', label: 'Tune', entries: ['Chunking', 'Retrieval', 'Gold Standard'] };
+  const ADMIN = { key: 'admin', label: 'Admin', entries: ['Collections', 'Users', 'Service keys', 'Audit', 'Health'] };
+  const account = (username, badge) => ({ key: 'account', label: `${username} ${badge}`, entries: ['Change password', 'Log out'] });
+  const want = {
+    end_user: [account('vfy-end-user', 'End User')],
+    developer: [DATA, TUNE, account('vfy-developer', 'Developer')],
+    engineer: [DATA, TUNE, ADMIN, account('vfy-engineer', 'AI Engineer')],
+  };
+  const name = { end_user: 'End User', developer: 'Developer', engineer: 'AI Engineer' };
+  const BTN = k => `nav button[data-menu="${k}"]`;
+  const ready = page => waitFor(page, () => document.querySelectorAll('nav button[data-menu]').length > 0, 'the nav');
+  const expanded = (page, k) => page.$eval(BTN(k), b => b.getAttribute('aria-expanded'));
+  const waitExpanded = (page, k, v) => waitFor(page, (sel, v) => document.querySelector(sel)?.getAttribute('aria-expanded') === v, `${k} aria-expanded=${v}`, BTN(k), v);
+  const focused = page => page.evaluate(() => document.activeElement?.getAttribute('data-menu') || document.activeElement?.textContent.trim() || null);
+  const waitFocused = (page, label) => waitFor(page, l => document.activeElement && (document.activeElement.getAttribute('data-menu') || document.activeElement.textContent.trim()) === l, `focus on ${label}`, label);
+  const key = async (page, k, focus) => { await page.keyboard.press(k); await waitFocused(page, focus); };
+  // What the nav marks as current: entries with aria-current and buttons with data-current.
+  const marked = page => page.evaluate(() => ({
+    current: [...document.querySelectorAll('nav [aria-current]')].map(e => [e.textContent.trim(), e.getAttribute('aria-current')]),
+    buttons: [...document.querySelectorAll('nav [data-current]')].map(b => [b.dataset.menu, b.dataset.current]),
+  }));
+  const colour = (page, sel, label) => page.evaluate((sel, l) => {
+    const e = [...document.querySelectorAll(sel)].find(x => x.textContent.trim() === l || x.dataset.menu === l);
+    return e ? getComputedStyle(e).color : null;
+  }, sel, label);
+  return [
+    ...['end_user', 'developer', 'engineer'].map(role => ({ name: `${name[role]} nav: Q&A, then ${want[role].map(m => m.key === 'account' ? 'the account menu' : m.label + ' (' + m.entries.join(', ') + ')').join(', ')}`, open: { role, path: '/qa', routes: base() }, async run(s) {
+      await ready(s.page);
+      const got = await readNav(s.page);
+      assert.deepEqual(got.links, ['Q&A']);
+      assert.deepEqual(got.menus, want[role]);
+    } })),
+    { name: 'A closed menu is a button with aria-haspopup=menu and aria-expanded=false and no entries; open, aria-controls names its role=menu, labelled by the button, of menuitems with tabindex=-1', open: { role: 'engineer', path: '/qa', routes: base() }, async run(s) {
+      await ready(s.page);
+      const closed = await s.page.$eval(BTN('data'), b => ({ type: b.type, popup: b.getAttribute('aria-haspopup'), expanded: b.getAttribute('aria-expanded'), controls: b.getAttribute('aria-controls'), hidden: [...b.querySelectorAll('[aria-hidden=true]')].map(x => x.textContent) }));
+      assert.deepEqual(closed, { type: 'button', popup: 'menu', expanded: 'false', controls: null, hidden: ['\u25be'] });
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav [role=menu], nav [role=menuitem]').length), 0);
+      await openMenu(s.page, 'data');
+      const open = await s.page.$eval(BTN('data'), b => {
+        const m = document.getElementById(b.getAttribute('aria-controls'));
+        return { expanded: b.getAttribute('aria-expanded'), role: m.getAttribute('role'), labelledBy: m.getAttribute('aria-labelledby') === b.id && !!b.id,
+                 items: [...m.children].map(e => [e.textContent.trim(), e.getAttribute('role'), e.getAttribute('tabindex')]) };
+      });
+      assert.deepEqual(open, { expanded: 'true', role: 'menu', labelledBy: true, items: [['Import', 'menuitem', '-1'], ['Transfer', 'menuitem', '-1']] });
+    } },
+    { name: 'Keyboard: Enter, Space and ArrowDown open on the first entry, ArrowUp on the last; arrows wrap, Home and End jump; Escape closes and returns focus to the button; Tab closes', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
+      await ready(s.page);
+      await s.page.focus(BTN('data'));
+      await key(s.page, 'Enter', 'Import');
+      assert.equal(await expanded(s.page, 'data'), 'true');
+      await key(s.page, 'ArrowDown', 'Transfer');
+      await key(s.page, 'ArrowDown', 'Import');
+      await key(s.page, 'ArrowUp', 'Transfer');
+      await key(s.page, 'Home', 'Import');
+      await key(s.page, 'End', 'Transfer');
+      await key(s.page, 'Escape', 'data');
+      assert.equal(await expanded(s.page, 'data'), 'false');
+      await key(s.page, 'Space', 'Import');
+      await key(s.page, 'Escape', 'data');
+      await key(s.page, 'ArrowDown', 'Import');
+      await key(s.page, 'Escape', 'data');
+      await key(s.page, 'ArrowUp', 'Transfer');
+      await s.page.keyboard.press('Tab');
+      await waitExpanded(s.page, 'data', 'false');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav [role=menu]').length), 0);
+      await s.page.focus(BTN('tune'));
+      await key(s.page, 'Enter', 'Chunking');
+      await key(s.page, 'ArrowDown', 'Retrieval');
+      await s.page.keyboard.press('Enter');
+      await waitPath(s.page, '/retrieval');
+      await waitExpanded(s.page, 'tune', 'false');
+    } },
+    { name: 'Pointer: a click opens a menu and another closes it; opening a second menu closes the first; a click outside closes it; choosing an entry opens the page and closes the menu', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
+      await ready(s.page);
+      await s.page.click(BTN('data'));
+      await waitExpanded(s.page, 'data', 'true');
+      await waitFocused(s.page, 'Import');
+      await s.page.click(BTN('tune'));
+      await waitExpanded(s.page, 'tune', 'true');
+      assert.equal(await expanded(s.page, 'data'), 'false');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav [role=menu]').length), 1);
+      await s.page.click('nav > span');
+      await waitExpanded(s.page, 'tune', 'false');
+      await s.page.click(BTN('data'));
+      await waitExpanded(s.page, 'data', 'true');
+      await s.page.click(BTN('data'));
+      await waitExpanded(s.page, 'data', 'false');
+      await s.page.click(BTN('data'));
+      await waitExpanded(s.page, 'data', 'true');
+      await s.page.click(`#${await s.page.$eval(BTN('data'), b => b.getAttribute('aria-controls'))} a:nth-child(2)`);
+      await waitPath(s.page, '/transfer');
+      await waitText(s.page, 'Export a collection');
+      await waitExpanded(s.page, 'data', 'false');
+    } },
+    { name: 'On /qa the Q&A link is the current page, highlighted, and no menu is', open: { role: 'engineer', path: '/qa', routes: base() }, async run(s) {
+      await ready(s.page);
+      await waitText(s.page, 'Ask a Question');
+      assert.deepEqual(await marked(s.page), { current: [['Q&A', 'page']], buttons: [] });
+      assert.notEqual(await colour(s.page, 'nav a', 'Q&A'), await colour(s.page, 'nav button', 'data'));
+    } },
+    { name: 'On /retrieval the Tune menu is highlighted, and in it Retrieval is the current page', open: { role: 'developer', path: '/retrieval', routes: base() }, async run(s) {
+      await ready(s.page);
+      assert.deepEqual(await marked(s.page), { current: [], buttons: [['tune', 'true']] });
+      assert.notEqual(await colour(s.page, 'nav button', 'tune'), await colour(s.page, 'nav button', 'data'));
+      await openMenu(s.page, 'tune');
+      assert.deepEqual((await marked(s.page)).current, [['Retrieval', 'page']]);
+      assert.notEqual(await colour(s.page, 'nav [role=menuitem]', 'Retrieval'), await colour(s.page, 'nav [role=menuitem]', 'Chunking'));
+    } },
+    { name: 'On /account/password the account menu is highlighted, and in it Change password is the current page', open: { role: 'end_user', path: '/account/password', routes: base() }, async run(s) {
+      await ready(s.page);
+      assert.deepEqual(await marked(s.page), { current: [], buttons: [['account', 'true']] });
+      await openMenu(s.page, 'account');
+      assert.deepEqual((await marked(s.page)).current, [['Change password', 'page']]);
+    } },
+    { name: 'On /help/transfer, which no menu holds, nothing in the nav is highlighted', open: { role: 'developer', path: '/help/transfer', routes: base() }, async run(s) {
+      await ready(s.page);
+      await waitText(s.page, 'Export and Import');
+      assert.deepEqual(await marked(s.page), { current: [], buttons: [] });
     } },
   ];
 }
@@ -308,7 +432,7 @@ function authCases() {
     } },
     { name: 'Log out calls the API and returns to the login page', open: { role: 'developer', path: '/qa', routes: base({ 'POST /api/auth/logout': json(200, { status: 'logged_out' }) }) }, async run(s) {
       await waitText(s.page, 'Ask a Question');
-      await press(s.page, 'Log out');
+      await chooseFromMenu(s.page, 'account', 'Log out');
       await waitText(s.page, 'Log in to continue');
       await waitPath(s.page, '/login');
       assert.equal(callsTo(s, 'POST', '/api/auth/logout').length, 1);
@@ -339,11 +463,11 @@ function authCases() {
       await waitText(s.page, 'Ask a Question');
       assert.deepEqual(callsTo(s, 'POST', '/api/auth/password').map(c => c.body), [{ current_password: 'generated-one', new_password: 'my new password' }]);
     } },
-    { name: 'Change password in the nav opens the form; the API\'s rule message is shown; success says other sessions ended', open: { role: 'end_user', path: '/qa', routes: base({
+    { name: 'Change password in the account menu opens the form; the API\'s rule message is shown; success says other sessions ended', open: { role: 'end_user', path: '/qa', routes: base({
       'POST /api/auth/password': call => call.body.new_password === 'short' ? apiError(422, 'INVALID_PASSWORD', 'The password must be at least 12 characters.') : json(200, { status: 'changed', ...user('end_user') }),
     }) }, async run(s) {
       await waitText(s.page, 'Ask a Question');
-      await press(s.page, 'Change password');
+      await chooseFromMenu(s.page, 'account', 'Change password');
       await waitPath(s.page, '/account/password');
       for (const [id, v] of [['#current-password', 'the old one!'], ['#new-password', 'short'], ['#confirm-password', 'short']]) await fill(s.page, id, v);
       await submit(s.page);
@@ -403,10 +527,10 @@ function usersCases() {
   const rowButtons = (page, username) => page.evaluate(u => [...document.querySelectorAll(`tr[data-username="${u}"] button`)].map(b => b.textContent.trim()), username);
   const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
   return [
-    { name: 'Engineer nav has Users, which opens the Users page', open: { role: 'engineer', path: '/qa', routes: usersApi() }, async run(s) {
+    { name: 'Engineer\'s Admin menu has Users, which opens the Users page', open: { role: 'engineer', path: '/qa', routes: usersApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
-      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys', 'Audit']);
-      await press(s.page, 'Users', 'nav a');
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Transfer', 'Chunking', 'Retrieval', 'Gold Standard', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
+      await chooseFromMenu(s.page, 'admin', 'Users');
       await waitPath(s.page, '/users');
       await waitText(s.page, 'vfy-developer');
     } },
@@ -534,10 +658,11 @@ function serviceKeysCases() {
   const status = (page, name) => page.evaluate(n => document.querySelector(`section[data-principal="${n}"] [data-testid=principal-status]`)?.textContent.trim(), name);
   const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
   return [
-    { name: 'Engineer nav has Service keys after Users, which opens the page', open: { role: 'engineer', path: '/qa', routes: keysApi() }, async run(s) {
+    { name: 'Engineer\'s Admin menu has Service keys after Users, which opens the page', open: { role: 'engineer', path: '/qa', routes: keysApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
-      assert.deepEqual((await nav(s.page)).slice(-3, -1), ['Users', 'Service keys']);
-      await press(s.page, 'Service keys', 'nav a');
+      const admin = (await readNav(s.page)).menus.find(m => m.key === 'admin').entries;
+      assert.equal(admin.indexOf('Service keys'), admin.indexOf('Users') + 1);
+      await chooseFromMenu(s.page, 'admin', 'Service keys');
       await waitPath(s.page, '/service-keys');
       await waitText(s.page, 'vfy-svc');
     } },
@@ -831,10 +956,11 @@ function auditCases() {
     return routes;
   };
   return [
-    { name: 'Engineer nav ends with Audit, which opens the page', open: { role: 'engineer', path: '/qa', routes: auditApi() }, async run(s) {
+    { name: 'Engineer\'s Admin menu has Audit after Service keys, which opens the page', open: { role: 'engineer', path: '/qa', routes: auditApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
-      assert.equal((await nav(s.page)).at(-1), 'Audit');
-      await press(s.page, 'Audit', 'nav a');
+      const admin = (await readNav(s.page)).menus.find(m => m.key === 'admin').entries;
+      assert.equal(admin.indexOf('Audit'), admin.indexOf('Service keys') + 1);
+      await chooseFromMenu(s.page, 'admin', 'Audit');
       await waitPath(s.page, '/audit');
       await waitText(s.page, 'nightly (key keyid0000001)');
     } },

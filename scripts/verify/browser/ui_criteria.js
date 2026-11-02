@@ -5,7 +5,7 @@
 // chunking-strategy selector, `input[type=text]` missed an input with no type
 // attribute, and a row's delete link matched a class test meant for the modal's
 // confirm button.
-const { sleep, makeReporter, launch, session, credentialsFor, bodyText, setValue, clickByText } = require('./lib');
+const { sleep, makeReporter, launch, session, credentialsFor, bodyText, setValue, clickByText, readNav, chooseFromMenu } = require('./lib');
 
 const BASE = process.env.RAG_UI_BASE || 'http://proxy';
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic'];
@@ -51,7 +51,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
       await submit();
     }
     await s.page.waitForFunction(() => location.pathname === '/qa' && document.querySelectorAll('nav a').length > 0, { timeout: 10000 }).catch(() => {});
-    const badge = await s.page.evaluate(() => document.querySelector('nav span.bg-blue-100')?.textContent.trim());
+    const badge = await s.page.evaluate(() => document.querySelector('nav button[data-menu=account] span.bg-blue-100')?.textContent.trim());
     r.check('logging in through the form opens /qa as the account\'s role', badge === 'AI Engineer', String(badge));
     const cookies = await s.page.cookies();
     const cookie = cookies.find(c => c.name === 'rag_session');
@@ -62,8 +62,9 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     for (const p of ['/qa', '/collections', '/health', '/qa']) {
       await s.page.goto(BASE + p, { waitUntil: 'networkidle2' }); await sleep(500);
     }
-    r.check('the session survives navigation and reloads', await s.page.evaluate(() => document.querySelectorAll('nav a').length === 11));  // the Engineer's links, Users, Service keys and Audit included
-    await clickByText(s.page, 'Log out');
+    const pages = (await readNav(s.page).catch(() => ({ pages: [] }))).pages;  // the Engineer's 11: Q&A and the menus' 10 (#616)
+    r.check('the session survives navigation and reloads', pages.length === 11, JSON.stringify(pages));
+    await chooseFromMenu(s.page, 'account', 'Log out').catch(() => {});
     await s.page.waitForFunction(() => location.pathname === '/login', { timeout: 10000 }).catch(() => {});
     const me = await s.page.evaluate(async () => (await fetch('/api/auth/me')).status);
     r.check('Log out ends the session at the API and returns to the login page', me === 401 && new URL(s.page.url()).pathname === '/login', `me=${me}`);
@@ -152,8 +153,9 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
   {
     const s = await session(browser, BASE, 'end_user');
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(1500);
-    const links = await s.page.evaluate(() => [...document.querySelectorAll('nav a')].map(a => a.textContent.trim()));
-    r.check('End User sees only Q&A in the nav', links.length === 1 && /Q&A/.test(links[0]), JSON.stringify(links));
+    const shown = await readNav(s.page).catch(e => ({ pages: [], menus: [], error: String(e) }));
+    r.check('End User sees only Q&A in the nav, and no Data, Tune or Admin menu',
+      JSON.stringify(shown.pages) === '["Q&A"]' && JSON.stringify(shown.menus.map(m => m.key)) === '["account"]', JSON.stringify(shown));
     await s.page.goto(BASE + '/collections', { waitUntil: 'networkidle2' }); await sleep(1200);
     const landed = await s.page.evaluate(() => location.pathname);
     r.check('End User cannot reach a gated route directly', landed === '/qa', `landed on ${landed}`);
@@ -162,7 +164,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
   {
     const s = await session(browser, BASE, 'engineer');
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(1500);
-    const links = await s.page.evaluate(() => [...document.querySelectorAll('nav a')].map(a => a.textContent.trim()));
+    const links = (await readNav(s.page).catch(() => ({ pages: [] }))).pages;  // through the menus (#616)
     for (const want of ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys', 'Audit']) {
       r.check(`Engineer nav includes ${want}`, links.includes(want), JSON.stringify(links));
     }
