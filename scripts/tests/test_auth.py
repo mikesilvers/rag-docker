@@ -279,7 +279,7 @@ class PolicyTests(unittest.TestCase):
         counts = {}
         for access in policy.ACCESS.values():
             counts[access] = counts.get(access, 0) + 1
-        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 19, "engineer": 26})
+        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 23, "engineer": 26})
         self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
         self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
         self.assertEqual(policy.ACCESS[("POST", "/collections")], "developer")

@@ -1,8 +1,14 @@
-import { useState, useEffect } from 'react'
-import { api, CollectionInfo, JobStatus, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB } from '../api/client'
+import { useState, useEffect, useRef } from 'react'
+import { api, CollectionInfo, IngestJobEntry, JobStatus, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB } from '../api/client'
 import { useRole } from '../context/AuthContext'
 import StrategyExplainer from '../components/StrategyExplainer'
 import ProgressPanel from '../components/ProgressPanel'
+import JobList, { newestToOpen, useJobList } from '../components/JobList'
+
+// Statuses an ingest job never leaves; polling stops at any of them.
+const TERMINAL = ['completed', 'failed', 'partial', 'cancelled']
+const ingestRunning = (j: { status: string }) => !TERMINAL.includes(j.status)
+const loadIngestJobs = () => api.listIngestJobs().then(r => r.jobs)
 
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
 
@@ -18,6 +24,12 @@ export default function ImportPage() {
   const [similarityThreshold, setSimilarityThreshold] = useState(0.85)
   const [jobId, setJobId] = useState('')
   const [job, setJob] = useState<JobStatus | null>(null)
+  // The job being polled: the one shown, while it runs (#617).
+  const [pollId, setPollId] = useState('')
+  // Set once the page has opened or started a job itself, so the job list's
+  // first answer no longer opens one (#617).
+  const touched = useRef(false)
+  const jobs = useJobList<IngestJobEntry>(loadIngestJobs, ingestRunning)
   // The status the upload was accepted with, shown with the job ID until the
   // first poll answers, so the page responds at once rather than 3 s later (#394).
   const [queuedStatus, setQueuedStatus] = useState('')
@@ -58,19 +70,44 @@ export default function ImportPage() {
   }, [])
 
   useEffect(() => {
-    if (!jobId) return
+    if (!pollId) return
     const interval = setInterval(async () => {
       try {
-        const j = await api.getJobStatus(jobId)
+        const j = await api.getJobStatus(pollId)
         setJob(j)
         setPollError('')
-        if (j.status === 'completed' || j.status === 'failed' || j.status === 'partial') clearInterval(interval)
+        if (!ingestRunning(j)) {
+          clearInterval(interval)
+          jobs.reload()
+        }
       } catch (e: unknown) {
         setPollError(`Could not check the import's progress: ${e instanceof Error ? e.message : String(e)}`)
       }
     }, 3000)
     return () => clearInterval(interval)
-  }, [jobId])
+    // jobs.reload is stable
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pollId])
+
+  // Shows a listed job as a started one is shown, polling it while it runs (#617).
+  function openJob(entry: IngestJobEntry) {
+    touched.current = true
+    setJobId(entry.job_id)
+    setJob(entry)
+    setQueuedStatus('')
+    setPollError('')
+    setPollId(ingestRunning(entry) ? entry.job_id : '')
+  }
+
+  // On the list's first answer, the newest running job, else the newest one,
+  // opens by itself, unless the page has already opened or started one.
+  useEffect(() => {
+    if (!jobs.loaded || touched.current) return
+    touched.current = true
+    const entry = newestToOpen(jobs.entries, ingestRunning)
+    if (entry) openJob(entry)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobs.loaded])
 
   function handleDrop(e: React.DragEvent) {
     e.preventDefault()
@@ -147,9 +184,12 @@ export default function ImportPage() {
     form.append('min_chunk_size', String(minChunkSize))
     try {
       const res = await api.uploadFiles(form)
+      touched.current = true
       setJobId(res.job_id)
       setQueuedStatus(res.status)
       setJob(null)
+      setPollId(res.job_id)
+      jobs.reload()
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -245,6 +285,15 @@ export default function ImportPage() {
       )}
       {job && <ProgressPanel job={job} />}
       {pollError && <p className="text-red-600 text-sm mt-2">{pollError}</p>}
+
+      <div className="mt-6">
+        <JobList error={jobs.error} loaded={jobs.loaded} showOwner={role === 'engineer'}
+          rows={jobs.entries.map(entry => ({
+            key: entry.job_id, kind: 'Ingest', target: entry.collection ?? '-', status: entry.status,
+            progress: `${entry.files_completed}/${entry.files_total} files`, createdAt: entry.created_at,
+            owner: entry.owner, open: entry.job_id === jobId, onOpen: () => openJob(entry),
+          }))} />
+      </div>
 
       {showNewColModal && (
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">

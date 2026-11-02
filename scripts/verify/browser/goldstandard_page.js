@@ -46,6 +46,8 @@ async function fixture(browser, base, opts = {}) {
   page.on('request', async request => {
     const path = new URL(request.url()).pathname;
     if (!path.startsWith('/api/')) return request.continue();
+    // No running or recent generations (#617), so nothing opens by itself.
+    if (path === '/api/goldstandard/sessions') return json(request, 200, { sessions: [] });
     if (path === '/api/collections') {
       return json(request, 200, { collections: ['FixtureGold', 'Other'].map(name => ({ name, object_count: 1, index_type: 'hnsw', distance_metric: 'cosine' })) });
     }

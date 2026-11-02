@@ -30,19 +30,23 @@ ACCESS: dict[tuple[str, str], str] = {
     ("POST", "/collections"): DEVELOPER,
     ("POST", "/ingest/upload"): DEVELOPER,
     ("GET", "/ingest/job/{job_id}"): DEVELOPER,
+    ("GET", "/ingest/jobs"): DEVELOPER,                 # the caller's jobs only (#617)
     ("GET", "/ingest/config/{collection}"): DEVELOPER,
     ("POST", "/ingest/config"): DEVELOPER,
     ("POST", "/retrieval/config"): DEVELOPER,
     ("POST", "/goldstandard/generate"): DEVELOPER,
     ("GET", "/goldstandard/session/{session_id}"): DEVELOPER,
+    ("GET", "/goldstandard/sessions"): DEVELOPER,       # the caller's generations only (#617)
     ("PATCH", "/goldstandard/session/{session_id}/pair/{pair_id}"): DEVELOPER,
     ("POST", "/goldstandard/regenerate"): DEVELOPER,
     ("POST", "/goldstandard/save"): DEVELOPER,
     ("GET", "/goldstandard/download/{filename}"): DEVELOPER,
     ("POST", "/export"): DEVELOPER,
     ("GET", "/export/job/{job_id}"): DEVELOPER,
+    ("GET", "/export/jobs"): DEVELOPER,                 # the caller's jobs only (#617)
     ("POST", "/import"): DEVELOPER,
     ("GET", "/import/job/{job_id}"): DEVELOPER,
+    ("GET", "/import/jobs"): DEVELOPER,                 # the caller's jobs only (#617)
     ("GET", "/packages"): DEVELOPER,
     ("GET", "/help/transfer"): DEVELOPER,
     ("GET", "/tune/{collection}"): DEVELOPER,          # read by the Transfer page (Q3)

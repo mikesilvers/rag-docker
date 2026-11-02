@@ -1418,7 +1418,7 @@ one may. The role of a request is the one stored for its user at that moment, ne
 | nothing | `GET /health`, `GET /auth/status`, `POST /auth/login` |
 | any session (also one with a password change due) | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password` |
 | `end_user` | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
-| `developer` | `POST /collections`; `POST /ingest/upload`, `GET /ingest/job/{job_id}`, `GET /ingest/config/{collection}`, `POST /ingest/config`; `POST /retrieval/config`; `POST /goldstandard/generate`, `GET /goldstandard/session/{session_id}`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST /goldstandard/save`, `GET /goldstandard/download/{filename}`; `POST /export`, `GET /export/job/{job_id}`, `POST /import`, `GET /import/job/{job_id}`, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
+| `developer` | `POST /collections`; `POST /ingest/upload`, `GET /ingest/job/{job_id}`, `GET /ingest/jobs`, `GET /ingest/config/{collection}`, `POST /ingest/config`; `POST /retrieval/config`; `POST /goldstandard/generate`, `GET /goldstandard/session/{session_id}`, `GET /goldstandard/sessions`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST /goldstandard/save`, `GET /goldstandard/download/{filename}`; `POST /export`, `GET /export/job/{job_id}`, `GET /export/jobs`, `POST /import`, `GET /import/job/{job_id}`, `GET /import/jobs`, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
 | `engineer` | `DELETE /collections/{name}`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json`; account administration: `GET /auth/users`, `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `POST /auth/users/{username}/role`, `POST /auth/users/{username}/disable`, `POST /auth/users/{username}/enable`; service principals and keys: `GET /auth/service-principals`, `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `POST /auth/service-principals/{name}/disable`, `POST /auth/service-principals/{name}/enable`, `POST /auth/service-principals/{name}/keys`, `POST /auth/service-principals/{name}/keys/{key_id}/revoke`; the audit log (§3.1.9): `GET /audit`, `GET /audit.csv` |
 
 The matrix is one table in `api/auth/policy.py`. A route without an entry is refused for everyone (`403
@@ -1665,6 +1665,61 @@ during it can't make it repeat or miss a record that existed when it started.
 Header `time,actor,actor_kind,role,key_id,client_ip,action,collection,target,result,status_code,job_id,details`,
 then every matching record newest first, `details` as compact JSON, empty cells for `null`; a cell starting with
 `=`, `+`, `-`, `@`, a tab or a carriage return gets a leading `'`.
+
+#### 3.1.10 Running and recent jobs (#617)
+
+A page that starts a long job (an ingest, a gold-standard generation, an export or an import)
+finds it again through these lists after the user has left the page, reloaded it, opened another
+tab or logged in again. Nothing about a job is kept in the browser.
+
+```
+GET /ingest/jobs             →  {"jobs": [ ... ]}
+GET /export/jobs             →  {"jobs": [ ... ]}
+GET /import/jobs             →  {"jobs": [ ... ]}
+GET /goldstandard/sessions   →  {"sessions": [ ... ]}
+```
+
+Each needs the Developer role (an API key of that role or higher may use them, §3.1.8), takes no
+parameters, and is not audited. The lookups by ID (`GET /ingest/job/{job_id}`,
+`/export/job/{job_id}`, `/import/job/{job_id}`, `/goldstandard/session/{session_id}`) answer as
+before: none of the fields below appears in them, and they are not scoped by owner.
+
+**What a job records.** A job started by a request records `owner`: `{"name": <principal name>,
+"kind": "user" | "service"}`, `service` when the request used an API key, so a key's jobs belong to
+its service principal. Ingest, export and import records (and tune records, which nothing lists)
+record `created_at` when stored and `finished_at` when they first reach a terminal status
+(`completed`, `failed`, `partial`, `cancelled`) or are marked interrupted at startup. A generated
+session records `created_at` when it starts and `finished_at` when its generation settles
+(completed, failed, cancelled, or failed as interrupted at startup). Neither time changes afterwards.
+Times are ISO 8601 in UTC. An ingest record also records `collection` and `files`: the uploaded
+files' names as the client sent them, in upload order.
+
+**Whose jobs.** An Engineer sees every job, with its owner. Any other caller sees only jobs whose
+`owner` has its name and kind. A record from before #617 has no owner: only an Engineer sees it, as
+"owner unknown" (`owner: null`).
+
+**Which jobs.** Every running job (an ingest, export or import whose status isn't terminal; a session
+whose status is `generating`) is listed. A finished job is listed when its finish time lies in the 24
+hours before the request; of those, only the 20 with the newest finish time, per list and caller.
+The finish time is `finished_at`; a finished ingest, export or import record from before #617 uses
+the time its record file was last saved, and a finished session without `finished_at` is not listed.
+`GET /goldstandard/sessions` lists only sessions generated on this install: one with
+`imported_from` never appears. The store's limit of 200 records per kind (§3.1.3) is unchanged, so a
+record already removed by it isn't listed.
+
+**Order and entries.** Newest first by `created_at`; an entry without it sorts by its finish time,
+and one with neither comes last. An ingest, export or import entry has every field of that job's
+lookup by ID, so an interrupted job is listed with its "Interrupted" message, plus `owner` (object or
+`null`), `created_at` (or `null`), `finished_at` (the finish time used, or `null` while running), and
+for ingest `collection` (or `null`) and `files` (`[]` when unknown). A session entry has
+`session_id`, `collection`, `status`, `pairs_total`, `pairs_attempted`, `pairs_completed`,
+`pairs_failed`, `errors`, `owner`, `created_at` and `finished_at`, and no pairs; the page reads the
+session itself through `GET /goldstandard/session/{session_id}`. A record the entry can't represent
+is left out and logged, so one bad record never fails a list.
+
+**Packages.** `owner`, `created_at` and `finished_at` belong to this install: an export leaves them
+out of every `goldstandard/<session_id>.json`, and an import drops them from every session it
+restores, whatever the package carries (`RAG_EXPORT_SPECIFICATIONS.md` §4.2).
 
 ### 3.2 Error Response Format
 
@@ -2561,6 +2616,7 @@ The question and the citations toggle are kept.
   - Engineer and Developer both see: chunk size slider, overlap slider (hidden for `semantic` and `context_aware`), minimum chunk size.
   - Engineer additionally sees: similarity threshold slider (visible only when `semantic` is selected).
 - "Start Ingest" button → calls `POST /ingest/upload`, displays job ID. The line "Job ID: <job_id>" appears as soon as the upload is accepted and stays while the job runs and after it ends, until a later upload is accepted. Until the first successful poll, a panel in the progress panel's place shows the status the upload was accepted with (`queued`) and "Waiting for the first progress update". With files chosen and no collection selected (none exist, or the list failed to load), the button sends nothing and the page says "Choose a collection to import into first. Use + New to create one." (#394).
+- Running and recent jobs (§7.15, #617): the caller's ingests, the newest running one (else the newest) opened by itself; clicking a row shows that job as a started one is shown.
 - Progress panel: polls `GET /ingest/job/{job_id}` every 3 seconds. Shows files completed/total, chunks stored, errors, "Submitted N · accepted N · stored N" when `chunks_submitted` and `chunks_accepted` are numbers and the three counts are not all equal (#302), "Replaced N chunks from a previous version" when `chunks_replaced` is above 0, and the skipped list under "N files skipped:" (each entry gives its reason).
 
 **Chunking strategy explanations** (shown in an info box when a strategy is selected):
@@ -2654,6 +2710,7 @@ A retained session can be loaded/refreshed by its session ID, including when its
 - Generation progress: polls `GET /goldstandard/session/{session_id}` every 2 seconds. Shows `pairs_completed / pairs_total`. Pairs appear in the review list as they complete (partial display during generation).
 - If a poll fails, polling stops and the page says so as an alert: "Could not read the generation's progress: " followed by the reason, then "Polling stopped; use Load / refresh session to check again." The progress is no longer shown and Generate is enabled again. "Load / refresh session" clears the message and polls again while the session is `generating` (#380).
 - When the session is no longer `generating`, the page shows its outcome under the controls (#380), for a session generated here and for a retained session loaded by ID. `completed`: "Generation completed: C of T pairs generated." and, when `pairs_failed` is above 0, "F pairs failed and are missing from the review list." (a warning). `completed` with `pairs_total` 0: "No pairs were generated: the collection has no chunks." `failed`: "Generation failed." and "F of T pairs failed." when `pairs_failed` is above 0 (an error). `cancelled`: "Generation was cancelled." Any other status: "Generation ended with status S." Under the headline the `errors` reasons are listed once each, with "(xN)" when a reason repeats, at most five, then "and K more reasons". Warnings and errors are alerts.
+- Running and recent jobs (§7.15, #617): the caller's generations that are running or finished in the last 24 hours; the newest generating session (else the newest) loads by itself, and clicking a row loads that session.
 - If a session already exists in the UI (from a previous generation), clicking "Generate Pairs" displays a confirmation dialog: "This will start a new session and replace the current one. Any unsaved pairs will be lost. Continue?" Previous sessions remain on the server (accessible via direct session ID) but are no longer referenced by the UI after confirmation.
 
 **Phase 2 — Review:**
@@ -2743,6 +2800,10 @@ A retained session can be loaded/refreshed by its session ID, including when its
   every note the job returned (models installed or skipped, sessions orphaned,
   sessions restored).
 
+Above both halves, one Running and recent jobs list (§7.15, #617) holds the
+caller's exports and imports; each half opens its newest job by itself, and
+clicking a row opens that job in its half.
+
 Both halves poll their job endpoint every 2s and stop polling when the job
 finishes or the page unmounts; a poll in flight at unmount, or a start answered
 after it, schedules nothing. A failed poll is shown ("Could not check the
@@ -2817,6 +2878,34 @@ page renders as one undifferentiated block.
   page says "Loading…" and "Older" is disabled, so a double click asks for the older page once.
 - "Download CSV" links to `/api/audit.csv` with the applied filters.
 - An API error shows its message.
+
+### 7.15 Running and recent jobs (#617)
+
+The Import, Gold Standard and Transfer pages each show a section headed **Running and recent jobs**,
+read from the lists of §3.1.10 when the page opens: `GET /ingest/jobs`, `GET /goldstandard/sessions`,
+and on Transfer both `GET /export/jobs` and `GET /import/jobs` in one list, newest first across both.
+So a job started earlier, before a reload, in another tab or in another session is found again;
+nothing about jobs is kept in browser storage.
+
+- One row per job, a button, showing the kind (`Ingest`, `Generation`, `Export`, `Import`), the
+  collection (the package filename for an import), the status, the progress (`F/T files`,
+  `A/T pairs`, `N chunks`) and "Started" with the start time in the browser's local time (`-` when
+  unknown). An Engineer also sees the owner: the name, the name followed by `(API key)` for a key's
+  job, or `owner unknown`. An empty list reads "No running or recent jobs."; a list that can't be
+  read says "Could not load the running and recent jobs:" with the reason, as an alert, and the
+  rest of the page works as before.
+- When the list first answers, unless the page has already opened or started a job, the newest
+  running job opens by itself, or the newest finished one when none runs. On Transfer this happens
+  for each panel on its own: the newest export opens in the export panel and the newest import in
+  the import panel. Clicking a row opens that job (in its own panel on Transfer). An open job's row
+  is marked (`aria-current="true"`).
+- An opened job is shown as a job started on the page is: on Import the "Job ID" line and the
+  progress panel, polled while it runs and stopping at any terminal status; on Gold Standard the
+  session loads as "Load / refresh session" loads it, its ID goes into the session ID field, and it
+  is polled while generating (not while an export of pairs is pending); on Transfer the panel's
+  progress and result, polled while it runs, with that panel's start button busy meanwhile.
+- The list is read again after the page starts a job, when a job it polls ends, and every 10 seconds
+  while the last answer held a running job; never after the page is left.
 
 ## 8. Configuration Defaults and Constraints
 
@@ -3285,6 +3374,16 @@ now lives once, in `api/services/ingest_config.py`.
       `chunks_replaced` is the other job's `chunks_stored`, and one digest, the winner's,
       names it.*
 
+- [x] Running and recent jobs (#617, §3.1.10): ingest, export and import records and generated
+      sessions record `owner`, `created_at` and `finished_at` (ingest also `collection` and `files`);
+      `GET /ingest/jobs`, `/export/jobs`, `/import/jobs` and `/goldstandard/sessions` list a
+      Developer's own jobs, a key's principal's own jobs, and everyone's (owner-less included) for an
+      Engineer; running jobs always, finished ones from the last 24 hours, at most the newest 20; the
+      lookups by ID are unchanged; packages and imports carry no session `owner` or times.
+      *`scripts/tests/test_job_lists.py` (API image) and `scripts/verify/job_lists.py` on the stack
+      (a Developer, a Developer-role key and the Engineer), both run by `02_ingest.sh`; the four
+      routes are in `auth_stack.py`'s matrix (`17_auth.sh`).*
+
 ### 10.2 Query
 
 - [x] Invalid query enums, bounds and non-finite values return a serializable 422 before retrieval or model work.
@@ -3548,6 +3647,15 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 
 - [x] Retrieval save confirmations and errors stay with their selection generation; the newest acknowledged success survives a newer failure and publishes at most once.
   *Evidence: `browser/query_config.js` stale success/failure, both acknowledged-success response orders, superseded notices/errors, independent notice timers and three-save edited-draft cases.*
+
+- [x] Running and recent jobs on the pages (#617, §7.15): an ingest started on the Import page,
+      the page left and opened again, is listed, opens by itself and shows its result once it ends;
+      with stubbed lists, a running ingest, generation and export each open by themselves, are open
+      again after leaving and coming back, and show their result when they end; clicking another row
+      switches; on Transfer the newest export and import open in their own panels; an Engineer sees
+      each owner (`(API key)`, `owner unknown`), a Developer no owner column; browser storage stays
+      empty.
+      *`scripts/verify/browser/ui_criteria.js` (suite 06), section "running and recent jobs (#617)".*
 
 ### 10.5 Infrastructure
 
