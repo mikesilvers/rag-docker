@@ -3452,12 +3452,63 @@ def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
             time.sleep(_INSERT_RETRY_DELAY)
 
 
+# Weaviate returns at most QUERY_MAXIMUM_RESULTS (10,000 by default) objects per
+# query and deletes at most that many per delete_many; offset paging stops there
+# too, and its cursor can't be combined with a filter (#622).
+_QUERY_MAXIMUM_RESULTS = 10_000
+_SOURCE_PROPERTIES = ["source_file", "created_at"]
+
+
+def _exact_source_objects(coll, name: str, accept=None):
+    """The objects stored under exactly `name`, read with only `source_file` and
+    `created_at` (#622).
+
+    `source_file` is word-tokenized, so equal(name) matches every name containing
+    all its words: `a/report.pdf`, `Report.PDF` and `report.pdf (part 1)` match
+    `report.pdf`. That superset always holds the exact name, so it is read and
+    filtered here by the exact value. Over QUERY_MAXIMUM_RESULTS matches a filtered
+    query can't reach them all, so the whole collection is walked instead.
+
+    `accept(value)` decides which values are kept; by default, the name itself. A
+    rule may accept only values among equal(name)'s matches, such as the name and
+    its `<name> (part N)` family. Objects are yielded lazily, so a caller that needs
+    one stops the walk there.
+    """
+    if accept is None:
+        def accept(value):
+            return value == name
+    words = Filter.by_property("source_file").equal(name)
+    total = telemetry.call("weaviate.aggregate", coll.aggregate.over_all,
+                           filters=words, total_count=True).total_count or 0
+    if not total:
+        return
+    if total <= _QUERY_MAXIMUM_RESULTS:
+        objects = telemetry.call("weaviate.query", coll.query.fetch_objects,
+            filters=words, limit=_QUERY_MAXIMUM_RESULTS, include_vector=False,
+            return_properties=_SOURCE_PROPERTIES).objects
+    else:
+        objects = telemetry.iterate(coll.iterator, include_vector=False,
+                                    return_properties=_SOURCE_PROPERTIES)
+    try:
+        for obj in objects:
+            value = (obj.properties or {}).get("source_file")
+            if isinstance(value, str) and accept(value):
+                yield obj
+    finally:
+        # Closed early, a walk ends its span now rather than when collected.
+        close = getattr(objects, "close", None)
+        if close is not None:
+            close()
+
+
 def _source_has_chunks_sync(collection_name: str, source_file: str) -> bool:
-    """Whether the collection holds any chunk stored under this logical name."""
+    """Whether the collection holds any chunk stored under exactly this name."""
     coll = get_client().collections.get(collection_name)
-    return bool(telemetry.call("weaviate.query", coll.query.fetch_objects,
-        filters=Filter.by_property("source_file").equal(source_file),
-        limit=1, return_properties=[]).objects)
+    selected = _exact_source_objects(coll, source_file)
+    try:
+        return next(selected, None) is not None
+    finally:
+        selected.close()
 
 
 class ReplaceError(RuntimeError):
@@ -3469,8 +3520,8 @@ class ReplaceError(RuntimeError):
         self.deleted = deleted
 
 
-# Weaviate removes at most QUERY_MAXIMUM_RESULTS (10,000 by default) objects per
-# delete_many, so removal repeats; this bounds it at a million chunks per file.
+# One replacement deletes at most this many batches of QUERY_MAXIMUM_RESULTS
+# earlier chunks: a million per name.
 _REPLACE_DELETE_ROUNDS = 100
 
 
@@ -3483,36 +3534,39 @@ def _delete_earlier_chunks_sync(collection_name: str, source_file: str,
     fails, the earlier version stays whole; if this fails, the name has
     duplicates but nothing is lost, and uploading it again repairs it.
 
-    The new chunks all carry the same `created_at`, written by this job. They are
-    told apart by equality with that value rather than by "older than", so the
-    selection depends neither on the precision Weaviate keeps nor on earlier
-    chunks' timestamps (an imported package's can be later than now). Before
-    deleting, the equality filter must match exactly the new chunks; afterwards
-    exactly they must remain. Returns how many earlier chunks were deleted.
+    Only chunks stored under exactly this name are counted or deleted (#622): they
+    are selected with _exact_source_objects and deleted by UUID. The new chunks all
+    carry the same `created_at`, written by this job, and are told apart by
+    equality with it, in Python, since a walk of the collection can't filter; the
+    value reads back to the microsecond. Equality rather than "older than" keeps
+    the selection independent of earlier chunks' timestamps (an imported
+    package's can be later than now). Before deleting, exactly `expected` of the
+    name's chunks must carry it; afterwards exactly they must remain. Returns how
+    many earlier chunks were deleted.
     """
     coll = get_client().collections.get(collection_name)
-    named = Filter.by_property("source_file").equal(source_file)
-
-    def count(where) -> int:
-        return telemetry.call("weaviate.aggregate", coll.aggregate.over_all, filters=where, total_count=True).total_count or 0
-
-    found = count(named & Filter.by_property("created_at").equal(created_at))
-    if found != expected:
-        raise ReplaceError(f"found {found} of its {expected} new chunks by their timestamp, "
+    new, earlier = 0, []
+    for obj in _exact_source_objects(coll, source_file):
+        if obj.properties.get("created_at") == created_at:
+            new += 1
+        else:
+            earlier.append(obj.uuid)
+    if new != expected:
+        raise ReplaceError(f"found {new} of its {expected} new chunks by their timestamp, "
                            "so none of the earlier ones were removed", 0)
-    earlier = named & Filter.by_property("created_at").not_equal(created_at)
+    bound = _REPLACE_DELETE_ROUNDS * _QUERY_MAXIMUM_RESULTS
+    if len(earlier) > bound:
+        raise ReplaceError(f"{len(earlier)} earlier chunks are more than one replacement "
+                           f"removes ({bound}), so none were removed", 0)
     deleted = 0
-    for _ in range(_REPLACE_DELETE_ROUNDS):
-        result = telemetry.call("weaviate.delete", coll.data.delete_many, where=earlier)
+    for start in range(0, len(earlier), _QUERY_MAXIMUM_RESULTS):
+        batch = earlier[start:start + _QUERY_MAXIMUM_RESULTS]
+        result = telemetry.call("weaviate.delete", coll.data.delete_many,
+                                where=Filter.by_id().contains_any(batch))
         deleted += result.successful or 0
         if result.failed:
             raise ReplaceError(f"Weaviate failed to delete {result.failed} earlier chunk(s)", deleted)
-        if not result.matches:
-            break
-    else:
-        raise ReplaceError(f"earlier chunks were still being found after "
-                           f"{_REPLACE_DELETE_ROUNDS} delete rounds", deleted)
-    left = count(named) - expected
+    left = sum(1 for _ in _exact_source_objects(coll, source_file)) - expected
     if left > 0:
         raise ReplaceError(f"{left} earlier chunk(s) remain", deleted)
     if left < 0:
@@ -19914,7 +19968,12 @@ the replaced files, before any insert, and deletes earlier chunks only after the
 marking failure fails only that file and changes nothing; a failed lookup of the later files
 is reported as the lookup, not the marking, and also changes nothing (#311); a failed insert keeps the earlier
 version; a removal failure keeps the new chunks and reports `partial`; a deleted collection is
-reported at the first lookup (#40). Also the delete rounds, precondition and final count,
+reported at the first lookup (#40). Also exact-name selection (#622): only the name's own
+chunks are deleted or counted among word matches such as `a/report.pdf`, `Report.PDF` and
+`report.pdf (part 1)`, over 10,000 word matches the collection is walked instead of queried,
+a name has chunks only when stored exactly, and a non-default rule selects what it accepts;
+the deletion by ID in batches of at most 10,000, never empty, and its bound, refused before
+deleting; the precondition and final count,
 retention releasing the name (also when the blob write fails, keeping shared digests), and
 rechunk coverage and per-(digest, name) rebuilds, rebuilding only names with stored chunks
 while a missing blob is still refused (#311), also for one blob under 50 names with one
@@ -19950,7 +20009,12 @@ ZIP (it completes with no errors, stores only its file and lists the AppleDouble
 that ingesting a new name leaves the session current and a replacing re-ingest marks it
 stale, naming the file. Two concurrent uploads of one name must leave exactly one job's
 version, whole: its chunk set, its digest, and `chunks_replaced` equal to the other job's
-chunks. `browser/ui_criteria.js` (suite 06) stubs the job response and checks that the Import
+chunks. Replacing a name touches only that name (#622): with `a/report.pdf` (in a ZIP) and
+`Report.PDF` stored, uploading `report.pdf` replaces nothing and uploading it again replaces
+only its first set, and the other two keep exactly their chunks. `exact_source.py` then checks
+the same selection in real Weaviate on a scratch collection without a vectorizer, on both
+paths: a few word matches read in one query, and over 10,000 walked.
+`browser/ui_criteria.js` (suite 06) stubs the job response and checks that the Import
 page shows "Replaced N chunk(s) from a previous version" only when `chunks_replaced` is above
 0, and the plain "N file(s) skipped:" heading with each entry's own reason.
 `05_transfer.sh` (E32) replaces a file, adds a second name for the new content, re-chunks,
@@ -20091,7 +20155,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_jsonl_ingest.py` | controlled JSON Lines reading, conversion, limit and gzip regressions, registered by ingest |
 | `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
 | `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
-| `../tests/test_reingest.py` | controlled re-ingest replacement, same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
+| `../tests/test_reingest.py` | controlled re-ingest replacement, exact-name selection (#622), same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
+| `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`) and over 10,000 (`walk`); the collection is removed afterwards |
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, registered by transfer |
@@ -28293,6 +28358,69 @@ ENDPY
 check "two concurrent uploads of one name leave exactly one job's version, whole" $?
 drop_collection "$RI"
 rm -rf "$RIFIX"
+
+# ── replacing a name touches only that name (#622) ───────────────────────────
+# source_file is word-tokenized, so Weaviate's equal("report.pdf") also matches
+# a/report.pdf and Report.PDF, and uploading report.pdf deleted their chunks.
+EX="${PREFIX}Exact"
+EXFIX=$(mktemp -d)
+python3 - "$FIX/policies.pdf" "$EXFIX/folder.zip" <<'ENDPY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[2], "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("a/report.pdf", open(sys.argv[1], "rb").read())
+ENDPY
+# Each stored name's chunk contents, sorted.
+ex_state() {
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$EX") <<'ENDPY'
+import json, sys
+from services import weaviate_client as wc
+try:
+    names = {}
+    for o in wc.get_client().collections.get(sys.argv[1]).iterator():
+        names.setdefault(o.properties["source_file"], []).append(o.properties["content"])
+    print(json.dumps({n: sorted(c) for n, c in names.items()}))
+finally:
+    wc.close_client()
+ENDPY
+}
+drop_collection "$EX"; make_collection "$EX"
+ingest "$EX" fixed 200 40 "$EXFIX/folder.zip"
+ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=Report.PDF"
+ex_state > /tmp/vfy_ex_before.json
+ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=report.pdf"
+cp /tmp/vfy_job.json /tmp/vfy_ex_job1.json
+ex_state > /tmp/vfy_ex_first.json
+ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=report.pdf"
+cp /tmp/vfy_job.json /tmp/vfy_ex_job2.json
+ex_state > /tmp/vfy_ex_second.json
+python3 - <<'ENDPY'
+import json, sys
+load = lambda name: json.load(open(f"/tmp/vfy_ex_{name}.json"))
+before, first, second = load("before"), load("first"), load("second")
+job1, job2 = load("job1"), load("job2")
+others = ("a/report.pdf", "Report.PDF")
+checks = {
+    "both uploads completed": job1["status"] == job2["status"] == "completed",
+    "the first report.pdf replaced nothing": job1.get("chunks_replaced") == 0,
+    "a/report.pdf and Report.PDF were stored": all(before.get(n) for n in others),
+    "the first report.pdf upload kept them": all(first.get(n) == before.get(n) for n in others),
+    "the re-upload kept them": all(second.get(n) == before.get(n) for n in others),
+    "the re-upload replaced the first report.pdf set":
+        bool(first.get("report.pdf")) and job2.get("chunks_replaced") == len(first["report.pdf"]),
+    "one report.pdf set remains": len(second.get("report.pdf", [])) == job2.get("chunks_stored"),
+}
+print({k: v for k, v in checks.items() if not v} or "ok",
+      {n: len(c) for n, c in second.items()}, job1.get("chunks_replaced"), job2.get("chunks_replaced"))
+sys.exit(0 if all(checks.values()) else 1)
+ENDPY
+check "re-uploading report.pdf replaces only report.pdf: a/report.pdf and Report.PDF keep all their chunks (#622)" $? \
+  "$(head -c 300 /tmp/vfy_ex_job1.json)"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" page < scripts/verify/exact_source.py)
+check "replacing a name on the page path selects exactly that name in real Weaviate (#622)" $?
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" walk < scripts/verify/exact_source.py)
+check "replacing a name on the walk path, past 10,000 word matches, selects exactly that name (#622)" $?
+drop_collection "$EX"
+rm -rf "$EXFIX"
 
 # ── job status transitions ───────────────────────────────────────────────────
 # `queued` is only observable when the executor is saturated, so this asserts
@@ -45037,13 +45165,19 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_replacement_dependency_calls_keep_safe_lineage(self):
         from datetime import datetime, timezone
-        coll = NS(query=NS(fetch_objects=lambda **kw: NS(objects=[object()])),
-                  aggregate=NS(over_all=lambda **kw: NS(total_count=1)),
-                  data=NS(delete_many=lambda **kw: NS(successful=0, failed=0, matches=0)))
+        import uuid
+        when = datetime.now(timezone.utc)
+        new = NS(uuid=uuid.uuid4(), properties={'source_file': SECRET, 'created_at': when})
+        earlier = NS(uuid=uuid.uuid4(), properties={'source_file': SECRET, 'created_at': datetime(2026, 1, 1, tzinfo=timezone.utc)})
+        # The lookup and the replacement's selection see both; the after check only the new one (#622).
+        pages = [[earlier, new], [earlier, new], [new]]
+        coll = NS(query=NS(fetch_objects=lambda **kw: NS(objects=pages.pop(0))),
+                  aggregate=NS(over_all=lambda **kw: NS(total_count=2)),
+                  data=NS(delete_many=lambda **kw: NS(successful=1, failed=0, matches=1)))
         with patch.object(wc, 'get_client', return_value=NS(collections=NS(get=lambda name: coll))), ot.bind((self.runtime, None)), ot.span('rag.ingest') as parent:
             self.assertTrue(wc._source_has_chunks_sync('TraceReplace', SECRET))
-            self.assertEqual(wc._delete_earlier_chunks_sync('TraceReplace', SECRET, datetime.now(timezone.utc), 1), 0)
-        for name, count in (('weaviate.query', 1), ('weaviate.aggregate', 2), ('weaviate.delete', 1)):
+            self.assertEqual(wc._delete_earlier_chunks_sync('TraceReplace', SECRET, when, 1), 1)
+        for name, count in (('weaviate.query', 3), ('weaviate.aggregate', 3), ('weaviate.delete', 1)):
             self.assertEqual(len(self.spans(name)), count)
             self.assertTrue(all(span.parent.span_id == parent.get_span_context().span_id for span in self.spans(name)))
         self.wire()
@@ -45852,7 +45986,7 @@ class ProducerOperationsTests(unittest.IsolatedAsyncioTestCase):
         metrics = {m.name:m for r in data.resource_metrics for s in r.scope_metrics for m in s.metrics}
         calls = {p.attributes['rag.dependency']:p.value
                  for p in metrics['rag.dependency.calls'].data.data_points}
-        self.assertEqual(calls, {'weaviate.query':1, 'weaviate.aggregate':2, 'weaviate.delete':1})
+        self.assertEqual(calls, {'weaviate.query':3, 'weaviate.aggregate':3, 'weaviate.delete':1})
         self.assertNotIn(SECRET, repr(calls))
 
     async def test_durable_restart_records_do_not_create_execution_metrics(self):

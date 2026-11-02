@@ -441,68 +441,170 @@ class WorkerTests(unittest.TestCase):
         self.assertTrue(self.marks[0][1].endswith("f08.txt, f09.txt and 2 more"), self.marks[0][1])
 
 
-class Result(SimpleNamespace):
-    pass
+class FakeSourceCollection:
+    """A collection whose word filter matches every stored object, a valid
+    superset of any name, as `source_file`'s word filter is in Weaviate (#622).
+    `count` overrides the superset size to force a path."""
+
+    def __init__(self, objects, count=None, fail=None, remove=True, also_remove=()):
+        self.objects = list(objects)
+        self.count, self.fail, self.remove, self.also_remove = count, dict(fail or {}), remove, set(also_remove)
+        self.calls, self.deleted_batches, self.taken = [], [], 0
+        self.aggregate = SimpleNamespace(over_all=self.over_all)
+        self.query = SimpleNamespace(fetch_objects=self.fetch_objects)
+        self.data = SimpleNamespace(delete_many=self.delete_many)
+
+    def over_all(self, filters=None, total_count=False):
+        self.calls.append(("count", None))
+        return SimpleNamespace(total_count=len(self.objects) if self.count is None else self.count)
+
+    def fetch_objects(self, filters=None, limit=None, include_vector=None, return_properties=None):
+        self.calls.append(("fetch", (limit, include_vector, tuple(return_properties))))
+        return SimpleNamespace(objects=list(self.objects[:limit]))
+
+    def iterator(self, include_vector=None, return_properties=None):
+        self.calls.append(("walk", (include_vector, tuple(return_properties))))
+        for obj in list(self.objects):
+            self.taken += 1
+            yield obj
+
+    def delete_many(self, where=None):
+        ids = set(where.value)
+        self.calls.append(("delete", len(ids)))
+        self.deleted_batches.append(sorted(ids))
+        failed = self.fail.get(len(self.deleted_batches), 0)
+        if self.remove:
+            gone = ids | self.also_remove
+            self.objects = [o for o in self.objects if str(o.uuid) not in gone]
+        return SimpleNamespace(successful=len(ids) - failed, failed=failed, matches=len(ids))
+
+    def kinds(self):
+        return [kind for kind, _ in self.calls]
 
 
-class DeleteEarlierTests(unittest.TestCase):
-    """The backend half: precondition, delete rounds, and the final count."""
+WHEN = datetime(2026, 10, 18, tzinfo=timezone.utc)
+EARLIER = datetime(2026, 10, 1, tzinfo=timezone.utc)
 
-    def collection(self, counts, deletes):
-        counts, deletes = list(counts), list(deletes)
-        calls = []
 
-        def over_all(filters=None, total_count=False):
-            calls.append(("count", filters))
-            return Result(total_count=counts.pop(0))
+def stored(name, when, n):
+    return [SimpleNamespace(uuid=uuid.uuid4(), properties={"source_file": name, "created_at": when})
+            for _ in range(n)]
 
-        def delete_many(where=None):
-            calls.append(("delete", where))
-            return deletes.pop(0)
 
-        coll = SimpleNamespace(aggregate=SimpleNamespace(over_all=over_all),
-                               data=SimpleNamespace(delete_many=delete_many))
+class ExactSourceTests(unittest.TestCase):
+    """Replacing and looking up a name touch exactly that name (#22, #622)."""
+
+    def others(self):
+        return (stored("a/report.pdf", EARLIER, 2) + stored("Report.PDF", EARLIER, 2)
+                + stored("report.pdf (part 1)", EARLIER, 2))
+
+    def replace(self, coll, expected=3):
         client = SimpleNamespace(collections=SimpleNamespace(get=lambda name: coll))
-        return client, calls
-
-    def run_delete(self, counts, deletes, expected=3):
-        client, calls = self.collection(counts, deletes)
         with patch.object(wc, "get_client", return_value=client):
             try:
-                return wc._delete_earlier_chunks_sync(
-                    "Coll", "p.txt", datetime(2026, 10, 18, tzinfo=timezone.utc), expected), calls
+                return wc._delete_earlier_chunks_sync("Coll", "report.pdf", WHEN, expected)
             except wc.ReplaceError as exc:
-                return exc, calls
+                return exc
 
-    def test_deletes_in_rounds_until_nothing_matches(self):
-        deleted, calls = self.run_delete(
-            [3, 3], [Result(successful=10000, matches=10000, failed=0),
-                     Result(successful=5, matches=5, failed=0),
-                     Result(successful=0, matches=0, failed=0)])
-        self.assertEqual(deleted, 10005)
-        self.assertEqual([c[0] for c in calls], ["count", "delete", "delete", "delete", "count"])
+    def has(self, coll, name="report.pdf"):
+        client = SimpleNamespace(collections=SimpleNamespace(get=lambda name: coll))
+        with patch.object(wc, "get_client", return_value=client):
+            return wc._source_has_chunks_sync("Coll", name)
 
-    def test_precondition_mismatch_deletes_nothing(self):
-        exc, calls = self.run_delete([2], [])
+    def names(self, coll):
+        return sorted(o.properties["source_file"] for o in coll.objects)
+
+    def test_only_the_exact_names_earlier_chunks_are_deleted(self):
+        others = self.others()
+        earlier, new = stored("report.pdf", EARLIER, 2), stored("report.pdf", WHEN, 3)
+        coll = FakeSourceCollection(others + earlier + new)
+        self.assertEqual(self.replace(coll), 2)
+        self.assertEqual(coll.deleted_batches, [sorted(str(o.uuid) for o in earlier)])
+        self.assertEqual(coll.objects, others + new)
+        for kind, args in coll.calls:
+            if kind == "fetch":
+                self.assertEqual(args, (wc._QUERY_MAXIMUM_RESULTS, False, ("source_file", "created_at")))
+
+    def test_a_before_check_mismatch_deletes_nothing(self):
+        coll = FakeSourceCollection(self.others() + stored("report.pdf", EARLIER, 2)
+                                    + stored("report.pdf", WHEN, 2))
+        exc = self.replace(coll)
         self.assertIsInstance(exc, wc.ReplaceError)
         self.assertEqual(exc.deleted, 0)
         self.assertIn("found 2 of its 3 new chunks", str(exc))
-        self.assertEqual([c[0] for c in calls], ["count"])
+        self.assertNotIn("delete", coll.kinds())
 
-    def test_failed_objects_stop_with_the_count_so_far(self):
-        exc, _ = self.run_delete([3], [Result(successful=4, matches=6, failed=2)])
-        self.assertEqual((exc.deleted, str(exc)), (4, "Weaviate failed to delete 2 earlier chunk(s)"))
+    def test_other_names_with_the_new_timestamp_are_not_counted(self):
+        # Before #622 the word filter counted them: 5 "new" chunks for 3 expected.
+        coll = FakeSourceCollection(stored("a/report.pdf", WHEN, 2) + stored("report.pdf", WHEN, 3))
+        self.assertEqual(self.replace(coll), 0)
+        self.assertNotIn("delete", coll.kinds())
+        self.assertEqual(len(coll.objects), 5)
 
-    def test_leftover_chunks_are_reported(self):
-        exc, _ = self.run_delete([3, 4], [Result(successful=1, matches=1, failed=0),
-                                          Result(successful=0, matches=0, failed=0)])
-        self.assertEqual((exc.deleted, str(exc)), (1, "1 earlier chunk(s) remain"))
+    def test_deletes_in_batches_never_empty(self):
+        coll = FakeSourceCollection(stored("report.pdf", EARLIER, 5) + stored("report.pdf", WHEN, 3))
+        with patch.object(wc, "_QUERY_MAXIMUM_RESULTS", 2):
+            self.assertEqual(self.replace(coll), 5)
+        self.assertEqual([len(b) for b in coll.deleted_batches], [2, 2, 1])
+        coll = FakeSourceCollection(self.others() + stored("report.pdf", WHEN, 3))
+        self.assertEqual(self.replace(coll), 0)
+        self.assertNotIn("delete", coll.kinds())
 
-    def test_rounds_are_bounded(self):
-        rounds = [Result(successful=1, matches=1, failed=0)] * wc._REPLACE_DELETE_ROUNDS
-        exc, calls = self.run_delete([3], rounds)
-        self.assertIsInstance(exc, wc.ReplaceError)
-        self.assertEqual(exc.deleted, wc._REPLACE_DELETE_ROUNDS)
+    def test_a_failed_delete_stops_with_the_count_so_far(self):
+        coll = FakeSourceCollection(stored("report.pdf", EARLIER, 5) + stored("report.pdf", WHEN, 3),
+                                    fail={2: 1})
+        with patch.object(wc, "_QUERY_MAXIMUM_RESULTS", 2):
+            exc = self.replace(coll)
+        self.assertEqual((exc.deleted, str(exc)), (3, "Weaviate failed to delete 1 earlier chunk(s)"))
+        self.assertEqual(len(coll.deleted_batches), 2)
+
+    def test_leftover_and_missing_chunks_are_reported(self):
+        new = stored("report.pdf", WHEN, 3)
+        coll = FakeSourceCollection(self.others() + stored("report.pdf", EARLIER, 2) + new, remove=False)
+        exc = self.replace(coll)
+        self.assertEqual((exc.deleted, str(exc)), (2, "2 earlier chunk(s) remain"))
+        coll = FakeSourceCollection(self.others() + stored("report.pdf", EARLIER, 2) + new,
+                                    also_remove={str(new[0].uuid)})
+        exc = self.replace(coll)
+        self.assertEqual((exc.deleted, str(exc)), (2, "1 of its 3 new chunks are missing afterwards"))
+
+    def test_the_bound_refuses_before_deleting(self):
+        coll = FakeSourceCollection(stored("report.pdf", EARLIER, 3) + stored("report.pdf", WHEN, 3))
+        with patch.object(wc, "_QUERY_MAXIMUM_RESULTS", 2), patch.object(wc, "_REPLACE_DELETE_ROUNDS", 1):
+            exc = self.replace(coll)
+        self.assertEqual((exc.deleted, str(exc)), (
+            0, "3 earlier chunks are more than one replacement removes (2), so none were removed"))
+        self.assertNotIn("delete", coll.kinds())
+
+    def test_the_path_follows_the_word_match_count(self):
+        objects = self.others() + stored("report.pdf", WHEN, 3)
+        coll = FakeSourceCollection(objects, count=10_001)
+        self.assertEqual(self.replace(coll), 0)
+        self.assertEqual(coll.kinds(), ["count", "walk", "count", "walk"])
+        self.assertEqual(coll.calls[1][1], (False, ("source_file", "created_at")))
+        coll = FakeSourceCollection(objects, count=10_000)
+        self.assertEqual(self.replace(coll), 0)
+        self.assertEqual(coll.kinds(), ["count", "fetch", "count", "fetch"])
+        self.assertEqual(coll.calls[1][1][0], 10_000)
+        coll = FakeSourceCollection([], count=0)
+        self.assertFalse(self.has(coll))
+        self.assertEqual(coll.kinds(), ["count"])
+
+    def test_a_name_has_chunks_only_when_stored_exactly(self):
+        coll = FakeSourceCollection(stored("a/report.pdf", EARLIER, 2) + stored("Report.PDF", EARLIER, 2))
+        self.assertFalse(self.has(coll))
+        self.assertTrue(self.has(coll, "Report.PDF"))
+        coll = FakeSourceCollection(stored("report.pdf", EARLIER, 1) + self.others(), count=10_001)
+        self.assertTrue(self.has(coll))
+        self.assertEqual(coll.taken, 1)
+        self.assertEqual(coll.kinds(), ["count", "walk"])
+
+    def test_a_rule_selects_what_it_accepts(self):
+        coll = FakeSourceCollection(self.others() + stored("report.pdf", WHEN, 1))
+        family = {"report.pdf", "report.pdf (part 1)"}
+        selected = list(wc._exact_source_objects(coll, "report.pdf", lambda value: value in family))
+        self.assertEqual(sorted(o.properties["source_file"] for o in selected),
+                         ["report.pdf", "report.pdf (part 1)", "report.pdf (part 1)"])
 
 
 class SourcesTests(unittest.TestCase):

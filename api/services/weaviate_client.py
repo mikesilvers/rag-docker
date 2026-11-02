@@ -388,12 +388,63 @@ def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
             time.sleep(_INSERT_RETRY_DELAY)
 
 
+# Weaviate returns at most QUERY_MAXIMUM_RESULTS (10,000 by default) objects per
+# query and deletes at most that many per delete_many; offset paging stops there
+# too, and its cursor can't be combined with a filter (#622).
+_QUERY_MAXIMUM_RESULTS = 10_000
+_SOURCE_PROPERTIES = ["source_file", "created_at"]
+
+
+def _exact_source_objects(coll, name: str, accept=None):
+    """The objects stored under exactly `name`, read with only `source_file` and
+    `created_at` (#622).
+
+    `source_file` is word-tokenized, so equal(name) matches every name containing
+    all its words: `a/report.pdf`, `Report.PDF` and `report.pdf (part 1)` match
+    `report.pdf`. That superset always holds the exact name, so it is read and
+    filtered here by the exact value. Over QUERY_MAXIMUM_RESULTS matches a filtered
+    query can't reach them all, so the whole collection is walked instead.
+
+    `accept(value)` decides which values are kept; by default, the name itself. A
+    rule may accept only values among equal(name)'s matches, such as the name and
+    its `<name> (part N)` family. Objects are yielded lazily, so a caller that needs
+    one stops the walk there.
+    """
+    if accept is None:
+        def accept(value):
+            return value == name
+    words = Filter.by_property("source_file").equal(name)
+    total = telemetry.call("weaviate.aggregate", coll.aggregate.over_all,
+                           filters=words, total_count=True).total_count or 0
+    if not total:
+        return
+    if total <= _QUERY_MAXIMUM_RESULTS:
+        objects = telemetry.call("weaviate.query", coll.query.fetch_objects,
+            filters=words, limit=_QUERY_MAXIMUM_RESULTS, include_vector=False,
+            return_properties=_SOURCE_PROPERTIES).objects
+    else:
+        objects = telemetry.iterate(coll.iterator, include_vector=False,
+                                    return_properties=_SOURCE_PROPERTIES)
+    try:
+        for obj in objects:
+            value = (obj.properties or {}).get("source_file")
+            if isinstance(value, str) and accept(value):
+                yield obj
+    finally:
+        # Closed early, a walk ends its span now rather than when collected.
+        close = getattr(objects, "close", None)
+        if close is not None:
+            close()
+
+
 def _source_has_chunks_sync(collection_name: str, source_file: str) -> bool:
-    """Whether the collection holds any chunk stored under this logical name."""
+    """Whether the collection holds any chunk stored under exactly this name."""
     coll = get_client().collections.get(collection_name)
-    return bool(telemetry.call("weaviate.query", coll.query.fetch_objects,
-        filters=Filter.by_property("source_file").equal(source_file),
-        limit=1, return_properties=[]).objects)
+    selected = _exact_source_objects(coll, source_file)
+    try:
+        return next(selected, None) is not None
+    finally:
+        selected.close()
 
 
 class ReplaceError(RuntimeError):
@@ -405,8 +456,8 @@ class ReplaceError(RuntimeError):
         self.deleted = deleted
 
 
-# Weaviate removes at most QUERY_MAXIMUM_RESULTS (10,000 by default) objects per
-# delete_many, so removal repeats; this bounds it at a million chunks per file.
+# One replacement deletes at most this many batches of QUERY_MAXIMUM_RESULTS
+# earlier chunks: a million per name.
 _REPLACE_DELETE_ROUNDS = 100
 
 
@@ -419,36 +470,39 @@ def _delete_earlier_chunks_sync(collection_name: str, source_file: str,
     fails, the earlier version stays whole; if this fails, the name has
     duplicates but nothing is lost, and uploading it again repairs it.
 
-    The new chunks all carry the same `created_at`, written by this job. They are
-    told apart by equality with that value rather than by "older than", so the
-    selection depends neither on the precision Weaviate keeps nor on earlier
-    chunks' timestamps (an imported package's can be later than now). Before
-    deleting, the equality filter must match exactly the new chunks; afterwards
-    exactly they must remain. Returns how many earlier chunks were deleted.
+    Only chunks stored under exactly this name are counted or deleted (#622): they
+    are selected with _exact_source_objects and deleted by UUID. The new chunks all
+    carry the same `created_at`, written by this job, and are told apart by
+    equality with it, in Python, since a walk of the collection can't filter; the
+    value reads back to the microsecond. Equality rather than "older than" keeps
+    the selection independent of earlier chunks' timestamps (an imported
+    package's can be later than now). Before deleting, exactly `expected` of the
+    name's chunks must carry it; afterwards exactly they must remain. Returns how
+    many earlier chunks were deleted.
     """
     coll = get_client().collections.get(collection_name)
-    named = Filter.by_property("source_file").equal(source_file)
-
-    def count(where) -> int:
-        return telemetry.call("weaviate.aggregate", coll.aggregate.over_all, filters=where, total_count=True).total_count or 0
-
-    found = count(named & Filter.by_property("created_at").equal(created_at))
-    if found != expected:
-        raise ReplaceError(f"found {found} of its {expected} new chunks by their timestamp, "
+    new, earlier = 0, []
+    for obj in _exact_source_objects(coll, source_file):
+        if obj.properties.get("created_at") == created_at:
+            new += 1
+        else:
+            earlier.append(obj.uuid)
+    if new != expected:
+        raise ReplaceError(f"found {new} of its {expected} new chunks by their timestamp, "
                            "so none of the earlier ones were removed", 0)
-    earlier = named & Filter.by_property("created_at").not_equal(created_at)
+    bound = _REPLACE_DELETE_ROUNDS * _QUERY_MAXIMUM_RESULTS
+    if len(earlier) > bound:
+        raise ReplaceError(f"{len(earlier)} earlier chunks are more than one replacement "
+                           f"removes ({bound}), so none were removed", 0)
     deleted = 0
-    for _ in range(_REPLACE_DELETE_ROUNDS):
-        result = telemetry.call("weaviate.delete", coll.data.delete_many, where=earlier)
+    for start in range(0, len(earlier), _QUERY_MAXIMUM_RESULTS):
+        batch = earlier[start:start + _QUERY_MAXIMUM_RESULTS]
+        result = telemetry.call("weaviate.delete", coll.data.delete_many,
+                                where=Filter.by_id().contains_any(batch))
         deleted += result.successful or 0
         if result.failed:
             raise ReplaceError(f"Weaviate failed to delete {result.failed} earlier chunk(s)", deleted)
-        if not result.matches:
-            break
-    else:
-        raise ReplaceError(f"earlier chunks were still being found after "
-                           f"{_REPLACE_DELETE_ROUNDS} delete rounds", deleted)
-    left = count(named) - expected
+    left = sum(1 for _ in _exact_source_objects(coll, source_file)) - expected
     if left > 0:
         raise ReplaceError(f"{left} earlier chunk(s) remain", deleted)
     if left < 0:

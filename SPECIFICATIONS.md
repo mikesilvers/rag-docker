@@ -743,10 +743,18 @@ member that will be skipped. A ZIP holding nothing else is refused with `NO_SUPP
   is parsed and chunked again with the request's settings, the new chunks are stored, and
   only then are the name's earlier chunks deleted, so a failed store leaves the earlier
   version whole. The earlier chunks are those with the same `source_file` and a different
-  `created_at` than the new chunks (which all share one); deletion repeats until none match
-  (Weaviate deletes at most `QUERY_MAXIMUM_RESULTS` per call), at most 100 times. It
-  proceeds only if exactly the new chunks match their own `created_at`, and afterwards
-  exactly they must remain. The job's `chunks_replaced` counts the deleted chunks.
+  `created_at` than the new chunks (which all share one). The name is matched exactly, case
+  and folders included: `a/report.pdf`, `Report.PDF` and `report.pdf` are three documents,
+  and replacing one never touches the others (#622). `source_file` is word-tokenized, so
+  Weaviate's equality filter on it matches every name sharing the name's words; those
+  matches are read and kept only where `source_file` is exactly the name, and when more
+  than 10,000 chunks match the words the whole collection is walked instead, reading only
+  `source_file` and `created_at`. The earlier chunks are deleted by ID, in batches of up to
+  10,000 (`QUERY_MAXIMUM_RESULTS`), at most 1,000,000 per replacement; a name with more
+  fails, before anything is deleted, with `<n> earlier chunks are more than one replacement
+  removes (1000000), so none were removed`. Deletion proceeds only if exactly the new chunks
+  of the name carry their own `created_at`, and afterwards exactly they must remain, both
+  counted over the exact name. The job's `chunks_replaced` counts the deleted chunks.
 - If the earlier chunks can't all be deleted, the new chunks stay, the file counts as
   failed (so the job is `partial`, or `failed` if every file failed) and `errors` gets
   `<file>: its new chunks were stored, but earlier chunks could not all be removed
@@ -3236,13 +3244,16 @@ now lives once, in `api/services/ingest_config.py`.
       job naming the replaced files before any insert, insert before delete, unchanged
       content, a marking failure (file failed, nothing changed, next file retries), a
       failed insert (earlier version kept), a removal failure (`partial`, new chunks kept),
-      a deleted collection at the lookup (#40), the delete rounds, precondition and final
-      count, and retention releasing the name even when the blob write fails.
+      a deleted collection at the lookup (#40), the exact-name selection (#622), the batched
+      deletion and its bound, precondition and final count, and retention releasing the name even when the blob write fails.
       `02_ingest.sh` ingests `policies.txt` twice (one chunk set, `chunks_replaced` equal to
       the first count), then a changed version (only its text remains, one digest names it,
       the first blob is gone). With a real gold-standard session planted, it checks that a
       new name leaves the session current and a replacing re-ingest marks it stale, naming
-      the file. `browser/ui_criteria.js` (suite 06) checks the Import page's "Replaced N
+      the file. It also stores `a/report.pdf`, `Report.PDF` and `report.pdf` and uploads
+      `report.pdf` again: the other two keep all their chunks, and `exact_source.py` checks
+      exact selection on both paths, under and over 10,000 word matches, in real Weaviate
+      (#622). `browser/ui_criteria.js` (suite 06) checks the Import page's "Replaced N
       chunks from a previous version" line, hidden at 0, and the plain "N files skipped:"
       heading. `test_reingest.py` also checks that a failed lookup of the later files is
       reported as the lookup, not as the marking (#311).*
