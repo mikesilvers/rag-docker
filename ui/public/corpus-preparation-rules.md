@@ -133,16 +133,27 @@ record or JSON Lines line once converted.
   6,400,000 characters. The chunks repeat the overlap, so this strategy has a second count,
   the text across its chunks: the text plus `chunk_overlap` for every chunk, limited to
   10,000,000 characters (section 2).
-- **`language`** splits at the blank line between records or paragraphs first, then at line
-  breaks, sentences and words, and keeps each piece whole, so a chunk can be only a little
-  over half full. Count one chunk for every `(chunk_size − chunk_overlap) ÷ 2` characters,
-  plus two for every record or paragraph longer than `chunk_size`. With the defaults, one
-  chunk per 400 characters: 8,000 chunks at about 3,200,000 characters. For JSON and JSON
-  Lines, one of these counts may be smaller, and you can use it instead:
-  - if no record is longer than `chunk_size`: one chunk per record, but never fewer than one
-    for every `chunk_size − chunk_overlap` characters;
-  - if every record is shorter than `(chunk_size − chunk_overlap) ÷ 2`: one chunk for every
-    `chunk_size − chunk_overlap − L` characters, where `L` is the longest record's length.
+- **`language`** splits at blank lines first (two line breaks in a row), then at line breaks,
+  at a full stop followed by a space, at spaces, and last between any two characters. It
+  keeps every piece shorter than `chunk_size` whole, so a chunk can be only a little over half
+  full, and it splits a longer piece again at the next level, which can leave a short chunk
+  on each side of it. Call a paragraph (the text between blank lines), a line, a sentence
+  (the text of a line between full stops followed by a space) or a word (the text of a line
+  between spaces) long when it has at least `chunk_size − 3` characters. Count one chunk for
+  every `(chunk_size − chunk_overlap) ÷ 2` characters, plus two for every long paragraph,
+  long line, long sentence and long word, plus one. Each level counts on its own: a long
+  word in a long sentence, in a long line, in a long paragraph counts eight. With the
+  defaults, one chunk per 400 characters, so a file with nothing long reaches 8,000 chunks at
+  about 3,200,000 characters. Whatever the structure, the count is never more than one chunk
+  for every `(chunk_size − chunk_overlap) ÷ 10` characters, plus one, and you can use that
+  instead of counting long pieces: with the defaults, one chunk per 80 characters, 8,000
+  chunks at about 640,000 characters. For JSON and JSON Lines, whose records are separated
+  by a blank line, one of these counts may be smaller, and you can use it instead:
+  - if no paragraph is long: one chunk per paragraph (one per blank line, plus one), but
+    never fewer than one for every `chunk_size − chunk_overlap` characters;
+  - if every paragraph is shorter than `chunk_size − chunk_overlap − 3`: one chunk for every
+    `chunk_size − chunk_overlap − 3 − L` characters, plus one, where `L` is the longest
+    paragraph's length.
 - **`context_aware`** puts JSON and JSON Lines records, and the paragraphs, titles and
   tables of other files, into chunks whole: short ones are joined up to `chunk_size`, and a
   longer one is a chunk of its own, split into pieces if it is over 6,000 characters
@@ -157,13 +168,15 @@ record or JSON Lines line once converted.
   - if every record is shorter than `chunk_size ÷ 2`: one chunk for every `chunk_size − L`
     characters, where `L` is the longest record's length.
 - **`semantic`**: one chunk per run of sentences on the same topic, so the count depends on
-  the text and isn't known before the import. Count one chunk per sentence (a sentence ends
-  at a full stop followed by a space; line breaks don't end one), a sentence longer than
-  6,000 characters counting as one for every 3,000 characters, rounded up. The strategy is
-  limited to 100,000 sentences per file as well.
+  the text and isn't known before the import. A chunk over 6,000 characters is then cut
+  into pieces (section 2), and the pieces can outnumber its sentences. Count one chunk per
+  sentence (a sentence ends at a full stop followed by a space or a line break), plus one
+  for every 3,000 characters of text, plus one. The strategy is limited to 100,000
+  sentences per file as well.
 - The app refuses a file early when the text alone is over 10,000 chunks at one chunk for
   every `chunk_size` characters (`fixed`, `context_aware`) or `chunk_size − chunk_overlap`
-  characters (`language`). That's why the record counts above never go below those.
+  characters (`language`). That's why the record and paragraph counts above never go below
+  those.
 - A larger `chunk_size` gives fewer chunks, at some cost to retrieval precision. A smaller
   `chunk_overlap` gives fewer chunks with `overlap` and `language`.
 

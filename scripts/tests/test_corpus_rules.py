@@ -10,11 +10,16 @@ Runs in the API image with the repository mounted (02_ingest.sh), or anywhere
 the API's dependencies are installed:
     RAG_TEST_API_DIR=api python scripts/tests/test_corpus_rules.py
 """
+import ast
+import inspect
 import os
 import re
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(ROOT / 'api'))
@@ -54,6 +59,15 @@ def client_upload_mb():
     return int(re.search(r'export const MAX_UPLOAD_MB = (\d+)', text).group(1))
 
 
+def language_split_levels():
+    """The separators chunk_language splits at before single characters: each
+    is a level at which a piece longer than chunk_size is split again."""
+    source = inspect.getsource(chunker.chunk_language)
+    separators = ast.literal_eval(re.search(r'separators=(\[.*?\])', source).group(1))
+    assert separators[-1] == '', separators
+    return len(separators) - 1
+
+
 def zip_default(name):
     # The class default, not the settings instance: an environment variable
     # in the image must not hide a changed default.
@@ -87,6 +101,12 @@ def expected():
     # _cap_chunk_length cuts an over-long chunk at whitespace no earlier than
     # half the cap, so a piece holds at least this many characters.
     cap_piece = chunker.MAX_CHUNK_CHARACTERS // 2
+    # language's count whatever the structure: 2 per (size - overlap) for the
+    # packing, plus 2 for each long piece, and at each separator level the long
+    # pieces are disjoint and at least chunk_size long, so at most text / size.
+    levels = language_split_levels()
+    language_any = 2 + 2 * levels
+    per_chunk_any = (size - overlap) // language_any
     for name, value in (('expanded', expanded % GIB), ('exempt', exempt % MIB)):
         assert value == 0, f'{name} is no longer a whole number of GiB/MiB; reword the file'
     phrases = {
@@ -120,6 +140,10 @@ def expected():
     for strategy in per_chunk:
         at_target = chunk_target * per_chunk[strategy]
         phrases[f'{chunk_target:,} chunks at about {at_target:,} characters'] = [at_target]
+    phrases[f'(chunk_size − chunk_overlap) ÷ {language_any}` characters'] = [language_any]
+    phrases[f'one chunk per {per_chunk_any:,} characters'] = [per_chunk_any]
+    phrases[f'{chunk_target:,} chunks at about {chunk_target * per_chunk_any:,} characters'] = [
+        chunk_target * per_chunk_any]
     phrases.update({
         '70 %': [70],
         '80 %': [80],
@@ -166,6 +190,68 @@ class CorpusRulesTests(unittest.TestCase):
         limits = proxy_body_limits_mb()
         self.assertGreaterEqual(len(limits), 2, limits)
         self.assertEqual(set(limits), {client_upload_mb()}, limits)
+
+
+def language_count(text, size, overlap):
+    """Section 4's `language` count, as a user computes it."""
+    long_at = size - 3
+    lines = text.split('\n')
+    long_pieces = (sum(len(p) >= long_at for p in text.split('\n\n'))
+                   + sum(len(line) >= long_at for line in lines)
+                   + sum(len(s) >= long_at for line in lines for s in line.split('. '))
+                   + sum(len(w) >= long_at for line in lines for w in line.split(' ')))
+    return 2 * len(text) / (size - overlap) + 2 * long_pieces + 1
+
+
+def semantic_count(text):
+    """Section 4's `semantic` count: sentences, plus one per 3,000 characters, plus one."""
+    sentences = text.count('. ') + text.count('.\n') + 1
+    return sentences + len(text) / (chunker.MAX_CHUNK_CHARACTERS // 2) + 1
+
+
+def at_target(record, count):
+    """Records joined by a blank line, as many as keep the count at the chunk target."""
+    target = int(chunker.MAX_CHUNKS_PER_FILE * 0.8)
+    n = max(1, int(10 * target / count('\n\n'.join([record] * 10))))
+    while count('\n\n'.join([record] * n)) > target:
+        n -= 1
+    return '\n\n'.join([record] * n)
+
+
+class SimilarModel:
+    """Embeds every sentence alike, so semantic merges them all into one chunk."""
+    def encode(self, sentences, convert_to_numpy=True):
+        return np.ones((len(sentences), 4))
+
+
+class FileAtTargetIsAcceptedTests(unittest.TestCase):
+    """A file at section 5's chunk target, counted as section 4 says, is not
+    refused (#615, PR #619 review)."""
+
+    def test_language_with_long_lines_inside_records(self):
+        # The review's shape: records of 50 line pairs, a short field then a
+        # field just over chunk_size. Each long line flushes the short buffer
+        # before it and leaves a short tail: about two extra chunks per line.
+        # Counting two per long record instead, the first two were refused.
+        def field(n):
+            return ('w ' * n)[:n - 1] + 'z'
+        for size, overlap, minimum, short, long in ((1000, 0, 0, 4, 1001), (1500, 0, 100, 100, 1600),
+                                                    (1000, 200, 100, 100, 1100)):
+            with self.subTest(size=size, overlap=overlap, minimum=minimum):
+                record = '\n'.join(f'a: {field(short - 3)}\nt: {field(long - 3)}' for _ in range(50))
+                text = at_target(record, lambda t: language_count(t, size, overlap))
+                chunks = chunker.chunk(text, 'language', size, overlap, 0.85, minimum)
+                self.assertLessEqual(len(chunks), language_count(text, size, overlap))
+
+    def test_semantic_chunks_cut_into_more_pieces_than_sentences(self):
+        # Sentences of 5,999 characters, all on one topic, with whitespace
+        # only every 3,001 characters: the 6,000-character ceiling cuts the
+        # merged chunk into a piece per 3,001 characters, two per sentence.
+        text = (('w' * 3000 + ' ' + 'w' * 2999 + '. ') * 300).strip()
+        with patch.object(chunker, '_get_semantic_model', return_value=SimilarModel()):
+            chunks = chunker.chunk(text, 'semantic', similarity_threshold=0.5, min_chunk_size=0)
+        self.assertGreater(len(chunks), 300)
+        self.assertLessEqual(len(chunks), semantic_count(text))
 
 
 if __name__ == '__main__':
