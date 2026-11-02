@@ -1,6 +1,7 @@
 """Overlap window invariants on inert synthetic text and the ingest worker."""
 import os
 import hashlib
+import json
 import runpy
 import sys
 import tempfile
@@ -67,16 +68,15 @@ class OverlapTests(unittest.TestCase):
                          'expected at least one whitespace-only window; '
                          'chunk lengths were ' + str([len(c) for c in chunks]))
 
-    def test_tuning_rechunk_over_budget_fails_before_rebuild(self):
-        # The coding review noted (by inspection, not a test) that
-        # tuning._chunks_from_sources raises before _rebuild is called, so a
-        # re-chunk that now hits chunk_overlap's per-file limit fails the
-        # tuning job as TUNE_FAILED without touching the live collection.
-        # This exercises that path instead of just trusting the inspection.
+    def test_tuning_rechunk_over_budget_rebuilds_as_parts(self):
+        # #621: a re-chunk whose new settings take a retained original over
+        # chunk_overlap's per-file limits rebuilds it as parts, each inside them,
+        # instead of failing the tuning job.
+        records = ''.join(json.dumps({'body': 'x' * 990}) + '\n' for _ in range(20)).encode()
         with tempfile.TemporaryDirectory() as directory:
             src_dir = Path(directory)
-            digest = hashlib.sha256(b'irrelevant retained bytes').hexdigest()
-            (src_dir / digest).write_bytes(b'irrelevant retained bytes')
+            digest = hashlib.sha256(records).hexdigest()
+            (src_dir / digest).write_bytes(records)
             job_id = 'tune-budget-test'
             tuning._jobs[job_id] = {'job_id': job_id}
             params = {'chunking': {'strategy': 'overlap', 'chunk_size': 1000,
@@ -85,22 +85,27 @@ class OverlapTests(unittest.TestCase):
             with patch.object(tuning.settings, 'upload_dir', directory), \
                  patch.object(tuning.sources, 'has_sources', return_value=True), \
                  patch.object(tuning.sources, 'load_index',
-                               return_value={'documents': {digest: {'filenames': ['big.txt']}}}), \
+                               return_value={'documents': {digest: {'filenames': ['big.jsonl']}}}), \
                  patch.object(tuning.sources, 'collection_dir', return_value=src_dir), \
-                 patch.object(tuning, '_parse_file', return_value=('x' * 100000, [])), \
-                 patch.object(tuning, '_rebuild') as rebuild, \
+                 patch.object(tuning, '_rebuild', return_value=0) as rebuild, \
                  patch.object(tuning.wc, 'get_client') as get_client:
-                # big.txt has stored chunks, so the rebuild has something to
-                # rebuild (#311, #328) and reaches the per-file limit.
+                # big.jsonl is stored as one part, so the rebuild has something
+                # to rebuild (#311, #328): a part counts for its original.
                 get_client.return_value.collections.get.return_value.iterator.return_value = [
-                    SimpleNamespace(properties={'source_file': 'big.txt', 'chunk_index': 0})]
+                    SimpleNamespace(properties={'source_file': 'big.jsonl (part 1)', 'chunk_index': 0})]
                 tuning._run(job_id, 'ReviewTuneBudget', 'rechunk', params)
             job = tuning._jobs.pop(job_id)
-            self.assertEqual(job['status'], 'failed', job)
-            self.assertEqual(job.get('error_code'), 'TUNE_FAILED', job)
-            self.assertIn('per-file limit', job.get('error', ''), job)
-            rebuild.assert_not_called()
-            # Coverage now reads the existing collection; destructive rebuild is still unreachable.
+            rebuild.assert_called_once()
+            properties = rebuild.call_args.args[1]
+            names = sorted({p['source_file'] for p in properties})
+            self.assertGreaterEqual(len(names), 2, names)
+            self.assertEqual(names, sorted(f'big.jsonl (part {n})' for n in range(1, len(names) + 1)))
+            for name in names:
+                windows = [p for p in properties if p['source_file'] == name]
+                self.assertLessEqual(len(windows), chunker.MAX_OVERLAP_WINDOWS)
+                self.assertEqual([p['chunk_index'] for p in windows], list(range(len(windows))))
+                self.assertLessEqual(sum(len(p['content']) for p in windows),
+                                     chunker.MAX_OVERLAP_OUTPUT_CHARACTERS)
 
 
     def test_long_token_has_bounded_windows_and_exact_coverage(self):
@@ -167,24 +172,32 @@ class OverlapTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'characters'):
                 chunker.chunk_overlap('x'*56,10,5,0)
 
-    def test_over_budget_file_fails_before_storage_and_other_file_continues(self):
+    def test_over_budget_file_is_stored_as_parts_and_other_file_continues(self):
+        # #621: a file whose overlap output would pass the per-file limits is
+        # split into parts, each inside them, instead of failing.
         with tempfile.TemporaryDirectory() as directory:
-            root=Path(directory);bad=root/'over-budget.txt';bad.write_text('inert')
-            good=root/'accepted.txt';good.write_text('inert')
+            root=Path(directory);bad=root/'over-budget.jsonl'
+            bad.write_text(''.join(json.dumps({'body':'x'*990})+'\n' for _ in range(20)))
+            good=root/'accepted.jsonl';good.write_text(json.dumps({'body':'inert text'})+'\n')
             job_id='overlap-budget-test'
-            job={'status':'queued','files_total':2,'files_completed':0,'files_failed':0,'chunks_stored':0,'errors':[]}
+            job={'status':'queued','files_total':2,'files_completed':0,'files_failed':0,'chunks_stored':0,'errors':[],'split':[]}
             ingest_pipeline._jobs[job_id]=job
             try:
-                with patch.object(ingest_pipeline,'_parse_file',side_effect=[('x'*100000,[]),('inert text',[])]), \
-                     patch.object(ingest_pipeline.wc,'_insert_chunks_sync') as store, \
+                with patch.object(ingest_pipeline.wc,'_insert_chunks_sync') as store, \
                      patch.object(ingest_pipeline.wc, '_source_has_chunks_sync', return_value=False), \
                      patch.object(ingest_pipeline.sources,'store') as retained:
                     ingest_pipeline._process_job_sync(job_id,[bad,good],root,'ReviewOverlap','overlap',1000,999,0.85,100)
-                    store.assert_called_once();retained.assert_called_once()
-                    self.assertEqual(store.call_args.args[1][0]['source_file'],'accepted.txt')
-                self.assertEqual(job['status'],'partial',job)
-                self.assertEqual((job['files_completed'],job['files_failed'],job['chunks_stored']),(1,1,1))
-                self.assertIn('over-budget.txt',job['errors'][0]);self.assertIn('per-file limit',job['errors'][0])
+                    names=[call.args[1][0]['source_file'] for call in store.call_args_list]
+                    self.assertGreaterEqual(len(names),3,names)
+                    self.assertEqual(names,[f'over-budget.jsonl (part {n})' for n in range(1,len(names))]+['accepted.jsonl'])
+                    for call in store.call_args_list:
+                        self.assertLessEqual(len(call.args[1]),chunker.MAX_OVERLAP_WINDOWS)
+                        self.assertLessEqual(sum(len(c['content']) for c in call.args[1]),chunker.MAX_OVERLAP_OUTPUT_CHARACTERS)
+                    self.assertEqual([c.args[1] for c in retained.call_args_list],['over-budget.jsonl','accepted.jsonl'])
+                self.assertEqual(job['status'],'completed',job)
+                self.assertEqual((job['files_completed'],job['files_failed']),(2,0))
+                self.assertEqual(job['split'],[f"over-budget.jsonl: split into {len(names)-1} parts, stored as "
+                                               f"'over-budget.jsonl (part 1)' to 'over-budget.jsonl (part {len(names)-1})'"])
             finally:ingest_pipeline._jobs.pop(job_id,None)
 
     def test_live_helper_rejects_empty_parser_output_instead_of_vacuous_success(self):

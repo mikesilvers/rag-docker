@@ -114,6 +114,9 @@ class JobStatusResponse(BaseModel):
     # Earlier chunks of the same names that this job removed (#22). Records
     # written before the field existed read back as 0.
     chunks_replaced: int = 0
+    # Files over the per-file limits, stored as parts `<name> (part N)` (#621):
+    # one entry per such file that completed. Older records read back as [].
+    split: list[str] = []
 
 
 class IngestConfig(BaseModel):

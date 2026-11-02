@@ -34,7 +34,7 @@ from pathlib import Path, PurePosixPath
 from services import collection_writes, jobstore
 from config import settings
 from services import goldstandard
-from services import sources
+from services import parts, sources, splitter
 from services import weaviate_client as wc
 from services import batch_write, collection_recovery
 from services.chunker import chunk as do_chunk
@@ -117,7 +117,9 @@ _MISSING_CHUNK_INDEX = object()
 def _source_coverage(collection: str, documents: dict) -> tuple[list[str], set[str]]:
     """The stored source files a rebuild from the retained originals would not
     reproduce, and every name that has stored chunks, from one walk of the
-    collection. A rebuild emits only the stored names (#311)."""
+    collection. A rebuild emits only the stored names (#311). A part
+    `<name> (part N)` that no digest lists is covered by its original `<name>`,
+    which then counts as stored (#621)."""
     by_filename: dict[str, list[str]] = {}
     for digest, entry in documents.items():
         for filename in entry["filenames"]:
@@ -131,10 +133,11 @@ def _source_coverage(collection: str, documents: dict) -> tuple[list[str], set[s
         if not isinstance(filename, str) or not filename:
             uncovered.add("<unknown>")
             continue
-        stored.add(filename)
+        listed = parts.resolve(filename, by_filename) or filename
+        stored.add(listed)
         # A rebuild emits one chunk set per (digest, name) (#22), so a name is
         # covered when exactly one digest lists it, whichever of its names it is.
-        if len(by_filename.get(filename, [])) != 1:
+        if len(by_filename.get(listed, [])) != 1:
             uncovered.add(filename)
             continue
         index = props.get("chunk_index")
@@ -189,7 +192,9 @@ def _has_stored_listed_name(collection: str, documents: dict) -> bool:
     """Whether any name the index lists has stored chunks; stops at the first."""
     names = _listed_names(documents)
     for obj in wc.get_client().collections.get(collection).iterator():
-        if (obj.properties or {}).get("source_file") in names:
+        filename = (obj.properties or {}).get("source_file")
+        # A part counts for its original (#621).
+        if isinstance(filename, str) and parts.resolve(filename, names) is not None:
             return True
     return False
 
@@ -318,27 +323,29 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                 staged = slot / PurePosixPath(filename).name
                 shutil.copyfile(blob, staged)
 
-                text, elements = _parse_file(staged)
-                chunks = do_chunk(
-                    text=text,
-                    strategy=strategy,
-                    chunk_size=chunk_size,
-                    chunk_overlap_size=chunk_overlap,
-                    similarity_threshold=similarity_threshold,
-                    min_chunk_size=min_chunk_size,
-                    elements=elements if strategy == "context_aware" else None,
-                )
                 source_type = source_type_of(staged)
-                out.extend({
-                    "content": c,
-                    "source_file": filename,
-                    "source_type": source_type,
-                    "chunk_index": i,
-                    "chunk_strategy": strategy,
-                    "chunk_size": chunk_size,
-                    "chunk_overlap": chunk_overlap,
-                    "created_at": now,
-                } for i, c in enumerate(chunks))
+                # Split as ingest splits it (#621): a file over the per-file
+                # limits under the new settings is rebuilt as parts, however
+                # many parts it had before.
+                number = 0
+                split_settings = splitter.Settings(strategy, chunk_size, chunk_overlap,
+                                                   similarity_threshold, min_chunk_size)
+                try:
+                    for kind, chunks in splitter.split_file(staged, split_settings, _parse_file, do_chunk):
+                        number += 1
+                        source = filename if kind == "whole" else parts.part_name(filename, number)
+                        out.extend({
+                            "content": c,
+                            "source_file": source,
+                            "source_type": source_type,
+                            "chunk_index": i,
+                            "chunk_strategy": strategy,
+                            "chunk_size": chunk_size,
+                            "chunk_overlap": chunk_overlap,
+                            "created_at": now,
+                        } for i, c in enumerate(chunks))
+                except splitter.PartError as exc:
+                    raise ValueError(f"part {exc.number}: {exc}") from exc.cause
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

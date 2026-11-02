@@ -63,20 +63,36 @@ try:
                     print(f'PASS {label}: real parsed text stored as {len(chunks)} bounded windows with exact coverage/overlap', flush=True)
                 finally:
                     ingest_pipeline._jobs.pop(job_id,None)
+        # #621: a file whose overlap output would pass the per-file limits is
+        # stored as parts, each inside them, with every character kept.
         stage = root / 'budget'
         stage.mkdir()
         source = stage / 'over-budget.txt'
-        source.write_text('x' * 100000)
+        text = 'x' * 20000
+        source.write_text(text)
         job_id='overlap-budget-'+uuid.uuid4().hex[:8]
-        job={'status':'queued','files_total':1,'files_completed':0,'files_failed':0,'chunks_stored':0,'errors':[]}
+        job={'status':'queued','files_total':1,'files_completed':0,'files_failed':0,'chunks_stored':0,'errors':[],'split':[]}
         ingest_pipeline._jobs[job_id]=job
         try:
-            ingest_pipeline._process_job_sync(job_id,[source],stage,collection,'overlap',1000,999,0.85,100)
-            assert job['status']=='failed' and job['files_failed']==1 and job['chunks_stored']==0,job
-            assert any('per-file limit' in error for error in job['errors']),job
-            stored=list(wc.get_client().collections.get(collection).iterator())
-            assert not any(o.properties['source_file']==source.name for o in stored)
-            print('PASS excessive overlap output fails before object storage',flush=True)
+            with patch.object(settings, 'sources_dir', str(root/'retained')):
+                ingest_pipeline._process_job_sync(job_id,[source],stage,collection,'overlap',1000,999,0.85,100)
+            assert job['status']=='completed' and job['files_completed']==1,job
+            stored=[o.properties for o in wc.get_client().collections.get(collection).iterator()
+                    if o.properties['source_file'].startswith(source.name)]
+            names=sorted({p['source_file'] for p in stored})
+            assert names==[f'{source.name} (part 1)',f'{source.name} (part 2)'],names
+            assert job['chunks_stored']==len(stored),job
+            assert job['split']==[f"{source.name}: split into 2 parts, stored as '{source.name} (part 1)' "
+                                  f"to '{source.name} (part 2)'"],job
+            restored=''
+            for name in names:
+                windows=[p['content'] for p in sorted((p for p in stored if p['source_file']==name),
+                                                      key=lambda p:p['chunk_index'])]
+                assert len(windows)<=chunker.MAX_OVERLAP_WINDOWS,(name,len(windows))
+                assert sum(map(len,windows))<=chunker.MAX_OVERLAP_OUTPUT_CHARACTERS,name
+                restored+=windows[0]+''.join(w[999:] for w in windows[1:])
+            assert restored==text,len(restored)
+            print('PASS excessive overlap output is stored as parts inside the per-file limits',flush=True)
         finally:
             ingest_pipeline._jobs.pop(job_id, None)
     print('PASS owned temporary source paths removed', flush=True)

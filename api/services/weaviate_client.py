@@ -437,14 +437,27 @@ def _exact_source_objects(coll, name: str, accept=None):
             close()
 
 
-def _source_has_chunks_sync(collection_name: str, source_file: str) -> bool:
-    """Whether the collection holds any chunk stored under exactly this name."""
+def _source_has_chunks_sync(collection_name: str, source_file: str, accept=None) -> bool:
+    """Whether the collection holds any chunk stored under exactly this name (or,
+    with `accept`, under a value it keeps)."""
     coll = get_client().collections.get(collection_name)
-    selected = _exact_source_objects(coll, source_file)
+    selected = _exact_source_objects(coll, source_file, accept)
     try:
         return next(selected, None) is not None
     finally:
         selected.close()
+
+
+def _family(name: str):
+    """The rule keeping `name` and its `<name> (part N)` parts, exactly (#621).
+    Every part's words include the name's, so equal(name) matches them all."""
+    from services import parts
+    return lambda value: parts.in_family(value, name)
+
+
+def _family_has_chunks_sync(collection_name: str, name: str) -> bool:
+    """Whether `name` or any of its parts has chunks (#621)."""
+    return _source_has_chunks_sync(collection_name, name, _family(name))
 
 
 class ReplaceError(RuntimeError):
@@ -463,7 +476,7 @@ _REPLACE_DELETE_ROUNDS = 100
 
 @collection_writes.serialized("collection_name")
 def _delete_earlier_chunks_sync(collection_name: str, source_file: str,
-                                created_at: datetime, expected: int) -> int:
+                                created_at: datetime, expected: int, accept=None) -> int:
     """Remove a name's earlier chunks after its `expected` new ones are stored (#22).
 
     Called only after the insert has been verified, never before: if the insert
@@ -478,11 +491,12 @@ def _delete_earlier_chunks_sync(collection_name: str, source_file: str,
     the selection independent of earlier chunks' timestamps (an imported
     package's can be later than now). Before deleting, exactly `expected` of the
     name's chunks must carry it; afterwards exactly they must remain. Returns how
-    many earlier chunks were deleted.
+    many earlier chunks were deleted. With `accept`, the chunks are those of the
+    values it keeps, such as a name and its parts (#621).
     """
     coll = get_client().collections.get(collection_name)
     new, earlier = 0, []
-    for obj in _exact_source_objects(coll, source_file):
+    for obj in _exact_source_objects(coll, source_file, accept):
         if obj.properties.get("created_at") == created_at:
             new += 1
         else:
@@ -502,11 +516,45 @@ def _delete_earlier_chunks_sync(collection_name: str, source_file: str,
         deleted += result.successful or 0
         if result.failed:
             raise ReplaceError(f"Weaviate failed to delete {result.failed} earlier chunk(s)", deleted)
-    left = sum(1 for _ in _exact_source_objects(coll, source_file)) - expected
+    left = sum(1 for _ in _exact_source_objects(coll, source_file, accept)) - expected
     if left > 0:
         raise ReplaceError(f"{left} earlier chunk(s) remain", deleted)
     if left < 0:
         raise ReplaceError(f"{-left} of its {expected} new chunks are missing afterwards", deleted)
+    return deleted
+
+
+def _delete_earlier_family_sync(collection_name: str, name: str, created_at: datetime,
+                                expected: int) -> int:
+    """Remove the earlier chunks of `name` and of every `<name> (part N)` once the
+    `expected` new ones are stored, so a re-upload leaves exactly the new family
+    whether or not either version was split (#621)."""
+    return _delete_earlier_chunks_sync(collection_name, name, created_at, expected,
+                                       accept=_family(name))
+
+
+@collection_writes.serialized("collection_name")
+def _delete_new_family_sync(collection_name: str, name: str, created_at: datetime) -> int:
+    """Remove the chunks this ingest stored for `name` and its parts (they carry
+    its `created_at`), so a file whose later part failed leaves its earlier
+    version whole (#621). Returns how many were removed; ReplaceError, with that
+    count, when Weaviate fails to remove some or some remain."""
+    coll = get_client().collections.get(collection_name)
+    accept = _family(name)
+    new = [obj.uuid for obj in _exact_source_objects(coll, name, accept)
+           if obj.properties.get("created_at") == created_at]
+    deleted = 0
+    for start in range(0, len(new), _QUERY_MAXIMUM_RESULTS):
+        batch = new[start:start + _QUERY_MAXIMUM_RESULTS]
+        result = telemetry.call("weaviate.delete", coll.data.delete_many,
+                                where=Filter.by_id().contains_any(batch))
+        deleted += result.successful or 0
+        if result.failed:
+            raise ReplaceError(f"Weaviate failed to delete {result.failed} new chunk(s)", deleted)
+    left = sum(1 for obj in _exact_source_objects(coll, name, accept)
+               if obj.properties.get("created_at") == created_at)
+    if left:
+        raise ReplaceError(f"{left} new chunk(s) remain", deleted)
     return deleted
 
 

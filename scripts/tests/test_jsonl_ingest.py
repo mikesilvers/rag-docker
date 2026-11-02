@@ -33,9 +33,17 @@ LINE_LIMIT = ("is longer than 10,000,000 bytes, the most one line can hold; "
 RECORD_CAP = "has more than 1,000,000 records, the most one file can hold; split the file"
 
 
-def too_large(line):
-    return (f"converts to more than 10,000,000 characters of text by line {line}, "
-            f"the per-file limit for every chunking strategy; split the file")
+def too_large(line, limit="10,000,000"):
+    # The bound is per record since #621: a file over it is split into parts at
+    # record boundaries, and a record is never split.
+    return (f"line {line} converts to more than {limit} characters of text, "
+            f"the most one record can hold; a record is never split")
+
+
+def expanding_record(values):
+    """One JSON Lines record whose converted text repeats a 200-character key path
+    for each of `values` values: about 211 characters a value."""
+    return json.dumps({"k" * 200: {f"v{i:06d}": 1 for i in range(values)}})
 
 
 class JsonlTestCase(unittest.TestCase):
@@ -236,17 +244,28 @@ class BudgetTests(JsonlTestCase):
         text, _ = self.parse(content)
         self.assertEqual(len(text), 10_000_000)
 
-    def test_one_character_over_names_the_line(self):
+    def test_records_together_over_the_limit_parse(self):
+        # #621: each record is bounded on its own; the file is split into parts later.
         content = json.dumps("a" * 4_999_999) + "\n" + json.dumps("b" * 5_000_000) + "\n"
+        self.assertEqual(len(self.parse(content)[0]), 10_000_001)
+
+    def test_one_record_over_the_limit_names_the_line(self):
+        # Under 1 MB of line whose key path repeats over 50,000 values: over 10M characters.
+        content = json.dumps("a" * 10) + "\n" + expanding_record(50_000) + "\n"
+        self.assertLess(len(content), 1_000_000)
         self.assert_fails(content, too_large(2))
+        text, _ = self.parse(json.dumps("a" * 10) + "\n" + expanding_record(40_000) + "\n")
+        self.assertGreater(len(text), 8_000_000)
 
     def test_a_dropped_record_costs_nothing_at_the_edge(self):
         content = (json.dumps("a" * 4_999_999) + "\n{}\n[]\n" + json.dumps("b" * 4_999_999) + "\n")
         self.assertEqual(len(self.parse(content)[0]), 10_000_000)
 
-    def test_reading_stops_once_the_limit_is_passed(self):
+    def test_reading_stops_at_the_record_over_the_limit(self):
         record = json.dumps({"title": "Remote work policy", "body": "x" * 80}) + "\n"
-        path = self.write(record * 200_000)  # about 21 MB
+        big = json.dumps({"title": "Remote work policy", "body": "x" * 200_000}) + "\n"
+        line = 500
+        path = self.write(record * (line - 1) + big + record * 200_000)  # about 21 MB
         positions = []
         real = ingest_pipeline._jsonl_records
 
@@ -266,14 +285,9 @@ class BudgetTests(JsonlTestCase):
             _, peak = tracemalloc.get_traced_memory()
         finally:
             tracemalloc.stop()
-        # Each record's text, and the blank line before every one after the first.
-        text = len("title: Remote work policy\nbody: ") + 80
-        line = 100_000 // (text + 2) + 1
-        self.assertEqual(str(caught.exception),
-                         f"converts to more than 100,000 characters of text by line {line}, the "
-                         f"per-file limit for every chunking strategy; split the file")
+        self.assertEqual(str(caught.exception), too_large(line, "100,000"))
         # Read up to the line that passed the limit, not the rest of the file.
-        self.assertLessEqual(positions[0], line * len(record))
+        self.assertLessEqual(positions[0], (line - 1) * len(record) + len(big))
         self.assertLess(time.monotonic() - started, 10)
         self.assertLess(peak, 5 * 1024 * 1024, f"peak {peak} bytes")
 
@@ -359,8 +373,8 @@ class GzipTests(JsonlTestCase):
                           "doc.jsonl.gz")
 
     def test_budget_error_is_prefixed(self):
-        content = json.dumps("a" * 4_999_999) + "\n" + json.dumps("b" * 5_000_000) + "\n"
-        self.assert_fails(content, "was decompressed, but it " + too_large(2), "doc.jsonl.gz")
+        content = json.dumps("a" * 10) + "\n" + expanding_record(50_000) + "\n"
+        self.assert_fails(content, "was decompressed, but " + too_large(2), "doc.jsonl.gz")
 
     def test_corrupt_gzip(self):
         path = self.dir / "doc.jsonl.gz"
@@ -475,14 +489,15 @@ class JobOutcomeTests(JsonlTestCase):
         self.assertEqual([c["content"] for c in stored],
                          [f"bill: HR-{i}\ntitle: " + "t" * 60 for i in range(3)])
 
-    def test_a_file_over_the_chunk_limit_fails_and_stores_nothing(self):
+    def test_a_record_over_the_chunk_limit_fails_and_stores_nothing(self):
+        # #621: a file over the chunk limit is split into parts, but a record is never
+        # split, so one record giving more than 10,000 chunks still fails the file.
         line = json.dumps({"body": "word " * 220_000}) + "\n"  # about 1.1M characters
         job, stored, retained = self.run_job([("big.jsonl", line.encode())], "fixed", 100)
         self.assertEqual(job["status"], "failed")
-        self.assertEqual(len(job["errors"]), 1)
-        self.assertTrue(job["errors"][0].startswith("big.jsonl: fixed chunking exceeds the per-file limit"),
-                        job["errors"][0])
-        self.assertIn("split the file", job["errors"][0])
+        self.assertEqual(job["errors"], [
+            "big.jsonl: line 1 gives more than 10,000 chunks with these chunk settings, the "
+            "most one part can hold; a record is never split, so use a larger chunk size"])
         self.assertEqual((stored, retained), ([], []))
 
     def test_a_file_over_the_record_cap_fails_and_stores_nothing(self):

@@ -27,8 +27,14 @@ from services import ingest_pipeline
 from services import weaviate_client as wc
 from services.chunker import chunk
 
-TOO_LARGE = ("converts to more than 10,000,000 characters of text, "
-             "the per-file limit for every chunking strategy; split the file")
+def too_large(ordinal="record 1"):
+    # The bound is per record since #621: a file over it is split into parts at
+    # record boundaries, and a record is never split.
+    return (f"{ordinal} converts to more than 10,000,000 characters of text, "
+            "the most one record can hold; a record is never split")
+
+
+TOO_LARGE = too_large()
 TOO_MANY = "has more than 1,000,000 records, the most one file can hold; split the file"
 TOO_BIG = ("is larger than 30,000,000 bytes, the most one JSON file can hold; "
            "split the file or convert it to JSON Lines")
@@ -252,20 +258,19 @@ class JsonFileTests(unittest.TestCase):
         doc[f"k{count:05d}"] = ""
         self.assert_invalid(json.dumps(doc), "^" + re.escape(TOO_LARGE) + "$")
 
-    def test_bound_is_shared_by_the_records_of_a_top_level_array(self):
-        # Reviewer test (PR #299), adjusted for #300's separator charge: one budget for all
-        # records and the blank lines between them, exactly at the limit, and a dropped
-        # (whitespace-only) record gives its characters back.
+    def test_bound_is_per_record_in_a_top_level_array(self):
+        # #621: the records of a top-level array no longer share one budget. Together
+        # they may pass the limit (the file is then split into parts); one record over
+        # it fails, named by its position, a dropped (whitespace-only) item counted.
         limit = ingest_pipeline.MAX_JSON_TEXT_CHARACTERS
-        count = (limit + 2) // 996  # each record is "k: <991 x>", 994 characters, 996 with its blank line
-        rest = limit - (count * 996 - 2) - 2  # the last record's characters, after its blank line
-        records = [" "] + [{"k": "x" * 991}] * count + [{"k": "x" * (rest - 3)}]
+        count = limit // 994 + 1  # each record is "k: <991 x>", 994 characters
+        records = [" "] + [{"k": "x" * 991}] * count
         text, elements = self.parse(json.dumps(records))
-        self.assertEqual(len(elements), count + 1)
-        self.assertEqual(len(text), limit)
-        self.assertEqual(sum(len(str(e)) for e in elements) + 2 * count, limit)
-        records.append({"k": ""})
-        self.assert_invalid(json.dumps(records), "^" + re.escape(TOO_LARGE) + "$")
+        self.assertEqual(len(elements), count)
+        self.assertGreater(len(text), limit)
+        records.append({"k": "x" * limit})
+        self.assert_invalid(json.dumps(records),
+                            "^" + re.escape(too_large(f"record {count + 2}")) + "$")
 
     # ── #300: records, input size, element-schema parse ──────────────────────
     def test_record_cap_counts_only_records_with_text(self):
@@ -395,7 +400,7 @@ class JsonFileTests(unittest.TestCase):
         doc = ('{"' + "a" * 262144 + '": [' + ",".join(["[0]"] * 65536) + "]}").encode()
         with self.assertRaises(ValueError) as caught:
             self.parse(gzip.compress(doc), "doc.json.gz")
-        self.assertEqual(str(caught.exception), "was decompressed, but it " + TOO_LARGE)
+        self.assertEqual(str(caught.exception), "was decompressed, but " + TOO_LARGE)
 
     # ── S1.1, S3.3: .json.gz members ──────────────────────────────────────────
     def test_json_gz_member_is_converted_the_same_way(self):

@@ -31,6 +31,7 @@ from services import age_stream
 from services import goldstandard
 from services import ingest_config
 from services import model_bundle
+from services import parts
 from services import retrieval_config
 from services import sources
 from services import weaviate_client as wc
@@ -176,7 +177,10 @@ def read_chunks(collection: str, documents: dict | None = None) -> Iterator[dict
         props = dict(obj.properties or {})
         # source_sha256 is a sibling field, not a stored property: spec §4.5
         # keeps the eight chunk properties unchanged. Resolve it from retention.
-        digests = by_filename.get(props.get("source_file"), [])
+        # A part `<name> (part N)` links to its original `<name>` (#621).
+        source_file = props.get("source_file")
+        listed = parts.resolve(source_file, by_filename) if isinstance(source_file, str) else None
+        digests = by_filename.get(listed, []) if listed is not None else []
         yield {
             "id": str(obj.uuid),
             "vector": vector,

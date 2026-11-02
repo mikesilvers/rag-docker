@@ -1009,6 +1009,9 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     fs.writeFileSync(small, 'Re-ingest fixture.\n');
     const jobId = 'vfyrein' + replaced;
     const skippedEntry = "u.zip:a/r.txt (replaced by r.txt later in this upload, same name 'a/r.txt')";
+    // A file over the per-file limits is stored as parts and listed in `split` (#621).
+    const splitEntry = "big.jsonl: split into 2 parts, stored as 'big.jsonl (part 1)' to 'big.jsonl (part 2)'";
+    const split = replaced === 3 ? [splitEntry] : [];
     const s = await session(browser, BASE, 'developer');
     await s.page.setRequestInterception(true);
     s.page.on('request', request => {
@@ -1016,7 +1019,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
       if (path === '/api/ingest/upload' && request.method() === 'POST')
         return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'x' }) });
       if (path === '/api/ingest/job/' + jobId)
-        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 2, errors: [], skipped: [skippedEntry], chunks_replaced: replaced }) });
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 2, errors: [], skipped: [skippedEntry], chunks_replaced: replaced, split }) });
       return request.continue();
     });
     try {
@@ -1037,6 +1040,12 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
                 text.includes('1 file skipped:') && !text.includes('not a supported type:') && text.includes(skippedEntry),
                 text.slice(0, 300));
       }
+      if (replaced === 3)
+        r.check('a split file is listed under "1 file split into parts:" with its part names (#621)',
+                text.includes('1 file split into parts:') && text.includes(splitEntry), text.slice(0, 400));
+      if (replaced === 0)
+        r.check('an empty split list shows no split heading (#621)', clicked && !text.includes('split into parts'),
+                text.slice(0, 300));
       r.check(`re-ingest progress fixture (${replaced}) causes no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')));
     } finally {
       fs.unlinkSync(small);

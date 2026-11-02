@@ -16,13 +16,13 @@ import zipfile
 import zlib
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Iterator
 
 from services import batch_write, collection_writes, jobstore
 from config import settings
 from models.schemas import IngestConfig
 from services.chunker import MAX_TEXT_CHARACTERS, chunk as do_chunk
-from services import sources
+from services import parts, sources, splitter
 from services import weaviate_client as wc
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".jsonl"}
@@ -141,21 +141,28 @@ class _JsonError(ValueError):
 
 
 class _JsonTooLarge(_JsonError):
-    """Valid JSON whose converted text would be over the per-file text limit."""
+    """A JSON record whose converted text would be over the per-record limit (#621).
+    `ordinal` names the record (`record N`) once it is known."""
 
-    def __init__(self) -> None:
-        detail = (f"converts to more than {MAX_JSON_TEXT_CHARACTERS:,} characters of text, "
-                  f"the per-file limit for every chunking strategy; split the file")
+    def __init__(self, ordinal: str = "a record") -> None:
+        detail = _record_too_large(ordinal)
         ValueError.__init__(self, detail)
         self.detail = detail
 
 
-# The most text one JSON file may convert to (#295 review). Each line repeats its
-# full key path, so a small file with a long key over many values could otherwise
-# expand to gigabytes. This is the chunker's own per-file limit: a file whose
-# records hold more text than this is refused by every chunking strategy anyway,
-# so the bound refuses nothing that could have been ingested; it only refuses
-# before the text is built.
+def _record_too_large(ordinal: str) -> str:
+    # A file over the per-file limits is split into parts at record boundaries
+    # (#621), so only one record can be too large: a record is never split.
+    return (f"{ordinal} converts to more than {MAX_JSON_TEXT_CHARACTERS:,} characters of text, "
+            f"the most one record can hold; a record is never split")
+
+
+# The most text one JSON or JSON Lines record may convert to (#295 review, #621).
+# Each line repeats its full key path, so a small record with a long key over
+# many values could otherwise expand to gigabytes; it is refused before that text
+# is built. It is the chunker's per-file text limit: a file over it is split into
+# parts at record boundaries (#621), and a record is never split, so a record
+# over it could not be ingested anyway.
 MAX_JSON_TEXT_CHARACTERS = MAX_TEXT_CHARACTERS
 # The most bytes of one JSON file that are parsed (#300). A .json file is parsed
 # whole, before the text bound can be checked, and parsing takes up to about 34
@@ -246,7 +253,7 @@ def _json_scalar(value: Any) -> str:
 
 
 class _JsonBudget:
-    """Characters of converted text left for this file."""
+    """Characters of converted text left for one record (#621)."""
 
     def __init__(self) -> None:
         self.left = MAX_JSON_TEXT_CHARACTERS
@@ -298,44 +305,52 @@ def _json_lines(value: Any, path: Any, out: list[str], budget: _JsonBudget) -> N
         _json_line(path, _json_scalar(value), out, budget)
 
 
-def _json_records(value: Any) -> list[str]:
+def _iter_json_records(value: Any) -> Iterator[tuple[str, str]]:
     """Ordinary JSON as readable text: one record per item of a top-level array
     that holds any object or array, otherwise one record. Records with no text
-    are dropped."""
+    are dropped. Yields (`record N`, text), N the item's position from 1; each
+    record's text is bounded on its own (#621)."""
     if isinstance(value, list) and not all(_is_json_scalar(item) for item in value):
         groups = value
     else:
         groups = [value]
-    records = []
-    budget = _JsonBudget()
-    try:
-        for group in groups:
-            lines: list[str] = []
-            left = budget.left
-            _json_lines(group, None, lines, budget)
-            text = "\n".join(lines)
-            if text.strip():
-                if records:
-                    budget.spend(2)  # the blank line before this record (#300)
-                if len(records) == MAX_JSON_RECORDS:
-                    raise _JsonTooManyRecords()
-                records.append(text)
-            else:
-                budget.left = left  # a dropped record's text is not stored
-    except RecursionError as exc:
-        raise _JsonError("it is nested too deeply to read") from exc
-    return records
+    kept = 0
+    for position, group in enumerate(groups, 1):
+        ordinal = f"record {position}"
+        lines: list[str] = []
+        try:
+            _json_lines(group, None, lines, _JsonBudget())
+        except _JsonTooLarge as exc:
+            raise _JsonTooLarge(ordinal) from exc
+        except RecursionError as exc:
+            raise _JsonError("it is nested too deeply to read") from exc
+        text = "\n".join(lines)
+        if text.strip():
+            if kept == MAX_JSON_RECORDS:
+                raise _JsonTooManyRecords()
+            kept += 1
+            yield ordinal, text
 
 
-def _parse_json(path: Path) -> tuple[str, list[Any]]:
-    """Ordinary JSON becomes `key: value` text, one element per record. A file of
-    serialized Unstructured elements is rehydrated by partition_json (#295)."""
+def _json_records(value: Any) -> list[str]:
+    """Every record of _iter_json_records, as a list."""
+    return [text for _, text in _iter_json_records(value)]
+
+
+def _json_units(path: Path) -> Iterator[tuple[str, str, Any]]:
+    """A JSON file's records in file order, as (ordinal, text, element) (#621).
+
+    Ordinary JSON gives `key: value` text, one record per item, element None. A
+    file of serialized Unstructured elements is rehydrated by partition_json
+    (#295), and each element is a record (`record N`) with its element. The file
+    is parsed whole, as before; ordinary records are converted one at a time.
+    """
     # Checked before anything is read: the parse is the cost (#300).
     if path.stat().st_size > MAX_JSON_INPUT_BYTES:
         raise ValueError(_json_input_too_large("is larger than"))
     raw, value = _read_json(path)
     if not raw:
-        return "", []
+        return
     from unstructured.partition.common.json_partitioning import is_element_shaped_dict
     if isinstance(value, list) and value and all(is_element_shaped_dict(i) for i in value):
         # Each item becomes one element, so the record cap applies to the items,
@@ -347,24 +362,46 @@ def _parse_json(path: Path) -> tuple[str, list[Any]]:
         # the two are not held together (#300).
         value = None
         # The text already read, so a byte-order mark is handled the same way.
-        elements = partition_json(text=raw)
+        for position, element in enumerate(partition_json(text=raw), 1):
+            yield f"record {position}", str(element), element
+        return
+    raw = None
+    for ordinal, text in _iter_json_records(value):
+        yield ordinal, text, None
+
+
+def _join_json_units(units: list[tuple[str, str, Any]]) -> tuple[str, list[Any]]:
+    """The text and elements of JSON records, as one file's parse gives them: an
+    element file's elements joined by a line break, ordinary records as Text
+    elements joined by a blank line, so the language splitter prefers to cut
+    between records."""
+    if units and units[0][2] is not None:
+        elements = [element for _, _, element in units]
         return "\n".join(str(el) for el in elements), elements
     from unstructured.documents.elements import Text
-    records = _json_records(value)
-    # A blank line between records, so the language splitter prefers to cut there.
-    return "\n\n".join(records), [Text(text=record) for record in records]
+    return "\n\n".join(text for _, text, _ in units), [Text(text=text) for _, text, _ in units]
 
 
-def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
+def _parse_json(path: Path) -> tuple[str, list[Any]]:
+    """Ordinary JSON becomes `key: value` text, one element per record. A file of
+    serialized Unstructured elements is rehydrated by partition_json (#295)."""
+    return _join_json_units(list(_json_units(path)))
+
+
+def _json_gz_units(path: Path) -> Iterator[tuple[str, str, Any]]:
+    """A .json.gz member's records, as _json_units gives them; it is decompressed
+    to a temporary file, removed when the records have been read."""
     fd, name = tempfile.mkstemp(dir=path.parent, suffix=".json")
     os.close(fd)
     plain = Path(name)
     try:
         _gunzip_bounded(path, plain)
         try:
-            return _parse_json(plain)
-        except (_JsonTooLarge, _JsonTooManyRecords) as exc:
+            yield from _json_units(plain)
+        except _JsonTooManyRecords as exc:
             raise ValueError(f"was decompressed, but it {exc.detail}") from exc
+        except _JsonTooLarge as exc:
+            raise ValueError(f"was decompressed, but {exc.detail}") from exc
         except _JsonError as exc:
             raise ValueError(
                 f"was decompressed, but its JSON could not be parsed: {exc.detail}") from exc
@@ -376,6 +413,10 @@ def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
         plain.unlink(missing_ok=True)
 
 
+def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
+    return _join_json_units(list(_json_gz_units(path)))
+
+
 class _JsonlError(ValueError):
     """A JSON Lines file that can't be ingested; `detail` names the line (#291)."""
 
@@ -385,8 +426,7 @@ class _JsonlError(ValueError):
 
 
 class _JsonlTooLarge(_JsonlError):
-    """A JSON Lines file whose text passes the per-file limit, or with more lines
-    than one file may hold (#314)."""
+    """A JSON Lines file with more lines than one file may hold (#314)."""
 
 
 class _BoundedLines:
@@ -408,17 +448,16 @@ _JSONL_BLANK = b" \t\r"
 _BOM = b"\xef\xbb\xbf"
 
 
-def _jsonl_records(stream: Any) -> list[str]:
-    """The records of a JSON Lines file, one per line with text (#291).
+def _iter_jsonl_records(stream: Any) -> Iterator[tuple[str, str]]:
+    """The records of a JSON Lines file, one per line with text (#291), as
+    (`line N`, text).
 
     Read one line at a time, at most MAX_JSONL_LINE_BYTES of it besides its line
     ending and line 1's byte-order mark, and stopped at the first bad line, at
-    the line past MAX_JSON_RECORDS, or when the file's text passes the per-file
-    limit, so memory is bounded by one line and that limit, never by the file's
-    size, and work by the line count.
+    the line past MAX_JSON_RECORDS, or at a record whose text passes the
+    per-record limit (#621), so memory is bounded by one line and one record,
+    never by the file's size, and work by the line count.
     """
-    budget = _JsonBudget()
-    records: list[str] = []
     number = 0
     blank = None  # the first blank line not yet followed by a record
     while True:
@@ -459,20 +498,10 @@ def _jsonl_records(stream: Any) -> list[str]:
             value = json.loads(line, parse_int=_JsonNumber, parse_float=_JsonNumber,
                                parse_constant=_reject_constant)
             lines: list[str] = []
-            left = budget.left
-            _json_lines(value, None, lines, budget)
+            _json_lines(value, None, lines, _JsonBudget())
             text = "\n".join(lines)
-            if text.strip():
-                if records:
-                    budget.spend(2)  # the blank line before this record
-                records.append(text)
-            else:
-                budget.left = left  # a record with no text is not stored
         except _JsonTooLarge as exc:
-            raise _JsonlTooLarge(
-                f"converts to more than {MAX_JSON_TEXT_CHARACTERS:,} characters of text by "
-                f"line {number}, the per-file limit for every chunking strategy; "
-                f"split the file") from exc
+            raise _JsonlError(_record_too_large(f"line {number}")) from exc
         except _JsonError as exc:
             raise _JsonlError(f"line {number} is not valid JSON: {exc.detail}") from exc
         except json.JSONDecodeError as exc:
@@ -481,7 +510,41 @@ def _jsonl_records(stream: Any) -> list[str]:
         except RecursionError as exc:
             raise _JsonlError(
                 f"line {number} is not valid JSON: it is nested too deeply to read") from exc
-    return records
+        # A record with no text is not stored.
+        if text.strip():
+            yield f"line {number}", text
+
+
+def _jsonl_records(stream: Any) -> list[str]:
+    """Every record of _iter_jsonl_records, as a list."""
+    return [text for _, text in _iter_jsonl_records(stream)]
+
+
+def _jsonl_units(path: Path) -> Iterator[tuple[str, str, None]]:
+    """A JSON Lines file's records in file order, as (ordinal, text, None), read
+    one line at a time, plain or gzipped (#621). Errors read as _parse_jsonl's."""
+    try:
+        if _is_jsonl_gz(path.name):
+            # Decompressed while read; nothing decompressed is written to disk.
+            with gzip.open(path, "rb") as gz:
+                for ordinal, text in _iter_jsonl_records(_BoundedLines(gz)):
+                    yield ordinal, text, None
+        else:
+            with path.open("rb") as fh:
+                for ordinal, text in _iter_jsonl_records(fh):
+                    yield ordinal, text, None
+    except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
+        raise ValueError(
+            f"is not a valid gzip file; it may be truncated or corrupt ({exc})") from exc
+    except _JsonlError as exc:
+        raise ValueError(_jsonl_reason(path, exc)) from exc
+
+
+def _jsonl_reason(path: Path, exc: _JsonlError) -> str:
+    if not _is_jsonl_gz(path.name):
+        return exc.detail
+    subject = "it " if isinstance(exc, _JsonlTooLarge) else ""
+    return f"was decompressed, but {subject}{exc.detail}"
 
 
 def _parse_jsonl(path: Path) -> tuple[str, list[Any]]:
@@ -497,14 +560,13 @@ def _parse_jsonl(path: Path) -> tuple[str, list[Any]]:
             raise ValueError(
                 f"is not a valid gzip file; it may be truncated or corrupt ({exc})") from exc
         except _JsonlError as exc:
-            subject = "it " if isinstance(exc, _JsonlTooLarge) else ""
-            raise ValueError(f"was decompressed, but {subject}{exc.detail}") from exc
+            raise ValueError(_jsonl_reason(path, exc)) from exc
     else:
         try:
             with path.open("rb") as fh:
                 records = _jsonl_records(fh)
         except _JsonlError as exc:
-            raise ValueError(exc.detail) from exc
+            raise ValueError(_jsonl_reason(path, exc)) from exc
     from unstructured.documents.elements import Text
     return "\n\n".join(records), [Text(text=record) for record in records]
 
@@ -581,11 +643,11 @@ def _count_writes(job: dict, submitted: int, accepted: int, stored: int = 0) -> 
 
 
 def _has_chunks(collection: str, name: str) -> bool:
-    """Whether the name already has chunks, which this file will replace (#22).
-    It is the job's first backend call for a file, so a deleted collection is
-    reported here the way _store_chunks reports it (#40)."""
+    """Whether the name or any of its parts already has chunks, which this file
+    will replace (#22, #621). It is the job's first backend call for a file, so a
+    deleted collection is reported here the way _store_chunks reports it (#40)."""
     try:
-        return wc._source_has_chunks_sync(collection, name)
+        return wc._family_has_chunks_sync(collection, name)
     except Exception as exc:
         if _collection_gone(collection):
             _log.warning("Collection %r disappeared before storing chunks: %s",
@@ -620,7 +682,7 @@ def _mark_replacement_stale(collection: str, name: str, rest: list[str]) -> None
     names the step that failed (#311); either way nothing has been marked.
     """
     try:
-        names = [name] + [other for other in rest if wc._source_has_chunks_sync(collection, other)]
+        names = [name] + [other for other in rest if wc._family_has_chunks_sync(collection, other)]
     except Exception as exc:
         raise _StaleLookupFailed(str(exc) or type(exc).__name__) from exc
     listed = ", ".join(names[:_MAX_NAMED_FILES])
@@ -636,16 +698,53 @@ def _mark_replacement_stale(collection: str, name: str, rest: list[str]) -> None
         raise _StaleMarkFailed(str(exc) or type(exc).__name__) from exc
 
 
+class _FileFailed(Exception):
+    """A file that failed, with the reason its error gives (#621)."""
+
+
+def _undo_new_chunks(job: dict, collection: str, name: str, created_at: datetime,
+                     exc: BaseException, kind: str, part_count: int, stored: int) -> _FileFailed:
+    """A file failed while its chunks were being stored: remove what this ingest
+    stored for it, so its earlier version stays whole (#621), and say why it failed.
+
+    A part that failed is named (`part N: ...`). `chunks_stored` is reduced by what
+    was removed.
+    """
+    cause = exc.cause if isinstance(exc, splitter.PartError) else exc
+    reason = str(cause) or type(cause).__name__
+    split = isinstance(exc, splitter.PartError) or kind == "part"
+    if isinstance(exc, splitter.PartError):
+        reason = f"part {exc.number}: {reason}"
+    elif kind == "part":
+        reason = f"part {part_count}: {reason}"
+    if not (stored or (split and part_count)):
+        return _FileFailed(reason)
+    try:
+        removed = wc._delete_new_family_sync(collection, name, created_at)
+        problem = None
+    except Exception as undo:
+        _log.error("Could not remove the new chunks of %r in %r", name, collection,
+                   exc_info=True)
+        removed, problem = getattr(undo, "deleted", 0), str(undo) or type(undo).__name__
+    job["chunks_stored"] = max(job["chunks_stored"] - removed, 0)
+    if problem is not None:
+        left = max(stored - removed, 0)
+        return _FileFailed(f"{reason}; {left} new chunks could not be removed ({problem}); "
+                           f"upload it again to retry")
+    return _FileFailed(f"{reason}; nothing from it was stored" if split else reason)
+
+
 def _remove_earlier(collection: str, name: str, created_at: datetime,
                     expected: int) -> tuple[int, str | None]:
-    """Remove a name's earlier chunks once its new ones are stored.
+    """Remove the earlier chunks of a name and its parts once its new ones are
+    stored (#22, #621).
 
     Returns how many were removed and, when not all of them could be, why. A
     failure here never undoes the insert: duplicates are recoverable by uploading
     again, lost chunks are not.
     """
     try:
-        return wc._delete_earlier_chunks_sync(collection, name, created_at, expected), None
+        return wc._delete_earlier_family_sync(collection, name, created_at, expected), None
     except Exception as exc:
         _log.error("Could not remove the earlier chunks of %r in %r", name, collection,
                    exc_info=True)
@@ -681,55 +780,65 @@ def _process_job_sync(
             name = logical[index]
             label = (labels or {}).get(path, name)
             try:
-                text, elements = _parse_file(path)
                 source_type = source_type_of(path)
-
-                chunks = do_chunk(
-                    text=text,
-                    strategy=strategy,
-                    chunk_size=chunk_size,
-                    chunk_overlap_size=chunk_overlap,
-                    similarity_threshold=similarity_threshold,
-                    min_chunk_size=min_chunk_size,
-                    elements=elements if strategy == "context_aware" else None,
-                )
-
+                settings = splitter.Settings(strategy, chunk_size, chunk_overlap,
+                                             similarity_threshold, min_chunk_size)
+                # One timestamp for every part of the file: replacement and the
+                # removal of a failed file's parts tell its chunks apart by it.
                 created = datetime.now(timezone.utc)
                 now = created.isoformat()
-                weaviate_chunks = [
-                    {
-                        "content": c,
-                        "source_file": name,
-                        "source_type": source_type,
-                        "chunk_index": i,
-                        "chunk_strategy": strategy,
-                        "chunk_size": chunk_size,
-                        "chunk_overlap": chunk_overlap,
-                        "created_at": now,
-                    }
-                    for i, c in enumerate(chunks)
-                ]
-
-                # The last ingest of a name wins (#22). Everything before the
-                # insert only reads, so a failure up to there changes nothing.
-                replacing = _has_chunks(collection, name)
-                if replacing and not marked:
-                    _mark_replacement_stale(collection, name, logical[index + 1:])
-                    marked = True
-
-                # Insert first, then remove the earlier chunks, never the other
-                # way round: a failed insert leaves the earlier version whole.
+                stored, part_count, kind, replacing = 0, 0, "whole", False
                 try:
-                    _store_chunks(collection, weaviate_chunks)
-                except Exception as exc:
-                    _count_writes(job, *(batch_write.write_counts(exc) or (0, 0)))
+                    # A file over the per-file limits comes as parts (#621), each
+                    # chunked and stored before the next is read.
+                    for kind, chunks in splitter.split_file(path, settings, _parse_file, do_chunk):
+                        if part_count == 0:
+                            # The last ingest of a name wins (#22). Everything
+                            # before the first insert only reads, so a failure up
+                            # to there changes nothing.
+                            replacing = _has_chunks(collection, name)
+                            if replacing and not marked:
+                                _mark_replacement_stale(collection, name, logical[index + 1:])
+                                marked = True
+                        part_count += 1
+                        source = name if kind == "whole" else parts.part_name(name, part_count)
+                        weaviate_chunks = [
+                            {
+                                "content": c,
+                                "source_file": source,
+                                "source_type": source_type,
+                                "chunk_index": i,
+                                "chunk_strategy": strategy,
+                                "chunk_size": chunk_size,
+                                "chunk_overlap": chunk_overlap,
+                                "created_at": now,
+                            }
+                            for i, c in enumerate(chunks)
+                        ]
+                        # Insert first, then remove the earlier chunks, never the
+                        # other way round: a failed insert leaves the earlier
+                        # version whole.
+                        try:
+                            _store_chunks(collection, weaviate_chunks)
+                        except Exception as exc:
+                            _count_writes(job, *(batch_write.write_counts(exc) or (0, 0)))
+                            raise
+                        # Stored counts here too, with the other two: counted
+                        # later, a clean job would show its counts apart until
+                        # then (#324).
+                        _count_writes(job, len(chunks), len(chunks), len(chunks))
+                        stored += len(chunks)
+                        del weaviate_chunks, chunks
+                except (_CollectionDeleted, _StaleMarkFailed, _StaleLookupFailed):
                     raise
-                # Stored counts here too, with the other two: counted later, a clean
-                # job would show its counts apart until then (#324).
-                _count_writes(job, len(chunks), len(chunks), len(chunks))
+                except Exception as exc:
+                    # All or nothing per file (#621): what it stored is removed.
+                    raise _undo_new_chunks(job, collection, name, created, exc, kind,
+                                           part_count, stored) from exc
+
                 removed, problem = 0, None
                 if replacing:
-                    removed, problem = _remove_earlier(collection, name, created, len(chunks))
+                    removed, problem = _remove_earlier(collection, name, created, stored)
                     job["chunks_replaced"] = job.get("chunks_replaced", 0) + removed
 
                 # Retain the original only after the file has been parsed,
@@ -755,6 +864,10 @@ def _process_job_sync(
 
                 if problem is None:
                     job["files_completed"] += 1
+                    if kind == "part":
+                        job.setdefault("split", []).append(
+                            f"{label}: split into {part_count} parts, stored as "
+                            f"'{parts.part_name(name, 1)}' to '{parts.part_name(name, part_count)}'")
                 else:
                     job["files_failed"] += 1
                     job["errors"].append(
@@ -1313,6 +1426,8 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
             "chunks_accepted": 0,
             # Earlier chunks of the same names removed by this job (#22).
             "chunks_replaced": 0,
+            # Files over the per-file limits, stored as parts (#621).
+            "split": [],
             "errors": [],
             "skipped": skipped,
         })
