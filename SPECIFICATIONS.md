@@ -2523,6 +2523,29 @@ The question and the citations toggle are kept.
 **Elements:**
 
 - Drag-and-drop file upload zone. Accepts: `.pdf`, `.docx`, `.txt`, `.md`, `.csv`, `.json`, `.zip`.
+- Below the upload zone, a link "Download corpus preparation rules (.md)" (#615): `href`
+  `/corpus-preparation-rules.md`, `download` `corpus-preparation-rules.md`. The file is
+  `ui/public/corpus-preparation-rules.md`, a static file of the UI build served through the
+  proxy's `location /`, so every install has it, offline ones included. Written for someone
+  preparing a corpus, it states how the app reads an upload, every ingest limit of §5 and
+  §3.1.3 (per upload, per ZIP, per file, per line, per chunk, and the chunk settings' bounds
+  and defaults), how JSON and JSON Lines become text, a worst-case chunk count for each
+  strategy and its settings, safe targets (70 % of the text limit, 80 % of the chunk cap,
+  and for `overlap` 80 % of the limit on the text across its chunks), how to split, and a
+  checklist. The counts hold for any structure: `language` and `context_aware` keep pieces
+  whole, so a chunk can be only a little over half full; `language` splits a piece longer
+  than `chunk_size` again at the next separator, which can leave a short chunk on each side,
+  so it counts two more for every long paragraph, line, sentence and word (or, without
+  counting them, one chunk per `(chunk_size − chunk_overlap) ÷ 10` characters); a chunk over
+  the 6,000-character ceiling is cut into pieces that each count, which for `semantic` adds
+  one per 3,000 characters to its one per sentence. A file at the targets, counted that way,
+  doesn't fail on the text or chunk limits. It says the
+  upload and ZIP limits are the shipped values an administrator can change. It states nothing about a host's speed or disk.
+  `scripts/tests/test_corpus_rules.py` derives each limit from the code, the settings
+  defaults, `docker-compose.yml` and the proxy, and fails when the file doesn't state it or
+  states a number none of them accounts for. It also runs the chunker on files built at the
+  chunk target, counted as the file says (`language` records of long lines, `semantic`
+  sentences the ceiling cuts in two), and fails if one is refused or gives more chunks.
 - File list showing queued files with remove buttons.
 - Collection selector (populated from `GET /collections`). Includes a "Create new collection" option that opens a modal with a name field and index type selector (defaults: HNSW, cosine). On confirm, calls `POST /collections` before submitting ingest. A refused create keeps the modal open and shows the API's message inside it, as an alert; the message clears on Cancel, when the modal is opened again, or when a create succeeds (#379). If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379). A create that succeeds closes the modal even if the list reload after it fails; that failure is shown as a failed list. After a create, the selector selects the new collection under the name the API answered with, which is the name the list shows (`myDocs` selects `MyDocs`, #372). If the list reload after a create fails, the new collection is added to the options already shown, so the selector still selects and shows it; the next successful load replaces the options (#430).
 - Chunking strategy selector (dropdown). On selection, displays the plain-language explanation for the chosen strategy.
@@ -2950,6 +2973,8 @@ rag-docker/
 │   ├── package.json
 │   ├── package-lock.json       # Required — `npm ci` fails without it
 │   ├── vite.config.ts
+│   ├── public/
+│   │   └── corpus-preparation-rules.md  # Downloaded from the Import page (#615)
 │   ├── src/
 │   │   ├── main.tsx
 │   │   ├── App.tsx
@@ -3491,6 +3516,16 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       poll; repeated Regenerate clicks; and an edit refused with 422, then retried. 30 of its checks
       fail on the code before #380 (no outcome shown, polling forever, a second session started,
       a second regenerate request, the modal closed with all three fields sent).*
+- [x] The Import page offers the corpus preparation rules as a markdown download, served by the UI build, and the limits the file states are the app's (#615).
+      *Evidence: `browser/ui_criteria.js` (suite 06) finds the link on `/import` with its `href`
+      and `download` values and fetches the file through the proxy. `test_corpus_rules.py`
+      (suite 02, in the API image with the repository mounted) derives every limit from the
+      chunker, the ingest pipeline, the settings defaults, the chunk-setting bounds,
+      `docker-compose.yml` and `proxy/locations.conf`, and fails when the file leaves one out,
+      states a number none of them accounts for, or the compose and proxy values disagree with
+      the code's. `test_corpus_rules_estimates.py` (suite 02, the same way) runs the chunker on
+      files built at the rules' targets for every strategy, and fails if one is refused or gives
+      more chunks than the rules count.*
 - [x] The Import page states the 512 MB upload limit and refuses a larger selection without sending it.
       *A 513 MB sparse file: the page names the limit and no `POST /ingest/upload`
       is made. A 413 or other proxy error page is shown as a readable message

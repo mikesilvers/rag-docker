@@ -716,6 +716,34 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     }
   }
 
+  // ── corpus preparation rules (#615) ────────────────────────────────────────
+  // The Import page offers the rules as a download: a static file of the UI
+  // build, served through the proxy. test_corpus_rules.py checks its limits.
+  r.section('corpus preparation rules');
+  {
+    const s = await session(browser, BASE, 'developer');
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const link = await s.page.evaluate(() => {
+        const a = [...document.querySelectorAll('a')]
+          .find(x => x.textContent.trim() === 'Download corpus preparation rules (.md)');
+        return a ? { path: new URL(a.href).pathname, download: a.getAttribute('download') } : null;
+      });
+      r.check('the Import page links to the corpus preparation rules as a download',
+              !!link && link.path === '/corpus-preparation-rules.md'
+                && link.download === 'corpus-preparation-rules.md', JSON.stringify(link));
+      const served = await s.page.evaluate(async () => {
+        const response = await fetch('/corpus-preparation-rules.md');
+        return { status: response.status, start: (await response.text()).slice(0, 60) };
+      });
+      r.check('the rules file is served as markdown through the proxy',
+              served.status === 200 && served.start.startsWith('# Preparing files for rag-docker ingest\n'),
+              JSON.stringify(served));
+    } finally {
+      await s.ctx.close();
+    }
+  }
+
   // ── import errors (#290) ───────────────────────────────────────────────────
   // A truncated ZIP once ended in a plain-text 500 that the page could only
   // show as "HTTP 500", and a failing status poll was ignored.

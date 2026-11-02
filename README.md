@@ -480,7 +480,7 @@ A collection is a named vector index that holds chunks from one or more document
 
 ### 2. Ingest documents
 
-Navigate to **Data → Import**, drop in your files (PDF, DOCX, TXT, MD, CSV, JSON, JSON Lines (`.jsonl`, `.jsonl.gz`), or ZIP), choose a collection, and click **Start Ingest**. A ZIP may also contain gzipped JSON (`.json.gz`) files. The page polls for progress automatically.
+Navigate to **Data → Import**, drop in your files (PDF, DOCX, TXT, MD, CSV, JSON, JSON Lines (`.jsonl`, `.jsonl.gz`), or ZIP), choose a collection, and click **Start Ingest**. A ZIP may also contain gzipped JSON (`.json.gz`) files. The page polls for progress automatically. Preparing a large corpus? The Import page's **Download corpus preparation rules (.md)** link gives the ingest limits (per upload, per ZIP, per file, per line and per chunk), how JSON and JSON Lines are measured, safe targets and a checklist, in one markdown file for whoever prepares the data, or for the tool they use.
 
 Uploading a file again under the same name replaces its earlier chunks (even if the content is unchanged); files inside a ZIP are named by their path in the archive, so `a/report.pdf` and `b/report.pdf` stay separate documents. macOS metadata in a ZIP (the `__MACOSX/` folder and `._*` files the Finder adds) is not ingested; the job lists it under skipped files.
 
