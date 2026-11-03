@@ -4509,6 +4509,16 @@ def _csv_dialect(stream: Any) -> Any:
         return csv.excel
 
 
+def _text_measure(unit: Unit) -> int:
+    """At most the text a unit adds to a whole-file parse. A CSV row's text is its
+    cells, so empty cells and separators are not counted: a sparse CSV's bytes
+    can be many times its text. Erring low only means trying a file whole that
+    the chunker then refuses; erring high would split a file within the limits."""
+    if unit.cells is not None:
+        return sum(len(cell.strip()) for cell in unit.cells)
+    return len(unit.text)
+
+
 def _csv_units(stream: Any, dialect: Any) -> tuple[str, Iterator[Unit]]:
     """The header row as CSV text, and every later row as a unit."""
     try:
@@ -4539,6 +4549,7 @@ class _Source:
         self.dialect = None
         self._stream = None
         self.own_size: int | None = None
+        self.header_cells: list[str] = []
         if ftype == "jsonl":
             self.units = (Unit(t, "record", o) for o, t, _ in ip._jsonl_units(path))
         elif ftype == "json":
@@ -4555,6 +4566,7 @@ class _Source:
             if ftype == "csv":
                 self.dialect = _csv_dialect(self._stream)
                 self.header, self.units = _csv_units(self._stream, self.dialect)
+                self.header_cells = next(csv.reader([self.header], self.dialect), [])
             else:
                 self.units = _text_units(self._stream, ftype == "md", limit)
         # What a part's units may hold: a CSV's header is repeated at the start
@@ -4691,8 +4703,13 @@ def _whole(path: Path, settings: Settings, parse: Callable, chunk: Callable) -> 
 
 def split_file(path: Path, settings: Settings, parse: Callable | None = None,
                chunk: Callable | None = None) -> Iterator[tuple[str, list[str]]]:
-    """Yields ("whole", chunks) once for a file that fits in one part, else
-    ("part", chunks) for each of its two or more parts, in order.
+    """Yields ("whole", chunks) once for a file stored whole, else ("part",
+    chunks) for each of its two or more parts, in order.
+
+    Whether a file is split is never estimated (#621, PR #630): a file whose text
+    is within MAX_TEXT_CHARACTERS is chunked whole, and split only when the
+    chunker refuses it (the chunk count or the overlap limits). The part-size
+    estimates only size the parts of a file that is split.
 
     `parse` and `chunk` default to ingest's _parse_file and the chunker's chunk;
     callers pass their own, so whatever they parse and chunk with is used.
@@ -4706,27 +4723,43 @@ def split_file(path: Path, settings: Settings, parse: Callable | None = None,
     chunk = chunk or chunker.chunk
     ftype = file_type(path)
     limit, _ = part_limits(settings)
+    text_limit = chunker.MAX_TEXT_CHARACTERS
 
-    if ftype in _STREAMED_TEXT and path.stat().st_size <= limit:
-        # Every encoding takes at least a byte a character, so the text fits.
-        try:
-            chunks = _whole(path, settings, parse, chunk)
-        except ChunkLimitError:
-            pass
-        else:
-            yield "whole", chunks
-            return
-        # Its chunks go over: split from its units (S3.1), at most one part's
-        # worth of text, so they are read at once.
+    if ftype in _STREAMED_TEXT:
+        # Parsed whole from the file itself, as before. Every encoding takes at
+        # least a byte a character, so text within the limit is certain when the
+        # bytes are; otherwise the text is measured in one pass, nothing kept.
+        fits = path.stat().st_size <= text_limit
+        if not fits:
+            probe = _Source(path, ftype, settings, limit, parse, chunk)
+            try:
+                total = sum(len(cell.strip()) for cell in probe.header_cells)
+                fits = True
+                for unit in probe.units:
+                    total += _text_measure(unit)
+                    if total > text_limit:
+                        fits = False
+                        break
+            finally:
+                probe.close()
+        if fits:
+            try:
+                chunks = _whole(path, settings, parse, chunk)
+            except ChunkLimitError:
+                pass
+            else:
+                yield "whole", chunks
+                return
         source = _Source(path, ftype, settings, limit, parse, chunk)
         try:
             source.check_header()
-            everything = list(source.presized())
-            yield from _parts(source, everything, None, iter(()), halve_first=True)
+            yield from _parts(source, [], None, source.presized())
         finally:
             source.close()
         return
 
+    # JSON, JSON Lines, PDF and DOCX: the units are the file's own text, so up to
+    # the text limit of them is read, then the file is chunked whole.
     source = _Source(path, ftype, settings, limit, parse, chunk)
     try:
         units = source.presized()
@@ -4735,28 +4768,20 @@ def split_file(path: Path, settings: Settings, parse: Callable | None = None,
         pending = None
         for unit in units:
             added = len(unit.text) + (_separator(ftype, unit.element is not None) if first else 0)
-            # Text only: whether the file fits whole is decided by chunking it.
-            if first and not _fits(chars + added, len(first) + 1, source.room, None):
+            if first and chars + added > text_limit:
                 pending = unit
                 break
             first.append(unit)
             chars += added
         else:
-            # The reader ended with the file inside one part's limits.
             try:
-                if ftype in _STREAMED_TEXT:
-                    chunks = _whole(path, settings, parse, chunk)
-                else:
-                    text, elements = source.build(first)
-                    chunks = _chunk(chunk, text, elements, settings)
+                text, elements = source.build(first)
+                chunks = _chunk(chunk, text, elements, settings)
             except ChunkLimitError:
                 pass
             else:
                 yield "whole", chunks
                 return
-            source.check_header()
-            yield from _parts(source, first, None, iter(()), halve_first=True)
-            return
         source.check_header()
         yield from _parts(source, first, pending, units)
     finally:
@@ -4842,15 +4867,16 @@ def _halves(source: _Source, units: list[Unit]) -> Iterator[list[str]]:
 
 
 def _parts(source: _Source, first: list[Unit], pending: Unit | None,
-           units: Iterator[Unit], halve_first: bool = False) -> Iterator[tuple[str, list[str]]]:
+           units: Iterator[Unit]) -> Iterator[tuple[str, list[str]]]:
     """Every part of a split file, from the units already read (`first`, and the
-    one that did not fit, `pending`) and the rest of the reader. With
-    `halve_first`, `first` is the whole file, known to go over as one part.
+    one that did not fit, `pending`) and the rest of the reader.
 
-    Every other part, the first included, is filled from one stream of units by
-    the room left beside a CSV header and, for `context_aware`, a replay of its
-    packing (PR #630). Before each part is handed on to be stored, the chunk text
-    stored so far is checked against ten times the file's own size."""
+    Every part is filled from one stream of units by the room left beside a CSV
+    header and, for `context_aware`, a replay of its packing (PR #630). The file
+    is known to need splitting, so if the first part would take every unit, it is
+    halved instead: a split file has two or more parts. Before each part is handed
+    on to be stored, the chunk text stored so far is checked against ten times
+    the file's own size."""
     limit = source.room  # a CSV's header takes its share of every part
     packing = source.settings.strategy == "context_aware"
     cap = chunker.MAX_CHUNKS_PER_FILE
@@ -4858,7 +4884,7 @@ def _parts(source: _Source, first: list[Unit], pending: Unit | None,
     number = 0
     # A file that is a single record over a limit is not split at all: its own
     # error is the file's, not a part's.
-    alone = halve_first and len(first) == 1 and first[0].kind == "record"
+    alone = False
 
     def hand_on(produced: Iterable[list[str]]) -> Iterator[tuple[str, list[str]]]:
         nonlocal stored, number
@@ -4871,9 +4897,6 @@ def _parts(source: _Source, first: list[Unit], pending: Unit | None,
             yield "part", chunks
 
     try:
-        if halve_first:
-            yield from hand_on(_halves(source, first))
-            return
         stream = itertools.chain(first, [pending] if pending is not None else [], units)
         pending = None
         while True:
@@ -4899,7 +4922,12 @@ def _parts(source: _Source, first: list[Unit], pending: Unit | None,
                 current.append(unit)
                 chars += added
                 pack = trial
-            yield from hand_on(_chunk_units(source, current))
+            if number == 0 and pending is None:
+                # The whole file in one part: it went over whole, so it is halved.
+                alone = len(current) == 1 and current[0].kind == "record"
+                yield from hand_on(_halves(source, current))
+            else:
+                yield from hand_on(_chunk_units(source, current))
     except Exception as exc:
         if alone or isinstance(exc, StoredTextTooLarge):
             raise
@@ -11848,7 +11876,7 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                             "created_at": now,
                         } for i, c in enumerate(chunks))
                 except splitter.PartError as exc:
-                    raise ValueError(f"part {exc.number}: {exc}") from exc.cause
+                    raise ValueError(f"{filename}: part {exc.number}: {exc}") from exc.cause
                 except splitter.StoredTextTooLarge as exc:
                     # The same cap as ingest (PR #630): the re-chunk fails whole,
                     # before the collection is touched.

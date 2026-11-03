@@ -2344,8 +2344,10 @@ as it is: the upload, ZIP, `.json` size, JSON Lines line and record count limits
   over them, keeps within 10,000 chunks, for `overlap` the most text whose windows stay within
   both window limits, for `semantic` the text limit alone. A part that still goes over when
   chunked is split in half and each half chunked again. Whether a file is split at all is not
-  estimated: a file whose text fits is chunked whole, and stored whole when its chunks fit
-  (PR #630).
+  estimated: a file whose text is within 10,000,000 characters is chunked whole, and split only
+  when the chunker refuses it (the chunk count or `overlap`'s window limits). A file's text is
+  measured, not its bytes: a sparse CSV's text is its cells, which can be a small share of its
+  bytes. The estimates above only size the parts of a file that is split (PR #630).
 - A file split into parts may store at most ten times its own size in chunk text (all its
   parts' chunks, repeated CSV headers and overlap included). Its own size is its bytes as
   uploaded, a gzipped file's decompressed bytes, or a `.pdf`'s or `.docx`'s extracted text.

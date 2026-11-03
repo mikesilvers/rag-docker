@@ -271,10 +271,10 @@ class AllOrNothingTests(JobCase):
         with self.assertLogs("services.ingest_pipeline", "ERROR"):
             job, _ = self.run_job([("data.jsonl", records(13_000, 600))], "context_aware",
                                   backend=backend)
-        # Adjusted for PR #630: 13,000 records fit by text, so they are chunked
-        # whole first and then halved, 6,500 a part (no longer 10,000 + 3,000).
+        # PR #630: 13,000 records fit by text, so they are chunked whole first and
+        # refused, then packed into parts of 10,000 and 3,000 chunks.
         self.assertEqual(job["errors"], [
-            "data.jsonl: part 2: Weaviate rejected the batch; 6500 new chunks could not be "
+            "data.jsonl: part 2: Weaviate rejected the batch; 10000 new chunks could not be "
             "removed (Weaviate failed to delete 10000 new chunk(s)); upload it again to retry"])
 
     def test_the_semantic_sentence_limit_fails_a_part_and_is_not_split_further(self):
@@ -642,9 +642,10 @@ class CsvHeaderTests(JobCase):
         return list(splitter.split_file(path, settings, chunk=chunk))
 
     def test_a_large_header_makes_every_part_smaller_so_none_goes_over(self):
-        # A 200,000-character header and 1,000,000 characters of rows. Every text
-        # handed to the chunker, its header included, is inside one part's limit:
-        # the header is counted when parts are sized, not found out by a refusal.
+        # A 200,000-character header and 1,000,000 characters of rows. The file is
+        # first chunked whole and refused (PR #630: split only on a refusal); after
+        # that, every part handed to the chunker, its header included, is inside one
+        # part's limit: the header is counted when parts are sized.
         seen = []
 
         def chunk(text, strategy, **kwargs):
@@ -654,7 +655,8 @@ class CsvHeaderTests(JobCase):
         parts = self.split(self.csv_text(100_000, 1000), chunk)
         self.assertGreaterEqual(len(parts), 2)
         self.assertEqual({k for k, _ in parts}, {"part"})
-        self.assertLessEqual(max(seen), self.LIMIT, seen)
+        self.assertGreater(seen[0], self.LIMIT, seen)  # the whole file, refused
+        self.assertLessEqual(max(seen[1:]), self.LIMIT, seen)
         for _, chunks in parts:
             self.assertTrue(chunks[0].startswith("h" * self.SIZE), chunks[0][:60])
         rows = __import__("re").findall(r"r(\d{6})", "".join("".join(c) for _, c in parts))
@@ -668,11 +670,18 @@ class CsvHeaderTests(JobCase):
                    f"can hold with these chunk settings ({self.LIMIT:,} characters); the header is "
                    f"repeated in every part, so shorten the header or split the file")
         calls = []
+
+        def refuse(text, strategy, **kw):
+            calls.append(len(text))
+            raise chunker.ChunkLimitError("over", "chunks")
+
         with self.assertRaises(ValueError) as caught:
-            self.split(data, lambda text, strategy, **kw: calls.append(1) or [text])
+            self.split(data, refuse)
         self.assertNotIsInstance(caught.exception, splitter.PartError)
         self.assertEqual(str(caught.exception), message)
-        self.assertEqual(calls, [])  # nothing was chunked, so nothing was stored
+        # Only the whole file was chunked, and refused (PR #630); no part was
+        # chunked, so nothing was stored.
+        self.assertEqual(len(calls), 1, calls)
         job, backend = self.run_job([("data/table.csv", data)], "fixed", self.SIZE)
         self.assertEqual((job["status"], job["errors"], job["split"]),
                          ("failed", [f"data/table.csv: {message}"], []))
@@ -722,7 +731,9 @@ class ReviewerCsvHeaderTests(JobCase):
         parts = self.split(self.csv_with(self.header_of(self.LIMIT // 2), rows), chunk)
         self.assertGreaterEqual(len(parts), 2)
         self.assertEqual({k for k, _ in parts}, {"part"})
-        self.assertLessEqual(max(seen), self.LIMIT, seen)
+        # After the whole file, chunked first and refused (PR #630), every part
+        # handed to the chunker is inside one part's limit.
+        self.assertLessEqual(max(seen[1:]), self.LIMIT, seen)
         found = __import__("re").findall(r"r(\d{6})", "".join("".join(c) for _, c in parts))
         self.assertEqual(found, [f"{i:06d}" for i in range(1000)])
         over = self.LIMIT // 2 + 1
@@ -889,6 +900,76 @@ class StoredTextCapTests(JobCase):
             with self.assertRaisesRegex(ValueError, r"^windows\.jsonl: it would store [\d,]+ "
                                                     r"characters of chunks, more than 10 times"):
                 tuning._chunks_from_sources("Coll", "overlap", 1000, 990, 0.85, 0)
+
+
+class SplitOnlyWhenRefusedTests(JobCase):
+    """PR #630 coding review (cc99010): whether a file is split is decided by the
+    chunker on the whole file, never by the part-size estimate or the raw size."""
+
+    def kinds(self, name, data, strategy, size):
+        from services import splitter
+        path = Path(tempfile.mkdtemp()) / name
+        path.write_text(data)
+        settings = splitter.Settings(strategy, size, 0, 0.85, 100)
+        return [kind for kind, _ in splitter.split_file(path, settings)]
+
+    @staticmethod
+    def sparse_csv(rows, cols=40):
+        return (",".join(f"c{i}" for i in range(cols)) + "\n"
+                + "".join(f"{r}" + "," * (cols - 1) + "\n" for r in range(rows)))
+
+    def test_a_sparse_csv_within_the_limits_is_stored_whole(self):
+        # The reviewer's probe: 2.69 MB of CSV, about 349,000 characters of text.
+        data = self.sparse_csv(60_000)
+        for strategy in ("context_aware", "fixed"):
+            with self.subTest(strategy=strategy):
+                self.assertEqual(self.kinds("s.csv", data, strategy, 200), ["whole"])
+
+    def test_a_csv_over_the_text_limit_in_bytes_but_not_in_text_is_stored_whole(self):
+        data = self.sparse_csv(250_000)
+        self.assertGreater(len(data), TEXT)
+        job, backend = self.run_job([("wide.csv", data)], "fixed", 1000)
+        self.assertEqual((job["status"], job["errors"], job["split"]), ("completed", [], []), job)
+        self.assertEqual(backend.names(), ["wide.csv"])
+
+    def test_text_between_one_part_estimate_and_the_text_limit_is_stored_whole(self):
+        # The band case: 5,000,200 characters at context_aware/500 is over
+        # 10,000 x 500 but chunks whole into 2,000 chunks.
+        bodies = ["r " * 1247 + "r"] * 2000  # records of 2,498 characters with "t: "
+        bodies[0] += "s" * 202
+        data = "".join(json.dumps({"t": b}) + "\n" for b in bodies)
+        text, _ = ingest_pipeline._parse_file(self.write("band.jsonl", data))
+        self.assertEqual(len(text), 5_000_200)
+        self.assertEqual(self.kinds("band.jsonl", data, "context_aware", 500), ["whole"])
+
+    def write(self, name, data):
+        path = Path(tempfile.mkdtemp()) / name
+        path.write_text(data)
+        return path
+
+    def test_a_rechunk_part_error_names_the_file(self):
+        data = records(13_000, 600).encode()
+        work = Path(tempfile.mkdtemp())
+        digest = __import__("hashlib").sha256(data).hexdigest()
+        (work / digest).write_bytes(data)
+        documents = {digest: {"filenames": ["big.jsonl"]}}
+        calls = []
+
+        def chunk(**kwargs):
+            calls.append(1)
+            if len(calls) == 3:  # the whole file, part 1, then part 2
+                raise ValueError("owned failure")
+            return chunker.chunk(**kwargs)
+
+        with patch.object(tuning.settings, "upload_dir", str(work)), \
+                patch.object(tuning.sources, "load_index", return_value={"documents": documents}), \
+                patch.object(tuning.sources, "collection_dir", return_value=work), \
+                patch.object(tuning, "do_chunk", side_effect=chunk), \
+                patch.object(tuning.wc, "get_client") as client:
+            client.return_value.collections.get.return_value.iterator.return_value = [
+                SimpleNamespace(properties={"source_file": "big.jsonl", "chunk_index": 0})]
+            with self.assertRaisesRegex(ValueError, r"^big\.jsonl: part 2: owned failure$"):
+                tuning._chunks_from_sources("Coll", "context_aware", 1000, 0, 0.85, 0)
 
 
 if __name__ == "__main__":

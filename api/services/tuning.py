@@ -345,7 +345,7 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                             "created_at": now,
                         } for i, c in enumerate(chunks))
                 except splitter.PartError as exc:
-                    raise ValueError(f"part {exc.number}: {exc}") from exc.cause
+                    raise ValueError(f"{filename}: part {exc.number}: {exc}") from exc.cause
                 except splitter.StoredTextTooLarge as exc:
                     # The same cap as ingest (PR #630): the re-chunk fails whole,
                     # before the collection is touched.
