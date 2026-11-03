@@ -266,10 +266,13 @@ def _csv_dialect(stream: Any) -> Any:
 
 
 def _text_measure(unit: Unit) -> int:
-    """At most the text a unit adds to a whole-file parse. A CSV row's text is its
-    cells, so empty cells and separators are not counted: a sparse CSV's bytes
-    can be many times its text. Erring low only means trying a file whole that
-    the chunker then refuses; erring high would split a file within the limits."""
+    """The raw measure of a unit, deciding whether a .txt, .md or .csv over
+    10,000,000 bytes is tried whole: its text, and a CSV row by its cells' text
+    (empty cells and separators not counted, since a sparse CSV's bytes can be
+    many times its text). It is not the parsed text and can be more (indentation,
+    Markdown link targets, NA cells), so such a file may be split although its
+    parsed text would fit; measuring raw units keeps memory bounded (maintainer's
+    decision, PR #630)."""
     if unit.cells is not None:
         return sum(len(cell.strip()) for cell in unit.cells)
     return len(unit.text)
@@ -517,13 +520,18 @@ def split_file(path: Path, settings: Settings, parse: Callable | None = None,
     # JSON, JSON Lines, PDF and DOCX: the units are the file's own text, so up to
     # the text limit of them is read, then the file is chunked whole.
     source = _Source(path, ftype, settings, limit, parse, chunk)
+    # Measured as the chunker measures it: under context_aware it is given the
+    # elements and counts their text alone; otherwise it counts the joined text,
+    # the separators between units included (PR #630).
+    joined = settings.strategy != "context_aware"
     try:
         units = source.presized()
         first: list[Unit] = []
         chars = 0
         pending = None
         for unit in units:
-            added = len(unit.text) + (_separator(ftype, unit.element is not None) if first else 0)
+            sep = _separator(ftype, unit.element is not None) if first and joined else 0
+            added = len(unit.text) + sep
             if first and chars + added > text_limit:
                 pending = unit
                 break

@@ -683,6 +683,7 @@ class CsvHeaderTests(JobCase):
         # Only the whole file was chunked, and refused (PR #630); no part was
         # chunked, so nothing was stored.
         self.assertEqual(len(calls), 1, calls)
+        self.assertGreater(calls[0], self.LIMIT, calls)  # reviewer: that call was the whole file
         job, backend = self.run_job([("data/table.csv", data)], "fixed", self.SIZE)
         self.assertEqual((job["status"], job["errors"], job["split"]),
                          ("failed", [f"data/table.csv: {message}"], []))
@@ -734,6 +735,7 @@ class ReviewerCsvHeaderTests(JobCase):
         self.assertEqual({k for k, _ in parts}, {"part"})
         # After the whole file, chunked first and refused (PR #630), every part
         # handed to the chunker is inside one part's limit.
+        self.assertGreater(seen[0], self.LIMIT, seen)  # reviewer: the whole file, refused
         self.assertLessEqual(max(seen[1:]), self.LIMIT, seen)
         found = __import__("re").findall(r"r(\d{6})", "".join("".join(c) for _, c in parts))
         self.assertEqual(found, [f"{i:06d}" for i in range(1000)])
@@ -948,6 +950,28 @@ class SplitOnlyWhenRefusedTests(JobCase):
         path.write_text(data)
         return path
 
+    def test_a_docx_is_tried_whole_by_the_text_the_chunker_counts(self):
+        # PR #630 coding review of f254f4c: under context_aware the chunker counts
+        # the elements' text alone, not the line breaks between paragraphs. 10,000
+        # paragraphs of 1,000 characters are exactly 10,000,000 characters (10,009,999
+        # with the breaks): stored whole under context_aware, and split under
+        # fixed, whose chunker counts the joined text.
+        from services import splitter
+        from unstructured.documents.elements import NarrativeText
+        elements = [NarrativeText(text=f"{i:05d}" + "x" * 995) for i in range(10_000)]
+        self.assertEqual(sum(len(str(el)) for el in elements), TEXT)
+        path = Path(tempfile.mkdtemp()) / "band.docx"
+        path.write_bytes(b"not read: parse is replaced")
+
+        def parse(_):
+            return "\n".join(str(el) for el in elements), elements
+
+        whole = splitter.split_file(path, splitter.Settings("context_aware", 6000, 0, 0.85, 0),
+                                    parse=parse)
+        self.assertEqual([kind for kind, _ in whole], ["whole"])
+        split = splitter.split_file(path, splitter.Settings("fixed", 6000, 0, 0.85, 0), parse=parse)
+        self.assertEqual({kind for kind, _ in split}, {"part"})
+
     def test_a_rechunk_part_error_names_the_file(self):
         data = records(13_000, 600).encode()
         work = Path(tempfile.mkdtemp())
@@ -1075,6 +1099,27 @@ class ReviewerStoredTextCapBoundaryTests(JobCase):
             list(splitter.split_file(path, splitter.Settings("overlap", 1000, 990, 0.85, 0),
                                      parse=parse))
         self.assertIn(f"more than 10 times its own size ({own:,} characters)", str(caught.exception))
+
+
+class ReviewerMultibyteTextTests(JobCase):
+    """PR #630 testing review (f254f4c): the streamed-text probe. A .txt over
+    10,000,000 bytes whose text is within 10,000,000 characters (multibyte UTF-8)
+    is measured in characters, found to fit, and stored whole, not split."""
+
+    def test_a_txt_over_the_limit_in_bytes_but_not_in_characters_is_stored_whole(self):
+        from services import splitter
+        paragraph = "\u20ac" * 999  # 999 characters, 2,997 bytes
+        data = "\n\n".join([paragraph] * 3_400)
+        self.assertGreater(len(data.encode()), TEXT)
+        self.assertLess(len(data), TEXT)
+        path = Path(tempfile.mkdtemp()) / "euro.txt"
+        path.write_text(data, encoding="utf-8")
+        settings = splitter.Settings("fixed", 1000, 0, 0.85, 0)
+        kinds = [kind for kind, _ in splitter.split_file(path, settings)]
+        self.assertEqual(kinds, ["whole"])
+        job, backend = self.run_job([("euro.txt", data)], "fixed", 1000)
+        self.assertEqual((job["status"], job["errors"], job["split"]), ("completed", [], []), job)
+        self.assertEqual(backend.names(), ["euro.txt"])
 
 
 if __name__ == "__main__":

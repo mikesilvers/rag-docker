@@ -2343,11 +2343,20 @@ as it is: the upload, ZIP, `.json` size, JSON Lines line and record count limits
   most `10,000 × chunk_size` characters and as many records or elements as its packing, replayed
   over them, keeps within 10,000 chunks, for `overlap` the most text whose windows stay within
   both window limits, for `semantic` the text limit alone. A part that still goes over when
-  chunked is split in half and each half chunked again. Whether a file is split at all is not
-  estimated: a file whose text is within 10,000,000 characters is chunked whole, and split only
-  when the chunker refuses it (the chunk count or `overlap`'s window limits). A file's text is
-  measured, not its bytes: a sparse CSV's text is its cells, which can be a small share of its
-  bytes. The estimates above only size the parts of a file that is split (PR #630).
+  chunked is split in half and each half chunked again. Whether a file is split is not
+  estimated from the part sizes: a file is tried whole, and split only when the chunker refuses
+  it (the chunk count, the text limit or `overlap`'s window limits). Which files are tried whole
+  (maintainer's decision, PR #630):
+  - a JSON, JSON Lines, `.pdf` or `.docx` file whose text, as the chunker counts it, is within
+    10,000,000 characters (under `context_aware` the records' or elements' text alone, otherwise
+    the joined text with the breaks between them);
+  - a `.txt`, `.md` or `.csv` file of at most 10,000,000 bytes;
+  - a larger `.txt`, `.md` or `.csv` whose raw paragraphs, lines or rows (a CSV row by its
+    cells' text) total at most 10,000,000 characters. That raw measure can be more than the
+    parsed text (indentation, Markdown link targets, `NA` cells), so such a file may be stored
+    as parts even when its parsed text would fit; measuring the raw units keeps memory bounded,
+    as the whole file is never parsed just to measure it.
+  The estimates above only size the parts of a file that is split.
 - A file split into parts may store at most ten times its own size in chunk text (all its
   parts' chunks, repeated CSV headers and overlap included). Its own size is its bytes as
   uploaded, a gzipped file's decompressed bytes, or a `.pdf`'s or `.docx`'s extracted text.
