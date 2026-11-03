@@ -186,6 +186,8 @@ export interface JobStatus {
   // Files that could not be parsed at all, or that a later file with the same
   // name replaced in the upload (#22) — never counted in files_total.
   skipped?: string[]
+  // Files over the per-file limits, stored as parts (#621)
+  split?: string[]
   // Earlier chunks of the same names this job removed (#22).
   chunks_replaced?: number
   // Chunks sent to Weaviate and those it acknowledged (#302); null on records

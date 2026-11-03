@@ -720,6 +720,27 @@ paths: a few word matches read in one query, and over 10,000 walked.
 `browser/ui_criteria.js` (suite 06) stubs the job response and checks that the Import
 page shows "Replaced N chunk(s) from a previous version" only when `chunks_replaced` is above
 0, and the plain "N file(s) skipped:" heading with each entry's own reason.
+
+`scripts/tests/test_split_parts.py` (#621) checks that a file over the per-file limits is
+stored as parts `<name> (part N)` instead of failing, with Weaviate replaced by an in-memory
+collection that keeps the replacement helpers' contract (`accept` included): 13,000 JSON Lines
+records of 600 characters under `context_aware`, and a `.jsonl`, a `.txt` and a `.json` over
+10,000,000 characters (each failing on the code before #621); a file within the limits stored
+as before; replacement of a name's whole family (a smaller, an unsplit and a newly split
+re-upload) with neighbours such as `a/data.jsonl` and `Data.jsonl` untouched; a bad line, a
+failed insert and a failed removal after part 1 (nothing stored, the earlier version whole);
+a record over the chunk cap; the cuts, CSV headers, Markdown fences, a streamed Latin-1 file
+and one no encoding reads, `overlap` sizing, the halving re-split and the `semantic` sentence
+limit; re-chunk coverage and rebuild, export links, and `ChunkLimitError`. `split_parts.py` then
+runs the same in the real ingest worker and Weaviate, on a scratch collection without a
+vectorizer (embedding 13,000 chunks through Ollama takes this project about an hour): the
+13,000-record file (`context_aware`) and a 10,519,499-character `.txt` (`fixed` 6,000) are
+stored as numbered parts with the job's `split` entry, re-uploading the `.txt` within the
+limits replaces every part and leaves the `.jsonl`'s parts untouched, and a bad line after
+part 1 fails the file and stores nothing. `overlap_chunks.py` (suite 08) stores a
+20,000-character file at 1,000/999 as two parts, each inside both window limits, that restore
+it exactly, and `browser/ui_criteria.js` checks the progress panel's "1 file split into
+parts:" list.
 `05_transfer.sh` (E32) replaces a file, adds a second name for the new content, re-chunks,
 and checks that only the new text comes back, under both names. It also adds a name with no
 stored chunks to the retained index first, and checks that the rechunk doesn't rebuild it and
@@ -844,8 +865,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, a failed metric read as the 503, the metric read on every query; registered by suite 03 |
 | `citation_score.py` | helper for suite 03 (#376), run in the API container: citation scores of known vectors on a real Weaviate for each distance metric, and after a collection is recreated with another metric |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
-| `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
-| `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
+| `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds, and a file over the output limits stored as parts inside them (#621) |
+| `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget (parts, #621) regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, review 404 codes and empty-edit refusal (#381), export schema, export name refusals (#370) |
 | `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
@@ -859,6 +880,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
 | `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
 | `../tests/test_reingest.py` | controlled re-ingest replacement, exact-name selection (#622), same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
+| `../tests/test_split_parts.py` | controlled regressions for files over the per-file limits stored as parts (#621): the reviewer's 13,000 records, files over 10,000,000 characters, family replacement, all or nothing, cuts, CSV, Markdown, encoding, `overlap` sizing, re-chunk and export links, registered by ingest |
+| `split_parts.py` | helper for ingest (#621), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, files over the per-file limits are stored as parts, a smaller re-upload replaces every part, and a bad line after part 1 stores nothing; the collection is removed afterwards |
 | `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`) and over 10,000 (`walk`); the collection is removed afterwards |
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |

@@ -1421,6 +1421,9 @@ class JobStatusResponse(BaseModel):
     # Earlier chunks of the same names that this job removed (#22). Records
     # written before the field existed read back as 0.
     chunks_replaced: int = 0
+    # Files over the per-file limits, stored as parts `<name> (part N)` (#621):
+    # one entry per such file that completed. Older records read back as [].
+    split: list[str] = []
 
 
 class IngestConfig(BaseModel):
@@ -3566,14 +3569,27 @@ def _exact_source_objects(coll, name: str, accept=None):
             close()
 
 
-def _source_has_chunks_sync(collection_name: str, source_file: str) -> bool:
-    """Whether the collection holds any chunk stored under exactly this name."""
+def _source_has_chunks_sync(collection_name: str, source_file: str, accept=None) -> bool:
+    """Whether the collection holds any chunk stored under exactly this name (or,
+    with `accept`, under a value it keeps)."""
     coll = get_client().collections.get(collection_name)
-    selected = _exact_source_objects(coll, source_file)
+    selected = _exact_source_objects(coll, source_file, accept)
     try:
         return next(selected, None) is not None
     finally:
         selected.close()
+
+
+def _family(name: str):
+    """The rule keeping `name` and its `<name> (part N)` parts, exactly (#621).
+    Every part's words include the name's, so equal(name) matches them all."""
+    from services import parts
+    return lambda value: parts.in_family(value, name)
+
+
+def _family_has_chunks_sync(collection_name: str, name: str) -> bool:
+    """Whether `name` or any of its parts has chunks (#621)."""
+    return _source_has_chunks_sync(collection_name, name, _family(name))
 
 
 class ReplaceError(RuntimeError):
@@ -3592,7 +3608,7 @@ _REPLACE_DELETE_ROUNDS = 100
 
 @collection_writes.serialized("collection_name")
 def _delete_earlier_chunks_sync(collection_name: str, source_file: str,
-                                created_at: datetime, expected: int) -> int:
+                                created_at: datetime, expected: int, accept=None) -> int:
     """Remove a name's earlier chunks after its `expected` new ones are stored (#22).
 
     Called only after the insert has been verified, never before: if the insert
@@ -3607,11 +3623,12 @@ def _delete_earlier_chunks_sync(collection_name: str, source_file: str,
     the selection independent of earlier chunks' timestamps (an imported
     package's can be later than now). Before deleting, exactly `expected` of the
     name's chunks must carry it; afterwards exactly they must remain. Returns how
-    many earlier chunks were deleted.
+    many earlier chunks were deleted. With `accept`, the chunks are those of the
+    values it keeps, such as a name and its parts (#621).
     """
     coll = get_client().collections.get(collection_name)
     new, earlier = 0, []
-    for obj in _exact_source_objects(coll, source_file):
+    for obj in _exact_source_objects(coll, source_file, accept):
         if obj.properties.get("created_at") == created_at:
             new += 1
         else:
@@ -3631,11 +3648,45 @@ def _delete_earlier_chunks_sync(collection_name: str, source_file: str,
         deleted += result.successful or 0
         if result.failed:
             raise ReplaceError(f"Weaviate failed to delete {result.failed} earlier chunk(s)", deleted)
-    left = sum(1 for _ in _exact_source_objects(coll, source_file)) - expected
+    left = sum(1 for _ in _exact_source_objects(coll, source_file, accept)) - expected
     if left > 0:
         raise ReplaceError(f"{left} earlier chunk(s) remain", deleted)
     if left < 0:
         raise ReplaceError(f"{-left} of its {expected} new chunks are missing afterwards", deleted)
+    return deleted
+
+
+def _delete_earlier_family_sync(collection_name: str, name: str, created_at: datetime,
+                                expected: int) -> int:
+    """Remove the earlier chunks of `name` and of every `<name> (part N)` once the
+    `expected` new ones are stored, so a re-upload leaves exactly the new family
+    whether or not either version was split (#621)."""
+    return _delete_earlier_chunks_sync(collection_name, name, created_at, expected,
+                                       accept=_family(name))
+
+
+@collection_writes.serialized("collection_name")
+def _delete_new_family_sync(collection_name: str, name: str, created_at: datetime) -> int:
+    """Remove the chunks this ingest stored for `name` and its parts (they carry
+    its `created_at`), so a file whose later part failed leaves its earlier
+    version whole (#621). Returns how many were removed; ReplaceError, with that
+    count, when Weaviate fails to remove some or some remain."""
+    coll = get_client().collections.get(collection_name)
+    accept = _family(name)
+    new = [obj.uuid for obj in _exact_source_objects(coll, name, accept)
+           if obj.properties.get("created_at") == created_at]
+    deleted = 0
+    for start in range(0, len(new), _QUERY_MAXIMUM_RESULTS):
+        batch = new[start:start + _QUERY_MAXIMUM_RESULTS]
+        result = telemetry.call("weaviate.delete", coll.data.delete_many,
+                                where=Filter.by_id().contains_any(batch))
+        deleted += result.successful or 0
+        if result.failed:
+            raise ReplaceError(f"Weaviate failed to delete {result.failed} new chunk(s)", deleted)
+    left = sum(1 for obj in _exact_source_objects(coll, name, accept)
+               if obj.properties.get("created_at") == created_at)
+    if left:
+        raise ReplaceError(f"{left} new chunk(s) remain", deleted)
     return deleted
 
 
@@ -3893,6 +3944,19 @@ MAX_SEMANTIC_SENTENCES = 10 * MAX_CHUNKS_PER_FILE
 # embedding model spend minutes on a huge file before refusing it.
 MAX_TEXT_CHARACTERS = MAX_OVERLAP_OUTPUT_CHARACTERS
 
+
+class ChunkLimitError(ValueError):
+    """A file's text or chunks over a per-file limit that splitting into parts
+    resolves (#621): the text limit, the chunk count and the overlap window limits.
+    The semantic sentence limit and settings errors stay plain ValueError. `kind`
+    is "text", "chunks" (the chunk count or overlap windows) or "overlap" (the
+    overlap text across windows)."""
+
+    def __init__(self, message: str, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
 _semantic_model = None
 _semantic_model_lock = threading.Lock()
 
@@ -3947,9 +4011,10 @@ def _cap_chunk_length(chunks: list[str]) -> list[str]:
 
 def _check_chunk_count(count: int, strategy: str, unit: str = "chunks") -> None:
     if count > MAX_CHUNKS_PER_FILE:
-        raise ValueError(
+        raise ChunkLimitError(
             f"{strategy} chunking exceeds the per-file limit: {count} {unit} "
-            f"(maximum {MAX_CHUNKS_PER_FILE}). Use a larger chunk size or split the file.")
+            f"(maximum {MAX_CHUNKS_PER_FILE}). Use a larger chunk size or split the file.",
+            "chunks")
 
 
 def chunk_fixed(text: str, chunk_size: int, min_chunk_size: int) -> list[str]:
@@ -3978,10 +4043,11 @@ def chunk_overlap(text: str, chunk_size: int, chunk_overlap: int, min_chunk_size
     # limits are conservative before the optional tail merge removes overlap.
     output_characters = len(text) + (windows - 1) * chunk_overlap
     if windows > MAX_OVERLAP_WINDOWS or output_characters > MAX_OVERLAP_OUTPUT_CHARACTERS:
-        raise ValueError(
+        raise ChunkLimitError(
             f"Overlap output exceeds per-file limit: {windows} pre-merge windows "
             f"(maximum {MAX_OVERLAP_WINDOWS}), {output_characters} characters "
-            f"(maximum {MAX_OVERLAP_OUTPUT_CHARACTERS}). Reduce overlap or input size.")
+            f"(maximum {MAX_OVERLAP_OUTPUT_CHARACTERS}). Reduce overlap or input size.",
+            "chunks" if windows > MAX_OVERLAP_WINDOWS else "overlap")
 
     chunks: list[str] = []
     start = 0
@@ -4102,9 +4168,9 @@ def chunk(
     similarity_threshold = config.similarity_threshold if config.similarity_threshold is not None else 0.85
     text_length = len(text) if elements is None else sum(len(str(el)) for el in elements)
     if text_length > MAX_TEXT_CHARACTERS:
-        raise ValueError(
+        raise ChunkLimitError(
             f"{strategy} chunking exceeds the per-file limit: {text_length} characters "
-            f"(maximum {MAX_TEXT_CHARACTERS}). Split the file.")
+            f"(maximum {MAX_TEXT_CHARACTERS}). Split the file.", "text")
     if strategy in ("fixed", "language", "context_aware"):
         # These split by size, so the count is known before splitting. Refuse
         # an oversized file before the splitter allocates every chunk.
@@ -4130,6 +4196,752 @@ def chunk(
     return chunks
 ```
 
+### api/services/parts.py
+
+```python
+"""Names of the parts a file over the per-file limits is stored as (#621).
+
+A file whose text or chunks go over the per-file limits is stored as parts named
+`<name> (part N)`. The original is retained once, under `<name>`, and every part
+maps back to it. A name and its parts are its family: uploading the name again
+replaces all of them.
+"""
+from __future__ import annotations
+
+import re
+from typing import Mapping
+
+_PART = re.compile(r" \(part ([1-9][0-9]*)\)\Z")
+
+
+def part_name(name: str, number: int) -> str:
+    """The stored name of part `number` (from 1) of `name`."""
+    return f"{name} (part {number})"
+
+
+def base_of(stored: str) -> str | None:
+    """The name a part belongs to, by one ` (part N)` suffix; None for any other name."""
+    match = _PART.search(stored)
+    return stored[:match.start()] if match else None
+
+
+def in_family(stored: str, name: str) -> bool:
+    """Whether `stored` is `name` itself or one of its parts, exactly."""
+    return stored == name or base_of(stored) == name
+
+
+def resolve(stored: str, listed: Mapping[str, object]) -> str | None:
+    """The retained name whose original `stored` came from: `stored` itself when it
+    is listed, else the name it is a part of when that is listed, else None."""
+    if stored in listed:
+        return stored
+    base = base_of(stored)
+    return base if base is not None and base in listed else None
+```
+
+### api/services/splitter.py
+
+```python
+"""Splitting a file over the per-file limits into parts (#621).
+
+A file whose text or chunks would go over the chunker's per-file limits (the
+10,000,000-character text limit, the 10,000-chunk cap and, for `overlap`, the
+window limits) is not refused: it is split into parts that each stay under them,
+and every part is chunked on its own, as a file of its own would be. The caller
+stores each part as `<name> (part N)`.
+
+Parts are cut from units, in file order: JSON and JSON Lines at record
+boundaries (a record is never split), `.txt` and `.md` at paragraphs (blank
+lines; `.md` never inside a fenced code block), a CSV by rows with its header
+repeated in every part, `.pdf` and `.docx` between elements. A paragraph,
+element or CSV row over a limit on its own is cut at line breaks, then at
+whitespace, then hard at the limit, as _cap_chunk_length cuts a chunk.
+
+JSON Lines, `.txt`, `.md` and `.csv` are read part by part, so memory is bounded
+by one part whatever the file's size. `.json`, `.pdf` and `.docx` are parsed
+whole, as before, and split by record or element. A file that fits in one part
+is chunked exactly as before and keeps its name.
+"""
+from __future__ import annotations
+
+import codecs
+import csv
+import io
+import itertools
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Iterable, Iterator
+
+from services import chunker
+from services.chunker import ChunkLimitError
+
+_BLOCK = 1024 * 1024
+# How much of a file the encoding is detected from when it isn't UTF-8: reading
+# the whole file to detect it would undo the per-part memory bound.
+_DETECT_BYTES = 1024 * 1024
+_SNIFF_CHARACTERS = 64 * 1024
+
+
+@dataclass
+class Unit:
+    """What a part is cut from. `kind` is "record" (never cut) or "text";
+    `ordinal` names a record in errors; `element` is a parsed element (its class
+    is kept when the unit is cut); `cells` are a CSV row's cells."""
+    text: str
+    kind: str = "text"
+    ordinal: str | None = None
+    element: Any = None
+    cells: list[str] | None = None
+
+
+class PartError(Exception):
+    """Producing part `number` failed; `cause` is why. The caller names the part."""
+
+    def __init__(self, number: int, cause: BaseException) -> None:
+        super().__init__(str(cause) or type(cause).__name__)
+        self.number = number
+        self.cause = cause
+
+
+@dataclass
+class Settings:
+    strategy: str
+    chunk_size: int
+    chunk_overlap: int
+    similarity_threshold: float
+    min_chunk_size: int
+
+
+# ── types ────────────────────────────────────────────────────────────────────
+
+def file_type(path: Path) -> str:
+    """jsonl, json, txt, md, csv or elements (`.pdf`, `.docx`)."""
+    from services import ingest_pipeline as ip
+    if ip._is_jsonl(path.name):
+        return "jsonl"
+    if ip._is_json_gz(path.name):
+        return "json"
+    ext = path.suffix.lower()
+    if ext == ".json":
+        return "json"
+    if ext in (".txt", ".md", ".csv"):
+        return ext[1:]
+    return "elements"
+
+
+_STREAMED_TEXT = ("txt", "md", "csv")
+
+
+# ── sizing (S4) ──────────────────────────────────────────────────────────────
+
+def _overlap_windows(length: int, size: int, overlap: int) -> int:
+    """How many windows chunk_overlap makes of `length` characters."""
+    if length <= 0:
+        return 0
+    if length <= size:
+        return 1
+    stride = size - overlap
+    return 1 + (length - size + stride - 1) // stride
+
+
+def part_limits(settings: Settings) -> tuple[int, int | None]:
+    """The most text one part may hold, so that its estimated chunking stays
+    inside the per-file limits. The second value is kept for callers and is always
+    None: `context_aware` parts are sized by replaying its packing (_Packing),
+    since a count of units would split files well inside the limits (PR #630)."""
+    cap = chunker.MAX_CHUNKS_PER_FILE
+    text = chunker.MAX_TEXT_CHARACTERS
+    size, overlap = settings.chunk_size, settings.chunk_overlap
+    strategy = settings.strategy
+    if strategy == "fixed":
+        return min(text, cap * size), None
+    if strategy == "language":
+        return min(text, cap * max(size - overlap, 1)), None
+    if strategy == "context_aware":
+        return min(text, cap * size), None
+    if strategy == "overlap":
+        def fits(length: int) -> bool:
+            windows = _overlap_windows(length, size, overlap)
+            return (windows <= chunker.MAX_OVERLAP_WINDOWS
+                    and length + max(windows - 1, 0) * overlap
+                    <= chunker.MAX_OVERLAP_OUTPUT_CHARACTERS)
+        low, high = 0, text
+        while low < high:
+            middle = (low + high + 1) // 2
+            if fits(middle):
+                low = middle
+            else:
+                high = middle - 1
+        return max(low, 1), None
+    return text, None
+
+
+def _separator(ftype: str, units_have_elements: bool) -> int:
+    """The characters joining two units in a part's text."""
+    if ftype == "csv":
+        return 0
+    if ftype == "elements" or units_have_elements:
+        return 1
+    return 2
+
+
+# ── encoding of streamed text (S3.6) ─────────────────────────────────────────
+
+def _decodes(path: Path, encoding: str) -> bool:
+    decoder = codecs.getincrementaldecoder(encoding)()
+    try:
+        with path.open("rb") as fh:
+            while True:
+                block = fh.read(_BLOCK)
+                if not block:
+                    break
+                decoder.decode(block)
+        decoder.decode(b"", final=True)
+    except (UnicodeDecodeError, UnicodeError):
+        return False
+    return True
+
+
+def text_encoding(path: Path) -> str:
+    """The encoding a streamed `.txt`, `.md` or `.csv` is read in: UTF-8 when the
+    whole file is (a byte-order mark dropped), else what Unstructured detects from
+    its first MiB, checked over the whole file before anything is stored."""
+    if _decodes(path, "utf-8-sig"):
+        return "utf-8-sig"
+    try:
+        from unstructured.file_utils.encoding import detect_file_encoding
+        with path.open("rb") as fh:
+            sample = fh.read(_DETECT_BYTES)
+        encoding, _ = detect_file_encoding(file=sample)
+        codecs.lookup(encoding)
+    except Exception:
+        encoding = None
+    if encoding and _decodes(path, encoding):
+        return encoding
+    raise ValueError("is not in an encoding that can be read in parts")
+
+
+# ── unit readers (S3) ────────────────────────────────────────────────────────
+
+def _cut_text(text: str, limit: int) -> list[str]:
+    """Pieces of at most `limit` characters: at the last line break that fits,
+    else the last whitespace, else hard at the limit, as _cap_chunk_length cuts."""
+    limit = max(limit, 1)
+    pieces: list[str] = []
+    start, end = 0, len(text)
+    while end - start > limit:
+        stop = start + limit
+        cut = text.rfind("\n", start + 1, stop + 1)
+        if cut <= start:
+            cut = max(text.rfind(ws, start + 1, stop + 1) for ws in (" ", "\t", "\r"))
+        if cut <= start:
+            cut = stop
+        piece = text[start:cut]
+        if piece.strip():
+            pieces.append(piece)
+        start = cut
+        if start < end and text[start] in "\n \t\r":
+            start += 1
+    if text[start:end].strip():
+        pieces.append(text[start:end])
+    return pieces
+
+
+def _new_element(element: Any, text: str) -> Any:
+    try:
+        return type(element)(text=text)
+    except Exception:
+        from unstructured.documents.elements import Text
+        return Text(text=text)
+
+
+def _csv_row(cells: list[str], dialect: Any) -> str:
+    out = io.StringIO()
+    csv.writer(out, dialect=dialect, lineterminator="\n").writerow(cells)
+    return out.getvalue()
+
+
+def cut_unit(unit: Unit, limit: int, dialect: Any = None) -> list[Unit]:
+    """A text unit over a limit on its own, as pieces of at most `limit`
+    characters. A CSV row is cut on its cells' text, each piece one cell."""
+    if unit.cells is not None:
+        pieces = _cut_text(" ".join(unit.cells), limit)
+        return [Unit(_csv_row([p], dialect), cells=[p]) for p in pieces]
+    pieces = _cut_text(unit.text, limit)
+    if unit.element is not None:
+        return [Unit(p, element=_new_element(unit.element, p)) for p in pieces]
+    return [Unit(p) for p in pieces]
+
+
+def _text_units(stream: Iterable[str] | Any, markdown: bool, limit: int) -> Iterator[Unit]:
+    """Paragraphs, the text between blank lines; for Markdown, a blank line inside
+    a fenced code block doesn't end one. A paragraph is given out in pieces when
+    it passes `limit`, cut at a line break, so one is never held whole."""
+    lines: list[str] = []
+    size = 0
+    fence = False
+    while True:
+        line = stream.readline(limit)
+        if not line:
+            break
+        if markdown and line.lstrip().startswith(("```", "~~~")):
+            fence = not fence
+        if not line.strip() and not fence:
+            if lines:
+                yield Unit("".join(lines).rstrip("\n"))
+                lines, size = [], 0
+            continue
+        if lines and size + len(line) > limit:
+            yield Unit("".join(lines).rstrip("\n"))
+            lines, size = [], 0
+        lines.append(line)
+        size += len(line)
+    if lines:
+        yield Unit("".join(lines).rstrip("\n"))
+
+
+def _csv_dialect(stream: Any) -> Any:
+    sample = stream.read(_SNIFF_CHARACTERS)
+    stream.seek(0)
+    try:
+        return csv.Sniffer().sniff(sample)
+    except csv.Error:
+        return csv.excel
+
+
+def _text_measure(unit: Unit) -> int:
+    """The raw measure of a unit, deciding whether a .txt, .md or .csv over
+    10,000,000 bytes is tried whole: its text, and a CSV row by its cells' text
+    (empty cells and separators not counted, since a sparse CSV's bytes can be
+    many times its text). It is not the parsed text and can be more (indentation,
+    Markdown link targets, NA cells), so such a file may be split although its
+    parsed text would fit; measuring raw units keeps memory bounded (maintainer's
+    decision, PR #630)."""
+    if unit.cells is not None:
+        return sum(len(cell.strip()) for cell in unit.cells)
+    return len(unit.text)
+
+
+def _csv_units(stream: Any, dialect: Any) -> tuple[str, Iterator[Unit]]:
+    """The header row as CSV text, and every later row as a unit."""
+    try:
+        from unstructured.partition.csv import CSV_FIELD_LIMIT
+        csv.field_size_limit(CSV_FIELD_LIMIT)
+    except ImportError:
+        pass
+    rows = csv.reader(stream, dialect)
+    header_cells = next(rows, None)
+    header = _csv_row(header_cells, dialect) if header_cells is not None else ""
+
+    def units() -> Iterator[Unit]:
+        for cells in rows:
+            yield Unit(_csv_row(cells, dialect), cells=list(cells))
+    return header, units()
+
+
+class _Source:
+    """A file's units, read lazily, and what a part's text is built from. `parse`
+    and `chunk` are the caller's _parse_file and chunk."""
+
+    def __init__(self, path: Path, ftype: str, settings: Settings, limit: int,
+                 parse: Callable, chunk: Callable) -> None:
+        from services import ingest_pipeline as ip
+        self.path, self.ftype, self.settings, self.limit = path, ftype, settings, limit
+        self.parse, self.chunk = parse, chunk
+        self.header = ""
+        self.dialect = None
+        self._stream = None
+        self.own_size: int | None = None
+        self.header_cells: list[str] = []
+        if ftype == "jsonl":
+            self.units = (Unit(t, "record", o) for o, t, _ in ip._jsonl_units(path))
+        elif ftype == "json":
+            raw = ip._json_gz_units(path) if ip._is_json_gz(path.name) else ip._json_units(path)
+            self.units = (Unit(t, "record", o, e) for o, t, e in raw)
+        elif ftype == "elements":
+            _, elements = parse(path)
+            self.units = iter([Unit(str(el), element=el) for el in elements])
+            # A PDF or DOCX is measured by its extracted text, not its (compressed) bytes.
+            self.own_size = sum(len(str(el)) for el in elements)
+        else:
+            encoding = text_encoding(path)
+            self._stream = path.open("r", encoding=encoding, newline="" if ftype == "csv" else None)
+            if ftype == "csv":
+                self.dialect = _csv_dialect(self._stream)
+                self.header, self.units = _csv_units(self._stream, self.dialect)
+                self.header_cells = next(csv.reader([self.header], self.dialect), [])
+            else:
+                self.units = _text_units(self._stream, ftype == "md", limit)
+        # What a part's units may hold: a CSV's header is repeated at the start
+        # of every part, so it takes its share of each (#621, PR #630 review).
+        self.room = limit - len(self.header)
+
+    def close(self) -> None:
+        if self._stream is not None:
+            self._stream.close()
+        close = getattr(self.units, "close", None)
+        if close is not None:
+            close()
+
+    def presized(self) -> Iterator[Unit]:
+        """The units, a text unit over the room in a part already cut into pieces.
+        A CSV header over half a part fails the file before it is split
+        (check_header), so the cut never goes below half a part."""
+        cut_at = max(self.room, self.limit // 2)
+        for unit in self.units:
+            if unit.kind == "text" and len(unit.text) > cut_at:
+                yield from cut_unit(unit, cut_at, self.dialect)
+            else:
+                yield unit
+
+    def own(self) -> int:
+        """The file's own size, which its stored chunk text is measured against:
+        its bytes; a gzip file's decompressed bytes; a PDF's or DOCX's text."""
+        if self.own_size is None:
+            size = self.path.stat().st_size
+            if self.path.name.lower().endswith(".gz"):
+                import gzip
+                try:
+                    size = 0
+                    with gzip.open(self.path, "rb") as gz:
+                        while True:
+                            block = gz.read(_BLOCK)
+                            if not block:
+                                break
+                            size += len(block)
+                except (OSError, EOFError):
+                    size = self.path.stat().st_size
+            self.own_size = size
+        return self.own_size
+
+    def check_header(self) -> None:
+        """Before a CSV is split: its header is repeated in every part, so one over
+        half of what a part can hold would multiply the file's stored text. That
+        fails the whole file (maintainer's decision on PR #630). A CSV that fits
+        in one part keeps any header."""
+        if self.ftype == "csv" and 2 * len(self.header) > self.limit:
+            raise ValueError(
+                f"its header row is {len(self.header):,} characters, more than half of what one "
+                f"part can hold with these chunk settings ({self.limit:,} characters); the header "
+                f"is repeated in every part, so shorten the header or split the file")
+
+    def build(self, units: list[Unit]) -> tuple[str, list[Any]]:
+        """A part's text and elements, as a file holding only these units would
+        give them (S3's table)."""
+        ftype = self.ftype
+        if ftype in ("jsonl", "json"):
+            from services import ingest_pipeline as ip
+            return ip._join_json_units([(u.ordinal, u.text, u.element) for u in units])
+        if ftype == "elements":
+            elements = [u.element for u in units]
+            return "\n".join(str(el) for el in elements), elements
+        if ftype == "csv":
+            from unstructured.partition.csv import partition_csv
+            data = (self.header + "".join(u.text for u in units)).encode("utf-8")
+            elements = partition_csv(file=io.BytesIO(data), encoding="utf-8")
+        elif ftype == "md":
+            from unstructured.partition.md import partition_md
+            elements = partition_md(text="\n\n".join(u.text for u in units))
+        else:
+            from unstructured.partition.text import partition_text
+            elements = partition_text(text="\n\n".join(u.text for u in units))
+        return "\n".join(str(el) for el in elements), elements
+
+
+# ── chunking a part (S3.3, S3.4) ─────────────────────────────────────────────
+
+def _chunk(chunk: Callable, text: str, elements: list[Any], settings: Settings) -> list[str]:
+    return chunk(
+        text=text,
+        strategy=settings.strategy,
+        chunk_size=settings.chunk_size,
+        chunk_overlap_size=settings.chunk_overlap,
+        similarity_threshold=settings.similarity_threshold,
+        min_chunk_size=settings.min_chunk_size,
+        elements=elements if settings.strategy == "context_aware" else None,
+    )
+
+
+def _record_over(unit: Unit, exc: ChunkLimitError) -> ValueError:
+    if getattr(exc, "kind", None) == "chunks":
+        return ValueError(
+            f"{unit.ordinal} gives more than {chunker.MAX_CHUNKS_PER_FILE:,} chunks with these "
+            f"chunk settings, the most one part can hold; a record is never split, so use a "
+            f"larger chunk size")
+    return ValueError(f"{unit.ordinal} is more than one part can hold with these chunk "
+                      f"settings ({exc}); a record is never split")
+
+
+def _chunk_units(source: _Source, units: list[Unit]) -> Iterator[list[str]]:
+    """The chunks of one part; a part that still goes over an in-scope limit is
+    split in half and each half chunked again, and a single text unit is cut."""
+    text, elements = source.build(units)
+    try:
+        chunks = _chunk(source.chunk, text, elements, source.settings)
+    except ChunkLimitError as exc:
+        del text, elements
+        if len(units) > 1:
+            middle = len(units) // 2
+            yield from _chunk_units(source, units[:middle])
+            yield from _chunk_units(source, units[middle:])
+            return
+        unit = units[0]
+        if unit.kind == "record":
+            raise _record_over(unit, exc) from exc
+        pieces = cut_unit(unit, (len(unit.text) + 1) // 2, source.dialect)
+        if len(pieces) < 2:
+            raise
+        yield from _chunk_units(source, pieces)
+        return
+    yield chunks
+
+
+# ── a file (S2, S3.1) ────────────────────────────────────────────────────────
+
+def _whole(path: Path, settings: Settings, parse: Callable, chunk: Callable) -> list[str]:
+    """A streamed text file chunked exactly as before the split existed."""
+    text, elements = parse(path)
+    return _chunk(chunk, text, elements, settings)
+
+
+def split_file(path: Path, settings: Settings, parse: Callable | None = None,
+               chunk: Callable | None = None) -> Iterator[tuple[str, list[str]]]:
+    """Yields ("whole", chunks) once for a file stored whole, else ("part",
+    chunks) for each of its two or more parts, in order.
+
+    Whether a file is split is never estimated (#621, PR #630): a file whose text
+    is within MAX_TEXT_CHARACTERS is chunked whole, and split only when the
+    chunker refuses it (the chunk count or the overlap limits). The part-size
+    estimates only size the parts of a file that is split.
+
+    `parse` and `chunk` default to ingest's _parse_file and the chunker's chunk;
+    callers pass their own, so whatever they parse and chunk with is used.
+
+    An exception raised while producing part N, once the file is known to be
+    split, is raised as PartError(N, exc).
+    """
+    if parse is None:
+        from services import ingest_pipeline as ip
+        parse = ip._parse_file
+    chunk = chunk or chunker.chunk
+    ftype = file_type(path)
+    limit, _ = part_limits(settings)
+    text_limit = chunker.MAX_TEXT_CHARACTERS
+
+    if ftype in _STREAMED_TEXT:
+        # Parsed whole from the file itself, as before. Every encoding takes at
+        # least a byte a character, so text within the limit is certain when the
+        # bytes are; otherwise the text is measured in one pass, nothing kept.
+        fits = path.stat().st_size <= text_limit
+        if not fits:
+            probe = _Source(path, ftype, settings, limit, parse, chunk)
+            try:
+                total = sum(len(cell.strip()) for cell in probe.header_cells)
+                fits = True
+                for unit in probe.units:
+                    total += _text_measure(unit)
+                    if total > text_limit:
+                        fits = False
+                        break
+            finally:
+                probe.close()
+        if fits:
+            try:
+                chunks = _whole(path, settings, parse, chunk)
+            except ChunkLimitError:
+                pass
+            else:
+                yield "whole", chunks
+                return
+        source = _Source(path, ftype, settings, limit, parse, chunk)
+        try:
+            source.check_header()
+            yield from _parts(source, [], None, source.presized())
+        finally:
+            source.close()
+        return
+
+    # JSON, JSON Lines, PDF and DOCX: the units are the file's own text, so up to
+    # the text limit of them is read, then the file is chunked whole.
+    source = _Source(path, ftype, settings, limit, parse, chunk)
+    # Measured as the chunker measures it: under context_aware it is given the
+    # elements and counts their text alone; otherwise it counts the joined text,
+    # the separators between units included (PR #630).
+    joined = settings.strategy != "context_aware"
+    try:
+        units = source.presized()
+        first: list[Unit] = []
+        chars = 0
+        pending = None
+        for unit in units:
+            sep = _separator(ftype, unit.element is not None) if first and joined else 0
+            added = len(unit.text) + sep
+            if first and chars + added > text_limit:
+                pending = unit
+                break
+            first.append(unit)
+            chars += added
+        else:
+            try:
+                text, elements = source.build(first)
+                chunks = _chunk(chunk, text, elements, settings)
+            except ChunkLimitError:
+                pass
+            else:
+                yield "whole", chunks
+                return
+        source.check_header()
+        yield from _parts(source, first, pending, units)
+    finally:
+        source.close()
+
+
+def _fits(chars: int, count: int, limit: int, max_units: int | None) -> bool:
+    return chars <= limit and (max_units is None or count <= max_units)
+
+
+def _pieces(length: int) -> int:
+    """How many chunks _cap_chunk_length makes of one chunk of `length` characters:
+    it cuts at whitespace no earlier than half the ceiling."""
+    ceiling = chunker.MAX_CHUNK_CHARACTERS
+    return 1 if length <= ceiling else -(-length // (ceiling // 2))
+
+
+class _Packing:
+    """Replays chunk_context_aware's packing over a part's units, to count its
+    chunks before minimum-size merging (which only lowers the count), plus the
+    pieces _cap_chunk_length cuts an over-long one into. Used to size
+    `context_aware` parts; halving remains the safety net."""
+
+    def __init__(self, size: int) -> None:
+        self.size, self.closed, self.buffer = size, 0, 0
+
+    def copy(self) -> "_Packing":
+        other = _Packing(self.size)
+        other.closed, other.buffer = self.closed, self.buffer
+        return other
+
+    def add(self, unit: Unit) -> None:
+        length = len(unit.text.strip())
+        if not length:
+            return
+        if getattr(unit.element, "category", None) == "Table":
+            if self.buffer:
+                self.closed += _pieces(self.buffer)
+                self.buffer = 0
+            self.closed += _pieces(length)
+        elif self.buffer and self.buffer + length + 1 > self.size:
+            self.closed += _pieces(self.buffer)
+            self.buffer = length
+        else:
+            self.buffer = self.buffer + 1 + length if self.buffer else length
+
+    def count(self) -> int:
+        return self.closed + (_pieces(self.buffer) if self.buffer else 0)
+
+
+# A file split into parts may store at most this many times its own size in
+# chunk text: a CSV header repeated in every part, overlap and JSON key paths all
+# multiply it (maintainer's decision on PR #630).
+MAX_STORED_RATIO = 10
+
+
+class StoredTextTooLarge(ValueError):
+    """A split file whose chunks would store more than MAX_STORED_RATIO times its
+    own size. The whole file fails; it is not a part's error."""
+
+    def __init__(self, stored: int, own: int) -> None:
+        super().__init__(
+            f"it would store {stored:,} characters of chunks, more than {MAX_STORED_RATIO} times "
+            f"its own size ({own:,} characters); use less chunk_overlap, shorten repeated "
+            f"headers or keys, or split the file")
+
+
+def _halves(source: _Source, units: list[Unit]) -> Iterator[list[str]]:
+    """The chunks of units known to go over as one part: at least two parts."""
+    if len(units) == 1:
+        unit = units[0]
+        if unit.kind == "record":
+            # A record is never split; chunking it says why it is too large.
+            yield from _chunk_units(source, units)
+            return
+        units = cut_unit(unit, (len(unit.text) + 1) // 2, source.dialect)
+        if len(units) < 2:
+            yield from _chunk_units(source, units)
+            return
+    middle = len(units) // 2
+    yield from _chunk_units(source, units[:middle])
+    yield from _chunk_units(source, units[middle:])
+
+
+def _parts(source: _Source, first: list[Unit], pending: Unit | None,
+           units: Iterator[Unit]) -> Iterator[tuple[str, list[str]]]:
+    """Every part of a split file, from the units already read (`first`, and the
+    one that did not fit, `pending`) and the rest of the reader.
+
+    Every part is filled from one stream of units by the room left beside a CSV
+    header and, for `context_aware`, a replay of its packing (PR #630). The file
+    is known to need splitting, so if the first part would take every unit, it is
+    halved instead: a split file has two or more parts. Before each part is handed
+    on to be stored, the chunk text stored so far is checked against ten times
+    the file's own size."""
+    limit = source.room  # a CSV's header takes its share of every part
+    packing = source.settings.strategy == "context_aware"
+    cap = chunker.MAX_CHUNKS_PER_FILE
+    stored = 0
+    number = 0
+    # A file that is a single record over a limit is not split at all: its own
+    # error is the file's, not a part's.
+    alone = False
+
+    def hand_on(produced: Iterable[list[str]]) -> Iterator[tuple[str, list[str]]]:
+        nonlocal stored, number
+        for chunks in produced:
+            # Checked before the part is handed on to be stored (#621, PR #630).
+            stored += sum(len(c) for c in chunks)
+            if stored > MAX_STORED_RATIO * source.own():
+                raise StoredTextTooLarge(stored, source.own())
+            number += 1
+            yield "part", chunks
+
+    try:
+        stream = itertools.chain(first, [pending] if pending is not None else [], units)
+        pending = None
+        while True:
+            if pending is not None:
+                current, pending = [pending], None
+            else:
+                unit = next(stream, None)
+                if unit is None:
+                    return
+                current = [unit]
+            sep = _separator(source.ftype, current[0].element is not None)
+            chars = len(current[0].text)
+            pack = _Packing(source.settings.chunk_size)
+            pack.add(current[0])
+            for unit in stream:
+                added = len(unit.text) + sep
+                trial = pack.copy()
+                trial.add(unit)
+                if (not _fits(chars + added, len(current) + 1, limit, None)
+                        or (packing and trial.count() > cap)):
+                    pending = unit
+                    break
+                current.append(unit)
+                chars += added
+                pack = trial
+            if number == 0 and pending is None:
+                # The whole file in one part: it went over whole, so it is halved.
+                alone = len(current) == 1 and current[0].kind == "record"
+                yield from hand_on(_halves(source, current))
+            else:
+                yield from hand_on(_chunk_units(source, current))
+    except Exception as exc:
+        if alone or isinstance(exc, StoredTextTooLarge):
+            raise
+        raise PartError(number + 1, exc) from exc
+```
+
 ### api/services/ingest_pipeline.py
 
 ```python
@@ -4151,13 +4963,13 @@ import zipfile
 import zlib
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Iterator
 
 from services import batch_write, collection_writes, jobstore
 from config import settings
 from models.schemas import IngestConfig
 from services.chunker import MAX_TEXT_CHARACTERS, chunk as do_chunk
-from services import sources
+from services import parts, sources, splitter
 from services import weaviate_client as wc
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".jsonl"}
@@ -4281,21 +5093,28 @@ class _JsonError(ValueError):
 
 
 class _JsonTooLarge(_JsonError):
-    """Valid JSON whose converted text would be over the per-file text limit."""
+    """A JSON record whose converted text would be over the per-record limit (#621).
+    `ordinal` names the record (`record N`) once it is known."""
 
-    def __init__(self) -> None:
-        detail = (f"converts to more than {MAX_JSON_TEXT_CHARACTERS:,} characters of text, "
-                  f"the per-file limit for every chunking strategy; split the file")
+    def __init__(self, ordinal: str = "a record") -> None:
+        detail = _record_too_large(ordinal)
         ValueError.__init__(self, detail)
         self.detail = detail
 
 
-# The most text one JSON file may convert to (#295 review). Each line repeats its
-# full key path, so a small file with a long key over many values could otherwise
-# expand to gigabytes. This is the chunker's own per-file limit: a file whose
-# records hold more text than this is refused by every chunking strategy anyway,
-# so the bound refuses nothing that could have been ingested; it only refuses
-# before the text is built.
+def _record_too_large(ordinal: str) -> str:
+    # A file over the per-file limits is split into parts at record boundaries
+    # (#621), so only one record can be too large: a record is never split.
+    return (f"{ordinal} converts to more than {MAX_JSON_TEXT_CHARACTERS:,} characters of text, "
+            f"the most one record can hold; a record is never split")
+
+
+# The most text one JSON or JSON Lines record may convert to (#295 review, #621).
+# Each line repeats its full key path, so a small record with a long key over
+# many values could otherwise expand to gigabytes; it is refused before that text
+# is built. It is the chunker's per-file text limit: a file over it is split into
+# parts at record boundaries (#621), and a record is never split, so a record
+# over it could not be ingested anyway.
 MAX_JSON_TEXT_CHARACTERS = MAX_TEXT_CHARACTERS
 # The most bytes of one JSON file that are parsed (#300). A .json file is parsed
 # whole, before the text bound can be checked, and parsing takes up to about 34
@@ -4386,7 +5205,7 @@ def _json_scalar(value: Any) -> str:
 
 
 class _JsonBudget:
-    """Characters of converted text left for this file."""
+    """Characters of converted text left for one record (#621)."""
 
     def __init__(self) -> None:
         self.left = MAX_JSON_TEXT_CHARACTERS
@@ -4438,44 +5257,52 @@ def _json_lines(value: Any, path: Any, out: list[str], budget: _JsonBudget) -> N
         _json_line(path, _json_scalar(value), out, budget)
 
 
-def _json_records(value: Any) -> list[str]:
+def _iter_json_records(value: Any) -> Iterator[tuple[str, str]]:
     """Ordinary JSON as readable text: one record per item of a top-level array
     that holds any object or array, otherwise one record. Records with no text
-    are dropped."""
+    are dropped. Yields (`record N`, text), N the item's position from 1; each
+    record's text is bounded on its own (#621)."""
     if isinstance(value, list) and not all(_is_json_scalar(item) for item in value):
         groups = value
     else:
         groups = [value]
-    records = []
-    budget = _JsonBudget()
-    try:
-        for group in groups:
-            lines: list[str] = []
-            left = budget.left
-            _json_lines(group, None, lines, budget)
-            text = "\n".join(lines)
-            if text.strip():
-                if records:
-                    budget.spend(2)  # the blank line before this record (#300)
-                if len(records) == MAX_JSON_RECORDS:
-                    raise _JsonTooManyRecords()
-                records.append(text)
-            else:
-                budget.left = left  # a dropped record's text is not stored
-    except RecursionError as exc:
-        raise _JsonError("it is nested too deeply to read") from exc
-    return records
+    kept = 0
+    for position, group in enumerate(groups, 1):
+        ordinal = f"record {position}"
+        lines: list[str] = []
+        try:
+            _json_lines(group, None, lines, _JsonBudget())
+        except _JsonTooLarge as exc:
+            raise _JsonTooLarge(ordinal) from exc
+        except RecursionError as exc:
+            raise _JsonError("it is nested too deeply to read") from exc
+        text = "\n".join(lines)
+        if text.strip():
+            if kept == MAX_JSON_RECORDS:
+                raise _JsonTooManyRecords()
+            kept += 1
+            yield ordinal, text
 
 
-def _parse_json(path: Path) -> tuple[str, list[Any]]:
-    """Ordinary JSON becomes `key: value` text, one element per record. A file of
-    serialized Unstructured elements is rehydrated by partition_json (#295)."""
+def _json_records(value: Any) -> list[str]:
+    """Every record of _iter_json_records, as a list."""
+    return [text for _, text in _iter_json_records(value)]
+
+
+def _json_units(path: Path) -> Iterator[tuple[str, str, Any]]:
+    """A JSON file's records in file order, as (ordinal, text, element) (#621).
+
+    Ordinary JSON gives `key: value` text, one record per item, element None. A
+    file of serialized Unstructured elements is rehydrated by partition_json
+    (#295), and each element is a record (`record N`) with its element. The file
+    is parsed whole, as before; ordinary records are converted one at a time.
+    """
     # Checked before anything is read: the parse is the cost (#300).
     if path.stat().st_size > MAX_JSON_INPUT_BYTES:
         raise ValueError(_json_input_too_large("is larger than"))
     raw, value = _read_json(path)
     if not raw:
-        return "", []
+        return
     from unstructured.partition.common.json_partitioning import is_element_shaped_dict
     if isinstance(value, list) and value and all(is_element_shaped_dict(i) for i in value):
         # Each item becomes one element, so the record cap applies to the items,
@@ -4487,24 +5314,46 @@ def _parse_json(path: Path) -> tuple[str, list[Any]]:
         # the two are not held together (#300).
         value = None
         # The text already read, so a byte-order mark is handled the same way.
-        elements = partition_json(text=raw)
+        for position, element in enumerate(partition_json(text=raw), 1):
+            yield f"record {position}", str(element), element
+        return
+    raw = None
+    for ordinal, text in _iter_json_records(value):
+        yield ordinal, text, None
+
+
+def _join_json_units(units: list[tuple[str, str, Any]]) -> tuple[str, list[Any]]:
+    """The text and elements of JSON records, as one file's parse gives them: an
+    element file's elements joined by a line break, ordinary records as Text
+    elements joined by a blank line, so the language splitter prefers to cut
+    between records."""
+    if units and units[0][2] is not None:
+        elements = [element for _, _, element in units]
         return "\n".join(str(el) for el in elements), elements
     from unstructured.documents.elements import Text
-    records = _json_records(value)
-    # A blank line between records, so the language splitter prefers to cut there.
-    return "\n\n".join(records), [Text(text=record) for record in records]
+    return "\n\n".join(text for _, text, _ in units), [Text(text=text) for _, text, _ in units]
 
 
-def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
+def _parse_json(path: Path) -> tuple[str, list[Any]]:
+    """Ordinary JSON becomes `key: value` text, one element per record. A file of
+    serialized Unstructured elements is rehydrated by partition_json (#295)."""
+    return _join_json_units(list(_json_units(path)))
+
+
+def _json_gz_units(path: Path) -> Iterator[tuple[str, str, Any]]:
+    """A .json.gz member's records, as _json_units gives them; it is decompressed
+    to a temporary file, removed when the records have been read."""
     fd, name = tempfile.mkstemp(dir=path.parent, suffix=".json")
     os.close(fd)
     plain = Path(name)
     try:
         _gunzip_bounded(path, plain)
         try:
-            return _parse_json(plain)
-        except (_JsonTooLarge, _JsonTooManyRecords) as exc:
+            yield from _json_units(plain)
+        except _JsonTooManyRecords as exc:
             raise ValueError(f"was decompressed, but it {exc.detail}") from exc
+        except _JsonTooLarge as exc:
+            raise ValueError(f"was decompressed, but {exc.detail}") from exc
         except _JsonError as exc:
             raise ValueError(
                 f"was decompressed, but its JSON could not be parsed: {exc.detail}") from exc
@@ -4516,6 +5365,10 @@ def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
         plain.unlink(missing_ok=True)
 
 
+def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
+    return _join_json_units(list(_json_gz_units(path)))
+
+
 class _JsonlError(ValueError):
     """A JSON Lines file that can't be ingested; `detail` names the line (#291)."""
 
@@ -4525,8 +5378,7 @@ class _JsonlError(ValueError):
 
 
 class _JsonlTooLarge(_JsonlError):
-    """A JSON Lines file whose text passes the per-file limit, or with more lines
-    than one file may hold (#314)."""
+    """A JSON Lines file with more lines than one file may hold (#314)."""
 
 
 class _BoundedLines:
@@ -4548,17 +5400,16 @@ _JSONL_BLANK = b" \t\r"
 _BOM = b"\xef\xbb\xbf"
 
 
-def _jsonl_records(stream: Any) -> list[str]:
-    """The records of a JSON Lines file, one per line with text (#291).
+def _iter_jsonl_records(stream: Any) -> Iterator[tuple[str, str]]:
+    """The records of a JSON Lines file, one per line with text (#291), as
+    (`line N`, text).
 
     Read one line at a time, at most MAX_JSONL_LINE_BYTES of it besides its line
     ending and line 1's byte-order mark, and stopped at the first bad line, at
-    the line past MAX_JSON_RECORDS, or when the file's text passes the per-file
-    limit, so memory is bounded by one line and that limit, never by the file's
-    size, and work by the line count.
+    the line past MAX_JSON_RECORDS, or at a record whose text passes the
+    per-record limit (#621), so memory is bounded by one line and one record,
+    never by the file's size, and work by the line count.
     """
-    budget = _JsonBudget()
-    records: list[str] = []
     number = 0
     blank = None  # the first blank line not yet followed by a record
     while True:
@@ -4599,20 +5450,10 @@ def _jsonl_records(stream: Any) -> list[str]:
             value = json.loads(line, parse_int=_JsonNumber, parse_float=_JsonNumber,
                                parse_constant=_reject_constant)
             lines: list[str] = []
-            left = budget.left
-            _json_lines(value, None, lines, budget)
+            _json_lines(value, None, lines, _JsonBudget())
             text = "\n".join(lines)
-            if text.strip():
-                if records:
-                    budget.spend(2)  # the blank line before this record
-                records.append(text)
-            else:
-                budget.left = left  # a record with no text is not stored
         except _JsonTooLarge as exc:
-            raise _JsonlTooLarge(
-                f"converts to more than {MAX_JSON_TEXT_CHARACTERS:,} characters of text by "
-                f"line {number}, the per-file limit for every chunking strategy; "
-                f"split the file") from exc
+            raise _JsonlError(_record_too_large(f"line {number}")) from exc
         except _JsonError as exc:
             raise _JsonlError(f"line {number} is not valid JSON: {exc.detail}") from exc
         except json.JSONDecodeError as exc:
@@ -4621,7 +5462,41 @@ def _jsonl_records(stream: Any) -> list[str]:
         except RecursionError as exc:
             raise _JsonlError(
                 f"line {number} is not valid JSON: it is nested too deeply to read") from exc
-    return records
+        # A record with no text is not stored.
+        if text.strip():
+            yield f"line {number}", text
+
+
+def _jsonl_records(stream: Any) -> list[str]:
+    """Every record of _iter_jsonl_records, as a list."""
+    return [text for _, text in _iter_jsonl_records(stream)]
+
+
+def _jsonl_units(path: Path) -> Iterator[tuple[str, str, None]]:
+    """A JSON Lines file's records in file order, as (ordinal, text, None), read
+    one line at a time, plain or gzipped (#621). Errors read as _parse_jsonl's."""
+    try:
+        if _is_jsonl_gz(path.name):
+            # Decompressed while read; nothing decompressed is written to disk.
+            with gzip.open(path, "rb") as gz:
+                for ordinal, text in _iter_jsonl_records(_BoundedLines(gz)):
+                    yield ordinal, text, None
+        else:
+            with path.open("rb") as fh:
+                for ordinal, text in _iter_jsonl_records(fh):
+                    yield ordinal, text, None
+    except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
+        raise ValueError(
+            f"is not a valid gzip file; it may be truncated or corrupt ({exc})") from exc
+    except _JsonlError as exc:
+        raise ValueError(_jsonl_reason(path, exc)) from exc
+
+
+def _jsonl_reason(path: Path, exc: _JsonlError) -> str:
+    if not _is_jsonl_gz(path.name):
+        return exc.detail
+    subject = "it " if isinstance(exc, _JsonlTooLarge) else ""
+    return f"was decompressed, but {subject}{exc.detail}"
 
 
 def _parse_jsonl(path: Path) -> tuple[str, list[Any]]:
@@ -4637,14 +5512,13 @@ def _parse_jsonl(path: Path) -> tuple[str, list[Any]]:
             raise ValueError(
                 f"is not a valid gzip file; it may be truncated or corrupt ({exc})") from exc
         except _JsonlError as exc:
-            subject = "it " if isinstance(exc, _JsonlTooLarge) else ""
-            raise ValueError(f"was decompressed, but {subject}{exc.detail}") from exc
+            raise ValueError(_jsonl_reason(path, exc)) from exc
     else:
         try:
             with path.open("rb") as fh:
                 records = _jsonl_records(fh)
         except _JsonlError as exc:
-            raise ValueError(exc.detail) from exc
+            raise ValueError(_jsonl_reason(path, exc)) from exc
     from unstructured.documents.elements import Text
     return "\n\n".join(records), [Text(text=record) for record in records]
 
@@ -4721,11 +5595,11 @@ def _count_writes(job: dict, submitted: int, accepted: int, stored: int = 0) -> 
 
 
 def _has_chunks(collection: str, name: str) -> bool:
-    """Whether the name already has chunks, which this file will replace (#22).
-    It is the job's first backend call for a file, so a deleted collection is
-    reported here the way _store_chunks reports it (#40)."""
+    """Whether the name or any of its parts already has chunks, which this file
+    will replace (#22, #621). It is the job's first backend call for a file, so a
+    deleted collection is reported here the way _store_chunks reports it (#40)."""
     try:
-        return wc._source_has_chunks_sync(collection, name)
+        return wc._family_has_chunks_sync(collection, name)
     except Exception as exc:
         if _collection_gone(collection):
             _log.warning("Collection %r disappeared before storing chunks: %s",
@@ -4760,7 +5634,7 @@ def _mark_replacement_stale(collection: str, name: str, rest: list[str]) -> None
     names the step that failed (#311); either way nothing has been marked.
     """
     try:
-        names = [name] + [other for other in rest if wc._source_has_chunks_sync(collection, other)]
+        names = [name] + [other for other in rest if wc._family_has_chunks_sync(collection, other)]
     except Exception as exc:
         raise _StaleLookupFailed(str(exc) or type(exc).__name__) from exc
     listed = ", ".join(names[:_MAX_NAMED_FILES])
@@ -4776,16 +5650,56 @@ def _mark_replacement_stale(collection: str, name: str, rest: list[str]) -> None
         raise _StaleMarkFailed(str(exc) or type(exc).__name__) from exc
 
 
+class _FileFailed(Exception):
+    """A file that failed, with the reason its error gives (#621)."""
+
+
+def _undo_new_chunks(job: dict, collection: str, name: str, created_at: datetime,
+                     exc: BaseException, kind: str, part_count: int, stored: int) -> _FileFailed:
+    """A file failed while its chunks were being stored: remove what this ingest
+    stored for it, so its earlier version stays whole (#621), and say why it failed.
+
+    A part that failed is named (`part N: ...`). `chunks_stored` is reduced by what
+    was removed.
+    """
+    cause = exc.cause if isinstance(exc, splitter.PartError) else exc
+    reason = str(cause) or type(cause).__name__
+    # Storing more than ten times its own size fails the whole file, not a part
+    # (PR #630): its parts are removed, and its error stands as it is.
+    whole = isinstance(exc, splitter.StoredTextTooLarge)
+    split = (isinstance(exc, splitter.PartError) or kind == "part") and not whole
+    if isinstance(exc, splitter.PartError):
+        reason = f"part {exc.number}: {reason}"
+    elif kind == "part" and not whole:
+        reason = f"part {part_count}: {reason}"
+    if not (stored or ((split or whole) and part_count)):
+        return _FileFailed(reason)
+    try:
+        removed = wc._delete_new_family_sync(collection, name, created_at)
+        problem = None
+    except Exception as undo:
+        _log.error("Could not remove the new chunks of %r in %r", name, collection,
+                   exc_info=True)
+        removed, problem = getattr(undo, "deleted", 0), str(undo) or type(undo).__name__
+    job["chunks_stored"] = max(job["chunks_stored"] - removed, 0)
+    if problem is not None:
+        left = max(stored - removed, 0)
+        return _FileFailed(f"{reason}; {left} new chunks could not be removed ({problem}); "
+                           f"upload it again to retry")
+    return _FileFailed(f"{reason}; nothing from it was stored" if split else reason)
+
+
 def _remove_earlier(collection: str, name: str, created_at: datetime,
                     expected: int) -> tuple[int, str | None]:
-    """Remove a name's earlier chunks once its new ones are stored.
+    """Remove the earlier chunks of a name and its parts once its new ones are
+    stored (#22, #621).
 
     Returns how many were removed and, when not all of them could be, why. A
     failure here never undoes the insert: duplicates are recoverable by uploading
     again, lost chunks are not.
     """
     try:
-        return wc._delete_earlier_chunks_sync(collection, name, created_at, expected), None
+        return wc._delete_earlier_family_sync(collection, name, created_at, expected), None
     except Exception as exc:
         _log.error("Could not remove the earlier chunks of %r in %r", name, collection,
                    exc_info=True)
@@ -4821,55 +5735,65 @@ def _process_job_sync(
             name = logical[index]
             label = (labels or {}).get(path, name)
             try:
-                text, elements = _parse_file(path)
                 source_type = source_type_of(path)
-
-                chunks = do_chunk(
-                    text=text,
-                    strategy=strategy,
-                    chunk_size=chunk_size,
-                    chunk_overlap_size=chunk_overlap,
-                    similarity_threshold=similarity_threshold,
-                    min_chunk_size=min_chunk_size,
-                    elements=elements if strategy == "context_aware" else None,
-                )
-
+                settings = splitter.Settings(strategy, chunk_size, chunk_overlap,
+                                             similarity_threshold, min_chunk_size)
+                # One timestamp for every part of the file: replacement and the
+                # removal of a failed file's parts tell its chunks apart by it.
                 created = datetime.now(timezone.utc)
                 now = created.isoformat()
-                weaviate_chunks = [
-                    {
-                        "content": c,
-                        "source_file": name,
-                        "source_type": source_type,
-                        "chunk_index": i,
-                        "chunk_strategy": strategy,
-                        "chunk_size": chunk_size,
-                        "chunk_overlap": chunk_overlap,
-                        "created_at": now,
-                    }
-                    for i, c in enumerate(chunks)
-                ]
-
-                # The last ingest of a name wins (#22). Everything before the
-                # insert only reads, so a failure up to there changes nothing.
-                replacing = _has_chunks(collection, name)
-                if replacing and not marked:
-                    _mark_replacement_stale(collection, name, logical[index + 1:])
-                    marked = True
-
-                # Insert first, then remove the earlier chunks, never the other
-                # way round: a failed insert leaves the earlier version whole.
+                stored, part_count, kind, replacing = 0, 0, "whole", False
                 try:
-                    _store_chunks(collection, weaviate_chunks)
-                except Exception as exc:
-                    _count_writes(job, *(batch_write.write_counts(exc) or (0, 0)))
+                    # A file over the per-file limits comes as parts (#621), each
+                    # chunked and stored before the next is read.
+                    for kind, chunks in splitter.split_file(path, settings, _parse_file, do_chunk):
+                        if part_count == 0:
+                            # The last ingest of a name wins (#22). Everything
+                            # before the first insert only reads, so a failure up
+                            # to there changes nothing.
+                            replacing = _has_chunks(collection, name)
+                            if replacing and not marked:
+                                _mark_replacement_stale(collection, name, logical[index + 1:])
+                                marked = True
+                        part_count += 1
+                        source = name if kind == "whole" else parts.part_name(name, part_count)
+                        weaviate_chunks = [
+                            {
+                                "content": c,
+                                "source_file": source,
+                                "source_type": source_type,
+                                "chunk_index": i,
+                                "chunk_strategy": strategy,
+                                "chunk_size": chunk_size,
+                                "chunk_overlap": chunk_overlap,
+                                "created_at": now,
+                            }
+                            for i, c in enumerate(chunks)
+                        ]
+                        # Insert first, then remove the earlier chunks, never the
+                        # other way round: a failed insert leaves the earlier
+                        # version whole.
+                        try:
+                            _store_chunks(collection, weaviate_chunks)
+                        except Exception as exc:
+                            _count_writes(job, *(batch_write.write_counts(exc) or (0, 0)))
+                            raise
+                        # Stored counts here too, with the other two: counted
+                        # later, a clean job would show its counts apart until
+                        # then (#324).
+                        _count_writes(job, len(chunks), len(chunks), len(chunks))
+                        stored += len(chunks)
+                        del weaviate_chunks, chunks
+                except (_CollectionDeleted, _StaleMarkFailed, _StaleLookupFailed):
                     raise
-                # Stored counts here too, with the other two: counted later, a clean
-                # job would show its counts apart until then (#324).
-                _count_writes(job, len(chunks), len(chunks), len(chunks))
+                except Exception as exc:
+                    # All or nothing per file (#621): what it stored is removed.
+                    raise _undo_new_chunks(job, collection, name, created, exc, kind,
+                                           part_count, stored) from exc
+
                 removed, problem = 0, None
                 if replacing:
-                    removed, problem = _remove_earlier(collection, name, created, len(chunks))
+                    removed, problem = _remove_earlier(collection, name, created, stored)
                     job["chunks_replaced"] = job.get("chunks_replaced", 0) + removed
 
                 # Retain the original only after the file has been parsed,
@@ -4895,6 +5819,10 @@ def _process_job_sync(
 
                 if problem is None:
                     job["files_completed"] += 1
+                    if kind == "part":
+                        job.setdefault("split", []).append(
+                            f"{label}: split into {part_count} parts, stored as "
+                            f"'{parts.part_name(name, 1)}' to '{parts.part_name(name, part_count)}'")
                 else:
                     job["files_failed"] += 1
                     job["errors"].append(
@@ -5457,6 +6385,8 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
             "chunks_accepted": 0,
             # Earlier chunks of the same names removed by this job (#22).
             "chunks_replaced": 0,
+            # Files over the per-file limits, stored as parts (#621).
+            "split": [],
             "errors": [],
             "skipped": skipped,
             # For the job lists (#617): where, what and who, as the client sent
@@ -7030,6 +7960,7 @@ from services import age_stream
 from services import goldstandard
 from services import ingest_config
 from services import model_bundle
+from services import parts
 from services import retrieval_config
 from services import sources
 from services import weaviate_client as wc
@@ -7175,7 +8106,10 @@ def read_chunks(collection: str, documents: dict | None = None) -> Iterator[dict
         props = dict(obj.properties or {})
         # source_sha256 is a sibling field, not a stored property: spec §4.5
         # keeps the eight chunk properties unchanged. Resolve it from retention.
-        digests = by_filename.get(props.get("source_file"), [])
+        # A part `<name> (part N)` links to its original `<name>` (#621).
+        source_file = props.get("source_file")
+        listed = parts.resolve(source_file, by_filename) if isinstance(source_file, str) else None
+        digests = by_filename.get(listed, []) if listed is not None else []
         yield {
             "id": str(obj.uuid),
             "vector": vector,
@@ -10639,7 +11573,7 @@ from pathlib import Path, PurePosixPath
 from services import collection_writes, jobstore
 from config import settings
 from services import goldstandard
-from services import sources
+from services import parts, sources, splitter
 from services import weaviate_client as wc
 from services import batch_write, collection_recovery
 from services.chunker import chunk as do_chunk
@@ -10722,7 +11656,9 @@ _MISSING_CHUNK_INDEX = object()
 def _source_coverage(collection: str, documents: dict) -> tuple[list[str], set[str]]:
     """The stored source files a rebuild from the retained originals would not
     reproduce, and every name that has stored chunks, from one walk of the
-    collection. A rebuild emits only the stored names (#311)."""
+    collection. A rebuild emits only the stored names (#311). A part
+    `<name> (part N)` that no digest lists is covered by its original `<name>`,
+    which then counts as stored (#621)."""
     by_filename: dict[str, list[str]] = {}
     for digest, entry in documents.items():
         for filename in entry["filenames"]:
@@ -10736,10 +11672,11 @@ def _source_coverage(collection: str, documents: dict) -> tuple[list[str], set[s
         if not isinstance(filename, str) or not filename:
             uncovered.add("<unknown>")
             continue
-        stored.add(filename)
+        listed = parts.resolve(filename, by_filename) or filename
+        stored.add(listed)
         # A rebuild emits one chunk set per (digest, name) (#22), so a name is
         # covered when exactly one digest lists it, whichever of its names it is.
-        if len(by_filename.get(filename, [])) != 1:
+        if len(by_filename.get(listed, [])) != 1:
             uncovered.add(filename)
             continue
         index = props.get("chunk_index")
@@ -10794,7 +11731,9 @@ def _has_stored_listed_name(collection: str, documents: dict) -> bool:
     """Whether any name the index lists has stored chunks; stops at the first."""
     names = _listed_names(documents)
     for obj in wc.get_client().collections.get(collection).iterator():
-        if (obj.properties or {}).get("source_file") in names:
+        filename = (obj.properties or {}).get("source_file")
+        # A part counts for its original (#621).
+        if isinstance(filename, str) and parts.resolve(filename, names) is not None:
             return True
     return False
 
@@ -10923,27 +11862,33 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                 staged = slot / PurePosixPath(filename).name
                 shutil.copyfile(blob, staged)
 
-                text, elements = _parse_file(staged)
-                chunks = do_chunk(
-                    text=text,
-                    strategy=strategy,
-                    chunk_size=chunk_size,
-                    chunk_overlap_size=chunk_overlap,
-                    similarity_threshold=similarity_threshold,
-                    min_chunk_size=min_chunk_size,
-                    elements=elements if strategy == "context_aware" else None,
-                )
                 source_type = source_type_of(staged)
-                out.extend({
-                    "content": c,
-                    "source_file": filename,
-                    "source_type": source_type,
-                    "chunk_index": i,
-                    "chunk_strategy": strategy,
-                    "chunk_size": chunk_size,
-                    "chunk_overlap": chunk_overlap,
-                    "created_at": now,
-                } for i, c in enumerate(chunks))
+                # Split as ingest splits it (#621): a file over the per-file
+                # limits under the new settings is rebuilt as parts, however
+                # many parts it had before.
+                number = 0
+                split_settings = splitter.Settings(strategy, chunk_size, chunk_overlap,
+                                                   similarity_threshold, min_chunk_size)
+                try:
+                    for kind, chunks in splitter.split_file(staged, split_settings, _parse_file, do_chunk):
+                        number += 1
+                        source = filename if kind == "whole" else parts.part_name(filename, number)
+                        out.extend({
+                            "content": c,
+                            "source_file": source,
+                            "source_type": source_type,
+                            "chunk_index": i,
+                            "chunk_strategy": strategy,
+                            "chunk_size": chunk_size,
+                            "chunk_overlap": chunk_overlap,
+                            "created_at": now,
+                        } for i, c in enumerate(chunks))
+                except splitter.PartError as exc:
+                    raise ValueError(f"{filename}: part {exc.number}: {exc}") from exc.cause
+                except splitter.StoredTextTooLarge as exc:
+                    # The same cap as ingest (PR #630): the re-chunk fails whole,
+                    # before the collection is touched.
+                    raise ValueError(f"{filename}: {exc}") from exc
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -16525,6 +17470,8 @@ export interface JobStatus {
   // Files that could not be parsed at all, or that a later file with the same
   // name replaced in the upload (#22) — never counted in files_total.
   skipped?: string[]
+  // Files over the per-file limits, stored as parts (#621)
+  split?: string[]
   // Earlier chunks of the same names this job removed (#22).
   chunks_replaced?: number
   // Chunks sent to Weaviate and those it acknowledged (#302); null on records
@@ -16961,6 +17908,18 @@ export default function ProgressPanel({ job }: { job: JobStatus }) {
         <ul className="mt-2 text-xs text-red-600 space-y-1">
           {job.errors.map((e, i) => <li key={i}>{e}</li>)}
         </ul>
+      )}
+      {(job.split?.length ?? 0) > 0 && (
+        // A file over the per-file limits is stored as parts named
+        // `<name> (part N)` (#621); not a failure, but the names differ.
+        <div className="mt-2 text-xs text-gray-700" data-testid="split-files">
+          <p className="font-medium">
+            {job.split!.length} file{job.split!.length === 1 ? '' : 's'} split into parts:
+          </p>
+          <ul className="space-y-1 mt-1">
+            {job.split!.map((f, i) => <li key={i}>{f}</li>)}
+          </ul>
+        </div>
       )}
       {(job.skipped?.length ?? 0) > 0 && (
         // Skipped files are never counted in files_total, so without this the
@@ -20708,6 +21667,27 @@ paths: a few word matches read in one query, and over 10,000 walked.
 `browser/ui_criteria.js` (suite 06) stubs the job response and checks that the Import
 page shows "Replaced N chunk(s) from a previous version" only when `chunks_replaced` is above
 0, and the plain "N file(s) skipped:" heading with each entry's own reason.
+
+`scripts/tests/test_split_parts.py` (#621) checks that a file over the per-file limits is
+stored as parts `<name> (part N)` instead of failing, with Weaviate replaced by an in-memory
+collection that keeps the replacement helpers' contract (`accept` included): 13,000 JSON Lines
+records of 600 characters under `context_aware`, and a `.jsonl`, a `.txt` and a `.json` over
+10,000,000 characters (each failing on the code before #621); a file within the limits stored
+as before; replacement of a name's whole family (a smaller, an unsplit and a newly split
+re-upload) with neighbours such as `a/data.jsonl` and `Data.jsonl` untouched; a bad line, a
+failed insert and a failed removal after part 1 (nothing stored, the earlier version whole);
+a record over the chunk cap; the cuts, CSV headers, Markdown fences, a streamed Latin-1 file
+and one no encoding reads, `overlap` sizing, the halving re-split and the `semantic` sentence
+limit; re-chunk coverage and rebuild, export links, and `ChunkLimitError`. `split_parts.py` then
+runs the same in the real ingest worker and Weaviate, on a scratch collection without a
+vectorizer (embedding 13,000 chunks through Ollama takes this project about an hour): the
+13,000-record file (`context_aware`) and a 10,519,499-character `.txt` (`fixed` 6,000) are
+stored as numbered parts with the job's `split` entry, re-uploading the `.txt` within the
+limits replaces every part and leaves the `.jsonl`'s parts untouched, and a bad line after
+part 1 fails the file and stores nothing. `overlap_chunks.py` (suite 08) stores a
+20,000-character file at 1,000/999 as two parts, each inside both window limits, that restore
+it exactly, and `browser/ui_criteria.js` checks the progress panel's "1 file split into
+parts:" list.
 `05_transfer.sh` (E32) replaces a file, adds a second name for the new content, re-chunks,
 and checks that only the new text comes back, under both names. It also adds a name with no
 stored chunks to the retained index first, and checks that the rechunk doesn't rebuild it and
@@ -20832,8 +21812,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, a failed metric read as the 503, the metric read on every query; registered by suite 03 |
 | `citation_score.py` | helper for suite 03 (#376), run in the API container: citation scores of known vectors on a real Weaviate for each distance metric, and after a collection is recreated with another metric |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
-| `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
-| `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
+| `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds, and a file over the output limits stored as parts inside them (#621) |
+| `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget (parts, #621) regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, review 404 codes and empty-edit refusal (#381), export schema, export name refusals (#370) |
 | `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
@@ -20847,6 +21827,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
 | `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
 | `../tests/test_reingest.py` | controlled re-ingest replacement, exact-name selection (#622), same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
+| `../tests/test_split_parts.py` | controlled regressions for files over the per-file limits stored as parts (#621): the reviewer's 13,000 records, files over 10,000,000 characters, family replacement, all or nothing, cuts, CSV, Markdown, encoding, `overlap` sizing, re-chunk and export links, registered by ingest |
+| `split_parts.py` | helper for ingest (#621), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, files over the per-file limits are stored as parts, a smaller re-upload replaces every part, and a bad line after part 1 stores nothing; the collection is removed afterwards |
 | `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`) and over 10,000 (`walk`); the collection is removed afterwards |
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
@@ -27330,20 +28312,63 @@ try:
                     print(f'PASS {label}: real parsed text stored as {len(chunks)} bounded windows with exact coverage/overlap', flush=True)
                 finally:
                     ingest_pipeline._jobs.pop(job_id,None)
+        # #621: a file whose overlap output would pass the per-file limits is
+        # stored as parts, each inside them, with every character kept. 1000/900
+        # stores just under ten times the text, inside the cap (PR #630).
         stage = root / 'budget'
         stage.mkdir()
         source = stage / 'over-budget.txt'
-        source.write_text('x' * 100000)
+        text = '\n\n'.join(['x' * 998] * 1100)
+        source.write_text(text)
         job_id='overlap-budget-'+uuid.uuid4().hex[:8]
-        job={'status':'queued','files_total':1,'files_completed':0,'files_failed':0,'chunks_stored':0,'errors':[]}
+        job={'status':'queued','files_total':1,'files_completed':0,'files_failed':0,'chunks_stored':0,'errors':[],'split':[]}
         ingest_pipeline._jobs[job_id]=job
         try:
-            ingest_pipeline._process_job_sync(job_id,[source],stage,collection,'overlap',1000,999,0.85,100)
-            assert job['status']=='failed' and job['files_failed']==1 and job['chunks_stored']==0,job
-            assert any('per-file limit' in error for error in job['errors']),job
-            stored=list(wc.get_client().collections.get(collection).iterator())
-            assert not any(o.properties['source_file']==source.name for o in stored)
-            print('PASS excessive overlap output fails before object storage',flush=True)
+            with patch.object(settings, 'sources_dir', str(root/'retained')):
+                ingest_pipeline._process_job_sync(job_id,[source],stage,collection,'overlap',1000,900,0.85,100)
+            assert job['status']=='completed' and job['files_completed']==1,job
+            stored=[o.properties for o in wc.get_client().collections.get(collection).iterator()
+                    if o.properties['source_file'].startswith(source.name)]
+            names=sorted({p['source_file'] for p in stored})
+            assert names==[f'{source.name} (part 1)',f'{source.name} (part 2)'],names
+            assert job['chunks_stored']==len(stored),job
+            assert job['split']==[f"{source.name}: split into 2 parts, stored as '{source.name} (part 1)' "
+                                  f"to '{source.name} (part 2)'"],job
+            # Each part restores exactly: its paragraphs, as the parser joins them
+            # (one line break between), every character and separator in place,
+            # and the parts together hold every paragraph once.
+            paragraphs=0
+            for name in names:
+                windows=[p['content'] for p in sorted((p for p in stored if p['source_file']==name),
+                                                      key=lambda p:p['chunk_index'])]
+                assert len(windows)<=chunker.MAX_OVERLAP_WINDOWS,(name,len(windows))
+                assert sum(map(len,windows))<=chunker.MAX_OVERLAP_OUTPUT_CHARACTERS,name
+                restored=windows[0]+''.join(w[900:] for w in windows[1:])
+                count=restored.count('\n')+1
+                assert restored=='\n'.join(['x'*998]*count),(name,len(restored))
+                paragraphs+=count
+            assert paragraphs==1100,paragraphs
+            print('PASS excessive overlap output is stored as parts inside the per-file limits',flush=True)
+        finally:
+            ingest_pipeline._jobs.pop(job_id, None)
+        # PR #630: a split file whose chunks would store more than ten times its
+        # size fails whole: 1000/999 stores about 1,000 times, and nothing stays.
+        stage = root / 'capped'
+        stage.mkdir()
+        source = stage / 'capped.txt'
+        source.write_text('x' * 20000)
+        job_id='overlap-capped-'+uuid.uuid4().hex[:8]
+        job={'status':'queued','files_total':1,'files_completed':0,'files_failed':0,'chunks_stored':0,'errors':[],'split':[]}
+        ingest_pipeline._jobs[job_id]=job
+        try:
+            with patch.object(settings, 'sources_dir', str(root/'retained')):
+                ingest_pipeline._process_job_sync(job_id,[source],stage,collection,'overlap',1000,999,0.85,100)
+            assert job['status']=='failed' and job['chunks_stored']==0,job
+            assert len(job['errors'])==1 and job['errors'][0].startswith('capped.txt: it would store ') \
+                and 'more than 10 times its own size (20,000 characters)' in job['errors'][0],job
+            assert not any(o.properties['source_file'].startswith('capped.txt')
+                           for o in wc.get_client().collections.get(collection).iterator())
+            print('PASS a split file storing over ten times its size fails whole, nothing stored',flush=True)
         finally:
             ingest_pipeline._jobs.pop(job_id, None)
     print('PASS owned temporary source paths removed', flush=True)
@@ -29279,6 +30304,86 @@ check "replacing a name on the page path selects exactly that name in real Weavi
 check "replacing a name on the walk path, past 10,000 word matches, selects exactly that name (#622)" $?
 drop_collection "$EX"
 rm -rf "$EXFIX"
+
+# ── a file over the per-file limits is stored as parts (#621) ────────────────
+# Controlled cases: the reviewer's 13,000 records, files over 10,000,000
+# characters, family replacement, all or nothing, cuts, CSV, Markdown, encoding,
+# overlap sizing, re-chunk, export links.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_split_parts.py)
+check "files over the per-file limits are split into parts: regressions (#621)" $?
+# The same in the real Weaviate and ingest worker, on a scratch collection
+# without a vectorizer (embedding 13,000 chunks takes this project about an
+# hour): the reviewer's 13,000 records, a 10,519,499-character .txt, a smaller
+# re-upload replacing every part, and a bad line after part 1 storing nothing.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" < scripts/verify/split_parts.py)
+check "files over the per-file limits are stored as parts in the real Weaviate, replaced whole, all or nothing (#621)" $?
+
+# Reviewer (PR #630): the same through the API and the proxy. The collection is
+# made in Weaviate without a vectorizer, so the 13,000 chunks store in seconds;
+# the upload, the worker and the job record are the real ones.
+SPL="${PREFIX}SplitApi"
+SPLFIX=$(mktemp -d)
+drop_collection "$SPL"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$SPL" <<'PY'
+import sys
+from weaviate.classes.config import Configure, VectorDistances
+from services import weaviate_client as wc
+wc.get_client().collections.create(
+    name=sys.argv[1], vectorizer_config=Configure.Vectorizer.none(),
+    vector_index_config=Configure.VectorIndex.hnsw(distance_metric=VectorDistances.COSINE),
+    properties=wc.COLLECTION_PROPERTIES)
+wc.close_client()
+PY
+)
+python3 - "$SPLFIX" <<'PY'
+import json, sys
+from pathlib import Path
+row = lambda i: json.dumps({"t": f"{i:07d} " + "x" * 589}) + "\n"
+Path(sys.argv[1], "big").mkdir()
+Path(sys.argv[1], "small").mkdir()
+Path(sys.argv[1], "big", "big.jsonl").write_text("".join(row(i) for i in range(13_000)))
+Path(sys.argv[1], "small", "big.jsonl").write_text("".join(row(i) for i in range(3)))
+PY
+split_upload() {
+  curl -s -m 600 -o /tmp/vfy_split_job.json -X POST "$API/ingest/upload" -F "collection=$SPL" \
+    -F "strategy=context_aware" -F "chunk_size=1000" -F "chunk_overlap=0" -F "min_chunk_size=0" \
+    -F "files=@$1" || return 1
+  local job; job=$(jfield "['job_id']" < /tmp/vfy_split_job.json) || return 1
+  wait_for_job "/ingest/job/$job" 900 >/dev/null
+  api_get "/ingest/job/$job" > /tmp/vfy_split_job.json
+}
+split_count() {
+  api_get "/collections" | python3 -c "
+import json,sys
+print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$SPL'][0])"
+}
+split_upload "$SPLFIX/big/big.jsonl"
+count=$(split_count)
+python3 - "$count" <<'PY'
+import json, sys
+job = json.load(open("/tmp/vfy_split_job.json"))
+n = len(job.get("split") or []) and int(job["split"][0].split("split into ")[1].split(" ")[0])
+ok = (job["status"] == "completed" and job["files_completed"] == 1 and job["errors"] == []
+      and job["chunks_stored"] == 13_000 and int(sys.argv[1]) == 13_000 and n >= 2
+      and job["split"] == [f"big.jsonl: split into {n} parts, stored as 'big.jsonl (part 1)' "
+                           f"to 'big.jsonl (part {n})'"])
+print({k: job.get(k) for k in ("status", "files_completed", "chunks_stored", "split", "errors")}, sys.argv[1])
+sys.exit(0 if ok else 1)
+PY
+check "reviewer: 13,000 records uploaded through the API complete as parts, listed in the job's split (#621)" $?
+split_upload "$SPLFIX/small/big.jsonl"
+count=$(split_count)
+python3 - "$count" <<'PY'
+import json, sys
+job = json.load(open("/tmp/vfy_split_job.json"))
+ok = (job["status"] == "completed" and job.get("split") == [] and job["chunks_replaced"] == 13_000
+      and int(sys.argv[1]) == job["chunks_stored"] > 0)
+print({k: job.get(k) for k in ("status", "chunks_stored", "chunks_replaced", "split")}, sys.argv[1])
+sys.exit(0 if ok else 1)
+PY
+check "reviewer: re-uploading the name through the API replaces every part (#621)" $?
+drop_collection "$SPL"
+rm -rf "$SPLFIX" /tmp/vfy_split_job.json
 
 # ── job status transitions ───────────────────────────────────────────────────
 # `queued` is only observable when the executor is saturated, so this asserts
@@ -34523,6 +35628,9 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     fs.writeFileSync(small, 'Re-ingest fixture.\n');
     const jobId = 'vfyrein' + replaced;
     const skippedEntry = "u.zip:a/r.txt (replaced by r.txt later in this upload, same name 'a/r.txt')";
+    // A file over the per-file limits is stored as parts and listed in `split` (#621).
+    const splitEntry = "big.jsonl: split into 2 parts, stored as 'big.jsonl (part 1)' to 'big.jsonl (part 2)'";
+    const split = replaced === 3 ? [splitEntry] : [];
     const s = await session(browser, BASE, 'developer');
     await s.page.setRequestInterception(true);
     s.page.on('request', request => {
@@ -34530,7 +35638,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
       if (path === '/api/ingest/upload' && request.method() === 'POST')
         return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'x' }) });
       if (path === '/api/ingest/job/' + jobId)
-        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 2, errors: [], skipped: [skippedEntry], chunks_replaced: replaced }) });
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 2, errors: [], skipped: [skippedEntry], chunks_replaced: replaced, split }) });
       return request.continue();
     });
     try {
@@ -34551,6 +35659,12 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
                 text.includes('1 file skipped:') && !text.includes('not a supported type:') && text.includes(skippedEntry),
                 text.slice(0, 300));
       }
+      if (replaced === 3)
+        r.check('a split file is listed under "1 file split into parts:" with its part names (#621)',
+                text.includes('1 file split into parts:') && text.includes(splitEntry), text.slice(0, 400));
+      if (replaced === 0)
+        r.check('an empty split list shows no split heading (#621)', clicked && !text.includes('split into parts'),
+                text.slice(0, 300));
       r.check(`re-ingest progress fixture (${replaced}) causes no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')));
     } finally {
       fs.unlinkSync(small);

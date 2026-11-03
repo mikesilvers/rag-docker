@@ -308,7 +308,10 @@ One JSON object per line:
 - `source_sha256` links the chunk to its file in `sources/`, and is `null` in
   `chunks-only` packages. It is also `null` when the chunk's file name maps to
   more than one retained digest, or to a blob missing on disk at export. A
-  non-null value always names a blob the package carries (#509).
+  non-null value always names a blob the package carries (#509). A part of a
+  file stored as parts, `source_file` `<name> (part N)` (`SPECIFICATIONS.md`
+  §5.1.1, #621), links to the file retained under `<name>` when no retained
+  file is listed under the part's own name.
 - Vectors are JSON numbers. A packed float32 sidecar was measured at only ~12%
   smaller after gzip and is rejected (`RAG_EXPORT_ANALYSIS.md` §6).
 

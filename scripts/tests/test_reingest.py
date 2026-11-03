@@ -242,30 +242,36 @@ class AdmissionTests(unittest.TestCase):
 
 
 class FakeCollection:
-    """Chunks by name, with the replacement helpers' contract."""
+    """Chunks by name, with the replacement helpers' contract. `accept`, as the
+    real helpers take it, selects a name's family (#621); without it, the name."""
 
     def __init__(self, **existing):
         self.chunks = {name: [{"content": c, "created_at": "old"} for c in contents]
                        for name, contents in existing.items()}
         self.calls = []
 
-    def has(self, collection, name):
+    def selected(self, name, accept=None):
+        return [n for n in self.chunks if (accept(n) if accept else n == name)]
+
+    def has(self, collection, name, accept=None):
         self.calls.append(("has", name))
-        return bool(self.chunks.get(name))
+        return any(self.chunks[n] for n in self.selected(name, accept))
 
     def insert(self, collection, chunks):
         self.calls.append(("insert", chunks[0]["source_file"] if chunks else None))
         for chunk in chunks:
             self.chunks.setdefault(chunk["source_file"], []).append(chunk)
 
-    def delete(self, collection, name, created_at, expected):
+    def delete(self, collection, name, created_at, expected, accept=None):
         self.calls.append(("delete", name))
         stamp = created_at.isoformat()
-        mine = [c for c in self.chunks[name] if c["created_at"] == stamp]
-        if len(mine) != expected:
+        names = self.selected(name, accept)
+        mine = {n: [c for c in self.chunks[n] if c["created_at"] == stamp] for n in names}
+        if sum(len(m) for m in mine.values()) != expected:
             raise wc.ReplaceError("mismatch", 0)
-        removed = len(self.chunks[name]) - len(mine)
-        self.chunks[name] = mine
+        removed = sum(len(self.chunks[n]) - len(mine[n]) for n in names)
+        for n in names:
+            self.chunks[n] = mine[n]
         return removed
 
 
@@ -379,7 +385,7 @@ class WorkerTests(unittest.TestCase):
     def test_a_removal_failure_keeps_new_chunks_and_reports_partial(self):
         backend = FakeCollection(**{"p.txt": ["v1", "v1b"]})
 
-        def delete(collection, name, created_at, expected):
+        def delete(collection, name, created_at, expected, accept=None):
             raise wc.ReplaceError("1 earlier chunk(s) remain", 1)
 
         with self.assertLogs("services.ingest_pipeline", "ERROR"):
@@ -395,7 +401,7 @@ class WorkerTests(unittest.TestCase):
     def test_a_deleted_collection_is_reported_at_the_lookup(self):
         backend = FakeCollection()
 
-        def has(collection, name):
+        def has(collection, name, accept=None):
             raise RuntimeError("could not find class Coll in schema")
 
         backend.has = has
@@ -412,11 +418,11 @@ class WorkerTests(unittest.TestCase):
         lookups = []
         has = backend.has
 
-        def flaky_has(collection, name):
+        def flaky_has(collection, name, accept=None):
             lookups.append(name)
             if name == "q.txt" and lookups.count("q.txt") == 1:
                 raise RuntimeError("weaviate read timed out")
-            return has(collection, name)
+            return has(collection, name, accept)
 
         backend.has = flaky_has
         with self.assertLogs("services.ingest_pipeline", "WARNING"):
