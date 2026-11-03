@@ -131,7 +131,7 @@ try:
         state = stored()
         check("a bad line after part 1 fails the file and stores nothing new",
               job["status"] == "failed" and len(job["errors"]) == 1
-              and job["errors"][0].startswith("big.jsonl: part ") and ": line 17001 " in job["errors"][0]
+              and job["errors"][0].startswith("big.jsonl: part 2: line 17001 ")
               and job["errors"][0].endswith("; nothing from it was stored"), job)
         check("the earlier big.jsonl parts are still whole", all(state.get(n) == before[n] for n in jparts))
 finally:

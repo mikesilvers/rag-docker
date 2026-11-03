@@ -240,7 +240,8 @@ class AllOrNothingTests(JobCase):
         self.assertEqual((job["status"], job["files_completed"], job["files_failed"]),
                          ("partial", 1, 1), job)
         self.assertEqual(len(job["errors"]), 1)
-        self.assertRegex(job["errors"][0], r"^data\.jsonl: part \d+: line 17001 is not valid JSON: "
+        # Part 1 is packed to 10,000 records; the bad line is read filling part 2.
+        self.assertRegex(job["errors"][0], r"^data\.jsonl: part 2: line 17001 is not valid JSON: "
                                            r".*; nothing from it was stored$")
         self.assertEqual([c["content"] for c in backend.of("data.jsonl")], ["earlier"])
         self.assertEqual(backend.names(), ["data.jsonl", "ok.jsonl"])
@@ -970,6 +971,110 @@ class SplitOnlyWhenRefusedTests(JobCase):
                 SimpleNamespace(properties={"source_file": "big.jsonl", "chunk_index": 0})]
             with self.assertRaisesRegex(ValueError, r"^big\.jsonl: part 2: owned failure$"):
                 tuning._chunks_from_sources("Coll", "context_aware", 1000, 0, 0.85, 0)
+
+
+class ReviewerStoredTextCapBoundaryTests(JobCase):
+    """PR #630 testing review (cc99010): the ten-times cap's boundary, the cap met
+    on a later part (after parts are stored) with an earlier version kept, and a
+    gzip file measured by its decompressed bytes (decision 5)."""
+
+    @staticmethod
+    def paragraphs(count=40, size=200):
+        return "\n\n".join(f"p{i:04d} " + "z" * (size - 6) for i in range(count))
+
+    def fake_chunk(self, path, per_part):
+        """Chunking the whole file goes over the cap, so it is split in two halves;
+        part n (1-based) gives the chunks per_part(n, text, own) returns."""
+        own = path.stat().st_size
+        calls = [0]
+
+        def chunk(text, strategy, **kwargs):
+            if len(text) > own // 2 + 100:
+                raise chunker.ChunkLimitError("over the cap", "chunks")
+            calls[0] += 1
+            return per_part(calls[0], text, own)
+        return chunk
+
+    def test_exactly_ten_times_its_size_is_stored_and_one_more_character_fails(self):
+        from services import splitter
+        path = Path(tempfile.mkdtemp()) / "edge.txt"
+        path.write_text(self.paragraphs())
+        own = path.stat().st_size
+        settings = splitter.Settings("fixed", 1000, 0, 0.85, 0)
+        first = 5 * own
+
+        def exact(n, text, own):
+            return ["a" * first] if n == 1 else ["a" * (10 * own - first)]
+        parts = list(splitter.split_file(path, settings, chunk=self.fake_chunk(path, exact)))
+        self.assertEqual([k for k, _ in parts], ["part", "part"])
+        self.assertEqual(sum(len(c) for _, cs in parts for c in cs), 10 * own)
+
+        def over(n, text, own):
+            return ["a" * first] if n == 1 else ["a" * (10 * own - first + 1)]
+        handed = []
+        with self.assertRaises(splitter.StoredTextTooLarge) as caught:
+            for kind, chunks in splitter.split_file(path, settings,
+                                                    chunk=self.fake_chunk(path, over)):
+                handed.append(kind)
+        self.assertEqual(handed, ["part"])  # part 2 is refused before it is handed on
+        self.assertEqual(str(caught.exception), StoredTextCapTests.message(10 * own + 1, own))
+
+    def test_the_cap_met_on_a_later_part_removes_stored_parts_and_keeps_the_earlier_version(self):
+        data = self.paragraphs()
+        own = len(data.encode())
+
+        def later_over(n, text, own):
+            # Part 1 stores its own text; part 2 alone takes the total over.
+            return [text] if n == 1 else [text] * (10 * own // len(text) + 2)
+        staged = Path(tempfile.mkdtemp()) / "notes.txt"
+        staged.write_text(data)
+        chunk = self.fake_chunk(staged, later_over)
+        backend = FakeCollection([("notes.txt", ["earlier"]), ("notes.txt (part 1)", ["older part"])])
+        with patch.object(ingest_pipeline, "do_chunk", chunk):
+            job, backend = self.run_job([("notes.txt", data), ("ok.jsonl", records(2, 50))],
+                                        "fixed", backend=backend)
+        self.assertGreaterEqual(backend.inserts, 2, "part 1 must have been stored first")
+        self.assertEqual((job["status"], job["files_completed"], job["files_failed"]),
+                         ("partial", 1, 1), job)
+        self.assertEqual(len(job["errors"]), 1, job["errors"])
+        self.assertRegex(job["errors"][0], r"^notes\.txt: it would store [\d,]+ characters of "
+                         r"chunks, more than 10 times its own size \(" + f"{own:,}" + r" characters\); "
+                         r"use less chunk_overlap, shorten repeated headers or keys, or split the file$")
+        self.assertNotIn("part ", job["errors"][0])
+        self.assertEqual(backend.of_contents("notes.txt"), ["earlier"])
+        self.assertEqual(backend.of_contents("notes.txt (part 1)"), ["older part"])
+        self.assertEqual(backend.names(), ["notes.txt", "notes.txt (part 1)", "ok.jsonl"])
+        self.assertEqual(job["chunks_stored"], len(backend.of("ok.jsonl")), job)
+        self.assertEqual(job["split"], [])
+        self.assertEqual(self.retained, ["ok.jsonl"])
+
+    def test_a_gzip_file_is_measured_by_its_decompressed_bytes(self):
+        import gzip
+        raw = records(250, 1000)
+        job, backend = self.run_job([("windows.jsonl.gz", gzip.compress(raw.encode()))],
+                                    "overlap", 1000, overlap=990)
+        self.assertEqual(job["status"], "failed", job)
+        self.assertEqual(len(job["errors"]), 1, job["errors"])
+        self.assertIn(f"more than 10 times its own size ({len(raw.encode()):,} characters)",
+                      job["errors"][0])
+        self.assertTrue(job["errors"][0].startswith("windows.jsonl.gz: it would store "))
+        self.assertEqual(backend.chunks, [])
+
+    def test_a_pdf_is_measured_by_its_extracted_text(self):
+        from services import splitter
+        from unstructured.documents.elements import NarrativeText
+        elements = [NarrativeText(text=f"e{i:04d} " + "q" * 994) for i in range(250)]
+
+        def parse(path):
+            return "\n".join(str(e) for e in elements), elements
+
+        path = Path(tempfile.mkdtemp()) / "report.pdf"
+        path.write_bytes(b"%PDF-1.4 stand-in")
+        own = sum(len(str(e)) for e in elements)
+        with self.assertRaises(splitter.StoredTextTooLarge) as caught:
+            list(splitter.split_file(path, splitter.Settings("overlap", 1000, 990, 0.85, 0),
+                                     parse=parse))
+        self.assertIn(f"more than 10 times its own size ({own:,} characters)", str(caught.exception))
 
 
 if __name__ == "__main__":

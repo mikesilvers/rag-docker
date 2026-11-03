@@ -28326,14 +28326,20 @@ try:
             assert job['chunks_stored']==len(stored),job
             assert job['split']==[f"{source.name}: split into 2 parts, stored as '{source.name} (part 1)' "
                                   f"to '{source.name} (part 2)'"],job
-            restored=''
+            # Each part restores exactly: its paragraphs, as the parser joins them
+            # (one line break between), every character and separator in place,
+            # and the parts together hold every paragraph once.
+            paragraphs=0
             for name in names:
                 windows=[p['content'] for p in sorted((p for p in stored if p['source_file']==name),
                                                       key=lambda p:p['chunk_index'])]
                 assert len(windows)<=chunker.MAX_OVERLAP_WINDOWS,(name,len(windows))
                 assert sum(map(len,windows))<=chunker.MAX_OVERLAP_OUTPUT_CHARACTERS,name
-                restored+=windows[0]+''.join(w[900:] for w in windows[1:])
-            assert restored.count('x')==text.count('x'),(restored.count('x'),text.count('x'))
+                restored=windows[0]+''.join(w[900:] for w in windows[1:])
+                count=restored.count('\n')+1
+                assert restored=='\n'.join(['x'*998]*count),(name,len(restored))
+                paragraphs+=count
+            assert paragraphs==1100,paragraphs
             print('PASS excessive overlap output is stored as parts inside the per-file limits',flush=True)
         finally:
             ingest_pipeline._jobs.pop(job_id, None)
