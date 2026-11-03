@@ -717,12 +717,15 @@ def _undo_new_chunks(job: dict, collection: str, name: str, created_at: datetime
     """
     cause = exc.cause if isinstance(exc, splitter.PartError) else exc
     reason = str(cause) or type(cause).__name__
-    split = isinstance(exc, splitter.PartError) or kind == "part"
+    # Storing more than ten times its own size fails the whole file, not a part
+    # (PR #630): its parts are removed, and its error stands as it is.
+    whole = isinstance(exc, splitter.StoredTextTooLarge)
+    split = (isinstance(exc, splitter.PartError) or kind == "part") and not whole
     if isinstance(exc, splitter.PartError):
         reason = f"part {exc.number}: {reason}"
-    elif kind == "part":
+    elif kind == "part" and not whole:
         reason = f"part {part_count}: {reason}"
-    if not (stored or (split and part_count)):
+    if not (stored or ((split or whole) and part_count)):
         return _FileFailed(reason)
     try:
         removed = wc._delete_new_family_sync(collection, name, created_at)

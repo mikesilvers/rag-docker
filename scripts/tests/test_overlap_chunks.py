@@ -72,7 +72,9 @@ class OverlapTests(unittest.TestCase):
         # #621: a re-chunk whose new settings take a retained original over
         # chunk_overlap's per-file limits rebuilds it as parts, each inside them,
         # instead of failing the tuning job.
-        records = ''.join(json.dumps({'body': 'x' * 990}) + '\n' for _ in range(20)).encode()
+        # 1000/800 (PR #630): 1000/999 stores about 1,000 times a split file's
+        # size and is now refused by the ten-times cap; 800 stores about 5 times.
+        records = ''.join(json.dumps({'body': 'x' * 990}) + '\n' for _ in range(2500)).encode()
         with tempfile.TemporaryDirectory() as directory:
             src_dir = Path(directory)
             digest = hashlib.sha256(records).hexdigest()
@@ -80,7 +82,7 @@ class OverlapTests(unittest.TestCase):
             job_id = 'tune-budget-test'
             tuning._jobs[job_id] = {'job_id': job_id}
             params = {'chunking': {'strategy': 'overlap', 'chunk_size': 1000,
-                                    'chunk_overlap': 999, 'similarity_threshold': 0.85,
+                                    'chunk_overlap': 800, 'similarity_threshold': 0.85,
                                     'min_chunk_size': 100}}
             with patch.object(tuning.settings, 'upload_dir', directory), \
                  patch.object(tuning.sources, 'has_sources', return_value=True), \
@@ -177,7 +179,8 @@ class OverlapTests(unittest.TestCase):
         # split into parts, each inside them, instead of failing.
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);bad=root/'over-budget.jsonl'
-            bad.write_text(''.join(json.dumps({'body':'x'*990})+'\n' for _ in range(20)))
+            # 1000/800 (PR #630): 1000/999 would store about 1,000 times its size.
+            bad.write_text(''.join(json.dumps({'body':'x'*990})+'\n' for _ in range(2500)))
             good=root/'accepted.jsonl';good.write_text(json.dumps({'body':'inert text'})+'\n')
             job_id='overlap-budget-test'
             job={'status':'queued','files_total':2,'files_completed':0,'files_failed':0,'chunks_stored':0,'errors':[],'split':[]}
@@ -186,7 +189,7 @@ class OverlapTests(unittest.TestCase):
                 with patch.object(ingest_pipeline.wc,'_insert_chunks_sync') as store, \
                      patch.object(ingest_pipeline.wc, '_source_has_chunks_sync', return_value=False), \
                      patch.object(ingest_pipeline.sources,'store') as retained:
-                    ingest_pipeline._process_job_sync(job_id,[bad,good],root,'ReviewOverlap','overlap',1000,999,0.85,100)
+                    ingest_pipeline._process_job_sync(job_id,[bad,good],root,'ReviewOverlap','overlap',1000,800,0.85,100)
                     names=[call.args[1][0]['source_file'] for call in store.call_args_list]
                     self.assertGreaterEqual(len(names),3,names)
                     self.assertEqual(names,[f'over-budget.jsonl (part {n})' for n in range(1,len(names))]+['accepted.jsonl'])

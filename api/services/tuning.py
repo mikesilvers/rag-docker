@@ -346,6 +346,10 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                         } for i, c in enumerate(chunks))
                 except splitter.PartError as exc:
                     raise ValueError(f"part {exc.number}: {exc}") from exc.cause
+                except splitter.StoredTextTooLarge as exc:
+                    # The same cap as ingest (PR #630): the re-chunk fails whole,
+                    # before the collection is touched.
+                    raise ValueError(f"{filename}: {exc}") from exc
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

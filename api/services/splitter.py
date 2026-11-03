@@ -23,6 +23,7 @@ from __future__ import annotations
 import codecs
 import csv
 import io
+import itertools
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
@@ -100,8 +101,10 @@ def _overlap_windows(length: int, size: int, overlap: int) -> int:
 
 
 def part_limits(settings: Settings) -> tuple[int, int | None]:
-    """The most text one part may hold, and the most units (`context_aware`), so
-    that its estimated chunking stays inside the per-file limits."""
+    """The most text one part may hold, so that its estimated chunking stays
+    inside the per-file limits. The second value is kept for callers and is always
+    None: `context_aware` parts are sized by replaying its packing (_Packing),
+    since a count of units would split files well inside the limits (PR #630)."""
     cap = chunker.MAX_CHUNKS_PER_FILE
     text = chunker.MAX_TEXT_CHARACTERS
     size, overlap = settings.chunk_size, settings.chunk_overlap
@@ -111,9 +114,7 @@ def part_limits(settings: Settings) -> tuple[int, int | None]:
     if strategy == "language":
         return min(text, cap * max(size - overlap, 1)), None
     if strategy == "context_aware":
-        # Packing never puts less than a whole unit in a chunk, but a unit longer
-        # than a chunk can give several.
-        return min(text, cap * size), cap
+        return min(text, cap * size), None
     if strategy == "overlap":
         def fits(length: int) -> bool:
             windows = _overlap_windows(length, size, overlap)
@@ -293,6 +294,7 @@ class _Source:
         self.header = ""
         self.dialect = None
         self._stream = None
+        self.own_size: int | None = None
         if ftype == "jsonl":
             self.units = (Unit(t, "record", o) for o, t, _ in ip._jsonl_units(path))
         elif ftype == "json":
@@ -301,6 +303,8 @@ class _Source:
         elif ftype == "elements":
             _, elements = parse(path)
             self.units = iter([Unit(str(el), element=el) for el in elements])
+            # A PDF or DOCX is measured by its extracted text, not its (compressed) bytes.
+            self.own_size = sum(len(str(el)) for el in elements)
         else:
             encoding = text_encoding(path)
             self._stream = path.open("r", encoding=encoding, newline="" if ftype == "csv" else None)
@@ -330,6 +334,26 @@ class _Source:
                 yield from cut_unit(unit, cut_at, self.dialect)
             else:
                 yield unit
+
+    def own(self) -> int:
+        """The file's own size, which its stored chunk text is measured against:
+        its bytes; a gzip file's decompressed bytes; a PDF's or DOCX's text."""
+        if self.own_size is None:
+            size = self.path.stat().st_size
+            if self.path.name.lower().endswith(".gz"):
+                import gzip
+                try:
+                    size = 0
+                    with gzip.open(self.path, "rb") as gz:
+                        while True:
+                            block = gz.read(_BLOCK)
+                            if not block:
+                                break
+                            size += len(block)
+                except (OSError, EOFError):
+                    size = self.path.stat().st_size
+            self.own_size = size
+        return self.own_size
 
     def check_header(self) -> None:
         """Before a CSV is split: its header is repeated in every part, so one over
@@ -437,7 +461,7 @@ def split_file(path: Path, settings: Settings, parse: Callable | None = None,
         parse = ip._parse_file
     chunk = chunk or chunker.chunk
     ftype = file_type(path)
-    limit, max_units = part_limits(settings)
+    limit, _ = part_limits(settings)
 
     if ftype in _STREAMED_TEXT and path.stat().st_size <= limit:
         # Every encoding takes at least a byte a character, so the text fits.
@@ -467,7 +491,8 @@ def split_file(path: Path, settings: Settings, parse: Callable | None = None,
         pending = None
         for unit in units:
             added = len(unit.text) + (_separator(ftype, unit.element is not None) if first else 0)
-            if first and not _fits(chars + added, len(first) + 1, source.room, max_units):
+            # Text only: whether the file fits whole is decided by chunking it.
+            if first and not _fits(chars + added, len(first) + 1, source.room, None):
                 pending = unit
                 break
             first.append(unit)
@@ -498,6 +523,63 @@ def _fits(chars: int, count: int, limit: int, max_units: int | None) -> bool:
     return chars <= limit and (max_units is None or count <= max_units)
 
 
+def _pieces(length: int) -> int:
+    """How many chunks _cap_chunk_length makes of one chunk of `length` characters:
+    it cuts at whitespace no earlier than half the ceiling."""
+    ceiling = chunker.MAX_CHUNK_CHARACTERS
+    return 1 if length <= ceiling else -(-length // (ceiling // 2))
+
+
+class _Packing:
+    """Replays chunk_context_aware's packing over a part's units, to count its
+    chunks before minimum-size merging (which only lowers the count), plus the
+    pieces _cap_chunk_length cuts an over-long one into. Used to size
+    `context_aware` parts; halving remains the safety net."""
+
+    def __init__(self, size: int) -> None:
+        self.size, self.closed, self.buffer = size, 0, 0
+
+    def copy(self) -> "_Packing":
+        other = _Packing(self.size)
+        other.closed, other.buffer = self.closed, self.buffer
+        return other
+
+    def add(self, unit: Unit) -> None:
+        length = len(unit.text.strip())
+        if not length:
+            return
+        if getattr(unit.element, "category", None) == "Table":
+            if self.buffer:
+                self.closed += _pieces(self.buffer)
+                self.buffer = 0
+            self.closed += _pieces(length)
+        elif self.buffer and self.buffer + length + 1 > self.size:
+            self.closed += _pieces(self.buffer)
+            self.buffer = length
+        else:
+            self.buffer = self.buffer + 1 + length if self.buffer else length
+
+    def count(self) -> int:
+        return self.closed + (_pieces(self.buffer) if self.buffer else 0)
+
+
+# A file split into parts may store at most this many times its own size in
+# chunk text: a CSV header repeated in every part, overlap and JSON key paths all
+# multiply it (maintainer's decision on PR #630).
+MAX_STORED_RATIO = 10
+
+
+class StoredTextTooLarge(ValueError):
+    """A split file whose chunks would store more than MAX_STORED_RATIO times its
+    own size. The whole file fails; it is not a part's error."""
+
+    def __init__(self, stored: int, own: int) -> None:
+        super().__init__(
+            f"it would store {stored:,} characters of chunks, more than {MAX_STORED_RATIO} times "
+            f"its own size ({own:,} characters); use less chunk_overlap, shorten repeated "
+            f"headers or keys, or split the file")
+
+
 def _halves(source: _Source, units: list[Unit]) -> Iterator[list[str]]:
     """The chunks of units known to go over as one part: at least two parts."""
     if len(units) == 1:
@@ -519,39 +601,62 @@ def _parts(source: _Source, first: list[Unit], pending: Unit | None,
            units: Iterator[Unit], halve_first: bool = False) -> Iterator[tuple[str, list[str]]]:
     """Every part of a split file, from the units already read (`first`, and the
     one that did not fit, `pending`) and the rest of the reader. With
-    `halve_first`, `first` is known to go over as one part."""
-    _, max_units = part_limits(source.settings)
+    `halve_first`, `first` is the whole file, known to go over as one part.
+
+    Every other part, the first included, is filled from one stream of units by
+    the room left beside a CSV header and, for `context_aware`, a replay of its
+    packing (PR #630). Before each part is handed on to be stored, the chunk text
+    stored so far is checked against ten times the file's own size."""
     limit = source.room  # a CSV's header takes its share of every part
+    packing = source.settings.strategy == "context_aware"
+    cap = chunker.MAX_CHUNKS_PER_FILE
+    stored = 0
     number = 0
-    current = first
     # A file that is a single record over a limit is not split at all: its own
     # error is the file's, not a part's.
     alone = halve_first and len(first) == 1 and first[0].kind == "record"
+
+    def hand_on(produced: Iterable[list[str]]) -> Iterator[tuple[str, list[str]]]:
+        nonlocal stored, number
+        for chunks in produced:
+            # Checked before the part is handed on to be stored (#621, PR #630).
+            stored += sum(len(c) for c in chunks)
+            if stored > MAX_STORED_RATIO * source.own():
+                raise StoredTextTooLarge(stored, source.own())
+            number += 1
+            yield "part", chunks
+
     try:
-        while current:
-            sep = _separator(source.ftype, current[0].element is not None)
-            if pending is None and not halve_first:
-                chars = sum(len(u.text) for u in current) + sep * (len(current) - 1)
-                for unit in units:
-                    added = len(unit.text) + sep
-                    if not _fits(chars + added, len(current) + 1, limit, max_units):
-                        pending = unit
-                        break
-                    current.append(unit)
-                    chars += added
-            produced = _halves(source, current) if halve_first else _chunk_units(source, current)
-            halve_first = False
-            for chunks in produced:
-                number += 1
-                yield "part", chunks
+        if halve_first:
+            yield from hand_on(_halves(source, first))
+            return
+        stream = itertools.chain(first, [pending] if pending is not None else [], units)
+        pending = None
+        while True:
             if pending is not None:
                 current, pending = [pending], None
             else:
-                current = []
-                for unit in units:
-                    current = [unit]
+                unit = next(stream, None)
+                if unit is None:
+                    return
+                current = [unit]
+            sep = _separator(source.ftype, current[0].element is not None)
+            chars = len(current[0].text)
+            pack = _Packing(source.settings.chunk_size)
+            pack.add(current[0])
+            for unit in stream:
+                added = len(unit.text) + sep
+                trial = pack.copy()
+                trial.add(unit)
+                if (not _fits(chars + added, len(current) + 1, limit, None)
+                        or (packing and trial.count() > cap)):
+                    pending = unit
                     break
+                current.append(unit)
+                chars += added
+                pack = trial
+            yield from hand_on(_chunk_units(source, current))
     except Exception as exc:
-        if alone:
+        if alone or isinstance(exc, StoredTextTooLarge):
             raise
         raise PartError(number + 1, exc) from exc

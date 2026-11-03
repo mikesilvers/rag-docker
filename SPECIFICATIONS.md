@@ -886,7 +886,10 @@ settings, the most one part can hold; a record is never split, so use a larger c
 be split, whose header row is more than half of what one part can hold, fails the file before
 anything is stored with `<file>: its header row is N characters, more than half of what one part
 can hold with these chunk settings (M characters); the header is repeated in every part, so
-shorten the header or split the file` (§5.1.1).
+shorten the header or split the file` (§5.1.1). A split file whose chunks would store more than
+ten times its own size fails whole, its stored parts removed, with `<file>: it would store N
+characters of chunks, more than 10 times its own size (M characters); use less chunk_overlap,
+shorten repeated headers or keys, or split the file` (§5.1.1).
 
 **Response 404** if the job ID does not exist:
 ```json
@@ -2337,9 +2340,21 @@ as it is: the upload, ZIP, `.json` size, JSON Lines line and record count limits
 - Parts are formed in file order, as large as an estimate of the strategy's chunking allows:
   the text at most 10,000,000 characters; for `fixed` and `language` at most
   `10,000 × (chunk_size − overlap)` characters (`language`'s overlap), for `context_aware` at
-  most `10,000 × chunk_size` characters and 10,000 records or elements, for `overlap` the most
-  text whose windows stay within both window limits, for `semantic` the text limit alone. A
-  part that still goes over when chunked is split in half and each half chunked again.
+  most `10,000 × chunk_size` characters and as many records or elements as its packing, replayed
+  over them, keeps within 10,000 chunks, for `overlap` the most text whose windows stay within
+  both window limits, for `semantic` the text limit alone. A part that still goes over when
+  chunked is split in half and each half chunked again. Whether a file is split at all is not
+  estimated: a file whose text fits is chunked whole, and stored whole when its chunks fit
+  (PR #630).
+- A file split into parts may store at most ten times its own size in chunk text (all its
+  parts' chunks, repeated CSV headers and overlap included). Its own size is its bytes as
+  uploaded, a gzipped file's decompressed bytes, or a `.pdf`'s or `.docx`'s extracted text.
+  The running total is checked before each part is stored; going over fails the whole file
+  through the all-or-nothing rollback, with `<file>: it would store N characters of chunks,
+  more than 10 times its own size (M characters); use less chunk_overlap, shorten repeated
+  headers or keys, or split the file` and no part number. A re-chunk that goes over fails
+  whole, with the collection unchanged. A file stored whole is never refused by it
+  (maintainer's decision, PR #630 security review).
 - A CSV's header row is repeated at the start of every part, so parts are sized with it: the
   rows of a part fill only what one part can hold less the header. A CSV that has to be split
   fails the file, before anything is stored, when its header row is more than half of what

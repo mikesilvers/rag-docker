@@ -125,11 +125,13 @@ try:
         check("big.jsonl's parts are untouched", all(state.get(n) == before[n] for n in jparts))
 
         # A bad line after part 1: nothing new is stored and the earlier version stays.
-        job = ingest(root, [("big.jsonl", "".join(lines[:10_500]) + "{bad\n")], "context_aware", 1000)
+        # 17,000 records are over the text limit, so parts come before the bad line.
+        more = lines + [json.dumps({"t": f"{i:07d} " + "x" * 589}) + "\n" for i in range(13_000, 17_000)]
+        job = ingest(root, [("big.jsonl", "".join(more) + "{bad\n")], "context_aware", 1000)
         state = stored()
         check("a bad line after part 1 fails the file and stores nothing new",
               job["status"] == "failed" and len(job["errors"]) == 1
-              and job["errors"][0].startswith("big.jsonl: part 2: line ")
+              and job["errors"][0].startswith("big.jsonl: part ") and ": line 17001 " in job["errors"][0]
               and job["errors"][0].endswith("; nothing from it was stored"), job)
         check("the earlier big.jsonl parts are still whole", all(state.get(n) == before[n] for n in jparts))
 finally:

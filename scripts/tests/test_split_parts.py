@@ -57,6 +57,9 @@ class FakeCollection:
     def of(self, name):
         return [c for c in self.chunks if c["source_file"] == name]
 
+    def of_contents(self, name):
+        return [c["content"] for c in sorted(self.of(name), key=lambda c: c["chunk_index"])]
+
     def insert(self, collection, chunks):
         self.inserts += 1
         if self.fail_insert_at == self.inserts:
@@ -227,18 +230,21 @@ class ReplacementTests(JobCase):
 
 class AllOrNothingTests(JobCase):
     def test_a_bad_line_after_the_first_part_stores_nothing_and_keeps_the_earlier_version(self):
-        data = records(10_500, 600) + "{not json\n"
+        # 17,000 records are over the text limit, so parts are stored before the bad
+        # line is read (PR #630: a file within the limits is no longer split, so
+        # 10,500 records now meet the bad line before anything is stored).
+        data = records(17_000, 600) + "{not json\n"
         backend = FakeCollection([("data.jsonl", ["earlier"])])
         job, backend = self.run_job([("data.jsonl", data), ("ok.jsonl", records(2, 50))],
                                     "context_aware", backend=backend)
         self.assertEqual((job["status"], job["files_completed"], job["files_failed"]),
                          ("partial", 1, 1), job)
         self.assertEqual(len(job["errors"]), 1)
-        self.assertRegex(job["errors"][0], r"^data\.jsonl: part 2: line 10501 is not valid JSON: "
+        self.assertRegex(job["errors"][0], r"^data\.jsonl: part \d+: line 17001 is not valid JSON: "
                                            r".*; nothing from it was stored$")
         self.assertEqual([c["content"] for c in backend.of("data.jsonl")], ["earlier"])
         self.assertEqual(backend.names(), ["data.jsonl", "ok.jsonl"])
-        # Part 1's 10,000 chunks were counted, then removed again.
+        # The earlier parts' chunks were counted, then removed again.
         self.assertEqual(job["chunks_stored"], len(backend.of("ok.jsonl")))
         self.assertEqual(job["split"], [])
         self.assertEqual(self.retained, ["ok.jsonl"])
@@ -265,8 +271,10 @@ class AllOrNothingTests(JobCase):
         with self.assertLogs("services.ingest_pipeline", "ERROR"):
             job, _ = self.run_job([("data.jsonl", records(13_000, 600))], "context_aware",
                                   backend=backend)
+        # Adjusted for PR #630: 13,000 records fit by text, so they are chunked
+        # whole first and then halved, 6,500 a part (no longer 10,000 + 3,000).
         self.assertEqual(job["errors"], [
-            "data.jsonl: part 2: Weaviate rejected the batch; 10000 new chunks could not be "
+            "data.jsonl: part 2: Weaviate rejected the batch; 6500 new chunks could not be "
             "removed (Weaviate failed to delete 10000 new chunk(s)); upload it again to retry"])
 
     def test_the_semantic_sentence_limit_fails_a_part_and_is_not_split_further(self):
@@ -489,13 +497,17 @@ class ReviewerAddedTests(JobCase):
     def test_a_rollback_keeps_the_submitted_and_accepted_counts(self):
         # Confirmed interpretation 4: chunks_stored goes back down by what was
         # removed; the submitted and accepted counts keep what was sent.
-        data = records(10_500, 600) + "{not json\n"
+        # Adjusted for PR #630 (17,000 records, over the text limit, so parts are
+        # stored first): the first part is packed to the chunk cap, 10,000
+        # records of one chunk each, all sent before the bad line.
+        data = records(17_000, 600) + "{not json\n"
         job, backend = self.run_job([("data.jsonl", data), ("ok.jsonl", records(2, 50))],
                                     "context_aware")
         ok = len(backend.of("ok.jsonl"))
+        sent = CAP
         self.assertEqual(job["chunks_stored"], ok, job)
-        self.assertEqual(job["chunks_submitted"], 10_000 + ok, job)
-        self.assertEqual(job["chunks_accepted"], 10_000 + ok, job)
+        self.assertEqual(job["chunks_submitted"], sent + ok, job)
+        self.assertEqual(job["chunks_accepted"], sent + ok, job)
 
     def test_a_jsonl_record_over_10_million_characters_fails_naming_it(self):
         # Decision 3: a single record over 10,000,000 characters still fails with
@@ -673,6 +685,210 @@ class CsvHeaderTests(JobCase):
         job, backend = self.run_job([("table.csv", data)], "fixed", self.SIZE)
         self.assertEqual((job["status"], job["errors"], job["split"]), ("completed", [], []), job)
         self.assertEqual(backend.names(), ["table.csv"])
+
+class ReviewerCsvHeaderTests(JobCase):
+    """PR #630 testing review (a764852): the header rule's boundary, a CSV row over
+    what a part has left beside a large header, the rule on the path where a CSV
+    fits by size but its chunks go over, and the limit of another strategy."""
+
+    SIZE = CsvHeaderTests.SIZE
+    LIMIT = CsvHeaderTests.LIMIT
+    split = CsvHeaderTests.split
+
+    @staticmethod
+    def header_of(length):
+        """Two header cells giving a header row of exactly `length` characters."""
+        first = (length - 2) // 2
+        return ["h" * first, "g" * (length - 2 - first)]
+
+    def csv_with(self, header, rows):
+        out = io.StringIO()
+        writer = csv.writer(out, lineterminator="\n")
+        writer.writerow(header)
+        writer.writerows(rows)
+        return out.getvalue()
+
+    def seen_chunk(self):
+        seen = []
+
+        def chunk(text, strategy, **kwargs):
+            seen.append(len(text))
+            return chunker.chunk(text, strategy, **kwargs)
+        return seen, chunk
+
+    def test_a_header_of_exactly_half_a_part_is_split_and_one_more_character_fails(self):
+        rows = [[f"r{i:06d}" + "x" * 1000, "y"] for i in range(1000)]
+        seen, chunk = self.seen_chunk()
+        parts = self.split(self.csv_with(self.header_of(self.LIMIT // 2), rows), chunk)
+        self.assertGreaterEqual(len(parts), 2)
+        self.assertEqual({k for k, _ in parts}, {"part"})
+        self.assertLessEqual(max(seen), self.LIMIT, seen)
+        found = __import__("re").findall(r"r(\d{6})", "".join("".join(c) for _, c in parts))
+        self.assertEqual(found, [f"{i:06d}" for i in range(1000)])
+        over = self.LIMIT // 2 + 1
+        with self.assertRaises(ValueError) as caught:
+            self.split(self.csv_with(self.header_of(over), rows), chunk)
+        self.assertIn(f"its header row is {over:,} characters", str(caught.exception))
+        self.assertIn(f"({self.LIMIT:,} characters)", str(caught.exception))
+
+    def test_a_row_over_what_is_left_beside_a_large_header_is_cut_and_kept(self):
+        # A 200,000-character header leaves 300,000 for rows; one row of 450,000
+        # characters (words) is cut into one-cell rows, every word kept, in order,
+        # and every part stays inside the cap.
+        words = [f"w{i:06d}" for i in range(450_000 // 8)]
+        data = self.csv_with(self.header_of(200_000), [["a", "b"], [" ".join(words)], ["c", "d"]])
+        job, backend = self.run_job([("wide.csv", data)], "fixed", self.SIZE)
+        self.assertEqual((job["status"], job["errors"]), ("completed", []), job["errors"])
+        self.assert_parts(backend, "wide.csv")
+        found = __import__("re").findall(r"w\d{6}", self.joined(backend, "wide.csv"))
+        self.assertEqual(found, words)
+
+    def test_the_header_rule_applies_when_a_csv_fits_by_size_but_its_chunks_go_over(self):
+        # 400,000 bytes, inside one part's text, but chunking it whole goes over the
+        # cap (a fake chunker): it has to be split, so a header over half a part
+        # fails the file, and one under half is split with the header in each part.
+        from services import splitter
+
+        def chunk(text, strategy, **kwargs):
+            if len(text) > 150_000:
+                raise chunker.ChunkLimitError("over the cap", "chunks")
+            return [text]
+        rows = [[f"r{i:06d}" + "x" * 100, "y"] for i in range(1000)]
+        big = self.csv_with(self.header_of(260_000), rows)
+        self.assertLess(len(big), self.LIMIT)
+        with self.assertRaises(ValueError) as caught:
+            self.split(big, chunk)
+        self.assertNotIsInstance(caught.exception, splitter.PartError)
+        self.assertIn("its header row is 260,000 characters", str(caught.exception))
+        parts = self.split(self.csv_with(self.header_of(100_000), rows), chunk)
+        self.assertGreaterEqual(len(parts), 2)
+        for _, chunks in parts:
+            self.assertTrue(chunks[0].startswith("h" * 50), chunks[0][:60])
+
+    def test_the_limit_is_that_of_the_active_strategy(self):
+        # language at chunk size 50 and overlap 25 holds half of what fixed does
+        # in a part: a header fine under fixed fails a split language file, and
+        # the message names language's limit.
+        from services import splitter
+        settings = splitter.Settings("language", self.SIZE, 25, 0.85, 0)
+        limit, _ = splitter.part_limits(settings)
+        self.assertEqual(limit, self.LIMIT // 2)
+        header = self.header_of(limit // 2 + 1)
+        rows = [[f"r{i:06d}" + "x" * 1000, "y"] for i in range(600)]
+        path = Path(tempfile.mkdtemp()) / "table.csv"
+        path.write_text(self.csv_with(header, rows))
+        with self.assertRaises(ValueError) as caught:
+            list(splitter.split_file(path, settings))
+        self.assertIn(f"its header row is {limit // 2 + 1:,} characters", str(caught.exception))
+        self.assertIn(f"({limit:,} characters)", str(caught.exception))
+        self.assertLessEqual(2 * (limit // 2 + 1), self.LIMIT)  # fine under fixed
+
+
+class ReviewerRechunkRefusalTests(unittest.TestCase):
+    """PR #630 testing review: the re-chunk refusal (#328) counts a part for its
+    original, so a collection holding only parts has something to rebuild."""
+
+    def test_only_parts_stored_still_counts_as_stored(self):
+        documents = {"d" * 64: {"filenames": ["big.jsonl"]}}
+        objects = [SimpleNamespace(properties={"source_file": "big.jsonl (part 1)"}),
+                   SimpleNamespace(properties={"source_file": "other.txt (part 1)"})]
+        with patch.object(tuning.wc, "get_client") as client:
+            client.return_value.collections.get.return_value.iterator.return_value = objects
+            self.assertTrue(tuning._has_stored_listed_name("Coll", documents))
+            client.return_value.collections.get.return_value.iterator.return_value = objects[1:]
+            self.assertFalse(tuning._has_stored_listed_name("Coll", documents))
+
+
+class WithinLimitsUnderContextAwareTests(JobCase):
+    """PR #630 coding review: a file within both limits is stored whole, whatever
+    its number of records; context_aware no longer splits at 10,000 units."""
+
+    def test_more_than_10000_records_under_10000_chunks_are_stored_whole(self):
+        data = "".join(json.dumps({"t": f"{i:07d} short"}) + "\n" for i in range(20_000))
+        job, backend = self.run_job([("many.jsonl", data)], "context_aware", 1000)
+        self.assertEqual((job["status"], job["errors"], job["split"]), ("completed", [], []), job)
+        self.assertEqual(backend.names(), ["many.jsonl"])
+        self.assertLessEqual(len(backend.of("many.jsonl")), CAP)
+        ids = __import__("re").findall(r"\d{7}", "".join(backend.of_contents("many.jsonl")))
+        self.assertEqual(ids, [f"{i:07d}" for i in range(20_000)])
+
+    def test_parts_are_sized_by_replaying_the_packing(self):
+        from services import splitter
+        # 600-character records, one chunk each at chunk_size 1000, 17,000 of them
+        # (over the text limit): each part's chunk count is predicted, not refused.
+        refused = []
+
+        def chunk(text, strategy, **kwargs):
+            try:
+                return chunker.chunk(text, strategy, **kwargs)
+            except chunker.ChunkLimitError:
+                refused.append(len(text))
+                raise
+
+        path = Path(tempfile.mkdtemp()) / "big.jsonl"
+        path.write_text(records(17_000, 600))
+        settings = splitter.Settings("context_aware", 1000, 0, 0.85, 0)
+        parts = list(splitter.split_file(path, settings, chunk=chunk))
+        self.assertEqual([len(c) for _, c in parts], [CAP, 7_000])
+        self.assertEqual(refused, [])
+
+
+class StoredTextCapTests(JobCase):
+    """PR #630 security review, maintainer's decision: a file split into parts
+    fails, through the all-or-nothing rollback, when its chunks would store more
+    than ten times its own size. A file stored whole is never refused by it."""
+
+    @staticmethod
+    def message(stored, own):
+        return (f"it would store {stored:,} characters of chunks, more than 10 times its own "
+                f"size ({own:,} characters); use less chunk_overlap, shorten repeated headers "
+                f"or keys, or split the file")
+
+    def test_a_split_jsonl_whose_overlap_stores_over_ten_times_its_size_fails_whole(self):
+        # overlap 1000/990: every character is stored about 100 times. 250 records
+        # of 1,000 characters are over one part (about 101,000 characters).
+        data = records(250, 1000)
+        job, backend = self.run_job([("windows.jsonl", data)], "overlap", 1000, overlap=990)
+        self.assertEqual((job["status"], job["split"]), ("failed", []), job)
+        self.assertEqual(len(job["errors"]), 1)
+        self.assertRegex(job["errors"][0], r"^windows\.jsonl: it would store [\d,]+ characters of "
+                         r"chunks, more than 10 times its own size \(" + f"{len(data):,}" + r" characters\)")
+        self.assertNotIn("part ", job["errors"][0])
+        self.assertEqual((backend.chunks, job["chunks_stored"]), ([], 0))
+
+    def test_a_split_csv_whose_parts_store_over_ten_times_its_size_fails_whole(self):
+        out = io.StringIO()
+        writer = csv.writer(out, lineterminator="\n")
+        writer.writerow(["name", "notes"])
+        writer.writerows([f"n{i:06d}", "word " * 40] for i in range(2_000))
+        job, backend = self.run_job([("people.csv", out.getvalue())], "overlap", 1000, overlap=990)
+        self.assertEqual(job["status"], "failed", job)
+        self.assertTrue(job["errors"][0].startswith("people.csv: it would store "), job["errors"])
+        self.assertEqual(backend.chunks, [])
+
+    def test_a_file_stored_whole_is_never_refused_by_the_cap(self):
+        # 20,000 characters at 1000/990 store about 2,000,000: 100 times, but one part.
+        data = records(20, 1000)
+        job, backend = self.run_job([("small.jsonl", data)], "overlap", 1000, overlap=990)
+        self.assertEqual((job["status"], job["errors"]), ("completed", []), job)
+        self.assertEqual(backend.names(), ["small.jsonl"])
+        self.assertGreater(sum(len(c["content"]) for c in backend.chunks), 10 * len(data))
+
+    def test_a_rechunk_over_the_cap_fails_whole(self):
+        data = records(250, 1000).encode()
+        work = Path(tempfile.mkdtemp())
+        digest = __import__("hashlib").sha256(data).hexdigest()
+        (work / digest).write_bytes(data)
+        documents = {digest: {"filenames": ["windows.jsonl"]}}
+        with patch.object(tuning.settings, "upload_dir", str(work)), \
+                patch.object(tuning.sources, "load_index", return_value={"documents": documents}), \
+                patch.object(tuning.sources, "collection_dir", return_value=work), \
+                patch.object(tuning.wc, "get_client") as client:
+            client.return_value.collections.get.return_value.iterator.return_value = [
+                SimpleNamespace(properties={"source_file": "windows.jsonl", "chunk_index": 0})]
+            with self.assertRaisesRegex(ValueError, r"^windows\.jsonl: it would store [\d,]+ "
+                                                    r"characters of chunks, more than 10 times"):
+                tuning._chunks_from_sources("Coll", "overlap", 1000, 990, 0.85, 0)
 
 
 if __name__ == "__main__":
