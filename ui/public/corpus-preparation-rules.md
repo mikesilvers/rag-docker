@@ -13,7 +13,8 @@ for an installation; the others are fixed in the app.
   over the text or chunk limit (section 2) is stored as parts named `<name> (part 1)`,
   `<name> (part 2)` and so on, each part a document of its own: JSON and JSON Lines between
   records, text between paragraphs, a CSV between rows with its header row at the start of
-  every part. The job lists such files under "split into parts". The file you uploaded is
+  every part. A CSV whose header row is over half of what one part can hold fails instead,
+  since every part would repeat it. The job lists such files under "split into parts". The file you uploaded is
   kept once, under its own name.
 - **Otherwise a file fails whole.** A file that breaks any other limit, or can't be read,
   stores nothing, and so does a split file one of whose parts fails. The other files in the

@@ -4553,6 +4553,9 @@ class _Source:
                 self.header, self.units = _csv_units(self._stream, self.dialect)
             else:
                 self.units = _text_units(self._stream, ftype == "md", limit)
+        # What a part's units may hold: a CSV's header is repeated at the start
+        # of every part, so it takes its share of each (#621, PR #630 review).
+        self.room = limit - len(self.header)
 
     def close(self) -> None:
         if self._stream is not None:
@@ -4562,12 +4565,26 @@ class _Source:
             close()
 
     def presized(self) -> Iterator[Unit]:
-        """The units, a text unit over the part limit already cut into pieces."""
+        """The units, a text unit over the room in a part already cut into pieces.
+        A CSV header over half a part fails the file before it is split
+        (check_header), so the cut never goes below half a part."""
+        cut_at = max(self.room, self.limit // 2)
         for unit in self.units:
-            if unit.kind == "text" and len(unit.text) > self.limit:
-                yield from cut_unit(unit, self.limit, self.dialect)
+            if unit.kind == "text" and len(unit.text) > cut_at:
+                yield from cut_unit(unit, cut_at, self.dialect)
             else:
                 yield unit
+
+    def check_header(self) -> None:
+        """Before a CSV is split: its header is repeated in every part, so one over
+        half of what a part can hold would multiply the file's stored text. That
+        fails the whole file (maintainer's decision on PR #630). A CSV that fits
+        in one part keeps any header."""
+        if self.ftype == "csv" and 2 * len(self.header) > self.limit:
+            raise ValueError(
+                f"its header row is {len(self.header):,} characters, more than half of what one "
+                f"part can hold with these chunk settings ({self.limit:,} characters); the header "
+                f"is repeated in every part, so shorten the header or split the file")
 
     def build(self, units: list[Unit]) -> tuple[str, list[Any]]:
         """A part's text and elements, as a file holding only these units would
@@ -4679,6 +4696,7 @@ def split_file(path: Path, settings: Settings, parse: Callable | None = None,
         # worth of text, so they are read at once.
         source = _Source(path, ftype, settings, limit, parse, chunk)
         try:
+            source.check_header()
             everything = list(source.presized())
             yield from _parts(source, everything, None, iter(()), halve_first=True)
         finally:
@@ -4693,7 +4711,7 @@ def split_file(path: Path, settings: Settings, parse: Callable | None = None,
         pending = None
         for unit in units:
             added = len(unit.text) + (_separator(ftype, unit.element is not None) if first else 0)
-            if first and not _fits(chars + added, len(first) + 1, limit, max_units):
+            if first and not _fits(chars + added, len(first) + 1, source.room, max_units):
                 pending = unit
                 break
             first.append(unit)
@@ -4711,8 +4729,10 @@ def split_file(path: Path, settings: Settings, parse: Callable | None = None,
             else:
                 yield "whole", chunks
                 return
+            source.check_header()
             yield from _parts(source, first, None, iter(()), halve_first=True)
             return
+        source.check_header()
         yield from _parts(source, first, pending, units)
     finally:
         source.close()
@@ -4744,7 +4764,8 @@ def _parts(source: _Source, first: list[Unit], pending: Unit | None,
     """Every part of a split file, from the units already read (`first`, and the
     one that did not fit, `pending`) and the rest of the reader. With
     `halve_first`, `first` is known to go over as one part."""
-    limit, max_units = part_limits(source.settings)
+    _, max_units = part_limits(source.settings)
+    limit = source.room  # a CSV's header takes its share of every part
     number = 0
     current = first
     # A file that is a single record over a limit is not split at all: its own

@@ -882,7 +882,11 @@ nothing from it was stored`. If that removal fails too, it ends instead `; K new
 not be removed (<reason>); upload it again to retry`. A record that gives more than 10,000
 chunks on its own fails the file with `record N gives more than 10,000 chunks with these chunk
 settings, the most one part can hold; a record is never split, so use a larger chunk size`
-(`line N` for JSON Lines), as `part N: …` when other parts came before it.
+(`line N` for JSON Lines), as `part N: …` when other parts came before it. A CSV that has to
+be split, whose header row is more than half of what one part can hold, fails the file before
+anything is stored with `<file>: its header row is N characters, more than half of what one part
+can hold with these chunk settings (M characters); the header is repeated in every part, so
+shorten the header or split the file` (§5.1.1).
 
 **Response 404** if the job ID does not exist:
 ```json
@@ -2336,6 +2340,14 @@ as it is: the upload, ZIP, `.json` size, JSON Lines line and record count limits
   most `10,000 × chunk_size` characters and 10,000 records or elements, for `overlap` the most
   text whose windows stay within both window limits, for `semantic` the text limit alone. A
   part that still goes over when chunked is split in half and each half chunked again.
+- A CSV's header row is repeated at the start of every part, so parts are sized with it: the
+  rows of a part fill only what one part can hold less the header. A CSV that has to be split
+  fails the file, before anything is stored, when its header row is more than half of what
+  one part can hold under the strategy and settings (`its header row is N characters, more
+  than half of what one part can hold with these chunk settings (M characters); the header is
+  repeated in every part, so shorten the header or split the file`), since every part would
+  repeat it. A CSV that fits in one part keeps any header (maintainer's decision, PR #630
+  security review).
 - A record is never split: one over 10,000,000 characters, or giving more than 10,000 chunks
   on its own, fails the file (§3.1.3). A paragraph, element or CSV row over a part on its own
   is cut at line breaks, then at whitespace, then hard at the limit; pieces of an element keep

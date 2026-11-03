@@ -605,5 +605,75 @@ class ReviewerAddedTests(JobCase):
         self.assertLess(peak, 4 * 1024 * 1024, f"peak {peak} bytes")
         self.assertGreaterEqual(count[0], 300)
 
+class CsvHeaderTests(JobCase):
+    """A CSV's header is repeated at the start of every part (PR #630 security
+    review): parts are sized with it, and a header over half a part fails the
+    file before it is split (maintainer's decision)."""
+
+    # fixed, chunk_size 50: a part holds at most 10,000 x 50 = 500,000 characters.
+    SIZE = 50
+    LIMIT = CAP * 50
+
+    @staticmethod
+    def csv_text(header_cell, rows, row_cell=1000):
+        out = io.StringIO()
+        writer = csv.writer(out, lineterminator="\n")
+        writer.writerow(["h" * header_cell, "g" * header_cell])
+        writer.writerows([f"r{i:06d}" + "x" * row_cell, "y"] for i in range(rows))
+        return out.getvalue()
+
+    def split(self, data, chunk):
+        from services import splitter
+        path = Path(tempfile.mkdtemp()) / "table.csv"
+        path.write_text(data)
+        settings = splitter.Settings("fixed", self.SIZE, 0, 0.85, 0)
+        return list(splitter.split_file(path, settings, chunk=chunk))
+
+    def test_a_large_header_makes_every_part_smaller_so_none_goes_over(self):
+        # A 200,000-character header and 1,000,000 characters of rows. Every text
+        # handed to the chunker, its header included, is inside one part's limit:
+        # the header is counted when parts are sized, not found out by a refusal.
+        seen = []
+
+        def chunk(text, strategy, **kwargs):
+            seen.append(len(text))
+            return chunker.chunk(text, strategy, **kwargs)
+
+        parts = self.split(self.csv_text(100_000, 1000), chunk)
+        self.assertGreaterEqual(len(parts), 2)
+        self.assertEqual({k for k, _ in parts}, {"part"})
+        self.assertLessEqual(max(seen), self.LIMIT, seen)
+        for _, chunks in parts:
+            self.assertTrue(chunks[0].startswith("h" * self.SIZE), chunks[0][:60])
+        rows = __import__("re").findall(r"r(\d{6})", "".join("".join(c) for _, c in parts))
+        self.assertEqual(rows, [f"{i:06d}" for i in range(1000)])
+
+    def test_a_header_over_half_a_part_fails_the_file_before_it_is_split(self):
+        from services import splitter
+        data = self.csv_text(130_000, 1000)  # a 260,002-character header row
+        header = 2 * 130_000 + 2
+        message = (f"its header row is {header:,} characters, more than half of what one part "
+                   f"can hold with these chunk settings ({self.LIMIT:,} characters); the header is "
+                   f"repeated in every part, so shorten the header or split the file")
+        calls = []
+        with self.assertRaises(ValueError) as caught:
+            self.split(data, lambda text, strategy, **kw: calls.append(1) or [text])
+        self.assertNotIsInstance(caught.exception, splitter.PartError)
+        self.assertEqual(str(caught.exception), message)
+        self.assertEqual(calls, [])  # nothing was chunked, so nothing was stored
+        job, backend = self.run_job([("data/table.csv", data)], "fixed", self.SIZE)
+        self.assertEqual((job["status"], job["errors"], job["split"]),
+                         ("failed", [f"data/table.csv: {message}"], []))
+        self.assertEqual((backend.chunks, job["chunks_stored"]), ([], 0))
+
+    def test_a_csv_in_one_part_keeps_any_header(self):
+        # 260,002 characters of header and three short rows: one part, not split,
+        # so the header rule doesn't apply.
+        data = self.csv_text(130_000, 3, row_cell=10)
+        job, backend = self.run_job([("table.csv", data)], "fixed", self.SIZE)
+        self.assertEqual((job["status"], job["errors"], job["split"]), ("completed", [], []), job)
+        self.assertEqual(backend.names(), ["table.csv"])
+
+
 if __name__ == "__main__":
     unittest.main()
