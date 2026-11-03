@@ -459,5 +459,151 @@ class PartsMapToTheirOriginalTests(unittest.TestCase):
         self.assertEqual(len(out), 13_000)
 
 
+class ReviewerAddedTests(JobCase):
+    """Added by the testing review of PR #630: confirmed interpretations and
+    branches the PR's own tests leave out."""
+
+    def test_13000_records_import_fully_as_parts_language(self):
+        # The issue names `language` as well as `context_aware`: records of 600
+        # characters with chunk_size 1000 give one chunk each.
+        job, backend = self.run_job([("lang.jsonl", records(13_000, 600))], "language", 1000)
+        self.assertEqual((job["status"], job["files_completed"], job["errors"]),
+                         ("completed", 1, []), job)
+        self.assert_parts(backend, "lang.jsonl")
+        ids = __import__("re").findall(r"\d{7}", self.joined(backend, "lang.jsonl"))
+        self.assertEqual(ids, [f"{i:07d}" for i in range(13_000)])
+
+    def test_a_small_text_file_over_the_chunk_cap_imports_as_parts(self):
+        # A .txt well under 10,000,000 characters whose paragraphs pack one to a
+        # chunk under context_aware: 13,000 chunks, so the whole-file attempt
+        # fails on the cap and the file is halved from its paragraphs.
+        data = "\n\n".join(f"p{i:07d} " + "y" * 590 for i in range(13_000))
+        self.assertLess(len(data), TEXT)
+        job, backend = self.run_job([("paras.txt", data)], "context_aware", 1000)
+        self.assertEqual((job["status"], job["files_completed"], job["errors"]),
+                         ("completed", 1, []), job)
+        self.assert_parts(backend, "paras.txt")
+        ids = __import__("re").findall(r"p(\d{7})", self.joined(backend, "paras.txt"))
+        self.assertEqual(ids, [f"{i:07d}" for i in range(13_000)])
+
+    def test_a_rollback_keeps_the_submitted_and_accepted_counts(self):
+        # Confirmed interpretation 4: chunks_stored goes back down by what was
+        # removed; the submitted and accepted counts keep what was sent.
+        data = records(10_500, 600) + "{not json\n"
+        job, backend = self.run_job([("data.jsonl", data), ("ok.jsonl", records(2, 50))],
+                                    "context_aware")
+        ok = len(backend.of("ok.jsonl"))
+        self.assertEqual(job["chunks_stored"], ok, job)
+        self.assertEqual(job["chunks_submitted"], 10_000 + ok, job)
+        self.assertEqual(job["chunks_accepted"], 10_000 + ok, job)
+
+    def test_a_jsonl_record_over_10_million_characters_fails_naming_it(self):
+        # Decision 3: a single record over 10,000,000 characters still fails with
+        # a clear error; nothing of the file is stored.
+        big = json.dumps({"k" * 200: {f"v{i:06d}": 1 for i in range(50_000)}})
+        data = json.dumps({"t": "small"}) + "\n" + big + "\n"
+        backend = FakeCollection([("rec.jsonl", ["earlier"])])
+        job, backend = self.run_job([("rec.jsonl", data)], "fixed", 6000, backend=backend)
+        self.assertEqual(job["status"], "failed", job)
+        self.assertEqual(job["errors"], [
+            "rec.jsonl: line 2 converts to more than 10,000,000 characters of text, the most "
+            "one record can hold; a record is never split"])
+        self.assertEqual([c["content"] for c in backend.of("rec.jsonl")], ["earlier"])
+
+    def test_a_csv_row_over_a_part_on_its_own_is_cut_into_one_cell_rows(self):
+        # Confirmed interpretation 1: line breaks, then whitespace, then a hard
+        # cut; each piece a one-cell row, so the part stays valid CSV.
+        from services import splitter
+        cells = ["id7", "word " * 30, "z" * 25]
+        pieces = splitter.cut_unit(splitter.Unit(splitter._csv_row(cells, csv.excel), cells=cells),
+                                   40, csv.excel)
+        self.assertGreaterEqual(len(pieces), 2)
+        for piece in pieces:
+            rows = list(csv.reader(io.StringIO(piece.text)))
+            self.assertEqual(len(rows), 1, piece.text)
+            self.assertEqual(len(rows[0]), 1, piece.text)
+            self.assertLessEqual(len(rows[0][0]), 40)
+        self.assertEqual(" ".join(p.cells[0] for p in pieces).split(), " ".join(cells).split())
+
+    def test_a_csv_with_one_row_over_a_part_keeps_the_header_and_every_word(self):
+        out = io.StringIO()
+        writer = csv.writer(out, lineterminator="\n")
+        writer.writerow(["name", "notes"])
+        writer.writerow(["small", "first row"])
+        writer.writerow(["huge", " ".join(f"w{i:06d}" for i in range(80_000))])  # 640,000 characters
+        writer.writerow(["last", "final row"])
+        path = Path(tempfile.mkdtemp()) / "rows.csv"
+        path.write_text(out.getvalue())
+        from services import splitter
+        parts = list(splitter.split_file(path, splitter.Settings("fixed", 50, 0, 0.85, 0)))
+        self.assertGreaterEqual(len(parts), 2)
+        for kind, chunks in parts:
+            self.assertEqual(kind, "part")
+            self.assertTrue(chunks[0].startswith("name notes"), chunks[0][:40])
+        seen = "".join("".join(chunks) for _, chunks in parts)
+        words = __import__("re").findall(r"w\d{6}", seen)
+        self.assertEqual(sorted(set(words)), [f"w{i:06d}" for i in range(80_000)])
+        self.assertIn("first row", seen)
+        self.assertIn("final row", seen)
+
+    def test_a_pdf_over_the_text_limit_is_split_between_elements(self):
+        # `.pdf` and `.docx` are parsed whole and split between elements.
+        from services import splitter
+        from unstructured.documents.elements import NarrativeText
+        elements = [NarrativeText(text=f"e{i:05d} " + "q" * 3993) for i in range(2_600)]  # 10,400,000
+
+        def parse(path):
+            return "\n".join(str(e) for e in elements), elements
+
+        path = Path(tempfile.mkdtemp()) / "report.pdf"
+        path.write_bytes(b"%PDF-1.4 stand-in")
+        parts = list(splitter.split_file(path, splitter.Settings("fixed", 6000, 0, 0.85, 0),
+                                         parse=parse))
+        self.assertGreaterEqual(len(parts), 2)
+        self.assertTrue(all(kind == "part" for kind, _ in parts))
+        seen = "".join("".join(chunks) for _, chunks in parts)
+        ids = __import__("re").findall(r"e(\d{5})", seen)
+        self.assertEqual(ids, [f"{i:05d}" for i in range(2_600)])
+
+    def test_a_text_file_is_read_part_by_part(self):
+        # Decision 2: text is read in parts (streamed), so memory stays bounded
+        # by a part. With the limits made small, a 16 MB file must never be held
+        # whole. Unstructured's partitioner is replaced by a plain one: its own
+        # tokenizer caches grow with the text it has seen, whatever the splitter does.
+        import tracemalloc
+        from services import splitter
+        from unstructured.documents.elements import Text
+        import unstructured.partition.text as partition
+
+        def write(path, count):
+            with path.open("w") as fh:
+                for i in range(count):
+                    fh.write(f"para {i:06d} " + "r" * 480 + "\n\n")
+            return path
+
+        count = [0]
+
+        def chunk(text, strategy, **kwargs):
+            count[0] += 1
+            return [text[:12]]
+
+        settings = splitter.Settings("fixed", 6000, 0, 0.85, 0)
+        work = Path(tempfile.mkdtemp())
+        path = write(work / "stream.txt", 32_000)
+        self.assertGreater(path.stat().st_size, 15_000_000)
+        with patch.object(chunker, "MAX_TEXT_CHARACTERS", 50_000), \
+                patch.object(partition, "partition_text", lambda text: [Text(text=text)]):
+            list(splitter.split_file(write(work / "warm.txt", 500), settings, chunk=chunk))
+            count[0] = 0
+            tracemalloc.start()
+            try:
+                for _ in splitter.split_file(path, settings, chunk=chunk):
+                    pass
+                _, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+        self.assertLess(peak, 4 * 1024 * 1024, f"peak {peak} bytes")
+        self.assertGreaterEqual(count[0], 300)
+
 if __name__ == "__main__":
     unittest.main()

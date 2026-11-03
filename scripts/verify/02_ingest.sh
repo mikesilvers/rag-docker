@@ -716,6 +716,73 @@ check "files over the per-file limits are split into parts: regressions (#621)" 
 (cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" < scripts/verify/split_parts.py)
 check "files over the per-file limits are stored as parts in the real Weaviate, replaced whole, all or nothing (#621)" $?
 
+# Reviewer (PR #630): the same through the API and the proxy. The collection is
+# made in Weaviate without a vectorizer, so the 13,000 chunks store in seconds;
+# the upload, the worker and the job record are the real ones.
+SPL="${PREFIX}SplitApi"
+SPLFIX=$(mktemp -d)
+drop_collection "$SPL"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$SPL" <<'PY'
+import sys
+from weaviate.classes.config import Configure, VectorDistances
+from services import weaviate_client as wc
+wc.get_client().collections.create(
+    name=sys.argv[1], vectorizer_config=Configure.Vectorizer.none(),
+    vector_index_config=Configure.VectorIndex.hnsw(distance_metric=VectorDistances.COSINE),
+    properties=wc.COLLECTION_PROPERTIES)
+wc.close_client()
+PY
+)
+python3 - "$SPLFIX" <<'PY'
+import json, sys
+from pathlib import Path
+row = lambda i: json.dumps({"t": f"{i:07d} " + "x" * 589}) + "\n"
+Path(sys.argv[1], "big").mkdir()
+Path(sys.argv[1], "small").mkdir()
+Path(sys.argv[1], "big", "big.jsonl").write_text("".join(row(i) for i in range(13_000)))
+Path(sys.argv[1], "small", "big.jsonl").write_text("".join(row(i) for i in range(3)))
+PY
+split_upload() {
+  curl -s -m 600 -o /tmp/vfy_split_job.json -X POST "$API/ingest/upload" -F "collection=$SPL" \
+    -F "strategy=context_aware" -F "chunk_size=1000" -F "chunk_overlap=0" -F "min_chunk_size=0" \
+    -F "files=@$1" || return 1
+  local job; job=$(jfield "['job_id']" < /tmp/vfy_split_job.json) || return 1
+  wait_for_job "/ingest/job/$job" 900 >/dev/null
+  api_get "/ingest/job/$job" > /tmp/vfy_split_job.json
+}
+split_count() {
+  api_get "/collections" | python3 -c "
+import json,sys
+print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$SPL'][0])"
+}
+split_upload "$SPLFIX/big/big.jsonl"
+count=$(split_count)
+python3 - "$count" <<'PY'
+import json, sys
+job = json.load(open("/tmp/vfy_split_job.json"))
+n = len(job.get("split") or []) and int(job["split"][0].split("split into ")[1].split(" ")[0])
+ok = (job["status"] == "completed" and job["files_completed"] == 1 and job["errors"] == []
+      and job["chunks_stored"] == 13_000 and int(sys.argv[1]) == 13_000 and n >= 2
+      and job["split"] == [f"big.jsonl: split into {n} parts, stored as 'big.jsonl (part 1)' "
+                           f"to 'big.jsonl (part {n})'"])
+print({k: job.get(k) for k in ("status", "files_completed", "chunks_stored", "split", "errors")}, sys.argv[1])
+sys.exit(0 if ok else 1)
+PY
+check "reviewer: 13,000 records uploaded through the API complete as parts, listed in the job's split (#621)" $?
+split_upload "$SPLFIX/small/big.jsonl"
+count=$(split_count)
+python3 - "$count" <<'PY'
+import json, sys
+job = json.load(open("/tmp/vfy_split_job.json"))
+ok = (job["status"] == "completed" and job.get("split") == [] and job["chunks_replaced"] == 13_000
+      and int(sys.argv[1]) == job["chunks_stored"] > 0)
+print({k: job.get(k) for k in ("status", "chunks_stored", "chunks_replaced", "split")}, sys.argv[1])
+sys.exit(0 if ok else 1)
+PY
+check "reviewer: re-uploading the name through the API replaces every part (#621)" $?
+drop_collection "$SPL"
+rm -rf "$SPLFIX" /tmp/vfy_split_job.json
+
 # ── job status transitions ───────────────────────────────────────────────────
 # `queued` is only observable when the executor is saturated, so this asserts
 # the terminal transition and that the POST reports the initial state.
