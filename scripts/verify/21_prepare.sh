@@ -47,8 +47,59 @@ else
   check "P9 the .txt becomes cleaned Markdown of source lines in order with its header; the .csv and .jsonl are unchanged" $?
   stack import
   check "P10 an unknown collection is 404; the import into a new collection completes and is recorded" $?
+  p10_collection=$(python3 -c 'import prepare_stack as p; print(p.state().get("collection", ""))')
+  p10_sources=$(cd "$REPO_ROOT" && docker compose exec -T api python - "$p10_collection" <<'ENDPY'
+import json, sys
+from services import weaviate_client as wc
+try:
+    coll = wc.get_client().collections.get(sys.argv[1])
+    print(json.dumps(sorted({o.properties["source_file"] for o in coll.iterator()})))
+finally:
+    wc.close_client()
+ENDPY
+)
+  python3 - "$p10_sources" <<'ENDPY'
+import json, sys
+import prepare_stack as p
+from auth_stack import role_token
+token = role_token("developer")
+want = sorted(part["name"] for i in p.state()["ids"].values()
+              for part in p.send("GET", "/prepare/documents/" + i, token)[1]["parts"])
+got = json.loads(sys.argv[1] or "[]")
+if want != got:
+    print("    the collection holds {}, the parts are {}".format(got, want), file=sys.stderr)
+sys.exit(0 if want and want == got else 1)
+ENDPY
+  check "P10 the collection's documents are named as the prepared parts, folder path included" $?
   stack prepared-download
   check "P11 the prepared download is the part; deleting the prepared output returns the document to raw" $?
+  python3 - "$FIX" <<'ENDPY'
+import sys
+from pathlib import Path
+import prepare_stack as p
+from auth_stack import role_token
+token = role_token("developer")
+fix = Path(sys.argv[1])
+status, body, _ = p.send("POST", "/prepare/upload", token, files=[
+    ("vfy-prepare-policies.pdf", (fix / "policies.pdf").read_bytes()),
+    ("vfy-prepare-policies.docx", (fix / "policies.docx").read_bytes())])
+if status != 201:
+    sys.exit("    upload answered {} {}".format(status, body))
+ids = {d["name"]: d["id"] for d in body["documents"]}
+status, body, _ = p.send("POST", "/prepare/jobs", token, body={"document_ids": list(ids.values())})
+job = p.wait_job(token, "/prepare/job/" + body["job_id"])
+if job["status"] != "completed":
+    sys.exit("    job ended {}: {}".format(job["status"], job["errors"]))
+for name, document_id in ids.items():
+    record = p.send("GET", "/prepare/documents/" + document_id, token)[1]
+    want = name.rsplit(".", 1)[0] + ".md"
+    if record["status"] != "prepared" or [x["name"] for x in record["parts"]] != [want]:
+        sys.exit("    {}: {} {}".format(name, record["status"], [x["name"] for x in record["parts"]]))
+    status, content, _ = p.send("GET", "/prepare/documents/{}/prepared".format(document_id), token, raw=True)
+    if status != 200 or "Overtime Approval" not in content.decode("utf-8"):
+        sys.exit("    {}: prepared text {} {!r}".format(name, status, content[:200]))
+ENDPY
+  check "PDF and DOCX documents are extracted with ingest's parsers and prepared as Markdown (S4.3, S4.5)" $?
 fi
 
 stack cleanup

@@ -1833,7 +1833,9 @@ before the job, as they do at API startup after an interrupted job.
    written; `.jsonl` for JSON (each record as compact JSON, numbers as written, element files as records) and
    JSON Lines (each line as written, blank lines dropped, gzip decompressed). Names: one part keeps the raw
    name, folders included, with the output suffix (`a/report.pdf` → `a/report.md`); several are
-   `<stem>-part-001<suffix>` and on.
+   `<stem>-part-001<suffix>` and on. A `.txt` or `.md` is read part by part, as ingest reads it (§5.1.1), so
+   memory is bounded by one part whatever the file's size: once to count its windows, then to clean and write
+   each part; a PDF or DOCX is parsed whole, as ingest parses it.
 4. *Clean* (PDF, DOCX, TXT, MD only) with §6.5: each part in windows of whole lines up to 3,000 characters
    (a longer line is not sent); the LLM names the lines to remove and code removes them, never rewriting.
    Each call has 120 s and is sent again once if it fails or times out; an unusable answer is asked again

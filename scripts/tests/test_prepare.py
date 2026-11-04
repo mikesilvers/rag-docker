@@ -339,6 +339,47 @@ class PartTests(AreaCase):
         for part in result.parts:
             self.assertLessEqual(len(self.part_text(record["id"], part)), 4000 + 1)
 
+    def test_a_large_text_file_is_prepared_part_by_part_in_bounded_memory(self):
+        # #621's streaming, kept by preparation (PR #639 review): a .txt many parts
+        # long is read part by part, its windows counted and built one part at a
+        # time, so the memory used stays near one part, far below the file's size.
+        import tracemalloc
+        paragraph = "word " * 199 + "\n"
+        path = self.root / "uploads" / "big.txt"
+        with path.open("w", encoding="utf-8") as fh:
+            for i in range(8000):
+                fh.write(f"Paragraph {i} " + paragraph + "\n")
+        size = path.stat().st_size
+        self.assertGreater(size, 7_000_000)
+        record = store.create("big.txt", path, OWNER)
+        produced, written = [0], []
+        real_iter = preparation.iter_parts
+
+        def counting(path, raw_type):
+            for part in real_iter(path, raw_type):
+                produced[0] += 1
+                yield part
+
+        async def write_part(index, suffix, data):
+            written.append(len(data))
+            return self.write(f"out{index}{suffix}", data)
+        with patch.object(preparation, "PART_LIMIT", 200_000), \
+                patch.object(preparation, "iter_parts", counting):
+            tracemalloc.start()
+            try:
+                result = self.prepare(record, write_part=write_part)
+                _, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+        # One part is 200,000 characters; the file is 40 times that.
+        self.assertLess(peak, size / 3, f"peak {peak:,} bytes for a {size:,}-byte file")
+        parts = len(result.parts)
+        self.assertGreater(parts, 30)
+        # Two streaming passes: one to count windows, one to prepare.
+        self.assertEqual(produced[0], 2 * parts)
+        self.assertEqual(result.parts[0]["fallbacks"], [{"window": None, "reason": "too-large-for-llm"}])
+        self.assertEqual(result.parts[-1]["name"], f"big-part-{parts:03d}.md")
+
     def test_csv_parts_repeat_the_header(self):
         rows = "".join(f"{i},value {i}\n" for i in range(300))
         with patch.object(preparation, "PART_LIMIT", 1000):
@@ -770,6 +811,145 @@ class WiringTests(unittest.TestCase):
         for action in ("prepare.upload", "prepare.start", "prepare.cancel", "prepare.import",
                        "prepare.download", "prepare.delete"):
             self.assertIn(f"'{action}'", page)
+
+
+# ── reviewer's additions (#638 testing review) ──────────────────────────────
+
+class ReviewerTests(JobCase):
+    """Considerations of the specification that the tests above don't reach."""
+
+    def setUp(self):
+        super().setUp()
+        self.client = TestClient(app, headers=auth_testing.headers("developer"))
+
+    def test_every_prepare_route_is_in_the_telemetry_route_list(self):
+        # S2, U12: a route missing from the vocabulary is labelled "unmatched".
+        from services import telemetry
+        routes = [f"{m} {p}" for m, p in policy.ACCESS if p.startswith("/prepare/")]
+        self.assertEqual(len(routes), 12)
+        self.assertEqual(sorted(r for r in routes if r not in telemetry.ROUTES), [])
+
+    def test_a_preparation_cap_under_1_mib_refuses_to_start(self):
+        # S1.2: the API refuses to start, naming the setting.
+        from config import Settings
+        with self.assertRaisesRegex(ValueError, "MAX_PREPARATION_BYTES"):
+            Settings(max_preparation_bytes=1024 * 1024 - 1)
+        self.assertEqual(Settings(max_preparation_bytes=1024 * 1024).max_preparation_bytes, 1024 * 1024)
+
+    def test_cancelling_a_queued_job_ends_it_at_once_and_its_documents_stay_raw(self):
+        # S4.2.2: a queued job ends cancelled at once; its documents return to raw,
+        # and the worker never prepares them afterwards.
+        async def scenario():
+            gate = asyncio.Event()
+
+            async def slow(system, user):
+                await gate.wait()
+                return '{"remove": []}'
+            self.llm.clean = slow
+            a = self.document("a.md", "A text.\n")
+            b = self.document("b.md", "B text.\n")
+            first = await jobs.start([a["id"]], OWNER)
+            second = await jobs.start([b["id"]], OWNER)
+            self.assertEqual(store.get(b["id"])["status"], "queued")
+            answer = await jobs.cancel(second["job_id"])
+            self.assertEqual(answer["status"], "cancelled")
+            self.assertEqual(jobs.get_job(second["job_id"])["status"], "cancelled")
+            self.assertEqual(store.get(b["id"])["status"], "raw")
+            self.assertFalse(store.is_busy(b["id"]))
+            gate.set()
+            await self.finish(first["job_id"])
+            for _ in range(20):
+                await asyncio.sleep(0.02)
+            self.assertEqual(jobs.get_job(second["job_id"])["status"], "cancelled")
+            self.assertEqual(store.get(b["id"])["status"], "raw")
+            self.assertEqual(store.get(a["id"])["status"], "prepared")
+        asyncio.run(scenario())
+
+    def test_busy_documents_are_refused_by_both_deletes_and_a_job_with_409(self):
+        # S4.1.1, S5.3: the routes answer DOCUMENT_BUSY, naming the document.
+        doc = self.upload_one("busy.txt", b"Busy.\n")
+        store.mark_busy([doc["id"]], "import")
+        try:
+            for answer in (self.client.delete(f"/prepare/documents/{doc['id']}"),
+                           self.client.delete(f"/prepare/documents/{doc['id']}/prepared"),
+                           self.client.post("/prepare/jobs", json={"document_ids": [doc["id"]]})):
+                self.assertEqual(answer.status_code, 409, answer.text)
+                self.assertEqual(answer.json()["error"]["code"], "DOCUMENT_BUSY")
+                self.assertIn("busy.txt", answer.json()["error"]["message"])
+        finally:
+            store.release([doc["id"]])
+        self.assertEqual(store.get(doc["id"])["status"], "raw")
+        self.assertEqual(self.client.delete(f"/prepare/documents/{doc['id']}").status_code, 204)
+
+    def test_a_zip_is_counted_as_expanded_against_the_limit(self):
+        # S1.4: a ZIP's members count as expanded; over the limit nothing is kept.
+        import random
+        rng = random.Random(638)
+        member = "".join(rng.choice("0123456789abcdef") for _ in range(1536 * 1024))
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("big.txt", member)
+        data = buf.getvalue()
+        limit = 1024 * 1024 + 1
+        self.assertLess(len(data), limit - store.usage())     # the ZIP itself would fit
+        with patch.object(settings, "max_preparation_bytes", limit):
+            answer = self.client.post("/prepare/upload", files=[("files", ("b.zip", data))])
+        self.assertEqual(answer.status_code, 409, answer.text)
+        self.assertEqual(answer.json()["error"]["code"], "PREPARATION_STORAGE_FULL")
+        self.assertEqual(self.client.get("/prepare/documents").json()["documents"], [])
+
+    def test_raw_download_types(self):
+        # S5.4: application/gzip for a gzipped file, the name's last segment.
+        gz = self.upload_one("logs.jsonl.gz", gzip.compress(b'{"a": 1}\n'))
+        answer = self.client.get(f"/prepare/documents/{gz['id']}/raw")
+        self.assertEqual(answer.headers["content-type"].split(";")[0], "application/gzip")
+        self.assertIn("logs.jsonl.gz", answer.headers["content-disposition"])
+        self.assertEqual(gzip.decompress(answer.content), b'{"a": 1}\n')
+
+    def test_prepare_all_takes_every_raw_prepared_and_failed_document_oldest_first(self):
+        # S4.1.1, S4.1.4: "all" is every raw, prepared and failed document, by created_at.
+        ids = [self.upload_one(name, b"Text.\n")["id"] for name in ("one.md", "two.md", "three.md")]
+        self.assertEqual(self.client.post("/prepare/jobs", json={"document_ids": ids, "all": True}).status_code, 422)
+
+        async def scenario():
+            answer = await jobs.start(None, OWNER)
+            self.assertEqual(answer["documents_queued"], 3)
+            return await self.finish(answer["job_id"])
+        job = asyncio.run(scenario())
+        self.assertEqual(job["status"], "completed")
+        created = {d["id"]: d["created_at"] for d in self.client.get("/prepare/documents").json()["documents"]}
+        self.assertEqual(job["document_ids"], sorted(ids, key=lambda i: created[i]))
+
+    def test_pdf_and_docx_elements_are_joined_by_a_blank_line_into_markdown(self):
+        # S4.3.1, S4.5: PDF and DOCX through ingest's parser (stubbed here: the real
+        # one downloads NLTK data, and these tests run with no network), each
+        # element's text separated by a blank line, written as .md.
+        class Element:
+            def __init__(self, text):
+                self.text = text
+
+            def __str__(self):
+                return self.text
+        elements = [Element("Overtime Approval. Requests go to the manager."), Element("  "),
+                    Element("Approval is granted by the department head.")]
+        def parse(path):
+            if Path(path).suffix == ".md":                   # the written part, as AreaCase reads it
+                return Path(path).read_text(encoding="utf-8"), []
+            return "", elements
+        with patch.object(ingest_pipeline, "_parse_file", parse):
+            for name in ("policies.pdf", "policies.docx"):
+                record = self.document(name, b"stub")
+                [part] = self.prepare(record).parts
+                self.assertEqual(part["name"], "policies.md")
+                self.assertEqual(self.part_text(record["id"], part),
+                                 "# Committee minutes\n\nSummary (generated): Items the committee carried "
+                                 "forward.\n\nOvertime Approval. Requests go to the manager.\n\n"
+                                 "Approval is granted by the department head.\n")
+
+    def upload_one(self, name, data):
+        answer = self.client.post("/prepare/upload", files=[("files", (name, data))])
+        self.assertEqual(answer.status_code, 201, answer.text)
+        return answer.json()["documents"][0]
 
 
 if __name__ == "__main__":

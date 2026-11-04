@@ -7575,6 +7575,36 @@ def windows(text: str) -> list[Window]:
     return out
 
 
+def _lines(text: str) -> Iterator[str]:
+    """The lines of `text`, as text.split("\n") gives them, one at a time."""
+    start = 0
+    while True:
+        end = text.find("\n", start)
+        if end < 0:
+            yield text[start:]
+            return
+        yield text[start:end]
+        start = end + 1
+
+
+def count_windows(text: str) -> int:
+    """len(windows(text)), without building the windows."""
+    count = 0
+    open_window = False
+    size = 0
+    for line in _lines(text):
+        if len(line) + 1 > WINDOW_CHARACTERS:
+            count += 1 + (1 if open_window else 0)
+            open_window, size = False, 0
+            continue
+        if open_window and size + len(line) + 1 > WINDOW_CHARACTERS:
+            count += 1
+            size = 0
+        open_window = True
+        size += len(line) + 1
+    return count + (1 if open_window else 0)
+
+
 # ── the LLM ──────────────────────────────────────────────────────────────────
 
 Chat = Callable[[str, str], Awaitable[str]]
@@ -7792,9 +7822,7 @@ async def prepare_document(raw: Path, name: str, raw_type: str, chat: Chat,
         raise Cancelled()
 
     if kind == "text":
-        # Parsed whole (PDF and DOCX are anyway), so the size cap counts every window.
-        parts = await asyncio.to_thread(lambda: list(iter_parts(raw, raw_type)))
-        return await _prepare_text(parts, name, llm, should_stop, write_part, progress)
+        return await _prepare_text(raw, raw_type, name, llm, should_stop, write_part, progress)
     return await _prepare_records(raw, raw_type, name, kind, llm, should_stop, write_part)
 
 
@@ -7802,27 +7830,56 @@ def _no_text(name: str) -> ValueError:
     return ValueError("has no text to prepare")
 
 
-async def _prepare_text(parts: list[Part], name: str, llm: LLM, should_stop, write_part,
-                        progress) -> Result:
-    if not parts:
+def _count_text_windows(parts: Iterator[Part], should_stop) -> tuple[int, int]:
+    """(parts, windows) of a document, one part held at a time."""
+    count = total = 0
+    for part in parts:
+        if should_stop():
+            raise Cancelled()
+        count += 1
+        total += count_windows(part.body)
+    return count, total
+
+
+async def _prepare_text(raw: Path, raw_type: str, name: str, llm: LLM, should_stop,
+                        write_part, progress) -> Result:
+    """PDF, DOCX, TXT and MD. A .txt or .md is read part by part twice, as ingest
+    reads it (#621), so memory is bounded by one part whatever the file's size:
+    once to count its windows against MAX_WINDOWS, then to clean and write each
+    part, building only that part's windows. A PDF or DOCX is parsed whole, as
+    ingest parses it, and its parts kept for both passes. Parts are written under
+    their index and named once the count is known."""
+    if raw_type in (".pdf", ".docx"):
+        held = await asyncio.to_thread(lambda: list(iter_parts(raw, raw_type)))
+
+        def source() -> Iterator[Part]:
+            return iter(held)
+    else:
+        def source() -> Iterator[Part]:
+            return iter_parts(raw, raw_type)
+    count, total = await asyncio.to_thread(_count_text_windows, source(), should_stop)
+    if not count:
         raise _no_text(name)
-    names = part_names(name, "text", len(parts))
-    split = [windows(part.body) for part in parts]
-    total = sum(len(ws) for ws in split)
     too_large = total > MAX_WINDOWS
     done = 0
     progress(done, total)
     result = Result()
-    for index, (part, part_windows) in enumerate(zip(parts, split)):
+    iterator = source()
+    index = 0
+    while True:
+        part = await asyncio.to_thread(next, iterator, None)
+        if part is None:
+            break
         fallbacks: list[dict] = []
         kept: list[str] = []
         if too_large:
             fallbacks.append({"window": None, "reason": "too-large-for-llm"})
-            kept = part.body.split("\n")
-            done += len(part_windows)
+            kept = [part.body]
+            done += count_windows(part.body)
+            progress(done, total)
         else:
             unavailable_noted = False
-            for number, window in enumerate(part_windows, 1):
+            for number, window in enumerate(windows(part.body), 1):
                 if should_stop():
                     raise Cancelled()
                 if llm.down:
@@ -7842,13 +7899,21 @@ async def _prepare_text(parts: list[Part], name: str, llm: LLM, should_stop, wri
                 done += 1
                 progress(done, total)
         body = "\n".join(kept).strip("\n")
+        del kept, part
         title, summary, error = await title_summary(body, llm)
         text = (header_text(title, summary) if title else "") + body + "\n"
-        entry = await _write(index, names[index], text, "text", write_part)
+        del body
+        entry = await _write(index, "", text, "text", write_part)
+        del text
         entry.update(title=title, summary=summary, summary_error=error,
                      fallback=bool(fallbacks), fallbacks=fallbacks)
         result.parts.append(entry)
         result.fallback = result.fallback or bool(fallbacks)
+        index += 1
+    if index != count:
+        raise ValueError("changed while it was being prepared; prepare it again")
+    for entry, part_name in zip(result.parts, part_names(name, "text", count)):
+        entry["name"] = part_name
     return result
 
 
@@ -27905,8 +27970,59 @@ else
   check "P9 the .txt becomes cleaned Markdown of source lines in order with its header; the .csv and .jsonl are unchanged" $?
   stack import
   check "P10 an unknown collection is 404; the import into a new collection completes and is recorded" $?
+  p10_collection=$(python3 -c 'import prepare_stack as p; print(p.state().get("collection", ""))')
+  p10_sources=$(cd "$REPO_ROOT" && docker compose exec -T api python - "$p10_collection" <<'ENDPY'
+import json, sys
+from services import weaviate_client as wc
+try:
+    coll = wc.get_client().collections.get(sys.argv[1])
+    print(json.dumps(sorted({o.properties["source_file"] for o in coll.iterator()})))
+finally:
+    wc.close_client()
+ENDPY
+)
+  python3 - "$p10_sources" <<'ENDPY'
+import json, sys
+import prepare_stack as p
+from auth_stack import role_token
+token = role_token("developer")
+want = sorted(part["name"] for i in p.state()["ids"].values()
+              for part in p.send("GET", "/prepare/documents/" + i, token)[1]["parts"])
+got = json.loads(sys.argv[1] or "[]")
+if want != got:
+    print("    the collection holds {}, the parts are {}".format(got, want), file=sys.stderr)
+sys.exit(0 if want and want == got else 1)
+ENDPY
+  check "P10 the collection's documents are named as the prepared parts, folder path included" $?
   stack prepared-download
   check "P11 the prepared download is the part; deleting the prepared output returns the document to raw" $?
+  python3 - "$FIX" <<'ENDPY'
+import sys
+from pathlib import Path
+import prepare_stack as p
+from auth_stack import role_token
+token = role_token("developer")
+fix = Path(sys.argv[1])
+status, body, _ = p.send("POST", "/prepare/upload", token, files=[
+    ("vfy-prepare-policies.pdf", (fix / "policies.pdf").read_bytes()),
+    ("vfy-prepare-policies.docx", (fix / "policies.docx").read_bytes())])
+if status != 201:
+    sys.exit("    upload answered {} {}".format(status, body))
+ids = {d["name"]: d["id"] for d in body["documents"]}
+status, body, _ = p.send("POST", "/prepare/jobs", token, body={"document_ids": list(ids.values())})
+job = p.wait_job(token, "/prepare/job/" + body["job_id"])
+if job["status"] != "completed":
+    sys.exit("    job ended {}: {}".format(job["status"], job["errors"]))
+for name, document_id in ids.items():
+    record = p.send("GET", "/prepare/documents/" + document_id, token)[1]
+    want = name.rsplit(".", 1)[0] + ".md"
+    if record["status"] != "prepared" or [x["name"] for x in record["parts"]] != [want]:
+        sys.exit("    {}: {} {}".format(name, record["status"], [x["name"] for x in record["parts"]]))
+    status, content, _ = p.send("GET", "/prepare/documents/{}/prepared".format(document_id), token, raw=True)
+    if status != 200 or "Overtime Approval" not in content.decode("utf-8"):
+        sys.exit("    {}: prepared text {} {!r}".format(name, status, content[:200]))
+ENDPY
+  check "PDF and DOCX documents are extracted with ingest's parsers and prepared as Markdown (S4.3, S4.5)" $?
 fi
 
 stack cleanup
@@ -31204,6 +31320,47 @@ class PartTests(AreaCase):
         for part in result.parts:
             self.assertLessEqual(len(self.part_text(record["id"], part)), 4000 + 1)
 
+    def test_a_large_text_file_is_prepared_part_by_part_in_bounded_memory(self):
+        # #621's streaming, kept by preparation (PR #639 review): a .txt many parts
+        # long is read part by part, its windows counted and built one part at a
+        # time, so the memory used stays near one part, far below the file's size.
+        import tracemalloc
+        paragraph = "word " * 199 + "\n"
+        path = self.root / "uploads" / "big.txt"
+        with path.open("w", encoding="utf-8") as fh:
+            for i in range(8000):
+                fh.write(f"Paragraph {i} " + paragraph + "\n")
+        size = path.stat().st_size
+        self.assertGreater(size, 7_000_000)
+        record = store.create("big.txt", path, OWNER)
+        produced, written = [0], []
+        real_iter = preparation.iter_parts
+
+        def counting(path, raw_type):
+            for part in real_iter(path, raw_type):
+                produced[0] += 1
+                yield part
+
+        async def write_part(index, suffix, data):
+            written.append(len(data))
+            return self.write(f"out{index}{suffix}", data)
+        with patch.object(preparation, "PART_LIMIT", 200_000), \
+                patch.object(preparation, "iter_parts", counting):
+            tracemalloc.start()
+            try:
+                result = self.prepare(record, write_part=write_part)
+                _, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+        # One part is 200,000 characters; the file is 40 times that.
+        self.assertLess(peak, size / 3, f"peak {peak:,} bytes for a {size:,}-byte file")
+        parts = len(result.parts)
+        self.assertGreater(parts, 30)
+        # Two streaming passes: one to count windows, one to prepare.
+        self.assertEqual(produced[0], 2 * parts)
+        self.assertEqual(result.parts[0]["fallbacks"], [{"window": None, "reason": "too-large-for-llm"}])
+        self.assertEqual(result.parts[-1]["name"], f"big-part-{parts:03d}.md")
+
     def test_csv_parts_repeat_the_header(self):
         rows = "".join(f"{i},value {i}\n" for i in range(300))
         with patch.object(preparation, "PART_LIMIT", 1000):
@@ -31635,6 +31792,145 @@ class WiringTests(unittest.TestCase):
         for action in ("prepare.upload", "prepare.start", "prepare.cancel", "prepare.import",
                        "prepare.download", "prepare.delete"):
             self.assertIn(f"'{action}'", page)
+
+
+# ── reviewer's additions (#638 testing review) ──────────────────────────────
+
+class ReviewerTests(JobCase):
+    """Considerations of the specification that the tests above don't reach."""
+
+    def setUp(self):
+        super().setUp()
+        self.client = TestClient(app, headers=auth_testing.headers("developer"))
+
+    def test_every_prepare_route_is_in_the_telemetry_route_list(self):
+        # S2, U12: a route missing from the vocabulary is labelled "unmatched".
+        from services import telemetry
+        routes = [f"{m} {p}" for m, p in policy.ACCESS if p.startswith("/prepare/")]
+        self.assertEqual(len(routes), 12)
+        self.assertEqual(sorted(r for r in routes if r not in telemetry.ROUTES), [])
+
+    def test_a_preparation_cap_under_1_mib_refuses_to_start(self):
+        # S1.2: the API refuses to start, naming the setting.
+        from config import Settings
+        with self.assertRaisesRegex(ValueError, "MAX_PREPARATION_BYTES"):
+            Settings(max_preparation_bytes=1024 * 1024 - 1)
+        self.assertEqual(Settings(max_preparation_bytes=1024 * 1024).max_preparation_bytes, 1024 * 1024)
+
+    def test_cancelling_a_queued_job_ends_it_at_once_and_its_documents_stay_raw(self):
+        # S4.2.2: a queued job ends cancelled at once; its documents return to raw,
+        # and the worker never prepares them afterwards.
+        async def scenario():
+            gate = asyncio.Event()
+
+            async def slow(system, user):
+                await gate.wait()
+                return '{"remove": []}'
+            self.llm.clean = slow
+            a = self.document("a.md", "A text.\n")
+            b = self.document("b.md", "B text.\n")
+            first = await jobs.start([a["id"]], OWNER)
+            second = await jobs.start([b["id"]], OWNER)
+            self.assertEqual(store.get(b["id"])["status"], "queued")
+            answer = await jobs.cancel(second["job_id"])
+            self.assertEqual(answer["status"], "cancelled")
+            self.assertEqual(jobs.get_job(second["job_id"])["status"], "cancelled")
+            self.assertEqual(store.get(b["id"])["status"], "raw")
+            self.assertFalse(store.is_busy(b["id"]))
+            gate.set()
+            await self.finish(first["job_id"])
+            for _ in range(20):
+                await asyncio.sleep(0.02)
+            self.assertEqual(jobs.get_job(second["job_id"])["status"], "cancelled")
+            self.assertEqual(store.get(b["id"])["status"], "raw")
+            self.assertEqual(store.get(a["id"])["status"], "prepared")
+        asyncio.run(scenario())
+
+    def test_busy_documents_are_refused_by_both_deletes_and_a_job_with_409(self):
+        # S4.1.1, S5.3: the routes answer DOCUMENT_BUSY, naming the document.
+        doc = self.upload_one("busy.txt", b"Busy.\n")
+        store.mark_busy([doc["id"]], "import")
+        try:
+            for answer in (self.client.delete(f"/prepare/documents/{doc['id']}"),
+                           self.client.delete(f"/prepare/documents/{doc['id']}/prepared"),
+                           self.client.post("/prepare/jobs", json={"document_ids": [doc["id"]]})):
+                self.assertEqual(answer.status_code, 409, answer.text)
+                self.assertEqual(answer.json()["error"]["code"], "DOCUMENT_BUSY")
+                self.assertIn("busy.txt", answer.json()["error"]["message"])
+        finally:
+            store.release([doc["id"]])
+        self.assertEqual(store.get(doc["id"])["status"], "raw")
+        self.assertEqual(self.client.delete(f"/prepare/documents/{doc['id']}").status_code, 204)
+
+    def test_a_zip_is_counted_as_expanded_against_the_limit(self):
+        # S1.4: a ZIP's members count as expanded; over the limit nothing is kept.
+        import random
+        rng = random.Random(638)
+        member = "".join(rng.choice("0123456789abcdef") for _ in range(1536 * 1024))
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("big.txt", member)
+        data = buf.getvalue()
+        limit = 1024 * 1024 + 1
+        self.assertLess(len(data), limit - store.usage())     # the ZIP itself would fit
+        with patch.object(settings, "max_preparation_bytes", limit):
+            answer = self.client.post("/prepare/upload", files=[("files", ("b.zip", data))])
+        self.assertEqual(answer.status_code, 409, answer.text)
+        self.assertEqual(answer.json()["error"]["code"], "PREPARATION_STORAGE_FULL")
+        self.assertEqual(self.client.get("/prepare/documents").json()["documents"], [])
+
+    def test_raw_download_types(self):
+        # S5.4: application/gzip for a gzipped file, the name's last segment.
+        gz = self.upload_one("logs.jsonl.gz", gzip.compress(b'{"a": 1}\n'))
+        answer = self.client.get(f"/prepare/documents/{gz['id']}/raw")
+        self.assertEqual(answer.headers["content-type"].split(";")[0], "application/gzip")
+        self.assertIn("logs.jsonl.gz", answer.headers["content-disposition"])
+        self.assertEqual(gzip.decompress(answer.content), b'{"a": 1}\n')
+
+    def test_prepare_all_takes_every_raw_prepared_and_failed_document_oldest_first(self):
+        # S4.1.1, S4.1.4: "all" is every raw, prepared and failed document, by created_at.
+        ids = [self.upload_one(name, b"Text.\n")["id"] for name in ("one.md", "two.md", "three.md")]
+        self.assertEqual(self.client.post("/prepare/jobs", json={"document_ids": ids, "all": True}).status_code, 422)
+
+        async def scenario():
+            answer = await jobs.start(None, OWNER)
+            self.assertEqual(answer["documents_queued"], 3)
+            return await self.finish(answer["job_id"])
+        job = asyncio.run(scenario())
+        self.assertEqual(job["status"], "completed")
+        created = {d["id"]: d["created_at"] for d in self.client.get("/prepare/documents").json()["documents"]}
+        self.assertEqual(job["document_ids"], sorted(ids, key=lambda i: created[i]))
+
+    def test_pdf_and_docx_elements_are_joined_by_a_blank_line_into_markdown(self):
+        # S4.3.1, S4.5: PDF and DOCX through ingest's parser (stubbed here: the real
+        # one downloads NLTK data, and these tests run with no network), each
+        # element's text separated by a blank line, written as .md.
+        class Element:
+            def __init__(self, text):
+                self.text = text
+
+            def __str__(self):
+                return self.text
+        elements = [Element("Overtime Approval. Requests go to the manager."), Element("  "),
+                    Element("Approval is granted by the department head.")]
+        def parse(path):
+            if Path(path).suffix == ".md":                   # the written part, as AreaCase reads it
+                return Path(path).read_text(encoding="utf-8"), []
+            return "", elements
+        with patch.object(ingest_pipeline, "_parse_file", parse):
+            for name in ("policies.pdf", "policies.docx"):
+                record = self.document(name, b"stub")
+                [part] = self.prepare(record).parts
+                self.assertEqual(part["name"], "policies.md")
+                self.assertEqual(self.part_text(record["id"], part),
+                                 "# Committee minutes\n\nSummary (generated): Items the committee carried "
+                                 "forward.\n\nOvertime Approval. Requests go to the manager.\n\n"
+                                 "Approval is granted by the department head.\n")
+
+    def upload_one(self, name, data):
+        answer = self.client.post("/prepare/upload", files=[("files", (name, data))])
+        self.assertEqual(answer.status_code, 201, answer.text)
+        return answer.json()["documents"][0]
 
 
 if __name__ == "__main__":
@@ -47669,6 +47965,154 @@ function auditCases() {
   ];
 }
 
+// The Prepare page (#638, SPECIFICATIONS.md §7): the document list, preview,
+// upload, preparation job, deletes and import, every API call stubbed.
+function prepareCases() {
+  const owner = { name: 'vfy-developer', kind: 'user' };
+  const doc = over => ({ raw_type: '.txt', raw_bytes: 2048, owner, created_at: '2026-11-04T10:00:00Z', status: 'raw', prepared_at: null,
+    prepared_bytes: 0, parts: [], fallback: false, code_only_by_type: false, last_error: null, imports: [], ...over });
+  const part = over => ({ name: 'minutes.md', bytes: 1536, characters: 1500, title: 'Committee minutes', summary: 'Items carried forward.',
+    summary_error: null, fallback: false, fallbacks: [], ...over });
+  const DOCS = [
+    doc({ id: 'aaaaaaaaaaa1', name: 'minutes.txt', status: 'prepared', prepared_at: '2026-11-04T10:05:00Z', prepared_bytes: 1536,
+      parts: [part({ fallback: true, fallbacks: [{ window: 2, reason: 'removed-too-much' }] })], fallback: true,
+      imports: [{ collection: A, job_id: 'ing00001', at: '2026-11-04T11:00:00Z' }] }),
+    doc({ id: 'bbbbbbbbbbb2', name: 'people.csv', raw_type: '.csv', raw_bytes: 100, status: 'prepared', prepared_bytes: 100,
+      parts: [part({ name: 'people.csv', bytes: 100, records: 2, title: null, summary: null, summary_error: 'llm-unavailable' })], code_only_by_type: true }),
+    doc({ id: 'ccccccccccc3', name: 'scan.pdf', raw_type: '.pdf', raw_bytes: 500, status: 'failed', last_error: 'scan.pdf has no text to prepare' }),
+  ];
+  const LIST = { documents: DOCS, used_bytes: 3 * 1024 * 1024, limit_bytes: 20 * 1024 * 1024 * 1024 };
+  const withPreview = d => ({ ...d, parts: d.parts.map(p => ({ ...p, preview: `# ${p.title || ''}\n\nPreview of ${p.name}` })) });
+  const routes = (extra = {}) => base({
+    'GET /api/prepare/documents': json(200, LIST),
+    'GET /api/prepare/jobs': json(200, { jobs: [] }),
+    'GET /api/prepare/documents/*': call => json(200, withPreview(DOCS.find(d => call.path.endsWith(d.id)))),
+    ...extra,
+  });
+  const open = (role = 'developer', extra = {}, more = {}) => ({ role, path: '/prepare', routes: routes(extra), ...more });
+  const rows = page => page.evaluate(() => [...document.querySelectorAll('tbody tr[data-document]')].map(r =>
+    [...r.querySelectorAll('td')].map(c => c.innerText.replace(/\s+/g, ' ').trim())));
+  const rowActions = (page, id) => page.evaluate(i => [...document.querySelectorAll(`tr[data-document="${i}"] td:last-child a, tr[data-document="${i}"] td:last-child button`)]
+    .map(e => [e.textContent.trim(), e.getAttribute('href')]), id);
+  const dialogs = [];
+  let acceptDialogs = false;
+  const check = (page, name) => page.evaluate(n => { const b = document.querySelector(`input[aria-label="Select ${n}"]`); b.click(); }, name);
+  return [
+    { name: 'Prepare page lists each document with status, sizes, parts, the fallback mark, imports, the last error and the space used', open: open(), async run(s) {
+      await waitText(s.page, 'minutes.txt');
+      await waitText(s.page, 'Space used: 3.0 MB of 20.00 GB');
+      await waitText(s.page, 'Preparation and ingest share the local LLM service');
+      const r = await rows(s.page);
+      assert.equal(r.length, 3);
+      assert.deepEqual(r[0].slice(1, 7), ['minutes.txt', 'prepared', '2.0 KB', '1.5 KB', '1', 'fell back (1)']);
+      assert.ok(r[0][7].startsWith(A), r[0][7]);
+      assert.deepEqual(r[1].slice(1, 7), ['people.csv', 'prepared', '100 B', '100 B', '1', 'code-only (by type)']);
+      assert.deepEqual(r[2].slice(1, 7), ['scan.pdf Last error: scan.pdf has no text to prepare', 'failed', '500 B', '-', '-', '']);
+      assert.deepEqual(await rowActions(s.page, 'aaaaaaaaaaa1'), [['Preview', null], ['Download raw', '/api/prepare/documents/aaaaaaaaaaa1/raw'],
+        ['Download prepared', '/api/prepare/documents/aaaaaaaaaaa1/prepared'], ['Delete prepared', null], ['Delete', null]]);
+      assert.deepEqual(await rowActions(s.page, 'ccccccccccc3'), [['Download raw', '/api/prepare/documents/ccccccccccc3/raw'], ['Delete', null]]);
+    } },
+    { name: 'Preview shows each part\'s name, size, title, summary or why there is none, fallbacks and the preview text', open: open(), async run(s) {
+      await waitText(s.page, 'minutes.txt');
+      await s.page.evaluate(() => [...document.querySelectorAll('tr[data-document="aaaaaaaaaaa1"] button')].find(b => b.textContent.trim() === 'Preview').click());
+      await waitText(s.page, 'Preview: minutes.txt');
+      for (const want of ['minutes.md (1.5 KB)', 'Title: Committee minutes', 'Summary: Items carried forward.', 'window 2: removed-too-much', 'Preview of minutes.md']) await waitText(s.page, want);
+      await s.page.evaluate(() => [...document.querySelectorAll('tr[data-document="bbbbbbbbbbb2"] button')].find(b => b.textContent.trim() === 'Preview').click());
+      await waitText(s.page, 'Preview: people.csv');
+      await waitText(s.page, 'No title or summary (llm-unavailable).');
+      assert.equal(callsTo(s, 'GET', '/api/prepare/documents/bbbbbbbbbbb2').length, 1);
+    } },
+    { name: 'Upload sends the queued files as "files", shows the skipped list and reloads the documents', open: open('developer', {
+      'POST /api/prepare/upload': json(201, { documents: [], skipped: ['x.exe: unsupported file type'] }) }), async run(s) {
+      await waitText(s.page, 'minutes.txt');
+      assert.equal((await buttonState(s.page, 'Upload')).disabled, true);
+      const input = await s.page.$('#prepare-file-input');
+      await input.uploadFile(...tempFiles(['raw.txt', 'more.md']));
+      await waitText(s.page, 'more.md');
+      await press(s.page, 'Upload');
+      await waitText(s.page, 'x.exe: unsupported file type');
+      const [form] = await forms(s.page);
+      assert.deepEqual(form, [['files', 'file:raw.txt'], ['files', 'file:more.md']]);
+      assert.equal(callsTo(s, 'GET', '/api/prepare/documents').length, 2);
+    } },
+    { name: 'Prepare selected and Prepare all send the selection; the job\'s progress, current windows and Cancel are shown', open: (() => {
+      let polls = 0;
+      return open('developer', {
+        'POST /api/prepare/jobs': json(202, { job_id: 'prep0001', status: 'queued', documents_queued: 1 }),
+        'GET /api/prepare/job/prep0001': () => { polls++; return json(200, { job_id: 'prep0001', status: 'running', documents_total: 2, documents_completed: 1,
+          documents_failed: 0, document_ids: [], names: ['minutes.txt', 'scan.pdf'], errors: [], owner, created_at: '2026-11-04T12:00:00Z',
+          current: { document_id: 'ccccccccccc3', name: 'scan.pdf', windows_done: 1, windows_total: 4 } }); },
+        'POST /api/prepare/job/prep0001/cancel': json(202, { job_id: 'prep0001', status: 'running' }),
+      });
+    })(), async run(s) {
+      await waitText(s.page, 'minutes.txt');
+      assert.equal((await buttonState(s.page, 'Prepare selected')).disabled, true);
+      await check(s.page, 'scan.pdf');
+      await press(s.page, 'Prepare selected');
+      await waitFor(s.page, () => document.body.innerText.includes('Now: scan.pdf (1/4 windows)'), 'the job progress');
+      await waitText(s.page, '1/2 documents');
+      assert.deepEqual(callsTo(s, 'POST', '/api/prepare/jobs')[0].body, { document_ids: ['ccccccccccc3'] });
+      await press(s.page, 'Cancel');
+      await new Promise(r => setTimeout(r, 300));
+      assert.equal(callsTo(s, 'POST', '/api/prepare/job/prep0001/cancel').length, 1);
+      await press(s.page, 'Prepare all');
+      await new Promise(r => setTimeout(r, 300));
+      assert.deepEqual(callsTo(s, 'POST', '/api/prepare/jobs')[1].body, { all: true });
+    } },
+    { name: 'Delete asks for confirmation first: dismissed sends nothing, accepted deletes the document or only its prepared output', open: open('developer', {
+        'DELETE /api/prepare/documents/aaaaaaaaaaa1': { status: 204, type: 'application/json', body: '' },
+        'DELETE /api/prepare/documents/aaaaaaaaaaa1/prepared': { status: 204, type: 'application/json', body: '' },
+      }, { onDialog: async d => { dialogs.push(d.message()); if (acceptDialogs) await d.accept(); else await d.dismiss(); } }), async run(s) {
+      await waitText(s.page, 'minutes.txt');
+      const press1 = label => s.page.evaluate(l => [...document.querySelectorAll('tr[data-document="aaaaaaaaaaa1"] button')].find(b => b.textContent.trim() === l).click(), label);
+      await press1('Delete');
+      await new Promise(r => setTimeout(r, 300));
+      assert.equal(callsTo(s, 'DELETE', '/api/prepare/documents/aaaaaaaaaaa1').length, 0);
+      assert.match(dialogs[0], /Delete 'minutes.txt' \(raw and prepared\)\?/);
+      acceptDialogs = true;
+      await press1('Delete prepared');
+      await new Promise(r => setTimeout(r, 300));
+      assert.equal(callsTo(s, 'DELETE', '/api/prepare/documents/aaaaaaaaaaa1/prepared').length, 1);
+      await press1('Delete');
+      await new Promise(r => setTimeout(r, 300));
+      assert.equal(callsTo(s, 'DELETE', '/api/prepare/documents/aaaaaaaaaaa1').length, 1);
+    } },
+    { name: 'Import selected and Import all prepared send the collection, selection and chunk settings and show the ingest job; a refusal is an alert', open: (() => {
+      let posts = 0;
+      return open('developer', {
+        'POST /api/prepare/import': () => { posts++; return posts === 1 ? json(202, { job_id: 'ing00002', status: 'queued', files_queued: 1, collection: B })
+          : apiError(409, 'DOCUMENT_NOT_PREPARED', 'Not prepared: scan.pdf.'); },
+        'GET /api/ingest/job/ing00002': json(200, { job_id: 'ing00002', status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 3, errors: [] }),
+      });
+    })(), async run(s) {
+      await waitText(s.page, 'minutes.txt');
+      await waitSelected(s.page, 0);
+      assert.equal((await buttonState(s.page, 'Import selected')).disabled, true);
+      assert.equal((await buttonState(s.page, 'Import all prepared')).disabled, false);
+      await fillNth(s.page, 'select', 0, B);
+      await fillNth(s.page, 'input[type=range]', 0, 2000);
+      await check(s.page, 'minutes.txt');
+      await press(s.page, 'Import selected');
+      await waitText(s.page, 'Job ID: ing00002');
+      assert.deepEqual(callsTo(s, 'POST', '/api/prepare/import')[0].body, { collection: B, document_ids: ['aaaaaaaaaaa1'], strategy: 'overlap',
+        chunk_size: 2000, chunk_overlap: 200, similarity_threshold: 0.85, min_chunk_size: 100 });
+      await press(s.page, 'Import all prepared');
+      await waitFor(s.page, () => [...document.querySelectorAll('[role=alert]')].some(a => a.textContent.includes('Not prepared: scan.pdf.')), 'the refusal alert');
+      assert.equal(callsTo(s, 'POST', '/api/prepare/import')[1].body.all, true);
+    } },
+    { name: 'The Import page links to the Prepare page ("Prepare documents first")', open: { role: 'developer', path: '/import', routes: routes() }, async run(s) {
+      await waitText(s.page, 'Prepare documents first');
+      await s.page.evaluate(() => [...document.querySelectorAll('a')].find(a => a.textContent.trim() === 'Prepare documents first').click());
+      await waitPath(s.page, '/prepare');
+      await waitText(s.page, 'Prepare Documents');
+    } },
+    { name: 'An End User opening /prepare directly is sent to Q&A', open: { role: 'end_user', path: '/prepare', routes: base() }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      await waitPath(s.page, '/qa');
+    } },
+  ];
+}
+
 async function runUiControlTests(browser, baseUrl, reporter) {
   S.BASE = baseUrl;
   const run = (section, cases) => S.runCases(browser, baseUrl, reporter, section, cases);
@@ -47679,6 +48123,7 @@ async function runUiControlTests(browser, baseUrl, reporter) {
   await run('Users page: Engineers manage accounts (#25)', usersCases());
   await run('Service keys page: Engineers manage service principals and keys (#25)', serviceKeysCases());
   await run('Audit page: Engineers read the audit log (#29)', auditCases());
+  await run('Prepare page: list, preview, upload, jobs, deletes and import (#638)', prepareCases());
   await run('Q&A input, citations toggle, answer display and End User view (#400)', qaCases());
   await run('Retrieval page status text, alpha slider and save (#400)', retrievalCases());
   await run('Client handling of the proxy error pages (#400)', proxyCases());

@@ -1015,6 +1015,154 @@ function auditCases() {
   ];
 }
 
+// The Prepare page (#638, SPECIFICATIONS.md §7): the document list, preview,
+// upload, preparation job, deletes and import, every API call stubbed.
+function prepareCases() {
+  const owner = { name: 'vfy-developer', kind: 'user' };
+  const doc = over => ({ raw_type: '.txt', raw_bytes: 2048, owner, created_at: '2026-11-04T10:00:00Z', status: 'raw', prepared_at: null,
+    prepared_bytes: 0, parts: [], fallback: false, code_only_by_type: false, last_error: null, imports: [], ...over });
+  const part = over => ({ name: 'minutes.md', bytes: 1536, characters: 1500, title: 'Committee minutes', summary: 'Items carried forward.',
+    summary_error: null, fallback: false, fallbacks: [], ...over });
+  const DOCS = [
+    doc({ id: 'aaaaaaaaaaa1', name: 'minutes.txt', status: 'prepared', prepared_at: '2026-11-04T10:05:00Z', prepared_bytes: 1536,
+      parts: [part({ fallback: true, fallbacks: [{ window: 2, reason: 'removed-too-much' }] })], fallback: true,
+      imports: [{ collection: A, job_id: 'ing00001', at: '2026-11-04T11:00:00Z' }] }),
+    doc({ id: 'bbbbbbbbbbb2', name: 'people.csv', raw_type: '.csv', raw_bytes: 100, status: 'prepared', prepared_bytes: 100,
+      parts: [part({ name: 'people.csv', bytes: 100, records: 2, title: null, summary: null, summary_error: 'llm-unavailable' })], code_only_by_type: true }),
+    doc({ id: 'ccccccccccc3', name: 'scan.pdf', raw_type: '.pdf', raw_bytes: 500, status: 'failed', last_error: 'scan.pdf has no text to prepare' }),
+  ];
+  const LIST = { documents: DOCS, used_bytes: 3 * 1024 * 1024, limit_bytes: 20 * 1024 * 1024 * 1024 };
+  const withPreview = d => ({ ...d, parts: d.parts.map(p => ({ ...p, preview: `# ${p.title || ''}\n\nPreview of ${p.name}` })) });
+  const routes = (extra = {}) => base({
+    'GET /api/prepare/documents': json(200, LIST),
+    'GET /api/prepare/jobs': json(200, { jobs: [] }),
+    'GET /api/prepare/documents/*': call => json(200, withPreview(DOCS.find(d => call.path.endsWith(d.id)))),
+    ...extra,
+  });
+  const open = (role = 'developer', extra = {}, more = {}) => ({ role, path: '/prepare', routes: routes(extra), ...more });
+  const rows = page => page.evaluate(() => [...document.querySelectorAll('tbody tr[data-document]')].map(r =>
+    [...r.querySelectorAll('td')].map(c => c.innerText.replace(/\s+/g, ' ').trim())));
+  const rowActions = (page, id) => page.evaluate(i => [...document.querySelectorAll(`tr[data-document="${i}"] td:last-child a, tr[data-document="${i}"] td:last-child button`)]
+    .map(e => [e.textContent.trim(), e.getAttribute('href')]), id);
+  const dialogs = [];
+  let acceptDialogs = false;
+  const check = (page, name) => page.evaluate(n => { const b = document.querySelector(`input[aria-label="Select ${n}"]`); b.click(); }, name);
+  return [
+    { name: 'Prepare page lists each document with status, sizes, parts, the fallback mark, imports, the last error and the space used', open: open(), async run(s) {
+      await waitText(s.page, 'minutes.txt');
+      await waitText(s.page, 'Space used: 3.0 MB of 20.00 GB');
+      await waitText(s.page, 'Preparation and ingest share the local LLM service');
+      const r = await rows(s.page);
+      assert.equal(r.length, 3);
+      assert.deepEqual(r[0].slice(1, 7), ['minutes.txt', 'prepared', '2.0 KB', '1.5 KB', '1', 'fell back (1)']);
+      assert.ok(r[0][7].startsWith(A), r[0][7]);
+      assert.deepEqual(r[1].slice(1, 7), ['people.csv', 'prepared', '100 B', '100 B', '1', 'code-only (by type)']);
+      assert.deepEqual(r[2].slice(1, 7), ['scan.pdf Last error: scan.pdf has no text to prepare', 'failed', '500 B', '-', '-', '']);
+      assert.deepEqual(await rowActions(s.page, 'aaaaaaaaaaa1'), [['Preview', null], ['Download raw', '/api/prepare/documents/aaaaaaaaaaa1/raw'],
+        ['Download prepared', '/api/prepare/documents/aaaaaaaaaaa1/prepared'], ['Delete prepared', null], ['Delete', null]]);
+      assert.deepEqual(await rowActions(s.page, 'ccccccccccc3'), [['Download raw', '/api/prepare/documents/ccccccccccc3/raw'], ['Delete', null]]);
+    } },
+    { name: 'Preview shows each part\'s name, size, title, summary or why there is none, fallbacks and the preview text', open: open(), async run(s) {
+      await waitText(s.page, 'minutes.txt');
+      await s.page.evaluate(() => [...document.querySelectorAll('tr[data-document="aaaaaaaaaaa1"] button')].find(b => b.textContent.trim() === 'Preview').click());
+      await waitText(s.page, 'Preview: minutes.txt');
+      for (const want of ['minutes.md (1.5 KB)', 'Title: Committee minutes', 'Summary: Items carried forward.', 'window 2: removed-too-much', 'Preview of minutes.md']) await waitText(s.page, want);
+      await s.page.evaluate(() => [...document.querySelectorAll('tr[data-document="bbbbbbbbbbb2"] button')].find(b => b.textContent.trim() === 'Preview').click());
+      await waitText(s.page, 'Preview: people.csv');
+      await waitText(s.page, 'No title or summary (llm-unavailable).');
+      assert.equal(callsTo(s, 'GET', '/api/prepare/documents/bbbbbbbbbbb2').length, 1);
+    } },
+    { name: 'Upload sends the queued files as "files", shows the skipped list and reloads the documents', open: open('developer', {
+      'POST /api/prepare/upload': json(201, { documents: [], skipped: ['x.exe: unsupported file type'] }) }), async run(s) {
+      await waitText(s.page, 'minutes.txt');
+      assert.equal((await buttonState(s.page, 'Upload')).disabled, true);
+      const input = await s.page.$('#prepare-file-input');
+      await input.uploadFile(...tempFiles(['raw.txt', 'more.md']));
+      await waitText(s.page, 'more.md');
+      await press(s.page, 'Upload');
+      await waitText(s.page, 'x.exe: unsupported file type');
+      const [form] = await forms(s.page);
+      assert.deepEqual(form, [['files', 'file:raw.txt'], ['files', 'file:more.md']]);
+      assert.equal(callsTo(s, 'GET', '/api/prepare/documents').length, 2);
+    } },
+    { name: 'Prepare selected and Prepare all send the selection; the job\'s progress, current windows and Cancel are shown', open: (() => {
+      let polls = 0;
+      return open('developer', {
+        'POST /api/prepare/jobs': json(202, { job_id: 'prep0001', status: 'queued', documents_queued: 1 }),
+        'GET /api/prepare/job/prep0001': () => { polls++; return json(200, { job_id: 'prep0001', status: 'running', documents_total: 2, documents_completed: 1,
+          documents_failed: 0, document_ids: [], names: ['minutes.txt', 'scan.pdf'], errors: [], owner, created_at: '2026-11-04T12:00:00Z',
+          current: { document_id: 'ccccccccccc3', name: 'scan.pdf', windows_done: 1, windows_total: 4 } }); },
+        'POST /api/prepare/job/prep0001/cancel': json(202, { job_id: 'prep0001', status: 'running' }),
+      });
+    })(), async run(s) {
+      await waitText(s.page, 'minutes.txt');
+      assert.equal((await buttonState(s.page, 'Prepare selected')).disabled, true);
+      await check(s.page, 'scan.pdf');
+      await press(s.page, 'Prepare selected');
+      await waitFor(s.page, () => document.body.innerText.includes('Now: scan.pdf (1/4 windows)'), 'the job progress');
+      await waitText(s.page, '1/2 documents');
+      assert.deepEqual(callsTo(s, 'POST', '/api/prepare/jobs')[0].body, { document_ids: ['ccccccccccc3'] });
+      await press(s.page, 'Cancel');
+      await new Promise(r => setTimeout(r, 300));
+      assert.equal(callsTo(s, 'POST', '/api/prepare/job/prep0001/cancel').length, 1);
+      await press(s.page, 'Prepare all');
+      await new Promise(r => setTimeout(r, 300));
+      assert.deepEqual(callsTo(s, 'POST', '/api/prepare/jobs')[1].body, { all: true });
+    } },
+    { name: 'Delete asks for confirmation first: dismissed sends nothing, accepted deletes the document or only its prepared output', open: open('developer', {
+        'DELETE /api/prepare/documents/aaaaaaaaaaa1': { status: 204, type: 'application/json', body: '' },
+        'DELETE /api/prepare/documents/aaaaaaaaaaa1/prepared': { status: 204, type: 'application/json', body: '' },
+      }, { onDialog: async d => { dialogs.push(d.message()); if (acceptDialogs) await d.accept(); else await d.dismiss(); } }), async run(s) {
+      await waitText(s.page, 'minutes.txt');
+      const press1 = label => s.page.evaluate(l => [...document.querySelectorAll('tr[data-document="aaaaaaaaaaa1"] button')].find(b => b.textContent.trim() === l).click(), label);
+      await press1('Delete');
+      await new Promise(r => setTimeout(r, 300));
+      assert.equal(callsTo(s, 'DELETE', '/api/prepare/documents/aaaaaaaaaaa1').length, 0);
+      assert.match(dialogs[0], /Delete 'minutes.txt' \(raw and prepared\)\?/);
+      acceptDialogs = true;
+      await press1('Delete prepared');
+      await new Promise(r => setTimeout(r, 300));
+      assert.equal(callsTo(s, 'DELETE', '/api/prepare/documents/aaaaaaaaaaa1/prepared').length, 1);
+      await press1('Delete');
+      await new Promise(r => setTimeout(r, 300));
+      assert.equal(callsTo(s, 'DELETE', '/api/prepare/documents/aaaaaaaaaaa1').length, 1);
+    } },
+    { name: 'Import selected and Import all prepared send the collection, selection and chunk settings and show the ingest job; a refusal is an alert', open: (() => {
+      let posts = 0;
+      return open('developer', {
+        'POST /api/prepare/import': () => { posts++; return posts === 1 ? json(202, { job_id: 'ing00002', status: 'queued', files_queued: 1, collection: B })
+          : apiError(409, 'DOCUMENT_NOT_PREPARED', 'Not prepared: scan.pdf.'); },
+        'GET /api/ingest/job/ing00002': json(200, { job_id: 'ing00002', status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 3, errors: [] }),
+      });
+    })(), async run(s) {
+      await waitText(s.page, 'minutes.txt');
+      await waitSelected(s.page, 0);
+      assert.equal((await buttonState(s.page, 'Import selected')).disabled, true);
+      assert.equal((await buttonState(s.page, 'Import all prepared')).disabled, false);
+      await fillNth(s.page, 'select', 0, B);
+      await fillNth(s.page, 'input[type=range]', 0, 2000);
+      await check(s.page, 'minutes.txt');
+      await press(s.page, 'Import selected');
+      await waitText(s.page, 'Job ID: ing00002');
+      assert.deepEqual(callsTo(s, 'POST', '/api/prepare/import')[0].body, { collection: B, document_ids: ['aaaaaaaaaaa1'], strategy: 'overlap',
+        chunk_size: 2000, chunk_overlap: 200, similarity_threshold: 0.85, min_chunk_size: 100 });
+      await press(s.page, 'Import all prepared');
+      await waitFor(s.page, () => [...document.querySelectorAll('[role=alert]')].some(a => a.textContent.includes('Not prepared: scan.pdf.')), 'the refusal alert');
+      assert.equal(callsTo(s, 'POST', '/api/prepare/import')[1].body.all, true);
+    } },
+    { name: 'The Import page links to the Prepare page ("Prepare documents first")', open: { role: 'developer', path: '/import', routes: routes() }, async run(s) {
+      await waitText(s.page, 'Prepare documents first');
+      await s.page.evaluate(() => [...document.querySelectorAll('a')].find(a => a.textContent.trim() === 'Prepare documents first').click());
+      await waitPath(s.page, '/prepare');
+      await waitText(s.page, 'Prepare Documents');
+    } },
+    { name: 'An End User opening /prepare directly is sent to Q&A', open: { role: 'end_user', path: '/prepare', routes: base() }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      await waitPath(s.page, '/qa');
+    } },
+  ];
+}
+
 async function runUiControlTests(browser, baseUrl, reporter) {
   S.BASE = baseUrl;
   const run = (section, cases) => S.runCases(browser, baseUrl, reporter, section, cases);
@@ -1025,6 +1173,7 @@ async function runUiControlTests(browser, baseUrl, reporter) {
   await run('Users page: Engineers manage accounts (#25)', usersCases());
   await run('Service keys page: Engineers manage service principals and keys (#25)', serviceKeysCases());
   await run('Audit page: Engineers read the audit log (#29)', auditCases());
+  await run('Prepare page: list, preview, upload, jobs, deletes and import (#638)', prepareCases());
   await run('Q&A input, citations toggle, answer display and End User view (#400)', qaCases());
   await run('Retrieval page status text, alpha slider and save (#400)', retrievalCases());
   await run('Client handling of the proxy error pages (#400)', proxyCases());

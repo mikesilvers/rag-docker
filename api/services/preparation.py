@@ -405,6 +405,36 @@ def windows(text: str) -> list[Window]:
     return out
 
 
+def _lines(text: str) -> Iterator[str]:
+    """The lines of `text`, as text.split("\n") gives them, one at a time."""
+    start = 0
+    while True:
+        end = text.find("\n", start)
+        if end < 0:
+            yield text[start:]
+            return
+        yield text[start:end]
+        start = end + 1
+
+
+def count_windows(text: str) -> int:
+    """len(windows(text)), without building the windows."""
+    count = 0
+    open_window = False
+    size = 0
+    for line in _lines(text):
+        if len(line) + 1 > WINDOW_CHARACTERS:
+            count += 1 + (1 if open_window else 0)
+            open_window, size = False, 0
+            continue
+        if open_window and size + len(line) + 1 > WINDOW_CHARACTERS:
+            count += 1
+            size = 0
+        open_window = True
+        size += len(line) + 1
+    return count + (1 if open_window else 0)
+
+
 # ── the LLM ──────────────────────────────────────────────────────────────────
 
 Chat = Callable[[str, str], Awaitable[str]]
@@ -622,9 +652,7 @@ async def prepare_document(raw: Path, name: str, raw_type: str, chat: Chat,
         raise Cancelled()
 
     if kind == "text":
-        # Parsed whole (PDF and DOCX are anyway), so the size cap counts every window.
-        parts = await asyncio.to_thread(lambda: list(iter_parts(raw, raw_type)))
-        return await _prepare_text(parts, name, llm, should_stop, write_part, progress)
+        return await _prepare_text(raw, raw_type, name, llm, should_stop, write_part, progress)
     return await _prepare_records(raw, raw_type, name, kind, llm, should_stop, write_part)
 
 
@@ -632,27 +660,56 @@ def _no_text(name: str) -> ValueError:
     return ValueError("has no text to prepare")
 
 
-async def _prepare_text(parts: list[Part], name: str, llm: LLM, should_stop, write_part,
-                        progress) -> Result:
-    if not parts:
+def _count_text_windows(parts: Iterator[Part], should_stop) -> tuple[int, int]:
+    """(parts, windows) of a document, one part held at a time."""
+    count = total = 0
+    for part in parts:
+        if should_stop():
+            raise Cancelled()
+        count += 1
+        total += count_windows(part.body)
+    return count, total
+
+
+async def _prepare_text(raw: Path, raw_type: str, name: str, llm: LLM, should_stop,
+                        write_part, progress) -> Result:
+    """PDF, DOCX, TXT and MD. A .txt or .md is read part by part twice, as ingest
+    reads it (#621), so memory is bounded by one part whatever the file's size:
+    once to count its windows against MAX_WINDOWS, then to clean and write each
+    part, building only that part's windows. A PDF or DOCX is parsed whole, as
+    ingest parses it, and its parts kept for both passes. Parts are written under
+    their index and named once the count is known."""
+    if raw_type in (".pdf", ".docx"):
+        held = await asyncio.to_thread(lambda: list(iter_parts(raw, raw_type)))
+
+        def source() -> Iterator[Part]:
+            return iter(held)
+    else:
+        def source() -> Iterator[Part]:
+            return iter_parts(raw, raw_type)
+    count, total = await asyncio.to_thread(_count_text_windows, source(), should_stop)
+    if not count:
         raise _no_text(name)
-    names = part_names(name, "text", len(parts))
-    split = [windows(part.body) for part in parts]
-    total = sum(len(ws) for ws in split)
     too_large = total > MAX_WINDOWS
     done = 0
     progress(done, total)
     result = Result()
-    for index, (part, part_windows) in enumerate(zip(parts, split)):
+    iterator = source()
+    index = 0
+    while True:
+        part = await asyncio.to_thread(next, iterator, None)
+        if part is None:
+            break
         fallbacks: list[dict] = []
         kept: list[str] = []
         if too_large:
             fallbacks.append({"window": None, "reason": "too-large-for-llm"})
-            kept = part.body.split("\n")
-            done += len(part_windows)
+            kept = [part.body]
+            done += count_windows(part.body)
+            progress(done, total)
         else:
             unavailable_noted = False
-            for number, window in enumerate(part_windows, 1):
+            for number, window in enumerate(windows(part.body), 1):
                 if should_stop():
                     raise Cancelled()
                 if llm.down:
@@ -672,13 +729,21 @@ async def _prepare_text(parts: list[Part], name: str, llm: LLM, should_stop, wri
                 done += 1
                 progress(done, total)
         body = "\n".join(kept).strip("\n")
+        del kept, part
         title, summary, error = await title_summary(body, llm)
         text = (header_text(title, summary) if title else "") + body + "\n"
-        entry = await _write(index, names[index], text, "text", write_part)
+        del body
+        entry = await _write(index, "", text, "text", write_part)
+        del text
         entry.update(title=title, summary=summary, summary_error=error,
                      fallback=bool(fallbacks), fallbacks=fallbacks)
         result.parts.append(entry)
         result.fallback = result.fallback or bool(fallbacks)
+        index += 1
+    if index != count:
+        raise ValueError("changed while it was being prepared; prepare it again")
+    for entry, part_name in zip(result.parts, part_names(name, "text", count)):
+        entry["name"] = part_name
     return result
 
 
