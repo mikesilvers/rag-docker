@@ -1875,7 +1875,7 @@ For `ui/` this is load-bearing rather than tidiness: the Dockerfile runs
 `node_modules/` would overwrite the container's freshly installed tree with
 packages built for the host platform.
 
-**Note on semantic chunking:** `sentence-transformers` is used locally within the API service to compute sentence-level similarity for the `semantic` chunking strategy. It does not require a separate service and uses `all-MiniLM-L6-v2`. The model weights (~90MB) must be downloaded at Docker **build** time (not runtime) to preserve the self-contained constraint. The `api/Dockerfile` includes a `RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"` step to pre-cache the model in the image.
+**Note on semantic chunking:** `sentence-transformers` is used locally within the API service to compute sentence-level similarity for the `semantic` chunking strategy. It does not require a separate service and uses `all-MiniLM-L6-v2`. The model weights (~90MB) must be downloaded at Docker **build** time (not runtime) to preserve the self-contained constraint. The `api/Dockerfile` includes a `RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"` step to pre-cache the model in the image. At runtime the api service sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` (in `docker-compose.yml` and as `ENV` in `api/Dockerfile`), so the first `semantic` ingest uses the cached copy with no network call to huggingface.co.
 
 ---
 
@@ -3249,6 +3249,8 @@ now lives once, in `api/services/ingest_config.py`.
 - [x] `chunk_size` is bounded to 50–6000 and `min_chunk_size` to 0–6000 wherever chunk settings are saved or used; a saved configuration from before the bounds is still returned and exported unchanged, and must be within them to be saved again or used for tuning (#53).
       *`test_settings_validation.py` saves and reads back both edges, rejects 49, 6001 and a minimum of 6001 without changing the saved configuration, and checks a saved 16000/8000 configuration is returned and exported unclamped but refused by save, rechunk and reembed. `07_settings.sh` checks both edges and their neighbours against the live stack.*
 
+- [x] A first `semantic` ingest makes no huggingface.co request: the api container sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`, and the pre-cached `all-MiniLM-L6-v2` model loads from the image cache with the endpoint unroutable (#618).
+      *`scripts/verify/20_offline_model.sh` checks the offline flags are set and honoured (`huggingface_hub.constants.HF_HUB_OFFLINE`), then loads the model with `HF_ENDPOINT` pointed at an unroutable address and requires it within 60 s; it fails on `develop` ("offline flags: None None False") and passes with the offline flags (model loaded in 0.1 s in the review run).*
 - [x] Single file upload (all six types) completes without error and stores chunks in Weaviate.
       *One file of each type. `.md` failed — `unstructured[pdf,docx,csv]` omitted
       the `md` extra, so Markdown ingestion had never worked. **Fixed**: added the

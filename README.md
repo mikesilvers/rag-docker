@@ -625,6 +625,8 @@ All API settings are environment variables in `docker-compose.yml`:
 | `AUDIT_LOG_QUESTIONS` | `false` | Whether the [audit log](#audit-log) records a query's question text. Exactly `true` or `false`; anything else stops the API |
 | `AUDIT_LOG_MAX_BYTES` | `10485760` (10 MiB) | The size at which `audit.jsonl` is rotated; at least 4096 |
 | `AUDIT_LOG_KEEP` | `10` | How many rotated audit files are kept (1-1000); the oldest beyond them is deleted |
+| `HF_HUB_OFFLINE` | `1` | Keeps the image's pre-cached sentence-transformers model from contacting huggingface.co; set to `0` only if you change the model and want it downloaded at runtime |
+| `TRANSFORMERS_OFFLINE` | `1` | Same offline enforcement for the transformers library; keep `1` to use the pre-cached model with no runtime network call |
 
 LAN mode reads two more settings from your shell or a `.env` file next to `docker-compose.yml`, used by `docker-compose.lan.yml`:
 
