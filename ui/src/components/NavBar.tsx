@@ -14,6 +14,7 @@ const ENGINEER: Role[] = ['engineer']
 const MENUS: MenuDef[] = [
   { key: 'data', label: 'Data', entries: [
     { label: 'Import', to: '/import', roles: STAFF },
+    { label: 'Prepare', to: '/prepare', roles: STAFF },
     { label: 'Transfer', to: '/transfer', roles: STAFF },
   ] },
   { key: 'tune', label: 'Tune', entries: [
