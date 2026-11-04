@@ -135,6 +135,14 @@ services:
       SOURCES_DIR: /app/sources
       EXPORTS_DIR: /app/exports
       OLLAMA_MODELS_DIR: /ollama
+      # The sentence-transformers model is pre-cached in the api image at
+      # build time (api/Dockerfile). Without these flags the Hugging Face
+      # libraries still try to reach huggingface.co on first load and, when
+      # the site is unreachable, retry each model file five times -- stalling
+      # the first semantic ingest for minutes (issue #618). Pin them to the
+      # local cache so offline installs and air-gapped hosts load instantly.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
       # Shown by /health and compared against the memory Docker actually
       # provides. Raise this if you allocate more to Docker Desktop.
       RECOMMENDED_MEMORY_GB: 12
@@ -164,12 +172,20 @@ services:
       AUDIT_LOG_QUESTIONS: "false"
       AUDIT_LOG_MAX_BYTES: "10485760"
       AUDIT_LOG_KEEP: "10"
+      # The preparation area (#638): raw documents and their prepared parts, in
+      # the rag_preparation volume until deleted. MAX_PREPARATION_BYTES (20 GiB)
+      # is the most they may hold together, checked before each upload and each
+      # prepared part is written; writes running at once may pass it briefly.
+      PREPARATION_DIR: /app/preparation
+      MAX_PREPARATION_BYTES: "21474836480"
     volumes:
       - ingest_uploads:/app/uploads
       # Accounts, sessions and the login throttle (#25), one SQLite file.
       - auth_data:/app/auth_data
       # Retained source documents; grows with the corpus.
       - rag_sources:/app/sources
+      # The preparation area (#638): raw and prepared documents until deleted.
+      - rag_preparation:/app/preparation
       # Bind mount, deliberately: an export is only useful if the user can
       # reach the file from the host without going through Docker.
       - ./exports:/app/exports
@@ -224,6 +240,7 @@ volumes:
   ollama_models:
   ingest_uploads:
   rag_sources:
+  rag_preparation:
   auth_data:
 
 networks:
@@ -966,6 +983,14 @@ class Settings(BaseSettings):
     # are kept (audit.jsonl.1 newest), the oldest beyond them deleted.
     audit_log_max_bytes: int = 10 * 1024 * 1024
     audit_log_keep: int = 10
+    # The preparation area (#638): raw documents uploaded for preparation and
+    # their prepared parts, in the rag_preparation volume, until deleted.
+    preparation_dir: str = "/app/preparation"
+    # The most the area's files may hold, raw and prepared together. A
+    # best-effort cap: each upload and each prepared part is checked before it
+    # is written, nothing is reserved, so writes running at once can pass it
+    # briefly (maintainer's decision, #638).
+    max_preparation_bytes: int = 20 * 1024 * 1024 * 1024
 
     @field_validator("auth_cookie_secure", "rag_lan_mode", "audit_log_questions", mode="before")
     @classmethod
@@ -984,6 +1009,13 @@ class Settings(BaseSettings):
         # One record must fit; a smaller limit would rotate on every write.
         if value < 4096:
             raise ValueError("AUDIT_LOG_MAX_BYTES must be at least 4096")
+        return value
+
+    @field_validator("max_preparation_bytes")
+    @classmethod
+    def _preparation_cap(cls, value):
+        if value < 1024 * 1024:
+            raise ValueError("MAX_PREPARATION_BYTES must be at least 1048576")
         return value
 
     @field_validator("audit_log_keep")
@@ -2074,6 +2106,58 @@ class ImportJobList(BaseModel):
 
 class GenerationList(BaseModel):
     sessions: list[GenerationEntry]
+
+
+# ── Document preparation (#638) ───────────────────────────────────────────────
+
+class _PrepareSelection(BaseModel):
+    """Exactly one of `document_ids` (possibly empty, which is refused with 400
+    NO_DOCUMENTS) or `all: true`."""
+    document_ids: Optional[list[str]] = None
+    all: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _one_selection(self):
+        if (self.document_ids is None) == (self.all is not True):
+            raise ValueError("give either document_ids or \"all\": true")
+        if self.document_ids is not None and self.all is not None:
+            raise ValueError("give either document_ids or \"all\": true, not both")
+        return self
+
+
+class PrepareStartRequest(_PrepareSelection):
+    pass
+
+
+class PrepareImportRequest(_PrepareSelection):
+    collection: CollectionName
+    strategy: ChunkingStrategy = "overlap"
+    chunk_size: ChunkSize = 1000
+    chunk_overlap: NonnegativeSize = 200
+    similarity_threshold: UnitInterval = 0.85
+    min_chunk_size: MinChunkSize = 100
+
+    @model_validator(mode="after")
+    def _overlap_rule(self):
+        if self.strategy in ("overlap", "language") and self.chunk_overlap >= self.chunk_size:
+            raise ValueError(OVERLAP_RULE)
+        return self
+
+
+class PrepareJobEntry(ListedTimes):
+    job_id: str
+    status: str
+    documents_total: int = 0
+    documents_completed: int = 0
+    documents_failed: int = 0
+    document_ids: list[str] = []
+    names: list[str] = []
+    current: Optional[dict] = None
+    errors: list[str] = []
+
+
+class PrepareJobList(BaseModel):
+    jobs: list[PrepareJobEntry]
 ```
 
 ### api/services/__init__.py
@@ -5257,17 +5341,22 @@ def _json_lines(value: Any, path: Any, out: list[str], budget: _JsonBudget) -> N
         _json_line(path, _json_scalar(value), out, budget)
 
 
+def _json_groups(value: Any) -> list[Any]:
+    """The values a JSON file's records come from: the items of a top-level array
+    that holds any object or array, otherwise the whole value as one (#295).
+    Document preparation (#638) writes each one as a JSON Lines line."""
+    if isinstance(value, list) and not all(_is_json_scalar(item) for item in value):
+        return value
+    return [value]
+
+
 def _iter_json_records(value: Any) -> Iterator[tuple[str, str]]:
     """Ordinary JSON as readable text: one record per item of a top-level array
     that holds any object or array, otherwise one record. Records with no text
     are dropped. Yields (`record N`, text), N the item's position from 1; each
     record's text is bounded on its own (#621)."""
-    if isinstance(value, list) and not all(_is_json_scalar(item) for item in value):
-        groups = value
-    else:
-        groups = [value]
     kept = 0
-    for position, group in enumerate(groups, 1):
+    for position, group in enumerate(_json_groups(value), 1):
         ordinal = f"record {position}"
         lines: list[str] = []
         try:
@@ -5402,7 +5491,17 @@ _BOM = b"\xef\xbb\xbf"
 
 def _iter_jsonl_records(stream: Any) -> Iterator[tuple[str, str]]:
     """The records of a JSON Lines file, one per line with text (#291), as
-    (`line N`, text).
+    (`line N`, text). See _iter_jsonl_lines."""
+    for number, _raw, text in _iter_jsonl_lines(stream):
+        if text.strip():
+            yield f"line {number}", text
+
+
+def _iter_jsonl_lines(stream: Any) -> Iterator[tuple[int, bytes, str]]:
+    """Every record line of a JSON Lines file as (number, line, text): the line's
+    bytes without its line ending or line 1's byte-order mark, and its converted
+    text, which is empty for a record with no text. Blank lines are not given.
+    Document preparation (#638) keeps the line as it is; ingest keeps the text.
 
     Read one line at a time, at most MAX_JSONL_LINE_BYTES of it besides its line
     ending and line 1's byte-order mark, and stopped at the first bad line, at
@@ -5462,9 +5561,7 @@ def _iter_jsonl_records(stream: Any) -> Iterator[tuple[str, str]]:
         except RecursionError as exc:
             raise _JsonlError(
                 f"line {number} is not valid JSON: it is nested too deeply to read") from exc
-        # A record with no text is not stored.
-        if text.strip():
-            yield f"line {number}", text
+        yield number, raw, text
 
 
 def _jsonl_records(stream: Any) -> list[str]:
@@ -6276,6 +6373,55 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
             queue.add(target, logical, f"{safe_name}:{member.filename}")
 
 
+async def stage_uploads(files: list[Any], tmp_dir: Path,
+                        names: list[str] | None = None) -> tuple["_Queue", list[str]]:
+    """Save an upload's files under tmp_dir and queue every supported one, ZIPs
+    validated and expanded (#290, #298, #28): the queue and the skipped list.
+    Ingest and document preparation (#638) stage uploads the same way.
+
+    `names`, when given, is each file's logical name in place of its file name
+    (#638: a prepared part keeps its folder path). The caller removes tmp_dir
+    when this raises."""
+    # Files the caller sent that this build cannot parse, and inputs replaced by
+    # a later one with the same name. Dropping them without a word makes a ZIP
+    # of 8 files silently report 6, with nothing saying which two or why.
+    skipped: list[str] = []
+    queue = _Queue(tmp_dir, skipped)
+    # One expansion total for every ZIP in this request (#298).
+    budget = _ExpansionBudget(settings.max_zip_expanded_bytes)
+
+    for index, upload in enumerate(files):
+        raw_name = upload.filename or ""
+        safe_name = Path(raw_name).name
+        if not safe_name:
+            continue
+        logical = names[index] if names is not None else safe_name
+        dest = queue.slot(safe_name)
+        # Copy in blocks rather than `await upload.read()`, which held the
+        # whole file in memory. Uploads can now reach 512 MB (issue #21),
+        # and this container already runs close to its memory budget. The
+        # copy blocks, so it runs off the event loop.
+        try:
+            await asyncio.to_thread(_save_upload, upload.file, dest)
+        except OSError as exc:
+            raise _rejected(
+                "UPLOAD_WRITE_FAILED",
+                f"Could not save '{safe_name}' on the server: {_os_reason(exc)}.",
+                safe_name) from exc
+
+        if safe_name.lower().endswith(".zip"):
+            # Off the event loop, like the copy above (#298).
+            await asyncio.to_thread(_extract_zip, dest, safe_name, queue, budget)
+            os.remove(dest)
+        elif (Path(safe_name).suffix.lower() in SUPPORTED_EXTENSIONS
+              or _is_jsonl_gz(safe_name)):
+            # A directly uploaded .json.gz is still skipped (#291 scope).
+            queue.add(dest, logical, logical)
+        else:
+            skipped.append(f"{safe_name} ({_skip_reason(safe_name)})")
+    return queue, skipped
+
+
 async def start_ingest_job(
     files: list[Any],
     collection: str,
@@ -6285,8 +6431,12 @@ async def start_ingest_job(
     similarity_threshold: float,
     min_chunk_size: int,
     owner: dict | None = None,
+    *,
+    names: list[str] | None = None,
 ) -> str:
-    """`owner` is who started the job (#617), recorded for the job lists."""
+    """`owner` is who started the job (#617), recorded for the job lists.
+    `names`, one per file, are the logical names to store them under instead of
+    their file names: an import of prepared documents (#638) keeps folder paths."""
     config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
                           chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
                           min_chunk_size=min_chunk_size)
@@ -6302,7 +6452,7 @@ async def start_ingest_job(
     try:
         return await _admit_ingest_job(job_id, files, collection, strategy, chunk_size,
                                        chunk_overlap, similarity_threshold, min_chunk_size,
-                                       owner)
+                                       owner, names)
     except BaseException:
         collection_writes.end_job("ingest", job_id)
         raise
@@ -6311,46 +6461,12 @@ async def start_ingest_job(
 async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, strategy: str,
                             chunk_size: int, chunk_overlap: int,
                             similarity_threshold: float, min_chunk_size: int,
-                            owner: dict | None = None) -> str:
+                            owner: dict | None = None,
+                            names: list[str] | None = None) -> str:
     # The prefix is how the startup sweep finds a killed job's staging (#377).
     tmp_dir = Path(tempfile.mkdtemp(prefix="ingest-", dir=settings.upload_dir))
-    # Files the caller sent that this build cannot parse, and inputs replaced by
-    # a later one with the same name. Dropping them without a word makes a ZIP
-    # of 8 files silently report 6, with nothing saying which two or why.
-    skipped: list[str] = []
-    queue = _Queue(tmp_dir, skipped)
-    # One expansion total for every ZIP in this request (#298).
-    budget = _ExpansionBudget(settings.max_zip_expanded_bytes)
-
     try:
-        for upload in files:
-            raw_name = upload.filename or ""
-            safe_name = Path(raw_name).name
-            if not safe_name:
-                continue
-            dest = queue.slot(safe_name)
-            # Copy in blocks rather than `await upload.read()`, which held the
-            # whole file in memory. Uploads can now reach 512 MB (issue #21),
-            # and this container already runs close to its memory budget. The
-            # copy blocks, so it runs off the event loop.
-            try:
-                await asyncio.to_thread(_save_upload, upload.file, dest)
-            except OSError as exc:
-                raise _rejected(
-                    "UPLOAD_WRITE_FAILED",
-                    f"Could not save '{safe_name}' on the server: {_os_reason(exc)}.",
-                    safe_name) from exc
-
-            if safe_name.lower().endswith(".zip"):
-                # Off the event loop, like the copy above (#298).
-                await asyncio.to_thread(_extract_zip, dest, safe_name, queue, budget)
-                os.remove(dest)
-            elif (Path(safe_name).suffix.lower() in SUPPORTED_EXTENSIONS
-                  or _is_jsonl_gz(safe_name)):
-                # A directly uploaded .json.gz is still skipped (#291 scope).
-                queue.add(dest, safe_name, safe_name)
-            else:
-                skipped.append(f"{safe_name} ({_skip_reason(safe_name)})")
+        queue, skipped = await stage_uploads(files, tmp_dir, names)
     except Exception:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
@@ -6439,6 +6555,1717 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
     future.add_done_callback(_on_done)
 
     return job_id
+```
+
+### api/services/preparation_store.py
+
+```python
+"""The preparation area (#638): raw documents and their prepared parts, on disk.
+
+One area for the instance, in the rag_preparation volume (`settings.preparation_dir`):
+
+    docs/<id>/record.json        the document's record (SPECIFICATIONS.md §3.1.11)
+    docs/<id>/raw/<file name>    the raw bytes, as uploaded
+    docs/<id>/prepared/NNN<sfx>  the prepared parts, by index; names are in the record
+    docs/<id>/prepared.new/      a preparation run's parts until they replace them
+    staging/                     files being copied in, renamed into docs/ when whole
+
+Ids are 12 hex characters, checked before any path is built; a client's name is
+never a path, only the last segment of it names the raw file. Links are refused.
+
+One lock guards the records and the busy set. It is held only for record reads
+and writes, the busy set and renames, never while content is copied or parsed;
+async callers run every function that touches the disk off the event loop.
+
+The size limit is a best-effort cap (maintainer's decision): `usage()` reads the
+files at the moment it is called, takes no lock and reserves nothing, so writes
+running at once can pass the limit briefly.
+
+Nothing here talks HTTP or to the LLM; errors carry the API's error codes.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import secrets
+import shutil
+import tempfile
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+from config import settings
+
+_log = logging.getLogger(__name__)
+
+_ID = re.compile(r"[0-9a-f]{12}\Z")
+RECORD = "record.json"
+PREVIEW_CHARACTERS = 2000
+
+STATUSES = ("raw", "queued", "preparing", "prepared", "failed")
+
+_lock = threading.RLock()
+# Document id -> why it is busy (a job id, or "import").
+_busy: dict[str, str] = {}
+
+
+class AreaError(Exception):
+    """An error the API answers with `status` and `code`."""
+    status = 400
+    code = "PREPARE_FAILED"
+
+    def __init__(self, message: str, detail: Any = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.detail = detail
+
+
+class DocumentNotFound(AreaError):
+    status, code = 404, "DOCUMENT_NOT_FOUND"
+
+
+class DocumentBusy(AreaError):
+    status, code = 409, "DOCUMENT_BUSY"
+
+
+class DocumentNotPrepared(AreaError):
+    status, code = 409, "DOCUMENT_NOT_PREPARED"
+
+
+class StorageFull(AreaError):
+    status, code = 409, "PREPARATION_STORAGE_FULL"
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ── paths ────────────────────────────────────────────────────────────────────
+
+def _root() -> Path:
+    return Path(settings.preparation_dir)
+
+
+def _docs() -> Path:
+    return _root() / "docs"
+
+
+def _staging() -> Path:
+    return _root() / "staging"
+
+
+def _ensure_dirs() -> None:
+    for folder in (_docs(), _staging()):
+        if folder.is_symlink():
+            raise AreaError("The preparation area holds a link where a folder belongs.")
+        folder.mkdir(parents=True, exist_ok=True)
+
+
+def valid_id(document_id: Any) -> bool:
+    return isinstance(document_id, str) and bool(_ID.fullmatch(document_id))
+
+
+def _doc_dir(document_id: str) -> Path:
+    if not valid_id(document_id):
+        raise DocumentNotFound(f"Document '{document_id}' not found.")
+    folder = _docs() / document_id
+    if folder.is_symlink():
+        raise DocumentNotFound(f"Document '{document_id}' not found.")
+    return folder
+
+
+def raw_file_name(name: str) -> str:
+    """The file name the raw bytes are kept under: the name's last segment, or
+    `file` when that segment couldn't be a plain file name."""
+    last = name.replace("\\", "/").rsplit("/", 1)[-1]
+    if not last or last in (".", "..") or "\x00" in last:
+        return "file"
+    return last
+
+
+def _check_plain(path: Path) -> Path:
+    if path.is_symlink():
+        raise AreaError("The preparation area holds a link where a file belongs.")
+    return path
+
+
+# ── records ──────────────────────────────────────────────────────────────────
+
+def _write_record(folder: Path, record: dict) -> None:
+    """Write a record whole: a temporary file, fsync, then rename."""
+    fd, tmp = tempfile.mkstemp(prefix=".record.", suffix=".tmp", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(record, fh, ensure_ascii=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, folder / RECORD)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _read_record(folder: Path) -> dict:
+    path = _check_plain(folder / RECORD)
+    try:
+        with path.open(encoding="utf-8") as fh:
+            record = json.load(fh)
+    except FileNotFoundError:
+        raise DocumentNotFound(f"Document '{folder.name}' not found.") from None
+    if not isinstance(record, dict) or record.get("id") != folder.name:
+        raise AreaError(f"The record of document '{folder.name}' can't be read.")
+    return record
+
+
+def _public(record: dict) -> dict:
+    """The record as the API shows it: without internal fields."""
+    return {key: value for key, value in record.items() if not key.startswith("_")}
+
+
+def get(document_id: str) -> dict:
+    with _lock:
+        return _public(_read_record(_doc_dir(document_id)))
+
+
+def _get_internal(document_id: str) -> dict:
+    return _read_record(_doc_dir(document_id))
+
+
+def _save(record: dict) -> None:
+    _write_record(_doc_dir(record["id"]), record)
+
+
+def list_documents() -> list[dict]:
+    """Every document's record, newest first by `created_at`. A record that
+    can't be read is left out and logged, so one bad record never fails the list."""
+    records = []
+    with _lock:
+        if not _docs().is_dir():
+            return []
+        for entry in _docs().iterdir():
+            if not valid_id(entry.name) or entry.is_symlink() or not entry.is_dir():
+                continue
+            try:
+                records.append(_public(_read_record(entry)))
+            except (AreaError, OSError, ValueError):
+                _log.warning("Left document %r out of the preparation list", entry.name,
+                             exc_info=True)
+    records.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+    return records
+
+
+# ── usage (best-effort) ──────────────────────────────────────────────────────
+
+def _tree_size(folder: Path) -> int:
+    total = 0
+    try:
+        entries = list(os.scandir(folder))
+    except (FileNotFoundError, NotADirectoryError):
+        return 0
+    for entry in entries:
+        try:
+            if entry.is_symlink():
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                total += _tree_size(Path(entry.path))
+            elif entry.is_file(follow_symlinks=False):
+                total += entry.stat(follow_symlinks=False).st_size
+        except FileNotFoundError:
+            # Deleted or renamed while the walk ran: not an error (best-effort).
+            continue
+    return total
+
+
+def usage() -> int:
+    """Bytes the area's files hold now, docs/ and staging/ together. No lock,
+    nothing reserved: a check made with it is best-effort."""
+    return _tree_size(_docs()) + _tree_size(_staging())
+
+
+def limit() -> int:
+    return settings.max_preparation_bytes
+
+
+def _mib(size: int) -> str:
+    return f"{size / (1024 * 1024):,.1f} MB"
+
+
+def check_space(adding: int, what: str) -> None:
+    """Refuse with StorageFull when `adding` more bytes would pass the limit."""
+    used = usage()
+    if used + adding > limit():
+        left = max(limit() - used, 0)
+        raise StorageFull(
+            f"The preparation area can't hold {what} ({_mib(adding)}): it uses "
+            f"{_mib(used)} of {_mib(limit())}, {_mib(left)} left. Delete documents "
+            f"you no longer need and try again.",
+            detail={"used_bytes": used, "limit_bytes": limit(), "left_bytes": left,
+                    "needed_bytes": adding})
+
+
+def check_not_full() -> None:
+    """Refuse with StorageFull when the area is already at or over the limit."""
+    used = usage()
+    if used >= limit():
+        raise StorageFull(
+            f"The preparation area is full: it uses {_mib(used)} of {_mib(limit())}. "
+            f"Delete documents you no longer need and try again.",
+            detail={"used_bytes": used, "limit_bytes": limit(), "left_bytes": 0})
+
+
+# ── documents ────────────────────────────────────────────────────────────────
+
+def new_id() -> str:
+    return secrets.token_hex(6)
+
+
+def raw_type_of(name: str) -> str:
+    lower = name.lower()
+    for double in (".jsonl.gz", ".json.gz"):
+        if lower.endswith(double):
+            return double
+    return Path(lower).suffix
+
+
+def create(name: str, source: Path, owner: dict | None) -> dict:
+    """A new `raw` document named `name` from the file at `source`, which is
+    copied into staging/ outside the lock and renamed into place under it."""
+    _ensure_dirs()
+    document_id = new_id()
+    fd, tmp = tempfile.mkstemp(prefix="upload.", dir=_staging())
+    os.close(fd)
+    staged = Path(tmp)
+    try:
+        shutil.copyfile(source, staged)
+        size = staged.stat().st_size
+        record = {
+            "id": document_id,
+            "name": name,
+            "raw_type": raw_type_of(name),
+            "raw_bytes": size,
+            "owner": owner,
+            "created_at": now_iso(),
+            "status": "raw",
+            "prepared_at": None,
+            "prepared_bytes": 0,
+            "parts": [],
+            "fallback": False,
+            "code_only_by_type": raw_type_of(name) in CODE_ONLY_TYPES,
+            "last_error": None,
+            "imports": [],
+        }
+        with _lock:
+            folder = _docs() / document_id
+            (folder / "raw").mkdir(parents=True)
+            os.replace(staged, folder / "raw" / raw_file_name(name))
+            _write_record(folder, record)
+        return _public(record)
+    except BaseException:
+        staged.unlink(missing_ok=True)
+        shutil.rmtree(_docs() / document_id, ignore_errors=True)
+        raise
+
+
+CODE_ONLY_TYPES = (".csv", ".json", ".json.gz", ".jsonl", ".jsonl.gz")
+
+
+def raw_path(document_id: str) -> Path:
+    with _lock:
+        record = _read_record(_doc_dir(document_id))
+        path = _check_plain(_doc_dir(document_id) / "raw" / raw_file_name(record["name"]))
+        if not path.is_file():
+            raise DocumentNotFound(f"Document '{document_id}' has no raw file.")
+        return path
+
+
+def part_paths(document_id: str) -> list[tuple[str, Path]]:
+    """(name, path) of each prepared part, in order."""
+    with _lock:
+        record = _read_record(_doc_dir(document_id))
+        return _part_paths(record)
+
+
+def _part_paths(record: dict) -> list[tuple[str, Path]]:
+    folder = _doc_dir(record["id"]) / "prepared"
+    out = []
+    for index, part in enumerate(record.get("parts") or []):
+        out.append((part["name"], _check_plain(folder / part["file"])))
+    return out
+
+
+def open_raw(document_id: str) -> tuple[dict, Any]:
+    """The record and an open handle on the raw file, opened under the lock, so a
+    delete after this can't cut a download short."""
+    with _lock:
+        record = _read_record(_doc_dir(document_id))
+        path = _check_plain(_doc_dir(document_id) / "raw" / raw_file_name(record["name"]))
+        try:
+            return _public(record), path.open("rb")
+        except FileNotFoundError:
+            raise DocumentNotFound(f"Document '{document_id}' has no raw file.") from None
+
+
+def open_parts(document_id: str) -> tuple[dict, list[tuple[str, Any]]]:
+    """The record and open handles on its prepared parts, opened under the lock."""
+    with _lock:
+        record = _read_record(_doc_dir(document_id))
+        if record.get("status") not in ("prepared", "queued", "preparing") or not record.get("parts"):
+            raise DocumentNotPrepared(f"Document '{record['name']}' has no prepared output.")
+        handles = []
+        try:
+            for name, path in _part_paths(record):
+                handles.append((name, path.open("rb")))
+        except BaseException:
+            for _, fh in handles:
+                fh.close()
+            raise
+        return _public(record), handles
+
+
+def preview(document_id: str) -> dict:
+    """The record, each part with its first 2,000 characters as `preview`."""
+    with _lock:
+        record = _read_record(_doc_dir(document_id))
+        paths = _part_paths(record) if record.get("parts") else []
+    out = _public(record)
+    parts = []
+    for part, (_, path) in zip(record.get("parts") or [], paths):
+        item = dict(part)
+        item.pop("file", None)
+        try:
+            with path.open(encoding="utf-8", errors="replace") as fh:
+                item["preview"] = fh.read(PREVIEW_CHARACTERS)
+        except OSError:
+            item["preview"] = ""
+        parts.append(item)
+    out["parts"] = parts
+    return out
+
+
+def list_entry(record: dict) -> dict:
+    """A record as the list shows it: parts without their file names."""
+    out = dict(record)
+    out["parts"] = [{k: v for k, v in part.items() if k != "file"}
+                    for part in record.get("parts") or []]
+    return out
+
+
+def is_busy(document_id: str) -> bool:
+    with _lock:
+        return document_id in _busy
+
+
+def mark_busy(ids: Iterable[str], reason: str) -> None:
+    """Mark documents busy (a job, or an import being admitted). All or none:
+    any already busy refuses them all with DocumentBusy."""
+    ids = list(ids)
+    with _lock:
+        taken = [i for i in ids if i in _busy]
+        if taken:
+            names = [_safe_name(i) for i in taken]
+            raise DocumentBusy(
+                f"{_list_names(names)} {'is' if len(names) == 1 else 'are'} being prepared "
+                f"or imported; wait until that finishes.", detail={"documents": names})
+        for i in ids:
+            _busy[i] = reason
+
+
+def release(ids: Iterable[str]) -> None:
+    with _lock:
+        for i in ids:
+            _busy.pop(i, None)
+
+
+def _safe_name(document_id: str) -> str:
+    try:
+        return _read_record(_doc_dir(document_id))["name"]
+    except Exception:
+        return document_id
+
+
+def _list_names(names: list[str]) -> str:
+    shown = ", ".join(f"'{n}'" for n in names[:10])
+    if len(names) > 10:
+        shown += f" and {len(names) - 10} more"
+    return shown
+
+
+def delete(document_id: str) -> dict:
+    """Remove a document, raw and prepared. Refused while it is busy."""
+    with _lock:
+        folder = _doc_dir(document_id)
+        record = _read_record(folder)
+        if document_id in _busy or record.get("status") in ("queued", "preparing"):
+            raise DocumentBusy(f"'{record['name']}' is being prepared or imported; wait "
+                               f"until that finishes.", detail={"documents": [record["name"]]})
+        # Renamed aside first, so the document is gone at once, then removed.
+        _ensure_dirs()
+        trash = Path(tempfile.mkdtemp(prefix="delete.", dir=_staging()))
+        os.replace(folder, trash / document_id)
+    shutil.rmtree(trash, ignore_errors=True)
+    return _public(record)
+
+
+def delete_prepared(document_id: str) -> dict:
+    """Remove a document's prepared output; it is `raw` again, its imports kept."""
+    with _lock:
+        folder = _doc_dir(document_id)
+        record = _read_record(folder)
+        if document_id in _busy or record.get("status") in ("queued", "preparing"):
+            raise DocumentBusy(f"'{record['name']}' is being prepared or imported; wait "
+                               f"until that finishes.", detail={"documents": [record["name"]]})
+        if record.get("status") != "prepared" or not record.get("parts"):
+            raise DocumentNotPrepared(f"Document '{record['name']}' has no prepared output.")
+        _ensure_dirs()
+        trash = Path(tempfile.mkdtemp(prefix="delete.", dir=_staging()))
+        if (folder / "prepared").exists():
+            os.replace(folder / "prepared", trash / "prepared")
+        record.update(status="raw", parts=[], prepared_bytes=0, prepared_at=None,
+                      fallback=False, last_error=None)
+        _write_record(folder, record)
+    shutil.rmtree(trash, ignore_errors=True)
+    return _public(record)
+
+
+# ── preparation runs ─────────────────────────────────────────────────────────
+
+def queue_for_job(ids: list[str], job_id: str) -> None:
+    """Mark documents busy for a job and `queued`, remembering their status."""
+    mark_busy(ids, job_id)
+    try:
+        with _lock:
+            for document_id in ids:
+                record = _read_record(_doc_dir(document_id))
+                record["_previous_status"] = record.get("status")
+                record["status"] = "queued"
+                _save(record)
+    except BaseException:
+        abandon(ids)
+        raise
+
+
+def abandon(ids: Iterable[str]) -> None:
+    """Cancel or interrupt: each document goes back to the status it had before
+    the job, its unfinished output removed, and is released."""
+    ids = list(ids)
+    with _lock:
+        for document_id in ids:
+            try:
+                folder = _doc_dir(document_id)
+                record = _read_record(folder)
+            except AreaError:
+                continue
+            shutil.rmtree(folder / "prepared.new", ignore_errors=True)
+            if record.get("status") in ("queued", "preparing"):
+                record["status"] = record.pop("_previous_status", None) or (
+                    "prepared" if record.get("parts") else "raw")
+                record.pop("_job_id", None)
+                _save(record)
+        release(ids)
+
+
+def begin(document_id: str, job_id: str) -> tuple[dict, Path]:
+    """Start preparing a document: `preparing`, an empty prepared.new/. Returns
+    the record and the folder parts are written to."""
+    with _lock:
+        folder = _doc_dir(document_id)
+        record = _read_record(folder)
+        record["status"] = "preparing"
+        record["_job_id"] = job_id
+        new = folder / "prepared.new"
+        shutil.rmtree(new, ignore_errors=True)
+        new.mkdir()
+        _save(record)
+        return _public(record), new
+
+
+def commit(document_id: str, parts: list[dict], fallback: bool) -> dict:
+    """The new output replaces any earlier one: prepared.new/ becomes prepared/."""
+    with _lock:
+        folder = _doc_dir(document_id)
+        record = _read_record(folder)
+        new, current = folder / "prepared.new", folder / "prepared"
+        _ensure_dirs()
+        trash = Path(tempfile.mkdtemp(prefix="replace.", dir=_staging()))
+        if current.exists():
+            os.replace(current, trash / "prepared")
+        os.replace(new, current)
+        record.update(status="prepared", parts=parts, fallback=fallback,
+                      prepared_bytes=sum(p["bytes"] for p in parts),
+                      prepared_at=now_iso(), last_error=None)
+        record.pop("_previous_status", None)
+        record.pop("_job_id", None)
+        _save(record)
+    shutil.rmtree(trash, ignore_errors=True)
+    release([document_id])
+    return _public(record)
+
+
+def fail(document_id: str, reason: str) -> dict:
+    """A failed run: its new output is removed. A document with earlier output
+    stays `prepared` with it and records the reason (maintainer's decision);
+    one without becomes `failed`."""
+    with _lock:
+        folder = _doc_dir(document_id)
+        record = _read_record(folder)
+        shutil.rmtree(folder / "prepared.new", ignore_errors=True)
+        has_output = bool(record.get("parts")) and (folder / "prepared").is_dir()
+        record["status"] = "prepared" if has_output else "failed"
+        record["last_error"] = reason
+        record.pop("_previous_status", None)
+        record.pop("_job_id", None)
+        _save(record)
+    release([document_id])
+    return _public(record)
+
+
+def add_import(ids: Iterable[str], collection: str, job_id: str) -> None:
+    with _lock:
+        for document_id in ids:
+            try:
+                record = _read_record(_doc_dir(document_id))
+            except AreaError:
+                continue
+            record.setdefault("imports", []).append(
+                {"collection": collection, "job_id": job_id, "at": now_iso()})
+            _save(record)
+
+
+def recover() -> list[str]:
+    """At startup: documents left `queued` or `preparing` by a killed process go
+    back to the status they had, and staging and unfinished output are removed."""
+    restored = []
+    if not _root().is_dir():
+        return restored
+    _busy.clear()
+    if _docs().is_dir():
+        for entry in _docs().iterdir():
+            if not valid_id(entry.name) or entry.is_symlink() or not entry.is_dir():
+                continue
+            try:
+                record = _read_record(entry)
+            except (AreaError, OSError, ValueError):
+                continue
+            shutil.rmtree(entry / "prepared.new", ignore_errors=True)
+            if record.get("status") in ("queued", "preparing"):
+                abandon([entry.name])
+                restored.append(record.get("name") or entry.name)
+    if _staging().is_dir() and not _staging().is_symlink():
+        for entry in _staging().iterdir():
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink(missing_ok=True)
+    return restored
+```
+
+### api/services/preparation.py
+
+```python
+"""Preparing one raw document (#638): code does the rule work, the LLM cleans.
+
+SPECIFICATIONS.md §3.1.11. In order, for one document:
+
+1. **Extract** the text with ingest's own readers, so a file ingest would refuse
+   fails here with ingest's reason, and **normalise** it (UTF-8, LF, NFC, no
+   control characters; JSON and JSON Lines keep their records unchanged).
+2. **Split** it into parts of at most PART_LIMIT characters as ingest will read
+   them, at ingest's boundaries: paragraphs, PDF/DOCX elements, CSV rows with
+   the header repeated, JSON Lines records (a record is never cut).
+3. **Clean** each PDF, DOCX, TXT or MD part with the LLM: it is shown windows of
+   numbered lines and answers which lines are headers, footers, page numbers or
+   boilerplate. Code removes them; the LLM never rewrites text. A window whose
+   answer fails the fidelity check keeps its code-only text, and the fallback
+   is recorded with its reason.
+4. Give every part a **title and summary** (in the text for the four text
+   types, in the record only for CSV and JSON Lines).
+5. **Check** each written part as ingest reads it, against the rules that don't
+   depend on chunk settings.
+
+The LLM and the part writer are passed in, so tests use a stub and the job
+decides where parts go and whether there is room (a best-effort cap).
+"""
+from __future__ import annotations
+
+import asyncio
+import codecs
+import gzip
+import json
+import logging
+import math
+import os
+import re
+import tempfile
+import unicodedata
+import zlib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Iterator
+
+import httpx
+
+from config import settings
+from services import ingest_pipeline as ip
+from services import splitter
+from services.chunker import MAX_CHUNKS_PER_FILE, MAX_TEXT_CHARACTERS
+
+_log = logging.getLogger(__name__)
+
+# The corpus rules' targets for the default `overlap` 1,000/200 (#615): at most
+# 7,000,000 characters and 8,000 chunks, which is about 6,400,000 characters.
+PART_LIMIT = 6_400_000
+# Room kept in a PDF/DOCX/TXT/MD part for the title and summary header.
+HEADER_ROOM = 2_000
+WINDOW_CHARACTERS = 3_000
+MAX_REMOVED_LINE = 200
+MAX_REMOVED_SHARE = 0.20
+MAX_WINDOWS = 1_000
+TITLE_INPUT = 6_000
+MAX_TITLE = 150
+MAX_SUMMARY_WORDS = 80
+CALL_SECONDS = 120.0
+FAILED_CALLS_IN_A_ROW = 3
+
+CLEANING_TYPES = (".pdf", ".docx", ".txt", ".md")
+
+CLEAN_SYSTEM = (
+    "You clean text extracted from a document. You are given numbered lines. Find the lines "
+    "that are page headers, page footers, page numbers, or repeated boilerplate (such as "
+    "copyright notices, navigation text or \"continued on next page\"), and nothing else. "
+    "Never choose a line that holds the document's own content. Return only a JSON object: "
+    "{\"remove\": [line numbers]}. Return {\"remove\": []} when there are none."
+)
+CLEAN_RETRY = (
+    " Your previous response was not a JSON object with a \"remove\" list of line numbers "
+    "from the lines given. Return ONLY that JSON object."
+)
+TITLE_SYSTEM = (
+    "You write a title and a short summary for a part of a document. Use only the text "
+    "given. The title is at most 15 words. The summary is at most 60 words. Return only a "
+    "JSON object: {\"title\": \"...\", \"summary\": \"...\"}."
+)
+TITLE_RETRY = (
+    " Your previous response was not a JSON object with a nonempty \"title\" of one line and "
+    "a nonempty \"summary\" of at most 60 words. Return ONLY that JSON object."
+)
+
+
+class Cancelled(Exception):
+    """The job was cancelled; the document goes back to its earlier state."""
+
+
+class StorageRefused(ValueError):
+    """The part writer refused a part: the area would pass its limit."""
+
+
+# ── normalisation ────────────────────────────────────────────────────────────
+
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def normalise_text(text: str) -> str:
+    """UTF-8 text without a byte-order mark, LF line endings, NFC, and no NUL or
+    other C0 control character except tab and newline, nor DEL."""
+    if text.startswith("﻿"):
+        text = text[1:]
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = unicodedata.normalize("NFC", text)
+    return _CONTROL.sub("", text)
+
+
+# ── output kinds and names ───────────────────────────────────────────────────
+
+def output_kind(raw_type: str) -> str:
+    """`text` (.md output), `csv` or `jsonl`."""
+    if raw_type in CLEANING_TYPES:
+        return "text"
+    if raw_type == ".csv":
+        return "csv"
+    return "jsonl"
+
+
+SUFFIX = {"text": ".md", "csv": ".csv", "jsonl": ".jsonl"}
+
+
+def stem_of(name: str) -> str:
+    lower = name.lower()
+    for double in (".jsonl.gz", ".json.gz"):
+        if lower.endswith(double):
+            return name[:-len(double)]
+    suffix = Path(name).suffix
+    return name[:-len(suffix)] if suffix else name
+
+
+def part_names(name: str, kind: str, count: int) -> list[str]:
+    """The names parts are imported under: the raw name with the output suffix,
+    folders kept; with several parts, `<stem>-part-001<suffix>` and on."""
+    stem, suffix = stem_of(name), SUFFIX[kind]
+    if count == 1:
+        return [stem + suffix]
+    return [f"{stem}-part-{i:03d}{suffix}" for i in range(1, count + 1)]
+
+
+# ── extraction and parts ─────────────────────────────────────────────────────
+
+@dataclass
+class Part:
+    """A part's code-only content. `body` is what the file holds (before any
+    cleaning and header); `measure` is its text as ingest reads it, for the
+    title and summary of CSV and JSON Lines; `records` counts CSV rows or JSON
+    Lines records."""
+    body: str
+    measure: str = ""
+    records: int | None = None
+    header: str = ""          # a CSV part's header row
+
+
+def _joined_parts(units: Iterator[str], limit: int) -> Iterator[str]:
+    """Units joined by a blank line into parts of at most `limit` characters; a
+    unit over the limit is cut at line breaks, then whitespace, then hard."""
+    current: list[str] = []
+    size = 0
+    for unit in units:
+        if not unit.strip():
+            continue
+        pieces = [unit] if len(unit) <= limit else splitter._cut_text(unit, limit)
+        for piece in pieces:
+            added = len(piece) + (2 if current else 0)
+            if current and size + added > limit:
+                yield "\n\n".join(current)
+                current, size = [], 0
+                added = len(piece)
+            current.append(piece)
+            size += added
+    if current:
+        yield "\n\n".join(current)
+
+
+def _text_units(path: Path, markdown: bool) -> Iterator[str]:
+    encoding = splitter.text_encoding(path)
+    with path.open(encoding=encoding, newline="") as stream:
+        for unit in splitter._text_units(stream, markdown, PART_LIMIT):
+            yield normalise_text(unit.text)
+
+
+def _element_units(path: Path) -> Iterator[str]:
+    _text, elements = ip._parse_file(path)
+    for element in elements:
+        text = normalise_text(str(element))
+        if text.strip():
+            yield text
+
+
+def _csv_rows(path: Path) -> tuple[str, Iterator[str]]:
+    """The header row and the other rows, each exactly as written (normalised),
+    ending in a line break. A row ends at a line break outside the dialect's
+    quote character, so a quoted field may hold line breaks."""
+    encoding = splitter.text_encoding(path)
+    with path.open(encoding=encoding, newline="") as probe:
+        dialect = splitter._csv_dialect(probe)
+    quote = getattr(dialect, "quotechar", '"') or '"'
+
+    def rows() -> Iterator[str]:
+        with path.open(encoding=encoding, newline="") as stream:
+            pending: list[str] = []
+            open_quote = False
+            for line in stream:
+                pending.append(line)
+                if line.count(quote) % 2:
+                    open_quote = not open_quote
+                if not open_quote:
+                    row = normalise_text("".join(pending))
+                    pending = []
+                    if not row.endswith("\n"):
+                        row += "\n"
+                    if row.strip():
+                        yield row
+            if pending:
+                row = normalise_text("".join(pending))
+                if not row.endswith("\n"):
+                    row += "\n"
+                if row.strip():
+                    yield row
+
+    iterator = rows()
+    header = next(iterator, "")
+    return header, iterator
+
+
+def _csv_parts(path: Path) -> Iterator[Part]:
+    header, rows = _csv_rows(path)
+    if not header:
+        return
+    if 2 * len(header) > PART_LIMIT:
+        raise ValueError(
+            f"its header row is {len(header):,} characters, more than half of what one part "
+            f"can hold ({PART_LIMIT:,} characters); the header is repeated in every part, so "
+            f"shorten the header or split the file")
+    room = PART_LIMIT - len(header)
+    current: list[str] = []
+    size = 0
+    for row in rows:
+        if current and size + len(row) > room:
+            body = header + "".join(current)
+            yield Part(body=body, measure=body, records=len(current), header=header)
+            current, size = [], 0
+        current.append(row)
+        size += len(row)
+    body = header + "".join(current)
+    yield Part(body=body, measure=body, records=len(current), header=header)
+
+
+def _compact_json(value: Any) -> str:
+    """JSON with no spaces, keys in order, non-ASCII as is, numbers as written."""
+    if isinstance(value, dict):
+        return "{" + ",".join(json.dumps(str(k), ensure_ascii=False) + ":" + _compact_json(v)
+                              for k, v in value.items()) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(_compact_json(v) for v in value) + "]"
+    if isinstance(value, ip._JsonNumber):
+        return value.text
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return "null"
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _json_records(path: Path) -> Iterator[tuple[str, str]]:
+    """A .json file's (or decompressed .json.gz member's) records as (line, text):
+    each record written as compact JSON, and its text as ingest converts it."""
+    if path.stat().st_size > ip.MAX_JSON_INPUT_BYTES:
+        raise ValueError(ip._json_input_too_large("is larger than"))
+    try:
+        raw, value = ip._read_json(path)
+    except ip._JsonError as exc:
+        raise ValueError(str(exc)) from exc
+    if not raw:
+        return
+    raw = None
+    groups = ip._json_groups(value)
+    if len(groups) > ip.MAX_JSON_RECORDS:
+        raise ValueError(ip._too_many_records())
+    for position, group in enumerate(groups, 1):
+        lines: list[str] = []
+        try:
+            ip._json_lines(group, None, lines, ip._JsonBudget())
+        except ip._JsonTooLarge as exc:
+            raise ValueError(ip._record_too_large(f"record {position}")) from exc
+        except RecursionError as exc:
+            raise ValueError("is not valid JSON: it is nested too deeply to read") from exc
+        yield _compact_json(group), "\n".join(lines)
+
+
+def _json_gz_records(path: Path) -> Iterator[tuple[str, str]]:
+    fd, name = tempfile.mkstemp(dir=settings.upload_dir, prefix="prepare-", suffix=".json")
+    os.close(fd)
+    plain = Path(name)
+    try:
+        ip._gunzip_bounded(path, plain)
+        try:
+            yield from _json_records(plain)
+        except ValueError as exc:
+            raise ValueError(f"was decompressed, but {exc}") from exc
+    finally:
+        plain.unlink(missing_ok=True)
+
+
+def _jsonl_records(path: Path) -> Iterator[tuple[str, str]]:
+    """A JSON Lines file's records as (line as written, text), blank lines left out."""
+    try:
+        if ip._is_jsonl_gz(path.name):
+            with gzip.open(path, "rb") as gz:
+                for _n, raw, text in ip._iter_jsonl_lines(ip._BoundedLines(gz)):
+                    yield raw.decode("utf-8"), text
+        else:
+            with path.open("rb") as fh:
+                for _n, raw, text in ip._iter_jsonl_lines(fh):
+                    yield raw.decode("utf-8"), text
+    except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
+        raise ValueError(
+            f"is not a valid gzip file; it may be truncated or corrupt ({exc})") from exc
+    except ip._JsonlError as exc:
+        raise ValueError(ip._jsonl_reason(path, exc)) from exc
+
+
+def _record_parts(records: Iterator[tuple[str, str]]) -> Iterator[Part]:
+    """JSON Lines parts: records in order, each part's text as ingest reads it
+    (records with text joined by a blank line) at most PART_LIMIT characters and
+    at most MAX_JSON_RECORDS records. A record over the limit is a part of its own."""
+    lines: list[str] = []
+    texts: list[str] = []
+    size = 0
+    for line, text in records:
+        added = (len(text) + (2 if texts else 0)) if text.strip() else 0
+        if lines and (size + added > PART_LIMIT or len(lines) >= ip.MAX_JSON_RECORDS):
+            yield Part(body="\n".join(lines) + "\n", measure="\n\n".join(texts),
+                       records=len(lines))
+            lines, texts, size = [], [], 0
+            added = len(text) if text.strip() else 0
+        lines.append(line)
+        if text.strip():
+            texts.append(text)
+        size += added
+    if lines:
+        yield Part(body="\n".join(lines) + "\n", measure="\n\n".join(texts),
+                   records=len(lines))
+
+
+def iter_parts(path: Path, raw_type: str) -> Iterator[Part]:
+    """The document's parts, code-only, in order. Raises ValueError with ingest's
+    reason for a file ingest would refuse."""
+    if raw_type in (".txt", ".md"):
+        for body in _joined_parts(_text_units(path, raw_type == ".md"), PART_LIMIT - HEADER_ROOM):
+            yield Part(body=body)
+    elif raw_type in (".pdf", ".docx"):
+        for body in _joined_parts(_element_units(path), PART_LIMIT - HEADER_ROOM):
+            yield Part(body=body)
+    elif raw_type == ".csv":
+        yield from _csv_parts(path)
+    elif raw_type == ".json":
+        yield from _record_parts(_json_records(path))
+    elif raw_type == ".json.gz":
+        yield from _record_parts(_json_gz_records(path))
+    elif raw_type in (".jsonl", ".jsonl.gz"):
+        yield from _record_parts(_jsonl_records(path))
+    else:
+        raise ValueError(ip._skip_reason(path.name))
+
+
+# ── windows ──────────────────────────────────────────────────────────────────
+
+@dataclass
+class Window:
+    lines: list[str]
+    send: bool = True
+
+    @property
+    def characters(self) -> int:
+        return sum(len(line) + 1 for line in self.lines)
+
+
+def windows(text: str) -> list[Window]:
+    """Whole lines, in order, as many as fit in WINDOW_CHARACTERS; a longer line is
+    a window of its own and isn't sent (no line that long can be removed)."""
+    out: list[Window] = []
+    current: list[str] = []
+    size = 0
+    for line in text.split("\n"):
+        if len(line) + 1 > WINDOW_CHARACTERS:
+            if current:
+                out.append(Window(current))
+                current, size = [], 0
+            out.append(Window([line], send=False))
+            continue
+        if current and size + len(line) + 1 > WINDOW_CHARACTERS:
+            out.append(Window(current))
+            current, size = [], 0
+        current.append(line)
+        size += len(line) + 1
+    if current:
+        out.append(Window(current))
+    return out
+
+
+# ── the LLM ──────────────────────────────────────────────────────────────────
+
+Chat = Callable[[str, str], Awaitable[str]]
+
+
+class LLM:
+    """One document's LLM calls: 120 s each, a failed or timed-out call sent once
+    more, and after three failed calls in a row, no more calls (`down`)."""
+
+    def __init__(self, chat: Chat, should_stop: Callable[[], bool],
+                 seconds: float = CALL_SECONDS) -> None:
+        self.chat = chat
+        self.should_stop = should_stop
+        self.seconds = seconds
+        self.failed_in_a_row = 0
+        self.down = False
+
+    async def call(self, system: str, user: str) -> tuple[str, str]:
+        """("ok", reply), or ("llm-timeout" | "llm-error" | "llm-unavailable", "")."""
+        kinds = []
+        for _ in range(2):
+            if self.down:
+                return "llm-unavailable", ""
+            if self.should_stop():
+                raise Cancelled()
+            try:
+                reply = await asyncio.wait_for(self.chat(system, user), self.seconds)
+            except (asyncio.TimeoutError, httpx.TimeoutException):
+                kinds.append("timeout")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:                        # noqa: BLE001
+                _log.info("LLM call failed: %s", type(exc).__name__)
+                kinds.append("error")
+            else:
+                self.failed_in_a_row = 0
+                return "ok", reply if isinstance(reply, str) else ""
+            self.failed_in_a_row += 1
+            if self.failed_in_a_row >= FAILED_CALLS_IN_A_ROW:
+                self.down = True
+        return ("llm-timeout" if all(k == "timeout" for k in kinds) else "llm-error"), ""
+
+
+def _first_object(reply: str) -> dict | None:
+    """The first JSON object in a reply (code fences and text around it allowed)."""
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", reply):
+        try:
+            value, _end = decoder.raw_decode(reply[match.start():])
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _removals(reply: str, count: int) -> list[int] | None:
+    """The line numbers to remove, or None when the answer is unusable."""
+    obj = _first_object(reply)
+    if obj is None or not isinstance(obj.get("remove"), list):
+        return None
+    numbers = obj["remove"]
+    if not all(isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= count
+               for n in numbers):
+        return None
+    return sorted(set(numbers))
+
+
+@dataclass
+class Cleaned:
+    lines: list[str]
+    reason: str | None = None   # a fallback's reason; None when cleaned
+
+
+def check_removal(window: Window, numbers: list[int]) -> str | None:
+    """The fidelity check: the reason the removal is refused, or None."""
+    removed = [window.lines[n - 1] for n in numbers]
+    if any(len(line) > MAX_REMOVED_LINE for line in removed):
+        return "removed-long-line"
+    if sum(len(line) + 1 for line in removed) > MAX_REMOVED_SHARE * window.characters:
+        return "removed-too-much"
+    return None
+
+
+async def clean_window(window: Window, llm: LLM) -> Cleaned:
+    if not window.send:
+        return Cleaned(window.lines)
+    user = "Lines:\n" + "\n".join(f"{i}: {line}" for i, line in enumerate(window.lines, 1))
+    system = CLEAN_SYSTEM
+    for attempt in range(2):
+        status, reply = await llm.call(system, user)
+        if status != "ok":
+            return Cleaned(window.lines, status)
+        numbers = _removals(reply, len(window.lines))
+        if numbers is not None:
+            reason = check_removal(window, numbers)
+            if reason:
+                return Cleaned(window.lines, reason)
+            drop = set(numbers)
+            return Cleaned([line for i, line in enumerate(window.lines, 1) if i not in drop])
+        system = CLEAN_SYSTEM + CLEAN_RETRY
+    return Cleaned(window.lines, "unusable-answer")
+
+
+def _usable_title(obj: dict | None) -> tuple[str, str] | None:
+    if obj is None:
+        return None
+    title, summary = obj.get("title"), obj.get("summary")
+    if not isinstance(title, str) or not isinstance(summary, str):
+        return None
+    title = normalise_text(title).strip()
+    summary = " ".join(normalise_text(summary).split())
+    if not title or "\n" in title or len(title) > MAX_TITLE:
+        return None
+    if not summary or len(summary.split()) > MAX_SUMMARY_WORDS:
+        return None
+    if len(header_text(title, summary)) > HEADER_ROOM:
+        return None
+    return title, summary
+
+
+def header_text(title: str, summary: str) -> str:
+    return f"# {title}\n\nSummary (generated): {summary}\n\n"
+
+
+async def title_summary(text: str, llm: LLM) -> tuple[str | None, str | None, str | None]:
+    """(title, summary, None), or (None, None, reason)."""
+    user = "Text:\n" + text[:TITLE_INPUT]
+    system = TITLE_SYSTEM
+    for attempt in range(2):
+        status, reply = await llm.call(system, user)
+        if status != "ok":
+            return None, None, status
+        usable = _usable_title(_first_object(reply))
+        if usable:
+            return usable[0], usable[1], None
+        system = TITLE_SYSTEM + TITLE_RETRY
+    return None, None, "unusable-answer"
+
+
+async def model_available(list_models: Callable[[], Awaitable[set[str]]]) -> bool:
+    try:
+        models = await asyncio.wait_for(list_models(), 15)
+    except Exception:                                       # noqa: BLE001
+        return False
+    wanted = settings.llm_model
+    return wanted in models or f"{wanted}:latest" in models or (
+        ":" not in wanted and any(m.split(":")[0] == wanted for m in models))
+
+
+# ── checks on a written part ─────────────────────────────────────────────────
+
+def overlap_estimate(characters: int) -> int:
+    """Chunks the default `overlap` 1,000/200 gives at most, as the rules count them."""
+    if characters <= 0:
+        return 0
+    return 1 + math.ceil(max(characters - 1000, 0) / 800)
+
+
+def check_part(path: Path, kind: str) -> tuple[int, int | None]:
+    """Read a written part as ingest reads it; refuse it when it breaks a rule
+    that doesn't depend on chunk settings. Returns (characters, records)."""
+    records = None
+    if kind == "jsonl":
+        texts = []
+        records = 0
+        with path.open("rb") as fh:
+            try:
+                for _n, _raw, text in ip._iter_jsonl_lines(fh):
+                    records += 1
+                    if text.strip():
+                        texts.append(text)
+            except ip._JsonlError as exc:
+                raise ValueError(f"a prepared part fails a JSON Lines rule: {exc.detail}") from exc
+        characters = sum(len(t) for t in texts) + 2 * max(len(texts) - 1, 0)
+    else:
+        text, _elements = ip._parse_file(path)
+        characters = len(text)
+    if characters > MAX_TEXT_CHARACTERS:
+        raise ValueError(f"a prepared part has {characters:,} characters of text, more than "
+                         f"{MAX_TEXT_CHARACTERS:,}, the most one file can hold")
+    if records is not None and records > ip.MAX_JSON_RECORDS:
+        raise ValueError(ip._too_many_records())
+    chunks = overlap_estimate(characters)
+    if chunks > MAX_CHUNKS_PER_FILE:
+        raise ValueError(f"a prepared part would give about {chunks:,} chunks with the default "
+                         f"settings, more than {MAX_CHUNKS_PER_FILE:,}; a record that large "
+                         f"can't be imported")
+    return characters, records
+
+
+# ── one document ─────────────────────────────────────────────────────────────
+
+WritePart = Callable[[int, str, bytes], Awaitable[Path]]
+Progress = Callable[[int, int], None]
+
+
+@dataclass
+class Result:
+    parts: list[dict] = field(default_factory=list)
+    fallback: bool = False
+
+
+async def prepare_document(raw: Path, name: str, raw_type: str, chat: Chat,
+                           list_models: Callable[[], Awaitable[set[str]]],
+                           should_stop: Callable[[], bool], write_part: WritePart,
+                           progress: Progress = lambda done, total: None) -> Result:
+    """Prepare one document. Raises ValueError (its failure reason), Cancelled,
+    or StorageRefused from write_part."""
+    kind = output_kind(raw_type)
+    llm = LLM(chat, should_stop)
+    if not await model_available(list_models):
+        llm.down = True
+    if should_stop():
+        raise Cancelled()
+
+    if kind == "text":
+        # Parsed whole (PDF and DOCX are anyway), so the size cap counts every window.
+        parts = await asyncio.to_thread(lambda: list(iter_parts(raw, raw_type)))
+        return await _prepare_text(parts, name, llm, should_stop, write_part, progress)
+    return await _prepare_records(raw, raw_type, name, kind, llm, should_stop, write_part)
+
+
+def _no_text(name: str) -> ValueError:
+    return ValueError("has no text to prepare")
+
+
+async def _prepare_text(parts: list[Part], name: str, llm: LLM, should_stop, write_part,
+                        progress) -> Result:
+    if not parts:
+        raise _no_text(name)
+    names = part_names(name, "text", len(parts))
+    split = [windows(part.body) for part in parts]
+    total = sum(len(ws) for ws in split)
+    too_large = total > MAX_WINDOWS
+    done = 0
+    progress(done, total)
+    result = Result()
+    for index, (part, part_windows) in enumerate(zip(parts, split)):
+        fallbacks: list[dict] = []
+        kept: list[str] = []
+        if too_large:
+            fallbacks.append({"window": None, "reason": "too-large-for-llm"})
+            kept = part.body.split("\n")
+            done += len(part_windows)
+        else:
+            unavailable_noted = False
+            for number, window in enumerate(part_windows, 1):
+                if should_stop():
+                    raise Cancelled()
+                if llm.down:
+                    if not unavailable_noted and window.send:
+                        fallbacks.append({"window": None, "reason": "llm-unavailable"})
+                        unavailable_noted = True
+                    kept.extend(window.lines)
+                else:
+                    cleaned = await clean_window(window, llm)
+                    if cleaned.reason == "llm-unavailable":
+                        if not unavailable_noted:
+                            fallbacks.append({"window": None, "reason": "llm-unavailable"})
+                            unavailable_noted = True
+                    elif cleaned.reason:
+                        fallbacks.append({"window": number, "reason": cleaned.reason})
+                    kept.extend(cleaned.lines)
+                done += 1
+                progress(done, total)
+        body = "\n".join(kept).strip("\n")
+        title, summary, error = await title_summary(body, llm)
+        text = (header_text(title, summary) if title else "") + body + "\n"
+        entry = await _write(index, names[index], text, "text", write_part)
+        entry.update(title=title, summary=summary, summary_error=error,
+                     fallback=bool(fallbacks), fallbacks=fallbacks)
+        result.parts.append(entry)
+        result.fallback = result.fallback or bool(fallbacks)
+    return result
+
+
+async def _write(index: int, part_name: str, text: str, kind: str, write_part) -> dict:
+    data = text.encode("utf-8")
+    path = await write_part(index, SUFFIX[kind], data)
+    characters, records = await asyncio.to_thread(check_part, path, kind)
+    entry = {"name": part_name, "file": path.name, "bytes": len(data),
+             "characters": characters}
+    if records is not None:
+        entry["records"] = records
+    return entry
+
+
+async def _prepare_records(raw: Path, raw_type: str, name: str, kind: str, llm: LLM,
+                           should_stop, write_part) -> Result:
+    """CSV, JSON and JSON Lines: code-only, a part at a time. Their names depend on
+    how many parts there are, so parts are written under their index and named
+    when the count is known."""
+    iterator = iter_parts(raw, raw_type)
+    result = Result()
+    entries: list[dict] = []
+    index = 0
+    while True:
+        part = await asyncio.to_thread(next, iterator, None)
+        if part is None:
+            break
+        if should_stop():
+            raise Cancelled()
+        title, summary, error = await title_summary(part.measure or part.body, llm)
+        entry = await _write(index, "", part.body, kind, write_part)
+        if kind == "csv":
+            entry["records"] = part.records
+        entry.update(title=title, summary=summary, summary_error=error,
+                     fallback=False, fallbacks=[])
+        entries.append(entry)
+        index += 1
+    if not entries:
+        raise _no_text(name)
+    for entry, part_name in zip(entries, part_names(name, kind, len(entries))):
+        entry["name"] = part_name
+    result.parts = entries
+    return result
+```
+
+### api/services/preparation_jobs.py
+
+```python
+"""Uploads, preparation jobs and imports of the preparation area (#638).
+
+SPECIFICATIONS.md §3.1.11.
+
+- **Upload.** Files are staged and validated exactly as ingest stages them
+  (`ingest_pipeline.stage_uploads`: ZIP limits, supported types), then each
+  becomes a `raw` document. The space check is best-effort: made once, before
+  the files are written to the area, with nothing reserved.
+- **Jobs.** A job (kind `prepare` in the job store) prepares its documents one
+  at a time. One job runs at a time on the instance; later ones wait, oldest
+  first. A job can be cancelled: a queued one at once, a running one after its
+  current LLM call. Documents it finished keep their output; the one in
+  progress and the ones not reached go back to their earlier state.
+- **Import.** The selected documents' parts go to one ordinary ingest job,
+  copied from the area into its staging and stored under their part names. The
+  documents are busy only while the import is admitted.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import shutil
+import tempfile
+import uuid
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+from config import settings
+from services import ingest_pipeline, jobstore, preparation
+from services import ollama_client as ollama
+from services import preparation_store as store
+from services import weaviate_client as wc
+
+_log = logging.getLogger(__name__)
+
+_jobs = jobstore.JobStore("prepare")
+_queue: asyncio.Queue | None = None
+_worker: asyncio.Task | None = None
+_cancel_requested: set[str] = set()
+
+
+class NoDocuments(store.AreaError):
+    status, code = 400, "NO_DOCUMENTS"
+
+
+class JobNotFound(store.AreaError):
+    status, code = 404, "JOB_NOT_FOUND"
+
+
+class JobNotRunning(store.AreaError):
+    status, code = 409, "JOB_NOT_RUNNING"
+
+
+class DuplicateNames(store.AreaError):
+    status, code = 409, "DUPLICATE_NAMES"
+
+
+class NoSupportedFiles(store.AreaError):
+    status, code = 400, "NO_SUPPORTED_FILES"
+
+
+def get_job(job_id: str) -> dict | None:
+    return _jobs.get(job_id)
+
+
+def job_records() -> list[tuple[str, dict, float | None]]:
+    return _jobs.snapshot()
+
+
+# ── upload ───────────────────────────────────────────────────────────────────
+
+async def upload(files: list[Any], owner: dict | None) -> tuple[list[dict], list[str]]:
+    """Stage, validate and store an upload's files as `raw` documents. Nothing
+    is kept when any step fails."""
+    tmp_dir = Path(tempfile.mkdtemp(prefix="prepare-", dir=settings.upload_dir))
+    created: list[dict] = []
+    try:
+        queue, skipped = await ingest_pipeline.stage_uploads(files, tmp_dir)
+        if not queue.entries:
+            detail = "; ".join(skipped)
+            raise NoSupportedFiles("No supported files found in upload."
+                                   + (f" Skipped: {detail}" if detail else ""))
+        total = sum(path.stat().st_size for path, _ in queue.entries.values())
+        await asyncio.to_thread(store.check_space, total, "this upload")
+        for logical, (path, _label) in queue.entries.items():
+            created.append(await asyncio.to_thread(store.create, logical, path, owner))
+        return created, skipped
+    except BaseException:
+        for record in created:
+            try:
+                await asyncio.to_thread(store.delete, record["id"])
+            except Exception:                               # noqa: BLE001
+                _log.exception("Could not remove document %r after a failed upload",
+                               record.get("id"))
+        raise
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ── selection ────────────────────────────────────────────────────────────────
+
+def _resolve(document_ids: list[str] | None, all_of: set[str]) -> list[dict]:
+    """The records selected: the ids in the order given, or every document whose
+    status is in `all_of`, oldest first."""
+    if document_ids is None:
+        records = [r for r in store.list_documents() if r.get("status") in all_of]
+        records.sort(key=lambda r: r.get("created_at") or "")
+    else:
+        records, missing = [], []
+        for document_id in dict.fromkeys(document_ids):
+            try:
+                records.append(store.get(document_id))
+            except store.DocumentNotFound:
+                missing.append(document_id)
+        if missing:
+            raise store.DocumentNotFound(
+                f"Document{'s' if len(missing) > 1 else ''} not found: {', '.join(missing)}.",
+                detail={"documents": missing})
+    if not records:
+        raise NoDocuments("No documents were selected.")
+    return records
+
+
+# ── jobs ─────────────────────────────────────────────────────────────────────
+
+async def start(document_ids: list[str] | None, owner: dict | None) -> dict:
+    """Queue a preparation job for the selected documents (or every document that
+    isn't being prepared, with document_ids None)."""
+    await asyncio.to_thread(store.check_not_full)
+    job_id = uuid.uuid4().hex[:8]
+
+    def admit() -> list[dict]:
+        records = _resolve(document_ids, {"raw", "prepared", "failed"})
+        busy = [r["name"] for r in records
+                if r.get("status") in ("queued", "preparing") or store.is_busy(r["id"])]
+        if busy:
+            raise store.DocumentBusy(
+                f"Being prepared or imported already: {', '.join(busy[:10])}"
+                f"{' and more' if len(busy) > 10 else ''}.", detail={"documents": busy})
+        store.queue_for_job([r["id"] for r in records], job_id)
+        return records
+
+    records = await asyncio.to_thread(admit)
+    ids = [r["id"] for r in records]
+    try:
+        await _jobs.create(job_id, {
+            "job_id": job_id,
+            "status": "queued",
+            "documents_total": len(ids),
+            "documents_completed": 0,
+            "documents_failed": 0,
+            "document_ids": ids,
+            "names": [r["name"] for r in records],
+            "current": None,
+            "errors": [],
+            "owner": owner,
+        })
+    except BaseException:
+        await asyncio.to_thread(store.abandon, ids)
+        raise
+    _enqueue(job_id)
+    return {"job_id": job_id, "status": "queued", "documents_queued": len(ids)}
+
+
+_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _enqueue(job_id: str) -> None:
+    """Put a job on the queue of the running event loop and make sure its one
+    worker runs. The API has one loop; a new loop (a test's) gets a new queue."""
+    global _queue, _worker, _loop
+    loop = asyncio.get_running_loop()
+    if _queue is None or _loop is not loop:
+        _queue, _worker, _loop = asyncio.Queue(), None, loop
+    _queue.put_nowait(job_id)
+    if _worker is None or _worker.done():
+        _worker = loop.create_task(_work(_queue))
+
+
+async def _work(queue: asyncio.Queue) -> None:
+    while True:
+        job_id = await queue.get()
+        try:
+            job = _jobs.get(job_id)
+            if job is None or job.get("status") != "queued":
+                continue
+            await _run(job_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:                                   # noqa: BLE001
+            _log.exception("Preparation job %s failed unexpectedly", job_id)
+            job = _jobs.get(job_id)
+            if job is not None and job.get("status") not in jobstore.TERMINAL:
+                await asyncio.to_thread(store.abandon, job.get("document_ids") or [])
+                job["errors"].append("the job stopped because of an unexpected server error; "
+                                     "the API log has the details")
+                job["status"] = "failed"
+        finally:
+            _cancel_requested.discard(job_id)
+
+
+async def _run(job_id: str) -> None:
+    job = _jobs[job_id]
+    job["status"] = "running"
+    ids: list[str] = list(job["document_ids"])
+    cancelled = False
+
+    def should_stop() -> bool:
+        return job_id in _cancel_requested
+
+    for position, document_id in enumerate(ids):
+        if should_stop():
+            await asyncio.to_thread(store.abandon, ids[position:])
+            cancelled = True
+            break
+        try:
+            record, folder = await asyncio.to_thread(store.begin, document_id, job_id)
+        except store.AreaError as exc:
+            # Deleted or unreadable since it was queued.
+            job["documents_failed"] = job["documents_failed"] + 1
+            job["errors"].append(f"{document_id}: {exc.message}")
+            store.release([document_id])
+            continue
+        name = record["name"]
+        job["current"] = {"document_id": document_id, "name": name,
+                          "windows_done": 0, "windows_total": 0}
+
+        def progress(done: int, total: int, document_id=document_id, name=name) -> None:
+            job["current"] = {"document_id": document_id, "name": name,
+                              "windows_done": done, "windows_total": total}
+
+        async def write_part(index: int, suffix: str, data: bytes, folder=folder) -> Path:
+            try:
+                await asyncio.to_thread(store.check_space, len(data), "this prepared part")
+            except store.StorageFull as exc:
+                raise preparation.StorageRefused(exc.message) from None
+            path = folder / f"{index + 1:03d}{suffix}"
+            await asyncio.to_thread(path.write_bytes, data)
+            return path
+
+        try:
+            raw = await asyncio.to_thread(store.raw_path, document_id)
+            result = await preparation.prepare_document(
+                raw, name, record["raw_type"], ollama.chat, ollama.list_models,
+                should_stop, write_part, progress)
+            await asyncio.to_thread(store.commit, document_id, result.parts, result.fallback)
+            job["documents_completed"] = job["documents_completed"] + 1
+        except preparation.Cancelled:
+            await asyncio.to_thread(store.abandon, ids[position:])
+            cancelled = True
+            break
+        except asyncio.CancelledError:
+            await asyncio.to_thread(store.abandon, ids[position:])
+            raise
+        except Exception as exc:                            # noqa: BLE001
+            reason = str(exc) or type(exc).__name__
+            if not isinstance(exc, (ValueError, store.AreaError)):
+                _log.warning("Preparing %r failed", name, exc_info=True)
+            await asyncio.to_thread(store.fail, document_id, reason)
+            job["errors"].append(f"{name}: {reason}")
+            job["documents_failed"] = job["documents_failed"] + 1
+
+    job["current"] = None
+    if cancelled:
+        job["status"] = "cancelled"
+    elif job["documents_failed"] == 0:
+        job["status"] = "completed"
+    elif job["documents_failed"] >= job["documents_total"]:
+        job["status"] = "failed"
+    else:
+        job["status"] = "partial"
+
+
+async def cancel(job_id: str) -> dict:
+    job = _jobs.get(job_id)
+    if job is None:
+        raise JobNotFound(f"Job '{job_id}' not found.")
+    if job.get("status") in jobstore.TERMINAL:
+        raise JobNotRunning(f"Job '{job_id}' has already ended ({job['status']}).")
+    if job.get("status") == "queued":
+        job["status"] = "cancelled"
+        await asyncio.to_thread(store.abandon, job.get("document_ids") or [])
+    else:
+        _cancel_requested.add(job_id)
+    return {"job_id": job_id, "status": job["status"]}
+
+
+def recover() -> list[str]:
+    """At startup, after the job store marked unfinished jobs interrupted."""
+    return store.recover()
+
+
+# ── import ───────────────────────────────────────────────────────────────────
+
+class _Part:
+    """A prepared part as start_ingest_job reads an upload."""
+
+    def __init__(self, name: str, handle: Any) -> None:
+        self.filename = store.raw_file_name(name)
+        self.file = handle
+        self.size = None
+
+
+async def import_documents(body: Any, owner: dict | None) -> dict:
+    """Start one ingest job with every part of the selected prepared documents."""
+
+    def select() -> tuple[list[dict], list[str]]:
+        records = _resolve(body.document_ids, {"prepared"})
+        busy = [r["name"] for r in records
+                if r.get("status") in ("queued", "preparing") or store.is_busy(r["id"])]
+        if busy:
+            raise store.DocumentBusy(
+                f"Being prepared or imported: {', '.join(busy[:10])}"
+                f"{' and more' if len(busy) > 10 else ''}.", detail={"documents": busy})
+        unprepared = [r["name"] for r in records if r.get("status") != "prepared"]
+        if unprepared:
+            raise store.DocumentNotPrepared(
+                f"Not prepared: {', '.join(unprepared[:10])}"
+                f"{' and more' if len(unprepared) > 10 else ''}.",
+                detail={"documents": unprepared})
+        names = [part["name"] for r in records for part in r.get("parts") or []]
+        seen, duplicates = set(), []
+        for name in names:
+            if name in seen and name not in duplicates:
+                duplicates.append(name)
+            seen.add(name)
+        if duplicates:
+            raise DuplicateNames(
+                f"Two selected documents have parts with the same name: "
+                f"{', '.join(duplicates[:10])}. Import them separately.",
+                detail={"names": duplicates})
+        return records, names
+
+    records, names = await asyncio.to_thread(select)
+    return {"records": records, "names": names}
+
+
+async def admit_import(records: list[dict], names: list[str], body: Any,
+                       owner: dict | None) -> str:
+    """Open the parts and start the ingest job; the documents are busy meanwhile."""
+    ids = [r["id"] for r in records]
+    await asyncio.to_thread(store.mark_busy, ids, "import")
+    handles: list[Any] = []
+    try:
+        files = []
+        for record in records:
+            _rec, opened = await asyncio.to_thread(store.open_parts, record["id"])
+            for part_name, handle in opened:
+                handles.append(handle)
+                files.append(_Part(part_name, handle))
+        job_id = await ingest_pipeline.start_ingest_job(
+            files=files, collection=body.collection, strategy=body.strategy,
+            chunk_size=body.chunk_size, chunk_overlap=body.chunk_overlap,
+            similarity_threshold=body.similarity_threshold,
+            min_chunk_size=body.min_chunk_size, owner=owner, names=names)
+        await asyncio.to_thread(store.add_import, ids, body.collection, job_id)
+        return job_id
+    finally:
+        for handle in handles:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        await asyncio.to_thread(store.release, ids)
+
+
+async def collection_exists(collection: str) -> bool:
+    return await wc.collection_exists(collection)
 ```
 
 ### api/services/rag_pipeline.py
@@ -9450,7 +11277,7 @@ from services import audit
 
 _log = logging.getLogger(__name__)
 
-KINDS = ("ingest", "export", "import", "tune")
+KINDS = ("ingest", "export", "import", "tune", "prepare")
 # The statuses a job never leaves; the same set scripts/verify/lib.sh waits for.
 TERMINAL = frozenset({"completed", "failed", "partial", "cancelled"})
 # Progress-only changes are written at most this often per job. Export and import
@@ -9471,6 +11298,7 @@ _REMEDY = {
     "export": "Start the export again.",
     "import": "Start the import again.",
     "tune": "Start the operation again.",
+    "prepare": "Start the preparation again.",
 }
 
 
@@ -9797,12 +11625,16 @@ class JobStore(MutableMapping):
         # reaches the disk terminal but without its message.
         if "finished_at" not in record:
             dict.__setitem__(record, "finished_at", now_iso())      # #617
-        if self.kind == "ingest":
-            completed = dict.get(record, "files_completed")
+        if self.kind in ("ingest", "prepare"):
+            # Both report per file or document in `errors` (#638 for prepare).
+            completed = dict.get(record, "files_completed" if self.kind == "ingest"
+                                 else "documents_completed")
             dict.__setitem__(record, "status", "partial"
                              if isinstance(completed, int) and completed > 0 else "failed")
+            if self.kind == "prepare":
+                dict.__setitem__(record, "current", None)
             errors = dict.get(record, "errors")
-            message = f"{INTERRUPTED_MESSAGE} {_REMEDY['ingest']}"
+            message = f"{INTERRUPTED_MESSAGE} {_REMEDY[self.kind]}"
             if isinstance(errors, list):
                 errors.append(message)
             else:
@@ -10377,7 +12209,7 @@ def _mark_finished(collection: str) -> None:
 # hard kill skips -- twelve of these were found holding 152 MB after the kill
 # tests, a with-models package would leave 2.3 GB behind each time, and an
 # ingest up to 512 MB of upload plus 2 GiB of extracted ZIP members.
-_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-", "ingest-")
+_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-", "ingest-", "prepare-")
 
 
 def sweep_stale_workdirs() -> list[str]:
@@ -12716,6 +14548,275 @@ async def save_ingest_config(body: SaveIngestConfigBody):
     return IngestConfigResponse(is_default=False, **cfg)
 ```
 
+### api/routers/prepare.py
+
+```python
+"""The preparation area's routes (#638): SPECIFICATIONS.md §3.1.11.
+
+Upload raw documents, prepare them in a background job, preview, download or
+delete them, and import prepared documents into a collection through the normal
+ingest path. Every route is Developer (auth/policy.py); the acting ones are
+audited with names and sizes, never document text.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import mimetypes
+import os
+import tempfile
+import zipfile
+from pathlib import Path
+from typing import Any, Iterator
+from urllib.parse import quote
+
+from fastapi import APIRouter, File, Request, UploadFile
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
+
+from config import settings
+from models.schemas import PrepareImportRequest, PrepareJobEntry, PrepareJobList, PrepareStartRequest
+from services import audit, ingest_pipeline, job_lists
+from services import preparation_jobs as jobs
+from services import preparation_store as store
+from services.collection_writes import CollectionDeletingError
+from utils import api_error, collection_check_unavailable, collection_deleting_error
+
+router = APIRouter(prefix="/prepare")
+_log = logging.getLogger(__name__)
+
+_BLOCK = 1024 * 1024
+
+
+def _error(exc: store.AreaError):
+    return api_error(exc.status, exc.code, exc.message, detail=exc.detail)
+
+
+# ── upload ───────────────────────────────────────────────────────────────────
+
+@router.post("/upload", status_code=201)
+async def upload(files: list[UploadFile] = File(...), request: Request = None):
+    audit.note(files=[f.filename for f in files], file_count=len(files),
+               total_bytes=sum(f.size or 0 for f in files))
+    try:
+        created, skipped = await jobs.upload(files, job_lists.job_owner(request))
+    except store.AreaError as exc:
+        return _error(exc)
+    except ingest_pipeline.UploadRejected as exc:
+        return api_error(exc.status, exc.code, exc.message, detail=exc.detail)
+    except Exception:
+        # %r: a filename can hold a newline that would forge a log line (#298).
+        _log.exception("Preparation upload failed unexpectedly (files: %r)",
+                       [f.filename for f in files])
+        return api_error(500, "PREPARE_FAILED",
+                         "The upload failed because of an unexpected server error. "
+                         "The API log has the details.")
+    return JSONResponse(status_code=201, content={
+        "documents": [store.list_entry(r) for r in created], "skipped": skipped})
+
+
+# ── reading ──────────────────────────────────────────────────────────────────
+
+@router.get("/documents")
+async def list_documents():
+    records = await asyncio.to_thread(store.list_documents)
+    used = await asyncio.to_thread(store.usage)
+    return {"documents": [store.list_entry(r) for r in records],
+            "used_bytes": used, "limit_bytes": store.limit()}
+
+
+@router.get("/documents/{document_id}")
+async def get_document(document_id: str):
+    try:
+        return await asyncio.to_thread(store.preview, document_id)
+    except store.AreaError as exc:
+        return _error(exc)
+
+
+# ── downloads ────────────────────────────────────────────────────────────────
+
+def _disposition(filename: str) -> str:
+    fallback = "".join(c if 32 <= ord(c) < 127 and c not in '"\\' else "_" for c in filename)
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename, safe='')}"
+
+
+def _stream(handle: Any) -> Iterator[bytes]:
+    try:
+        while True:
+            block = handle.read(_BLOCK)
+            if not block:
+                break
+            yield block
+    finally:
+        handle.close()
+
+
+def _media_type(name: str) -> str:
+    media, encoding = mimetypes.guess_type(name)
+    if encoding == "gzip":
+        return "application/gzip"
+    return media or "application/octet-stream"
+
+
+@router.get("/documents/{document_id}/raw")
+async def download_raw(document_id: str):
+    try:
+        record, handle = await asyncio.to_thread(store.open_raw, document_id)
+    except store.AreaError as exc:
+        return _error(exc)
+    audit.note(target=record["name"], kind="raw")
+    filename = store.raw_file_name(record["name"])
+    size = os.fstat(handle.fileno()).st_size
+    return StreamingResponse(_stream(handle), media_type=_media_type(filename),
+                             headers={"Content-Disposition": _disposition(filename),
+                                      "Content-Length": str(size)})
+
+
+def _build_zip(handles: list[tuple[str, Any]]) -> Path:
+    fd, name = tempfile.mkstemp(prefix="prepare-", suffix=".zip", dir=settings.upload_dir)
+    os.close(fd)
+    path = Path(name)
+    try:
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for part_name, handle in handles:
+                with archive.open(store.raw_file_name(part_name), "w") as out:
+                    while True:
+                        block = handle.read(_BLOCK)
+                        if not block:
+                            break
+                        out.write(block)
+        return path
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    finally:
+        for _, handle in handles:
+            handle.close()
+
+
+@router.get("/documents/{document_id}/prepared")
+async def download_prepared(document_id: str):
+    try:
+        record, handles = await asyncio.to_thread(store.open_parts, document_id)
+    except store.AreaError as exc:
+        return _error(exc)
+    audit.note(target=record["name"], kind="prepared")
+    if len(handles) == 1:
+        part_name, handle = handles[0]
+        filename = store.raw_file_name(part_name)
+        size = os.fstat(handle.fileno()).st_size
+        return StreamingResponse(_stream(handle), media_type=_media_type(filename),
+                                 headers={"Content-Disposition": _disposition(filename),
+                                          "Content-Length": str(size)})
+    path = await asyncio.to_thread(_build_zip, handles)
+    handle = path.open("rb")
+    size = os.fstat(handle.fileno()).st_size
+    filename = store.raw_file_name(record["name"])
+    from services.preparation import stem_of
+    return StreamingResponse(
+        _stream(handle), media_type="application/zip",
+        headers={"Content-Disposition": _disposition(f"{stem_of(filename)}-prepared.zip"),
+                 "Content-Length": str(size)},
+        background=BackgroundTask(path.unlink, missing_ok=True))
+
+
+# ── deletes ──────────────────────────────────────────────────────────────────
+
+@router.delete("/documents/{document_id}", status_code=204)
+async def delete_document(document_id: str):
+    try:
+        record = await asyncio.to_thread(store.delete, document_id)
+    except store.AreaError as exc:
+        return _error(exc)
+    audit.note(target=record["name"], kind="document")
+    return Response(status_code=204)
+
+
+@router.delete("/documents/{document_id}/prepared", status_code=204)
+async def delete_prepared(document_id: str):
+    try:
+        record = await asyncio.to_thread(store.delete_prepared, document_id)
+    except store.AreaError as exc:
+        return _error(exc)
+    audit.note(target=record["name"], kind="prepared")
+    return Response(status_code=204)
+
+
+# ── jobs ─────────────────────────────────────────────────────────────────────
+
+@router.post("/jobs", status_code=202)
+async def start_job(body: PrepareStartRequest, request: Request = None):
+    if body.all:
+        audit.note(all=True)
+    else:
+        audit.note(document_ids=body.document_ids)
+    try:
+        answer = await jobs.start(body.document_ids, job_lists.job_owner(request))
+    except store.AreaError as exc:
+        return _error(exc)
+    return JSONResponse(status_code=202, content=answer)
+
+
+@router.get("/jobs", response_model=PrepareJobList)
+async def list_jobs(request: Request):
+    principal = request.state.auth
+
+    def build():
+        items = job_lists.job_items(jobs.job_records())
+        return job_lists.entries(PrepareJobEntry, items, principal)
+    return PrepareJobList(jobs=await asyncio.to_thread(build))
+
+
+@router.get("/job/{job_id}")
+async def job_status(job_id: str):
+    job = jobs.get_job(job_id)
+    if job is None:
+        return api_error(404, "JOB_NOT_FOUND", f"Job '{job_id}' not found.")
+    return {key: value for key, value in dict(job).items() if not key.startswith("_")}
+
+
+@router.post("/job/{job_id}/cancel", status_code=202)
+async def cancel_job(job_id: str):
+    audit.note(job_id=job_id)
+    try:
+        answer = await jobs.cancel(job_id)
+    except store.AreaError as exc:
+        return _error(exc)
+    return JSONResponse(status_code=202, content=answer)
+
+
+# ── import ───────────────────────────────────────────────────────────────────
+
+@router.post("/import", status_code=202)
+async def import_documents(body: PrepareImportRequest, request: Request = None):
+    collection = body.collection
+    audit.note(collection=collection)
+    try:
+        selected = await jobs.import_documents(body, None)
+    except store.AreaError as exc:
+        return _error(exc)
+    audit.note(names=selected["names"])
+    try:
+        exists = await jobs.collection_exists(collection)
+    except Exception:                                       # noqa: BLE001
+        _log.exception("Could not check whether %r exists for a preparation import", collection)
+        return collection_check_unavailable(collection, "No job was started")
+    if not exists:
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
+    try:
+        job_id = await jobs.admit_import(selected["records"], selected["names"], body,
+                                         job_lists.job_owner(request))
+    except store.AreaError as exc:
+        return _error(exc)
+    except CollectionDeletingError:
+        return collection_deleting_error(collection)
+    except ingest_pipeline.UploadRejected as exc:
+        return api_error(exc.status, exc.code, exc.message, detail=exc.detail)
+    return JSONResponse(status_code=202, content={
+        "job_id": job_id, "status": "queued", "files_queued": len(selected["names"]),
+        "collection": collection})
+```
+
 ### api/routers/query.py
 
 ```python
@@ -14376,6 +16477,19 @@ ACCESS: dict[tuple[str, str], str] = {
     ("GET", "/packages"): DEVELOPER,
     ("GET", "/help/transfer"): DEVELOPER,
     ("GET", "/tune/{collection}"): DEVELOPER,          # read by the Transfer page (Q3)
+    # Document preparation (#638): the ingest permissions (C3).
+    ("POST", "/prepare/upload"): DEVELOPER,
+    ("GET", "/prepare/documents"): DEVELOPER,
+    ("GET", "/prepare/documents/{document_id}"): DEVELOPER,
+    ("GET", "/prepare/documents/{document_id}/raw"): DEVELOPER,
+    ("GET", "/prepare/documents/{document_id}/prepared"): DEVELOPER,
+    ("DELETE", "/prepare/documents/{document_id}"): DEVELOPER,
+    ("DELETE", "/prepare/documents/{document_id}/prepared"): DEVELOPER,
+    ("POST", "/prepare/jobs"): DEVELOPER,
+    ("GET", "/prepare/jobs"): DEVELOPER,
+    ("GET", "/prepare/job/{job_id}"): DEVELOPER,
+    ("POST", "/prepare/job/{job_id}/cancel"): DEVELOPER,
+    ("POST", "/prepare/import"): DEVELOPER,
     # Collections management, tuning, the Health page's data (Q3, Q5, Q6).
     ("DELETE", "/collections/{name}"): ENGINEER,
     ("POST", "/tune/rechunk"): ENGINEER,
@@ -15918,6 +18032,14 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("POST", "/tune/reindex"): "tune.reindex",
     ("POST", "/goldstandard/save"): "goldstandard.save",
     ("GET", "/goldstandard/download/{filename}"): "goldstandard.download",
+    ("POST", "/prepare/upload"): "prepare.upload",
+    ("POST", "/prepare/jobs"): "prepare.start",
+    ("POST", "/prepare/job/{job_id}/cancel"): "prepare.cancel",
+    ("POST", "/prepare/import"): "prepare.import",
+    ("GET", "/prepare/documents/{document_id}/raw"): "prepare.download",
+    ("GET", "/prepare/documents/{document_id}/prepared"): "prepare.download",
+    ("DELETE", "/prepare/documents/{document_id}"): "prepare.delete",
+    ("DELETE", "/prepare/documents/{document_id}/prepared"): "prepare.delete",
     ("POST", "/auth/users"): "admin.user.create",
     ("POST", "/auth/users/{username}/reset-password"): "admin.user.reset-password",
     ("POST", "/auth/users/{username}/role"): "admin.user.set-role",
@@ -16614,10 +18736,11 @@ async def lifespan(app: FastAPI):
         # mid-import is reported failed and its half-built collection already swept.
         # No worker from the previous process is alive, so any job still queued or
         # running is marked interrupted before the first request is served.
-        from services import exporter, importer, ingest_pipeline, tuning
+        from services import exporter, importer, ingest_pipeline, preparation_jobs, tuning
         interrupted = []
         for kind, module in (("ingest", ingest_pipeline), ("export", exporter),
-                             ("import", importer), ("tune", tuning)):
+                             ("import", importer), ("tune", tuning),
+                             ("prepare", preparation_jobs)):
             try:
                 marked = await asyncio.to_thread(module._jobs.load)
                 interrupted += [f"{kind} {job_id}" for job_id in marked]
@@ -16626,6 +18749,15 @@ async def lifespan(app: FastAPI):
         if interrupted:
             log.warning("Marked %d job(s) interrupted by the restart: %s. Their status now "
                         "says so; start them again.", len(interrupted), ", ".join(interrupted))
+        # Documents a killed preparation job left queued or preparing go back to
+        # the state they had before it (#638).
+        try:
+            restored = await asyncio.to_thread(preparation_jobs.recover)
+            if restored:
+                log.warning("Returned %d document(s) of an interrupted preparation to their "
+                            "earlier state: %s", len(restored), ", ".join(restored))
+        except Exception:                                 # noqa: BLE001
+            log.exception("Could not recover the preparation area")
         # One audit record per start, saying whether question text is recorded,
         # so a reader can tell why some query records carry it (#29).
         from config import settings
@@ -16715,13 +18847,14 @@ app.add_middleware(AuditMiddleware)
 app.add_middleware(RequestTracing)
 
 from routers import audit as audit_router
-from routers import auth as auth_router, help as help_router, health, collections, ingest, query, goldstandard, metrics, retrieval_config, transfer, tuning
+from routers import auth as auth_router, help as help_router, health, collections, ingest, prepare, query, goldstandard, metrics, retrieval_config, transfer, tuning
 
 app.include_router(health.router)
 app.include_router(auth_router.router)
 app.include_router(help_router.router)
 app.include_router(collections.router)
 app.include_router(ingest.router)
+app.include_router(prepare.router)
 app.include_router(query.router)
 app.include_router(goldstandard.router)
 app.include_router(metrics.router)
@@ -16941,6 +19074,7 @@ import SetupRequiredPage from './pages/SetupRequiredPage'
 import ChangePasswordPage from './pages/ChangePasswordPage'
 import QAPage from './pages/QAPage'
 import ImportPage from './pages/ImportPage'
+import PreparePage from './pages/PreparePage'
 import ChunkingPage from './pages/ChunkingPage'
 import RetrievalPage from './pages/RetrievalPage'
 import GoldStandardPage from './pages/GoldStandardPage'
@@ -16995,6 +19129,7 @@ export default function AppRouter() {
           {role !== 'end_user' && (
             <>
               <Route path="/import" element={<ImportPage />} />
+              <Route path="/prepare" element={<PreparePage />} />
               <Route path="/chunking" element={<ChunkingPage />} />
               <Route path="/retrieval" element={<RetrievalPage />} />
               <Route path="/goldstandard" element={<GoldStandardPage />} />
@@ -17417,6 +19552,22 @@ export const api = {
   // The caller's running and recent jobs (#617); an Engineer gets everyone's.
   listIngestJobs: () => request<{ jobs: IngestJobEntry[] }>('GET', '/ingest/jobs'),
   getIngestConfig: (collection: string) => request<IngestConfig>('GET', `/ingest/config/${collection}`),
+
+  // Document preparation (#638): the preparation area on the instance.
+  uploadForPreparation: (form: FormData) =>
+    request<{ documents: PreparedDocument[]; skipped: string[] }>('POST', '/prepare/upload', form, true),
+  listPrepared: () => request<PreparedList>('GET', '/prepare/documents'),
+  getPrepared: (id: string) => request<PreparedDocument>('GET', `/prepare/documents/${encodeURIComponent(id)}`),
+  deletePrepared: (id: string) => request<null>('DELETE', `/prepare/documents/${encodeURIComponent(id)}`),
+  deletePreparedOutput: (id: string) => request<null>('DELETE', `/prepare/documents/${encodeURIComponent(id)}/prepared`),
+  startPreparation: (ids: string[] | 'all') =>
+    request<{ job_id: string; status: string; documents_queued: number }>('POST', '/prepare/jobs',
+      ids === 'all' ? { all: true } : { document_ids: ids }),
+  getPrepareJob: (jobId: string) => request<PrepareJob>('GET', `/prepare/job/${encodeURIComponent(jobId)}`),
+  listPrepareJobs: () => request<{ jobs: PrepareJob[] }>('GET', '/prepare/jobs'),
+  cancelPrepareJob: (jobId: string) => request<{ job_id: string; status: string }>('POST', `/prepare/job/${encodeURIComponent(jobId)}/cancel`),
+  importPrepared: (body: PrepareImportBody) =>
+    request<{ job_id: string; status: string; files_queued: number; collection: string }>('POST', '/prepare/import', body),
   saveIngestConfig: (body: SaveIngestConfigBody) => request<IngestConfig>('POST', '/ingest/config', body),
 
   // Retrieval settings are stored per collection by the API, not in the browser.
@@ -17617,6 +19768,33 @@ export interface HealthResult {
     }
   }
 }
+
+// Document preparation (#638).
+export const preparedRawUrl = (id: string) => `${BASE}/prepare/documents/${encodeURIComponent(id)}/raw`
+export const preparedOutputUrl = (id: string) => `${BASE}/prepare/documents/${encodeURIComponent(id)}/prepared`
+export interface PreparedFallback { window: number | null; reason: string }
+export interface PreparedPart {
+  name: string; bytes: number; characters: number; records?: number
+  title: string | null; summary: string | null; summary_error: string | null
+  fallback: boolean; fallbacks: PreparedFallback[]; preview?: string
+}
+export interface PreparedDocument {
+  id: string; name: string; raw_type: string; raw_bytes: number; owner: JobOwner | null; created_at: string
+  status: 'raw' | 'queued' | 'preparing' | 'prepared' | 'failed'; prepared_at: string | null; prepared_bytes: number
+  parts: PreparedPart[]; fallback: boolean; code_only_by_type: boolean; last_error: string | null
+  imports: { collection: string; job_id: string; at: string }[]
+}
+export interface PreparedList { documents: PreparedDocument[]; used_bytes: number; limit_bytes: number }
+export interface PrepareJob {
+  job_id: string; status: string; documents_total: number; documents_completed: number; documents_failed: number
+  document_ids: string[]; names: string[]; errors: string[]
+  current: { document_id: string; name: string; windows_done: number; windows_total: number } | null
+  owner: JobOwner | null; created_at: string | null; finished_at?: string | null
+}
+export interface PrepareImportBody {
+  collection: string; document_ids?: string[]; all?: boolean; strategy: string; chunk_size: number
+  chunk_overlap: number; similarity_threshold: number; min_chunk_size: number
+}
 ```
 
 ### ui/src/components/NavBar.tsx
@@ -17638,6 +19816,7 @@ const ENGINEER: Role[] = ['engineer']
 const MENUS: MenuDef[] = [
   { key: 'data', label: 'Data', entries: [
     { label: 'Import', to: '/import', roles: STAFF },
+    { label: 'Prepare', to: '/prepare', roles: STAFF },
     { label: 'Transfer', to: '/transfer', roles: STAFF },
   ] },
   { key: 'tune', label: 'Tune', entries: [
@@ -18456,6 +20635,7 @@ export default function QAPage() {
 
 ```typescript
 import { useState, useEffect, useRef } from 'react'
+import { Link } from 'react-router-dom'
 import { api, CollectionInfo, IngestJobEntry, JobStatus, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB } from '../api/client'
 import { useRole } from '../context/AuthContext'
 import StrategyExplainer from '../components/StrategyExplainer'
@@ -18674,6 +20854,9 @@ export default function ImportPage() {
         Preparing a large corpus? Read the limits and how to stay under them first:{' '}
         <a href="/corpus-preparation-rules.md" download="corpus-preparation-rules.md"
           className="text-blue-600 hover:underline">Download corpus preparation rules (.md)</a>
+        {' · '}
+        {/* The preparation area (#638): raw documents made rules-compliant on the instance. */}
+        <Link to="/prepare" className="text-blue-600 hover:underline">Prepare documents first</Link>
       </p>
 
       {files.length > 0 && (
@@ -18764,6 +20947,489 @@ export default function ImportPage() {
             {newColError && <p role="alert" className="text-red-600 text-sm mb-4">{newColError}</p>}
             <div className="flex justify-end gap-2">
               <button onClick={closeNewCol} className="text-sm text-gray-500 hover:text-gray-700">Cancel</button>
+              <button onClick={createCollection} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">Create</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+```
+
+### ui/src/pages/PreparePage.tsx
+
+```typescript
+import { useEffect, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
+import {
+  api, CollectionInfo, JobStatus, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, PreparedDocument, PreparedList,
+  PrepareJob, preparedOutputUrl, preparedRawUrl,
+} from '../api/client'
+import { useRole } from '../context/AuthContext'
+import StrategyExplainer from '../components/StrategyExplainer'
+import ProgressPanel from '../components/ProgressPanel'
+import JobList, { newestToOpen, useJobList } from '../components/JobList'
+
+// Document preparation (#638). Raw documents are uploaded to the preparation area
+// on the instance, prepared by a background job (the code does the corpus rules'
+// work, the local LLM only removes headers, footers and boilerplate and writes a
+// title and summary), reviewed here, and imported into a collection through the
+// normal ingest path. They stay on the instance until deleted.
+
+const TERMINAL = ['completed', 'failed', 'partial', 'cancelled', 'interrupted']
+const prepareRunning = (j: { status: string }) => !TERMINAL.includes(j.status)
+const loadPrepareJobs = () => api.listPrepareJobs().then(r => r.jobs)
+const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
+const ACCEPT = '.pdf,.docx,.txt,.md,.csv,.json,.jsonl,.jsonl.gz,.zip'
+
+function size(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
+}
+
+function message(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
+
+function fallbackMark(d: PreparedDocument): string {
+  if (d.code_only_by_type) return 'code-only (by type)'
+  const count = d.parts.reduce((n, p) => n + p.fallbacks.length, 0)
+  return d.fallback ? `fell back (${count})` : ''
+}
+
+export default function PreparePage() {
+  const { role } = useRole()
+  const [files, setFiles] = useState<File[]>([])
+  const [list, setList] = useState<PreparedList | null>(null)
+  const [listError, setListError] = useState('')
+  const [selected, setSelected] = useState<string[]>([])
+  const [error, setError] = useState('')
+  const [skipped, setSkipped] = useState<string[]>([])
+  const [preview, setPreview] = useState<PreparedDocument | null>(null)
+  // The preparation job shown, polled while it runs.
+  const [prepareJob, setPrepareJob] = useState<PrepareJob | null>(null)
+  const [prepareJobId, setPrepareJobId] = useState('')
+  const touched = useRef(false)
+  const jobs = useJobList<PrepareJob>(loadPrepareJobs, prepareRunning)
+  // The import: collection, chunk settings, and the ingest job it started.
+  const [collections, setCollections] = useState<CollectionInfo[]>([])
+  const [collection, setCollection] = useState('')
+  const [collectionsError, setCollectionsError] = useState('')
+  const [strategy, setStrategy] = useState('overlap')
+  const [chunkSize, setChunkSize] = useState(1000)
+  const [chunkOverlap, setChunkOverlap] = useState(200)
+  const [minChunkSize, setMinChunkSize] = useState(100)
+  const [similarityThreshold, setSimilarityThreshold] = useState(0.85)
+  const [ingestJobId, setIngestJobId] = useState('')
+  const [ingestJob, setIngestJob] = useState<JobStatus | null>(null)
+  const [showNewColModal, setShowNewColModal] = useState(false)
+  const [newColName, setNewColName] = useState('')
+  const [newColIndexType, setNewColIndexType] = useState('hnsw')
+  const [newColError, setNewColError] = useState('')
+
+  const showOverlap = strategy !== 'semantic' && strategy !== 'context_aware'
+  const showSimilarity = strategy === 'semantic' && role === 'engineer'
+
+  async function loadList() {
+    try {
+      const l = await api.listPrepared()
+      setList(l)
+      setListError('')
+      setSelected(s => s.filter(id => l.documents.some(d => d.id === id)))
+    } catch (e: unknown) {
+      setListError(`Could not load the prepared documents: ${message(e)}`)
+    }
+  }
+
+  async function loadCollections(): Promise<CollectionInfo[] | null> {
+    try {
+      const r = await api.getCollections()
+      setCollections(r.collections)
+      setCollectionsError('')
+      return r.collections
+    } catch (e: unknown) {
+      setCollectionsError(`Could not load the collections: ${message(e)}`)
+      return null
+    }
+  }
+
+  useEffect(() => {
+    loadList()
+    loadCollections().then(l => { if (l && l.length > 0) setCollection(l[0].name) })
+  }, [])
+
+  // The preparation job shown is polled every 3 seconds while it runs; the list
+  // is read again when it ends.
+  useEffect(() => {
+    if (!prepareJobId) return
+    const interval = setInterval(async () => {
+      try {
+        const j = await api.getPrepareJob(prepareJobId)
+        setPrepareJob(j)
+        if (!prepareRunning(j)) {
+          clearInterval(interval)
+          jobs.reload()
+          loadList()
+        }
+      } catch (e: unknown) {
+        setError(`Could not check the preparation's progress: ${message(e)}`)
+      }
+    }, 3000)
+    return () => clearInterval(interval)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prepareJobId])
+
+  useEffect(() => {
+    if (!ingestJobId) return
+    const interval = setInterval(async () => {
+      try {
+        const j = await api.getJobStatus(ingestJobId)
+        setIngestJob(j)
+        if (!prepareRunning(j)) clearInterval(interval)
+      } catch (e: unknown) {
+        setError(`Could not check the import's progress: ${message(e)}`)
+      }
+    }, 3000)
+    return () => clearInterval(interval)
+  }, [ingestJobId])
+
+  function openJob(entry: PrepareJob) {
+    touched.current = true
+    setPrepareJob(entry)
+    setPrepareJobId(prepareRunning(entry) ? entry.job_id : '')
+  }
+
+  useEffect(() => {
+    if (!jobs.loaded || touched.current) return
+    touched.current = true
+    const entry = newestToOpen(jobs.entries, prepareRunning)
+    if (entry) openJob(entry)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobs.loaded])
+
+  async function upload() {
+    if (!files.length) return
+    setError('')
+    const total = files.reduce((n, f) => n + f.size, 0)
+    if (total > MAX_UPLOAD_BYTES) {
+      setError(`These files total ${(total / 1024 / 1024).toFixed(0)} MB; one upload can be at most ${MAX_UPLOAD_MB} MB. Split them into smaller batches.`)
+      return
+    }
+    const form = new FormData()
+    files.forEach(f => form.append('files', f))
+    try {
+      const r = await api.uploadForPreparation(form)
+      setSkipped(r.skipped)
+      setFiles([])
+      await loadList()
+    } catch (e: unknown) {
+      setError(message(e))
+    }
+  }
+
+  async function prepare(ids: string[] | 'all') {
+    setError('')
+    try {
+      const r = await api.startPreparation(ids)
+      touched.current = true
+      setPrepareJobId(r.job_id)
+      setPrepareJob(null)
+      jobs.reload()
+      await loadList()
+    } catch (e: unknown) {
+      setError(message(e))
+    }
+  }
+
+  async function cancel() {
+    if (!prepareJob) return
+    try {
+      const r = await api.cancelPrepareJob(prepareJob.job_id)
+      setPrepareJob({ ...prepareJob, status: r.status })
+    } catch (e: unknown) {
+      setError(message(e))
+    }
+  }
+
+  async function remove(d: PreparedDocument, outputOnly: boolean) {
+    const what = outputOnly ? `the prepared output of '${d.name}'` : `'${d.name}' (raw and prepared)`
+    if (!window.confirm(`Delete ${what}? This can't be undone.`)) return
+    setError('')
+    try {
+      if (outputOnly) await api.deletePreparedOutput(d.id)
+      else await api.deletePrepared(d.id)
+      if (preview?.id === d.id) setPreview(null)
+      await loadList()
+    } catch (e: unknown) {
+      setError(message(e))
+    }
+  }
+
+  async function showPreview(d: PreparedDocument) {
+    setError('')
+    try {
+      setPreview(await api.getPrepared(d.id))
+    } catch (e: unknown) {
+      setError(message(e))
+    }
+  }
+
+  async function importPrepared(all: boolean) {
+    setError('')
+    if (!collection) {
+      setError('Choose a collection to import into first. Use + New to create one.')
+      return
+    }
+    try {
+      const r = await api.importPrepared({
+        collection, ...(all ? { all: true } : { document_ids: selected }), strategy, chunk_size: chunkSize,
+        chunk_overlap: chunkOverlap, similarity_threshold: similarityThreshold, min_chunk_size: minChunkSize,
+      })
+      setIngestJobId(r.job_id)
+      setIngestJob(null)
+      await loadList()
+    } catch (e: unknown) {
+      setError(message(e))
+    }
+  }
+
+  async function createCollection() {
+    if (!newColName.trim()) return
+    let created: string
+    try {
+      created = (await api.createCollection({
+        name: newColName, index_type: newColIndexType, distance_metric: 'cosine',
+        hnsw_config: { efConstruction: 128, maxConnections: 64, ef: 64 },
+      })).name
+    } catch (e: unknown) {
+      setNewColError(message(e))
+      return
+    }
+    setShowNewColModal(false)
+    setNewColName('')
+    setNewColError('')
+    await loadCollections()
+    setCollections(prev => prev.some(c => c.name === created) ? prev : [...prev, {
+      name: created, object_count: 0, index_type: newColIndexType, distance_metric: 'cosine', created_at: null,
+    }])
+    setCollection(created)
+  }
+
+  const docs = list?.documents ?? []
+  const toggle = (id: string) => setSelected(s => s.includes(id) ? s.filter(x => x !== id) : [...s, id])
+  const anyPrepared = docs.some(d => d.status === 'prepared')
+
+  return (
+    <div className="max-w-5xl mx-auto">
+      <h1 className="text-2xl font-bold mb-2">Prepare Documents</h1>
+      <p className="text-sm text-gray-600 mb-4">
+        Raw documents are made to follow the corpus rules here: the code extracts the text, splits it to the limits,
+        normalises it and converts JSON, and the local LLM only removes page headers, footers, page numbers and
+        boilerplate and writes a title and summary. Where its cleaning would lose content, the part keeps the
+        code-only text and the fallback is shown. Documents stay on this instance until you delete them.
+        {' '}<Link to="/import" className="text-blue-600 hover:underline">Import page</Link>
+      </p>
+      <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2 mb-4">
+        Preparation and ingest share the local LLM service, so either is slower while the other runs.
+      </p>
+
+      <div
+        onDrop={e => { e.preventDefault(); setFiles(prev => [...prev, ...Array.from(e.dataTransfer.files)]) }}
+        onDragOver={e => e.preventDefault()}
+        className="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center mb-3 cursor-pointer hover:border-blue-400"
+        onClick={() => document.getElementById('prepare-file-input')?.click()}
+      >
+        <p className="text-gray-500">Drop raw files here or click to browse</p>
+        <p className="text-xs text-gray-400 mt-1">PDF, DOCX, TXT, MD, CSV, JSON, JSONL, ZIP · up to {MAX_UPLOAD_MB} MB per upload</p>
+        <input id="prepare-file-input" type="file" multiple className="hidden" accept={ACCEPT}
+          onChange={e => setFiles(prev => [...prev, ...Array.from(e.target.files || [])])} />
+      </div>
+      {files.length > 0 && (
+        <ul className="mb-3 space-y-1">
+          {files.map((f, i) => (
+            <li key={i} className="flex justify-between text-sm bg-gray-50 border rounded px-3 py-1">
+              <span>{f.name}</span>
+              <button onClick={() => setFiles(files.filter((_, j) => j !== i))} className="text-red-400 hover:text-red-600">✕</button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <button onClick={upload} disabled={!files.length}
+        className="bg-blue-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-blue-700 mb-2">Upload</button>
+      {skipped.length > 0 && (
+        <div className="text-sm text-gray-600 mb-2">{skipped.length} files skipped:
+          <ul className="list-disc ml-6">{skipped.map((s, i) => <li key={i}>{s}</li>)}</ul>
+        </div>
+      )}
+      {error && <p role="alert" className="text-red-600 text-sm my-2">{error}</p>}
+
+      <section aria-label="Prepared documents" className="bg-white border rounded p-4 my-4">
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+          <h2 className="font-semibold">Documents</h2>
+          {list && <span data-testid="prepare-usage" className="text-sm text-gray-600">Space used: {size(list.used_bytes)} of {size(list.limit_bytes)}</span>}
+        </div>
+        {listError && <p role="alert" className="text-red-600 text-sm">{listError}</p>}
+        {list && docs.length === 0 && <p className="text-sm text-gray-500">No documents yet.</p>}
+        {docs.length > 0 && (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm border-collapse">
+              <thead>
+                <tr className="border-b text-left text-gray-600">
+                  <th className="py-1 pr-2"></th><th className="py-1 pr-2">Name</th>
+                  {role === 'engineer' && <th className="py-1 pr-2">Owner</th>}
+                  <th className="py-1 pr-2">Status</th><th className="py-1 pr-2">Raw</th><th className="py-1 pr-2">Prepared</th>
+                  <th className="py-1 pr-2">Parts</th><th className="py-1 pr-2">Fallback</th><th className="py-1 pr-2">Imports</th>
+                  <th className="py-1">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {docs.map(d => (
+                  <tr key={d.id} data-document={d.id} className="border-b align-top">
+                    <td className="py-1 pr-2"><input type="checkbox" aria-label={`Select ${d.name}`}
+                      checked={selected.includes(d.id)} onChange={() => toggle(d.id)} /></td>
+                    <td className="py-1 pr-2 break-all">{d.name}
+                      {d.last_error && <div className="text-xs text-red-600">Last error: {d.last_error}</div>}</td>
+                    {role === 'engineer' && <td className="py-1 pr-2">{d.owner?.name ?? 'owner unknown'}</td>}
+                    <td className="py-1 pr-2">{d.status}</td>
+                    <td className="py-1 pr-2 whitespace-nowrap">{size(d.raw_bytes)}</td>
+                    <td className="py-1 pr-2 whitespace-nowrap">{d.prepared_bytes ? size(d.prepared_bytes) : '-'}</td>
+                    <td className="py-1 pr-2">{d.parts.length || '-'}</td>
+                    <td className="py-1 pr-2">{fallbackMark(d)}</td>
+                    <td className="py-1 pr-2 text-xs">{d.imports.map((i, n) =>
+                      <div key={n}>{i.collection} · {new Date(i.at).toLocaleString()}</div>)}</td>
+                    <td className="py-1 text-xs space-x-2 whitespace-nowrap">
+                      {d.status === 'prepared' && <button onClick={() => showPreview(d)} className="text-blue-600 hover:underline">Preview</button>}
+                      <a href={preparedRawUrl(d.id)} className="text-blue-600 hover:underline">Download raw</a>
+                      {d.status === 'prepared' && <a href={preparedOutputUrl(d.id)} className="text-blue-600 hover:underline">Download prepared</a>}
+                      {d.status === 'prepared' && <button onClick={() => remove(d, true)} className="text-red-600 hover:underline">Delete prepared</button>}
+                      <button onClick={() => remove(d, false)} className="text-red-600 hover:underline">Delete</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <div className="flex gap-2 mt-3">
+          <button onClick={() => prepare(selected)} disabled={!selected.length}
+            className="bg-blue-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-blue-700">Prepare selected</button>
+          <button onClick={() => prepare('all')} disabled={!docs.length}
+            className="border px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-gray-50">Prepare all</button>
+        </div>
+      </section>
+
+      {prepareJob && (
+        <section aria-label="Preparation progress" className="border rounded p-4 mb-4 bg-gray-50 text-sm">
+          <div className="flex justify-between">
+            <span>Preparation <span className="font-mono">{prepareJob.job_id}</span>: {prepareJob.documents_completed + prepareJob.documents_failed}/{prepareJob.documents_total} documents</span>
+            <span className="text-blue-600">{prepareJob.status}</span>
+          </div>
+          {prepareJob.current && (
+            <p className="mt-1">Now: {prepareJob.current.name}
+              {prepareJob.current.windows_total > 0 && ` (${prepareJob.current.windows_done}/${prepareJob.current.windows_total} windows)`}</p>
+          )}
+          {prepareJob.errors.length > 0 && (
+            <ul className="mt-2 text-red-600 list-disc ml-6">{prepareJob.errors.map((e, i) => <li key={i}>{e}</li>)}</ul>
+          )}
+          {prepareRunning(prepareJob) && (
+            <button onClick={cancel} className="mt-2 border border-red-300 text-red-700 px-3 py-1 rounded hover:bg-red-50">Cancel</button>
+          )}
+        </section>
+      )}
+
+      {preview && (
+        <section aria-label="Preview" className="border rounded p-4 mb-4">
+          <div className="flex justify-between mb-2">
+            <h2 className="font-semibold">Preview: {preview.name}</h2>
+            <button onClick={() => setPreview(null)} className="text-sm text-gray-500 hover:text-gray-700">Close</button>
+          </div>
+          {preview.parts.map(p => (
+            <div key={p.name} className="mb-4">
+              <p className="font-medium break-all">{p.name} <span className="text-gray-500 font-normal">({size(p.bytes)})</span></p>
+              {p.title ? <p className="text-sm"><span className="text-gray-500">Title:</span> {p.title}</p> : null}
+              {p.summary ? <p className="text-sm"><span className="text-gray-500">Summary:</span> {p.summary}</p>
+                : <p className="text-sm text-gray-500">No title or summary ({p.summary_error ?? 'none'}).</p>}
+              {p.fallbacks.length > 0 && (
+                <ul className="text-xs text-amber-700 list-disc ml-6">{p.fallbacks.map((f, i) =>
+                  <li key={i}>{f.window === null ? 'whole part' : `window ${f.window}`}: {f.reason}</li>)}</ul>
+              )}
+              <pre className="mt-1 text-xs bg-gray-50 border rounded p-2 whitespace-pre-wrap max-h-64 overflow-auto">{p.preview}</pre>
+            </div>
+          ))}
+        </section>
+      )}
+
+      <section aria-label="Import prepared documents" className="border rounded p-4 mb-4">
+        <h2 className="font-semibold mb-2">Import into a collection</h2>
+        <div className="mb-3">
+          <label className="block text-sm font-medium mb-1">Collection</label>
+          <div className="flex gap-2">
+            <select value={collection} onChange={e => setCollection(e.target.value)} className="border rounded px-3 py-2 text-sm flex-1">
+              {collections.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
+            </select>
+            <button onClick={() => { setNewColError(''); setShowNewColModal(true) }} className="text-sm border rounded px-3 py-2 hover:bg-gray-50">+ New</button>
+          </div>
+          {collectionsError && <p role="alert" className="text-red-600 text-sm mt-2">{collectionsError}</p>}
+        </div>
+        <label className="block text-sm font-medium mb-1">Chunking Strategy</label>
+        <select value={strategy} onChange={e => setStrategy(e.target.value)} className="border rounded px-3 py-2 text-sm w-full">
+          {STRATEGIES.map(s => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
+        </select>
+        <StrategyExplainer strategy={strategy} />
+        <div className="grid grid-cols-2 gap-4 mt-3 mb-3">
+          <div>
+            <label className="block text-xs text-gray-600 mb-1">Chunk Size: {chunkSize}</label>
+            <input type="range" min={50} max={6000} step={50} value={chunkSize} onChange={e => { const s = +e.target.value; setChunkSize(s); setChunkOverlap(o => Math.min(o, Math.max(0, s - 50))) }} className="w-full" />
+          </div>
+          {showOverlap && (
+            <div>
+              <label className="block text-xs text-gray-600 mb-1">Overlap: {chunkOverlap}</label>
+              <input type="range" min={0} max={Math.max(0, Math.min(2000, chunkSize - 50))} step={50} value={chunkOverlap} onChange={e => setChunkOverlap(+e.target.value)} className="w-full" />
+            </div>
+          )}
+          <div>
+            <label className="block text-xs text-gray-600 mb-1">Min Chunk Size: {minChunkSize}</label>
+            <input type="range" min={0} max={6000} step={10} value={minChunkSize} onChange={e => setMinChunkSize(+e.target.value)} className="w-full" />
+          </div>
+          {showSimilarity && (
+            <div>
+              <label className="block text-xs text-gray-600 mb-1">Similarity Threshold: {similarityThreshold}</label>
+              <input type="range" min={0} max={1} step={0.05} value={similarityThreshold} onChange={e => setSimilarityThreshold(+e.target.value)} className="w-full" />
+            </div>
+          )}
+        </div>
+        <div className="flex gap-2">
+          <button onClick={() => importPrepared(false)} disabled={!selected.length}
+            className="bg-blue-600 text-white px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-blue-700">Import selected</button>
+          <button onClick={() => importPrepared(true)} disabled={!anyPrepared}
+            className="border px-4 py-2 rounded text-sm disabled:opacity-50 hover:bg-gray-50">Import all prepared</button>
+        </div>
+        {ingestJobId && <p className="text-sm text-gray-600 mt-2">Job ID: <span className="font-mono">{ingestJobId}</span></p>}
+        {ingestJob && <ProgressPanel job={ingestJob} />}
+      </section>
+
+      <JobList error={jobs.error} loaded={jobs.loaded} showOwner={role === 'engineer'}
+        rows={jobs.entries.map(entry => ({
+          key: entry.job_id, kind: 'Preparation', target: entry.names.slice(0, 3).join(', ') + (entry.names.length > 3 ? '…' : ''),
+          status: entry.status, progress: `${entry.documents_completed + entry.documents_failed}/${entry.documents_total} documents`,
+          createdAt: entry.created_at, owner: entry.owner, open: entry.job_id === prepareJob?.job_id, onOpen: () => openJob(entry),
+        }))} />
+
+      {showNewColModal && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div className="bg-white rounded-xl p-6 w-80 shadow-xl">
+            <h2 className="font-semibold mb-4">New Collection</h2>
+            <input value={newColName} onChange={e => setNewColName(e.target.value)} placeholder="Collection name" className="border rounded px-3 py-2 text-sm w-full mb-3" />
+            <select value={newColIndexType} onChange={e => setNewColIndexType(e.target.value)} className="border rounded px-3 py-2 text-sm w-full mb-4">
+              <option value="hnsw">HNSW (Approximate)</option>
+              <option value="flat">Flat (Exact KNN)</option>
+            </select>
+            {newColError && <p role="alert" className="text-red-600 text-sm mb-4">{newColError}</p>}
+            <div className="flex justify-end gap-2">
+              <button onClick={() => { setShowNewColModal(false); setNewColError('') }} className="text-sm text-gray-500 hover:text-gray-700">Cancel</button>
               <button onClick={createCollection} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">Create</button>
             </div>
           </div>
@@ -20719,6 +23385,7 @@ const ACTIONS = [
   'auth.login', 'auth.logout', 'auth.password', 'collection.create', 'collection.delete', 'export',
   'goldstandard.download', 'goldstandard.save', 'import', 'ingest', 'ingest.config', 'operator.bootstrap',
   'operator.create-user', 'operator.disable', 'operator.enable', 'operator.reset-password', 'operator.set-role',
+  'prepare.cancel', 'prepare.delete', 'prepare.download', 'prepare.import', 'prepare.start', 'prepare.upload',
   'query', 'retrieval.config', 'system.start', 'tune.rechunk', 'tune.reembed', 'tune.reindex',
 ]
 const RESULTS = ['success', 'refused', 'error', 'accepted', 'succeeded', 'failed', 'interrupted']
@@ -21025,6 +23692,17 @@ and, when the 60-second window closes, one record with `details.count` and `last
 `../tests/test_audit.py` covers the rest in the API image, among it the counting of repeated failed logins, ids
 that stay in order across processes and a clock that steps back, the telemetry route list and the Audit page's
 action list (#577).
+
+`21_prepare.sh` checks document preparation (#638, SPECIFICATIONS.md §3.1.11 and §10.8). It runs
+`../tests/test_prepare.py` in the API image with no network and a stub LLM (windows and the fidelity check,
+the LLM's limits, titles and summaries, normalisation, parts and names, JSON to JSON Lines, the storage limit,
+jobs, cancel and restart, busy documents, import, downloads, routes), then checks the verify project through
+`prepare_stack.py` as the harness Developer: the role matrix of every `/prepare` route, an upload with a ZIP,
+ZIP refusals with ingest's codes, the raw download and the space used, deletes, import refusals, an unknown
+job's cancel and the audit records. In a full run (not `RAG_SKIP_SLOW=1`) it prepares three small files with
+the local LLM, one job at a time, checks that the cleaned text holds only source lines in order and that the
+CSV and JSON Lines come back unchanged, imports them into a throwaway `VfyPrepare*` collection and downloads a
+prepared part. Its `vfy-prepare-*` documents and its collections are removed at the end.
 
 ## Entry point and verify project
 
@@ -22432,7 +25110,7 @@ printf '\nBuilding fixtures in %s\n' "$FIX"
 rm -rf "$FIX"; python3 ./fixtures.py "$FIX" >/dev/null
 export RAG_FIXTURES="$FIX"
 
-ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit 20_offline_model)
+ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit 20_offline_model 21_prepare)
 if [ "$#" -gt 0 ]; then
   SUITES=()
   for want in "$@"; do
@@ -25175,6 +27853,438 @@ if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
 ```
 
+### scripts/verify/21_prepare.sh
+
+```bash
+#!/usr/bin/env bash
+# Document preparation (#638): SPECIFICATIONS.md §3.1.11 and §10.8.
+#
+# The unit checks (U1-U13) run in the API image with no network and a stub LLM.
+# The stack checks (P1-P11) run on the verify project through prepare_stack.py,
+# one check each, as the harness Developer. P9-P11 prepare three small files with
+# the local LLM, one job at a time, so they run only in a full run
+# (RAG_SKIP_SLOW unset). Documents this suite uploads are vfy-prepare-*, its
+# collections VfyPrepare*; both are removed at the end.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
+[ -f "$FIX/zip_high_ratio.zip" ] || python3 ./fixtures.py "$FIX" >/dev/null
+require_stack
+
+stack() { _rag_require_lock_owner; python3 ./prepare_stack.py "$1" "$FIX"; }
+
+section "Preparation units: windows, fidelity, LLM limits, parts, JSON, storage, jobs, import, routes"
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_prepare.py)
+check "test_prepare.py: the preparation area, pipeline, jobs, import and routes (U1-U13)" $?
+
+stack cleanup >/dev/null 2>&1
+
+section "Access and the area (P1-P8)"
+stack access
+check "P1 every /prepare route refuses no session (401) and an End User (403) and admits a Developer" $?
+stack upload
+check "P2 a .txt, a .csv and a ZIP's .jsonl become raw documents; the unsupported member is skipped" $?
+stack archives
+check "P3 a ZIP over the ratio limit and a damaged ZIP are refused with ingest's codes, nothing kept" $?
+stack download
+check "P4 the raw download is the uploaded bytes; the list reports the space used and the limit" $?
+stack delete
+check "P5 deleting a document removes it and lowers the space used; a second delete is 404" $?
+stack import-refusals
+check "P6 import refuses a raw document (409), an unknown one (404), no selection (400), bad settings (422)" $?
+stack cancel-unknown
+check "P7 cancelling an unknown job is 404" $?
+stack audit
+check "P8 the audit log records upload, download and delete with names and no document text" $?
+
+section "Preparation with the local LLM (P9-P11)"
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "P9-P11 prepare, import and download with the LLM" "RAG_SKIP_SLOW=1"
+else
+  stack prepare
+  check "P9 the .txt becomes cleaned Markdown of source lines in order with its header; the .csv and .jsonl are unchanged" $?
+  stack import
+  check "P10 an unknown collection is 404; the import into a new collection completes and is recorded" $?
+  stack prepared-download
+  check "P11 the prepared download is the part; deleting the prepared output returns the document to raw" $?
+fi
+
+stack cleanup
+check "the suite's documents and collections are removed" $?
+
+summary
+```
+
+### scripts/verify/prepare_stack.py
+
+```python
+"""Document preparation checks on the verify project (#638), one per subcommand.
+Host-side, standard library, Python 3.9+. Run by 21_prepare.sh, which turns each
+exit status into a check:
+
+    python3 prepare_stack.py CHECK FIXTURES_DIR
+
+Exit 0 when the check holds, 1 when it doesn't (the reason on stderr). Requests
+are sent as the harness Developer (End User and no session for the role checks).
+Documents this suite uploads are named vfy-prepare-*, and `cleanup` deletes them
+with the VfyPrepare* collections. State between checks is a small JSON file in
+the harness's private folder. SPECIFICATIONS.md §10.8, P1-P11.
+"""
+import io
+import json
+import os
+import secrets
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+from pathlib import Path
+
+import auth_setup
+from auth_setup import request
+from auth_stack import CheckFailed, code, error_code, expect, role_token
+
+TERMINAL = ("completed", "failed", "partial", "cancelled")
+STATE = Path(auth_setup.private_dir()) / "prepare-state.json"
+COLLECTION_PREFIX = "VfyPrepare"
+
+PAGES = "\n".join(
+    line for page in range(1, 4) for line in (
+        ["ACME CORP CONFIDENTIAL"]
+        + [f"Paragraph {page}.{n}: the committee reviewed item {page * 10 + n} and agreed to carry it "
+           f"forward to the next session." for n in range(6)]
+        + [f"Page {page}", ""])) + "\n"
+CSV = "name,team\nAda,core\nBo,docs\nCy,ops\n"
+JSONL = '{"id": 1, "text": "first record"}\n{"id": 2, "text": "second record"}\n'
+
+
+def state():
+    try:
+        return json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save(data):
+    STATE.write_text(json.dumps(data))
+    os.chmod(STATE, 0o600)
+
+
+def send(method, path, token, body=None, files=None, raw=False):
+    """(status, parsed JSON or bytes, headers) for a request as a same-origin browser."""
+    headers = {"Origin": auth_setup.origin()}
+    if token:
+        headers["Cookie"] = "rag_session=" + token
+    data = None
+    if files is not None:
+        boundary = "vfy" + secrets.token_hex(8)
+        parts = []
+        for name, content in files:
+            parts.append('--{}\r\nContent-Disposition: form-data; name="files"; filename="{}"\r\n'
+                         'Content-Type: application/octet-stream\r\n\r\n'.format(boundary, name).encode()
+                         + content + b"\r\n")
+        parts.append("--{}--\r\n".format(boundary).encode())
+        data = b"".join(parts)
+        headers["Content-Type"] = "multipart/form-data; boundary=" + boundary
+    elif body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(auth_setup.api_base() + path, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=300) as response:
+            status, content, got = response.status, response.read(), response.headers
+    except urllib.error.HTTPError as error:
+        status, content, got = error.code, error.read(), error.headers
+    if raw:
+        return status, content, got
+    try:
+        return status, json.loads(content) if content else None, got
+    except ValueError:
+        return status, content, got
+
+
+def documents(token):
+    status, body, _ = send("GET", "/prepare/documents", token)
+    expect(status == 200, "GET /prepare/documents answered {}".format(status))
+    return body
+
+
+def ours(token):
+    return [d for d in documents(token)["documents"] if d["name"].startswith(("vfy-prepare-", "vfy/"))]
+
+
+def zip_bytes(members):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, data in members.items():
+            z.writestr(name, data)
+    return buf.getvalue()
+
+
+def wait_job(token, path, timeout=1800):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status, job, _ = send("GET", path, token)
+        expect(status == 200, "{} answered {}".format(path, status))
+        if job["status"] in TERMINAL:
+            return job
+        time.sleep(2)
+    raise CheckFailed("{} didn't end within {}s".format(path, timeout))
+
+
+# ── checks ───────────────────────────────────────────────────────────────────
+
+ROUTES = [("POST", "/prepare/upload"), ("GET", "/prepare/documents"),
+          ("GET", "/prepare/documents/aaaaaaaaaaaa"), ("GET", "/prepare/documents/aaaaaaaaaaaa/raw"),
+          ("GET", "/prepare/documents/aaaaaaaaaaaa/prepared"), ("DELETE", "/prepare/documents/aaaaaaaaaaaa"),
+          ("DELETE", "/prepare/documents/aaaaaaaaaaaa/prepared"), ("POST", "/prepare/jobs"),
+          ("GET", "/prepare/jobs"), ("GET", "/prepare/job/none"), ("POST", "/prepare/job/none/cancel"),
+          ("POST", "/prepare/import")]
+
+
+def check_access(fix):
+    """P1: every route refuses no session (401) and an End User (403), and admits a Developer."""
+    wrong = []
+    end_user = role_token("end_user")
+    developer = role_token("developer")
+    for method, path in ROUTES:
+        body = {} if method == "POST" and path != "/prepare/upload" else None
+        status, raw, _ = code(method, path, body=body)
+        if status != 401:
+            wrong.append("{} {} without a session -> {}".format(method, path, status))
+        status, raw, _ = code(method, path, body=body, token=end_user)
+        if status != 403:
+            wrong.append("{} {} as End User -> {}".format(method, path, status))
+        status, raw, _ = code(method, path, body=body, token=developer)
+        if status in (401, 403):
+            wrong.append("{} {} as Developer -> {} {}".format(method, path, status, error_code(raw)))
+    request("POST", "/auth/logout", token=end_user)
+    expect(not wrong, "; ".join(wrong))
+
+
+def check_upload(fix):
+    """P2: a .txt, a .csv and a ZIP with a .jsonl and an unsupported member."""
+    token = role_token("developer")
+    status, body, _ = send("POST", "/prepare/upload", token, files=[
+        ("vfy-prepare-minutes.txt", PAGES.encode()), ("vfy-prepare-people.csv", CSV.encode()),
+        ("vfy-prepare-bundle.zip", zip_bytes({"vfy/records.jsonl": JSONL, "vfy/tool.exe": "no"}))])
+    expect(status == 201, "upload answered {} {}".format(status, body))
+    names = sorted(d["name"] for d in body["documents"])
+    expect(names == ["vfy-prepare-minutes.txt", "vfy-prepare-people.csv", "vfy/records.jsonl"],
+           "documents {}".format(names))
+    expect(all(d["status"] == "raw" for d in body["documents"]), "not all raw")
+    expect(any("tool.exe" in s for s in body["skipped"]), "skipped {}".format(body["skipped"]))
+    save({"ids": {d["name"]: d["id"] for d in body["documents"]}})
+
+
+def check_archives(fix):
+    """P3: a ZIP over the ratio limit and a damaged ZIP are refused; nothing is kept."""
+    token = role_token("developer")
+    before = documents(token)["documents"]
+    for name, want in (("zip_high_ratio.zip", "ARCHIVE_RATIO_TOO_HIGH"), ("truncated.zip", "ARCHIVE_UNREADABLE")):
+        status, body, _ = send("POST", "/prepare/upload", token,
+                               files=[("vfy-prepare-" + name, (Path(fix) / name).read_bytes())])
+        expect(status == 400 and body["error"]["code"] == want, "{} -> {} {}".format(name, status, body))
+    expect(documents(token)["documents"] == before, "the list changed")
+
+
+def check_download(fix):
+    """P4: raw download returns the uploaded bytes; the list reports its usage and limit."""
+    token = role_token("developer")
+    ids = state()["ids"]
+    status, content, headers = send("GET", "/prepare/documents/{}/raw".format(ids["vfy-prepare-people.csv"]),
+                                    token, raw=True)
+    expect(status == 200 and content == CSV.encode(), "raw download {} {!r}".format(status, content[:60]))
+    expect("vfy-prepare-people.csv" in headers.get("Content-Disposition", ""), "no file name")
+    listing = documents(token)
+    expect(listing["used_bytes"] > 0 and listing["limit_bytes"] >= 1024 * 1024,
+           "usage {} of {}".format(listing["used_bytes"], listing["limit_bytes"]))
+
+
+def check_delete(fix):
+    """P5: deleting a document removes it and lowers the usage; an unknown id is 404."""
+    token = role_token("developer")
+    status, body, _ = send("POST", "/prepare/upload", token, files=[("vfy-prepare-gone.md", b"x" * 4096)])
+    expect(status == 201, "upload answered {}".format(status))
+    doc = body["documents"][0]
+    used = documents(token)["used_bytes"]
+    status, _, _ = send("DELETE", "/prepare/documents/" + doc["id"], token)
+    expect(status == 204, "delete answered {}".format(status))
+    listing = documents(token)
+    expect(all(d["id"] != doc["id"] for d in listing["documents"]), "still listed")
+    expect(listing["used_bytes"] < used, "usage {} not below {}".format(listing["used_bytes"], used))
+    status, body, _ = send("DELETE", "/prepare/documents/" + doc["id"], token)
+    expect(status == 404 and body["error"]["code"] == "DOCUMENT_NOT_FOUND", "second delete {}".format(status))
+
+
+def check_import_refusals(fix):
+    """P6: a raw document 409, an unknown document 404, an empty selection 400, invalid settings 422."""
+    token = role_token("developer")
+    raw_id = state()["ids"]["vfy-prepare-people.csv"]
+    cases = [({"collection": "VfyPrepareNone", "document_ids": [raw_id]}, 409, "DOCUMENT_NOT_PREPARED"),
+             ({"collection": "VfyPrepareNone", "document_ids": ["bbbbbbbbbbbb"]}, 404, "DOCUMENT_NOT_FOUND"),
+             ({"collection": "VfyPrepareNone", "document_ids": []}, 400, "NO_DOCUMENTS"),
+             ({"collection": "VfyPrepareNone", "all": True, "chunk_size": 100, "chunk_overlap": 100},
+              422, "INVALID_PARAMETER")]
+    wrong = []
+    for body, status_want, code_want in cases:
+        status, answer, _ = send("POST", "/prepare/import", token, body=body)
+        got = answer.get("error", {}).get("code") if isinstance(answer, dict) else None
+        if (status, got) != (status_want, code_want):
+            wrong.append("{} -> {} {}".format(body, status, got))
+    expect(not wrong, "; ".join(wrong))
+
+
+def check_cancel_unknown(fix):
+    """P7: cancelling an unknown job is 404."""
+    status, body, _ = send("POST", "/prepare/job/nosuchjob/cancel", role_token("developer"))
+    expect(status == 404 and body["error"]["code"] == "JOB_NOT_FOUND", "cancel answered {}".format(status))
+
+
+def check_audit(fix):
+    """P8: prepare.upload, prepare.download and prepare.delete records with names, no content."""
+    admin = role_token("engineer")
+    found = {}
+    for action in ("prepare.upload", "prepare.download", "prepare.delete"):
+        query = urllib.parse.urlencode({"action": action, "limit": 200})
+        status, raw, _ = code("GET", "/audit?" + query, token=admin)
+        expect(status == 200, "GET /audit answered {}".format(status))
+        found[action] = json.loads(raw)["records"]
+    expect(any("vfy-prepare-minutes.txt" in (r["details"].get("files") or []) for r in found["prepare.upload"]),
+           "no prepare.upload record naming the upload")
+    expect(any(r.get("target") == "vfy-prepare-people.csv" and r["details"].get("kind") == "raw"
+               for r in found["prepare.download"]), "no prepare.download record of the raw CSV")
+    expect(any(r.get("target") == "vfy-prepare-gone.md" for r in found["prepare.delete"]),
+           "no prepare.delete record")
+    text = json.dumps(found)
+    expect("committee reviewed" not in text and "Ada,core" not in text, "document text in the audit records")
+
+
+# ── with the LLM (full runs only) ────────────────────────────────────────────
+
+def check_prepare(fix):
+    """P9: preparing the .txt, the .csv and the .jsonl."""
+    token = role_token("developer")
+    ids = state()["ids"]
+    status, body, _ = send("POST", "/prepare/jobs", token, body={"document_ids": list(ids.values())})
+    expect(status == 202, "start answered {} {}".format(status, body))
+    job = wait_job(token, "/prepare/job/" + body["job_id"])
+    expect(job["status"] == "completed", "job ended {}: {}".format(job["status"], job["errors"]))
+    txt = send("GET", "/prepare/documents/" + ids["vfy-prepare-minutes.txt"], token)[1]
+    expect(txt["status"] == "prepared" and len(txt["parts"]) == 1, "txt {}".format(txt["status"]))
+    part = txt["parts"][0]
+    expect(part["name"] == "vfy-prepare-minutes.md", "part named {}".format(part["name"]))
+    status, content, _ = send("GET", "/prepare/documents/{}/prepared".format(txt["id"]), token, raw=True)
+    expect(status == 200, "prepared download {}".format(status))
+    text = content.decode("utf-8")
+    lines = text.split("\n")
+    if part["title"]:
+        header = "# {}".format(part["title"])
+        expect(lines[0] == header and lines[2] == "Summary (generated): {}".format(part["summary"]),
+               "no header: {!r}".format(lines[:3]))
+        lines = lines[4:]
+    source = PAGES.split("\n")
+    position = 0
+    for line in lines:
+        if not line:
+            continue
+        try:
+            position = source.index(line, position) + 1
+        except ValueError:
+            raise CheckFailed("a line that isn't a source line, in order: {!r}".format(line))
+    for reason in (f["reason"] for f in part["fallbacks"]):
+        expect(reason in ("removed-too-much", "removed-long-line", "unusable-answer", "llm-timeout",
+                          "llm-error", "llm-unavailable", "too-large-for-llm"), "reason {}".format(reason))
+    for name, want in (("vfy-prepare-people.csv", CSV), ("vfy/records.jsonl", JSONL)):
+        record = send("GET", "/prepare/documents/" + ids[name], token)[1]
+        expect(record["status"] == "prepared" and record["code_only_by_type"], "{} {}".format(name, record["status"]))
+        status, content, _ = send("GET", "/prepare/documents/{}/prepared".format(record["id"]), token, raw=True)
+        expect(content.decode("utf-8") == want, "{} changed: {!r}".format(name, content[:80]))
+
+
+def check_import(fix):
+    """P10: an unknown collection is 404; an import into a new collection completes."""
+    token = role_token("developer")
+    ids = state()["ids"]
+    status, body, _ = send("POST", "/prepare/import", token,
+                           body={"collection": "VfyPrepareMissing", "document_ids": list(ids.values())})
+    expect(status == 404 and body["error"]["code"] == "COLLECTION_NOT_FOUND", "missing collection {}".format(status))
+    collection = COLLECTION_PREFIX + secrets.token_hex(3)
+    status, raw, _ = code("POST", "/collections", body={
+        "name": collection, "index_type": "hnsw", "distance_metric": "cosine",
+        "hnsw_config": {"efConstruction": 128, "maxConnections": 64, "ef": 64}}, token=token)
+    expect(status in (200, 201), "create collection {}".format(status))
+    status, body, _ = send("POST", "/prepare/import", token, body={
+        "collection": collection, "document_ids": list(ids.values()), "chunk_size": 500, "chunk_overlap": 50})
+    expect(status == 202, "import answered {} {}".format(status, body))
+    job = wait_job(token, "/ingest/job/" + body["job_id"])
+    expect(job["status"] == "completed", "ingest ended {}: {}".format(job["status"], job["errors"]))
+    status, raw, _ = code("GET", "/collections", token=token)
+    expect(status == 200, "collections {}".format(status))
+    for document_id in ids.values():
+        record = send("GET", "/prepare/documents/" + document_id, token)[1]
+        expect(record["imports"] and record["imports"][-1]["collection"] == collection
+               and record["imports"][-1]["job_id"] == body["job_id"], "imports {}".format(record["imports"]))
+    data = state()
+    data["collection"] = collection
+    save(data)
+
+
+def check_prepared_download(fix):
+    """P11: the prepared download is the part; delete prepared returns the document to raw."""
+    token = role_token("developer")
+    csv_id = state()["ids"]["vfy-prepare-people.csv"]
+    status, content, headers = send("GET", "/prepare/documents/{}/prepared".format(csv_id), token, raw=True)
+    expect(status == 200 and content == CSV.encode(), "prepared download {}".format(status))
+    status, _, _ = send("DELETE", "/prepare/documents/{}/prepared".format(csv_id), token)
+    expect(status == 204, "delete prepared {}".format(status))
+    record = send("GET", "/prepare/documents/" + csv_id, token)[1]
+    expect(record["status"] == "raw" and record["parts"] == [] and record["imports"], "after delete {}".format(record))
+
+
+def check_cleanup(fix):
+    token = role_token("developer")
+    for doc in ours(token):
+        send("DELETE", "/prepare/documents/" + doc["id"], token)
+    admin = role_token("engineer")
+    status, raw, _ = code("GET", "/collections", token=admin)
+    if status == 200:
+        for item in json.loads(raw)["collections"]:
+            if item["name"].startswith(COLLECTION_PREFIX):
+                code("DELETE", "/collections/{}?confirm=true".format(item["name"]), token=admin)
+    STATE.unlink(missing_ok=True)
+    expect(not ours(token), "documents left")
+
+
+CHECKS = {
+    "access": check_access, "upload": check_upload, "archives": check_archives,
+    "download": check_download, "delete": check_delete, "import-refusals": check_import_refusals,
+    "cancel-unknown": check_cancel_unknown, "audit": check_audit, "prepare": check_prepare,
+    "import": check_import, "prepared-download": check_prepared_download, "cleanup": check_cleanup,
+}
+
+
+def main(argv):
+    if len(argv) != 3 or argv[1] not in CHECKS:
+        print("usage: prepare_stack.py {} FIXTURES_DIR".format("|".join(CHECKS)), file=sys.stderr)
+        return 2
+    try:
+        CHECKS[argv[1]](argv[2])
+    except CheckFailed as exc:
+        print("    {}".format(exc), file=sys.stderr)
+        return 1
+    except Exception as exc:                                # noqa: BLE001
+        print("    {}: {}".format(type(exc).__name__, exc), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+```
+
 ### scripts/verify/job_lists.py
 
 The job lists on the verify project (#617), run by `02_ingest.sh` with `--operator`.
@@ -26532,12 +29642,16 @@ class PolicyTests(unittest.TestCase):
         counts = {}
         for access in policy.ACCESS.values():
             counts[access] = counts.get(access, 0) + 1
-        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 23, "engineer": 26})
+        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 35, "engineer": 26})
         self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
         self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
         self.assertEqual(policy.ACCESS[("POST", "/collections")], "developer")
         self.assertEqual(policy.ACCESS[("GET", "/tune/{collection}")], "developer")
         self.assertEqual(policy.ACCESS[("GET", "/tune/job/{job_id}")], "engineer")
+        # Document preparation (#638) follows the ingest permissions: all Developer.
+        prepare = {key: access for key, access in policy.ACCESS.items() if key[1].startswith("/prepare/")}
+        self.assertEqual(len(prepare), 12)
+        self.assertEqual(set(prepare.values()), {"developer"})
         # Account administration is the Engineer's, and nothing deletes an account (R1).
         admin = {key: access for key, access in policy.ACCESS.items() if key[1].startswith("/auth/users")}
         self.assertEqual(set(admin), {("GET", "/auth/users"), ("POST", "/auth/users"),
@@ -27744,6 +30858,775 @@ class ImplementationCopyTests(unittest.TestCase):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.CRITICAL)
     unittest.main(verbosity=2)
+```
+
+### scripts/tests/test_prepare.py
+
+```python
+"""Document preparation (#638): the area, the pipeline, jobs, import and routes.
+
+SPECIFICATIONS.md §3.1.11 and §10.8 (U1-U13). Runs with the API's dependencies,
+in the built API image with no network (`21_prepare.sh`):
+
+    docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
+      "$(docker compose images -q api)" python scripts/tests/test_prepare.py
+
+The LLM is a stub; nothing reaches Ollama or Weaviate. The preparation area and
+the upload folder are temporary. Routes go through `main.app` with real sessions
+in a temporary account store (`auth.testing`), without the lifespan.
+"""
+import asyncio
+import gzip
+import io
+import json
+import os
+import re
+import sys
+import tempfile
+import unittest
+import zipfile
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+sys.path.insert(0, os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api"))
+
+from fastapi.testclient import TestClient
+
+from config import settings
+from main import app
+from auth import policy
+from auth import testing as auth_testing
+from services import audit, ingest_pipeline, preparation
+from services import preparation_jobs as jobs
+from services import preparation_store as store
+
+ROOT = Path(__file__).resolve().parents[2]
+OWNER = {"name": "dev", "kind": "user"}
+
+
+def page_text(pages=3, lines_per_page=6):
+    """Text whose pages repeat a header and a page number line."""
+    out = []
+    for page in range(1, pages + 1):
+        out.append("ACME CORP CONFIDENTIAL")
+        for line in range(lines_per_page):
+            out.append(f"Paragraph {page}.{line}: the committee reviewed item {page * 10 + line} "
+                       f"and agreed to carry it forward to the next session.")
+        out.append(f"Page {page}")
+        out.append("")
+    return "\n".join(out)
+
+
+class StubLLM:
+    """Answers the cleaning prompt by naming header and page-number lines, and the
+    title prompt with a fixed title. Behaviour can be switched per test."""
+
+    def __init__(self, clean=None, title=None):
+        self.calls = []
+        self.clean = clean
+        self.title = title
+
+    async def chat(self, system, user):
+        self.calls.append((system, user))
+        if system.startswith(preparation.CLEAN_SYSTEM):
+            if self.clean is not None:
+                return await self._answer(self.clean, system, user)
+            numbers = []
+            for line in user.split("\n")[1:]:
+                n, _, text = line.partition(": ")
+                if text == "ACME CORP CONFIDENTIAL" or re.fullmatch(r"Page \d+", text):
+                    numbers.append(int(n))
+            return json.dumps({"remove": numbers})
+        if self.title is not None:
+            return await self._answer(self.title, system, user)
+        return '```json\n{"title": "Committee minutes", "summary": "Items the committee carried forward."}\n```'
+
+    async def _answer(self, behaviour, system, user):
+        if callable(behaviour):
+            result = behaviour(system, user)
+            if asyncio.iscoroutine(result):
+                result = await result
+            return result
+        return behaviour
+
+    async def models(self):
+        return {f"{settings.llm_model}:latest", "nomic-embed-text:latest"}
+
+
+class AreaCase(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        (self.root / "uploads").mkdir()
+        for name, value in (("preparation_dir", str(self.root / "area")),
+                            ("upload_dir", str(self.root / "uploads")),
+                            ("max_preparation_bytes", 10 * 1024 * 1024),
+                            ("audit_dir", str(self.root / "audit"))):
+            change = patch.object(settings, name, value)
+            change.start()
+            self.addCleanup(change.stop)
+        store._busy.clear()
+        jobs._queue = None
+        jobs._worker = None
+        jobs._loop = None
+        jobs._cancel_requested.clear()
+        jobs._jobs._records.clear()
+
+    def write(self, name, data):
+        path = self.root / "uploads" / name.replace("/", "_")
+        path.write_bytes(data if isinstance(data, bytes) else data.encode("utf-8"))
+        return path
+
+    def document(self, name, data):
+        return store.create(name, self.write(name, data), OWNER)
+
+    def prepare(self, record, llm=None, should_stop=lambda: False, write_part=None):
+        llm = llm or StubLLM()
+        folder = self.root / "out" / record["id"]
+        folder.mkdir(parents=True, exist_ok=True)
+
+        async def default_write(index, suffix, data):
+            path = folder / f"{index + 1:03d}{suffix}"
+            path.write_bytes(data)
+            return path
+
+        return asyncio.run(preparation.prepare_document(
+            store.raw_path(record["id"]), record["name"], record["raw_type"], llm.chat,
+            llm.models, should_stop, write_part or default_write))
+
+    def part_text(self, record_id, entry):
+        return (self.root / "out" / record_id / entry["file"]).read_text(encoding="utf-8")
+
+
+# ── U1, U2: windows and the fidelity check ──────────────────────────────────
+
+class WindowTests(unittest.TestCase):
+    def test_windows_hold_whole_lines_up_to_3000_characters(self):
+        text = "\n".join("x" * 99 for _ in range(100))
+        ws = preparation.windows(text)
+        self.assertTrue(all(w.characters <= 3000 for w in ws))
+        self.assertEqual(sum(len(w.lines) for w in ws), 100)
+        self.assertEqual([line for w in ws for line in w.lines], text.split("\n"))
+
+    def test_a_line_over_3000_characters_is_alone_and_not_sent(self):
+        text = "short\n" + "y" * 3500 + "\nafter"
+        ws = preparation.windows(text)
+        self.assertEqual([w.send for w in ws], [True, False, True])
+        self.assertEqual(ws[1].lines, ["y" * 3500])
+
+    def clean(self, lines, answers):
+        answers = list(answers)
+
+        async def chat(system, user):
+            answer = answers.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+        llm = preparation.LLM(chat, lambda: False, seconds=5)
+        return asyncio.run(preparation.clean_window(preparation.Window(lines), llm)), llm
+
+    def test_numbered_lines_are_sent_and_the_named_ones_removed(self):
+        seen = []
+
+        async def chat(system, user):
+            seen.append(user)
+            return '{"remove": [1, 3]}'
+        llm = preparation.LLM(chat, lambda: False)
+        lines = ["HEADER", "a long line of real content " * 3, "7"]
+        cleaned = asyncio.run(preparation.clean_window(preparation.Window(lines + ["more content " * 10]), llm))
+        self.assertIsNone(cleaned.reason)
+        self.assertEqual(cleaned.lines, [lines[1], "more content " * 10])
+        self.assertTrue(seen[0].startswith("Lines:\n1: HEADER\n2: "))
+
+    def test_a_long_line_named_falls_back(self):
+        lines = ["H", "z" * 201] + ["content " * 30] * 3
+        cleaned, _ = self.clean(lines, ['{"remove": [2]}'])
+        self.assertEqual(cleaned.reason, "removed-long-line")
+        self.assertEqual(cleaned.lines, lines)
+
+    def test_removing_more_than_a_fifth_falls_back(self):
+        lines = ["header line"] * 5 + ["content"] * 3
+        cleaned, _ = self.clean(lines, ['{"remove": [1, 2, 3]}'])
+        self.assertEqual(cleaned.reason, "removed-too-much")
+        self.assertEqual(cleaned.lines, lines)
+
+    def test_an_unusable_answer_is_asked_again_once(self):
+        lines = ["H", "content " * 30]
+        cleaned, _ = self.clean(lines, ["no json here", '{"remove": [1]}'])
+        self.assertIsNone(cleaned.reason)
+        self.assertEqual(cleaned.lines, [lines[1]])
+        cleaned, _ = self.clean(lines, ["nope", '{"remove": [9]}'])
+        self.assertEqual(cleaned.reason, "unusable-answer")
+        cleaned, _ = self.clean(lines, ['{"remove": "1"}', '{"remove": [true]}'])
+        self.assertEqual(cleaned.reason, "unusable-answer")
+
+    def test_timeouts_and_errors(self):
+        lines = ["H", "content " * 30]
+        cleaned, _ = self.clean(lines, [asyncio.TimeoutError(), asyncio.TimeoutError()])
+        self.assertEqual(cleaned.reason, "llm-timeout")
+        cleaned, _ = self.clean(lines, [RuntimeError("x"), RuntimeError("y")])
+        self.assertEqual(cleaned.reason, "llm-error")
+        cleaned, _ = self.clean(lines, [asyncio.TimeoutError(), RuntimeError("y")])
+        self.assertEqual(cleaned.reason, "llm-error")
+        cleaned, _ = self.clean(lines, [asyncio.TimeoutError(), '{"remove": []}'])
+        self.assertIsNone(cleaned.reason)
+
+    def test_a_valid_small_removal_is_not_a_fallback(self):
+        lines = ["Page 3"] + ["content line"] * 20
+        cleaned, _ = self.clean(lines, ['{"remove": [1]}'])
+        self.assertIsNone(cleaned.reason)
+        self.assertEqual(len(cleaned.lines), 20)
+
+
+# ── U3, U4: LLM unavailable, size cap, title and summary ────────────────────
+
+class LlmDocumentTests(AreaCase):
+    def test_a_text_document_is_cleaned_titled_and_written_as_markdown(self):
+        record = self.document("minutes.txt", page_text())
+        result = self.prepare(record)
+        [part] = result.parts
+        text = self.part_text(record["id"], part)
+        self.assertEqual(part["name"], "minutes.md")
+        self.assertTrue(text.startswith("# Committee minutes\n\nSummary (generated): Items the "
+                                        "committee carried forward.\n\n"))
+        self.assertNotIn("ACME CORP CONFIDENTIAL", text)
+        self.assertNotIn("Page 2", text)
+        for line in page_text().split("\n"):
+            if line.startswith("Paragraph"):
+                self.assertIn(line, text)
+        self.assertFalse(part["fallback"])
+        self.assertEqual(part["fallbacks"], [])
+
+    def test_three_failed_calls_in_a_row_make_the_rest_code_only(self):
+        async def failing(system, user):
+            raise RuntimeError("down")
+        llm = StubLLM(clean=failing, title=failing)
+        record = self.document("minutes.txt", page_text(pages=40))
+        result = self.prepare(record, llm)
+        [part] = result.parts
+        reasons = [f["reason"] for f in part["fallbacks"]]
+        self.assertEqual(reasons[0], "llm-error")
+        self.assertIn("llm-unavailable", reasons)
+        self.assertEqual(len(llm.calls), 3)
+        self.assertEqual(part["summary_error"], "llm-unavailable")
+        self.assertIsNone(part["title"])
+        text = self.part_text(record["id"], part)
+        self.assertFalse(text.startswith("# "))
+        self.assertIn("ACME CORP CONFIDENTIAL", text)
+
+    def test_a_missing_model_makes_the_document_code_only(self):
+        llm = StubLLM()
+
+        async def no_model():
+            return {"nomic-embed-text:latest"}
+        llm.models = no_model
+        record = self.document("a.md", page_text())
+        result = self.prepare(record, llm)
+        self.assertEqual(result.parts[0]["fallbacks"], [{"window": None, "reason": "llm-unavailable"}])
+        self.assertEqual(llm.calls, [])
+        self.assertTrue(result.fallback)
+
+    def test_over_1000_windows_is_too_large_for_the_llm_but_titled(self):
+        with patch.object(preparation, "MAX_WINDOWS", 2):
+            llm = StubLLM()
+            record = self.document("big.txt", page_text(pages=20))
+            result = self.prepare(record, llm)
+        [part] = result.parts
+        self.assertEqual(part["fallbacks"], [{"window": None, "reason": "too-large-for-llm"}])
+        self.assertTrue(part["fallback"])
+        self.assertEqual(part["title"], "Committee minutes")
+        self.assertTrue(all(not s.startswith(preparation.CLEAN_SYSTEM) for s, _ in llm.calls))
+
+    def test_title_retried_then_left_out(self):
+        answers = ['{"title": "", "summary": "x"}', '{"title": "Ok", "summary": "Fine."}']
+        llm = StubLLM(title=lambda s, u: answers.pop(0))
+        record = self.document("a.md", "Some text.\n")
+        part = self.prepare(record, llm).parts[0]
+        self.assertEqual((part["title"], part["summary"], part["summary_error"]), ("Ok", "Fine.", None))
+        long_summary = " ".join(["word"] * 81)
+        llm = StubLLM(title=json.dumps({"title": "T", "summary": long_summary}))
+        record = self.document("b.md", "Some text.\n")
+        part = self.prepare(record, llm).parts[0]
+        self.assertEqual((part["title"], part["summary_error"]), (None, "unusable-answer"))
+        self.assertFalse(part["fallback"])
+        llm = StubLLM(title=json.dumps({"title": "Two\nlines", "summary": "s"}))
+        part = self.prepare(self.document("c.md", "Text.\n"), llm).parts[0]
+        self.assertEqual(part["summary_error"], "unusable-answer")
+
+    def test_csv_and_jsonl_keep_title_in_the_record_only(self):
+        csv_data = "name,team\nAda,core\nBo,docs\n"
+        record = self.document("people.csv", csv_data)
+        part = self.prepare(record).parts[0]
+        self.assertEqual(self.part_text(record["id"], part), csv_data)
+        self.assertEqual(part["title"], "Committee minutes")
+        self.assertEqual(part["records"], 2)
+        jsonl = '{"a": 1}\n{"b": "x"}\n'
+        record = self.document("d.jsonl", jsonl)
+        part = self.prepare(record).parts[0]
+        self.assertEqual(self.part_text(record["id"], part), jsonl)
+        self.assertEqual(part["name"], "d.jsonl")
+        self.assertEqual(part["records"], 2)
+
+
+# ── U5: normalisation ───────────────────────────────────────────────────────
+
+class NormaliseTests(unittest.TestCase):
+    def test_bom_line_endings_nfc_and_control_characters(self):
+        raw = "﻿a\r\nb\rc\x00d\x07e\tf\x7fg\x0cÉ"
+        self.assertEqual(preparation.normalise_text(raw), "a\nb\ncde\tfgÉ")
+
+
+# ── U6: parts, names and checks ─────────────────────────────────────────────
+
+class PartTests(AreaCase):
+    def test_text_parts_stay_under_the_limit_and_are_named(self):
+        paragraphs = "\n\n".join(f"Paragraph {i} " + "word " * 40 for i in range(200))
+        with patch.object(preparation, "PART_LIMIT", 4000), patch.object(preparation, "HEADER_ROOM", 500):
+            record = self.document("dir/report.txt", paragraphs)
+            result = self.prepare(record)
+        self.assertGreater(len(result.parts), 1)
+        self.assertEqual(result.parts[0]["name"], "dir/report-part-001.md")
+        self.assertEqual(result.parts[-1]["name"], f"dir/report-part-{len(result.parts):03d}.md")
+        for part in result.parts:
+            self.assertLessEqual(len(self.part_text(record["id"], part)), 4000 + 1)
+
+    def test_csv_parts_repeat_the_header(self):
+        rows = "".join(f"{i},value {i}\n" for i in range(300))
+        with patch.object(preparation, "PART_LIMIT", 1000):
+            record = self.document("t.csv", "id,value\n" + rows)
+            result = self.prepare(record)
+        self.assertGreater(len(result.parts), 1)
+        joined = ""
+        for part in result.parts:
+            text = self.part_text(record["id"], part)
+            self.assertTrue(text.startswith("id,value\n"))
+            joined += text[len("id,value\n"):]
+        self.assertEqual(joined, rows)
+
+    def test_a_quoted_csv_field_keeps_its_line_break(self):
+        data = 'id,note\n1,"two\nlines"\n2,plain\n'
+        record = self.document("q.csv", data)
+        part = self.prepare(record).parts[0]
+        self.assertEqual(self.part_text(record["id"], part), data)
+        self.assertEqual(part["records"], 2)
+
+    def test_a_csv_header_over_half_a_part_fails(self):
+        with patch.object(preparation, "PART_LIMIT", 100):
+            record = self.document("h.csv", "x" * 60 + "\n1\n")
+            with self.assertRaisesRegex(ValueError, "header row"):
+                self.prepare(record)
+
+    def test_a_record_is_never_cut(self):
+        records = [json.dumps({"text": "r" * 500, "n": i}) for i in range(10)]
+        with patch.object(preparation, "PART_LIMIT", 1200):
+            record = self.document("r.jsonl", "\n".join(records) + "\n")
+            result = self.prepare(record)
+        lines = []
+        for part in result.parts:
+            lines += self.part_text(record["id"], part).splitlines()
+        self.assertEqual(lines, records)
+        self.assertTrue(all(p["name"].startswith("r-part-") for p in result.parts))
+
+    def test_names(self):
+        self.assertEqual(preparation.part_names("a/b.jsonl.gz", "jsonl", 1), ["a/b.jsonl"])
+        self.assertEqual(preparation.part_names("x.json.gz", "jsonl", 2),
+                         ["x-part-001.jsonl", "x-part-002.jsonl"])
+        self.assertEqual(preparation.part_names("report.pdf", "text", 1), ["report.md"])
+        self.assertEqual(preparation.part_names("notes", "text", 1), ["notes.md"])
+
+    def test_a_part_over_the_chunk_limit_fails_the_check(self):
+        path = self.root / "big.jsonl"
+        path.write_text(json.dumps({"t": "w " * 100}) + "\n")
+        with patch.object(preparation, "MAX_CHUNKS_PER_FILE", 0):
+            with self.assertRaisesRegex(ValueError, "chunks"):
+                preparation.check_part(path, "jsonl")
+        self.assertEqual(preparation.overlap_estimate(1000), 1)
+        self.assertEqual(preparation.overlap_estimate(1801), 3)
+
+    def test_a_file_ingest_refuses_fails_with_its_reason(self):
+        record = self.document("bad.jsonl", '{"a": 1}\n\n{"b": 2}\n')
+        with self.assertRaisesRegex(ValueError, "line 2 is blank"):
+            self.prepare(record)
+        record = self.document("empty.txt", "\n\n")
+        with self.assertRaisesRegex(ValueError, "no text"):
+            self.prepare(record)
+
+
+# ── U7: JSON to JSON Lines ──────────────────────────────────────────────────
+
+class JsonTests(AreaCase):
+    def test_records_as_ingest_numbers_as_written_empty_kept_no_nfc(self):
+        decomposed = "É"
+        data = '[{"n": 1.50, "s": "%s"}, {}, {"deep": [1, 2]}]' % decomposed
+        record = self.document("d.json", data)
+        part = self.prepare(record).parts[0]
+        lines = self.part_text(record["id"], part).splitlines()
+        self.assertEqual(lines, ['{"n":1.50,"s":"%s"}' % decomposed, "{}", '{"deep":[1,2]}'])
+        self.assertEqual(part["name"], "d.jsonl")
+        self.assertEqual(part["records"], 3)
+
+    def test_a_scalar_array_is_one_record(self):
+        record = self.document("s.json", "[1, 2, 3]")
+        part = self.prepare(record).parts[0]
+        self.assertEqual(self.part_text(record["id"], part), "[1,2,3]\n")
+
+    def test_element_files_are_written_as_records(self):
+        data = json.dumps([{"type": "Title", "element_id": "a", "text": "Hello", "metadata": {}}])
+        record = self.document("e.json", data)
+        part = self.prepare(record).parts[0]
+        self.assertEqual(json.loads(self.part_text(record["id"], part)), json.loads(data)[0])
+
+    def test_gzipped_json_lines_are_decompressed(self):
+        record = self.document("z.jsonl.gz", gzip.compress(b'{"a": 1}\r\n{"b": 2}\n'))
+        part = self.prepare(record).parts[0]
+        self.assertEqual(self.part_text(record["id"], part), '{"a": 1}\n{"b": 2}\n')
+        self.assertEqual(part["name"], "z.jsonl")
+
+    def test_blank_lines_after_the_last_record_are_dropped(self):
+        record = self.document("t.jsonl", '{"a": 1}\n\n\n')
+        part = self.prepare(record).parts[0]
+        self.assertEqual(self.part_text(record["id"], part), '{"a": 1}\n')
+
+    def test_ingest_reads_json_lines_as_before(self):
+        records = list(ingest_pipeline._iter_jsonl_records(io.BytesIO(b'{"a": 1}\n{}\n{"b": [1, 2]}\n')))
+        self.assertEqual(records, [("line 1", "a: 1"), ("line 3", "b: 1, 2")])
+
+
+# ── jobs: U8-U11 ────────────────────────────────────────────────────────────
+
+class JobCase(AreaCase):
+    def setUp(self):
+        super().setUp()
+        self.llm = StubLLM()
+        for name, value in (("chat", self.llm.chat), ("list_models", self.llm.models)):
+            change = patch.object(jobs.ollama, name, value)
+            change.start()
+            self.addCleanup(change.stop)
+
+    async def run_job(self, ids):
+        answer = await jobs.start(ids, OWNER)
+        await self.finish(answer["job_id"])
+        return jobs.get_job(answer["job_id"])
+
+    async def finish(self, job_id, timeout=30):
+        for _ in range(int(timeout / 0.02)):
+            job = jobs.get_job(job_id)
+            if job and job["status"] in ("completed", "failed", "partial", "cancelled"):
+                return job
+            await asyncio.sleep(0.02)
+        self.fail(f"job {job_id} did not end")
+
+
+class JobTests(JobCase):
+    def test_a_job_prepares_its_documents(self):
+        a = self.document("a.txt", page_text())
+        b = self.document("b.csv", "x,y\n1,2\n")
+        job = asyncio.run(self.run_job([a["id"], b["id"]]))
+        self.assertEqual((job["status"], job["documents_completed"], job["documents_failed"]),
+                         ("completed", 2, 0))
+        self.assertEqual(store.get(a["id"])["status"], "prepared")
+        self.assertTrue(store.get(b["id"])["code_only_by_type"])
+        self.assertEqual(store.get(b["id"])["parts"][0]["name"], "b.csv")
+
+    def test_a_failed_first_run_leaves_the_document_failed(self):
+        bad = self.document("bad.jsonl", "not json\n")
+        good = self.document("good.md", "Fine text.\n")
+        job = asyncio.run(self.run_job([bad["id"], good["id"]]))
+        self.assertEqual(job["status"], "partial")
+        record = store.get(bad["id"])
+        self.assertEqual(record["status"], "failed")
+        self.assertIn("not valid JSON", record["last_error"])
+        self.assertEqual(record["parts"], [])
+
+    def test_a_failed_rerun_keeps_the_earlier_output(self):
+        doc = self.document("a.md", "Fine text.\n")
+        asyncio.run(self.run_job([doc["id"]]))
+        earlier = store.get(doc["id"])["parts"]
+        with patch.object(preparation, "check_part", side_effect=ValueError("broken part")):
+            job = asyncio.run(self.run_job([doc["id"]]))
+        self.assertEqual(job["status"], "failed")
+        record = store.get(doc["id"])
+        self.assertEqual((record["status"], record["last_error"]), ("prepared", "broken part"))
+        self.assertEqual(record["parts"], earlier)
+        self.assertEqual(len(store.part_paths(doc["id"])), 1)
+        self.assertTrue(store.part_paths(doc["id"])[0][1].is_file())
+        # A later successful run clears the error and replaces the output.
+        asyncio.run(self.run_job([doc["id"]]))
+        self.assertIsNone(store.get(doc["id"])["last_error"])
+
+    def test_the_storage_limit_refuses_a_part_and_keeps_nothing(self):
+        doc = self.document("a.md", "x " * 5000)
+        with patch.object(settings, "max_preparation_bytes", store.usage() + 100):
+            job = asyncio.run(self.run_job([doc["id"]]))
+        record = store.get(doc["id"])
+        self.assertEqual(record["status"], "failed")
+        self.assertIn("can't hold this prepared part", record["last_error"])
+        self.assertFalse((Path(settings.preparation_dir) / "docs" / doc["id"] / "prepared").exists())
+        self.assertEqual(job["status"], "failed")
+        with patch.object(settings, "max_preparation_bytes", store.usage()):
+            with self.assertRaises(store.StorageFull):
+                asyncio.run(jobs.start([doc["id"]], OWNER))
+
+    def test_cancel_returns_documents_to_their_earlier_state(self):
+        started = None
+
+        async def scenario():
+            nonlocal started
+            gate = asyncio.Event()
+
+            async def slow(system, user):
+                await gate.wait()
+                return '{"remove": []}'
+            self.llm.clean = slow
+            prepared = self.document("p.md", "Earlier.\n")
+            self.llm.clean = None
+            await self.run_job([prepared["id"]])
+            self.llm.clean = slow
+            first = self.document("a.md", page_text())
+            answer = await jobs.start([first["id"], prepared["id"]], OWNER)
+            for _ in range(200):
+                if store.get(first["id"])["status"] == "preparing":
+                    break
+                await asyncio.sleep(0.01)
+            await jobs.cancel(answer["job_id"])
+            gate.set()
+            job = await self.finish(answer["job_id"])
+            started = (first, prepared, job)
+        asyncio.run(scenario())
+        first, prepared, job = started
+        self.assertEqual(job["status"], "cancelled")
+        self.assertEqual(store.get(first["id"])["status"], "raw")
+        self.assertEqual(store.get(prepared["id"])["status"], "prepared")
+        self.assertFalse(store.is_busy(first["id"]))
+        with self.assertRaises(jobs.JobNotRunning):
+            asyncio.run(jobs.cancel(job["job_id"]))
+        with self.assertRaises(jobs.JobNotFound):
+            asyncio.run(jobs.cancel("nope"))
+
+    def test_one_job_at_a_time_and_busy_documents(self):
+        async def scenario():
+            gate = asyncio.Event()
+
+            async def slow(system, user):
+                await gate.wait()
+                return '{"remove": []}'
+            self.llm.clean = slow
+            a = self.document("a.md", "A text.\n")
+            b = self.document("b.md", "B text.\n")
+            first = await jobs.start([a["id"]], OWNER)
+            second = await jobs.start([b["id"]], OWNER)
+            for _ in range(200):
+                if jobs.get_job(first["job_id"])["status"] == "running":
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(jobs.get_job(second["job_id"])["status"], "queued")
+            with self.assertRaises(store.DocumentBusy):
+                await jobs.start([a["id"]], OWNER)
+            with self.assertRaises(store.DocumentBusy):
+                store.delete(a["id"])
+            with self.assertRaises(store.DocumentBusy):
+                await jobs.import_documents(SimpleNamespace(document_ids=[a["id"]]), OWNER)
+            gate.set()
+            await self.finish(first["job_id"])
+            await self.finish(second["job_id"])
+            self.assertEqual(jobs.get_job(second["job_id"])["status"], "completed")
+        asyncio.run(scenario())
+
+    def test_an_interrupted_job_reads_failed_with_the_reason(self):
+        folder = Path(settings.upload_dir) / "jobs" / "prepare"
+        folder.mkdir(parents=True)
+        (folder / "p1.json").write_text(json.dumps({
+            "job_id": "p1", "status": "running", "documents_total": 2, "documents_completed": 1,
+            "documents_failed": 0, "document_ids": [], "names": [], "errors": [],
+            "current": {"document_id": "x", "name": "a.md", "windows_done": 1, "windows_total": 2}}))
+        bound = jobs.jobstore.JobStore("prepare")
+        self.assertEqual(bound.load(), ["p1"])
+        record = bound["p1"]
+        self.assertEqual((record["status"], record["current"]), ("partial", None))
+        self.assertIn("Start the preparation again.", record["errors"][-1])
+
+    def test_restart_recovery(self):
+        doc = self.document("a.md", "Text.\n")
+        store.queue_for_job([doc["id"]], "j1")
+        store.begin(doc["id"], "j1")
+        store._busy.clear()
+        self.assertEqual(store.recover(), ["a.md"])
+        self.assertEqual(store.get(doc["id"])["status"], "raw")
+        self.assertFalse((Path(settings.preparation_dir) / "docs" / doc["id"] / "prepared.new").exists())
+
+
+# ── routes: upload, list, download, delete, import (U8, U11-U13) ─────────────
+
+class RouteTests(JobCase):
+    def setUp(self):
+        super().setUp()
+        self.client = TestClient(app, headers=auth_testing.headers("developer"))
+
+    def upload(self, files):
+        return self.client.post("/prepare/upload", files=[("files", f) for f in files])
+
+    def zip_bytes(self, members):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            for name, data in members.items():
+                z.writestr(name, data)
+        return buf.getvalue()
+
+    def test_upload_list_download_and_delete(self):
+        answer = self.upload([("a.txt", b"Hello.\n"), ("b.zip", self.zip_bytes(
+            {"dir/c.jsonl": '{"a": 1}\n', "x.exe": "no", "__MACOSX/._c.jsonl": "meta"}))])
+        self.assertEqual(answer.status_code, 201, answer.text)
+        body = answer.json()
+        self.assertEqual(sorted(d["name"] for d in body["documents"]), ["a.txt", "dir/c.jsonl"])
+        self.assertTrue(any("x.exe" in s for s in body["skipped"]))
+        listing = self.client.get("/prepare/documents").json()
+        self.assertEqual(len(listing["documents"]), 2)
+        self.assertEqual(listing["limit_bytes"], settings.max_preparation_bytes)
+        self.assertGreater(listing["used_bytes"], 0)
+        doc = next(d for d in body["documents"] if d["name"] == "a.txt")
+        raw = self.client.get(f"/prepare/documents/{doc['id']}/raw")
+        self.assertEqual(raw.content, b"Hello.\n")
+        self.assertIn("a.txt", raw.headers["content-disposition"])
+        self.assertEqual(self.client.get(f"/prepare/documents/{doc['id']}/prepared").status_code, 409)
+        self.assertEqual(self.client.delete(f"/prepare/documents/{doc['id']}/prepared").status_code, 409)
+        used = listing["used_bytes"]
+        self.assertEqual(self.client.delete(f"/prepare/documents/{doc['id']}").status_code, 204)
+        listing = self.client.get("/prepare/documents").json()
+        self.assertEqual(len(listing["documents"]), 1)
+        self.assertLess(listing["used_bytes"], used)
+        self.assertEqual(self.client.delete(f"/prepare/documents/{doc['id']}").status_code, 404)
+        self.assertEqual(self.client.get("/prepare/documents/zzz").status_code, 404)
+
+    def test_upload_refusals_keep_nothing(self):
+        self.assertEqual(self.upload([("x.exe", b"no")]).json()["error"]["code"], "NO_SUPPORTED_FILES")
+        damaged = self.zip_bytes({"a.txt": "hello"})[:-30]
+        answer = self.upload([("d.zip", damaged)])
+        self.assertEqual(answer.json()["error"]["code"], "ARCHIVE_UNREADABLE")
+        with patch.object(settings, "max_preparation_bytes", 1024 * 1024):
+            answer = self.upload([("big.txt", b"x" * (1024 * 1024 + 1))])
+        self.assertEqual(answer.status_code, 409)
+        self.assertEqual(answer.json()["error"]["code"], "PREPARATION_STORAGE_FULL")
+        self.assertEqual(self.client.get("/prepare/documents").json()["documents"], [])
+        self.assertEqual(list((self.root / "uploads").glob("prepare-*")), [])
+
+    def test_job_routes_refusals(self):
+        self.assertEqual(self.client.post("/prepare/jobs", json={}).status_code, 422)
+        self.assertEqual(self.client.post("/prepare/jobs", json={"document_ids": []}).json()["error"]["code"],
+                         "NO_DOCUMENTS")
+        self.assertEqual(self.client.post("/prepare/jobs", json={"document_ids": ["aaaaaaaaaaaa"]}).status_code, 404)
+        self.assertEqual(self.client.get("/prepare/job/nope").status_code, 404)
+        self.assertEqual(self.client.post("/prepare/job/nope/cancel").status_code, 404)
+        self.assertEqual(self.client.get("/prepare/jobs").json(), {"jobs": []})
+
+    def test_import_refusals(self):
+        doc = self.upload([("a.txt", b"Hello.\n")]).json()["documents"][0]
+        answer = self.client.post("/prepare/import", json={"collection": "Docs", "document_ids": [doc["id"]]})
+        self.assertEqual(answer.json()["error"]["code"], "DOCUMENT_NOT_PREPARED")
+        answer = self.client.post("/prepare/import", json={"collection": "Docs", "document_ids": []})
+        self.assertEqual(answer.json()["error"]["code"], "NO_DOCUMENTS")
+        answer = self.client.post("/prepare/import", json={"collection": "Docs", "document_ids": ["bbbbbbbbbbbb"]})
+        self.assertEqual(answer.status_code, 404)
+        answer = self.client.post("/prepare/import", json={"collection": "Docs", "all": True,
+                                                            "chunk_size": 100, "chunk_overlap": 100})
+        self.assertEqual(answer.json()["error"]["code"], "INVALID_PARAMETER")
+
+    def prepared(self, files):
+        docs = self.upload(files).json()["documents"]
+        job = asyncio.run(self.run_job([d["id"] for d in docs]))
+        self.assertEqual(job["status"], "completed", job)
+        return docs
+
+    def test_import_starts_one_ingest_job_with_the_part_names(self):
+        docs = self.prepared([("b.zip", self.zip_bytes({"dir/one.txt": "One.\n", "two.csv": "a,b\n1,2\n"}))])
+        seen = {}
+
+        async def fake_start(files, collection, **kwargs):
+            seen["files"] = [(f.filename, f.file.read()) for f in files]
+            seen["names"] = kwargs["names"]
+            seen["collection"] = collection
+            return "ing00001"
+        with patch.object(jobs.wc, "collection_exists", AsyncMock(return_value=False)):
+            answer = self.client.post("/prepare/import", json={"collection": "Docs", "all": True})
+        self.assertEqual(answer.json()["error"]["code"], "COLLECTION_NOT_FOUND")
+        with patch.object(jobs.wc, "collection_exists", AsyncMock(return_value=True)), \
+                patch.object(jobs.ingest_pipeline, "start_ingest_job", fake_start):
+            answer = self.client.post("/prepare/import", json={"collection": "docs", "all": True})
+        self.assertEqual(answer.status_code, 202, answer.text)
+        self.assertEqual(answer.json()["job_id"], "ing00001")
+        self.assertEqual(seen["collection"], "Docs")
+        self.assertEqual(sorted(seen["names"]), ["dir/one.md", "two.csv"])
+        self.assertIn(("two.csv", b"a,b\n1,2\n"), seen["files"])
+        for doc in docs:
+            record = self.client.get(f"/prepare/documents/{doc['id']}").json()
+            self.assertEqual(record["imports"][0]["collection"], "Docs")
+            self.assertEqual(record["imports"][0]["job_id"], "ing00001")
+            self.assertFalse(store.is_busy(doc["id"]))
+            self.assertTrue(record["parts"][0]["preview"])
+
+    def test_duplicate_part_names_are_refused(self):
+        self.prepared([("a.txt", b"One.\n"), ("a.md", b"Two.\n")])
+        with patch.object(jobs.wc, "collection_exists", AsyncMock(return_value=True)):
+            answer = self.client.post("/prepare/import", json={"collection": "Docs", "all": True})
+        self.assertEqual(answer.json()["error"]["code"], "DUPLICATE_NAMES")
+
+    def test_prepared_download_is_one_file_or_a_zip_of_parts(self):
+        [single] = self.prepared([("s.csv", b"a\n1\n")])
+        answer = self.client.get(f"/prepare/documents/{single['id']}/prepared")
+        self.assertEqual(answer.content, b"a\n1\n")
+        rows = "".join(f"{i}\n" for i in range(400))
+        with patch.object(preparation, "PART_LIMIT", 500):
+            [multi] = self.prepared([("m.csv", ("n\n" + rows).encode())])
+        answer = self.client.get(f"/prepare/documents/{multi['id']}/prepared")
+        self.assertIn("m-prepared.zip", answer.headers["content-disposition"])
+        with zipfile.ZipFile(io.BytesIO(answer.content)) as z:
+            names = z.namelist()
+            self.assertGreater(len(names), 1)
+            self.assertEqual(names[0], "m-part-001.csv")
+            self.assertEqual("".join(z.read(n).decode()[2:] for n in names), rows)
+        self.assertEqual(self.client.delete(f"/prepare/documents/{multi['id']}/prepared").status_code, 204)
+        self.assertEqual(self.client.get(f"/prepare/documents/{multi['id']}").json()["status"], "raw")
+
+    def test_roles(self):
+        anonymous = TestClient(app)
+        self.assertEqual(anonymous.get("/prepare/documents").status_code, 401)
+        end_user = TestClient(app, headers=auth_testing.headers("end_user"))
+        self.assertEqual(end_user.get("/prepare/documents").status_code, 403)
+
+
+class WiringTests(unittest.TestCase):
+    ROUTES = [("POST", "/prepare/upload"), ("GET", "/prepare/documents"),
+              ("GET", "/prepare/documents/{document_id}"),
+              ("GET", "/prepare/documents/{document_id}/raw"),
+              ("GET", "/prepare/documents/{document_id}/prepared"),
+              ("DELETE", "/prepare/documents/{document_id}"),
+              ("DELETE", "/prepare/documents/{document_id}/prepared"),
+              ("POST", "/prepare/jobs"), ("GET", "/prepare/jobs"), ("GET", "/prepare/job/{job_id}"),
+              ("POST", "/prepare/job/{job_id}/cancel"), ("POST", "/prepare/import")]
+
+    def test_every_route_is_developer_and_the_acting_ones_audited(self):
+        for key in self.ROUTES:
+            self.assertEqual(policy.ACCESS[key], "developer", key)
+        self.assertEqual({k: v for k, v in audit.ACTIONS.items() if k[1].startswith("/prepare")}, {
+            ("POST", "/prepare/upload"): "prepare.upload",
+            ("POST", "/prepare/jobs"): "prepare.start",
+            ("POST", "/prepare/job/{job_id}/cancel"): "prepare.cancel",
+            ("POST", "/prepare/import"): "prepare.import",
+            ("GET", "/prepare/documents/{document_id}/raw"): "prepare.download",
+            ("GET", "/prepare/documents/{document_id}/prepared"): "prepare.download",
+            ("DELETE", "/prepare/documents/{document_id}"): "prepare.delete",
+            ("DELETE", "/prepare/documents/{document_id}/prepared"): "prepare.delete"})
+
+    def test_the_audit_page_lists_the_new_actions(self):
+        page = (ROOT / "ui/src/pages/AuditPage.tsx").read_text()
+        for action in ("prepare.upload", "prepare.start", "prepare.cancel", "prepare.import",
+                       "prepare.download", "prepare.delete"):
+            self.assertIn(f"'{action}'", page)
+
+
+if __name__ == "__main__":
+    unittest.main()
 ```
 
 ### scripts/tests/test_auth_enforcement.py
@@ -34681,8 +38564,8 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     for (const p of ['/qa', '/collections', '/health', '/qa']) {
       await s.page.goto(BASE + p, { waitUntil: 'networkidle2' }); await sleep(500);
     }
-    const pages = (await readNav(s.page).catch(() => ({ pages: [] }))).pages;  // the Engineer's 11: Q&A and the menus' 10 (#616)
-    r.check('the session survives navigation and reloads', pages.length === 11, JSON.stringify(pages));
+    const pages = (await readNav(s.page).catch(() => ({ pages: [] }))).pages;  // the Engineer's 12: Q&A and the menus' 11 (#616, Prepare #638)
+    r.check('the session survives navigation and reloads', pages.length === 12, JSON.stringify(pages));
     await chooseFromMenu(s.page, 'account', 'Log out').catch(() => {});
     await s.page.waitForFunction(() => location.pathname === '/login', { timeout: 10000 }).catch(() => {});
     const me = await s.page.evaluate(async () => (await fetch('/api/auth/me')).status);
@@ -34784,7 +38667,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     const s = await session(browser, BASE, 'engineer');
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(1500);
     const links = (await readNav(s.page).catch(() => ({ pages: [] }))).pages;  // through the menus (#616)
-    for (const want of ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys', 'Audit']) {
+    for (const want of ['Q&A', 'Import', 'Prepare', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys', 'Audit']) {
       r.check(`Engineer nav includes ${want}`, links.includes(want), JSON.stringify(links));
     }
     await s.ctx.close();
@@ -43026,7 +46909,7 @@ function navigationCases() {
 // menu; each role keeps its pages, and a menu with none isn't shown. The menus
 // follow the WAI-ARIA menu button pattern for the keyboard and screen readers.
 function navMenuCases() {
-  const DATA = { key: 'data', label: 'Data', entries: ['Import', 'Transfer'] };
+  const DATA = { key: 'data', label: 'Data', entries: ['Import', 'Prepare', 'Transfer'] };
   const TUNE = { key: 'tune', label: 'Tune', entries: ['Chunking', 'Retrieval', 'Gold Standard'] };
   const ADMIN = { key: 'admin', label: 'Admin', entries: ['Collections', 'Users', 'Service keys', 'Audit', 'Health'] };
   const account = (username, badge) => ({ key: 'account', label: `${username} ${badge}`, entries: ['Change password', 'Log out'] });
@@ -43288,7 +47171,7 @@ function usersCases() {
   return [
     { name: 'Engineer\'s Admin menu has Users, which opens the Users page', open: { role: 'engineer', path: '/qa', routes: usersApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
-      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Transfer', 'Chunking', 'Retrieval', 'Gold Standard', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Prepare', 'Transfer', 'Chunking', 'Retrieval', 'Gold Standard', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
       await chooseFromMenu(s.page, 'admin', 'Users');
       await waitPath(s.page, '/users');
       await waitText(s.page, 'vfy-developer');
@@ -44788,7 +48671,7 @@ ENUMS = {
 SPAN_NAMES = frozenset("rag." + v for v in ENUMS["rag.operation"])
 
 # Explicit code-owned vocabulary. Raw URL/path values never enter this schema.
-ROUTES = frozenset(('DELETE /collections/{name}', 'GET /audit', 'GET /audit.csv', 'GET /auth/me', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /export/job/{job_id}', 'GET /export/jobs', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /goldstandard/sessions', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /import/jobs', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /ingest/jobs', 'GET /metrics/latency', 'GET /packages', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/logout', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
+ROUTES = frozenset(('DELETE /collections/{name}', 'DELETE /prepare/documents/{document_id}', 'DELETE /prepare/documents/{document_id}/prepared', 'GET /audit', 'GET /audit.csv', 'GET /auth/me', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /export/job/{job_id}', 'GET /export/jobs', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /goldstandard/sessions', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /import/jobs', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /ingest/jobs', 'GET /metrics/latency', 'GET /packages', 'GET /prepare/documents', 'GET /prepare/documents/{document_id}', 'GET /prepare/documents/{document_id}/prepared', 'GET /prepare/documents/{document_id}/raw', 'GET /prepare/job/{job_id}', 'GET /prepare/jobs', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/logout', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /prepare/import', 'POST /prepare/job/{job_id}/cancel', 'POST /prepare/jobs', 'POST /prepare/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
 ENUMS.update({"http.route": ROUTES | {"unmatched"},
               "rag.tuning_operation": frozenset(("rechunk", "reembed", "reindex")),
               "http.status_class": frozenset(("1xx", "2xx", "3xx", "4xx", "5xx"))})
@@ -46485,6 +50368,9 @@ class TelemetryTests(unittest.TestCase):
                                     packager=SimpleNamespace(sweep_build_leftovers=lambda:[]),
                                     weaviate_client=wc,importer=importer,exporter=job_module('export'),
                                     ingest_pipeline=job_module('ingest'),tuning=job_module('tune'),
+                                    # Document preparation (#638): its jobs, then its area's recovery.
+                                    preparation_jobs=SimpleNamespace(_jobs=SimpleNamespace(load=lambda:(order.append('prepare') or [])),
+                                                                     recover=lambda:(order.append('recover') or [])),
                                     audit=SimpleNamespace(record=lambda *args,**kwargs:order.append('audit'),
                                                           login_flusher=lambda:asyncio.sleep(3600),
                                                           flush_logins=lambda:order.append('flush')))
@@ -46502,7 +50388,8 @@ class TelemetryTests(unittest.TestCase):
             if not fail:
                 # 'audit': the start's audit record (#29), after the job records load;
                 # 'flush': the open failed-login counts at shutdown (#577).
-                self.assertEqual(order, ['bootstrap', 'load', 'ingest', 'export', 'import', 'tune', 'audit',
+                self.assertEqual(order, ['bootstrap', 'load', 'ingest', 'export', 'import', 'tune', 'prepare',
+                                         'recover', 'audit',
                                          'yield', 'flush', 'close', 'shutdown'])
 
     def test_lifecycle_deadline_single_worker_and_eventual_shutdown(self):
