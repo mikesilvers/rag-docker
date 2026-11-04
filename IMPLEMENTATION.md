@@ -30967,6 +30967,18 @@ class AreaCase(unittest.TestCase):
             change = patch.object(settings, name, value)
             change.start()
             self.addCleanup(change.stop)
+        # Unstructured's Markdown parser fetches a spaCy model on first use, and
+        # these tests run with no network: the part check reads a written .md part
+        # as its plain text here. P9 (21_prepare.sh) checks the real parser.
+        real_parse = ingest_pipeline._parse_file
+
+        def parse(path):
+            if Path(path).suffix.lower() == ".md":
+                return Path(path).read_text(encoding="utf-8"), []
+            return real_parse(path)
+        change = patch.object(ingest_pipeline, "_parse_file", parse)
+        change.start()
+        self.addCleanup(change.stop)
         store._busy.clear()
         jobs._queue = None
         jobs._worker = None
@@ -46953,13 +46965,14 @@ function navMenuCases() {
         return { expanded: b.getAttribute('aria-expanded'), role: m.getAttribute('role'), labelledBy: m.getAttribute('aria-labelledby') === b.id && !!b.id,
                  items: [...m.children].map(e => [e.textContent.trim(), e.getAttribute('role'), e.getAttribute('tabindex')]) };
       });
-      assert.deepEqual(open, { expanded: 'true', role: 'menu', labelledBy: true, items: [['Import', 'menuitem', '-1'], ['Transfer', 'menuitem', '-1']] });
+      assert.deepEqual(open, { expanded: 'true', role: 'menu', labelledBy: true, items: [['Import', 'menuitem', '-1'], ['Prepare', 'menuitem', '-1'], ['Transfer', 'menuitem', '-1']] });
     } },
     { name: 'Keyboard: Enter, Space and ArrowDown open on the first entry, ArrowUp on the last; arrows wrap, Home and End jump; Escape closes and returns focus to the button; Tab closes', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
       await ready(s.page);
       await s.page.focus(BTN('data'));
       await key(s.page, 'Enter', 'Import');
       assert.equal(await expanded(s.page, 'data'), 'true');
+      await key(s.page, 'ArrowDown', 'Prepare');
       await key(s.page, 'ArrowDown', 'Transfer');
       await key(s.page, 'ArrowDown', 'Import');
       await key(s.page, 'ArrowUp', 'Transfer');
@@ -46999,7 +47012,7 @@ function navMenuCases() {
       await waitExpanded(s.page, 'data', 'false');
       await s.page.click(BTN('data'));
       await waitExpanded(s.page, 'data', 'true');
-      await s.page.click(`#${await s.page.$eval(BTN('data'), b => b.getAttribute('aria-controls'))} a:nth-child(2)`);
+      await s.page.click(`#${await s.page.$eval(BTN('data'), b => b.getAttribute('aria-controls'))} a:nth-child(3)`);
       await waitPath(s.page, '/transfer');
       await waitText(s.page, 'Export a collection');
       await waitExpanded(s.page, 'data', 'false');

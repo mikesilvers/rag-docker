@@ -102,6 +102,18 @@ class AreaCase(unittest.TestCase):
             change = patch.object(settings, name, value)
             change.start()
             self.addCleanup(change.stop)
+        # Unstructured's Markdown parser fetches a spaCy model on first use, and
+        # these tests run with no network: the part check reads a written .md part
+        # as its plain text here. P9 (21_prepare.sh) checks the real parser.
+        real_parse = ingest_pipeline._parse_file
+
+        def parse(path):
+            if Path(path).suffix.lower() == ".md":
+                return Path(path).read_text(encoding="utf-8"), []
+            return real_parse(path)
+        change = patch.object(ingest_pipeline, "_parse_file", parse)
+        change.start()
+        self.addCleanup(change.stop)
         store._busy.clear()
         jobs._queue = None
         jobs._worker = None
