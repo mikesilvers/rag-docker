@@ -400,6 +400,62 @@ class PartTests(AreaCase):
         self.assertEqual(self.part_text(record["id"], part), data)
         self.assertEqual(part["records"], 2)
 
+    def test_a_stray_quote_in_a_csv_is_text_and_its_rows_stay_bounded(self):
+        # PR #639 review: a quote inside an unquoted field (5" screen) is text, as
+        # csv.reader reads it for ingest; it must not join the following rows.
+        rows = ["1,5\" screen,x\n"] + [f"{i},plain {i},y\n" for i in range(2, 400)]
+        with patch.object(preparation, "PART_LIMIT", 2000):
+            record = self.document("stray.csv", "id,item,z\n" + "".join(rows))
+            result = self.prepare(record)
+        self.assertGreater(len(result.parts), 2)
+        joined = ""
+        for part in result.parts:
+            text = self.part_text(record["id"], part)
+            self.assertLessEqual(len(text), 2000)
+            self.assertTrue(text.startswith("id,item,z\n"))
+            joined += text[len("id,item,z\n"):]
+        self.assertEqual(joined, "".join(rows))
+        self.assertEqual(sum(p["records"] for p in result.parts), len(rows))
+
+    def test_an_unclosed_quote_fails_cleanly_without_holding_the_file(self):
+        # A quote opened and never closed would swallow every following line;
+        # the row is refused once it is longer than a part, without holding more.
+        # (The encoding check reads 1 MiB blocks, as ingest's does, so the peak is
+        # flat in the file's size; the file is large enough to show that.)
+        import tracemalloc
+        lines = "".join(f"{i},line {i} " + "w" * 80 + "\n" for i in range(120_000))
+        record = self.document("open.csv", 'id,note\n1,"never closed\n' + lines)
+        size = store.raw_path(record["id"]).stat().st_size
+        with patch.object(preparation, "PART_LIMIT", 20_000):
+            tracemalloc.start()
+            try:
+                with self.assertRaisesRegex(ValueError, "CSV row longer than"):
+                    self.prepare(record)
+                _, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+        self.assertLess(peak, size / 4, f"peak {peak:,} bytes for a {size:,}-byte file")
+
+    def test_one_huge_line_fails_cleanly(self):
+        # One line with no line break, longer than a part: as a data row, and as
+        # the header (the header rule's message).
+        with patch.object(preparation, "PART_LIMIT", 5000):
+            record = self.document("long.csv", "a,b\n1," + "x" * 50_000)
+            with self.assertRaisesRegex(ValueError, "CSV row longer than"):
+                self.prepare(record)
+            record = self.document("nohead.csv", "h" * 50_000)
+            with self.assertRaisesRegex(ValueError, "header row"):
+                self.prepare(record)
+
+    def test_a_field_over_the_csv_field_limit_fails_cleanly(self):
+        # Ingest's csv.reader refuses a field over Unstructured's CSV_FIELD_LIMIT;
+        # so does preparation, as a reason, not a crash.
+        from unstructured.partition.csv import CSV_FIELD_LIMIT
+        record = self.document("field.csv", 'a,b\n1,"' + "f" * (CSV_FIELD_LIMIT + 10) + '"\n')
+        with patch.object(preparation, "PART_LIMIT", 4 * CSV_FIELD_LIMIT):
+            with self.assertRaisesRegex(ValueError, "is not a CSV that can be read"):
+                self.prepare(record)
+
     def test_a_csv_header_over_half_a_part_fails(self):
         with patch.object(preparation, "PART_LIMIT", 100):
             record = self.document("h.csv", "x" * 60 + "\n1\n")
