@@ -24,6 +24,7 @@ REGISTERED = (
     ('scripts/tests/test_corpus_rules_estimates.py', '02_ingest.sh', True),
     ('scripts/tests/test_retrieval_controls.py', '11_retrieval.sh', True),
     ('scripts/tests/test_export_encryption.py', '05_transfer.sh', True),
+    ('scripts/tests/test_prepare.py', '21_prepare.sh', True),
 )
 
 

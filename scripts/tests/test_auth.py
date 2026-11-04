@@ -279,12 +279,16 @@ class PolicyTests(unittest.TestCase):
         counts = {}
         for access in policy.ACCESS.values():
             counts[access] = counts.get(access, 0) + 1
-        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 23, "engineer": 26})
+        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 35, "engineer": 26})
         self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
         self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
         self.assertEqual(policy.ACCESS[("POST", "/collections")], "developer")
         self.assertEqual(policy.ACCESS[("GET", "/tune/{collection}")], "developer")
         self.assertEqual(policy.ACCESS[("GET", "/tune/job/{job_id}")], "engineer")
+        # Document preparation (#638) follows the ingest permissions: all Developer.
+        prepare = {key: access for key, access in policy.ACCESS.items() if key[1].startswith("/prepare/")}
+        self.assertEqual(len(prepare), 12)
+        self.assertEqual(set(prepare.values()), {"developer"})
         # Account administration is the Engineer's, and nothing deletes an account (R1).
         admin = {key: access for key, access in policy.ACCESS.items() if key[1].startswith("/auth/users")}
         self.assertEqual(set(admin), {("GET", "/auth/users"), ("POST", "/auth/users"),

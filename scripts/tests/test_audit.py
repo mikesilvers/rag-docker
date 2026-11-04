@@ -206,7 +206,12 @@ class PolicyTests(unittest.TestCase):
     def test_every_audited_route_is_a_policy_route(self):
         for key in audit.ACTIONS:
             self.assertIn(key, policy.ACCESS)
-        self.assertEqual(len(set(audit.ACTIONS.values())), len(audit.ACTIONS))
+        # One action per route, except the preparation area's downloads and
+        # deletes (#638), two routes each, told apart by details.kind.
+        shared = {"prepare.download": 2, "prepare.delete": 2}
+        for action in set(audit.ACTIONS.values()):
+            routes = [key for key, name in audit.ACTIONS.items() if name == action]
+            self.assertEqual(len(routes), shared.get(action, 1), action)
 
 
 class MiddlewareTests(AuditTestCase):
@@ -661,12 +666,18 @@ class ReviewerCoverageTests(AuditTestCase):
             "tune.reindex", "goldstandard.save", "goldstandard.download", "admin.user.create",
             "admin.user.reset-password", "admin.user.set-role", "admin.user.disable", "admin.user.enable",
             "admin.principal.create", "admin.principal.set-role", "admin.principal.disable",
-            "admin.principal.enable", "admin.key.issue", "admin.key.revoke", "audit.view", "audit.download"})
+            "admin.principal.enable", "admin.key.issue", "admin.key.revoke", "audit.view", "audit.download",
+            # Document preparation (#638).
+            "prepare.upload", "prepare.start", "prepare.cancel", "prepare.import", "prepare.download",
+            "prepare.delete"})
         # Not recorded (D3): other GETs, job polling, gold-standard generate/edit/regenerate.
+        # A preparation job's cancel is an action, not polling (#638).
         for method, path in audit.ACTIONS:
-            self.assertFalse(method == "GET" and path not in ("/goldstandard/download/{filename}", "/audit",
-                                                              "/audit.csv"), path)
-            self.assertNotIn("/job/", path)
+            self.assertFalse(method == "GET" and path not in (
+                "/goldstandard/download/{filename}", "/audit", "/audit.csv",
+                "/prepare/documents/{document_id}/raw", "/prepare/documents/{document_id}/prepared"), path)
+            if path != "/prepare/job/{job_id}/cancel":
+                self.assertNotIn("/job/", path)
             self.assertFalse(path.startswith("/goldstandard/") and path not in (
                 "/goldstandard/save", "/goldstandard/download/{filename}"), path)
 
