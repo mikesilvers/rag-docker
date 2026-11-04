@@ -96,9 +96,10 @@ class BoundTests(StoreTestCase):
         store["0c5fd445"] = doc
         job = store["0c5fd445"]
         self.assertIsNot(job, doc)
-        self.assertEqual(job, doc)
+        # The store adds the time it was created (#617), nothing else.
+        self.assertEqual(job, {**doc, "created_at": job["created_at"]})
         path = self.root / "jobs" / "export" / "0c5fd445.json"
-        self.assertEqual(json.loads(path.read_text()), doc)
+        self.assertEqual(json.loads(path.read_text()), {**doc, "created_at": job["created_at"]})
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_status_changes_and_changes_after_a_terminal_status_are_written_at_once(self):

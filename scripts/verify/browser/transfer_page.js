@@ -7,7 +7,7 @@
 // page's 2 s poll delay is cut to 20 ms, so 30 failed polls take well under a
 // second.
 const assert = require('node:assert/strict');
-const { makeReporter, setValue, stubAuth } = require('./lib');
+const { makeReporter, setValue, stubAuth, chooseFromMenu } = require('./lib');
 
 const A = 'VfyTransferA', B = 'VfyTransferB';
 const PACKAGE = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz';
@@ -44,6 +44,9 @@ async function fixture(browser, base, { hold = [] } = {}) {
     'GET /api/packages': json(200, packagesBody),
     ['GET /api/tune/' + A]: json(200, tuneBody(A)),
     ['GET /api/tune/' + B]: json(200, tuneBody(B)),
+    // No running or recent jobs (#617), so neither panel opens one by itself.
+    'GET /api/export/jobs': json(200, { jobs: [] }),
+    'GET /api/import/jobs': json(200, { jobs: [] }),
   };
   for (const key of hold) delete fixed[key];
   await page.evaluateOnNewDocument(answers => {
@@ -95,7 +98,7 @@ async function expectButton(page, half, busy) {
   await page.waitForFunction((label, disabled) => [...document.querySelectorAll('button')].some(x => x.textContent.trim() === label && x.disabled === disabled), { timeout: 5000 }, want, busy)
     .catch(async () => { throw new Error(`expected "${want}" ${busy ? 'disabled' : 'enabled'}, got ${JSON.stringify(await button(page, half))}`); });
 }
-// Buttons only by default: the nav has an "Import" link as well as the Import button.
+// Buttons only by default: the nav's Data menu has an "Import" link as well as the Import button.
 const click = (page, label, selector = 'button') => page.evaluate((t, sel) => {
   const b = [...document.querySelectorAll(sel)].find(x => x.textContent.trim() === t);
   if (!b) return false; b.click(); return true;
@@ -170,7 +173,7 @@ async function runTransferPageTests(browser, base, reporter) {
       await startAndPoll(page, half);
       await release(page, h.poll, h.job('running'));
       await pending(page, h.poll);
-      assert.equal(await click(page, 'Collections', 'a'), true, 'no Collections link');
+      await chooseFromMenu(page, 'admin', 'Collections');  // throws if there is no such entry
       await page.waitForFunction(() => location.pathname === '/collections');
       await release(page, h.poll, h.job('running'));
       await sleep(400);
@@ -179,7 +182,7 @@ async function runTransferPageTests(browser, base, reporter) {
   }
   cases.push(['export: a start answered after the page was left starts no polling', async page => {
     await start(page, 'export');
-    assert.equal(await click(page, 'Collections', 'a'), true, 'no Collections link');
+    await chooseFromMenu(page, 'admin', 'Collections');  // throws if there is no such entry
     await page.waitForFunction(() => location.pathname === '/collections');
     await release(page, HALVES.export.start, HALVES.export.started, 'POST');
     await sleep(400);

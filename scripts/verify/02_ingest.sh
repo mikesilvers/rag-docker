@@ -403,6 +403,13 @@ check "chunks below min_chunk_size are merged" $? "stored $(python3 -c "import j
 check "chunker per-file limits, 6,000-character ceiling and semantic floor (#111)" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_insert_chunks.py)
 check "chunk inserts are batched and retried while the index isn't ready" $?
+# The corpus preparation rules the Import page offers state the app's own
+# ingest limits, read from the same constants, settings and proxy (#615).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_corpus_rules.py)
+check "the corpus preparation rules state the app's ingest limits (#615)" $?
+# Their chunk counts hold for the real chunker, for every strategy (#615).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_corpus_rules_estimates.py)
+check "the corpus preparation rules' chunk counts hold for every strategy (#615)" $?
 
 # ── one bad file must not fail the batch ─────────────────────────────────────
 drop_collection "$C"; make_collection "$C"
@@ -633,6 +640,149 @@ check "two concurrent uploads of one name leave exactly one job's version, whole
 drop_collection "$RI"
 rm -rf "$RIFIX"
 
+# ── replacing a name touches only that name (#622) ───────────────────────────
+# source_file is word-tokenized, so Weaviate's equal("report.pdf") also matches
+# a/report.pdf and Report.PDF, and uploading report.pdf deleted their chunks.
+EX="${PREFIX}Exact"
+EXFIX=$(mktemp -d)
+python3 - "$FIX/policies.pdf" "$EXFIX/folder.zip" <<'ENDPY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[2], "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("a/report.pdf", open(sys.argv[1], "rb").read())
+ENDPY
+# Each stored name's chunk contents, sorted.
+ex_state() {
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$EX") <<'ENDPY'
+import json, sys
+from services import weaviate_client as wc
+try:
+    names = {}
+    for o in wc.get_client().collections.get(sys.argv[1]).iterator():
+        names.setdefault(o.properties["source_file"], []).append(o.properties["content"])
+    print(json.dumps({n: sorted(c) for n, c in names.items()}))
+finally:
+    wc.close_client()
+ENDPY
+}
+drop_collection "$EX"; make_collection "$EX"
+ingest "$EX" fixed 200 40 "$EXFIX/folder.zip"
+ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=Report.PDF"
+ex_state > /tmp/vfy_ex_before.json
+ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=report.pdf"
+cp /tmp/vfy_job.json /tmp/vfy_ex_job1.json
+ex_state > /tmp/vfy_ex_first.json
+ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=report.pdf"
+cp /tmp/vfy_job.json /tmp/vfy_ex_job2.json
+ex_state > /tmp/vfy_ex_second.json
+python3 - <<'ENDPY'
+import json, sys
+load = lambda name: json.load(open(f"/tmp/vfy_ex_{name}.json"))
+before, first, second = load("before"), load("first"), load("second")
+job1, job2 = load("job1"), load("job2")
+others = ("a/report.pdf", "Report.PDF")
+checks = {
+    "both uploads completed": job1["status"] == job2["status"] == "completed",
+    "the first report.pdf replaced nothing": job1.get("chunks_replaced") == 0,
+    "a/report.pdf and Report.PDF were stored": all(before.get(n) for n in others),
+    "the first report.pdf upload kept them": all(first.get(n) == before.get(n) for n in others),
+    "the re-upload kept them": all(second.get(n) == before.get(n) for n in others),
+    "the re-upload replaced the first report.pdf set":
+        bool(first.get("report.pdf")) and job2.get("chunks_replaced") == len(first["report.pdf"]),
+    "one report.pdf set remains": len(second.get("report.pdf", [])) == job2.get("chunks_stored"),
+}
+print({k: v for k, v in checks.items() if not v} or "ok",
+      {n: len(c) for n, c in second.items()}, job1.get("chunks_replaced"), job2.get("chunks_replaced"))
+sys.exit(0 if all(checks.values()) else 1)
+ENDPY
+check "re-uploading report.pdf replaces only report.pdf: a/report.pdf and Report.PDF keep all their chunks (#622)" $? \
+  "$(head -c 300 /tmp/vfy_ex_job1.json)"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" page < scripts/verify/exact_source.py)
+check "replacing a name on the page path selects exactly that name in real Weaviate (#622)" $?
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" walk < scripts/verify/exact_source.py)
+check "replacing a name on the walk path, past 10,000 word matches, selects exactly that name (#622)" $?
+drop_collection "$EX"
+rm -rf "$EXFIX"
+
+# ── a file over the per-file limits is stored as parts (#621) ────────────────
+# Controlled cases: the reviewer's 13,000 records, files over 10,000,000
+# characters, family replacement, all or nothing, cuts, CSV, Markdown, encoding,
+# overlap sizing, re-chunk, export links.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_split_parts.py)
+check "files over the per-file limits are split into parts: regressions (#621)" $?
+# The same in the real Weaviate and ingest worker, on a scratch collection
+# without a vectorizer (embedding 13,000 chunks takes this project about an
+# hour): the reviewer's 13,000 records, a 10,519,499-character .txt, a smaller
+# re-upload replacing every part, and a bad line after part 1 storing nothing.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" < scripts/verify/split_parts.py)
+check "files over the per-file limits are stored as parts in the real Weaviate, replaced whole, all or nothing (#621)" $?
+
+# Reviewer (PR #630): the same through the API and the proxy. The collection is
+# made in Weaviate without a vectorizer, so the 13,000 chunks store in seconds;
+# the upload, the worker and the job record are the real ones.
+SPL="${PREFIX}SplitApi"
+SPLFIX=$(mktemp -d)
+drop_collection "$SPL"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$SPL" <<'PY'
+import sys
+from weaviate.classes.config import Configure, VectorDistances
+from services import weaviate_client as wc
+wc.get_client().collections.create(
+    name=sys.argv[1], vectorizer_config=Configure.Vectorizer.none(),
+    vector_index_config=Configure.VectorIndex.hnsw(distance_metric=VectorDistances.COSINE),
+    properties=wc.COLLECTION_PROPERTIES)
+wc.close_client()
+PY
+)
+python3 - "$SPLFIX" <<'PY'
+import json, sys
+from pathlib import Path
+row = lambda i: json.dumps({"t": f"{i:07d} " + "x" * 589}) + "\n"
+Path(sys.argv[1], "big").mkdir()
+Path(sys.argv[1], "small").mkdir()
+Path(sys.argv[1], "big", "big.jsonl").write_text("".join(row(i) for i in range(13_000)))
+Path(sys.argv[1], "small", "big.jsonl").write_text("".join(row(i) for i in range(3)))
+PY
+split_upload() {
+  curl -s -m 600 -o /tmp/vfy_split_job.json -X POST "$API/ingest/upload" -F "collection=$SPL" \
+    -F "strategy=context_aware" -F "chunk_size=1000" -F "chunk_overlap=0" -F "min_chunk_size=0" \
+    -F "files=@$1" || return 1
+  local job; job=$(jfield "['job_id']" < /tmp/vfy_split_job.json) || return 1
+  wait_for_job "/ingest/job/$job" 900 >/dev/null
+  api_get "/ingest/job/$job" > /tmp/vfy_split_job.json
+}
+split_count() {
+  api_get "/collections" | python3 -c "
+import json,sys
+print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$SPL'][0])"
+}
+split_upload "$SPLFIX/big/big.jsonl"
+count=$(split_count)
+python3 - "$count" <<'PY'
+import json, sys
+job = json.load(open("/tmp/vfy_split_job.json"))
+n = len(job.get("split") or []) and int(job["split"][0].split("split into ")[1].split(" ")[0])
+ok = (job["status"] == "completed" and job["files_completed"] == 1 and job["errors"] == []
+      and job["chunks_stored"] == 13_000 and int(sys.argv[1]) == 13_000 and n >= 2
+      and job["split"] == [f"big.jsonl: split into {n} parts, stored as 'big.jsonl (part 1)' "
+                           f"to 'big.jsonl (part {n})'"])
+print({k: job.get(k) for k in ("status", "files_completed", "chunks_stored", "split", "errors")}, sys.argv[1])
+sys.exit(0 if ok else 1)
+PY
+check "reviewer: 13,000 records uploaded through the API complete as parts, listed in the job's split (#621)" $?
+split_upload "$SPLFIX/small/big.jsonl"
+count=$(split_count)
+python3 - "$count" <<'PY'
+import json, sys
+job = json.load(open("/tmp/vfy_split_job.json"))
+ok = (job["status"] == "completed" and job.get("split") == [] and job["chunks_replaced"] == 13_000
+      and int(sys.argv[1]) == job["chunks_stored"] > 0)
+print({k: job.get(k) for k in ("status", "chunks_stored", "chunks_replaced", "split")}, sys.argv[1])
+sys.exit(0 if ok else 1)
+PY
+check "reviewer: re-uploading the name through the API replaces every part (#621)" $?
+drop_collection "$SPL"
+rm -rf "$SPLFIX" /tmp/vfy_split_job.json
+
 # ── job status transitions ───────────────────────────────────────────────────
 # `queued` is only observable when the executor is saturated, so this asserts
 # the terminal transition and that the POST reports the initial state.
@@ -748,6 +898,22 @@ check_eq "the deleted collection is still gone 10 s later" "$(object_count "$DC"
 # writes, startup marking of interrupted jobs, corrupt files and retention.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_jobstore.py)
 check "job store: persistence, throttling, startup marking and retention" $?
+
+# ── running and recent jobs (#617) ───────────────────────────────────────────
+# Units in the API image with no network: owners and timestamps recorded, who
+# sees what, the 24-hour window and the cap, sessions, packages. Then the lists
+# on the stack: a Developer's and a Developer-role key's ingests, the
+# Developer's export and import, each listed for its owner and the Engineer
+# only. The stack check creates a principal, so it runs only on the verify project.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_job_lists.py)
+check "job lists: owners and timestamps, visibility, window, cap, sessions, packages" $?
+if [ -z "$(volume_removal_refusal_reason)" ]; then
+  _rag_require_lock_owner
+  python3 ./job_lists.py --operator
+  check "GET /ingest/jobs, /export/jobs, /import/jobs list each caller's own jobs, and everyone's for the Engineer" $?
+else
+  skip "job lists on the stack: not the verify project"
+fi
 # A killed job's leftovers (#377): ingest staging in UPLOAD_DIR, and an export's
 # `.build-*` directory and `.*.tar.gz.partial` archive in EXPORTS_DIR.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_startup_sweep.py)

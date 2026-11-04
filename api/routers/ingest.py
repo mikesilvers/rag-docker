@@ -4,13 +4,14 @@ import json
 import logging
 import re
 from pathlib import Path
-from fastapi import APIRouter, Form, UploadFile, File
+from fastapi import APIRouter, Form, Request, UploadFile, File
 from pydantic import ValidationError
 
 from config import settings
 from models.schemas import (CollectionName, IngestConfig, IngestConfigResponse,
-                            IngestUploadResponse, JobStatusResponse)
-from services import audit, ingest_config
+                            IngestJobEntry, IngestJobList, IngestUploadResponse,
+                            JobStatusResponse)
+from services import audit, ingest_config, job_lists
 from services import ingest_pipeline
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError, canonical
@@ -34,6 +35,8 @@ async def ingest_upload(
     similarity_threshold: str = Form("0.85"),
     min_chunk_size: str = Form("100"),
     files: list[UploadFile] = File(...),
+    # Injected by FastAPI; None only when a test calls the handler directly.
+    request: Request = None,
 ):
     # A form field's default is not validated through CollectionName, so the
     # stored-name rule is applied here (#372).
@@ -44,7 +47,8 @@ async def ingest_upload(
                total_bytes=sum(f.size or 0 for f in files))
     try:
         return await _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
-                                    similarity_threshold, min_chunk_size, files)
+                                    similarity_threshold, min_chunk_size, files,
+                                    job_lists.job_owner(request))
     except Exception:
         # Anything not handled below used to reach the client as a plain-text
         # 500, which the Import page could only show as "HTTP 500" (#290).
@@ -57,7 +61,7 @@ async def ingest_upload(
 
 
 async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
-                         similarity_threshold, min_chunk_size, files):
+                         similarity_threshold, min_chunk_size, files, owner=None):
     try:
         config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
                               chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
@@ -83,6 +87,7 @@ async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
             chunk_overlap=config.chunk_overlap,
             similarity_threshold=config.similarity_threshold,
             min_chunk_size=config.min_chunk_size,
+            owner=owner,
         )
     except CollectionDeletingError:
         return collection_deleting_error(collection)
@@ -97,6 +102,16 @@ async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
         files_queued=len(files),
         collection=collection,
     )
+
+
+@router.get("/jobs", response_model=IngestJobList)
+async def list_jobs(request: Request):
+    """The caller's running and recent ingest jobs (#617; see services/job_lists)."""
+    principal = request.state.auth
+    def build():
+        items = job_lists.job_items(ingest_pipeline.job_records())
+        return job_lists.entries(IngestJobEntry, items, principal)
+    return IngestJobList(jobs=await asyncio.to_thread(build))
 
 
 @router.get("/job/{job_id}", response_model=JobStatusResponse)

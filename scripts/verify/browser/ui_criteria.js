@@ -5,7 +5,7 @@
 // chunking-strategy selector, `input[type=text]` missed an input with no type
 // attribute, and a row's delete link matched a class test meant for the modal's
 // confirm button.
-const { sleep, makeReporter, launch, session, credentialsFor, bodyText, setValue, clickByText } = require('./lib');
+const { sleep, makeReporter, launch, session, credentialsFor, bodyText, setValue, clickByText, readNav, chooseFromMenu } = require('./lib');
 
 const BASE = process.env.RAG_UI_BASE || 'http://proxy';
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic'];
@@ -51,7 +51,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
       await submit();
     }
     await s.page.waitForFunction(() => location.pathname === '/qa' && document.querySelectorAll('nav a').length > 0, { timeout: 10000 }).catch(() => {});
-    const badge = await s.page.evaluate(() => document.querySelector('nav span.bg-blue-100')?.textContent.trim());
+    const badge = await s.page.evaluate(() => document.querySelector('nav button[data-menu=account] span.bg-blue-100')?.textContent.trim());
     r.check('logging in through the form opens /qa as the account\'s role', badge === 'AI Engineer', String(badge));
     const cookies = await s.page.cookies();
     const cookie = cookies.find(c => c.name === 'rag_session');
@@ -62,8 +62,9 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     for (const p of ['/qa', '/collections', '/health', '/qa']) {
       await s.page.goto(BASE + p, { waitUntil: 'networkidle2' }); await sleep(500);
     }
-    r.check('the session survives navigation and reloads', await s.page.evaluate(() => document.querySelectorAll('nav a').length === 11));  // the Engineer's links, Users, Service keys and Audit included
-    await clickByText(s.page, 'Log out');
+    const pages = (await readNav(s.page).catch(() => ({ pages: [] }))).pages;  // the Engineer's 11: Q&A and the menus' 10 (#616)
+    r.check('the session survives navigation and reloads', pages.length === 11, JSON.stringify(pages));
+    await chooseFromMenu(s.page, 'account', 'Log out').catch(() => {});
     await s.page.waitForFunction(() => location.pathname === '/login', { timeout: 10000 }).catch(() => {});
     const me = await s.page.evaluate(async () => (await fetch('/api/auth/me')).status);
     r.check('Log out ends the session at the API and returns to the login page', me === 401 && new URL(s.page.url()).pathname === '/login', `me=${me}`);
@@ -152,8 +153,9 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
   {
     const s = await session(browser, BASE, 'end_user');
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(1500);
-    const links = await s.page.evaluate(() => [...document.querySelectorAll('nav a')].map(a => a.textContent.trim()));
-    r.check('End User sees only Q&A in the nav', links.length === 1 && /Q&A/.test(links[0]), JSON.stringify(links));
+    const shown = await readNav(s.page).catch(e => ({ pages: [], menus: [], error: String(e) }));
+    r.check('End User sees only Q&A in the nav, and no Data, Tune or Admin menu',
+      JSON.stringify(shown.pages) === '["Q&A"]' && JSON.stringify(shown.menus.map(m => m.key)) === '["account"]', JSON.stringify(shown));
     await s.page.goto(BASE + '/collections', { waitUntil: 'networkidle2' }); await sleep(1200);
     const landed = await s.page.evaluate(() => location.pathname);
     r.check('End User cannot reach a gated route directly', landed === '/qa', `landed on ${landed}`);
@@ -162,7 +164,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
   {
     const s = await session(browser, BASE, 'engineer');
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(1500);
-    const links = await s.page.evaluate(() => [...document.querySelectorAll('nav a')].map(a => a.textContent.trim()));
+    const links = (await readNav(s.page).catch(() => ({ pages: [] }))).pages;  // through the menus (#616)
     for (const want of ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys', 'Audit']) {
       r.check(`Engineer nav includes ${want}`, links.includes(want), JSON.stringify(links));
     }
@@ -714,6 +716,34 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     }
   }
 
+  // ── corpus preparation rules (#615) ────────────────────────────────────────
+  // The Import page offers the rules as a download: a static file of the UI
+  // build, served through the proxy. test_corpus_rules.py checks its limits.
+  r.section('corpus preparation rules');
+  {
+    const s = await session(browser, BASE, 'developer');
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const link = await s.page.evaluate(() => {
+        const a = [...document.querySelectorAll('a')]
+          .find(x => x.textContent.trim() === 'Download corpus preparation rules (.md)');
+        return a ? { path: new URL(a.href).pathname, download: a.getAttribute('download') } : null;
+      });
+      r.check('the Import page links to the corpus preparation rules as a download',
+              !!link && link.path === '/corpus-preparation-rules.md'
+                && link.download === 'corpus-preparation-rules.md', JSON.stringify(link));
+      const served = await s.page.evaluate(async () => {
+        const response = await fetch('/corpus-preparation-rules.md');
+        return { status: response.status, start: (await response.text()).slice(0, 60) };
+      });
+      r.check('the rules file is served as markdown through the proxy',
+              served.status === 200 && served.start.startsWith('# Preparing files for rag-docker ingest\n'),
+              JSON.stringify(served));
+    } finally {
+      await s.ctx.close();
+    }
+  }
+
   // ── import errors (#290) ───────────────────────────────────────────────────
   // A truncated ZIP once ended in a plain-text 500 that the page could only
   // show as "HTTP 500", and a failing status poll was ignored.
@@ -979,6 +1009,9 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     fs.writeFileSync(small, 'Re-ingest fixture.\n');
     const jobId = 'vfyrein' + replaced;
     const skippedEntry = "u.zip:a/r.txt (replaced by r.txt later in this upload, same name 'a/r.txt')";
+    // A file over the per-file limits is stored as parts and listed in `split` (#621).
+    const splitEntry = "big.jsonl: split into 2 parts, stored as 'big.jsonl (part 1)' to 'big.jsonl (part 2)'";
+    const split = replaced === 3 ? [splitEntry] : [];
     const s = await session(browser, BASE, 'developer');
     await s.page.setRequestInterception(true);
     s.page.on('request', request => {
@@ -986,7 +1019,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
       if (path === '/api/ingest/upload' && request.method() === 'POST')
         return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'x' }) });
       if (path === '/api/ingest/job/' + jobId)
-        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 2, errors: [], skipped: [skippedEntry], chunks_replaced: replaced }) });
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 2, errors: [], skipped: [skippedEntry], chunks_replaced: replaced, split }) });
       return request.continue();
     });
     try {
@@ -1007,6 +1040,12 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
                 text.includes('1 file skipped:') && !text.includes('not a supported type:') && text.includes(skippedEntry),
                 text.slice(0, 300));
       }
+      if (replaced === 3)
+        r.check('a split file is listed under "1 file split into parts:" with its part names (#621)',
+                text.includes('1 file split into parts:') && text.includes(splitEntry), text.slice(0, 400));
+      if (replaced === 0)
+        r.check('an empty split list shows no split heading (#621)', clicked && !text.includes('split into parts'),
+                text.slice(0, 300));
       r.check(`re-ingest progress fixture (${replaced}) causes no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')));
     } finally {
       fs.unlinkSync(small);
@@ -1346,6 +1385,244 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     }
     r.check('no console errors on the help page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
     await s.ctx.close();
+  }
+
+  // ── running and recent jobs (#617) ────────────────────────────────────────
+  // Each page lists the caller's running and recent jobs, read from the API when
+  // the page opens, and opens the newest by itself; leaving the page and coming
+  // back finds the job again. The first check uses the real API; the rest stub
+  // the lists and lookups so states and timing are fixed.
+  r.section('running and recent jobs (#617)');
+  {
+    const fs = require('fs');
+    const crypto = require('crypto');
+    const json = body => ({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+    const now = Date.now();
+    const at = secondsAgo => new Date(now - secondsAgo * 1000).toISOString();
+    const opened = page => page.evaluate(() =>
+      [...document.querySelectorAll('section[aria-label="Running and recent jobs"] button[aria-current="true"]')]
+        .map(b => b.innerText.replace(/\s+/g, ' ').trim()));
+    const rows = page => page.evaluate(() =>
+      [...document.querySelectorAll('section[aria-label="Running and recent jobs"] li button')]
+        .map(b => b.innerText.replace(/\s+/g, ' ').trim()));
+    const clickRowAt = (page, n) => page.evaluate(i => {
+      const b = document.querySelectorAll('section[aria-label="Running and recent jobs"] li button')[i];
+      if (!b) return false; b.click(); return true;
+    }, n);
+    const clickRow = (page, text) => page.evaluate(t => {
+      const b = [...document.querySelectorAll('section[aria-label="Running and recent jobs"] li button')]
+        .find(x => x.innerText.includes(t));
+      if (!b) return false; b.click(); return true;
+    }, text);
+    const leaveAndReturn = async (page, path) => {
+      await page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(500);
+      await page.goto(BASE + path, { waitUntil: 'networkidle2' }); await sleep(1500);
+    };
+
+    // Import, real API: start an ingest, leave at once, come back.
+    {
+      const small = '/tmp/vfy-jobs-617.txt';
+      fs.writeFileSync(small, 'A note for the running and recent jobs check.\n'.repeat(20));
+      const s = await session(browser, BASE, 'developer');
+      try {
+        const name = await s.page.evaluate(async n => {
+          const res = await fetch('/api/collections', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: n, index_type: 'hnsw', distance_metric: 'cosine' }) });
+          return res.ok ? (await res.json()).name : null;
+        }, 'VfyUiJobs' + crypto.randomBytes(3).toString('hex'));
+        await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+        await setValue(s.page, `() => [...document.querySelectorAll('select')].find(x => [...x.options].some(o => o.value === ${JSON.stringify(name)}))`, name);
+        const input = await s.page.$('#file-input');
+        await input.uploadFile(small);
+        await sleep(300);
+        // The job ID from the upload's answer: the page may already show an
+        // earlier job it opened by itself.
+        const accepted = s.page.waitForResponse(res => new URL(res.url()).pathname === '/api/ingest/upload', { timeout: 30000 })
+          .then(res => res.json()).catch(() => ({}));
+        const clicked = await clickByText(s.page, 'Start Ingest');
+        const jobId = (await accepted).job_id;
+        await leaveAndReturn(s.page, '/import');
+        const back = await bodyText(s.page);
+        const open = await opened(s.page);
+        r.check('Import: an ingest started, the page left and opened again, is listed and opened by itself',
+          !!name && clicked && !!jobId && back.includes('Job ID: ' + jobId) && open.length === 1 && open[0].includes(name)
+            && open[0].startsWith('Ingest'),
+          `name=${name} clicked=${clicked} job=${jobId} open=${JSON.stringify(open)} text: ${back.slice(0, 200)}`);
+        await s.page.waitForFunction(() => /Files: 1\/1/.test(document.body.innerText) &&
+          [...document.querySelectorAll('span')].some(x => x.textContent.trim() === 'completed'), { timeout: 180000 }).catch(() => {});
+        const done = await bodyText(s.page);
+        r.check('Import: the job found again shows its result once it has finished',
+          done.includes('Job ID: ' + jobId) && done.includes('Files: 1/1') && /completed/.test(done), done.slice(0, 300));
+        r.check('Import: nothing about jobs is kept in browser storage',
+          await s.page.evaluate(() => sessionStorage.length === 0 && localStorage.length === 0));
+      } finally { await s.ctx.close(); fs.unlinkSync(small); }
+    }
+
+    // Import, stubbed: a running job and a finished one; the running one opens,
+    // survives leaving the page, then ends; clicking the other switches.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        let finished = false;
+        const job = (id, status, done) => ({ job_id: id, status, files_total: 2, files_completed: done, files_failed: 0,
+          chunks_stored: done * 3, errors: [], skipped: [] });
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (path === '/api/ingest/jobs') return request.respond(json({ jobs: [
+            { ...job('vfy617a', finished ? 'completed' : 'running', finished ? 2 : 1), collection: 'StubRunning617', files: ['a.txt', 'b.txt'],
+              owner: { name: 'vfy-developer', kind: 'user' }, created_at: at(60), finished_at: finished ? at(1) : null },
+            { ...job('vfy617b', 'completed', 2), collection: 'StubFinished617', files: ['c.txt'],
+              owner: { name: 'vfy-developer', kind: 'user' }, created_at: at(3600), finished_at: at(3500) }] }));
+          if (path === '/api/ingest/job/vfy617a') return request.respond(json(job('vfy617a', finished ? 'completed' : 'running', finished ? 2 : 1)));
+          if (path === '/api/ingest/job/vfy617b') return request.respond(json(job('vfy617b', 'completed', 2)));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+        const listed = await rows(s.page);
+        r.check('Import: the list shows kind, collection, status, progress and start time for each job',
+          listed.length === 2 && /^Ingest StubRunning617 running 1\/2 files Started /.test(listed[0])
+            && /^Ingest StubFinished617 completed 2\/2 files Started /.test(listed[1]), JSON.stringify(listed));
+        r.check('Import: the newest running job opens by itself',
+          (await opened(s.page)).join() .includes('StubRunning617') && (await bodyText(s.page)).includes('Job ID: vfy617a'));
+        r.check('Import: a Developer sees no owner column',
+          await s.page.evaluate(() => document.querySelectorAll('.job-owner').length === 0));
+        await leaveAndReturn(s.page, '/import');
+        r.check('Import: after leaving and coming back the running job is open again',
+          (await bodyText(s.page)).includes('Job ID: vfy617a') && (await opened(s.page)).join().includes('StubRunning617'));
+        finished = true;
+        await sleep(4000);
+        const ended = await bodyText(s.page);
+        r.check('Import: its result shows once it has finished', ended.includes('Files: 2/2') && ended.includes('Job ID: vfy617a'), ended.slice(0, 300));
+        const clicked = await clickRow(s.page, 'StubFinished617');
+        await sleep(300);
+        r.check('Import: clicking another row switches to that job',
+          clicked && (await bodyText(s.page)).includes('Job ID: vfy617b') && (await opened(s.page)).join().includes('StubFinished617'));
+        r.check('Import list fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // Gold Standard, stubbed: a generating session opens, survives leaving the
+    // page, then completes; clicking another row loads it.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        let finished = false;
+        const pair = n => ({ pair_id: 'p' + n, question: `Stub question ${n}?`, answer: 'Inert', contexts: ['Inert'],
+          ground_truth: 'Inert', source_file: 'inert.txt', chunk_index: n, status: 'pending' });
+        const G1 = 'gs_617a0001', G2 = 'gs_617a0002';
+        const one = () => ({ session_id: G1, collection: 'StubGenerating617', status: finished ? 'completed' : 'generating',
+          pairs_total: 2, pairs_attempted: finished ? 2 : 1, pairs_completed: finished ? 2 : 1, pairs_failed: 0, errors: [],
+          pairs: finished ? [pair(1), pair(2)] : [pair(1)] });
+        const two = { session_id: G2, collection: 'StubGenerated617', status: 'completed', pairs_total: 1, pairs_attempted: 1,
+          pairs_completed: 1, pairs_failed: 0, errors: [], pairs: [pair(3)] };
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          const listed = ({ pairs, ...rest }) => ({ ...rest, owner: { name: 'vfy-developer', kind: 'user' } });
+          if (path === '/api/goldstandard/sessions') return request.respond(json({ sessions: [
+            { ...listed(one()), created_at: at(60), finished_at: finished ? at(1) : null },
+            { ...listed(two), created_at: at(7200), finished_at: at(7000) }] }));
+          if (path === '/api/goldstandard/session/' + G1) return request.respond(json(one()));
+          if (path === '/api/goldstandard/session/' + G2) return request.respond(json(two));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/goldstandard', { waitUntil: 'networkidle2' }); await sleep(1500);
+        const first = await bodyText(s.page);
+        r.check('Gold Standard: the generating session is listed and opens by itself',
+          first.includes('Generating… 1/2 pairs') && first.includes('Session ' + G1) && (await opened(s.page)).join().includes('StubGenerating617')
+            && (await rows(s.page)).length === 2, first.slice(0, 300));
+        await leaveAndReturn(s.page, '/goldstandard');
+        r.check('Gold Standard: after leaving and coming back the generation is open again',
+          (await bodyText(s.page)).includes('Generating… 1/2 pairs'));
+        finished = true;
+        await sleep(3000);
+        const ended = await bodyText(s.page);
+        r.check('Gold Standard: its outcome shows once the generation has finished',
+          ended.includes('Generation completed: 2 of 2 pairs generated.') && ended.includes('Stub question 2?'), ended.slice(0, 300));
+        const clicked = await clickRow(s.page, 'StubGenerated617');
+        await sleep(800);
+        const other = await bodyText(s.page);
+        r.check('Gold Standard: clicking another row loads that session',
+          clicked && other.includes('Session ' + G2) && other.includes('Stub question 3?')
+            && await s.page.evaluate(id => document.getElementById('retained-session').value === id, G2), other.slice(0, 300));
+        r.check('Gold Standard list fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // Transfer, stubbed: one list for both kinds; each panel opens its own
+    // newest job; a running export survives leaving the page, then ends.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        let finished = false;
+        const exportJob = (id, done) => ({ job_id: id, status: done ? 'completed' : 'running', collection: 'StubExport617',
+          chunks_written: done ? 9 : 5, filename: done ? `ragpkg-${id}.tar.gz` : null, size_bytes: done ? 2048 : null,
+          source_document_count: done ? 1 : null, fidelity: done ? 'with-sources' : null, models_bundled: done ? false : null,
+          retrieve_script: done ? true : null, warnings: [], error: null, error_code: null, error_detail: null });
+        const importJob = { job_id: 'vfy617i', status: 'completed', filename: 'ragpkg-stub617.tar.gz', on_conflict: 'rename',
+          collection: 'StubImported617', original_collection: 'StubImported617', chunks_written: 4, fidelity: 'with-sources',
+          renamed: false, notes: [], restored_sessions: [], error: null, error_code: null, error_detail: null };
+        const mine = { name: 'vfy-developer', kind: 'user' };
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (path === '/api/export/jobs') return request.respond(json({ jobs: [
+            { ...exportJob('vfy617e', finished), owner: mine, created_at: at(30), finished_at: finished ? at(1) : null },
+            { ...exportJob('vfy617d', true), owner: mine, created_at: at(9000), finished_at: at(8900) }] }));
+          if (path === '/api/import/jobs') return request.respond(json({ jobs: [
+            { ...importJob, owner: mine, created_at: at(600), finished_at: at(500) }] }));
+          if (path === '/api/export/job/vfy617e') return request.respond(json(exportJob('vfy617e', finished)));
+          if (path === '/api/import/job/vfy617i') return request.respond(json(importJob));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' }); await sleep(1500);
+        const listed = await rows(s.page);
+        const text = await bodyText(s.page);
+        r.check('Transfer: one list holds exports and imports, newest first, with their kind',
+          listed.length === 3 && listed[0].startsWith('Export StubExport617 running') && listed[1].startsWith('Import ragpkg-stub617.tar.gz completed')
+            && listed[2].startsWith('Export StubExport617 completed'), JSON.stringify(listed));
+        r.check('Transfer: the newest export opens in the export panel and the newest import in the import panel',
+          text.includes('Writing… 5 chunks so far.') && text.includes('Imported as StubImported617') && (await opened(s.page)).length === 2,
+          text.slice(0, 400));
+        await leaveAndReturn(s.page, '/transfer');
+        r.check('Transfer: after leaving and coming back the running export is open again',
+          (await bodyText(s.page)).includes('Writing… 5 chunks so far.'));
+        finished = true;
+        await sleep(3000);
+        const ended = await bodyText(s.page);
+        r.check('Transfer: the export\'s result shows once it has finished',
+          ended.includes('ragpkg-vfy617e.tar.gz') && ended.includes('Imported as StubImported617'), ended.slice(0, 400));
+        // Rows: the export that just ended, the import, then the older export.
+        const clicked = await clickRowAt(s.page, 2);
+        await sleep(300);
+        r.check('Transfer: clicking an export row opens it in the export panel, leaving the import panel as it was',
+          clicked && (await bodyText(s.page)).includes('ragpkg-vfy617d.tar.gz') && (await bodyText(s.page)).includes('Imported as StubImported617'));
+        r.check('Transfer list fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // An Engineer sees the owner of each job: a user, an API key, or unknown.
+    {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const job = (id, owner) => ({ job_id: id, status: 'completed', files_total: 1, files_completed: 1, files_failed: 0,
+          chunks_stored: 1, errors: [], skipped: [], collection: 'StubOwners617', files: ['a.txt'], owner,
+          created_at: at(Number(id.slice(-1)) * 10), finished_at: at(1) });
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          if (new URL(request.url()).pathname === '/api/ingest/jobs') return request.respond(json({ jobs: [
+            job('own1', { name: 'vfy-developer', kind: 'user' }), job('own2', { name: 'vfy-s-svc', kind: 'service' }), job('own3', null)] }));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+        const owners = await s.page.evaluate(() => [...document.querySelectorAll('.job-owner')].map(x => x.textContent.trim()));
+        r.check('Import as an Engineer: each row shows its owner, an API key\'s marked, an unknown one as "owner unknown"',
+          JSON.stringify(owners) === JSON.stringify(['vfy-developer', 'vfy-s-svc (API key)', 'owner unknown']), JSON.stringify(owners));
+        r.check('nothing about jobs is kept in browser storage after the list checks',
+          await s.page.evaluate(() => sessionStorage.length === 0 && localStorage.length === 0));
+      } finally { await s.ctx.close(); }
+    }
   }
 
   // ── nginx's login rate limit on the login page (#577) ─────────────────────

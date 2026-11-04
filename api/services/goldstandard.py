@@ -67,6 +67,16 @@ _MARKER_MESSAGES = {
     False: "History marker could not be saved. The session is treated as historical and current export is refused only until restart. Check local storage, then edit this session to save the marker.",
 }
 
+# What a generated session records about this install only (#617): who started
+# it and when it started and finished. Packages leave these out, and an import
+# drops them, so an imported session is never listed as a generation here.
+LOCAL_FIELDS = ("owner", "created_at", "finished_at")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 _ROLLBACK_FAILED_MESSAGE = "A stale marker from an aborted collection replacement could not be removed, so the session stays historical. Check local storage."
 # Rollback bookkeeping for an aborted durable marking (#275): a field the
 # session didn't have, a pending marker the call didn't touch, and a pending
@@ -494,6 +504,15 @@ def sessions_for(collection: str) -> list[dict]:
         return copy.deepcopy(found)
 
 
+def generation_sessions() -> list[dict]:
+    """Copies of the sessions generated on this install, for
+    GET /goldstandard/sessions (#617); an imported session is never one."""
+    _scan_sessions()
+    with _state_lock:
+        return copy.deepcopy([session for session in _sessions.values()
+                              if isinstance(session, dict) and not session.get("imported_from")])
+
+
 def store_session(session: dict) -> None:
     """Write through the durable store so the cache cannot undo an import.
 
@@ -552,6 +571,9 @@ def _store_generated_session(session: dict) -> dict:
 def store_imported_session(session: dict, source_collection: str) -> dict:
     """Serialize source-ID collision handling with generation and other imports."""
     snapshot = copy.deepcopy(session)
+    # Who generated it and when belong to the source install (#617).
+    for key in LOCAL_FIELDS:
+        snapshot.pop(key, None)
     # Import preflight (check 4a) has already refused noncanonical source IDs.
     # Allocation keeps the source ID only when it is free; it stays provenance.
     SessionResponse.model_validate(snapshot, strict=True)
@@ -859,6 +881,8 @@ async def _generate_pair(chunk: dict) -> dict:
 
 def _failed_generation(current: dict, exc: Exception) -> None:
     current["status"] = "failed"
+    # Every caller ends a generation; a later failure report keeps the first time (#617).
+    current.setdefault("finished_at", _now_iso())
     if isinstance(exc, GoldStandardError):
         reason = f"{exc.code}: {exc.message}"
     elif isinstance(exc, _GenerationInterrupted):
@@ -952,6 +976,7 @@ async def _settle_generation(session_id: str, cancelled: bool,
         if current.get("status") == "generating":
             current["status"] = ("cancelled" if cancelled else
                 "failed" if not current["pairs"] and current.get("errors") else "completed")
+            current.setdefault("finished_at", _now_iso())       # #617
         if current.get("status") == "failed":
             telemetry.outcome("error")
     await asyncio.to_thread(_update_session_sync, session_id, finish)
@@ -985,7 +1010,8 @@ def _settle_abandoned_start(prepare: asyncio.Future) -> None:
 _GENERATION_GUARD_TIMEOUT_SECONDS = 1.0
 
 
-def _prepare_generation_sync(collection: str, sample_size: int, seed: int | None):
+def _prepare_generation_sync(collection: str, sample_size: int, seed: int | None,
+                             owner: dict | None = None):
     """Publish the sampled corpus identity before a writer can invalidate it."""
     from services.collection_writes import (CollectionBusyError, delete_in_progress,
                                             deleting_message, guard)
@@ -1011,6 +1037,9 @@ def _prepare_generation_sync(collection: str, sample_size: int, seed: int | None
                 "pairs_completed": 0,
                 "pairs_failed": 0,
                 "pairs": [],
+                # For the generation list (#617); finished_at when it settles.
+                "owner": owner,
+                "created_at": _now_iso(),
             }
             session = _store_generated_session(session)
             # Still inside the guard, so no delete can pass between publication
@@ -1029,14 +1058,16 @@ async def start_generation(
     collection: str,
     sample_size: int,
     seed: int | None,
+    owner: dict | None = None,
 ) -> dict:
+    """`owner` is who started it (#617), recorded for the generation list."""
     from models.schemas import GenerateRequest
     request = GenerateRequest(collection=collection, sample_size=sample_size, seed=seed)
     # Shielded: cancelling a plain to_thread await loses the thread's result, and
     # with it the registration it made, which then refused DELETE until a
     # restart (#302). A cancelled caller hands the result to a settle step.
     prepare = asyncio.ensure_future(asyncio.to_thread(
-        _prepare_generation_sync, collection, request.sample_size, request.seed))
+        _prepare_generation_sync, collection, request.sample_size, request.seed, owner))
     try:
         session, all_chunks = await asyncio.shield(prepare)
     except asyncio.CancelledError:

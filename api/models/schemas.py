@@ -114,6 +114,9 @@ class JobStatusResponse(BaseModel):
     # Earlier chunks of the same names that this job removed (#22). Records
     # written before the field existed read back as 0.
     chunks_replaced: int = 0
+    # Files over the per-file limits, stored as parts `<name> (part N)` (#621):
+    # one entry per such file that completed. Older records read back as [].
+    split: list[str] = []
 
 
 class IngestConfig(BaseModel):
@@ -699,3 +702,68 @@ class ErrorDetail(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: ErrorDetail
+
+
+# ── Running and recent jobs (#617) ────────────────────────────────────────────
+# What GET /ingest/jobs, /export/jobs, /import/jobs and /goldstandard/sessions
+# answer: the fields of the lookup by ID, plus who started the job and when it
+# started and finished. The lookups by ID answer as before.
+
+class JobOwner(BaseModel):
+    name: str
+    kind: Literal["user", "service"]
+
+
+class ListedTimes(BaseModel):
+    # None: a record from before #617, shown to Engineers as "owner unknown".
+    owner: Optional[JobOwner] = None
+    created_at: Optional[str] = None
+    # The finish time the list used; None while the job runs.
+    finished_at: Optional[str] = None
+
+
+class IngestJobEntry(JobStatusResponse, ListedTimes):
+    collection: Optional[str] = None
+    files: list[str] = []
+
+
+class ExportJobEntry(ExportJobStatusResponse, ListedTimes):
+    pass
+
+
+class ImportJobEntry(ImportJobStatusResponse, ListedTimes):
+    pass
+
+
+class GenerationEntry(ListedTimes):
+    session_id: str
+    collection: str = ""
+    status: str
+    pairs_total: int
+    pairs_attempted: Optional[int] = None
+    pairs_completed: int
+    pairs_failed: int = 0
+    errors: list[str] = []
+
+    @model_validator(mode="after")
+    def _attempted_defaults_to_completed(self):
+        # As GET /goldstandard/session/{id} answers a session without it.
+        if self.pairs_attempted is None:
+            self.pairs_attempted = self.pairs_completed
+        return self
+
+
+class IngestJobList(BaseModel):
+    jobs: list[IngestJobEntry]
+
+
+class ExportJobList(BaseModel):
+    jobs: list[ExportJobEntry]
+
+
+class ImportJobList(BaseModel):
+    jobs: list[ImportJobEntry]
+
+
+class GenerationList(BaseModel):
+    sessions: list[GenerationEntry]

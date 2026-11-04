@@ -587,6 +587,23 @@ job's three counts agree.
 "Submitted N · accepted N · stored N" line appears only when the counts differ, and an upload
 answered `409 COLLECTION_DELETING` to check its message is shown.
 
+`scripts/tests/test_job_lists.py` (#617, API image, no network) checks the running and recent job
+lists: new records get `created_at`, `finished_at` on their first terminal status or when marked
+interrupted, and ingest records `collection`, `files` and `owner`; who sees which job (a Developer
+its own, a key its principal's, an Engineer everyone's including owner-less records); running jobs
+always listed, finished ones from the last 24 hours, the newest 20; a pre-#617 record's last-saved
+time standing in for `finished_at`; the order; sessions (generating, finished, without
+`finished_at`, imported); the routes, their role, a malformed record left out, the lookups by ID
+unchanged, the owner each start route hands its service; and no session `owner` or times in a
+package or after an import. `02_ingest.sh` runs it, then `job_lists.py --operator` on the verify
+project: the harness Developer and a throwaway `vfy-s-*` Developer-role key each ingest a file into
+a throwaway `VfyJobs*` collection and see only their own job, with owner, collection, files and
+times; the Engineer sees both; the Developer's export and import are listed for it and the
+Engineer, not the key. `browser/ui_criteria.js` (suite 06) checks the pages' Running and recent
+jobs lists: a real ingest found again after leaving the Import page, then stubbed lists for a
+running ingest, generation and export that open by themselves, survive leaving the page and show
+their result, row switching, one job per Transfer panel, and the Engineer's owner column.
+
 `scripts/tests/test_jobstore.py` (#23) checks the job store that keeps ingest, export, import
 and tune job records across an API restart: an unbound store (no lifespan) is a plain dict
 that writes nothing; status changes and terminal records are written at once, owner-only;
@@ -654,7 +671,12 @@ the replaced files, before any insert, and deletes earlier chunks only after the
 marking failure fails only that file and changes nothing; a failed lookup of the later files
 is reported as the lookup, not the marking, and also changes nothing (#311); a failed insert keeps the earlier
 version; a removal failure keeps the new chunks and reports `partial`; a deleted collection is
-reported at the first lookup (#40). Also the delete rounds, precondition and final count,
+reported at the first lookup (#40). Also exact-name selection (#622): only the name's own
+chunks are deleted or counted among word matches such as `a/report.pdf`, `Report.PDF` and
+`report.pdf (part 1)`, over 10,000 word matches the collection is walked instead of queried,
+a name has chunks only when stored exactly, and a non-default rule selects what it accepts;
+the deletion by ID in batches of at most 10,000, never empty, and its bound, refused before
+deleting; the precondition and final count,
 retention releasing the name (also when the blob write fails, keeping shared digests), and
 rechunk coverage and per-(digest, name) rebuilds, rebuilding only names with stored chunks
 while a missing blob is still refused (#311), also for one blob under 50 names with one
@@ -690,9 +712,35 @@ ZIP (it completes with no errors, stores only its file and lists the AppleDouble
 that ingesting a new name leaves the session current and a replacing re-ingest marks it
 stale, naming the file. Two concurrent uploads of one name must leave exactly one job's
 version, whole: its chunk set, its digest, and `chunks_replaced` equal to the other job's
-chunks. `browser/ui_criteria.js` (suite 06) stubs the job response and checks that the Import
+chunks. Replacing a name touches only that name (#622): with `a/report.pdf` (in a ZIP) and
+`Report.PDF` stored, uploading `report.pdf` replaces nothing and uploading it again replaces
+only its first set, and the other two keep exactly their chunks. `exact_source.py` then checks
+the same selection in real Weaviate on a scratch collection without a vectorizer, on both
+paths: a few word matches read in one query, and over 10,000 walked.
+`browser/ui_criteria.js` (suite 06) stubs the job response and checks that the Import
 page shows "Replaced N chunk(s) from a previous version" only when `chunks_replaced` is above
 0, and the plain "N file(s) skipped:" heading with each entry's own reason.
+
+`scripts/tests/test_split_parts.py` (#621) checks that a file over the per-file limits is
+stored as parts `<name> (part N)` instead of failing, with Weaviate replaced by an in-memory
+collection that keeps the replacement helpers' contract (`accept` included): 13,000 JSON Lines
+records of 600 characters under `context_aware`, and a `.jsonl`, a `.txt` and a `.json` over
+10,000,000 characters (each failing on the code before #621); a file within the limits stored
+as before; replacement of a name's whole family (a smaller, an unsplit and a newly split
+re-upload) with neighbours such as `a/data.jsonl` and `Data.jsonl` untouched; a bad line, a
+failed insert and a failed removal after part 1 (nothing stored, the earlier version whole);
+a record over the chunk cap; the cuts, CSV headers, Markdown fences, a streamed Latin-1 file
+and one no encoding reads, `overlap` sizing, the halving re-split and the `semantic` sentence
+limit; re-chunk coverage and rebuild, export links, and `ChunkLimitError`. `split_parts.py` then
+runs the same in the real ingest worker and Weaviate, on a scratch collection without a
+vectorizer (embedding 13,000 chunks through Ollama takes this project about an hour): the
+13,000-record file (`context_aware`) and a 10,519,499-character `.txt` (`fixed` 6,000) are
+stored as numbered parts with the job's `split` entry, re-uploading the `.txt` within the
+limits replaces every part and leaves the `.jsonl`'s parts untouched, and a bad line after
+part 1 fails the file and stores nothing. `overlap_chunks.py` (suite 08) stores a
+20,000-character file at 1,000/999 as two parts, each inside both window limits, that restore
+it exactly, and `browser/ui_criteria.js` checks the progress panel's "1 file split into
+parts:" list.
 `05_transfer.sh` (E32) replaces a file, adds a second name for the new content, re-chunks,
 and checks that only the new text comes back, under both names. It also adds a name with no
 stored chunks to the retained index first, and checks that the rechunk doesn't rebuild it and
@@ -817,8 +865,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, a failed metric read as the 503, the metric read on every query; registered by suite 03 |
 | `citation_score.py` | helper for suite 03 (#376), run in the API container: citation scores of known vectors on a real Weaviate for each distance metric, and after a collection is recreated with another metric |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
-| `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
-| `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
+| `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds, and a file over the output limits stored as parts inside them (#621) |
+| `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget (parts, #621) regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, review 404 codes and empty-edit refusal (#381), export schema, export name refusals (#370) |
 | `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
@@ -831,7 +879,10 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_jsonl_ingest.py` | controlled JSON Lines reading, conversion, limit and gzip regressions, registered by ingest |
 | `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
 | `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
-| `../tests/test_reingest.py` | controlled re-ingest replacement, same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
+| `../tests/test_reingest.py` | controlled re-ingest replacement, exact-name selection (#622), same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
+| `../tests/test_split_parts.py` | controlled regressions for files over the per-file limits stored as parts (#621): the reviewer's 13,000 records, files over 10,000,000 characters, family replacement, all or nothing, cuts, CSV, Markdown, encoding, `overlap` sizing, re-chunk and export links, registered by ingest |
+| `split_parts.py` | helper for ingest (#621), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, files over the per-file limits are stored as parts, a smaller re-upload replaces every part, and a bad line after part 1 stores nothing; the collection is removed afterwards |
+| `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`) and over 10,000 (`walk`); the collection is removed afterwards |
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, registered by transfer |
@@ -842,6 +893,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `../tests/test_batch_implementation.py` | host-side: exact embedded source checks for `api/main.py`, the Weaviate client, the batch-write, recovery, import and tuning services and their verify scripts, and the restart-recovery block of `05_transfer.sh` with stubbed commands (refused-prefix skip, `RAG_ALLOW_RESTART`, the #152 refusal), registered by transfer |
 | `../tests/test_chunk_limits.py` / `../tests/test_insert_chunks.py` | controlled chunker per-file limits, chunk ceiling and semantic floor (#111) / insert batching and the "index not ready" retry, registered by ingest in the API image with the repository mounted (#386) |
+| `../tests/test_corpus_rules.py` | controlled: the corpus preparation rules the Import page offers (`ui/public/corpus-preparation-rules.md`) state every ingest limit as the chunker, the ingest pipeline, the settings defaults, the chunk-setting bounds, `docker-compose.yml` and the proxy define it, and no other number (#615), registered by ingest in the API image with the repository mounted |
+| `../tests/test_corpus_rules_estimates.py` | controlled: the chunk counts the corpus preparation rules give hold for the real chunker for every strategy, on files built at the rules' targets, which are never refused for the text or chunk limits (#615), registered by ingest in the API image with the repository mounted |
 | `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
 | `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
@@ -854,7 +907,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |
 | `../tests/test_retrieve_script.py` | controlled `retrieve.py` defaults, flags and exit codes against a stub API, registered by suite 15 |
 | `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15 |
-| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, the page controls of #400 (see "UI control browser checks") and, last, the login page against nginx's real login rate limit (#577) |
+| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, the Import page's corpus preparation rules download (#615), the page controls of #400 (see "UI control browser checks") and, last, the login page against nginx's real login rate limit (#577) |
 | `14_reindex.sh` | exact-record reindex: a host check that the embedded sources match the real files (`../tests/test_reindex_preservation.py`), 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
@@ -1129,7 +1182,8 @@ nothing reaches the backend or a model. 67 cases:
 - `ui_controls.js`: the Collections table (columns, a dash for a null created date) and create
   modal (HNSW slider defaults, bounds and labels, Flat hiding them, the create payload); the Import
   queue, slider visibility per strategy and role, Chunk Size pulling Overlap down, the upload
-  form fields and the "+ New" modal; the Developer nav and the redirects of a Developer and an End
+  form fields and the "+ New" modal; the nav's menus per role, their keyboard and screen-reader
+  behaviour and the current-page highlight (#616), and the redirects of a Developer and an End
   User; the login page, logout, the setup-required page, the forced and voluntary password change
   and the return to login on a 401 (#25), with `GET /api/auth/me` answered from the case's role; the Q&A box
   (Ctrl+Enter, plain Enter, Ask disabled while empty or loading), the citations toggle, markdown,

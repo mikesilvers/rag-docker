@@ -1421,6 +1421,9 @@ class JobStatusResponse(BaseModel):
     # Earlier chunks of the same names that this job removed (#22). Records
     # written before the field existed read back as 0.
     chunks_replaced: int = 0
+    # Files over the per-file limits, stored as parts `<name> (part N)` (#621):
+    # one entry per such file that completed. Older records read back as [].
+    split: list[str] = []
 
 
 class IngestConfig(BaseModel):
@@ -2006,6 +2009,71 @@ class ErrorDetail(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: ErrorDetail
+
+
+# ── Running and recent jobs (#617) ────────────────────────────────────────────
+# What GET /ingest/jobs, /export/jobs, /import/jobs and /goldstandard/sessions
+# answer: the fields of the lookup by ID, plus who started the job and when it
+# started and finished. The lookups by ID answer as before.
+
+class JobOwner(BaseModel):
+    name: str
+    kind: Literal["user", "service"]
+
+
+class ListedTimes(BaseModel):
+    # None: a record from before #617, shown to Engineers as "owner unknown".
+    owner: Optional[JobOwner] = None
+    created_at: Optional[str] = None
+    # The finish time the list used; None while the job runs.
+    finished_at: Optional[str] = None
+
+
+class IngestJobEntry(JobStatusResponse, ListedTimes):
+    collection: Optional[str] = None
+    files: list[str] = []
+
+
+class ExportJobEntry(ExportJobStatusResponse, ListedTimes):
+    pass
+
+
+class ImportJobEntry(ImportJobStatusResponse, ListedTimes):
+    pass
+
+
+class GenerationEntry(ListedTimes):
+    session_id: str
+    collection: str = ""
+    status: str
+    pairs_total: int
+    pairs_attempted: Optional[int] = None
+    pairs_completed: int
+    pairs_failed: int = 0
+    errors: list[str] = []
+
+    @model_validator(mode="after")
+    def _attempted_defaults_to_completed(self):
+        # As GET /goldstandard/session/{id} answers a session without it.
+        if self.pairs_attempted is None:
+            self.pairs_attempted = self.pairs_completed
+        return self
+
+
+class IngestJobList(BaseModel):
+    jobs: list[IngestJobEntry]
+
+
+class ExportJobList(BaseModel):
+    jobs: list[ExportJobEntry]
+
+
+class ImportJobList(BaseModel):
+    jobs: list[ImportJobEntry]
+
+
+class GenerationList(BaseModel):
+    sessions: list[GenerationEntry]
 ```
 
 ### api/services/__init__.py
@@ -3452,12 +3520,76 @@ def _insert_chunks_sync(collection_name: str, chunks: list[dict]) -> None:
             time.sleep(_INSERT_RETRY_DELAY)
 
 
-def _source_has_chunks_sync(collection_name: str, source_file: str) -> bool:
-    """Whether the collection holds any chunk stored under this logical name."""
+# Weaviate returns at most QUERY_MAXIMUM_RESULTS (10,000 by default) objects per
+# query and deletes at most that many per delete_many; offset paging stops there
+# too, and its cursor can't be combined with a filter (#622).
+_QUERY_MAXIMUM_RESULTS = 10_000
+_SOURCE_PROPERTIES = ["source_file", "created_at"]
+
+
+def _exact_source_objects(coll, name: str, accept=None):
+    """The objects stored under exactly `name`, read with only `source_file` and
+    `created_at` (#622).
+
+    `source_file` is word-tokenized, so equal(name) matches every name containing
+    all its words: `a/report.pdf`, `Report.PDF` and `report.pdf (part 1)` match
+    `report.pdf`. That superset always holds the exact name, so it is read and
+    filtered here by the exact value. Over QUERY_MAXIMUM_RESULTS matches a filtered
+    query can't reach them all, so the whole collection is walked instead.
+
+    `accept(value)` decides which values are kept; by default, the name itself. A
+    rule may accept only values among equal(name)'s matches, such as the name and
+    its `<name> (part N)` family. Objects are yielded lazily, so a caller that needs
+    one stops the walk there.
+    """
+    if accept is None:
+        def accept(value):
+            return value == name
+    words = Filter.by_property("source_file").equal(name)
+    total = telemetry.call("weaviate.aggregate", coll.aggregate.over_all,
+                           filters=words, total_count=True).total_count or 0
+    if not total:
+        return
+    if total <= _QUERY_MAXIMUM_RESULTS:
+        objects = telemetry.call("weaviate.query", coll.query.fetch_objects,
+            filters=words, limit=_QUERY_MAXIMUM_RESULTS, include_vector=False,
+            return_properties=_SOURCE_PROPERTIES).objects
+    else:
+        objects = telemetry.iterate(coll.iterator, include_vector=False,
+                                    return_properties=_SOURCE_PROPERTIES)
+    try:
+        for obj in objects:
+            value = (obj.properties or {}).get("source_file")
+            if isinstance(value, str) and accept(value):
+                yield obj
+    finally:
+        # Closed early, a walk ends its span now rather than when collected.
+        close = getattr(objects, "close", None)
+        if close is not None:
+            close()
+
+
+def _source_has_chunks_sync(collection_name: str, source_file: str, accept=None) -> bool:
+    """Whether the collection holds any chunk stored under exactly this name (or,
+    with `accept`, under a value it keeps)."""
     coll = get_client().collections.get(collection_name)
-    return bool(telemetry.call("weaviate.query", coll.query.fetch_objects,
-        filters=Filter.by_property("source_file").equal(source_file),
-        limit=1, return_properties=[]).objects)
+    selected = _exact_source_objects(coll, source_file, accept)
+    try:
+        return next(selected, None) is not None
+    finally:
+        selected.close()
+
+
+def _family(name: str):
+    """The rule keeping `name` and its `<name> (part N)` parts, exactly (#621).
+    Every part's words include the name's, so equal(name) matches them all."""
+    from services import parts
+    return lambda value: parts.in_family(value, name)
+
+
+def _family_has_chunks_sync(collection_name: str, name: str) -> bool:
+    """Whether `name` or any of its parts has chunks (#621)."""
+    return _source_has_chunks_sync(collection_name, name, _family(name))
 
 
 class ReplaceError(RuntimeError):
@@ -3469,54 +3601,92 @@ class ReplaceError(RuntimeError):
         self.deleted = deleted
 
 
-# Weaviate removes at most QUERY_MAXIMUM_RESULTS (10,000 by default) objects per
-# delete_many, so removal repeats; this bounds it at a million chunks per file.
+# One replacement deletes at most this many batches of QUERY_MAXIMUM_RESULTS
+# earlier chunks: a million per name.
 _REPLACE_DELETE_ROUNDS = 100
 
 
 @collection_writes.serialized("collection_name")
 def _delete_earlier_chunks_sync(collection_name: str, source_file: str,
-                                created_at: datetime, expected: int) -> int:
+                                created_at: datetime, expected: int, accept=None) -> int:
     """Remove a name's earlier chunks after its `expected` new ones are stored (#22).
 
     Called only after the insert has been verified, never before: if the insert
     fails, the earlier version stays whole; if this fails, the name has
     duplicates but nothing is lost, and uploading it again repairs it.
 
-    The new chunks all carry the same `created_at`, written by this job. They are
-    told apart by equality with that value rather than by "older than", so the
-    selection depends neither on the precision Weaviate keeps nor on earlier
-    chunks' timestamps (an imported package's can be later than now). Before
-    deleting, the equality filter must match exactly the new chunks; afterwards
-    exactly they must remain. Returns how many earlier chunks were deleted.
+    Only chunks stored under exactly this name are counted or deleted (#622): they
+    are selected with _exact_source_objects and deleted by UUID. The new chunks all
+    carry the same `created_at`, written by this job, and are told apart by
+    equality with it, in Python, since a walk of the collection can't filter; the
+    value reads back to the microsecond. Equality rather than "older than" keeps
+    the selection independent of earlier chunks' timestamps (an imported
+    package's can be later than now). Before deleting, exactly `expected` of the
+    name's chunks must carry it; afterwards exactly they must remain. Returns how
+    many earlier chunks were deleted. With `accept`, the chunks are those of the
+    values it keeps, such as a name and its parts (#621).
     """
     coll = get_client().collections.get(collection_name)
-    named = Filter.by_property("source_file").equal(source_file)
-
-    def count(where) -> int:
-        return telemetry.call("weaviate.aggregate", coll.aggregate.over_all, filters=where, total_count=True).total_count or 0
-
-    found = count(named & Filter.by_property("created_at").equal(created_at))
-    if found != expected:
-        raise ReplaceError(f"found {found} of its {expected} new chunks by their timestamp, "
+    new, earlier = 0, []
+    for obj in _exact_source_objects(coll, source_file, accept):
+        if obj.properties.get("created_at") == created_at:
+            new += 1
+        else:
+            earlier.append(obj.uuid)
+    if new != expected:
+        raise ReplaceError(f"found {new} of its {expected} new chunks by their timestamp, "
                            "so none of the earlier ones were removed", 0)
-    earlier = named & Filter.by_property("created_at").not_equal(created_at)
+    bound = _REPLACE_DELETE_ROUNDS * _QUERY_MAXIMUM_RESULTS
+    if len(earlier) > bound:
+        raise ReplaceError(f"{len(earlier)} earlier chunks are more than one replacement "
+                           f"removes ({bound}), so none were removed", 0)
     deleted = 0
-    for _ in range(_REPLACE_DELETE_ROUNDS):
-        result = telemetry.call("weaviate.delete", coll.data.delete_many, where=earlier)
+    for start in range(0, len(earlier), _QUERY_MAXIMUM_RESULTS):
+        batch = earlier[start:start + _QUERY_MAXIMUM_RESULTS]
+        result = telemetry.call("weaviate.delete", coll.data.delete_many,
+                                where=Filter.by_id().contains_any(batch))
         deleted += result.successful or 0
         if result.failed:
             raise ReplaceError(f"Weaviate failed to delete {result.failed} earlier chunk(s)", deleted)
-        if not result.matches:
-            break
-    else:
-        raise ReplaceError(f"earlier chunks were still being found after "
-                           f"{_REPLACE_DELETE_ROUNDS} delete rounds", deleted)
-    left = count(named) - expected
+    left = sum(1 for _ in _exact_source_objects(coll, source_file, accept)) - expected
     if left > 0:
         raise ReplaceError(f"{left} earlier chunk(s) remain", deleted)
     if left < 0:
         raise ReplaceError(f"{-left} of its {expected} new chunks are missing afterwards", deleted)
+    return deleted
+
+
+def _delete_earlier_family_sync(collection_name: str, name: str, created_at: datetime,
+                                expected: int) -> int:
+    """Remove the earlier chunks of `name` and of every `<name> (part N)` once the
+    `expected` new ones are stored, so a re-upload leaves exactly the new family
+    whether or not either version was split (#621)."""
+    return _delete_earlier_chunks_sync(collection_name, name, created_at, expected,
+                                       accept=_family(name))
+
+
+@collection_writes.serialized("collection_name")
+def _delete_new_family_sync(collection_name: str, name: str, created_at: datetime) -> int:
+    """Remove the chunks this ingest stored for `name` and its parts (they carry
+    its `created_at`), so a file whose later part failed leaves its earlier
+    version whole (#621). Returns how many were removed; ReplaceError, with that
+    count, when Weaviate fails to remove some or some remain."""
+    coll = get_client().collections.get(collection_name)
+    accept = _family(name)
+    new = [obj.uuid for obj in _exact_source_objects(coll, name, accept)
+           if obj.properties.get("created_at") == created_at]
+    deleted = 0
+    for start in range(0, len(new), _QUERY_MAXIMUM_RESULTS):
+        batch = new[start:start + _QUERY_MAXIMUM_RESULTS]
+        result = telemetry.call("weaviate.delete", coll.data.delete_many,
+                                where=Filter.by_id().contains_any(batch))
+        deleted += result.successful or 0
+        if result.failed:
+            raise ReplaceError(f"Weaviate failed to delete {result.failed} new chunk(s)", deleted)
+    left = sum(1 for obj in _exact_source_objects(coll, name, accept)
+               if obj.properties.get("created_at") == created_at)
+    if left:
+        raise ReplaceError(f"{left} new chunk(s) remain", deleted)
     return deleted
 
 
@@ -3774,6 +3944,19 @@ MAX_SEMANTIC_SENTENCES = 10 * MAX_CHUNKS_PER_FILE
 # embedding model spend minutes on a huge file before refusing it.
 MAX_TEXT_CHARACTERS = MAX_OVERLAP_OUTPUT_CHARACTERS
 
+
+class ChunkLimitError(ValueError):
+    """A file's text or chunks over a per-file limit that splitting into parts
+    resolves (#621): the text limit, the chunk count and the overlap window limits.
+    The semantic sentence limit and settings errors stay plain ValueError. `kind`
+    is "text", "chunks" (the chunk count or overlap windows) or "overlap" (the
+    overlap text across windows)."""
+
+    def __init__(self, message: str, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
 _semantic_model = None
 _semantic_model_lock = threading.Lock()
 
@@ -3828,9 +4011,10 @@ def _cap_chunk_length(chunks: list[str]) -> list[str]:
 
 def _check_chunk_count(count: int, strategy: str, unit: str = "chunks") -> None:
     if count > MAX_CHUNKS_PER_FILE:
-        raise ValueError(
+        raise ChunkLimitError(
             f"{strategy} chunking exceeds the per-file limit: {count} {unit} "
-            f"(maximum {MAX_CHUNKS_PER_FILE}). Use a larger chunk size or split the file.")
+            f"(maximum {MAX_CHUNKS_PER_FILE}). Use a larger chunk size or split the file.",
+            "chunks")
 
 
 def chunk_fixed(text: str, chunk_size: int, min_chunk_size: int) -> list[str]:
@@ -3859,10 +4043,11 @@ def chunk_overlap(text: str, chunk_size: int, chunk_overlap: int, min_chunk_size
     # limits are conservative before the optional tail merge removes overlap.
     output_characters = len(text) + (windows - 1) * chunk_overlap
     if windows > MAX_OVERLAP_WINDOWS or output_characters > MAX_OVERLAP_OUTPUT_CHARACTERS:
-        raise ValueError(
+        raise ChunkLimitError(
             f"Overlap output exceeds per-file limit: {windows} pre-merge windows "
             f"(maximum {MAX_OVERLAP_WINDOWS}), {output_characters} characters "
-            f"(maximum {MAX_OVERLAP_OUTPUT_CHARACTERS}). Reduce overlap or input size.")
+            f"(maximum {MAX_OVERLAP_OUTPUT_CHARACTERS}). Reduce overlap or input size.",
+            "chunks" if windows > MAX_OVERLAP_WINDOWS else "overlap")
 
     chunks: list[str] = []
     start = 0
@@ -3983,9 +4168,9 @@ def chunk(
     similarity_threshold = config.similarity_threshold if config.similarity_threshold is not None else 0.85
     text_length = len(text) if elements is None else sum(len(str(el)) for el in elements)
     if text_length > MAX_TEXT_CHARACTERS:
-        raise ValueError(
+        raise ChunkLimitError(
             f"{strategy} chunking exceeds the per-file limit: {text_length} characters "
-            f"(maximum {MAX_TEXT_CHARACTERS}). Split the file.")
+            f"(maximum {MAX_TEXT_CHARACTERS}). Split the file.", "text")
     if strategy in ("fixed", "language", "context_aware"):
         # These split by size, so the count is known before splitting. Refuse
         # an oversized file before the splitter allocates every chunk.
@@ -4011,6 +4196,752 @@ def chunk(
     return chunks
 ```
 
+### api/services/parts.py
+
+```python
+"""Names of the parts a file over the per-file limits is stored as (#621).
+
+A file whose text or chunks go over the per-file limits is stored as parts named
+`<name> (part N)`. The original is retained once, under `<name>`, and every part
+maps back to it. A name and its parts are its family: uploading the name again
+replaces all of them.
+"""
+from __future__ import annotations
+
+import re
+from typing import Mapping
+
+_PART = re.compile(r" \(part ([1-9][0-9]*)\)\Z")
+
+
+def part_name(name: str, number: int) -> str:
+    """The stored name of part `number` (from 1) of `name`."""
+    return f"{name} (part {number})"
+
+
+def base_of(stored: str) -> str | None:
+    """The name a part belongs to, by one ` (part N)` suffix; None for any other name."""
+    match = _PART.search(stored)
+    return stored[:match.start()] if match else None
+
+
+def in_family(stored: str, name: str) -> bool:
+    """Whether `stored` is `name` itself or one of its parts, exactly."""
+    return stored == name or base_of(stored) == name
+
+
+def resolve(stored: str, listed: Mapping[str, object]) -> str | None:
+    """The retained name whose original `stored` came from: `stored` itself when it
+    is listed, else the name it is a part of when that is listed, else None."""
+    if stored in listed:
+        return stored
+    base = base_of(stored)
+    return base if base is not None and base in listed else None
+```
+
+### api/services/splitter.py
+
+```python
+"""Splitting a file over the per-file limits into parts (#621).
+
+A file whose text or chunks would go over the chunker's per-file limits (the
+10,000,000-character text limit, the 10,000-chunk cap and, for `overlap`, the
+window limits) is not refused: it is split into parts that each stay under them,
+and every part is chunked on its own, as a file of its own would be. The caller
+stores each part as `<name> (part N)`.
+
+Parts are cut from units, in file order: JSON and JSON Lines at record
+boundaries (a record is never split), `.txt` and `.md` at paragraphs (blank
+lines; `.md` never inside a fenced code block), a CSV by rows with its header
+repeated in every part, `.pdf` and `.docx` between elements. A paragraph,
+element or CSV row over a limit on its own is cut at line breaks, then at
+whitespace, then hard at the limit, as _cap_chunk_length cuts a chunk.
+
+JSON Lines, `.txt`, `.md` and `.csv` are read part by part, so memory is bounded
+by one part whatever the file's size. `.json`, `.pdf` and `.docx` are parsed
+whole, as before, and split by record or element. A file that fits in one part
+is chunked exactly as before and keeps its name.
+"""
+from __future__ import annotations
+
+import codecs
+import csv
+import io
+import itertools
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Iterable, Iterator
+
+from services import chunker
+from services.chunker import ChunkLimitError
+
+_BLOCK = 1024 * 1024
+# How much of a file the encoding is detected from when it isn't UTF-8: reading
+# the whole file to detect it would undo the per-part memory bound.
+_DETECT_BYTES = 1024 * 1024
+_SNIFF_CHARACTERS = 64 * 1024
+
+
+@dataclass
+class Unit:
+    """What a part is cut from. `kind` is "record" (never cut) or "text";
+    `ordinal` names a record in errors; `element` is a parsed element (its class
+    is kept when the unit is cut); `cells` are a CSV row's cells."""
+    text: str
+    kind: str = "text"
+    ordinal: str | None = None
+    element: Any = None
+    cells: list[str] | None = None
+
+
+class PartError(Exception):
+    """Producing part `number` failed; `cause` is why. The caller names the part."""
+
+    def __init__(self, number: int, cause: BaseException) -> None:
+        super().__init__(str(cause) or type(cause).__name__)
+        self.number = number
+        self.cause = cause
+
+
+@dataclass
+class Settings:
+    strategy: str
+    chunk_size: int
+    chunk_overlap: int
+    similarity_threshold: float
+    min_chunk_size: int
+
+
+# ── types ────────────────────────────────────────────────────────────────────
+
+def file_type(path: Path) -> str:
+    """jsonl, json, txt, md, csv or elements (`.pdf`, `.docx`)."""
+    from services import ingest_pipeline as ip
+    if ip._is_jsonl(path.name):
+        return "jsonl"
+    if ip._is_json_gz(path.name):
+        return "json"
+    ext = path.suffix.lower()
+    if ext == ".json":
+        return "json"
+    if ext in (".txt", ".md", ".csv"):
+        return ext[1:]
+    return "elements"
+
+
+_STREAMED_TEXT = ("txt", "md", "csv")
+
+
+# ── sizing (S4) ──────────────────────────────────────────────────────────────
+
+def _overlap_windows(length: int, size: int, overlap: int) -> int:
+    """How many windows chunk_overlap makes of `length` characters."""
+    if length <= 0:
+        return 0
+    if length <= size:
+        return 1
+    stride = size - overlap
+    return 1 + (length - size + stride - 1) // stride
+
+
+def part_limits(settings: Settings) -> tuple[int, int | None]:
+    """The most text one part may hold, so that its estimated chunking stays
+    inside the per-file limits. The second value is kept for callers and is always
+    None: `context_aware` parts are sized by replaying its packing (_Packing),
+    since a count of units would split files well inside the limits (PR #630)."""
+    cap = chunker.MAX_CHUNKS_PER_FILE
+    text = chunker.MAX_TEXT_CHARACTERS
+    size, overlap = settings.chunk_size, settings.chunk_overlap
+    strategy = settings.strategy
+    if strategy == "fixed":
+        return min(text, cap * size), None
+    if strategy == "language":
+        return min(text, cap * max(size - overlap, 1)), None
+    if strategy == "context_aware":
+        return min(text, cap * size), None
+    if strategy == "overlap":
+        def fits(length: int) -> bool:
+            windows = _overlap_windows(length, size, overlap)
+            return (windows <= chunker.MAX_OVERLAP_WINDOWS
+                    and length + max(windows - 1, 0) * overlap
+                    <= chunker.MAX_OVERLAP_OUTPUT_CHARACTERS)
+        low, high = 0, text
+        while low < high:
+            middle = (low + high + 1) // 2
+            if fits(middle):
+                low = middle
+            else:
+                high = middle - 1
+        return max(low, 1), None
+    return text, None
+
+
+def _separator(ftype: str, units_have_elements: bool) -> int:
+    """The characters joining two units in a part's text."""
+    if ftype == "csv":
+        return 0
+    if ftype == "elements" or units_have_elements:
+        return 1
+    return 2
+
+
+# ── encoding of streamed text (S3.6) ─────────────────────────────────────────
+
+def _decodes(path: Path, encoding: str) -> bool:
+    decoder = codecs.getincrementaldecoder(encoding)()
+    try:
+        with path.open("rb") as fh:
+            while True:
+                block = fh.read(_BLOCK)
+                if not block:
+                    break
+                decoder.decode(block)
+        decoder.decode(b"", final=True)
+    except (UnicodeDecodeError, UnicodeError):
+        return False
+    return True
+
+
+def text_encoding(path: Path) -> str:
+    """The encoding a streamed `.txt`, `.md` or `.csv` is read in: UTF-8 when the
+    whole file is (a byte-order mark dropped), else what Unstructured detects from
+    its first MiB, checked over the whole file before anything is stored."""
+    if _decodes(path, "utf-8-sig"):
+        return "utf-8-sig"
+    try:
+        from unstructured.file_utils.encoding import detect_file_encoding
+        with path.open("rb") as fh:
+            sample = fh.read(_DETECT_BYTES)
+        encoding, _ = detect_file_encoding(file=sample)
+        codecs.lookup(encoding)
+    except Exception:
+        encoding = None
+    if encoding and _decodes(path, encoding):
+        return encoding
+    raise ValueError("is not in an encoding that can be read in parts")
+
+
+# ── unit readers (S3) ────────────────────────────────────────────────────────
+
+def _cut_text(text: str, limit: int) -> list[str]:
+    """Pieces of at most `limit` characters: at the last line break that fits,
+    else the last whitespace, else hard at the limit, as _cap_chunk_length cuts."""
+    limit = max(limit, 1)
+    pieces: list[str] = []
+    start, end = 0, len(text)
+    while end - start > limit:
+        stop = start + limit
+        cut = text.rfind("\n", start + 1, stop + 1)
+        if cut <= start:
+            cut = max(text.rfind(ws, start + 1, stop + 1) for ws in (" ", "\t", "\r"))
+        if cut <= start:
+            cut = stop
+        piece = text[start:cut]
+        if piece.strip():
+            pieces.append(piece)
+        start = cut
+        if start < end and text[start] in "\n \t\r":
+            start += 1
+    if text[start:end].strip():
+        pieces.append(text[start:end])
+    return pieces
+
+
+def _new_element(element: Any, text: str) -> Any:
+    try:
+        return type(element)(text=text)
+    except Exception:
+        from unstructured.documents.elements import Text
+        return Text(text=text)
+
+
+def _csv_row(cells: list[str], dialect: Any) -> str:
+    out = io.StringIO()
+    csv.writer(out, dialect=dialect, lineterminator="\n").writerow(cells)
+    return out.getvalue()
+
+
+def cut_unit(unit: Unit, limit: int, dialect: Any = None) -> list[Unit]:
+    """A text unit over a limit on its own, as pieces of at most `limit`
+    characters. A CSV row is cut on its cells' text, each piece one cell."""
+    if unit.cells is not None:
+        pieces = _cut_text(" ".join(unit.cells), limit)
+        return [Unit(_csv_row([p], dialect), cells=[p]) for p in pieces]
+    pieces = _cut_text(unit.text, limit)
+    if unit.element is not None:
+        return [Unit(p, element=_new_element(unit.element, p)) for p in pieces]
+    return [Unit(p) for p in pieces]
+
+
+def _text_units(stream: Iterable[str] | Any, markdown: bool, limit: int) -> Iterator[Unit]:
+    """Paragraphs, the text between blank lines; for Markdown, a blank line inside
+    a fenced code block doesn't end one. A paragraph is given out in pieces when
+    it passes `limit`, cut at a line break, so one is never held whole."""
+    lines: list[str] = []
+    size = 0
+    fence = False
+    while True:
+        line = stream.readline(limit)
+        if not line:
+            break
+        if markdown and line.lstrip().startswith(("```", "~~~")):
+            fence = not fence
+        if not line.strip() and not fence:
+            if lines:
+                yield Unit("".join(lines).rstrip("\n"))
+                lines, size = [], 0
+            continue
+        if lines and size + len(line) > limit:
+            yield Unit("".join(lines).rstrip("\n"))
+            lines, size = [], 0
+        lines.append(line)
+        size += len(line)
+    if lines:
+        yield Unit("".join(lines).rstrip("\n"))
+
+
+def _csv_dialect(stream: Any) -> Any:
+    sample = stream.read(_SNIFF_CHARACTERS)
+    stream.seek(0)
+    try:
+        return csv.Sniffer().sniff(sample)
+    except csv.Error:
+        return csv.excel
+
+
+def _text_measure(unit: Unit) -> int:
+    """The raw measure of a unit, deciding whether a .txt, .md or .csv over
+    10,000,000 bytes is tried whole: its text, and a CSV row by its cells' text
+    (empty cells and separators not counted, since a sparse CSV's bytes can be
+    many times its text). It is not the parsed text and can be more (indentation,
+    Markdown link targets, NA cells), so such a file may be split although its
+    parsed text would fit; measuring raw units keeps memory bounded (maintainer's
+    decision, PR #630)."""
+    if unit.cells is not None:
+        return sum(len(cell.strip()) for cell in unit.cells)
+    return len(unit.text)
+
+
+def _csv_units(stream: Any, dialect: Any) -> tuple[str, Iterator[Unit]]:
+    """The header row as CSV text, and every later row as a unit."""
+    try:
+        from unstructured.partition.csv import CSV_FIELD_LIMIT
+        csv.field_size_limit(CSV_FIELD_LIMIT)
+    except ImportError:
+        pass
+    rows = csv.reader(stream, dialect)
+    header_cells = next(rows, None)
+    header = _csv_row(header_cells, dialect) if header_cells is not None else ""
+
+    def units() -> Iterator[Unit]:
+        for cells in rows:
+            yield Unit(_csv_row(cells, dialect), cells=list(cells))
+    return header, units()
+
+
+class _Source:
+    """A file's units, read lazily, and what a part's text is built from. `parse`
+    and `chunk` are the caller's _parse_file and chunk."""
+
+    def __init__(self, path: Path, ftype: str, settings: Settings, limit: int,
+                 parse: Callable, chunk: Callable) -> None:
+        from services import ingest_pipeline as ip
+        self.path, self.ftype, self.settings, self.limit = path, ftype, settings, limit
+        self.parse, self.chunk = parse, chunk
+        self.header = ""
+        self.dialect = None
+        self._stream = None
+        self.own_size: int | None = None
+        self.header_cells: list[str] = []
+        if ftype == "jsonl":
+            self.units = (Unit(t, "record", o) for o, t, _ in ip._jsonl_units(path))
+        elif ftype == "json":
+            raw = ip._json_gz_units(path) if ip._is_json_gz(path.name) else ip._json_units(path)
+            self.units = (Unit(t, "record", o, e) for o, t, e in raw)
+        elif ftype == "elements":
+            _, elements = parse(path)
+            self.units = iter([Unit(str(el), element=el) for el in elements])
+            # A PDF or DOCX is measured by its extracted text, not its (compressed) bytes.
+            self.own_size = sum(len(str(el)) for el in elements)
+        else:
+            encoding = text_encoding(path)
+            self._stream = path.open("r", encoding=encoding, newline="" if ftype == "csv" else None)
+            if ftype == "csv":
+                self.dialect = _csv_dialect(self._stream)
+                self.header, self.units = _csv_units(self._stream, self.dialect)
+                self.header_cells = next(csv.reader([self.header], self.dialect), [])
+            else:
+                self.units = _text_units(self._stream, ftype == "md", limit)
+        # What a part's units may hold: a CSV's header is repeated at the start
+        # of every part, so it takes its share of each (#621, PR #630 review).
+        self.room = limit - len(self.header)
+
+    def close(self) -> None:
+        if self._stream is not None:
+            self._stream.close()
+        close = getattr(self.units, "close", None)
+        if close is not None:
+            close()
+
+    def presized(self) -> Iterator[Unit]:
+        """The units, a text unit over the room in a part already cut into pieces.
+        A CSV header over half a part fails the file before it is split
+        (check_header), so the cut never goes below half a part."""
+        cut_at = max(self.room, self.limit // 2)
+        for unit in self.units:
+            if unit.kind == "text" and len(unit.text) > cut_at:
+                yield from cut_unit(unit, cut_at, self.dialect)
+            else:
+                yield unit
+
+    def own(self) -> int:
+        """The file's own size, which its stored chunk text is measured against:
+        its bytes; a gzip file's decompressed bytes; a PDF's or DOCX's text."""
+        if self.own_size is None:
+            size = self.path.stat().st_size
+            if self.path.name.lower().endswith(".gz"):
+                import gzip
+                try:
+                    size = 0
+                    with gzip.open(self.path, "rb") as gz:
+                        while True:
+                            block = gz.read(_BLOCK)
+                            if not block:
+                                break
+                            size += len(block)
+                except (OSError, EOFError):
+                    size = self.path.stat().st_size
+            self.own_size = size
+        return self.own_size
+
+    def check_header(self) -> None:
+        """Before a CSV is split: its header is repeated in every part, so one over
+        half of what a part can hold would multiply the file's stored text. That
+        fails the whole file (maintainer's decision on PR #630). A CSV that fits
+        in one part keeps any header."""
+        if self.ftype == "csv" and 2 * len(self.header) > self.limit:
+            raise ValueError(
+                f"its header row is {len(self.header):,} characters, more than half of what one "
+                f"part can hold with these chunk settings ({self.limit:,} characters); the header "
+                f"is repeated in every part, so shorten the header or split the file")
+
+    def build(self, units: list[Unit]) -> tuple[str, list[Any]]:
+        """A part's text and elements, as a file holding only these units would
+        give them (S3's table)."""
+        ftype = self.ftype
+        if ftype in ("jsonl", "json"):
+            from services import ingest_pipeline as ip
+            return ip._join_json_units([(u.ordinal, u.text, u.element) for u in units])
+        if ftype == "elements":
+            elements = [u.element for u in units]
+            return "\n".join(str(el) for el in elements), elements
+        if ftype == "csv":
+            from unstructured.partition.csv import partition_csv
+            data = (self.header + "".join(u.text for u in units)).encode("utf-8")
+            elements = partition_csv(file=io.BytesIO(data), encoding="utf-8")
+        elif ftype == "md":
+            from unstructured.partition.md import partition_md
+            elements = partition_md(text="\n\n".join(u.text for u in units))
+        else:
+            from unstructured.partition.text import partition_text
+            elements = partition_text(text="\n\n".join(u.text for u in units))
+        return "\n".join(str(el) for el in elements), elements
+
+
+# ── chunking a part (S3.3, S3.4) ─────────────────────────────────────────────
+
+def _chunk(chunk: Callable, text: str, elements: list[Any], settings: Settings) -> list[str]:
+    return chunk(
+        text=text,
+        strategy=settings.strategy,
+        chunk_size=settings.chunk_size,
+        chunk_overlap_size=settings.chunk_overlap,
+        similarity_threshold=settings.similarity_threshold,
+        min_chunk_size=settings.min_chunk_size,
+        elements=elements if settings.strategy == "context_aware" else None,
+    )
+
+
+def _record_over(unit: Unit, exc: ChunkLimitError) -> ValueError:
+    if getattr(exc, "kind", None) == "chunks":
+        return ValueError(
+            f"{unit.ordinal} gives more than {chunker.MAX_CHUNKS_PER_FILE:,} chunks with these "
+            f"chunk settings, the most one part can hold; a record is never split, so use a "
+            f"larger chunk size")
+    return ValueError(f"{unit.ordinal} is more than one part can hold with these chunk "
+                      f"settings ({exc}); a record is never split")
+
+
+def _chunk_units(source: _Source, units: list[Unit]) -> Iterator[list[str]]:
+    """The chunks of one part; a part that still goes over an in-scope limit is
+    split in half and each half chunked again, and a single text unit is cut."""
+    text, elements = source.build(units)
+    try:
+        chunks = _chunk(source.chunk, text, elements, source.settings)
+    except ChunkLimitError as exc:
+        del text, elements
+        if len(units) > 1:
+            middle = len(units) // 2
+            yield from _chunk_units(source, units[:middle])
+            yield from _chunk_units(source, units[middle:])
+            return
+        unit = units[0]
+        if unit.kind == "record":
+            raise _record_over(unit, exc) from exc
+        pieces = cut_unit(unit, (len(unit.text) + 1) // 2, source.dialect)
+        if len(pieces) < 2:
+            raise
+        yield from _chunk_units(source, pieces)
+        return
+    yield chunks
+
+
+# ── a file (S2, S3.1) ────────────────────────────────────────────────────────
+
+def _whole(path: Path, settings: Settings, parse: Callable, chunk: Callable) -> list[str]:
+    """A streamed text file chunked exactly as before the split existed."""
+    text, elements = parse(path)
+    return _chunk(chunk, text, elements, settings)
+
+
+def split_file(path: Path, settings: Settings, parse: Callable | None = None,
+               chunk: Callable | None = None) -> Iterator[tuple[str, list[str]]]:
+    """Yields ("whole", chunks) once for a file stored whole, else ("part",
+    chunks) for each of its two or more parts, in order.
+
+    Whether a file is split is never estimated (#621, PR #630): a file whose text
+    is within MAX_TEXT_CHARACTERS is chunked whole, and split only when the
+    chunker refuses it (the chunk count or the overlap limits). The part-size
+    estimates only size the parts of a file that is split.
+
+    `parse` and `chunk` default to ingest's _parse_file and the chunker's chunk;
+    callers pass their own, so whatever they parse and chunk with is used.
+
+    An exception raised while producing part N, once the file is known to be
+    split, is raised as PartError(N, exc).
+    """
+    if parse is None:
+        from services import ingest_pipeline as ip
+        parse = ip._parse_file
+    chunk = chunk or chunker.chunk
+    ftype = file_type(path)
+    limit, _ = part_limits(settings)
+    text_limit = chunker.MAX_TEXT_CHARACTERS
+
+    if ftype in _STREAMED_TEXT:
+        # Parsed whole from the file itself, as before. Every encoding takes at
+        # least a byte a character, so text within the limit is certain when the
+        # bytes are; otherwise the text is measured in one pass, nothing kept.
+        fits = path.stat().st_size <= text_limit
+        if not fits:
+            probe = _Source(path, ftype, settings, limit, parse, chunk)
+            try:
+                total = sum(len(cell.strip()) for cell in probe.header_cells)
+                fits = True
+                for unit in probe.units:
+                    total += _text_measure(unit)
+                    if total > text_limit:
+                        fits = False
+                        break
+            finally:
+                probe.close()
+        if fits:
+            try:
+                chunks = _whole(path, settings, parse, chunk)
+            except ChunkLimitError:
+                pass
+            else:
+                yield "whole", chunks
+                return
+        source = _Source(path, ftype, settings, limit, parse, chunk)
+        try:
+            source.check_header()
+            yield from _parts(source, [], None, source.presized())
+        finally:
+            source.close()
+        return
+
+    # JSON, JSON Lines, PDF and DOCX: the units are the file's own text, so up to
+    # the text limit of them is read, then the file is chunked whole.
+    source = _Source(path, ftype, settings, limit, parse, chunk)
+    # Measured as the chunker measures it: under context_aware it is given the
+    # elements and counts their text alone; otherwise it counts the joined text,
+    # the separators between units included (PR #630).
+    joined = settings.strategy != "context_aware"
+    try:
+        units = source.presized()
+        first: list[Unit] = []
+        chars = 0
+        pending = None
+        for unit in units:
+            sep = _separator(ftype, unit.element is not None) if first and joined else 0
+            added = len(unit.text) + sep
+            if first and chars + added > text_limit:
+                pending = unit
+                break
+            first.append(unit)
+            chars += added
+        else:
+            try:
+                text, elements = source.build(first)
+                chunks = _chunk(chunk, text, elements, settings)
+            except ChunkLimitError:
+                pass
+            else:
+                yield "whole", chunks
+                return
+        source.check_header()
+        yield from _parts(source, first, pending, units)
+    finally:
+        source.close()
+
+
+def _fits(chars: int, count: int, limit: int, max_units: int | None) -> bool:
+    return chars <= limit and (max_units is None or count <= max_units)
+
+
+def _pieces(length: int) -> int:
+    """How many chunks _cap_chunk_length makes of one chunk of `length` characters:
+    it cuts at whitespace no earlier than half the ceiling."""
+    ceiling = chunker.MAX_CHUNK_CHARACTERS
+    return 1 if length <= ceiling else -(-length // (ceiling // 2))
+
+
+class _Packing:
+    """Replays chunk_context_aware's packing over a part's units, to count its
+    chunks before minimum-size merging (which only lowers the count), plus the
+    pieces _cap_chunk_length cuts an over-long one into. Used to size
+    `context_aware` parts; halving remains the safety net."""
+
+    def __init__(self, size: int) -> None:
+        self.size, self.closed, self.buffer = size, 0, 0
+
+    def copy(self) -> "_Packing":
+        other = _Packing(self.size)
+        other.closed, other.buffer = self.closed, self.buffer
+        return other
+
+    def add(self, unit: Unit) -> None:
+        length = len(unit.text.strip())
+        if not length:
+            return
+        if getattr(unit.element, "category", None) == "Table":
+            if self.buffer:
+                self.closed += _pieces(self.buffer)
+                self.buffer = 0
+            self.closed += _pieces(length)
+        elif self.buffer and self.buffer + length + 1 > self.size:
+            self.closed += _pieces(self.buffer)
+            self.buffer = length
+        else:
+            self.buffer = self.buffer + 1 + length if self.buffer else length
+
+    def count(self) -> int:
+        return self.closed + (_pieces(self.buffer) if self.buffer else 0)
+
+
+# A file split into parts may store at most this many times its own size in
+# chunk text: a CSV header repeated in every part, overlap and JSON key paths all
+# multiply it (maintainer's decision on PR #630).
+MAX_STORED_RATIO = 10
+
+
+class StoredTextTooLarge(ValueError):
+    """A split file whose chunks would store more than MAX_STORED_RATIO times its
+    own size. The whole file fails; it is not a part's error."""
+
+    def __init__(self, stored: int, own: int) -> None:
+        super().__init__(
+            f"it would store {stored:,} characters of chunks, more than {MAX_STORED_RATIO} times "
+            f"its own size ({own:,} characters); use less chunk_overlap, shorten repeated "
+            f"headers or keys, or split the file")
+
+
+def _halves(source: _Source, units: list[Unit]) -> Iterator[list[str]]:
+    """The chunks of units known to go over as one part: at least two parts."""
+    if len(units) == 1:
+        unit = units[0]
+        if unit.kind == "record":
+            # A record is never split; chunking it says why it is too large.
+            yield from _chunk_units(source, units)
+            return
+        units = cut_unit(unit, (len(unit.text) + 1) // 2, source.dialect)
+        if len(units) < 2:
+            yield from _chunk_units(source, units)
+            return
+    middle = len(units) // 2
+    yield from _chunk_units(source, units[:middle])
+    yield from _chunk_units(source, units[middle:])
+
+
+def _parts(source: _Source, first: list[Unit], pending: Unit | None,
+           units: Iterator[Unit]) -> Iterator[tuple[str, list[str]]]:
+    """Every part of a split file, from the units already read (`first`, and the
+    one that did not fit, `pending`) and the rest of the reader.
+
+    Every part is filled from one stream of units by the room left beside a CSV
+    header and, for `context_aware`, a replay of its packing (PR #630). The file
+    is known to need splitting, so if the first part would take every unit, it is
+    halved instead: a split file has two or more parts. Before each part is handed
+    on to be stored, the chunk text stored so far is checked against ten times
+    the file's own size."""
+    limit = source.room  # a CSV's header takes its share of every part
+    packing = source.settings.strategy == "context_aware"
+    cap = chunker.MAX_CHUNKS_PER_FILE
+    stored = 0
+    number = 0
+    # A file that is a single record over a limit is not split at all: its own
+    # error is the file's, not a part's.
+    alone = False
+
+    def hand_on(produced: Iterable[list[str]]) -> Iterator[tuple[str, list[str]]]:
+        nonlocal stored, number
+        for chunks in produced:
+            # Checked before the part is handed on to be stored (#621, PR #630).
+            stored += sum(len(c) for c in chunks)
+            if stored > MAX_STORED_RATIO * source.own():
+                raise StoredTextTooLarge(stored, source.own())
+            number += 1
+            yield "part", chunks
+
+    try:
+        stream = itertools.chain(first, [pending] if pending is not None else [], units)
+        pending = None
+        while True:
+            if pending is not None:
+                current, pending = [pending], None
+            else:
+                unit = next(stream, None)
+                if unit is None:
+                    return
+                current = [unit]
+            sep = _separator(source.ftype, current[0].element is not None)
+            chars = len(current[0].text)
+            pack = _Packing(source.settings.chunk_size)
+            pack.add(current[0])
+            for unit in stream:
+                added = len(unit.text) + sep
+                trial = pack.copy()
+                trial.add(unit)
+                if (not _fits(chars + added, len(current) + 1, limit, None)
+                        or (packing and trial.count() > cap)):
+                    pending = unit
+                    break
+                current.append(unit)
+                chars += added
+                pack = trial
+            if number == 0 and pending is None:
+                # The whole file in one part: it went over whole, so it is halved.
+                alone = len(current) == 1 and current[0].kind == "record"
+                yield from hand_on(_halves(source, current))
+            else:
+                yield from hand_on(_chunk_units(source, current))
+    except Exception as exc:
+        if alone or isinstance(exc, StoredTextTooLarge):
+            raise
+        raise PartError(number + 1, exc) from exc
+```
+
 ### api/services/ingest_pipeline.py
 
 ```python
@@ -4032,13 +4963,13 @@ import zipfile
 import zlib
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Iterator
 
 from services import batch_write, collection_writes, jobstore
 from config import settings
 from models.schemas import IngestConfig
 from services.chunker import MAX_TEXT_CHARACTERS, chunk as do_chunk
-from services import sources
+from services import parts, sources, splitter
 from services import weaviate_client as wc
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".jsonl"}
@@ -4088,6 +5019,11 @@ class UploadRejected(Exception):
 
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
+
+
+def job_records() -> list[tuple[str, dict, float | None]]:
+    """Copies of every ingest record, for GET /ingest/jobs (#617)."""
+    return _jobs.snapshot()
 
 
 def _is_json_gz(name: str) -> bool:
@@ -4157,21 +5093,28 @@ class _JsonError(ValueError):
 
 
 class _JsonTooLarge(_JsonError):
-    """Valid JSON whose converted text would be over the per-file text limit."""
+    """A JSON record whose converted text would be over the per-record limit (#621).
+    `ordinal` names the record (`record N`) once it is known."""
 
-    def __init__(self) -> None:
-        detail = (f"converts to more than {MAX_JSON_TEXT_CHARACTERS:,} characters of text, "
-                  f"the per-file limit for every chunking strategy; split the file")
+    def __init__(self, ordinal: str = "a record") -> None:
+        detail = _record_too_large(ordinal)
         ValueError.__init__(self, detail)
         self.detail = detail
 
 
-# The most text one JSON file may convert to (#295 review). Each line repeats its
-# full key path, so a small file with a long key over many values could otherwise
-# expand to gigabytes. This is the chunker's own per-file limit: a file whose
-# records hold more text than this is refused by every chunking strategy anyway,
-# so the bound refuses nothing that could have been ingested; it only refuses
-# before the text is built.
+def _record_too_large(ordinal: str) -> str:
+    # A file over the per-file limits is split into parts at record boundaries
+    # (#621), so only one record can be too large: a record is never split.
+    return (f"{ordinal} converts to more than {MAX_JSON_TEXT_CHARACTERS:,} characters of text, "
+            f"the most one record can hold; a record is never split")
+
+
+# The most text one JSON or JSON Lines record may convert to (#295 review, #621).
+# Each line repeats its full key path, so a small record with a long key over
+# many values could otherwise expand to gigabytes; it is refused before that text
+# is built. It is the chunker's per-file text limit: a file over it is split into
+# parts at record boundaries (#621), and a record is never split, so a record
+# over it could not be ingested anyway.
 MAX_JSON_TEXT_CHARACTERS = MAX_TEXT_CHARACTERS
 # The most bytes of one JSON file that are parsed (#300). A .json file is parsed
 # whole, before the text bound can be checked, and parsing takes up to about 34
@@ -4262,7 +5205,7 @@ def _json_scalar(value: Any) -> str:
 
 
 class _JsonBudget:
-    """Characters of converted text left for this file."""
+    """Characters of converted text left for one record (#621)."""
 
     def __init__(self) -> None:
         self.left = MAX_JSON_TEXT_CHARACTERS
@@ -4314,44 +5257,52 @@ def _json_lines(value: Any, path: Any, out: list[str], budget: _JsonBudget) -> N
         _json_line(path, _json_scalar(value), out, budget)
 
 
-def _json_records(value: Any) -> list[str]:
+def _iter_json_records(value: Any) -> Iterator[tuple[str, str]]:
     """Ordinary JSON as readable text: one record per item of a top-level array
     that holds any object or array, otherwise one record. Records with no text
-    are dropped."""
+    are dropped. Yields (`record N`, text), N the item's position from 1; each
+    record's text is bounded on its own (#621)."""
     if isinstance(value, list) and not all(_is_json_scalar(item) for item in value):
         groups = value
     else:
         groups = [value]
-    records = []
-    budget = _JsonBudget()
-    try:
-        for group in groups:
-            lines: list[str] = []
-            left = budget.left
-            _json_lines(group, None, lines, budget)
-            text = "\n".join(lines)
-            if text.strip():
-                if records:
-                    budget.spend(2)  # the blank line before this record (#300)
-                if len(records) == MAX_JSON_RECORDS:
-                    raise _JsonTooManyRecords()
-                records.append(text)
-            else:
-                budget.left = left  # a dropped record's text is not stored
-    except RecursionError as exc:
-        raise _JsonError("it is nested too deeply to read") from exc
-    return records
+    kept = 0
+    for position, group in enumerate(groups, 1):
+        ordinal = f"record {position}"
+        lines: list[str] = []
+        try:
+            _json_lines(group, None, lines, _JsonBudget())
+        except _JsonTooLarge as exc:
+            raise _JsonTooLarge(ordinal) from exc
+        except RecursionError as exc:
+            raise _JsonError("it is nested too deeply to read") from exc
+        text = "\n".join(lines)
+        if text.strip():
+            if kept == MAX_JSON_RECORDS:
+                raise _JsonTooManyRecords()
+            kept += 1
+            yield ordinal, text
 
 
-def _parse_json(path: Path) -> tuple[str, list[Any]]:
-    """Ordinary JSON becomes `key: value` text, one element per record. A file of
-    serialized Unstructured elements is rehydrated by partition_json (#295)."""
+def _json_records(value: Any) -> list[str]:
+    """Every record of _iter_json_records, as a list."""
+    return [text for _, text in _iter_json_records(value)]
+
+
+def _json_units(path: Path) -> Iterator[tuple[str, str, Any]]:
+    """A JSON file's records in file order, as (ordinal, text, element) (#621).
+
+    Ordinary JSON gives `key: value` text, one record per item, element None. A
+    file of serialized Unstructured elements is rehydrated by partition_json
+    (#295), and each element is a record (`record N`) with its element. The file
+    is parsed whole, as before; ordinary records are converted one at a time.
+    """
     # Checked before anything is read: the parse is the cost (#300).
     if path.stat().st_size > MAX_JSON_INPUT_BYTES:
         raise ValueError(_json_input_too_large("is larger than"))
     raw, value = _read_json(path)
     if not raw:
-        return "", []
+        return
     from unstructured.partition.common.json_partitioning import is_element_shaped_dict
     if isinstance(value, list) and value and all(is_element_shaped_dict(i) for i in value):
         # Each item becomes one element, so the record cap applies to the items,
@@ -4363,24 +5314,46 @@ def _parse_json(path: Path) -> tuple[str, list[Any]]:
         # the two are not held together (#300).
         value = None
         # The text already read, so a byte-order mark is handled the same way.
-        elements = partition_json(text=raw)
+        for position, element in enumerate(partition_json(text=raw), 1):
+            yield f"record {position}", str(element), element
+        return
+    raw = None
+    for ordinal, text in _iter_json_records(value):
+        yield ordinal, text, None
+
+
+def _join_json_units(units: list[tuple[str, str, Any]]) -> tuple[str, list[Any]]:
+    """The text and elements of JSON records, as one file's parse gives them: an
+    element file's elements joined by a line break, ordinary records as Text
+    elements joined by a blank line, so the language splitter prefers to cut
+    between records."""
+    if units and units[0][2] is not None:
+        elements = [element for _, _, element in units]
         return "\n".join(str(el) for el in elements), elements
     from unstructured.documents.elements import Text
-    records = _json_records(value)
-    # A blank line between records, so the language splitter prefers to cut there.
-    return "\n\n".join(records), [Text(text=record) for record in records]
+    return "\n\n".join(text for _, text, _ in units), [Text(text=text) for _, text, _ in units]
 
 
-def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
+def _parse_json(path: Path) -> tuple[str, list[Any]]:
+    """Ordinary JSON becomes `key: value` text, one element per record. A file of
+    serialized Unstructured elements is rehydrated by partition_json (#295)."""
+    return _join_json_units(list(_json_units(path)))
+
+
+def _json_gz_units(path: Path) -> Iterator[tuple[str, str, Any]]:
+    """A .json.gz member's records, as _json_units gives them; it is decompressed
+    to a temporary file, removed when the records have been read."""
     fd, name = tempfile.mkstemp(dir=path.parent, suffix=".json")
     os.close(fd)
     plain = Path(name)
     try:
         _gunzip_bounded(path, plain)
         try:
-            return _parse_json(plain)
-        except (_JsonTooLarge, _JsonTooManyRecords) as exc:
+            yield from _json_units(plain)
+        except _JsonTooManyRecords as exc:
             raise ValueError(f"was decompressed, but it {exc.detail}") from exc
+        except _JsonTooLarge as exc:
+            raise ValueError(f"was decompressed, but {exc.detail}") from exc
         except _JsonError as exc:
             raise ValueError(
                 f"was decompressed, but its JSON could not be parsed: {exc.detail}") from exc
@@ -4392,6 +5365,10 @@ def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
         plain.unlink(missing_ok=True)
 
 
+def _parse_json_gz(path: Path) -> tuple[str, list[Any]]:
+    return _join_json_units(list(_json_gz_units(path)))
+
+
 class _JsonlError(ValueError):
     """A JSON Lines file that can't be ingested; `detail` names the line (#291)."""
 
@@ -4401,8 +5378,7 @@ class _JsonlError(ValueError):
 
 
 class _JsonlTooLarge(_JsonlError):
-    """A JSON Lines file whose text passes the per-file limit, or with more lines
-    than one file may hold (#314)."""
+    """A JSON Lines file with more lines than one file may hold (#314)."""
 
 
 class _BoundedLines:
@@ -4424,17 +5400,16 @@ _JSONL_BLANK = b" \t\r"
 _BOM = b"\xef\xbb\xbf"
 
 
-def _jsonl_records(stream: Any) -> list[str]:
-    """The records of a JSON Lines file, one per line with text (#291).
+def _iter_jsonl_records(stream: Any) -> Iterator[tuple[str, str]]:
+    """The records of a JSON Lines file, one per line with text (#291), as
+    (`line N`, text).
 
     Read one line at a time, at most MAX_JSONL_LINE_BYTES of it besides its line
     ending and line 1's byte-order mark, and stopped at the first bad line, at
-    the line past MAX_JSON_RECORDS, or when the file's text passes the per-file
-    limit, so memory is bounded by one line and that limit, never by the file's
-    size, and work by the line count.
+    the line past MAX_JSON_RECORDS, or at a record whose text passes the
+    per-record limit (#621), so memory is bounded by one line and one record,
+    never by the file's size, and work by the line count.
     """
-    budget = _JsonBudget()
-    records: list[str] = []
     number = 0
     blank = None  # the first blank line not yet followed by a record
     while True:
@@ -4475,20 +5450,10 @@ def _jsonl_records(stream: Any) -> list[str]:
             value = json.loads(line, parse_int=_JsonNumber, parse_float=_JsonNumber,
                                parse_constant=_reject_constant)
             lines: list[str] = []
-            left = budget.left
-            _json_lines(value, None, lines, budget)
+            _json_lines(value, None, lines, _JsonBudget())
             text = "\n".join(lines)
-            if text.strip():
-                if records:
-                    budget.spend(2)  # the blank line before this record
-                records.append(text)
-            else:
-                budget.left = left  # a record with no text is not stored
         except _JsonTooLarge as exc:
-            raise _JsonlTooLarge(
-                f"converts to more than {MAX_JSON_TEXT_CHARACTERS:,} characters of text by "
-                f"line {number}, the per-file limit for every chunking strategy; "
-                f"split the file") from exc
+            raise _JsonlError(_record_too_large(f"line {number}")) from exc
         except _JsonError as exc:
             raise _JsonlError(f"line {number} is not valid JSON: {exc.detail}") from exc
         except json.JSONDecodeError as exc:
@@ -4497,7 +5462,41 @@ def _jsonl_records(stream: Any) -> list[str]:
         except RecursionError as exc:
             raise _JsonlError(
                 f"line {number} is not valid JSON: it is nested too deeply to read") from exc
-    return records
+        # A record with no text is not stored.
+        if text.strip():
+            yield f"line {number}", text
+
+
+def _jsonl_records(stream: Any) -> list[str]:
+    """Every record of _iter_jsonl_records, as a list."""
+    return [text for _, text in _iter_jsonl_records(stream)]
+
+
+def _jsonl_units(path: Path) -> Iterator[tuple[str, str, None]]:
+    """A JSON Lines file's records in file order, as (ordinal, text, None), read
+    one line at a time, plain or gzipped (#621). Errors read as _parse_jsonl's."""
+    try:
+        if _is_jsonl_gz(path.name):
+            # Decompressed while read; nothing decompressed is written to disk.
+            with gzip.open(path, "rb") as gz:
+                for ordinal, text in _iter_jsonl_records(_BoundedLines(gz)):
+                    yield ordinal, text, None
+        else:
+            with path.open("rb") as fh:
+                for ordinal, text in _iter_jsonl_records(fh):
+                    yield ordinal, text, None
+    except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
+        raise ValueError(
+            f"is not a valid gzip file; it may be truncated or corrupt ({exc})") from exc
+    except _JsonlError as exc:
+        raise ValueError(_jsonl_reason(path, exc)) from exc
+
+
+def _jsonl_reason(path: Path, exc: _JsonlError) -> str:
+    if not _is_jsonl_gz(path.name):
+        return exc.detail
+    subject = "it " if isinstance(exc, _JsonlTooLarge) else ""
+    return f"was decompressed, but {subject}{exc.detail}"
 
 
 def _parse_jsonl(path: Path) -> tuple[str, list[Any]]:
@@ -4513,14 +5512,13 @@ def _parse_jsonl(path: Path) -> tuple[str, list[Any]]:
             raise ValueError(
                 f"is not a valid gzip file; it may be truncated or corrupt ({exc})") from exc
         except _JsonlError as exc:
-            subject = "it " if isinstance(exc, _JsonlTooLarge) else ""
-            raise ValueError(f"was decompressed, but {subject}{exc.detail}") from exc
+            raise ValueError(_jsonl_reason(path, exc)) from exc
     else:
         try:
             with path.open("rb") as fh:
                 records = _jsonl_records(fh)
         except _JsonlError as exc:
-            raise ValueError(exc.detail) from exc
+            raise ValueError(_jsonl_reason(path, exc)) from exc
     from unstructured.documents.elements import Text
     return "\n\n".join(records), [Text(text=record) for record in records]
 
@@ -4597,11 +5595,11 @@ def _count_writes(job: dict, submitted: int, accepted: int, stored: int = 0) -> 
 
 
 def _has_chunks(collection: str, name: str) -> bool:
-    """Whether the name already has chunks, which this file will replace (#22).
-    It is the job's first backend call for a file, so a deleted collection is
-    reported here the way _store_chunks reports it (#40)."""
+    """Whether the name or any of its parts already has chunks, which this file
+    will replace (#22, #621). It is the job's first backend call for a file, so a
+    deleted collection is reported here the way _store_chunks reports it (#40)."""
     try:
-        return wc._source_has_chunks_sync(collection, name)
+        return wc._family_has_chunks_sync(collection, name)
     except Exception as exc:
         if _collection_gone(collection):
             _log.warning("Collection %r disappeared before storing chunks: %s",
@@ -4636,7 +5634,7 @@ def _mark_replacement_stale(collection: str, name: str, rest: list[str]) -> None
     names the step that failed (#311); either way nothing has been marked.
     """
     try:
-        names = [name] + [other for other in rest if wc._source_has_chunks_sync(collection, other)]
+        names = [name] + [other for other in rest if wc._family_has_chunks_sync(collection, other)]
     except Exception as exc:
         raise _StaleLookupFailed(str(exc) or type(exc).__name__) from exc
     listed = ", ".join(names[:_MAX_NAMED_FILES])
@@ -4652,16 +5650,56 @@ def _mark_replacement_stale(collection: str, name: str, rest: list[str]) -> None
         raise _StaleMarkFailed(str(exc) or type(exc).__name__) from exc
 
 
+class _FileFailed(Exception):
+    """A file that failed, with the reason its error gives (#621)."""
+
+
+def _undo_new_chunks(job: dict, collection: str, name: str, created_at: datetime,
+                     exc: BaseException, kind: str, part_count: int, stored: int) -> _FileFailed:
+    """A file failed while its chunks were being stored: remove what this ingest
+    stored for it, so its earlier version stays whole (#621), and say why it failed.
+
+    A part that failed is named (`part N: ...`). `chunks_stored` is reduced by what
+    was removed.
+    """
+    cause = exc.cause if isinstance(exc, splitter.PartError) else exc
+    reason = str(cause) or type(cause).__name__
+    # Storing more than ten times its own size fails the whole file, not a part
+    # (PR #630): its parts are removed, and its error stands as it is.
+    whole = isinstance(exc, splitter.StoredTextTooLarge)
+    split = (isinstance(exc, splitter.PartError) or kind == "part") and not whole
+    if isinstance(exc, splitter.PartError):
+        reason = f"part {exc.number}: {reason}"
+    elif kind == "part" and not whole:
+        reason = f"part {part_count}: {reason}"
+    if not (stored or ((split or whole) and part_count)):
+        return _FileFailed(reason)
+    try:
+        removed = wc._delete_new_family_sync(collection, name, created_at)
+        problem = None
+    except Exception as undo:
+        _log.error("Could not remove the new chunks of %r in %r", name, collection,
+                   exc_info=True)
+        removed, problem = getattr(undo, "deleted", 0), str(undo) or type(undo).__name__
+    job["chunks_stored"] = max(job["chunks_stored"] - removed, 0)
+    if problem is not None:
+        left = max(stored - removed, 0)
+        return _FileFailed(f"{reason}; {left} new chunks could not be removed ({problem}); "
+                           f"upload it again to retry")
+    return _FileFailed(f"{reason}; nothing from it was stored" if split else reason)
+
+
 def _remove_earlier(collection: str, name: str, created_at: datetime,
                     expected: int) -> tuple[int, str | None]:
-    """Remove a name's earlier chunks once its new ones are stored.
+    """Remove the earlier chunks of a name and its parts once its new ones are
+    stored (#22, #621).
 
     Returns how many were removed and, when not all of them could be, why. A
     failure here never undoes the insert: duplicates are recoverable by uploading
     again, lost chunks are not.
     """
     try:
-        return wc._delete_earlier_chunks_sync(collection, name, created_at, expected), None
+        return wc._delete_earlier_family_sync(collection, name, created_at, expected), None
     except Exception as exc:
         _log.error("Could not remove the earlier chunks of %r in %r", name, collection,
                    exc_info=True)
@@ -4697,55 +5735,65 @@ def _process_job_sync(
             name = logical[index]
             label = (labels or {}).get(path, name)
             try:
-                text, elements = _parse_file(path)
                 source_type = source_type_of(path)
-
-                chunks = do_chunk(
-                    text=text,
-                    strategy=strategy,
-                    chunk_size=chunk_size,
-                    chunk_overlap_size=chunk_overlap,
-                    similarity_threshold=similarity_threshold,
-                    min_chunk_size=min_chunk_size,
-                    elements=elements if strategy == "context_aware" else None,
-                )
-
+                settings = splitter.Settings(strategy, chunk_size, chunk_overlap,
+                                             similarity_threshold, min_chunk_size)
+                # One timestamp for every part of the file: replacement and the
+                # removal of a failed file's parts tell its chunks apart by it.
                 created = datetime.now(timezone.utc)
                 now = created.isoformat()
-                weaviate_chunks = [
-                    {
-                        "content": c,
-                        "source_file": name,
-                        "source_type": source_type,
-                        "chunk_index": i,
-                        "chunk_strategy": strategy,
-                        "chunk_size": chunk_size,
-                        "chunk_overlap": chunk_overlap,
-                        "created_at": now,
-                    }
-                    for i, c in enumerate(chunks)
-                ]
-
-                # The last ingest of a name wins (#22). Everything before the
-                # insert only reads, so a failure up to there changes nothing.
-                replacing = _has_chunks(collection, name)
-                if replacing and not marked:
-                    _mark_replacement_stale(collection, name, logical[index + 1:])
-                    marked = True
-
-                # Insert first, then remove the earlier chunks, never the other
-                # way round: a failed insert leaves the earlier version whole.
+                stored, part_count, kind, replacing = 0, 0, "whole", False
                 try:
-                    _store_chunks(collection, weaviate_chunks)
-                except Exception as exc:
-                    _count_writes(job, *(batch_write.write_counts(exc) or (0, 0)))
+                    # A file over the per-file limits comes as parts (#621), each
+                    # chunked and stored before the next is read.
+                    for kind, chunks in splitter.split_file(path, settings, _parse_file, do_chunk):
+                        if part_count == 0:
+                            # The last ingest of a name wins (#22). Everything
+                            # before the first insert only reads, so a failure up
+                            # to there changes nothing.
+                            replacing = _has_chunks(collection, name)
+                            if replacing and not marked:
+                                _mark_replacement_stale(collection, name, logical[index + 1:])
+                                marked = True
+                        part_count += 1
+                        source = name if kind == "whole" else parts.part_name(name, part_count)
+                        weaviate_chunks = [
+                            {
+                                "content": c,
+                                "source_file": source,
+                                "source_type": source_type,
+                                "chunk_index": i,
+                                "chunk_strategy": strategy,
+                                "chunk_size": chunk_size,
+                                "chunk_overlap": chunk_overlap,
+                                "created_at": now,
+                            }
+                            for i, c in enumerate(chunks)
+                        ]
+                        # Insert first, then remove the earlier chunks, never the
+                        # other way round: a failed insert leaves the earlier
+                        # version whole.
+                        try:
+                            _store_chunks(collection, weaviate_chunks)
+                        except Exception as exc:
+                            _count_writes(job, *(batch_write.write_counts(exc) or (0, 0)))
+                            raise
+                        # Stored counts here too, with the other two: counted
+                        # later, a clean job would show its counts apart until
+                        # then (#324).
+                        _count_writes(job, len(chunks), len(chunks), len(chunks))
+                        stored += len(chunks)
+                        del weaviate_chunks, chunks
+                except (_CollectionDeleted, _StaleMarkFailed, _StaleLookupFailed):
                     raise
-                # Stored counts here too, with the other two: counted later, a clean
-                # job would show its counts apart until then (#324).
-                _count_writes(job, len(chunks), len(chunks), len(chunks))
+                except Exception as exc:
+                    # All or nothing per file (#621): what it stored is removed.
+                    raise _undo_new_chunks(job, collection, name, created, exc, kind,
+                                           part_count, stored) from exc
+
                 removed, problem = 0, None
                 if replacing:
-                    removed, problem = _remove_earlier(collection, name, created, len(chunks))
+                    removed, problem = _remove_earlier(collection, name, created, stored)
                     job["chunks_replaced"] = job.get("chunks_replaced", 0) + removed
 
                 # Retain the original only after the file has been parsed,
@@ -4771,6 +5819,10 @@ def _process_job_sync(
 
                 if problem is None:
                     job["files_completed"] += 1
+                    if kind == "part":
+                        job.setdefault("split", []).append(
+                            f"{label}: split into {part_count} parts, stored as "
+                            f"'{parts.part_name(name, 1)}' to '{parts.part_name(name, part_count)}'")
                 else:
                     job["files_failed"] += 1
                     job["errors"].append(
@@ -5232,7 +6284,9 @@ async def start_ingest_job(
     chunk_overlap: int,
     similarity_threshold: float,
     min_chunk_size: int,
+    owner: dict | None = None,
 ) -> str:
+    """`owner` is who started the job (#617), recorded for the job lists."""
     config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
                           chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
                           min_chunk_size=min_chunk_size)
@@ -5247,7 +6301,8 @@ async def start_ingest_job(
     collection_writes.register_job(collection, "ingest", job_id)
     try:
         return await _admit_ingest_job(job_id, files, collection, strategy, chunk_size,
-                                       chunk_overlap, similarity_threshold, min_chunk_size)
+                                       chunk_overlap, similarity_threshold, min_chunk_size,
+                                       owner)
     except BaseException:
         collection_writes.end_job("ingest", job_id)
         raise
@@ -5255,7 +6310,8 @@ async def start_ingest_job(
 
 async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, strategy: str,
                             chunk_size: int, chunk_overlap: int,
-                            similarity_threshold: float, min_chunk_size: int) -> str:
+                            similarity_threshold: float, min_chunk_size: int,
+                            owner: dict | None = None) -> str:
     # The prefix is how the startup sweep finds a killed job's staging (#377).
     tmp_dir = Path(tempfile.mkdtemp(prefix="ingest-", dir=settings.upload_dir))
     # Files the caller sent that this build cannot parse, and inputs replaced by
@@ -5329,8 +6385,15 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
             "chunks_accepted": 0,
             # Earlier chunks of the same names removed by this job (#22).
             "chunks_replaced": 0,
+            # Files over the per-file limits, stored as parts (#621).
+            "split": [],
             "errors": [],
             "skipped": skipped,
+            # For the job lists (#617): where, what and who, as the client sent
+            # the names. created_at and finished_at are the store's.
+            "collection": collection,
+            "files": [upload.filename or "" for upload in files],
+            "owner": owner,
         })
     except BaseException:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -5639,6 +6702,16 @@ _MARKER_MESSAGES = {
     True: "History marker could not be saved in the session file. A pending marker keeps the session historical after restart, and current export is refused. Check local storage; the next successful write of this session saves the marker.",
     False: "History marker could not be saved. The session is treated as historical and current export is refused only until restart. Check local storage, then edit this session to save the marker.",
 }
+
+# What a generated session records about this install only (#617): who started
+# it and when it started and finished. Packages leave these out, and an import
+# drops them, so an imported session is never listed as a generation here.
+LOCAL_FIELDS = ("owner", "created_at", "finished_at")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 _ROLLBACK_FAILED_MESSAGE = "A stale marker from an aborted collection replacement could not be removed, so the session stays historical. Check local storage."
 # Rollback bookkeeping for an aborted durable marking (#275): a field the
@@ -6067,6 +7140,15 @@ def sessions_for(collection: str) -> list[dict]:
         return copy.deepcopy(found)
 
 
+def generation_sessions() -> list[dict]:
+    """Copies of the sessions generated on this install, for
+    GET /goldstandard/sessions (#617); an imported session is never one."""
+    _scan_sessions()
+    with _state_lock:
+        return copy.deepcopy([session for session in _sessions.values()
+                              if isinstance(session, dict) and not session.get("imported_from")])
+
+
 def store_session(session: dict) -> None:
     """Write through the durable store so the cache cannot undo an import.
 
@@ -6125,6 +7207,9 @@ def _store_generated_session(session: dict) -> dict:
 def store_imported_session(session: dict, source_collection: str) -> dict:
     """Serialize source-ID collision handling with generation and other imports."""
     snapshot = copy.deepcopy(session)
+    # Who generated it and when belong to the source install (#617).
+    for key in LOCAL_FIELDS:
+        snapshot.pop(key, None)
     # Import preflight (check 4a) has already refused noncanonical source IDs.
     # Allocation keeps the source ID only when it is free; it stays provenance.
     SessionResponse.model_validate(snapshot, strict=True)
@@ -6432,6 +7517,8 @@ async def _generate_pair(chunk: dict) -> dict:
 
 def _failed_generation(current: dict, exc: Exception) -> None:
     current["status"] = "failed"
+    # Every caller ends a generation; a later failure report keeps the first time (#617).
+    current.setdefault("finished_at", _now_iso())
     if isinstance(exc, GoldStandardError):
         reason = f"{exc.code}: {exc.message}"
     elif isinstance(exc, _GenerationInterrupted):
@@ -6525,6 +7612,7 @@ async def _settle_generation(session_id: str, cancelled: bool,
         if current.get("status") == "generating":
             current["status"] = ("cancelled" if cancelled else
                 "failed" if not current["pairs"] and current.get("errors") else "completed")
+            current.setdefault("finished_at", _now_iso())       # #617
         if current.get("status") == "failed":
             telemetry.outcome("error")
     await asyncio.to_thread(_update_session_sync, session_id, finish)
@@ -6558,7 +7646,8 @@ def _settle_abandoned_start(prepare: asyncio.Future) -> None:
 _GENERATION_GUARD_TIMEOUT_SECONDS = 1.0
 
 
-def _prepare_generation_sync(collection: str, sample_size: int, seed: int | None):
+def _prepare_generation_sync(collection: str, sample_size: int, seed: int | None,
+                             owner: dict | None = None):
     """Publish the sampled corpus identity before a writer can invalidate it."""
     from services.collection_writes import (CollectionBusyError, delete_in_progress,
                                             deleting_message, guard)
@@ -6584,6 +7673,9 @@ def _prepare_generation_sync(collection: str, sample_size: int, seed: int | None
                 "pairs_completed": 0,
                 "pairs_failed": 0,
                 "pairs": [],
+                # For the generation list (#617); finished_at when it settles.
+                "owner": owner,
+                "created_at": _now_iso(),
             }
             session = _store_generated_session(session)
             # Still inside the guard, so no delete can pass between publication
@@ -6602,14 +7694,16 @@ async def start_generation(
     collection: str,
     sample_size: int,
     seed: int | None,
+    owner: dict | None = None,
 ) -> dict:
+    """`owner` is who started it (#617), recorded for the generation list."""
     from models.schemas import GenerateRequest
     request = GenerateRequest(collection=collection, sample_size=sample_size, seed=seed)
     # Shielded: cancelling a plain to_thread await loses the thread's result, and
     # with it the registration it made, which then refused DELETE until a
     # restart (#302). A cancelled caller hands the result to a settle step.
     prepare = asyncio.ensure_future(asyncio.to_thread(
-        _prepare_generation_sync, collection, request.sample_size, request.seed))
+        _prepare_generation_sync, collection, request.sample_size, request.seed, owner))
     try:
         session, all_chunks = await asyncio.shield(prepare)
     except asyncio.CancelledError:
@@ -6866,6 +7960,7 @@ from services import age_stream
 from services import goldstandard
 from services import ingest_config
 from services import model_bundle
+from services import parts
 from services import retrieval_config
 from services import sources
 from services import weaviate_client as wc
@@ -7011,7 +8106,10 @@ def read_chunks(collection: str, documents: dict | None = None) -> Iterator[dict
         props = dict(obj.properties or {})
         # source_sha256 is a sibling field, not a stored property: spec §4.5
         # keeps the eight chunk properties unchanged. Resolve it from retention.
-        digests = by_filename.get(props.get("source_file"), [])
+        # A part `<name> (part N)` links to its original `<name>` (#621).
+        source_file = props.get("source_file")
+        listed = parts.resolve(source_file, by_filename) if isinstance(source_file, str) else None
+        digests = by_filename.get(listed, []) if listed is not None else []
         yield {
             "id": str(obj.uuid),
             "vector": vector,
@@ -7150,7 +8248,9 @@ def _goldstandard_sessions(collection: str) -> list[dict]:
     # Preserve export's detached on-disk snapshots. The cache contains live
     # generation/edit objects, which must not change during JSON serialization.
     # Disk reads still share schema, identity and regular-file validation.
-    return [session for session in goldstandard._sessions_on_disk()
+    # Who generated a session and when stay on this install (#617).
+    return [{key: value for key, value in session.items() if key not in goldstandard.LOCAL_FIELDS}
+            for session in goldstandard._sessions_on_disk()
             if session["collection"] == collection]
 
 
@@ -8321,6 +9421,12 @@ reaches a terminal status, or is marked interrupted at startup. What the end
 record needs is kept in the job record as `_audit` (the status answers ignore
 it), with `ended` set once that record is written.
 
+**Timestamps (#617).** A bound store stamps `created_at` on a new record and
+`finished_at` when a record first reaches a terminal status, or is marked
+interrupted at startup; neither is changed afterwards. `snapshot()` hands the
+job lists copies of the records and the time each was last saved, which stands
+in for `finished_at` on a record from before #617.
+
 A job record is never recovery authority: retained import and tuning data is
 owned by `collection_recovery` and the import markers (#43, #44), never by
 anything in `jobs/`.
@@ -8336,6 +9442,7 @@ import tempfile
 import threading
 import time
 from collections.abc import MutableMapping
+from datetime import datetime, timezone
 from pathlib import Path
 
 from config import settings
@@ -8365,6 +9472,17 @@ _REMEDY = {
     "import": "Start the import again.",
     "tune": "Start the operation again.",
 }
+
+
+def now_iso() -> str:
+    """The current time as the API writes timestamps: ISO 8601 in UTC."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _stamp_finished(record: dict) -> None:
+    """Set `finished_at` once, with plain dict methods (no write of its own)."""
+    if dict.get(record, "status") in TERMINAL and "finished_at" not in record:
+        dict.__setitem__(record, "finished_at", now_iso())
 
 
 class _Job(dict):
@@ -8439,6 +9557,10 @@ class JobStore(MutableMapping):
             old = self._records.get(job_id)
             if isinstance(old, _Job):
                 self._cancel(old)
+                # A replaced record keeps its timestamps (#617).
+                for key in ("created_at", "finished_at"):
+                    if key in old and key not in record:
+                        dict.__setitem__(record, key, dict.__getitem__(old, key))
             if old is None:
                 # Inside an audited request this writes the job's `accepted`
                 # record (#29), before the job can end, and returns what its
@@ -8446,6 +9568,9 @@ class JobStore(MutableMapping):
                 snapshot = audit.job_started(job_id)
                 if snapshot is not None:
                     dict.__setitem__(record, "_audit", snapshot)
+                if "created_at" not in record:
+                    dict.__setitem__(record, "created_at", now_iso())
+            _stamp_finished(record)
             self._records[job_id] = record
             self._write(record, durable=True)
             if old is None:
@@ -8492,6 +9617,19 @@ class JobStore(MutableMapping):
         except Exception:                       # noqa: BLE001 - logged, never raised
             _log.exception("Could not remove abandoned %s job %s", self.kind, job_id)
 
+    def snapshot(self) -> list[tuple[str, dict, float | None]]:
+        """Copies of every record for the job lists (#617): `(job_id, record,
+        saved)`, where `saved` is when the record was last saved (its file's
+        modification time for one loaded at startup), or None for a record of
+        an unbound store. The audit snapshot is left out."""
+        with self._lock:
+            rows = []
+            for job_id, record in self._records.items():
+                copy = {key: value for key, value in dict.items(record) if key != "_audit"}
+                saved = record._saved if isinstance(record, _Job) and record._saved else None
+                rows.append((job_id, json.loads(json.dumps(copy, default=str)), saved))
+            return rows
+
     # ── persistence ─────────────────────────────────────────────────────────
 
     def _bind(self, job_id: str, doc) -> _Job:
@@ -8533,6 +9671,8 @@ class JobStore(MutableMapping):
         with self._lock:
             if status_changed or record.get("status") in TERMINAL:
                 self._cancel(record)
+                if status_changed:
+                    _stamp_finished(record)     # saved by the write below (#617)
                 ended = status_changed and record.get("status") in TERMINAL and _audit_open(record)
                 if ended:
                     record["_audit"]["ended"] = True    # saved by the write below
@@ -8655,6 +9795,8 @@ class JobStore(MutableMapping):
     def _mark_interrupted(self, record: _Job) -> None:
         # Plain dict methods only: one durable write afterwards, so no record
         # reaches the disk terminal but without its message.
+        if "finished_at" not in record:
+            dict.__setitem__(record, "finished_at", now_iso())      # #617
         if self.kind == "ingest":
             completed = dict.get(record, "files_completed")
             dict.__setitem__(record, "status", "partial"
@@ -8708,6 +9850,146 @@ def _sync_dir(path: Path) -> None:
         os.close(fd)
 ```
 
+### api/services/job_lists.py
+
+The running and recent job lists (#617, `SPECIFICATIONS.md` §3.1.10): who sees which job, the 24-hour window and the cap of 20 finished jobs, the order, and the entries the four list routes answer. The routes read `JobStore.snapshot()` (ingest, export, import) and `goldstandard.generation_sessions()`.
+
+```python
+"""The running and recent jobs a caller may list (#617).
+
+`GET /ingest/jobs`, `/export/jobs`, `/import/jobs` and `/goldstandard/sessions`
+let a page find its jobs again after the user left it. What they list:
+
+- **Whose.** An Engineer sees every job, including those recorded before
+  #617 with no owner ("owner unknown"). Anyone else sees only jobs whose
+  `owner` names them: the same name and kind, so a user's own jobs, or an API
+  key's principal's. The lookups by ID are not scoped; only these lists are.
+- **Which.** Every running job, and the finished ones whose finish time lies in
+  the last 24 hours, at most the newest 20 of those per list and caller.
+- **Finish time.** A record's `finished_at`; for a job record from before #617,
+  the time its record was last saved. A finished session without
+  `finished_at` is not listed.
+- **Order.** Newest first by `created_at`, else by finish time; neither, last.
+"""
+from __future__ import annotations
+
+import logging
+import time
+from datetime import datetime, timezone
+
+from pydantic import ValidationError
+
+from services import jobstore
+
+_log = logging.getLogger(__name__)
+
+WINDOW_S = 24 * 3600
+FINISHED_CAP = 20
+
+
+def job_owner(request) -> dict | None:
+    """Who is making this request, as a job records it: name and kind. None
+    for no request (a handler called directly, as some tests do)."""
+    principal = getattr(getattr(request, "state", None), "auth", None)
+    if principal is None:
+        return None
+    return {"name": principal.username,
+            "kind": "service" if principal.kind == "service" else "user"}
+
+
+def visible(owner, principal) -> bool:
+    if principal.role == "engineer":
+        return True
+    if not isinstance(owner, dict):
+        return False
+    kind = "service" if principal.kind == "service" else "user"
+    return owner.get("name") == principal.username and owner.get("kind") == kind
+
+
+def _parse(value) -> float | None:
+    """Epoch seconds for an ISO 8601 timestamp, or None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.timestamp()
+
+
+def _iso(seconds: float) -> str:
+    return datetime.fromtimestamp(seconds, timezone.utc).isoformat()
+
+
+def select(items, principal, now: float) -> list[dict]:
+    """The records to list, in order, each with `finished_at` as listed.
+
+    `items` are `(record, running, finish)`, where `finish` is the finish time
+    in epoch seconds of a finished record, or None when it has none.
+    """
+    running, finished = [], []
+    for record, is_running, finish in items:
+        if not visible(record.get("owner"), principal):
+            continue
+        if is_running:
+            running.append((record, None))
+        elif finish is not None and now - WINDOW_S <= finish <= now:
+            finished.append((record, finish))
+    finished.sort(key=lambda pair: pair[1], reverse=True)
+    kept = running + finished[:FINISHED_CAP]
+
+    def order(pair):
+        record, finish = pair
+        started = _parse(record.get("created_at"))
+        moment = started if started is not None else finish
+        return (moment is not None, moment or 0.0)
+
+    kept.sort(key=order, reverse=True)
+    out = []
+    for record, finish in kept:
+        entry = dict(record)
+        entry["finished_at"] = _iso(finish) if finish is not None else None
+        out.append(entry)
+    return out
+
+
+def job_items(rows) -> list[tuple[dict, bool, float | None]]:
+    """`JobStore.snapshot()` rows as `select` items."""
+    items = []
+    for _, record, saved in rows:
+        is_running = record.get("status") not in jobstore.TERMINAL
+        finish = None if is_running else _parse(record.get("finished_at"))
+        if not is_running and finish is None:
+            finish = saved                      # a record from before #617
+        items.append((record, is_running, finish))
+    return items
+
+
+def session_items(sessions) -> list[tuple[dict, bool, float | None]]:
+    """Generated sessions as `select` items."""
+    items = []
+    for session in sessions:
+        is_running = session.get("status") == "generating"
+        finish = None if is_running else _parse(session.get("finished_at"))
+        items.append((session, is_running, finish))
+    return items
+
+
+def entries(model, items, principal, id_key: str = "job_id") -> list:
+    """The listed records as `model` entries. A record the model can't
+    represent is left out and logged, so one bad record never fails the list."""
+    out = []
+    for record in select(items, principal, time.time()):
+        try:
+            out.append(model.model_validate(record))
+        except ValidationError as exc:
+            _log.warning("Left %r out of the job list: %d invalid field(s)",
+                         record.get(id_key), exc.error_count())
+    return out
+```
+
 ### api/services/exporter.py
 
 ```python
@@ -8751,6 +10033,11 @@ class ExportStartingError(Exception):
 
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
+
+
+def job_records() -> list[tuple[str, dict, float | None]]:
+    """Copies of every export record, for GET /export/jobs (#617)."""
+    return _jobs.snapshot()
 
 
 def active_job_for(collection: str) -> str | None:
@@ -8822,7 +10109,7 @@ def _run(job_id: str, collection: str, include_models: bool,
 
 
 async def start_export_job(collection: str, include_models: bool = False,
-                           passphrase: str | None = None) -> str:
+                           passphrase: str | None = None, owner: dict | None = None) -> str:
     """Register the job and run the build off the event loop.
 
     A passphrase makes the package encrypted (#27). It is handed to the worker
@@ -8885,6 +10172,7 @@ async def start_export_job(collection: str, include_models: bool = False,
                 "error": None,
                 "error_code": None,
                 "error_detail": None,
+                "owner": owner,                 # who started it, for the job lists (#617)
             })
         except BaseException:
             collection_writes.end_job("export", job_id)
@@ -8991,6 +10279,11 @@ class PassphraseError(Exception):
 
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
+
+
+def job_records() -> list[tuple[str, dict, float | None]]:
+    """Copies of every import record, for GET /import/jobs (#617)."""
+    return _jobs.snapshot()
 
 
 # ── Surviving a hard kill ─────────────────────────────────────────────────────
@@ -9870,7 +11163,8 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
         _release_targets(job_id)
 
 
-async def start_import_job(filename: str, on_conflict: str, passphrase: str | None = None) -> str:
+async def start_import_job(filename: str, on_conflict: str, passphrase: str | None = None,
+                           owner: dict | None = None) -> str:
     """Register the job and run the import off the event loop.
 
     An encrypted package is known by its name (`.tar.gz.age`, #27), so a missing
@@ -9911,6 +11205,7 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
             "error_code": None,
             "error_detail": None,
             "encrypted": encrypted,
+            "owner": owner,                     # who started it, for the job lists (#617)
         })
     except BaseException:
         with _lock:
@@ -10278,7 +11573,7 @@ from pathlib import Path, PurePosixPath
 from services import collection_writes, jobstore
 from config import settings
 from services import goldstandard
-from services import sources
+from services import parts, sources, splitter
 from services import weaviate_client as wc
 from services import batch_write, collection_recovery
 from services.chunker import chunk as do_chunk
@@ -10361,7 +11656,9 @@ _MISSING_CHUNK_INDEX = object()
 def _source_coverage(collection: str, documents: dict) -> tuple[list[str], set[str]]:
     """The stored source files a rebuild from the retained originals would not
     reproduce, and every name that has stored chunks, from one walk of the
-    collection. A rebuild emits only the stored names (#311)."""
+    collection. A rebuild emits only the stored names (#311). A part
+    `<name> (part N)` that no digest lists is covered by its original `<name>`,
+    which then counts as stored (#621)."""
     by_filename: dict[str, list[str]] = {}
     for digest, entry in documents.items():
         for filename in entry["filenames"]:
@@ -10375,10 +11672,11 @@ def _source_coverage(collection: str, documents: dict) -> tuple[list[str], set[s
         if not isinstance(filename, str) or not filename:
             uncovered.add("<unknown>")
             continue
-        stored.add(filename)
+        listed = parts.resolve(filename, by_filename) or filename
+        stored.add(listed)
         # A rebuild emits one chunk set per (digest, name) (#22), so a name is
         # covered when exactly one digest lists it, whichever of its names it is.
-        if len(by_filename.get(filename, [])) != 1:
+        if len(by_filename.get(listed, [])) != 1:
             uncovered.add(filename)
             continue
         index = props.get("chunk_index")
@@ -10433,7 +11731,9 @@ def _has_stored_listed_name(collection: str, documents: dict) -> bool:
     """Whether any name the index lists has stored chunks; stops at the first."""
     names = _listed_names(documents)
     for obj in wc.get_client().collections.get(collection).iterator():
-        if (obj.properties or {}).get("source_file") in names:
+        filename = (obj.properties or {}).get("source_file")
+        # A part counts for its original (#621).
+        if isinstance(filename, str) and parts.resolve(filename, names) is not None:
             return True
     return False
 
@@ -10562,27 +11862,33 @@ def _chunks_from_sources(collection: str, strategy: str, chunk_size: int,
                 staged = slot / PurePosixPath(filename).name
                 shutil.copyfile(blob, staged)
 
-                text, elements = _parse_file(staged)
-                chunks = do_chunk(
-                    text=text,
-                    strategy=strategy,
-                    chunk_size=chunk_size,
-                    chunk_overlap_size=chunk_overlap,
-                    similarity_threshold=similarity_threshold,
-                    min_chunk_size=min_chunk_size,
-                    elements=elements if strategy == "context_aware" else None,
-                )
                 source_type = source_type_of(staged)
-                out.extend({
-                    "content": c,
-                    "source_file": filename,
-                    "source_type": source_type,
-                    "chunk_index": i,
-                    "chunk_strategy": strategy,
-                    "chunk_size": chunk_size,
-                    "chunk_overlap": chunk_overlap,
-                    "created_at": now,
-                } for i, c in enumerate(chunks))
+                # Split as ingest splits it (#621): a file over the per-file
+                # limits under the new settings is rebuilt as parts, however
+                # many parts it had before.
+                number = 0
+                split_settings = splitter.Settings(strategy, chunk_size, chunk_overlap,
+                                                   similarity_threshold, min_chunk_size)
+                try:
+                    for kind, chunks in splitter.split_file(staged, split_settings, _parse_file, do_chunk):
+                        number += 1
+                        source = filename if kind == "whole" else parts.part_name(filename, number)
+                        out.extend({
+                            "content": c,
+                            "source_file": source,
+                            "source_type": source_type,
+                            "chunk_index": i,
+                            "chunk_strategy": strategy,
+                            "chunk_size": chunk_size,
+                            "chunk_overlap": chunk_overlap,
+                            "created_at": now,
+                        } for i, c in enumerate(chunks))
+                except splitter.PartError as exc:
+                    raise ValueError(f"{filename}: part {exc.number}: {exc}") from exc.cause
+                except splitter.StoredTextTooLarge as exc:
+                    # The same cap as ingest (PR #630): the re-chunk fails whole,
+                    # before the collection is touched.
+                    raise ValueError(f"{filename}: {exc}") from exc
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -11278,13 +12584,14 @@ import json
 import logging
 import re
 from pathlib import Path
-from fastapi import APIRouter, Form, UploadFile, File
+from fastapi import APIRouter, Form, Request, UploadFile, File
 from pydantic import ValidationError
 
 from config import settings
 from models.schemas import (CollectionName, IngestConfig, IngestConfigResponse,
-                            IngestUploadResponse, JobStatusResponse)
-from services import audit, ingest_config
+                            IngestJobEntry, IngestJobList, IngestUploadResponse,
+                            JobStatusResponse)
+from services import audit, ingest_config, job_lists
 from services import ingest_pipeline
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError, canonical
@@ -11308,6 +12615,8 @@ async def ingest_upload(
     similarity_threshold: str = Form("0.85"),
     min_chunk_size: str = Form("100"),
     files: list[UploadFile] = File(...),
+    # Injected by FastAPI; None only when a test calls the handler directly.
+    request: Request = None,
 ):
     # A form field's default is not validated through CollectionName, so the
     # stored-name rule is applied here (#372).
@@ -11318,7 +12627,8 @@ async def ingest_upload(
                total_bytes=sum(f.size or 0 for f in files))
     try:
         return await _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
-                                    similarity_threshold, min_chunk_size, files)
+                                    similarity_threshold, min_chunk_size, files,
+                                    job_lists.job_owner(request))
     except Exception:
         # Anything not handled below used to reach the client as a plain-text
         # 500, which the Import page could only show as "HTTP 500" (#290).
@@ -11331,7 +12641,7 @@ async def ingest_upload(
 
 
 async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
-                         similarity_threshold, min_chunk_size, files):
+                         similarity_threshold, min_chunk_size, files, owner=None):
     try:
         config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
                               chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
@@ -11357,6 +12667,7 @@ async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
             chunk_overlap=config.chunk_overlap,
             similarity_threshold=config.similarity_threshold,
             min_chunk_size=config.min_chunk_size,
+            owner=owner,
         )
     except CollectionDeletingError:
         return collection_deleting_error(collection)
@@ -11371,6 +12682,16 @@ async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
         files_queued=len(files),
         collection=collection,
     )
+
+
+@router.get("/jobs", response_model=IngestJobList)
+async def list_jobs(request: Request):
+    """The caller's running and recent ingest jobs (#617; see services/job_lists)."""
+    principal = request.state.auth
+    def build():
+        items = job_lists.job_items(ingest_pipeline.job_records())
+        return job_lists.entries(IngestJobEntry, items, principal)
+    return IngestJobList(jobs=await asyncio.to_thread(build))
 
 
 @router.get("/job/{job_id}", response_model=JobStatusResponse)
@@ -11521,10 +12842,14 @@ import asyncio
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from models.schemas import (
+    ExportJobEntry,
+    ExportJobList,
     ExportJobStatusResponse,
+    ImportJobEntry,
+    ImportJobList,
     ExportRequest,
     ExportStartResponse,
     ImportJobStatusResponse,
@@ -11533,7 +12858,7 @@ from models.schemas import (
     PackageListResponse,
     PackageSummary,
 )
-from services import age_stream, audit, exporter, importer, packager
+from services import age_stream, audit, exporter, importer, job_lists, packager
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError
 from utils import api_error, collection_check_unavailable, collection_deleting_error
@@ -11543,7 +12868,7 @@ _log = logging.getLogger(__name__)
 
 
 @router.post("/export", response_model=ExportStartResponse, status_code=202)
-async def start_export(body: ExportRequest):
+async def start_export(body: ExportRequest, request: Request = None):
     # The audit record's parameters (#29): whether it is encrypted, never the passphrase.
     audit.note(collection=body.collection, include_models=body.include_models, encrypted=body.passphrase is not None)
     try:
@@ -11560,7 +12885,8 @@ async def start_export(body: ExportRequest):
     try:
         job_id = await exporter.start_export_job(
             body.collection, body.include_models,
-            body.passphrase.get_secret_value() if body.passphrase is not None else None)
+            body.passphrase.get_secret_value() if body.passphrase is not None else None,
+            owner=job_lists.job_owner(request))
     except CollectionDeletingError:
         return collection_deleting_error(body.collection)
     except exporter.ExportStartingError:
@@ -11577,6 +12903,15 @@ async def start_export(body: ExportRequest):
     return ExportStartResponse(job_id=job_id, status="queued", collection=body.collection)
 
 
+@router.get("/export/jobs", response_model=ExportJobList)
+async def list_export_jobs(request: Request):
+    """The caller's running and recent exports (#617; see services/job_lists)."""
+    principal = request.state.auth
+    def build():
+        return job_lists.entries(ExportJobEntry, job_lists.job_items(exporter.job_records()), principal)
+    return ExportJobList(jobs=await asyncio.to_thread(build))
+
+
 @router.get("/export/job/{job_id}", response_model=ExportJobStatusResponse)
 async def export_job_status(job_id: str):
     job = exporter.get_job(job_id)
@@ -11586,7 +12921,7 @@ async def export_job_status(job_id: str):
 
 
 @router.post("/import", response_model=ImportStartResponse, status_code=202)
-async def start_import(body: ImportRequest):
+async def start_import(body: ImportRequest, request: Request = None):
     # The audit record's parameters (#29); the collection is added when the job ends.
     audit.note(package=body.filename, on_conflict=body.on_conflict, encrypted=body.passphrase is not None)
     # Everything else — unreadable archive, bad digest, embedding mismatch,
@@ -11594,7 +12929,8 @@ async def start_import(body: ImportRequest):
     # after reading the package, which takes long enough to need a job.
     passphrase = body.passphrase.get_secret_value() if body.passphrase is not None else None
     try:
-        job_id = await importer.start_import_job(body.filename, body.on_conflict, passphrase)
+        job_id = await importer.start_import_job(body.filename, body.on_conflict, passphrase,
+                                                 owner=job_lists.job_owner(request))
     except importer.PassphraseError as exc:
         # Decided by the filename before any job exists (#27).
         return api_error(400, exc.code, str(exc), detail={"filename": body.filename})
@@ -11603,6 +12939,15 @@ async def start_import(body: ImportRequest):
                          f"An import of '{exc}' is already running.",
                          detail={"filename": str(exc)})
     return ImportStartResponse(job_id=job_id, status="queued", filename=body.filename)
+
+
+@router.get("/import/jobs", response_model=ImportJobList)
+async def list_import_jobs(request: Request):
+    """The caller's running and recent imports (#617; see services/job_lists)."""
+    principal = request.state.auth
+    def build():
+        return job_lists.entries(ImportJobEntry, job_lists.job_items(importer.job_records()), principal)
+    return ImportJobList(jobs=await asyncio.to_thread(build))
 
 
 @router.get("/import/job/{job_id}", response_model=ImportJobStatusResponse)
@@ -11823,12 +13168,14 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse
 
 from models.schemas import (
     GenerateRequest,
     GenerateResponse,
+    GenerationEntry,
+    GenerationList,
     GoldPair,
     PatchPairRequest,
     RegenerateRequest,
@@ -11837,7 +13184,7 @@ from models.schemas import (
     SessionResponse,
     SessionValidity,
 )
-from services import audit
+from services import audit, job_lists
 from services import goldstandard as gs
 from services import weaviate_client as wc
 from utils import api_error, collection_check_unavailable
@@ -11847,7 +13194,7 @@ _log = logging.getLogger(__name__)
 
 
 @router.post("/generate", response_model=GenerateResponse, status_code=202)
-async def generate(body: GenerateRequest):
+async def generate(body: GenerateRequest, request: Request = None):
     try:
         exists = await wc.collection_exists(body.collection)
     except Exception:                                 # noqa: BLE001
@@ -11863,10 +13210,21 @@ async def generate(body: GenerateRequest):
             collection=body.collection,
             sample_size=body.sample_size,
             seed=body.seed,
+            owner=job_lists.job_owner(request),
         )
     except gs.GoldStandardError as exc:
         return api_error(exc.status, exc.code, exc.message, detail=exc.detail)
     return GenerateResponse(**result)
+
+
+@router.get("/sessions", response_model=GenerationList)
+async def list_generations(request: Request):
+    """The caller's running and recent generations (#617; see services/job_lists)."""
+    principal = request.state.auth
+    def build():
+        items = job_lists.session_items(gs.generation_sessions())
+        return job_lists.entries(GenerationEntry, items, principal, id_key="session_id")
+    return GenerationList(sessions=await asyncio.to_thread(build))
 
 
 @router.get("/session/{session_id}", response_model=SessionResponse)
@@ -12998,19 +14356,23 @@ ACCESS: dict[tuple[str, str], str] = {
     ("POST", "/collections"): DEVELOPER,
     ("POST", "/ingest/upload"): DEVELOPER,
     ("GET", "/ingest/job/{job_id}"): DEVELOPER,
+    ("GET", "/ingest/jobs"): DEVELOPER,                 # the caller's jobs only (#617)
     ("GET", "/ingest/config/{collection}"): DEVELOPER,
     ("POST", "/ingest/config"): DEVELOPER,
     ("POST", "/retrieval/config"): DEVELOPER,
     ("POST", "/goldstandard/generate"): DEVELOPER,
     ("GET", "/goldstandard/session/{session_id}"): DEVELOPER,
+    ("GET", "/goldstandard/sessions"): DEVELOPER,       # the caller's generations only (#617)
     ("PATCH", "/goldstandard/session/{session_id}/pair/{pair_id}"): DEVELOPER,
     ("POST", "/goldstandard/regenerate"): DEVELOPER,
     ("POST", "/goldstandard/save"): DEVELOPER,
     ("GET", "/goldstandard/download/{filename}"): DEVELOPER,
     ("POST", "/export"): DEVELOPER,
     ("GET", "/export/job/{job_id}"): DEVELOPER,
+    ("GET", "/export/jobs"): DEVELOPER,                 # the caller's jobs only (#617)
     ("POST", "/import"): DEVELOPER,
     ("GET", "/import/job/{job_id}"): DEVELOPER,
+    ("GET", "/import/jobs"): DEVELOPER,                 # the caller's jobs only (#617)
     ("GET", "/packages"): DEVELOPER,
     ("GET", "/help/transfer"): DEVELOPER,
     ("GET", "/tune/{collection}"): DEVELOPER,          # read by the Transfer page (Q3)
@@ -16052,6 +17414,8 @@ export const api = {
   // Ingest — form field is "strategy"; job status URL is /ingest/job/{id}; config POST is /ingest/config
   uploadFiles: (form: FormData) => request<{ job_id: string; status: string; files_queued: number; collection: string }>('POST', '/ingest/upload', form, true),
   getJobStatus: (jobId: string) => request<JobStatus>('GET', `/ingest/job/${jobId}`),
+  // The caller's running and recent jobs (#617); an Engineer gets everyone's.
+  listIngestJobs: () => request<{ jobs: IngestJobEntry[] }>('GET', '/ingest/jobs'),
   getIngestConfig: (collection: string) => request<IngestConfig>('GET', `/ingest/config/${collection}`),
   saveIngestConfig: (body: SaveIngestConfigBody) => request<IngestConfig>('POST', '/ingest/config', body),
 
@@ -16063,6 +17427,7 @@ export const api = {
 
   generateGoldStandard: (body: GenerateBody) => request<GenerateResult>('POST', '/goldstandard/generate', body),
   getSession: (sessionId: string) => request<Session>('GET', `/goldstandard/session/${encodeURIComponent(sessionId)}`),
+  listGenerations: () => request<{ sessions: GenerationEntry[] }>('GET', '/goldstandard/sessions'),
   patchPair: (sessionId: string, pairId: string, body: PatchPairBody) => request<GoldPair>('PATCH', `/goldstandard/session/${encodeURIComponent(sessionId)}/pair/${encodeURIComponent(pairId)}`, body),
   regeneratePair: (body: { session_id: string; pair_id: string }) => request<GoldPair>('POST', '/goldstandard/regenerate', body),
   saveSession: (body: { session_id: string; filename?: string; allow_historical?: boolean }) => request<SaveResult>('POST', '/goldstandard/save', body),
@@ -16073,6 +17438,8 @@ export const api = {
   getExportJob: (jobId: string) => request<ExportJob>('GET', `/export/job/${jobId}`),
   startImport: (body: ImportBody) => request<ImportStart>('POST', '/import', body),
   getImportJob: (jobId: string) => request<ImportJob>('GET', `/import/job/${jobId}`),
+  listExportJobs: () => request<{ jobs: ExportJobEntry[] }>('GET', '/export/jobs'),
+  listImportJobs: () => request<{ jobs: ImportJobEntry[] }>('GET', '/import/jobs'),
   getPackages: () => request<{ packages: PackageSummary[] }>('GET', '/packages'),
   getTuneOptions: (collection: string) => request<TuneOptions>('GET', `/tune/${collection}`),
   getTransferHelp: () => request<{ topic: string; markdown: string }>('GET', '/help/transfer'),
@@ -16103,6 +17470,8 @@ export interface JobStatus {
   // Files that could not be parsed at all, or that a later file with the same
   // name replaced in the upload (#22) — never counted in files_total.
   skipped?: string[]
+  // Files over the per-file limits, stored as parts (#621)
+  split?: string[]
   // Earlier chunks of the same names this job removed (#22).
   chunks_replaced?: number
   // Chunks sent to Weaviate and those it acknowledged (#302); null on records
@@ -16185,6 +17554,17 @@ export interface ImportJob {
   error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
   encrypted?: boolean
 }
+// Running and recent jobs (#617). owner is null for a job recorded before
+// owners were, which only an Engineer sees ("owner unknown").
+export interface JobOwner { name: string; kind: 'user' | 'service' }
+export interface ListedTimes { owner: JobOwner | null; created_at: string | null; finished_at: string | null }
+export interface IngestJobEntry extends JobStatus, ListedTimes { collection: string | null; files: string[] }
+export interface ExportJobEntry extends ExportJob, ListedTimes {}
+export interface ImportJobEntry extends ImportJob, ListedTimes {}
+export interface GenerationEntry extends ListedTimes {
+  session_id: string; collection: string; status: string; pairs_total: number; pairs_attempted: number
+  pairs_completed: number; pairs_failed: number; errors: string[]
+}
 export type AuditResult = 'success' | 'refused' | 'error' | 'accepted' | 'succeeded' | 'failed' | 'interrupted'
 export interface AuditRecord {
   id: string; time: string; actor: string | null; actor_kind: string; role: Role | null; key_id: string | null
@@ -16242,13 +17622,168 @@ export interface HealthResult {
 ### ui/src/components/NavBar.tsx
 
 ```typescript
-import { Link, useNavigate } from 'react-router-dom'
+import { KeyboardEvent, ReactNode, useCallback, useEffect, useRef, useState } from 'react'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
+import type { Role } from '../api/client'
+
+// The pages grouped into menus (#616). Each role sees the pages it had before;
+// a menu with none of them isn't shown. Hiding a page is a convenience: the
+// router and the API refuse what the role can't do (#25).
+interface PageEntry { label: string; to: string; roles: Role[] }
+interface MenuDef { key: string; label: string; entries: PageEntry[] }
+
+const STAFF: Role[] = ['engineer', 'developer']
+const ENGINEER: Role[] = ['engineer']
+const MENUS: MenuDef[] = [
+  { key: 'data', label: 'Data', entries: [
+    { label: 'Import', to: '/import', roles: STAFF },
+    { label: 'Transfer', to: '/transfer', roles: STAFF },
+  ] },
+  { key: 'tune', label: 'Tune', entries: [
+    { label: 'Chunking', to: '/chunking', roles: STAFF },
+    { label: 'Retrieval', to: '/retrieval', roles: STAFF },
+    { label: 'Gold Standard', to: '/goldstandard', roles: STAFF },
+  ] },
+  { key: 'admin', label: 'Admin', entries: [
+    { label: 'Collections', to: '/collections', roles: ENGINEER },
+    { label: 'Users', to: '/users', roles: ENGINEER },
+    { label: 'Service keys', to: '/service-keys', roles: ENGINEER },
+    { label: 'Audit', to: '/audit', roles: ENGINEER },
+    { label: 'Health', to: '/health', roles: ENGINEER },
+  ] },
+]
+
+type Item = { label: string; to: string; current: boolean } | { label: string; onSelect: () => void }
+type Focus = 'first' | 'last'
+
+const TOP = 'text-sm px-2 py-1 rounded hover:text-blue-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-600'
+const CURRENT = 'text-blue-700 font-semibold bg-blue-50'
+const ENTRY = 'block w-full text-left whitespace-nowrap px-3 py-1.5 text-sm hover:bg-gray-100 focus:bg-gray-100 focus:outline-none'
+
+// One menu button and its menu, after the WAI-ARIA menu button pattern: Enter,
+// Space or ArrowDown opens it on the first entry, ArrowUp on the last; the
+// arrows, Home and End move; Escape closes it and returns focus to the button;
+// Tab closes it. Choosing an entry or a click outside closes it too.
+function NavMenu({ menuKey, label, items, current, open, focus, align, onOpen, onClose }: {
+  menuKey: string
+  label: ReactNode
+  items: Item[]
+  current: boolean
+  open: boolean
+  focus: Focus
+  align: 'left' | 'right'
+  onOpen: (focus: Focus) => void
+  onClose: () => void
+}) {
+  const wrapper = useRef<HTMLDivElement>(null)
+  const button = useRef<HTMLButtonElement>(null)
+  const menu = useRef<HTMLDivElement>(null)
+  const menuId = `nav-menu-${menuKey}`
+  const buttonId = `${menuId}-button`
+
+  const entries = () => [...(menu.current?.querySelectorAll<HTMLElement>('[role=menuitem]') ?? [])]
+
+  useEffect(() => {
+    if (!open) return
+    const all = entries()
+    all[focus === 'last' ? all.length - 1 : 0]?.focus()
+  }, [open, focus])
+
+  useEffect(() => {
+    if (!open) return
+    const outside = (e: MouseEvent) => {
+      if (wrapper.current && !wrapper.current.contains(e.target as Node)) onClose()
+    }
+    document.addEventListener('mousedown', outside)
+    return () => document.removeEventListener('mousedown', outside)
+  }, [open, onClose])
+
+  function onButtonKey(e: KeyboardEvent<HTMLButtonElement>) {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault()
+      onOpen(e.key === 'ArrowUp' ? 'last' : 'first')
+    }
+  }
+
+  function onMenuKey(e: KeyboardEvent<HTMLDivElement>) {
+    const all = entries()
+    const at = all.indexOf(document.activeElement as HTMLElement)
+    const move = (i: number) => { e.preventDefault(); all[(i + all.length) % all.length]?.focus() }
+    if (e.key === 'ArrowDown') move(at + 1)
+    else if (e.key === 'ArrowUp') move(at - 1)
+    else if (e.key === 'Home') move(0)
+    else if (e.key === 'End') move(all.length - 1)
+    else if (e.key === 'Escape') { e.preventDefault(); onClose(); button.current?.focus() }
+    else if (e.key === 'Tab') onClose()
+  }
+
+  return (
+    <div ref={wrapper} className={`relative${align === 'right' ? ' ml-auto' : ''}`}>
+      <button
+        ref={button}
+        type="button"
+        id={buttonId}
+        data-menu={menuKey}
+        data-current={current ? 'true' : undefined}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-controls={open ? menuId : undefined}
+        onClick={() => (open ? onClose() : onOpen('first'))}
+        onKeyDown={onButtonKey}
+        className={`${TOP} flex items-center gap-1 ${current ? CURRENT : 'text-gray-700'}`}
+      >
+        {label}
+        <span aria-hidden="true" className="text-xs">▾</span>
+      </button>
+      {open && (
+        <div
+          ref={menu}
+          role="menu"
+          id={menuId}
+          aria-labelledby={buttonId}
+          onKeyDown={onMenuKey}
+          className={`absolute top-full mt-1 z-30 min-w-[11rem] bg-white border border-gray-200 rounded shadow-lg py-1 ${align === 'right' ? 'right-0' : 'left-0'}`}
+        >
+          {items.map(item => 'to' in item ? (
+            <Link
+              key={item.label}
+              to={item.to}
+              role="menuitem"
+              tabIndex={-1}
+              aria-current={item.current ? 'page' : undefined}
+              onClick={onClose}
+              className={`${ENTRY} ${item.current ? CURRENT : 'text-gray-700'}`}
+            >
+              {item.label}
+            </Link>
+          ) : (
+            <button
+              key={item.label}
+              type="button"
+              role="menuitem"
+              tabIndex={-1}
+              onClick={() => { onClose(); item.onSelect() }}
+              className={`${ENTRY} text-gray-700`}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
 
 export default function NavBar() {
   const { user, logout } = useAuth()
   const navigate = useNavigate()
+  const { pathname } = useLocation()
   const role = user?.role ?? null
+  const [open, setOpen] = useState<{ key: string; focus: Focus } | null>(null)
+
+  // A change of page closes any open menu.
+  useEffect(() => { setOpen(null) }, [pathname])
 
   async function logOut() {
     await logout()
@@ -16256,36 +17791,53 @@ export default function NavBar() {
   }
 
   const roleLabel = role === 'engineer' ? 'AI Engineer' : role === 'developer' ? 'Developer' : 'End User'
+  const close = useCallback(() => setOpen(null), [])
+  const menuProps = (key: string) => ({
+    menuKey: key,
+    open: open?.key === key,
+    focus: (open && open.key === key ? open.focus : 'first') as Focus,
+    onOpen: (focus: Focus) => setOpen({ key, focus }),
+    onClose: close,
+  })
+
+  const menus = MENUS
+    .map(m => ({ ...m, entries: m.entries.filter(e => role !== null && e.roles.includes(role)) }))
+    .filter(m => m.entries.length > 0)
+  const accountCurrent = pathname === '/account/password'
 
   return (
-    <nav className="bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-6">
-      <span className="font-bold text-blue-700 text-lg">RAG Platform</span>
-      <Link to="/qa" className="text-sm text-gray-700 hover:text-blue-600">Q&amp;A</Link>
-      {role !== 'end_user' && (
-        <>
-          <Link to="/import" className="text-sm text-gray-700 hover:text-blue-600">Import</Link>
-          <Link to="/chunking" className="text-sm text-gray-700 hover:text-blue-600">Chunking</Link>
-          <Link to="/retrieval" className="text-sm text-gray-700 hover:text-blue-600">Retrieval</Link>
-          <Link to="/goldstandard" className="text-sm text-gray-700 hover:text-blue-600">Gold Standard</Link>
-          <Link to="/transfer" className="text-sm text-gray-700 hover:text-blue-600">Transfer</Link>
-        </>
-      )}
-      {role === 'engineer' && (
-        <>
-          <Link to="/collections" className="text-sm text-gray-700 hover:text-blue-600">Collections</Link>
-          <Link to="/health" className="text-sm text-gray-700 hover:text-blue-600">Health</Link>
-          <Link to="/users" className="text-sm text-gray-700 hover:text-blue-600">Users</Link>
-          <Link to="/service-keys" className="text-sm text-gray-700 hover:text-blue-600">Service keys</Link>
-          <Link to="/audit" className="text-sm text-gray-700 hover:text-blue-600">Audit</Link>
-        </>
-      )}
-      <div className="ml-auto flex items-center gap-3">
-        <span className="text-sm text-gray-700" data-testid="nav-username">{user?.username}</span>
-        <span className="text-xs bg-blue-100 text-blue-800 px-2 py-1 rounded">{roleLabel}</span>
-        {/* A button, not a link: the nav's links are the role's pages. */}
-        <button onClick={() => navigate('/account/password')} className="text-sm text-gray-500 hover:text-blue-600">Change password</button>
-        <button onClick={logOut} className="text-sm text-gray-500 hover:text-blue-600">Log out</button>
-      </div>
+    <nav className="bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-4">
+      <span className="font-bold text-blue-700 text-lg mr-2">RAG Platform</span>
+      <Link
+        to="/qa"
+        aria-current={pathname === '/qa' ? 'page' : undefined}
+        className={`${TOP} ${pathname === '/qa' ? CURRENT : 'text-gray-700'}`}
+      >
+        Q&amp;A
+      </Link>
+      {menus.map(m => (
+        <NavMenu
+          key={m.key}
+          {...menuProps(m.key)}
+          label={m.label}
+          align="left"
+          current={m.entries.some(e => e.to === pathname)}
+          items={m.entries.map(e => ({ label: e.label, to: e.to, current: e.to === pathname }))}
+        />
+      ))}
+      <NavMenu
+        {...menuProps('account')}
+        label={<>
+          <span data-testid="nav-username">{user?.username}</span>{' '}
+          <span className="text-xs bg-blue-100 text-blue-800 px-2 py-1 rounded">{roleLabel}</span>
+        </>}
+        align="right"
+        current={accountCurrent}
+        items={[
+          { label: 'Change password', to: '/account/password', current: accountCurrent },
+          { label: 'Log out', onSelect: logOut },
+        ]}
+      />
     </nav>
   )
 }
@@ -16357,6 +17909,18 @@ export default function ProgressPanel({ job }: { job: JobStatus }) {
           {job.errors.map((e, i) => <li key={i}>{e}</li>)}
         </ul>
       )}
+      {(job.split?.length ?? 0) > 0 && (
+        // A file over the per-file limits is stored as parts named
+        // `<name> (part N)` (#621); not a failure, but the names differ.
+        <div className="mt-2 text-xs text-gray-700" data-testid="split-files">
+          <p className="font-medium">
+            {job.split!.length} file{job.split!.length === 1 ? '' : 's'} split into parts:
+          </p>
+          <ul className="space-y-1 mt-1">
+            {job.split!.map((f, i) => <li key={i}>{f}</li>)}
+          </ul>
+        </div>
+      )}
       {(job.skipped?.length ?? 0) > 0 && (
         // Skipped files are never counted in files_total, so without this the
         // count simply reads lower than what the user uploaded. Each entry
@@ -16371,6 +17935,127 @@ export default function ProgressPanel({ job }: { job: JobStatus }) {
         </div>
       )}
     </div>
+  )
+}
+```
+
+### ui/src/components/JobList.tsx
+
+The Running and recent jobs list the Import, Gold Standard and Transfer pages show (#617, `SPECIFICATIONS.md` §7.15): `useJobList` reads a list on opening, after `reload()` and every 10 s while it holds a running job; `newestToOpen` picks the job a page opens by itself.
+
+```typescript
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { JobOwner } from '../api/client'
+
+// The running and recent jobs a page lists (#617). The list is read from the
+// API whenever the page opens, so a job started earlier, in another tab or
+// before a reload is found again. Nothing is kept in browser storage (#25).
+
+// While the last answer held a running job, the list is read again this often.
+const RELOAD_MS = 10000
+
+export interface JobRow {
+  key: string
+  kind: string
+  target: string
+  status: string
+  progress: string
+  createdAt: string | null
+  owner: JobOwner | null
+  open: boolean
+  onOpen: () => void
+}
+
+function message(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
+
+// Reads a list once on mount, again on reload(), and every RELOAD_MS while it
+// holds a running entry; nothing after the page is left. `loaded` turns true
+// with the first answer, successful or not.
+export function useJobList<T>(load: () => Promise<T[]>, isRunning: (entry: T) => boolean) {
+  const [entries, setEntries] = useState<T[]>([])
+  const [error, setError] = useState('')
+  const [loaded, setLoaded] = useState(false)
+  const alive = useRef(true)
+  const timer = useRef<number | null>(null)
+  const loadRef = useRef(load)
+  const runningRef = useRef(isRunning)
+  loadRef.current = load
+  runningRef.current = isRunning
+
+  const reload = useCallback(() => {
+    if (timer.current) { window.clearTimeout(timer.current); timer.current = null }
+    loadRef.current().then(list => {
+      if (!alive.current) return
+      setEntries(list)
+      setError('')
+      setLoaded(true)
+      if (list.some(e => runningRef.current(e))) timer.current = window.setTimeout(reload, RELOAD_MS)
+    }, (e: unknown) => {
+      if (!alive.current) return
+      setError(`Could not load the running and recent jobs: ${message(e)}`)
+      setLoaded(true)
+    })
+  }, [])
+
+  useEffect(() => {
+    alive.current = true
+    reload()
+    return () => {
+      alive.current = false
+      if (timer.current) window.clearTimeout(timer.current)
+    }
+  }, [reload])
+
+  return { entries, error, loaded, reload }
+}
+
+// The entry a page opens by itself: the newest running one, else the newest.
+// `entries` are newest first, as the API orders them.
+export function newestToOpen<T>(entries: T[], isRunning: (entry: T) => boolean): T | null {
+  return entries.find(isRunning) ?? entries[0] ?? null
+}
+
+export function startedLabel(createdAt: string | null): string {
+  if (!createdAt) return '-'
+  const when = new Date(createdAt)
+  return Number.isNaN(when.getTime()) ? '-' : when.toLocaleString()
+}
+
+export function ownerLabel(owner: JobOwner | null): string {
+  if (!owner) return 'owner unknown'
+  return owner.kind === 'service' ? `${owner.name} (API key)` : owner.name
+}
+
+export default function JobList({ rows, error, loaded, showOwner }: {
+  rows: JobRow[]; error: string; loaded: boolean; showOwner: boolean
+}) {
+  return (
+    <section aria-label="Running and recent jobs" className="bg-white border rounded p-4 mb-6">
+      <h2 className="font-semibold mb-2">Running and recent jobs</h2>
+      {error && <p role="alert" className="text-red-600 text-sm mb-2">{error}</p>}
+      {loaded && !error && rows.length === 0 && (
+        <p className="text-sm text-gray-500">No running or recent jobs.</p>
+      )}
+      {rows.length > 0 && (
+        <ul className="space-y-1">
+          {rows.map(row => (
+            <li key={row.key}>
+              <button type="button" onClick={row.onOpen} aria-current={row.open ? 'true' : undefined}
+                className={`job-row w-full text-left text-sm border rounded px-3 py-2 flex flex-wrap gap-x-3 ${row.open ? 'border-blue-500 bg-blue-50' : 'hover:bg-gray-50'}`}>
+                <span className="font-medium">{row.kind}</span>
+                <span className="flex-1 break-all">{row.target}</span>
+                <span className={row.status === 'completed' ? 'text-green-600' : row.status === 'failed' ? 'text-red-600' : 'text-blue-600'}>{row.status}</span>
+                <span className="text-gray-600">{row.progress}</span>
+                <span className="text-gray-500 text-xs self-center">Started {startedLabel(row.createdAt)}</span>
+                {showOwner && <span className="job-owner text-gray-500 text-xs self-center">{ownerLabel(row.owner)}</span>}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   )
 }
 ```
@@ -16770,11 +18455,17 @@ export default function QAPage() {
 ### ui/src/pages/ImportPage.tsx
 
 ```typescript
-import { useState, useEffect } from 'react'
-import { api, CollectionInfo, JobStatus, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB } from '../api/client'
+import { useState, useEffect, useRef } from 'react'
+import { api, CollectionInfo, IngestJobEntry, JobStatus, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB } from '../api/client'
 import { useRole } from '../context/AuthContext'
 import StrategyExplainer from '../components/StrategyExplainer'
 import ProgressPanel from '../components/ProgressPanel'
+import JobList, { newestToOpen, useJobList } from '../components/JobList'
+
+// Statuses an ingest job never leaves; polling stops at any of them.
+const TERMINAL = ['completed', 'failed', 'partial', 'cancelled']
+const ingestRunning = (j: { status: string }) => !TERMINAL.includes(j.status)
+const loadIngestJobs = () => api.listIngestJobs().then(r => r.jobs)
 
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
 
@@ -16790,6 +18481,12 @@ export default function ImportPage() {
   const [similarityThreshold, setSimilarityThreshold] = useState(0.85)
   const [jobId, setJobId] = useState('')
   const [job, setJob] = useState<JobStatus | null>(null)
+  // The job being polled: the one shown, while it runs (#617).
+  const [pollId, setPollId] = useState('')
+  // Set once the page has opened or started a job itself, so the job list's
+  // first answer no longer opens one (#617).
+  const touched = useRef(false)
+  const jobs = useJobList<IngestJobEntry>(loadIngestJobs, ingestRunning)
   // The status the upload was accepted with, shown with the job ID until the
   // first poll answers, so the page responds at once rather than 3 s later (#394).
   const [queuedStatus, setQueuedStatus] = useState('')
@@ -16830,19 +18527,44 @@ export default function ImportPage() {
   }, [])
 
   useEffect(() => {
-    if (!jobId) return
+    if (!pollId) return
     const interval = setInterval(async () => {
       try {
-        const j = await api.getJobStatus(jobId)
+        const j = await api.getJobStatus(pollId)
         setJob(j)
         setPollError('')
-        if (j.status === 'completed' || j.status === 'failed' || j.status === 'partial') clearInterval(interval)
+        if (!ingestRunning(j)) {
+          clearInterval(interval)
+          jobs.reload()
+        }
       } catch (e: unknown) {
         setPollError(`Could not check the import's progress: ${e instanceof Error ? e.message : String(e)}`)
       }
     }, 3000)
     return () => clearInterval(interval)
-  }, [jobId])
+    // jobs.reload is stable
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pollId])
+
+  // Shows a listed job as a started one is shown, polling it while it runs (#617).
+  function openJob(entry: IngestJobEntry) {
+    touched.current = true
+    setJobId(entry.job_id)
+    setJob(entry)
+    setQueuedStatus('')
+    setPollError('')
+    setPollId(ingestRunning(entry) ? entry.job_id : '')
+  }
+
+  // On the list's first answer, the newest running job, else the newest one,
+  // opens by itself, unless the page has already opened or started one.
+  useEffect(() => {
+    if (!jobs.loaded || touched.current) return
+    touched.current = true
+    const entry = newestToOpen(jobs.entries, ingestRunning)
+    if (entry) openJob(entry)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobs.loaded])
 
   function handleDrop(e: React.DragEvent) {
     e.preventDefault()
@@ -16919,9 +18641,12 @@ export default function ImportPage() {
     form.append('min_chunk_size', String(minChunkSize))
     try {
       const res = await api.uploadFiles(form)
+      touched.current = true
       setJobId(res.job_id)
       setQueuedStatus(res.status)
       setJob(null)
+      setPollId(res.job_id)
+      jobs.reload()
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -16942,6 +18667,14 @@ export default function ImportPage() {
         <input id="file-input" type="file" multiple className="hidden" accept=".pdf,.docx,.txt,.md,.csv,.json,.jsonl,.jsonl.gz,.zip"
           onChange={e => setFiles(prev => [...prev, ...Array.from(e.target.files || [])])} />
       </div>
+      {/* A static file of the UI build (ui/public), so it is in every install,
+          offline ones included. scripts/tests/test_corpus_rules.py checks its
+          limits against the app's (#615). */}
+      <p className="text-xs text-gray-500 mb-4">
+        Preparing a large corpus? Read the limits and how to stay under them first:{' '}
+        <a href="/corpus-preparation-rules.md" download="corpus-preparation-rules.md"
+          className="text-blue-600 hover:underline">Download corpus preparation rules (.md)</a>
+      </p>
 
       {files.length > 0 && (
         <ul className="mb-4 space-y-1">
@@ -17009,6 +18742,15 @@ export default function ImportPage() {
       )}
       {job && <ProgressPanel job={job} />}
       {pollError && <p className="text-red-600 text-sm mt-2">{pollError}</p>}
+
+      <div className="mt-6">
+        <JobList error={jobs.error} loaded={jobs.loaded} showOwner={role === 'engineer'}
+          rows={jobs.entries.map(entry => ({
+            key: entry.job_id, kind: 'Ingest', target: entry.collection ?? '-', status: entry.status,
+            progress: `${entry.files_completed}/${entry.files_total} files`, createdAt: entry.created_at,
+            owner: entry.owner, open: entry.job_id === jobId, onOpen: () => openJob(entry),
+          }))} />
+      </div>
 
       {showNewColModal && (
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
@@ -17373,7 +19115,12 @@ export default function RetrievalPage() {
 
 ```typescript
 import { useState, useEffect, useRef } from 'react'
-import { api, CollectionInfo, Session, GoldPair } from '../api/client'
+import { api, CollectionInfo, GenerationEntry, Session, GoldPair } from '../api/client'
+import { useRole } from '../context/AuthContext'
+import JobList, { newestToOpen, useJobList } from '../components/JobList'
+
+const generating = (s: { status: string }) => s.status === 'generating'
+const loadGenerations = () => api.listGenerations().then(r => r.sessions)
 
 // The API's own default export name (#393): {collection}_{YYYYMMDD_HHMMSS}.json in
 // UTC, spaces in the collection name as '_', other characters outside A-Z, a-z,
@@ -17411,6 +19158,11 @@ function outcomeOf(s: Session): Outcome | null {
 }
 
 export default function GoldStandardPage() {
+  const { role } = useRole()
+  // Running and recent generations (#617); the first answer opens the newest
+  // generating one, else the newest, unless the page already opened one.
+  const generations = useJobList<GenerationEntry>(loadGenerations, generating)
+  const touched = useRef(false)
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   const [collection, setCollection] = useState('')
   const [sampleSize, setSampleSize] = useState(20)
@@ -17466,6 +19218,7 @@ export default function GoldStandardPage() {
         setSession(s)
         if (s.status !== 'generating') {
           clearInterval(pollRef.current!)
+          generations.reload()
         }
       } catch (e: unknown) {
         if (!active || activeSessionRef.current !== sessionId) return
@@ -17480,9 +19233,13 @@ export default function GoldStandardPage() {
     setAllowHistorical(false)
   }, [sessionId, session?.stale, session?.orphaned, session?.stale_at, session?.orphaned_at])
 
-  async function loadSession() {
-    const id = sessionLookup.trim()
+  // Loads the typed session ID, or `chosen` when a listed generation is opened
+  // (#617), which also puts its ID in the field.
+  async function loadSession(chosen?: string) {
+    const id = (chosen ?? sessionLookup).trim()
     if (!id || exportPendingRef.current) return
+    touched.current = true
+    if (chosen !== undefined) setSessionLookup(chosen)
     activeSessionRef.current = ''
     setSessionId(''); setSession(null); setAllowHistorical(false); setFilename(''); setEditingPair(null)
     setError(''); setPollError(''); setSaveResult(''); setLoading(true)
@@ -17505,6 +19262,8 @@ export default function GoldStandardPage() {
     setSaveResult('')
     try {
       const res = await api.generateGoldStandard({ collection, sample_size: sampleSize })
+      touched.current = true
+      generations.reload()
       activeSessionRef.current = res.session_id
       setSessionId(res.session_id)
       setSessionLookup(res.session_id)
@@ -17516,6 +19275,14 @@ export default function GoldStandardPage() {
       setLoading(false)
     }
   }
+
+  useEffect(() => {
+    if (!generations.loaded || touched.current) return
+    touched.current = true
+    const entry = newestToOpen(generations.entries, generating)
+    if (entry) loadSession(entry.session_id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [generations.loaded])
 
   function applyPair(pairId: string, updated: GoldPair) {
     setSession(prev => prev ? { ...prev, pairs: prev.pairs.map(p => p.pair_id === pairId ? updated : p) } : prev)
@@ -17647,10 +19414,17 @@ export default function GoldStandardPage() {
         <label htmlFor="retained-session" className="block text-sm font-semibold mb-2">Inspect a retained session</label>
         <div className="flex gap-3">
           <input id="retained-session" disabled={exportPending} value={sessionLookup} onChange={e => setSessionLookup(e.target.value)} placeholder="Session ID" className="border rounded px-3 py-2 text-sm flex-1" />
-          <button onClick={loadSession} disabled={loading || exportPending || !sessionLookup.trim()} className="border rounded px-3 py-2 text-sm disabled:opacity-50">Load / refresh session</button>
+          <button onClick={() => loadSession()} disabled={loading || exportPending || !sessionLookup.trim()} className="border rounded px-3 py-2 text-sm disabled:opacity-50">Load / refresh session</button>
         </div>
         {session && <p className="text-xs text-gray-500 mt-2">Session {session.session_id} · Collection {session.collection}</p>}
       </div>
+
+      <JobList error={generations.error} loaded={generations.loaded} showOwner={role === 'engineer'}
+        rows={generations.entries.map(entry => ({
+          key: entry.session_id, kind: 'Generation', target: entry.collection, status: entry.status,
+          progress: `${entry.pairs_attempted}/${entry.pairs_total} pairs`, createdAt: entry.created_at,
+          owner: entry.owner, open: entry.session_id === sessionId, onOpen: () => loadSession(entry.session_id),
+        }))} />
 
       {error && <p className="text-red-600 text-sm mb-4">{error}</p>}
       {session && historical && (
@@ -17919,8 +19693,22 @@ export default function CollectionsPage() {
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
-  api, CollectionInfo, ExportJob, ImportJob, PackageSummary, TuneOptions,
+  api, CollectionInfo, ExportJob, ExportJobEntry, ImportJob, ImportJobEntry, PackageSummary, TuneOptions,
 } from '../api/client'
+import { useRole } from '../context/AuthContext'
+import JobList, { JobRow, newestToOpen, useJobList } from '../components/JobList'
+
+// A transfer job is running until it completes or fails (#617).
+const transferRunning = (j: { status: string }) => j.status !== 'completed' && j.status !== 'failed'
+const loadExportJobs = () => api.listExportJobs().then(r => r.jobs)
+const loadImportJobs = () => api.listImportJobs().then(r => r.jobs)
+
+// Newest first by start time, else by finish time, as the API orders each list.
+function newestFirst(a: { created_at: string | null; finished_at: string | null },
+                     b: { created_at: string | null; finished_at: string | null }): number {
+  const at = (j: typeof a) => Date.parse(j.created_at ?? j.finished_at ?? '') || 0
+  return at(b) - at(a)
+}
 
 function sizeLabel(bytes: number | null): string {
   if (bytes === null) return ''
@@ -17957,6 +19745,13 @@ function message(e: unknown): string {
 }
 
 export default function TransferPage() {
+  const { role } = useRole()
+  // Running and recent exports and imports, in one list (#617). Each panel
+  // opens its own newest job on the first answer, unless it already has one.
+  const exportJobs = useJobList<ExportJobEntry>(loadExportJobs, transferRunning)
+  const importJobs = useJobList<ImportJobEntry>(loadImportJobs, transferRunning)
+  const exportTouched = useRef(false)
+  const importTouched = useRef(false)
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   const [collection, setCollection] = useState('')
   const [tune, setTune] = useState<TuneOptions | null>(null)
@@ -18040,6 +19835,7 @@ export default function TransferPage() {
         exportPoll.current = null
         setExportWatching(false)
         loadPackages()
+        exportJobs.reload()
       } else {
         exportTimer.current = window.setTimeout(() => pollExport(jobId), POLL_MS)
       }
@@ -18067,6 +19863,7 @@ export default function TransferPage() {
       }
       importPoll.current = null
       setImportWatching(false)
+      importJobs.reload()
       if (job.status === 'completed') {
         api.getCollections().then(r => setCollections(r.collections)).catch(() => {})
       }
@@ -18083,6 +19880,53 @@ export default function TransferPage() {
     })
   }
 
+  // Opens a listed job in its own panel, as a started one is shown (#617).
+  function openExport(entry: ExportJobEntry) {
+    exportTouched.current = true
+    if (exportTimer.current) window.clearTimeout(exportTimer.current)
+    setExportError(''); setExportPollError('')
+    setExportJob(entry)
+    if (transferRunning(entry)) {
+      exportPoll.current = entry.job_id
+      setExportWatching(true)
+      pollExport(entry.job_id)
+    } else {
+      exportPoll.current = null
+      setExportWatching(false)
+    }
+  }
+
+  function openImport(entry: ImportJobEntry) {
+    importTouched.current = true
+    if (importTimer.current) window.clearTimeout(importTimer.current)
+    setImportError(''); setImportPollError('')
+    setImportJob(entry)
+    if (transferRunning(entry)) {
+      importPoll.current = entry.job_id
+      setImportWatching(true)
+      pollImport(entry.job_id)
+    } else {
+      importPoll.current = null
+      setImportWatching(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!exportJobs.loaded || exportTouched.current) return
+    exportTouched.current = true
+    const entry = newestToOpen(exportJobs.entries, transferRunning)
+    if (entry) openExport(entry)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [exportJobs.loaded])
+
+  useEffect(() => {
+    if (!importJobs.loaded || importTouched.current) return
+    importTouched.current = true
+    const entry = newestToOpen(importJobs.entries, transferRunning)
+    if (entry) openImport(entry)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [importJobs.loaded])
+
   async function startExport() {
     setExportError(''); setExportPollError(''); setExportJob(null)
     try {
@@ -18091,6 +19935,9 @@ export default function TransferPage() {
         : { collection, include_models: includeModels })
       setPassphrase(''); setConfirmPassphrase('')
       if (!alive.current) return
+      exportTouched.current = true
+      exportJobs.reload()
+      if (exportTimer.current) window.clearTimeout(exportTimer.current)
       exportPoll.current = r.job_id
       setExportWatching(true)
       pollExport(r.job_id)
@@ -18107,6 +19954,9 @@ export default function TransferPage() {
         : { filename, on_conflict: onConflict })
       setImportPassphrase('')
       if (!alive.current) return
+      importTouched.current = true
+      importJobs.reload()
+      if (importTimer.current) window.clearTimeout(importTimer.current)
       importPoll.current = r.job_id
       setImportWatching(true)
       pollImport(r.job_id)
@@ -18127,6 +19977,19 @@ export default function TransferPage() {
     : ''
   const selectedEncrypted = packages.some(p => p.filename === filename && p.encrypted)
 
+  const jobRows: (JobRow & { sort: { created_at: string | null; finished_at: string | null } })[] = [
+    ...exportJobs.entries.map(entry => ({
+      key: 'export:' + entry.job_id, kind: 'Export', target: entry.collection, status: entry.status,
+      progress: `${entry.chunks_written} chunks`, createdAt: entry.created_at, owner: entry.owner,
+      open: exportJob?.job_id === entry.job_id, onOpen: () => openExport(entry), sort: entry,
+    })),
+    ...importJobs.entries.map(entry => ({
+      key: 'import:' + entry.job_id, kind: 'Import', target: entry.filename, status: entry.status,
+      progress: `${entry.chunks_written} chunks`, createdAt: entry.created_at, owner: entry.owner,
+      open: importJob?.job_id === entry.job_id, onOpen: () => openImport(entry), sort: entry,
+    })),
+  ].sort((a, b) => newestFirst(a.sort, b.sort))
+
   return (
     <div className="max-w-3xl mx-auto">
       <div className="flex items-baseline justify-between mb-2">
@@ -18138,6 +20001,10 @@ export default function TransferPage() {
       <p className="text-sm text-gray-500 mb-6">
         Packages are written to and read from <code>./exports</code> in the project directory.
       </p>
+
+      <JobList rows={jobRows} showOwner={role === 'engineer'}
+        loaded={exportJobs.loaded && importJobs.loaded}
+        error={[exportJobs.error, importJobs.error].filter(Boolean).join(' ')} />
 
       {/* ── Export ─────────────────────────────────────────────────────── */}
       <section className="bg-white border rounded p-4 mb-6">
@@ -19667,6 +21534,23 @@ job's three counts agree.
 "Submitted N · accepted N · stored N" line appears only when the counts differ, and an upload
 answered `409 COLLECTION_DELETING` to check its message is shown.
 
+`scripts/tests/test_job_lists.py` (#617, API image, no network) checks the running and recent job
+lists: new records get `created_at`, `finished_at` on their first terminal status or when marked
+interrupted, and ingest records `collection`, `files` and `owner`; who sees which job (a Developer
+its own, a key its principal's, an Engineer everyone's including owner-less records); running jobs
+always listed, finished ones from the last 24 hours, the newest 20; a pre-#617 record's last-saved
+time standing in for `finished_at`; the order; sessions (generating, finished, without
+`finished_at`, imported); the routes, their role, a malformed record left out, the lookups by ID
+unchanged, the owner each start route hands its service; and no session `owner` or times in a
+package or after an import. `02_ingest.sh` runs it, then `job_lists.py --operator` on the verify
+project: the harness Developer and a throwaway `vfy-s-*` Developer-role key each ingest a file into
+a throwaway `VfyJobs*` collection and see only their own job, with owner, collection, files and
+times; the Engineer sees both; the Developer's export and import are listed for it and the
+Engineer, not the key. `browser/ui_criteria.js` (suite 06) checks the pages' Running and recent
+jobs lists: a real ingest found again after leaving the Import page, then stubbed lists for a
+running ingest, generation and export that open by themselves, survive leaving the page and show
+their result, row switching, one job per Transfer panel, and the Engineer's owner column.
+
 `scripts/tests/test_jobstore.py` (#23) checks the job store that keeps ingest, export, import
 and tune job records across an API restart: an unbound store (no lifespan) is a plain dict
 that writes nothing; status changes and terminal records are written at once, owner-only;
@@ -19734,7 +21618,12 @@ the replaced files, before any insert, and deletes earlier chunks only after the
 marking failure fails only that file and changes nothing; a failed lookup of the later files
 is reported as the lookup, not the marking, and also changes nothing (#311); a failed insert keeps the earlier
 version; a removal failure keeps the new chunks and reports `partial`; a deleted collection is
-reported at the first lookup (#40). Also the delete rounds, precondition and final count,
+reported at the first lookup (#40). Also exact-name selection (#622): only the name's own
+chunks are deleted or counted among word matches such as `a/report.pdf`, `Report.PDF` and
+`report.pdf (part 1)`, over 10,000 word matches the collection is walked instead of queried,
+a name has chunks only when stored exactly, and a non-default rule selects what it accepts;
+the deletion by ID in batches of at most 10,000, never empty, and its bound, refused before
+deleting; the precondition and final count,
 retention releasing the name (also when the blob write fails, keeping shared digests), and
 rechunk coverage and per-(digest, name) rebuilds, rebuilding only names with stored chunks
 while a missing blob is still refused (#311), also for one blob under 50 names with one
@@ -19770,9 +21659,35 @@ ZIP (it completes with no errors, stores only its file and lists the AppleDouble
 that ingesting a new name leaves the session current and a replacing re-ingest marks it
 stale, naming the file. Two concurrent uploads of one name must leave exactly one job's
 version, whole: its chunk set, its digest, and `chunks_replaced` equal to the other job's
-chunks. `browser/ui_criteria.js` (suite 06) stubs the job response and checks that the Import
+chunks. Replacing a name touches only that name (#622): with `a/report.pdf` (in a ZIP) and
+`Report.PDF` stored, uploading `report.pdf` replaces nothing and uploading it again replaces
+only its first set, and the other two keep exactly their chunks. `exact_source.py` then checks
+the same selection in real Weaviate on a scratch collection without a vectorizer, on both
+paths: a few word matches read in one query, and over 10,000 walked.
+`browser/ui_criteria.js` (suite 06) stubs the job response and checks that the Import
 page shows "Replaced N chunk(s) from a previous version" only when `chunks_replaced` is above
 0, and the plain "N file(s) skipped:" heading with each entry's own reason.
+
+`scripts/tests/test_split_parts.py` (#621) checks that a file over the per-file limits is
+stored as parts `<name> (part N)` instead of failing, with Weaviate replaced by an in-memory
+collection that keeps the replacement helpers' contract (`accept` included): 13,000 JSON Lines
+records of 600 characters under `context_aware`, and a `.jsonl`, a `.txt` and a `.json` over
+10,000,000 characters (each failing on the code before #621); a file within the limits stored
+as before; replacement of a name's whole family (a smaller, an unsplit and a newly split
+re-upload) with neighbours such as `a/data.jsonl` and `Data.jsonl` untouched; a bad line, a
+failed insert and a failed removal after part 1 (nothing stored, the earlier version whole);
+a record over the chunk cap; the cuts, CSV headers, Markdown fences, a streamed Latin-1 file
+and one no encoding reads, `overlap` sizing, the halving re-split and the `semantic` sentence
+limit; re-chunk coverage and rebuild, export links, and `ChunkLimitError`. `split_parts.py` then
+runs the same in the real ingest worker and Weaviate, on a scratch collection without a
+vectorizer (embedding 13,000 chunks through Ollama takes this project about an hour): the
+13,000-record file (`context_aware`) and a 10,519,499-character `.txt` (`fixed` 6,000) are
+stored as numbered parts with the job's `split` entry, re-uploading the `.txt` within the
+limits replaces every part and leaves the `.jsonl`'s parts untouched, and a bad line after
+part 1 fails the file and stores nothing. `overlap_chunks.py` (suite 08) stores a
+20,000-character file at 1,000/999 as two parts, each inside both window limits, that restore
+it exactly, and `browser/ui_criteria.js` checks the progress panel's "1 file split into
+parts:" list.
 `05_transfer.sh` (E32) replaces a file, adds a second name for the new content, re-chunks,
 and checks that only the new text comes back, under both names. It also adds a name with no
 stored chunks to the retained index first, and checks that the rechunk doesn't rebuild it and
@@ -19897,8 +21812,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, a failed metric read as the 503, the metric read on every query; registered by suite 03 |
 | `citation_score.py` | helper for suite 03 (#376), run in the API container: citation scores of known vectors on a real Weaviate for each distance metric, and after a collection is recreated with another metric |
 | `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
-| `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
-| `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
+| `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds, and a file over the output limits stored as parts inside them (#621) |
+| `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget (parts, #621) regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
 | `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, review 404 codes and empty-edit refusal (#381), export schema, export name refusals (#370) |
 | `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
@@ -19911,7 +21826,10 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_jsonl_ingest.py` | controlled JSON Lines reading, conversion, limit and gzip regressions, registered by ingest |
 | `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
 | `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
-| `../tests/test_reingest.py` | controlled re-ingest replacement, same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
+| `../tests/test_reingest.py` | controlled re-ingest replacement, exact-name selection (#622), same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
+| `../tests/test_split_parts.py` | controlled regressions for files over the per-file limits stored as parts (#621): the reviewer's 13,000 records, files over 10,000,000 characters, family replacement, all or nothing, cuts, CSV, Markdown, encoding, `overlap` sizing, re-chunk and export links, registered by ingest |
+| `split_parts.py` | helper for ingest (#621), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, files over the per-file limits are stored as parts, a smaller re-upload replaces every part, and a bad line after part 1 stores nothing; the collection is removed afterwards |
+| `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`) and over 10,000 (`walk`); the collection is removed afterwards |
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, registered by transfer |
@@ -19922,6 +21840,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `../tests/test_batch_implementation.py` | host-side: exact embedded source checks for `api/main.py`, the Weaviate client, the batch-write, recovery, import and tuning services and their verify scripts, and the restart-recovery block of `05_transfer.sh` with stubbed commands (refused-prefix skip, `RAG_ALLOW_RESTART`, the #152 refusal), registered by transfer |
 | `../tests/test_chunk_limits.py` / `../tests/test_insert_chunks.py` | controlled chunker per-file limits, chunk ceiling and semantic floor (#111) / insert batching and the "index not ready" retry, registered by ingest in the API image with the repository mounted (#386) |
+| `../tests/test_corpus_rules.py` | controlled: the corpus preparation rules the Import page offers (`ui/public/corpus-preparation-rules.md`) state every ingest limit as the chunker, the ingest pipeline, the settings defaults, the chunk-setting bounds, `docker-compose.yml` and the proxy define it, and no other number (#615), registered by ingest in the API image with the repository mounted |
+| `../tests/test_corpus_rules_estimates.py` | controlled: the chunk counts the corpus preparation rules give hold for the real chunker for every strategy, on files built at the rules' targets, which are never refused for the text or chunk limits (#615), registered by ingest in the API image with the repository mounted |
 | `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
 | `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
@@ -19934,7 +21854,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |
 | `../tests/test_retrieve_script.py` | controlled `retrieve.py` defaults, flags and exit codes against a stub API, registered by suite 15 |
 | `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15 |
-| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, the page controls of #400 (see "UI control browser checks") and, last, the login page against nginx's real login rate limit (#577) |
+| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, the Import page's corpus preparation rules download (#615), the page controls of #400 (see "UI control browser checks") and, last, the login page against nginx's real login rate limit (#577) |
 | `14_reindex.sh` | exact-record reindex: a host check that the embedded sources match the real files (`../tests/test_reindex_preservation.py`), 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
@@ -20209,7 +22129,8 @@ nothing reaches the backend or a model. 67 cases:
 - `ui_controls.js`: the Collections table (columns, a dash for a null created date) and create
   modal (HNSW slider defaults, bounds and labels, Flat hiding them, the create payload); the Import
   queue, slider visibility per strategy and role, Chunk Size pulling Overlap down, the upload
-  form fields and the "+ New" modal; the Developer nav and the redirects of a Developer and an End
+  form fields and the "+ New" modal; the nav's menus per role, their keyboard and screen-reader
+  behaviour and the current-page highlight (#616), and the redirects of a Developer and an End
   User; the login page, logout, the setup-required page, the forced and voluntary password change
   and the return to login on a 401 (#25), with `GET /api/auth/me` answered from the case's role; the Q&A box
   (Ctrl+Enter, plain Enter, Ask disabled while empty or loading), the citations toggle, markdown,
@@ -22035,19 +23956,23 @@ MATRIX = (
     ("POST", "/collections", {}, "developer"),
     ("POST", "/ingest/upload", {}, "developer"),
     ("GET", "/ingest/job/vfy-no-such-job", None, "developer"),
+    ("GET", "/ingest/jobs", None, "developer"),            # the caller's jobs (#617)
     ("GET", "/ingest/config/" + X, None, "developer"),
     ("POST", "/ingest/config", {}, "developer"),
     ("POST", "/retrieval/config", {}, "developer"),
     ("POST", "/goldstandard/generate", {}, "developer"),
     ("GET", "/goldstandard/session/gs_vfynosuch", None, "developer"),
+    ("GET", "/goldstandard/sessions", None, "developer"),
     ("PATCH", "/goldstandard/session/gs_vfynosuch/pair/p", {}, "developer"),
     ("POST", "/goldstandard/regenerate", {}, "developer"),
     ("POST", "/goldstandard/save", {}, "developer"),
     ("GET", "/goldstandard/download/vfy_no_such.json", None, "developer"),
     ("POST", "/export", {}, "developer"),
     ("GET", "/export/job/vfy-no-such-job", None, "developer"),
+    ("GET", "/export/jobs", None, "developer"),
     ("POST", "/import", {}, "developer"),
     ("GET", "/import/job/vfy-no-such-job", None, "developer"),
+    ("GET", "/import/jobs", None, "developer"),
     ("GET", "/packages", None, "developer"),
     ("GET", "/help/transfer", None, "developer"),
     ("GET", "/tune/" + X, None, "developer"),
@@ -23250,6 +25175,168 @@ if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
 ```
 
+### scripts/verify/job_lists.py
+
+The job lists on the verify project (#617), run by `02_ingest.sh` with `--operator`.
+
+```python
+"""Running and recent job lists on the verify project (#617). Host-side,
+standard library, Python 3.9+. Run by 02_ingest.sh:
+
+    python3 job_lists.py --operator
+
+Exit 0 when every check holds, 1 when one doesn't (the reason on stderr).
+The harness Developer and a throwaway vfy-s-<random> Developer-role service
+principal each ingest a small file into a throwaway VfyJobs<random>
+collection; the Developer then exports it and imports the package under a new
+name. GET /ingest/jobs, /export/jobs and /import/jobs must show each caller
+only its own jobs, and the harness Engineer everyone's with their owners.
+Needs --operator (02_ingest.sh passes it only on the verify project as
+stack.sh sets it up). The key is held in memory only and never printed.
+"""
+import json
+import os
+import secrets
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+import auth_setup
+from auth_setup import request
+from auth_stack import CheckFailed, bearer, code, error_code, expect, new_principal, role_token
+
+TERMINAL = ("completed", "failed", "partial", "cancelled")
+DEVELOPER = auth_setup.ROLES["developer"]
+
+
+def upload(collection, name, content, token=None, headers=None):
+    """POST /ingest/upload of one text file, with a session or a key's headers."""
+    boundary = "vfy" + secrets.token_hex(8)
+    body = ('--{b}\r\nContent-Disposition: form-data; name="collection"\r\n\r\n{c}\r\n'
+            '--{b}\r\nContent-Disposition: form-data; name="files"; filename="{n}"\r\n'
+            'Content-Type: text/plain\r\n\r\n').format(b=boundary, c=collection, n=name).encode()
+    body += content + "\r\n--{}--\r\n".format(boundary).encode()
+    sent = dict(headers) if headers else {"Origin": auth_setup.origin(), "Cookie": "rag_session=" + token}
+    sent["Content-Type"] = "multipart/form-data; boundary=" + boundary
+    req = urllib.request.Request(auth_setup.api_base() + "/ingest/upload", data=body, method="POST", headers=sent)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        return error.code, error.read()
+
+
+def get(path, token=None, headers=None):
+    status, raw, _ = code("GET", path, token=token, headers=headers)
+    expect(status == 200, "GET {} answered {} {}".format(path, status, error_code(raw)))
+    return json.loads(raw)
+
+
+def wait_job(path, token=None, headers=None, timeout=900):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        job = get(path, token, headers)
+        if job["status"] in TERMINAL:
+            return job
+        time.sleep(1)
+    raise CheckFailed("{} didn't end within {}s".format(path, timeout))
+
+
+def listed(path, token=None, headers=None):
+    """The entries of a job list, by job ID."""
+    return {job["job_id"]: job for job in get(path, token, headers)["jobs"]}
+
+
+def main(argv):
+    if "--operator" not in argv:
+        print("creates a collection and a service principal, so it runs only on the verify project",
+              file=sys.stderr)
+        return 1
+    dev = role_token("developer")
+    admin = role_token("engineer")
+    name = "VfyJobs" + secrets.token_hex(4)
+    imported = package = principal = None
+    try:
+        principal, _, key = new_principal(admin, "developer")
+        as_key = bearer(key)
+        status, raw, _ = code("POST", "/collections", {"name": name}, token=dev)
+        expect(status == 201, "creating {} answered {} {}".format(name, status, error_code(raw)))
+        name = json.loads(raw)["name"]
+
+        status, mine = upload(name, "vfy-jobs-dev.txt", b"A note the Developer imports.\n" * 20, token=dev)
+        expect(status == 202, "the Developer's upload answered {} {}".format(status, mine))
+        status, keys = upload(name, "vfy-jobs-key.txt", b"A note the key imports.\n" * 20, headers=as_key)
+        expect(status == 202, "the key's upload answered {} {}".format(status, keys))
+        dev_id, key_id = mine["job_id"], keys["job_id"]
+
+        # While they run, or once they have ended: each sees its own job only.
+        seen = listed("/ingest/jobs", token=dev)
+        expect(dev_id in seen and key_id not in seen, "the Developer's list holds {}".format(sorted(seen)))
+        entry = seen[dev_id]
+        expect(entry["owner"] == {"name": DEVELOPER, "kind": "user"}, "the owner is {}".format(entry["owner"]))
+        expect(entry["collection"] == name and entry["files"] == ["vfy-jobs-dev.txt"],
+               "the entry names {} {}".format(entry["collection"], entry["files"]))
+        expect(entry["created_at"], "the entry has no created_at")
+        seen = listed("/ingest/jobs", headers=as_key)
+        expect(key_id in seen and dev_id not in seen, "the key's list holds {}".format(sorted(seen)))
+        expect(seen[key_id]["owner"] == {"name": principal, "kind": "service"},
+               "the key's job owner is {}".format(seen[key_id]["owner"]))
+
+        for job_id, who in ((dev_id, {"token": dev}), (key_id, {"headers": as_key})):
+            job = wait_job("/ingest/job/" + job_id, **who)
+            expect(job["status"] == "completed", "ingest {} ended {}".format(job_id, job["status"]))
+            expect("owner" not in job and "created_at" not in job, "the lookup by ID gained the new fields")
+        seen = listed("/ingest/jobs", token=dev)
+        expect(seen.get(dev_id, {}).get("finished_at"), "the finished job has no finished_at in the list")
+        everyone = listed("/ingest/jobs", token=admin)
+        expect(dev_id in everyone and key_id in everyone, "the Engineer's list lacks a job")
+        expect(everyone[key_id]["owner"] == {"name": principal, "kind": "service"},
+               "the Engineer sees the key's job owned by {}".format(everyone[key_id]["owner"]))
+
+        status, raw, _ = code("POST", "/export", {"collection": name}, token=dev)
+        expect(status == 202, "the export answered {} {}".format(status, error_code(raw)))
+        export_id = json.loads(raw)["job_id"]
+        expect(export_id in listed("/export/jobs", token=dev), "the running or ended export isn't listed")
+        export = wait_job("/export/job/" + export_id, token=dev)
+        package = export.get("filename")
+        expect(export["status"] == "completed", "the export ended {}".format(export["status"]))
+        status, raw, _ = code("POST", "/import", {"filename": package, "on_conflict": "rename"}, token=dev)
+        expect(status == 202, "the import answered {} {}".format(status, error_code(raw)))
+        import_id = json.loads(raw)["job_id"]
+        job = wait_job("/import/job/" + import_id, token=dev)
+        imported = job.get("collection")
+        expect(job["status"] == "completed", "the import ended {} {}".format(job["status"], job.get("error")))
+
+        for path, job_id in (("/export/jobs", export_id), ("/import/jobs", import_id)):
+            seen = listed(path, token=dev)
+            expect(job_id in seen and seen[job_id]["owner"] == {"name": DEVELOPER, "kind": "user"}
+                   and seen[job_id]["created_at"] and seen[job_id]["finished_at"],
+                   "{} for the Developer: {}".format(path, seen.get(job_id)))
+            expect(job_id in listed(path, token=admin), "{} for the Engineer lacks {}".format(path, job_id))
+            expect(job_id not in listed(path, headers=as_key), "{} for the key holds {}".format(path, job_id))
+        return 0
+    except CheckFailed as failure:
+        print(str(failure), file=sys.stderr)
+        return 1
+    finally:
+        for collection in (name, imported):
+            if collection:
+                code("DELETE", "/collections/{}?confirm=true".format(collection), token=admin)
+        if package:
+            exports = Path(os.environ.get("RAG_EXPORTS_DIR") or auth_setup.REPO / "exports")
+            (exports / package).unlink(missing_ok=True)
+        if principal:
+            code("POST", "/auth/service-principals/{}/disable".format(principal), token=admin)
+        request("POST", "/auth/logout", token=dev)
+        request("POST", "/auth/logout", token=admin)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+```
+
 ### scripts/verify/18_lan.sh
 
 ```bash
@@ -24445,7 +26532,7 @@ class PolicyTests(unittest.TestCase):
         counts = {}
         for access in policy.ACCESS.values():
             counts[access] = counts.get(access, 0) + 1
-        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 19, "engineer": 26})
+        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 23, "engineer": 26})
         self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
         self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
         self.assertEqual(policy.ACCESS[("POST", "/collections")], "developer")
@@ -25699,13 +27786,14 @@ X = "VfyAuthNoSuch"
 PROTECTED = (
     ("GET", "/collections"), ("POST", "/collections"), ("DELETE", f"/collections/{X}?confirm=true"),
     ("POST", "/query"), ("GET", f"/retrieval/config/{X}"), ("POST", "/retrieval/config"),
-    ("POST", "/ingest/upload"), ("GET", "/ingest/job/nope"), ("GET", f"/ingest/config/{X}"),
+    ("POST", "/ingest/upload"), ("GET", "/ingest/job/nope"), ("GET", "/ingest/jobs"), ("GET", f"/ingest/config/{X}"),
     ("POST", "/ingest/config"),
-    ("POST", "/goldstandard/generate"), ("GET", "/goldstandard/session/gs_nope"),
+    ("POST", "/goldstandard/generate"), ("GET", "/goldstandard/session/gs_nope"), ("GET", "/goldstandard/sessions"),
     ("PATCH", "/goldstandard/session/gs_nope/pair/p"), ("POST", "/goldstandard/regenerate"),
     ("POST", "/goldstandard/save"), ("GET", "/goldstandard/download/nope.json"),
     ("GET", "/goldstandard/diagnostics"),
-    ("POST", "/export"), ("GET", "/export/job/nope"), ("POST", "/import"), ("GET", "/import/job/nope"),
+    ("POST", "/export"), ("GET", "/export/job/nope"), ("GET", "/export/jobs"), ("POST", "/import"),
+    ("GET", "/import/job/nope"), ("GET", "/import/jobs"),
     ("GET", "/packages"), ("GET", "/help/transfer"),
     ("POST", "/tune/rechunk"), ("POST", "/tune/reembed"), ("POST", "/tune/reindex"),
     ("GET", "/tune/job/nope"), ("GET", f"/tune/{X}"),
@@ -26224,20 +28312,63 @@ try:
                     print(f'PASS {label}: real parsed text stored as {len(chunks)} bounded windows with exact coverage/overlap', flush=True)
                 finally:
                     ingest_pipeline._jobs.pop(job_id,None)
+        # #621: a file whose overlap output would pass the per-file limits is
+        # stored as parts, each inside them, with every character kept. 1000/900
+        # stores just under ten times the text, inside the cap (PR #630).
         stage = root / 'budget'
         stage.mkdir()
         source = stage / 'over-budget.txt'
-        source.write_text('x' * 100000)
+        text = '\n\n'.join(['x' * 998] * 1100)
+        source.write_text(text)
         job_id='overlap-budget-'+uuid.uuid4().hex[:8]
-        job={'status':'queued','files_total':1,'files_completed':0,'files_failed':0,'chunks_stored':0,'errors':[]}
+        job={'status':'queued','files_total':1,'files_completed':0,'files_failed':0,'chunks_stored':0,'errors':[],'split':[]}
         ingest_pipeline._jobs[job_id]=job
         try:
-            ingest_pipeline._process_job_sync(job_id,[source],stage,collection,'overlap',1000,999,0.85,100)
-            assert job['status']=='failed' and job['files_failed']==1 and job['chunks_stored']==0,job
-            assert any('per-file limit' in error for error in job['errors']),job
-            stored=list(wc.get_client().collections.get(collection).iterator())
-            assert not any(o.properties['source_file']==source.name for o in stored)
-            print('PASS excessive overlap output fails before object storage',flush=True)
+            with patch.object(settings, 'sources_dir', str(root/'retained')):
+                ingest_pipeline._process_job_sync(job_id,[source],stage,collection,'overlap',1000,900,0.85,100)
+            assert job['status']=='completed' and job['files_completed']==1,job
+            stored=[o.properties for o in wc.get_client().collections.get(collection).iterator()
+                    if o.properties['source_file'].startswith(source.name)]
+            names=sorted({p['source_file'] for p in stored})
+            assert names==[f'{source.name} (part 1)',f'{source.name} (part 2)'],names
+            assert job['chunks_stored']==len(stored),job
+            assert job['split']==[f"{source.name}: split into 2 parts, stored as '{source.name} (part 1)' "
+                                  f"to '{source.name} (part 2)'"],job
+            # Each part restores exactly: its paragraphs, as the parser joins them
+            # (one line break between), every character and separator in place,
+            # and the parts together hold every paragraph once.
+            paragraphs=0
+            for name in names:
+                windows=[p['content'] for p in sorted((p for p in stored if p['source_file']==name),
+                                                      key=lambda p:p['chunk_index'])]
+                assert len(windows)<=chunker.MAX_OVERLAP_WINDOWS,(name,len(windows))
+                assert sum(map(len,windows))<=chunker.MAX_OVERLAP_OUTPUT_CHARACTERS,name
+                restored=windows[0]+''.join(w[900:] for w in windows[1:])
+                count=restored.count('\n')+1
+                assert restored=='\n'.join(['x'*998]*count),(name,len(restored))
+                paragraphs+=count
+            assert paragraphs==1100,paragraphs
+            print('PASS excessive overlap output is stored as parts inside the per-file limits',flush=True)
+        finally:
+            ingest_pipeline._jobs.pop(job_id, None)
+        # PR #630: a split file whose chunks would store more than ten times its
+        # size fails whole: 1000/999 stores about 1,000 times, and nothing stays.
+        stage = root / 'capped'
+        stage.mkdir()
+        source = stage / 'capped.txt'
+        source.write_text('x' * 20000)
+        job_id='overlap-capped-'+uuid.uuid4().hex[:8]
+        job={'status':'queued','files_total':1,'files_completed':0,'files_failed':0,'chunks_stored':0,'errors':[],'split':[]}
+        ingest_pipeline._jobs[job_id]=job
+        try:
+            with patch.object(settings, 'sources_dir', str(root/'retained')):
+                ingest_pipeline._process_job_sync(job_id,[source],stage,collection,'overlap',1000,999,0.85,100)
+            assert job['status']=='failed' and job['chunks_stored']==0,job
+            assert len(job['errors'])==1 and job['errors'][0].startswith('capped.txt: it would store ') \
+                and 'more than 10 times its own size (20,000 characters)' in job['errors'][0],job
+            assert not any(o.properties['source_file'].startswith('capped.txt')
+                           for o in wc.get_client().collections.get(collection).iterator())
+            print('PASS a split file storing over ten times its size fails whole, nothing stored',flush=True)
         finally:
             ingest_pipeline._jobs.pop(job_id, None)
     print('PASS owned temporary source paths removed', flush=True)
@@ -27874,6 +30005,13 @@ check "chunks below min_chunk_size are merged" $? "stored $(python3 -c "import j
 check "chunker per-file limits, 6,000-character ceiling and semantic floor (#111)" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_insert_chunks.py)
 check "chunk inserts are batched and retried while the index isn't ready" $?
+# The corpus preparation rules the Import page offers state the app's own
+# ingest limits, read from the same constants, settings and proxy (#615).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_corpus_rules.py)
+check "the corpus preparation rules state the app's ingest limits (#615)" $?
+# Their chunk counts hold for the real chunker, for every strategy (#615).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_corpus_rules_estimates.py)
+check "the corpus preparation rules' chunk counts hold for every strategy (#615)" $?
 
 # ── one bad file must not fail the batch ─────────────────────────────────────
 drop_collection "$C"; make_collection "$C"
@@ -28104,6 +30242,149 @@ check "two concurrent uploads of one name leave exactly one job's version, whole
 drop_collection "$RI"
 rm -rf "$RIFIX"
 
+# ── replacing a name touches only that name (#622) ───────────────────────────
+# source_file is word-tokenized, so Weaviate's equal("report.pdf") also matches
+# a/report.pdf and Report.PDF, and uploading report.pdf deleted their chunks.
+EX="${PREFIX}Exact"
+EXFIX=$(mktemp -d)
+python3 - "$FIX/policies.pdf" "$EXFIX/folder.zip" <<'ENDPY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[2], "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("a/report.pdf", open(sys.argv[1], "rb").read())
+ENDPY
+# Each stored name's chunk contents, sorted.
+ex_state() {
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$EX") <<'ENDPY'
+import json, sys
+from services import weaviate_client as wc
+try:
+    names = {}
+    for o in wc.get_client().collections.get(sys.argv[1]).iterator():
+        names.setdefault(o.properties["source_file"], []).append(o.properties["content"])
+    print(json.dumps({n: sorted(c) for n, c in names.items()}))
+finally:
+    wc.close_client()
+ENDPY
+}
+drop_collection "$EX"; make_collection "$EX"
+ingest "$EX" fixed 200 40 "$EXFIX/folder.zip"
+ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=Report.PDF"
+ex_state > /tmp/vfy_ex_before.json
+ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=report.pdf"
+cp /tmp/vfy_job.json /tmp/vfy_ex_job1.json
+ex_state > /tmp/vfy_ex_first.json
+ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=report.pdf"
+cp /tmp/vfy_job.json /tmp/vfy_ex_job2.json
+ex_state > /tmp/vfy_ex_second.json
+python3 - <<'ENDPY'
+import json, sys
+load = lambda name: json.load(open(f"/tmp/vfy_ex_{name}.json"))
+before, first, second = load("before"), load("first"), load("second")
+job1, job2 = load("job1"), load("job2")
+others = ("a/report.pdf", "Report.PDF")
+checks = {
+    "both uploads completed": job1["status"] == job2["status"] == "completed",
+    "the first report.pdf replaced nothing": job1.get("chunks_replaced") == 0,
+    "a/report.pdf and Report.PDF were stored": all(before.get(n) for n in others),
+    "the first report.pdf upload kept them": all(first.get(n) == before.get(n) for n in others),
+    "the re-upload kept them": all(second.get(n) == before.get(n) for n in others),
+    "the re-upload replaced the first report.pdf set":
+        bool(first.get("report.pdf")) and job2.get("chunks_replaced") == len(first["report.pdf"]),
+    "one report.pdf set remains": len(second.get("report.pdf", [])) == job2.get("chunks_stored"),
+}
+print({k: v for k, v in checks.items() if not v} or "ok",
+      {n: len(c) for n, c in second.items()}, job1.get("chunks_replaced"), job2.get("chunks_replaced"))
+sys.exit(0 if all(checks.values()) else 1)
+ENDPY
+check "re-uploading report.pdf replaces only report.pdf: a/report.pdf and Report.PDF keep all their chunks (#622)" $? \
+  "$(head -c 300 /tmp/vfy_ex_job1.json)"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" page < scripts/verify/exact_source.py)
+check "replacing a name on the page path selects exactly that name in real Weaviate (#622)" $?
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" walk < scripts/verify/exact_source.py)
+check "replacing a name on the walk path, past 10,000 word matches, selects exactly that name (#622)" $?
+drop_collection "$EX"
+rm -rf "$EXFIX"
+
+# ── a file over the per-file limits is stored as parts (#621) ────────────────
+# Controlled cases: the reviewer's 13,000 records, files over 10,000,000
+# characters, family replacement, all or nothing, cuts, CSV, Markdown, encoding,
+# overlap sizing, re-chunk, export links.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_split_parts.py)
+check "files over the per-file limits are split into parts: regressions (#621)" $?
+# The same in the real Weaviate and ingest worker, on a scratch collection
+# without a vectorizer (embedding 13,000 chunks takes this project about an
+# hour): the reviewer's 13,000 records, a 10,519,499-character .txt, a smaller
+# re-upload replacing every part, and a bad line after part 1 storing nothing.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" < scripts/verify/split_parts.py)
+check "files over the per-file limits are stored as parts in the real Weaviate, replaced whole, all or nothing (#621)" $?
+
+# Reviewer (PR #630): the same through the API and the proxy. The collection is
+# made in Weaviate without a vectorizer, so the 13,000 chunks store in seconds;
+# the upload, the worker and the job record are the real ones.
+SPL="${PREFIX}SplitApi"
+SPLFIX=$(mktemp -d)
+drop_collection "$SPL"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$SPL" <<'PY'
+import sys
+from weaviate.classes.config import Configure, VectorDistances
+from services import weaviate_client as wc
+wc.get_client().collections.create(
+    name=sys.argv[1], vectorizer_config=Configure.Vectorizer.none(),
+    vector_index_config=Configure.VectorIndex.hnsw(distance_metric=VectorDistances.COSINE),
+    properties=wc.COLLECTION_PROPERTIES)
+wc.close_client()
+PY
+)
+python3 - "$SPLFIX" <<'PY'
+import json, sys
+from pathlib import Path
+row = lambda i: json.dumps({"t": f"{i:07d} " + "x" * 589}) + "\n"
+Path(sys.argv[1], "big").mkdir()
+Path(sys.argv[1], "small").mkdir()
+Path(sys.argv[1], "big", "big.jsonl").write_text("".join(row(i) for i in range(13_000)))
+Path(sys.argv[1], "small", "big.jsonl").write_text("".join(row(i) for i in range(3)))
+PY
+split_upload() {
+  curl -s -m 600 -o /tmp/vfy_split_job.json -X POST "$API/ingest/upload" -F "collection=$SPL" \
+    -F "strategy=context_aware" -F "chunk_size=1000" -F "chunk_overlap=0" -F "min_chunk_size=0" \
+    -F "files=@$1" || return 1
+  local job; job=$(jfield "['job_id']" < /tmp/vfy_split_job.json) || return 1
+  wait_for_job "/ingest/job/$job" 900 >/dev/null
+  api_get "/ingest/job/$job" > /tmp/vfy_split_job.json
+}
+split_count() {
+  api_get "/collections" | python3 -c "
+import json,sys
+print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$SPL'][0])"
+}
+split_upload "$SPLFIX/big/big.jsonl"
+count=$(split_count)
+python3 - "$count" <<'PY'
+import json, sys
+job = json.load(open("/tmp/vfy_split_job.json"))
+n = len(job.get("split") or []) and int(job["split"][0].split("split into ")[1].split(" ")[0])
+ok = (job["status"] == "completed" and job["files_completed"] == 1 and job["errors"] == []
+      and job["chunks_stored"] == 13_000 and int(sys.argv[1]) == 13_000 and n >= 2
+      and job["split"] == [f"big.jsonl: split into {n} parts, stored as 'big.jsonl (part 1)' "
+                           f"to 'big.jsonl (part {n})'"])
+print({k: job.get(k) for k in ("status", "files_completed", "chunks_stored", "split", "errors")}, sys.argv[1])
+sys.exit(0 if ok else 1)
+PY
+check "reviewer: 13,000 records uploaded through the API complete as parts, listed in the job's split (#621)" $?
+split_upload "$SPLFIX/small/big.jsonl"
+count=$(split_count)
+python3 - "$count" <<'PY'
+import json, sys
+job = json.load(open("/tmp/vfy_split_job.json"))
+ok = (job["status"] == "completed" and job.get("split") == [] and job["chunks_replaced"] == 13_000
+      and int(sys.argv[1]) == job["chunks_stored"] > 0)
+print({k: job.get(k) for k in ("status", "chunks_stored", "chunks_replaced", "split")}, sys.argv[1])
+sys.exit(0 if ok else 1)
+PY
+check "reviewer: re-uploading the name through the API replaces every part (#621)" $?
+drop_collection "$SPL"
+rm -rf "$SPLFIX" /tmp/vfy_split_job.json
+
 # ── job status transitions ───────────────────────────────────────────────────
 # `queued` is only observable when the executor is saturated, so this asserts
 # the terminal transition and that the POST reports the initial state.
@@ -28219,6 +30500,22 @@ check_eq "the deleted collection is still gone 10 s later" "$(object_count "$DC"
 # writes, startup marking of interrupted jobs, corrupt files and retention.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_jobstore.py)
 check "job store: persistence, throttling, startup marking and retention" $?
+
+# ── running and recent jobs (#617) ───────────────────────────────────────────
+# Units in the API image with no network: owners and timestamps recorded, who
+# sees what, the 24-hour window and the cap, sessions, packages. Then the lists
+# on the stack: a Developer's and a Developer-role key's ingests, the
+# Developer's export and import, each listed for its owner and the Engineer
+# only. The stack check creates a principal, so it runs only on the verify project.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_job_lists.py)
+check "job lists: owners and timestamps, visibility, window, cap, sessions, packages" $?
+if [ -z "$(volume_removal_refusal_reason)" ]; then
+  _rag_require_lock_owner
+  python3 ./job_lists.py --operator
+  check "GET /ingest/jobs, /export/jobs, /import/jobs list each caller's own jobs, and everyone's for the Engineer" $?
+else
+  skip "job lists on the stack: not the verify project"
+fi
 # A killed job's leftovers (#377): ingest staging in UPLOAD_DIR, and an export's
 # `.build-*` directory and `.*.tar.gz.partial` archive in EXPORTS_DIR.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_startup_sweep.py)
@@ -31949,7 +34246,59 @@ const clickByText = (page, text) => page.evaluate(t => {
   if (!el) return false; el.click(); return true;
 }, text);
 
-module.exports = { sleep, makeReporter, launch, session, login, stubAuth, credentialsFor, bodyText, setValue, clickByText };
+// The nav's menus (#616). A menu button is `nav button[data-menu=<key>]` (data,
+// tune, admin, account); while its menu is open, its aria-controls names the
+// role="menu" element. A closed menu's entries aren't in the page.
+async function openMenu(page, key) {
+  const found = await page.evaluate(k => {
+    const b = document.querySelector(`nav button[data-menu="${k}"]`);
+    if (!b) return false;
+    if (b.getAttribute('aria-expanded') !== 'true') b.click();
+    return true;
+  }, key);
+  if (!found) throw new Error(`no ${key} menu in the nav`);
+  await page.waitForFunction(k => {
+    const b = document.querySelector(`nav button[data-menu="${k}"]`);
+    return b && b.getAttribute('aria-expanded') === 'true' && !!document.getElementById(b.getAttribute('aria-controls') || '');
+  }, { timeout: 5000 }, key);
+}
+
+async function chooseFromMenu(page, key, label) {
+  await openMenu(page, key);
+  const chosen = await page.evaluate((k, t) => {
+    const b = document.querySelector(`nav button[data-menu="${k}"]`);
+    const m = document.getElementById(b.getAttribute('aria-controls'));
+    const e = [...m.querySelectorAll('[role=menuitem]')].find(x => x.textContent.trim() === t);
+    if (!e) return false; e.click(); return true;
+  }, key, label);
+  if (!chosen) throw new Error(`no "${label}" in the ${key} menu`);
+}
+
+// The nav as the user sees it: the top-level links, then each menu in order
+// with its label and the entries it shows when opened. Each menu is opened and
+// closed again. `pages` is the links and every menu's entries but the account's.
+async function readNav(page) {
+  const { links, keys } = await page.evaluate(() => ({
+    links: [...document.querySelectorAll('nav a')].filter(a => !a.closest('[role=menu]')).map(a => a.textContent.trim()),
+    keys: [...document.querySelectorAll('nav button[aria-haspopup=menu]')].map(b => b.dataset.menu),
+  }));
+  const menus = [];
+  for (const key of keys) {
+    await openMenu(page, key);
+    menus.push(await page.evaluate(k => {
+      const b = document.querySelector(`nav button[data-menu="${k}"]`);
+      const shown = b.cloneNode(true);
+      shown.querySelectorAll('[aria-hidden=true]').forEach(x => x.remove());
+      const m = document.getElementById(b.getAttribute('aria-controls'));
+      return { key: k, label: shown.textContent.replace(/\s+/g, ' ').trim(), entries: [...m.querySelectorAll('[role=menuitem]')].map(x => x.textContent.trim()) };
+    }, key));
+    await page.evaluate(k => document.querySelector(`nav button[data-menu="${k}"]`).click(), key);
+    await page.waitForFunction(k => document.querySelector(`nav button[data-menu="${k}"]`)?.getAttribute('aria-expanded') === 'false', { timeout: 5000 }, key);
+  }
+  return { links, menus, pages: [...links, ...menus.filter(m => m.key !== 'account').flatMap(m => m.entries)] };
+}
+
+module.exports = { sleep, makeReporter, launch, session, login, stubAuth, credentialsFor, bodyText, setValue, clickByText, openMenu, chooseFromMenu, readNav };
 ```
 
 ### scripts/verify/browser/query_config.js
@@ -32275,7 +34624,7 @@ if (require.main === module) {
 // chunking-strategy selector, `input[type=text]` missed an input with no type
 // attribute, and a row's delete link matched a class test meant for the modal's
 // confirm button.
-const { sleep, makeReporter, launch, session, credentialsFor, bodyText, setValue, clickByText } = require('./lib');
+const { sleep, makeReporter, launch, session, credentialsFor, bodyText, setValue, clickByText, readNav, chooseFromMenu } = require('./lib');
 
 const BASE = process.env.RAG_UI_BASE || 'http://proxy';
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic'];
@@ -32321,7 +34670,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
       await submit();
     }
     await s.page.waitForFunction(() => location.pathname === '/qa' && document.querySelectorAll('nav a').length > 0, { timeout: 10000 }).catch(() => {});
-    const badge = await s.page.evaluate(() => document.querySelector('nav span.bg-blue-100')?.textContent.trim());
+    const badge = await s.page.evaluate(() => document.querySelector('nav button[data-menu=account] span.bg-blue-100')?.textContent.trim());
     r.check('logging in through the form opens /qa as the account\'s role', badge === 'AI Engineer', String(badge));
     const cookies = await s.page.cookies();
     const cookie = cookies.find(c => c.name === 'rag_session');
@@ -32332,8 +34681,9 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     for (const p of ['/qa', '/collections', '/health', '/qa']) {
       await s.page.goto(BASE + p, { waitUntil: 'networkidle2' }); await sleep(500);
     }
-    r.check('the session survives navigation and reloads', await s.page.evaluate(() => document.querySelectorAll('nav a').length === 11));  // the Engineer's links, Users, Service keys and Audit included
-    await clickByText(s.page, 'Log out');
+    const pages = (await readNav(s.page).catch(() => ({ pages: [] }))).pages;  // the Engineer's 11: Q&A and the menus' 10 (#616)
+    r.check('the session survives navigation and reloads', pages.length === 11, JSON.stringify(pages));
+    await chooseFromMenu(s.page, 'account', 'Log out').catch(() => {});
     await s.page.waitForFunction(() => location.pathname === '/login', { timeout: 10000 }).catch(() => {});
     const me = await s.page.evaluate(async () => (await fetch('/api/auth/me')).status);
     r.check('Log out ends the session at the API and returns to the login page', me === 401 && new URL(s.page.url()).pathname === '/login', `me=${me}`);
@@ -32422,8 +34772,9 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
   {
     const s = await session(browser, BASE, 'end_user');
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(1500);
-    const links = await s.page.evaluate(() => [...document.querySelectorAll('nav a')].map(a => a.textContent.trim()));
-    r.check('End User sees only Q&A in the nav', links.length === 1 && /Q&A/.test(links[0]), JSON.stringify(links));
+    const shown = await readNav(s.page).catch(e => ({ pages: [], menus: [], error: String(e) }));
+    r.check('End User sees only Q&A in the nav, and no Data, Tune or Admin menu',
+      JSON.stringify(shown.pages) === '["Q&A"]' && JSON.stringify(shown.menus.map(m => m.key)) === '["account"]', JSON.stringify(shown));
     await s.page.goto(BASE + '/collections', { waitUntil: 'networkidle2' }); await sleep(1200);
     const landed = await s.page.evaluate(() => location.pathname);
     r.check('End User cannot reach a gated route directly', landed === '/qa', `landed on ${landed}`);
@@ -32432,7 +34783,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
   {
     const s = await session(browser, BASE, 'engineer');
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(1500);
-    const links = await s.page.evaluate(() => [...document.querySelectorAll('nav a')].map(a => a.textContent.trim()));
+    const links = (await readNav(s.page).catch(() => ({ pages: [] }))).pages;  // through the menus (#616)
     for (const want of ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys', 'Audit']) {
       r.check(`Engineer nav includes ${want}`, links.includes(want), JSON.stringify(links));
     }
@@ -32984,6 +35335,34 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     }
   }
 
+  // ── corpus preparation rules (#615) ────────────────────────────────────────
+  // The Import page offers the rules as a download: a static file of the UI
+  // build, served through the proxy. test_corpus_rules.py checks its limits.
+  r.section('corpus preparation rules');
+  {
+    const s = await session(browser, BASE, 'developer');
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const link = await s.page.evaluate(() => {
+        const a = [...document.querySelectorAll('a')]
+          .find(x => x.textContent.trim() === 'Download corpus preparation rules (.md)');
+        return a ? { path: new URL(a.href).pathname, download: a.getAttribute('download') } : null;
+      });
+      r.check('the Import page links to the corpus preparation rules as a download',
+              !!link && link.path === '/corpus-preparation-rules.md'
+                && link.download === 'corpus-preparation-rules.md', JSON.stringify(link));
+      const served = await s.page.evaluate(async () => {
+        const response = await fetch('/corpus-preparation-rules.md');
+        return { status: response.status, start: (await response.text()).slice(0, 60) };
+      });
+      r.check('the rules file is served as markdown through the proxy',
+              served.status === 200 && served.start.startsWith('# Preparing files for rag-docker ingest\n'),
+              JSON.stringify(served));
+    } finally {
+      await s.ctx.close();
+    }
+  }
+
   // ── import errors (#290) ───────────────────────────────────────────────────
   // A truncated ZIP once ended in a plain-text 500 that the page could only
   // show as "HTTP 500", and a failing status poll was ignored.
@@ -33249,6 +35628,9 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     fs.writeFileSync(small, 'Re-ingest fixture.\n');
     const jobId = 'vfyrein' + replaced;
     const skippedEntry = "u.zip:a/r.txt (replaced by r.txt later in this upload, same name 'a/r.txt')";
+    // A file over the per-file limits is stored as parts and listed in `split` (#621).
+    const splitEntry = "big.jsonl: split into 2 parts, stored as 'big.jsonl (part 1)' to 'big.jsonl (part 2)'";
+    const split = replaced === 3 ? [splitEntry] : [];
     const s = await session(browser, BASE, 'developer');
     await s.page.setRequestInterception(true);
     s.page.on('request', request => {
@@ -33256,7 +35638,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
       if (path === '/api/ingest/upload' && request.method() === 'POST')
         return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'x' }) });
       if (path === '/api/ingest/job/' + jobId)
-        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 2, errors: [], skipped: [skippedEntry], chunks_replaced: replaced }) });
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 2, errors: [], skipped: [skippedEntry], chunks_replaced: replaced, split }) });
       return request.continue();
     });
     try {
@@ -33277,6 +35659,12 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
                 text.includes('1 file skipped:') && !text.includes('not a supported type:') && text.includes(skippedEntry),
                 text.slice(0, 300));
       }
+      if (replaced === 3)
+        r.check('a split file is listed under "1 file split into parts:" with its part names (#621)',
+                text.includes('1 file split into parts:') && text.includes(splitEntry), text.slice(0, 400));
+      if (replaced === 0)
+        r.check('an empty split list shows no split heading (#621)', clicked && !text.includes('split into parts'),
+                text.slice(0, 300));
       r.check(`re-ingest progress fixture (${replaced}) causes no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')));
     } finally {
       fs.unlinkSync(small);
@@ -33616,6 +36004,244 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     }
     r.check('no console errors on the help page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
     await s.ctx.close();
+  }
+
+  // ── running and recent jobs (#617) ────────────────────────────────────────
+  // Each page lists the caller's running and recent jobs, read from the API when
+  // the page opens, and opens the newest by itself; leaving the page and coming
+  // back finds the job again. The first check uses the real API; the rest stub
+  // the lists and lookups so states and timing are fixed.
+  r.section('running and recent jobs (#617)');
+  {
+    const fs = require('fs');
+    const crypto = require('crypto');
+    const json = body => ({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+    const now = Date.now();
+    const at = secondsAgo => new Date(now - secondsAgo * 1000).toISOString();
+    const opened = page => page.evaluate(() =>
+      [...document.querySelectorAll('section[aria-label="Running and recent jobs"] button[aria-current="true"]')]
+        .map(b => b.innerText.replace(/\s+/g, ' ').trim()));
+    const rows = page => page.evaluate(() =>
+      [...document.querySelectorAll('section[aria-label="Running and recent jobs"] li button')]
+        .map(b => b.innerText.replace(/\s+/g, ' ').trim()));
+    const clickRowAt = (page, n) => page.evaluate(i => {
+      const b = document.querySelectorAll('section[aria-label="Running and recent jobs"] li button')[i];
+      if (!b) return false; b.click(); return true;
+    }, n);
+    const clickRow = (page, text) => page.evaluate(t => {
+      const b = [...document.querySelectorAll('section[aria-label="Running and recent jobs"] li button')]
+        .find(x => x.innerText.includes(t));
+      if (!b) return false; b.click(); return true;
+    }, text);
+    const leaveAndReturn = async (page, path) => {
+      await page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(500);
+      await page.goto(BASE + path, { waitUntil: 'networkidle2' }); await sleep(1500);
+    };
+
+    // Import, real API: start an ingest, leave at once, come back.
+    {
+      const small = '/tmp/vfy-jobs-617.txt';
+      fs.writeFileSync(small, 'A note for the running and recent jobs check.\n'.repeat(20));
+      const s = await session(browser, BASE, 'developer');
+      try {
+        const name = await s.page.evaluate(async n => {
+          const res = await fetch('/api/collections', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: n, index_type: 'hnsw', distance_metric: 'cosine' }) });
+          return res.ok ? (await res.json()).name : null;
+        }, 'VfyUiJobs' + crypto.randomBytes(3).toString('hex'));
+        await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+        await setValue(s.page, `() => [...document.querySelectorAll('select')].find(x => [...x.options].some(o => o.value === ${JSON.stringify(name)}))`, name);
+        const input = await s.page.$('#file-input');
+        await input.uploadFile(small);
+        await sleep(300);
+        // The job ID from the upload's answer: the page may already show an
+        // earlier job it opened by itself.
+        const accepted = s.page.waitForResponse(res => new URL(res.url()).pathname === '/api/ingest/upload', { timeout: 30000 })
+          .then(res => res.json()).catch(() => ({}));
+        const clicked = await clickByText(s.page, 'Start Ingest');
+        const jobId = (await accepted).job_id;
+        await leaveAndReturn(s.page, '/import');
+        const back = await bodyText(s.page);
+        const open = await opened(s.page);
+        r.check('Import: an ingest started, the page left and opened again, is listed and opened by itself',
+          !!name && clicked && !!jobId && back.includes('Job ID: ' + jobId) && open.length === 1 && open[0].includes(name)
+            && open[0].startsWith('Ingest'),
+          `name=${name} clicked=${clicked} job=${jobId} open=${JSON.stringify(open)} text: ${back.slice(0, 200)}`);
+        await s.page.waitForFunction(() => /Files: 1\/1/.test(document.body.innerText) &&
+          [...document.querySelectorAll('span')].some(x => x.textContent.trim() === 'completed'), { timeout: 180000 }).catch(() => {});
+        const done = await bodyText(s.page);
+        r.check('Import: the job found again shows its result once it has finished',
+          done.includes('Job ID: ' + jobId) && done.includes('Files: 1/1') && /completed/.test(done), done.slice(0, 300));
+        r.check('Import: nothing about jobs is kept in browser storage',
+          await s.page.evaluate(() => sessionStorage.length === 0 && localStorage.length === 0));
+      } finally { await s.ctx.close(); fs.unlinkSync(small); }
+    }
+
+    // Import, stubbed: a running job and a finished one; the running one opens,
+    // survives leaving the page, then ends; clicking the other switches.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        let finished = false;
+        const job = (id, status, done) => ({ job_id: id, status, files_total: 2, files_completed: done, files_failed: 0,
+          chunks_stored: done * 3, errors: [], skipped: [] });
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (path === '/api/ingest/jobs') return request.respond(json({ jobs: [
+            { ...job('vfy617a', finished ? 'completed' : 'running', finished ? 2 : 1), collection: 'StubRunning617', files: ['a.txt', 'b.txt'],
+              owner: { name: 'vfy-developer', kind: 'user' }, created_at: at(60), finished_at: finished ? at(1) : null },
+            { ...job('vfy617b', 'completed', 2), collection: 'StubFinished617', files: ['c.txt'],
+              owner: { name: 'vfy-developer', kind: 'user' }, created_at: at(3600), finished_at: at(3500) }] }));
+          if (path === '/api/ingest/job/vfy617a') return request.respond(json(job('vfy617a', finished ? 'completed' : 'running', finished ? 2 : 1)));
+          if (path === '/api/ingest/job/vfy617b') return request.respond(json(job('vfy617b', 'completed', 2)));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+        const listed = await rows(s.page);
+        r.check('Import: the list shows kind, collection, status, progress and start time for each job',
+          listed.length === 2 && /^Ingest StubRunning617 running 1\/2 files Started /.test(listed[0])
+            && /^Ingest StubFinished617 completed 2\/2 files Started /.test(listed[1]), JSON.stringify(listed));
+        r.check('Import: the newest running job opens by itself',
+          (await opened(s.page)).join() .includes('StubRunning617') && (await bodyText(s.page)).includes('Job ID: vfy617a'));
+        r.check('Import: a Developer sees no owner column',
+          await s.page.evaluate(() => document.querySelectorAll('.job-owner').length === 0));
+        await leaveAndReturn(s.page, '/import');
+        r.check('Import: after leaving and coming back the running job is open again',
+          (await bodyText(s.page)).includes('Job ID: vfy617a') && (await opened(s.page)).join().includes('StubRunning617'));
+        finished = true;
+        await sleep(4000);
+        const ended = await bodyText(s.page);
+        r.check('Import: its result shows once it has finished', ended.includes('Files: 2/2') && ended.includes('Job ID: vfy617a'), ended.slice(0, 300));
+        const clicked = await clickRow(s.page, 'StubFinished617');
+        await sleep(300);
+        r.check('Import: clicking another row switches to that job',
+          clicked && (await bodyText(s.page)).includes('Job ID: vfy617b') && (await opened(s.page)).join().includes('StubFinished617'));
+        r.check('Import list fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // Gold Standard, stubbed: a generating session opens, survives leaving the
+    // page, then completes; clicking another row loads it.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        let finished = false;
+        const pair = n => ({ pair_id: 'p' + n, question: `Stub question ${n}?`, answer: 'Inert', contexts: ['Inert'],
+          ground_truth: 'Inert', source_file: 'inert.txt', chunk_index: n, status: 'pending' });
+        const G1 = 'gs_617a0001', G2 = 'gs_617a0002';
+        const one = () => ({ session_id: G1, collection: 'StubGenerating617', status: finished ? 'completed' : 'generating',
+          pairs_total: 2, pairs_attempted: finished ? 2 : 1, pairs_completed: finished ? 2 : 1, pairs_failed: 0, errors: [],
+          pairs: finished ? [pair(1), pair(2)] : [pair(1)] });
+        const two = { session_id: G2, collection: 'StubGenerated617', status: 'completed', pairs_total: 1, pairs_attempted: 1,
+          pairs_completed: 1, pairs_failed: 0, errors: [], pairs: [pair(3)] };
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          const listed = ({ pairs, ...rest }) => ({ ...rest, owner: { name: 'vfy-developer', kind: 'user' } });
+          if (path === '/api/goldstandard/sessions') return request.respond(json({ sessions: [
+            { ...listed(one()), created_at: at(60), finished_at: finished ? at(1) : null },
+            { ...listed(two), created_at: at(7200), finished_at: at(7000) }] }));
+          if (path === '/api/goldstandard/session/' + G1) return request.respond(json(one()));
+          if (path === '/api/goldstandard/session/' + G2) return request.respond(json(two));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/goldstandard', { waitUntil: 'networkidle2' }); await sleep(1500);
+        const first = await bodyText(s.page);
+        r.check('Gold Standard: the generating session is listed and opens by itself',
+          first.includes('Generating… 1/2 pairs') && first.includes('Session ' + G1) && (await opened(s.page)).join().includes('StubGenerating617')
+            && (await rows(s.page)).length === 2, first.slice(0, 300));
+        await leaveAndReturn(s.page, '/goldstandard');
+        r.check('Gold Standard: after leaving and coming back the generation is open again',
+          (await bodyText(s.page)).includes('Generating… 1/2 pairs'));
+        finished = true;
+        await sleep(3000);
+        const ended = await bodyText(s.page);
+        r.check('Gold Standard: its outcome shows once the generation has finished',
+          ended.includes('Generation completed: 2 of 2 pairs generated.') && ended.includes('Stub question 2?'), ended.slice(0, 300));
+        const clicked = await clickRow(s.page, 'StubGenerated617');
+        await sleep(800);
+        const other = await bodyText(s.page);
+        r.check('Gold Standard: clicking another row loads that session',
+          clicked && other.includes('Session ' + G2) && other.includes('Stub question 3?')
+            && await s.page.evaluate(id => document.getElementById('retained-session').value === id, G2), other.slice(0, 300));
+        r.check('Gold Standard list fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // Transfer, stubbed: one list for both kinds; each panel opens its own
+    // newest job; a running export survives leaving the page, then ends.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        let finished = false;
+        const exportJob = (id, done) => ({ job_id: id, status: done ? 'completed' : 'running', collection: 'StubExport617',
+          chunks_written: done ? 9 : 5, filename: done ? `ragpkg-${id}.tar.gz` : null, size_bytes: done ? 2048 : null,
+          source_document_count: done ? 1 : null, fidelity: done ? 'with-sources' : null, models_bundled: done ? false : null,
+          retrieve_script: done ? true : null, warnings: [], error: null, error_code: null, error_detail: null });
+        const importJob = { job_id: 'vfy617i', status: 'completed', filename: 'ragpkg-stub617.tar.gz', on_conflict: 'rename',
+          collection: 'StubImported617', original_collection: 'StubImported617', chunks_written: 4, fidelity: 'with-sources',
+          renamed: false, notes: [], restored_sessions: [], error: null, error_code: null, error_detail: null };
+        const mine = { name: 'vfy-developer', kind: 'user' };
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (path === '/api/export/jobs') return request.respond(json({ jobs: [
+            { ...exportJob('vfy617e', finished), owner: mine, created_at: at(30), finished_at: finished ? at(1) : null },
+            { ...exportJob('vfy617d', true), owner: mine, created_at: at(9000), finished_at: at(8900) }] }));
+          if (path === '/api/import/jobs') return request.respond(json({ jobs: [
+            { ...importJob, owner: mine, created_at: at(600), finished_at: at(500) }] }));
+          if (path === '/api/export/job/vfy617e') return request.respond(json(exportJob('vfy617e', finished)));
+          if (path === '/api/import/job/vfy617i') return request.respond(json(importJob));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' }); await sleep(1500);
+        const listed = await rows(s.page);
+        const text = await bodyText(s.page);
+        r.check('Transfer: one list holds exports and imports, newest first, with their kind',
+          listed.length === 3 && listed[0].startsWith('Export StubExport617 running') && listed[1].startsWith('Import ragpkg-stub617.tar.gz completed')
+            && listed[2].startsWith('Export StubExport617 completed'), JSON.stringify(listed));
+        r.check('Transfer: the newest export opens in the export panel and the newest import in the import panel',
+          text.includes('Writing… 5 chunks so far.') && text.includes('Imported as StubImported617') && (await opened(s.page)).length === 2,
+          text.slice(0, 400));
+        await leaveAndReturn(s.page, '/transfer');
+        r.check('Transfer: after leaving and coming back the running export is open again',
+          (await bodyText(s.page)).includes('Writing… 5 chunks so far.'));
+        finished = true;
+        await sleep(3000);
+        const ended = await bodyText(s.page);
+        r.check('Transfer: the export\'s result shows once it has finished',
+          ended.includes('ragpkg-vfy617e.tar.gz') && ended.includes('Imported as StubImported617'), ended.slice(0, 400));
+        // Rows: the export that just ended, the import, then the older export.
+        const clicked = await clickRowAt(s.page, 2);
+        await sleep(300);
+        r.check('Transfer: clicking an export row opens it in the export panel, leaving the import panel as it was',
+          clicked && (await bodyText(s.page)).includes('ragpkg-vfy617d.tar.gz') && (await bodyText(s.page)).includes('Imported as StubImported617'));
+        r.check('Transfer list fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // An Engineer sees the owner of each job: a user, an API key, or unknown.
+    {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const job = (id, owner) => ({ job_id: id, status: 'completed', files_total: 1, files_completed: 1, files_failed: 0,
+          chunks_stored: 1, errors: [], skipped: [], collection: 'StubOwners617', files: ['a.txt'], owner,
+          created_at: at(Number(id.slice(-1)) * 10), finished_at: at(1) });
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          if (new URL(request.url()).pathname === '/api/ingest/jobs') return request.respond(json({ jobs: [
+            job('own1', { name: 'vfy-developer', kind: 'user' }), job('own2', { name: 'vfy-s-svc', kind: 'service' }), job('own3', null)] }));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+        const owners = await s.page.evaluate(() => [...document.querySelectorAll('.job-owner')].map(x => x.textContent.trim()));
+        r.check('Import as an Engineer: each row shows its owner, an API key\'s marked, an unknown one as "owner unknown"',
+          JSON.stringify(owners) === JSON.stringify(['vfy-developer', 'vfy-s-svc (API key)', 'owner unknown']), JSON.stringify(owners));
+        r.check('nothing about jobs is kept in browser storage after the list checks',
+          await s.page.evaluate(() => sessionStorage.length === 0 && localStorage.length === 0));
+      } finally { await s.ctx.close(); }
+    }
   }
 
   // ── nginx's login rate limit on the login page (#577) ─────────────────────
@@ -39280,7 +41906,7 @@ if (require.main === module) (async () => {
 // page's 2 s poll delay is cut to 20 ms, so 30 failed polls take well under a
 // second.
 const assert = require('node:assert/strict');
-const { makeReporter, setValue, stubAuth } = require('./lib');
+const { makeReporter, setValue, stubAuth, chooseFromMenu } = require('./lib');
 
 const A = 'VfyTransferA', B = 'VfyTransferB';
 const PACKAGE = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz';
@@ -39317,6 +41943,9 @@ async function fixture(browser, base, { hold = [] } = {}) {
     'GET /api/packages': json(200, packagesBody),
     ['GET /api/tune/' + A]: json(200, tuneBody(A)),
     ['GET /api/tune/' + B]: json(200, tuneBody(B)),
+    // No running or recent jobs (#617), so neither panel opens one by itself.
+    'GET /api/export/jobs': json(200, { jobs: [] }),
+    'GET /api/import/jobs': json(200, { jobs: [] }),
   };
   for (const key of hold) delete fixed[key];
   await page.evaluateOnNewDocument(answers => {
@@ -39368,7 +41997,7 @@ async function expectButton(page, half, busy) {
   await page.waitForFunction((label, disabled) => [...document.querySelectorAll('button')].some(x => x.textContent.trim() === label && x.disabled === disabled), { timeout: 5000 }, want, busy)
     .catch(async () => { throw new Error(`expected "${want}" ${busy ? 'disabled' : 'enabled'}, got ${JSON.stringify(await button(page, half))}`); });
 }
-// Buttons only by default: the nav has an "Import" link as well as the Import button.
+// Buttons only by default: the nav's Data menu has an "Import" link as well as the Import button.
 const click = (page, label, selector = 'button') => page.evaluate((t, sel) => {
   const b = [...document.querySelectorAll(sel)].find(x => x.textContent.trim() === t);
   if (!b) return false; b.click(); return true;
@@ -39443,7 +42072,7 @@ async function runTransferPageTests(browser, base, reporter) {
       await startAndPoll(page, half);
       await release(page, h.poll, h.job('running'));
       await pending(page, h.poll);
-      assert.equal(await click(page, 'Collections', 'a'), true, 'no Collections link');
+      await chooseFromMenu(page, 'admin', 'Collections');  // throws if there is no such entry
       await page.waitForFunction(() => location.pathname === '/collections');
       await release(page, h.poll, h.job('running'));
       await sleep(400);
@@ -39452,7 +42081,7 @@ async function runTransferPageTests(browser, base, reporter) {
   }
   cases.push(['export: a start answered after the page was left starts no polling', async page => {
     await start(page, 'export');
-    assert.equal(await click(page, 'Collections', 'a'), true, 'no Collections link');
+    await chooseFromMenu(page, 'admin', 'Collections');  // throws if there is no such entry
     await page.waitForFunction(() => location.pathname === '/collections');
     await release(page, HALVES.export.start, HALVES.export.started, 'POST');
     await sleep(400);
@@ -39622,6 +42251,8 @@ async function fixture(browser, base, opts = {}) {
   page.on('request', async request => {
     const path = new URL(request.url()).pathname;
     if (!path.startsWith('/api/')) return request.continue();
+    // No running or recent generations (#617), so nothing opens by itself.
+    if (path === '/api/goldstandard/sessions') return json(request, 200, { sessions: [] });
     if (path === '/api/collections') {
       return json(request, 200, { collections: ['FixtureGold', 'Other'].map(name => ({ name, object_count: 1, index_type: 'hnsw', distance_metric: 'cosine' })) });
     }
@@ -39974,7 +42605,7 @@ if (require.main === module) {
 // browser context, with every /api/ request answered by the check itself. Nothing
 // reaches the backend: an /api/ request with no stub is answered 599 and recorded,
 // and the case fails on it.
-const { makeReporter } = require('./lib');
+const { makeReporter, readNav, openMenu, chooseFromMenu } = require('./lib');
 
 const json = (status, body) => ({ status, type: 'application/json', body: JSON.stringify(body) });
 const apiError = (status, code, message) => json(status, { error: { code, message, detail: null } });
@@ -40003,6 +42634,12 @@ async function openPage(browser, base, { role = 'engineer', routes = {}, path = 
     'GET /api/auth/status': json(200, { setup_required: false }),
     'GET /api/auth/me': role ? json(200, { username: 'vfy-' + role.replace('_', '-'), role, must_change_password: false })
                              : apiError(401, 'AUTH_REQUIRED', 'Log in to use this.'),
+    // The running and recent job lists the Import, Gold Standard and Transfer
+    // pages read on opening (#617): empty, so no job opens by itself.
+    'GET /api/ingest/jobs': json(200, { jobs: [] }),
+    'GET /api/export/jobs': json(200, { jobs: [] }),
+    'GET /api/import/jobs': json(200, { jobs: [] }),
+    'GET /api/goldstandard/sessions': json(200, { sessions: [] }),
     ...routes,
   };
   await page.evaluateOnNewDocument(fast => {
@@ -40087,7 +42724,8 @@ const buttonState = (page, label) => page.evaluate(t => {
   return b ? { disabled: b.disabled } : null;
 }, label);
 
-const nav = page => page.evaluate(() => [...document.querySelectorAll('nav a')].map(a => a.textContent.trim()));
+// The pages the nav offers, in order, read through its menus (#616).
+const nav = async page => (await readNav(page)).pages;
 const path = page => page.evaluate(() => location.pathname);
 async function waitPath(page, want) {
   await waitFor(page, w => location.pathname === w, `the path ${want}`, want);
@@ -40113,7 +42751,7 @@ async function runCases(browser, base, reporter, section, cases) {
   }
 }
 
-module.exports = { json, apiError, html, hold, openPage, callsTo, text, waitFor, waitText, click, press, fill, fillNth, forms, buttonState, nav, path, waitPath, runCases, makeReporter };
+module.exports = { json, apiError, html, hold, openPage, callsTo, text, waitFor, waitText, click, press, fill, fillNth, forms, buttonState, nav, readNav, openMenu, chooseFromMenu, path, waitPath, runCases, makeReporter };
 ```
 
 ### scripts/verify/browser/ui_controls.js
@@ -40128,7 +42766,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const S = require('./stub');
-const { json, apiError, html, hold, callsTo, text, waitFor, waitText, press, fill, fillNth, forms, buttonState, nav, waitPath } = S;
+const { json, apiError, html, hold, callsTo, text, waitFor, waitText, press, fill, fillNth, forms, buttonState, nav, readNav, openMenu, chooseFromMenu, waitPath } = S;
 
 const A = 'VfyUiA', B = 'VfyUiB';
 const DASH = '\u2014', DOT = '\u00b7', ELLIPSIS = '\u2026', CROSS = '\u2715';
@@ -40360,10 +42998,7 @@ function navigationCases() {
   const gated = ['/import', '/chunking', '/retrieval', '/goldstandard', '/transfer', '/help/transfer'];
   const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
   return [
-    { name: 'Developer nav has Q&A, Import, Chunking, Retrieval, Gold Standard and Transfer, and no Collections or Health', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
-      await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
-      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer']);
-    } },
+    ...navMenuCases(),
     { name: 'Developer is sent back to Q&A from /collections and /health, but can open /transfer and /help/transfer', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
       for (const p of ['/collections', '/health']) {
         await goto(s.page, p);
@@ -40383,6 +43018,133 @@ function navigationCases() {
         await waitText(s.page, 'Ask a Question');
         await waitPath(s.page, '/qa');
       }
+    } },
+  ];
+}
+
+// The nav's menus (#616): Q&A, then Data, Tune and Admin, then the account
+// menu; each role keeps its pages, and a menu with none isn't shown. The menus
+// follow the WAI-ARIA menu button pattern for the keyboard and screen readers.
+function navMenuCases() {
+  const DATA = { key: 'data', label: 'Data', entries: ['Import', 'Transfer'] };
+  const TUNE = { key: 'tune', label: 'Tune', entries: ['Chunking', 'Retrieval', 'Gold Standard'] };
+  const ADMIN = { key: 'admin', label: 'Admin', entries: ['Collections', 'Users', 'Service keys', 'Audit', 'Health'] };
+  const account = (username, badge) => ({ key: 'account', label: `${username} ${badge}`, entries: ['Change password', 'Log out'] });
+  const want = {
+    end_user: [account('vfy-end-user', 'End User')],
+    developer: [DATA, TUNE, account('vfy-developer', 'Developer')],
+    engineer: [DATA, TUNE, ADMIN, account('vfy-engineer', 'AI Engineer')],
+  };
+  const name = { end_user: 'End User', developer: 'Developer', engineer: 'AI Engineer' };
+  const BTN = k => `nav button[data-menu="${k}"]`;
+  const ready = page => waitFor(page, () => document.querySelectorAll('nav button[data-menu]').length > 0, 'the nav');
+  const expanded = (page, k) => page.$eval(BTN(k), b => b.getAttribute('aria-expanded'));
+  const waitExpanded = (page, k, v) => waitFor(page, (sel, v) => document.querySelector(sel)?.getAttribute('aria-expanded') === v, `${k} aria-expanded=${v}`, BTN(k), v);
+  const focused = page => page.evaluate(() => document.activeElement?.getAttribute('data-menu') || document.activeElement?.textContent.trim() || null);
+  const waitFocused = (page, label) => waitFor(page, l => document.activeElement && (document.activeElement.getAttribute('data-menu') || document.activeElement.textContent.trim()) === l, `focus on ${label}`, label);
+  const key = async (page, k, focus) => { await page.keyboard.press(k); await waitFocused(page, focus); };
+  // What the nav marks as current: entries with aria-current and buttons with data-current.
+  const marked = page => page.evaluate(() => ({
+    current: [...document.querySelectorAll('nav [aria-current]')].map(e => [e.textContent.trim(), e.getAttribute('aria-current')]),
+    buttons: [...document.querySelectorAll('nav [data-current]')].map(b => [b.dataset.menu, b.dataset.current]),
+  }));
+  const colour = (page, sel, label) => page.evaluate((sel, l) => {
+    const e = [...document.querySelectorAll(sel)].find(x => x.textContent.trim() === l || x.dataset.menu === l);
+    return e ? getComputedStyle(e).color : null;
+  }, sel, label);
+  return [
+    ...['end_user', 'developer', 'engineer'].map(role => ({ name: `${name[role]} nav: Q&A, then ${want[role].map(m => m.key === 'account' ? 'the account menu' : m.label + ' (' + m.entries.join(', ') + ')').join(', ')}`, open: { role, path: '/qa', routes: base() }, async run(s) {
+      await ready(s.page);
+      const got = await readNav(s.page);
+      assert.deepEqual(got.links, ['Q&A']);
+      assert.deepEqual(got.menus, want[role]);
+    } })),
+    { name: 'A closed menu is a button with aria-haspopup=menu and aria-expanded=false and no entries; open, aria-controls names its role=menu, labelled by the button, of menuitems with tabindex=-1', open: { role: 'engineer', path: '/qa', routes: base() }, async run(s) {
+      await ready(s.page);
+      const closed = await s.page.$eval(BTN('data'), b => ({ type: b.type, popup: b.getAttribute('aria-haspopup'), expanded: b.getAttribute('aria-expanded'), controls: b.getAttribute('aria-controls'), hidden: [...b.querySelectorAll('[aria-hidden=true]')].map(x => x.textContent) }));
+      assert.deepEqual(closed, { type: 'button', popup: 'menu', expanded: 'false', controls: null, hidden: ['\u25be'] });
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav [role=menu], nav [role=menuitem]').length), 0);
+      await openMenu(s.page, 'data');
+      const open = await s.page.$eval(BTN('data'), b => {
+        const m = document.getElementById(b.getAttribute('aria-controls'));
+        return { expanded: b.getAttribute('aria-expanded'), role: m.getAttribute('role'), labelledBy: m.getAttribute('aria-labelledby') === b.id && !!b.id,
+                 items: [...m.children].map(e => [e.textContent.trim(), e.getAttribute('role'), e.getAttribute('tabindex')]) };
+      });
+      assert.deepEqual(open, { expanded: 'true', role: 'menu', labelledBy: true, items: [['Import', 'menuitem', '-1'], ['Transfer', 'menuitem', '-1']] });
+    } },
+    { name: 'Keyboard: Enter, Space and ArrowDown open on the first entry, ArrowUp on the last; arrows wrap, Home and End jump; Escape closes and returns focus to the button; Tab closes', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
+      await ready(s.page);
+      await s.page.focus(BTN('data'));
+      await key(s.page, 'Enter', 'Import');
+      assert.equal(await expanded(s.page, 'data'), 'true');
+      await key(s.page, 'ArrowDown', 'Transfer');
+      await key(s.page, 'ArrowDown', 'Import');
+      await key(s.page, 'ArrowUp', 'Transfer');
+      await key(s.page, 'Home', 'Import');
+      await key(s.page, 'End', 'Transfer');
+      await key(s.page, 'Escape', 'data');
+      assert.equal(await expanded(s.page, 'data'), 'false');
+      await key(s.page, 'Space', 'Import');
+      await key(s.page, 'Escape', 'data');
+      await key(s.page, 'ArrowDown', 'Import');
+      await key(s.page, 'Escape', 'data');
+      await key(s.page, 'ArrowUp', 'Transfer');
+      await s.page.keyboard.press('Tab');
+      await waitExpanded(s.page, 'data', 'false');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav [role=menu]').length), 0);
+      await s.page.focus(BTN('tune'));
+      await key(s.page, 'Enter', 'Chunking');
+      await key(s.page, 'ArrowDown', 'Retrieval');
+      await s.page.keyboard.press('Enter');
+      await waitPath(s.page, '/retrieval');
+      await waitExpanded(s.page, 'tune', 'false');
+    } },
+    { name: 'Pointer: a click opens a menu and another closes it; opening a second menu closes the first; a click outside closes it; choosing an entry opens the page and closes the menu', open: { role: 'developer', path: '/qa', routes: base() }, async run(s) {
+      await ready(s.page);
+      await s.page.click(BTN('data'));
+      await waitExpanded(s.page, 'data', 'true');
+      await waitFocused(s.page, 'Import');
+      await s.page.click(BTN('tune'));
+      await waitExpanded(s.page, 'tune', 'true');
+      assert.equal(await expanded(s.page, 'data'), 'false');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav [role=menu]').length), 1);
+      await s.page.click('nav > span');
+      await waitExpanded(s.page, 'tune', 'false');
+      await s.page.click(BTN('data'));
+      await waitExpanded(s.page, 'data', 'true');
+      await s.page.click(BTN('data'));
+      await waitExpanded(s.page, 'data', 'false');
+      await s.page.click(BTN('data'));
+      await waitExpanded(s.page, 'data', 'true');
+      await s.page.click(`#${await s.page.$eval(BTN('data'), b => b.getAttribute('aria-controls'))} a:nth-child(2)`);
+      await waitPath(s.page, '/transfer');
+      await waitText(s.page, 'Export a collection');
+      await waitExpanded(s.page, 'data', 'false');
+    } },
+    { name: 'On /qa the Q&A link is the current page, highlighted, and no menu is', open: { role: 'engineer', path: '/qa', routes: base() }, async run(s) {
+      await ready(s.page);
+      await waitText(s.page, 'Ask a Question');
+      assert.deepEqual(await marked(s.page), { current: [['Q&A', 'page']], buttons: [] });
+      assert.notEqual(await colour(s.page, 'nav a', 'Q&A'), await colour(s.page, 'nav button', 'data'));
+    } },
+    { name: 'On /retrieval the Tune menu is highlighted, and in it Retrieval is the current page', open: { role: 'developer', path: '/retrieval', routes: base() }, async run(s) {
+      await ready(s.page);
+      assert.deepEqual(await marked(s.page), { current: [], buttons: [['tune', 'true']] });
+      assert.notEqual(await colour(s.page, 'nav button', 'tune'), await colour(s.page, 'nav button', 'data'));
+      await openMenu(s.page, 'tune');
+      assert.deepEqual((await marked(s.page)).current, [['Retrieval', 'page']]);
+      assert.notEqual(await colour(s.page, 'nav [role=menuitem]', 'Retrieval'), await colour(s.page, 'nav [role=menuitem]', 'Chunking'));
+    } },
+    { name: 'On /account/password the account menu is highlighted, and in it Change password is the current page', open: { role: 'end_user', path: '/account/password', routes: base() }, async run(s) {
+      await ready(s.page);
+      assert.deepEqual(await marked(s.page), { current: [], buttons: [['account', 'true']] });
+      await openMenu(s.page, 'account');
+      assert.deepEqual((await marked(s.page)).current, [['Change password', 'page']]);
+    } },
+    { name: 'On /help/transfer, which no menu holds, nothing in the nav is highlighted', open: { role: 'developer', path: '/help/transfer', routes: base() }, async run(s) {
+      await ready(s.page);
+      await waitText(s.page, 'Export and Import');
+      assert.deepEqual(await marked(s.page), { current: [], buttons: [] });
     } },
   ];
 }
@@ -40429,7 +43191,7 @@ function authCases() {
     } },
     { name: 'Log out calls the API and returns to the login page', open: { role: 'developer', path: '/qa', routes: base({ 'POST /api/auth/logout': json(200, { status: 'logged_out' }) }) }, async run(s) {
       await waitText(s.page, 'Ask a Question');
-      await press(s.page, 'Log out');
+      await chooseFromMenu(s.page, 'account', 'Log out');
       await waitText(s.page, 'Log in to continue');
       await waitPath(s.page, '/login');
       assert.equal(callsTo(s, 'POST', '/api/auth/logout').length, 1);
@@ -40460,11 +43222,11 @@ function authCases() {
       await waitText(s.page, 'Ask a Question');
       assert.deepEqual(callsTo(s, 'POST', '/api/auth/password').map(c => c.body), [{ current_password: 'generated-one', new_password: 'my new password' }]);
     } },
-    { name: 'Change password in the nav opens the form; the API\'s rule message is shown; success says other sessions ended', open: { role: 'end_user', path: '/qa', routes: base({
+    { name: 'Change password in the account menu opens the form; the API\'s rule message is shown; success says other sessions ended', open: { role: 'end_user', path: '/qa', routes: base({
       'POST /api/auth/password': call => call.body.new_password === 'short' ? apiError(422, 'INVALID_PASSWORD', 'The password must be at least 12 characters.') : json(200, { status: 'changed', ...user('end_user') }),
     }) }, async run(s) {
       await waitText(s.page, 'Ask a Question');
-      await press(s.page, 'Change password');
+      await chooseFromMenu(s.page, 'account', 'Change password');
       await waitPath(s.page, '/account/password');
       for (const [id, v] of [['#current-password', 'the old one!'], ['#new-password', 'short'], ['#confirm-password', 'short']]) await fill(s.page, id, v);
       await submit(s.page);
@@ -40524,10 +43286,10 @@ function usersCases() {
   const rowButtons = (page, username) => page.evaluate(u => [...document.querySelectorAll(`tr[data-username="${u}"] button`)].map(b => b.textContent.trim()), username);
   const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
   return [
-    { name: 'Engineer nav has Users, which opens the Users page', open: { role: 'engineer', path: '/qa', routes: usersApi() }, async run(s) {
+    { name: 'Engineer\'s Admin menu has Users, which opens the Users page', open: { role: 'engineer', path: '/qa', routes: usersApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
-      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys', 'Audit']);
-      await press(s.page, 'Users', 'nav a');
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Transfer', 'Chunking', 'Retrieval', 'Gold Standard', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
+      await chooseFromMenu(s.page, 'admin', 'Users');
       await waitPath(s.page, '/users');
       await waitText(s.page, 'vfy-developer');
     } },
@@ -40655,10 +43417,11 @@ function serviceKeysCases() {
   const status = (page, name) => page.evaluate(n => document.querySelector(`section[data-principal="${n}"] [data-testid=principal-status]`)?.textContent.trim(), name);
   const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
   return [
-    { name: 'Engineer nav has Service keys after Users, which opens the page', open: { role: 'engineer', path: '/qa', routes: keysApi() }, async run(s) {
+    { name: 'Engineer\'s Admin menu has Service keys after Users, which opens the page', open: { role: 'engineer', path: '/qa', routes: keysApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
-      assert.deepEqual((await nav(s.page)).slice(-3, -1), ['Users', 'Service keys']);
-      await press(s.page, 'Service keys', 'nav a');
+      const admin = (await readNav(s.page)).menus.find(m => m.key === 'admin').entries;
+      assert.equal(admin.indexOf('Service keys'), admin.indexOf('Users') + 1);
+      await chooseFromMenu(s.page, 'admin', 'Service keys');
       await waitPath(s.page, '/service-keys');
       await waitText(s.page, 'vfy-svc');
     } },
@@ -40952,10 +43715,11 @@ function auditCases() {
     return routes;
   };
   return [
-    { name: 'Engineer nav ends with Audit, which opens the page', open: { role: 'engineer', path: '/qa', routes: auditApi() }, async run(s) {
+    { name: 'Engineer\'s Admin menu has Audit after Service keys, which opens the page', open: { role: 'engineer', path: '/qa', routes: auditApi() }, async run(s) {
       await waitFor(s.page, () => document.querySelectorAll('nav a').length > 0, 'the nav');
-      assert.equal((await nav(s.page)).at(-1), 'Audit');
-      await press(s.page, 'Audit', 'nav a');
+      const admin = (await readNav(s.page)).menus.find(m => m.key === 'admin').entries;
+      assert.equal(admin.indexOf('Audit'), admin.indexOf('Service keys') + 1);
+      await chooseFromMenu(s.page, 'admin', 'Audit');
       await waitPath(s.page, '/audit');
       await waitText(s.page, 'nightly (key keyid0000001)');
     } },
@@ -42024,7 +44788,7 @@ ENUMS = {
 SPAN_NAMES = frozenset("rag." + v for v in ENUMS["rag.operation"])
 
 # Explicit code-owned vocabulary. Raw URL/path values never enter this schema.
-ROUTES = frozenset(('DELETE /collections/{name}', 'GET /audit', 'GET /audit.csv', 'GET /auth/me', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /export/job/{job_id}', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /metrics/latency', 'GET /packages', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/logout', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
+ROUTES = frozenset(('DELETE /collections/{name}', 'GET /audit', 'GET /audit.csv', 'GET /auth/me', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /export/job/{job_id}', 'GET /export/jobs', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /goldstandard/sessions', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /import/jobs', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /ingest/jobs', 'GET /metrics/latency', 'GET /packages', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/logout', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
 ENUMS.update({"http.route": ROUTES | {"unmatched"},
               "rag.tuning_operation": frozenset(("rechunk", "reembed", "reindex")),
               "http.status_class": frozenset(("1xx", "2xx", "3xx", "4xx", "5xx"))})
@@ -44638,13 +47402,19 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_replacement_dependency_calls_keep_safe_lineage(self):
         from datetime import datetime, timezone
-        coll = NS(query=NS(fetch_objects=lambda **kw: NS(objects=[object()])),
-                  aggregate=NS(over_all=lambda **kw: NS(total_count=1)),
-                  data=NS(delete_many=lambda **kw: NS(successful=0, failed=0, matches=0)))
+        import uuid
+        when = datetime.now(timezone.utc)
+        new = NS(uuid=uuid.uuid4(), properties={'source_file': SECRET, 'created_at': when})
+        earlier = NS(uuid=uuid.uuid4(), properties={'source_file': SECRET, 'created_at': datetime(2026, 1, 1, tzinfo=timezone.utc)})
+        # The lookup and the replacement's selection see both; the after check only the new one (#622).
+        pages = [[earlier, new], [earlier, new], [new]]
+        coll = NS(query=NS(fetch_objects=lambda **kw: NS(objects=pages.pop(0))),
+                  aggregate=NS(over_all=lambda **kw: NS(total_count=2)),
+                  data=NS(delete_many=lambda **kw: NS(successful=1, failed=0, matches=1)))
         with patch.object(wc, 'get_client', return_value=NS(collections=NS(get=lambda name: coll))), ot.bind((self.runtime, None)), ot.span('rag.ingest') as parent:
             self.assertTrue(wc._source_has_chunks_sync('TraceReplace', SECRET))
-            self.assertEqual(wc._delete_earlier_chunks_sync('TraceReplace', SECRET, datetime.now(timezone.utc), 1), 0)
-        for name, count in (('weaviate.query', 1), ('weaviate.aggregate', 2), ('weaviate.delete', 1)):
+            self.assertEqual(wc._delete_earlier_chunks_sync('TraceReplace', SECRET, when, 1), 1)
+        for name, count in (('weaviate.query', 3), ('weaviate.aggregate', 3), ('weaviate.delete', 1)):
             self.assertEqual(len(self.spans(name)), count)
             self.assertTrue(all(span.parent.span_id == parent.get_span_context().span_id for span in self.spans(name)))
         self.wire()
@@ -45453,7 +48223,7 @@ class ProducerOperationsTests(unittest.IsolatedAsyncioTestCase):
         metrics = {m.name:m for r in data.resource_metrics for s in r.scope_metrics for m in s.metrics}
         calls = {p.attributes['rag.dependency']:p.value
                  for p in metrics['rag.dependency.calls'].data.data_points}
-        self.assertEqual(calls, {'weaviate.query':1, 'weaviate.aggregate':2, 'weaviate.delete':1})
+        self.assertEqual(calls, {'weaviate.query':3, 'weaviate.aggregate':3, 'weaviate.delete':1})
         self.assertNotIn(SECRET, repr(calls))
 
     async def test_durable_restart_records_do_not_create_execution_metrics(self):
@@ -47239,11 +50009,13 @@ Disposable directories only; nothing reaches a backend. The lifespan case runs
 in a child process, so the module stores of this process stay unbound.
 """
 import asyncio
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -47253,7 +50025,7 @@ API_DIR = os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().par
 sys.path.insert(0, API_DIR)
 
 from config import settings
-from services import ingest_pipeline, jobstore
+from services import collection_writes, exporter, importer, ingest_pipeline, jobstore, tuning
 
 INGEST_MESSAGE = ("Interrupted: the API restarted while this job was running. "
                   "Re-upload the files to try again.")
@@ -47325,9 +50097,10 @@ class BoundTests(StoreTestCase):
         store["0c5fd445"] = doc
         job = store["0c5fd445"]
         self.assertIsNot(job, doc)
-        self.assertEqual(job, doc)
+        # The store adds the time it was created (#617), nothing else.
+        self.assertEqual(job, {**doc, "created_at": job["created_at"]})
         path = self.root / "jobs" / "export" / "0c5fd445.json"
-        self.assertEqual(json.loads(path.read_text()), doc)
+        self.assertEqual(json.loads(path.read_text()), {**doc, "created_at": job["created_at"]})
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_status_changes_and_changes_after_a_terminal_status_are_written_at_once(self):
@@ -47496,11 +50269,12 @@ sys.path.insert(0, sys.argv[2])
 from config import settings
 settings.upload_dir = sys.argv[1]
 from main import app, lifespan
-from services import exporter, importer, weaviate_client as wc
+from services import exporter, importer, packager, weaviate_client as wc
 async def run():
     with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), \\
          patch.object(importer, 'sweep_interrupted_imports', return_value=[]), \\
          patch.object(importer, 'sweep_stale_workdirs', return_value=[]), \\
+         patch.object(packager, 'sweep_build_leftovers', return_value=[]), \\
          patch.object(wc, 'close_client'):
         async with lifespan(app):
             print(json.dumps(exporter.get_job('abcd1234')))
@@ -47512,6 +50286,598 @@ asyncio.run(run())
         job = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertEqual((job["status"], job["error_code"]), ("failed", "INTERRUPTED"))
         self.assertIn("Marked 1 job(s) interrupted by the restart: export abcd1234", result.stderr)
+
+
+class PruneTests(StoreTestCase):
+    """Retention while the API runs (#309)."""
+
+    def setUp(self):
+        super().setUp()
+        change = patch.object(jobstore, "RETENTION", 3)
+        change.start()
+        self.addCleanup(change.stop)
+
+    def path(self, kind, job_id):
+        return self.root / "jobs" / kind / f"{job_id}.json"
+
+    def add(self, store, job_id, status, saved=None):
+        store[job_id] = {"job_id": job_id, "status": status}
+        if saved is not None:
+            store[job_id]._saved = saved
+        return store[job_id]
+
+    def test_the_finished_records_saved_longest_ago_go_from_memory_and_disk(self):
+        store = self.bound()
+        for n, job_id in enumerate(("r2", "r1", "r3")):
+            self.add(store, job_id, "completed", saved=[200.0, 100.0, 300.0][n])
+        with self.assertLogs("services.jobstore", "INFO") as logs:
+            self.add(store, "r4", "queued")
+        self.assertEqual(set(store), {"r2", "r3", "r4"})
+        self.assertFalse(self.path("export", "r1").exists())
+        self.assertTrue(all(self.path("export", i).exists() for i in ("r2", "r3", "r4")))
+        self.assertTrue(any("Removed old export job record r1" in line for line in logs.output))
+        self.assertIsNone(store.get("r1"))                    # the endpoint's 404
+
+    def test_queued_and_running_records_are_never_removed(self):
+        store = self.bound("import")
+        self.add(store, "a1", "running", saved=1.0)
+        self.add(store, "a2", "queued", saved=2.0)
+        self.add(store, "a3", "running", saved=3.0)
+        self.add(store, "a4", "queued")
+        self.add(store, "a5", "failed")                       # the record just stored stays
+        self.assertEqual(len(store), 5)
+        store["a1"]["status"] = "completed"
+        store["a1"]._saved = 1.0
+        store["a5"]._saved = 5.0
+        self.add(store, "a6", "partial")
+        self.assertEqual(set(store), {"a2", "a3", "a4", "a6"})
+        self.assertFalse(self.path("import", "a1").exists())
+        self.assertFalse(self.path("import", "a5").exists())
+
+    def test_records_from_startup_are_ordered_by_their_file_time(self):
+        self.put("tune", "l1", {"job_id": "l1", "status": "completed"}, age=200)
+        self.put("tune", "l2", {"job_id": "l2", "status": "failed"}, age=300)
+        self.put("tune", "l3", {"job_id": "l3", "status": "completed"}, age=100)
+        store = jobstore.JobStore("tune")
+        store.load()
+        self.add(store, "n1", "queued")
+        self.assertEqual(set(store), {"l1", "l3", "n1"})
+        self.assertFalse(self.path("tune", "l2").exists())
+
+    def test_a_removed_record_cancels_its_pending_write(self):
+        store = self.bound()
+        for job_id, saved in (("t1", 1.0), ("t2", 2.0), ("t3", 3.0)):
+            self.add(store, job_id, "completed", saved=saved)
+        timer = threading.Timer(60, lambda: None)
+        store["t1"]._timer = timer
+        timer.start()
+        self.add(store, "t4", "running")
+        self.assertNotIn("t1", store)
+        self.assertFalse(timer.is_alive() and not timer.finished.is_set())
+
+    def test_an_unbound_store_never_prunes(self):
+        store = jobstore.JobStore("export")
+        for n in range(5):
+            store[f"u{n}"] = {"status": "completed"}
+        self.assertEqual(len(store), 5)
+
+    def test_a_failed_file_removal_is_logged_and_the_record_still_dropped(self):
+        store = self.bound()
+        for job_id, saved in (("e1", 1.0), ("e2", 2.0), ("e3", 3.0)):
+            self.add(store, job_id, "completed", saved=saved)
+        with patch.object(Path, "unlink", side_effect=OSError("read-only")), \
+             self.assertLogs("services.jobstore", "ERROR"):
+            self.add(store, "e4", "queued")                  # no exception
+        self.assertEqual(set(store), {"e2", "e3", "e4"})
+        self.assertTrue(self.path("export", "e1").exists())   # startup retention removes it
+
+    def test_the_order_follows_each_record_s_own_last_write(self):
+        # No stamps set by hand: the order comes from the writes themselves.
+        store = self.bound()
+        for job_id in ("w1", "w2", "w3"):
+            self.add(store, job_id, "running")
+        for job_id in ("w2", "w1", "w3"):
+            time.sleep(0.02)
+            store[job_id]["status"] = "completed"     # a status change is written at once
+        self.add(store, "w4", "queued")
+        self.assertEqual(set(store), {"w1", "w3", "w4"})
+        self.assertFalse(self.path("export", "w2").exists())
+
+    def test_replacing_a_record_prunes_nothing(self):
+        store = self.bound()
+        for job_id in ("p1", "p2", "p3", "p4"):
+            self.add(store, job_id, "running")
+        store["p1"]["status"] = "completed"
+        store["p2"] = {"job_id": "p2", "status": "running"}
+        self.assertEqual(set(store), {"p1", "p2", "p3", "p4"})
+
+
+class Recording(jobstore.JobStore):
+    """A bound store that notes which thread stores each record, and can hold
+    that write until released."""
+
+    def __init__(self, kind, hold=False):
+        super().__init__(kind)
+        self.threads, self.ids = [], []
+        self.entered, self.release = threading.Event(), threading.Event()
+        self.stored = threading.Event()
+        if not hold:
+            self.release.set()
+
+    def __setitem__(self, job_id, doc):
+        self.threads.append(threading.get_ident())
+        self.ids.append(job_id)
+        self.entered.set()
+        self.release.wait(10)
+        super().__setitem__(job_id, doc)
+        self.stored.set()
+
+
+class Failing(Recording):
+    """A Recording whose held write raises instead of storing."""
+
+    def __setitem__(self, job_id, doc):
+        self.ids.append(job_id)
+        self.entered.set()
+        self.release.wait(10)
+        raise OSError("disk gone")
+
+
+class FirstHeld(Recording):
+    """A Recording that holds only its first write, which then stores, or raises
+    if fail is set; later writes go straight through."""
+
+    def __init__(self, kind, fail=False):
+        super().__init__(kind, hold=True)
+        self.fail = fail
+
+    def __setitem__(self, job_id, doc):
+        if self.ids:
+            self.ids.append(job_id)
+            jobstore.JobStore.__setitem__(self, job_id, doc)
+            return
+        self.ids.append(job_id)
+        self.entered.set()
+        self.release.wait(10)
+        if self.fail:
+            raise OSError("disk gone")
+        jobstore.JobStore.__setitem__(self, job_id, doc)
+        self.stored.set()
+
+
+class FailThenHold(Recording):
+    """A Recording whose first write is held and then raises, and whose second
+    write is held until second_release, then stores."""
+
+    def __init__(self, kind):
+        super().__init__(kind, hold=True)
+        self.second_release = threading.Event()
+
+    def __setitem__(self, job_id, doc):
+        first = not self.ids
+        self.ids.append(job_id)
+        if first:
+            self.entered.set()
+            self.release.wait(10)
+            raise OSError("disk gone")
+        self.second_release.wait(10)
+        jobstore.JobStore.__setitem__(self, job_id, doc)
+        self.stored.set()
+
+
+class StartTests(StoreTestCase):
+    """The four job starts store their first record off the event loop, and a
+    start cancelled during that write leaves nothing behind (#309). A second
+    export of a collection waits for that write before it names the first (#326),
+    for at most START_WAIT (#338)."""
+
+    KINDS = {"export": (exporter, "_run"), "import": (importer, "_run"),
+             "tune": (tuning, "_run"), "ingest": (ingest_pipeline, "_process_job_sync")}
+
+    def harness(self, kind, hold=False):
+        module, worker = self.KINDS[kind]
+        store = Recording(kind, hold)
+        self.assertEqual(store.load(), [])
+        calls = []
+        for change in (patch.object(module, "_jobs", store),
+                       patch.object(module, worker, side_effect=lambda *a, **k: calls.append(a))):
+            change.start()
+            self.addCleanup(change.stop)
+        return module, store, calls
+
+    @staticmethod
+    def start(kind, name):
+        if kind == "export":
+            return exporter.start_export_job(name)
+        if kind == "import":
+            return importer.start_import_job(name, "abort")
+        if kind == "tune":
+            return tuning.start_tune_job(name, "reindex", {})
+        upload = type("Upload", (), {"filename": "a.txt", "file": io.BytesIO(b"hello world")})()
+        return ingest_pipeline.start_ingest_job([upload], name, "fixed", 300, 0, 0.85, 50)
+
+    def guards_free(self, kind, module, name):
+        key = collection_writes.canonical(name) if kind == "tune" else name
+        active = key in module._active if kind != "ingest" else False
+        return not active and collection_writes.active_jobs(name) == []
+
+    def test_each_start_stores_its_record_off_the_event_loop(self):
+        for kind in self.KINDS:
+            with self.subTest(kind=kind):
+                module, store, calls = self.harness(kind)
+                name = f"Vfy309{kind.capitalize()}"
+
+                async def run():
+                    loop_thread = threading.get_ident()
+                    job_id = await self.start(kind, name)
+                    stored = job_id in store and self.path_exists(kind, job_id)
+                    for _ in range(500):
+                        if calls:
+                            break
+                        await asyncio.sleep(0.01)
+                    return loop_thread, job_id, stored
+
+                loop_thread, job_id, stored = asyncio.run(run())
+                self.assertEqual(store.ids, [job_id])
+                self.assertNotEqual(store.threads, [loop_thread])
+                self.assertTrue(stored)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(store[job_id]["status"], "queued")
+                # the stub worker never ran, so release what it would have
+                collection_writes.end_job(kind, job_id)
+                if kind == "export":
+                    module._active.pop(name, None)
+                elif kind == "tune":
+                    module._active.discard(collection_writes.canonical(name))
+                elif kind == "import":
+                    module._active.discard(name)
+
+    def path_exists(self, kind, job_id):
+        return (self.root / "jobs" / kind / f"{job_id}.json").exists()
+
+    def test_a_start_cancelled_during_its_write_leaves_nothing_behind(self):
+        for kind in self.KINDS:
+            with self.subTest(kind=kind):
+                module, store, calls = self.harness(kind, hold=True)
+                name = f"Vfy309Cancel{kind.capitalize()}"
+
+                async def run():
+                    task = asyncio.ensure_future(self.start(kind, name))
+                    entered = await asyncio.get_running_loop().run_in_executor(
+                        None, store.entered.wait, 10)
+                    self.assertTrue(entered)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                    freed = self.guards_free(kind, module, name)
+                    store.release.set()
+                    job_id = store.ids[0]
+                    # the abandoned write still stores the record; then it goes
+                    self.assertTrue(await asyncio.get_running_loop().run_in_executor(
+                        None, store.stored.wait, 10))
+                    for _ in range(500):
+                        if job_id not in store and not self.path_exists(kind, job_id):
+                            break
+                        await asyncio.sleep(0.01)
+                    return freed, job_id
+
+                freed, job_id = asyncio.run(run())
+                self.assertTrue(freed)
+                self.assertNotIn(job_id, store)
+                self.assertFalse(self.path_exists(kind, job_id))
+                self.assertEqual(calls, [])
+                if kind == "ingest":
+                    self.assertEqual([p.name for p in self.root.iterdir()], ["jobs"])
+
+
+    def release_export(self, name, job_id):
+        # the stub worker never ran, so release what it would have
+        collection_writes.end_job("export", job_id)
+        exporter._active.pop(name, None)
+
+    @staticmethod
+    async def second_start(name):
+        """The second start's job id, or the id its RuntimeError (the 409) names
+        and whether that job could be read when it was raised."""
+        try:
+            return await exporter.start_export_job(name), None
+        except RuntimeError as exc:
+            return str(exc), exporter.get_job(str(exc)) is not None
+
+    def test_a_second_export_waits_until_the_first_has_stored_its_record(self):
+        module, store, calls = self.harness("export", hold=True)
+        name = "Vfy326Wait"
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job(name))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            second = asyncio.ensure_future(self.second_start(name))
+            await asyncio.sleep(0.2)
+            pending = not second.done()
+            store.release.set()
+            return pending, await first, await second
+
+        pending, job_id, (named, readable) = asyncio.run(run())
+        self.release_export(name, job_id)
+        self.assertTrue(pending)                      # it waited for the write
+        self.assertEqual(named, job_id)               # then answered the 409
+        self.assertTrue(readable)                     # naming a job that reads 200
+        self.assertEqual(store.ids, [job_id])
+
+    def test_an_export_waiting_on_a_cancelled_start_starts_its_own(self):
+        module, store, calls = self.harness("export", hold=True)
+        name = "Vfy326Cancel"
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job(name))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            second = asyncio.ensure_future(self.second_start(name))
+            await asyncio.sleep(0.2)
+            first.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await first
+            store.release.set()
+            outcome = await second
+            for _ in range(500):      # the abandoned record goes; the second's worker runs
+                if store.ids[0] not in store and calls:
+                    break
+                await asyncio.sleep(0.01)
+            return outcome
+
+        second_id, refused = asyncio.run(run())
+        first_id = store.ids[0]
+        self.assertIsNone(refused)                    # no 409 naming the cancelled job
+        self.assertNotEqual(second_id, first_id)
+        self.assertEqual(exporter._active.get(name), second_id)
+        self.assertEqual(store[second_id]["status"], "queued")
+        self.assertNotIn(first_id, store)
+        self.assertEqual(len(calls), 1)
+        self.release_export(name, second_id)
+
+    def test_an_abandoned_write_that_raises_is_logged_and_leaves_nothing(self):
+        store = Failing("export", hold=True)
+        self.assertEqual(store.load(), [])
+
+        async def run(logs):
+            loop = asyncio.get_running_loop()
+            task = asyncio.ensure_future(store.create("abcd0326", {"status": "queued"}))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            store.release.set()
+            for _ in range(500):
+                if any("abandoned" in line for line in logs.output):
+                    break
+                await asyncio.sleep(0.01)
+
+        with self.assertLogs("services.jobstore", "ERROR") as logs:
+            asyncio.run(run(logs))
+        self.assertIn("Could not store abandoned export job abcd0326: disk gone",
+                      "\n".join(logs.output))
+        self.assertNotIn("abcd0326", store)
+        self.assertFalse(self.path_exists("export", "abcd0326"))
+
+    # Added by the testing reviewer (#326): the 409 at once, a failed first
+    # write, a cancelled waiter and other collections.
+    def first_held(self, fail=False):
+        store = FirstHeld("export", fail)
+        self.assertEqual(store.load(), [])
+        calls = []
+        for change in (patch.object(exporter, "_jobs", store),
+                       patch.object(exporter, "_run", side_effect=lambda *a, **k: calls.append(a))):
+            change.start()
+            self.addCleanup(change.stop)
+        return store, calls
+
+    def test_a_second_export_answers_409_at_once_once_the_record_is_stored(self):
+        module, store, calls = self.harness("export")
+        name = "Vfy326Stored"
+
+        async def run():
+            first = await exporter.start_export_job(name)
+            self.assertNotIn(first, exporter._starting)
+            return first, await asyncio.wait_for(self.second_start(name), 1)
+
+        job_id, (named, readable) = asyncio.run(run())
+        self.release_export(name, job_id)
+        self.assertEqual((named, readable), (job_id, True))
+        self.assertEqual(store.ids, [job_id])
+        self.assertEqual(exporter._starting, {})
+
+    def test_an_export_waiting_on_a_start_whose_write_fails_starts_its_own(self):
+        store, calls = self.first_held(fail=True)
+        name = "Vfy326Failed"
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job(name))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            second = asyncio.ensure_future(self.second_start(name))
+            await asyncio.sleep(0.2)
+            pending = not second.done()
+            store.release.set()
+            with self.assertRaises(OSError):
+                await first
+            outcome = await second
+            for _ in range(500):
+                if calls:
+                    break
+                await asyncio.sleep(0.01)
+            return pending, outcome
+
+        pending, (second_id, refused) = asyncio.run(run())
+        first_id = store.ids[0]
+        self.assertTrue(pending)                      # it waited for the write
+        self.assertIsNone(refused)                    # no 409 naming the failed job
+        self.assertNotEqual(second_id, first_id)
+        self.assertEqual(exporter._active.get(name), second_id)
+        self.assertNotIn(first_id, store)
+        self.assertEqual(store[second_id]["status"], "queued")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(exporter._starting, {})
+        self.release_export(name, second_id)
+
+    def test_a_waiting_export_cancelled_holds_nothing_and_the_first_goes_on(self):
+        module, store, calls = self.harness("export", hold=True)
+        name = "Vfy326Waiter"
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job(name))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            second = asyncio.ensure_future(exporter.start_export_job(name))
+            await asyncio.sleep(0.2)
+            second.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await second
+            starting = list(exporter._starting)
+            store.release.set()
+            job_id = await first
+            for _ in range(500):
+                if calls:
+                    break
+                await asyncio.sleep(0.01)
+            return starting, job_id
+
+        starting, job_id = asyncio.run(run())
+        self.assertEqual(starting, [job_id])          # the waiter added nothing
+        self.assertEqual(store.ids, [job_id])         # and never wrote
+        self.assertEqual(exporter._active.get(name), job_id)
+        self.assertEqual(store[job_id]["status"], "queued")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(exporter._starting, {})
+        self.release_export(name, job_id)
+
+    def test_exports_of_different_collections_never_wait_on_each_other(self):
+        store, calls = self.first_held()
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job("Vfy326A"))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            other = await asyncio.wait_for(exporter.start_export_job("Vfy326B"), 5)
+            first_done = first.done()
+            store.release.set()
+            return first_done, await first, other
+
+        first_done, first_id, other_id = asyncio.run(run())
+        self.release_export("Vfy326A", first_id)
+        self.release_export("Vfy326B", other_id)
+        self.assertFalse(first_done)                  # B finished while A was held
+        self.assertNotEqual(first_id, other_id)
+        self.assertEqual(store[other_id]["status"], "queued")
+        self.assertEqual(exporter._starting, {})
+
+    def test_a_second_export_gives_up_after_the_bound_and_holds_nothing(self):
+        module, store, calls = self.harness("export", hold=True)
+        name = "Vfy338Bound"
+        change = patch.object(exporter, "START_WAIT", 0.2)
+        change.start()
+        self.addCleanup(change.stop)
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job(name))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            with self.assertRaises(exporter.ExportStartingError):
+                await asyncio.wait_for(exporter.start_export_job(name), 5)
+            first_done, starting = first.done(), list(exporter._starting)
+            store.release.set()
+            job_id = await first
+            for _ in range(500):
+                if calls:
+                    break
+                await asyncio.sleep(0.01)
+            return first_done, starting, job_id
+
+        first_done, starting, job_id = asyncio.run(run())
+        self.release_export(name, job_id)
+        self.assertFalse(first_done)                  # it gave up while the write was held
+        self.assertEqual(starting, [job_id])          # and added nothing
+        self.assertEqual(store.ids, [job_id])         # nor wrote
+        self.assertEqual(store[job_id]["status"], "queued")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(exporter._starting, {})
+
+    # Added by the testing reviewer (#338): the bound covers all of a start's
+    # waits together, counted from its first wait, not each wait afresh.
+    def test_the_bound_counts_from_the_first_wait_across_later_waits(self):
+        store = FailThenHold("export")
+        self.assertEqual(store.load(), [])
+        calls = []
+        for change in (patch.object(exporter, "_jobs", store),
+                       patch.object(exporter, "_run", side_effect=lambda *a, **k: calls.append(a)),
+                       patch.object(exporter, "START_WAIT", 2.0)):
+            change.start()
+            self.addCleanup(change.stop)
+        self.addCleanup(store.release.set)
+        self.addCleanup(store.second_release.set)
+        name = "Vfy338Total"
+
+        async def timed():
+            began = asyncio.get_running_loop().time()
+            try:
+                return await exporter.start_export_job(name), None
+            except exporter.ExportStartingError as exc:
+                return exc, asyncio.get_running_loop().time() - began
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            first = asyncio.ensure_future(exporter.start_export_job(name))
+            self.assertTrue(await loop.run_in_executor(None, store.entered.wait, 10))
+            waiters = [asyncio.ensure_future(timed()) for _ in range(2)]
+            await asyncio.sleep(1.5)             # both wait on the first start
+            store.release.set()                  # its write fails; one waiter takes the slot
+            with self.assertRaises(OSError):
+                await first
+            # the other waits again, on the winner, whose write is held
+            done, _ = await asyncio.wait(waiters, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+            gave_up = [w.result() for w in done]
+            store.second_release.set()
+            results = [await w for w in waiters]
+            for _ in range(500):
+                if calls:
+                    break
+                await asyncio.sleep(0.01)
+            return gave_up, results
+
+        gave_up, results = asyncio.run(run())
+        refused = [elapsed for value, elapsed in results if elapsed is not None]
+        started = [value for value, elapsed in results if elapsed is None]
+        self.assertEqual(len(refused), 1, results)
+        self.assertEqual(len(started), 1, results)
+        # 2.0 s from its first wait, not 1.5 + 2.0 s from its second
+        self.assertGreaterEqual(refused[0], 1.9)
+        self.assertLess(refused[0], 3.0)
+        # the waiter done while the winner's write was held is the one that gave up
+        self.assertEqual(gave_up, [(value, elapsed) for value, elapsed in results
+                                   if elapsed is not None])
+        self.assertIsInstance(gave_up[0][0], exporter.ExportStartingError)
+        self.assertEqual(len(store.ids), 2)           # the first start's failed write, the winner's
+        self.assertEqual(store.ids[1], started[0])    # the waiter that gave up never wrote
+        self.assertEqual(len(calls), 1)               # only the winner's worker ran
+        self.assertEqual(exporter._active.get(name), started[0])
+        self.assertEqual(store[started[0]]["status"], "queued")
+        self.assertEqual(exporter._starting, {})
+        self.release_export(name, started[0])
+
+    def test_the_route_answers_export_starting_with_no_job_id(self):
+        from unittest.mock import AsyncMock
+        from models.schemas import ExportRequest
+        from routers import transfer as route
+        with patch.object(route.wc, "collection_exists", new=AsyncMock(return_value=True)), \
+             patch.object(exporter, "start_export_job",
+                          new=AsyncMock(side_effect=exporter.ExportStartingError("Vfy338"))):
+            response = asyncio.run(route.start_export(ExportRequest(collection="Vfy338")))
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(json.loads(response.body)["error"], {
+            "code": "EXPORT_STARTING",
+            "message": "An export of 'Vfy338' is starting; retry shortly.",
+            "detail": None,
+        })
 
 
 class IngestFallbackTests(StoreTestCase):
@@ -47541,5 +50907,430 @@ if __name__ == "__main__":
     if not os.environ.get("RAG_TEST_LOG_LEVEL"):
         import logging
         logging.getLogger().setLevel(logging.CRITICAL)
+    unittest.main()
+```
+
+### scripts/tests/test_job_lists.py
+
+Run by `02_ingest.sh` in the API image with no network (#617).
+
+```python
+"""Running and recent jobs (#617): what job records carry, and what the lists show.
+
+Runs with the API's dependencies, in the built API image with no network
+(`02_ingest.sh`):
+
+    docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
+      "$(docker compose images -q api)" python scripts/tests/test_job_lists.py
+
+Requests go through `main.app` with FastAPI's TestClient and real sessions in a
+temporary account store (`auth.testing`), without the lifespan. Job stores are
+bound to a temporary folder; nothing reaches a backend.
+"""
+import asyncio
+import io
+import json
+import os
+import sys
+import tempfile
+import time
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+sys.path.insert(0, os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api"))
+
+from fastapi.testclient import TestClient
+
+from config import settings
+from main import app
+from auth import store as auth_store
+from auth import testing as auth_testing
+from services import exporter, goldstandard, importer, ingest_pipeline, job_lists, jobstore, packager
+from services import weaviate_client as wc
+
+DEV = SimpleNamespace(username="dev", kind="user", role="developer")
+OTHER = SimpleNamespace(username="other", kind="user", role="developer")
+KEY = SimpleNamespace(username="dev", kind="service", role="developer")
+ENG = SimpleNamespace(username="eng", kind="user", role="engineer")
+NOW = time.time()
+
+
+def iso(seconds_ago: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).isoformat()
+
+
+def owner(name="dev", kind="user"):
+    return {"name": name, "kind": kind}
+
+
+def ingest_record(job_id, status="completed", **extra):
+    record = {"job_id": job_id, "status": status, "files_total": 1, "files_completed": 1,
+              "files_failed": 0, "chunks_stored": 2, "errors": [], "skipped": []}
+    record.update(extra)
+    return record
+
+
+class TempUploadCase(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        change = patch.object(settings, "upload_dir", temp.name)
+        change.start()
+        self.addCleanup(change.stop)
+
+    def bound(self, kind):
+        store = jobstore.JobStore(kind)
+        self.assertEqual(store.load(), [])
+        return store
+
+
+class RecordTimestampTests(TempUploadCase):
+    def test_new_record_gets_created_at_and_no_finished_at(self):
+        store = self.bound("ingest")
+        store["a1"] = ingest_record("a1", status="queued")
+        self.assertIsNotNone(job_lists._parse(store["a1"]["created_at"]))
+        self.assertNotIn("finished_at", store["a1"])
+        on_disk = json.loads((self.root / "jobs" / "ingest" / "a1.json").read_text())
+        self.assertEqual(on_disk["created_at"], store["a1"]["created_at"])
+
+    def test_finished_at_on_first_terminal_status_and_never_moved(self):
+        store = self.bound("export")
+        store["e1"] = {"job_id": "e1", "status": "queued"}
+        store["e1"]["status"] = "running"
+        self.assertNotIn("finished_at", store["e1"])
+        store["e1"]["status"] = "completed"
+        first = store["e1"]["finished_at"]
+        on_disk = json.loads((self.root / "jobs" / "export" / "e1.json").read_text())
+        self.assertEqual(on_disk["finished_at"], first)
+        time.sleep(0.01)
+        store["e1"].update(status="failed", error="later")
+        self.assertEqual(store["e1"]["finished_at"], first)
+
+    def test_interrupted_at_startup_gets_finished_at(self):
+        directory = self.root / "jobs" / "import"
+        directory.mkdir(parents=True)
+        (directory / "i1.json").write_text(json.dumps({"job_id": "i1", "status": "running"}))
+        store = jobstore.JobStore("import")
+        self.assertEqual(store.load(), ["i1"])
+        on_disk = json.loads((directory / "i1.json").read_text())
+        self.assertEqual(on_disk["error_code"], "INTERRUPTED")
+        self.assertIsNotNone(job_lists._parse(on_disk["finished_at"]))
+
+    def test_snapshot_copies_and_saved_time(self):
+        directory = self.root / "jobs" / "ingest"
+        directory.mkdir(parents=True)
+        path = directory / "old1.json"
+        path.write_text(json.dumps({**ingest_record("old1"), "_audit": {"actor": "x"}}))
+        stamp = NOW - 3600
+        os.utime(path, (stamp, stamp))
+        store = jobstore.JobStore("ingest")
+        store.load()
+        [(job_id, record, saved)] = store.snapshot()
+        self.assertEqual(job_id, "old1")
+        self.assertNotIn("_audit", record)
+        self.assertAlmostEqual(saved, stamp, delta=1)
+        record["status"] = "changed"
+        self.assertEqual(store["old1"]["status"], "completed")
+
+    def test_unbound_store_is_unchanged(self):
+        store = jobstore.JobStore("ingest")
+        doc = {"status": "queued"}
+        store["u1"] = doc
+        self.assertIs(store["u1"], doc)
+        self.assertEqual(doc, {"status": "queued"})
+        self.assertEqual(store.snapshot(), [("u1", {"status": "queued"}, None)])
+
+
+class SelectTests(unittest.TestCase):
+    def items(self, *records):
+        return [(r, r["status"] == "running", job_lists._parse(r.get("finished_at"))) for r in records]
+
+    def ids(self, items, principal):
+        return [r["job_id"] for r in job_lists.select(items, principal, time.time())]
+
+    def test_developer_sees_only_own_jobs_and_engineer_sees_all(self):
+        items = self.items(
+            {"job_id": "mine", "status": "running", "owner": owner(), "created_at": iso(10)},
+            {"job_id": "theirs", "status": "running", "owner": owner("other"), "created_at": iso(20)},
+            {"job_id": "keys", "status": "running", "owner": owner("dev", "service"), "created_at": iso(30)},
+            {"job_id": "unknown", "status": "running", "created_at": iso(40)},
+            {"job_id": "nullowner", "status": "running", "owner": None, "created_at": iso(50)})
+        self.assertEqual(self.ids(items, DEV), ["mine"])
+        self.assertEqual(self.ids(items, OTHER), ["theirs"])
+        self.assertEqual(self.ids(items, KEY), ["keys"])
+        self.assertEqual(self.ids(items, ENG), ["mine", "theirs", "keys", "unknown", "nullowner"])
+
+    def test_running_always_listed_and_finished_capped_to_newest_twenty(self):
+        running = [{"job_id": f"r{i}", "status": "running", "owner": owner(), "created_at": iso(i)}
+                   for i in range(25)]
+        finished = [{"job_id": f"f{i}", "status": "completed", "owner": owner(),
+                     "created_at": iso(1000 + i), "finished_at": iso(500 + i)} for i in range(25)]
+        listed = self.ids(self.items(*running, *finished), DEV)
+        self.assertEqual(len([i for i in listed if i.startswith("r")]), 25)
+        self.assertEqual([i for i in listed if i.startswith("f")], [f"f{i}" for i in range(20)])
+
+    def test_finished_outside_the_window_is_dropped(self):
+        items = self.items(
+            {"job_id": "recent", "status": "failed", "owner": owner(), "finished_at": iso(23 * 3600)},
+            {"job_id": "old", "status": "failed", "owner": owner(), "finished_at": iso(25 * 3600)})
+        self.assertEqual(self.ids(items, DEV), ["recent"])
+
+    def test_order_newest_first_by_created_at_else_finish(self):
+        items = self.items(
+            {"job_id": "a", "status": "completed", "owner": owner(), "created_at": iso(300), "finished_at": iso(10)},
+            {"job_id": "b", "status": "running", "owner": owner(), "created_at": iso(100)},
+            {"job_id": "c", "status": "completed", "owner": owner(), "finished_at": iso(200)})
+        self.assertEqual(self.ids(items, DEV), ["b", "c", "a"])
+
+    def test_listed_finished_at_is_the_finish_time_and_none_while_running(self):
+        listed = job_lists.select([({"job_id": "x", "status": "completed", "owner": owner()}, False, NOW - 60),
+                                   ({"job_id": "y", "status": "running", "owner": owner()}, True, None)],
+                                  DEV, NOW)
+        by_id = {r["job_id"]: r for r in listed}
+        self.assertAlmostEqual(job_lists._parse(by_id["x"]["finished_at"]), NOW - 60, delta=1)
+        self.assertIsNone(by_id["y"]["finished_at"])
+
+    def test_job_items_fall_back_to_saved_time_for_old_records(self):
+        rows = [("old", {"status": "completed"}, NOW - 60),
+                ("new", {"status": "completed", "finished_at": iso(120)}, NOW),
+                ("run", {"status": "queued"}, NOW),
+                ("lost", {"status": "partial"}, None)]
+        items = {r_id: item for (r_id, _, _), item in zip(rows, job_lists.job_items(rows))}
+        self.assertEqual(items["old"][2], NOW - 60)
+        self.assertAlmostEqual(items["new"][2], NOW - 120, delta=1)
+        self.assertEqual(items["run"][1:], (True, None))
+        self.assertIsNone(items["lost"][2])         # never listed
+
+    def test_session_items(self):
+        sessions = [{"session_id": "gen", "status": "generating"},
+                    {"session_id": "done", "status": "completed", "finished_at": iso(60)},
+                    {"session_id": "legacy", "status": "completed"}]
+        items = job_lists.session_items(sessions)
+        self.assertEqual([(i[1], i[2] is not None) for i in items], [(True, False), (False, True), (False, False)])
+        listed = job_lists.select([(dict(s, owner=owner()), r, f) for s, r, f in items], DEV, time.time())
+        # "gen" has neither a start nor a finish time, so it sorts last (S3.6).
+        self.assertEqual([s["session_id"] for s in listed], ["done", "gen"])
+
+
+def session(session_id, **extra):
+    record = {"session_id": session_id, "collection": "OwnedLists", "status": "completed",
+              "pairs_total": 0, "pairs_completed": 0, "pairs": []}
+    record.update(extra)
+    return record
+
+
+class GoldStandardTests(TempUploadCase):
+    def setUp(self):
+        super().setUp()
+        for attribute, value in (("_sessions", {}), ("_diagnostics", {}), ("_scan_cache", {})):
+            patcher = patch.object(goldstandard, attribute, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_generation_sessions_leave_out_imported_ones(self):
+        goldstandard.store_session(session("gs_0000000a", owner=owner(), created_at=iso(5)))
+        goldstandard.store_session(session("gs_0000000b", imported_from={
+            "session_id": "gs_0000000c", "collection": "X", "imported_at": iso(1)}))
+        self.assertEqual([s["session_id"] for s in goldstandard.generation_sessions()], ["gs_0000000a"])
+
+    def test_settling_a_generation_sets_finished_at_once(self):
+        goldstandard.store_session(session("gs_0000000d", status="generating", pairs_total=1,
+                                           owner=owner(), created_at=iso(5)))
+        asyncio.run(goldstandard._settle_generation("gs_0000000d", cancelled=False))
+        settled = goldstandard.get_session("gs_0000000d")
+        self.assertEqual(settled["status"], "completed")
+        first = settled["finished_at"]
+        self.assertIsNotNone(job_lists._parse(first))
+        goldstandard._failed_generation(settled, RuntimeError("later"))
+        self.assertEqual(settled["finished_at"], first)
+
+    def test_failed_generation_sets_finished_at(self):
+        current = {"status": "generating"}
+        goldstandard._failed_generation(current, RuntimeError("boom"))
+        self.assertEqual(current["status"], "failed")
+        self.assertIsNotNone(job_lists._parse(current["finished_at"]))
+
+    def test_restart_settlement_sets_finished_at(self):
+        goldstandard.store_session(session("gs_0000000e", status="generating", pairs_total=1))
+        with patch.object(goldstandard, "_tasks", set()):
+            goldstandard.reconcile_interrupted_generations()
+        self.assertIsNotNone(job_lists._parse(goldstandard.get_session("gs_0000000e")["finished_at"]))
+
+    def test_import_drops_local_fields(self):
+        saved = goldstandard.store_imported_session(
+            session("gs_0000000f", owner=owner(), created_at=iso(5), finished_at=iso(1)), "Source")
+        for key in goldstandard.LOCAL_FIELDS:
+            self.assertNotIn(key, saved)
+            self.assertNotIn(key, goldstandard.get_session(saved["session_id"]))
+        self.assertEqual(goldstandard.generation_sessions(), [])
+
+    def test_packages_leave_out_local_fields(self):
+        with patch.object(goldstandard, "_sessions_on_disk", return_value=[
+                session("gs_00000010", owner=owner(), created_at=iso(5), finished_at=iso(1))]):
+            [packed] = packager._goldstandard_sessions("OwnedLists")
+        for key in goldstandard.LOCAL_FIELDS:
+            self.assertNotIn(key, packed)
+        self.assertEqual(packed["session_id"], "gs_00000010")
+
+
+class RouteTests(TempUploadCase):
+    def setUp(self):
+        super().setUp()
+        self.stores = {}
+        for module, kind in ((ingest_pipeline, "ingest"), (exporter, "export"), (importer, "import")):
+            store = self.bound(kind)
+            self.stores[kind] = store
+            patcher = patch.object(module, "_jobs", store)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for attribute, value in (("_sessions", {}), ("_diagnostics", {}), ("_scan_cache", {})):
+            patcher = patch.object(goldstandard, attribute, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.dev_headers = auth_testing.headers("developer")
+        self.eng_headers = auth_testing.headers("engineer")
+        self.dev = auth_testing._accounts["developer"].username
+        name = f"vfy-s-lists-{time.time_ns()}"
+        auth_store.create_principal(name, "developer")
+        _, secret = auth_store.issue_key(name)
+        self.key_name = name
+        self.key_headers = {"Authorization": f"Bearer {secret}"}
+        self.client = TestClient(app, raise_server_exceptions=False)
+        self.addCleanup(self.client.close)
+
+    def get(self, path, headers):
+        response = self.client.get(path, headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def test_lists_are_scoped_and_carry_the_new_fields(self):
+        ingest = self.stores["ingest"]
+        ingest["d1"] = ingest_record("d1", status="running", owner=owner(self.dev),
+                                     collection="OwnedLists", files=["a.txt", "b.md"])
+        ingest["k1"] = ingest_record("k1", owner=owner(self.key_name, "service"), collection="OwnedLists",
+                                     files=["c.txt"])
+        ingest["o1"] = ingest_record("o1")                          # from before #617
+        mine = self.get("/ingest/jobs", self.dev_headers)["jobs"]
+        self.assertEqual([j["job_id"] for j in mine], ["d1"])
+        self.assertEqual(mine[0]["owner"], owner(self.dev))
+        self.assertEqual((mine[0]["collection"], mine[0]["files"]), ("OwnedLists", ["a.txt", "b.md"]))
+        self.assertIsNotNone(mine[0]["created_at"])
+        self.assertIsNone(mine[0]["finished_at"])
+        keys = self.get("/ingest/jobs", self.key_headers)["jobs"]
+        self.assertEqual([j["job_id"] for j in keys], ["k1"])
+        self.assertIsNotNone(keys[0]["finished_at"])
+        everyone = self.get("/ingest/jobs", self.eng_headers)["jobs"]
+        self.assertEqual(sorted(j["job_id"] for j in everyone), ["d1", "k1", "o1"])
+        self.assertIsNone(next(j for j in everyone if j["job_id"] == "o1")["owner"])
+
+    def test_export_import_and_session_lists(self):
+        self.stores["export"]["e1"] = {
+            "job_id": "e1", "status": "completed", "collection": "OwnedLists", "chunks_written": 3,
+            "filename": "ragpkg-x.tar.gz", "size_bytes": 10, "source_document_count": 1,
+            "fidelity": "with-sources", "models_bundled": False, "retrieve_script": True,
+            "warnings": [], "error": None, "error_code": None, "error_detail": None,
+            "owner": owner(self.dev)}
+        self.stores["import"]["i1"] = {
+            "job_id": "i1", "status": "failed", "filename": "ragpkg-x.tar.gz", "on_conflict": "abort",
+            "collection": None, "original_collection": None, "chunks_written": 0, "fidelity": None,
+            "renamed": False, "notes": [], "error": "Interrupted", "error_code": "INTERRUPTED",
+            "error_detail": None, "owner": owner(self.dev)}
+        goldstandard.store_session(session("gs_00000011", status="generating", pairs_total=4,
+                                           pairs_attempted=1, owner=owner(self.dev), created_at=iso(5),
+                                           pairs=[]))
+        goldstandard.store_session(session("gs_00000012", owner=owner(self.dev)))   # no finished_at
+        exports = self.get("/export/jobs", self.dev_headers)["jobs"]
+        self.assertEqual([(j["job_id"], j["filename"]) for j in exports], [("e1", "ragpkg-x.tar.gz")])
+        imports = self.get("/import/jobs", self.dev_headers)["jobs"]
+        self.assertEqual([(j["job_id"], j["error_code"]) for j in imports], [("i1", "INTERRUPTED")])
+        self.assertEqual(self.get("/export/jobs", self.key_headers)["jobs"], [])
+        sessions = self.get("/goldstandard/sessions", self.dev_headers)["sessions"]
+        self.assertEqual([(s["session_id"], s["pairs_attempted"]) for s in sessions], [("gs_00000011", 1)])
+        self.assertNotIn("pairs", sessions[0])
+        self.assertEqual(self.get("/goldstandard/sessions", self.key_headers)["sessions"], [])
+
+    def test_a_malformed_record_is_left_out(self):
+        self.stores["ingest"]["bad"] = {"job_id": "bad", "status": "completed", "owner": owner(self.dev)}
+        self.stores["ingest"]["good"] = ingest_record("good", owner=owner(self.dev))
+        self.assertEqual([j["job_id"] for j in self.get("/ingest/jobs", self.dev_headers)["jobs"]], ["good"])
+
+    def test_lookups_by_id_answer_without_the_new_fields(self):
+        self.stores["ingest"]["d2"] = ingest_record("d2", owner=owner(self.dev), collection="C", files=["a"])
+        answer = self.get("/ingest/job/d2", self.dev_headers)
+        for key in ("owner", "created_at", "finished_at", "collection", "files"):
+            self.assertNotIn(key, answer)
+        goldstandard.store_session(session("gs_00000013", owner=owner(self.dev), created_at=iso(5),
+                                           finished_at=iso(1)))
+        answer = self.get("/goldstandard/session/gs_00000013", self.dev_headers)
+        for key in goldstandard.LOCAL_FIELDS:
+            self.assertNotIn(key, answer)
+
+    def test_lists_need_the_developer_role(self):
+        user_headers = auth_testing.headers("end_user")
+        for path in ("/ingest/jobs", "/export/jobs", "/import/jobs", "/goldstandard/sessions"):
+            with self.subTest(path=path):
+                self.assertEqual(self.client.get(path).status_code, 401)
+                self.assertEqual(self.client.get(path, headers=user_headers).status_code, 403)
+
+    def test_starts_record_the_owner(self):
+        with patch.object(wc, "collection_exists", AsyncMock(return_value=True)), \
+                patch.object(ingest_pipeline, "start_ingest_job", AsyncMock(return_value="j1")) as ingest, \
+                patch.object(exporter, "start_export_job", AsyncMock(return_value="j2")) as export, \
+                patch.object(importer, "start_import_job", AsyncMock(return_value="j3")) as imp, \
+                patch.object(goldstandard, "start_generation", AsyncMock(return_value={
+                    "session_id": "gs_00000014", "status": "generating", "pairs_total": 1,
+                    "pairs_completed": 0})) as gen:
+            response = self.client.post("/ingest/upload", headers=self.dev_headers,
+                                        data={"collection": "OwnedLists"},
+                                        files=[("files", ("a.txt", io.BytesIO(b"x"), "text/plain"))])
+            self.assertEqual(response.status_code, 202, response.text)
+            response = self.client.post("/export", headers=self.key_headers, json={"collection": "OwnedLists"})
+            self.assertEqual(response.status_code, 202, response.text)
+            response = self.client.post("/import", headers=self.dev_headers,
+                                        json={"filename": "ragpkg-x.tar.gz", "on_conflict": "abort"})
+            self.assertEqual(response.status_code, 202, response.text)
+            response = self.client.post("/goldstandard/generate", headers=self.eng_headers,
+                                        json={"collection": "OwnedLists", "sample_size": 1})
+            self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(ingest.call_args.kwargs["owner"], owner(self.dev))
+        self.assertEqual(export.call_args.kwargs["owner"], owner(self.key_name, "service"))
+        self.assertEqual(imp.call_args.kwargs["owner"], owner(self.dev))
+        self.assertEqual(gen.call_args.kwargs["owner"],
+                         owner(auth_testing._accounts["engineer"].username))
+
+
+class IngestRecordTests(TempUploadCase):
+    def test_ingest_record_carries_collection_files_and_owner(self):
+        store = self.bound("ingest")
+
+        class Upload:
+            def __init__(self, name, data):
+                self.filename = name
+                self.file = io.BytesIO(data)
+                self.size = len(data)
+
+        async def start():
+            # The worker is replaced: only the record the admission stores is checked.
+            with patch.object(ingest_pipeline, "_jobs", store), \
+                    patch.object(ingest_pipeline, "_process_job_sync", lambda *args: None):
+                job_id = await ingest_pipeline._admit_ingest_job(
+                    "rec1", [Upload("notes.txt", b"hello"), Upload("skip.exe", b"x")], "OwnedLists",
+                    "fixed", 300, 0, 0.85, 0, owner=owner())
+                await asyncio.sleep(0.1)
+                return job_id
+        self.assertEqual(asyncio.run(start()), "rec1")
+        record = store.get("rec1")
+        self.assertIsNotNone(record)
+        self.assertEqual(record["collection"], "OwnedLists")
+        self.assertEqual(record["files"], ["notes.txt", "skip.exe"])
+        self.assertEqual(record["owner"], owner())
+        self.assertIsNotNone(record["created_at"])
+
+
+if __name__ == "__main__":
     unittest.main()
 ```

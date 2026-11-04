@@ -36,6 +36,18 @@ export default function ProgressPanel({ job }: { job: JobStatus }) {
           {job.errors.map((e, i) => <li key={i}>{e}</li>)}
         </ul>
       )}
+      {(job.split?.length ?? 0) > 0 && (
+        // A file over the per-file limits is stored as parts named
+        // `<name> (part N)` (#621); not a failure, but the names differ.
+        <div className="mt-2 text-xs text-gray-700" data-testid="split-files">
+          <p className="font-medium">
+            {job.split!.length} file{job.split!.length === 1 ? '' : 's'} split into parts:
+          </p>
+          <ul className="space-y-1 mt-1">
+            {job.split!.map((f, i) => <li key={i}>{f}</li>)}
+          </ul>
+        </div>
+      )}
       {(job.skipped?.length ?? 0) > 0 && (
         // Skipped files are never counted in files_total, so without this the
         // count simply reads lower than what the user uploaded. Each entry

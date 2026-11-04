@@ -130,6 +130,8 @@ export const api = {
   // Ingest — form field is "strategy"; job status URL is /ingest/job/{id}; config POST is /ingest/config
   uploadFiles: (form: FormData) => request<{ job_id: string; status: string; files_queued: number; collection: string }>('POST', '/ingest/upload', form, true),
   getJobStatus: (jobId: string) => request<JobStatus>('GET', `/ingest/job/${jobId}`),
+  // The caller's running and recent jobs (#617); an Engineer gets everyone's.
+  listIngestJobs: () => request<{ jobs: IngestJobEntry[] }>('GET', '/ingest/jobs'),
   getIngestConfig: (collection: string) => request<IngestConfig>('GET', `/ingest/config/${collection}`),
   saveIngestConfig: (body: SaveIngestConfigBody) => request<IngestConfig>('POST', '/ingest/config', body),
 
@@ -141,6 +143,7 @@ export const api = {
 
   generateGoldStandard: (body: GenerateBody) => request<GenerateResult>('POST', '/goldstandard/generate', body),
   getSession: (sessionId: string) => request<Session>('GET', `/goldstandard/session/${encodeURIComponent(sessionId)}`),
+  listGenerations: () => request<{ sessions: GenerationEntry[] }>('GET', '/goldstandard/sessions'),
   patchPair: (sessionId: string, pairId: string, body: PatchPairBody) => request<GoldPair>('PATCH', `/goldstandard/session/${encodeURIComponent(sessionId)}/pair/${encodeURIComponent(pairId)}`, body),
   regeneratePair: (body: { session_id: string; pair_id: string }) => request<GoldPair>('POST', '/goldstandard/regenerate', body),
   saveSession: (body: { session_id: string; filename?: string; allow_historical?: boolean }) => request<SaveResult>('POST', '/goldstandard/save', body),
@@ -151,6 +154,8 @@ export const api = {
   getExportJob: (jobId: string) => request<ExportJob>('GET', `/export/job/${jobId}`),
   startImport: (body: ImportBody) => request<ImportStart>('POST', '/import', body),
   getImportJob: (jobId: string) => request<ImportJob>('GET', `/import/job/${jobId}`),
+  listExportJobs: () => request<{ jobs: ExportJobEntry[] }>('GET', '/export/jobs'),
+  listImportJobs: () => request<{ jobs: ImportJobEntry[] }>('GET', '/import/jobs'),
   getPackages: () => request<{ packages: PackageSummary[] }>('GET', '/packages'),
   getTuneOptions: (collection: string) => request<TuneOptions>('GET', `/tune/${collection}`),
   getTransferHelp: () => request<{ topic: string; markdown: string }>('GET', '/help/transfer'),
@@ -181,6 +186,8 @@ export interface JobStatus {
   // Files that could not be parsed at all, or that a later file with the same
   // name replaced in the upload (#22) — never counted in files_total.
   skipped?: string[]
+  // Files over the per-file limits, stored as parts (#621)
+  split?: string[]
   // Earlier chunks of the same names this job removed (#22).
   chunks_replaced?: number
   // Chunks sent to Weaviate and those it acknowledged (#302); null on records
@@ -262,6 +269,17 @@ export interface ImportJob {
   restored_sessions?: { source_session_id: string; session_id: string; collection: string }[]
   error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
   encrypted?: boolean
+}
+// Running and recent jobs (#617). owner is null for a job recorded before
+// owners were, which only an Engineer sees ("owner unknown").
+export interface JobOwner { name: string; kind: 'user' | 'service' }
+export interface ListedTimes { owner: JobOwner | null; created_at: string | null; finished_at: string | null }
+export interface IngestJobEntry extends JobStatus, ListedTimes { collection: string | null; files: string[] }
+export interface ExportJobEntry extends ExportJob, ListedTimes {}
+export interface ImportJobEntry extends ImportJob, ListedTimes {}
+export interface GenerationEntry extends ListedTimes {
+  session_id: string; collection: string; status: string; pairs_total: number; pairs_attempted: number
+  pairs_completed: number; pairs_failed: number; errors: string[]
 }
 export type AuditResult = 'success' | 'refused' | 'error' | 'accepted' | 'succeeded' | 'failed' | 'interrupted'
 export interface AuditRecord {

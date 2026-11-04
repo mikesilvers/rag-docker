@@ -480,7 +480,9 @@ A collection is a named vector index that holds chunks from one or more document
 
 ### 2. Ingest documents
 
-Navigate to **Import**, drop in your files (PDF, DOCX, TXT, MD, CSV, JSON, JSON Lines (`.jsonl`, `.jsonl.gz`), or ZIP), choose a collection, and click **Start Ingest**. A ZIP may also contain gzipped JSON (`.json.gz`) files. The page polls for progress automatically.
+Navigate to **Data → Import**, drop in your files (PDF, DOCX, TXT, MD, CSV, JSON, JSON Lines (`.jsonl`, `.jsonl.gz`), or ZIP), choose a collection, and click **Start Ingest**. A ZIP may also contain gzipped JSON (`.json.gz`) files. The page polls for progress automatically. Preparing a large corpus? The Import page's **Download corpus preparation rules (.md)** link gives the ingest limits (per upload, per ZIP, per file, per line and per chunk), how JSON and JSON Lines are measured, safe targets and a checklist, in one markdown file for whoever prepares the data, or for the tool they use.
+
+You don't have to stay on the page while a job runs. The Import, Gold Standard and Transfer pages each show a **Running and recent jobs** list, read from the server whenever the page opens, so coming back to it (after visiting another page, reloading, in another tab or after logging in again) shows the running job's progress, or its result once it has finished. The newest job opens by itself; click another row to switch. The list holds your own jobs that are running or finished in the last 24 hours (at most 20 finished ones); an AI Engineer sees everyone's, with who started each.
 
 Uploading a file again under the same name replaces its earlier chunks (even if the content is unchanged); files inside a ZIP are named by their path in the archive, so `a/report.pdf` and `b/report.pdf` stay separate documents. macOS metadata in a ZIP (the `__MACOSX/` folder and `._*` files the Finder adds) is not ingested; the job lists it under skipped files.
 
@@ -496,7 +498,7 @@ Supported chunking strategies:
 
 ### 3. Configure retrieval
 
-Navigate to **Retrieval** to choose a retrieval mode and top-K value for a collection. Settings are saved **per collection on the server**, so they survive a restart, are shared by every browser, and travel with a RAG export. The Q&A page loads the settings for whichever collection you have selected.
+Navigate to **Tune → Retrieval** to choose a retrieval mode and top-K value for a collection. Settings are saved **per collection on the server**, so they survive a restart, are shared by every browser, and travel with a RAG export. The Q&A page loads the settings for whichever collection you have selected.
 
 | Mode | Description |
 |---|---|
@@ -512,11 +514,11 @@ Navigate to **Q&A**, select a collection, type your question, and press **Ask** 
 
 ### 5. Generate gold standard data
 
-Navigate to **Gold Standard**, choose a collection and sample size, and click **Generate Pairs**. The platform samples chunks and uses the LLM to generate question/answer pairs. The page shows how the generation ended, including pairs that failed and why. Review each pair (approve, edit, reject, or regenerate), then export to a RAGAS-compatible JSON file.
+Navigate to **Tune → Gold Standard**, choose a collection and sample size, and click **Generate Pairs**. The platform samples chunks and uses the LLM to generate question/answer pairs. The page shows how the generation ended, including pairs that failed and why. Review each pair (approve, edit, reject, or regenerate), then export to a RAGAS-compatible JSON file.
 
 ## Health check
 
-Navigate to **Health** (AI Engineer role) to see live status and latency for Weaviate, the LLM, and the embedding model. Latency charts populate after the first few Q&A queries.
+Navigate to **Admin → Health** (AI Engineer role) to see live status and latency for Weaviate, the LLM, and the embedding model. Latency charts populate after the first few Q&A queries.
 
 You can also hit the API directly:
 
@@ -1183,7 +1185,7 @@ curl -s -b ~/.rag-session -H 'Origin: http://localhost:8080' -o /dev/null -w '%{
   -F 'collection=mydocs' -F 'files=@/dev/null;type=text/plain'   # -> 404
 ```
 
-Overlap uses exact character windows, including internal whitespace-only windows, so boundaries can split words. Per-file limits are 10,000 chunks and 10 million parsed characters; overlap also caps duplicated output at 10 million characters. At default 1000/200 sizing, more than 8,000,200 characters exceeds the window limit. Split large documents or select suitable chunk settings. These limits bound ingestion work independently of the upload byte limit.
+Overlap uses exact character windows, including internal whitespace-only windows, so boundaries can split words. Per-file limits are 10,000 chunks and 10 million parsed characters; overlap also caps duplicated output at 10 million characters. At default 1000/200 sizing, more than 8,000,200 characters exceeds the window limit. A file over these limits is not refused: it is stored as parts `<name> (part 1)`, `<name> (part 2)` and so on, each inside them (JSON and JSON Lines between records, text between paragraphs, a CSV between rows with its header in every part, the header counted in every part's size; a CSV whose header is over half a part fails instead of being split). A split file may store at most ten times its own size in chunk text, overlap and repeated headers included; over that it fails whole, the job lists it under `split`, and uploading the name again replaces every part (#621). One JSON or JSON Lines record over 10 million characters, or over 10,000 chunks on its own, still fails, because a record is never split. These limits bound the work per part independently of the upload byte limit.
 
 ## Optional backend telemetry
 

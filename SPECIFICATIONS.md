@@ -743,10 +743,27 @@ member that will be skipped. A ZIP holding nothing else is refused with `NO_SUPP
   is parsed and chunked again with the request's settings, the new chunks are stored, and
   only then are the name's earlier chunks deleted, so a failed store leaves the earlier
   version whole. The earlier chunks are those with the same `source_file` and a different
-  `created_at` than the new chunks (which all share one); deletion repeats until none match
-  (Weaviate deletes at most `QUERY_MAXIMUM_RESULTS` per call), at most 100 times. It
-  proceeds only if exactly the new chunks match their own `created_at`, and afterwards
-  exactly they must remain. The job's `chunks_replaced` counts the deleted chunks.
+  `created_at` than the new chunks (which all share one). The name is matched exactly, case
+  and folders included: `a/report.pdf`, `Report.PDF` and `report.pdf` are three documents,
+  and replacing one never touches the others (#622). `source_file` is word-tokenized, so
+  Weaviate's equality filter on it matches every name sharing the name's words; those
+  matches are read and kept only where `source_file` is exactly the name, and when more
+  than 10,000 chunks match the words the whole collection is walked instead, reading only
+  `source_file` and `created_at`. The earlier chunks are deleted by ID, in batches of up to
+  10,000 (`QUERY_MAXIMUM_RESULTS`), at most 1,000,000 per replacement; a name with more
+  fails, before anything is deleted, with `<n> earlier chunks are more than one replacement
+  removes (1000000), so none were removed`. Deletion proceeds only if exactly the new chunks
+  of the name carry their own `created_at`, and afterwards exactly they must remain, both
+  counted over the exact name. The job's `chunks_replaced` counts the deleted chunks.
+- **A name stored as parts is replaced whole (#621).** A file over the per-file limits is
+  stored as parts `<name> (part N)` (§5.1.1); the name and every one of its parts are its
+  family, matched exactly (a name, then ` (part `, a number from 1 without leading zeros,
+  `)`). Re-ingesting the name replaces its whole family, whether the earlier or the new
+  version was split: a smaller re-upload, a file no longer split and a file newly split all
+  leave exactly the new chunks. `a/data.jsonl`, `Data.jsonl` and `data.jsonl.bak (part 1)`
+  are not in `data.jsonl`'s family. Whether the name already has chunks, the deletion
+  precondition and the final count are all over the family, and gold-standard stale
+  marking uses the same check.
 - If the earlier chunks can't all be deleted, the new chunks stay, the file counts as
   failed (so the job is `partial`, or `failed` if every file failed) and `errors` gets
   `<file>: its new chunks were stored, but earlier chunks could not all be removed
@@ -788,7 +805,8 @@ GET /ingest/job/{job_id}
   "chunks_accepted": 142,
   "chunks_replaced": 0,
   "errors": [],
-  "skipped": []
+  "skipped": [],
+  "split": []
 }
 ```
 
@@ -804,7 +822,11 @@ these two fields existed read back with both `null`, not `0`, which would be unt
 `chunks_replaced` is how many earlier chunks of the same names the job deleted (#22); job
 records written before it existed read back as `0`. `skipped` lists inputs that were not
 ingested, each with its reason: an unsupported type, macOS metadata in a ZIP (#378), or a
-later input with the same name.
+later input with the same name. `split` lists the files stored as parts (§5.1.1, #621), one
+entry per such file that completed, in order: `<file>: split into N parts, stored as
+'<name> (part 1)' to '<name> (part N)'`, `<file>` as in `errors` and `<name>` its logical
+name. A split file is not a failure: it counts once in `files_completed`. Job records written
+before the field existed read back with `[]`.
 
 `status` values: `"queued"`, `"running"`, `"completed"`, `"partial"` (some files failed),
 `"failed"`.
@@ -833,10 +855,11 @@ On failure, `errors` contains per-file error messages, each `"<file>: <reason>"`
 convert it to JSON Lines` (decompression stops there; #300); or JSON that can't be parsed after
 decompression. A `.json` file over 30,000,000 bytes fails, before it is read, with `is larger than
 30,000,000 bytes, the most one JSON file can hold; split the file or convert it to JSON Lines`. A `.json` file
-that isn't valid JSON fails with `is not valid JSON: <reason>`, giving the parser's line and column; one whose
-converted text would exceed 10,000,000 characters fails with `converts to more than 10,000,000 characters of
-text, the per-file limit for every chunking strategy; split the file` (a `.json.gz` member: `was decompressed,
-but it converts to more than …`); one with more than 1,000,000 records fails with `has more than 1,000,000
+that isn't valid JSON fails with `is not valid JSON: <reason>`, giving the parser's line and column; one with a
+record whose converted text would exceed 10,000,000 characters fails with `record N converts to more than
+10,000,000 characters of text, the most one record can hold; a record is never split` (N the record's position
+in the file, from 1; a `.json.gz` member: `was decompressed, but record N converts to more than …`); one with
+more than 1,000,000 records fails with `has more than 1,000,000
 records, the most one file can hold; split the file` (a `.json.gz` member: `was decompressed, but it has more
 than …`).
 
@@ -844,13 +867,29 @@ A `.jsonl` or `.jsonl.gz` file fails as a whole, with nothing stored, at its fir
 (§5.1): `line N is blank` (a blank line followed by another record), `line N is not valid JSON:
 <reason> at column C`, `line N is not UTF-8 text (<reason> at byte B)`, `line N is longer than
 10,000,000 bytes, the most one line can hold; split the record across lines or files`,
-`converts to more than 10,000,000 characters of text by line N, the per-file limit for every
-chunking strategy; split the file`, or, past 1,000,000 lines, `has more than 1,000,000 records,
+`line N converts to more than 10,000,000 characters of text, the most one record can hold; a
+record is never split` (#621), or, past 1,000,000 lines, `has more than 1,000,000 records,
 the most one file can hold; split the file` (#314). For a `.jsonl.gz` these read `was
-decompressed, but line N …` (and `was decompressed, but it converts to more than …`, `was
-decompressed, but it has more than …`); a corrupt or truncated gzip gives the
+decompressed, but line N …` (and `was decompressed, but it has more than …`); a corrupt or truncated gzip gives the
 `.json.gz` message above, and passing the 512 MB limit gives `decompresses to more than 512 MB,
 the limit for one compressed file; nothing from it was stored`.
+
+A file stored as parts (§5.1.1, #621) is stored whole or not at all. If any part fails (reading
+a later line, a bad line, a record over a limit, chunking, the `semantic` sentence limit,
+storing), every chunk this ingest stored for the file is removed, the earlier version stays
+whole, `chunks_stored` drops by what was removed, and the error is `<file>: part N: <reason>;
+nothing from it was stored`. If that removal fails too, it ends instead `; K new chunks could
+not be removed (<reason>); upload it again to retry`. A record that gives more than 10,000
+chunks on its own fails the file with `record N gives more than 10,000 chunks with these chunk
+settings, the most one part can hold; a record is never split, so use a larger chunk size`
+(`line N` for JSON Lines), as `part N: …` when other parts came before it. A CSV that has to
+be split, whose header row is more than half of what one part can hold, fails the file before
+anything is stored with `<file>: its header row is N characters, more than half of what one part
+can hold with these chunk settings (M characters); the header is repeated in every part, so
+shorten the header or split the file` (§5.1.1). A split file whose chunks would store more than
+ten times its own size fails whole, its stored parts removed, with `<file>: it would store N
+characters of chunks, more than 10 times its own size (M characters); use less chunk_overlap,
+shorten repeated headers or keys, or split the file` (§5.1.1).
 
 **Response 404** if the job ID does not exist:
 ```json
@@ -1410,7 +1449,7 @@ one may. The role of a request is the one stored for its user at that moment, ne
 | nothing | `GET /health`, `GET /auth/status`, `POST /auth/login` |
 | any session (also one with a password change due) | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password` |
 | `end_user` | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
-| `developer` | `POST /collections`; `POST /ingest/upload`, `GET /ingest/job/{job_id}`, `GET /ingest/config/{collection}`, `POST /ingest/config`; `POST /retrieval/config`; `POST /goldstandard/generate`, `GET /goldstandard/session/{session_id}`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST /goldstandard/save`, `GET /goldstandard/download/{filename}`; `POST /export`, `GET /export/job/{job_id}`, `POST /import`, `GET /import/job/{job_id}`, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
+| `developer` | `POST /collections`; `POST /ingest/upload`, `GET /ingest/job/{job_id}`, `GET /ingest/jobs`, `GET /ingest/config/{collection}`, `POST /ingest/config`; `POST /retrieval/config`; `POST /goldstandard/generate`, `GET /goldstandard/session/{session_id}`, `GET /goldstandard/sessions`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST /goldstandard/save`, `GET /goldstandard/download/{filename}`; `POST /export`, `GET /export/job/{job_id}`, `GET /export/jobs`, `POST /import`, `GET /import/job/{job_id}`, `GET /import/jobs`, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
 | `engineer` | `DELETE /collections/{name}`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json`; account administration: `GET /auth/users`, `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `POST /auth/users/{username}/role`, `POST /auth/users/{username}/disable`, `POST /auth/users/{username}/enable`; service principals and keys: `GET /auth/service-principals`, `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `POST /auth/service-principals/{name}/disable`, `POST /auth/service-principals/{name}/enable`, `POST /auth/service-principals/{name}/keys`, `POST /auth/service-principals/{name}/keys/{key_id}/revoke`; the audit log (§3.1.9): `GET /audit`, `GET /audit.csv` |
 
 The matrix is one table in `api/auth/policy.py`. A route without an entry is refused for everyone (`403
@@ -1657,6 +1696,61 @@ during it can't make it repeat or miss a record that existed when it started.
 Header `time,actor,actor_kind,role,key_id,client_ip,action,collection,target,result,status_code,job_id,details`,
 then every matching record newest first, `details` as compact JSON, empty cells for `null`; a cell starting with
 `=`, `+`, `-`, `@`, a tab or a carriage return gets a leading `'`.
+
+#### 3.1.10 Running and recent jobs (#617)
+
+A page that starts a long job (an ingest, a gold-standard generation, an export or an import)
+finds it again through these lists after the user has left the page, reloaded it, opened another
+tab or logged in again. Nothing about a job is kept in the browser.
+
+```
+GET /ingest/jobs             →  {"jobs": [ ... ]}
+GET /export/jobs             →  {"jobs": [ ... ]}
+GET /import/jobs             →  {"jobs": [ ... ]}
+GET /goldstandard/sessions   →  {"sessions": [ ... ]}
+```
+
+Each needs the Developer role (an API key of that role or higher may use them, §3.1.8), takes no
+parameters, and is not audited. The lookups by ID (`GET /ingest/job/{job_id}`,
+`/export/job/{job_id}`, `/import/job/{job_id}`, `/goldstandard/session/{session_id}`) answer as
+before: none of the fields below appears in them, and they are not scoped by owner.
+
+**What a job records.** A job started by a request records `owner`: `{"name": <principal name>,
+"kind": "user" | "service"}`, `service` when the request used an API key, so a key's jobs belong to
+its service principal. Ingest, export and import records (and tune records, which nothing lists)
+record `created_at` when stored and `finished_at` when they first reach a terminal status
+(`completed`, `failed`, `partial`, `cancelled`) or are marked interrupted at startup. A generated
+session records `created_at` when it starts and `finished_at` when its generation settles
+(completed, failed, cancelled, or failed as interrupted at startup). Neither time changes afterwards.
+Times are ISO 8601 in UTC. An ingest record also records `collection` and `files`: the uploaded
+files' names as the client sent them, in upload order.
+
+**Whose jobs.** An Engineer sees every job, with its owner. Any other caller sees only jobs whose
+`owner` has its name and kind. A record from before #617 has no owner: only an Engineer sees it, as
+"owner unknown" (`owner: null`).
+
+**Which jobs.** Every running job (an ingest, export or import whose status isn't terminal; a session
+whose status is `generating`) is listed. A finished job is listed when its finish time lies in the 24
+hours before the request; of those, only the 20 with the newest finish time, per list and caller.
+The finish time is `finished_at`; a finished ingest, export or import record from before #617 uses
+the time its record file was last saved, and a finished session without `finished_at` is not listed.
+`GET /goldstandard/sessions` lists only sessions generated on this install: one with
+`imported_from` never appears. The store's limit of 200 records per kind (§3.1.3) is unchanged, so a
+record already removed by it isn't listed.
+
+**Order and entries.** Newest first by `created_at`; an entry without it sorts by its finish time,
+and one with neither comes last. An ingest, export or import entry has every field of that job's
+lookup by ID, so an interrupted job is listed with its "Interrupted" message, plus `owner` (object or
+`null`), `created_at` (or `null`), `finished_at` (the finish time used, or `null` while running), and
+for ingest `collection` (or `null`) and `files` (`[]` when unknown). A session entry has
+`session_id`, `collection`, `status`, `pairs_total`, `pairs_attempted`, `pairs_completed`,
+`pairs_failed`, `errors`, `owner`, `created_at` and `finished_at`, and no pairs; the page reads the
+session itself through `GET /goldstandard/session/{session_id}`. A record the entry can't represent
+is left out and logged, so one bad record never fails a list.
+
+**Packages.** `owner`, `created_at` and `finished_at` belong to this install: an export leaves them
+out of every `goldstandard/<session_id>.json`, and an import drops them from every session it
+restores, whatever the package carries (`RAG_EXPORT_SPECIFICATIONS.md` §4.2).
 
 ### 3.2 Error Response Format
 
@@ -2218,10 +2312,84 @@ Flat (KNN) index has no tunable parameters.
 | Plain text | `.txt` | Unstructured (`partition_text`) | UTF-8 encoding assumed |
 | Markdown | `.md` | Unstructured (`partition_md`) | Heading structure preserved |
 | CSV | `.csv` | Unstructured (`partition_csv`) | Each row treated as a text chunk candidate |
-| JSON | `.json` | Own converter; Unstructured (`partition_json`) for element files | Converted to readable `key: value` lines, keys in the file's order, non-ASCII text as is, strings unquoted, numbers as written, `true`/`false`/`null` as is. Nested keys are dotted paths (`meta.author: A`); an array of scalars is one line (`tags: a, b, c`); other arrays use indexed paths (`items[0].name: x`). A top-level array holding any object or array gives one element per item (scalar items included), separated by a blank line, so `language` and `context_aware` chunking split between records. Empty objects and arrays write nothing: `{}`, `[]` or an empty file completes with 0 chunks. Invalid JSON (including `NaN`/`Infinity` and non-UTF-8 text; a UTF-8 byte-order mark is accepted) fails that file with "is not valid JSON: <reason>". Because every line repeats its key path, the converted text is bounded: a file whose records, with the blank lines between them, would hold more than 10,000,000 characters (`MAX_TEXT_CHARACTERS`, the chunker's per-file limit for every strategy) fails with "converts to more than 10,000,000 characters of text …" before that text is built. A file keeps at most 1,000,000 records (records with no text don't count); more fails with "has more than 1,000,000 records …", before any element is built (#300). An element file's items count the same way, every item included, and are counted before `partition_json` builds them (#321). A file is parsed whole, so a `.json` file over 30,000,000 bytes (`MAX_JSON_INPUT_BYTES`, an element file included) fails before it is read with "is larger than 30,000,000 bytes, the most one JSON file can hold; split the file or convert it to JSON Lines", and a `.json.gz` member stops decompressing there ("decompresses to more than 30,000,000 bytes …"); the rest of the job carries on (#300). A non-empty array of serialized Unstructured elements is rehydrated by `partition_json` (#295) |
-| JSON Lines | `.jsonl`, `.jsonl.gz` | Own reader and the JSON converter above (#291) | One file is one document. Read one line at a time (lines end at `\n` or `\r\n`, so CRLF and LF files read the same; the last line needs no newline); a `.jsonl.gz` is decompressed as it is read, at most 512 MB. Each non-blank line is one record: its JSON value (any value, not only an object) converted by the JSON rules above from the root, so an array line is one record with indexed paths (`[0].a: 1`). Records are separated by a blank line and each is one element, so `language` and `context_aware` chunking split between lines; lines are never treated as Unstructured element files. A line with no text (`{}`, `[]`, `""`) adds nothing; an empty or blank-only file completes with 0 chunks. A UTF-8 byte-order mark on line 1 is accepted. The file fails as a whole, with nothing stored, at its first bad line: a blank line followed by another record (`line N is blank`; blank lines after the last record are accepted), invalid JSON (`line N is not valid JSON: <reason> at column C`), non-UTF-8 text, or a line over 10,000,000 bytes, not counting its line ending or line 1's byte-order mark (`line N is longer than 10,000,000 bytes …`; at most that much of one line is read, so one record's parse stays bounded; #314). A file holds at most 1,000,000 lines, the JSON record cap: every line counts, blank lines and lines with no text included, and reading stops at line 1,000,001, which fails the file (`has more than 1,000,000 records, the most one file can hold; split the file`; #314). The whole file's text, blank lines between records included, is bounded by the same 10,000,000 characters as JSON: reading stops at the line that passes it (`converts to more than 10,000,000 characters of text by line N …`). Larger corpora are #312. `source_type` is `jsonl` |
+| JSON | `.json` | Own converter; Unstructured (`partition_json`) for element files | Converted to readable `key: value` lines, keys in the file's order, non-ASCII text as is, strings unquoted, numbers as written, `true`/`false`/`null` as is. Nested keys are dotted paths (`meta.author: A`); an array of scalars is one line (`tags: a, b, c`); other arrays use indexed paths (`items[0].name: x`). A top-level array holding any object or array gives one element per item (scalar items included), separated by a blank line, so `language` and `context_aware` chunking split between records. Empty objects and arrays write nothing: `{}`, `[]` or an empty file completes with 0 chunks. Invalid JSON (including `NaN`/`Infinity` and non-UTF-8 text; a UTF-8 byte-order mark is accepted) fails that file with "is not valid JSON: <reason>". Because every line repeats its key path, each record's converted text is bounded: a record that would hold more than 10,000,000 characters (`MAX_TEXT_CHARACTERS`, the chunker's per-file limit for every strategy) fails the file with "record N converts to more than 10,000,000 characters of text …" before that text is built. A file whose records together hold more is split into parts (§5.1.1, #621). A file keeps at most 1,000,000 records (records with no text don't count); more fails with "has more than 1,000,000 records …", before any element is built (#300). An element file's items count the same way, every item included, and are counted before `partition_json` builds them (#321). A file is parsed whole, so a `.json` file over 30,000,000 bytes (`MAX_JSON_INPUT_BYTES`, an element file included) fails before it is read with "is larger than 30,000,000 bytes, the most one JSON file can hold; split the file or convert it to JSON Lines", and a `.json.gz` member stops decompressing there ("decompresses to more than 30,000,000 bytes …"); the rest of the job carries on (#300). A non-empty array of serialized Unstructured elements is rehydrated by `partition_json` (#295) |
+| JSON Lines | `.jsonl`, `.jsonl.gz` | Own reader and the JSON converter above (#291) | One file is one document. Read one line at a time (lines end at `\n` or `\r\n`, so CRLF and LF files read the same; the last line needs no newline); a `.jsonl.gz` is decompressed as it is read, at most 512 MB. Each non-blank line is one record: its JSON value (any value, not only an object) converted by the JSON rules above from the root, so an array line is one record with indexed paths (`[0].a: 1`). Records are separated by a blank line and each is one element, so `language` and `context_aware` chunking split between lines; lines are never treated as Unstructured element files. A line with no text (`{}`, `[]`, `""`) adds nothing; an empty or blank-only file completes with 0 chunks. A UTF-8 byte-order mark on line 1 is accepted. The file fails as a whole, with nothing stored, at its first bad line: a blank line followed by another record (`line N is blank`; blank lines after the last record are accepted), invalid JSON (`line N is not valid JSON: <reason> at column C`), non-UTF-8 text, or a line over 10,000,000 bytes, not counting its line ending or line 1's byte-order mark (`line N is longer than 10,000,000 bytes …`; at most that much of one line is read, so one record's parse stays bounded; #314). A file holds at most 1,000,000 lines, the JSON record cap: every line counts, blank lines and lines with no text included, and reading stops at line 1,000,001, which fails the file (`has more than 1,000,000 records, the most one file can hold; split the file`; #314). Each record's text is bounded by the same 10,000,000 characters as JSON: reading stops at a line that passes it (`line N converts to more than 10,000,000 characters of text …`). A file whose records together hold more is read and stored part by part (§5.1.1, #621). `source_type` is `jsonl` |
 
 For ZIP uploads: extract to temp directory, process all files with supported extensions, skip unsupported files (logged as warnings) and macOS metadata (`__MACOSX/` members and `._*` AppleDouble files, listed in `skipped`, #378). `.json.gz` members are also extracted; each is decompressed (at most 30,000,000 bytes, #300) and parsed as JSON, with per-file errors for a corrupt gzip, an over-limit size or unparseable JSON. `.jsonl` and `.jsonl.gz` members are extracted and read as JSON Lines (#291), like direct uploads. Every member is validated first; a damaged or unreadable archive refuses the whole upload with a 400 (§3.1.3). An upload's ZIPs may expand to at most `max_zip_expanded_bytes` (2 GiB) in all, gzipped members' output included; over it, the upload is refused with `ARCHIVE_TOO_LARGE` (§3.1.3, #298). One ZIP may hold at most `max_zip_members` (5,000) entries, and a member of 1 MiB or more may expand to at most `max_zip_member_ratio` (200) times its compressed size, or the upload is refused with `ARCHIVE_TOO_MANY_MEMBERS` or `ARCHIVE_RATIO_TOO_HIGH`. Members whose path leaves the archive are validated and counted but never extracted, and are listed in `skipped` (§3.1.3, #28). This work runs in a worker thread, off the event loop.
+
+### 5.1.1 Files over the per-file limits (#621)
+
+A file whose text or chunking would go over the per-file limits, for the collection's strategy
+and chunk settings, is not refused: it is split into parts that each stay under them, stored as
+`<name> (part 1)` to `<name> (part N)` (N at least 2), each chunked on its own as a file of its
+own would be (`chunk_index` from 0 in every part; one `created_at` for all of a file's parts).
+No chunk is stored under `<name>` itself, and a file within the limits is stored exactly as
+before. The limits are the 10,000,000-character text limit, the 10,000-chunk limit, and for
+`overlap` its 10,000 windows and 10,000,000 window characters (§5.2). Every other limit stays
+as it is: the upload, ZIP, `.json` size, JSON Lines line and record count limits, and the
+`semantic` 100,000-sentence limit, which applies to each part.
+
+| Type | Read | Split at | A part's text |
+|---|---|---|---|
+| `.jsonl`, `.jsonl.gz` | a line at a time | records (lines), never inside one | its records, as one file's |
+| `.json`, `.json.gz` member | whole, as before | records (an element file's items), never inside one | its records, as one file's |
+| `.txt`, `.md` | in blocks | paragraphs: blank lines (in Markdown, not inside a fenced code block) | `partition_text` / `partition_md` of its paragraphs |
+| `.csv` | by rows | rows; the header row is repeated at the start of every part | `partition_csv` of the header and its rows |
+| `.pdf`, `.docx` | whole, as before | elements | its elements |
+
+- Parts are formed in file order, as large as an estimate of the strategy's chunking allows:
+  the text at most 10,000,000 characters; for `fixed` and `language` at most
+  `10,000 × (chunk_size − overlap)` characters (`language`'s overlap), for `context_aware` at
+  most `10,000 × chunk_size` characters and as many records or elements as its packing, replayed
+  over them, keeps within 10,000 chunks, for `overlap` the most text whose windows stay within
+  both window limits, for `semantic` the text limit alone. A part that still goes over when
+  chunked is split in half and each half chunked again. Whether a file is split is not
+  estimated from the part sizes: a file is tried whole, and split only when the chunker refuses
+  it (the chunk count, the text limit or `overlap`'s window limits). Which files are tried whole
+  (maintainer's decision, PR #630):
+  - a JSON, JSON Lines, `.pdf` or `.docx` file whose text, as the chunker counts it, is within
+    10,000,000 characters (under `context_aware` the records' or elements' text alone, otherwise
+    the joined text with the breaks between them);
+  - a `.txt`, `.md` or `.csv` file of at most 10,000,000 bytes;
+  - a larger `.txt`, `.md` or `.csv` whose raw paragraphs, lines or rows (a CSV row by its
+    cells' text) total at most 10,000,000 characters. That raw measure can be more than the
+    parsed text (indentation, Markdown link targets, `NA` cells), so such a file may be stored
+    as parts even when its parsed text would fit; measuring the raw units keeps memory bounded,
+    as the whole file is never parsed just to measure it.
+  The estimates above only size the parts of a file that is split.
+- A file split into parts may store at most ten times its own size in chunk text (all its
+  parts' chunks, repeated CSV headers and overlap included). Its own size is its bytes as
+  uploaded, a gzipped file's decompressed bytes, or a `.pdf`'s or `.docx`'s extracted text.
+  The running total is checked before each part is stored; going over fails the whole file
+  through the all-or-nothing rollback, with `<file>: it would store N characters of chunks,
+  more than 10 times its own size (M characters); use less chunk_overlap, shorten repeated
+  headers or keys, or split the file` and no part number. A re-chunk that goes over fails
+  whole, with the collection unchanged. A file stored whole is never refused by it
+  (maintainer's decision, PR #630 security review).
+- A CSV's header row is repeated at the start of every part, so parts are sized with it: the
+  rows of a part fill only what one part can hold less the header. A CSV that has to be split
+  fails the file, before anything is stored, when its header row is more than half of what
+  one part can hold under the strategy and settings (`its header row is N characters, more
+  than half of what one part can hold with these chunk settings (M characters); the header is
+  repeated in every part, so shorten the header or split the file`), since every part would
+  repeat it. A CSV that fits in one part keeps any header (maintainer's decision, PR #630
+  security review).
+- A record is never split: one over 10,000,000 characters, or giving more than 10,000 chunks
+  on its own, fails the file (§3.1.3). A paragraph, element or CSV row over a part on its own
+  is cut at line breaks, then at whitespace, then hard at the limit; pieces of an element keep
+  its category, and a CSV row's pieces are rows of one cell. Text therefore always fits.
+- JSON Lines, `.txt`, `.md` and `.csv` are read part by part, so memory is bounded by one part
+  whatever the file's size; a large file just takes longer. A streamed `.txt`, `.md` or `.csv`
+  is read as UTF-8 when the whole file is, otherwise in the encoding Unstructured detects from
+  its first MiB; the whole file is checked before anything is stored, and one no encoding
+  reads fails with `is not in an encoding that can be read in parts`.
+- The original is retained once, under `<name>`. A part maps back to it: export links a part's
+  chunks to it (`source_sha256`, `RAG_EXPORT_SPECIFICATIONS.md` §4.5), re-chunking rebuilds it
+  and splits it again (so the number of parts follows the new settings), and a part counts for
+  it in re-chunk coverage when no retained original is listed under the part's own name.
+  Re-embedding and re-indexing keep the stored parts.
+- Replacement covers the whole family (§3.1.3), the job lists each split file in `split`, and
+  a failed part fails the file with nothing stored (§3.1.3).
 
 ### 5.2 Chunking Strategy Specifications
 
@@ -2233,7 +2401,7 @@ For ZIP uploads: extract to temp directory, process all files with supported ext
 #### Fixed Size with Overlap (`overlap`)
 - Splitter: explicit character windows, independent of paragraph/word separators
 - Parameters: `chunk_size`, `chunk_overlap`, `min_chunk_size`
-- Per-file pre-merge output limits: at most 10,000 windows and 10,000,000 total window characters, including repeated overlap. Count and total payload are computed before allocating windows. Excess fails that file with a clear ingest-job error; other files can continue. These are candidate/payload character bounds, not parser or encoded-byte limits. The optional final-tail merge does not relax the pre-allocation limits.
+- Per-file pre-merge output limits: at most 10,000 windows and 10,000,000 total window characters, including repeated overlap. Count and total payload are computed before allocating windows. A file over them is split into parts that each stay under them (§5.1.1, #621). These are candidate/payload character bounds, not parser or encoded-byte limits. The optional final-tail merge does not relax the pre-allocation limits.
 - Behavior: consecutive windows share exactly `chunk_overlap` characters. Nonblank
   text is covered in order, including internal and boundary whitespace; blank-only
   input yields no chunks. Python character counts, rather than encoded byte counts,
@@ -2432,25 +2600,43 @@ password page.
 
 ### 7.2 Navigation Bar
 
-Visible on all pages after login. Contents vary by role; hiding a page is a convenience, and the API refuses
-what the role can't do (§3.1.8):
+Visible on all pages after login. The pages are grouped into menus (#616):
 
-| Nav Item | Engineer | Developer | End User |
-|---|---|---|---|
-| Q&A | ✓ | ✓ | ✓ |
-| Import Documents | ✓ | ✓ | — |
-| Chunking Config | ✓ | ✓ | — |
-| Retrieval Config | ✓ | ✓ | — |
-| Gold Standard | ✓ | ✓ | — |
-| Transfer | ✓ | ✓ | — |
-| Collections | ✓ | — | — |
-| Health | ✓ | — | — |
-| Users | ✓ | — | — |
-| Service keys | ✓ | — | — |
-| Audit | ✓ | — | — |
-| Username and role badge | ✓ | ✓ | ✓ |
-| Change password (button) | ✓ | ✓ | ✓ |
-| Log out (button) | ✓ | ✓ | ✓ |
+```
+RAG Platform   Q&A   Data ▾   Tune ▾   Admin ▾        <username> <role> ▾
+```
+
+Contents vary by role; hiding a page is a convenience, and the API refuses what the role can't do
+(§3.1.8). A menu with no page for the role isn't shown: an End User sees Q&A and the account menu, a
+Developer also Data and Tune, an Engineer also Admin.
+
+| Menu | Entry | Engineer | Developer | End User |
+|---|---|---|---|---|
+| (top level) | Q&A | ✓ | ✓ | ✓ |
+| Data | Import | ✓ | ✓ | — |
+| Data | Transfer | ✓ | ✓ | — |
+| Tune | Chunking | ✓ | ✓ | — |
+| Tune | Retrieval | ✓ | ✓ | — |
+| Tune | Gold Standard | ✓ | ✓ | — |
+| Admin | Collections | ✓ | — | — |
+| Admin | Users | ✓ | — | — |
+| Admin | Service keys | ✓ | — | — |
+| Admin | Audit | ✓ | — | — |
+| Admin | Health | ✓ | — | — |
+| Account (labelled with the username and role badge) | Change password | ✓ | ✓ | ✓ |
+| Account | Log out | ✓ | ✓ | ✓ |
+
+- **Current page.** The current page's entry has `aria-current="page"` and is highlighted, and so is
+  the button of the menu that holds it (`/account/password` highlights the account menu). A page with
+  no entry, such as `/help/transfer`, highlights nothing.
+- **Menus.** Each menu follows the WAI-ARIA menu button pattern: a button with `aria-haspopup="menu"`,
+  `aria-expanded` and, while open, `aria-controls` naming a `role="menu"` element labelled by the
+  button, whose entries are `role="menuitem"`. A closed menu's entries aren't in the page, and only one
+  menu is open at a time.
+- **Keyboard.** On a menu button, Enter, Space or ArrowDown opens it on the first entry and ArrowUp on
+  the last. In the menu, ArrowDown and ArrowUp move (wrapping), Home and End go to the first and last
+  entry, Enter chooses, Escape closes it and returns focus to its button, and Tab closes it.
+- **Closing.** A menu closes when an entry is chosen, on a click outside it, and on a change of page.
 
 ### 7.3 Q&A Page
 
@@ -2505,6 +2691,29 @@ The question and the citations toggle are kept.
 **Elements:**
 
 - Drag-and-drop file upload zone. Accepts: `.pdf`, `.docx`, `.txt`, `.md`, `.csv`, `.json`, `.zip`.
+- Below the upload zone, a link "Download corpus preparation rules (.md)" (#615): `href`
+  `/corpus-preparation-rules.md`, `download` `corpus-preparation-rules.md`. The file is
+  `ui/public/corpus-preparation-rules.md`, a static file of the UI build served through the
+  proxy's `location /`, so every install has it, offline ones included. Written for someone
+  preparing a corpus, it states how the app reads an upload, every ingest limit of §5 and
+  §3.1.3 (per upload, per ZIP, per file, per line, per chunk, and the chunk settings' bounds
+  and defaults), how JSON and JSON Lines become text, a worst-case chunk count for each
+  strategy and its settings, safe targets (70 % of the text limit, 80 % of the chunk cap,
+  and for `overlap` 80 % of the limit on the text across its chunks), how to split, and a
+  checklist. The counts hold for any structure: `language` and `context_aware` keep pieces
+  whole, so a chunk can be only a little over half full; `language` splits a piece longer
+  than `chunk_size` again at the next separator, which can leave a short chunk on each side,
+  so it counts two more for every long paragraph, line, sentence and word (or, without
+  counting them, one chunk per `(chunk_size − chunk_overlap) ÷ 10` characters); a chunk over
+  the 6,000-character ceiling is cut into pieces that each count, which for `semantic` adds
+  one per 3,000 characters to its one per sentence. A file at the targets, counted that way,
+  doesn't fail on the text or chunk limits. It says the
+  upload and ZIP limits are the shipped values an administrator can change. It states nothing about a host's speed or disk.
+  `scripts/tests/test_corpus_rules.py` derives each limit from the code, the settings
+  defaults, `docker-compose.yml` and the proxy, and fails when the file doesn't state it or
+  states a number none of them accounts for. It also runs the chunker on files built at the
+  chunk target, counted as the file says (`language` records of long lines, `semantic`
+  sentences the ceiling cuts in two), and fails if one is refused or gives more chunks.
 - File list showing queued files with remove buttons.
 - Collection selector (populated from `GET /collections`). Includes a "Create new collection" option that opens a modal with a name field and index type selector (defaults: HNSW, cosine). On confirm, calls `POST /collections` before submitting ingest. A refused create keeps the modal open and shows the API's message inside it, as an alert; the message clears on Cancel, when the modal is opened again, or when a create succeeds (#379). If the collection list can't be loaded, the page says so as an alert, "Could not load the collections:" followed by the reason, instead of showing an empty selector (#379). A create that succeeds closes the modal even if the list reload after it fails; that failure is shown as a failed list. After a create, the selector selects the new collection under the name the API answered with, which is the name the list shows (`myDocs` selects `MyDocs`, #372). If the list reload after a create fails, the new collection is added to the options already shown, so the selector still selects and shows it; the next successful load replaces the options (#430).
 - Chunking strategy selector (dropdown). On selection, displays the plain-language explanation for the chosen strategy.
@@ -2512,7 +2721,8 @@ The question and the citations toggle are kept.
   - Engineer and Developer both see: chunk size slider, overlap slider (hidden for `semantic` and `context_aware`), minimum chunk size.
   - Engineer additionally sees: similarity threshold slider (visible only when `semantic` is selected).
 - "Start Ingest" button → calls `POST /ingest/upload`, displays job ID. The line "Job ID: <job_id>" appears as soon as the upload is accepted and stays while the job runs and after it ends, until a later upload is accepted. Until the first successful poll, a panel in the progress panel's place shows the status the upload was accepted with (`queued`) and "Waiting for the first progress update". With files chosen and no collection selected (none exist, or the list failed to load), the button sends nothing and the page says "Choose a collection to import into first. Use + New to create one." (#394).
-- Progress panel: polls `GET /ingest/job/{job_id}` every 3 seconds. Shows files completed/total, chunks stored, errors, "Submitted N · accepted N · stored N" when `chunks_submitted` and `chunks_accepted` are numbers and the three counts are not all equal (#302), "Replaced N chunks from a previous version" when `chunks_replaced` is above 0, and the skipped list under "N files skipped:" (each entry gives its reason).
+- Running and recent jobs (§7.15, #617): the caller's ingests, the newest running one (else the newest) opened by itself; clicking a row shows that job as a started one is shown.
+- Progress panel: polls `GET /ingest/job/{job_id}` every 3 seconds. Shows files completed/total, chunks stored, errors, "Submitted N · accepted N · stored N" when `chunks_submitted` and `chunks_accepted` are numbers and the three counts are not all equal (#302), "Replaced N chunks from a previous version" when `chunks_replaced` is above 0, the files stored as parts under "N files split into parts:" (each entry names its parts, #621), and the skipped list under "N files skipped:" (each entry gives its reason).
 
 **Chunking strategy explanations** (shown in an info box when a strategy is selected):
 
@@ -2605,6 +2815,7 @@ A retained session can be loaded/refreshed by its session ID, including when its
 - Generation progress: polls `GET /goldstandard/session/{session_id}` every 2 seconds. Shows `pairs_completed / pairs_total`. Pairs appear in the review list as they complete (partial display during generation).
 - If a poll fails, polling stops and the page says so as an alert: "Could not read the generation's progress: " followed by the reason, then "Polling stopped; use Load / refresh session to check again." The progress is no longer shown and Generate is enabled again. "Load / refresh session" clears the message and polls again while the session is `generating` (#380).
 - When the session is no longer `generating`, the page shows its outcome under the controls (#380), for a session generated here and for a retained session loaded by ID. `completed`: "Generation completed: C of T pairs generated." and, when `pairs_failed` is above 0, "F pairs failed and are missing from the review list." (a warning). `completed` with `pairs_total` 0: "No pairs were generated: the collection has no chunks." `failed`: "Generation failed." and "F of T pairs failed." when `pairs_failed` is above 0 (an error). `cancelled`: "Generation was cancelled." Any other status: "Generation ended with status S." Under the headline the `errors` reasons are listed once each, with "(xN)" when a reason repeats, at most five, then "and K more reasons". Warnings and errors are alerts.
+- Running and recent jobs (§7.15, #617): the caller's generations that are running or finished in the last 24 hours; the newest generating session (else the newest) loads by itself, and clicking a row loads that session.
 - If a session already exists in the UI (from a previous generation), clicking "Generate Pairs" displays a confirmation dialog: "This will start a new session and replace the current one. Any unsaved pairs will be lost. Continue?" Previous sessions remain on the server (accessible via direct session ID) but are no longer referenced by the UI after confirmation.
 
 **Phase 2 — Review:**
@@ -2694,6 +2905,10 @@ A retained session can be loaded/refreshed by its session ID, including when its
   every note the job returned (models installed or skipped, sessions orphaned,
   sessions restored).
 
+Above both halves, one Running and recent jobs list (§7.15, #617) holds the
+caller's exports and imports; each half opens its newest job by itself, and
+clicking a row opens that job in its half.
+
 Both halves poll their job endpoint every 2s and stop polling when the job
 finishes or the page unmounts; a poll in flight at unmount, or a start answered
 after it, schedules nothing. A failed poll is shown ("Could not check the
@@ -2768,6 +2983,34 @@ page renders as one undifferentiated block.
   page says "Loading…" and "Older" is disabled, so a double click asks for the older page once.
 - "Download CSV" links to `/api/audit.csv` with the applied filters.
 - An API error shows its message.
+
+### 7.15 Running and recent jobs (#617)
+
+The Import, Gold Standard and Transfer pages each show a section headed **Running and recent jobs**,
+read from the lists of §3.1.10 when the page opens: `GET /ingest/jobs`, `GET /goldstandard/sessions`,
+and on Transfer both `GET /export/jobs` and `GET /import/jobs` in one list, newest first across both.
+So a job started earlier, before a reload, in another tab or in another session is found again;
+nothing about jobs is kept in browser storage.
+
+- One row per job, a button, showing the kind (`Ingest`, `Generation`, `Export`, `Import`), the
+  collection (the package filename for an import), the status, the progress (`F/T files`,
+  `A/T pairs`, `N chunks`) and "Started" with the start time in the browser's local time (`-` when
+  unknown). An Engineer also sees the owner: the name, the name followed by `(API key)` for a key's
+  job, or `owner unknown`. An empty list reads "No running or recent jobs."; a list that can't be
+  read says "Could not load the running and recent jobs:" with the reason, as an alert, and the
+  rest of the page works as before.
+- When the list first answers, unless the page has already opened or started a job, the newest
+  running job opens by itself, or the newest finished one when none runs. On Transfer this happens
+  for each panel on its own: the newest export opens in the export panel and the newest import in
+  the import panel. Clicking a row opens that job (in its own panel on Transfer). An open job's row
+  is marked (`aria-current="true"`).
+- An opened job is shown as a job started on the page is: on Import the "Job ID" line and the
+  progress panel, polled while it runs and stopping at any terminal status; on Gold Standard the
+  session loads as "Load / refresh session" loads it, its ID goes into the session ID field, and it
+  is polled while generating (not while an export of pairs is pending); on Transfer the panel's
+  progress and result, polled while it runs, with that panel's start button busy meanwhile.
+- The list is read again after the page starts a job, when a job it polls ends, and every 10 seconds
+  while the last answer held a running job; never after the page is left.
 
 ## 8. Configuration Defaults and Constraints
 
@@ -2932,6 +3175,8 @@ rag-docker/
 │   ├── package.json
 │   ├── package-lock.json       # Required — `npm ci` fails without it
 │   ├── vite.config.ts
+│   ├── public/
+│   │   └── corpus-preparation-rules.md  # Downloaded from the Import page (#615)
 │   ├── src/
 │   │   ├── main.tsx
 │   │   ├── App.tsx
@@ -3058,6 +3303,31 @@ now lives once, in `api/services/ingest_config.py`.
       the file and storing nothing, `context_aware` one chunk per record); `02_ingest.sh`
       checks that a gzipped file of 1,000,001 `{}` lines fails with the exact message and
       stores nothing.*
+- [x] A file over the per-file limits (10,000 chunks, 10,000,000 characters, and `overlap`'s window limits) is ingested as parts `<name> (part N)` instead of failing: JSON and JSON Lines at record boundaries, text at paragraphs, a CSV by rows with its header in every part; re-uploading the name replaces every part; a failed part stores nothing; the job lists the file in `split`; export, re-chunking and gold-standard stale marking map parts back to the original (#621).
+      *Before #621 such a file failed with "exceeds the per-file limit", and record-structured
+      JSON Lines under `context_aware` passed the pre-check and failed after chunking (13,000
+      records of 600 characters gave 13,000 chunks). The whole-file JSON and JSON Lines text
+      bound from #295 and #291 is now per record: a file whose records together pass it is
+      split, a single record over it still fails. `test_split_parts.py` (API image, Weaviate
+      replaced by an in-memory collection keeping the replacement helpers' contract) covers the
+      13,000-record case, a `.jsonl`, a `.txt` and a `.json` over 10,000,000 characters (each
+      failing on the code before #621), a file within the limits stored as before, family
+      replacement (smaller, unsplit and newly split re-uploads; neighbours such as
+      `a/data.jsonl` and `Data.jsonl` untouched), a bad line, a failed insert and a failed
+      removal after part 1, a record over the chunk cap, the cuts, CSV headers, Markdown fences,
+      a streamed Latin-1 file and one no encoding reads, `overlap` sizing, the halving
+      re-split, the `semantic` sentence limit failing a part, re-chunk coverage and rebuild,
+      export links and `ChunkLimitError`. `test_overlap_chunks.py`, `test_json_ingest.py` and
+      `test_jsonl_ingest.py` now check splitting and the per-record bound where they checked
+      the old failures, and `test_reingest.py`'s fake backend takes the `accept` rule.
+      `split_parts.py` (suite 02, in the API container) stores the 13,000-record file
+      (`context_aware`) and a 10,519,499-character `.txt` (`fixed` 6,000) in the real Weaviate,
+      on a scratch collection without a vectorizer, reads the part names and counts back,
+      re-uploads the `.txt` within the limits and checks no part is left, and a bad line after
+      part 1 stores nothing; and
+      `overlap_chunks.py` stores a 20,000-character file at 1,000/999 as two parts that
+      restore it exactly. `browser/ui_criteria.js` (suite 06) checks the progress panel's
+      "1 file split into parts:" list and that an empty one shows nothing.*
 - [x] ZIP batch upload extracts and processes all supported files; unsupported files are skipped with a warning.
       *A ZIP of 8 files yielded 6 processed, 2 skipped — but silently, with
       nothing naming what was dropped. **Fixed**: the job now carries a `skipped`
@@ -3195,13 +3465,16 @@ now lives once, in `api/services/ingest_config.py`.
       job naming the replaced files before any insert, insert before delete, unchanged
       content, a marking failure (file failed, nothing changed, next file retries), a
       failed insert (earlier version kept), a removal failure (`partial`, new chunks kept),
-      a deleted collection at the lookup (#40), the delete rounds, precondition and final
-      count, and retention releasing the name even when the blob write fails.
+      a deleted collection at the lookup (#40), the exact-name selection (#622), the batched
+      deletion and its bound, precondition and final count, and retention releasing the name even when the blob write fails.
       `02_ingest.sh` ingests `policies.txt` twice (one chunk set, `chunks_replaced` equal to
       the first count), then a changed version (only its text remains, one digest names it,
       the first blob is gone). With a real gold-standard session planted, it checks that a
       new name leaves the session current and a replacing re-ingest marks it stale, naming
-      the file. `browser/ui_criteria.js` (suite 06) checks the Import page's "Replaced N
+      the file. It also stores `a/report.pdf`, `Report.PDF` and `report.pdf` and uploads
+      `report.pdf` again: the other two keep all their chunks, and `exact_source.py` checks
+      exact selection on both paths, under and over 10,000 word matches, in real Weaviate
+      (#622). `browser/ui_criteria.js` (suite 06) checks the Import page's "Replaced N
       chunks from a previous version" line, hidden at 0, and the plain "N files skipped:"
       heading. `test_reingest.py` also checks that a failed lookup of the later files is
       reported as the lookup, not as the marking (#311).*
@@ -3232,6 +3505,16 @@ now lives once, in `api/services/ingest_config.py`.
       stored, its chunk count is the winner's `chunks_stored`, the winner's
       `chunks_replaced` is the other job's `chunks_stored`, and one digest, the winner's,
       names it.*
+
+- [x] Running and recent jobs (#617, §3.1.10): ingest, export and import records and generated
+      sessions record `owner`, `created_at` and `finished_at` (ingest also `collection` and `files`);
+      `GET /ingest/jobs`, `/export/jobs`, `/import/jobs` and `/goldstandard/sessions` list a
+      Developer's own jobs, a key's principal's own jobs, and everyone's (owner-less included) for an
+      Engineer; running jobs always, finished ones from the last 24 hours, at most the newest 20; the
+      lookups by ID are unchanged; packages and imports carry no session `owner` or times.
+      *`scripts/tests/test_job_lists.py` (API image) and `scripts/verify/job_lists.py` on the stack
+      (a Developer, a Developer-role key and the Engineer), both run by `02_ingest.sh`; the four
+      routes are in `auth_stack.py`'s matrix (`17_auth.sh`).*
 
 ### 10.2 Query
 
@@ -3384,11 +3667,20 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       while loading, an answer and an error on screen when the collection changes, and Ask
       used on B while A is still in flight. All eight checks fail on the code before #511.*
 - [x] Logging in through the login page opens `/qa` as the account's role; the session is an HttpOnly, `SameSite=Strict` cookie that page scripts can't read, nothing about the user is kept in browser storage, the session persists across navigation and reloads, and Log out ends it at the API and returns to the login page (#25).
-      *Evidence: `scripts/verify/browser/ui_criteria.js` (suite 06) logs in with the harness's engineer through the form against the real API, and checks the cookie, storage, navigation and logout.*
+      *Evidence: `scripts/verify/browser/ui_criteria.js` (suite 06) logs in with the harness's engineer through the form against the real API, and checks the cookie, storage, navigation and logout (chosen from the account menu).*
 - [x] Login page, setup-required page, forced and voluntary password change, the API's messages for a failed or throttled login, and the return to the login or password page on `401 AUTH_REQUIRED` or `403 PASSWORD_CHANGE_REQUIRED` (#25).
       *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request interception.*
 - [x] End User role shows only the Q&A page in navigation.
       *Nav shows only Q&A, and `/collections` redirects to `/qa`; the API refuses those pages' requests too (§10.6).*
+- [x] The navigation groups the pages into Data, Tune and Admin menus and an account menu (§7.2, #616): each
+      role sees the pages it had before, a menu with none isn't shown, the current page and its menu are
+      highlighted, and the menus work with the keyboard and a screen reader and close on a choice or a
+      click outside.
+      *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request
+      interception, checks each role's menus and entries, the ARIA attributes closed and open, Enter, Space,
+      the arrows, Home, End, Escape and Tab, the pointer, and the highlight on `/qa`, `/retrieval`,
+      `/account/password` and `/help/transfer`; `ui_criteria.js` reads the real End User's and Engineer's
+      pages through the menus.*
 - [x] Citations toggle correctly hides/shows citation panel.
       *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06) answers `POST /query` by request
       interception and checks that the box starts unchecked and the query sends
@@ -3466,6 +3758,16 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       poll; repeated Regenerate clicks; and an edit refused with 422, then retried. 30 of its checks
       fail on the code before #380 (no outcome shown, polling forever, a second session started,
       a second regenerate request, the modal closed with all three fields sent).*
+- [x] The Import page offers the corpus preparation rules as a markdown download, served by the UI build, and the limits the file states are the app's (#615).
+      *Evidence: `browser/ui_criteria.js` (suite 06) finds the link on `/import` with its `href`
+      and `download` values and fetches the file through the proxy. `test_corpus_rules.py`
+      (suite 02, in the API image with the repository mounted) derives every limit from the
+      chunker, the ingest pipeline, the settings defaults, the chunk-setting bounds,
+      `docker-compose.yml` and `proxy/locations.conf`, and fails when the file leaves one out,
+      states a number none of them accounts for, or the compose and proxy values disagree with
+      the code's. `test_corpus_rules_estimates.py` (suite 02, the same way) runs the chunker on
+      files built at the rules' targets for every strategy, and fails if one is refused or gives
+      more chunks than the rules count.*
 - [x] The Import page states the 512 MB upload limit and refuses a larger selection without sending it.
       *A 513 MB sparse file: the page names the limit and no `POST /ingest/upload`
       is made. A 413 or other proxy error page is shown as a readable message
@@ -3477,6 +3779,15 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 
 - [x] Retrieval save confirmations and errors stay with their selection generation; the newest acknowledged success survives a newer failure and publishes at most once.
   *Evidence: `browser/query_config.js` stale success/failure, both acknowledged-success response orders, superseded notices/errors, independent notice timers and three-save edited-draft cases.*
+
+- [x] Running and recent jobs on the pages (#617, §7.15): an ingest started on the Import page,
+      the page left and opened again, is listed, opens by itself and shows its result once it ends;
+      with stubbed lists, a running ingest, generation and export each open by themselves, are open
+      again after leaving and coming back, and show their result when they end; clicking another row
+      switches; on Transfer the newest export and import open in their own panels; an Engineer sees
+      each owner (`(API key)`, `owner unknown`), a Developer no owner column; browser storage stays
+      empty.
+      *`scripts/verify/browser/ui_criteria.js` (suite 06), section "running and recent jobs (#617)".*
 
 ### 10.5 Infrastructure
 
@@ -3568,7 +3879,7 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   routes for every role and `auth_stack.py admin-accounts` on the running stack, with a throwaway `vfy-t-*`
   account and the API log searched for the generated passwords (suite 17). These checks fail on the code before
   PR 2 of #25, which has no such routes.*
-- [x] The Users page: an engineer-only nav link and route; the account list; create and reset show the generated
+- [x] The Users page: an engineer-only entry in the nav's Admin menu and route; the account list; create and reset show the generated
   password once until "Done"; no reset on the own row; role change, disable and enable; a refusal's message.
   *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request
   interception; `ui_criteria.js` checks the real engineer's nav includes Users.*
@@ -3585,7 +3896,7 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   `auth_stack.py matrix` with the seven routes for every role, `auth_stack.py key-matrix` with a key of each role,
   and `auth_stack.py service-keys` on the running stack with throwaway `vfy-s-*` principals and the API log
   searched for the keys (suite 17). These checks fail on the code before PR 3 of #25, which has no keys.*
-- [x] The Service keys page: an engineer-only nav link and route; the principals and their keys; create, role
+- [x] The Service keys page: an engineer-only entry in the nav's Admin menu and route; the principals and their keys; create, role
   change, disable and enable; issuance shows the key once until "Done"; revoke only on active keys; a refusal's
   message.
   *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request
@@ -3629,7 +3940,7 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   *Evidence: `test_audit.py` `ApiTests` (suite 19); `audit_stack.py filters` (suite 19).*
 - [x] Records survive an API restart, which writes a new `system.start` (with `RAG_ALLOW_RESTART=1`).
   *Evidence: `audit_stack.py restart-prepare` and `restart-verify` (suite 19).*
-- [x] The Audit page: an engineer-only nav link (last) and route; the records and paging; filters applied and
+- [x] The Audit page: an engineer-only entry in the nav's Admin menu (after Service keys) and route; the records and paging; filters applied and
   carried into the CSV link; the question-text note and the failed-writes warning; a double click on Older while a
   page loads asks for it once.
   *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request

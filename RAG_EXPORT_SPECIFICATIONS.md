@@ -232,7 +232,7 @@ files (`ingest_config.json`, `retrieval_config.json`) and the evaluation session
 are written by routes that don't take it, so each of those files in a package is
 coherent on its own but may be newer than the chunks.
 
-Exported evaluation sessions are validated, detached snapshots read from the persisted session files. The exporter MUST NOT serialize the live generation/edit cache; later cached pair or counter updates must not change a selected export snapshot. Atomic and serialized session persistence remains separate work.
+Exported evaluation sessions are validated, detached snapshots read from the persisted session files. They leave out `owner`, `created_at` and `finished_at`, which name who generated a session on this install and when (#617); an import drops those fields from every session it restores, so a restored session never appears in `GET /goldstandard/sessions` (`SPECIFICATIONS.md` §3.1.10). The exporter MUST NOT serialize the live generation/edit cache; later cached pair or counter updates must not change a selected export snapshot. Atomic and serialized session persistence remains separate work.
 
 ### 4.3 Fidelity
 
@@ -308,7 +308,10 @@ One JSON object per line:
 - `source_sha256` links the chunk to its file in `sources/`, and is `null` in
   `chunks-only` packages. It is also `null` when the chunk's file name maps to
   more than one retained digest, or to a blob missing on disk at export. A
-  non-null value always names a blob the package carries (#509).
+  non-null value always names a blob the package carries (#509). A part of a
+  file stored as parts, `source_file` `<name> (part N)` (`SPECIFICATIONS.md`
+  §5.1.1, #621), links to the file retained under `<name>` when no retained
+  file is listed under the part's own name.
 - Vectors are JSON numbers. A packed float32 sidecar was measured at only ~12%
   smaller after gzip and is rejected (`RAG_EXPORT_ANALYSIS.md` §6).
 

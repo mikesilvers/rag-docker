@@ -2,7 +2,7 @@
 // browser context, with every /api/ request answered by the check itself. Nothing
 // reaches the backend: an /api/ request with no stub is answered 599 and recorded,
 // and the case fails on it.
-const { makeReporter } = require('./lib');
+const { makeReporter, readNav, openMenu, chooseFromMenu } = require('./lib');
 
 const json = (status, body) => ({ status, type: 'application/json', body: JSON.stringify(body) });
 const apiError = (status, code, message) => json(status, { error: { code, message, detail: null } });
@@ -31,6 +31,12 @@ async function openPage(browser, base, { role = 'engineer', routes = {}, path = 
     'GET /api/auth/status': json(200, { setup_required: false }),
     'GET /api/auth/me': role ? json(200, { username: 'vfy-' + role.replace('_', '-'), role, must_change_password: false })
                              : apiError(401, 'AUTH_REQUIRED', 'Log in to use this.'),
+    // The running and recent job lists the Import, Gold Standard and Transfer
+    // pages read on opening (#617): empty, so no job opens by itself.
+    'GET /api/ingest/jobs': json(200, { jobs: [] }),
+    'GET /api/export/jobs': json(200, { jobs: [] }),
+    'GET /api/import/jobs': json(200, { jobs: [] }),
+    'GET /api/goldstandard/sessions': json(200, { sessions: [] }),
     ...routes,
   };
   await page.evaluateOnNewDocument(fast => {
@@ -115,7 +121,8 @@ const buttonState = (page, label) => page.evaluate(t => {
   return b ? { disabled: b.disabled } : null;
 }, label);
 
-const nav = page => page.evaluate(() => [...document.querySelectorAll('nav a')].map(a => a.textContent.trim()));
+// The pages the nav offers, in order, read through its menus (#616).
+const nav = async page => (await readNav(page)).pages;
 const path = page => page.evaluate(() => location.pathname);
 async function waitPath(page, want) {
   await waitFor(page, w => location.pathname === w, `the path ${want}`, want);
@@ -141,4 +148,4 @@ async function runCases(browser, base, reporter, section, cases) {
   }
 }
 
-module.exports = { json, apiError, html, hold, openPage, callsTo, text, waitFor, waitText, click, press, fill, fillNth, forms, buttonState, nav, path, waitPath, runCases, makeReporter };
+module.exports = { json, apiError, html, hold, openPage, callsTo, text, waitFor, waitText, click, press, fill, fillNth, forms, buttonState, nav, readNav, openMenu, chooseFromMenu, path, waitPath, runCases, makeReporter };

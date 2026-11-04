@@ -570,7 +570,7 @@ class ProducerOperationsTests(unittest.IsolatedAsyncioTestCase):
         metrics = {m.name:m for r in data.resource_metrics for s in r.scope_metrics for m in s.metrics}
         calls = {p.attributes['rag.dependency']:p.value
                  for p in metrics['rag.dependency.calls'].data.data_points}
-        self.assertEqual(calls, {'weaviate.query':1, 'weaviate.aggregate':2, 'weaviate.delete':1})
+        self.assertEqual(calls, {'weaviate.query':3, 'weaviate.aggregate':3, 'weaviate.delete':1})
         self.assertNotIn(SECRET, repr(calls))
 
     async def test_durable_restart_records_do_not_create_execution_metrics(self):

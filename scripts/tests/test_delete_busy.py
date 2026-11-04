@@ -62,7 +62,8 @@ class Backend:
 
 
 class BusyTestCase(unittest.TestCase):
-    def has_chunks(self, collection, source_file):
+    def has_chunks(self, collection, source_file, accept=None):
+        # `accept` selects a name's family of parts (#621); nothing is stored here.
         if not self.backend.exists(collection):
             raise RuntimeError(f"could not find class {collection} in schema")
         return False
