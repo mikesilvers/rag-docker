@@ -696,7 +696,7 @@ huggingface_hub==1.31.0
 idna==3.19
 installer==0.7.0
 joblib==1.6.0
-joserfc==1.7.5
+joserfc==1.7.6
 jsonpatch==1.33
 jsonpointer==3.1.1
 kiwisolver==1.5.1
