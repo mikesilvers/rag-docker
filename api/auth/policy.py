@@ -50,6 +50,19 @@ ACCESS: dict[tuple[str, str], str] = {
     ("GET", "/packages"): DEVELOPER,
     ("GET", "/help/transfer"): DEVELOPER,
     ("GET", "/tune/{collection}"): DEVELOPER,          # read by the Transfer page (Q3)
+    # Document preparation (#638): the ingest permissions (C3).
+    ("POST", "/prepare/upload"): DEVELOPER,
+    ("GET", "/prepare/documents"): DEVELOPER,
+    ("GET", "/prepare/documents/{document_id}"): DEVELOPER,
+    ("GET", "/prepare/documents/{document_id}/raw"): DEVELOPER,
+    ("GET", "/prepare/documents/{document_id}/prepared"): DEVELOPER,
+    ("DELETE", "/prepare/documents/{document_id}"): DEVELOPER,
+    ("DELETE", "/prepare/documents/{document_id}/prepared"): DEVELOPER,
+    ("POST", "/prepare/jobs"): DEVELOPER,
+    ("GET", "/prepare/jobs"): DEVELOPER,
+    ("GET", "/prepare/job/{job_id}"): DEVELOPER,
+    ("POST", "/prepare/job/{job_id}/cancel"): DEVELOPER,
+    ("POST", "/prepare/import"): DEVELOPER,
     # Collections management, tuning, the Health page's data (Q3, Q5, Q6).
     ("DELETE", "/collections/{name}"): ENGINEER,
     ("POST", "/tune/rechunk"): ENGINEER,

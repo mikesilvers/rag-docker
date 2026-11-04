@@ -767,3 +767,55 @@ class ImportJobList(BaseModel):
 
 class GenerationList(BaseModel):
     sessions: list[GenerationEntry]
+
+
+# ── Document preparation (#638) ───────────────────────────────────────────────
+
+class _PrepareSelection(BaseModel):
+    """Exactly one of `document_ids` (possibly empty, which is refused with 400
+    NO_DOCUMENTS) or `all: true`."""
+    document_ids: Optional[list[str]] = None
+    all: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _one_selection(self):
+        if (self.document_ids is None) == (self.all is not True):
+            raise ValueError("give either document_ids or \"all\": true")
+        if self.document_ids is not None and self.all is not None:
+            raise ValueError("give either document_ids or \"all\": true, not both")
+        return self
+
+
+class PrepareStartRequest(_PrepareSelection):
+    pass
+
+
+class PrepareImportRequest(_PrepareSelection):
+    collection: CollectionName
+    strategy: ChunkingStrategy = "overlap"
+    chunk_size: ChunkSize = 1000
+    chunk_overlap: NonnegativeSize = 200
+    similarity_threshold: UnitInterval = 0.85
+    min_chunk_size: MinChunkSize = 100
+
+    @model_validator(mode="after")
+    def _overlap_rule(self):
+        if self.strategy in ("overlap", "language") and self.chunk_overlap >= self.chunk_size:
+            raise ValueError(OVERLAP_RULE)
+        return self
+
+
+class PrepareJobEntry(ListedTimes):
+    job_id: str
+    status: str
+    documents_total: int = 0
+    documents_completed: int = 0
+    documents_failed: int = 0
+    document_ids: list[str] = []
+    names: list[str] = []
+    current: Optional[dict] = None
+    errors: list[str] = []
+
+
+class PrepareJobList(BaseModel):
+    jobs: list[PrepareJobEntry]

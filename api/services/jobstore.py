@@ -76,7 +76,7 @@ from services import audit
 
 _log = logging.getLogger(__name__)
 
-KINDS = ("ingest", "export", "import", "tune")
+KINDS = ("ingest", "export", "import", "tune", "prepare")
 # The statuses a job never leaves; the same set scripts/verify/lib.sh waits for.
 TERMINAL = frozenset({"completed", "failed", "partial", "cancelled"})
 # Progress-only changes are written at most this often per job. Export and import
@@ -97,6 +97,7 @@ _REMEDY = {
     "export": "Start the export again.",
     "import": "Start the import again.",
     "tune": "Start the operation again.",
+    "prepare": "Start the preparation again.",
 }
 
 
@@ -423,12 +424,16 @@ class JobStore(MutableMapping):
         # reaches the disk terminal but without its message.
         if "finished_at" not in record:
             dict.__setitem__(record, "finished_at", now_iso())      # #617
-        if self.kind == "ingest":
-            completed = dict.get(record, "files_completed")
+        if self.kind in ("ingest", "prepare"):
+            # Both report per file or document in `errors` (#638 for prepare).
+            completed = dict.get(record, "files_completed" if self.kind == "ingest"
+                                 else "documents_completed")
             dict.__setitem__(record, "status", "partial"
                              if isinstance(completed, int) and completed > 0 else "failed")
+            if self.kind == "prepare":
+                dict.__setitem__(record, "current", None)
             errors = dict.get(record, "errors")
-            message = f"{INTERRUPTED_MESSAGE} {_REMEDY['ingest']}"
+            message = f"{INTERRUPTED_MESSAGE} {_REMEDY[self.kind]}"
             if isinstance(errors, list):
                 errors.append(message)
             else:

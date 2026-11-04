@@ -60,6 +60,14 @@ class Settings(BaseSettings):
     # are kept (audit.jsonl.1 newest), the oldest beyond them deleted.
     audit_log_max_bytes: int = 10 * 1024 * 1024
     audit_log_keep: int = 10
+    # The preparation area (#638): raw documents uploaded for preparation and
+    # their prepared parts, in the rag_preparation volume, until deleted.
+    preparation_dir: str = "/app/preparation"
+    # The most the area's files may hold, raw and prepared together. A
+    # best-effort cap: each upload and each prepared part is checked before it
+    # is written, nothing is reserved, so writes running at once can pass it
+    # briefly (maintainer's decision, #638).
+    max_preparation_bytes: int = 20 * 1024 * 1024 * 1024
 
     @field_validator("auth_cookie_secure", "rag_lan_mode", "audit_log_questions", mode="before")
     @classmethod
@@ -78,6 +86,13 @@ class Settings(BaseSettings):
         # One record must fit; a smaller limit would rotate on every write.
         if value < 4096:
             raise ValueError("AUDIT_LOG_MAX_BYTES must be at least 4096")
+        return value
+
+    @field_validator("max_preparation_bytes")
+    @classmethod
+    def _preparation_cap(cls, value):
+        if value < 1024 * 1024:
+            raise ValueError("MAX_PREPARATION_BYTES must be at least 1048576")
         return value
 
     @field_validator("audit_log_keep")
