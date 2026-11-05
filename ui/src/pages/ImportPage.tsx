@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import { Link } from 'react-router-dom'
 import { api, CollectionInfo, IngestJobEntry, JobStatus, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB } from '../api/client'
 import { useRole } from '../context/AuthContext'
 import StrategyExplainer from '../components/StrategyExplainer'
@@ -217,6 +218,9 @@ export default function ImportPage() {
         Preparing a large corpus? Read the limits and how to stay under them first:{' '}
         <a href="/corpus-preparation-rules.md" download="corpus-preparation-rules.md"
           className="text-blue-600 hover:underline">Download corpus preparation rules (.md)</a>
+        {' · '}
+        {/* The preparation area (#638): raw documents made rules-compliant on the instance. */}
+        <Link to="/prepare" className="text-blue-600 hover:underline">Prepare documents first</Link>
       </p>
 
       {files.length > 0 && (

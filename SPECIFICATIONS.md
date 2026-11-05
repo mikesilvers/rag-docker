@@ -135,12 +135,20 @@ services:
       # docker-compose.lan.yml serves TLS and sets it true (#26). Exactly true
       # or false.
       AUTH_COOKIE_SECURE: "false"
+      # The preparation area (#638): raw documents and their prepared parts, in
+      # the rag_preparation volume until deleted. MAX_PREPARATION_BYTES (20 GiB)
+      # is the most they may hold together, checked before each upload and each
+      # prepared part is written; writes running at once may pass it briefly.
+      PREPARATION_DIR: /app/preparation
+      MAX_PREPARATION_BYTES: "21474836480"
     volumes:
       - ingest_uploads:/app/uploads
       # Accounts, sessions and the login throttle (#25), one SQLite file.
       - auth_data:/app/auth_data
       # Retained source documents; grows with the corpus.
       - rag_sources:/app/sources
+      # The preparation area (#638): raw and prepared documents until deleted.
+      - rag_preparation:/app/preparation
       # Bind mount, deliberately: an export is only useful if the user can
       # reach the file from the host without going through Docker.
       - ./exports:/app/exports
@@ -195,6 +203,7 @@ volumes:
   ollama_models:
   ingest_uploads:
   rag_sources:
+  rag_preparation:
   auth_data:
 
 networks:
@@ -1449,7 +1458,7 @@ one may. The role of a request is the one stored for its user at that moment, ne
 | nothing | `GET /health`, `GET /auth/status`, `POST /auth/login` |
 | any session (also one with a password change due) | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password` |
 | `end_user` | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
-| `developer` | `POST /collections`; `POST /ingest/upload`, `GET /ingest/job/{job_id}`, `GET /ingest/jobs`, `GET /ingest/config/{collection}`, `POST /ingest/config`; `POST /retrieval/config`; `POST /goldstandard/generate`, `GET /goldstandard/session/{session_id}`, `GET /goldstandard/sessions`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST /goldstandard/save`, `GET /goldstandard/download/{filename}`; `POST /export`, `GET /export/job/{job_id}`, `GET /export/jobs`, `POST /import`, `GET /import/job/{job_id}`, `GET /import/jobs`, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
+| `developer` | `POST /collections`; `POST /ingest/upload`, `GET /ingest/job/{job_id}`, `GET /ingest/jobs`, `GET /ingest/config/{collection}`, `POST /ingest/config`; `POST /retrieval/config`; `POST /goldstandard/generate`, `GET /goldstandard/session/{session_id}`, `GET /goldstandard/sessions`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST /goldstandard/save`, `GET /goldstandard/download/{filename}`; `POST /export`, `GET /export/job/{job_id}`, `GET /export/jobs`, `POST /import`, `GET /import/job/{job_id}`, `GET /import/jobs`, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}`; document preparation (§3.1.11): `POST /prepare/upload`, `GET /prepare/documents`, `GET /prepare/documents/{document_id}`, `GET /prepare/documents/{document_id}/raw`, `GET /prepare/documents/{document_id}/prepared`, `DELETE /prepare/documents/{document_id}`, `DELETE /prepare/documents/{document_id}/prepared`, `POST /prepare/jobs`, `GET /prepare/jobs`, `GET /prepare/job/{job_id}`, `POST /prepare/job/{job_id}/cancel`, `POST /prepare/import` |
 | `engineer` | `DELETE /collections/{name}`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json`; account administration: `GET /auth/users`, `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `POST /auth/users/{username}/role`, `POST /auth/users/{username}/disable`, `POST /auth/users/{username}/enable`; service principals and keys: `GET /auth/service-principals`, `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `POST /auth/service-principals/{name}/disable`, `POST /auth/service-principals/{name}/enable`, `POST /auth/service-principals/{name}/keys`, `POST /auth/service-principals/{name}/keys/{key_id}/revoke`; the audit log (§3.1.9): `GET /audit`, `GET /audit.csv` |
 
 The matrix is one table in `api/auth/policy.py`. A route without an entry is refused for everyone (`403
@@ -1643,7 +1652,11 @@ built yet; it is to include this folder.
 `admin.key.issue`, `admin.key.revoke`; `audit.view`, `audit.download`; `operator.bootstrap`, `operator.create-user`,
 `operator.reset-password`, `operator.set-role`, `operator.disable`, `operator.enable` (`python -m auth`; not `list`,
 not usage errors); `system.start` (each API start, after the job records are loaded, with `question_text_logged`,
-`max_bytes` and `keep`). Nothing else: no other GET, no job polling, no gold-standard generate, edit or regenerate.
+`max_bytes` and `keep`); document preparation (§3.1.11): `prepare.upload` (names, count, bytes), `prepare.start`
+(the ids or `all`; the job's `accepted` and end records), `prepare.cancel`, `prepare.import` (collection and part
+names; the ingest job's records), `prepare.download` and `prepare.delete` (two routes each, `target` the
+document's name, `details.kind` `raw`/`prepared` or `document`/`prepared`). Nothing else: no other GET, no job
+polling, no gold-standard generate, edit or regenerate.
 
 **When.** A request to an audited route writes one record once its answer has been sent, so a page or CSV never
 holds its own `audit.view` or `audit.download`. A refusal by the authentication middleware is recorded only when it
@@ -1751,6 +1764,110 @@ is left out and logged, so one bad record never fails a list.
 **Packages.** `owner`, `created_at` and `finished_at` belong to this install: an export leaves them
 out of every `goldstandard/<session_id>.json`, and an import drops them from every session it
 restores, whatever the package carries (`RAG_EXPORT_SPECIFICATIONS.md` §4.2).
+
+#### 3.1.11 Document preparation (#638)
+
+A preparation area where raw documents are made to follow the corpus rules (#615), stored on the
+instance and imported with one action. Code does the rule work exactly; the local LLM (`LLM_MODEL`) only
+removes headers, footers, page numbers and boilerplate, and writes a title and summary. One area for the
+instance, in the `rag_preparation` volume (`PREPARATION_DIR`, `/app/preparation`); documents stay until
+deleted. Every route is `developer` (§3.1.8); documents are shared, each showing its owner, and any caller
+with access may delete any document.
+
+**Storage limit.** `MAX_PREPARATION_BYTES` (default 21474836480, 20 GiB; at least 1048576 or the API
+refuses to start): the most the area's files may hold, raw and prepared together. A best-effort cap
+(maintainer's decision): the space is checked before each write (an upload's files, a ZIP's members counted
+as expanded; each prepared part), nothing is reserved, so writes running at the same time may briefly take
+it over the limit, and later checks refuse until it is back under. Over it: `409 PREPARATION_STORAGE_FULL`
+with the space used, the space left and the size asked for. A job is refused at start the same way when the
+area is already full. Collection export packages don't include the area; whole-instance backup (#38) is to.
+
+**Upload.** `POST /prepare/upload`, multipart `files`, 201 `{"documents": [...], "skipped": [...]}`.
+Accepted: `.pdf .docx .txt .md .csv .json .jsonl .jsonl.gz` and `.zip` (with `.json.gz` inside a ZIP), staged
+and validated exactly as `POST /ingest/upload` (§3.1.3: the 512 MB request limit, every ZIP limit and code,
+`NO_SUPPORTED_FILES`, `UPLOAD_WRITE_FAILED`; skipped files listed with ingest's reason). Each supported file or
+ZIP member becomes one document, status `raw`, named by its file name or its path in the archive; the ZIP
+itself isn't kept. Two documents may share a name. A refused upload keeps nothing; anything unexpected is
+`500 PREPARE_FAILED`.
+
+**Documents.** `GET /prepare/documents`: `{"documents", "used_bytes", "limit_bytes"}`, newest first. `GET
+/prepare/documents/{document_id}`: the record, each part with `preview`, its first 2,000 characters. A record:
+`id` (12 hex characters), `name`, `raw_type`, `raw_bytes`, `owner`, `created_at`, `status` (`raw` no output,
+`queued`, `preparing`, `prepared`, `failed` its last preparation failed and it had no earlier output),
+`prepared_at`, `prepared_bytes`, `parts` (`name`, `bytes`, `characters`, `records` for CSV and JSON Lines,
+`title`, `summary`, `summary_error`, `fallback`, `fallbacks`), `fallback`, `code_only_by_type` (CSV, JSON, JSON
+Lines), `last_error`, `imports` (`collection`, `job_id`, `at`). `GET .../raw`: the bytes as uploaded. `GET
+.../prepared`: one part as its file, several as `<stem>-prepared.zip`; `409 DOCUMENT_NOT_PREPARED` without
+output. A download is read from a handle opened before it starts, so a delete meanwhile can't cut it short.
+`DELETE /prepare/documents/{document_id}` (raw and prepared) and `DELETE .../prepared` (the output only; the
+document is `raw` again, its imports kept; `409 DOCUMENT_NOT_PREPARED` without output) answer 204. Unknown id:
+`404 DOCUMENT_NOT_FOUND`; a document `queued`, `preparing` or in an import being admitted: `409 DOCUMENT_BUSY`.
+
+**Preparation jobs.** `POST /prepare/jobs` with `{"document_ids": [...]}` or `{"all": true}` (every `raw`,
+`prepared` or `failed` document), exactly one: 202 `{"job_id", "status": "queued", "documents_queued"}`.
+Empty selection `400 NO_DOCUMENTS`, unknown id `404 DOCUMENT_NOT_FOUND`, busy `409 DOCUMENT_BUSY`, a body
+that gives neither or both `422 INVALID_PARAMETER`. A new job kind `prepare` in the job store (restart,
+retention, audit records, `GET /prepare/jobs` with the rules of §3.1.10, `GET /prepare/job/{job_id}`). One
+preparation job runs at a time on the instance, later ones `queued` oldest first; other jobs neither wait for
+it nor block it, but preparation and ingest share Ollama, so either is slower meanwhile (#613). Documents are
+prepared one at a time. The record: `job_id`, `status` (`queued`, `running`, `completed`, `partial`, `failed`,
+`cancelled`), `documents_total`, `documents_completed`, `documents_failed`, `document_ids`, `names`,
+`current` (`document_id`, `name`, `windows_done`, `windows_total`), `errors` (`<name>: <reason>`), `owner`,
+`created_at`, `finished_at`. `POST /prepare/job/{job_id}/cancel`: 202; `404 JOB_NOT_FOUND`; `409
+JOB_NOT_RUNNING` once ended. A queued job ends `cancelled` at once; a running one after its current LLM call.
+Finished documents keep their output; the one in progress and those not reached return to the state they had
+before the job, as they do at API startup after an interrupted job.
+
+**What a preparation does**, per document:
+
+1. *Extract* with ingest's own readers; a file ingest would refuse (§5.1: invalid JSON, a JSON Lines line over
+   the limit, `.json` over 30,000,000 bytes, more than 1,000,000 records, a record over 10,000,000 characters,
+   an unreadable encoding, a CSV header over half a part) fails with ingest's reason. A document with no text
+   fails `has no text to prepare`.
+2. *Normalise*: UTF-8 without a byte-order mark, LF, NFC, NUL and other C0 control characters except tab and
+   newline, and DEL, removed. JSON and JSON Lines get the encoding only, so records stay unchanged.
+3. *Split* into parts of at most 6,400,000 characters as ingest will read them (the corpus rules' targets for
+   `overlap` 1,000/200; the title header counts), at ingest's boundaries: paragraphs, PDF/DOCX elements, CSV
+   rows with the header repeated in every part, JSON Lines records (never cut; one over the size is a part of
+   its own, at most 1,000,000 per part). Output: `.md` for PDF, DOCX, TXT and MD; `.csv` with its rows as
+   written; `.jsonl` for JSON (each record as compact JSON, numbers as written, element files as records) and
+   JSON Lines (each line as written, blank lines dropped, gzip decompressed). Names: one part keeps the raw
+   name, folders included, with the output suffix (`a/report.pdf` → `a/report.md`); several are
+   `<stem>-part-001<suffix>` and on. A `.txt` or `.md` is read part by part, as ingest reads it (§5.1.1), so
+   memory is bounded by one part whatever the file's size: once to count its windows, then to clean and write
+   each part; a PDF or DOCX is parsed whole, as ingest parses it. CSV rows are found by `csv.reader` under
+   Unstructured's `CSV_FIELD_LIMIT`, as ingest finds them (a quote inside an unquoted field is text, a field over
+   the limit fails the document), and kept as written. A row longer, as written, than a part can hold beside the
+   header (the header: longer than half a part) fails the document; reading stops as soon as a row's raw text
+   passes twice that, so an unclosed quote or a file with no line breaks is never held whole.
+4. *Clean* (PDF, DOCX, TXT, MD only) with §6.5: each part in windows of whole lines up to 3,000 characters
+   (a longer line is not sent); the LLM names the lines to remove and code removes them, never rewriting.
+   Each call has 120 s and is sent again once if it fails or times out; an unusable answer is asked again
+   once. A window keeps its code-only text, recorded `{"window", "reason"}` on its part, when the lines named
+   hold over 20 % of its characters (`removed-too-much`), include one over 200 characters
+   (`removed-long-line`), or after `unusable-answer`, `llm-timeout` or `llm-error`. If the model isn't in
+   Ollama's list when a document starts, or three of its calls in a row fail, it makes no further calls
+   (`llm-unavailable`). A document over 1,000 windows is code-only (`too-large-for-llm`) but still titled.
+5. *Title and summary* for every part with §6.6, from its first 6,000 characters: a title of at most 150
+   characters on one line and a summary of at most 80 words, else asked again once, else left out with
+   `summary_error`. For the four text types the part begins `# <title>`, a blank line, `Summary (generated):
+   <summary>`, a blank line; CSV and JSON Lines keep them in the record only.
+6. *Check* each written part as ingest reads it: at most 10,000,000 characters, at most 1,000,000 records,
+   valid JSON Lines, at most 10,000 chunks estimated for `overlap` 1,000/200. A failure fails the document.
+
+A document's earlier output stays until a new one is complete and checked. A failed run removes its new
+output; a document with earlier output stays `prepared` with it and records the reason in `last_error`
+(maintainer's decision), one without becomes `failed`. A successful run clears `last_error`.
+
+**Import.** `POST /prepare/import`, JSON: `collection`, `document_ids` or `"all": true` (every `prepared`
+document), and `strategy`, `chunk_size`, `chunk_overlap`, `similarity_threshold`, `min_chunk_size` with
+ingest's defaults and validation (`422 INVALID_PARAMETER`). Checked in order, before anything is staged: the
+body, the selection (`400 NO_DOCUMENTS`, `404 DOCUMENT_NOT_FOUND`, `409 DOCUMENT_BUSY`, `409
+DOCUMENT_NOT_PREPARED`, two parts with one name `409 DUPLICATE_NAMES`), then the collection as ingest checks it
+(`404 COLLECTION_NOT_FOUND`, `409 COLLECTION_DELETING`, `503 SERVICE_UNAVAILABLE`). Accepted: one ordinary
+ingest job with every part, copied from the area into its staging and stored under the part's name, folders
+included; the answer and the job are `POST /ingest/upload`'s (§3.1.3, §5.1.1). The documents are busy only
+while the import is admitted; each records the import. Nothing is deleted.
 
 ### 3.2 Error Response Format
 
@@ -2568,6 +2685,40 @@ After a JSON object with an unusable field:
 
 After a third unusable reply the pair fails; §3.1.5 describes how failures are reported. A chunk whose source filename is null gives a pair with an empty `source_file`.
 
+### 6.5 Document Preparation Cleaning Prompt (#638)
+
+**System:**
+```
+You clean text extracted from a document. You are given numbered lines. Find the lines that are page headers, page footers, page numbers, or repeated boilerplate (such as copyright notices, navigation text or "continued on next page"), and nothing else. Never choose a line that holds the document's own content. Return only a JSON object: {"remove": [line numbers]}. Return {"remove": []} when there are none.
+```
+
+**User:** `Lines:` followed by each line of the window as `<n>: <text>`, numbered from 1.
+
+A usable answer is a JSON object whose `remove` is a list of integers that are line numbers of the window. After
+an unusable answer the API asks once more with this added to the end of the system prompt:
+
+```
+ Your previous response was not a JSON object with a "remove" list of line numbers from the lines given. Return ONLY that JSON object.
+```
+
+The lines named are removed only when the fidelity check of §3.1.11 passes.
+
+### 6.6 Document Preparation Title and Summary Prompt (#638)
+
+**System:**
+```
+You write a title and a short summary for a part of a document. Use only the text given. The title is at most 15 words. The summary is at most 60 words. Return only a JSON object: {"title": "...", "summary": "..."}.
+```
+
+**User:** `Text:` followed by the part's first 6,000 characters.
+
+Usable: a nonempty `title` of at most 150 characters on one line and a nonempty `summary` of at most 80 words
+whose header fits in 2,000 characters. Retry text:
+
+```
+ Your previous response was not a JSON object with a nonempty "title" of one line and a nonempty "summary" of at most 60 words. Return ONLY that JSON object.
+```
+
 ---
 
 ## 7. Web UI Specification
@@ -2614,6 +2765,7 @@ Developer also Data and Tune, an Engineer also Admin.
 |---|---|---|---|---|
 | (top level) | Q&A | ✓ | ✓ | ✓ |
 | Data | Import | ✓ | ✓ | — |
+| Data | Prepare | ✓ | ✓ | — |
 | Data | Transfer | ✓ | ✓ | — |
 | Tune | Chunking | ✓ | ✓ | — |
 | Tune | Retrieval | ✓ | ✓ | — |
@@ -3012,6 +3164,30 @@ nothing about jobs is kept in browser storage.
 - The list is read again after the page starts a job, when a job it polls ends, and every 10 seconds
   while the last answer held a running job; never after the page is left.
 
+### 7.16 Prepare Documents Page (#638)
+
+**Route:** `/prepare`, in the Data menu after Import
+**Roles:** Engineer, Developer
+
+- What the page does (code does the rule work, the LLM only cleans and titles), and a note that preparation and
+  ingest share the local LLM service, so either is slower while the other runs.
+- An upload zone for the §3.1.11 types, refusing a selection over 512 MB before sending; the answer's skipped
+  files are listed.
+- The documents: name, owner (Engineers), status, raw and prepared size, parts, a fallback mark ("fell back" with
+  the count, or "code-only (by type)"), the last error, imports (collection and time), a checkbox, and per row
+  Preview, Download raw, Download prepared, Delete prepared and Delete (both deletes ask for confirmation).
+  Above them, "Space used: X of Y".
+- "Prepare selected" and "Prepare all" start a job; its progress (documents done of total, the current
+  document's windows) and errors are shown, polled every 3 seconds, with Cancel while it is queued or running.
+  "Running and recent jobs" (§7.15) lists preparation jobs.
+- Preview: each part's name, size, title, summary (or why there is none), fallbacks with their reasons, and its
+  first 2,000 characters. No editing.
+- Import: a collection selector with "+ New" and the strategy and chunk settings as on the Import page, "Import
+  selected" and "Import all prepared"; the ingest job's ID and progress are shown as on the Import page.
+- A refusal shows the API's message as an alert.
+
+The Import page shows a link "Prepare documents first" to `/prepare` beside the corpus rules link.
+
 ## 8. Configuration Defaults and Constraints
 
 The table gives API request bounds; narrower UI sliders are presentation choices. Internal import/rebuild preserves positive stored HNSW construction/connections settings and stored `ef=-1` (dynamic) or positive values beyond new-request limits. Index/distance enums and numeric type validation still apply; no clamping or migration is performed.
@@ -3035,6 +3211,8 @@ The `chunk_size` and `min_chunk_size` bounds apply whenever chunk settings are s
 | `max_zip_member_ratio` | 200 | — | — | API setting (env `MAX_ZIP_MEMBER_RATIO`), not a request parameter: the most a ZIP member of 1 MiB or more may expand relative to its compressed size, declared and as read (§3.1.3, #28) |
 | `max_package_expanded_bytes` | 17179869184 | — | — | API setting (env `MAX_PACKAGE_EXPANDED_BYTES`), not a request parameter: the most an imported package's members may add up to when unpacked; over it the import fails `PACKAGE_TOO_LARGE` (RAG_EXPORT_SPECIFICATIONS.md §6.2, #317) |
 | `max_package_members` | 100000 | — | — | API setting (env `MAX_PACKAGE_MEMBERS`), not a request parameter: the most entries an imported package may hold, folders included; over it the import fails `PACKAGE_TOO_MANY_MEMBERS` (RAG_EXPORT_SPECIFICATIONS.md §6.2, #317) |
+| `max_preparation_bytes` | 21474836480 | 1048576 | — | API setting (env `MAX_PREPARATION_BYTES`), not a request parameter: the most the preparation area may hold, raw and prepared together; a best-effort cap checked before each write (§3.1.11, #638) |
+| `preparation_dir` | `/app/preparation` | — | — | API setting (env `PREPARATION_DIR`): the preparation area, the `rag_preparation` volume (§3.1.11) |
 
 Optional telemetry (#282) is configured by API container environment settings, not request parameters. They are read only when `RAG_OTEL_ENABLED` is `true`; an invalid value fails API startup with an error naming the field only. See "Optional telemetry foundation (#282)" below and README "Optional backend telemetry".
 
@@ -3127,6 +3305,7 @@ rag-docker/
 │   │   ├── health.py
 │   │   ├── collections.py
 │   │   ├── ingest.py
+│   │   ├── prepare.py           # /prepare: the preparation area (#638)
 │   │   ├── query.py
 │   │   ├── retrieval_config.py  # Per-collection retrieval settings endpoints
 │   │   ├── transfer.py          # /export, /import, /packages
@@ -3138,6 +3317,9 @@ rag-docker/
 │   │   ├── weaviate_client.py   # Weaviate connection, schema, and query operations
 │   │   ├── ollama_client.py     # Ollama LLM and embed calls
 │   │   ├── ingest_pipeline.py   # Parse → chunk → embed → store
+│   │   ├── preparation_store.py # The preparation area on disk (#638)
+│   │   ├── preparation.py       # Preparing one document: extract, split, clean, title, check
+│   │   ├── preparation_jobs.py  # Uploads, preparation jobs and imports of the area
 │   │   ├── chunker.py           # All five chunking strategies
 │   │   ├── rag_pipeline.py      # Reformulate → retrieve → synthesize
 │   │   ├── sources.py           # Retained original documents (content-addressed)
@@ -3951,6 +4133,33 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 *End of Specifications — Version 1.4*
 
 ---
+
+### 10.8 Document preparation (#638)
+
+`scripts/verify/21_prepare.sh` runs `scripts/tests/test_prepare.py` in the API image with a stub LLM (U1-U13)
+and checks the verify project through `prepare_stack.py` (P1-P11).
+
+- [x] Every `/prepare` route refuses no session (401) and an End User (403) and admits a Developer (P1).
+- [x] An upload of a `.txt`, a `.csv` and a ZIP with a `.jsonl` member and an unsupported member gives three `raw`
+      documents named by file name and archive path, the unsupported member skipped (P2); a ZIP over the ratio
+      limit and a damaged ZIP are refused with ingest's codes, keeping nothing (P3).
+- [x] The raw download is the uploaded bytes and the list reports the space used and the limit (P4); a delete
+      removes the document and lowers the space used, a second one is 404 (P5).
+- [x] An import is refused for a `raw` document (409), an unknown one (404), no selection (400) and bad chunk
+      settings (422) (P6); cancelling an unknown job is 404 (P7).
+- [x] Uploads, downloads and deletes are audited with names and no document text (P8).
+- [x] With the LLM (full runs): a `.txt` becomes `.md` whose lines are source lines in order, with the title
+      header when there is a title; the `.csv` and `.jsonl` come back unchanged and code-only (P9); an import into
+      an unknown collection is 404 and one into a new collection completes and is recorded on each document
+      (P10); the prepared download is the part, and deleting the prepared output returns the document to `raw`
+      (P11).
+- [x] Windows, numbering and removal; every fallback reason; `llm-unavailable` after three failed calls and with
+      the model missing; `too-large-for-llm`; titles and summaries usable, retried or left out, and written into
+      the text only for the four text types; normalisation; part sizes, the CSV header in every part, records
+      never cut, names and the checks of a written part; JSON to JSON Lines with numbers as written; the storage
+      limit refusing an upload, a job start and a part; replacing output, a failed re-run keeping the earlier
+      output, cancel and restart; one job at a time; busy documents; the routes' roles and audit actions; and
+      the prepared download of several parts as a ZIP (U1-U13).
 
 ## 11. Host Requirements and Distribution
 

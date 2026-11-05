@@ -310,17 +310,22 @@ def _json_lines(value: Any, path: Any, out: list[str], budget: _JsonBudget) -> N
         _json_line(path, _json_scalar(value), out, budget)
 
 
+def _json_groups(value: Any) -> list[Any]:
+    """The values a JSON file's records come from: the items of a top-level array
+    that holds any object or array, otherwise the whole value as one (#295).
+    Document preparation (#638) writes each one as a JSON Lines line."""
+    if isinstance(value, list) and not all(_is_json_scalar(item) for item in value):
+        return value
+    return [value]
+
+
 def _iter_json_records(value: Any) -> Iterator[tuple[str, str]]:
     """Ordinary JSON as readable text: one record per item of a top-level array
     that holds any object or array, otherwise one record. Records with no text
     are dropped. Yields (`record N`, text), N the item's position from 1; each
     record's text is bounded on its own (#621)."""
-    if isinstance(value, list) and not all(_is_json_scalar(item) for item in value):
-        groups = value
-    else:
-        groups = [value]
     kept = 0
-    for position, group in enumerate(groups, 1):
+    for position, group in enumerate(_json_groups(value), 1):
         ordinal = f"record {position}"
         lines: list[str] = []
         try:
@@ -455,7 +460,17 @@ _BOM = b"\xef\xbb\xbf"
 
 def _iter_jsonl_records(stream: Any) -> Iterator[tuple[str, str]]:
     """The records of a JSON Lines file, one per line with text (#291), as
-    (`line N`, text).
+    (`line N`, text). See _iter_jsonl_lines."""
+    for number, _raw, text in _iter_jsonl_lines(stream):
+        if text.strip():
+            yield f"line {number}", text
+
+
+def _iter_jsonl_lines(stream: Any) -> Iterator[tuple[int, bytes, str]]:
+    """Every record line of a JSON Lines file as (number, line, text): the line's
+    bytes without its line ending or line 1's byte-order mark, and its converted
+    text, which is empty for a record with no text. Blank lines are not given.
+    Document preparation (#638) keeps the line as it is; ingest keeps the text.
 
     Read one line at a time, at most MAX_JSONL_LINE_BYTES of it besides its line
     ending and line 1's byte-order mark, and stopped at the first bad line, at
@@ -515,9 +530,7 @@ def _iter_jsonl_records(stream: Any) -> Iterator[tuple[str, str]]:
         except RecursionError as exc:
             raise _JsonlError(
                 f"line {number} is not valid JSON: it is nested too deeply to read") from exc
-        # A record with no text is not stored.
-        if text.strip():
-            yield f"line {number}", text
+        yield number, raw, text
 
 
 def _jsonl_records(stream: Any) -> list[str]:
@@ -1329,6 +1342,55 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
             queue.add(target, logical, f"{safe_name}:{member.filename}")
 
 
+async def stage_uploads(files: list[Any], tmp_dir: Path,
+                        names: list[str] | None = None) -> tuple["_Queue", list[str]]:
+    """Save an upload's files under tmp_dir and queue every supported one, ZIPs
+    validated and expanded (#290, #298, #28): the queue and the skipped list.
+    Ingest and document preparation (#638) stage uploads the same way.
+
+    `names`, when given, is each file's logical name in place of its file name
+    (#638: a prepared part keeps its folder path). The caller removes tmp_dir
+    when this raises."""
+    # Files the caller sent that this build cannot parse, and inputs replaced by
+    # a later one with the same name. Dropping them without a word makes a ZIP
+    # of 8 files silently report 6, with nothing saying which two or why.
+    skipped: list[str] = []
+    queue = _Queue(tmp_dir, skipped)
+    # One expansion total for every ZIP in this request (#298).
+    budget = _ExpansionBudget(settings.max_zip_expanded_bytes)
+
+    for index, upload in enumerate(files):
+        raw_name = upload.filename or ""
+        safe_name = Path(raw_name).name
+        if not safe_name:
+            continue
+        logical = names[index] if names is not None else safe_name
+        dest = queue.slot(safe_name)
+        # Copy in blocks rather than `await upload.read()`, which held the
+        # whole file in memory. Uploads can now reach 512 MB (issue #21),
+        # and this container already runs close to its memory budget. The
+        # copy blocks, so it runs off the event loop.
+        try:
+            await asyncio.to_thread(_save_upload, upload.file, dest)
+        except OSError as exc:
+            raise _rejected(
+                "UPLOAD_WRITE_FAILED",
+                f"Could not save '{safe_name}' on the server: {_os_reason(exc)}.",
+                safe_name) from exc
+
+        if safe_name.lower().endswith(".zip"):
+            # Off the event loop, like the copy above (#298).
+            await asyncio.to_thread(_extract_zip, dest, safe_name, queue, budget)
+            os.remove(dest)
+        elif (Path(safe_name).suffix.lower() in SUPPORTED_EXTENSIONS
+              or _is_jsonl_gz(safe_name)):
+            # A directly uploaded .json.gz is still skipped (#291 scope).
+            queue.add(dest, logical, logical)
+        else:
+            skipped.append(f"{safe_name} ({_skip_reason(safe_name)})")
+    return queue, skipped
+
+
 async def start_ingest_job(
     files: list[Any],
     collection: str,
@@ -1338,8 +1400,12 @@ async def start_ingest_job(
     similarity_threshold: float,
     min_chunk_size: int,
     owner: dict | None = None,
+    *,
+    names: list[str] | None = None,
 ) -> str:
-    """`owner` is who started the job (#617), recorded for the job lists."""
+    """`owner` is who started the job (#617), recorded for the job lists.
+    `names`, one per file, are the logical names to store them under instead of
+    their file names: an import of prepared documents (#638) keeps folder paths."""
     config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
                           chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
                           min_chunk_size=min_chunk_size)
@@ -1355,7 +1421,7 @@ async def start_ingest_job(
     try:
         return await _admit_ingest_job(job_id, files, collection, strategy, chunk_size,
                                        chunk_overlap, similarity_threshold, min_chunk_size,
-                                       owner)
+                                       owner, names)
     except BaseException:
         collection_writes.end_job("ingest", job_id)
         raise
@@ -1364,46 +1430,12 @@ async def start_ingest_job(
 async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, strategy: str,
                             chunk_size: int, chunk_overlap: int,
                             similarity_threshold: float, min_chunk_size: int,
-                            owner: dict | None = None) -> str:
+                            owner: dict | None = None,
+                            names: list[str] | None = None) -> str:
     # The prefix is how the startup sweep finds a killed job's staging (#377).
     tmp_dir = Path(tempfile.mkdtemp(prefix="ingest-", dir=settings.upload_dir))
-    # Files the caller sent that this build cannot parse, and inputs replaced by
-    # a later one with the same name. Dropping them without a word makes a ZIP
-    # of 8 files silently report 6, with nothing saying which two or why.
-    skipped: list[str] = []
-    queue = _Queue(tmp_dir, skipped)
-    # One expansion total for every ZIP in this request (#298).
-    budget = _ExpansionBudget(settings.max_zip_expanded_bytes)
-
     try:
-        for upload in files:
-            raw_name = upload.filename or ""
-            safe_name = Path(raw_name).name
-            if not safe_name:
-                continue
-            dest = queue.slot(safe_name)
-            # Copy in blocks rather than `await upload.read()`, which held the
-            # whole file in memory. Uploads can now reach 512 MB (issue #21),
-            # and this container already runs close to its memory budget. The
-            # copy blocks, so it runs off the event loop.
-            try:
-                await asyncio.to_thread(_save_upload, upload.file, dest)
-            except OSError as exc:
-                raise _rejected(
-                    "UPLOAD_WRITE_FAILED",
-                    f"Could not save '{safe_name}' on the server: {_os_reason(exc)}.",
-                    safe_name) from exc
-
-            if safe_name.lower().endswith(".zip"):
-                # Off the event loop, like the copy above (#298).
-                await asyncio.to_thread(_extract_zip, dest, safe_name, queue, budget)
-                os.remove(dest)
-            elif (Path(safe_name).suffix.lower() in SUPPORTED_EXTENSIONS
-                  or _is_jsonl_gz(safe_name)):
-                # A directly uploaded .json.gz is still skipped (#291 scope).
-                queue.add(dest, safe_name, safe_name)
-            else:
-                skipped.append(f"{safe_name} ({_skip_reason(safe_name)})")
+        queue, skipped = await stage_uploads(files, tmp_dir, names)
     except Exception:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise

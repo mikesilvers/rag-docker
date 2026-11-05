@@ -48,6 +48,7 @@ Three things scale with your corpus rather than with the stack:
 
 - the **Weaviate index** and its vectors,
 - **retained source documents** (`rag_sources`), which hold one copy of every ingested file so a collection can be exported at `with-sources` fidelity and re-chunked later,
+- the **preparation area** (`rag_preparation`, at most `MAX_PREPARATION_BYTES`, 20 GiB by default), which keeps raw documents and their prepared parts until you delete them,
 - **export packages** in `./exports`, which live on the *host* filesystem rather than Docker's virtual disk. A package is roughly the size of the corpus it came from, and about 2.3 GB larger if exported with `include_models: true`.
 
 So budget the figures above **plus the size of your document corpus** — counted twice if you keep exports of it alongside the live collections.
@@ -484,6 +485,8 @@ Navigate to **Data → Import**, drop in your files (PDF, DOCX, TXT, MD, CSV, JS
 
 You don't have to stay on the page while a job runs. The Import, Gold Standard and Transfer pages each show a **Running and recent jobs** list, read from the server whenever the page opens, so coming back to it (after visiting another page, reloading, in another tab or after logging in again) shows the running job's progress, or its result once it has finished. The newest job opens by itself; click another row to switch. The list holds your own jobs that are running or finished in the last 24 hours (at most 20 finished ones); an AI Engineer sees everyone's, with who started each.
 
+**Documents that break the corpus rules?** **Data → Prepare** makes raw documents follow them on this instance, without downloading and uploading them again. Upload the raw files (the same types and ZIP limits as Import), then **Prepare**: the code extracts the text, splits it into parts within the rules' limits, normalises the encoding and converts JSON to JSON Lines; the local LLM only removes page headers, footers, page numbers and boilerplate from PDF, DOCX, TXT and Markdown, and writes a title and short summary for each part. It never rewrites text: where its cleaning would remove too much, or a long line, that part of the document keeps the code-only text, and the page shows the fallback and why. CSV, JSON and JSON Lines are prepared by code only. Review each document's parts in **Preview**, then **Import selected** or **Import all prepared** into a collection, with the usual chunk settings; this starts an ordinary ingest job. Raw and prepared documents stay until you delete them, and each can be downloaded. Preparation uses the same local LLM as Q&A and ingest's embeddings, so on a CPU-only machine a long document takes a while, and either is slower while the other runs.
+
 Uploading a file again under the same name replaces its earlier chunks (even if the content is unchanged); files inside a ZIP are named by their path in the archive, so `a/report.pdf` and `b/report.pdf` stay separate documents. macOS metadata in a ZIP (the `__MACOSX/` folder and `._*` files the Finder adds) is not ingested; the job lists it under skipped files.
 
 Supported chunking strategies:
@@ -625,6 +628,8 @@ All API settings are environment variables in `docker-compose.yml`:
 | `AUDIT_LOG_QUESTIONS` | `false` | Whether the [audit log](#audit-log) records a query's question text. Exactly `true` or `false`; anything else stops the API |
 | `AUDIT_LOG_MAX_BYTES` | `10485760` (10 MiB) | The size at which `audit.jsonl` is rotated; at least 4096 |
 | `AUDIT_LOG_KEEP` | `10` | How many rotated audit files are kept (1-1000); the oldest beyond them is deleted |
+| `PREPARATION_DIR` | `/app/preparation` | Container path of the preparation area, the `rag_preparation` volume |
+| `MAX_PREPARATION_BYTES` | `21474836480` (20 GiB) | The most the preparation area may hold, raw and prepared documents together; at least 1048576. Checked before each upload and each prepared part is written; uploads and preparation running at the same time may pass it briefly. Over it, `PREPARATION_STORAGE_FULL` |
 | `HF_HUB_OFFLINE` | `1` | Keeps the image's pre-cached sentence-transformers model from contacting huggingface.co; set to `0` only if you change the model and want it downloaded at runtime |
 | `TRANSFORMERS_OFFLINE` | `1` | Same offline enforcement for the transformers library; keep `1` to use the pre-cached model with no runtime network call |
 
@@ -648,7 +653,7 @@ docker compose up -d --force-recreate ui proxy
 
 ## Data persistence
 
-Five named Docker volumes persist data across restarts:
+Six named Docker volumes persist data across restarts:
 
 | Volume | Contents |
 |---|---|
@@ -656,6 +661,7 @@ Five named Docker volumes persist data across restarts:
 | `ollama_models` | Downloaded model weights |
 | `ingest_uploads` | Ingest configs, gold standard sessions, exported gold-standard JSON files (`goldstandard_exports/`), metrics ring buffer (`metrics.jsonl`, bounded to 1,000 lines), the audit log (`audit/`, #29) |
 | `rag_sources` | Original uploaded documents, content-addressed per collection. Grows with your corpus |
+| `rag_preparation` | The preparation area (#638): raw documents uploaded on **Data → Prepare** and their prepared parts, until deleted. At most `MAX_PREPARATION_BYTES`. Not part of collection export packages |
 | `auth_data` | Accounts, password hashes, sessions and the login throttle (`auth.db`, SQLite, #25) |
 
 Run `docker compose down -v` to delete all volumes and start fresh.

@@ -752,6 +752,9 @@ class TelemetryTests(unittest.TestCase):
                                     packager=SimpleNamespace(sweep_build_leftovers=lambda:[]),
                                     weaviate_client=wc,importer=importer,exporter=job_module('export'),
                                     ingest_pipeline=job_module('ingest'),tuning=job_module('tune'),
+                                    # Document preparation (#638): its jobs, then its area's recovery.
+                                    preparation_jobs=SimpleNamespace(_jobs=SimpleNamespace(load=lambda:(order.append('prepare') or [])),
+                                                                     recover=lambda:(order.append('recover') or [])),
                                     audit=SimpleNamespace(record=lambda *args,**kwargs:order.append('audit'),
                                                           login_flusher=lambda:asyncio.sleep(3600),
                                                           flush_logins=lambda:order.append('flush')))
@@ -769,7 +772,8 @@ class TelemetryTests(unittest.TestCase):
             if not fail:
                 # 'audit': the start's audit record (#29), after the job records load;
                 # 'flush': the open failed-login counts at shutdown (#577).
-                self.assertEqual(order, ['bootstrap', 'load', 'ingest', 'export', 'import', 'tune', 'audit',
+                self.assertEqual(order, ['bootstrap', 'load', 'ingest', 'export', 'import', 'tune', 'prepare',
+                                         'recover', 'audit',
                                          'yield', 'flush', 'close', 'shutdown'])
 
     def test_lifecycle_deadline_single_worker_and_eventual_shutdown(self):

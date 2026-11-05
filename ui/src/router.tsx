@@ -6,6 +6,7 @@ import SetupRequiredPage from './pages/SetupRequiredPage'
 import ChangePasswordPage from './pages/ChangePasswordPage'
 import QAPage from './pages/QAPage'
 import ImportPage from './pages/ImportPage'
+import PreparePage from './pages/PreparePage'
 import ChunkingPage from './pages/ChunkingPage'
 import RetrievalPage from './pages/RetrievalPage'
 import GoldStandardPage from './pages/GoldStandardPage'
@@ -60,6 +61,7 @@ export default function AppRouter() {
           {role !== 'end_user' && (
             <>
               <Route path="/import" element={<ImportPage />} />
+              <Route path="/prepare" element={<PreparePage />} />
               <Route path="/chunking" element={<ChunkingPage />} />
               <Route path="/retrieval" element={<RetrievalPage />} />
               <Route path="/goldstandard" element={<GoldStandardPage />} />

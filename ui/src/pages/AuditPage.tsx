@@ -9,6 +9,7 @@ const ACTIONS = [
   'auth.login', 'auth.logout', 'auth.password', 'collection.create', 'collection.delete', 'export',
   'goldstandard.download', 'goldstandard.save', 'import', 'ingest', 'ingest.config', 'operator.bootstrap',
   'operator.create-user', 'operator.disable', 'operator.enable', 'operator.reset-password', 'operator.set-role',
+  'prepare.cancel', 'prepare.delete', 'prepare.download', 'prepare.import', 'prepare.start', 'prepare.upload',
   'query', 'retrieval.config', 'system.start', 'tune.rechunk', 'tune.reembed', 'tune.reindex',
 ]
 const RESULTS = ['success', 'refused', 'error', 'accepted', 'succeeded', 'failed', 'interrupted']

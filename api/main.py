@@ -70,10 +70,11 @@ async def lifespan(app: FastAPI):
         # mid-import is reported failed and its half-built collection already swept.
         # No worker from the previous process is alive, so any job still queued or
         # running is marked interrupted before the first request is served.
-        from services import exporter, importer, ingest_pipeline, tuning
+        from services import exporter, importer, ingest_pipeline, preparation_jobs, tuning
         interrupted = []
         for kind, module in (("ingest", ingest_pipeline), ("export", exporter),
-                             ("import", importer), ("tune", tuning)):
+                             ("import", importer), ("tune", tuning),
+                             ("prepare", preparation_jobs)):
             try:
                 marked = await asyncio.to_thread(module._jobs.load)
                 interrupted += [f"{kind} {job_id}" for job_id in marked]
@@ -82,6 +83,15 @@ async def lifespan(app: FastAPI):
         if interrupted:
             log.warning("Marked %d job(s) interrupted by the restart: %s. Their status now "
                         "says so; start them again.", len(interrupted), ", ".join(interrupted))
+        # Documents a killed preparation job left queued or preparing go back to
+        # the state they had before it (#638).
+        try:
+            restored = await asyncio.to_thread(preparation_jobs.recover)
+            if restored:
+                log.warning("Returned %d document(s) of an interrupted preparation to their "
+                            "earlier state: %s", len(restored), ", ".join(restored))
+        except Exception:                                 # noqa: BLE001
+            log.exception("Could not recover the preparation area")
         # One audit record per start, saying whether question text is recorded,
         # so a reader can tell why some query records carry it (#29).
         from config import settings
@@ -171,13 +181,14 @@ app.add_middleware(AuditMiddleware)
 app.add_middleware(RequestTracing)
 
 from routers import audit as audit_router
-from routers import auth as auth_router, help as help_router, health, collections, ingest, query, goldstandard, metrics, retrieval_config, transfer, tuning
+from routers import auth as auth_router, help as help_router, health, collections, ingest, prepare, query, goldstandard, metrics, retrieval_config, transfer, tuning
 
 app.include_router(health.router)
 app.include_router(auth_router.router)
 app.include_router(help_router.router)
 app.include_router(collections.router)
 app.include_router(ingest.router)
+app.include_router(prepare.router)
 app.include_router(query.router)
 app.include_router(goldstandard.router)
 app.include_router(metrics.router)

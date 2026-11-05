@@ -133,6 +133,22 @@ export const api = {
   // The caller's running and recent jobs (#617); an Engineer gets everyone's.
   listIngestJobs: () => request<{ jobs: IngestJobEntry[] }>('GET', '/ingest/jobs'),
   getIngestConfig: (collection: string) => request<IngestConfig>('GET', `/ingest/config/${collection}`),
+
+  // Document preparation (#638): the preparation area on the instance.
+  uploadForPreparation: (form: FormData) =>
+    request<{ documents: PreparedDocument[]; skipped: string[] }>('POST', '/prepare/upload', form, true),
+  listPrepared: () => request<PreparedList>('GET', '/prepare/documents'),
+  getPrepared: (id: string) => request<PreparedDocument>('GET', `/prepare/documents/${encodeURIComponent(id)}`),
+  deletePrepared: (id: string) => request<null>('DELETE', `/prepare/documents/${encodeURIComponent(id)}`),
+  deletePreparedOutput: (id: string) => request<null>('DELETE', `/prepare/documents/${encodeURIComponent(id)}/prepared`),
+  startPreparation: (ids: string[] | 'all') =>
+    request<{ job_id: string; status: string; documents_queued: number }>('POST', '/prepare/jobs',
+      ids === 'all' ? { all: true } : { document_ids: ids }),
+  getPrepareJob: (jobId: string) => request<PrepareJob>('GET', `/prepare/job/${encodeURIComponent(jobId)}`),
+  listPrepareJobs: () => request<{ jobs: PrepareJob[] }>('GET', '/prepare/jobs'),
+  cancelPrepareJob: (jobId: string) => request<{ job_id: string; status: string }>('POST', `/prepare/job/${encodeURIComponent(jobId)}/cancel`),
+  importPrepared: (body: PrepareImportBody) =>
+    request<{ job_id: string; status: string; files_queued: number; collection: string }>('POST', '/prepare/import', body),
   saveIngestConfig: (body: SaveIngestConfigBody) => request<IngestConfig>('POST', '/ingest/config', body),
 
   // Retrieval settings are stored per collection by the API, not in the browser.
@@ -332,4 +348,31 @@ export interface HealthResult {
       note?: string
     }
   }
+}
+
+// Document preparation (#638).
+export const preparedRawUrl = (id: string) => `${BASE}/prepare/documents/${encodeURIComponent(id)}/raw`
+export const preparedOutputUrl = (id: string) => `${BASE}/prepare/documents/${encodeURIComponent(id)}/prepared`
+export interface PreparedFallback { window: number | null; reason: string }
+export interface PreparedPart {
+  name: string; bytes: number; characters: number; records?: number
+  title: string | null; summary: string | null; summary_error: string | null
+  fallback: boolean; fallbacks: PreparedFallback[]; preview?: string
+}
+export interface PreparedDocument {
+  id: string; name: string; raw_type: string; raw_bytes: number; owner: JobOwner | null; created_at: string
+  status: 'raw' | 'queued' | 'preparing' | 'prepared' | 'failed'; prepared_at: string | null; prepared_bytes: number
+  parts: PreparedPart[]; fallback: boolean; code_only_by_type: boolean; last_error: string | null
+  imports: { collection: string; job_id: string; at: string }[]
+}
+export interface PreparedList { documents: PreparedDocument[]; used_bytes: number; limit_bytes: number }
+export interface PrepareJob {
+  job_id: string; status: string; documents_total: number; documents_completed: number; documents_failed: number
+  document_ids: string[]; names: string[]; errors: string[]
+  current: { document_id: string; name: string; windows_done: number; windows_total: number } | null
+  owner: JobOwner | null; created_at: string | null; finished_at?: string | null
+}
+export interface PrepareImportBody {
+  collection: string; document_ids?: string[]; all?: boolean; strategy: string; chunk_size: number
+  chunk_overlap: number; similarity_threshold: number; min_chunk_size: number
 }
