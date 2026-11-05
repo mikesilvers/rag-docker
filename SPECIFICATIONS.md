@@ -1837,8 +1837,9 @@ before the job, as they do at API startup after an interrupted job.
    memory is bounded by one part whatever the file's size: once to count its windows, then to clean and write
    each part; a PDF or DOCX is parsed whole, as ingest parses it. CSV rows are found by `csv.reader` under
    Unstructured's `CSV_FIELD_LIMIT`, as ingest finds them (a quote inside an unquoted field is text, a field over
-   the limit fails the document), and kept as written; a row longer than a part can hold beside the header (an
-   unclosed quote, a file with no line breaks) fails the document as soon as it passes that, before it is held.
+   the limit fails the document), and kept as written. A row longer, as written, than a part can hold beside the
+   header (the header: longer than half a part) fails the document; reading stops as soon as a row's raw text
+   passes twice that, so an unclosed quote or a file with no line breaks is never held whole.
 4. *Clean* (PDF, DOCX, TXT, MD only) with §6.5: each part in windows of whole lines up to 3,000 characters
    (a longer line is not sent); the LLM names the lines to remove and code removes them, never rewriting.
    Each call has 120 s and is sent again once if it fails or times out; an unusable answer is asked again

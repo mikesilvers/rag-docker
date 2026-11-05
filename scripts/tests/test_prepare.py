@@ -1008,5 +1008,362 @@ class ReviewerTests(JobCase):
         return answer.json()["documents"][0]
 
 
+
+# ── testing review of 183ae0f: .txt and .md prepared part by part ──────────
+
+class StreamingReviewTests(JobCase):
+    """The streaming rewrite of _prepare_text (183ae0f): the window count, the two
+    passes, a file that changes between them, cancelling while counting, progress
+    and memory on the LLM path, and PDF/DOCX parsed once."""
+
+    def test_count_windows_matches_the_windows_built(self):
+        import random
+        w = preparation.WINDOW_CHARACTERS
+        texts = ["", "\n", "\n\n", "a", "a\n", "\na", "x" * (w - 1), "x" * w, "x" * (w + 5),
+                 "x" * (w - 1) + "\n" + "y", "a\n" + "x" * w + "\nb", "x" * w + "\n" + "x" * w,
+                 "\n".join("z" * 999 for _ in range(7)), "\n".join("q" * 1499 for _ in range(4)),
+                 "short\n" + "y" * 3500 + "\nafter"]
+        rng = random.Random(183)
+        for _ in range(300):
+            lines = [rng.choice("abc") * rng.choice([0, 1, 50, 998, 1499, 1500, 2998, 2999, 3000, 4000])
+                     for _ in range(rng.randint(0, 12))]
+            texts.append("\n".join(lines) + rng.choice(["", "\n"]))
+        for text in texts:
+            self.assertEqual(preparation.count_windows(text), len(preparation.windows(text)),
+                             f"lines {[len(l) for l in text.split(chr(10))]}")
+            self.assertEqual(list(preparation._lines(text)), text.split("\n"))
+
+    def changing_iter_parts(self, first, second):
+        """iter_parts that yields `first` parts on its first call, `second` after."""
+        calls = [0]
+
+        def fake(path, raw_type):
+            calls[0] += 1
+            count = first if calls[0] == 1 else second
+            for i in range(count):
+                yield preparation.Part(body=f"Part {i} text.\n")
+        return fake, calls
+
+    def test_a_text_file_that_changes_between_the_passes_fails_and_keeps_nothing(self):
+        # Data mutation: the count pass and the writing pass disagree.
+        for first, second in ((3, 2), (2, 3)):
+            fake, calls = self.changing_iter_parts(first, second)
+            record = self.document(f"moving-{first}{second}.txt", "Part text.\n")
+            with patch.object(preparation, "iter_parts", fake):
+                with self.assertRaisesRegex(ValueError, "changed while it was being prepared"):
+                    self.prepare(record)
+            self.assertEqual(calls[0], 2)
+            # Through a job: a first run fails, nothing prepared is left behind.
+            with patch.object(preparation, "iter_parts", self.changing_iter_parts(first, second)[0]):
+                job = asyncio.run(self.run_job([record["id"]]))
+            self.assertEqual(job["status"], "failed", job)
+            after = store.get(record["id"])
+            self.assertEqual(after["status"], "failed")
+            self.assertIn("changed while it was being prepared", after["last_error"])
+            self.assertEqual(after["parts"], [])
+            folder = Path(settings.preparation_dir) / "docs" / record["id"]
+            self.assertFalse((folder / "prepared.new").exists())
+            self.assertFalse(store.is_busy(record["id"]))
+
+    def test_a_changed_file_keeps_the_earlier_prepared_output(self):
+        record = self.document("kept.md", "Kept text.\n")
+        job = asyncio.run(self.run_job([record["id"]]))
+        self.assertEqual(job["status"], "completed")
+        before = store.get(record["id"])
+        with patch.object(preparation, "iter_parts", self.changing_iter_parts(2, 1)[0]):
+            job = asyncio.run(self.run_job([record["id"]]))
+        after = store.get(record["id"])
+        self.assertEqual(after["status"], "prepared")
+        self.assertEqual(after["parts"], before["parts"])
+        self.assertIn("changed while it was being prepared", after["last_error"])
+
+    def test_cancelling_while_windows_are_counted_writes_nothing(self):
+        stops = [0]
+
+        def should_stop():
+            stops[0] += 1
+            return stops[0] >= 3         # the check before the text, then during the count
+        written = []
+
+        async def write_part(index, suffix, data):
+            written.append(index)
+            return self.write(f"c{index}{suffix}", data)
+        paragraphs = "\n\n".join(f"Paragraph {i} " + "word " * 40 for i in range(200))
+        with patch.object(preparation, "PART_LIMIT", 4000), patch.object(preparation, "HEADER_ROOM", 500):
+            record = self.document("cancel.txt", paragraphs)
+            with self.assertRaises(preparation.Cancelled):
+                self.prepare(record, should_stop=should_stop, write_part=write_part)
+        self.assertEqual(written, [])
+
+    def test_progress_counts_every_window_once_on_both_paths(self):
+        paragraphs = "\n\n".join(f"Paragraph {i} " + "word " * 40 for i in range(200))
+        for max_windows in (1_000, 2):          # the LLM path, then too large for it
+            seen = []
+            with patch.object(preparation, "PART_LIMIT", 4000), \
+                    patch.object(preparation, "HEADER_ROOM", 500), \
+                    patch.object(preparation, "MAX_WINDOWS", max_windows):
+                record = self.document(f"progress{max_windows}.txt", paragraphs)
+                llm = StubLLM()
+                result = asyncio.run(preparation.prepare_document(
+                    store.raw_path(record["id"]), record["name"], record["raw_type"], llm.chat,
+                    llm.models, lambda: False, self._writer(record), lambda d, t: seen.append((d, t))))
+                expected = sum(len(preparation.windows(p.body))
+                               for p in preparation.iter_parts(store.raw_path(record["id"]), ".txt"))
+            self.assertGreater(len(result.parts), 1)
+            totals = {t for _, t in seen}
+            self.assertEqual(len(totals), 1, totals)
+            total = totals.pop()
+            self.assertEqual(total, expected)
+            done = [d for d, _ in seen]
+            self.assertEqual(done, sorted(done))
+            self.assertEqual((done[0], done[-1]), (0, total))
+            cleaning = [s for s, _ in llm.calls if s.startswith(preparation.CLEAN_SYSTEM)]
+            self.assertEqual(len(cleaning), total if max_windows == 1_000 else 0)
+
+    def _writer(self, record):
+        folder = self.root / "out" / record["id"]
+        folder.mkdir(parents=True, exist_ok=True)
+
+        async def write(index, suffix, data):
+            path = folder / f"{index + 1:03d}{suffix}"
+            path.write_bytes(data)
+            return path
+        return write
+
+    def test_the_llm_path_is_bounded_and_keeps_every_line_in_order(self):
+        # Bounded memory with the LLM cleaning every window, not only the
+        # too-large path the PR's own test takes: a file four times longer
+        # needs about the same peak, and far less than its size.
+        import tracemalloc
+        cleaned = [0]
+
+        class LeanLLM:
+            """Keeps no prompts, so the measure is the pipeline's memory."""
+            async def chat(self, system, user):
+                if system.startswith(preparation.CLEAN_SYSTEM):
+                    cleaned[0] += 1
+                    return '{"remove": []}'
+                return '{"title": "Long text", "summary": "Numbered paragraphs."}'
+
+            async def models(self):
+                return {f"{settings.llm_model}:latest"}
+
+        def run(name, paragraphs):
+            path = self.root / "uploads" / name
+            with path.open("w", encoding="utf-8") as fh:
+                for i in range(paragraphs):
+                    fh.write(f"Paragraph {i} " + "word " * 199 + "\n\n")
+            record = store.create(name, path, OWNER)
+            cleaned[0] = 0
+            with patch.object(preparation, "PART_LIMIT", 200_000), \
+                    patch.object(preparation, "MAX_WINDOWS", 100_000):
+                tracemalloc.start()
+                try:
+                    result = self.prepare(record, LeanLLM())
+                    _, peak = tracemalloc.get_traced_memory()
+                finally:
+                    tracemalloc.stop()
+            return record, result, peak, path.stat().st_size
+        _, _, small_peak, small_size = run("short.md", 2000)
+        record, result, peak, size = run("long.md", 8000)
+        print(f"\n    LLM path peaks: {small_peak:,} B for {small_size:,} B, {peak:,} B for {size:,} B",
+              file=sys.stderr)
+        self.assertLess(peak, size / 3, f"peak {peak:,} bytes for a {size:,}-byte file")
+        self.assertLess(peak, small_peak + small_size / 2,
+                        f"peak grew from {small_peak:,} to {peak:,} bytes with a file 4 times longer")
+        self.assertGreater(len(result.parts), 30)
+        self.assertFalse(result.fallback)
+        self.assertGreater(cleaned[0], 2000)
+        numbers = []
+        for i, part in enumerate(result.parts, 1):
+            self.assertEqual(part["name"], f"long-part-{i:03d}.md")
+            text = self.part_text(record["id"], part)
+            numbers += [int(m) for m in re.findall(r"^Paragraph (\d+) ", text, re.M)]
+        self.assertEqual(numbers, list(range(8000)))
+
+    def test_pdf_and_docx_are_parsed_once_and_text_files_read_twice(self):
+        class Element:
+            def __init__(self, text):
+                self.text = text
+
+            def __str__(self):
+                return self.text
+        parsed = []
+
+        def parse(path):
+            if Path(path).suffix == ".md":
+                return Path(path).read_text(encoding="utf-8"), []
+            parsed.append(Path(path).suffix)
+            return "", [Element("Overtime Approval. Requests go to the manager.")]
+        real = preparation.iter_parts
+        calls = []
+
+        def counting(path, raw_type):
+            calls.append(raw_type)
+            return real(path, raw_type)
+        with patch.object(ingest_pipeline, "_parse_file", parse), \
+                patch.object(preparation, "iter_parts", counting):
+            for name in ("once.pdf", "once.docx", "twice.txt", "twice.md"):
+                self.prepare(self.document(name, b"stub" if name.endswith(("pdf", "docx")) else "Text.\n"))
+        self.assertEqual(calls, [".pdf", ".docx", ".txt", ".txt", ".md", ".md"])
+        self.assertEqual(sorted(parsed), [".docx", ".pdf"])
+
+
+# ── testing review of 0fe2620: CSV rows found by csv.reader, bounded ────────
+
+class CsvReviewTests(JobCase):
+    """_csv_rows at 0fe2620: rows as ingest's csv.reader finds them, the row and
+    header limits at their boundaries, CRLF, memory with no line break, files
+    closed on every path, and a refused CSV through a job."""
+
+    def parts_of(self, name, data, limit):
+        with patch.object(preparation, "PART_LIMIT", limit):
+            record = self.document(name, data)
+            result = self.prepare(record)
+        return record, [self.part_text(record["id"], p) for p in result.parts], result
+
+    def test_a_row_that_exactly_fills_a_part_beside_the_header_is_kept(self):
+        # Spec §(prepare) step 3: only a row *longer* than a part can hold beside
+        # the header fails. header (4) + row (96) == PART_LIMIT (100) fits.
+        header = "a,b\n"
+        row = "1," + "x" * (100 - len(header) - 3) + "\n"
+        self.assertEqual(len(header) + len(row), 100)
+        record, texts, _ = self.parts_of("fill.csv", header + row, 100)
+        self.assertEqual(texts, [header + row])
+
+    def test_a_row_one_longer_than_a_part_holds_is_refused(self):
+        header = "a,b\n"
+        row = "1," + "x" * (100 - len(header) - 2) + "\n"
+        with patch.object(preparation, "PART_LIMIT", 100):
+            record = self.document("over.csv", header + row)
+            with self.assertRaisesRegex(ValueError, "CSV row longer than"):
+                self.prepare(record)
+
+    def test_a_crlf_row_that_fits_once_normalised_is_kept(self):
+        # A CRLF row is a character shorter once normalised; a row that fits a part
+        # after normalisation (what is written) should be kept.
+        header = "a,b\r\n"
+        row = "1," + "x" * (100 - 4 - 4) + "\r\n"          # normalised: 95 chars
+        record, texts, _ = self.parts_of("crlf.csv", header + row, 100)
+        self.assertEqual(texts, ["a,b\n" + row.replace("\r\n", "\n")])
+
+    def test_the_header_limit_is_half_a_part(self):
+        ok = "h" * 49 + "\n"                                   # 50 == 100 // 2
+        record, texts, _ = self.parts_of("half.csv", ok + "1\n", 100)
+        self.assertEqual(texts, [ok + "1\n"])
+        with patch.object(preparation, "PART_LIMIT", 100):
+            record = self.document("half1.csv", "h" * 50 + "\n1\n")
+            with self.assertRaisesRegex(ValueError, "header row is 51 characters or more"):
+                self.prepare(record)
+
+    def test_rows_are_the_rows_ingest_reads(self):
+        # Differential: for each dialect and quoting case, the prepared rows,
+        # read back with csv.reader, are ingest's rows (splitter._csv_units), in
+        # order, with nothing lost or joined, and each part under the limit.
+        import csv
+        import random
+        from services import splitter
+        rng = random.Random(639)
+        cells = ['plain', '5" screen', '"quoted, comma"', '"two\nlines"', '"say ""hi"""',
+                 'x' * 40, '', 'naïve', '"a\n\nb"', "it's"]
+        for delim in (",", ";", "\t", "|"):
+            for newline in ("\n", "\r\n"):
+                header = delim.join(["id", "name", "note"]) + newline
+                rows = []
+                for i in range(300):
+                    picked = [str(i), rng.choice(cells), rng.choice(cells)]
+                    rows.append(delim.join(c if delim not in c or c.startswith('"') else '"' + c + '"'
+                                           for c in picked) + newline)
+                data = header + "".join(rows)
+                name = f"d{ord(delim)}{len(newline)}.csv"
+                record, texts, result = self.parts_of(name, data, 1500)
+                path = store.raw_path(record["id"])
+                with path.open(encoding=splitter.text_encoding(path), newline="") as stream:
+                    dialect = splitter._csv_dialect(stream)
+                    _, units = splitter._csv_units(stream, dialect)
+                    expected = [u.cells for u in units if u.cells]
+                got = []
+                for text in texts:
+                    self.assertLessEqual(len(text), 1500)
+                    parsed = list(csv.reader(io.StringIO(text, newline=""), dialect))
+                    got += [r for r in parsed[1:] if r]
+                self.assertEqual(len(got), len(expected), name)
+                self.assertEqual(got, [[c.replace("\r\n", "\n") for c in r] for r in expected], name)
+                self.assertEqual(sum(p["records"] for p in result.parts), len(expected), name)
+
+    def test_one_long_line_is_refused_in_bounded_memory(self):
+        # No line break at all: readline is bounded by the row limit, so the peak
+        # is flat in the file's size (the encoding check reads 1 MiB blocks, a
+        # fixed ~2 MB): compare a 4 MB and a 16 MB file.
+        import tracemalloc
+        peaks = {}
+        for size in (4_000_000, 16_000_000):
+            record = self.document(f"flat{size}.csv", "a,b\n1," + "y" * size)
+            with patch.object(preparation, "PART_LIMIT", 20_000):
+                tracemalloc.start()
+                try:
+                    with self.assertRaisesRegex(ValueError, "CSV row longer than"):
+                        self.prepare(record)
+                    _, peaks[size] = tracemalloc.get_traced_memory()
+                finally:
+                    tracemalloc.stop()
+        self.assertLess(peaks[16_000_000], 16_000_000 / 4, peaks)
+        self.assertLess(peaks[16_000_000] - peaks[4_000_000], 1_000_000, peaks)
+
+    def test_the_csv_is_closed_on_every_path(self):
+        import gc
+        import warnings
+        cases = [("ok.csv", "a,b\n1,2\n", None),
+                 ("headonly.csv", "a,b\n", None),
+                 ("blank.csv", "\n\n\n", None),
+                 # An unclosed quote that swallows more than a part is refused while
+                 # it is read; one that still fits is refused by the part check's
+                 # partition_csv, as ingest refuses it.
+                 ("bad.csv", 'a,b\n1,"open\n' + "z,z\n" * 400, "CSV row longer than"),
+                 ("unclosed.csv", 'a,b\n1,"open\n' + "z,z\n" * 200, "EOF inside string"),
+                 ("field.csv", None, "is not a CSV that can be read")]
+        from unstructured.partition.csv import CSV_FIELD_LIMIT
+        for name, data, error in cases:
+            if data is None:
+                data = 'a,b\n1,"' + "f" * (CSV_FIELD_LIMIT + 10) + '"\n'
+            limit = 4 * CSV_FIELD_LIMIT if name == "field.csv" else 1000
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ResourceWarning)
+                with patch.object(preparation, "PART_LIMIT", limit):
+                    record = self.document(name, data)
+                    if error:
+                        with self.assertRaisesRegex(ValueError, error):
+                            self.prepare(record)
+                    else:
+                        try:
+                            self.prepare(record)
+                        except ValueError:
+                            pass
+                gc.collect()
+            leaks = [str(w.message) for w in caught if issubclass(w.category, ResourceWarning)]
+            self.assertEqual(leaks, [], name)
+
+    def test_a_refused_csv_fails_its_job_and_keeps_nothing(self):
+        with patch.object(preparation, "PART_LIMIT", 1000):
+            record = self.document("job.csv", 'id,note\n1,"never closed\n' + "2,two\n" * 400)
+            job = asyncio.run(self.run_job([record["id"]]))
+        self.assertEqual(job["status"], "failed", job)
+        after = store.get(record["id"])
+        self.assertEqual(after["status"], "failed")
+        self.assertIn("CSV row longer than", after["last_error"])
+        self.assertEqual(after["parts"], [])
+        folder = Path(settings.preparation_dir) / "docs" / record["id"]
+        self.assertFalse((folder / "prepared.new").exists())
+        self.assertFalse(store.is_busy(record["id"]))
+        # The other documents of the job still run: a good CSV next to a bad one.
+        with patch.object(preparation, "PART_LIMIT", 1000):
+            good = self.document("good.csv", "x,y\n1,2\n")
+            bad = self.document("bad2.csv", "x,y\n1," + "q" * 5000 + "\n")
+            job = asyncio.run(self.run_job([good["id"], bad["id"]]))
+        self.assertEqual(job["status"], "partial", job)
+        self.assertEqual(store.get(good["id"])["status"], "prepared")
+        self.assertEqual(store.get(bad["id"])["status"], "failed")
+
+
 if __name__ == "__main__":
     unittest.main()

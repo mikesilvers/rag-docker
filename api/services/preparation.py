@@ -193,93 +193,67 @@ def _element_units(path: Path) -> Iterator[str]:
 
 
 class _RowTooLong(ValueError):
-    pass
+    def __init__(self, limit: int, characters: int) -> None:
+        self.characters = characters
+        super().__init__(
+            f"has a CSV row longer than {limit:,} characters, more than one part can hold; a "
+            f"row is never cut, so check the file for an unclosed quote, or split the row")
 
 
-def _row_too_long(limit: int) -> _RowTooLong:
-    return _RowTooLong(
-        f"has a CSV row longer than {limit:,} characters, more than one part can hold; a row "
-        f"is never cut, so check the file for an unclosed quote, or split the row")
-
-
-def _csv_rows(path: Path) -> tuple[str, Iterator[str]]:
-    """The header row and the other rows, each exactly as written (normalised),
+class _CsvRows:
+    """The rows of an open CSV stream, each exactly as written (normalised) and
     ending in a line break.
 
     Rows are found by csv.reader under Unstructured's CSV_FIELD_LIMIT, as ingest
     reads a CSV (splitter._csv_units): a quote inside an unquoted field is text,
     a quoted field may hold line breaks, and a field over the limit fails the
-    file. The reader is fed whole lines through a reader that keeps each row's raw
-    lines, so a row stays exactly as written, and that refuses a line or a row
-    longer than one part can hold (the header: half a part, as its rule says)
-    before it is held, so an unclosed quote or a file with no line break can't
-    grow a row without bound (PR #639 review)."""
-    try:
-        from unstructured.partition.csv import CSV_FIELD_LIMIT
-        csv.field_size_limit(CSV_FIELD_LIMIT)
-    except ImportError:
-        pass
-    encoding = splitter.text_encoding(path)
-    with path.open(encoding=encoding, newline="") as probe:
-        dialect = splitter._csv_dialect(probe)
+    file. The reader is fed whole lines through one that keeps each row's raw
+    lines, so a row stays exactly as written.
 
-    stream = path.open(encoding=encoding, newline="")
-    raw: list[str] = []
-    state = {"size": 0, "limit": PART_LIMIT // 2}
+    Two limits (PR #639 review): a row is refused when, normalised, it is longer
+    than `limit`, what a part can hold for it; and reading stops as soon as a
+    row's raw text passes twice that, so an unclosed quote or a file with no line
+    break can't grow a row without bound. Normalising only shortens a row (CRLF
+    becomes LF, control characters go, NFC composes), so no row that fits is
+    refused by the raw bound."""
 
-    def lines() -> Iterator[str]:
+    def __init__(self, stream: Any, dialect: Any, limit: int) -> None:
+        self.stream = stream
+        self.limit = limit
+        self.raw: list[str] = []
+        self.size = 0
+        self.reader = csv.reader(self._lines(), dialect)
+
+    def _lines(self) -> Iterator[str]:
         while True:
-            limit = state["limit"]
-            line = stream.readline(limit + 1)
+            cap = 2 * self.limit
+            line = self.stream.readline(cap + 1)
             if not line:
                 return
-            state["size"] += len(line)
-            if state["size"] > limit:
-                raise _row_too_long(limit)
-            raw.append(line)
+            self.size += len(line)
+            if self.size > cap:
+                raise _RowTooLong(self.limit, self.size)
+            self.raw.append(line)
             yield line
 
-    reader = csv.reader(lines(), dialect)
-
-    def next_row() -> str | None:
+    def next(self) -> str | None:
+        """The next row with text, or None at the end of the file."""
         while True:
-            raw.clear()
-            state["size"] = 0
+            self.raw.clear()
+            self.size = 0
             try:
-                next(reader)
+                next(self.reader)
             except StopIteration:
                 return None
             except csv.Error as exc:
                 raise ValueError(f"is not a CSV that can be read: {exc}") from exc
-            row = normalise_text("".join(raw))
+            row = normalise_text("".join(self.raw))
             if not row.endswith("\n"):
                 row += "\n"
+            if len(row) > self.limit:
+                raise _RowTooLong(self.limit, len(row))
             if row.strip():
                 return row
-
-    try:
-        header = next_row() or ""
-    except _RowTooLong:
-        stream.close()
-        raise _header_too_long(state["size"]) from None
-    except BaseException:
-        stream.close()
-        raise
-    # A data row may hold what a part has left beside the header (less one for
-    # the line break a last row without one is given).
-    state["limit"] = max(PART_LIMIT - len(header) - 1, 1)
-
-    def rows() -> Iterator[str]:
-        try:
-            while True:
-                row = next_row()
-                if row is None:
-                    return
-                yield row
-        finally:
-            stream.close()
-
-    return header, rows()
 
 
 def _header_too_long(characters: int) -> ValueError:
@@ -290,23 +264,43 @@ def _header_too_long(characters: int) -> ValueError:
 
 
 def _csv_parts(path: Path) -> Iterator[Part]:
-    header, rows = _csv_rows(path)
-    if not header:
-        return
-    if 2 * len(header) > PART_LIMIT:
-        raise _header_too_long(len(header))
-    room = PART_LIMIT - len(header)
-    current: list[str] = []
-    size = 0
-    for row in rows:
-        if current and size + len(row) > room:
-            body = header + "".join(current)
-            yield Part(body=body, measure=body, records=len(current), header=header)
-            current, size = [], 0
-        current.append(row)
-        size += len(row)
-    body = header + "".join(current)
-    yield Part(body=body, measure=body, records=len(current), header=header)
+    """A CSV's parts: its rows, in order, with the header row repeated at the start
+    of each, every part at most PART_LIMIT characters as written. The file is
+    opened here, so every way out of this closes it."""
+    try:
+        from unstructured.partition.csv import CSV_FIELD_LIMIT
+        csv.field_size_limit(CSV_FIELD_LIMIT)
+    except ImportError:
+        pass
+    encoding = splitter.text_encoding(path)
+    with path.open(encoding=encoding, newline="") as probe:
+        dialect = splitter._csv_dialect(probe)
+    with path.open(encoding=encoding, newline="") as stream:
+        # The header may hold at most half a part, as its rule says.
+        rows = _CsvRows(stream, dialect, PART_LIMIT // 2)
+        try:
+            header = rows.next()
+        except _RowTooLong as exc:
+            raise _header_too_long(exc.characters) from None
+        if not header:
+            return
+        # A data row may hold what a part has left beside the header.
+        room = PART_LIMIT - len(header)
+        rows.limit = room
+        current: list[str] = []
+        size = 0
+        while True:
+            row = rows.next()
+            if row is None:
+                break
+            if current and size + len(row) > room:
+                body = header + "".join(current)
+                yield Part(body=body, measure=body, records=len(current), header=header)
+                current, size = [], 0
+            current.append(row)
+            size += len(row)
+        body = header + "".join(current)
+        yield Part(body=body, measure=body, records=len(current), header=header)
 
 
 def _compact_json(value: Any) -> str:
