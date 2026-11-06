@@ -192,6 +192,19 @@ class EmbedBatchingTests(unittest.TestCase):
             self.insert(collection, chunks(2))
         self.assertEqual(len(collection.batch.sent), 1)
 
+    def test_a_send_error_during_a_retry_keeps_the_first_pass_acknowledged(self):
+        class SendFailsOnRetry(Batch):
+            def add_object(self, properties, uuid, vector=None):
+                if len(self.sent) == 1:
+                    raise ConnectionError("send failed")
+                super().add_object(properties, uuid, vector)
+        collection = Collection([fail(2)])
+        collection.batch = SendFailsOnRetry(collection)
+        with self.assertRaises(ConnectionError) as raised:
+            self.insert(collection, chunks(5))
+        self.assertEqual(batch_write.write_counts(raised.exception), (5, 3))
+        self.assertEqual(collection.rows, {})            # owned records rolled back
+
     def test_a_stream_that_changes_before_a_retry_fails(self):
         collection = Collection([fail(1)])
         rows = chunks(3)

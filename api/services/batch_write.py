@@ -294,8 +294,8 @@ def insert(collection, records, *, exact: bool = True, expected_count: int | Non
     A write with any record left to Weaviate's vectorizer uses bounded batches;
     objects whose embedding timed out in Weaviate are sent again, up to
     EMBED_TIMEOUT_RETRIES times, and no other failure is retried (#613).
-    A failure carries `write_counts` = (records queued, records the flushed batch
-    acknowledged without a per-object error); 0 acknowledged if it never flushed.
+    A failure carries `write_counts` = (records queued, records the flushed batches
+    acknowledged without a per-object error); 0 acknowledged if none flushed.
     """
     factory = _factory(records)
     with ExpectedRecords() as expected:
@@ -324,10 +324,10 @@ def insert(collection, records, *, exact: bool = True, expected_count: int | Non
                     failed = collection.batch.failed_objects or []
                     if not failed:
                         break
+                    accepted = queued - len(failed)
                     resend = {_failed_uuid(error) for error in failed}
                     if (attempt == EMBED_TIMEOUT_RETRIES or None in resend
                             or not all(_vectorizer_timeout(error) for error in failed)):
-                        accepted = queued - len(failed)
                         detail = getattr(failed[0], "message", None)
                         raise RuntimeError(
                             f"Weaviate rejected {len(failed)} batch object(s)"
