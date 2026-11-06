@@ -703,7 +703,7 @@ docker compose down -v
 docker volume prune -a
 ```
 
-On Docker 23.0 and later, `docker volume prune` without `--all`, and `docker system prune --volumes` with or without `-a`, remove only anonymous volumes, which this stack doesn't use, so they leave its data alone. No clean-up here needs them.
+Don't run `docker volume prune` or `docker system prune --volumes` either. On Docker before 23.0 they delete every volume no container uses, which after `docker compose down` is all of this stack's. Docker 23.0 and later limits them to anonymous volumes, but no clean-up here needs them.
 
 ## GPU acceleration (optional)
 
