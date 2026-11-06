@@ -57,7 +57,7 @@ So budget the figures above **plus the size of your document corpus** — counte
 
 To change the disk allocation: **Docker Desktop → Settings → Resources → Virtual disk limit**, then apply and restart. On Docker Engine (Linux) there is no virtual disk — the limit is simply free space on `/var/lib/docker`.
 
-Reclaim space at any time with `docker builder prune` (build cache only) or `docker system prune -a` (also removes unused images, forcing a full rebuild).
+To free the space a rebuild leaves behind, see [Freeing space after an update](#freeing-space-after-an-update).
 
 ## Quick start
 
@@ -340,9 +340,9 @@ browser's `Host` with its port, which the API's same-origin check compares with
 `Origin`. The file is a single-file bind mount, so a running proxy keeps the old
 copy: until it is recreated, every change the UI sends (a query, an upload,
 logout, a password change) is refused `403 CROSS_ORIGIN_REFUSED`, although the
-login itself works. After pulling, run
-`docker compose up -d --build --force-recreate` (or at least
-`docker compose up -d --force-recreate proxy`).
+login itself works. Update as in
+[Updating to a newer version](#updating-to-a-newer-version): its rebuild step
+recreates the proxy.
 
 A package's `retrieve.py` now logs in: `python3 retrieve.py --username alice
 "question"` asks for the password (or reads it with `--password-stdin`). A
@@ -573,9 +573,8 @@ docker compose down -v
 docker compose logs -f api
 docker compose logs -f ollama
 
-# Rebuild after code changes
-docker compose build api ui
-docker compose up -d
+# Rebuild and restart after pulling new code (see "Updating to a newer version")
+docker compose up -d --build --force-recreate
 
 # Check service health
 docker compose ps
@@ -585,9 +584,126 @@ docker compose ps
 `proxy/locations.conf` and LAN mode's `proxy/nginx.lan.conf`, are each mounted as a single file. `git pull`
 replaces a changed file instead of rewriting it, so a running proxy keeps reading the old copy, and
 `docker compose up -d` alone doesn't recreate it. After pulling a change to any of them, run
-`docker compose up -d --force-recreate proxy` (in LAN mode with its two `-f` options). Until then, for example,
+`docker compose up -d --force-recreate proxy` (in LAN mode with its two `-f` options). The [update steps](#updating-to-a-newer-version) do this. Until then, for example,
 `POST /api/goldstandard/regenerate` (regenerating a gold-standard pair) keeps the old configuration's generic
 300 s read timeout and can end in a 504 from the proxy (#278).
+
+## Updating to a newer version
+
+Run these commands in the `rag-docker` folder. Your collections, accounts and downloaded models are kept: they live in Docker volumes that these steps don't touch. There are two ways to get the new code: the latest release, for normal use, or `develop`, for testing.
+
+### 1. Get the new code
+
+Pick one of the two.
+
+**The latest release (normal use)**
+
+```bash
+# Download the newest branches and release tags
+git fetch origin --tags
+# Switch to the release branch (a fresh clone starts on develop)
+git switch main
+# Bring it up to date
+git pull
+# Print the newest release tag
+git tag --sort=-v:refname | head -n 1
+# Print the release this folder is on
+git describe --tags
+```
+
+When the last two print the same name, for example `v1.1.0`, you have the latest release.
+
+**Testing new code (`develop`), for testing only**
+
+`develop` holds work that isn't in a release yet. Use it to try new code, not for normal use.
+
+```bash
+# Switch to the development branch
+git switch develop
+# Bring it up to date
+git pull
+```
+
+Both ways continue with the same steps below.
+
+### 2. Rebuild and restart
+
+```bash
+# Rebuild api and ui, download any newer images, recreate every container (data is kept)
+docker compose up -d --build --force-recreate
+```
+
+Recreating every container includes the proxy, so it reads the new configuration files. In LAN mode ([Sharing with your office](#sharing-with-your-office)) use the same two `-f` options:
+
+```bash
+# Rebuild api and ui, download any newer images, recreate every container (data is kept)
+docker compose -f docker-compose.yml -f docker-compose.lan.yml up -d --build --force-recreate
+```
+
+The rebuild takes a few minutes; the api image alone takes about 3 minutes from scratch.
+
+### 3. Check that it is back
+
+```bash
+# List the services and their state
+docker compose ps
+# Ask the API whether it is healthy
+curl http://localhost:8080/api/health
+```
+
+It is ready when weaviate, ollama and api show `healthy`, and ui and proxy `running`. The first start after an update can take up to about 3 minutes.
+
+In LAN mode:
+
+```bash
+# List the services and their state
+docker compose -f docker-compose.yml -f docker-compose.lan.yml ps
+# Ask the API whether it is healthy
+curl -k https://office-mac.local/api/health
+```
+
+Use one of your `RAG_LAN_HOSTNAMES` in place of `office-mac.local`. `-k` accepts the self-signed certificate. If you set `RAG_LAN_PORT`, add `:<port>` after the name.
+
+### 4. Reload the browser
+
+Reload every open tab of the workbench (Cmd+Shift+R on a Mac, Ctrl+Shift+R elsewhere) so it loads the new UI: a tab left open keeps running the old one.
+
+### Freeing space after an update
+
+A rebuild leaves the old images and build cache behind.
+
+```bash
+# Show how much space images, containers, volumes and build cache take, and how much can be reclaimed (changes nothing)
+docker system df
+# Remove old images that are no longer tagged, such as the api and ui images a rebuild replaced
+docker image prune
+# Remove leftover build cache (a later build may take a little longer)
+docker builder prune
+```
+
+Both prune commands ask `y/N` before deleting and never touch volumes, so your data is safe.
+
+Optional, to also remove old versions of the ollama, weaviate and nginx images: run this only while the stack is running, as step 3 shows.
+
+```bash
+# Remove every image that no container uses
+docker image prune -a
+```
+
+With the stack stopped (`docker compose down`), it deletes the stack's own images too: the next start downloads about 3.5 GB again and rebuilds api and ui. It also removes the images of any other project that has no container at the time.
+
+### Don't run these
+
+These delete your collections, accounts, uploads and the downloaded models:
+
+```bash
+# Deletes all of this stack's volumes
+docker compose down -v
+# Deletes every volume no container uses: after `docker compose down`, all of this stack's (--all is the same)
+docker volume prune -a
+```
+
+Don't run `docker volume prune` or `docker system prune --volumes` either. On Docker before 23.0 they delete every volume no container uses, which after `docker compose down` is all of this stack's. Docker 23.0 and later limits them to anonymous volumes, but no clean-up here needs them.
 
 ## GPU acceleration (optional)
 
@@ -664,7 +780,7 @@ Six named Docker volumes persist data across restarts:
 | `rag_preparation` | The preparation area (#638): raw documents uploaded on **Data → Prepare** and their prepared parts, until deleted. At most `MAX_PREPARATION_BYTES`. Not part of collection export packages |
 | `auth_data` | Accounts, password hashes, sessions and the login throttle (`auth.db`, SQLite, #25) |
 
-Run `docker compose down -v` to delete all volumes and start fresh.
+Run `docker compose down -v` to delete all volumes and start fresh. Updating keeps every volume; see [Don't run these](#dont-run-these) for the commands that delete them.
 
 ## Project structure
 
