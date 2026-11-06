@@ -13,8 +13,11 @@ SPECIFICATIONS.md §3.1.11. In order, for one document:
    boilerplate. Code removes them; the LLM never rewrites text. A window whose
    answer fails the fidelity check keeps its code-only text, and the fallback
    is recorded with its reason.
-4. Give every part a **title and summary** (in the text for the four text
-   types, in the record only for CSV and JSON Lines).
+4. Give every part a **title and summary**. For the four text types the LLM
+   writes them, at the start of the part's text. CSV and JSON Lines parts are
+   labelled from their data with no LLM call (#648): the file name and part n
+   of N, the record count, the field names, and the first and last records'
+   keys, in the record only. A CSV or JSON document makes no LLM call at all.
 5. **Check** each written part as ingest reads it, against the rules that don't
    depend on chunk settings.
 
@@ -60,6 +63,8 @@ MAX_WINDOWS = 1_000
 TITLE_INPUT = 6_000
 MAX_TITLE = 150
 MAX_SUMMARY_WORDS = 80
+LABEL_CHARACTERS = 40
+MAX_LABEL_FIELDS = 20
 CALL_SECONDS = 120.0
 FAILED_CALLS_IN_A_ROW = 3
 
@@ -147,13 +152,16 @@ def part_names(name: str, kind: str, count: int) -> list[str]:
 @dataclass
 class Part:
     """A part's code-only content. `body` is what the file holds (before any
-    cleaning and header); `measure` is its text as ingest reads it, for the
-    title and summary of CSV and JSON Lines; `records` counts CSV rows or JSON
-    Lines records."""
+    cleaning and header); `measure` is its text as ingest reads it; `records`
+    counts CSV rows or JSON Lines records. A CSV or JSON Lines part also has its
+    label's field names and first and last record keys (#648)."""
     body: str
     measure: str = ""
     records: int | None = None
     header: str = ""          # a CSV part's header row
+    fields: list[str] = field(default_factory=list)
+    first_key: str = ""
+    last_key: str = ""
 
 
 def _joined_parts(units: Iterator[str], limit: int) -> Iterator[str]:
@@ -222,6 +230,7 @@ class _CsvRows:
         self.limit = limit
         self.raw: list[str] = []
         self.size = 0
+        self.cells: list[str] = []    # the cells of the row `next` returned last
         self.reader = csv.reader(self._lines(), dialect)
 
     def _lines(self) -> Iterator[str]:
@@ -242,7 +251,7 @@ class _CsvRows:
             self.raw.clear()
             self.size = 0
             try:
-                next(self.reader)
+                cells = next(self.reader)
             except StopIteration:
                 return None
             except csv.Error as exc:
@@ -253,6 +262,7 @@ class _CsvRows:
             if len(row) > self.limit:
                 raise _RowTooLong(self.limit, len(row))
             if row.strip():
+                self.cells = cells
                 return row
 
 
@@ -284,23 +294,32 @@ def _csv_parts(path: Path) -> Iterator[Part]:
             raise _header_too_long(exc.characters) from None
         if not header:
             return
+        fields = [_label(normalise_text(cell)) or "(blank)" for cell in rows.cells]
         # A data row may hold what a part has left beside the header.
         room = PART_LIMIT - len(header)
         rows.limit = room
         current: list[str] = []
         size = 0
+        position = 0
+        first = last = ""
         while True:
             row = rows.next()
             if row is None:
                 break
             if current and size + len(row) > room:
                 body = header + "".join(current)
-                yield Part(body=body, measure=body, records=len(current), header=header)
+                yield Part(body=body, measure=body, records=len(current), header=header,
+                           fields=fields, first_key=first, last_key=last)
                 current, size = [], 0
+            position += 1
+            last = _csv_key(rows.cells, position)
+            if not current:
+                first = last
             current.append(row)
             size += len(row)
         body = header + "".join(current)
-        yield Part(body=body, measure=body, records=len(current), header=header)
+        yield Part(body=body, measure=body, records=len(current), header=header,
+                   fields=fields, first_key=first, last_key=last)
 
 
 def _compact_json(value: Any) -> str:
@@ -321,9 +340,10 @@ def _compact_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def _json_records(path: Path) -> Iterator[tuple[str, str]]:
-    """A .json file's (or decompressed .json.gz member's) records as (line, text):
-    each record written as compact JSON, and its text as ingest converts it."""
+def _json_records(path: Path) -> Iterator[tuple[str, str, Any]]:
+    """A .json file's (or decompressed .json.gz member's) records as (line, text,
+    value): each record written as compact JSON, its text as ingest converts it,
+    and the record itself."""
     if path.stat().st_size > ip.MAX_JSON_INPUT_BYTES:
         raise ValueError(ip._json_input_too_large("is larger than"))
     try:
@@ -344,10 +364,10 @@ def _json_records(path: Path) -> Iterator[tuple[str, str]]:
             raise ValueError(ip._record_too_large(f"record {position}")) from exc
         except RecursionError as exc:
             raise ValueError("is not valid JSON: it is nested too deeply to read") from exc
-        yield _compact_json(group), "\n".join(lines)
+        yield _compact_json(group), "\n".join(lines), group
 
 
-def _json_gz_records(path: Path) -> Iterator[tuple[str, str]]:
+def _json_gz_records(path: Path) -> Iterator[tuple[str, str, Any]]:
     fd, name = tempfile.mkstemp(dir=settings.upload_dir, prefix="prepare-", suffix=".json")
     os.close(fd)
     plain = Path(name)
@@ -361,17 +381,18 @@ def _json_gz_records(path: Path) -> Iterator[tuple[str, str]]:
         plain.unlink(missing_ok=True)
 
 
-def _jsonl_records(path: Path) -> Iterator[tuple[str, str]]:
-    """A JSON Lines file's records as (line as written, text), blank lines left out."""
+def _jsonl_records(path: Path) -> Iterator[tuple[str, str, Any]]:
+    """A JSON Lines file's records as (line as written, text, value), blank lines
+    left out."""
     try:
         if ip._is_jsonl_gz(path.name):
             with gzip.open(path, "rb") as gz:
-                for _n, raw, text in ip._iter_jsonl_lines(ip._BoundedLines(gz)):
-                    yield raw.decode("utf-8"), text
+                for _n, raw, text, value in ip._iter_jsonl_values(ip._BoundedLines(gz)):
+                    yield raw.decode("utf-8"), text, value
         else:
             with path.open("rb") as fh:
-                for _n, raw, text in ip._iter_jsonl_lines(fh):
-                    yield raw.decode("utf-8"), text
+                for _n, raw, text, value in ip._iter_jsonl_values(fh):
+                    yield raw.decode("utf-8"), text, value
     except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
         raise ValueError(
             f"is not a valid gzip file; it may be truncated or corrupt ({exc})") from exc
@@ -379,27 +400,115 @@ def _jsonl_records(path: Path) -> Iterator[tuple[str, str]]:
         raise ValueError(ip._jsonl_reason(path, exc)) from exc
 
 
-def _record_parts(records: Iterator[tuple[str, str]]) -> Iterator[Part]:
+def _record_parts(records: Iterator[tuple[str, str, Any]]) -> Iterator[Part]:
     """JSON Lines parts: records in order, each part's text as ingest reads it
     (records with text joined by a blank line) at most PART_LIMIT characters and
-    at most MAX_JSON_RECORDS records. A record over the limit is a part of its own."""
+    at most MAX_JSON_RECORDS records. A record over the limit is a part of its own.
+    Each part has its label's fields (the top-level keys of its object records,
+    first seen first) and its first and last records' keys (#648)."""
     lines: list[str] = []
     texts: list[str] = []
+    keys: dict[str, None] = {}
+    first = last = ""
     size = 0
-    for line, text in records:
+    position = 0
+
+    def part() -> Part:
+        return Part(body="\n".join(lines) + "\n", measure="\n\n".join(texts),
+                    records=len(lines), fields=[_label(k) for k in keys],
+                    first_key=first, last_key=last)
+
+    for line, text, value in records:
         added = (len(text) + (2 if texts else 0)) if text.strip() else 0
         if lines and (size + added > PART_LIMIT or len(lines) >= ip.MAX_JSON_RECORDS):
-            yield Part(body="\n".join(lines) + "\n", measure="\n\n".join(texts),
-                       records=len(lines))
-            lines, texts, size = [], [], 0
+            yield part()
+            lines, texts, keys, size = [], [], {}, 0
             added = len(text) if text.strip() else 0
+        position += 1
+        last = _json_key(value, position)
+        if not lines:
+            first = last
+        if isinstance(value, dict):
+            for key in value:
+                keys.setdefault(str(key), None)
         lines.append(line)
         if text.strip():
             texts.append(text)
         size += added
     if lines:
-        yield Part(body="\n".join(lines) + "\n", measure="\n\n".join(texts),
-                   records=len(lines))
+        yield part()
+
+
+# ── record labels (#648) ─────────────────────────────────────────────────────
+
+def _label(text: str) -> str:
+    """Whitespace runs made one space; over LABEL_CHARACTERS, cut with an ellipsis."""
+    text = " ".join(text.split())
+    if len(text) > LABEL_CHARACTERS:
+        text = text[:LABEL_CHARACTERS - 1] + "…"
+    return text
+
+
+def _position_key(position: int) -> str:
+    return f"record {position:,}"
+
+
+def _csv_key(cells: list[str], position: int) -> str:
+    """A CSV row's key: its first cell, or its position when that is blank."""
+    key = _label(normalise_text(cells[0])) if cells else ""
+    return key or _position_key(position)
+
+
+def _json_key(value: Any, position: int) -> str:
+    """A JSON record's key: the value of its first top-level field, or its
+    position when it isn't an object, is empty, or that value is null or blank."""
+    if not isinstance(value, dict) or not value:
+        return _position_key(position)
+    first = next(iter(value.values()))
+    if first is None:
+        return _position_key(position)
+    if isinstance(first, str):
+        text = first
+    elif isinstance(first, ip._JsonNumber):
+        text = first.text
+    elif first is True or first is False:
+        text = "true" if first else "false"
+    else:
+        text = _compact_json(first)
+    return _label(text) or _position_key(position)
+
+
+def record_title(name: str, number: int, total: int) -> str:
+    """`<name>`, or `<name>, part n of N`; the name cut to keep it in MAX_TITLE."""
+    name = " ".join(name.split())
+    suffix = f", part {number} of {total}" if total > 1 else ""
+    room = MAX_TITLE - len(suffix)
+    if len(name) > room:
+        name = name[:room - 1] + "…"
+    return name + suffix
+
+
+def record_summary(count: int, fields: list[str], first: str, last: str) -> str:
+    """`<count> records. Fields: a, b. First: <key>; last: <key>.`: at most
+    MAX_LABEL_FIELDS names, fewer if needed to stay in MAX_SUMMARY_WORDS words,
+    then `and M more`. Names and keys are at most LABEL_CHARACTERS (20 words)
+    each, so one name always fits: 8 fixed words + 20 + 2 x 20 = 68. A CSV with
+    a header and no rows has no keys: `First: none; last: none`."""
+    def text(shown: int) -> str:
+        if not fields:
+            listed = "none"
+        else:
+            listed = ", ".join(fields[:shown])
+            if len(fields) > shown:
+                listed += f", and {len(fields) - shown:,} more"
+        return (f"{count:,} records. Fields: {listed}. First: {first or 'none'}; "
+                f"last: {last or 'none'}.")
+    shown = min(len(fields), MAX_LABEL_FIELDS)
+    summary = text(shown)
+    while shown > 1 and len(summary.split()) > MAX_SUMMARY_WORDS:
+        shown -= 1
+        summary = text(shown)
+    return summary
 
 
 def iter_parts(path: Path, raw_type: str) -> Iterator[Part]:
@@ -698,15 +807,17 @@ async def prepare_document(raw: Path, name: str, raw_type: str, chat: Chat,
     """Prepare one document. Raises ValueError (its failure reason), Cancelled,
     or StorageRefused from write_part."""
     kind = output_kind(raw_type)
+    if kind != "text":
+        # CSV and JSON are labelled from their data: no LLM call, no model check (#648).
+        if should_stop():
+            raise Cancelled()
+        return await _prepare_records(raw, raw_type, name, kind, should_stop, write_part)
     llm = LLM(chat, should_stop)
     if not await model_available(list_models):
         llm.down = True
     if should_stop():
         raise Cancelled()
-
-    if kind == "text":
-        return await _prepare_text(raw, raw_type, name, llm, should_stop, write_part, progress)
-    return await _prepare_records(raw, raw_type, name, kind, llm, should_stop, write_part)
+    return await _prepare_text(raw, raw_type, name, llm, should_stop, write_part, progress)
 
 
 def _no_text(name: str) -> ValueError:
@@ -811,11 +922,11 @@ async def _write(index: int, part_name: str, text: str, kind: str, write_part) -
     return entry
 
 
-async def _prepare_records(raw: Path, raw_type: str, name: str, kind: str, llm: LLM,
+async def _prepare_records(raw: Path, raw_type: str, name: str, kind: str,
                            should_stop, write_part) -> Result:
-    """CSV, JSON and JSON Lines: code-only, a part at a time. Their names depend on
-    how many parts there are, so parts are written under their index and named
-    when the count is known."""
+    """CSV, JSON and JSON Lines: code-only, a part at a time, each labelled from its
+    data (#648). Their names and titles depend on how many parts there are, so parts
+    are written under their index and named and titled when the count is known."""
     iterator = iter_parts(raw, raw_type)
     result = Result()
     entries: list[dict] = []
@@ -826,17 +937,19 @@ async def _prepare_records(raw: Path, raw_type: str, name: str, kind: str, llm: 
             break
         if should_stop():
             raise Cancelled()
-        title, summary, error = await title_summary(part.measure or part.body, llm)
+        summary = record_summary(part.records or 0, part.fields, part.first_key, part.last_key)
         entry = await _write(index, "", part.body, kind, write_part)
         if kind == "csv":
             entry["records"] = part.records
-        entry.update(title=title, summary=summary, summary_error=error,
+        entry.update(title=None, summary=summary, summary_error=None,
                      fallback=False, fallbacks=[])
         entries.append(entry)
         index += 1
     if not entries:
         raise _no_text(name)
-    for entry, part_name in zip(entries, part_names(name, kind, len(entries))):
+    count = len(entries)
+    for number, (entry, part_name) in enumerate(zip(entries, part_names(name, kind, count)), 1):
         entry["name"] = part_name
+        entry["title"] = record_title(name, number, count)
     result.parts = entries
     return result
