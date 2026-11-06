@@ -20,6 +20,7 @@ REGISTERED = (
     ('scripts/verify/model_integrity.py', '05_transfer.sh', False),
     ('scripts/tests/test_chunk_limits.py', '02_ingest.sh', True),
     ('scripts/tests/test_insert_chunks.py', '02_ingest.sh', True),
+    ('scripts/tests/test_embed_batching.py', '02_ingest.sh', True),
     ('scripts/tests/test_corpus_rules.py', '02_ingest.sh', True),
     ('scripts/tests/test_corpus_rules_estimates.py', '02_ingest.sh', True),
     ('scripts/tests/test_retrieval_controls.py', '11_retrieval.sh', True),

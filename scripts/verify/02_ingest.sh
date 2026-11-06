@@ -403,6 +403,40 @@ check "chunks below min_chunk_size are merged" $? "stored $(python3 -c "import j
 check "chunker per-file limits, 6,000-character ceiling and semantic floor (#111)" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_insert_chunks.py)
 check "chunk inserts are batched and retried while the index isn't ready" $?
+# Embedding writes (#613): a write that leaves vectors to text2vec-ollama uses
+# bounded batches, and only objects whose embedding timed out are sent again;
+# controlled, then on the real Weaviate and Ollama.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_embed_batching.py)
+check "embedding writes are bounded and resend only timed-out embeddings (#613)" $?
+EB="${PREFIX}EmbedBatch"
+drop_collection "$EB"; make_collection "$EB"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$EB" <<'ENDPY'
+import sys
+from unittest.mock import patch
+from services import batch_write
+from services import weaviate_client as wc
+try:
+    collection = wc.get_client().collections.get(sys.argv[1])
+    rows = [{"properties": {"content": f"Embedding batch check {i}. " + "lorem ipsum dolor " * 40,
+                            "source_file": "embed_batch.txt", "source_type": "txt", "chunk_index": i,
+                            "chunk_strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0}}
+            for i in range(45)]
+    batch = collection.batch
+    with patch.object(batch, "fixed_size", wraps=batch.fixed_size) as fixed, \
+            patch.object(batch, "dynamic", wraps=batch.dynamic) as dynamic:
+        stored = batch_write.insert(collection, rows, exact=False, cleanup_owned=True)
+    calls = [c.kwargs for c in fixed.call_args_list]
+finally:
+    wc.close_client()
+print(f"stored={stored} fixed_size={calls} dynamic={dynamic.call_count}")
+ok = (stored == 45 and dynamic.call_count == 0
+      and calls == [{"batch_size": 20, "concurrent_requests": 1}])
+sys.exit(0 if ok else 1)
+ENDPY
+) >/tmp/vfy_embed_batch.log 2>&1
+check "45 vectorless chunks are embedded by the real Ollama in bounded batches and all stored (#613)" $? \
+  "$(tail -1 /tmp/vfy_embed_batch.log)"
+drop_collection "$EB"
 # The corpus preparation rules the Import page offers state the app's own
 # ingest limits, read from the same constants, settings and proxy (#615).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_corpus_rules.py)
