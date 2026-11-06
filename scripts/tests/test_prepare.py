@@ -1,6 +1,6 @@
 """Document preparation (#638): the area, the pipeline, jobs, import and routes.
 
-SPECIFICATIONS.md §3.1.11 and §10.8 (U1-U13). Runs with the API's dependencies,
+SPECIFICATIONS.md §3.1.11 and §10.8 (U1-U14). Runs with the API's dependencies,
 in the built API image with no network (`21_prepare.sh`):
 
     docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
@@ -59,6 +59,7 @@ class StubLLM:
 
     def __init__(self, clean=None, title=None):
         self.calls = []
+        self.model_calls = 0
         self.clean = clean
         self.title = title
 
@@ -86,6 +87,7 @@ class StubLLM:
         return behaviour
 
     async def models(self):
+        self.model_calls += 1
         return {f"{settings.llm_model}:latest", "nomic-embed-text:latest"}
 
 
@@ -302,12 +304,13 @@ class LlmDocumentTests(AreaCase):
         part = self.prepare(self.document("c.md", "Text.\n"), llm).parts[0]
         self.assertEqual(part["summary_error"], "unusable-answer")
 
-    def test_csv_and_jsonl_keep_title_in_the_record_only(self):
+    def test_csv_and_jsonl_are_labelled_from_their_data_in_the_record_only(self):
         csv_data = "name,team\nAda,core\nBo,docs\n"
         record = self.document("people.csv", csv_data)
         part = self.prepare(record).parts[0]
         self.assertEqual(self.part_text(record["id"], part), csv_data)
-        self.assertEqual(part["title"], "Committee minutes")
+        self.assertEqual((part["title"], part["summary"], part["summary_error"]),
+                         ("people.csv", "2 records. Fields: name, team. First: Ada; last: Bo.", None))
         self.assertEqual(part["records"], 2)
         jsonl = '{"a": 1}\n{"b": "x"}\n'
         record = self.document("d.jsonl", jsonl)
@@ -315,6 +318,154 @@ class LlmDocumentTests(AreaCase):
         self.assertEqual(self.part_text(record["id"], part), jsonl)
         self.assertEqual(part["name"], "d.jsonl")
         self.assertEqual(part["records"], 2)
+        self.assertEqual((part["title"], part["summary"], part["summary_error"]),
+                         ("d.jsonl", "2 records. Fields: a, b. First: 1; last: x.", None))
+
+
+# ── U14: record labels from the data (#648) ─────────────────────────────────
+
+class RecordLabelTests(AreaCase):
+    def label(self, name, data, llm=None):
+        result = self.prepare(self.document(name, data), llm)
+        return [(p["title"], p["summary"]) for p in result.parts]
+
+    def test_titles_name_the_file_and_the_part(self):
+        rows = "".join(f"{i},v{i}\n" for i in range(1, 301))
+        with patch.object(preparation, "PART_LIMIT", 1000):
+            result = self.prepare(self.document("a/t.csv", "id,value\n" + rows))
+        count = len(result.parts)
+        self.assertGreater(count, 2)
+        self.assertEqual([p["title"] for p in result.parts],
+                         [f"a/t.csv, part {n} of {count}" for n in range(1, count + 1)])
+        # Keys are document positions' rows, so each part starts where the last ended.
+        firsts = [p["summary"].split("First: ")[1].split(";")[0] for p in result.parts]
+        lasts = [p["summary"].split("last: ")[1].rstrip(".") for p in result.parts]
+        self.assertEqual(firsts[0], "1")
+        self.assertEqual(lasts[-1], "300")
+        for previous, first in zip(lasts, firsts[1:]):
+            self.assertEqual(int(first), int(previous) + 1)
+        self.assertEqual(sum(p["records"] for p in result.parts), 300)
+        self.assertEqual(preparation.record_title("x.csv", 1, 1), "x.csv")
+
+    def test_a_long_name_is_cut_to_keep_the_title_in_150_characters(self):
+        name = "n" * 200 + ".csv"
+        one = preparation.record_title(name, 1, 1)
+        self.assertEqual(len(one), 150)
+        self.assertTrue(one.endswith("…"))
+        several = preparation.record_title(name, 3, 12)
+        self.assertEqual(len(several), 150)
+        self.assertTrue(several.endswith("…, part 3 of 12"))
+        self.assertEqual(preparation.record_title("a  b\tc.csv", 1, 2), "a b c.csv, part 1 of 2")
+
+    def test_csv_fields_are_the_header_cells(self):
+        [(title, summary)] = self.label("p.csv", 'id,,"long  name"\n7,x,y\n')
+        self.assertEqual(summary, "1 records. Fields: id, (blank), long name. First: 7; last: 7.")
+
+    def test_json_lines_fields_are_top_level_keys_first_seen_and_a_nested_object_is_one(self):
+        data = ('{"id": "b1", "meta": {"x": 1, "y": 2}}\n'
+                '[1, 2]\n'
+                '{"title": "t", "id": "b2"}\n')
+        [(title, summary)] = self.label("bills.jsonl", data)
+        self.assertEqual(title, "bills.jsonl")
+        self.assertEqual(summary, "3 records. Fields: id, meta, title. First: b1; last: t.")
+
+    def test_a_part_with_no_object_records_has_no_fields(self):
+        [(title, summary)] = self.label("s.json", "[1, 2, 3]")
+        self.assertEqual(summary, "1 records. Fields: none. First: record 1; last: record 1.")
+
+    def test_more_than_20_fields(self):
+        header = ",".join(f"f{i}" for i in range(1, 26))
+        [(title, summary)] = self.label("w.csv", header + "\n" + ",".join("1" * 25) + "\n")
+        listed = ", ".join(f"f{i}" for i in range(1, 21))
+        self.assertEqual(summary, f"1 records. Fields: {listed}, and 5 more. First: 1; last: 1.")
+
+    def test_key_kinds(self):
+        key = preparation._json_key
+        number = ingest_pipeline._JsonNumber
+        self.assertEqual(key({"a": "x  y\nz"}, 1), "x y z")
+        self.assertEqual(key({"a": number("1.50")}, 1), "1.50")
+        self.assertEqual(key({"a": True}, 1), "true")
+        self.assertEqual(key({"a": False}, 1), "false")
+        self.assertEqual(key({"a": {"b": number("2")}}, 1), '{"b":2}')
+        self.assertEqual(key({"a": [number("1"), "x"]}, 1), '[1,"x"]')
+        self.assertEqual(key({"a": {}}, 1), "{}")
+        data = '{"n": 1.50}\n{"n": true}\n'
+        [(title, summary)] = self.label("k.jsonl", data)
+        self.assertEqual(summary, "2 records. Fields: n. First: 1.50; last: true.")
+
+    def test_fallbacks_use_the_record_position_in_the_document(self):
+        key = preparation._json_key
+        for value in ([1], "s", None, {}, {"a": None}, {"a": ""}, {"a": "  \t"}):
+            self.assertEqual(key(value, 1234), "record 1,234", value)
+        self.assertEqual(preparation._csv_key(["  ", "x"], 5), "record 5")
+        self.assertEqual(preparation._csv_key([], 5), "record 5")
+        lines = "".join('{"id": %s, "pad": "%s"}\n' % ('null' if i % 2 else i, "p" * 20)
+                        for i in range(1, 101))
+        with patch.object(preparation, "PART_LIMIT", 300):
+            result = self.prepare(self.document("f.jsonl", lines))
+        self.assertGreater(len(result.parts), 2)
+        position = 0
+        for part in result.parts:
+            first, last = position + 1, position + part["records"]
+            want_first = f"record {first:,}" if first % 2 else str(first)
+            want_last = f"record {last:,}" if last % 2 else str(last)
+            self.assertTrue(part["summary"].endswith(f"First: {want_first}; last: {want_last}."),
+                            part["summary"])
+            position = last
+        rows = "id,v\n1,a\n,b\n"
+        [(title, summary)] = self.label("c.csv", rows)
+        self.assertEqual(summary, "2 records. Fields: id, v. First: 1; last: record 2.")
+
+    def test_values_and_names_are_cut_at_40_characters(self):
+        long = "x" * 60
+        cut = "x" * 39 + "…"
+        self.assertEqual(preparation._json_key({"a": long}, 1), cut)
+        [(title, summary)] = self.label("l.csv", f"{long},b\n{long},1\n")
+        self.assertEqual(summary, f"1 records. Fields: {cut}, b. First: {cut}; last: {cut}.")
+
+    def test_the_summary_stays_in_80_words(self):
+        name = " ".join("w" for _ in range(20))         # 39 characters, 20 words
+        fields = [name] * 20
+        key = " ".join("k" for _ in range(20))
+        summary = preparation.record_summary(5000, fields, key, key)
+        self.assertLessEqual(len(summary.split()), preparation.MAX_SUMMARY_WORDS)
+        self.assertIn(f"Fields: {name}, and 19 more.", summary)
+        self.assertTrue(summary.startswith("5,000 records. "))
+        short = preparation.record_summary(3, ["a", "b"], "x", "y")
+        self.assertEqual(short, "3 records. Fields: a, b. First: x; last: y.")
+        self.assertEqual(preparation.record_summary(0, ["a"], "", ""),
+                         "0 records. Fields: a. First: none; last: none.")
+
+    def test_record_documents_make_no_llm_call_and_skip_the_model_check(self):
+        async def failing(system, user):
+            raise RuntimeError("down")
+
+        async def no_model():
+            return set()
+        samples = (("r.csv", b"id,v\n1,a\n"), ("r.jsonl", b'{"id": 1}\n'),
+                   ("r.jsonl.gz", gzip.compress(b'{"id": 1}\n')), ("r.json", b'[{"id": 1}]'),
+                   ("r.json.gz", gzip.compress(b'[{"id": 1}]')))
+        for name, data in samples:
+            for broken in (False, True):
+                llm = StubLLM(clean=failing if broken else None, title=failing if broken else None)
+                if broken:
+                    llm.models = no_model
+                result = self.prepare(self.document(name, data), llm)
+                [part] = result.parts
+                self.assertEqual(llm.calls, [], name)
+                self.assertEqual(llm.model_calls, 0, name)
+                self.assertEqual(part["title"], name)
+                self.assertEqual(part["summary"], "1 records. Fields: id, v. First: 1; last: 1."
+                                 if name.endswith(".csv") else
+                                 "1 records. Fields: id. First: 1; last: 1.")
+                self.assertIsNone(part["summary_error"])
+                self.assertFalse(result.fallback)
+
+    def test_text_documents_still_check_the_model_and_use_the_llm_title(self):
+        llm = StubLLM()
+        part = self.prepare(self.document("m.txt", page_text()), llm).parts[0]
+        self.assertEqual(llm.model_calls, 1)
+        self.assertEqual(part["title"], "Committee minutes")
 
 
 # ── U5: normalisation ───────────────────────────────────────────────────────
