@@ -41,6 +41,10 @@ class Batch:
         self.pending = []
         return self
 
+    def fixed_size(self, batch_size, concurrent_requests):
+        # Vectorless writes use bounded batches (#613); same fake behaviour.
+        return self.dynamic()
+
     def __enter__(self):
         return self
 

@@ -2658,6 +2658,17 @@ from config import settings
 log = logging.getLogger(__name__)
 LOOKUP_SIZE = 100
 
+# Records without a vector are embedded by Weaviate's text2vec-ollama, which
+# sends about 10 objects per /api/embed request and a batch's requests at once.
+# CPU-only Ollama serves them one at a time, and Weaviate gives up on each after
+# 50 s, so dynamic() batching (48 objects, 2 to 3 requests in flight) queued
+# about 10 requests and failed whole files (#613). Bounded batches keep about
+# two embed requests waiting; a request that still runs out of time fails its
+# objects unstored, and only those are sent again.
+EMBED_BATCH_SIZE = 20
+EMBED_CONCURRENT_REQUESTS = 1
+EMBED_TIMEOUT_RETRIES = 2
+
 
 class BatchVerificationError(RuntimeError):
     """A completed read proved that stored records differ from expectations."""
@@ -2809,6 +2820,10 @@ class ExpectedRecords:
             raise ValueError("Record stream changed after preflight")
         return {**record, "id": key}
 
+    def vectorless(self) -> bool:
+        """Whether any record leaves its vector to Weaviate's vectorizer."""
+        return self.db.execute("SELECT 1 FROM expected WHERE vector IS NULL LIMIT 1").fetchone() is not None
+
     def id_batches(self):
         cursor = self.db.execute("SELECT id FROM expected ORDER BY position")
         while rows := cursor.fetchmany(LOOKUP_SIZE):
@@ -2885,6 +2900,19 @@ def _record_counts(exc: Exception, submitted: int, accepted: int) -> None:
         pass
 
 
+def _vectorizer_timeout(error) -> bool:
+    """Weaviate's own embed request ran out of time: the object was not stored."""
+    message = getattr(error, "message", None) or ""
+    return "failed to vectorize" in message and "context deadline exceeded" in message
+
+
+def _failed_uuid(error) -> str | None:
+    try:
+        return str(uuid.UUID(str(error.object_.uuid)))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def write_counts(exc: BaseException | None) -> tuple[int, int] | None:
     """(submitted, accepted) recorded on a failed insert's exception or its cause."""
     for error in (exc, getattr(exc, "__cause__", None)):
@@ -2900,29 +2928,48 @@ def insert(collection, records, *, exact: bool = True, expected_count: int | Non
 
     Only ingestion-generated UUIDs may be rolled back individually. Import and
     tuning own new collections and retain/remove them at their operation boundary.
-    A failure carries `write_counts` = (records queued, records the flushed batch
-    acknowledged without a per-object error); 0 acknowledged if it never flushed.
+    A write with any record left to Weaviate's vectorizer uses bounded batches;
+    objects whose embedding timed out in Weaviate are sent again, up to
+    EMBED_TIMEOUT_RETRIES times, and no other failure is retried (#613).
+    A failure carries `write_counts` = (records queued, records the flushed batches
+    acknowledged without a per-object error); 0 acknowledged if none flushed.
     """
     factory = _factory(records)
     with ExpectedRecords() as expected:
         expected.capture(factory, expected_count, generated_only=cleanup_owned)
+        if expected.vectorless():
+            def open_batch():
+                return collection.batch.fixed_size(batch_size=EMBED_BATCH_SIZE,
+                                                   concurrent_requests=EMBED_CONCURRENT_REQUESTS)
+        else:
+            open_batch = collection.batch.dynamic
         queued = accepted = 0
         try:
             with telemetry.span("weaviate.batch"):
-                with collection.batch.dynamic() as batch:
-                    for position, record in enumerate(factory()):
-                        record = expected.prepare(position, record)
-                        batch.add_object(properties=record["properties"], uuid=record["id"], vector=record.get("vector"))
-                        queued += 1
-                    if queued != expected.count:
-                        raise ValueError("Record stream changed after preflight")
-                failed = collection.batch.failed_objects
-                accepted = queued - len(failed or ())
-                if failed:
-                    detail = getattr(failed[0], "message", None)
-                    raise RuntimeError(
-                        f"Weaviate rejected {len(failed)} batch object(s)"
-                        + (f": {detail}" if detail else ""))
+                resend = None                  # None: every record; else the UUIDs to send again
+                for attempt in range(EMBED_TIMEOUT_RETRIES + 1):
+                    with open_batch() as batch:
+                        for position, record in enumerate(factory()):
+                            record = expected.prepare(position, record)
+                            if resend is not None and record["id"] not in resend:
+                                continue
+                            batch.add_object(properties=record["properties"], uuid=record["id"], vector=record.get("vector"))
+                            if resend is None:
+                                queued += 1
+                        if resend is None and queued != expected.count:
+                            raise ValueError("Record stream changed after preflight")
+                    failed = collection.batch.failed_objects or []
+                    if not failed:
+                        break
+                    accepted = queued - len(failed)
+                    resend = {_failed_uuid(error) for error in failed}
+                    if (attempt == EMBED_TIMEOUT_RETRIES or None in resend
+                            or not all(_vectorizer_timeout(error) for error in failed)):
+                        detail = getattr(failed[0], "message", None)
+                        raise RuntimeError(
+                            f"Weaviate rejected {len(failed)} batch object(s)"
+                            + (f": {detail}" if detail else ""))
+                accepted = queued
             return expected.verify(collection, exact=exact)
         except Exception as original:
             _record_counts(original, queued, accepted)
@@ -24636,6 +24683,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `../tests/test_batch_implementation.py` | host-side: exact embedded source checks for `api/main.py`, the Weaviate client, the batch-write, recovery, import and tuning services and their verify scripts, and the restart-recovery block of `05_transfer.sh` with stubbed commands (refused-prefix skip, `RAG_ALLOW_RESTART`, the #152 refusal), registered by transfer |
 | `../tests/test_chunk_limits.py` / `../tests/test_insert_chunks.py` | controlled chunker per-file limits, chunk ceiling and semantic floor (#111) / insert batching and the "index not ready" retry, registered by ingest in the API image with the repository mounted (#386) |
+| `../tests/test_embed_batching.py` | controlled embedding writes (#613): a write that leaves vectors to Weaviate's `text2vec-ollama` uses `fixed_size(20, 1)` batches and one with every vector `dynamic()`; only objects whose embed request timed out in Weaviate are sent again, at most twice, with the write counts and rollback unchanged, and no other failure is retried. Registered by ingest in the API image with the repository mounted, after which ingest writes 45 vectorless chunks to a scratch `<prefix>EmbedBatch` collection on the real Weaviate and Ollama and checks they are all stored, through `fixed_size(20, 1)` and never `dynamic()`; the collection is removed afterwards |
 | `../tests/test_corpus_rules.py` | controlled: the corpus preparation rules the Import page offers (`ui/public/corpus-preparation-rules.md`) state every ingest limit as the chunker, the ingest pipeline, the settings defaults, the chunk-setting bounds, `docker-compose.yml` and the proxy define it, and no other number (#615), registered by ingest in the API image with the repository mounted |
 | `../tests/test_corpus_rules_estimates.py` | controlled: the chunk counts the corpus preparation rules give hold for the real chunker for every strategy, on files built at the rules' targets, which are never refused for the text or chunk limits (#615), registered by ingest in the API image with the repository mounted |
 | `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
@@ -34662,6 +34710,40 @@ check "chunks below min_chunk_size are merged" $? "stored $(python3 -c "import j
 check "chunker per-file limits, 6,000-character ceiling and semantic floor (#111)" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_insert_chunks.py)
 check "chunk inserts are batched and retried while the index isn't ready" $?
+# Embedding writes (#613): a write that leaves vectors to text2vec-ollama uses
+# bounded batches, and only objects whose embedding timed out are sent again;
+# controlled, then on the real Weaviate and Ollama.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_embed_batching.py)
+check "embedding writes are bounded and resend only timed-out embeddings (#613)" $?
+EB="${PREFIX}EmbedBatch"
+drop_collection "$EB"; make_collection "$EB"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$EB" <<'ENDPY'
+import sys
+from unittest.mock import patch
+from services import batch_write
+from services import weaviate_client as wc
+try:
+    collection = wc.get_client().collections.get(sys.argv[1])
+    rows = [{"properties": {"content": f"Embedding batch check {i}. " + "lorem ipsum dolor " * 40,
+                            "source_file": "embed_batch.txt", "source_type": "txt", "chunk_index": i,
+                            "chunk_strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0}}
+            for i in range(45)]
+    batch = collection.batch
+    with patch.object(batch, "fixed_size", wraps=batch.fixed_size) as fixed, \
+            patch.object(batch, "dynamic", wraps=batch.dynamic) as dynamic:
+        stored = batch_write.insert(collection, rows, exact=False, cleanup_owned=True)
+    calls = [c.kwargs for c in fixed.call_args_list]
+finally:
+    wc.close_client()
+print(f"stored={stored} fixed_size={calls} dynamic={dynamic.call_count}")
+ok = (stored == 45 and dynamic.call_count == 0
+      and calls == [{"batch_size": 20, "concurrent_requests": 1}])
+sys.exit(0 if ok else 1)
+ENDPY
+) >/tmp/vfy_embed_batch.log 2>&1
+check "45 vectorless chunks are embedded by the real Ollama in bounded batches and all stored (#613)" $? \
+  "$(tail -1 /tmp/vfy_embed_batch.log)"
+drop_collection "$EB"
 # The corpus preparation rules the Import page offers state the app's own
 # ingest limits, read from the same constants, settings and proxy (#615).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_corpus_rules.py)
