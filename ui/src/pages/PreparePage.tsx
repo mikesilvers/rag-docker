@@ -12,7 +12,8 @@ import JobList, { newestToOpen, useJobList } from '../components/JobList'
 // Document preparation (#638). Raw documents are uploaded to the preparation area
 // on the instance, prepared by a background job (the code does the corpus rules'
 // work, the local LLM only removes headers, footers and boilerplate and writes a
-// title and summary), reviewed here, and imported into a collection through the
+// title and summary for PDF, DOCX, TXT and MD; CSV and JSON parts are labelled
+// from their data, #648), reviewed here, and imported into a collection through the
 // normal ingest path. They stay on the instance until deleted.
 
 const TERMINAL = ['completed', 'failed', 'partial', 'cancelled', 'interrupted']
@@ -266,7 +267,8 @@ export default function PreparePage() {
       <p className="text-sm text-gray-600 mb-4">
         Raw documents are made to follow the corpus rules here: the code extracts the text, splits it to the limits,
         normalises it and converts JSON, and the local LLM only removes page headers, footers, page numbers and
-        boilerplate and writes a title and summary. Where its cleaning would lose content, the part keeps the
+        boilerplate and writes a title and summary for PDF, DOCX, TXT and MD. CSV and JSON parts are labelled from
+        their data, with no LLM call. Where its cleaning would lose content, the part keeps the
         code-only text and the fallback is shown. Documents stay on this instance until you delete them.
         {' '}<Link to="/import" className="text-blue-600 hover:underline">Import page</Link>
       </p>
