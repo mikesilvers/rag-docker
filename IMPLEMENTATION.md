@@ -7717,8 +7717,9 @@ def record_summary(count: int, fields: list[str], first: str, last: str) -> str:
     """`<count> records. Fields: a, b. First: <key>; last: <key>.`: at most
     MAX_LABEL_FIELDS names, fewer if needed to stay in MAX_SUMMARY_WORDS words,
     then `and M more`. Names and keys are at most LABEL_CHARACTERS (20 words)
-    each, so one name always fits: 8 fixed words + 20 + 2 x 20 = 68. A CSV with
-    a header and no rows has no keys: `First: none; last: none`."""
+    each, so one name always fits: 8 fixed words + 20 + 2 x 20 = 68. One record
+    reads `1 record.`; a part with none (a CSV with a header and no rows) leaves
+    out the First/last sentence."""
     def text(shown: int) -> str:
         if not fields:
             listed = "none"
@@ -7726,8 +7727,11 @@ def record_summary(count: int, fields: list[str], first: str, last: str) -> str:
             listed = ", ".join(fields[:shown])
             if len(fields) > shown:
                 listed += f", and {len(fields) - shown:,} more"
-        return (f"{count:,} records. Fields: {listed}. First: {first or 'none'}; "
-                f"last: {last or 'none'}.")
+        noun = "record" if count == 1 else "records"
+        summary = f"{count:,} {noun}. Fields: {listed}."
+        if count:
+            summary += f" First: {first}; last: {last}."
+        return summary
     shown = min(len(fields), MAX_LABEL_FIELDS)
     summary = text(shown)
     while shown > 1 and len(summary.split()) > MAX_SUMMARY_WORDS:
@@ -31571,7 +31575,7 @@ class RecordLabelTests(AreaCase):
 
     def test_csv_fields_are_the_header_cells(self):
         [(title, summary)] = self.label("p.csv", 'id,,"long  name"\n7,x,y\n')
-        self.assertEqual(summary, "1 records. Fields: id, (blank), long name. First: 7; last: 7.")
+        self.assertEqual(summary, "1 record. Fields: id, (blank), long name. First: 7; last: 7.")
 
     def test_json_lines_fields_are_top_level_keys_first_seen_and_a_nested_object_is_one(self):
         data = ('{"id": "b1", "meta": {"x": 1, "y": 2}}\n'
@@ -31583,13 +31587,13 @@ class RecordLabelTests(AreaCase):
 
     def test_a_part_with_no_object_records_has_no_fields(self):
         [(title, summary)] = self.label("s.json", "[1, 2, 3]")
-        self.assertEqual(summary, "1 records. Fields: none. First: record 1; last: record 1.")
+        self.assertEqual(summary, "1 record. Fields: none. First: record 1; last: record 1.")
 
     def test_more_than_20_fields(self):
         header = ",".join(f"f{i}" for i in range(1, 26))
         [(title, summary)] = self.label("w.csv", header + "\n" + ",".join("1" * 25) + "\n")
         listed = ", ".join(f"f{i}" for i in range(1, 21))
-        self.assertEqual(summary, f"1 records. Fields: {listed}, and 5 more. First: 1; last: 1.")
+        self.assertEqual(summary, f"1 record. Fields: {listed}, and 5 more. First: 1; last: 1.")
 
     def test_key_kinds(self):
         key = preparation._json_key
@@ -31633,7 +31637,7 @@ class RecordLabelTests(AreaCase):
         cut = "x" * 39 + "…"
         self.assertEqual(preparation._json_key({"a": long}, 1), cut)
         [(title, summary)] = self.label("l.csv", f"{long},b\n{long},1\n")
-        self.assertEqual(summary, f"1 records. Fields: {cut}, b. First: {cut}; last: {cut}.")
+        self.assertEqual(summary, f"1 record. Fields: {cut}, b. First: {cut}; last: {cut}.")
 
     def test_the_summary_stays_in_80_words(self):
         name = " ".join("w" for _ in range(20))         # 39 characters, 20 words
@@ -31645,8 +31649,11 @@ class RecordLabelTests(AreaCase):
         self.assertTrue(summary.startswith("5,000 records. "))
         short = preparation.record_summary(3, ["a", "b"], "x", "y")
         self.assertEqual(short, "3 records. Fields: a, b. First: x; last: y.")
-        self.assertEqual(preparation.record_summary(0, ["a"], "", ""),
-                         "0 records. Fields: a. First: none; last: none.")
+        self.assertEqual(preparation.record_summary(1, ["a"], "x", "x"),
+                         "1 record. Fields: a. First: x; last: x.")
+        self.assertEqual(preparation.record_summary(0, ["a", "b"], "", ""), "0 records. Fields: a, b.")
+        [(title, summary)] = self.label("h.csv", "a,b\n")
+        self.assertEqual(summary, "0 records. Fields: a, b.")
 
     def test_record_documents_make_no_llm_call_and_skip_the_model_check(self):
         async def failing(system, user):
@@ -31667,9 +31674,9 @@ class RecordLabelTests(AreaCase):
                 self.assertEqual(llm.calls, [], name)
                 self.assertEqual(llm.model_calls, 0, name)
                 self.assertEqual(part["title"], name)
-                self.assertEqual(part["summary"], "1 records. Fields: id, v. First: 1; last: 1."
+                self.assertEqual(part["summary"], "1 record. Fields: id, v. First: 1; last: 1."
                                  if name.endswith(".csv") else
-                                 "1 records. Fields: id. First: 1; last: 1.")
+                                 "1 record. Fields: id. First: 1; last: 1.")
                 self.assertIsNone(part["summary_error"])
                 self.assertFalse(result.fallback)
 

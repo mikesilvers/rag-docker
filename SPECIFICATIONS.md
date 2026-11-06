@@ -1859,14 +1859,15 @@ before the job, as they do at API startup after an interrupted job.
    - Title: the document's name with one part; `<name>, part <n> of <N>` with several. Whitespace runs
      become one space; a title over 150 characters has its name cut, ending `…`.
    - Summary: `<count> records. Fields: <fields>. First: <first key>; last: <last key>.` The count has
-     thousands separators. The fields are a CSV's header cells (a blank one reads `(blank)`), or the
+     thousands separators; one record reads `1 record.`, and a part with no records (a CSV with a header and
+     no rows) leaves out the First/last sentence: `0 records. Fields: <fields>.` The fields are a CSV's header cells (a blank one reads `(blank)`), or the
      top-level keys of every JSON record in the part, first seen first (a nested object or array is one
      field; `none` when no record is an object); at most 20, then `, and <M> more`, fewer when needed to
      keep the summary within 80 words. A record's key is a CSV row's first cell, or the value of a JSON
      record's first top-level field (a number as written, an object or array as compact JSON); when that is
      blank or `null`, or the record isn't an object or is empty, it is `record <position>`, its position in
      the document from 1. Names and keys have whitespace runs made one space and are cut at 40 characters,
-     ending `…`. A CSV with a header and no rows reads `First: none; last: none`.
+     ending `…`.
 6. *Check* each written part as ingest reads it: at most 10,000,000 characters, at most 1,000,000 records,
    valid JSON Lines, at most 10,000 chunks estimated for `overlap` 1,000/200. A failure fails the document.
 
@@ -4179,7 +4180,8 @@ and checks the verify project through `prepare_stack.py` (P1-P11).
       limit refusing an upload, a job start and a part; replacing output, a failed re-run keeping the earlier
       output, cancel and restart; one job at a time; busy documents; the routes' roles and audit actions; and
       the prepared download of several parts as a ZIP (U1-U13); CSV and JSON parts labelled from their data:
-      titles for one and several parts and the 150-character cut, fields, more than 20 fields, keys of every
+      titles for one and several parts and the 150-character cut, `1 record.` and a part with no records,
+      fields, more than 20 fields, keys of every
       kind and their fallbacks by document position, the 40-character cut, the 80-word limit, and no LLM call
       or model check for all five types, with the model missing or the LLM failing (U14).
 
