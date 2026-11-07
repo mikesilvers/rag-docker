@@ -220,6 +220,34 @@ class EmbedBatchingTests(unittest.TestCase):
         self.assertEqual(str(raised.exception), "Record stream changed after preflight")
         self.assertEqual(len(collection.batch.sent), 1)
 
+    def test_a_non_timeout_failure_on_a_retry_fails_the_write(self):
+        collection = Collection([fail(2), fail(1, NOT_READY)])
+        with self.assertRaises(RuntimeError) as raised:
+            self.insert(collection, chunks(5))
+        self.assertEqual([len(ids) for ids in collection.batch.sent], [5, 2])
+        self.assertEqual(str(raised.exception), "Weaviate rejected 1 batch object(s): " + NOT_READY)
+        self.assertEqual(batch_write.write_counts(raised.exception), (5, 4))
+        self.assertEqual(collection.rows, {})            # owned records rolled back
+
+    def test_the_client_error_objects_are_read(self):
+        """The fake's failures have the shape of weaviate-client's own ErrorObject."""
+        from weaviate.collections.classes.batch import BatchObject, ErrorObject
+
+        class RealErrors(Batch):
+            def __exit__(self, *args):
+                done = super().__exit__(*args)
+                self.failed_objects = [
+                    ErrorObject(message=error.message,
+                                object_=BatchObject(collection="VfyIngest", uuid=error.object_.uuid, index=0))
+                    for error in self.failed_objects]
+                return done
+        collection = Collection([fail(2)])
+        collection.batch = RealErrors(collection)
+        self.assertEqual(self.insert(collection, chunks(5)), 5)
+        first, second = collection.batch.sent
+        self.assertEqual(second, first[:2])
+        self.assertEqual(sorted(collection.stores.values()), [1] * 5)
+
     def test_vectorizer_timeout_needs_both_phrases(self):
         timeout = batch_write._vectorizer_timeout
         self.assertTrue(timeout(SimpleNamespace(message=TIMEOUT)))
