@@ -81,13 +81,13 @@ action list (#577).
 
 `21_prepare.sh` checks document preparation (#638, SPECIFICATIONS.md §3.1.11 and §10.8). It runs
 `../tests/test_prepare.py` in the API image with no network and a stub LLM (windows and the fidelity check,
-the LLM's limits, titles and summaries, normalisation, parts and names, JSON to JSON Lines, the storage limit,
+the LLM's limits, titles and summaries, the labels of CSV and JSON parts, normalisation, parts and names, JSON to JSON Lines, the storage limit,
 jobs, cancel and restart, busy documents, import, downloads, routes), then checks the verify project through
 `prepare_stack.py` as the harness Developer: the role matrix of every `/prepare` route, an upload with a ZIP,
 ZIP refusals with ingest's codes, the raw download and the space used, deletes, import refusals, an unknown
 job's cancel and the audit records. In a full run (not `RAG_SKIP_SLOW=1`) it prepares three small files with
 the local LLM, one job at a time, checks that the cleaned text holds only source lines in order and that the
-CSV and JSON Lines come back unchanged, imports them into a throwaway `VfyPrepare*` collection and downloads a
+CSV and JSON Lines come back unchanged, labelled from their data, imports them into a throwaway `VfyPrepare*` collection and downloads a
 prepared part. Its `vfy-prepare-*` documents and its collections are removed at the end.
 
 ## Entry point and verify project

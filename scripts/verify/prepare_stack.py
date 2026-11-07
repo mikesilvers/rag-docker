@@ -245,7 +245,8 @@ def check_audit(fix):
 # ── with the LLM (full runs only) ────────────────────────────────────────────
 
 def check_prepare(fix):
-    """P9: preparing the .txt, the .csv and the .jsonl."""
+    """P9: preparing the .txt, the .csv and the .jsonl; the .csv and .jsonl are
+    labelled from their data."""
     token = role_token("developer")
     ids = state()["ids"]
     status, body, _ = send("POST", "/prepare/jobs", token, body={"document_ids": list(ids.values())})
@@ -277,11 +278,17 @@ def check_prepare(fix):
     for reason in (f["reason"] for f in part["fallbacks"]):
         expect(reason in ("removed-too-much", "removed-long-line", "unusable-answer", "llm-timeout",
                           "llm-error", "llm-unavailable", "too-large-for-llm"), "reason {}".format(reason))
+    labels = {"vfy-prepare-people.csv": "3 records. Fields: name, team. First: Ada; last: Cy.",
+              "vfy/records.jsonl": "2 records. Fields: id, text. First: 1; last: 2."}
     for name, want in (("vfy-prepare-people.csv", CSV), ("vfy/records.jsonl", JSONL)):
         record = send("GET", "/prepare/documents/" + ids[name], token)[1]
         expect(record["status"] == "prepared" and record["code_only_by_type"], "{} {}".format(name, record["status"]))
         status, content, _ = send("GET", "/prepare/documents/{}/prepared".format(record["id"]), token, raw=True)
         expect(content.decode("utf-8") == want, "{} changed: {!r}".format(name, content[:80]))
+        # Labelled from the data, with no LLM call (#648).
+        [part] = record["parts"]
+        got = (part["title"], part["summary"], part["summary_error"])
+        expect(got == (name, labels[name], None), "{} labelled {!r}".format(name, got))
 
 
 def check_import(fix):
