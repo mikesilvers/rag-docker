@@ -5549,6 +5549,14 @@ def _iter_jsonl_lines(stream: Any) -> Iterator[tuple[int, bytes, str]]:
     bytes without its line ending or line 1's byte-order mark, and its converted
     text, which is empty for a record with no text. Blank lines are not given.
     Document preparation (#638) keeps the line as it is; ingest keeps the text.
+    See _iter_jsonl_values, which reads them."""
+    for number, raw, text, _value in _iter_jsonl_values(stream):
+        yield number, raw, text
+
+
+def _iter_jsonl_values(stream: Any) -> Iterator[tuple[int, bytes, str, Any]]:
+    """_iter_jsonl_lines with each record's parsed value as well, numbers kept as
+    written: document preparation labels its parts from it (#648).
 
     Read one line at a time, at most MAX_JSONL_LINE_BYTES of it besides its line
     ending and line 1's byte-order mark, and stopped at the first bad line, at
@@ -5608,7 +5616,7 @@ def _iter_jsonl_lines(stream: Any) -> Iterator[tuple[int, bytes, str]]:
         except RecursionError as exc:
             raise _JsonlError(
                 f"line {number} is not valid JSON: it is nested too deeply to read") from exc
-        yield number, raw, text
+        yield number, raw, text, value
 
 
 def _jsonl_records(stream: Any) -> list[str]:
@@ -7230,8 +7238,11 @@ SPECIFICATIONS.md §3.1.11. In order, for one document:
    boilerplate. Code removes them; the LLM never rewrites text. A window whose
    answer fails the fidelity check keeps its code-only text, and the fallback
    is recorded with its reason.
-4. Give every part a **title and summary** (in the text for the four text
-   types, in the record only for CSV and JSON Lines).
+4. Give every part a **title and summary**. For the four text types the LLM
+   writes them, at the start of the part's text. CSV and JSON Lines parts are
+   labelled from their data with no LLM call (#648): the file name and part n
+   of N, the record count, the field names, and the first and last records'
+   keys, in the record only. A CSV or JSON document makes no LLM call at all.
 5. **Check** each written part as ingest reads it, against the rules that don't
    depend on chunk settings.
 
@@ -7277,6 +7288,8 @@ MAX_WINDOWS = 1_000
 TITLE_INPUT = 6_000
 MAX_TITLE = 150
 MAX_SUMMARY_WORDS = 80
+LABEL_CHARACTERS = 40
+MAX_LABEL_FIELDS = 20
 CALL_SECONDS = 120.0
 FAILED_CALLS_IN_A_ROW = 3
 
@@ -7364,13 +7377,16 @@ def part_names(name: str, kind: str, count: int) -> list[str]:
 @dataclass
 class Part:
     """A part's code-only content. `body` is what the file holds (before any
-    cleaning and header); `measure` is its text as ingest reads it, for the
-    title and summary of CSV and JSON Lines; `records` counts CSV rows or JSON
-    Lines records."""
+    cleaning and header); `measure` is its text as ingest reads it; `records`
+    counts CSV rows or JSON Lines records. A CSV or JSON Lines part also has its
+    label's field names and first and last record keys (#648)."""
     body: str
     measure: str = ""
     records: int | None = None
     header: str = ""          # a CSV part's header row
+    fields: list[str] = field(default_factory=list)
+    first_key: str = ""
+    last_key: str = ""
 
 
 def _joined_parts(units: Iterator[str], limit: int) -> Iterator[str]:
@@ -7439,6 +7455,7 @@ class _CsvRows:
         self.limit = limit
         self.raw: list[str] = []
         self.size = 0
+        self.cells: list[str] = []    # the cells of the row `next` returned last
         self.reader = csv.reader(self._lines(), dialect)
 
     def _lines(self) -> Iterator[str]:
@@ -7459,7 +7476,7 @@ class _CsvRows:
             self.raw.clear()
             self.size = 0
             try:
-                next(self.reader)
+                cells = next(self.reader)
             except StopIteration:
                 return None
             except csv.Error as exc:
@@ -7470,6 +7487,7 @@ class _CsvRows:
             if len(row) > self.limit:
                 raise _RowTooLong(self.limit, len(row))
             if row.strip():
+                self.cells = cells
                 return row
 
 
@@ -7501,23 +7519,32 @@ def _csv_parts(path: Path) -> Iterator[Part]:
             raise _header_too_long(exc.characters) from None
         if not header:
             return
+        fields = [_label(normalise_text(cell)) or "(blank)" for cell in rows.cells]
         # A data row may hold what a part has left beside the header.
         room = PART_LIMIT - len(header)
         rows.limit = room
         current: list[str] = []
         size = 0
+        position = 0
+        first = last = ""
         while True:
             row = rows.next()
             if row is None:
                 break
             if current and size + len(row) > room:
                 body = header + "".join(current)
-                yield Part(body=body, measure=body, records=len(current), header=header)
+                yield Part(body=body, measure=body, records=len(current), header=header,
+                           fields=fields, first_key=first, last_key=last)
                 current, size = [], 0
+            position += 1
+            last = _csv_key(rows.cells, position)
+            if not current:
+                first = last
             current.append(row)
             size += len(row)
         body = header + "".join(current)
-        yield Part(body=body, measure=body, records=len(current), header=header)
+        yield Part(body=body, measure=body, records=len(current), header=header,
+                   fields=fields, first_key=first, last_key=last)
 
 
 def _compact_json(value: Any) -> str:
@@ -7538,9 +7565,10 @@ def _compact_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def _json_records(path: Path) -> Iterator[tuple[str, str]]:
-    """A .json file's (or decompressed .json.gz member's) records as (line, text):
-    each record written as compact JSON, and its text as ingest converts it."""
+def _json_records(path: Path) -> Iterator[tuple[str, str, Any]]:
+    """A .json file's (or decompressed .json.gz member's) records as (line, text,
+    value): each record written as compact JSON, its text as ingest converts it,
+    and the record itself."""
     if path.stat().st_size > ip.MAX_JSON_INPUT_BYTES:
         raise ValueError(ip._json_input_too_large("is larger than"))
     try:
@@ -7561,10 +7589,10 @@ def _json_records(path: Path) -> Iterator[tuple[str, str]]:
             raise ValueError(ip._record_too_large(f"record {position}")) from exc
         except RecursionError as exc:
             raise ValueError("is not valid JSON: it is nested too deeply to read") from exc
-        yield _compact_json(group), "\n".join(lines)
+        yield _compact_json(group), "\n".join(lines), group
 
 
-def _json_gz_records(path: Path) -> Iterator[tuple[str, str]]:
+def _json_gz_records(path: Path) -> Iterator[tuple[str, str, Any]]:
     fd, name = tempfile.mkstemp(dir=settings.upload_dir, prefix="prepare-", suffix=".json")
     os.close(fd)
     plain = Path(name)
@@ -7578,17 +7606,18 @@ def _json_gz_records(path: Path) -> Iterator[tuple[str, str]]:
         plain.unlink(missing_ok=True)
 
 
-def _jsonl_records(path: Path) -> Iterator[tuple[str, str]]:
-    """A JSON Lines file's records as (line as written, text), blank lines left out."""
+def _jsonl_records(path: Path) -> Iterator[tuple[str, str, Any]]:
+    """A JSON Lines file's records as (line as written, text, value), blank lines
+    left out."""
     try:
         if ip._is_jsonl_gz(path.name):
             with gzip.open(path, "rb") as gz:
-                for _n, raw, text in ip._iter_jsonl_lines(ip._BoundedLines(gz)):
-                    yield raw.decode("utf-8"), text
+                for _n, raw, text, value in ip._iter_jsonl_values(ip._BoundedLines(gz)):
+                    yield raw.decode("utf-8"), text, value
         else:
             with path.open("rb") as fh:
-                for _n, raw, text in ip._iter_jsonl_lines(fh):
-                    yield raw.decode("utf-8"), text
+                for _n, raw, text, value in ip._iter_jsonl_values(fh):
+                    yield raw.decode("utf-8"), text, value
     except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
         raise ValueError(
             f"is not a valid gzip file; it may be truncated or corrupt ({exc})") from exc
@@ -7596,27 +7625,119 @@ def _jsonl_records(path: Path) -> Iterator[tuple[str, str]]:
         raise ValueError(ip._jsonl_reason(path, exc)) from exc
 
 
-def _record_parts(records: Iterator[tuple[str, str]]) -> Iterator[Part]:
+def _record_parts(records: Iterator[tuple[str, str, Any]]) -> Iterator[Part]:
     """JSON Lines parts: records in order, each part's text as ingest reads it
     (records with text joined by a blank line) at most PART_LIMIT characters and
-    at most MAX_JSON_RECORDS records. A record over the limit is a part of its own."""
+    at most MAX_JSON_RECORDS records. A record over the limit is a part of its own.
+    Each part has its label's fields (the top-level keys of its object records,
+    first seen first) and its first and last records' keys (#648)."""
     lines: list[str] = []
     texts: list[str] = []
+    keys: dict[str, None] = {}
+    first = last = ""
     size = 0
-    for line, text in records:
+    position = 0
+
+    def part() -> Part:
+        return Part(body="\n".join(lines) + "\n", measure="\n\n".join(texts),
+                    records=len(lines), fields=[_label(k) for k in keys],
+                    first_key=first, last_key=last)
+
+    for line, text, value in records:
         added = (len(text) + (2 if texts else 0)) if text.strip() else 0
         if lines and (size + added > PART_LIMIT or len(lines) >= ip.MAX_JSON_RECORDS):
-            yield Part(body="\n".join(lines) + "\n", measure="\n\n".join(texts),
-                       records=len(lines))
-            lines, texts, size = [], [], 0
+            yield part()
+            lines, texts, keys, size = [], [], {}, 0
             added = len(text) if text.strip() else 0
+        position += 1
+        last = _json_key(value, position)
+        if not lines:
+            first = last
+        if isinstance(value, dict):
+            for key in value:
+                keys.setdefault(str(key), None)
         lines.append(line)
         if text.strip():
             texts.append(text)
         size += added
     if lines:
-        yield Part(body="\n".join(lines) + "\n", measure="\n\n".join(texts),
-                   records=len(lines))
+        yield part()
+
+
+# ── record labels (#648) ─────────────────────────────────────────────────────
+
+def _label(text: str) -> str:
+    """Whitespace runs made one space; over LABEL_CHARACTERS, cut with an ellipsis."""
+    text = " ".join(text.split())
+    if len(text) > LABEL_CHARACTERS:
+        text = text[:LABEL_CHARACTERS - 1] + "…"
+    return text
+
+
+def _position_key(position: int) -> str:
+    return f"record {position:,}"
+
+
+def _csv_key(cells: list[str], position: int) -> str:
+    """A CSV row's key: its first cell, or its position when that is blank."""
+    key = _label(normalise_text(cells[0])) if cells else ""
+    return key or _position_key(position)
+
+
+def _json_key(value: Any, position: int) -> str:
+    """A JSON record's key: the value of its first top-level field, or its
+    position when it isn't an object, is empty, or that value is null or blank."""
+    if not isinstance(value, dict) or not value:
+        return _position_key(position)
+    first = next(iter(value.values()))
+    if first is None:
+        return _position_key(position)
+    if isinstance(first, str):
+        text = first
+    elif isinstance(first, ip._JsonNumber):
+        text = first.text
+    elif first is True or first is False:
+        text = "true" if first else "false"
+    else:
+        text = _compact_json(first)
+    return _label(text) or _position_key(position)
+
+
+def record_title(name: str, number: int, total: int) -> str:
+    """`<name>`, or `<name>, part n of N`; the name cut to keep it in MAX_TITLE."""
+    name = " ".join(name.split())
+    suffix = f", part {number} of {total}" if total > 1 else ""
+    room = MAX_TITLE - len(suffix)
+    if len(name) > room:
+        name = name[:room - 1] + "…"
+    return name + suffix
+
+
+def record_summary(count: int, fields: list[str], first: str, last: str) -> str:
+    """`<count> records. Fields: a, b. First: <key>; last: <key>.`: at most
+    MAX_LABEL_FIELDS names, fewer if needed to stay in MAX_SUMMARY_WORDS words,
+    then `and M more`. Names and keys are at most LABEL_CHARACTERS (20 words)
+    each, so one name always fits: 8 fixed words + 20 + 2 x 20 = 68. One record
+    reads `1 record.`; a part with none (a CSV with a header and no rows) leaves
+    out the First/last sentence."""
+    def text(shown: int) -> str:
+        if not fields:
+            listed = "none"
+        else:
+            listed = ", ".join(fields[:shown])
+            if len(fields) > shown:
+                listed += f", and {len(fields) - shown:,} more"
+        noun = "record" if count == 1 else "records"
+        summary = f"{count:,} {noun}. Fields: {listed}."
+        if count:
+            summary += f" First: {first}; last: {last}."
+        return summary
+    shown = min(len(fields), MAX_LABEL_FIELDS)
+    summary = text(shown)
+    while shown > 1 and len(summary.split()) > MAX_SUMMARY_WORDS:
+        shown -= 1
+        summary = text(shown)
+    return summary
 
 
 def iter_parts(path: Path, raw_type: str) -> Iterator[Part]:
@@ -7915,15 +8036,17 @@ async def prepare_document(raw: Path, name: str, raw_type: str, chat: Chat,
     """Prepare one document. Raises ValueError (its failure reason), Cancelled,
     or StorageRefused from write_part."""
     kind = output_kind(raw_type)
+    if kind != "text":
+        # CSV and JSON are labelled from their data: no LLM call, no model check (#648).
+        if should_stop():
+            raise Cancelled()
+        return await _prepare_records(raw, raw_type, name, kind, should_stop, write_part)
     llm = LLM(chat, should_stop)
     if not await model_available(list_models):
         llm.down = True
     if should_stop():
         raise Cancelled()
-
-    if kind == "text":
-        return await _prepare_text(raw, raw_type, name, llm, should_stop, write_part, progress)
-    return await _prepare_records(raw, raw_type, name, kind, llm, should_stop, write_part)
+    return await _prepare_text(raw, raw_type, name, llm, should_stop, write_part, progress)
 
 
 def _no_text(name: str) -> ValueError:
@@ -8028,11 +8151,11 @@ async def _write(index: int, part_name: str, text: str, kind: str, write_part) -
     return entry
 
 
-async def _prepare_records(raw: Path, raw_type: str, name: str, kind: str, llm: LLM,
+async def _prepare_records(raw: Path, raw_type: str, name: str, kind: str,
                            should_stop, write_part) -> Result:
-    """CSV, JSON and JSON Lines: code-only, a part at a time. Their names depend on
-    how many parts there are, so parts are written under their index and named
-    when the count is known."""
+    """CSV, JSON and JSON Lines: code-only, a part at a time, each labelled from its
+    data (#648). Their names and titles depend on how many parts there are, so parts
+    are written under their index and named and titled when the count is known."""
     iterator = iter_parts(raw, raw_type)
     result = Result()
     entries: list[dict] = []
@@ -8043,18 +8166,20 @@ async def _prepare_records(raw: Path, raw_type: str, name: str, kind: str, llm: 
             break
         if should_stop():
             raise Cancelled()
-        title, summary, error = await title_summary(part.measure or part.body, llm)
+        summary = record_summary(part.records or 0, part.fields, part.first_key, part.last_key)
         entry = await _write(index, "", part.body, kind, write_part)
         if kind == "csv":
             entry["records"] = part.records
-        entry.update(title=title, summary=summary, summary_error=error,
+        entry.update(title=None, summary=summary, summary_error=None,
                      fallback=False, fallbacks=[])
         entries.append(entry)
         index += 1
     if not entries:
         raise _no_text(name)
-    for entry, part_name in zip(entries, part_names(name, kind, len(entries))):
+    count = len(entries)
+    for number, (entry, part_name) in enumerate(zip(entries, part_names(name, kind, count)), 1):
         entry["name"] = part_name
+        entry["title"] = record_title(name, number, count)
     result.parts = entries
     return result
 ```
@@ -21139,7 +21264,8 @@ import JobList, { newestToOpen, useJobList } from '../components/JobList'
 // Document preparation (#638). Raw documents are uploaded to the preparation area
 // on the instance, prepared by a background job (the code does the corpus rules'
 // work, the local LLM only removes headers, footers and boilerplate and writes a
-// title and summary), reviewed here, and imported into a collection through the
+// title and summary for PDF, DOCX, TXT and MD; CSV and JSON parts are labelled
+// from their data, #648), reviewed here, and imported into a collection through the
 // normal ingest path. They stay on the instance until deleted.
 
 const TERMINAL = ['completed', 'failed', 'partial', 'cancelled', 'interrupted']
@@ -21393,7 +21519,8 @@ export default function PreparePage() {
       <p className="text-sm text-gray-600 mb-4">
         Raw documents are made to follow the corpus rules here: the code extracts the text, splits it to the limits,
         normalises it and converts JSON, and the local LLM only removes page headers, footers, page numbers and
-        boilerplate and writes a title and summary. Where its cleaning would lose content, the part keeps the
+        boilerplate and writes a title and summary for PDF, DOCX, TXT and MD. CSV and JSON parts are labelled from
+        their data, with no LLM call. Where its cleaning would lose content, the part keeps the
         code-only text and the fallback is shown. Documents stay on this instance until you delete them.
         {' '}<Link to="/import" className="text-blue-600 hover:underline">Import page</Link>
       </p>
@@ -23860,13 +23987,13 @@ action list (#577).
 
 `21_prepare.sh` checks document preparation (#638, SPECIFICATIONS.md §3.1.11 and §10.8). It runs
 `../tests/test_prepare.py` in the API image with no network and a stub LLM (windows and the fidelity check,
-the LLM's limits, titles and summaries, normalisation, parts and names, JSON to JSON Lines, the storage limit,
+the LLM's limits, titles and summaries, the labels of CSV and JSON parts, normalisation, parts and names, JSON to JSON Lines, the storage limit,
 jobs, cancel and restart, busy documents, import, downloads, routes), then checks the verify project through
 `prepare_stack.py` as the harness Developer: the role matrix of every `/prepare` route, an upload with a ZIP,
 ZIP refusals with ingest's codes, the raw download and the space used, deletes, import refusals, an unknown
 job's cancel and the audit records. In a full run (not `RAG_SKIP_SLOW=1`) it prepares three small files with
 the local LLM, one job at a time, checks that the cleaned text holds only source lines in order and that the
-CSV and JSON Lines come back unchanged, imports them into a throwaway `VfyPrepare*` collection and downloads a
+CSV and JSON Lines come back unchanged, labelled from their data, imports them into a throwaway `VfyPrepare*` collection and downloads a
 prepared part. Its `vfy-prepare-*` documents and its collections are removed at the end.
 
 ## Entry point and verify project
@@ -28025,7 +28152,7 @@ if __name__ == "__main__":
 #!/usr/bin/env bash
 # Document preparation (#638): SPECIFICATIONS.md §3.1.11 and §10.8.
 #
-# The unit checks (U1-U13) run in the API image with no network and a stub LLM.
+# The unit checks (U1-U14) run in the API image with no network and a stub LLM.
 # The stack checks (P1-P11) run on the verify project through prepare_stack.py,
 # one check each, as the harness Developer. P9-P11 prepare three small files with
 # the local LLM, one job at a time, so they run only in a full run
@@ -28041,7 +28168,7 @@ stack() { _rag_require_lock_owner; python3 ./prepare_stack.py "$1" "$FIX"; }
 
 section "Preparation units: windows, fidelity, LLM limits, parts, JSON, storage, jobs, import, routes"
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_prepare.py)
-check "test_prepare.py: the preparation area, pipeline, jobs, import and routes (U1-U13)" $?
+check "test_prepare.py: the preparation area, pipeline, jobs, import and routes (U1-U14)" $?
 
 stack cleanup >/dev/null 2>&1
 
@@ -28068,7 +28195,7 @@ if [ "$SKIP_SLOW" = "1" ]; then
   skip "P9-P11 prepare, import and download with the LLM" "RAG_SKIP_SLOW=1"
 else
   stack prepare
-  check "P9 the .txt becomes cleaned Markdown of source lines in order with its header; the .csv and .jsonl are unchanged" $?
+  check "P9 the .txt becomes cleaned Markdown of source lines in order with its header; the .csv and .jsonl are unchanged and labelled from their data" $?
   stack import
   check "P10 an unknown collection is 404; the import into a new collection completes and is recorded" $?
   p10_collection=$(python3 -c 'import prepare_stack as p; print(p.state().get("collection", ""))')
@@ -28382,7 +28509,8 @@ def check_audit(fix):
 # ── with the LLM (full runs only) ────────────────────────────────────────────
 
 def check_prepare(fix):
-    """P9: preparing the .txt, the .csv and the .jsonl."""
+    """P9: preparing the .txt, the .csv and the .jsonl; the .csv and .jsonl are
+    labelled from their data."""
     token = role_token("developer")
     ids = state()["ids"]
     status, body, _ = send("POST", "/prepare/jobs", token, body={"document_ids": list(ids.values())})
@@ -28414,11 +28542,17 @@ def check_prepare(fix):
     for reason in (f["reason"] for f in part["fallbacks"]):
         expect(reason in ("removed-too-much", "removed-long-line", "unusable-answer", "llm-timeout",
                           "llm-error", "llm-unavailable", "too-large-for-llm"), "reason {}".format(reason))
+    labels = {"vfy-prepare-people.csv": "3 records. Fields: name, team. First: Ada; last: Cy.",
+              "vfy/records.jsonl": "2 records. Fields: id, text. First: 1; last: 2."}
     for name, want in (("vfy-prepare-people.csv", CSV), ("vfy/records.jsonl", JSONL)):
         record = send("GET", "/prepare/documents/" + ids[name], token)[1]
         expect(record["status"] == "prepared" and record["code_only_by_type"], "{} {}".format(name, record["status"]))
         status, content, _ = send("GET", "/prepare/documents/{}/prepared".format(record["id"]), token, raw=True)
         expect(content.decode("utf-8") == want, "{} changed: {!r}".format(name, content[:80]))
+        # Labelled from the data, with no LLM call (#648).
+        [part] = record["parts"]
+        got = (part["title"], part["summary"], part["summary_error"])
+        expect(got == (name, labels[name], None), "{} labelled {!r}".format(name, got))
 
 
 def check_import(fix):
@@ -31082,7 +31216,7 @@ if __name__ == "__main__":
 ```python
 """Document preparation (#638): the area, the pipeline, jobs, import and routes.
 
-SPECIFICATIONS.md §3.1.11 and §10.8 (U1-U13). Runs with the API's dependencies,
+SPECIFICATIONS.md §3.1.11 and §10.8 (U1-U14). Runs with the API's dependencies,
 in the built API image with no network (`21_prepare.sh`):
 
     docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
@@ -31141,6 +31275,7 @@ class StubLLM:
 
     def __init__(self, clean=None, title=None):
         self.calls = []
+        self.model_calls = 0
         self.clean = clean
         self.title = title
 
@@ -31168,6 +31303,7 @@ class StubLLM:
         return behaviour
 
     async def models(self):
+        self.model_calls += 1
         return {f"{settings.llm_model}:latest", "nomic-embed-text:latest"}
 
 
@@ -31384,12 +31520,13 @@ class LlmDocumentTests(AreaCase):
         part = self.prepare(self.document("c.md", "Text.\n"), llm).parts[0]
         self.assertEqual(part["summary_error"], "unusable-answer")
 
-    def test_csv_and_jsonl_keep_title_in_the_record_only(self):
+    def test_csv_and_jsonl_are_labelled_from_their_data_in_the_record_only(self):
         csv_data = "name,team\nAda,core\nBo,docs\n"
         record = self.document("people.csv", csv_data)
         part = self.prepare(record).parts[0]
         self.assertEqual(self.part_text(record["id"], part), csv_data)
-        self.assertEqual(part["title"], "Committee minutes")
+        self.assertEqual((part["title"], part["summary"], part["summary_error"]),
+                         ("people.csv", "2 records. Fields: name, team. First: Ada; last: Bo.", None))
         self.assertEqual(part["records"], 2)
         jsonl = '{"a": 1}\n{"b": "x"}\n'
         record = self.document("d.jsonl", jsonl)
@@ -31397,6 +31534,157 @@ class LlmDocumentTests(AreaCase):
         self.assertEqual(self.part_text(record["id"], part), jsonl)
         self.assertEqual(part["name"], "d.jsonl")
         self.assertEqual(part["records"], 2)
+        self.assertEqual((part["title"], part["summary"], part["summary_error"]),
+                         ("d.jsonl", "2 records. Fields: a, b. First: 1; last: x.", None))
+
+
+# ── U14: record labels from the data (#648) ─────────────────────────────────
+
+class RecordLabelTests(AreaCase):
+    def label(self, name, data, llm=None):
+        result = self.prepare(self.document(name, data), llm)
+        return [(p["title"], p["summary"]) for p in result.parts]
+
+    def test_titles_name_the_file_and_the_part(self):
+        rows = "".join(f"{i},v{i}\n" for i in range(1, 301))
+        with patch.object(preparation, "PART_LIMIT", 1000):
+            result = self.prepare(self.document("a/t.csv", "id,value\n" + rows))
+        count = len(result.parts)
+        self.assertGreater(count, 2)
+        self.assertEqual([p["title"] for p in result.parts],
+                         [f"a/t.csv, part {n} of {count}" for n in range(1, count + 1)])
+        # Keys are document positions' rows, so each part starts where the last ended.
+        firsts = [p["summary"].split("First: ")[1].split(";")[0] for p in result.parts]
+        lasts = [p["summary"].split("last: ")[1].rstrip(".") for p in result.parts]
+        self.assertEqual(firsts[0], "1")
+        self.assertEqual(lasts[-1], "300")
+        for previous, first in zip(lasts, firsts[1:]):
+            self.assertEqual(int(first), int(previous) + 1)
+        self.assertEqual(sum(p["records"] for p in result.parts), 300)
+        self.assertEqual(preparation.record_title("x.csv", 1, 1), "x.csv")
+
+    def test_a_long_name_is_cut_to_keep_the_title_in_150_characters(self):
+        name = "n" * 200 + ".csv"
+        one = preparation.record_title(name, 1, 1)
+        self.assertEqual(len(one), 150)
+        self.assertTrue(one.endswith("…"))
+        several = preparation.record_title(name, 3, 12)
+        self.assertEqual(len(several), 150)
+        self.assertTrue(several.endswith("…, part 3 of 12"))
+        self.assertEqual(preparation.record_title("a  b\tc.csv", 1, 2), "a b c.csv, part 1 of 2")
+
+    def test_csv_fields_are_the_header_cells(self):
+        [(title, summary)] = self.label("p.csv", 'id,,"long  name"\n7,x,y\n')
+        self.assertEqual(summary, "1 record. Fields: id, (blank), long name. First: 7; last: 7.")
+
+    def test_json_lines_fields_are_top_level_keys_first_seen_and_a_nested_object_is_one(self):
+        data = ('{"id": "b1", "meta": {"x": 1, "y": 2}}\n'
+                '[1, 2]\n'
+                '{"title": "t", "id": "b2"}\n')
+        [(title, summary)] = self.label("bills.jsonl", data)
+        self.assertEqual(title, "bills.jsonl")
+        self.assertEqual(summary, "3 records. Fields: id, meta, title. First: b1; last: t.")
+
+    def test_a_part_with_no_object_records_has_no_fields(self):
+        [(title, summary)] = self.label("s.json", "[1, 2, 3]")
+        self.assertEqual(summary, "1 record. Fields: none. First: record 1; last: record 1.")
+
+    def test_more_than_20_fields(self):
+        header = ",".join(f"f{i}" for i in range(1, 26))
+        [(title, summary)] = self.label("w.csv", header + "\n" + ",".join("1" * 25) + "\n")
+        listed = ", ".join(f"f{i}" for i in range(1, 21))
+        self.assertEqual(summary, f"1 record. Fields: {listed}, and 5 more. First: 1; last: 1.")
+
+    def test_key_kinds(self):
+        key = preparation._json_key
+        number = ingest_pipeline._JsonNumber
+        self.assertEqual(key({"a": "x  y\nz"}, 1), "x y z")
+        self.assertEqual(key({"a": number("1.50")}, 1), "1.50")
+        self.assertEqual(key({"a": True}, 1), "true")
+        self.assertEqual(key({"a": False}, 1), "false")
+        self.assertEqual(key({"a": {"b": number("2")}}, 1), '{"b":2}')
+        self.assertEqual(key({"a": [number("1"), "x"]}, 1), '[1,"x"]')
+        self.assertEqual(key({"a": {}}, 1), "{}")
+        data = '{"n": 1.50}\n{"n": true}\n'
+        [(title, summary)] = self.label("k.jsonl", data)
+        self.assertEqual(summary, "2 records. Fields: n. First: 1.50; last: true.")
+
+    def test_fallbacks_use_the_record_position_in_the_document(self):
+        key = preparation._json_key
+        for value in ([1], "s", None, {}, {"a": None}, {"a": ""}, {"a": "  \t"}):
+            self.assertEqual(key(value, 1234), "record 1,234", value)
+        self.assertEqual(preparation._csv_key(["  ", "x"], 5), "record 5")
+        self.assertEqual(preparation._csv_key([], 5), "record 5")
+        lines = "".join('{"id": %s, "pad": "%s"}\n' % ('null' if i % 2 else i, "p" * 20)
+                        for i in range(1, 101))
+        with patch.object(preparation, "PART_LIMIT", 300):
+            result = self.prepare(self.document("f.jsonl", lines))
+        self.assertGreater(len(result.parts), 2)
+        position = 0
+        for part in result.parts:
+            first, last = position + 1, position + part["records"]
+            want_first = f"record {first:,}" if first % 2 else str(first)
+            want_last = f"record {last:,}" if last % 2 else str(last)
+            self.assertTrue(part["summary"].endswith(f"First: {want_first}; last: {want_last}."),
+                            part["summary"])
+            position = last
+        rows = "id,v\n1,a\n,b\n"
+        [(title, summary)] = self.label("c.csv", rows)
+        self.assertEqual(summary, "2 records. Fields: id, v. First: 1; last: record 2.")
+
+    def test_values_and_names_are_cut_at_40_characters(self):
+        long = "x" * 60
+        cut = "x" * 39 + "…"
+        self.assertEqual(preparation._json_key({"a": long}, 1), cut)
+        [(title, summary)] = self.label("l.csv", f"{long},b\n{long},1\n")
+        self.assertEqual(summary, f"1 record. Fields: {cut}, b. First: {cut}; last: {cut}.")
+
+    def test_the_summary_stays_in_80_words(self):
+        name = " ".join("w" for _ in range(20))         # 39 characters, 20 words
+        fields = [name] * 20
+        key = " ".join("k" for _ in range(20))
+        summary = preparation.record_summary(5000, fields, key, key)
+        self.assertLessEqual(len(summary.split()), preparation.MAX_SUMMARY_WORDS)
+        self.assertIn(f"Fields: {name}, and 19 more.", summary)
+        self.assertTrue(summary.startswith("5,000 records. "))
+        short = preparation.record_summary(3, ["a", "b"], "x", "y")
+        self.assertEqual(short, "3 records. Fields: a, b. First: x; last: y.")
+        self.assertEqual(preparation.record_summary(1, ["a"], "x", "x"),
+                         "1 record. Fields: a. First: x; last: x.")
+        self.assertEqual(preparation.record_summary(0, ["a", "b"], "", ""), "0 records. Fields: a, b.")
+        [(title, summary)] = self.label("h.csv", "a,b\n")
+        self.assertEqual(summary, "0 records. Fields: a, b.")
+
+    def test_record_documents_make_no_llm_call_and_skip_the_model_check(self):
+        async def failing(system, user):
+            raise RuntimeError("down")
+
+        async def no_model():
+            return set()
+        samples = (("r.csv", b"id,v\n1,a\n"), ("r.jsonl", b'{"id": 1}\n'),
+                   ("r.jsonl.gz", gzip.compress(b'{"id": 1}\n')), ("r.json", b'[{"id": 1}]'),
+                   ("r.json.gz", gzip.compress(b'[{"id": 1}]')))
+        for name, data in samples:
+            for broken in (False, True):
+                llm = StubLLM(clean=failing if broken else None, title=failing if broken else None)
+                if broken:
+                    llm.models = no_model
+                result = self.prepare(self.document(name, data), llm)
+                [part] = result.parts
+                self.assertEqual(llm.calls, [], name)
+                self.assertEqual(llm.model_calls, 0, name)
+                self.assertEqual(part["title"], name)
+                self.assertEqual(part["summary"], "1 record. Fields: id, v. First: 1; last: 1."
+                                 if name.endswith(".csv") else
+                                 "1 record. Fields: id. First: 1; last: 1.")
+                self.assertIsNone(part["summary_error"])
+                self.assertFalse(result.fallback)
+
+    def test_text_documents_still_check_the_model_and_use_the_llm_title(self):
+        llm = StubLLM()
+        part = self.prepare(self.document("m.txt", page_text()), llm).parts[0]
+        self.assertEqual(llm.model_calls, 1)
+        self.assertEqual(part["title"], "Committee minutes")
 
 
 # ── U5: normalisation ───────────────────────────────────────────────────────

@@ -1770,7 +1770,8 @@ restores, whatever the package carries (`RAG_EXPORT_SPECIFICATIONS.md` §4.2).
 
 A preparation area where raw documents are made to follow the corpus rules (#615), stored on the
 instance and imported with one action. Code does the rule work exactly; the local LLM (`LLM_MODEL`) only
-removes headers, footers, page numbers and boilerplate, and writes a title and summary. One area for the
+removes headers, footers, page numbers and boilerplate, and writes a title and summary, for PDF, DOCX, TXT and
+MD parts. CSV and JSON parts are labelled from their data, with no LLM call (#648). One area for the
 instance, in the `rag_preparation` volume (`PREPARATION_DIR`, `/app/preparation`); documents stay until
 deleted. Every route is `developer` (§3.1.8); documents are shared, each showing its owner, and any caller
 with access may delete any document.
@@ -1847,12 +1848,27 @@ before the job, as they do at API startup after an interrupted job.
    once. A window keeps its code-only text, recorded `{"window", "reason"}` on its part, when the lines named
    hold over 20 % of its characters (`removed-too-much`), include one over 200 characters
    (`removed-long-line`), or after `unusable-answer`, `llm-timeout` or `llm-error`. If the model isn't in
-   Ollama's list when a document starts, or three of its calls in a row fail, it makes no further calls
-   (`llm-unavailable`). A document over 1,000 windows is code-only (`too-large-for-llm`) but still titled.
-5. *Title and summary* for every part with §6.6, from its first 6,000 characters: a title of at most 150
-   characters on one line and a summary of at most 80 words, else asked again once, else left out with
-   `summary_error`. For the four text types the part begins `# <title>`, a blank line, `Summary (generated):
-   <summary>`, a blank line; CSV and JSON Lines keep them in the record only.
+   Ollama's list when a PDF, DOCX, TXT or MD document starts, or three of its calls in a row fail, it makes no
+   further calls (`llm-unavailable`). A document over 1,000 windows is code-only (`too-large-for-llm`) but
+   still titled. A CSV or JSON document makes no LLM call and its model isn't checked, so it prepares the same
+   with the LLM down.
+5. *Title and summary* for every part. PDF, DOCX, TXT and MD: with §6.6, from its first 6,000 characters: a
+   title of at most 150 characters on one line and a summary of at most 80 words, else asked again once, else
+   left out with `summary_error`; the part begins `# <title>`, a blank line, `Summary (generated): <summary>`,
+   a blank line. CSV and JSON (`.csv`, `.jsonl`, `.jsonl.gz`, `.json`, `.json.gz`): from the data, with no
+   LLM call (#648), kept in the record only, `summary_error` null:
+   - Title: the document's name with one part; `<name>, part <n> of <N>` with several. Whitespace runs
+     become one space; a title over 150 characters has its name cut, ending `…`.
+   - Summary: `<count> records. Fields: <fields>. First: <first key>; last: <last key>.` The count has
+     thousands separators; one record reads `1 record.`, and a part with no records (a CSV with a header and
+     no rows) leaves out the First/last sentence: `0 records. Fields: <fields>.` The fields are a CSV's header cells (a blank one reads `(blank)`), or the
+     top-level keys of every JSON record in the part, first seen first (a nested object or array is one
+     field; `none` when no record is an object); at most 20, then `, and <M> more`, fewer when needed to
+     keep the summary within 80 words. A record's key is a CSV row's first cell, or the value of a JSON
+     record's first top-level field (a number as written, an object or array as compact JSON); when that is
+     blank or `null`, or the record isn't an object or is empty, it is `record <position>`, its position in
+     the document from 1. Names and keys have whitespace runs made one space and are cut at 40 characters,
+     ending `…`.
 6. *Check* each written part as ingest reads it: at most 10,000,000 characters, at most 1,000,000 records,
    valid JSON Lines, at most 10,000 chunks estimated for `overlap` 1,000/200. A failure fails the document.
 
@@ -2720,6 +2736,8 @@ The lines named are removed only when the fidelity check of §3.1.11 passes.
 You write a title and a short summary for a part of a document. Use only the text given. The title is at most 15 words. The summary is at most 60 words. Return only a JSON object: {"title": "...", "summary": "..."}.
 ```
 
+Used for PDF, DOCX, TXT and MD parts only; CSV and JSON parts are labelled from their data (§3.1.11).
+
 **User:** `Text:` followed by the part's first 6,000 characters.
 
 Usable: a nonempty `title` of at most 150 characters on one line and a nonempty `summary` of at most 80 words
@@ -3179,7 +3197,8 @@ nothing about jobs is kept in browser storage.
 **Route:** `/prepare`, in the Data menu after Import
 **Roles:** Engineer, Developer
 
-- What the page does (code does the rule work, the LLM only cleans and titles), and a note that preparation and
+- What the page does (code does the rule work, the LLM only cleans and titles PDF, DOCX, TXT and MD; CSV and JSON
+  are labelled from their data), and a note that preparation and
   ingest share the local LLM service, so either is slower while the other runs.
 - An upload zone for the §3.1.11 types, refusing a selection over 512 MB before sending; the answer's skipped
   files are listed.
@@ -4155,7 +4174,7 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 
 ### 10.8 Document preparation (#638)
 
-`scripts/verify/21_prepare.sh` runs `scripts/tests/test_prepare.py` in the API image with a stub LLM (U1-U13)
+`scripts/verify/21_prepare.sh` runs `scripts/tests/test_prepare.py` in the API image with a stub LLM (U1-U14)
 and checks the verify project through `prepare_stack.py` (P1-P11).
 
 - [x] Every `/prepare` route refuses no session (401) and an End User (403) and admits a Developer (P1).
@@ -4168,7 +4187,8 @@ and checks the verify project through `prepare_stack.py` (P1-P11).
       settings (422) (P6); cancelling an unknown job is 404 (P7).
 - [x] Uploads, downloads and deletes are audited with names and no document text (P8).
 - [x] With the LLM (full runs): a `.txt` becomes `.md` whose lines are source lines in order, with the title
-      header when there is a title; the `.csv` and `.jsonl` come back unchanged and code-only (P9); an import into
+      header when there is a title; the `.csv` and `.jsonl` come back unchanged and code-only, with the title and
+      summary from their data and `summary_error` null (P9); an import into
       an unknown collection is 404 and one into a new collection completes and is recorded on each document
       (P10); the prepared download is the part, and deleting the prepared output returns the document to `raw`
       (P11).
@@ -4178,7 +4198,11 @@ and checks the verify project through `prepare_stack.py` (P1-P11).
       never cut, names and the checks of a written part; JSON to JSON Lines with numbers as written; the storage
       limit refusing an upload, a job start and a part; replacing output, a failed re-run keeping the earlier
       output, cancel and restart; one job at a time; busy documents; the routes' roles and audit actions; and
-      the prepared download of several parts as a ZIP (U1-U13).
+      the prepared download of several parts as a ZIP (U1-U13); CSV and JSON parts labelled from their data:
+      titles for one and several parts and the 150-character cut, `1 record.` and a part with no records,
+      fields, more than 20 fields, keys of every
+      kind and their fallbacks by document position, the 40-character cut, the 80-word limit, and no LLM call
+      or model check for all five types, with the model missing or the LLM failing (U14).
 
 ## 11. Host Requirements and Distribution
 

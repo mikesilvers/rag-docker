@@ -471,6 +471,14 @@ def _iter_jsonl_lines(stream: Any) -> Iterator[tuple[int, bytes, str]]:
     bytes without its line ending or line 1's byte-order mark, and its converted
     text, which is empty for a record with no text. Blank lines are not given.
     Document preparation (#638) keeps the line as it is; ingest keeps the text.
+    See _iter_jsonl_values, which reads them."""
+    for number, raw, text, _value in _iter_jsonl_values(stream):
+        yield number, raw, text
+
+
+def _iter_jsonl_values(stream: Any) -> Iterator[tuple[int, bytes, str, Any]]:
+    """_iter_jsonl_lines with each record's parsed value as well, numbers kept as
+    written: document preparation labels its parts from it (#648).
 
     Read one line at a time, at most MAX_JSONL_LINE_BYTES of it besides its line
     ending and line 1's byte-order mark, and stopped at the first bad line, at
@@ -530,7 +538,7 @@ def _iter_jsonl_lines(stream: Any) -> Iterator[tuple[int, bytes, str]]:
         except RecursionError as exc:
             raise _JsonlError(
                 f"line {number} is not valid JSON: it is nested too deeply to read") from exc
-        yield number, raw, text
+        yield number, raw, text, value
 
 
 def _jsonl_records(stream: Any) -> list[str]:

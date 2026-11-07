@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Document preparation (#638): SPECIFICATIONS.md §3.1.11 and §10.8.
 #
-# The unit checks (U1-U13) run in the API image with no network and a stub LLM.
+# The unit checks (U1-U14) run in the API image with no network and a stub LLM.
 # The stack checks (P1-P11) run on the verify project through prepare_stack.py,
 # one check each, as the harness Developer. P9-P11 prepare three small files with
 # the local LLM, one job at a time, so they run only in a full run
@@ -17,7 +17,7 @@ stack() { _rag_require_lock_owner; python3 ./prepare_stack.py "$1" "$FIX"; }
 
 section "Preparation units: windows, fidelity, LLM limits, parts, JSON, storage, jobs, import, routes"
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_prepare.py)
-check "test_prepare.py: the preparation area, pipeline, jobs, import and routes (U1-U13)" $?
+check "test_prepare.py: the preparation area, pipeline, jobs, import and routes (U1-U14)" $?
 
 stack cleanup >/dev/null 2>&1
 
@@ -44,7 +44,7 @@ if [ "$SKIP_SLOW" = "1" ]; then
   skip "P9-P11 prepare, import and download with the LLM" "RAG_SKIP_SLOW=1"
 else
   stack prepare
-  check "P9 the .txt becomes cleaned Markdown of source lines in order with its header; the .csv and .jsonl are unchanged" $?
+  check "P9 the .txt becomes cleaned Markdown of source lines in order with its header; the .csv and .jsonl are unchanged and labelled from their data" $?
   stack import
   check "P10 an unknown collection is 404; the import into a new collection completes and is recorded" $?
   p10_collection=$(python3 -c 'import prepare_stack as p; print(p.state().get("collection", ""))')
