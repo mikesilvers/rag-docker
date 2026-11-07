@@ -1,8 +1,8 @@
-"""Host-only check that the pinned dependencies are at or above their patched versions (#522, #562).
+"""Host-only check that the pinned dependencies are at or above their patched versions (#522, #562, #651).
 
 Reads the Python locks, api/requirements.in, ui/package.json and
 ui/package-lock.json. The floors are the first patched versions of the
-Dependabot alerts #522 and #562 closed. filelock (3.x, no patched release that
+Dependabot alerts #522, #562 and #651 closed. filelock (3.x, no patched release that
 unstructured accepts) is left out on purpose; the #522 PR explains its alerts.
 postcss-selector-parser stays on 6.x (tailwindcss 3). Its nested copy under
 @tailwindcss/typography, which pins 6.0.10 exactly, is lifted by a scoped npm
@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 FLOORS = {
     'api/requirements.txt': {
-        'pillow': '13.0.0', 'certifi': '2026.10.19', 'pypdf': '6.21.2', 'urllib3': '2.8.0',
+        'pillow': '13.0.0', 'certifi': '2026.10.19', 'pypdf': '6.21.4', 'urllib3': '2.8.0',
         'opentelemetry-api': '1.45.1', 'opentelemetry-sdk': '1.45.1', 'opentelemetry-proto': '1.45.1',
         'opentelemetry-exporter-otlp-proto-common': '1.45.1',
         'opentelemetry-exporter-otlp-proto-http': '1.45.1',
