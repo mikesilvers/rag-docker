@@ -1234,7 +1234,7 @@ synthesis failing is the Ollama 503 (and that it used the engineer system prompt
 Ollama failure in the reformulation or the synthesis in `hybrid` and `semantic` modes still
 names Ollama only (#456), that a Weaviate failure in `hybrid` and `semantic`
 modes names Ollama too (Weaviate embeds the question through it there), and that a help
-template `RuntimeError` answers `HELP_RENDER_FAILED` with its own message. Suite 01 then
+template `RuntimeError` answers `HELP_RENDER_FAILED` with a fixed message, the cause logged (#657). Suite 01 then
 checks the envelope through the proxy on the running stack: an unknown route answers 404
 `NOT_FOUND`, and `PUT /query` answers 405 with `Allow: POST` and the code
 `METHOD_NOT_ALLOWED` (#456), the request going through the lock-checked `api_request` helper.
