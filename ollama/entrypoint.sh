@@ -11,14 +11,28 @@ until ollama list > /dev/null 2>&1; do
   sleep 2
 done
 
+# Is the model downloaded? `ollama list` prints NAME as "<name>:<tag>", with
+# ":latest" added to a name pulled without a tag; its columns are separated by
+# tabs or spaces, so `read` splits them. The NAME must match exactly: another
+# variant of a tagged name (llama3.1:8b-instruct-q8_0 for llama3.1:8b) is a
+# different model and doesn't count (#647).
+model_present() {
+    local name rest
+    while read -r name rest; do
+        if [ "${name}" = "$1" ] || [ "${name}" = "$1:latest" ]; then
+            return 0
+        fi
+    done < <(ollama list)
+    return 1
+}
+
 # Pull a model with retry. Ollama resumes partial downloads so retries are cheap.
 # timeout 7200 (2 hours) kills a truly hung connection while allowing slow downloads.
 pull_with_retry() {
     local model="$1"
 
-    # Skip if already downloaded. `ollama list` prints NAME as "<model>:latest",
-    # so anchor the match to the start of the line.
-    if ollama list | grep -q "^${model}"; then
+    # Skip if already downloaded.
+    if model_present "${model}"; then
         echo "ollama: ${model} already present, skipping pull."
         return 0
     fi
@@ -37,7 +51,7 @@ pull_with_retry() {
     echo "ollama: ${model} ready."
 }
 
-pull_with_retry phi3.5
+pull_with_retry llama3.1:8b
 pull_with_retry nomic-embed-text
 
 wait $OLLAMA_PID

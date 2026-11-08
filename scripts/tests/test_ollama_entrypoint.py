@@ -18,7 +18,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 ENTRYPOINT = ROOT / "ollama" / "entrypoint.sh"
-MODELS = ("phi3.5", "nomic-embed-text")
+MODELS = ("llama3.1:8b", "nomic-embed-text")
+LLM = MODELS[0]
 
 # `ollama`: `serve` exits at once; `list` fails while list-fail tokens remain, then
 # prints a header and one line per pulled model; `pull <m>` fails while fail-<m>
@@ -35,9 +36,13 @@ case "$1" in
   serve) exit 0 ;;
   list)
     take "$state/list-fail" && exit 1
-    echo "NAME                    ID              SIZE      MODIFIED"
+    # Ollama's table writer separates the columns with tabs.
+    printf 'NAME\tID\tSIZE\tMODIFIED\n'
     for m in "$state"/models/*; do
-      [ -e "$m" ] && echo "$(basename "$m"):latest    0123456789ab    2.2 GB    1 day ago"
+      [ -e "$m" ] || continue
+      # As Ollama does: a name pulled without a tag is listed with ":latest".
+      name=$(basename "$m"); case "$name" in *:*) ;; *) name="$name:latest" ;; esac
+      printf '%s\t0123456789ab\t2.2 GB\t1 day ago\n' "$name"
     done
     exit 0 ;;
   pull)
@@ -111,8 +116,26 @@ class EntrypointTests(EntrypointTestCase):
         self.present("nomic-embed-text")
         result, calls = self.run_entrypoint()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.pulls(calls), ["timeout 7200 ollama pull phi3.5"])
+        self.assertEqual(self.pulls(calls), [f"timeout 7200 ollama pull {LLM}"])
         self.assertIn("ollama: nomic-embed-text already present, skipping pull.", result.stdout)
+
+    def test_an_upgraded_volume_pulls_only_the_new_answering_model(self):
+        # An install from before #647 holds phi3.5 and nomic-embed-text.
+        self.present("phi3.5", "nomic-embed-text")
+        result, calls = self.run_entrypoint()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.pulls(calls), [f"timeout 7200 ollama pull {LLM}"])
+        self.assertIn(f"ollama: {LLM} ready.", result.stdout)
+        self.assertIn("ollama: nomic-embed-text already present, skipping pull.", result.stdout)
+        self.assertNotIn("ollama pull phi3.5", "\n".join(calls))
+
+    def test_another_variant_of_the_model_does_not_count_as_present(self):
+        # A prefix match would take llama3.1:8b-instruct-q8_0 for llama3.1:8b (#647).
+        self.present("llama3.1:8b-instruct-q8_0", "llama3.1:latest", "nomic-embed-text")
+        result, calls = self.run_entrypoint()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.pulls(calls), [f"timeout 7200 ollama pull {LLM}"])
+        self.assertNotIn(f"ollama: {LLM} already present", result.stdout)
 
     def test_missing_models_are_pulled_under_a_two_hour_timeout(self):
         # The server isn't ready for the first two `ollama list` calls.
@@ -126,29 +149,29 @@ class EntrypointTests(EntrypointTestCase):
             self.assertIn(f"ollama: {model} ready.", result.stdout)
         # Nothing is pulled before the server answers: two failed `ollama list` calls,
         # 2 s apart, come first.
-        first_pull = calls.index("timeout 7200 ollama pull phi3.5")
+        first_pull = calls.index(f"timeout 7200 ollama pull {LLM}")
         self.assertEqual(calls[:first_pull].count("sleep 2"), 2)
 
     def test_a_failed_or_timed_out_pull_is_retried_after_15_seconds(self):
         self.present("nomic-embed-text")
-        self.tokens("hang-phi3.5", 1)   # the first attempt times out
-        self.tokens("fail-phi3.5", 1)   # the second fails
+        self.tokens(f"hang-{LLM}", 1)   # the first attempt times out
+        self.tokens(f"fail-{LLM}", 1)   # the second fails
         result, calls = self.run_entrypoint()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.pulls(calls), ["timeout 7200 ollama pull phi3.5"] * 3)
+        self.assertEqual(self.pulls(calls), [f"timeout 7200 ollama pull {LLM}"] * 3)
         self.assertEqual([c for c in calls if c == "sleep 15"], ["sleep 15"] * 2)
         for attempt in (1, 2):
-            self.assertIn(f"ollama: pull of phi3.5 failed or timed out (attempt {attempt}/5), "
+            self.assertIn(f"ollama: pull of {LLM} failed or timed out (attempt {attempt}/5), "
                           "retrying in 15s...", result.stdout)
-        self.assertIn("ollama: phi3.5 ready.", result.stdout)
+        self.assertIn(f"ollama: {LLM} ready.", result.stdout)
 
     def test_five_failed_attempts_stop_the_container(self):
-        self.tokens("fail-phi3.5", 99)
+        self.tokens(f"fail-{LLM}", 99)
         result, calls = self.run_entrypoint()
         self.assertEqual(result.returncode, 1)
-        self.assertEqual(self.pulls(calls), ["timeout 7200 ollama pull phi3.5"] * 5)
+        self.assertEqual(self.pulls(calls), [f"timeout 7200 ollama pull {LLM}"] * 5)
         self.assertEqual(calls.count("sleep 15"), 4)
-        self.assertIn("ERROR: failed to pull phi3.5 after 5 attempts.", result.stderr)
+        self.assertIn(f"ERROR: failed to pull {LLM} after 5 attempts.", result.stderr)
         # Nothing more is pulled.
         self.assertNotIn("nomic-embed-text", "\n".join(calls))
 
