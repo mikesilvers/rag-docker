@@ -70,6 +70,12 @@ class UploadRejected(Exception):
                        "members_omitted": max(0, len(members) - _MAX_NAMED_MEMBERS)}
 
 
+class NoSupportedFiles(ValueError):
+    """An upload with no supported file. The ingest router answers this type
+    alone as NO_SUPPORTED_FILES, so no other ValueError's text reaches the
+    client under that code (#657). Still a ValueError, as it was before."""
+
+
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
 
@@ -1256,7 +1262,10 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
     remedy = "Re-create the zip and upload it again."
     try:
         archive = zipfile.ZipFile(dest, "r")
-    except (zipfile.BadZipFile, OSError) as exc:
+    except (zipfile.BadZipFile, OSError, ValueError) as exc:
+        # ValueError: a member name flagged UTF-8 that isn't valid UTF-8 raises
+        # UnicodeDecodeError while the directory is read. The archive can't be
+        # read, and the codec's text is not sent (#657).
         raise _rejected(
             "ARCHIVE_UNREADABLE",
             f"'{safe_name}' is damaged and can't be read, so nothing from it was imported. "
@@ -1457,7 +1466,7 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
     if not file_paths:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         detail = "; ".join(skipped)
-        raise ValueError(
+        raise NoSupportedFiles(
             "No supported files found in upload."
             + (f" Skipped: {detail}" if detail else ""))
 

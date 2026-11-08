@@ -36,6 +36,16 @@ class ExportStartingError(Exception):
     START_WAIT, so there is no job to name yet (#338)."""
 
 
+class ExportInProgressError(RuntimeError):
+    """An export of this collection is already running; `job_id` names it. Its
+    own type, so the router never answers another RuntimeError as
+    EXPORT_IN_PROGRESS (#657)."""
+
+    def __init__(self, job_id: str) -> None:
+        super().__init__(job_id)
+        self.job_id = job_id
+
+
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
 
@@ -120,7 +130,7 @@ async def start_export_job(collection: str, include_models: bool = False,
     A passphrase makes the package encrypted (#27). It is handed to the worker
     as an argument only: the job record says `encrypted`, never the passphrase.
 
-    Raises RuntimeError carrying the running job id if one is already in flight
+    Raises ExportInProgressError carrying the running job id if one is already in flight
     for this collection; that job's record is always stored by then (#326).
     Raises ExportStartingError if that start hasn't stored it within START_WAIT.
     """
@@ -135,7 +145,7 @@ async def start_export_job(collection: str, include_models: bool = False,
                 break
             starting = _starting.get(running)
         if starting is None:
-            raise RuntimeError(running)
+            raise ExportInProgressError(running)
         # That start hasn't stored its record yet: wait until it has, or has
         # released the slot, then look again (#326). Holds nothing meanwhile, and
         # gives up once START_WAIT has passed since the first wait (#338).

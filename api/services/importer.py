@@ -77,6 +77,15 @@ class PassphraseError(Exception):
         self.code = code
 
 
+class ImportInProgressError(RuntimeError):
+    """An import of this package file is already running. Its own type, so the
+    router never answers another RuntimeError as IMPORT_IN_PROGRESS (#657)."""
+
+    def __init__(self, filename: str) -> None:
+        super().__init__(filename)
+        self.filename = filename
+
+
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
 
@@ -983,7 +992,7 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
     job_id = str(uuid.uuid4())[:8]
     with _lock:
         if key in _active:
-            raise RuntimeError(filename)
+            raise ImportInProgressError(filename)
         _active.add(key)
 
     # The first write is durable, so it runs off the event loop (#309). A start

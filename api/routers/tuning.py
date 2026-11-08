@@ -57,10 +57,10 @@ async def _start(collection: str, operation: str, params: dict):
                          "could not be read. No job was started; try again when Weaviate "
                          "is available.",
                          detail={"collection": collection})
-    except RuntimeError as exc:
+    except tuning.TuneInProgressError as exc:
         return api_error(409, "TUNE_IN_PROGRESS",
-                         f"'{exc}' is already being tuned.",
-                         detail={"collection": str(exc)})
+                         f"'{exc.collection}' is already being tuned.",
+                         detail={"collection": exc.collection})
     return TuneStartResponse(job_id=job_id, status="queued",
                              collection=collection, operation=operation)
 

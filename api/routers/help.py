@@ -36,8 +36,12 @@ async def transfer_help():
     dimensions = await _embedding_dimensions()
     try:
         markdown = packager.render_help(dimensions)
-    except RuntimeError as exc:
-        return api_error(500, "HELP_RENDER_FAILED", str(exc))
+    except RuntimeError:
+        # A template that can't be filled in. The cause is logged, not sent (#657).
+        _log.exception("Could not render the help page from its templates")
+        return api_error(500, "HELP_RENDER_FAILED",
+                         "The help page could not be rendered: a help template is "
+                         "invalid. The API log has the details.")
     except OSError:
         # A template file missing or unreadable. Its path is logged, not sent (#373).
         _log.exception("Could not read a help template")

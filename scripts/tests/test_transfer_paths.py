@@ -242,6 +242,7 @@ class HelpTests(RouteTestCase):
         self.assertIn(f"`{settings.embed_model}` at 768 dimensions.", response.json()["markdown"])
 
     def test_a_template_that_cannot_render_is_help_render_failed(self):
+        # A fixed message; the template's own error is logged, not sent (#657).
         templates = self.root / "templates"
         (templates / "partials").mkdir(parents=True)
         cases = (("@@INCLUDE:missing_partial@@\n", "no such template partial: missing_partial"),
@@ -249,11 +250,16 @@ class HelpTests(RouteTestCase):
                   "help_transfer.md.tmpl: unsubstituted placeholder @@NOT_A_VALUE@@"))
         with patch.object(packager, "_TEMPLATE_DIR", templates), \
                 patch.object(ollama_client, "embed", AsyncMock(return_value=[0.0] * 4)):
-            for text, message in cases:
+            for text, cause in cases:
                 with self.subTest(template=text):
                     (templates / "help_transfer.md.tmpl").write_text(text)
-                    self.assert_error(self.client.get("/help/transfer"), 500,
-                                      "HELP_RENDER_FAILED", message)
+                    with self.assertLogs("routers.help", "ERROR") as logs:
+                        response = self.client.get("/help/transfer")
+                    self.assert_error(response, 500, "HELP_RENDER_FAILED",
+                                      "The help page could not be rendered: a help template "
+                                      "is invalid. The API log has the details.")
+                    self.assertNotIn(cause, response.text)
+                    self.assertIn(cause, "\n".join(logs.output))
 
 
 class TuneInProgressTests(RouteTestCase):
@@ -292,6 +298,49 @@ class TuneInProgressTests(RouteTestCase):
                               {"collection": "Coll"})
         self.assertEqual(jobs_while_running, {first.json()["job_id"]})
         self.assertEqual(collection_writes.active_jobs("Coll"), [])
+
+
+class StartErrorTests(RouteTestCase):
+    """Only the services' own already-running types are *_IN_PROGRESS; another
+    RuntimeError from a start is a 500 whose text is not sent (#657)."""
+
+    CAUSE = "SENTINEL library text"
+
+    def starts(self):
+        """(service, start function, request) for export, import and tune."""
+        return ((exporter, "start_export_job", ("/export", {"collection": "Coll"})),
+                (importer, "start_import_job",
+                 ("/import", {"filename": "ragpkg-a.tar.gz", "on_conflict": "rename"})),
+                (tuning, "start_tune_job", ("/tune/reindex", {"collection": "Coll"})))
+
+    def test_the_already_running_types_answer_as_before(self):
+        expected = {
+            "start_export_job": (exporter.ExportInProgressError("j1"), "EXPORT_IN_PROGRESS",
+                                 "An export of 'Coll' is already running.", {"job_id": "j1"}),
+            "start_import_job": (importer.ImportInProgressError("ragpkg-a.tar.gz"),
+                                 "IMPORT_IN_PROGRESS",
+                                 "An import of 'ragpkg-a.tar.gz' is already running.",
+                                 {"filename": "ragpkg-a.tar.gz"}),
+            "start_tune_job": (tuning.TuneInProgressError("Coll"), "TUNE_IN_PROGRESS",
+                               "'Coll' is already being tuned.", {"collection": "Coll"}),
+        }
+        with patch.object(wc, "collection_exists", AsyncMock(return_value=True)):
+            for service, name, (path, body) in self.starts():
+                error, code, message, detail = expected[name]
+                with self.subTest(start=name), \
+                        patch.object(service, name, AsyncMock(side_effect=error)):
+                    self.assert_error(self.client.post(path, json=body), 409, code, message, detail)
+
+    def test_another_runtime_error_is_a_500_and_its_text_is_not_sent(self):
+        with patch.object(wc, "collection_exists", AsyncMock(return_value=True)):
+            for service, name, (path, body) in self.starts():
+                with self.subTest(start=name), \
+                        patch.object(service, name,
+                                     AsyncMock(side_effect=RuntimeError(self.CAUSE))), \
+                        self.assertLogs("main", "ERROR"):
+                    response = self.client.post(path, json=body)
+                    self.assert_error(response, 500, "INTERNAL_ERROR")
+                    self.assertNotIn(self.CAUSE, response.text)
 
 
 class RechunkNoChunksTests(RouteTestCase):
