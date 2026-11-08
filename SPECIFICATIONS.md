@@ -88,7 +88,7 @@ services:
       interval: 20s
       timeout: 15s
       retries: 20
-      start_period: 120s
+      start_period: 1800s   # a first download of ~5.2 GB on a slow link (#647); see 2.3
     # Optional GPU support (uncomment on GPU host):
     # deploy:
     #   resources:
@@ -248,10 +248,10 @@ healthcheck:
   interval: 20s
   timeout: 15s
   retries: 20
-  start_period: 120s
+  start_period: 1800s
 ```
 
-`start_period: 120s` gives the model pull time to complete on first run before health retries begin counting as failures. The API service's `depends_on: { ollama: service_healthy }` ensures no API traffic flows until both models are confirmed present.
+`start_period: 1800s` gives the model pull time to complete on first run before health retries begin counting as failures: about 5.2 GB (#647), so a link down to about 23 Mbps finishes inside it, and ollama is marked unhealthy only after about 37 minutes. Docker still runs the check every 20 s during the start period and marks the container healthy at the first pass, so a start with the models present is as fast as before. `scripts/verify/stack.sh` waits up to two 900 s rounds for the stack, which together cover the start period. The API service's `depends_on: { ollama: service_healthy }` ensures no API traffic flows until both models are confirmed present.
 
 ### 2.4 Startup Sequence
 

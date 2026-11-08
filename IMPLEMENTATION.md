@@ -109,7 +109,11 @@ services:
       interval: 20s
       timeout: 15s
       retries: 20
-      start_period: 120s
+      # The first start downloads the models, about 5.2 GB (#647); failed checks
+      # don't count until this has passed, so a slow link doesn't make
+      # `docker compose up` fail. A start with the models present still turns
+      # healthy at the first passing check, 20 s in.
+      start_period: 1800s
     # Optional GPU support (uncomment on GPU host):
     # deploy:
     #   resources:

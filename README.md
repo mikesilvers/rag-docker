@@ -96,7 +96,7 @@ bandwidth-bound, so a slower link stretches them proportionally.
 | ~5min | The 3.2 GB ollama image finishes pulling; the container starts and immediately begins downloading models |
 | ~13min | llama3.1:8b (4.9 GB) and nomic-embed-text (274 MB) finish; ollama passes its healthcheck and api, ui and nginx start |
 
-**Total first run: roughly 15–25 minutes**, dominated by downloads rather than CPU. On a slower link the model download can outlast the ollama health check's wait (about 9 minutes), and `docker compose up` stops with ollama unhealthy; the download carries on, so wait for it in `docker compose logs -f ollama`, then run `docker compose up -d` again.
+**Total first run: roughly 15–25 minutes**, dominated by downloads rather than CPU. The ollama health check waits up to 30 minutes for the first download (enough down to about 23 Mbps), so api, ui and nginx simply start later on a slow link. Only a slower download makes `docker compose up` stop with ollama unhealthy; the download carries on, so wait for it in `docker compose logs -f ollama`, then run `docker compose up -d` again.
 Note that nothing can pull models until the ollama image itself has downloaded,
 so the model wait begins several minutes in — the stack is not stuck.
 
@@ -852,7 +852,7 @@ In LAN mode, stop with `docker compose -f docker-compose.yml -f docker-compose.l
   ```
 
   The first start of 1.2.1 then finds it and downloads nothing.
-- **On a slow link.** If the download takes longer than the ollama health check waits (about 9 minutes), `docker compose up` stops and reports ollama as unhealthy. The download carries on. Watch it with `docker compose logs -f ollama`, and once it reads `ollama: llama3.1:8b ready.`, run `docker compose up -d` again.
+- **On a slow link.** The first start waits up to 30 minutes for the download (enough down to about 23 Mbps) before api, ui and nginx start. Only a slower download makes `docker compose up` stop and report ollama as unhealthy. The download carries on. Watch it with `docker compose logs -f ollama`, and once it reads `ollama: llama3.1:8b ready.`, run `docker compose up -d` again.
 - **phi3.5 stays in the volume.** Nothing uses it after the update, and it takes about 2.2 GB. Once 1.2.1 answers questions, remove it:
 
   ```bash
@@ -1390,7 +1390,7 @@ If this fails after Docker restarts, Docker's internal networking is broken — 
 
 **4. Disconnect any active VPN** — VPNs frequently block Docker's connection to Docker Hub. Disconnect, retry the pull, then reconnect once all images are cached.
 
-**Ollama health check is stuck after images are pulled** — The model download phase (`ollama pull llama3.1:8b` etc.) is in progress. Run `docker compose logs -f ollama` to watch. If the internet drops mid-download, the entrypoint script detects the stall via a 2-hour per-attempt timeout, kills the hung pull, and retries automatically up to 5 times. Ollama resumes partial downloads so retries pick up where they left off.
+**Ollama health check is stuck after images are pulled** — The model download phase (`ollama pull llama3.1:8b` etc.) is in progress. Run `docker compose logs -f ollama` to watch. The health check gives the first download up to 30 minutes before it marks ollama unhealthy; if `docker compose up` stopped on that, run it again once the log reads `ollama: llama3.1:8b ready.` If the internet drops mid-download, the entrypoint script detects the stall via a 2-hour per-attempt timeout, kills the hung pull, and retries automatically up to 5 times. Ollama resumes partial downloads so retries pick up where they left off.
 
 **LLM answers are garbage or time out** — Answers come back in mixed scripts or as fragments of unrelated instructions, run to thousands of characters, or time out, while `/api/health` still reports the LLM as ok. Ollama's model runner has degraded; it does not recover on its own. Restart it with `docker compose restart ollama`. `scripts/verify/all.sh` checks for this before its LLM suites and stops with the same advice.
 
