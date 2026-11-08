@@ -105,7 +105,7 @@ services:
     networks: [rag-internal]
     healthcheck:
       # The ollama image has no curl/wget; the CLI is the only probe available.
-      test: ["CMD-SHELL", "ollama list | grep -q phi3.5 && ollama list | grep -q nomic-embed-text"]
+      test: ["CMD-SHELL", "ollama list | grep -q llama3.1:8b && ollama list | grep -q nomic-embed-text"]
       interval: 20s
       timeout: 15s
       retries: 20
@@ -129,7 +129,7 @@ services:
       WEAVIATE_PORT: 8080
       OLLAMA_HOST: ollama
       OLLAMA_PORT: 11434
-      LLM_MODEL: phi3.5
+      LLM_MODEL: llama3.1:8b
       EMBED_MODEL: nomic-embed-text
       UPLOAD_DIR: /app/uploads
       SOURCES_DIR: /app/sources
@@ -382,14 +382,28 @@ until ollama list > /dev/null 2>&1; do
   sleep 2
 done
 
+# Is the model downloaded? `ollama list` prints NAME as "<name>:<tag>", with
+# ":latest" added to a name pulled without a tag; its columns are separated by
+# tabs or spaces, so `read` splits them. The NAME must match exactly: another
+# variant of a tagged name (llama3.1:8b-instruct-q8_0 for llama3.1:8b) is a
+# different model and doesn't count (#647).
+model_present() {
+    local name rest
+    while read -r name rest; do
+        if [ "${name}" = "$1" ] || [ "${name}" = "$1:latest" ]; then
+            return 0
+        fi
+    done < <(ollama list)
+    return 1
+}
+
 # Pull a model with retry. Ollama resumes partial downloads so retries are cheap.
 # timeout 7200 (2 hours) kills a truly hung connection while allowing slow downloads.
 pull_with_retry() {
     local model="$1"
 
-    # Skip if already downloaded. `ollama list` prints NAME as "<model>:latest",
-    # so anchor the match to the start of the line.
-    if ollama list | grep -q "^${model}"; then
+    # Skip if already downloaded.
+    if model_present "${model}"; then
         echo "ollama: ${model} already present, skipping pull."
         return 0
     fi
@@ -408,7 +422,7 @@ pull_with_retry() {
     echo "ollama: ${model} ready."
 }
 
-pull_with_retry phi3.5
+pull_with_retry llama3.1:8b
 pull_with_retry nomic-embed-text
 
 wait $OLLAMA_PID
@@ -930,7 +944,7 @@ class Settings(BaseSettings):
     weaviate_port: int = 8080
     ollama_host: str = "localhost"
     ollama_port: int = 11434
-    llm_model: str = "phi3.5"
+    llm_model: str = "llama3.1:8b"
     embed_model: str = "nomic-embed-text"
     upload_dir: str = "/app/uploads"
     # Retained original documents, content-addressed per collection. Kept in
@@ -24166,9 +24180,9 @@ top of the main `README.md` shows its result on `develop`.
   every service, with timestamps, and `docker compose ps -a`, also when `up`
   failed.
 - **The model cache.** Even with `RAG_SKIP_SLOW=1`, ingest needs the embedding
-  model, so Ollama starts with both models (about 2.5 GB). The cache key is
+  model, so Ollama starts with both models (about 5.2 GB). The cache key is
   built from the models `ollama/entrypoint.sh` pulls
-  (`ollama-models-phi3.5-nomic-embed-text`). On a hit, the cached models are
+  (`ollama-models-llama3.1:8b-nomic-embed-text`). On a hit, the cached models are
   copied into `rag-verify-ollama-models` before `up`, and Ollama pulls
   nothing. On a miss, Ollama pulls them; after `down`, the workflow copies the
   volume's `models/` folder out, only once every model's manifest is there,
@@ -41820,10 +41834,13 @@ Self-contained bundle (~4.6 GB) for an air-gapped target: source plus
 #     built with `git archive`, exactly as package.sh does. Untracked and
 #     ignored files and uncommitted changes are left out (#384).
 #   * all five Docker images, pre-built (docker save)
-#   * the Ollama model weights (phi3.5 + nomic-embed-text)
+#   * the Ollama model weights (llama3.1:8b + nomic-embed-text), the whole
+#     model volume: a model left in it, such as phi3.5 from before 1.2.1, is
+#     carried too
 #
-# Measured at 4.6 GB (2.5 GB images + 2.2 GB model weights) with both models
-# present. Build it on a machine where the stack already works,
+# About 7.7 GB (2.5 GB images + 5.2 GB model weights) with both models present,
+# estimated from the parts (4.6 GB was measured when the LLM was the 2.2 GB
+# phi3.5). Build it on a machine where the stack already works,
 # then move the file to the target Mac and run install-offline.sh there.
 
 set -euo pipefail
@@ -41867,6 +41884,27 @@ PROJECT="$(docker compose config --format json | tr -d ' \n' | sed -n 's/^{"name
 MODELVOL="${PROJECT}_ollama_models"
 docker volume inspect "$MODELVOL" >/dev/null 2>&1 \
   || { echo "ERROR: volume '$MODELVOL' not found. Start the stack once so the models download." >&2; exit 1; }
+
+# The volume must hold every model ollama/entrypoint.sh pulls, or the offline
+# target would try to download the missing one (#647: an install from before
+# llama3.1:8b became the default holds only phi3.5). The names are read as the
+# CI model cache reads them; a manifest without a tag is under "latest".
+MODELS="$(sed -n 's/^pull_with_retry \([A-Za-z0-9._:-]*\)$/\1/p' ollama/entrypoint.sh | tr '\n' ' ')"
+[ -n "$MODELS" ] || { echo "ERROR: no pull_with_retry lines in ollama/entrypoint.sh." >&2; exit 1; }
+# shellcheck disable=SC2086  # one argument per model name
+MISSING="$(docker run --rm --network none --entrypoint sh \
+  -v "$MODELVOL":/models:ro \
+  ollama/ollama:0.3.14 \
+  -c 'for m in "$@"; do
+        n=${m%%:*}; t=latest
+        case "$m" in *:*) t=${m#*:} ;; esac
+        [ -f "/models/models/manifests/registry.ollama.ai/library/$n/$t" ] || echo "$m"
+      done' sh $MODELS)" \
+  || { echo "ERROR: could not read the models in volume '$MODELVOL'." >&2; exit 1; }
+if [ -n "$MISSING" ]; then
+  echo "ERROR: volume '$MODELVOL' doesn't hold $(echo $MISSING). Start the stack once (docker compose up -d) and wait until ollama is healthy, so the models download, then run package-offline.sh again." >&2
+  exit 1
+fi
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
@@ -42062,6 +42100,8 @@ class PackageArchiveTests(unittest.TestCase):
         self.repo.mkdir()
         for name in SCRIPTS + ('.gitignore',):
             shutil.copy(ROOT / name, self.repo / name)
+        # package-offline.sh reads the model names from the entrypoint (#647).
+        write(self.repo / 'ollama' / 'entrypoint.sh', (ROOT / 'ollama' / 'entrypoint.sh').read_text())
         write(self.repo / 'install-offline.sh', '#!/usr/bin/env bash\necho install\n', 0o755)
         write(self.repo / 'README.md', COMMITTED_README)
         write(self.repo / 'ingest-inbox' / '.gitkeep', '')
@@ -54669,6 +54709,8 @@ class Packager(unittest.TestCase):
             with self.subTest(telemetry=telemetry), tempfile.TemporaryDirectory() as folder:
                 root=Path(folder);(root/'bin').mkdir();(root/'scripts').mkdir()
                 shutil.copy(ROOT/'package-offline.sh',root/'package-offline.sh')
+                # package-offline.sh reads the model names from the entrypoint (#647).
+                (root/'ollama').mkdir();shutil.copy(ROOT/'ollama/entrypoint.sh',root/'ollama/entrypoint.sh')
                 (root/'scripts/collector_offline.py').write_text("from pathlib import Path\nimport sys\nPath(sys.argv[2],'collector.tar').touch()\n")
                 stub=root/'bin/docker'
                 stub.write_text("""#!/usr/bin/env python3
@@ -54685,7 +54727,7 @@ if args[:1]==['run']:
                 git = ['git', '-c', 'core.hooksPath=/dev/null',
                        '-c', 'commit.gpgsign=false', '-c', 'user.name=Test',
                        '-c', 'user.email=test@example.invalid']
-                for args in (['init', '-q'], ['add', 'package-offline.sh', 'scripts'],
+                for args in (['init', '-q'], ['add', 'package-offline.sh', 'scripts', 'ollama'],
                              ['commit', '-qm', 'fixture']):
                     subprocess.run(git + args, cwd=root, check=True,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -55085,10 +55127,13 @@ volumes:
 #     built with `git archive`, exactly as package.sh does. Untracked and
 #     ignored files and uncommitted changes are left out (#384).
 #   * all five Docker images, pre-built (docker save)
-#   * the Ollama model weights (phi3.5 + nomic-embed-text)
+#   * the Ollama model weights (llama3.1:8b + nomic-embed-text), the whole
+#     model volume: a model left in it, such as phi3.5 from before 1.2.1, is
+#     carried too
 #
-# Measured at 4.6 GB (2.5 GB images + 2.2 GB model weights) with both models
-# present. Build it on a machine where the stack already works,
+# About 7.7 GB (2.5 GB images + 5.2 GB model weights) with both models present,
+# estimated from the parts (4.6 GB was measured when the LLM was the 2.2 GB
+# phi3.5). Build it on a machine where the stack already works,
 # then move the file to the target Mac and run install-offline.sh there.
 
 set -euo pipefail
@@ -55132,6 +55177,27 @@ PROJECT="$(docker compose config --format json | tr -d ' \n' | sed -n 's/^{"name
 MODELVOL="${PROJECT}_ollama_models"
 docker volume inspect "$MODELVOL" >/dev/null 2>&1 \
   || { echo "ERROR: volume '$MODELVOL' not found. Start the stack once so the models download." >&2; exit 1; }
+
+# The volume must hold every model ollama/entrypoint.sh pulls, or the offline
+# target would try to download the missing one (#647: an install from before
+# llama3.1:8b became the default holds only phi3.5). The names are read as the
+# CI model cache reads them; a manifest without a tag is under "latest".
+MODELS="$(sed -n 's/^pull_with_retry \([A-Za-z0-9._:-]*\)$/\1/p' ollama/entrypoint.sh | tr '\n' ' ')"
+[ -n "$MODELS" ] || { echo "ERROR: no pull_with_retry lines in ollama/entrypoint.sh." >&2; exit 1; }
+# shellcheck disable=SC2086  # one argument per model name
+MISSING="$(docker run --rm --network none --entrypoint sh \
+  -v "$MODELVOL":/models:ro \
+  ollama/ollama:0.3.14 \
+  -c 'for m in "$@"; do
+        n=${m%%:*}; t=latest
+        case "$m" in *:*) t=${m#*:} ;; esac
+        [ -f "/models/models/manifests/registry.ollama.ai/library/$n/$t" ] || echo "$m"
+      done' sh $MODELS)" \
+  || { echo "ERROR: could not read the models in volume '$MODELVOL'." >&2; exit 1; }
+if [ -n "$MISSING" ]; then
+  echo "ERROR: volume '$MODELVOL' doesn't hold $(echo $MISSING). Start the stack once (docker compose up -d) and wait until ollama is healthy, so the models download, then run package-offline.sh again." >&2
+  exit 1
+fi
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
