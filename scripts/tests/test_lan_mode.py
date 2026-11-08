@@ -425,13 +425,20 @@ class NginxTests(unittest.TestCase):
         lines = directives(block)
         for line in ("limit_req zone=login burst=5 nodelay;", "limit_req_status 429;",
                      "error_page 429 = @login_rate_limited;", "proxy_pass http://api/auth/login;",
-                     "proxy_set_header X-Real-IP $remote_addr;"):
+                     "proxy_set_header X-Real-IP $remote_addr;", "client_max_body_size 16k;"):
             self.assertIn(line, lines)
+        # #663: login reads a body before authentication, so it has a small,
+        # buffered body limit, not /api/'s 512m streamed uploads.
+        self.assertEqual([l for l in lines if l.startswith("proxy_request_buffering")], [])
         api = self.locations[self.locations.index("location /api/ {"):]
         api = directives(api[:api.index("\n}\n")])
-        self.assertEqual([l for l in lines if not l.startswith(("location", "limit_req", "error_page", "proxy_pass"))],
-                         [l for l in api if not l.startswith(("location", "proxy_pass"))],
-                         "the login location proxies differently from /api/")
+        self.assertIn("client_max_body_size 512m;", api)
+        self.assertIn("proxy_request_buffering off;", api)
+        body = ("client_max_body_size", "proxy_request_buffering")
+        login_only = ("location", "limit_req", "error_page", "proxy_pass") + body
+        self.assertEqual([l for l in lines if not l.startswith(login_only)],
+                         [l for l in api if not l.startswith(("location", "proxy_pass") + body)],
+                         "the login location proxies differently from /api/ beyond its body limit")
         named = self.locations[self.locations.index("location @login_rate_limited {"):]
         body = re.search(r"return 429 '([^']*)';", named).group(1)
         message = "Too many login attempts. Wait a minute and try again."

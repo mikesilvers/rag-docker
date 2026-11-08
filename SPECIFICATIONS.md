@@ -308,7 +308,8 @@ on Docker Desktop for Mac: a request through the host's LAN address arrives from
 `localhost` from the Docker network's gateway, not from the client's own address.
 
 **Login rate limit (#577).** Both servers define `limit_req_zone $binary_remote_addr zone=login:1m rate=10r/m;`,
-and `locations.conf` limits `POST /api/auth/login` (an exact location, otherwise proxied as `/api/`) with
+and `locations.conf` limits `POST /api/auth/login` (an exact location, otherwise proxied as `/api/` except its
+body: at most 16k, buffered; a larger one is refused `413` by nginx before the API reads it, #663) with
 `limit_req zone=login burst=5 nodelay;`. Beyond it nginx answers `429` itself, `application/json`,
 `{"error":{"code":"LOGIN_RATE_LIMITED","message":"Too many login attempts. Wait a minute and try again.","detail":null}}`,
 which the login page shows; the API never sees the attempt, so it writes no audit record. The API's own answers

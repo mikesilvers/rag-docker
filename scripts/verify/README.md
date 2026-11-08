@@ -55,7 +55,9 @@ read the jar through `auth_headers.py`; in-process checks in the API image use
 `17_auth.sh` checks authentication itself: the endpoint/role matrix for no session and each
 role (written out in `auth_stack.py`, not read from the API), login, logout, cookies, origin
 rules, throttling, nginx's login rate limit (logins sent without waiting until one is refused
-`429 LOGIN_RATE_LIMITED` in the error envelope, and no audit record for the refused ones), the
+`429 LOGIN_RATE_LIMITED` in the error envelope, and no audit record for the refused ones), nginx's
+16k login body limit (a larger login body is refused `413` before the API; one at the field limits
+reaches it, #663), the
 operator command's effect on existing sessions (on throwaway `vfy-t-*`
 accounts), an Engineer's account administration through the API (on a throwaway account; the
 generated passwords must not reach the API log), service API keys (throwaway `vfy-s-*`
