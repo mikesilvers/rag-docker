@@ -257,7 +257,7 @@ and on import.
     "source_document_count": 37
   },
   "embedding": {"model": "nomic-embed-text", "dimensions": 768},
-  "llm": {"model": "phi3.5"},
+  "llm": {"model": "llama3.1:8b"},
   "chunking": {"strategy": "overlap", "chunk_size": 1000, "chunk_overlap": 200},
   "fidelity": "with-sources",
   "models_bundled": false,
@@ -656,8 +656,8 @@ models/
 │       ├── manifest.json      the Ollama manifest, verbatim
 │       └── blobs/
 │           └── sha256-<hex>   config and layer blobs it names
-└── phi3.5/
-    └── latest/
+└── llama3.1/
+    └── 8b/
         ├── manifest.json
         └── blobs/
             └── sha256-<hex>

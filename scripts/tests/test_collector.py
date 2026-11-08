@@ -230,6 +230,8 @@ class Packager(unittest.TestCase):
             with self.subTest(telemetry=telemetry), tempfile.TemporaryDirectory() as folder:
                 root=Path(folder);(root/'bin').mkdir();(root/'scripts').mkdir()
                 shutil.copy(ROOT/'package-offline.sh',root/'package-offline.sh')
+                # package-offline.sh reads the model names from the entrypoint (#647).
+                (root/'ollama').mkdir();shutil.copy(ROOT/'ollama/entrypoint.sh',root/'ollama/entrypoint.sh')
                 (root/'scripts/collector_offline.py').write_text("from pathlib import Path\nimport sys\nPath(sys.argv[2],'collector.tar').touch()\n")
                 stub=root/'bin/docker'
                 stub.write_text("""#!/usr/bin/env python3
@@ -246,7 +248,7 @@ if args[:1]==['run']:
                 git = ['git', '-c', 'core.hooksPath=/dev/null',
                        '-c', 'commit.gpgsign=false', '-c', 'user.name=Test',
                        '-c', 'user.email=test@example.invalid']
-                for args in (['init', '-q'], ['add', 'package-offline.sh', 'scripts'],
+                for args in (['init', '-q'], ['add', 'package-offline.sh', 'scripts', 'ollama'],
                              ['commit', '-qm', 'fixture']):
                     subprocess.run(git + args, cwd=root, check=True,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)

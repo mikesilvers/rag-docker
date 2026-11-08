@@ -9,7 +9,7 @@ A self-contained, Dockerized Retrieval-Augmented Generation (RAG) platform. Uplo
 | Component | Technology | Purpose |
 |---|---|---|
 | Vector store | Weaviate 1.40.2 | Stores and retrieves document chunks |
-| LLM + embeddings | Ollama 0.3.14 | Runs phi3.5 (chat) and nomic-embed-text (embeddings) locally |
+| LLM + embeddings | Ollama 0.3.14 | Runs llama3.1:8b (chat) and nomic-embed-text (embeddings) locally |
 | API | FastAPI + Python 3.11 | RAG pipeline, ingest, gold standard generation |
 | UI | React 18 + Vite + Tailwind | Web interface with login and three roles |
 | Proxy | nginx 1.29 | Routes traffic; listens on port 80 in-container, published on host port 8080 |
@@ -17,7 +17,7 @@ A self-contained, Dockerized Retrieval-Augmented Generation (RAG) platform. Uplo
 ## Prerequisites
 
 - **Docker Desktop with Engine 28.0.0 or newer** (or Docker Engine 28.0.0+ with Compose v2) — [install](https://docs.docker.com/get-docker/)
-- **12 GB RAM and 2 GB swap allocated to Docker** (Docker Desktop → Settings → Resources → Memory and Swap). phi3.5 alone is ~6 GB resident; at 10 GB, full verification runs still hit Ollama timeouts under memory pressure, and below that the model is repeatedly evicted and reloaded and queries time out. Swap turns a short spike into a slowdown instead of a failure. Leave macOS at least 4 GB: on a 16 GB Mac, 12 GB is the practical ceiling. `/health` reports what Docker actually has against this recommendation
+- **12 GB RAM and 2 GB swap allocated to Docker** (Docker Desktop → Settings → Resources → Memory and Swap). llama3.1:8b alone is ~6 GB resident; at 10 GB, full verification runs still hit Ollama timeouts under memory pressure, and below that the model is repeatedly evicted and reloaded and queries time out. Swap turns a short spike into a slowdown instead of a failure. Leave macOS at least 4 GB: on a 16 GB Mac, 12 GB is the practical ceiling. `/health` reports what Docker actually has against this recommendation
 - **20 GB disk minimum allocated to Docker, 32 GB recommended** — see [Storage requirements](#storage-requirements) below. Check your current limit before building — a small virtual disk (8 GB or so) cannot hold this stack, and the build fails partway through with a confusing error.
 - Port **8080** free on the host — `docker-compose.yml` publishes the proxy as `127.0.0.1:8080:80`, bound to host loopback on supported engines
 
@@ -37,12 +37,12 @@ All of this lives inside Docker's virtual disk, not your host filesystem. Measur
 | `weaviate` image | 200 MB | first pull |
 | `nginx` image | 50 MB | first pull |
 | **Images after a full build** | **~6.5 GB** | |
-| Model weights (phi3.5 2.2 GB, nomic-embed-text 274 MB) | ~2.5 GB | first run, into the `ollama_models` volume |
-| **Total steady state** | **~9.0 GB** | |
+| Model weights (llama3.1:8b 4.9 GB, nomic-embed-text 274 MB) | ~5.2 GB | first run, into the `ollama_models` volume |
+| **Total steady state** | **~11.7 GB** | |
 
 Build cache adds several GB on top, though much of it shares layers with the images rather than duplicating them. A rebuild also holds the old and new image layers at once until you prune.
 
-**Allocate 20 GB minimum.** That covers the steady-state ~9.0 GB plus build cache and rebuild headroom. **32 GB is recommended** if you plan to ingest a meaningful document corpus, since the Weaviate index, the uploaded files and the retained originals all grow on top of everything above.
+**Allocate 20 GB minimum.** That covers the steady-state ~11.7 GB plus build cache and rebuild headroom. **32 GB is recommended** if you plan to ingest a meaningful document corpus, since the Weaviate index, the uploaded files and the retained originals all grow on top of everything above.
 
 Three things scale with your corpus rather than with the stack:
 
@@ -69,7 +69,7 @@ cd rag-docker
 # 2. Start the stack
 docker compose up -d
 
-# 3. Watch Ollama download the models (first run only — ~5 minutes)
+# 3. Watch Ollama download the models (first run only — ~8 minutes)
 docker compose logs -f ollama
 
 # 4. Create the first AI Engineer (first start only); it prints a one-time password
@@ -94,9 +94,9 @@ bandwidth-bound, so a slower link stretches them proportionally.
 | ~1min | Weaviate starts — its image is only 120 MB, so it is ready well before the others |
 | ~4min | api image finishes building. That build measures **~3 min from scratch**: apt 32s, pip install 97s, sentence-transformers pre-cache 19s. The ui image finishes sooner |
 | ~5min | The 3.2 GB ollama image finishes pulling; the container starts and immediately begins downloading models |
-| ~10min | phi3.5 (2.2 GB) and nomic-embed-text (274 MB) finish; ollama passes its healthcheck and api, ui and nginx start |
+| ~13min | llama3.1:8b (4.9 GB) and nomic-embed-text (274 MB) finish; ollama passes its healthcheck and api, ui and nginx start |
 
-**Total first run: roughly 10–20 minutes**, dominated by downloads rather than CPU.
+**Total first run: roughly 15–25 minutes**, dominated by downloads rather than CPU. The ollama health check waits up to 30 minutes for the first download (enough down to about 23 Mbps), so api, ui and nginx simply start later on a slow link. Only a slower download makes `docker compose up` stop with ollama unhealthy; the download carries on, so wait for it in `docker compose logs -f ollama`, then run `docker compose up -d` again.
 Note that nothing can pull models until the ollama image itself has downloaded,
 so the model wait begins several minutes in — the stack is not stuck.
 
@@ -613,6 +613,8 @@ Run these commands in the `rag-docker` folder. Your collections, accounts and do
 
 Coming from 1.1.0? Follow [Upgrading from 1.1.0 to 1.2.0](#upgrading-from-110-to-120) first: it includes these steps.
 
+Coming from 1.2.0? Read [Upgrading to 1.2.1](#upgrading-to-121-the-new-answering-model) first: the first start downloads a new answering model.
+
 ### 1. Get the new code
 
 Pick one of the two.
@@ -852,6 +854,30 @@ docker compose up -d --build --force-recreate
 
 In LAN mode, stop with `docker compose -f docker-compose.yml -f docker-compose.lan.yml down` instead of `docker compose down`. Never use `down -v`.
 
+### Upgrading to 1.2.1: the new answering model
+
+1.2.1 answers with `llama3.1:8b` instead of `phi3.5` (#647). In tests on CPU, phi3.5 fell into runs of empty or garbled answers and often named committees or sponsors that weren't in the retrieved text; llama3.1:8b gave no empty or garbled answers, and one wrong answer in 240.
+
+- **The first start downloads it.** The first start of 1.2.1 downloads `llama3.1:8b`, about 4.9 GB, into the `ollama_models` volume. The stack answers once the download is done.
+- **Answers take longer.** About 50 s per answer on CPU, against about 37 s for phi3.5. Memory stays about the same: the model is about 6 GB resident, within the 12 GB Docker allocation.
+- **Download it first, if you like.** While 1.2.0 still runs, before you get the new code:
+
+  ```bash
+  # Download the new model into the running stack's model volume (about 4.9 GB)
+  docker compose exec ollama ollama pull llama3.1:8b
+  ```
+
+  The first start of 1.2.1 then finds it and downloads nothing.
+- **On a slow link.** The first start waits up to 30 minutes for the download (enough down to about 23 Mbps) before api, ui and nginx start. Only a slower download makes `docker compose up` stop and report ollama as unhealthy. The download carries on. Watch it with `docker compose logs -f ollama`, and once it reads `ollama: llama3.1:8b ready.`, run `docker compose up -d` again.
+- **phi3.5 stays in the volume.** Nothing uses it after the update, and it takes about 2.2 GB. Once 1.2.1 answers questions, remove it:
+
+  ```bash
+  # Remove the old answering model from the model volume (frees about 2.2 GB)
+  docker compose exec ollama ollama rm phi3.5
+  ```
+
+  `package-offline.sh` bundles the whole model volume, so remove phi3.5 before building an offline bundle, or the bundle carries it too.
+
 ## GPU acceleration (optional)
 
 To use a CUDA GPU for Ollama, uncomment the `deploy` block in `docker-compose.yml`:
@@ -874,7 +900,7 @@ All API settings are environment variables in `docker-compose.yml`:
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_MODEL` | `phi3.5` | Ollama model name for chat |
+| `LLM_MODEL` | `llama3.1:8b` | Ollama model name for chat |
 | `EMBED_MODEL` | `nomic-embed-text` | Ollama model name for embeddings |
 | `WEAVIATE_HOST` | `weaviate` | Weaviate hostname (internal) |
 | `OLLAMA_HOST` | `ollama` | Ollama hostname (internal) |
@@ -1102,7 +1128,7 @@ curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localho
   -d '{"collection": "Policies", "include_models": true}'
 ```
 
-That takes the package from roughly 80 KB to ~2.3 GB, because it carries the
+That takes the package from roughly 80 KB to ~5.2 GB, because it carries the
 embedding model and the LLM as Ollama's own manifest and blob files. On import,
 a model already present is left alone, provided its files match their checksums;
 a missing one is installed from the package and verified before the collection
@@ -1258,9 +1284,9 @@ not `./package.sh`, so it does not depend on its own executable bit.
 | Hardware | Apple Silicon (arm64) |
 | Docker Desktop | installed and running, Engine 28.0.0+ |
 | Docker disk | 20 GB minimum, 32 GB recommended |
-| Docker memory | 12 GB, plus 2 GB swap (phi3.5 is ~6 GB resident) |
+| Docker memory | 12 GB, plus 2 GB swap (llama3.1:8b is ~6 GB resident) |
 | Free host port | 8080 |
-| Network | ~8–10 GB downloaded on first run |
+| Network | ~11–13 GB downloaded on first run |
 
 No Python, Node, compiler or model files are needed on the target machine. Everything is built inside Docker.
 
@@ -1294,14 +1320,19 @@ Build the bundle on a machine where the stack already works and the models have
 been downloaded:
 
 ```bash
-bash package-offline.sh              # writes rag-docker-offline.tar (~4.6 GB)
+bash package-offline.sh              # writes rag-docker-offline.tar (~7.7 GB)
 ```
 
 Its source tree is the same as `package.sh`'s: the files git tracks in the
 current commit, so run it in a git checkout too. It runs `docker save` on all
 five images (~2.5 GB compressed) and exports the
-Ollama model weights from the `ollama_models` volume (~2.2 GB). Expect a few
-minutes; saving the image layers is the slow part.
+Ollama model weights from the `ollama_models` volume (~5.2 GB). Expect a few
+minutes; saving the image layers is the slow part. It stops if the volume doesn't
+hold every model the stack pulls (an install from before 1.2.1 may hold only
+phi3.5): start the stack once so the missing model downloads, then run it again.
+It exports the whole volume, so a model left in it, such as phi3.5, goes into
+the bundle too; see [Upgrading to 1.2.1](#upgrading-to-121-the-new-answering-model)
+to remove it first.
 
 Move the file to the target Mac, then:
 
@@ -1315,8 +1346,8 @@ bash install-offline.sh
 project's volume, and runs `docker compose up -d --no-build`. Nothing is pulled
 and nothing is compiled. The target needs only Docker Desktop, running with Engine 28.0.0 or newer.
 
-**Requirements on the target:** Apple Silicon, Docker Desktop with Engine 28.0.0+, ~12 GB of Docker
-disk, ~10 GB of free space on the host filesystem for the archive plus its
+**Requirements on the target:** Apple Silicon, Docker Desktop with Engine 28.0.0+, ~15 GB of Docker
+disk, ~16 GB of free space on the host filesystem for the archive plus its
 extraction, and port 8080 free. No Python, Node, compiler or network needed.
 
 The bundle deliberately omits the Weaviate index and uploaded files — those are
@@ -1331,7 +1362,7 @@ docker compose logs ollama | grep 'already present'
 curl http://localhost:8080/api/health
 ```
 
-The Ollama log should read `phi3.5 already present, skipping pull` — that
+The Ollama log should read `llama3.1:8b already present, skipping pull` — that
 confirms the weights came from the bundle rather than the network.
 
 ## Troubleshooting
@@ -1375,7 +1406,7 @@ If this fails after Docker restarts, Docker's internal networking is broken — 
 
 **4. Disconnect any active VPN** — VPNs frequently block Docker's connection to Docker Hub. Disconnect, retry the pull, then reconnect once all images are cached.
 
-**Ollama health check is stuck after images are pulled** — The model download phase (`ollama pull phi3.5` etc.) is in progress. Run `docker compose logs -f ollama` to watch. If the internet drops mid-download, the entrypoint script detects the stall via a 2-hour per-attempt timeout, kills the hung pull, and retries automatically up to 5 times. Ollama resumes partial downloads so retries pick up where they left off.
+**Ollama health check is stuck after images are pulled** — The model download phase (`ollama pull llama3.1:8b` etc.) is in progress. Run `docker compose logs -f ollama` to watch. The health check gives the first download up to 30 minutes before it marks ollama unhealthy; if `docker compose up` stopped on that, run it again once the log reads `ollama: llama3.1:8b ready.` If the internet drops mid-download, the entrypoint script detects the stall via a 2-hour per-attempt timeout, kills the hung pull, and retries automatically up to 5 times. Ollama resumes partial downloads so retries pick up where they left off.
 
 **LLM answers are garbage or time out** — Answers come back in mixed scripts or as fragments of unrelated instructions, run to thousands of characters, or time out, while `/api/health` still reports the LLM as ok. Ollama's model runner has degraded; it does not recover on its own. Restart it with `docker compose restart ollama`. `scripts/verify/all.sh` checks for this before its LLM suites and stops with the same advice.
 
@@ -1421,7 +1452,7 @@ This discards ingested documents; re-ingest after it comes back up. The `ollama_
 docker compose exec <service> sh -c 'command -v curl wget'
 ```
 
-**Queries time out, or `httpx.ReadTimeout` appears in the api log** — Almost always memory. phi3.5 is ~6 GB resident, so on a Docker allocation below the recommended 12 GB the model can be evicted and reloaded between calls and generation never completes. Note the Ollama healthcheck cannot detect this: it runs `ollama list`, which succeeds while generation is wedged.
+**Queries time out, or `httpx.ReadTimeout` appears in the api log** — Almost always memory. llama3.1:8b is ~6 GB resident, so on a Docker allocation below the recommended 12 GB the model can be evicted and reloaded between calls and generation never completes. Note the Ollama healthcheck cannot detect this: it runs `ollama list`, which succeeds while generation is wedged.
 
 Check what Docker actually has, and what is loaded:
 

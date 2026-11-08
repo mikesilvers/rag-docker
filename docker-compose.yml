@@ -62,11 +62,15 @@ services:
     networks: [rag-internal]
     healthcheck:
       # The ollama image has no curl/wget; the CLI is the only probe available.
-      test: ["CMD-SHELL", "ollama list | grep -q phi3.5 && ollama list | grep -q nomic-embed-text"]
+      test: ["CMD-SHELL", "ollama list | grep -q llama3.1:8b && ollama list | grep -q nomic-embed-text"]
       interval: 20s
       timeout: 15s
       retries: 20
-      start_period: 120s
+      # The first start downloads the models, about 5.2 GB (#647); failed checks
+      # don't count until this has passed, so a slow link doesn't make
+      # `docker compose up` fail. A start with the models present still turns
+      # healthy at the first passing check, 20 s in.
+      start_period: 1800s
     # Optional GPU support (uncomment on GPU host):
     # deploy:
     #   resources:
@@ -86,7 +90,7 @@ services:
       WEAVIATE_PORT: 8080
       OLLAMA_HOST: ollama
       OLLAMA_PORT: 11434
-      LLM_MODEL: phi3.5
+      LLM_MODEL: llama3.1:8b
       EMBED_MODEL: nomic-embed-text
       UPLOAD_DIR: /app/uploads
       SOURCES_DIR: /app/sources

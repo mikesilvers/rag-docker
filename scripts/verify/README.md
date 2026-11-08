@@ -263,9 +263,9 @@ top of the main `README.md` shows its result on `develop`.
   every service, with timestamps, and `docker compose ps -a`, also when `up`
   failed.
 - **The model cache.** Even with `RAG_SKIP_SLOW=1`, ingest needs the embedding
-  model, so Ollama starts with both models (about 2.5 GB). The cache key is
+  model, so Ollama starts with both models (about 5.2 GB). The cache key is
   built from the models `ollama/entrypoint.sh` pulls
-  (`ollama-models-phi3.5-nomic-embed-text`). On a hit, the cached models are
+  (`ollama-models-llama3.1:8b-nomic-embed-text`). On a hit, the cached models are
   copied into `rag-verify-ollama-models` before `up`, and Ollama pulls
   nothing. On a miss, Ollama pulls them; after `down`, the workflow copies the
   volume's `models/` folder out, only once every model's manifest is there,

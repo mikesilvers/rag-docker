@@ -84,11 +84,11 @@ services:
     networks: [rag-internal]
     healthcheck:
       # The ollama image has no curl/wget; the CLI is the only probe available.
-      test: ["CMD-SHELL", "ollama list | grep -q phi3.5 && ollama list | grep -q nomic-embed-text"]
+      test: ["CMD-SHELL", "ollama list | grep -q llama3.1:8b && ollama list | grep -q nomic-embed-text"]
       interval: 20s
       timeout: 15s
       retries: 20
-      start_period: 120s
+      start_period: 1800s   # a first download of ~5.2 GB on a slow link (#647); see 2.3
     # Optional GPU support (uncomment on GPU host):
     # deploy:
     #   resources:
@@ -108,7 +108,7 @@ services:
       WEAVIATE_PORT: 8080
       OLLAMA_HOST: ollama
       OLLAMA_PORT: 11434
-      LLM_MODEL: phi3.5
+      LLM_MODEL: llama3.1:8b
       EMBED_MODEL: nomic-embed-text
       UPLOAD_DIR: /app/uploads
       SOURCES_DIR: /app/sources
@@ -239,8 +239,9 @@ ollama serve &
 OLLAMA_PID=$!
 # Wait for server to be ready
 until ollama list > /dev/null 2>&1; do sleep 2; done   # no curl in this image
-# Pull models if not already cached in volume
-ollama pull phi3.5
+# Pull models if not already cached in volume (a model counts as cached only when
+# a NAME in `ollama list` is exactly its name, or its name with :latest)
+ollama pull llama3.1:8b
 ollama pull nomic-embed-text
 wait $OLLAMA_PID
 ```
@@ -249,19 +250,19 @@ The Ollama healthcheck is extended to verify both models are present, not merely
 
 ```yaml
 healthcheck:
-  test: ["CMD-SHELL", "ollama list | grep -q phi3.5 && ollama list | grep -q nomic-embed-text"]
+  test: ["CMD-SHELL", "ollama list | grep -q llama3.1:8b && ollama list | grep -q nomic-embed-text"]
   interval: 20s
   timeout: 15s
   retries: 20
-  start_period: 120s
+  start_period: 1800s
 ```
 
-`start_period: 120s` gives the model pull time to complete on first run before health retries begin counting as failures. The API service's `depends_on: { ollama: service_healthy }` ensures no API traffic flows until both models are confirmed present.
+`start_period: 1800s` gives the model pull time to complete on first run before health retries begin counting as failures: about 5.2 GB (#647), so a link down to about 23 Mbps finishes inside it, and ollama is marked unhealthy only after about 37 minutes. Docker still runs the check every 20 s during the start period and marks the container healthy at the first pass, so a start with the models present is as fast as before. `scripts/verify/stack.sh` waits up to two 900 s rounds for the stack, which together cover the start period. The API service's `depends_on: { ollama: service_healthy }` ensures no API traffic flows until both models are confirmed present.
 
 ### 2.4 Startup Sequence
 
 1. Weaviate starts with a 180-second healthcheck start period for cold Raft replay → healthcheck passes (ready endpoint returns 200)
-2. Ollama starts → pulls models (phi3.5, nomic-embed-text) → healthcheck passes
+2. Ollama starts → pulls models (llama3.1:8b, nomic-embed-text) → healthcheck passes
 3. API starts → verifies both downstream connections → healthcheck passes
 4. UI starts (static build, no runtime deps)
 5. Nginx proxy starts
@@ -369,7 +370,7 @@ GET /health
   "services": {
     "weaviate": { "status": "ok", "latency_ms": 1 },
     "ollama": {
-      "llm": { "status": "ok", "latency_ms": 5, "model": "phi3.5" },
+      "llm": { "status": "ok", "latency_ms": 5, "model": "llama3.1:8b" },
       "embed": { "status": "ok", "latency_ms": 5, "model": "nomic-embed-text" }
     }
   },
@@ -1088,10 +1089,10 @@ Ollama are available."
 not returned. Any other failure in the pipeline answers `500 INTERNAL_ERROR` (§3.2).
 
 **RAG pipeline (internal steps):**
-1. Reformat user question for retrieval using Phi-3.5 Mini (Section 6.1 prompt).
+1. Reformat user question for retrieval using the LLM, `llama3.1:8b` by default (Section 6.1 prompt).
 2. Embed reformulated question — **only for `hnsw` and `flat` modes**: call Ollama `/api/embeddings` directly; for `hybrid` and `semantic` modes, Weaviate handles query embedding internally via `text2vec-ollama`.
 3. Retrieve top_k chunks from Weaviate using the specified retrieval mode and its parameters.
-4. Pass original question + retrieved chunks to Phi-3.5 Mini for synthesis (Section 6.2 or 6.3 prompt).
+4. Pass original question + retrieved chunks to the LLM for synthesis (Section 6.2 or 6.3 prompt).
 5. Format response according to `response_format`.
 
 ---
@@ -2639,7 +2640,7 @@ file, asking whether its name already has chunks (#22, §3.1.3), fails.
 
 ## 6. LLM Prompt Specifications
 
-All prompts use Ollama's `/api/chat` endpoint with `model: phi3.5`.
+All prompts use Ollama's `/api/chat` endpoint with `model: llama3.1:8b` (the `LLM_MODEL` setting; phi3.5 until 1.2.1, #647).
 
 ### 6.1 Query Reformulation Prompt
 
@@ -4230,8 +4231,8 @@ and checks the verify project through `prepare_stack.py` (P1-P11).
 |---|---|---|
 | Hardware | Apple Silicon (arm64) | All images resolve arm64 natively; torch is installed from the CPU index, which publishes linux/aarch64 wheels |
 | Docker Desktop | installed and running, Engine 28.0.0+ | The only host dependency. No Python, Node or compiler is required |
-| **Docker memory** | **12 GB, plus 2 GB swap** | phi3.5 is ~6 GB resident. At 10 GB, full verification runs still hit Ollama timeouts under memory pressure; below that the model is evicted and reloaded between calls and generation times out with `httpx.ReadTimeout`. Swap absorbs short spikes. Leave macOS at least 4 GB: on a 16 GB Mac, 12 GB is the practical ceiling |
-| Docker disk | 20 GB minimum, 32 GB recommended | ~6.5 GB images + ~2.5 GB model weights + build cache |
+| **Docker memory** | **12 GB, plus 2 GB swap** | llama3.1:8b is ~6 GB resident. At 10 GB, full verification runs still hit Ollama timeouts under memory pressure; below that the model is evicted and reloaded between calls and generation times out with `httpx.ReadTimeout`. Swap absorbs short spikes. Leave macOS at least 4 GB: on a 16 GB Mac, 12 GB is the practical ceiling |
+| Docker disk | 20 GB minimum, 32 GB recommended | ~6.5 GB images + ~5.2 GB model weights + build cache |
 | Free host port | 8080 | `proxy` publishes `127.0.0.1:8080:80` |
 
 Memory and swap are set in **Docker Desktop → Settings → Resources**, not in
@@ -4248,10 +4249,10 @@ stale backend leaves the VM unreachable and the daemon never comes up.
 
 | | `package.sh` | `package-offline.sh` |
 |---|---|---|
-| Archive | ~1.3 MB zip | ~4.6 GB tar |
+| Archive | ~1.3 MB zip | ~7.7 GB tar |
 | Contains | source only | source + all 5 images + model weights |
-| Target needs internet | **yes** (~8–10 GB downloaded) | **no** |
-| Docker disk on target | 20 GB | ~12 GB (no build cache needed) |
+| Target needs internet | **yes** (~11–13 GB downloaded) | **no** |
+| Docker disk on target | 20 GB | ~15 GB (no build cache needed) |
 
 Both archives MUST hold exactly the files git tracks in the current commit
 (`HEAD`), built with `git archive`, so nothing untracked or ignored goes in:
@@ -4272,8 +4273,14 @@ rag-docker/
 ├── install-offline.sh
 └── offline/
     ├── images.tar.gz            # docker save of all 5 images (~2.5 GB)
-    └── ollama_models.tar.gz     # phi3.5 + nomic-embed-text (~2.2 GB)
+    └── ollama_models.tar.gz     # llama3.1:8b + nomic-embed-text (~5.2 GB)
 ```
+
+Before saving any image, `package-offline.sh` MUST check that the
+`ollama_models` volume holds a manifest for every model `ollama/entrypoint.sh`
+pulls, and stop naming the missing ones otherwise (#647): a bundle without one
+would make the offline target try to download it. It exports the whole volume,
+so a model left in it (phi3.5, after an upgrade to 1.2.1) goes in too.
 
 The image list MUST match the images `docker compose config` resolves. It is
 `rag-docker-api:latest`, `rag-docker-ui:latest`,

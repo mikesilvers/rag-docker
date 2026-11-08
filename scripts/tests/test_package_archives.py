@@ -67,6 +67,8 @@ class PackageArchiveTests(unittest.TestCase):
         self.repo.mkdir()
         for name in SCRIPTS + ('.gitignore',):
             shutil.copy(ROOT / name, self.repo / name)
+        # package-offline.sh reads the model names from the entrypoint (#647).
+        write(self.repo / 'ollama' / 'entrypoint.sh', (ROOT / 'ollama' / 'entrypoint.sh').read_text())
         write(self.repo / 'install-offline.sh', '#!/usr/bin/env bash\necho install\n', 0o755)
         write(self.repo / 'README.md', COMMITTED_README)
         write(self.repo / 'ingest-inbox' / '.gitkeep', '')

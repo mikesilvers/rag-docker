@@ -73,10 +73,13 @@ case "$1" in
     for arg in "$@"; do
       case "$arg" in *:/out)
         out="${arg%:/out}"; mkdir -p "$STUB_MODELS/models"; echo weights > "$STUB_MODELS/models/blob"
-        tar czf "$out/ollama_models.tar.gz" -C "$STUB_MODELS" . ;;
+        tar czf "$out/ollama_models.tar.gz" -C "$STUB_MODELS" .
+        exit 0 ;;
       esac
     done
-    exit 0 ;;
+    # The model check: it prints the models whose manifest is missing.
+    for m in $STUB_MISSING_MODELS; do echo "$m"; done
+    exit "${STUB_CHECK_RC:-0}" ;;
 esac
 echo "stub docker: unexpected call: $*" >&2
 exit 99
@@ -91,6 +94,12 @@ def offline_images():
     text = (ROOT / "package-offline.sh").read_text()
     block = re.search(r"^IMAGES=\(\n(.*?)^\)", text, re.S | re.M).group(1)
     return [line.strip() for line in block.splitlines() if line.strip()]
+
+
+def entrypoint_models():
+    """The models ollama/entrypoint.sh pulls, read as package-offline.sh and the CI cache read them."""
+    text = (ROOT / "ollama" / "entrypoint.sh").read_text()
+    return re.findall(r"^pull_with_retry ([A-Za-z0-9._:-]*)$", text, re.M)
 
 
 def tracked_files():
@@ -240,6 +249,42 @@ class OfflinePackageTests(Workspace):
         self.assertIn("ERROR: volume 'rag-docker_ollama_models' not found.", result.stderr)
         self.assertFalse(out.exists())
         self.assertEqual([c for c in self.calls() if c[0] in ("save", "run")], [])
+
+
+    def test_the_model_check_reads_the_entrypoint_names_from_the_volume_read_only(self):
+        result, _out, _files = self.build({})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        models = entrypoint_models()
+        self.assertIn("llama3.1:8b", models)
+        runs = [c for c in self.calls() if c[0] == "run"]
+        self.assertEqual(len(runs), 2)
+        check, export = runs
+        self.assertEqual(check[-len(models) - 1:], ["sh"] + models)
+        for arg in ("--network", "none", "rag-docker_ollama_models:/models:ro", "ollama/ollama:0.3.14"):
+            self.assertIn(arg, check)
+        self.assertFalse(any(a.endswith(":/out") for a in check))
+        self.assertTrue(any(a.endswith(":/out") for a in export))
+        # The check comes before anything is saved.
+        calls = self.calls()
+        self.assertLess(calls.index(check), next(i for i, c in enumerate(calls) if c[0] == "save"))
+
+    def test_a_missing_model_stops_before_anything_is_saved(self):
+        # An install from before #647 holds phi3.5, not llama3.1:8b.
+        result, out, _files = self.build({}, STUB_MISSING_MODELS="llama3.1:8b")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ERROR: volume 'rag-docker_ollama_models' doesn't hold llama3.1:8b. "
+                      "Start the stack once (docker compose up -d)", result.stderr)
+        self.assertFalse(out.exists())
+        self.assertEqual([c for c in self.calls() if c[0] == "save"], [])
+        self.assertEqual(len([c for c in self.calls() if c[0] == "run"]), 1)
+
+    def test_a_failed_model_check_stops_before_anything_is_saved(self):
+        result, out, _files = self.build({}, STUB_CHECK_RC="1")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ERROR: could not read the models in volume 'rag-docker_ollama_models'.",
+                      result.stderr)
+        self.assertFalse(out.exists())
+        self.assertEqual([c for c in self.calls() if c[0] == "save"], [])
 
 
 class ImageListTests(unittest.TestCase):
