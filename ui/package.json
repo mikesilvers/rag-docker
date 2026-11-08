@@ -1,6 +1,6 @@
 {
   "name": "rag-ui",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "private": true,
   "scripts": {
     "dev": "vite",
@@ -8,11 +8,11 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "lucide-react": "^1.48.0",
+    "lucide-react": "^1.64.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^9.0.1",
-    "react-router-dom": "^7.18.4",
+    "react-router-dom": "^7.18.5",
     "recharts": "^3.10.1",
     "remark-gfm": "^4.0.0"
   },
@@ -21,10 +21,15 @@
     "@types/react": "^18.3.5",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
-    "autoprefixer": "^10.6.1",
-    "postcss": "^8.4.45",
+    "autoprefixer": "^10.6.2",
+    "postcss": "^8.5.32",
     "tailwindcss": "^3.4.11",
     "typescript": "^7.0.2",
-    "vite": "^6.4.3"
+    "vite": "^6.4.4"
+  },
+  "overrides": {
+    "@tailwindcss/typography": {
+      "postcss-selector-parser": "^6.1.5"
+    }
   }
 }

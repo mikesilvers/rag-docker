@@ -1,7 +1,7 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { api, CollectionInfo, Citation } from '../api/client'
-import { useRole } from '../context/RoleContext'
+import { useRole } from '../context/AuthContext'
 import { useQueryConfig } from '../context/QueryConfigContext'
 import CitationsPanel from '../components/CitationsPanel'
 
@@ -18,18 +18,35 @@ export default function QAPage() {
   const [showCitations, setShowCitations] = useState(false)
   const [latency, setLatency] = useState<{ ret: number; llm: number } | null>(null)
   const [error, setError] = useState('')
+  // A failed collection list is shown, not swallowed (#379).
+  const [listError, setListError] = useState('')
+  // Each query belongs to a request generation (#511). A new question or a
+  // collection change starts a new one; only the current generation's query
+  // may show its answer or error, or end the loading state.
+  const generation = useRef(0)
 
-  useEffect(() => {
+  // Loads the collection list, on opening the page and from the failed-list
+  // alert's Retry (#575). A collection already chosen, here or on the Retrieval
+  // page, is kept; the first one is selected only when none is. The choice is
+  // read when the list arrives, not when the load started (#593).
+  function loadCollections() {
     api.getCollections().then(r => {
       setCollections(r.collections)
-      if (!collection && r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => {})
+      setListError('')
+      if (r.collections.length > 0) setCollection(c => c || r.collections[0].name)
+    }).catch((e: unknown) => setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`))
+  }
+
+  useEffect(() => {
+    loadCollections()
     // Runs once; a collection already chosen on the Retrieval page is kept.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   async function submit() {
-    if (!question.trim() || !collection) return
+    // The same gate as the Ask button, so Ctrl+Enter cannot start a second query.
+    if (loading || !question.trim() || !collection) return
+    const ticket = ++generation.current
     setLoading(true)
     setError('')
     setAnswer('')
@@ -45,14 +62,29 @@ export default function QAPage() {
         include_citations: showCitations,
         response_format: role === 'end_user' ? 'end_user' : 'engineer',
       })
+      if (ticket !== generation.current) return
       setAnswer(result.answer)
       setCitations(result.citations)
       setLatency({ ret: result.retrieval_latency_ms, llm: result.llm_latency_ms })
     } catch (e: unknown) {
+      if (ticket !== generation.current) return
       setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setLoading(false)
+      if (ticket === generation.current) setLoading(false)
     }
+  }
+
+  // The result on screen and any query in flight belong to the previous
+  // collection: clear the one and drop the other, so nothing from it is shown
+  // under the new selection (#511).
+  function changeCollection(name: string) {
+    generation.current++
+    setLoading(false)
+    setError('')
+    setAnswer('')
+    setCitations(null)
+    setLatency(null)
+    setCollection(name)
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -66,7 +98,7 @@ export default function QAPage() {
     <div className="max-w-3xl mx-auto">
       <h1 className="text-2xl font-bold mb-6">Ask a Question</h1>
       <div className="flex gap-3 mb-3">
-        <select value={collection} onChange={e => setCollection(e.target.value)} className="border rounded px-3 py-2 text-sm flex-1">
+        <select value={collection} onChange={e => changeCollection(e.target.value)} className="border rounded px-3 py-2 text-sm flex-1">
           {collections.map(c => <option key={c.name} value={c.name}>{c.name} ({c.object_count} chunks)</option>)}
         </select>
         {role !== 'end_user' && (
@@ -75,6 +107,12 @@ export default function QAPage() {
           </select>
         )}
       </div>
+      {listError && (
+        <p role="alert" className="text-red-600 text-sm mb-3">
+          {listError}
+          <button type="button" onClick={() => loadCollections()} className="ml-2 underline hover:text-red-800">Retry</button>
+        </p>
+      )}
       <textarea
         value={question}
         onChange={e => setQuestion(e.target.value)}

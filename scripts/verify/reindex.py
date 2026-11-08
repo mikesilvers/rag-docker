@@ -5,6 +5,7 @@ from unittest.mock import patch
 import httpx
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs, tuning, ingest_pipeline as ingest
 from services import weaviate_client as wc
 
@@ -94,7 +95,9 @@ async def retained_cutover_checks(api,client,name,temp,record_create,jobs,check)
     col=client.collections.get(collection)
     await asyncio.to_thread(col.data.insert,properties={'content':'Owned inert recovery','source_file':'owned.txt','chunk_index':0},uuid=str(uuid.uuid4()),vector=[.125]*768)
     before=await asyncio.to_thread(tuning._existing_records,collection)
-    session={'session_id':sid,'collection':collection[:1].lower()+collection[1:],'status':'completed','pairs_total':1,'pairs_completed':1,'pairs_attempted':1,'pairs_failed':0,'pairs':[{'pair_id':'p_owned','question':'Owned','answer':'Owned','contexts':['Owned inert recovery'],'ground_truth':'Owned','source_file':'owned.txt','chunk_index':0,'status':'approved'}]}
+    # Sessions are stored under the collection's stored name (#372); the request below
+    # still uses the lowercase-first spelling, which the API resolves to it.
+    session={'session_id':sid,'collection':collection,'status':'completed','pairs_total':1,'pairs_completed':1,'pairs_attempted':1,'pairs_failed':0,'pairs':[{'pair_id':'p_owned','question':'Owned','answer':'Owned','contexts':['Owned inert recovery'],'ground_truth':'Owned','source_file':'owned.txt','chunk_index':0,'status':'approved'}]}
     await asyncio.to_thread(gs.store_session,session);session_bytes=await asyncio.to_thread(lambda:gs._session_path(sid).read_bytes())
     def create(target,*args,**kwargs):
         if target==collection:raise RuntimeError('Owned injected final-create failure after cutover')
@@ -117,6 +120,7 @@ async def retained_cutover_checks(api,client,name,temp,record_create,jobs,check)
     child="""import asyncio,json,sys
 from services import weaviate_client as wc,goldstandard as gs,tuning
 from main import app,lifespan
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 expected=json.load(sys.stdin)
 async def proof():
     async with lifespan(app):
@@ -126,11 +130,11 @@ async def proof():
 asyncio.run(proof())
 print('PASS independent API lifespan restores recovery, exact records and historical session')
 """
-    env={**os.environ,'UPLOAD_DIR':temp,'SOURCES_DIR':str(Path(temp)/'sources')}
+    env={**os.environ,'UPLOAD_DIR':temp,'SOURCES_DIR':str(Path(temp)/'sources'),'EXPORTS_DIR':str(Path(temp)/'exports')}
     restarted=await asyncio.to_thread(subprocess.run,[sys.executable,'-c',child,stage,sid],input=json.dumps(before),text=True,capture_output=True,env=env,timeout=30)
     if restarted.returncode:print(restarted.stderr,flush=True)
     check(restarted.returncode==0,'fresh API process restores owned recovery and exact records: '+restarted.stderr[-200:])
-    deletion=await api.delete('/collections/'+stage[:1].lower()+stage[1:])
+    deletion=await api.delete('/collections/'+stage[:1].lower()+stage[1:]+'?confirm=true')
     check(deletion.status_code==200 and deletion.json()['objects_deleted']==len(before),'explicit lowercase-alias DELETE removes the retained backend copy')
     check(not await asyncio.to_thread(paths[0].exists) and not await asyncio.to_thread(snapshot.parent.parent.exists),'explicit recovery deletion retires exactly its ownership journal and metadata snapshots')
 
@@ -184,7 +188,7 @@ async def collection_deletion_checks(api,client,name,temp,check):
                 if collection != neighbor or exc.status_code != 422 or 'similar class' not in str(exc):
                     raise
                 neighbor_supported=False
-                check(True,'backend rejects a case-only neighbor; verifying case-distinct sidecars and sessions on the Linux volume')
+                print('NOTE backend rejects a case-only neighbor; verifying case-distinct sidecars and sessions on the Linux volume', flush=True)
                 continue
             await asyncio.to_thread(client.collections.get(collection).data.insert,properties={'content':'Owned deletion fixture'},vector=[.125]*768)
         identities={spelling:'gs_'+uuid.uuid4().hex[:8] for spelling in (canonical,alias,neighbor)}
@@ -194,7 +198,7 @@ async def collection_deletion_checks(api,client,name,temp,check):
             await asyncio.to_thread(retrieval_config.save,{'collection':spelling})
             await asyncio.to_thread(gs.store_session,{'session_id':sid,'collection':spelling,'status':'completed','pairs_total':0,'pairs_completed':0,'pairs':[]})
         await asyncio.to_thread(collection_routes._save_registry, {canonical:'owned', alias:'owned', neighbor:'neighbor'})
-        response=await api.delete('/collections/'+caller)
+        response=await api.delete('/collections/'+caller+'?confirm=true')
         registry=await asyncio.to_thread(collection_routes._load_registry)
         check(registry=={neighbor:'neighbor'},'registry removes both aliases and preserves case-distinct neighbor')
         check(response.status_code==200 and response.json()['objects_deleted']==1 and not await asyncio.to_thread(client.collections.exists,canonical),'HTTP deletion removes canonical backend collection via '+caller)
@@ -240,7 +244,7 @@ async def main():
             def check(condition,label):
                 nonlocal checks
                 assert condition,label; checks+=1; print('PASS '+label,flush=True)
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned') as api:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned'), base_url='http://owned') as api:
                 try:
                     await asyncio.to_thread(wc._create_collection_sync,probe,'hnsw','cosine',{})
                     try:
@@ -252,7 +256,7 @@ async def main():
                     check(await asyncio.to_thread(lambda:client.collections.get(probe).aggregate.over_all(total_count=True).total_count)==0,'failed embedding probe stores no object')
                     alias=name[:1].lower()+name[1:]
                     creation=await api.post('/collections',json={'name':alias,'index_type':'hnsw','distance_metric':'cosine'})
-                    check(creation.status_code==201 and creation.json()['name']==alias,'collection HTTP creation echoes a supported lowercase alias')
+                    check(creation.status_code==201 and creation.json()['name']==name,'collection HTTP creation from a supported lowercase alias answers the stored name (#372)')
                     col=client.collections.get(name)
                     source=[]
                     for i in range(2):

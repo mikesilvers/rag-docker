@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E29)
+# RAG_EXPORT_SPECIFICATIONS.md §13 — export, import and tuning (E5-E20, E23, E26-E40)
 cd "$(dirname "$0")" && . ./lib.sh
 REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
@@ -19,10 +19,34 @@ section "Export, import and tuning"
 check "evaluation import and generated-session regressions" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_source_index_boundary.py)
 check "retained-source index boundary regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_export_snapshot.py)
+check "export holds the writer guard: chunks and sources from one point in time (#509)" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_retrieval_import.py)
 check "retrieval import and generated-script trust-boundary regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_import_embedding.py)
+check "E12 embedding mismatch and post-install Ollama check regressions" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_import_guard.py)
+check "concurrent imports of one package or one target refused (#391)" $?
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_batch_recovery.py)
 check "import and tuning recovery regressions" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_batch_recovery_fixture.py)
+check "test_batch_recovery_fixture.py registered regression checks" $?
+# Bundled models (#386): install safety, E21 and E22 with a temporary store,
+# then the real pulled embedding model copied through a temporary package.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_model_bundle.py)
+check "bundled-model install safety, E21 install and E22 EMBEDDING_MODEL_MISSING" $?
+(cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/model_integrity.py)
+check "real embedding model exported, installed and refused when mismatched" $?
+# The package listing reads each manifest without decompressing the package (#383).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_package_listing.py)
+check "the package listing reads only up to each manifest (#383)" $?
+# Passphrase encryption (#27): the age module against the CCTV vectors, export,
+# import, listing and refusals, with no backend.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_export_encryption.py)
+check "export encryption: age format, encrypted export and import, refusals (#27)" $?
+
+python3 "$REPO_ROOT/scripts/tests/test_batch_implementation.py"
+check "test_batch_implementation.py registered regression checks" $?
 python3 "$REPO_ROOT/scripts/tests/test_session_implementation.py"
 check "embedded session/import verification sources match" $?
 
@@ -34,6 +58,9 @@ wait_for_job "/ingest/job/$job" 900 >/dev/null
 chunks_before=$(api_get "/collections" | python3 -c "
 import json,sys; print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$C'][0])")
 
+# Saved ingest settings (the upload's own values) so the package carries
+# ingest_config.json and import restores it through settings_store (#189).
+api_post "/ingest/config" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":150,\"min_chunk_size\":40}" >/dev/null
 # Retrieval settings must exist for the package to carry retrieve.py.
 api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
 
@@ -51,6 +78,178 @@ check_eq "a tuned collection ships retrieve.py" "$script" "True"
 
 python3 ./validate_package.py "$EXPORTS/$PKG" > /tmp/vfy_val.txt 2>&1
 check "package satisfies every §4 clause" $? "$(tail -2 /tmp/vfy_val.txt | head -1)"
+# A real export, archived manifest first, lists as readable with its metadata (#383).
+api_get "/packages" > /tmp/vfy_pkglist.json
+python3 - "$PKG" "$C" "$chunks_before" > /tmp/vfy_pkglist.txt 2>&1 <<'ENDPY'
+import json, sys
+pkg, coll, chunks = sys.argv[1], sys.argv[2], int(sys.argv[3])
+entry = next((p for p in json.load(open("/tmp/vfy_pkglist.json"))["packages"] if p["filename"] == pkg), None)
+print(entry)
+sys.exit(0 if entry and entry["readable"] is True and entry["collection"] == coll
+         and entry["chunk_count"] == chunks and entry["fidelity"] == "with-sources" and entry["created_at"] else 1)
+ENDPY
+check "GET /packages lists the new export as readable with its manifest metadata (#383)" $? "$(tail -1 /tmp/vfy_pkglist.txt)"
+
+# ── encrypted packages (#27) ─────────────────────────────────────────────────
+# An encrypted export of the same collection, validated after decryption; a
+# wrong passphrase fails DECRYPT_FAILED with nothing touched; the passphrase
+# refusals; the right passphrase imports it. The passphrase is test data.
+PASS27="vfy-27 correct horse battery"
+post_code() {   # path body outfile -> the HTTP status
+  _rag_require_lock_owner
+  curl -s -m 600 -o "$3" -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"
+}
+code=$(post_code "/export" "{\"collection\":\"$C\",\"passphrase\":\"short-pass\"}" /tmp/vfy_enc_short.json)
+python3 - "$code" > /tmp/vfy_enc_short.txt 2>&1 <<'ENDPY'
+import json, sys
+body = open("/tmp/vfy_enc_short.json").read()
+print(sys.argv[1], body[:300])
+sys.exit(0 if sys.argv[1] == "422" and json.loads(body)["error"]["code"] == "INVALID_PARAMETER"
+         and "short-pass" not in body else 1)
+ENDPY
+check "#27 an 11-character passphrase is refused 422 INVALID_PARAMETER without being echoed" $? "$(tail -1 /tmp/vfy_enc_short.txt)"
+
+api_post "/export" "{\"collection\":\"$C\",\"passphrase\":\"$PASS27\"}" > /tmp/vfy_enc_exp.json
+encjob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_enc_exp.json'))['job_id'])")
+encstatus=$(wait_for_job "/export/job/$encjob" 1800)
+check_eq "#27 an encrypted export completes" "$encstatus" "completed"
+api_get "/export/job/$encjob" > /tmp/vfy_enc_expjob.json
+ENCPKG=$(python3 -c "import json;print(json.load(open('/tmp/vfy_enc_expjob.json'))['filename'])")
+python3 - "$EXPORTS/$ENCPKG" "$PASS27" > /tmp/vfy_enc_file.txt 2>&1 <<'ENDPY'
+import json, pathlib, sys
+path, phrase = pathlib.Path(sys.argv[1]), sys.argv[2]
+job = json.load(open("/tmp/vfy_enc_expjob.json"))
+head = path.read_bytes()[:200] if path.is_file() else b""
+lines = head.split(b"\n")
+print(path.name, job.get("encrypted"), lines[:2])
+sys.exit(0 if path.name.endswith(".tar.gz.age") and job.get("encrypted") is True
+         and lines[0] == b"age-encryption.org/v1" and lines[1].startswith(b"-> scrypt ")
+         and lines[1].endswith(b" 18") and phrase.encode() not in path.read_bytes()
+         and phrase not in json.dumps(job) else 1)
+ENDPY
+check "#27 the job reports encrypted and the file is an age scrypt file (work factor 18) named .tar.gz.age" $? "$(tail -1 /tmp/vfy_enc_file.txt)"
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_PACKAGE_PASSPHRASE="$PASS27" api \
+  python - "/app/exports/$ENCPKG" < scripts/verify/validate_package.py) > /tmp/vfy_enc_val.txt 2>&1
+check "#27 the decrypted package satisfies every §4 clause" $? "$(tail -2 /tmp/vfy_enc_val.txt | head -1)"
+api_get "/packages" > /tmp/vfy_enc_list.json
+python3 - "$ENCPKG" > /tmp/vfy_enc_list.txt 2>&1 <<'ENDPY'
+import json, sys
+entry = next((p for p in json.load(open("/tmp/vfy_enc_list.json"))["packages"] if p["filename"] == sys.argv[1]), None)
+print(entry)
+sys.exit(0 if entry and entry["encrypted"] is True and entry["readable"] is True
+         and all(entry[k] is None for k in ("collection", "chunk_count", "fidelity", "created_at")) else 1)
+ENDPY
+check "#27 GET /packages lists the encrypted package with encrypted: true and no metadata" $? "$(tail -1 /tmp/vfy_enc_list.txt)"
+
+# Wrong passphrase, on_conflict=replace against the existing collection: nothing touched.
+enc_sum() { python3 -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$EXPORTS/$ENCPKG"; }
+enc_state() { api_get "/collections" | python3 -c "
+import json,sys; c=json.load(sys.stdin)['collections']; print(sorted((x['name'], x['object_count']) for x in c))"; }
+enc_workdirs() { (cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/uploads/import-* 2>/dev/null | wc -l') | tr -d ' \r'; }
+sum_before=$(enc_sum); state_before=$(enc_state); workdirs_before=$(enc_workdirs)
+api_post "/import" "{\"filename\":\"$ENCPKG\",\"on_conflict\":\"replace\",\"passphrase\":\"not the passphrase\"}" > /tmp/vfy_enc_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_enc_imp.json'))['job_id'])")
+wait_for_job "/import/job/$ijob" 900 >/dev/null
+api_get "/import/job/$ijob" > /tmp/vfy_enc_impjob.json
+python3 > /tmp/vfy_enc_wrong.txt 2>&1 <<'ENDPY'
+import json, sys
+d = json.load(open("/tmp/vfy_enc_impjob.json"))
+print(d["status"], d["error_code"], d["error_detail"], d.get("encrypted"))
+sys.exit(0 if d["status"] == "failed" and d["error_code"] == "DECRYPT_FAILED"
+         and d["error_detail"] == {"reason": "passphrase"} and d.get("encrypted") is True
+         and "not the passphrase" not in json.dumps(d) else 1)
+ENDPY
+check "#27 a wrong passphrase fails the import DECRYPT_FAILED (reason passphrase)" $? "$(tail -1 /tmp/vfy_enc_wrong.txt)"
+[ "$(enc_state)" = "$state_before" ] && [ "$(enc_sum)" = "$sum_before" ]
+check "#27 ... and touches nothing: collections, their counts and the package file unchanged" $?
+check_eq "#27 ... and leaves no import work directory behind" "$(enc_workdirs)" "$workdirs_before"
+
+code=$(post_code "/import" "{\"filename\":\"$ENCPKG\",\"on_conflict\":\"rename\"}" /tmp/vfy_enc_req.json)
+check_eq "#27 an encrypted package without a passphrase is refused 400" "$code" "400"
+check_eq "#27 ... with PASSPHRASE_REQUIRED" "$(jfield "['error']['code']" < /tmp/vfy_enc_req.json)" "PASSPHRASE_REQUIRED"
+code=$(post_code "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"rename\",\"passphrase\":\"$PASS27\"}" /tmp/vfy_enc_nexp.json)
+check_eq "#27 a passphrase for an unencrypted package is refused 400" "$code" "400"
+check_eq "#27 ... with PASSPHRASE_NOT_EXPECTED" "$(jfield "['error']['code']" < /tmp/vfy_enc_nexp.json)" "PASSPHRASE_NOT_EXPECTED"
+[ "$(enc_state)" = "$state_before" ]
+check "#27 ... and neither refusal changed any collection" $?
+
+api_post "/import" "{\"filename\":\"$ENCPKG\",\"on_conflict\":\"rename\",\"passphrase\":\"$PASS27\"}" > /tmp/vfy_enc_imp.json
+ijob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_enc_imp.json'))['job_id'])")
+wait_for_job "/import/job/$ijob" 1800 >/dev/null
+api_get "/import/job/$ijob" > /tmp/vfy_enc_impjob.json
+read -r encstat encname encwritten encflag <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_enc_impjob.json'))
+print(d['status'], d['collection'], d['chunks_written'], d.get('encrypted'))")"
+check_eq "#27 the right passphrase imports the encrypted package" "$encstat" "completed"
+[ "$encname" != "$C" ] && [ "$encwritten" = "$chunks_before" ] && [ "$encflag" = "True" ]
+check "#27 ... under a new name with every chunk, and the job reports encrypted" $? "$encname $encwritten/$chunks_before $encflag"
+[ -n "$encname" ] && [ "$encname" != "$C" ] && [ "$encname" != "None" ] && drop_collection "$encname"
+rm -f "$EXPORTS/$ENCPKG"
+
+# ── E30: vectors are attributed to the collection's stored model (#196) ──────
+EMBED_MODEL=$(cd "$REPO_ROOT" && docker compose exec -T api python -c 'from config import settings; print(settings.embed_model)' | tr -d '\r')
+python3 - "$EXPORTS/$PKG" "$EMBED_MODEL" > /tmp/vfy_e30_match.txt 2>&1 <<'ENDPY'
+import json, sys, tarfile
+pkg, model = sys.argv[1], sys.argv[2]
+with tarfile.open(pkg) as t:
+    def read(name):
+        m = next(x for x in t.getmembers() if x.isfile() and x.name.rsplit("/", 1)[-1] == name)
+        return json.load(t.extractfile(m))
+    coll, man = read("collection.json"), read("manifest.json")
+print(f"collection.json={coll.get('embedding_model')!r} manifest={man['embedding']['model']!r} configured={model!r}")
+sys.exit(0 if model and coll.get("embedding_model") == model == man["embedding"]["model"] else 1)
+ENDPY
+check "E30: a matching collection records its stored model in collection.json and the manifest" $? "$(tail -1 /tmp/vfy_e30_match.txt)"
+
+# Collections the API would never create: an equal-width vector from another
+# model's name, a named-vector schema, and no vectorizer. Each export must fail
+# with the re-embedding remedy and leave nothing in the exports folder.
+E30_DRIFT="${PREFIX}E30Drift"; E30_NAMED="${PREFIX}E30Named"; E30_NONE="${PREFIX}E30None"
+e30_collections() {   # create | drop
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$1" "$C" "$E30_DRIFT" "$E30_NAMED" "$E30_NONE") <<'ENDPY'
+import sys
+from weaviate.classes.config import Configure, DataType, Property
+from config import settings
+from services import weaviate_client as wc
+action, source, drift, named, none = sys.argv[1:6]
+client = wc.get_client()
+for n in (drift, named, none):
+    if client.collections.exists(n):
+        client.collections.delete(n)
+if action == "drop":
+    sys.exit(0)
+endpoint = f"http://{settings.ollama_host}:{settings.ollama_port}"
+props = [Property(name="text", data_type=DataType.TEXT)]
+# Same width as the configured model's vectors: provenance can't come from dimensions.
+width = len(next(client.collections.get(source).iterator(include_vector=True)).vector["default"])
+client.collections.create(drift, properties=props, vectorizer_config=Configure.Vectorizer.text2vec_ollama(
+    api_endpoint=endpoint, model=settings.embed_model + "-e30-other", vectorize_collection_name=False))
+client.collections.get(drift).data.insert({"text": "e30 drift"}, vector=[0.01] * width)
+vectors = getattr(Configure, "Vectors", None)
+named_cfg = (vectors.text2vec_ollama(name="default", api_endpoint=endpoint, model=settings.embed_model)
+             if vectors else Configure.NamedVectors.text2vec_ollama(name="default", api_endpoint=endpoint, model=settings.embed_model))
+client.collections.create(named, properties=props, vector_config=[named_cfg])
+client.collections.create(none, properties=props, vectorizer_config=Configure.Vectorizer.none())
+print(f"created {drift} (width {width}), {named}, {none}")
+ENDPY
+}
+e30_collections create > /tmp/vfy_e30_setup.txt 2>&1
+check "E30: mismatch fixtures created on the verify project" $? "$(tail -1 /tmp/vfy_e30_setup.txt)"
+for e30c in "$E30_DRIFT" "$E30_NAMED" "$E30_NONE"; do
+  before=$(ls -A "$EXPORTS" | sort)
+  api_post "/export" "{\"collection\":\"$e30c\",\"include_models\":true}" > /tmp/vfy_e30_exp.json
+  e30job=$(jfield "['job_id']" < /tmp/vfy_e30_exp.json)
+  e30status=$(wait_for_job "/export/job/$e30job" 600)
+  e30err=$(api_get "/export/job/$e30job" | jfield "['error']")
+  [ "$e30status" = "failed" ] && [[ "$e30err" == PackageError:*Re-embed* ]]
+  check "E30: export of $e30c refuses with the re-embedding remedy" $? "status '$e30status', error '$e30err'"
+  check_eq "E30: refusal exposes EMBEDDING_MISMATCH" "$(api_get "/export/job/$e30job" | jfield "['error_code']")" "EMBEDDING_MISMATCH"
+  after=$(ls -A "$EXPORTS" | sort)
+  [ "$before" = "$after" ]
+  check "E30: ... and leaves nothing in the exports folder ($e30c)" $? "$(diff <(echo "$before") <(echo "$after") | tail -3)"
+done
+e30_collections drop >/dev/null 2>&1
+check "E30: mismatch fixtures removed" $?
 
 # ── corruption is detected ───────────────────────────────────────────────────
 python3 - "$EXPORTS/$PKG" <<'ENDPY'
@@ -371,6 +570,58 @@ for mode in abs trav mismatch; do
 done
 api_post "/retrieval/config" "{\"collection\":\"$C\",\"retrieval_mode\":\"hybrid\",\"top_k\":6,\"alpha\":0.5,\"ef\":null,\"response_format\":\"engineer\"}" >/dev/null
 
+# ── manifest files keys never hash outside the package (E33, #371) ──────────
+# An otherwise valid package lists the outside sentinel in manifest.json's
+# files map, by absolute path and by ../ path, with its real digest and with a
+# wrong one. Import must refuse it naming manifest.json, never report the
+# sentinel's digest, and create no collection.
+E371_HEX=$(python3 -c "import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" "$E29_TEXT")
+make_files_pkg() {   # make_files_pkg <abs|trav> <real|wrong> <suffix>; prints the new filename
+  python3 - "$EXPORTS/$PKG" "$1" "$2" "$3" "$E29_SENT" "$E371_HEX" <<'ENDPY'
+import json, pathlib, sys, tarfile, tempfile
+src, mode, dig, suffix, sent, hexd = pathlib.Path(sys.argv[1]), *sys.argv[2:]
+with tempfile.TemporaryDirectory() as td:
+    work = pathlib.Path(td)
+    with tarfile.open(src) as t:
+        t.extractall(work, filter="data")
+    root = next(p for p in work.iterdir() if p.is_dir())
+    manifest = json.loads((root / "manifest.json").read_text())
+    key = sent if mode == "abs" else "../" * 12 + sent.lstrip("/")
+    manifest["files"][key] = "sha256:" + (hexd if dig == "real" else "0" * 64)
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    out = src.parent / (src.name.replace(".tar.gz", "") + f"-{suffix}.tar.gz")
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
+    print(out.name)
+ENDPY
+}
+for mode in abs trav; do
+  for dig in wrong real; do
+    names_before=$(collection_names)
+    P=$(make_files_pkg "$mode" "$dig" "files$mode$dig")
+    run_import "$P" rename
+    check_eq "E33: a $mode manifest files key ($dig digest) is refused as PACKAGE_CORRUPT" \
+      "$(jfield "['error_code']" < /tmp/vfy_e29job.json)" "PACKAGE_CORRUPT"
+    check_eq "E33: ... naming manifest.json ($mode, $dig)" \
+      "$(jfield "['error_detail']" < /tmp/vfy_e29job.json)" "{'file': 'manifest.json'}"
+    python3 -c "
+import json,sys; d=json.dumps(json.load(open('/tmp/vfy_e29job.json')))
+sys.exit(1 if '$E371_HEX' in d or '$E29_SENT' in d else 0)"
+    check "E33: ... with no outside digest or path in the job ($mode, $dig)" $?
+    read -r fstat fname <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_e29job.json')); print(d['status'], d.get('collection') or '-')")"
+    names_after=$(collection_names)
+    [ "$fstat" = "completed" ] && [ "$fname" != "-" ] && drop_collection "$fname"
+    check_eq "E33: ... and creates no collection ($mode, $dig)" "$names_after" "$names_before"
+    rm -f "$EXPORTS/$P"
+  done
+done
+
 # The valid in-directory source still round-trips after the refusals.
 api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_e29exp.json
 e29job=$(jfield "['job_id']" < /tmp/vfy_e29exp.json)
@@ -427,16 +678,118 @@ for mode in abs link; do
   check_eq "E29: export refuses an on-disk $mode source entry" \
     "$(wait_for_job "/export/job/$(jfield "['job_id']" < /tmp/vfy_e29exp.json)" 1800)" "failed"
   leak=$(no_sentinel_in_exports); check "E29: ... and archives no outside bytes ($mode)" $? "$leak"
-  api_post "/tune/rechunk" "{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
-  check_eq "E29: re-chunking refuses an on-disk $mode source entry" \
-    "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "failed"
+  RECHUNK="{\"collection\":\"$C\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}"
+  if [ "$mode" = abs ]; then
+    # An index that fails validation refuses the source-dependent starts with
+    # the typed 409, before any job is created (#389).
+    for route in rechunk reembed; do
+      check_eq "E29: $route with chunking on an on-disk abs entry is HTTP 409" \
+        "$(api_post_code "/tune/$route" "$RECHUNK")" "409"
+      api_post "/tune/$route" "$RECHUNK" > /tmp/vfy_tj.json
+      check_eq "E29: ... with error code SOURCE_INDEX_INVALID and no job ($route)" \
+        "$(jfield "['error']['code']" < /tmp/vfy_tj.json) $(jfield ".get('job_id')" < /tmp/vfy_tj.json)" \
+        "SOURCE_INDEX_INVALID None"
+    done
+  else
+    api_post "/tune/rechunk" "$RECHUNK" > /tmp/vfy_tj.json
+    check_eq "E29: re-chunking refuses an on-disk $mode source entry" \
+      "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "failed"
+  fi
   check_eq "E29: ... and leaves the chunk count alone ($mode)" "$(count_of "$C")" "$chunks_before"
-  echo "    (info) GET /tune/$C with the $mode entry planted: HTTP $(api_code "$API/tune/$C")"
+  if [ "$mode" = abs ]; then
+    # An index that fails validation is a typed 409, not a 500, and doesn't
+    # block tuning that never reads sources (reindex copies stored records).
+    check_eq "E29: GET /tune reports an on-disk abs entry as HTTP 409" "$(api_code "$API/tune/$C")" "409"
+    check_eq "E29: ... with error code SOURCE_INDEX_INVALID" \
+      "$(api_get "/tune/$C" | jfield "['error']['code']")" "SOURCE_INDEX_INVALID"
+    api_post "/tune/reindex" "{\"collection\":\"$C\"}" > /tmp/vfy_tj.json
+    check_eq "E29: re-indexing from stored records still completes with an on-disk abs entry" \
+      "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_tj.json)" 1800)" "completed"
+    check_eq "E29: ... and keeps the chunk count (abs)" "$(count_of "$C")" "$chunks_before"
+    leak=$(no_sentinel_in_exports); check "E29: ... and nothing in exports holds outside bytes after it (abs)" $? "$leak"
+    # Re-embedding from stored chunk text never reads the sources either, so
+    # without chunking fields it still starts a job (#389).
+    api_post "/tune/reembed" "{\"collection\":\"$C\"}" > /tmp/vfy_tj.json
+    e29rejob=$(jfield "['job_id']" < /tmp/vfy_tj.json)
+    check_eq "E29: re-embedding without chunking fields still starts a job with an on-disk abs entry" \
+      "$(jfield "['status']" < /tmp/vfy_tj.json) $([ -n "$e29rejob" ] && echo job)" "queued job"
+    check_eq "E29: ... and completes (re-embed, abs)" \
+      "$(wait_for_job "/tune/job/$e29rejob" 1800)" "completed"
+    check_eq "E29: ... and keeps the chunk count (re-embed, abs)" "$(count_of "$C")" "$chunks_before"
+  else
+    echo "    (info) GET /tune/$C with the $mode entry planted: HTTP $(api_code "$API/tune/$C")"
+  fi
   plant restore
   check "E29: restored the collection's own source index ($mode)" $?
 done
 check_eq "E29: the restored index is the original" "$(src_index_hash "$C")" "$idx_before"
 (cd "$REPO_ROOT" && docker compose exec -T api rm -f "$E29_SENT") >/dev/null 2>&1 || true
+
+# ── unindexed package blobs are never retained (E29, #179) ───────────────────
+# A digest-valid package carries an extra sources/ file named after the SHA-256
+# of a document not yet ingested, holding other bytes. Import must not retain
+# it, so a later ingest of that document keeps the document's own bytes.
+E29_FUTURE="$FIX/e29-future-$E29_TAG.txt"
+printf 'E29 future document %s: the bytes a later ingest must retain.\n' "$E29_TAG" > "$E29_FUTURE"
+E29_FDIG=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$E29_FUTURE")
+UNIDX=$(python3 - "$EXPORTS/$PKG" "$E29_FDIG" <<'ENDPY'
+import hashlib, json, pathlib, sys, tarfile, tempfile
+src, fdig = pathlib.Path(sys.argv[1]), sys.argv[2]
+with tempfile.TemporaryDirectory() as td:
+    work = pathlib.Path(td)
+    with tarfile.open(src) as t:
+        t.extractall(work, filter="data")
+    root = next(p for p in work.iterdir() if p.is_dir())
+    manifest = json.loads((root / "manifest.json").read_text())
+    index = json.loads((root / "sources" / "index.json").read_text())
+    assert index["documents"] and fdig not in index["documents"]
+    planted = root / "sources" / fdig
+    planted.write_bytes(b"E29 planted unindexed bytes")
+    manifest["files"]["sources/" + fdig] = "sha256:" + hashlib.sha256(planted.read_bytes()).hexdigest()
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    out = src.parent / (src.name.replace(".tar.gz", "") + "-unindexed.tar.gz")
+    part = out.with_name("." + out.name + ".part")
+    try:
+        with tarfile.open(part, "w:gz") as t:
+            t.add(root, arcname=root.name)
+        part.replace(out)
+    finally:
+        part.unlink(missing_ok=True)
+    print(out.name)
+ENDPY
+)
+run_import "$UNIDX" rename
+read -r ustat uname <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_e29job.json')); print(d['status'], d.get('collection') or '-')")"
+check_eq "E29: a digest-valid package with an unindexed source blob imports (rename)" "$ustat" "completed"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$uname" "$E29_FDIG" <<'ENDPY'
+import json, sys
+from services import sources
+d, fdig = sources.collection_dir(sys.argv[1]), sys.argv[2]
+names = {p.name for p in d.iterdir()} if d.is_dir() else set()
+docs = set(json.loads((d / "index.json").read_text())["documents"]) if (d / "index.json").is_file() else set()
+print("    retained:", sorted(names))
+sys.exit(0 if docs and names == docs | {"index.json"} and fdig not in names else 1)
+ENDPY
+)
+check "E29: import retains only the indexed blobs and index.json, not the unindexed one" $?
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$uname" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$E29_FUTURE" > /tmp/vfy_e29ing.json
+check_eq "E29: ingesting the document the planted name targets completes" \
+  "$(wait_for_job "/ingest/job/$(jfield "['job_id']" < /tmp/vfy_e29ing.json)" 900)" "completed"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$uname" "$E29_FDIG" <<'ENDPY'
+import hashlib, sys
+from services import sources
+name, fdig = sys.argv[1], sys.argv[2]
+p = sources.blob_path(name, fdig)
+got = hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "missing"
+print("    retained blob hashes to", got)
+sys.exit(0 if got == fdig and fdig in sources.load_index(name)["documents"] else 1)
+ENDPY
+)
+check "E29: ... and its retained blob holds the document's own bytes" $?
+[ "$uname" != "-" ] && [ "$uname" != "$C" ] && drop_collection "$uname"
+rm -f "$EXPORTS/$UNIDX" "$E29_FUTURE"
 
 # ── conflict handling ────────────────────────────────────────────────────────
 api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"abort\"}" > /tmp/vfy_imp.json
@@ -462,6 +815,12 @@ config=json.load(sys.stdin)
 expected={"retrieval_mode":"hybrid","top_k":6,"alpha":0.5,"ef":None,"response_format":"engineer"}
 sys.exit(0 if all(config[k] == v for k,v in expected.items()) and not config["is_default"] else 1)'
 check "renamed import preserves every saved retrieval setting" $?
+api_get "/ingest/config/$iname" | python3 -c '
+import json,sys
+config=json.load(sys.stdin)
+expected={"collection":sys.argv[1],"chunking_strategy":"fixed","chunk_size":150,"min_chunk_size":40}
+sys.exit(0 if all(config[k] == v for k,v in expected.items()) and not config["is_default"] else 1)' "$iname"
+check "renamed import restores the package's saved ingest settings (#189)" $?
 
 # A successful destructive replace must be exercised as well as abort/rename.
 api_post "/import" "{\"filename\":\"$PKG\",\"on_conflict\":\"replace\"}" > /tmp/vfy_replace.json
@@ -584,6 +943,67 @@ check_eq "the live model store was only read" "$(m live_untouched)" "True"
 [ -s /tmp/vfy_models.json ] || sed 's/^/      /' /tmp/vfy_models.err | tail -5
 e27c=$(m e27_collection); [ -n "$e27c" ] && [ "$e27c" != "None" ] && [ "$e27c" != "$C" ] && drop_collection "$e27c"
 
+# ── a model installed from a bundle is reported by Ollama (#452) ─────────────
+# The only suite step that writes to the verify model copy. It installs the
+# embedding model's own manifest and blobs under a throwaway name, asks
+# Ollama's real /api/tags for that name, and removes the manifest in a
+# `finally`, before any result is read. The blobs are already there, so only
+# that one manifest is written. It runs only when both the api and ollama
+# containers mount rag-verify-ollama-models, never the live volume; stack.sh's
+# copy sync removes anything left behind on the next `up`.
+alias_mounts=$(cd "$REPO_ROOT" && for mount in api:/ollama ollama:/root/.ollama; do
+  docker inspect -f "{{range .Mounts}}{{if eq .Destination \"${mount#*:}\"}}{{.Name}}{{end}}{{end}}" \
+    "$(docker compose ps -q "${mount%%:*}")" 2>/dev/null
+done | tr '\n' ' ')
+if [ "$alias_mounts" = "rag-verify-ollama-models rag-verify-ollama-models " ]; then
+  (cd "$REPO_ROOT" && docker compose exec -T api python -) > /tmp/vfy_alias.json 2>/tmp/vfy_alias.err <<'ENDPY'
+import json, shutil, tempfile
+from pathlib import Path
+from config import settings
+from services import importer, model_bundle as models
+alias, name = "vfy-install-alias:latest", "vfy-install-alias"
+out = {"error": None}
+target = models.manifest_path(alias)
+try:
+    own = models.manifest_path(settings.embed_model)
+    digests = models._digests(json.loads(own.read_bytes()))
+    stamps = {p: p.stat().st_mtime_ns for p in [own, *map(models.blob_path, digests)]}
+    target.unlink(missing_ok=True)                   # left by an interrupted run
+    out["reported_before"] = importer._ollama_reports(name)
+    with tempfile.TemporaryDirectory(prefix="vfy-alias-", dir=settings.upload_dir) as td:
+        bundle = Path(td) / "models" / name / "latest"
+        (bundle / "blobs").mkdir(parents=True)
+        shutil.copyfile(own, bundle / "manifest.json")
+        for digest in digests:
+            shutil.copyfile(models.blob_path(digest), bundle / "blobs" / digest.replace(":", "-"))
+        models.install_model(Path(td), alias)
+        out["reported_after"] = importer._ollama_reports(name)
+    out["bundle_removed"] = not Path(td).exists()
+    out["embed_untouched"] = all(p.stat().st_mtime_ns == s for p, s in stamps.items())
+except Exception as exc:                             # noqa: BLE001
+    out["error"] = f"{type(exc).__name__}: {exc}"
+finally:
+    target.unlink(missing_ok=True)
+    try:
+        target.parent.rmdir()                        # the alias folder, when empty
+    except OSError:
+        pass
+    out["removed"] = not target.exists()
+print(json.dumps(out))
+ENDPY
+  al() { python3 -c "import json,sys;print(json.load(open('/tmp/vfy_alias.json')).get(sys.argv[1]))" "$1" 2>/dev/null; }
+  check_eq "the throwaway model name isn't reported before it is installed" "$(al reported_before)" "False"
+  check_eq "a model installed from a bundle into the verify model copy is reported by Ollama's /api/tags" "$(al reported_after)" "True"
+  check_eq "the throwaway model's manifest is removed afterwards" "$(al removed)" "True"
+  check_eq "the embedding model's own files are left unchanged" "$(al embed_untouched)" "True"
+  check_eq "the temporary bundle folder is removed" "$(al bundle_removed)" "True"
+  [ -s /tmp/vfy_alias.json ] || sed 's/^/      /' /tmp/vfy_alias.err | tail -5
+  [ "$(al error)" = None ] || printf '      %s\n' "$(al error)"
+else
+  check "the install-then-report check runs only on the verify model copy" 1 \
+    "api and ollama must both mount rag-verify-ollama-models; found: '${alias_mounts}'"
+fi
+
 # ── tuning ───────────────────────────────────────────────────────────────────
 api_get "/tune/$C" > /tmp/vfy_tune.json
 check_eq "tune options report with-sources" "$(jfield "['fidelity']" < /tmp/vfy_tune.json)" "with-sources"
@@ -609,6 +1029,76 @@ after_chunks=$(api_get "/tune/job/$tjob" | jfield "['chunks_written']")
 [ "$after_chunks" -gt "$chunks_before" ]
 check "re-chunking with a smaller size yields more chunks" $? "$chunks_before -> $after_chunks"
 
+# ── re-chunking after a replacement (#22, E17, E32) ──────────────────────────
+# Re-ingesting replaces a name's chunks and retained original, so a rebuild
+# brings back only the new version; a second name for the same content is
+# rebuilt under both names (one chunk set per digest and name).
+RC="${PREFIX}Rechunk"
+RCFIX=$(mktemp -d)
+printf '%s\n\n%s\n' \
+  "Parking Permits. Facilities issue parking permits each January, and a permit is valid for one named vehicle only." \
+  "Visitor Badges. Reception prints a visitor badge on arrival, and badges are returned at the end of the day." \
+  > "$RCFIX/policies.txt"
+cp "$RCFIX/policies.txt" "$RCFIX/copy.txt"
+drop_collection "$RC"; make_collection "$RC"
+for f in "$FIX/policies.txt" "$RCFIX/policies.txt" "$RCFIX/copy.txt"; do
+  curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$RC" -F "strategy=fixed" \
+    -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$f" > /tmp/vfy_rc.json
+  rjob=$(jfield "['job_id']" < /tmp/vfy_rc.json)
+  wait_for_job "/ingest/job/$rjob" 900 >/dev/null
+done
+# #311: the retained index can list a name the collection has no chunks for
+# (a file that produced none, or a crafted package); rechunk must skip it.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$RC") <<'ENDPY'
+import sys
+from services import sources
+c = sys.argv[1]
+docs = sources.load_index(c)["documents"]
+digest = next(d for d, e in docs.items() if "copy.txt" in e["filenames"])
+sources.store(c, "ghost.txt", sources.blob_path(c, digest).read_bytes(), replace=True)
+sys.exit(0 if "ghost.txt" in sources.load_index(c)["documents"][digest]["filenames"] else 1)
+ENDPY
+check "E17: a name with no stored chunks is added to the retained index" $?
+check_eq "E32: re-chunking is offered after a replacement and a second name" \
+  "$(api_get "/tune/$RC" | jfield "['can_rechunk']")" "True"
+api_post "/tune/rechunk" "{\"collection\":\"$RC\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_tj.json
+tjob=$(jfield "['job_id']" < /tmp/vfy_tj.json)
+check_eq "E32: the re-chunk completes" "$(wait_for_job "/tune/job/$tjob" 1800)" "completed"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$RC") > /tmp/vfy_rc_chunks.json <<'ENDPY'
+import json, sys
+from services import weaviate_client as wc
+try:
+    coll = wc.get_client().collections.get(sys.argv[1])
+    print(json.dumps([[o.properties["source_file"], o.properties["content"]] for o in coll.iterator()]))
+finally:
+    wc.close_client()
+ENDPY
+python3 - <<'ENDPY'
+import json, sys
+chunks = json.load(open('/tmp/vfy_rc_chunks.json'))
+texts = " ".join(c for _, c in chunks)
+names = {n for n, _ in chunks}
+print(sorted(names), "Travel Booking" in texts)
+sys.exit(0 if names == {"policies.txt", "copy.txt"} and "Travel Booking" not in texts
+         and "Parking Permits" in texts else 1)
+ENDPY
+check "E32: the rebuild holds only the new version, under both of its names" $?
+rc_index=$( (cd "$REPO_ROOT" && docker compose exec -T api python - "$RC") <<'ENDPY'
+import sys
+from services import sources
+print(sorted(n for e in sources.load_index(sys.argv[1])["documents"].values() for n in e["filenames"]))
+ENDPY
+)
+python3 - "$rc_index" <<'ENDPY'
+import json, sys
+names = {n for n, _ in json.load(open('/tmp/vfy_rc_chunks.json'))}
+sys.exit(0 if "ghost.txt" not in names and "'ghost.txt'" in sys.argv[1] else 1)
+ENDPY
+check "E17: a listed name with no stored chunks is not rebuilt, and the index still lists it" $? \
+  "index: $rc_index"
+drop_collection "$RC"
+rm -rf "$RCFIX"
+
 # ── chunks-only refuses re-chunking ──────────────────────────────────────────
 SRCLESS="${PREFIX}Chunksonly"
 drop_collection "$SRCLESS"; make_collection "$SRCLESS"
@@ -631,6 +1121,50 @@ wait_for_job "/tune/job/$tjob" 900 >/dev/null
 check_eq "re-embedding a chunks-only collection with new chunking is refused" \
   "$(api_get "/tune/job/$tjob" | jfield "['error_code']")" "SOURCES_REQUIRED"
 drop_collection "$SRCLESS"
+
+# ── #328 (reviewer): retained originals with no stored chunks ────────────────
+# A file that produces no chunks is still retained at ingest. With nothing to
+# rebuild, re-chunking isn't offered and is refused up front: no job is made.
+NOCH="${PREFIX}Nochunks"
+NOCHFIX=$(mktemp -d)
+printf '   \n\n   \n' > "$NOCHFIX/blank.txt"
+drop_collection "$NOCH"; make_collection "$NOCH"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$NOCH" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$NOCHFIX/blank.txt" > /tmp/vfy_nc.json
+njob=$(jfield "['job_id']" < /tmp/vfy_nc.json)
+[ -n "$njob" ] && wait_for_job "/ingest/job/$njob" 900 >/dev/null
+nc_state=$( (cd "$REPO_ROOT" && docker compose exec -T api python - "$NOCH") <<'ENDPY'
+import sys
+from services import sources
+from services import weaviate_client as wc
+c = sys.argv[1]
+try:
+    stored = sum(1 for _ in wc.get_client().collections.get(c).iterator())
+finally:
+    wc.close_client()
+names = sorted(n for e in sources.load_index(c)["documents"].values() for n in e["filenames"])
+print(f"{stored} {names}")
+ENDPY
+)
+check_eq "#328: a file that produced no chunks is retained, and the collection holds none" \
+  "$nc_state" "0 ['blank.txt']"
+api_get "/tune/$NOCH" > /tmp/vfy_nc_tune.json
+check_eq "#328: GET /tune doesn't offer re-chunking with nothing to rebuild" \
+  "$(jfield "['can_rechunk']" < /tmp/vfy_nc_tune.json)" "False"
+check_eq "#328: GET /tune gives the nothing-to-rebuild reason" \
+  "$(jfield "['note']" < /tmp/vfy_nc_tune.json | cut -c1-48)" "No retained original file has stored chunks, so "
+for op in rechunk reembed; do
+  code=$(curl -s -o /tmp/vfy_nc_start.json -m 120 -w '%{http_code}' -X POST "$API/tune/$op" \
+    -H 'Content-Type: application/json' \
+    -d "{\"collection\":\"$NOCH\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80}")
+  check_eq "#328: POST /tune/$op with chunking answers 409" "$code" "409"
+  check_eq "#328: POST /tune/$op with chunking is SOURCES_REQUIRED" \
+    "$(jfield "['error']['code']" < /tmp/vfy_nc_start.json)" "SOURCES_REQUIRED"
+  check_eq "#328: POST /tune/$op with chunking returns no job" \
+    "$(jfield ".get('job_id')" < /tmp/vfy_nc_start.json)" "None"
+done
+drop_collection "$NOCH"
+rm -rf "$NOCHFIX"
 
 # ── the help page and the package README share a source ──────────────────────
 api_get "/help/transfer" > /tmp/vfy_help.json
@@ -664,6 +1198,201 @@ m=json.load(open('/tmp/vfy_help.json'))['markdown']
 sys.exit(0 if not re.search(r'@@[A-Z_0-9]+@@', m) else 1)"
 check "the help page has no unsubstituted placeholders" $?
 
+# ── export job status survives an API restart (#23; opt-in: restarts the API) ──
+# The export from the top of this suite must read back unchanged, and an export
+# killed part-way must read `failed` with INTERRUPTED and its progress, not 404;
+# so must an import killed part-way (#309). A synthetic
+# 30,000-chunk collection (supplied vectors, no embedding) exports for about
+# 40 s, so the restart lands early in it. `--timeout 0`: with the default 10 s
+# stop timeout the worker could finish the export during shutdown.
+XR="${PREFIX}ExportRestart"
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "export job status across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+elif [ -n "$restart_refusal" ]; then
+  check "export job status across an API restart" 1 "$restart_refusal"
+else
+  api_get "/export/job/$ejob" > /tmp/vfy_xrestart_done.json
+  drop_collection "$XR"
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$XR" 30000 <<'ENDPY'
+import random, sys
+from datetime import datetime, timezone
+from services import batch_write
+from services import weaviate_client as wc
+name, count = sys.argv[1], int(sys.argv[2])
+try:
+    wc._create_collection_sync(name, "hnsw", "cosine",
+                               {"efConstruction": 128, "maxConnections": 64, "ef": 64})
+    collection = wc.get_client().collections.get(name)
+    rng, now = random.Random(23), datetime.now(timezone.utc).isoformat()
+    for base in range(0, count, 2000):
+        records = [{"properties": {"content": f"Synthetic chunk {i}. " + "lorem ipsum dolor " * 30,
+                                   "source_file": f"synthetic_{i // 100}.txt", "source_type": "txt",
+                                   "chunk_index": i % 100, "chunk_strategy": "fixed",
+                                   "chunk_size": 1000, "chunk_overlap": 0, "created_at": now},
+                    "vector": [rng.uniform(-1, 1) for _ in range(768)]}
+                   for i in range(base, min(count, base + 2000))]
+        batch_write.insert(collection, lambda r=records: iter(r), exact=False, cleanup_owned=True)
+finally:
+    wc.close_client()
+ENDPY
+  ) >/tmp/vfy_xrestart_prepare.log 2>&1
+  check "a 30,000-chunk collection is built for the interrupted export" $? \
+    "$(grep -E 'Error' /tmp/vfy_xrestart_prepare.log | tail -1)"
+  builds_before=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
+  api_post "/export" "{\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_xrestart_start.json
+  xjob=$(jfield "['job_id']" < /tmp/vfy_xrestart_start.json)
+  state=""
+  for _ in $(seq 1 600); do
+    api_get "/export/job/$xjob" > /tmp/vfy_xrestart_before.json
+    state=$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_xrestart_before.json'))
+print(d['status'] + ('-writing' if d['chunks_written'] > 0 else ''))" 2>/dev/null)
+    case "$state" in running-writing|completed*|failed*) break ;; esac
+    sleep 0.5
+  done
+  if [ "$state" != running-writing ]; then
+    check "an export is running with chunks written before the restart" 1 "last status '$state'; nothing restarted"
+  else
+    sleep 2
+    # The build directory this export is writing; the restart kills it there.
+    builds_during=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
+    killed=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_during") | grep '^/app/exports/\.build-' || true)
+    _rag_require_lock_owner
+    (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
+    for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+    api_get "/export/job/$ejob" > /tmp/vfy_xrestart_done_after.json
+    python3 -c "
+import json,sys
+sys.exit(0 if json.load(open('/tmp/vfy_xrestart_done.json')) == json.load(open('/tmp/vfy_xrestart_done_after.json')) else 1)"
+    check "a completed export job reads back unchanged after a restart" $?
+    code=$(curl -s -m 120 -o /tmp/vfy_xrestart_after.json -w '%{http_code}' "$API/export/job/$xjob")
+    python3 - "$code" <<'ENDPY'
+import json, sys
+after = json.load(open('/tmp/vfy_xrestart_after.json'))
+ok = (sys.argv[1] == "200" and after.get("status") == "failed"
+      and after.get("error_code") == "INTERRUPTED"
+      and after.get("error") == "Interrupted: the API restarted while this job was running. "
+                                "Start the export again."
+      and after.get("chunks_written", 0) > 0)
+sys.exit(0 if ok else 1)
+ENDPY
+    check "an interrupted export reads back 200 'failed' with INTERRUPTED and its progress" $? \
+      "$(head -c 300 /tmp/vfy_xrestart_after.json)"
+    # The killed build's leftovers (root, mode 0700) are the startup sweep's to
+    # remove (#377): its build directory and any temporary archive must be gone,
+    # and the completed package from the top of this suite still there.
+    check "the interrupted export had a build directory for the restart to sweep" \
+      "$([ -n "$killed" ] && echo 0 || echo 1)" "no new /app/exports/.build-* while the export ran"
+    stem=$(printf '%s' "$XR" | tr '[:upper:]' '[:lower:]')
+    left=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c '
+      for p in "$@" /app/exports/.ragpkg-'"$stem"'-*.tar.gz.partial; do
+        if [ -e "$p" ] || [ -L "$p" ]; then echo "$p"; fi
+      done; echo checked' sh $killed)
+    check "the restart removes the interrupted export's build directory and temporary archive" \
+      "$([ "$left" = checked ] && echo 0 || echo 1)" "still there: $left"
+    check "the restart sweep keeps completed packages" "$([ -f "$EXPORTS/$PKG" ] && echo 0 || echo 1)" \
+      "$EXPORTS/$PKG is gone"
+  fi
+
+  # An import killed part-way reads `failed` with INTERRUPTED (#309): the same
+  # collection, exported whole, dropped and imported back. The startup sweep
+  # removes the half-built collection the killed import leaves.
+  api_post "/export" "{\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_irestart_export.json
+  xpkg_job=$(jfield "['job_id']" < /tmp/vfy_irestart_export.json)
+  xpkg_status=$(wait_for_job "/export/job/$xpkg_job" 1800)
+  xpkg=$(api_get "/export/job/$xpkg_job" | jfield "['filename']")
+  if [ "$xpkg_status" != completed ] || [ -z "$xpkg" ] || [ "$xpkg" = None ]; then
+    check "an import is running before the restart" 1 "the package export ended '$xpkg_status'; nothing restarted"
+  else
+    drop_collection "$XR"
+    api_post "/import" "{\"filename\":\"$xpkg\",\"on_conflict\":\"abort\"}" > /tmp/vfy_irestart_start.json
+    ijob_r=$(jfield "['job_id']" < /tmp/vfy_irestart_start.json)
+    # Import reports chunks_written once, after its insert, so the restart
+    # comes as soon as the job is running: unpacking, checks and the insert
+    # of 30,000 chunks still lie ahead of it.
+    state=""
+    for _ in $(seq 1 600); do
+      state=$(api_get "/import/job/$ijob_r" | jfield "['status']")
+      case "$state" in running|completed|failed) break ;; esac
+      sleep 0.2
+    done
+    if [ "$state" != running ]; then
+      check "an import is running before the restart" 1 "last status '$state'; nothing restarted"
+    else
+      _rag_require_lock_owner
+      (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
+      for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+      code=$(curl -s -m 120 -o /tmp/vfy_irestart_after.json -w '%{http_code}' "$API/import/job/$ijob_r")
+      python3 - "$code" <<'ENDPY'
+import json, sys
+after = json.load(open('/tmp/vfy_irestart_after.json'))
+ok = (sys.argv[1] == "200" and after.get("status") == "failed"
+      and after.get("error_code") == "INTERRUPTED"
+      and after.get("error") == "Interrupted: the API restarted while this job was running. "
+                                "Start the import again.")
+sys.exit(0 if ok else 1)
+ENDPY
+      check "an interrupted import reads back 200 'failed' with INTERRUPTED" $? \
+        "$(head -c 300 /tmp/vfy_irestart_after.json)"
+    fi
+    rm -f "$EXPORTS/$xpkg"
+  fi
+  drop_collection "$XR"
+fi
+
+# ── one spelling for per-collection state (#372) ─────────────────────────────
+# Weaviate stores a collection with its first letter capitalised. Everything
+# below is sent under the lowercase-first spelling; the registry, the retained
+# originals, the package and the metrics must all land under the stored name.
+SC="$(printf %s "${PREFIX:0:1}" | tr '[:lower:]' '[:upper:]')${PREFIX:1}Spelling"
+SL="$(printf %s "${SC:0:1}" | tr '[:upper:]' '[:lower:]')${SC:1}"
+drop_collection "$SC"
+api_post "/collections" "{\"name\":\"$SL\"}" > /tmp/vfy_sp_create.json
+check_eq "#372: creating '$SL' answers the stored name" \
+  "$(jfield "['name']" < /tmp/vfy_sp_create.json)" "$SC"
+check "#372: the list gives '$SC' its created_at" "$(api_get "/collections" | python3 -c "
+import json,sys
+c=[c for c in json.load(sys.stdin)['collections'] if c['name']=='$SC']
+print(0 if c and c[0]['created_at'] else 1)")"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$SL" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_sp_up.json
+check_eq "#372: an upload to '$SL' answers the stored name" \
+  "$(jfield "['collection']" < /tmp/vfy_sp_up.json)" "$SC"
+check_eq "#372: the upload completes" \
+  "$(wait_for_job "/ingest/job/$(jfield "['job_id']" < /tmp/vfy_sp_up.json)" 900)" "completed"
+# Read back under the stored name: an upload under the typed spelling used to
+# file its originals where the stored name never looked.
+api_get "/tune/$SC" > /tmp/vfy_sp_tune.json
+check_eq "#372: '$SC' finds the originals uploaded as '$SL' (re-chunk offered)" \
+  "$(jfield "['can_rechunk']" < /tmp/vfy_sp_tune.json)" "True"
+api_post "/export" "{\"collection\":\"$SC\",\"include_models\":false}" > /tmp/vfy_sp_exp.json
+spjob=$(jfield "['job_id']" < /tmp/vfy_sp_exp.json)
+check_eq "#372: the export of '$SC' completes" "$(wait_for_job "/export/job/$spjob" 1800)" "completed"
+api_get "/export/job/$spjob" > /tmp/vfy_sp_expjob.json
+check_eq "#372: the export of '$SC' carries the originals uploaded as '$SL'" \
+  "$(jfield "['fidelity']" < /tmp/vfy_sp_expjob.json)" "with-sources"
+sppkg=$(jfield "['filename']" < /tmp/vfy_sp_expjob.json)
+api_post "/tune/rechunk" "{\"collection\":\"$SL\",\"chunking_strategy\":\"fixed\",\"chunk_size\":80,\"min_chunk_size\":30}" > /tmp/vfy_sp_tj.json
+check_eq "#372: a re-chunk of '$SL' completes" \
+  "$(wait_for_job "/tune/job/$(jfield "['job_id']" < /tmp/vfy_sp_tj.json)" 1800)" "completed"
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "#372: a query's metrics under both spellings" "set RAG_SKIP_SLOW=0 to include model calls"
+else
+  # The body goes through a variable: inside "$(...)" its braces would be
+  # brace-expanded into three requests.
+  spq="{\"question\":\"who approves overtime?\",\"collection\":\"$SL\",\"top_k\":3}"
+  spcode=$(api_post_code "/query" "$spq")
+  check_eq "#372: a query on '$SL' answers" "$spcode" "200"
+  spl=$(api_get "/metrics/latency?collection=$SL&history_limit=0" | jfield "['total_records']")
+  spc=$(api_get "/metrics/latency?collection=$SC&history_limit=0" | jfield "['total_records']")
+  check "#372: the metrics filter finds the query under both spellings" \
+    "$([ -n "$spl" ] && [ "$spl" -ge 1 ] && [ "$spl" = "$spc" ] && echo 0 || echo 1)" "lowercase=$spl stored=$spc"
+fi
+[ -n "$sppkg" ] && rm -f "$EXPORTS/$sppkg"
+drop_collection "$SC"
+
 # ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
 RP="${PREFIX}BatchRecovery"
 # Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
@@ -696,4 +1425,11 @@ drop_collection "$C"
 cleanup_prefixed
 bash ./10_validity.sh
 check "retained-session validity acceptance suite" $?
+
+# -- transfer and tuning paths with no check before (#387) --------------------
+# Import refusals, on_conflict, unknown job ids, /packages, export without the
+# model store, retrieve.py (E8-E10), E11 and the distribution scripts; its own
+# collection and packages, removed again.
+bash ./15_transfer_paths.sh
+check "transfer and tuning paths suite (#387)" $?
 summary

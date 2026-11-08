@@ -16,6 +16,7 @@ import signal
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -42,7 +43,14 @@ STUB = textwrap.dedent(r'''
             print(text)
     if args[:1] == ['compose']:
         if 'config' in args:
-            print(open(os.environ['STUB_CONFIG']).read())
+            # LAN mode's configuration once stack.sh has switched to it (#26).
+            lan = os.environ.get('STUB_CONFIG_LAN')
+            if lan and 'docker-compose.lan.yml' in os.environ.get('COMPOSE_FILE', ''):
+                print(open(lan).read())
+            else:
+                print(open(os.environ['STUB_CONFIG']).read())
+        elif 'exec' in args and 'cat' in args:
+            print('-----BEGIN CERTIFICATE-----')
         elif 'up' in args:
             sys.exit(0 if os.environ.get('STUB_UP_OK') else 1)
         elif 'ps' in args:
@@ -133,6 +141,32 @@ def passing_config(checkout, exports, port='8081'):
             'rag_sources': {'name': 'rag-verify_rag_sources'},
         },
     }
+
+
+def lan_config(checkout, exports, port='8081'):
+    """passing_config switched to LAN mode as stack.sh --lan resolves it (#26):
+    TLS on loopback at the verify port, the tls-init step and its volume."""
+    config = passing_config(checkout, exports, port)
+    checkout = str(checkout)
+    services = config['services']
+    proxy = services['proxy']
+    proxy['ports'][0]['target'] = 443
+    proxy['depends_on']['tls-init'] = {'condition': 'service_completed_successfully', 'required': True}
+    proxy['volumes'] = [
+        {'type': 'bind', 'source': checkout + '/proxy/nginx.lan.conf', 'target': '/etc/nginx/nginx.conf',
+         'read_only': True, 'bind': {}},
+        {'type': 'bind', 'source': checkout + '/proxy/locations.conf', 'target': '/etc/nginx/rag/locations.conf',
+         'read_only': True, 'bind': {}},
+        {'type': 'volume', 'source': 'lan_certs', 'target': '/etc/nginx/certs', 'read_only': True, 'volume': {}}]
+    services['api']['environment'].update(RAG_LAN_MODE='true', AUTH_COOKIE_SECURE='true')
+    services['tls-init'] = {
+        'image': 'rag-verify-api:latest', 'command': ['python', '-m', 'tls_cert'], 'entrypoint': None,
+        'environment': {'RAG_LAN_HOSTNAMES': 'vfy-lan.invalid,192.0.2.10'}, 'networks': {'rag-internal': None},
+        'volumes': [{'type': 'bind', 'source': checkout + '/proxy/certs', 'target': '/byo', 'read_only': True,
+                     'bind': {}},
+                    {'type': 'volume', 'source': 'lan_certs', 'target': '/certs', 'volume': {}}]}
+    config['volumes']['lan_certs'] = {'name': 'rag-verify_lan_certs'}
+    return config
 
 
 class Sandbox:
@@ -307,6 +341,51 @@ class ConfigGuardTests(unittest.TestCase):
         result = self.guard(passing_config(self.checkout, self.exports, port='8082'))
         self.assertEqual(result.returncode, 2)
 
+    def guard_lan(self, config, port='8081'):
+        path = self.dir / 'config.json'
+        path.write_text(json.dumps(config))
+        return subprocess.run(['python3', '-c', self.block, str(self.checkout), str(self.exports), port, str(path),
+                               str(self.checkout), 'lan'], capture_output=True, text=True)
+
+    def test_lan_mode_wants_tls_on_loopback(self):
+        # #26: in LAN mode rule (c) wants exactly proxy:127.0.0.1:<port>->443/tcp;
+        # every other rule still applies, tls-init included.
+        result = self.guard_lan(lan_config(self.checkout, self.exports))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.guard_lan(passing_config(self.checkout, self.exports))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('->443/tcp', result.stdout)
+        result = self.guard(lan_config(self.checkout, self.exports))
+        self.assertEqual(result.returncode, 2, 'the default rule (c) must refuse the LAN publication')
+
+    def test_lan_mode_refuses_other_publications(self):
+        def mutate(change):
+            config = lan_config(self.checkout, self.exports)
+            change(config)
+            return config
+        P = lambda c: c['services']['proxy']['ports']
+        variants = [
+            ('all interfaces', mutate(lambda c: P(c)[0].update(host_ip='0.0.0.0'))),
+            ('no host address', mutate(lambda c: P(c)[0].pop('host_ip'))),
+            ('port 80 beside it', mutate(lambda c: P(c).append({'host_ip': '127.0.0.1', 'target': 80,
+                                                                'published': '8082', 'protocol': 'tcp'}))),
+            ('a second port', mutate(lambda c: P(c).append({'host_ip': '127.0.0.1', 'target': 443,
+                                                            'published': '8443', 'protocol': 'tcp'}))),
+            ('the live port', mutate(lambda c: P(c)[0].update(published='8080'))),
+            ('the override port', mutate(lambda c: P(c)[0].update(published='443'))),
+            ('tls-init publishes', mutate(lambda c: c['services']['tls-init'].update(
+                ports=[{'host_ip': '127.0.0.1', 'target': 443, 'published': '8081', 'protocol': 'tcp'}]))),
+        ]
+        for name, config in variants:
+            with self.subTest(variant=name):
+                result = self.guard_lan(config)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn('(c)', result.stdout)
+        live = mutate(lambda c: c['services']['tls-init'].update(image='rag-docker-api:latest'))
+        result = self.guard_lan(live)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('(b)', result.stdout)
+
 
 class LiveGuardTests(unittest.TestCase):
     """S18 and S36: suites and all.sh refuse the live stack unless RAG_VERIFY_LIVE=1."""
@@ -396,7 +475,8 @@ class RestartGuardTests(unittest.TestCase):
         self.assertEqual(self.reason(COMPOSE_PROJECT_NAME='rag-verify'), '')
 
     def test_every_restart_section_asks_first(self):
-        for name in ('01_infrastructure.sh', '04_goldstandard.sh', '05_transfer.sh'):
+        for name in ('01_infrastructure.sh', '02_ingest.sh', '03_query.sh', '04_goldstandard.sh', '05_transfer.sh',
+                     '16_api_paths.sh', '17_auth.sh', '19_audit.sh'):
             with self.subTest(suite=name):
                 text = (VERIFY / name).read_text()
                 block = text[text.index('if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]'):]
@@ -406,6 +486,55 @@ class RestartGuardTests(unittest.TestCase):
                 self.assertLess(ask, min(acts))
         self.assertNotIn('COMPOSE_PROJECT_NAME:-rag-docker', (VERIFY / '01_infrastructure.sh').read_text())
 
+    def removal(self, **env):
+        box = Sandbox(self)
+        result = box.run(['bash', '-c', f'. "{VERIFY}/lib.sh"; volume_removal_refusal_reason'], **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_volume_removal_refusals(self):
+        # #465: `down -v` runs only on rag-verify with the overlay in COMPOSE_FILE.
+        both = '/c/docker-compose.yml:/h/docker-compose.verify.yml'
+        refused = {
+            'project unset': dict(COMPOSE_FILE=both),
+            'rag-docker': dict(COMPOSE_PROJECT_NAME='rag-docker', COMPOSE_FILE=both),
+            'rag-docker, RAG_VERIFY_LIVE=1': dict(COMPOSE_PROJECT_NAME='rag-docker', COMPOSE_FILE=both,
+                                                  RAG_VERIFY_LIVE='1'),
+            'another project': dict(COMPOSE_PROJECT_NAME='my-rag', COMPOSE_FILE=both),
+            'RAG-VERIFY': dict(COMPOSE_PROJECT_NAME='RAG-VERIFY', COMPOSE_FILE=both),
+            'COMPOSE_FILE unset': dict(COMPOSE_PROJECT_NAME='rag-verify'),
+            'COMPOSE_FILE empty': dict(COMPOSE_PROJECT_NAME='rag-verify', COMPOSE_FILE=''),
+            'base file only': dict(COMPOSE_PROJECT_NAME='rag-verify', COMPOSE_FILE='/c/docker-compose.yml'),
+            'look-alike suffix': dict(COMPOSE_PROJECT_NAME='rag-verify',
+                                      COMPOSE_FILE='/c/docker-compose.yml:/h/docker-compose.verify.yml.bak'),
+            'look-alike prefix': dict(COMPOSE_PROJECT_NAME='rag-verify',
+                                      COMPOSE_FILE='/c/docker-compose.yml:/h/my-docker-compose.verify.yml'),
+            'overlay as a folder': dict(COMPOSE_PROJECT_NAME='rag-verify',
+                                        COMPOSE_FILE='/h/docker-compose.verify.yml/x.yml'),
+            'other separator': dict(COMPOSE_PROJECT_NAME='rag-verify', COMPOSE_PATH_SEPARATOR=';',
+                                    COMPOSE_FILE='/c:/docker-compose.verify.yml.d;/c/docker-compose.yml'),
+        }
+        for case, env in refused.items():
+            with self.subTest(case=case):
+                reason = self.removal(**env)
+                self.assertTrue(reason)
+                if env.get('COMPOSE_PROJECT_NAME') != 'rag-docker':
+                    self.assertIn('stack.sh', reason)
+        self.assertEqual(self.removal(COMPOSE_PROJECT_NAME='rag-verify', COMPOSE_FILE=both), '')
+        self.assertEqual(self.removal(COMPOSE_PROJECT_NAME='rag-verify',
+                                      COMPOSE_FILE='/h/docker-compose.verify.yml'), '')
+        self.assertEqual(self.removal(COMPOSE_PROJECT_NAME='rag-verify', COMPOSE_PATH_SEPARATOR=';',
+                                      COMPOSE_FILE='/c/docker-compose.yml;/h/docker-compose.verify.yml'), '')
+
+    def test_api_paths_asks_before_removing_volumes(self):
+        # #465: the first-start check asks the volume guard before `down -v`.
+        text = (VERIFY / '16_api_paths.sh').read_text()
+        down_v = [m.start() for m in re.finditer(r'docker compose[^\n]*down -v', text)]
+        self.assertEqual(len(down_v), 1)
+        ask = text.find('$(volume_removal_refusal_reason)')
+        self.assertNotEqual(ask, -1, 'the volume guard is not asked')
+        self.assertLess(ask, down_v[0])
+
     def test_infrastructure_checks_the_limit_before_restarting(self):
         # #130: an invalid RAG_RESTART_LIMIT_S fails the check and restarts nothing.
         text = (VERIFY / '01_infrastructure.sh').read_text()
@@ -413,6 +542,53 @@ class RestartGuardTests(unittest.TestCase):
         down = re.search(r'docker compose[^\n]*down', block)
         self.assertIsNotNone(down, 'restart command not found')
         self.assertIn('restart_limit', block[:down.start()])
+
+
+
+class ApiPathsFirstStartTests(unittest.TestCase):
+    """#465: suite 16 removes volumes only on the verify project, run with Docker and curl stubbed."""
+
+    BOTH = '/c/docker-compose.yml:/h/docker-compose.verify.yml'
+
+    def run_suite(self, **env):
+        box = Sandbox(self)
+        # The test accounts (#25): a stand-in that logs every call and logs in no one.
+        setup = box.root / 'auth_setup.py'
+        (box.root / 'auth').mkdir()
+        setup.write_text('import json, os, sys\n'
+                         'open(os.environ["STUB_LOG"], "a").write(json.dumps(["auth_setup"] + sys.argv[1:]) + "\\n")\n'
+                         'if sys.argv[1] == "login": open(sys.argv[3], "w").close()\n')
+        result = box.run(['bash', str(VERIFY / '16_api_paths.sh')], STUB_CURL_CODE='200',
+                         RAG_API='http://localhost:9/api', RAG_ALLOW_RESTART='1', RAG_SKIP_SLOW='1',
+                         RAG_RESTART_LIMIT_S='5', RAG_AUTH_SETUP=str(setup),
+                         RAG_AUTH_DIR=str(box.root / 'auth'), **env)
+        compose = [call for call in box.calls() if call[:2] == ['docker', 'compose']]
+        removed = [call for call in compose if 'down' in call and '-v' in call]
+        restarted = [call for call in compose if 'down' in call and '-v' not in call]
+        self.setups = [call for call in box.calls() if call[:1] == ['auth_setup']]
+        self.assertTrue(restarted, 'the suite did not reach its restart check: ' + result.stdout + result.stderr)
+        return result, removed
+
+    def test_another_project_keeps_its_volumes(self):
+        result, removed = self.run_suite(COMPOSE_PROJECT_NAME='my-rag', COMPOSE_FILE=self.BOTH)
+        self.assertEqual(removed, [])
+        # Not the verify project: the operator command is never allowed (#25).
+        self.assertNotIn('--operator', [arg for call in self.setups for arg in call])
+        self.assertRegex(result.stdout, r'FAIL\s+a first start from empty volumes[^\n]*rag-verify')
+
+    def test_verify_project_without_the_overlay_keeps_its_volumes(self):
+        result, removed = self.run_suite(COMPOSE_PROJECT_NAME='rag-verify', COMPOSE_FILE='/c/docker-compose.yml')
+        self.assertEqual(removed, [])
+        self.assertRegex(result.stdout, r'FAIL\s+a first start from empty volumes[^\n]*docker-compose\.verify\.yml')
+
+    def test_verify_project_with_the_overlay_removes_them(self):
+        result, removed = self.run_suite(COMPOSE_PROJECT_NAME='rag-verify', COMPOSE_FILE=self.BOTH)
+        self.assertEqual([call[-2:] for call in removed], [['down', '-v']])
+        # The accounts went with the volumes: the suite sets them up again (#25).
+        self.assertEqual(self.setups[-2:], [['auth_setup', 'ensure', '--operator'],
+                                            ['auth_setup', 'login', 'engineer', self.setups[-1][-1]]])
+        self.assertIn('-p', removed[0])
+        self.assertEqual(removed[0][removed[0].index('-p') + 1], 'rag-verify')
 
 
 # Weaviate's measured cold start on a copy of real data, rounded up to 30s (#130).
@@ -464,14 +640,14 @@ class RestartTimingTests(unittest.TestCase):
                 self.assertEqual(result.stdout, str(RESTART_LIMIT_DEFAULT_S))
 
     def test_valid_override(self):
-        for value, limit in (('45', '45'), ('007', '7')):
+        for value, limit in (('45', '45'), ('007', '7'), ('999999', '999999')):
             with self.subTest(value=value):
                 result = self.bash('restart_limit', RAG_RESTART_LIMIT_S=value)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, limit)
 
     def test_invalid_values_are_refused(self):
-        for value in ('0', '000', '-5', '1.5', 'abc', '10s', ' 30'):
+        for value in ('0', '000', '-5', '1.5', 'abc', '10s', ' 30', '1000000', '99999999999999999999'):
             with self.subTest(value=value):
                 result = self.bash('restart_limit', RAG_RESTART_LIMIT_S=value)
                 self.assertEqual(result.returncode, 1)
@@ -485,10 +661,21 @@ class RestartTimingTests(unittest.TestCase):
         self.assertRegex(result.stdout, r'^[0-9]+$')
         self.assertLessEqual(int(result.stdout), 1)
 
+    def test_wait_measures_from_the_given_start(self):
+        # The time counts from `down`, not from the first poll.
+        result = self.bash('wait_healthy_timed "$(( $(date +%s) - 5 ))" 30', STUB_CURL_CODE='200',
+                           RAG_API='http://localhost:9/api')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(result.stdout, ('5', '6'))
+
     def test_wait_prints_nothing_at_the_cap(self):
+        started = time.monotonic()
         result = self.bash('wait_healthy_timed "$(date +%s)" 2', STUB_CURL_CODE='000',
                            RAG_API='http://localhost:9/api')
+        # A missing or failing helper also prints nothing, so check it ran and waited.
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, '')
+        self.assertGreaterEqual(time.monotonic() - started, 2)
 
     def test_results_report_the_time(self):
         cases = (('300 143', 'PASS', 'restart reaches healthy within 300s (took 143s)'),
@@ -516,6 +703,9 @@ class StackArgumentTests(unittest.TestCase):
             (['up', '--checkout'], {}),
             (['down', '--pull'], {}),
             (['run', '--pull'], {}),
+            (['down', '--lan'], {}),
+            (['run', '--lan', '--telemetry'], {}),
+            (['up', '--telemetry', '--lan'], {}),
             (['bogus'], {}),
             ([], {}),
         ]
@@ -591,6 +781,51 @@ class StackDockerCallTests(unittest.TestCase):
         self.assertEqual(order, sorted(order), 'seed, guard, build, up must run in that order')
         self.assertIn('logs', [a for c in compose for a in c])
         self.assert_no_live_object(box.calls())
+
+    def test_up_lan_bootstraps_then_switches_to_lan_mode(self):
+        # #26: default up, the first Engineer, the LAN guard, the LAN up without a
+        # build, then the certificate copied for the suites, in that order.
+        box = Sandbox(self)
+        (box.root / 'config.json').write_text(json.dumps(passing_config(ROOT, box.exports)))
+        (box.root / 'config-lan.json').write_text(json.dumps(lan_config(ROOT, box.exports)))
+        result = box.run(['bash', str(STACK), 'up', '--lan'], STUB_UP_OK='1', STUB_CURL_CODE='200',
+                         STUB_CONFIG_LAN=str(box.root / 'config-lan.json'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        compose = [c[1:] for c in box.calls() if c[0] == 'docker' and c[1:2] == ['compose']]
+        for call in compose:
+            self.assertEqual(call[1:3], ['-p', 'rag-verify'], call)
+        steps = [c[3:] for c in compose if c[3:4] in (['config'], ['build'], ['up'], ['exec'])]
+        self.assertEqual(steps, [
+            ['config', '--format', 'json'],
+            ['build'],
+            ['up', '-d', '--wait', '--wait-timeout', '900'],
+            ['exec', '-T', 'api', 'python', '-m', 'auth', 'bootstrap', 'vfy-engineer'],
+            ['config', '--format', 'json'],
+            ['up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '300'],
+            ['exec', '-T', 'proxy', 'cat', '/etc/nginx/certs/live/cert.pem'],
+        ])
+        cert = box.private / 'lan-cert.pem'
+        self.assertEqual(cert.stat().st_mode & 0o777, 0o600)
+        self.assertIn('export RAG_API=https://localhost:8081/api', result.stdout)
+        self.assertIn(f'export CURL_CA_BUNDLE={cert}', result.stdout)
+        self.assertIn('export RAG_VERIFY_LAN=1', result.stdout)
+        self.assertIn('docker-compose.lan.verify.yml', result.stdout)
+        curls = [c for c in box.calls() if c[0] == 'curl']
+        self.assertIn('https://localhost:8081/api/health', curls[-1])
+        self.assert_no_live_object(box.calls())
+
+    def test_up_lan_stops_when_the_lan_guard_refuses(self):
+        box = Sandbox(self)
+        (box.root / 'config.json').write_text(json.dumps(passing_config(ROOT, box.exports)))
+        bad = lan_config(ROOT, box.exports)
+        bad['services']['proxy']['ports'][0]['host_ip'] = '0.0.0.0'
+        (box.root / 'config-lan.json').write_text(json.dumps(bad))
+        result = box.run(['bash', str(STACK), 'up', '--lan'], STUB_UP_OK='1', STUB_CURL_CODE='200',
+                         STUB_CONFIG_LAN=str(box.root / 'config-lan.json'))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('(c)', result.stdout + result.stderr)
+        compose = [c[1:] for c in box.calls() if c[0] == 'docker' and c[1:2] == ['compose']]
+        self.assertEqual(len([c for c in compose if 'up' in c]), 1, 'only the default up may run')
 
     def test_guard_refusal_stops_before_build(self):
         box = Sandbox(self)
@@ -733,6 +968,19 @@ class StackLockTests(unittest.TestCase):
     """#154 (S18, S30): the build check holds the verify lock in its own
     shell; stack.sh inherits it, doesn't release it, and a second run waits."""
 
+    def test_init_or_zero_cannot_authorize_an_inherited_lock(self):
+        for owner in ('0', '1'):
+            with self.subTest(owner=owner):
+                box = Sandbox(self)
+                lock = Path(box.env['RAG_VERIFY_LOCK'])
+                lock.mkdir()
+                (lock / 'pid').write_text(owner)
+                result = box.run(['bash', '-c', f'. "{VERIFY}/lock.sh"; echo forbidden'],
+                                 RAG_VERIFY_LOCK_HELD='1')
+                self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                self.assertNotIn('forbidden', result.stdout)
+                self.assertEqual((lock / 'pid').read_text(), owner)
+
     def test_held_lock_is_inherited_not_released(self):
         box = Sandbox(self)
         lock = box.env['RAG_VERIFY_LOCK']
@@ -858,10 +1106,13 @@ class StackRunSuiteGroupTests(unittest.TestCase):
         box = Sandbox(self)
         child = box.root / 'child.pid'
         checkout = self.checkout(box, f'sleep 300 &\necho $! > "{child}"\nexit 0\n')
+        # Registered before the run: when the group isn't stopped, box.run
+        # times out on the child's inherited pipe and the child would be left.
+        self.addCleanup(lambda: child.exists() and alive(int(child.read_text()))
+                        and os.kill(int(child.read_text()), signal.SIGKILL))
         result = box.run(['bash', str(STACK), 'run', '--checkout', str(checkout)],
                          STUB_UP_OK='1', STUB_CURL_CODE='200')
         pid = int(child.read_text())
-        self.addCleanup(lambda: alive(pid) and os.kill(pid, signal.SIGKILL))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_gone(pid)
         self.assert_torn_down_after_up(box)
@@ -881,6 +1132,32 @@ class StackRunSuiteGroupTests(unittest.TestCase):
         self.assertIn('verify project rag-verify removed', out)
         self.assert_torn_down_after_up(box)
         self.assertFalse(Path(box.env['RAG_VERIFY_LOCK']).exists(), 'the verify lock is released')
+
+    def test_term_between_fork_and_pid_registration_stops_the_suite(self):
+        box = Sandbox(self)
+        child = box.root / 'child.pid'
+        checkout = self.checkout(box, f'echo $$ > "{child}"\nsleep 300\n')
+        instrumented = box.root / 'stack.sh'
+        source = STACK.read_text()
+        source = re.sub(r'^HARNESS=.*$', f'HARNESS="{ROOT}"', source, count=1, flags=re.M)
+        source = source.replace('    SUITE=$!', '    kill -TERM $$\n    SUITE=$!')
+        instrumented.write_text(source)
+        self.addCleanup(lambda: child.exists() and alive(int(child.read_text()))
+                        and os.kill(int(child.read_text()), signal.SIGKILL))
+        result = box.run(['bash', str(instrumented), 'run', '--checkout', str(checkout)],
+                         STUB_UP_OK='1', STUB_CURL_CODE='200')
+        self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
+        if child.exists(): self.assert_gone(int(child.read_text()))
+        self.assert_torn_down_after_up(box)
+
+    def test_background_output_signal_cannot_stop_suite(self):
+        box = Sandbox(self)
+        checkout = self.checkout(box, 'kill -TTOU $$\necho output-survived\n')
+        proc = self.start(box, checkout)
+        out, err = proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 0, out + err)
+        self.assertIn('output-survived', out)
+        self.assert_torn_down_after_up(box)
 
     def test_the_suite_reads_no_terminal(self):
         # With job control on, a background job keeps the caller's stdin. From
@@ -921,13 +1198,14 @@ class CraftedPackageWriteTests(unittest.TestCase):
     Desktop the container can read a freshly closed bind-mounted file as empty."""
 
     def test_every_crafted_package_is_renamed_into_place(self):
-        for name, count in (('05_transfer.sh', 4), ('retrieval_settings.py', 1)):
+        for name, var, count in (('05_transfer.sh', 'part', 6), ('retrieval_settings.py', 'part', 1),
+                                 ('legacy_retrieval.py', 'partial', 1)):
             with self.subTest(file=name):
                 source = (VERIFY / name).read_text()
                 opened = re.findall(r"tarfile\.open\(([^,()]+), ['\"]w:gz['\"]\)", source)
                 self.assertEqual(len(opened), count, opened)
-                self.assertEqual(set(opened), {'part'}, 'written straight to the final name')
-                self.assertEqual(source.count('part.replace('), count)
+                self.assertEqual(set(opened), {var}, 'written straight to the final name')
+                self.assertEqual(source.count(var + '.replace('), count)
 
 
 @unittest.skipUnless(shutil.which('sha256sum'), 'needs sha256sum (it runs in the ollama image)')

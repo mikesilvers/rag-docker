@@ -25,10 +25,13 @@ fi
 C="${PREFIX}Ui"
 drop_collection "$C"; make_collection "$C"
 
-docker run --rm --network "$NETWORK" \
+# The test accounts' credentials go in on standard input (#25), never on a
+# command line or in the environment; browser/lib.js reads them once.
+_rag_require_lock_owner
+docker run --rm -i --network "$NETWORK" \
   -e RAG_UI_BASE="${RAG_UI_BASE:-http://proxy}" \
-  -e RAG_SKIP_SLOW="$SKIP_SLOW" \
-  -v "$PWD/browser":/w:ro -w /w "$IMAGE" node ui_criteria.js
+  -e RAG_SKIP_SLOW="$SKIP_SLOW" -e RAG_AUTH_STDIN=1 \
+  -v "$PWD/browser":/w:ro -w /w "$IMAGE" node ui_criteria.js < "$RAG_AUTH_DIR/credentials"
 rc=$?
 
 drop_collection "$C"

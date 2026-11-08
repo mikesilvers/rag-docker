@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPECIFICATIONS.md §10.2 — Query
 cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 [ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
 require_stack
@@ -9,6 +10,17 @@ check "effective retrieval controls acceptance suite" $?
 C="${PREFIX}Query"
 
 section "§10.2 Query"
+# A failed metrics write never fails a query, and metrics.jsonl is bounded (#374):
+# controlled, in the API image with no network.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_metrics.py)
+check "a failed metrics write keeps the answer; metrics.jsonl is bounded and reloads (#374)" $?
+# Citation scores are higher-is-better in every mode, and null when missing (#376):
+# controlled in the API image with no network, then on the real Weaviate with each
+# distance metric (models controlled, no LLM work).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_citation_score.py)
+check "citation scores convert each metric's distance, best first; missing reads as null (#376)" $?
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_PREFIX="$PREFIX" api python - < scripts/verify/citation_score.py)
+check "real Weaviate: cosine, dot and l2-squared scores, and a recreated collection's new metric (#376)" $?
 
 drop_collection "$C"; make_collection "$C"
 curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
@@ -43,7 +55,7 @@ import json,sys; d=json.load(open('/tmp/vfy_ans.json'))
 c = d.get('citations') or []
 ok = bool(c) and all(
     isinstance(x.get('source_file'), str) and x['source_file']
-    and isinstance(x.get('score'), (int, float))
+    and (x.get('score') is None or isinstance(x.get('score'), (int, float)))
     and isinstance(x.get('chunk_index'), int)
     and isinstance(x.get('excerpt'), str) for x in c)
 sys.exit(0 if ok else 1)"
@@ -64,23 +76,84 @@ try: d=json.load(open('/tmp/vfy_ans.json'))
 except Exception: sys.exit(1)
 sys.exit(0 if 'error' not in d and d.get('chunks_retrieved',0) > 0 and d.get('answer','').strip() else 1)"
   check "retrieval mode '$mode' returns results" $?
+  python3 -c "
+import json,sys
+try: c=json.load(open('/tmp/vfy_ans.json')).get('citations') or []
+except Exception: sys.exit(1)
+s=[x.get('score') for x in c]
+sys.exit(0 if s and all(isinstance(v,(int,float)) for v in s) and s==sorted(s,reverse=True) else 1)"
+  check "retrieval mode '$mode' citation scores are numbers, best (highest) first (#376)" $? \
+    "$(python3 -c "import json;print([x.get('score') for x in json.load(open('/tmp/vfy_ans.json')).get('citations') or []])" 2>/dev/null)"
 done
 
 # ── end_user is shorter than engineer ────────────────────────────────────────
 # The end_user prompt asks for a short answer (#109), but a CPU model still
-# varies answer to answer, so a single pair is noise. Compare the mean length
-# across trials.
+# varies answer to answer, so a single pair is noise. Compare the median length
+# across trials: one long answer can swing a mean over a few trials. A pair with
+# a failed query is dropped, never counted as a short answer, and more than half
+# of the trials must answer (#567).
+answer_length() {  # answer_length <curl exit> -> the last answer's length, or "error: <why>"
+  python3 - "$1" <<'ENDPY'
+import json, sys
+try:
+    raw = open("/tmp/vfy_ans.json", "rb").read()
+except OSError:
+    raw = b""
+body = " ".join(raw.decode("utf-8", "replace").split())[:150]
+try:
+    answer = json.loads(raw).get("answer")
+except (ValueError, AttributeError):
+    answer = None
+if isinstance(answer, str) and answer.strip():
+    print(len(answer))
+else:
+    print("error: " + (body or "no response (curl exit %s)" % sys.argv[1]))
+ENDPY
+}
 trials="${RAG_FORMAT_TRIALS:-3}"
-eu_total=0; en_total=0; eu_wins=0
-for _ in $(seq 1 "$trials"); do
-  ask flat end_user false;  eu=$(python3 -c "import json;print(len(json.load(open('/tmp/vfy_ans.json'))['answer']))")
-  ask flat engineer false;  en=$(python3 -c "import json;print(len(json.load(open('/tmp/vfy_ans.json'))['answer']))")
-  eu_total=$((eu_total+eu)); en_total=$((en_total+en))
+eu_lens=""; en_lens=""; eu_wins=0; answered=0; failures=""
+for trial in $(seq 1 "$trials"); do
+  ask flat end_user false;  eu=$(answer_length $?)
+  ask flat engineer false;  en=$(answer_length $?)
+  case "$eu" in error:*) failures="$failures; trial $trial end_user $eu" ;; esac
+  case "$en" in error:*) failures="$failures; trial $trial engineer $en" ;; esac
+  case "$eu$en" in *error:*) continue ;; esac
+  answered=$((answered+1)); eu_lens="$eu_lens $eu"; en_lens="$en_lens $en"
   [ "$eu" -lt "$en" ] && eu_wins=$((eu_wins+1))
 done
-[ "$eu_total" -lt "$en_total" ]
-check "end_user answers are shorter than engineer on average" $? \
-  "mean end_user=$((eu_total/trials)) engineer=$((en_total/trials)); end_user shorter in $eu_wins/$trials trials"
+read -r eu_median en_median shorter <<<"$(python3 -c "
+import statistics,sys
+eu=[int(x) for x in sys.argv[1].split()]; en=[int(x) for x in sys.argv[2].split()]
+if 2*len(eu) <= int(sys.argv[3]): print('- - 0'); sys.exit()
+m,n=statistics.median(eu),statistics.median(en)
+print(m, n, int(m < n))" "$eu_lens" "$en_lens" "$trials")"
+[ "$shorter" = 1 ]
+check "end_user answers are shorter than engineer by median length" $? \
+  "median end_user=$eu_median engineer=$en_median over $answered/$trials answered pairs; end_user shorter in $eu_wins/$answered${failures:+; failed: ${failures#; }}"
+
+# ── the query metrics reload after an API restart (#374; opt-in: it restarts the api) ──
+# The queries above wrote metrics records; a restart goes through the
+# lifespan's load_from_disk, so GET /metrics/latency must report the same records.
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
+  restart_refusal=$(restart_refusal_reason)
+  if [ -n "$restart_refusal" ]; then
+    check "query metrics reload after an API restart (#374)" 1 "$restart_refusal"
+  else
+    api_get "/metrics/latency?collection=$C&history_limit=500" > /tmp/vfy_metrics_before.json
+    project="$COMPOSE_PROJECT_NAME"
+    started=$(python3 -c "import time;print(time.time())")
+    (cd "$REPO_ROOT" && docker compose -p "$project" restart api >/dev/null 2>&1)
+    elapsed=$(wait_healthy_timed "$started" 300)
+    api_get "/metrics/latency?collection=$C&history_limit=500" > /tmp/vfy_metrics_after.json
+    python3 -c "
+import json,sys
+b=json.load(open('/tmp/vfy_metrics_before.json')); a=json.load(open('/tmp/vfy_metrics_after.json'))
+sys.exit(0 if b['total_records'] > 0 and a['history'] == b['history'] else 1)"
+    check "query metrics reload after an API restart (#374)" $? "healthy after ${elapsed:-never}s"
+  fi
+else
+  skip "query metrics reload after an API restart (#374)" "set RAG_ALLOW_RESTART=1 to include it"
+fi
 
 drop_collection "$C"
 cleanup_prefixed

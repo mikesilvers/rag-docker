@@ -370,7 +370,8 @@ failure) is the one most likely to be skipped and most likely to matter.
   second import of the same package: identical files, UUIDs and distances to six
   decimal places.
 - **E12** — a package claiming `bge-large-en`/1024 was refused `EMBEDDING_MISMATCH`,
-  naming both models and stating the re-embedding remedy.
+  naming both models. The refusal then also offered re-embedding as the remedy;
+  #390 removed that, since a refused package is never re-embedded.
 - **E13** — a truncated package failed `PACKAGE_CORRUPT` naming `chunks.jsonl`
   and carrying both digests.
 - **E14** — `abort` failed `COLLECTION_EXISTS`; `rename` imported as
@@ -388,9 +389,10 @@ Also verified: validation runs in spec §6.2 order and stops at the first failur
 (missing file, non-archive, absent manifest, future `package_format`, bad digest,
 embedding mismatch, collision each produce their own code); `on_conflict` is
 rejected as missing or invalid with 422; `IMPORT_IN_PROGRESS` fires for a
-concurrent import of the same file; and a package containing
-`../../../../tmp/evil-escaped.txt` was refused `PACKAGE_UNREADABLE` with nothing
-written inside or outside the container.
+concurrent import of the same file (since #391 compared by its name in
+`./exports`, and also failing an import job whose target collection another import
+is building); and a package containing `../../../../tmp/evil-escaped.txt` was
+refused `PACKAGE_UNREADABLE` with nothing written inside or outside the container.
 
 **A defect this phase found and fixed:** a failed `replace` reported "The
 imported data is available as 'Policies__importing_d4ce4033'" when the staging
@@ -703,7 +705,7 @@ guarantee held — but an abandoned staging collection is not merely untidy: it 
 returned by `GET /collections` and appears in the UI's collection pickers as
 though it were real.
 
-Two fixes, both at startup, where nothing can be mid-operation:
+Historical fixes (superseded by the ownership rules in the note below):
 
 1. `weaviate_client.sweep_staging()` removes any collection carrying the
    `__importing_` or `__tuning_` marker.

@@ -40,10 +40,18 @@ documentation improvements are all welcome.
 - Say which verification run you did (full or `RAG_SKIP_SLOW=1`) and whether it
   passed.
 
-Only the maintainer can merge. Workflows on pull requests from forks run after
-the maintainer approves them.
+The maintainer merges pull requests. The one exception, for the maintainer's own
+agents' tier-1 bug fixes, is in [CLAUDE.md](CLAUDE.md#merging-into-develop).
+Workflows on pull requests from forks run after the maintainer approves them.
 
 ## License
 
 By contributing, you agree that your contributions are licensed under the
 [MIT License](LICENSE).
+
+First-party UI and MCP versions track the repository release. When preparing a release, update `ui/package.json`, the root package versions in `ui/package-lock.json`, `mcp/mcpapp.py`, and the `service.version` default in `api/services/telemetry.py` together with their embedded documentation.
+
+## Release checklist
+
+- Before publishing a release, confirm that `SECURITY.md` names the supported
+  release policy accurately and links to the latest published release.

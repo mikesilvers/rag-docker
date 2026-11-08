@@ -1,0 +1,17 @@
+# Overlay for LAN mode on the disposable verify project (#26). Loaded only by
+# scripts/verify/stack.sh --lan, after docker-compose.lan.yml and
+# docker-compose.verify.yml, from the harness checkout. Run any other way, it
+# refuses to resolve.
+services:
+  proxy:
+    # Loopback only, at the verify port: the verify project never publishes on
+    # another address, LAN mode included. Replaces the override's 0.0.0.0:443.
+    ports: !override
+      - "127.0.0.1:${RAG_VERIFY_PORT:?set by scripts/verify/stack.sh}:443"
+  tls-init:
+    # The verify image: the override's rag-docker-api:latest is the live tag.
+    image: rag-verify-api:latest
+    environment:
+      # Reserved names (RFC 2606 .invalid, RFC 5737 TEST-NET-1), so the test
+      # certificate can't name a real host.
+      RAG_LAN_HOSTNAMES: "vfy-lan.invalid,192.0.2.10"

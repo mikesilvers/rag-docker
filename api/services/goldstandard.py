@@ -1,9 +1,11 @@
 from __future__ import annotations
+from services import telemetry
 import asyncio
 import json
 import logging
 import copy
 import os
+import stat
 import tempfile
 import threading
 
@@ -14,9 +16,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from config import settings
-from models.schemas import SessionResponse
+from models.schemas import SessionResponse, SessionValidity
 from services import ollama_client as ollama
 from services import weaviate_client as wc
+from services.collection_writes import aliases, end_job, register_job
 
 GS_SYSTEM = (
     "You are creating evaluation data for a RAG system. Given a text chunk, generate one question "
@@ -28,6 +31,11 @@ GS_RETRY_SUFFIX = (
     " Your previous response was not valid JSON. Return ONLY the JSON object with keys: "
     "question, answer, ground_truth. No markdown, no explanation."
 )
+GS_FIELD_RETRY_SUFFIX = (
+    " Your previous response did not give question, answer and ground_truth as nonempty strings. "
+    "Return ONLY the JSON object with keys: question, answer, ground_truth, each a nonempty string. "
+    "No markdown, no explanation."
+)
 
 log = logging.getLogger(__name__)
 
@@ -35,11 +43,12 @@ log = logging.getLogger(__name__)
 class GoldStandardError(Exception):
     """Carries an API error code so the router does not have to guess."""
 
-    def __init__(self, code: str, message: str, status: int):
+    def __init__(self, code: str, message: str, status: int, detail=None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.status = status
+        self.detail = detail
 
 _sessions: dict[str, dict] = {}
 _tasks: set[asyncio.Task] = set()
@@ -57,6 +66,24 @@ _MARKER_MESSAGES = {
     True: "History marker could not be saved in the session file. A pending marker keeps the session historical after restart, and current export is refused. Check local storage; the next successful write of this session saves the marker.",
     False: "History marker could not be saved. The session is treated as historical and current export is refused only until restart. Check local storage, then edit this session to save the marker.",
 }
+
+# What a generated session records about this install only (#617): who started
+# it and when it started and finished. Packages leave these out, and an import
+# drops them, so an imported session is never listed as a generation here.
+LOCAL_FIELDS = ("owner", "created_at", "finished_at")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+_ROLLBACK_FAILED_MESSAGE = "A stale marker from an aborted collection replacement could not be removed, so the session stays historical. Check local storage."
+# Rollback bookkeeping for an aborted durable marking (#275): a field the
+# session didn't have, a pending marker the call didn't touch, and a pending
+# marker whose earlier content couldn't be read.
+_ABSENT = object()
+_UNTOUCHED = object()
+_UNKNOWN = object()
 
 
 def validate_session_id(session_id: str) -> None:
@@ -205,7 +232,7 @@ def _replace_durably(path: Path, payload: str) -> None:
             try:
                 temporary.unlink(missing_ok=True)
             except OSError:
-                log.exception("Could not remove owned session temporary file %s", temporary.name)
+                log.exception("Could not remove owned temporary file %s", temporary.name)
 
 
 def _save_session_sync(session: dict) -> None:
@@ -392,6 +419,31 @@ def load_sessions_from_disk() -> None:
     _scan_sessions()
 
 
+class _GenerationInterrupted(RuntimeError):
+    """The restart interruption startup settlement records; its reason is written plain."""
+
+
+def reconcile_interrupted_generations() -> None:
+    """Startup only: no generation worker survives a process restart."""
+    if _tasks:
+        raise RuntimeError("Generation recovery must run before workers start")
+    interruption = _GenerationInterrupted("Generation interrupted by API restart. Retained pairs are available for review; start a new generation for missing pairs.")
+    with _state_lock:
+        interrupted = [sid for sid, value in _sessions.items() if value.get("status") == "generating"]
+    for session_id in interrupted:
+        def settle(current):
+            if current.get("status") == "generating":
+                _failed_generation(current, interruption)
+        try:
+            _update_session_sync(session_id, settle)
+        except Exception as write_error:
+            # Keep the stored snapshot for a later retry, but never advertise a
+            # live worker that does not exist. Existing diagnostics expose the
+            # persistence failure and a subsequent restart retries settlement.
+            log.exception("Could not persist interrupted generation %s", session_id)
+            _publish_generation_failure(session_id, interruption, write_error)
+
+
 def _sessions_on_disk() -> list[dict]:
     """Return detached, validated files for export without changing the cache."""
     try:
@@ -452,6 +504,15 @@ def sessions_for(collection: str) -> list[dict]:
         return copy.deepcopy(found)
 
 
+def generation_sessions() -> list[dict]:
+    """Copies of the sessions generated on this install, for
+    GET /goldstandard/sessions (#617); an imported session is never one."""
+    _scan_sessions()
+    with _state_lock:
+        return copy.deepcopy([session for session in _sessions.values()
+                              if isinstance(session, dict) and not session.get("imported_from")])
+
+
 def store_session(session: dict) -> None:
     """Write through the durable store so the cache cannot undo an import.
 
@@ -510,6 +571,9 @@ def _store_generated_session(session: dict) -> dict:
 def store_imported_session(session: dict, source_collection: str) -> dict:
     """Serialize source-ID collision handling with generation and other imports."""
     snapshot = copy.deepcopy(session)
+    # Who generated it and when belong to the source install (#617).
+    for key in LOCAL_FIELDS:
+        snapshot.pop(key, None)
     # Import preflight (check 4a) has already refused noncanonical source IDs.
     # Allocation keeps the source ID only when it is free; it stays provenance.
     SessionResponse.model_validate(snapshot, strict=True)
@@ -537,7 +601,74 @@ def _update_session_sync(session_id: str, change):
         return copy.deepcopy(result)
 
 
-def _flag_sessions(collection: str, flag: str, reason: str) -> int:
+def _restore_fields(current: dict, previous: dict) -> None:
+    for key, value in previous.items():
+        if value is _ABSENT:
+            current.pop(key, None)
+        else:
+            current[key] = value
+
+
+def _pending_marker_text(session_id: str) -> str | None:
+    """The pending marker's current text, or None when there is none."""
+    with _state_lock:
+        path = _pending_path(session_id)
+        return path.read_text() if path.exists() else None
+
+
+def _restore_pending_marker(session_id: str, text: str | None) -> None:
+    with _state_lock:
+        path = _pending_path(session_id)
+        if text is None:
+            if path.exists():
+                path.unlink()
+                _sync_directory(path.parent)
+        else:
+            _replace_durably(path, text)
+            _sync_directory(path.parent)
+
+
+def _roll_back_markers(undo: list[dict]) -> None:
+    """Undo the markers an aborted durable marking wrote (#275).
+
+    Only the flag fields and the pending marker go back to their earlier state.
+    Whatever can't be restored stays marked, which keeps the session historical.
+    """
+    global _store_revision
+    with _state_lock:
+        for entry in reversed(undo):
+            session_id = entry["session_id"]
+            previous = entry["previous"]
+            key = _session_key(session_id)
+            try:
+                if entry["marker"] is _UNKNOWN:
+                    raise ValueError("The pending marker's earlier content could not be read.")
+                if entry["marker"] is not _UNTOUCHED:
+                    _restore_pending_marker(session_id, entry["marker"])
+                if entry["file_written"]:
+                    _update_session_sync(session_id, lambda current, p=previous: _restore_fields(current, p))
+                else:
+                    current = _sessions.get(session_id)
+                    if current is not None:
+                        snapshot = copy.deepcopy(current)
+                        _restore_fields(snapshot, previous)
+                        _sessions[session_id] = snapshot
+                        _store_revision += 1
+                    # The session file write failed, but no marker is pending now.
+                    if _diagnostics.get(str(key), {}).get("code", "SESSION_WRITE_FAILED") == "SESSION_WRITE_FAILED":
+                        _record_issue(key, "SESSION_WRITE_FAILED")
+            except (GoldStandardError, OSError, ValueError, RuntimeError) as exc:
+                if isinstance(exc, GoldStandardError) and exc.code == "SESSION_DURABILITY_UNCERTAIN":
+                    # The restoring write replaced the file; its diagnostic stays.
+                    log.warning("Rolled back the stale marker of session %s with uncertain durability", session_id)
+                    continue
+                log.exception("Could not roll back the stale marker of session %s", session_id)
+                if _diagnostics.get(str(key), {}).get("code", "SESSION_WRITE_FAILED") == "SESSION_WRITE_FAILED":
+                    _record_issue(key, "SESSION_WRITE_FAILED", _ROLLBACK_FAILED_MESSAGE)
+
+
+def _flag_sessions(collection: str, flag: str, reason: str, *, require_durable: bool = False,
+                   undo: list[dict] | None = None) -> int:
     """Mark every session for a collection, on disk and in memory.
 
     Sessions are never deleted and never remapped. A remap that guesses which
@@ -547,26 +678,50 @@ def _flag_sessions(collection: str, flag: str, reason: str) -> int:
     If a completed mutation cannot persist a marker to the session file, the
     historical guard is kept in memory and in a pending marker that survives
     restart.
+
+    With `undo`, each session's earlier flag fields and pending marker are
+    recorded there, so `mark_stale` can roll the call back if it aborts.
     """
     global _store_revision
     sessions = sessions_for(collection)
     now = datetime.now(timezone.utc).isoformat()
+    fields = (flag, f"{flag}_reason", f"{flag}_at")
     marked = 0
     for session in sessions:
+        previous = {}
         def change(current):
+            # Only the first call sees the earlier values: an uncertain-durability
+            # write has already published the marker when the fallback runs.
+            if not previous:
+                previous.update({key: current.get(key, _ABSENT) for key in fields})
             current[flag] = True
             current[f"{flag}_reason"] = reason
             current[f"{flag}_at"] = now
         try:
             _update_session_sync(session["session_id"], change)
             marked += 1
-        except (GoldStandardError, OSError, ValueError, RuntimeError):
-            # The primary collection mutation already happened. Preserve the
-            # failed-write diagnostic. Publish the marker in the process cache
-            # even when disk still holds the prior snapshot, so a completed
-            # delete/rebuild cannot export this session as a current baseline.
-            # A pending marker carries it across restart; a later successful
-            # session write persists it and removes the pending marker.
+            if undo is not None:
+                undo.append({"session_id": session["session_id"], "previous": previous,
+                             "file_written": True, "marker": _UNTOUCHED})
+        except (GoldStandardError, OSError, ValueError, RuntimeError) as exc:
+            # Without require_durable the caller's primary collection mutation
+            # already happened. With it, the caller hasn't mutated anything yet:
+            # a pending marker that can't be written aborts the call, and
+            # mark_stale rolls back the markers this call wrote. Either way,
+            # preserve the failed-write diagnostic. Publish the marker in the
+            # process cache even when disk still holds the prior snapshot, so a
+            # completed delete/rebuild cannot export this session as a current
+            # baseline. A pending marker carries it across restart; a later
+            # successful session write persists it and removes the pending marker.
+            if undo is not None:
+                try:
+                    earlier_marker = _pending_marker_text(session["session_id"])
+                except (OSError, ValueError):
+                    earlier_marker = _UNKNOWN
+                # An uncertain-durability write did replace the session file.
+                replaced = isinstance(exc, GoldStandardError) and exc.code == "SESSION_DURABILITY_UNCERTAIN"
+                undo.append({"session_id": session["session_id"], "previous": previous,
+                             "file_written": replaced, "marker": earlier_marker})
             with _state_lock:
                 current = _sessions.get(session["session_id"])
                 if current is not None:
@@ -582,17 +737,29 @@ def _flag_sessions(collection: str, flag: str, reason: str) -> int:
                 # An uncertain-durability report keeps its own wording.
                 if _diagnostics.get(str(key), {}).get("code", "SESSION_WRITE_FAILED") == "SESSION_WRITE_FAILED":
                     _record_issue(key, "SESSION_WRITE_FAILED", _MARKER_MESSAGES[saved])
+            if require_durable and not saved:
+                raise GoldStandardError("SESSION_WRITE_FAILED", "Cannot replace collection: a historical marker could not be persisted.", 503)
     return marked
 
 
-def mark_stale(collection: str, reason: str) -> int:
+def mark_stale(collection: str, reason: str, *, require_durable: bool = False) -> int:
     """Chunk identity changed, so the pairs no longer describe what is stored."""
-    from services.collection_writes import canonical
-    name = canonical(collection)
     # Backend aliases address the same corpus, but retained provenance keeps
     # the spelling supplied when a session was created or imported.
-    aliases = {name, name[:1].lower() + name[1:]}
-    return sum(_flag_sessions(alias, "stale", reason) for alias in sorted(aliases))
+    if not require_durable:
+        return sum(_flag_sessions(alias, "stale", reason) for alias in aliases(collection))
+    # Before a replacement nothing has changed yet, so an abort under either
+    # spelling undoes every marker this call wrote (#275).
+    undo: list[dict] = []
+    try:
+        return sum(_flag_sessions(alias, "stale", reason, require_durable=True, undo=undo)
+                   for alias in aliases(collection))
+    except Exception:
+        try:
+            _roll_back_markers(undo)
+        except Exception:                             # noqa: BLE001
+            log.exception("Could not roll back stale markers for %s", collection)
+        raise
 
 
 def mark_orphaned(collection: str, reason: str) -> int:
@@ -662,31 +829,51 @@ async def _chat_once(system: str, user: str) -> str:
 # Each attempt costs an LLM call, so the budget is small and fixed.
 _GENERATION_ATTEMPTS = 3
 
+# Three validation attempts, each allowing two nominal 300s transport calls.
+# Bound the whole model operation: per-read transport timeouts are not a total
+# wall-clock deadline. nginx and verification clients allow completion headroom.
+_REGENERATION_TIMEOUT_SECONDS = 1800
 
+
+@telemetry.traced("rag.pair")
 async def _generate_pair(chunk: dict) -> dict:
     user_msg = f"Chunk:\n{chunk['content']}"
     data = None
     last_error: Exception | None = None
+    # Each reprompt names what was wrong with the reply before it (#273).
+    suffix = ""
     for attempt in range(_GENERATION_ATTEMPTS):
-        system = GS_SYSTEM if attempt == 0 else GS_SYSTEM + GS_RETRY_SUFFIX
-        raw = await _chat_once(system, user_msg)
+        raw = await _chat_once(GS_SYSTEM + suffix, user_msg)
         try:
-            data = _parse_gs_json(raw)
-            break
+            candidate = _parse_gs_json(raw)
         except Exception as exc:                      # noqa: BLE001
-            last_error = exc
+            last_error, suffix = exc, GS_RETRY_SUFFIX
             log.info("Pair generation attempt %d/%d did not yield valid JSON: %s",
                      attempt + 1, _GENERATION_ATTEMPTS, exc)
+            continue
+        try:
+            for field in ("question", "answer", "ground_truth"):
+                value = candidate.get(field, candidate.get("answer") if field == "ground_truth" else None)
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"Model {field} must be a nonempty string")
+                candidate[field] = value
+        except ValueError as exc:
+            last_error, suffix = exc, GS_FIELD_RETRY_SUFFIX
+            log.info("Pair generation attempt %d/%d returned an unusable field: %s",
+                     attempt + 1, _GENERATION_ATTEMPTS, exc)
+            continue
+        data = candidate
+        break
     if data is None:
         raise last_error or ValueError("no usable reply from the model")
 
     return {
         "pair_id": f"p_{uuid.uuid4().hex[:8]}",
-        "question": str(data.get("question", "")),
-        "answer": str(data.get("answer", "")),
+        "question": data["question"],
+        "answer": data["answer"],
         "contexts": [chunk["content"]],
-        "ground_truth": str(data.get("ground_truth", data.get("answer", ""))),
-        "source_file": chunk.get("source_file", ""),
+        "ground_truth": data["ground_truth"],
+        "source_file": str(chunk.get("source_file") or ""),
         "chunk_index": int(chunk.get("chunk_index", 0)),
         "status": "pending",
     }
@@ -694,8 +881,14 @@ async def _generate_pair(chunk: dict) -> dict:
 
 def _failed_generation(current: dict, exc: Exception) -> None:
     current["status"] = "failed"
-    reason = (f"{exc.code}: {exc.message}" if isinstance(exc, GoldStandardError)
-              else f"{type(exc).__name__}: {exc}")
+    # Every caller ends a generation; a later failure report keeps the first time (#617).
+    current.setdefault("finished_at", _now_iso())
+    if isinstance(exc, GoldStandardError):
+        reason = f"{exc.code}: {exc.message}"
+    elif isinstance(exc, _GenerationInterrupted):
+        reason = str(exc)
+    else:
+        reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
     errors = current.setdefault("errors", [])
     if reason not in errors:
         errors.append(reason)
@@ -717,11 +910,13 @@ def _publish_generation_failure(session_id: str, exc: Exception, write_error: Ex
         _store_revision += 1
 
 
+@telemetry.traced("rag.failure_report")
 async def _record_generation_failure(session_id: str, exc: Exception) -> None:
     try:
         await asyncio.to_thread(_update_session_sync, session_id,
                                 lambda current: _failed_generation(current, exc))
     except Exception as write_error:
+        telemetry.outcome("error", write_error)
         log.exception("Could not durably report failed generation for %s", session_id)
         # Otherwise `generating` stays in the cache for as long as the fault
         # lasts, and the UI polls it forever. The cache runs ahead of disk;
@@ -733,6 +928,7 @@ async def _record_generation_failure(session_id: str, exc: Exception) -> None:
             log.exception("Could not publish failed generation for %s", session_id)
 
 
+@telemetry.traced("rag.evaluation")
 async def _run_generation(session_id: str, chunks: list[dict]) -> None:
     cancelled = False
     persistence_failure = None
@@ -744,6 +940,7 @@ async def _run_generation(session_id: str, chunks: list[dict]) -> None:
                 cancelled = True
                 raise
             except Exception as exc:
+                telemetry.outcome("partial", exc)
                 reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
                 log.warning("Gold-standard pair generation failed: %s", reason, exc_info=True)
                 def failed(current):
@@ -764,50 +961,136 @@ async def _run_generation(session_id: str, chunks: list[dict]) -> None:
         cancelled = True
         raise
     finally:
-        def finish(current):
-            if persistence_failure is not None:
-                _failed_generation(current, persistence_failure)
-                return
-            if current.get("status") == "generating":
-                current["status"] = ("cancelled" if cancelled else
-                    "failed" if not current["pairs"] and current.get("errors") else "completed")
-        await asyncio.to_thread(_update_session_sync, session_id, finish)
+        await _settle_generation(session_id, cancelled, persistence_failure)
+
+
+async def _settle_generation(session_id: str, cancelled: bool,
+                             persistence_failure: Exception | None = None) -> None:
+    # Before the status turns terminal: a client that sees generation end
+    # can delete the collection at once (#40).
+    end_job("goldstandard", session_id)
+    def finish(current):
+        if persistence_failure is not None:
+            _failed_generation(current, persistence_failure)
+            return
+        if current.get("status") == "generating":
+            current["status"] = ("cancelled" if cancelled else
+                "failed" if not current["pairs"] and current.get("errors") else "completed")
+            current.setdefault("finished_at", _now_iso())       # #617
+        if current.get("status") == "failed":
+            telemetry.outcome("error")
+    await asyncio.to_thread(_update_session_sync, session_id, finish)
+
+
+def _track_settling(session_id: str, task: asyncio.Task) -> None:
+    """Keep a settling task alive, and report it if it raises, as _on_task_done does."""
+    _tasks.add(task)
+    def done(t: asyncio.Task) -> None:
+        _tasks.discard(t)
+        exc = t.exception() if not t.cancelled() else None
+        if exc is not None:
+            reporter = asyncio.create_task(_record_generation_failure(session_id, exc))
+            _tasks.add(reporter)
+            reporter.add_done_callback(_tasks.discard)
+    task.add_done_callback(done)
+
+
+def _settle_abandoned_start(prepare: asyncio.Future) -> None:
+    """The request that started a generation was cancelled while it was being
+    prepared (#302). The preparation still ran to the end in its thread; if it
+    published and registered a session, nothing will generate for it, so it is
+    settled the way a cancelled generation is: registration ended, `cancelled`."""
+    if prepare.cancelled() or prepare.exception() is not None:
+        return                        # nothing was registered
+    session, _ = prepare.result()
+    session_id = session["session_id"]
+    _track_settling(session_id, asyncio.create_task(_settle_generation(session_id, cancelled=True)))
+
+
+_GENERATION_GUARD_TIMEOUT_SECONDS = 1.0
+
+
+def _prepare_generation_sync(collection: str, sample_size: int, seed: int | None,
+                             owner: dict | None = None):
+    """Publish the sampled corpus identity before a writer can invalidate it."""
+    from services.collection_writes import (CollectionBusyError, delete_in_progress,
+                                            deleting_message, guard)
+    # Before the guard's one-second wait, so a delete in progress is reported as
+    # one, like the other job kinds report it (#302).
+    if delete_in_progress(collection):
+        raise GoldStandardError("COLLECTION_DELETING", deleting_message(collection), 409,
+                                detail={"collection": collection})
+    try:
+        with guard(collection, timeout=_GENERATION_GUARD_TIMEOUT_SECONDS):
+            all_chunks = wc._sample_chunks_sync(collection, limit=sample_size, seed=seed)
+            actual_size = len(all_chunks)
+
+            session = {
+                "session_id": "",
+                "collection": collection,
+                "status": "generating",
+                "pairs_total": actual_size,
+                # `attempted` drives progress and always reaches `total`; `completed`
+                # counts pairs that actually exist. Reporting one number for both made
+                # a session with a failed pair read "3/3" while holding 2.
+                "pairs_attempted": 0,
+                "pairs_completed": 0,
+                "pairs_failed": 0,
+                "pairs": [],
+                # For the generation list (#617); finished_at when it settles.
+                "owner": owner,
+                "created_at": _now_iso(),
+            }
+            session = _store_generated_session(session)
+            # Still inside the guard, so no delete can pass between publication
+            # and registration; DELETE /collections refuses from here (#40).
+            register_job(collection, "goldstandard", session["session_id"])
+            return session, all_chunks
+    except CollectionBusyError as exc:
+        raise GoldStandardError("COLLECTION_BUSY",
+            f"Collection '{collection}' is busy. Retry after its current operation finishes.", 409) from exc
+    except wc.CollectionNotFoundError as exc:
+        raise GoldStandardError("COLLECTION_NOT_FOUND",
+            f"Collection '{collection}' not found.", 404) from exc
 
 
 async def start_generation(
     collection: str,
     sample_size: int,
     seed: int | None,
+    owner: dict | None = None,
 ) -> dict:
+    """`owner` is who started it (#617), recorded for the generation list."""
     from models.schemas import GenerateRequest
     request = GenerateRequest(collection=collection, sample_size=sample_size, seed=seed)
-    all_chunks = await wc.sample_chunks(collection, limit=request.sample_size, seed=request.seed)
-    actual_size = len(all_chunks)
-
-    session = {
-        "session_id": "",
-        "collection": collection,
-        "status": "generating",
-        "pairs_total": actual_size,
-        # `attempted` drives progress and always reaches `total`; `completed`
-        # counts pairs that actually exist. Reporting one number for both made
-        # a session with a failed pair read "3/3" while holding 2.
-        "pairs_attempted": 0,
-        "pairs_completed": 0,
-        "pairs_failed": 0,
-        "pairs": [],
-    }
-    session = await asyncio.to_thread(_store_generated_session, session)
+    # Shielded: cancelling a plain to_thread await loses the thread's result, and
+    # with it the registration it made, which then refused DELETE until a
+    # restart (#302). A cancelled caller hands the result to a settle step.
+    prepare = asyncio.ensure_future(asyncio.to_thread(
+        _prepare_generation_sync, collection, request.sample_size, request.seed, owner))
+    try:
+        session, all_chunks = await asyncio.shield(prepare)
+    except asyncio.CancelledError:
+        prepare.add_done_callback(_settle_abandoned_start)
+        raise
     session_id = session["session_id"]
 
-    task = asyncio.create_task(_run_generation(session_id, all_chunks))
+    try:
+        task = asyncio.create_task(telemetry.admitted(_run_generation)(session_id, all_chunks))
+    except BaseException:
+        end_job("goldstandard", session_id)
+        raise
     _tasks.add(task)
 
+    report_failure = telemetry.admitted(_record_generation_failure)
+
     def _on_task_done(t: asyncio.Task) -> None:
+        # _run_generation ends it first; this covers a task that never ran it.
+        end_job("goldstandard", session_id)
         _tasks.discard(t)
         exc = t.exception() if not t.cancelled() else None
         if exc is not None:
-            reporter = asyncio.create_task(_record_generation_failure(session_id, exc))
+            reporter = asyncio.create_task(report_failure(session_id, exc))
             _tasks.add(reporter)
             reporter.add_done_callback(_tasks.discard)
 
@@ -816,25 +1099,38 @@ async def start_generation(
     return {
         "session_id": session_id,
         "status": "generating",
-        "pairs_total": actual_size,
+        "pairs_total": session["pairs_total"],
         "pairs_completed": 0,
     }
 
 
+def _session_not_found(session_id: str) -> GoldStandardError:
+    return GoldStandardError("SESSION_NOT_FOUND", f"Session '{session_id}' not found.", 404)
+
+
 async def update_pair(session_id: str, pair_id: str, updates: dict) -> dict | None:
+    """The updated pair, or None for an unknown pair. An unknown session raises
+    SESSION_NOT_FOUND, so the two 404s stay apart (#381)."""
     def change(current):
         for pair in current["pairs"]:
             if pair["pair_id"] == pair_id:
                 pair.update({key: value for key, value in updates.items() if value is not None})
                 return pair
         return None
-    return await asyncio.to_thread(_update_session_sync, session_id, change)
+
+    def apply():
+        with _state_lock:
+            if session_id not in _sessions:
+                raise _session_not_found(session_id)
+            return _update_session_sync(session_id, change)
+    return await asyncio.to_thread(apply)
 
 
+@telemetry.traced("rag.regenerate")
 async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
     session = get_session(session_id)
     if session is None:
-        return None
+        raise _session_not_found(session_id)
     if session.get("status") == "generating":
         # The generation loop is appending to session["pairs"] and saving it;
         # regenerating underneath that races with it and can lose a pair.
@@ -850,7 +1146,13 @@ async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
                 "chunk_index": pair["chunk_index"],
             }
             try:
-                new_pair = await _generate_pair(chunk)
+                new_pair = await asyncio.wait_for(
+                    _generate_pair(chunk), timeout=_REGENERATION_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError as exc:
+                raise GoldStandardError(
+                    "PAIR_GENERATION_TIMEOUT",
+                    "The model exceeded the regeneration time limit. "
+                    "The existing pair is unchanged; try again.", 504) from exc
             except Exception as exc:                  # noqa: BLE001
                 # The model regularly returns unparseable JSON. Generation
                 # records that and moves on; regeneration used to let it escape
@@ -876,10 +1178,57 @@ async def regenerate_pair(session_id: str, pair_id: str) -> dict | None:
     return None
 
 
+# Exports have their own folder so that a caller-chosen name can never reach the
+# registry, the metrics file or the session store beside them (#370).
+EXPORT_DIRNAME = "goldstandard_exports"
+_EXPORT_NAME_MAX = 128
+_EXPORT_NAME_RE = re.compile(r"[A-Za-z0-9_. -]{1,%d}" % _EXPORT_NAME_MAX)
+
+
+def export_path(filename) -> Path:
+    """The path of export `filename`, or INVALID_PATH when the name breaks the rule."""
+    if (not isinstance(filename, str) or not _EXPORT_NAME_RE.fullmatch(filename)
+            or not filename.lower().endswith(".json")):
+        raise GoldStandardError(
+            "INVALID_PATH",
+            "Invalid filename. Use 1-128 ASCII letters, digits, '_', '-', '.' or spaces, "
+            "ending in .json, with no path.", 400)
+    return Path(settings.upload_dir).resolve() / EXPORT_DIRNAME / filename
+
+
+def export_entry_is_other(path: Path) -> bool:
+    """True when something other than a regular file (a directory, a link) has the name."""
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return False
+    return not stat.S_ISREG(mode)
+
+
+def export_folder_exists(folder: Path) -> bool:
+    """False when the exports folder is missing; True when it is a directory.
+
+    Anything else with its name (a file saved as `goldstandard_exports` before #370,
+    a symbolic link) is refused rather than followed or failed on (#402).
+    """
+    try:
+        mode = os.lstat(folder).st_mode
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(mode):
+        raise GoldStandardError(
+            "EXPORTS_FOLDER_INVALID",
+            f"'{EXPORT_DIRNAME}' in the upload folder is not a directory (a file or a "
+            "link has its name). Move or rename it, then retry.", 409)
+    return True
+
+
 # Published cache snapshots are immutable. Export captures one stable reference
 # and never mutates or exposes it; later commits publish a different object.
+# The export goes to a new temporary file that replaces the name, so a link at
+# the name is replaced rather than followed, and no reader sees half a file (#402).
 def _save_export_sync(out_path: Path, ragas: list[dict]) -> None:
-    out_path.write_text(json.dumps(ragas, indent=2))
+    _replace_durably(out_path, json.dumps(ragas, indent=2))
 
 
 async def save_session(session_id: str, filename: str | None, allow_historical: bool = False) -> dict | None:
@@ -887,7 +1236,7 @@ async def save_session(session_id: str, filename: str | None, allow_historical: 
     if session is None:
         return None
 
-    from models.schemas import SessionValidity
+    # Keep direct Python callers as strict as the HTTP request model.
     if not isinstance(allow_historical, bool):
         raise ValueError("allow_historical must be a boolean")
     validity = SessionValidity.model_validate(session).model_dump()
@@ -906,15 +1255,17 @@ async def save_session(session_id: str, filename: str | None, allow_historical: 
     if not filename:
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         safe = re.sub(r"[^a-zA-Z0-9_]", "", collection.replace(" ", "_"))
-        filename = f"{safe}_{ts}.json"
+        suffix = f"_{ts}.json"
+        filename = safe[:_EXPORT_NAME_MAX - len(suffix)] + suffix
 
-    # Sanitize: only the basename; no path traversal
-    filename = Path(filename).name
-    out_dir = Path(settings.upload_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = (out_dir / filename).resolve()
-    if not str(out_path).startswith(str(out_dir) + "/"):
-        raise ValueError("Invalid filename.")
+    # The name is checked as given; a path is refused, not stripped (#370).
+    out_path = export_path(filename)
+    if not export_folder_exists(out_path.parent):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        export_folder_exists(out_path.parent)
+    if export_entry_is_other(out_path):
+        raise GoldStandardError(
+            "INVALID_PATH", f"'{filename}' is not an export file.", 400)
 
     ragas = [
         {

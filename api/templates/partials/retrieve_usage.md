@@ -1,9 +1,14 @@
 ```bash
-python3 retrieve.py "your question here"
-python3 retrieve.py --top-k 10 --mode hybrid "your question here"
-python3 retrieve.py --api-url http://localhost:9090/api "your question here"
-python3 retrieve.py --timeout 900 "a question that needs a long answer"
+python3 retrieve.py --username alice "your question here"
+python3 retrieve.py --username alice --top-k 10 --mode hybrid "your question here"
+python3 retrieve.py --username alice --api-url http://localhost:9090/api "your question here"
+python3 retrieve.py --username alice --timeout 900 "a question that needs a long answer"
 ```
+
+The API needs an account; any role may ask. The script asks for the password
+(or reads it from standard input with `--password-stdin`), logs in, asks and
+logs out. The password is never a flag or an environment variable;
+`RAG_USERNAME` may stand in for `--username`.
 
 It needs Python 3 and nothing else — no `pip install` — because the air-gapped
 case is the one this project targets. It exits 0 on success, 2 on bad usage,

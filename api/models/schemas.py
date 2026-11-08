@@ -1,6 +1,8 @@
 from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
-from pydantic import BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator, SecretStr, StrictInt
+
+from services.collection_writes import canonical
 
 
 def _numeric(value):
@@ -29,6 +31,10 @@ TopK = Annotated[int, BeforeValidator(_numeric), Field(ge=1, le=50)]
 SEARCH_EF_MIN, SEARCH_EF_MAX = 16, 512
 SearchEf = Annotated[int, BeforeValidator(_numeric), Field(ge=SEARCH_EF_MIN, le=SEARCH_EF_MAX)]
 OVERLAP_RULE = "chunk_overlap must be smaller than chunk_size for overlap/language"
+# A collection name as a caller sends it, replaced by the name Weaviate stores
+# (first character upper-cased), so every file, registry entry, session, metric
+# and guard is keyed by one spelling (#372).
+CollectionName = Annotated[str, AfterValidator(canonical)]
 
 
 # ── Collections ──────────────────────────────────────────────────────────────
@@ -40,7 +46,7 @@ class HnswConfig(BaseModel):
 
 
 class CreateCollectionRequest(BaseModel):
-    name: str
+    name: CollectionName
     index_type: IndexType = "hnsw"
     distance_metric: DistanceMetric = "cosine"
     hnsw_config: HnswConfig = HnswConfig()
@@ -95,10 +101,22 @@ class JobStatusResponse(BaseModel):
     files_completed: int
     files_failed: int
     chunks_stored: int
+    # Chunks sent to Weaviate and those it acknowledged without a per-chunk
+    # error, including ones removed again because the check failed (#302).
+    # Null on records written before they existed, where 0 would be untrue.
+    chunks_submitted: int | None = None
+    chunks_accepted: int | None = None
     errors: list[str]
     # Files the caller sent that could not be parsed at all; they never
-    # became part of files_total, so without this they vanish silently.
+    # became part of files_total, so without this they vanish silently. Also
+    # inputs replaced by a later one with the same name in the upload (#22).
     skipped: list[str] = []
+    # Earlier chunks of the same names that this job removed (#22). Records
+    # written before the field existed read back as 0.
+    chunks_replaced: int = 0
+    # Files over the per-file limits, stored as parts `<name> (part N)` (#621):
+    # one entry per such file that completed. Older records read back as [].
+    split: list[str] = []
 
 
 class IngestConfig(BaseModel):
@@ -113,6 +131,14 @@ class IngestConfig(BaseModel):
         if self.chunking_strategy in ("overlap", "language") and self.chunk_overlap >= self.chunk_size:
             raise ValueError(OVERLAP_RULE)
         return self
+
+
+class StoredIngestConfig(IngestConfig):
+    # Ingest settings in an import package (#510). A configuration saved before the
+    # #53 chunk bounds is imported as it is, never clamped, so these two fields keep
+    # the rules from before the bounds; every other save rule still applies.
+    chunk_size: PositiveSize = 1000
+    min_chunk_size: NonnegativeSize = 100
 
 
 class IngestConfigResponse(BaseModel):
@@ -131,7 +157,7 @@ class IngestConfigResponse(BaseModel):
 # SEARCH_EF_MIN-SEARCH_EF_MAX was stored before PR #108 and is inactive, so
 # export and import clear it to null (retrieval_config.normalize), not refuse it.
 class SaveRetrievalConfigBody(BaseModel):
-    collection: str
+    collection: CollectionName
     retrieval_mode: RetrievalMode = "hnsw"
     top_k: TopK = 5
     alpha: UnitInterval = 0.75
@@ -143,7 +169,7 @@ class RetrievalConfigResponse(BaseModel):
     collection: str
     retrieval_mode: str
     top_k: int
-    alpha: float
+    alpha: Annotated[float, Field(allow_inf_nan=False)]   # JSON has no NaN (#477)
     ef: Optional[int]
     response_format: str
     is_default: bool
@@ -156,9 +182,38 @@ class HelpResponse(BaseModel):
 
 # ── Export / Import ───────────────────────────────────────────────────────────
 
+# Passphrase length for an encrypted export (#27): long enough to resist
+# guessing with scrypt in the way, short enough to bound the request.
+PASSPHRASE_MIN = 12
+PASSPHRASE_MAX = 1024
+
+
+def _utf8_passphrase(v: Optional[SecretStr]) -> Optional[SecretStr]:
+    """A passphrase is used as UTF-8. JSON can carry a lone surrogate (`\\ud800`),
+    which has no UTF-8 form; it is refused here, as a 422, instead of failing in
+    the worker (#27 review). The message never contains the value."""
+    if v is not None:
+        try:
+            v.get_secret_value().encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("passphrase must be valid Unicode text (no lone surrogates)") from None
+    return v
+
+
 class ExportRequest(BaseModel):
-    collection: str
+    collection: CollectionName
     include_models: bool = False
+    # Optional: given, the package is written encrypted as `.tar.gz.age` (#27).
+    # SecretStr keeps it out of any repr or log line, and the 422 handler drops
+    # `input`, so a refused passphrase is never echoed.
+    passphrase: Optional[SecretStr] = None
+
+    @field_validator("passphrase")
+    @classmethod
+    def _passphrase(cls, v: Optional[SecretStr]) -> Optional[SecretStr]:
+        if v is not None and not PASSPHRASE_MIN <= len(v.get_secret_value()) <= PASSPHRASE_MAX:
+            raise ValueError(f"passphrase must be {PASSPHRASE_MIN} to {PASSPHRASE_MAX} characters")
+        return _utf8_passphrase(v)
 
 
 class ExportStartResponse(BaseModel):
@@ -182,13 +237,26 @@ class ExportJobStatusResponse(BaseModel):
     retrieve_script: Optional[bool]
     warnings: list[str]
     error: Optional[str]
+    # Whether the export was requested with a passphrase (#27). Records from
+    # before #27 have no such key.
+    encrypted: bool = False
 
+    error_code: Optional[str] = None
+    error_detail: Optional[dict] = None
 
 class ImportRequest(BaseModel):
     filename: str
     # Required, no default (spec §6.4): silently picking a conflict policy could
     # delete a collection the caller did not mean to touch.
     on_conflict: str
+    # Required for a `.tar.gz.age` package and refused for any other (#27).
+    # Its length is checked on export only; any encodable value is tried here.
+    passphrase: Optional[SecretStr] = None
+
+    @field_validator("passphrase")
+    @classmethod
+    def _passphrase(cls, v: Optional[SecretStr]) -> Optional[SecretStr]:
+        return _utf8_passphrase(v)
 
     @field_validator("on_conflict")
     @classmethod
@@ -228,6 +296,7 @@ class ImportJobStatusResponse(BaseModel):
     error: Optional[str]
     error_code: Optional[str]
     error_detail: Optional[dict]
+    encrypted: bool = False
 
 
 class PackageSummary(BaseModel):
@@ -240,6 +309,10 @@ class PackageSummary(BaseModel):
     fidelity: Optional[str]
     created_at: Optional[str]
     readable: bool
+    # An encrypted package (`.tar.gz.age`, #27) lists no metadata: its manifest
+    # can't be read without the passphrase. `readable` then says whether its
+    # age header is valid.
+    encrypted: bool = False
 
 
 class PackageListResponse(BaseModel):
@@ -284,16 +357,16 @@ class _ChunkingFields(BaseModel):
 
 
 class RechunkRequest(_ChunkingFields):
-    collection: str
+    collection: CollectionName
 
 
 class ReembedRequest(_ChunkingFields):
     """Chunking fields are optional here, and only legal with `with-sources`."""
-    collection: str
+    collection: CollectionName
 
 
 class ReindexRequest(BaseModel):
-    collection: str
+    collection: CollectionName
     index_type: Optional[IndexType] = None
     distance_metric: Optional[DistanceMetric] = None
 
@@ -332,7 +405,7 @@ class TuneOptionsResponse(BaseModel):
 
 class QueryRequest(BaseModel):
     question: str
-    collection: str
+    collection: CollectionName
     retrieval_mode: RetrievalMode = "hnsw"
     top_k: TopK = 5
     alpha: UnitInterval = 0.75
@@ -343,7 +416,7 @@ class QueryRequest(BaseModel):
 class Citation(BaseModel):
     source_file: str
     chunk_index: int
-    score: float
+    score: Optional[float]  # higher is better in every mode; null when missing (#376)
     excerpt: str
 
 
@@ -358,7 +431,7 @@ class QueryResponse(BaseModel):
 # ── Gold Standard ─────────────────────────────────────────────────────────────
 
 class GenerateRequest(BaseModel):
-    collection: str
+    collection: CollectionName
     sample_size: int = 20
     seed: Optional[int] = None
 
@@ -451,6 +524,15 @@ class PatchPairRequest(BaseModel):
                 f"got status={self.status!r}")
         return self
 
+    @field_validator("question", "answer", "ground_truth")
+    @classmethod
+    def _content_not_empty(cls, v: Optional[str], info) -> Optional[str]:
+        """An empty field would be saved into the RAGAS export as an empty row
+        field. Generation refuses empty model fields the same way (#381)."""
+        if v is not None and not v.strip():
+            raise ValueError(f"{info.field_name} must not be empty or only whitespace")
+        return v
+
     @field_validator("status")
     @classmethod
     def validate_status(cls, v: Optional[str]) -> Optional[str]:
@@ -521,6 +603,95 @@ class MetricsResponse(BaseModel):
     history: list[LatencyRecord]
 
 
+# ── Authentication (#25) ─────────────────────────────────────────────────────
+
+# Generous caps, so absurd input is a 422 before any hashing work; the real
+# rules (usernames 3-32 characters, passwords 12-256) are checked by the routes.
+class LoginRequest(BaseModel):
+    username: str = Field(max_length=256)
+    password: str = Field(max_length=1024)
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(max_length=1024)
+    new_password: str = Field(max_length=1024)
+
+
+class AuthStatus(BaseModel):
+    setup_required: bool
+
+
+class AuthUser(BaseModel):
+    username: str
+    role: Literal["end_user", "developer", "engineer"]
+    must_change_password: bool
+    kind: Optional[Literal["user", "service"]] = None   # GET /auth/me: a session's user or a key's principal
+
+
+class AdminUser(BaseModel):
+    username: str
+    role: Literal["end_user", "developer", "engineer"]
+    enabled: bool
+    must_change_password: bool
+    created_at: str
+
+
+class AdminUserList(BaseModel):
+    users: list[AdminUser]
+
+
+class AdminUserResult(BaseModel):
+    user: AdminUser
+    password: Optional[str] = None   # a generated password, in this answer only
+
+
+class UserCreateRequest(BaseModel):
+    username: str = Field(max_length=256)
+    role: Literal["end_user", "developer", "engineer"]
+
+
+class RoleChangeRequest(BaseModel):
+    role: Literal["end_user", "developer", "engineer"]
+
+
+class ServiceKey(BaseModel):
+    id: str
+    label: str
+    created_at: str
+    expires_at: str
+    revoked_at: Optional[str]
+    last_used_at: Optional[str]
+    status: Literal["active", "expired", "revoked"]
+
+
+class ServicePrincipal(BaseModel):
+    name: str
+    role: Literal["end_user", "developer", "engineer"]
+    enabled: bool
+    created_at: str
+    keys: list[ServiceKey]
+
+
+class ServicePrincipalList(BaseModel):
+    principals: list[ServicePrincipal]
+
+
+class ServicePrincipalResult(BaseModel):
+    principal: ServicePrincipal
+    key: Optional[ServiceKey] = None
+    secret: Optional[str] = None   # a newly issued key, in this answer only
+
+
+class PrincipalCreateRequest(BaseModel):
+    name: str = Field(max_length=256)
+    role: Literal["end_user", "developer", "engineer"]
+
+
+class KeyIssueRequest(BaseModel):
+    label: str = Field(default="", max_length=64)
+    days: StrictInt = Field(default=90, ge=1, le=365)
+
+
 # ── Error ─────────────────────────────────────────────────────────────────────
 
 class ErrorDetail(BaseModel):
@@ -531,3 +702,120 @@ class ErrorDetail(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: ErrorDetail
+
+
+# ── Running and recent jobs (#617) ────────────────────────────────────────────
+# What GET /ingest/jobs, /export/jobs, /import/jobs and /goldstandard/sessions
+# answer: the fields of the lookup by ID, plus who started the job and when it
+# started and finished. The lookups by ID answer as before.
+
+class JobOwner(BaseModel):
+    name: str
+    kind: Literal["user", "service"]
+
+
+class ListedTimes(BaseModel):
+    # None: a record from before #617, shown to Engineers as "owner unknown".
+    owner: Optional[JobOwner] = None
+    created_at: Optional[str] = None
+    # The finish time the list used; None while the job runs.
+    finished_at: Optional[str] = None
+
+
+class IngestJobEntry(JobStatusResponse, ListedTimes):
+    collection: Optional[str] = None
+    files: list[str] = []
+
+
+class ExportJobEntry(ExportJobStatusResponse, ListedTimes):
+    pass
+
+
+class ImportJobEntry(ImportJobStatusResponse, ListedTimes):
+    pass
+
+
+class GenerationEntry(ListedTimes):
+    session_id: str
+    collection: str = ""
+    status: str
+    pairs_total: int
+    pairs_attempted: Optional[int] = None
+    pairs_completed: int
+    pairs_failed: int = 0
+    errors: list[str] = []
+
+    @model_validator(mode="after")
+    def _attempted_defaults_to_completed(self):
+        # As GET /goldstandard/session/{id} answers a session without it.
+        if self.pairs_attempted is None:
+            self.pairs_attempted = self.pairs_completed
+        return self
+
+
+class IngestJobList(BaseModel):
+    jobs: list[IngestJobEntry]
+
+
+class ExportJobList(BaseModel):
+    jobs: list[ExportJobEntry]
+
+
+class ImportJobList(BaseModel):
+    jobs: list[ImportJobEntry]
+
+
+class GenerationList(BaseModel):
+    sessions: list[GenerationEntry]
+
+
+# ── Document preparation (#638) ───────────────────────────────────────────────
+
+class _PrepareSelection(BaseModel):
+    """Exactly one of `document_ids` (possibly empty, which is refused with 400
+    NO_DOCUMENTS) or `all: true`."""
+    document_ids: Optional[list[str]] = None
+    all: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _one_selection(self):
+        if (self.document_ids is None) == (self.all is not True):
+            raise ValueError("give either document_ids or \"all\": true")
+        if self.document_ids is not None and self.all is not None:
+            raise ValueError("give either document_ids or \"all\": true, not both")
+        return self
+
+
+class PrepareStartRequest(_PrepareSelection):
+    pass
+
+
+class PrepareImportRequest(_PrepareSelection):
+    collection: CollectionName
+    strategy: ChunkingStrategy = "overlap"
+    chunk_size: ChunkSize = 1000
+    chunk_overlap: NonnegativeSize = 200
+    similarity_threshold: UnitInterval = 0.85
+    min_chunk_size: MinChunkSize = 100
+
+    @model_validator(mode="after")
+    def _overlap_rule(self):
+        if self.strategy in ("overlap", "language") and self.chunk_overlap >= self.chunk_size:
+            raise ValueError(OVERLAP_RULE)
+        return self
+
+
+class PrepareJobEntry(ListedTimes):
+    job_id: str
+    status: str
+    documents_total: int = 0
+    documents_completed: int = 0
+    documents_failed: int = 0
+    document_ids: list[str] = []
+    names: list[str] = []
+    current: Optional[dict] = None
+    errors: list[str] = []
+
+
+class PrepareJobList(BaseModel):
+    jobs: list[PrepareJobEntry]

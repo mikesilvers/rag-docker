@@ -76,6 +76,8 @@ api_get()  { _rag_require_lock_owner; curl -s -m 120 "$API$1"; }
 api_code() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -w '%{http_code}' "$@"; }
 api_post() { _rag_require_lock_owner; curl -s -m 600 -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
 api_post_code() { _rag_require_lock_owner; curl -s -o /dev/null -m 600 -w '%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -d "$2"; }
+# Any other request, headers and body included: pass curl's own arguments and a full URL.
+api_request() { _rag_require_lock_owner; curl -s -m 120 "$@"; }
 
 require_stack() {
   local code
@@ -85,6 +87,58 @@ require_stack() {
     printf '  Start the verify project first:  bash scripts/verify/stack.sh up\n\n'
     exit 2
   fi
+  auth_ensure
+}
+
+# ── test accounts (#25) ──────────────────────────────────────────────────────
+# Every API route but /health and the login needs a session. auth_setup.py keeps
+# one account per role (vfy-engineer, vfy-developer, vfy-end-user) with its
+# password in $RAG_AUTH_DIR/credentials (mode 0600, folder 0700, outside the
+# checkout), never printed, on a command line or in the environment. It runs
+# the operator command (`python -m auth`) only when the target is the verify
+# project as stack.sh sets it up, the same condition as removing its volumes;
+# anywhere else a password that doesn't work is a failure, never a reset.
+#
+# The suites then send the engineer's session with every request: the curl
+# function below adds the cookie jar and a same-origin Origin (the API refuses a
+# cookie-authenticated change without one) to every curl call in a suite,
+# api_* helpers included. A check that needs no session, another role or another
+# origin calls `command curl` and passes its own. Python helpers read the same
+# jar through auth_headers.py.
+RAG_AUTH_DIR="${RAG_AUTH_DIR:-$(printf '%s' "${TMPDIR:-/tmp}" | sed 's:/*$::')/rag-verify-auth-$(id -u)}"
+# The script that does it; test_verify_stack.py's sandboxes, which stub docker
+# and curl, put a stand-in here. The --operator condition below stays lib.sh's.
+RAG_AUTH_SETUP="${RAG_AUTH_SETUP:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/auth_setup.py}"
+RAG_AUTH_ORIGIN=$(python3 -c 'import sys; from urllib.parse import urlsplit; u = urlsplit(sys.argv[1]); print(u.scheme + "://" + u.netloc)' "$API")
+export RAG_AUTH_DIR RAG_AUTH_ORIGIN
+
+curl() {
+  if [ -n "${RAG_AUTH_JAR:-}" ]; then
+    command curl -b "$RAG_AUTH_JAR" -H "Origin: $RAG_AUTH_ORIGIN" "$@"
+  else
+    command curl "$@"
+  fi
+}
+
+# auth_jar <role>: logs the role's test account in and prints its cookie jar.
+auth_jar() {
+  local jar="$RAG_AUTH_DIR/$1.jar"
+  _rag_require_lock_owner
+  python3 "$RAG_AUTH_SETUP" login "$1" "$jar" || return 1
+  printf '%s' "$jar"
+}
+
+auth_ensure() {
+  local operator="" jar
+  _rag_require_lock_owner
+  [ -n "$(volume_removal_refusal_reason)" ] || operator=--operator
+  if ! python3 "$RAG_AUTH_SETUP" ensure $operator; then
+    printf '\n  Could not set up the test accounts on %s (see above).\n\n' "$API"
+    exit 2
+  fi
+  jar=$(auth_jar engineer) || { printf '\n  The test engineer could not log in.\n\n'; exit 2; }
+  RAG_AUTH_JAR="$jar"
+  export RAG_AUTH_JAR
 }
 
 # wait_for_job <url-path> [timeout-seconds] — polls until status is terminal.
@@ -194,6 +248,30 @@ restart_refusal_reason() {
   fi
 }
 
+# Prints why removing the project's volumes (`docker compose down -v`) must not
+# run here, or nothing (#465). Only the verify project as stack.sh sets it up:
+# COMPOSE_PROJECT_NAME rag-verify and a COMPOSE_FILE that includes the overlay
+# docker-compose.verify.yml, whose model volume is external and so kept. Any
+# other project would lose all its volumes, models included.
+volume_removal_refusal_reason() {
+  local reason sep="${COMPOSE_PATH_SEPARATOR:-:}" rest entry
+  reason=$(restart_refusal_reason)
+  if [ -n "$reason" ]; then printf '%s' "$reason"; return 0; fi
+  if [ "$COMPOSE_PROJECT_NAME" != rag-verify ]; then
+    printf "volumes are removed only on the verify project rag-verify, not '%s'; run it through scripts/verify/stack.sh" "$COMPOSE_PROJECT_NAME"
+    return 0
+  fi
+  # Split as compose splits COMPOSE_FILE; only that exact file name counts.
+  rest="${COMPOSE_FILE:-}"
+  while [ -n "$rest" ]; do
+    entry="${rest%%"$sep"*}"
+    [ "${entry##*/}" = docker-compose.verify.yml ] && return 0
+    [ "$entry" = "$rest" ] && break
+    rest="${rest#*"$sep"}"
+  done
+  printf 'COMPOSE_FILE does not include docker-compose.verify.yml, whose model volume is kept; run it through scripts/verify/stack.sh'
+}
+
 # Default for RAG_RESTART_LIMIT_S (#130): Weaviate's start_period in
 # docker-compose.yml plus 60s for `down` and the api's own start.
 RESTART_LIMIT_DEFAULT_S=240
@@ -204,9 +282,9 @@ restart_limit() {
   local value="${RAG_RESTART_LIMIT_S:-$RESTART_LIMIT_DEFAULT_S}"
   case "$value" in
     ''|*[!0-9]*) ;;
-    *) if [ "$((10#$value))" -gt 0 ]; then printf '%s' "$((10#$value))"; return 0; fi ;;
+    *) if [ "${#value}" -le 6 ] && [ "$((10#$value))" -gt 0 ]; then printf '%s' "$((10#$value))"; return 0; fi ;;
   esac
-  printf "RAG_RESTART_LIMIT_S must be a positive whole number of seconds, not '%s'" "$value"
+  printf "RAG_RESTART_LIMIT_S must be a positive whole number of seconds (at most 6 digits), not '%s'" "$value"
   return 1
 }
 

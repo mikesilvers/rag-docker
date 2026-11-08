@@ -2,6 +2,11 @@ import { JobStatus } from '../api/client'
 
 export default function ProgressPanel({ job }: { job: JobStatus }) {
   const pct = job.files_total > 0 ? Math.round((job.files_completed / job.files_total) * 100) : 0
+  // Shown only when sending, acknowledgement and the check disagree (#302), so a
+  // clean job looks as it always did. Older records carry no counts at all.
+  const counted = typeof job.chunks_submitted === 'number' && typeof job.chunks_accepted === 'number'
+  const writesDiffer = counted &&
+    !(job.chunks_submitted === job.chunks_stored && job.chunks_accepted === job.chunks_stored)
   return (
     <div className="mt-4 p-4 border rounded bg-gray-50">
       <div className="flex justify-between text-sm mb-1">
@@ -14,17 +19,42 @@ export default function ProgressPanel({ job }: { job: JobStatus }) {
       <div className="w-full bg-gray-200 rounded h-2">
         <div className="bg-blue-500 h-2 rounded transition-all" style={{ width: `${pct}%` }} />
       </div>
+      {writesDiffer && (
+        <p className="mt-2 text-xs text-gray-600">
+          Submitted {job.chunks_submitted} · accepted {job.chunks_accepted} · stored {job.chunks_stored}
+        </p>
+      )}
+      {(job.chunks_replaced ?? 0) > 0 && (
+        // Re-ingesting a name replaces its chunks (#22), so the total can stay
+        // the same while the content changed.
+        <p className="mt-2 text-xs text-gray-600">
+          Replaced {job.chunks_replaced} chunk{job.chunks_replaced === 1 ? '' : 's'} from a previous version
+        </p>
+      )}
       {job.errors.length > 0 && (
         <ul className="mt-2 text-xs text-red-600 space-y-1">
           {job.errors.map((e, i) => <li key={i}>{e}</li>)}
         </ul>
       )}
+      {(job.split?.length ?? 0) > 0 && (
+        // A file over the per-file limits is stored as parts named
+        // `<name> (part N)` (#621); not a failure, but the names differ.
+        <div className="mt-2 text-xs text-gray-700" data-testid="split-files">
+          <p className="font-medium">
+            {job.split!.length} file{job.split!.length === 1 ? '' : 's'} split into parts:
+          </p>
+          <ul className="space-y-1 mt-1">
+            {job.split!.map((f, i) => <li key={i}>{f}</li>)}
+          </ul>
+        </div>
+      )}
       {(job.skipped?.length ?? 0) > 0 && (
         // Skipped files are never counted in files_total, so without this the
-        // count simply reads lower than what the user uploaded.
+        // count simply reads lower than what the user uploaded. Each entry
+        // says why: an unsupported type, or a later file with the same name.
         <div className="mt-2 text-xs text-amber-700">
           <p className="font-medium">
-            {job.skipped!.length} file{job.skipped!.length === 1 ? '' : 's'} skipped — not a supported type:
+            {job.skipped!.length} file{job.skipped!.length === 1 ? '' : 's'} skipped:
           </p>
           <ul className="space-y-1 mt-1">
             {job.skipped!.map((f, i) => <li key={i}>{f}</li>)}

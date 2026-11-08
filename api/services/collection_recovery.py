@@ -5,6 +5,7 @@ allows startup to remove scratch; recovery records survive until explicit
 collection deletion or successful completion of their owning operation.
 """
 from __future__ import annotations
+from services import telemetry
 
 import json
 import logging
@@ -58,7 +59,7 @@ def begin(target: str, operation: str, client) -> dict:
     token = uuid.uuid4().hex
     marker = "__importing_" if operation == "import" else "__tuning_"
     staging = f"{target}{marker}{token}"
-    if client.collections.exists(staging):
+    if telemetry.call("weaviate.exists", client.collections.exists, staging):
         raise RuntimeError(f"Recovery name '{staging}' is already in use")
     record = dict(version=1, operation_id=token, operation=operation,
                   target=target, staging=staging, state="scratch")
@@ -80,8 +81,10 @@ def retain(record: dict, *, package: Path | None = None, source_collection: str 
     metadata.mkdir()
     target, staging = source_collection or record["target"], record["staging"]
     upload = Path(settings.upload_dir)
-    _copy(package / "sources" if package else sources.collection_dir(target),
-          sources.collection_dir(staging))
+    if package is not None:
+        sources.restore_package(package, staging)
+    else:
+        _copy(sources.collection_dir(target), sources.collection_dir(staging))
     for kind in ("ingest", "retrieval"):
         origin = package / f"{kind}_config.json" if package else upload / f"{kind}_configs" / f"{target}.json"
         _copy(origin, metadata / f"{kind}_config.json")
@@ -127,6 +130,57 @@ def retain(record: dict, *, package: Path | None = None, source_collection: str 
     record.update(updated)
 
 
+def cutover_description(record: dict) -> str:
+    return "rag-tune:" + record["operation_id"]
+
+
+def begin_cutover(record: dict) -> None:
+    """Persist final-write intent before deleting a tuning target."""
+    updated = {**record, "cutover_pending": True}
+    _write(updated)
+    record.update(updated)
+
+
+def _finish_cutover_check(record: dict, outcome: str) -> None:
+    """Retire only the check; recovery data remains available for inspection."""
+    updated = {**record, "cutover_pending": False, "cutover_checked": outcome}
+    _write(updated)
+    record.update(updated)
+
+
+def _check_tuning_cutover(record: dict, client) -> None:
+    """Check the owned target without deleting data based on mutable recovery."""
+    from services import batch_write, goldstandard
+    target, staging = record["target"], record["staging"]
+    if not telemetry.call("weaviate.exists", client.collections.exists, staging):
+        log.warning("Tuning recovery %r is unavailable; target and journal preserved", staging)
+        return
+    if telemetry.call("weaviate.exists", client.collections.exists, target):
+        collection = client.collections.get(target)
+        if telemetry.call("weaviate.config", collection.config.get).description != cutover_description(record):
+            log.warning("Tuning target %r has another instance; preserved", target)
+            _finish_cutover_check(record, "other-instance")
+            return
+        def expected():
+            for obj in telemetry.iterate(client.collections.get(staging).iterator, include_vector=True):
+                vector = obj.vector
+                if isinstance(vector, dict):
+                    if set(vector) != {"default"}:
+                        raise ValueError("Unsupported recovery vectors")
+                    vector = vector["default"]
+                yield {"id": str(obj.uuid), "properties": dict(obj.properties or {}), "vector": vector}
+        try:
+            batch_write.verify(collection, expected, exact=True)
+            _finish_cutover_check(record, "complete")
+            return  # Fully written target: no historical flag or deletion.
+        except batch_write.BatchVerificationError:
+            goldstandard.mark_stale(target, "interrupted tuning final write; verified recovery retained")
+            log.warning("Incomplete owned tuning target %r; target and recovery %r preserved for inspection", target, staging)
+    else:
+        goldstandard.mark_stale(target, "interrupted tuning cutover; verified recovery retained")
+    _finish_cutover_check(record, "stale")
+
+
 def sidecar_reference(record: dict) -> str:
     """The snapshot directory relative to UPLOAD_DIR, for job error details.
 
@@ -149,8 +203,8 @@ def discard(record: dict, client) -> None:
         _write(updated)
         record.update(updated)
     name = record["staging"]
-    if client.collections.exists(name):
-        client.collections.delete(name)
+    if telemetry.call("weaviate.exists", client.collections.exists, name):
+        telemetry.call("weaviate.delete", client.collections.delete, name)
     sources.delete(name)
     if sources.collection_dir(name).exists():
         raise OSError(f"Could not remove recovery sources for {name}")
@@ -175,7 +229,9 @@ def _read_owned_record(path: Path) -> dict:
             or not re.fullmatch(r"[0-9a-f]{32}", token)
             or path.name != f"{token}.json" or not _NAME.fullmatch(record["target"])
             or record["staging"] != f"{record['target']}{marker}{token}"
-            or record["state"] not in ("scratch", "recovery", "cleanup")):
+            or record["state"] not in ("scratch", "recovery", "cleanup")
+            or ("cutover_pending" in record and (type(record["cutover_pending"]) is not bool
+                                                  or operation != "tune"))):
         raise ValueError("Invalid collection ownership record")
     return record
 
@@ -202,6 +258,8 @@ def sweep(client) -> list[str]:
         try:
             record = _read_owned_record(path)
             if record["state"] == "recovery":
+                if record.get("cutover_pending"):
+                    _check_tuning_cutover(record, client)
                 log.warning("Retained recovery collection %r; sidecar snapshots: %s",
                             record["staging"], _root() / record["operation_id"])
                 continue

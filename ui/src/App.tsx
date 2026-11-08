@@ -1,16 +1,16 @@
 import { BrowserRouter } from 'react-router-dom'
-import { RoleProvider } from './context/RoleContext'
+import { AuthProvider } from './context/AuthContext'
 import { QueryConfigProvider } from './context/QueryConfigContext'
 import AppRouter from './router'
 
 export default function App() {
   return (
     <BrowserRouter>
-      <RoleProvider>
+      <AuthProvider>
         <QueryConfigProvider>
           <AppRouter />
         </QueryConfigProvider>
-      </RoleProvider>
+      </AuthProvider>
     </BrowserRouter>
   )
 }

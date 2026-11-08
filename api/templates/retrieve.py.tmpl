@@ -5,14 +5,22 @@ The defaults below are the settings this collection was tuned with. Every one
 can be overridden with a flag. Standard library only, on purpose: this has to
 run on an air-gapped machine where `pip install` is not an option.
 
+The API needs an account (#25): pass --username, and type the password when
+asked, or give it on standard input with --password-stdin. It is never a flag
+or an environment variable, so it can't end up in the process list or a shell
+history. The script logs in, asks, and logs out again.
+
 Exit codes: 0 ok, 2 bad usage, 3 API unreachable, 4 collection absent,
-5 API returned an error.
+5 API returned an error (a refused login too).
 """
 
 import argparse
+import getpass
 import json
+import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # ── Baked in at export from the collection's saved retrieval settings ─────────
@@ -33,6 +41,7 @@ DEFAULT_TIMEOUT_SECONDS = 600
 # the API is down the proxy answers with a gateway error rather than refusing
 # the connection. That is still "unreachable", not "the API rejected this".
 GATEWAY_STATUSES = (502, 503, 504)
+SESSION_COOKIE = "rag_session"
 
 
 def build_parser():
@@ -60,6 +69,12 @@ def build_parser():
                    help="print the raw API response instead of formatted text")
     p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS,
                    help="seconds to wait for an answer (default: %(default)s)")
+    p.add_argument("--username", default=os.environ.get("RAG_USERNAME"),
+                   help="the account to log in with; any role may query "
+                        "(default: $RAG_USERNAME)")
+    p.add_argument("--password-stdin", action="store_true",
+                   help="read the password from the first line of standard input "
+                        "instead of asking for it")
     return p
 
 
@@ -69,41 +84,35 @@ def fail(code, message, hint):
     return code
 
 
-def main(argv=None):
-    args = build_parser().parse_args(argv)
+def session_token(set_cookies):
+    """The session cookie's value from a login's Set-Cookie headers, or None."""
+    for header in set_cookies:
+        name, _, rest = header.partition("=")
+        if name.strip() == SESSION_COOKIE:
+            return rest.split(";", 1)[0] or None
+    return None
 
-    if not args.question.strip():
-        return fail(2, "The question is empty.",
-                    'Pass it as one argument, e.g. retrieve.py "who approves overtime?"')
-    if not 1 <= args.top_k <= 50:
-        return fail(2, "--top-k must be between 1 and 50, got %d." % args.top_k,
-                    "The collection was exported with --top-k %s." % DEFAULT_TOP_K)
-    if not 0.0 <= args.alpha <= 1.0:
-        return fail(2, "--alpha must be between 0.0 and 1.0, got %s." % args.alpha,
-                    "0 is pure keyword matching, 1 is pure meaning.")
-    if args.timeout <= 0:
-        return fail(2, "--timeout must be greater than 0, got %s." % args.timeout,
-                    "It is a number of seconds to wait for the answer.")
 
-    url = args.api_url.rstrip("/") + "/query"
-    payload = json.dumps({
-        "question": args.question,
-        "collection": args.collection,
-        "retrieval_mode": args.mode,
-        "top_k": args.top_k,
-        "alpha": args.alpha,
-        "include_citations": bool(args.citations),
-        "response_format": args.response_format,
-    }).encode("utf-8")
+def logout(base, headers):
+    """End the session; a failure here changes nothing about the answer."""
+    try:
+        request = urllib.request.Request(base + "/auth/logout", data=b"", method="POST", headers=headers)
+        urllib.request.urlopen(request, timeout=10).close()
+    except Exception:
+        pass
 
+
+def post(args, url, payload, headers, refused):
+    """(parsed JSON body, Set-Cookie headers), or the exit code once the failure
+    is reported. `refused` begins the sentence for an error the API returns."""
     request = urllib.request.Request(
-        url, data=payload, method="POST",
-        headers={"Content-Type": "application/json"},
+        url, data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers=dict(headers, **{"Content-Type": "application/json"}),
     )
-
     try:
         with urllib.request.urlopen(request, timeout=args.timeout) as response:
-            body = json.loads(response.read().decode("utf-8"))
+            cookies = response.headers.get_all("Set-Cookie") or []
+            return json.loads(response.read().decode("utf-8")), cookies
     except urllib.error.HTTPError as exc:
         # A rag-docker error carries {"error": {"code", "message", "detail"}};
         # anything else is some other server that happened to answer.
@@ -126,12 +135,19 @@ def main(argv=None):
             return fail(5, "No rag-docker API answered at %s." % url,
                         "Something responded but it is not this API. Check "
                         "--api-url; it should end in /api.")
-        if exc.code in GATEWAY_STATUSES:
+        if exc.code in GATEWAY_STATUSES and code != "SETUP_REQUIRED":
             return fail(3, "The API is not responding behind %s (HTTP %s)."
                         % (args.api_url, exc.code),
                         "The proxy is up but the API is not. Check it with "
                         "`docker compose ps` and start it with `docker compose up -d`.")
-        return fail(5, "The API rejected the query: %s" % message,
+        if code == "AUTH_REQUIRED":
+            return fail(5, "%s: %s" % (refused, message),
+                        "The API needs an account: pass --username, and the password "
+                        "when asked or with --password-stdin.")
+        if code == "PASSWORD_CHANGE_REQUIRED":
+            return fail(5, "%s: %s" % (refused, message),
+                        "Log in to the web UI once and choose your own password.")
+        return fail(5, "%s: %s" % (refused, message),
                     "HTTP %s from %s." % (exc.code, url))
     except urllib.error.URLError as exc:
         # URLError subclasses OSError and wraps socket errors, so a connect
@@ -154,6 +170,73 @@ def main(argv=None):
     except ValueError:
         return fail(5, "The API returned a response that is not JSON.",
                     "Check that %s is a rag-docker API and not something else." % args.api_url)
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    if not args.question.strip():
+        return fail(2, "The question is empty.",
+                    'Pass it as one argument, e.g. retrieve.py "who approves overtime?"')
+    if not 1 <= args.top_k <= 50:
+        return fail(2, "--top-k must be between 1 and 50, got %d." % args.top_k,
+                    "The collection was exported with --top-k %s." % DEFAULT_TOP_K)
+    if not 0.0 <= args.alpha <= 1.0:
+        return fail(2, "--alpha must be between 0.0 and 1.0, got %s." % args.alpha,
+                    "0 is pure keyword matching, 1 is pure meaning.")
+    if args.timeout <= 0:
+        return fail(2, "--timeout must be greater than 0, got %s." % args.timeout,
+                    "It is a number of seconds to wait for the answer.")
+
+    if args.password_stdin and not args.username:
+        return fail(2, "--password-stdin needs --username.",
+                    "Pass the account to log in with, e.g. --username alice.")
+
+    base = args.api_url.rstrip("/")
+    url = base + "/query"
+    parts = urllib.parse.urlsplit(base)
+    # The API refuses a logged-in change (a POST) that doesn't say it comes from
+    # its own origin, as a browser would.
+    headers = {"Origin": "%s://%s" % (parts.scheme, parts.netloc)}
+
+    if args.username:
+        if args.password_stdin:
+            password = sys.stdin.readline().rstrip("\r\n")
+        else:
+            try:
+                password = getpass.getpass("Password for %s: " % args.username)
+            except (EOFError, KeyboardInterrupt):
+                password = ""
+        if not password:
+            return fail(2, "No password was given.",
+                        "Type it when asked, or pipe it in with --password-stdin.")
+        answer = post(args, base + "/auth/login", {"username": args.username, "password": password},
+                      headers, "The login was refused")
+        if isinstance(answer, int):
+            return answer
+        token = session_token(answer[1])
+        if token is None:
+            return fail(5, "The API did not start a session.",
+                        "Check that %s is a rag-docker API." % args.api_url)
+        headers["Cookie"] = "%s=%s" % (SESSION_COOKIE, token)
+
+    payload = {
+        "question": args.question,
+        "collection": args.collection,
+        "retrieval_mode": args.mode,
+        "top_k": args.top_k,
+        "alpha": args.alpha,
+        "include_citations": bool(args.citations),
+        "response_format": args.response_format,
+    }
+    try:
+        answer = post(args, url, payload, headers, "The API rejected the query")
+    finally:
+        if "Cookie" in headers:
+            logout(base, headers)
+    if isinstance(answer, int):
+        return answer
+    body = answer[0]
 
     if args.json:
         print(json.dumps(body, indent=2))

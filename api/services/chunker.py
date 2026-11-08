@@ -1,4 +1,5 @@
 from __future__ import annotations
+from services import telemetry
 import threading
 from typing import Any
 from models.schemas import IngestConfig
@@ -21,6 +22,19 @@ MAX_SEMANTIC_SENTENCES = 10 * MAX_CHUNKS_PER_FILE
 # or embedding: the count caps alone still let a size-based splitter or the
 # embedding model spend minutes on a huge file before refusing it.
 MAX_TEXT_CHARACTERS = MAX_OVERLAP_OUTPUT_CHARACTERS
+
+
+class ChunkLimitError(ValueError):
+    """A file's text or chunks over a per-file limit that splitting into parts
+    resolves (#621): the text limit, the chunk count and the overlap window limits.
+    The semantic sentence limit and settings errors stay plain ValueError. `kind`
+    is "text", "chunks" (the chunk count or overlap windows) or "overlap" (the
+    overlap text across windows)."""
+
+    def __init__(self, message: str, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
 
 _semantic_model = None
 _semantic_model_lock = threading.Lock()
@@ -76,9 +90,10 @@ def _cap_chunk_length(chunks: list[str]) -> list[str]:
 
 def _check_chunk_count(count: int, strategy: str, unit: str = "chunks") -> None:
     if count > MAX_CHUNKS_PER_FILE:
-        raise ValueError(
+        raise ChunkLimitError(
             f"{strategy} chunking exceeds the per-file limit: {count} {unit} "
-            f"(maximum {MAX_CHUNKS_PER_FILE}). Use a larger chunk size or split the file.")
+            f"(maximum {MAX_CHUNKS_PER_FILE}). Use a larger chunk size or split the file.",
+            "chunks")
 
 
 def chunk_fixed(text: str, chunk_size: int, min_chunk_size: int) -> list[str]:
@@ -107,10 +122,11 @@ def chunk_overlap(text: str, chunk_size: int, chunk_overlap: int, min_chunk_size
     # limits are conservative before the optional tail merge removes overlap.
     output_characters = len(text) + (windows - 1) * chunk_overlap
     if windows > MAX_OVERLAP_WINDOWS or output_characters > MAX_OVERLAP_OUTPUT_CHARACTERS:
-        raise ValueError(
+        raise ChunkLimitError(
             f"Overlap output exceeds per-file limit: {windows} pre-merge windows "
             f"(maximum {MAX_OVERLAP_WINDOWS}), {output_characters} characters "
-            f"(maximum {MAX_OVERLAP_OUTPUT_CHARACTERS}). Reduce overlap or input size.")
+            f"(maximum {MAX_OVERLAP_OUTPUT_CHARACTERS}). Reduce overlap or input size.",
+            "chunks" if windows > MAX_OVERLAP_WINDOWS else "overlap")
 
     chunks: list[str] = []
     start = 0
@@ -213,6 +229,7 @@ def chunk_semantic(
     return _enforce_min_chunk_size(chunks, max(min_chunk_size, MIN_SEMANTIC_CHUNK_CHARACTERS))
 
 
+@telemetry.traced("rag.chunk")
 def chunk(
     text: str,
     strategy: str,
@@ -230,9 +247,9 @@ def chunk(
     similarity_threshold = config.similarity_threshold if config.similarity_threshold is not None else 0.85
     text_length = len(text) if elements is None else sum(len(str(el)) for el in elements)
     if text_length > MAX_TEXT_CHARACTERS:
-        raise ValueError(
+        raise ChunkLimitError(
             f"{strategy} chunking exceeds the per-file limit: {text_length} characters "
-            f"(maximum {MAX_TEXT_CHARACTERS}). Split the file.")
+            f"(maximum {MAX_TEXT_CHARACTERS}). Split the file.", "text")
     if strategy in ("fixed", "language", "context_aware"):
         # These split by size, so the count is known before splitting. Refuse
         # an oversized file before the splitter allocates every chunk.

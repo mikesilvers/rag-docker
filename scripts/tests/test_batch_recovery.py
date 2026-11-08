@@ -1,5 +1,7 @@
 """Controlled final-flush faults against real writer and recovery services."""
+import asyncio
 import copy
+import hashlib
 import json
 import os
 import sys
@@ -11,7 +13,7 @@ from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
 from config import settings
@@ -33,6 +35,10 @@ class Batch:
         self.failed_objects = []
         self.pending = []
         return self
+
+    def fixed_size(self, batch_size, concurrent_requests):
+        # Vectorless writes use bounded batches (#613); same fake behaviour.
+        return self.dynamic()
 
     def __enter__(self):
         return self
@@ -280,7 +286,8 @@ class RecoveryTests(unittest.TestCase):
         before = copy.deepcopy(self.cols.get(name).rows)
         recovery.sweep(self.client)
         self.assertEqual(self.cols.get(name).rows, before)
-        self.assertEqual((Path(settings.sources_dir) / name / 'source-blob').read_bytes(), b'original source')
+        blob = hashlib.sha256(b'original source').hexdigest() if record['operation'] == 'import' else 'source-blob'
+        self.assertEqual((Path(settings.sources_dir) / name / blob).read_bytes(), b'original source')
         metadata = recovery._root() / record['operation_id']
         self.assertTrue((metadata / 'goldstandard' / 'gs_0123abcd.json').is_file())
         for kind in ('ingest', 'retrieval'):
@@ -367,7 +374,9 @@ class RecoveryTests(unittest.TestCase):
         (pkg / 'chunks.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in self.original))
         source = pkg / 'sources'
         source.mkdir(exist_ok=True)
-        (source / 'source-blob').write_bytes(b'original source')
+        digest = hashlib.sha256(b'original source').hexdigest()
+        (source / digest).write_bytes(b'original source')
+        (source / 'index.json').write_text(json.dumps({'version': 1, 'documents': {digest: {'filenames': ['source.txt']}}}))
         for kind in ('ingest', 'retrieval'):
             (pkg / f'{kind}_config.json').write_text(json.dumps({'collection': 'Corpus', 'setting': kind}))
         gold = pkg / 'goldstandard'
@@ -395,6 +404,113 @@ class RecoveryTests(unittest.TestCase):
             importer._run('job', 'fixture.tar.gz', 'replace')
         return importer._jobs['job']
 
+    def test_interrupted_tuning_partial_target_is_checked_at_startup(self):
+        self.cols.interrupt = True
+        with self.assertRaises(KeyboardInterrupt):
+            self.rebuild()
+        record = self.recovery_record()
+        self.assertTrue(record['cutover_pending'])
+        self.cols.interrupt = False
+        self.cols.create('Corpus', description=recovery.cutover_description(record))
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            recovery.sweep(self.client)
+        self.assertTrue(self.cols.exists('Corpus'))
+        self.assertTrue(self.cols.exists(record['staging']))
+        stale.assert_called_once()
+
+    def test_interrupted_tuning_never_deletes_another_target_instance(self):
+        self.cols.interrupt = True
+        with self.assertRaises(KeyboardInterrupt):
+            self.rebuild()
+        record = self.recovery_record()
+        self.cols.interrupt = False
+        self.cols.create('Corpus', description='new user collection')
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            recovery.sweep(self.client)
+        self.assertTrue(self.cols.exists('Corpus'))
+        stale.assert_not_called()
+
+    def test_interrupted_tuning_keeps_complete_target_and_unreadable_state(self):
+        self.cols.interrupt = True
+        with self.assertRaises(KeyboardInterrupt):
+            self.rebuild()
+        record = self.recovery_record()
+        self.cols.interrupt = False
+        self.cols.create('Corpus', description=recovery.cutover_description(record))
+        self.cols.get('Corpus').rows = copy.deepcopy(self.cols.get(record['staging']).rows)
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            recovery.sweep(self.client)
+            self.assertTrue(self.cols.exists('Corpus'))
+            stale.assert_not_called()
+            self.cols.get('Corpus').fault = 'read'
+            recovery.sweep(self.client)
+            self.assertTrue(self.cols.exists('Corpus'))
+            stale.assert_not_called()
+
+    def interrupted_cutover(self):
+        self.cols.interrupt = True
+        with self.assertRaises(KeyboardInterrupt):
+            self.rebuild()
+        self.cols.interrupt = False
+        record = self.recovery_record()
+        self.cols.create('Corpus', description=recovery.cutover_description(record))
+        return record
+
+    def test_startup_check_flags_an_interrupted_cutover_only_once(self):
+        record = self.interrupted_cutover()
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            recovery.sweep(self.client)
+            recovery.sweep(self.client)
+        stale.assert_called_once_with('Corpus', 'interrupted tuning final write; verified recovery retained')
+        checked = self.recovery_record()
+        self.assertFalse(checked['cutover_pending'])
+        self.assertEqual(checked['cutover_checked'], 'stale')
+        self.assertTrue(self.cols.exists(record['staging']))
+        self.assertTrue(self.cols.exists('Corpus'))
+
+    def test_complete_cutover_is_not_rechecked_after_later_mutation(self):
+        record = self.interrupted_cutover()
+        self.cols.get('Corpus').rows = copy.deepcopy(self.cols.get(record['staging']).rows)
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            recovery.sweep(self.client)
+            self.assertEqual(self.recovery_record()['cutover_checked'], 'complete')
+            self.cols.get('Corpus').rows.clear()
+            with patch.object(batch_write, 'verify', side_effect=AssertionError('rechecked')) as verify:
+                recovery.sweep(self.client)
+                verify.assert_not_called()
+            stale.assert_not_called()
+
+    def test_other_instance_decision_is_retired_without_touching_sessions(self):
+        record = self.interrupted_cutover()
+        self.cols.get('Corpus').config = SimpleNamespace(get=lambda: SimpleNamespace(description='later'))
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            recovery.sweep(self.client)
+            recovery.sweep(self.client)
+            stale.assert_not_called()
+        self.assertEqual(self.recovery_record()['cutover_checked'], 'other-instance')
+        self.assertTrue(self.cols.exists(record['staging']))
+
+    def test_unreadable_cutover_stays_pending_until_check_can_finish(self):
+        record = self.interrupted_cutover()
+        self.cols.get('Corpus').fault = 'read'
+        recovery.sweep(self.client)
+        self.assertTrue(self.recovery_record()['cutover_pending'])
+        self.cols.get('Corpus').fault = None
+        with patch.object(tuning.goldstandard, 'mark_stale') as stale:
+            recovery.sweep(self.client)
+            recovery.sweep(self.client)
+            stale.assert_called_once()
+        self.assertFalse(self.recovery_record()['cutover_pending'])
+
+    def test_failed_outcome_write_keeps_cutover_pending_for_retry(self):
+        self.interrupted_cutover()
+        with patch.object(tuning.goldstandard, 'mark_stale'), patch.object(recovery, '_write', side_effect=OSError('disk full')):
+            recovery.sweep(self.client)
+        self.assertTrue(self.recovery_record()['cutover_pending'])
+        with patch.object(tuning.goldstandard, 'mark_stale'):
+            recovery.sweep(self.client)
+        self.assertFalse(self.recovery_record()['cutover_pending'])
+
     def test_import_replace_note_counts_canonical_and_alias_sessions(self):
         seen = []
         def sessions(name):
@@ -405,6 +521,28 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(job['status'], 'completed')
         self.assertEqual(set(seen), {'Corpus', 'corpus'})
         self.assertTrue(any('2 gold-standard session(s)' in note for note in job['notes']), job)
+
+    def assert_replace_note_count(self, by_spelling, expected):
+        # #180: the note counts retained sessions across both spellings, each session once.
+        with patch.object(importer.goldstandard, 'sessions_for',
+                          side_effect=lambda name: [{'session_id': sid} for sid in by_spelling.get(name, [])]):
+            job = self.import_replace()
+        self.assertEqual(job['status'], 'completed', job)
+        notes = [note for note in job['notes'] if 'gold-standard session(s) from the replaced' in note]
+        if expected:
+            self.assertEqual(len(notes), 1, job)
+            self.assertTrue(notes[0].startswith(f'{expected} gold-standard session(s)'), notes)
+        else:
+            self.assertEqual(notes, [], job)
+
+    def test_import_replace_note_counts_alias_only_sessions(self):
+        self.assert_replace_note_count({'corpus': ['gs_18000003']}, 1)
+
+    def test_import_replace_note_counts_a_session_under_both_spellings_once(self):
+        self.assert_replace_note_count({'Corpus': ['gs_18000004'], 'corpus': ['gs_18000004']}, 1)
+
+    def test_import_replace_without_retained_sessions_adds_no_note(self):
+        self.assert_replace_note_count({}, 0)
 
     def test_replace_final_create_and_batch_failure_survive_restart(self):
         for fault in ('create', 'reject', 'partial', 'properties', 'vector'):
@@ -420,6 +558,25 @@ class RecoveryTests(unittest.TestCase):
                 self.assertEqual(self.cols.get(record['staging']).rows, {r['id']: r for r in self.original})
                 self.assert_retained(record)
                 recovery.discard(record, self.client)
+
+    def test_failed_replace_recovery_excludes_unindexed_future_blob(self):
+        from services import sources
+        pkg, manifest = self.package()
+        future = b'future legitimate document'
+        digest = hashlib.sha256(future).hexdigest()
+        (pkg / 'sources' / digest).write_bytes(b'planted wrong bytes')
+        (pkg / 'sources' / 'extra-folder').mkdir()
+        self.cols.create_failure = True
+        with patch.object(self, 'package', return_value=(pkg, manifest)):
+            job = self.import_replace()
+        self.assertEqual(job['status'], 'failed')
+        recovered = job['error_detail']['recovered_as']
+        directory = sources.collection_dir(recovered)
+        self.assertEqual({p.name for p in directory.iterdir()},
+                         set(sources.load_index(recovered)['documents']) | {'index.json'})
+        self.assertFalse((directory / digest).exists())
+        sources.store(recovered, 'future.txt', future)
+        self.assertEqual((directory / digest).read_bytes(), future)
 
     def test_replace_restart_after_target_delete_preserves_staging(self):
         self.cols.interrupt = True
@@ -949,6 +1106,134 @@ class SourceCoverageTests(unittest.TestCase):
                 self.assertEqual([r["properties"]["content"] for r in cols.get("Corpus").rows.values()], ["retained original"])
                 self.assertEqual(set(cols.items), {"Corpus"})
                 self.assertEqual(list(recovery._root().glob("*.json")), [])
+
+
+    # Each case: retained originals as (name, bytes), stored chunks as
+    # (source_file, chunk_index) with None for no chunk_index, and the
+    # names the coverage rule must report.
+    DROP_CASES = {
+        # Stored before #22 made re-ingesting replace: one name, two versions.
+        "a name with two retained versions": (
+            [("a.txt", b"v1"), ("a.txt", b"v2")], [("a.txt", 0), ("a.txt", 1)], ["a.txt"]),
+        "re-upload whose retention failed": (
+            [("a.txt", b"v1")], [("a.txt", 0), ("a.txt", 1), ("a.txt", 0), ("a.txt", 1)], ["a.txt"]),
+        "identical re-upload, retained twice": (
+            [("a.txt", b"same"), ("a.txt", b"same")], [("a.txt", 0), ("a.txt", 0)], ["a.txt"]),
+        "two chunks with no chunk_index": (
+            [("a.txt", b"v1")], [("a.txt", None), ("a.txt", None)], ["a.txt"]),
+    }
+
+    @staticmethod
+    def corpus(cols, chunks):
+        cols.create("Corpus")
+        rows = records(len(chunks))
+        for row, (name, index) in zip(rows, chunks):
+            row["properties"]["source_file"] = name
+            if index is not None:
+                row["properties"]["chunk_index"] = index
+        cols.get("Corpus").rows = {r["id"]: copy.deepcopy(r) for r in rows}
+        return rows
+
+    def test_rechunk_refuses_names_it_would_drop(self):
+        from services import sources
+        chunking = {"strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0, "similarity_threshold": .85, "min_chunk_size": 0}
+        for operation in ("rechunk", "reembed"):
+            for case, (retained, chunks, expected) in self.DROP_CASES.items():
+                with self.subTest(operation=operation, case=case), tempfile.TemporaryDirectory() as tmp:
+                    cols = Collections()
+                    original = self.corpus(cols, chunks)
+                    with patch.object(settings, "upload_dir", tmp), patch.object(settings, "sources_dir", str(Path(tmp)/"sources")), patch.object(wc, "get_client", return_value=SimpleNamespace(collections=cols)):
+                        for name, data in retained:
+                            sources.store("Corpus", name, data)
+                        job = {}
+                        with patch.dict(tuning._jobs, {"coverage": job}), patch.object(tuning, "_parse_file") as parse:
+                            tuning._run("coverage", "Corpus", operation, {"chunking": dict(chunking)})
+                        self.assertEqual(job["status"], "failed")
+                        self.assertEqual(job["error_code"], "SOURCES_REQUIRED")
+                        self.assertEqual(job["error_detail"]["uncovered_source_files"], expected)
+                        parse.assert_not_called()
+                        self.assertEqual(cols.get("Corpus").rows, {r["id"]: r for r in original})
+                        self.assertEqual(cols.deleted, [])
+                        self.assertEqual(set(cols.items), {"Corpus"})
+                        self.assertEqual(list(recovery._root().glob("*.json")), [])
+
+    def test_single_chunk_set_per_name_completes(self):
+        from services import sources
+        with tempfile.TemporaryDirectory() as tmp:
+            cols = Collections()
+            self.corpus(cols, [("a.txt", 0), ("a.txt", 1), ("a.txt", 2)])
+            with patch.object(settings, "upload_dir", tmp), patch.object(settings, "sources_dir", str(Path(tmp)/"sources")), patch.object(wc, "get_client", return_value=SimpleNamespace(collections=cols)), patch.object(wc, "_create_collection_sync", side_effect=lambda name, *a, **kw: cols.create(name)), patch.object(wc, "_collection_config_sync", return_value={"index_type": "hnsw", "distance_metric": "cosine", "hnsw_config": {}}), patch.object(tuning, "_parse_file", side_effect=lambda p: (p.read_text(), [])), patch.object(tuning, "do_chunk", side_effect=lambda **kw: [kw["text"]]):
+                sources.store("Corpus", "a.txt", b"retained original")
+                job = {}
+                with patch.dict(tuning._jobs, {"coverage": job}):
+                    tuning._run("coverage", "Corpus", "rechunk", {"chunking": {"strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0, "similarity_threshold": .85, "min_chunk_size": 0}})
+                self.assertEqual(job["status"], "completed", job)
+                self.assertEqual([r["properties"]["source_file"] for r in cols.get("Corpus").rows.values()], ["a.txt"])
+
+
+    def test_second_name_for_the_same_content_is_rebuilt_under_both_names(self):
+        # #22 lifted this refusal: one chunk set per (digest, name), as ingested.
+        from services import sources
+        with tempfile.TemporaryDirectory() as tmp:
+            cols = Collections()
+            self.corpus(cols, [("a.txt", 0), ("docs/b.txt", 0)])
+            with patch.object(settings, "upload_dir", tmp), patch.object(settings, "sources_dir", str(Path(tmp)/"sources")), patch.object(wc, "get_client", return_value=SimpleNamespace(collections=cols)), patch.object(wc, "_create_collection_sync", side_effect=lambda name, *a, **kw: cols.create(name)), patch.object(wc, "_collection_config_sync", return_value={"index_type": "hnsw", "distance_metric": "cosine", "hnsw_config": {}}), patch.object(tuning, "_parse_file", side_effect=lambda p: (p.read_text(), [])), patch.object(tuning, "do_chunk", side_effect=lambda **kw: [kw["text"]]):
+                sources.store("Corpus", "a.txt", b"same original")
+                sources.store("Corpus", "docs/b.txt", b"same original")
+                job = {}
+                with patch.dict(tuning._jobs, {"coverage": job}):
+                    tuning._run("coverage", "Corpus", "rechunk", {"chunking": {"strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0, "similarity_threshold": .85, "min_chunk_size": 0}})
+                self.assertEqual(job["status"], "completed", job)
+                rows = cols.get("Corpus").rows.values()
+                self.assertEqual(sorted(r["properties"]["source_file"] for r in rows), ["a.txt", "docs/b.txt"])
+                self.assertEqual({r["properties"]["content"] for r in rows}, {"same original"})
+
+    def test_tune_options_match_the_refusal(self):
+        from routers import tuning as tuning_router
+        from services import sources
+        chunks_only = ("No original documents were retained, so this collection cannot be "
+                       "re-chunked. Re-embedding works from the stored chunk text, which "
+                       "leaves chunk boundaries unchanged.")
+        refused = ("Some stored source files have no single retained original, or a "
+                   "retained original is missing, so this collection cannot be "
+                   "re-chunked. Re-embedding works from the stored chunk text, which "
+                   "leaves chunk boundaries unchanged, and re-indexing is available.")
+        nothing_to_rebuild = ("No retained original file has stored chunks, so this collection "
+                              "cannot be re-chunked: there is nothing to rebuild. Re-embedding works "
+                              "from the stored chunk text, which leaves chunk boundaries unchanged, "
+                              "and re-indexing is available.")
+        two_versions = self.DROP_CASES["a name with two retained versions"]
+        repeated_set = self.DROP_CASES["re-upload whose retention failed"]
+        cases = {
+            "nothing retained": ([], [("a.txt", 0)], False, chunks_only, False),
+            "fully covered": ([("a.txt", b"v1")], [("a.txt", 0), ("a.txt", 1)], True,
+                              "Every tuning operation is available.", False),
+            "second name for the same content": ([("a.txt", b"same"), ("b.txt", b"same")],
+                                                  [("a.txt", 0), ("b.txt", 0)], True,
+                                                  "Every tuning operation is available.", False),
+            "a name with two retained versions": (two_versions[0], two_versions[1], False, refused, False),
+            "repeated chunk set": (repeated_set[0], repeated_set[1], False, refused, False),
+            "retained original missing from disk": ([("a.txt", b"v1")], [("a.txt", 0)], False, refused, True),
+            # #328: every retained file produced no chunks; the reason comes
+            # first, as the start refuses it before the others.
+            "retained originals with no stored chunks": ([("a.txt", b"v1")], [], False,
+                                                         nothing_to_rebuild, False),
+            "nothing to rebuild and a blob missing": ([("a.txt", b"v1")], [("b.txt", 0)], False,
+                                                      nothing_to_rebuild, True),
+        }
+        for case, (retained, chunks, can_rechunk, note, drop_blob) in cases.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                cols = Collections()
+                self.corpus(cols, chunks)
+                with patch.object(settings, "sources_dir", str(Path(tmp)/"sources")), patch.object(wc, "get_client", return_value=SimpleNamespace(collections=cols)), patch.object(tuning_router.wc, "collection_exists", new_callable=AsyncMock, return_value=True):
+                    for name, data in retained:
+                        digest = sources.store("Corpus", name, data)
+                    if drop_blob:
+                        sources.blob_path("Corpus", digest).unlink()
+                    response = asyncio.run(tuning_router.tune_options("Corpus"))
+                self.assertEqual(response.can_rechunk, can_rechunk)
+                self.assertEqual(response.note, note)
+                self.assertEqual(response.fidelity, "with-sources" if retained else "chunks-only")
 
 
 if __name__ == '__main__':

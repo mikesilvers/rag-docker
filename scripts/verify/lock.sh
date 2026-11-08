@@ -42,6 +42,8 @@ _rag_lock_owner_ok() {
   [ ! -L "$lock" ] || return 1
   owner=$(cat "$lock/pid" 2>/dev/null) || return 1
   case "$owner" in ''|*[!0-9]*) return 1 ;; esac
+  # PID 1 is every orphan’s ancestor; it cannot authorize this run.
+  [ "${#owner}" -le 10 ] && [ "$owner" -gt 1 ] || return 1
   pid=$$
   while [ "$steps" -lt 64 ]; do
     [ "$pid" = "$owner" ] && return 0

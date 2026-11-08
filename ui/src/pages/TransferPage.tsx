@@ -1,8 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
-  api, CollectionInfo, ExportJob, ImportJob, PackageSummary, TuneOptions,
+  api, CollectionInfo, ExportJob, ExportJobEntry, ImportJob, ImportJobEntry, PackageSummary, TuneOptions,
 } from '../api/client'
+import { useRole } from '../context/AuthContext'
+import JobList, { JobRow, newestToOpen, useJobList } from '../components/JobList'
+
+// A transfer job is running until it completes or fails (#617).
+const transferRunning = (j: { status: string }) => j.status !== 'completed' && j.status !== 'failed'
+const loadExportJobs = () => api.listExportJobs().then(r => r.jobs)
+const loadImportJobs = () => api.listImportJobs().then(r => r.jobs)
+
+// Newest first by start time, else by finish time, as the API orders each list.
+function newestFirst(a: { created_at: string | null; finished_at: string | null },
+                     b: { created_at: string | null; finished_at: string | null }): number {
+  const at = (j: typeof a) => Date.parse(j.created_at ?? j.finished_at ?? '') || 0
+  return at(b) - at(a)
+}
 
 function sizeLabel(bytes: number | null): string {
   if (bytes === null) return ''
@@ -15,95 +29,274 @@ function sizeLabel(bytes: number | null): string {
 const CONFLICT = [
   { id: 'abort', label: 'Abort', description: 'Fail if a collection of that name already exists. Nothing is changed.' },
   { id: 'rename', label: 'Rename', description: 'Import alongside the existing one, under a new name the API reports back.' },
-  { id: 'replace', label: 'Replace', description: 'Overwrite the existing collection — but only after this package is proven to import cleanly, so a failure leaves it intact.' },
+  { id: 'replace', label: 'Replace', description: 'Overwrite the existing collection — but only after this package is proven to import cleanly. A failure while the final copy is built can leave the name missing; the data is then kept in a recovery collection the error names.' },
 ]
 
+// Both halves poll their job every 2 s. A failed poll is shown and retried;
+// after POLL_ATTEMPTS failures in a row (about a minute, long enough for an API
+// restart) the page stops watching that job and enables its button again, so
+// one transient 502 can no longer leave it stuck until a reload (#382).
+const POLL_MS = 2000
+const POLL_ATTEMPTS = 30
+
+// Passphrase bounds for an encrypted export, as the API checks them (#27).
+const PASSPHRASE_MIN = 12
+const PASSPHRASE_MAX = 1024
+
+// Characters, not UTF-16 units, as the API counts them.
+function charCount(s: string): number {
+  return Array.from(s).length
+}
+
+function message(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
+
 export default function TransferPage() {
+  const { role } = useRole()
+  // Running and recent exports and imports, in one list (#617). Each panel
+  // opens its own newest job on the first answer, unless it already has one.
+  const exportJobs = useJobList<ExportJobEntry>(loadExportJobs, transferRunning)
+  const importJobs = useJobList<ImportJobEntry>(loadImportJobs, transferRunning)
+  const exportTouched = useRef(false)
+  const importTouched = useRef(false)
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   const [collection, setCollection] = useState('')
   const [tune, setTune] = useState<TuneOptions | null>(null)
+  const [tuneError, setTuneError] = useState('')
   const [includeModels, setIncludeModels] = useState(false)
+  // Passphrases live only in this component's state, and are cleared once a
+  // job has started with them (#27).
+  const [encrypt, setEncrypt] = useState(false)
+  const [passphrase, setPassphrase] = useState('')
+  const [confirmPassphrase, setConfirmPassphrase] = useState('')
   const [exportJob, setExportJob] = useState<ExportJob | null>(null)
   const [exportError, setExportError] = useState('')
+  const [exportWatching, setExportWatching] = useState(false)
+  const [exportPollError, setExportPollError] = useState('')
 
   const [packages, setPackages] = useState<PackageSummary[]>([])
+  const [packagesError, setPackagesError] = useState('')
   const [filename, setFilename] = useState('')
   const [onConflict, setOnConflict] = useState('abort')
+  const [importPassphrase, setImportPassphrase] = useState('')
   const [importJob, setImportJob] = useState<ImportJob | null>(null)
   const [importError, setImportError] = useState('')
+  const [importWatching, setImportWatching] = useState(false)
+  const [importPollError, setImportPollError] = useState('')
 
   // Polling handles are kept so a job that finishes, or a page that unmounts,
-  // does not leave a timer running against a job nobody is watching.
+  // does not leave a timer running against a job nobody is watching. The job
+  // id being polled is kept too: a poll that answers after the page unmounted,
+  // or after it stopped watching that job, schedules nothing and changes nothing.
+  const alive = useRef(true)
   const exportTimer = useRef<number | null>(null)
   const importTimer = useRef<number | null>(null)
+  const exportPoll = useRef<string | null>(null)
+  const importPoll = useRef<string | null>(null)
 
   const loadPackages = useCallback(() => {
-    api.getPackages().then(r => setPackages(r.packages)).catch(() => {})
+    api.getPackages().then(r => {
+      setPackages(r.packages)
+      setPackagesError('')
+    }, (e: unknown) => setPackagesError(`Could not list the packages in ./exports: ${message(e)}`))
   }, [])
 
   useEffect(() => {
+    alive.current = true
     api.getCollections().then(r => {
       setCollections(r.collections)
       if (r.collections.length > 0) setCollection(c => c || r.collections[0].name)
     }).catch(() => {})
     loadPackages()
     return () => {
+      alive.current = false
+      exportPoll.current = null
+      importPoll.current = null
       if (exportTimer.current) window.clearTimeout(exportTimer.current)
       if (importTimer.current) window.clearTimeout(importTimer.current)
     }
   }, [loadPackages])
 
   // Fidelity is shown before the export runs, so the choice is informed rather
-  // than discovered afterwards in the manifest.
+  // than discovered afterwards in the manifest. A lookup that fails says so
+  // instead of hiding the line, and an answer for a collection that is no
+  // longer selected is ignored.
   useEffect(() => {
-    if (!collection) { setTune(null); return }
-    api.getTuneOptions(collection).then(setTune).catch(() => setTune(null))
+    setTune(null); setTuneError('')
+    if (!collection) return
+    let current = true
+    api.getTuneOptions(collection).then(t => {
+      if (current) setTune(t)
+    }, (e: unknown) => {
+      if (current) setTuneError(message(e))
+    })
+    return () => { current = false }
   }, [collection])
 
-  function pollExport(jobId: string) {
+  function pollExport(jobId: string, failures = 0) {
     api.getExportJob(jobId).then(job => {
+      if (exportPoll.current !== jobId) return
       setExportJob(job)
+      setExportPollError('')
       if (job.status === 'completed' || job.status === 'failed') {
+        exportPoll.current = null
+        setExportWatching(false)
         loadPackages()
+        exportJobs.reload()
       } else {
-        exportTimer.current = window.setTimeout(() => pollExport(jobId), 2000)
+        exportTimer.current = window.setTimeout(() => pollExport(jobId), POLL_MS)
       }
-    }).catch((e: unknown) => setExportError(e instanceof Error ? e.message : String(e)))
+    }, (e: unknown) => {
+      if (exportPoll.current !== jobId) return
+      if (failures + 1 >= POLL_ATTEMPTS) {
+        exportPoll.current = null
+        setExportWatching(false)
+        setExportPollError(`Stopped checking the export's progress after ${POLL_ATTEMPTS} failed attempts; the export may still be running. Last error: ${message(e)}`)
+      } else {
+        setExportPollError(`Could not check the export's progress, retrying: ${message(e)}`)
+        exportTimer.current = window.setTimeout(() => pollExport(jobId, failures + 1), POLL_MS)
+      }
+    })
   }
 
-  function pollImport(jobId: string) {
+  function pollImport(jobId: string, failures = 0) {
     api.getImportJob(jobId).then(job => {
+      if (importPoll.current !== jobId) return
       setImportJob(job)
+      setImportPollError('')
       if (job.status !== 'completed' && job.status !== 'failed') {
-        importTimer.current = window.setTimeout(() => pollImport(jobId), 2000)
-      } else if (job.status === 'completed') {
+        importTimer.current = window.setTimeout(() => pollImport(jobId), POLL_MS)
+        return
+      }
+      importPoll.current = null
+      setImportWatching(false)
+      importJobs.reload()
+      if (job.status === 'completed') {
         api.getCollections().then(r => setCollections(r.collections)).catch(() => {})
       }
-    }).catch((e: unknown) => setImportError(e instanceof Error ? e.message : String(e)))
+    }, (e: unknown) => {
+      if (importPoll.current !== jobId) return
+      if (failures + 1 >= POLL_ATTEMPTS) {
+        importPoll.current = null
+        setImportWatching(false)
+        setImportPollError(`Stopped checking the import's progress after ${POLL_ATTEMPTS} failed attempts; the import may still be running. Last error: ${message(e)}`)
+      } else {
+        setImportPollError(`Could not check the import's progress, retrying: ${message(e)}`)
+        importTimer.current = window.setTimeout(() => pollImport(jobId, failures + 1), POLL_MS)
+      }
+    })
   }
 
+  // Opens a listed job in its own panel, as a started one is shown (#617).
+  function openExport(entry: ExportJobEntry) {
+    exportTouched.current = true
+    if (exportTimer.current) window.clearTimeout(exportTimer.current)
+    setExportError(''); setExportPollError('')
+    setExportJob(entry)
+    if (transferRunning(entry)) {
+      exportPoll.current = entry.job_id
+      setExportWatching(true)
+      pollExport(entry.job_id)
+    } else {
+      exportPoll.current = null
+      setExportWatching(false)
+    }
+  }
+
+  function openImport(entry: ImportJobEntry) {
+    importTouched.current = true
+    if (importTimer.current) window.clearTimeout(importTimer.current)
+    setImportError(''); setImportPollError('')
+    setImportJob(entry)
+    if (transferRunning(entry)) {
+      importPoll.current = entry.job_id
+      setImportWatching(true)
+      pollImport(entry.job_id)
+    } else {
+      importPoll.current = null
+      setImportWatching(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!exportJobs.loaded || exportTouched.current) return
+    exportTouched.current = true
+    const entry = newestToOpen(exportJobs.entries, transferRunning)
+    if (entry) openExport(entry)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [exportJobs.loaded])
+
+  useEffect(() => {
+    if (!importJobs.loaded || importTouched.current) return
+    importTouched.current = true
+    const entry = newestToOpen(importJobs.entries, transferRunning)
+    if (entry) openImport(entry)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [importJobs.loaded])
+
   async function startExport() {
-    setExportError(''); setExportJob(null)
+    setExportError(''); setExportPollError(''); setExportJob(null)
     try {
-      const r = await api.startExport({ collection, include_models: includeModels })
+      const r = await api.startExport(encrypt
+        ? { collection, include_models: includeModels, passphrase }
+        : { collection, include_models: includeModels })
+      setPassphrase(''); setConfirmPassphrase('')
+      if (!alive.current) return
+      exportTouched.current = true
+      exportJobs.reload()
+      if (exportTimer.current) window.clearTimeout(exportTimer.current)
+      exportPoll.current = r.job_id
+      setExportWatching(true)
       pollExport(r.job_id)
     } catch (e: unknown) {
-      setExportError(e instanceof Error ? e.message : String(e))
+      setExportError(message(e))
     }
   }
 
   async function startImport() {
-    setImportError(''); setImportJob(null)
+    setImportError(''); setImportPollError(''); setImportJob(null)
     try {
-      const r = await api.startImport({ filename, on_conflict: onConflict })
+      const r = await api.startImport(selectedEncrypted
+        ? { filename, on_conflict: onConflict, passphrase: importPassphrase }
+        : { filename, on_conflict: onConflict })
+      setImportPassphrase('')
+      if (!alive.current) return
+      importTouched.current = true
+      importJobs.reload()
+      if (importTimer.current) window.clearTimeout(importTimer.current)
+      importPoll.current = r.job_id
+      setImportWatching(true)
       pollImport(r.job_id)
     } catch (e: unknown) {
-      setImportError(e instanceof Error ? e.message : String(e))
+      setImportError(message(e))
     }
   }
 
-  const exportBusy = exportJob !== null && exportJob.status !== 'completed' && exportJob.status !== 'failed'
-  const importBusy = importJob !== null && importJob.status !== 'completed' && importJob.status !== 'failed'
+  const exportBusy = exportWatching
+  const importBusy = importWatching
+
+  // What still stops an encrypted export, or '' when nothing does.
+  const passphraseLength = charCount(passphrase)
+  const passphraseProblem = !encrypt ? ''
+    : passphraseLength < PASSPHRASE_MIN ? `The passphrase needs at least ${PASSPHRASE_MIN} characters.`
+    : passphraseLength > PASSPHRASE_MAX ? `The passphrase can have at most ${PASSPHRASE_MAX} characters.`
+    : passphrase !== confirmPassphrase ? 'The two passphrases do not match.'
+    : ''
+  const selectedEncrypted = packages.some(p => p.filename === filename && p.encrypted)
+
+  const jobRows: (JobRow & { sort: { created_at: string | null; finished_at: string | null } })[] = [
+    ...exportJobs.entries.map(entry => ({
+      key: 'export:' + entry.job_id, kind: 'Export', target: entry.collection, status: entry.status,
+      progress: `${entry.chunks_written} chunks`, createdAt: entry.created_at, owner: entry.owner,
+      open: exportJob?.job_id === entry.job_id, onOpen: () => openExport(entry), sort: entry,
+    })),
+    ...importJobs.entries.map(entry => ({
+      key: 'import:' + entry.job_id, kind: 'Import', target: entry.filename, status: entry.status,
+      progress: `${entry.chunks_written} chunks`, createdAt: entry.created_at, owner: entry.owner,
+      open: importJob?.job_id === entry.job_id, onOpen: () => openImport(entry), sort: entry,
+    })),
+  ].sort((a, b) => newestFirst(a.sort, b.sort))
 
   return (
     <div className="max-w-3xl mx-auto">
@@ -116,6 +309,10 @@ export default function TransferPage() {
       <p className="text-sm text-gray-500 mb-6">
         Packages are written to and read from <code>./exports</code> in the project directory.
       </p>
+
+      <JobList rows={jobRows} showOwner={role === 'engineer'}
+        loaded={exportJobs.loaded && importJobs.loaded}
+        error={[exportJobs.error, importJobs.error].filter(Boolean).join(' ')} />
 
       {/* ── Export ─────────────────────────────────────────────────────── */}
       <section className="bg-white border rounded p-4 mb-6">
@@ -133,7 +330,7 @@ export default function TransferPage() {
           ))}
         </select>
 
-        {tune && (
+        {tune ? (
           <p className="text-xs mb-3">
             <span className={tune.fidelity === 'with-sources' ? 'text-green-700' : 'text-amber-700'}>
               Fidelity: <strong>{tune.fidelity}</strong>
@@ -143,7 +340,13 @@ export default function TransferPage() {
               ? `${tune.source_document_count} original document(s) will travel with the package.`
               : 'No original documents were retained, so the package cannot be re-chunked after import.'}
           </p>
-        )}
+        ) : tuneError ? (
+          <p className="text-xs mb-3 text-red-600">
+            Fidelity: <strong>unknown</strong> — it could not be read: {tuneError}
+          </p>
+        ) : collection ? (
+          <p className="text-xs mb-3 text-gray-500">Fidelity: reading…</p>
+        ) : null}
 
         <label className="flex items-start gap-2 text-sm mb-3">
           <input type="checkbox" checked={includeModels} onChange={e => setIncludeModels(e.target.checked)} className="mt-1" />
@@ -156,15 +359,38 @@ export default function TransferPage() {
           </span>
         </label>
 
+        <label className="flex items-start gap-2 text-sm mb-3">
+          <input type="checkbox" checked={encrypt} onChange={e => setEncrypt(e.target.checked)} className="mt-1" />
+          <span>
+            Encrypt with a passphrase
+            <span className="block text-xs text-gray-500">
+              Writes an encrypted <code>.tar.gz.age</code> package that only this passphrase opens.
+              It can't be recovered, so keep it safe and send it separately from the file.
+            </span>
+          </span>
+        </label>
+        {encrypt && (
+          <div className="mb-3 space-y-2">
+            <input type="password" autoComplete="new-password" placeholder="Passphrase"
+                   value={passphrase} onChange={e => setPassphrase(e.target.value)}
+                   className="w-full border rounded px-3 py-2 text-sm" />
+            <input type="password" autoComplete="new-password" placeholder="Confirm the passphrase"
+                   value={confirmPassphrase} onChange={e => setConfirmPassphrase(e.target.value)}
+                   className="w-full border rounded px-3 py-2 text-sm" />
+            {passphraseProblem && <p className="text-xs text-amber-700">{passphraseProblem}</p>}
+          </div>
+        )}
+
         <button
           onClick={startExport}
-          disabled={!collection || exportBusy}
+          disabled={!collection || exportBusy || passphraseProblem !== ''}
           className="bg-blue-600 text-white px-5 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50"
         >
           {exportBusy ? 'Exporting…' : 'Export'}
         </button>
 
         {exportError && <p className="text-red-600 text-sm mt-3">{exportError}</p>}
+        {exportPollError && <p className="text-red-600 text-sm mt-3">{exportPollError}</p>}
         {exportJob && (
           <div className="mt-3 text-sm">
             <p className="text-gray-600">
@@ -177,12 +403,18 @@ export default function TransferPage() {
                 <code className="text-xs break-all">{exportJob.filename}</code>
                 <span className="text-gray-500 text-xs">
                   {' '}({sizeLabel(exportJob.size_bytes)}, {exportJob.fidelity}
+                  {exportJob.encrypted ? ', encrypted' : ''}
                   {exportJob.models_bundled ? ', models included' : ''}
                   {exportJob.retrieve_script ? ', with retrieve.py' : ', no retrieve.py'})
                 </span>
               </p>
             )}
-            {exportJob.status === 'failed' && <p className="text-red-600">{exportJob.error}</p>}
+            {exportJob.status === 'failed' && (
+              <p className="text-red-600">
+                {exportJob.error_code && <code className="text-xs mr-2">{exportJob.error_code}</code>}
+                {exportJob.error}
+              </p>
+            )}
             {exportJob.warnings.map((w, i) => (
               <p key={i} className="text-amber-700 text-xs mt-1">{w}</p>
             ))}
@@ -207,16 +439,31 @@ export default function TransferPage() {
           {packages.map(p => (
             <option key={p.filename} value={p.filename}>
               {p.filename}
-              {p.readable
+              {p.encrypted
+                ? (p.readable ? ` — encrypted, ${sizeLabel(p.size_bytes)}` : ' — encrypted, unreadable')
+                : p.readable
                 ? ` — ${p.collection}, ${p.chunk_count} chunks, ${p.fidelity}, ${sizeLabel(p.size_bytes)}`
                 : ' — unreadable'}
             </option>
           ))}
         </select>
-        {packages.length === 0 && (
+        {packagesError && <p className="text-red-600 text-xs mb-3">{packagesError}</p>}
+        {packages.length === 0 && !packagesError && (
           <p className="text-xs text-gray-500 mb-3">
             Nothing in <code>./exports</code> yet. Copy a package there and press Refresh.
           </p>
+        )}
+
+        {selectedEncrypted && (
+          <div className="mb-3">
+            <label className="block text-sm font-medium mb-1">Passphrase</label>
+            <input type="password" autoComplete="off" value={importPassphrase}
+                   onChange={e => setImportPassphrase(e.target.value)}
+                   className="w-full border rounded px-3 py-2 text-sm" />
+            <p className="text-xs text-gray-500 mt-1">
+              This package is encrypted. Enter the passphrase it was exported with.
+            </p>
+          </div>
         )}
 
         <label className="block text-sm font-medium mb-2">If the collection already exists</label>
@@ -235,13 +482,14 @@ export default function TransferPage() {
 
         <button
           onClick={startImport}
-          disabled={!filename || importBusy}
+          disabled={!filename || importBusy || (selectedEncrypted && importPassphrase === '')}
           className="bg-blue-600 text-white px-5 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50"
         >
           {importBusy ? 'Importing…' : 'Import'}
         </button>
 
         {importError && <p className="text-red-600 text-sm mt-3">{importError}</p>}
+        {importPollError && <p className="text-red-600 text-sm mt-3">{importPollError}</p>}
         {importJob && (
           <div className="mt-3 text-sm">
             <p className="text-gray-600">

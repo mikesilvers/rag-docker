@@ -1,6 +1,7 @@
 # Moving a RAG between machines
 
-A collection can be exported as a single `.tar.gz` and imported somewhere else —
+A collection can be exported as a single `.tar.gz` (or, with a passphrase, an
+encrypted `.tar.gz.age`) and imported somewhere else —
 another laptop, a customer's machine, an air-gapped network. The package carries
 the chunks and their vectors, the settings the collection was tuned with, a
 standalone query script and, when the originals were retained, the source
@@ -14,8 +15,9 @@ Everything below is rendered from the same templates that generate the
 Both directions use `./exports/` in the project directory, which is a bind mount
 rather than a Docker volume so you can pick files up and drop them in directly.
 
-- **Exporting** writes the `.tar.gz` there.
-- **Importing** reads from there: copy a package in first, then import by filename.
+- **Exporting** writes the package there.
+- **Importing** reads from there: copy a package in first, then import by filename,
+  with its passphrase when the package is encrypted.
 
 `GET /api/packages` lists what is currently in that directory, including files it
 cannot read — those are shown rather than hidden, so nothing disappears silently.
@@ -69,7 +71,7 @@ choice can delete a collection.
 |---|---|
 | `abort` | Fail if a collection of that name already exists. |
 | `rename` | Import alongside it as `<name>_imported_<id8>`. |
-| `replace` | Overwrite it — but only after the incoming package has been proven to import cleanly, so a failed replace leaves the original intact. |
+| `replace` | Overwrite it — but only after the incoming package has been proven to import cleanly. A failure before the existing collection is deleted leaves it as it was; a failure while the final copy is being built can leave the name missing or partial, with the incoming data kept in a recovery collection named in the error (`recovered_as`). |
 
 Replacing a collection keeps its gold-standard sessions and marks them orphaned,
 and the import result reports how many. They are never deleted silently.
@@ -86,8 +88,10 @@ and the import result reports how many. They are never deleted silently.
 
 `GET /api/tune/<collection>` reports which of these a given collection can do.
 
-Every rebuild is staged into a temporary collection and swapped in only once it
-succeeds, so a failed tune leaves the collection as it was.
+Every rebuild is staged into a temporary collection and verified before the
+original is touched, so a failure before cutover leaves the collection as it was.
+A failure during the final replacement can leave its name missing or partial, with
+the data kept in a recovery collection named in the error (`recovered_as`).
 
 **Gold-standard sessions are flagged, never deleted or remapped.** Re-chunking or
 re-embedding changes which chunks exist, so evaluation pairs built against the

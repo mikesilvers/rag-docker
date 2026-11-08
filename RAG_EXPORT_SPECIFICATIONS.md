@@ -26,10 +26,11 @@ tune it there.
 | Gold-standard sessions | exported; invalidated on re-chunk | confirmed |
 | Duplicate documents | content-addressed, stored once per collection | **decided here** (§2.2) |
 | Sessions of a replaced collection | retained, marked orphaned, count reported | **decided here** (§8, rule 4) |
+| Encryption | optional, by passphrase, age v1 format (§4.6) | maintainer decision on #27 |
 
 ### Out of scope
 
-Incremental export, encryption, signing, merging two corpora into one
+Incremental export, signing, merging two corpora into one
 collection, migration to another vector store, and cross-version vector
 portability guarantees beyond those in §7.2.
 
@@ -63,18 +64,46 @@ proportional to the corpus rather than to upload count, and it makes "have we
 seen this document?" answerable. The cost is that the original upload filename is
 no longer the storage key, which `index.json` exists to solve.
 
+**Same name, new content replaces (#22).** A logical filename belongs to one digest at a
+time. When ingest retains a file, its name is first removed from every other digest's
+`filenames`; a digest left with no names is removed from `index.json`, and its blob is
+deleted after the index is saved. This happens even if writing the new blob fails, so the
+name never keeps pointing at the version it replaced (re-chunking would rebuild that).
+Ingest replaces the name's chunks the same way (`SPECIFICATIONS.md` §3.1.3), so the
+retained originals keep matching the chunks. The same content under two names is still one
+blob listing both names. Logical names of ZIP members include their folders inside the
+archive (`a/report.pdf`). A name retained under several digests before this rule (a
+re-upload) stays so until it is ingested again.
+
 An imported source index MUST name blobs only by lowercase SHA-256 digest.
 Import validates the index and its regular content-addressed files before
 model installation, collection mutation, or sidecar restoration; a mismatch is
 `PACKAGE_CORRUPT`. Export and re-chunking refuse invalid identities or linked
 blobs at their read boundaries, so source metadata cannot select an arbitrary
 filesystem path. If an indexed blob is missing on disk, export warns and omits
-that entry from the shipped index; the package remains importable with its
+that entry from the shipped index, and a chunk that would link to it is exported
+with `source_sha256` `null` (#509); the package remains importable with its
 available sources and chunks. Existing valid indexes keep their original fidelity.
 An invalid on-disk index makes tuning options return a typed 409
-`SOURCE_INDEX_INVALID`; re-embedding from stored chunks and re-indexing do not
-need to read retained sources. A failed retention write after chunk storage does
+`SOURCE_INDEX_INVALID`, and re-chunking (or re-embedding with chunking
+parameters) is refused with the same 409 before any job is created (#389);
+re-embedding from stored chunks and re-indexing do not need to read retained
+sources. A failed retention write after chunk storage does
 not misreport the ingested file as failed.
+
+Retained-source import restores only blobs named by the validated index. Unindexed
+files are ignored, including sources in chunks-only packages with no index. Older
+packages whose indexes name missing blobs remain rejected as `PACKAGE_CORRUPT`;
+re-export from the repaired source rather than silently reducing claimed fidelity.
+So are packages whose chunks name a `source_sha256` that isn't in the package's
+source index (#509), including those an older export made by skipping a missing
+blob while keeping its digest on the chunks: re-export them.
+After manifest digest verification, each indexed blob’s manifest digest must equal
+`sha256:<filename>`. This preserves content-addressed identity without hashing a
+listed blob twice. Indexed blobs not listed in the manifest are hashed separately;
+a listed digest that differs from the filename is rejected.
+The same indexed-only copy rule applies to replace-mode recovery collections;
+unindexed package files cannot survive a failed final cutover.
 
 Retention MUST NOT change chunking, embedding, or any existing response shape.
 
@@ -89,7 +118,9 @@ anywhere in the UI.
 Collections ingested before this change have no source directory. They are not
 reconstructed. Their exports are `chunks-only` (§4.3) and the UI MUST label them
 as such wherever export is offered, so the lower fidelity is visible before the
-user ships the package, not after.
+user ships the package, not after. When the UI cannot read a collection's fidelity
+(`GET /tune/{collection}` fails), it MUST say the fidelity is unknown and why,
+never hide the label.
 
 ### 2.5 Disk
 
@@ -98,6 +129,7 @@ minimum, 32 GB recommended) assumes the current behaviour and MUST be restated a
 "plus the size of your document corpus".
 
 ---
+
 
 ## 3. Prerequisite B — Retrieval Settings Persistence
 
@@ -121,7 +153,11 @@ carry the corpus's parameters.
 ### 3.2 Endpoints
 
 - `GET /retrieval/config/{collection}` → the saved config, or the defaults above
-  with `is_default: true`, matching how `/ingest/config/{collection}` behaves.
+  with `is_default: true`, matching how `/ingest/config/{collection}` behaves. A saved
+  file that can't be read, isn't JSON, isn't a JSON object or has a field of the wrong
+  type is logged and also answered with the defaults (#439); export still refuses it (§5).
+  A non-finite `alpha` counts as the wrong type, and a saved `is_default` key also gives
+  the defaults, though export ignores that key like any unknown one (#477).
 - `POST /retrieval/config` → upsert; collection in the **body**, not the path.
 
 The path shape deliberately mirrors ingest config, including the asymmetry that
@@ -146,6 +182,7 @@ saved settings are defaults, not a constraint.
 
 ```
 ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz
+ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz.age    (encrypted, §4.6)
 ```
 
 - `<collection-slug>`: stored collection name, lowercased, each run of characters
@@ -153,7 +190,8 @@ ragpkg-<collection-slug>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz
 - `<YYYYMMDDTHHMMSSZ>`: UTC, basic ISO 8601, no separators.
 - `<id8>`: first 8 lowercase hex of the manifest digest (§4.4).
 
-The archive MUST expand to a single directory of the same name minus `.tar.gz`.
+The archive MUST expand to a single directory of the same name minus `.tar.gz`
+(minus `.tar.gz.age` for an encrypted package, once decrypted).
 
 **The filename is a label, never an input.** The slug is lossy: it lowercases a
 name Weaviate capitalised, and two distinct collections can slug identically.
@@ -166,7 +204,7 @@ filename.
 ragpkg-.../
 ├── README.md               generated; §9
 ├── manifest.json           §4.4
-├── collection.json         schema, index type, distance metric, HNSW params
+├── collection.json         schema, stored embedding_model, index type, distance metric, HNSW params
 ├── chunks.jsonl            one object per line; §4.5
 ├── ingest_config.json      present if the collection has one
 ├── retrieval_config.json   §3.1
@@ -179,7 +217,22 @@ ragpkg-.../
 └── models/                 present only when models are bundled
 ```
 
-Exported evaluation sessions are validated, detached snapshots read from the persisted session files. The exporter MUST NOT serialize the live generation/edit cache; later cached pair or counter updates must not change a selected export snapshot. Atomic and serialized session persistence remains separate work.
+In the archive, `manifest.json` comes right after the directory entry, before
+every other file, so a reader that wants only the manifest (the package listing)
+can stop there (#383). Readers MUST NOT rely on that order: packages built before
+#383 have `README.md`, `chunks.jsonl`, `collection.json`, `goldstandard/` and
+`ingest_config.json` before it.
+What the listing takes from the manifest, and when a wrongly typed value makes
+it list the package as unreadable, is in §4.4 (#451).
+
+An export reads the collection's chunks and its retained sources at one point in
+time: it holds the collection's writer guard for its whole run (§6.1, #509), and
+every writer of chunks or retained sources takes that guard. The configuration
+files (`ingest_config.json`, `retrieval_config.json`) and the evaluation sessions
+are written by routes that don't take it, so each of those files in a package is
+coherent on its own but may be newer than the chunks.
+
+Exported evaluation sessions are validated, detached snapshots read from the persisted session files. They leave out `owner`, `created_at` and `finished_at`, which name who generated a session on this install and when (#617); an import drops those fields from every session it restores, so a restored session never appears in `GET /goldstandard/sessions` (`SPECIFICATIONS.md` §3.1.10). The exporter MUST NOT serialize the live generation/edit cache; later cached pair or counter updates must not change a selected export snapshot. Atomic and serialized session persistence remains separate work.
 
 ### 4.3 Fidelity
 
@@ -208,12 +261,23 @@ and on import.
   "chunking": {"strategy": "overlap", "chunk_size": 1000, "chunk_overlap": 200},
   "fidelity": "with-sources",
   "models_bundled": false,
+  "bundled_models": [],
   "files": {"chunks.jsonl": "sha256:...", "collection.json": "sha256:..."}
 }
 ```
 
 `collection.name` is authoritative. `embedding` is the field import checks
 hardest (§6.2).
+
+`bundled_models` lists each model the package carries whole, as `name:tag`
+(a name with no tag is `name:latest`), sorted; it is `[]` when none is, and
+`models_bundled` is true exactly when it isn't empty (§6.3, #425, #487).
+
+The package listing (`GET /packages`) shows `collection.name` and
+`collection.chunk_count`, `fidelity` and `created_at`, with the types above:
+`collection` an object, `chunk_count` an integer, the other three strings. A
+value that is absent or `null` is listed as `null`; any other type is not
+coerced, and the package is listed `readable: false` (#451).
 
 `files` covers every file except `manifest.json`, `README.md` and `retrieve.py`.
 
@@ -242,9 +306,56 @@ One JSON object per line:
 
 - `properties` carries the eight stored properties, unchanged.
 - `source_sha256` links the chunk to its file in `sources/`, and is `null` in
-  `chunks-only` packages.
+  `chunks-only` packages. It is also `null` when the chunk's file name maps to
+  more than one retained digest, or to a blob missing on disk at export. A
+  non-null value always names a blob the package carries (#509). A part of a
+  file stored as parts, `source_file` `<name> (part N)` (`SPECIFICATIONS.md`
+  §5.1.1, #621), links to the file retained under `<name>` when no retained
+  file is listed under the part's own name.
 - Vectors are JSON numbers. A packed float32 sidecar was measured at only ~12%
   smaller after gzip and is rejected (`RAG_EXPORT_ANALYSIS.md` §6).
+
+### 4.6 Encryption (#27)
+
+A package exported with a passphrase is encrypted. Its plaintext is exactly the
+`.tar.gz` byte stream §4.1 to §4.5 describe; the file is an age v1 file
+(https://c2sp.org/age), binary (not armored), with exactly one `scrypt`
+(passphrase) recipient stanza, named `<stem>.tar.gz.age`. `age -d` opens it with
+the same passphrase.
+
+- **Encryption.** A random 16-byte file key, a random 16-byte scrypt salt, work
+  factor (log2 N) 18 with r=8 and p=1 (age's default), the file key wrapped with
+  ChaCha20-Poly1305, the header MAC, a random 16-byte payload nonce and the STREAM
+  payload in 64 KiB plaintext chunks with ChaCha20-Poly1305, all as the age
+  specification defines. The tar.gz writer streams through the encryptor into the
+  temporary file: no unencrypted archive is written, and only one chunk is held in
+  memory. The package's files are still staged unencrypted in
+  `./exports/.build-*` while the export runs (§6.1), removed when it ends or by
+  the next start-up's sweep; moving that staging out of the bind mount is a
+  follow-up.
+- **Decryption** accepts only a header that parses under the age grammar and
+  holds one stanza, of type `scrypt`, with a canonical 16-byte salt, a work
+  factor, and a 32-byte body. A work factor that is not one or two decimal digits
+  without a sign or leading zero is refused `DECRYPT_FAILED` (`reason`
+  `work_factor`) before it is converted, so no field length can cause an
+  unhandled error; a work factor
+  above 20 (about 1 GiB of scrypt memory; a maintainer decision on #27, below
+  age's own limit of 22, about 4 GiB) is refused `DECRYPT_FAILED` without
+  deriving anything, and at most one scrypt derivation runs at a time in the API.
+  The header MAC is checked before any plaintext is released, and every payload
+  chunk is authenticated before it is; a file that ends inside the payload nonce,
+  a truncated payload, a missing or
+  misplaced final chunk, or data after it fails.
+- **Passphrase.** 12 to 1024 characters, any characters, checked at export. It is
+  encoded as UTF-8; a passphrase that has no UTF-8 form (a lone surrogate, which
+  JSON can carry) is refused `422 INVALID_PARAMETER` by `POST /export` and
+  `POST /import` alike. It is never stored, logged, attached to telemetry or returned.
+- **Implementation.** `api/services/age_stream.py`, on `cryptography` (a direct
+  dependency since #27, at its locked version). It passes every applicable vector
+  of the C2SP CCTV age testkit, vendored in `scripts/tests/fixtures/age-testkit`.
+- **Listing.** No metadata is kept beside an encrypted package; `GET /packages`
+  lists it with `encrypted: true` and null metadata. A file that can't be read or
+  parsed is listed `readable: false`; it never fails the listing of the others.
 
 ---
 
@@ -263,8 +374,9 @@ literals, and substitution MUST NOT interpret tokens inside inserted data.
 
 ### 5.1 Requirements
 
-1. **Standard library only.** `urllib.request`, `json`, `argparse`. Anything
-   needing `pip install` fails in the air-gapped case this project targets.
+1. **Standard library only.** `urllib.request`, `json`, `argparse` (and, for the
+   login, `getpass`, `os` and `urllib.parse`). Anything needing `pip install` fails
+   in the air-gapped case this project targets.
 2. **Targets the RAG API** (`POST /query`), not Weaviate and Ollama directly.
    Reimplementing the pipeline would drift from `rag_pipeline.py`.
 3. **Baked defaults, overridable by flags:**
@@ -279,6 +391,18 @@ python retrieve.py --timeout 900 "..."
    Defaults: collection and parameters from the package; `--api-url` defaults to
    `http://localhost:8080/api`; `--timeout` defaults to 600 seconds, because
    generation runs on CPU and a single answer was measured at 236 s.
+3a. **Logs in (#25).** The API needs an account. `--username` (default
+   `$RAG_USERNAME`) names it; the password is asked for with `getpass`, or read
+   from the first line of standard input with `--password-stdin`, and is never a
+   flag or an environment variable. The script logs in (`POST /auth/login`),
+   sends the query with the session cookie and an `Origin` matching
+   `--api-url`, and logs out. A refused login is exit `5`, quoting the API; so is
+   a query refused for want of a login (`AUTH_REQUIRED`, whose hint names
+   `--username`) or a password change due (`PASSWORD_CHANGE_REQUIRED`, whose
+   hint says to log in to the web UI once). `--password-stdin` without
+   `--username`, or an empty password, is `2`. Scripts in packages exported
+   before #25 send no login and get `AUTH_REQUIRED`; export again for one that
+   logs in.
 4. **Records its provenance** — the source manifest's `id8` and `created_at` in the
    script's `PACKAGE_METADATA` literal, beside `package_filename`, `embed_model` and
    `embed_dimensions`, so a script separated from its package can still be traced.
@@ -315,21 +439,66 @@ because nothing signals the discrepancy.
 Both are long-running and both follow the existing job-and-poll pattern used by
 `/ingest/upload`.
 
+**Who may call them (#25).** `POST /export`, `GET /export/job/{job_id}`, `POST /import`,
+`GET /import/job/{job_id}`, `GET /packages` and `GET /help/transfer` need the Developer role or
+higher; without a session they answer `401 AUTH_REQUIRED`, and for an End User `403 FORBIDDEN`
+(SPECIFICATIONS.md §3.1.8). A `with-sources` package carries the original documents, so any
+Developer can take every document out of a collection.
+
 ### 6.1 Export
 
 `POST /export` with `{"collection": "<name>", "include_models": false}` → `202`
 and `{"job_id": "..."}`. `GET /export/job/{job_id}` reports progress and, on
 completion, the written filename.
 
+- An optional `passphrase` (12 to 1024 characters) writes the package encrypted
+  (§4.6); one outside those bounds is refused `422 INVALID_PARAMETER` before any
+  job, without being echoed. The job reports `encrypted` and never holds the
+  passphrase (#27).
+
 - Export of a collection that does not exist fails immediately with
   `COLLECTION_NOT_FOUND`, before any job is created.
-- Only one export per collection may run at a time; a second request while one is
+- When Weaviate can't be read to check whether the collection exists, the export
+  fails with HTTP 503 `SERVICE_UNAVAILABLE` before any job is created; `detail` is
+  `{"collection": "<name>"}`. The cause is logged, not returned (#366).
+- The requested name is first replaced by the name as stored, its first character
+  upper-cased (`SPECIFICATIONS.md` §3.1, #372), so `policies` exports `Policies`
+  with its retained originals and gold-standard sessions. Originals and sessions
+  saved under the lowercase spelling before #372 are not migrated and are not
+  included.
+- Only one export per collection may run at a time, whichever first-letter spelling
+  each request uses (#372); a second request while one is
   in flight fails with `EXPORT_IN_PROGRESS`, naming the running `job_id`. Two
-  concurrent exports would race on the temporary file described below.
+  concurrent exports would race on the temporary file described below. A request
+  that arrives while that export is still storing its first record waits for it,
+  at most 30 s, so the named `job_id` can always be read; if that start is
+  cancelled instead, or its record write fails, the request starts its own
+  export (#326, #347). If it is still storing that record after 30 s, the
+  request fails with `EXPORT_STARTING`, with no `job_id`, and can be retried
+  shortly (#338).
 - The package is written to `/app/exports` (host `./exports`), never streamed.
 - Chunks are read with `include_vector=True`, paged, so memory does not scale
   with collection size.
-- Export MUST NOT block ingest or query.
+- Export MUST refuse `EMBEDDING_MISMATCH` before reading chunks or publishing a
+  package when the collection’s stored embedding model differs from this instance
+  or its vectorizer configuration is unsupported. Re-embed into a supported
+  collection with this instance’s model before exporting. `collection.json` and
+  the manifest bind vectors to that stored model.
+- Failed export jobs expose typed package refusal fields `error_code` and
+  `error_detail`, alongside the human-readable `error`. An export whose build is
+  cancelled ends `failed`, with an `error` saying it was cancelled before it
+  finished and to start it again, never staying `running` (#521).
+- Export holds the collection's writer guard, the lock its ingest, tuning and
+  import writers share, for its whole run, from before the settings and chunks are read until the archive
+  is renamed into place, so the chunks and retained sources come from one point
+  in time (#509). The job reads `queued` while it waits for the guard. Guarded
+  writes to that collection wait for the export, as they wait for any other
+  guard holder: ingest, re-ingest and tuning jobs stay `queued`, a replace-import
+  waits before its conflict check,
+  gold-standard generation answers `409 COLLECTION_BUSY` after its one-second
+  wait, and a delete is refused as for any active job. An export never blocks
+  queries, unguarded saves (§4.2), or anything for another collection. The build
+  runs off the event loop.
 - Writing is atomic: build under a temporary name in the same directory and
   rename on success, so a partial file is never mistaken for a package.
 
@@ -338,20 +507,83 @@ completion, the written filename.
 `POST /import` with `{"filename": "<name in ./exports>", "on_conflict": "..."}`
 → `202` + `job_id`.
 
+A package whose filename ends in `.tar.gz.age` is encrypted and needs
+`"passphrase"`: without one, the request is refused `400 PASSPHRASE_REQUIRED`;
+a passphrase sent for any other package is refused `400
+PASSPHRASE_NOT_EXPECTED`. Both are decided by the filename before any job is
+created (#27). The job reports `encrypted` and never holds the passphrase.
+
 Checks run in this order and stop at the first failure:
 
 | # | Check | On failure |
 |---|---|---|
-| 1 | File exists and is a readable `.tar.gz` | `PACKAGE_UNREADABLE` |
+| 1 | File exists and is a readable `.tar.gz`; for a `.tar.gz.age` package, it has a valid age passphrase header and decrypts with the passphrase (§4.6) | `PACKAGE_UNREADABLE`; `DECRYPT_FAILED` for a wrong passphrase, damaged or truncated encrypted data, or a work factor above 20; `PACKAGE_TOO_MANY_MEMBERS` or `PACKAGE_TOO_LARGE` over the extraction caps below (#317) |
 | 2 | `manifest.json` present, `package_format` understood | `PACKAGE_FORMAT_UNSUPPORTED` |
-| 3 | Every `files` digest matches | `PACKAGE_CORRUPT`, naming the file |
-| 3a | Retained-source index names only valid digest identities and matching regular blobs | `PACKAGE_CORRUPT`, naming `sources/index.json` |
+| 3 | Every `files` key is a normalised relative path inside the package, and every `files` digest matches | `PACKAGE_CORRUPT`, naming the file (`manifest.json` for a key outside the package) |
+| 3a | Retained-source index names only valid digest identities and matching regular blobs; every chunk's `source_sha256` is `null` or a digest of that index (#509) | `PACKAGE_CORRUPT`, naming `sources/index.json`, or `chunks.jsonl` and the line for a chunk's digest |
 | 4 | **Embedding model and dimensions match this instance** | `EMBEDDING_MISMATCH` — refuse |
 | 4a | Every evaluation sidecar has a valid session schema, generated session ID, matching collection and unique identity within the package; the local session storage directory is a regular directory inside the upload directory | `PACKAGE_CORRUPT`, naming the sidecar |
 | 4b | Optional retrieval settings are a JSON object satisfying the API save schema, normalized with its defaults and numeric conversion | `PACKAGE_CORRUPT`, naming `retrieval_config.json` |
+| 4c | Optional ingest settings are a JSON object satisfying the API save schema, except the chunk bounds, normalized with its defaults and numeric conversion | `PACKAGE_CORRUPT`, naming `ingest_config.json` |
 | 5 | Collection name collision | resolved per `on_conflict` |
 
-Check 3a runs before embedding-model checks and all live mutation. Check 4b runs before model installation, collection creation/replacement, recovery
+Check 1 for an encrypted package decrypts it as a stream into the tar reader:
+each member is checked (no links, only files and directories, nothing outside
+the work directory and no `..` component in its path) just before it is
+extracted, and once the archive ends the rest of the file is read and
+authenticated to its final chunk. No decrypted copy
+of the archive is written. A file that is not an age passphrase file is
+`PACKAGE_UNREADABLE`; a failure to decrypt is `DECRYPT_FAILED` with
+`error_detail.reason` `passphrase`, `header` (the header MAC), `payload` or
+`work_factor`. Either way nothing outside the job's work directory is touched,
+and every later check reads the decrypted files exactly as for an unencrypted
+package (#27).
+
+Check 1 also caps what a package may expand to (#317), because a small `.tar.gz`
+can otherwise fill the disk the job's work directory is on. Every member counts
+as one entry, directories included, and so does every folder extraction would
+make for it that no earlier member made: the missing parent folders of its path,
+read as written. Each folder counts once; a directory member's own folder is its
+entry. A member's header size is
+added to a running total; for a member that isn't sparse that size is exactly
+what extraction writes. A sparse file isn't allowed: extraction writes every
+chunk of its map before truncating it to its size, so its size doesn't bound
+what is written. The caps are API settings: `max_package_members` (env
+`MAX_PACKAGE_MEMBERS`, default 100,000 entries) and `max_package_expanded_bytes` (env `MAX_PACKAGE_EXPANDED_BYTES`,
+default 17,179,869,184 bytes = 16 GiB), set in `docker-compose.yml`. Exactly at a
+cap is within it. Members are taken one at a time as their headers are read,
+never collected first, and for each one: it is counted (over the member cap:
+`PACKAGE_TOO_MANY_MEMBERS`), checked for links, type and path as above (a path
+with a `..` component is refused even when it resolves inside the work directory:
+tarfile makes the folders a path names as written, so a `..` could name folders
+outside the work directory that are made and never removed, #597), for a
+negative header size, which would otherwise lower the total, and for a sparse file
+(`PACKAGE_UNREADABLE`), then its new folders are counted (over the member cap:
+`PACKAGE_TOO_MANY_MEMBERS`), then its size is added (over the size cap:
+`PACKAGE_TOO_LARGE`). The first member to fail decides, and no header after it is
+read. For a `.tar.gz` every header is checked this way before anything is
+extracted, so a refusal extracts nothing; for a `.tar.gz.age` each member is
+checked just before it is extracted, so a refusal leaves at most the cap's bytes
+in the job's work directory, which the job removes. The messages are
+`'<file>' holds more than 100,000 entries, the most a package may hold
+(MAX_PACKAGE_MEMBERS), so nothing from it was imported.` with `detail`
+`{"limit": 100000}`, and `'<file>' expands to more than 16,384 MB when unpacked,
+the most a package may expand to (MAX_PACKAGE_EXPANDED_BYTES), so nothing from it
+was imported.` with `detail` `{"limit": 17179869184, "member": "<member that went
+over>"}` (each with the configured cap; a cap that isn't a whole number of MiB is
+given in bytes). There is no per-member cap: the total bounds every member.
+
+Check 3 checks every `files` key before it hashes anything (#371). A key that is
+empty, absolute, has a `..` component, isn't in normalised form (`./a`, `a//b`,
+`a/`) or resolves, links followed, to the package directory itself or outside it
+is refused as `PACKAGE_CORRUPT` with `detail` `{"file": "manifest.json"}`; the
+message and `detail` carry neither the key nor any digest, so a package can't
+make import hash, or report the digest of, a file outside it.
+
+Check 3a runs before embedding-model checks and all live mutation. It reads
+`chunks.jsonl` once: a chunk whose `source_sha256` is not `null` and is not a
+digest of the validated source index (any non-null value when the package has no
+index) is refused with `detail` `{"file": "chunks.jsonl", "line": <n>}` (#509). Check 4b runs before model installation, collection creation/replacement, recovery
 ownership, or sidecar publication. Keep its normalized snapshot for restoration;
 do not reread unvalidated settings after building the collection. Rebind the
 collection to the actual import target. Missing fields retain API defaults,
@@ -361,6 +593,22 @@ and the completed job notes it. A missing settings file remains supported.
 Invalid JSON, non-object settings, invalid enum values, booleans in numeric fields
 (including `ef`), other out-of-range values, and non-finite alpha are refusals in
 every conflict mode.
+
+Check 4c applies the same rules to `ingest_config.json` (#510), with the
+`POST /ingest/config` save schema. It runs right after check 4b, before the same
+mutations, and its normalized snapshot, rebound to the actual import target, is
+what restoration publishes; the package file is not read again. Missing fields
+retain API defaults and unknown fields are ignored. The chunk bounds don't apply:
+a `chunk_size` or `min_chunk_size` saved before them (`SPECIFICATIONS.md` §8) is
+restored as it is, never clamped, so `chunk_size` only has to be an integer of at
+least 1 and `min_chunk_size` one of at least 0. A missing settings file remains
+supported. Invalid JSON, non-object settings, a non-regular file, an unknown
+`chunking_strategy`, booleans or non-integers in the size fields, a negative
+`chunk_overlap`, a `similarity_threshold` outside 0-1 or not finite, and a
+`chunk_overlap` not smaller than `chunk_size` for `overlap` or `language` are
+refusals in every conflict mode, with the message `Invalid ingest settings.`.
+Without this check such a package imported as `completed` and left the
+collection's chunking configuration unreadable.
 
 Check 4a runs before bundled-model installation, collection creation/deletion,
 or restoring any sidecar. All sessions MUST be preflighted together, including
@@ -386,25 +634,33 @@ exports. They MUST NOT abort flagging after a collection has been deleted.
 Check 4 is a refusal, not a warning. Vectors from a different model are
 meaningless rather than merely different, and a collection built from them
 answers every query confidently and wrongly. The error MUST name both models and
-both dimension counts, and state that re-embedding is available when the package
-is `with-sources`.
+both dimension counts, in the message and in `detail` (`package_model`,
+`package_dimensions`, `instance_model`, `instance_dimensions`). This instance's
+count comes from an embedding call; when Ollama can't answer it, the import is
+still refused, `instance_dimensions` is `null` and the message says the count
+couldn't be read. A refused package is not re-embedded, whatever its fidelity, so
+the error offers no re-embedding: the remedy is an instance running the package's
+model, or a re-export from one (#390).
 
 ### 6.3 Bundled models
 
 `include_models` defaults to `false`. When `true`, `models/` contains the
 **embedding model and the LLM named in the manifest**, as the Ollama manifest and
-blob files required to serve them, under `models/<model-name>/`:
+blob files required to serve them, in a folder per name and tag,
+`models/<name>/<tag>/` (a name with no tag has tag `latest`):
 
 ```
 models/
 ├── nomic-embed-text/
-│   ├── manifest.json          the Ollama manifest, verbatim
-│   └── blobs/
-│       └── sha256-<hex>       config and layer blobs it names
+│   └── latest/
+│       ├── manifest.json      the Ollama manifest, verbatim
+│       └── blobs/
+│           └── sha256-<hex>   config and layer blobs it names
 └── phi3.5/
-    ├── manifest.json
-    └── blobs/
-        └── sha256-<hex>
+    └── latest/
+        ├── manifest.json
+        └── blobs/
+            └── sha256-<hex>
 ```
 
 Blobs are resolved **through each model's manifest**, never by copying the blob
@@ -414,6 +670,29 @@ bundle unrelated weights. Ollama writes blob filenames with a hyphen
 
 Every model file appears in the package manifest's `files` map and is digest
 verified on import like any other file.
+
+A model is bundled whole or not at all. If any of its files can't be copied,
+the files of that model already copied are removed from the package and from
+`files`, and a warning names the model (#449). Import takes a model with a
+`models/<name>/<tag>/manifest.json` as bundled, so a partly copied model must
+never be left behind. A model used for both embedding and the LLM is copied
+once; the two are compared by name and tag, so `x` and `x:latest` are one
+model (#494).
+
+Two tags of one name (an embedding model `foo:a` and an LLM `foo:b`) are both
+bundled, each in its own folder (#487). Import uses a folder only for the name
+and tag it holds: a package that bundles `bar:x` doesn't bundle `bar:y`, so an
+instance whose LLM is `bar:y` gets the "absent, not bundled" outcome below,
+never `bar:x`'s files under the name `bar:y`.
+
+Packages built before #487 put a model in `models/<name>/`, without the tag.
+Import reads such a folder's tag from the package manifest: when
+`embedding.model` and `llm.model` name exactly one tag of that name, the folder
+holds that tag. When they name two tags of it, the two models shared the
+folder and one overwrote the other's manifest, so the folder counts as not
+bundled for either. An instance from before #487 that imports a newer package
+doesn't find its models, and gives its "absent, not bundled" outcome.
+`package_format` stays `1`.
 
 **The API service must mount the Ollama model volume** (`ollama_models:/ollama`)
 for any of this to work. Installing a model means writing its exact manifest and
@@ -433,7 +712,7 @@ On import:
 |---|---|
 | Model present and its files match their checksums | skip; do not overwrite. A target's existing model is assumed deliberate |
 | Model present but a file is missing or doesn't match its checksum | embedding model: fail with `MODEL_INTEGRITY_FAILED`, naming the model and saying to restore or re-pull it. LLM: note it on the import and continue. Never overwrite it: blobs are shared, and replacing one could affect other models |
-| Model absent, package bundles it | install into the `ollama_models` volume, then verify it appears in `ollama list` before proceeding |
+| Model absent, package bundles it | install into the `ollama_models` volume, then verify it appears in `ollama list` before proceeding. If Ollama doesn't report it: the embedding model fails `EMBEDDING_MODEL_MISSING`, the LLM `IMPORT_FAILED`. If Ollama can't be reached, either fails `IMPORT_FAILED`, saying so rather than calling the model missing |
 | Model absent, package does not bundle it | fail with `EMBEDDING_MODEL_MISSING`, naming the model and stating that it must be pulled or a `with-models` package used |
 | Namespaced model name (`user/model`) | it has no path in the model store, so it can't be checked or installed from a package. If Ollama reports it, note that its files weren't checked and continue. If not: the embedding model fails `EMBEDDING_MODEL_MISSING`, saying to pull it; the LLM gets a note. If Ollama can't be reached, the embedding model fails `IMPORT_FAILED`, saying so rather than calling the model missing; the LLM gets a note |
 
@@ -504,7 +783,8 @@ exit, then confirm the persisted UUID set, properties and vectors. Duplicate IDs
 partial acceptance and manifest count mismatches MUST fail. Supplied vectors are
 compared by their float32 encoding; generated vectors must be finite and nonempty.
 `chunks_written` and ingest stored counts represent confirmed objects, not enqueue
-attempts. Verification MUST stream records with disk-backed UUID/property/vector
+attempts; ingest's `chunks_submitted` and `chunks_accepted` are the unconfirmed
+counts, reported beside them (#302). Verification MUST stream records with disk-backed UUID/property/vector
 fingerprints rather than retain a full decoded corpus in memory. Failed ingestion
 MUST remove only UUIDs generated by that attempt; cleanup failure MUST preserve
 the original error and explicitly report that accepted chunks may remain.
@@ -547,6 +827,7 @@ first request, which is what makes this safe.
 | New-target partial import | a small version-4 marker bound by SHA-256 to a compact SQLite expectation snapshot, and by a random instance token to the schema description (`rag-import:<token>`) the import gives the collection it creates | only for the collection carrying the marker's token: verify the full stored records and delete a proven mismatch. A collection without the token was created later under that name: keep it and retire the marker. Preserve on unreadable/legacy metadata or backend read failure. A version-3 marker carries no token and never deletes: in state `building` it is kept and logged; in state `cleanup` its cleanup is finished |
 | Orphaned expectation snapshot | a `<32 hex>.sqlite3` file in the markers folder that no marker names | delete it; if any marker cannot be parsed, delete none |
 | Extraction workspace (`import-*`, `rechunk-*` under `UPLOAD_DIR`) | the directory name prefix | delete the abandoned workspace; recovery sidecars are stored outside it |
+| Job record left `queued` or `running` | its file under `UPLOAD_DIR/jobs/<kind>/` | mark it interrupted: export, import and tune `failed` with `INTERRUPTED`, ingest `partial` (a file was stored) or `failed`; keep the newest 200 records per kind, at startup and while the API runs (only finished records are removed, #309). A job record never authorizes or blocks any cleanup above |
 
 Recovery ownership is atomic and flushed before the destructive step. Cleanup
 intent is also durable, so a failure after backend deletion does not leave a
@@ -577,6 +858,10 @@ longer needed. Import never modifies or deletes the original package in `./expor
 
 ### 7.1 Available operations
 
+`POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex` and `GET /tune/job/{job_id}` need
+the AI Engineer role; `GET /tune/{collection}`, which the Transfer page reads, needs Developer (#25,
+SPECIFICATIONS.md §3.1.8).
+
 | Goal | Requires | Mechanism |
 |---|---|---|
 | Change mode / `top_k` / `alpha` | nothing | per-request on `POST /query`; persist via §3.2 |
@@ -594,15 +879,19 @@ rather than silently ignoring one of them.
 
 ### 7.3 Gold-standard invalidation
 
-Invalidation covers both supported first-character collection aliases without changing stored session provenance.
-
 Any operation that changes chunk identity — re-chunking, or re-embedding that
 rebuilds the collection — MUST mark every gold-standard session for that
 collection `stale`, recording why and when. Sessions are not deleted and are not
 remapped: a wrong remap corrupts an evaluation baseline silently, which is worse
-than an honest stale flag.
+than an honest stale flag. Invalidation MUST cover both supported first-character
+collection aliases without changing stored session provenance.
 
 For identity-changing rebuilds, persist the flag after preparation succeeds but before deleting the live collection. A failure after cutover begins also marks history stale, including a failed reindex whose original collection may be missing or partial. A successful identity-preserving reindex keeps its existing validity semantics. This request-time validity barrier is separate from session persistence concurrency and durable collection recovery.
+
+Re-ingesting a file whose name already has chunks replaces them (#22), which also
+changes chunk identity: ingest marks the collection's sessions `stale` once per job, before
+storing the first replacing file's chunks, and that file fails if the marking can't be
+saved (`SPECIFICATIONS.md` §3.1.3). Ingesting new names marks nothing.
 
 Changing only the index type or distance metric does **not** change chunk
 identity, and MUST NOT mark sessions stale.
@@ -636,6 +925,23 @@ or when a step fails before the original is deleted. If marking gold-standard
 sessions stale fails at that point, the job fails `TUNE_FAILED`, says so and that
 the original collection is unchanged, and the retained copy is discarded.
 
+### 7.5 Weaviate unreadable at a tune route
+
+A tune route that can't read Weaviate answers HTTP 503 `SERVICE_UNAVAILABLE` as a JSON
+error, with `detail` `{"collection": "<name>"}`; the cause is logged, not returned. Two checks
+can fail this way:
+
+- **The existence check** (#349): `POST /tune/rechunk`, `POST /tune/reembed`,
+  `POST /tune/reindex` and `GET /tune/{collection}` read Weaviate to check that the
+  collection exists. No job is created and nothing is registered.
+- **The re-chunk coverage check** (#340): `POST /tune/rechunk` and `POST /tune/reembed`
+  with chunking fields read the stored chunks to check that there is something to rebuild
+  (§13 E17), and `GET /tune/{collection}`, for a collection with retained originals, reads them to
+  decide whether to offer re-chunking. For a start, no job is created and its guards are released.
+
+A re-embed without chunking fields and a re-index don't run the coverage check. Try again
+when Weaviate is available.
+
 ---
 
 ## 8. Lifecycle Rules
@@ -662,8 +968,13 @@ Every package contains one, generated from the manifest so it cannot drift:
 - exact import steps for this package
 - how to run `retrieve.py`, or why it is absent
 - the embedding-model requirement, stated as a prerequisite
-- a plain statement that the package is **not encrypted** and may contain
-  sensitive documents
+- the encryption section (`partials/encryption.md`, #27): a package is encrypted
+  only when exported with a passphrase, as `.tar.gz.age`, which import and
+  `age -d` open with it; the passphrase can't be recovered and should travel
+  separately; a `.tar.gz` package is **not encrypted** and may contain sensitive
+  documents; decrypted or imported contents are plaintext again
+- the file as delivered, and for an encrypted package the `passphrase` in the
+  import request
 
 ---
 
@@ -698,20 +1009,30 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 
 | Code | Meaning |
 |---|---|
-| `PACKAGE_UNREADABLE` | missing or not a readable archive |
+| `PACKAGE_UNREADABLE` | missing or not a readable archive, or a `.tar.gz.age` file that is not an age passphrase file |
+| `DECRYPT_FAILED` | an encrypted package could not be decrypted: wrong passphrase, damaged or truncated data, or a work factor above 20; `error_detail.reason` is `passphrase`, `header`, `payload` or `work_factor`; nothing is touched (#27) |
+| `PACKAGE_TOO_MANY_MEMBERS` | the package holds more than `max_package_members` entries (100,000 by default), directories included, implied ones too; `detail` `{"limit": <cap>}`; nothing is imported (§6.2 check 1, #317) |
+| `PACKAGE_TOO_LARGE` | the package's members add up to more than `max_package_expanded_bytes` (16 GiB by default); `detail` `{"limit": <cap>, "member": <name>}`; nothing is imported (§6.2 check 1, #317) |
+| `PASSPHRASE_REQUIRED` | HTTP 400 from `POST /import`: a `.tar.gz.age` package without a passphrase; no job (#27) |
+| `PASSPHRASE_NOT_EXPECTED` | HTTP 400 from `POST /import`: a passphrase for a package that is not encrypted; no job (#27) |
 | `PACKAGE_FORMAT_UNSUPPORTED` | `package_format` newer than this instance |
-| `PACKAGE_CORRUPT` | digest mismatch, invalid retained sources (check 3a), or invalid evaluation-session metadata (check 4a); names the file |
+| `PACKAGE_CORRUPT` | digest mismatch, a manifest `files` key outside the package (check 3), invalid retained sources or a chunk naming a source the package lacks (check 3a), or invalid evaluation-session metadata (check 4a); names the file |
 | `EMBEDDING_MISMATCH` | model or dimensions differ; names both |
 | `EMBEDDING_MODEL_MISSING` | target lacks the embedding model and the package does not bundle it |
 | `MODEL_INTEGRITY_FAILED` | the embedding model is installed but a file is missing or doesn't match its checksum; names the model |
 | `COLLECTION_EXISTS` | collision with `on_conflict=abort` |
 | `COLLECTION_NOT_FOUND` | export requested for a collection that does not exist |
-| `SOURCES_REQUIRED` | tuning needs retained originals covering every stored source file unambiguously; missing or ambiguous coverage is refused before staging |
+| `SERVICE_UNAVAILABLE` | HTTP 503: Weaviate can't be read to check whether the collection exists, from `POST /export` (#366) and from `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/{collection}` (#349); or can't be read for the re-chunk coverage check, from `POST /tune/rechunk`, `POST /tune/reembed` with chunking fields and `GET /tune/{collection}` (#340). No job is created, `detail` is `{"collection": "<name>"}` and the cause is logged, not returned (§7.5) |
+| `SOURCES_REQUIRED` | tuning needs retained originals covering every stored source file unambiguously; missing or ambiguous coverage is refused before staging; a collection none of whose retained names has stored chunks is refused before any job is created (HTTP 409) (#328) |
 | `EXPORT_IN_PROGRESS` | concurrent export of the same collection |
-| `IMPORT_IN_PROGRESS` | concurrent import of the same package file |
+| `EXPORT_STARTING` | HTTP 409: a concurrent export of the same collection is still storing its first record after 30 s; no `job_id`; retry shortly (#338) |
+| `IMPORT_IN_PROGRESS` | HTTP 409 from `POST /import` for a concurrent import of the same package file (compared by its name in `./exports`), and an import job's failure when another import into the same target collection is running, whatever either job's `on_conflict`, with `error_detail` `{"collection": "<target>"}` (#391) |
 | `TUNE_IN_PROGRESS` | concurrent tuning of the same collection |
+| `COLLECTION_DELETING` | HTTP 409 for a new export or tune, and an import job's failure: a delete of the collection is in progress (SPECIFICATIONS.md §3.1.2; #302) |
 | `TUNE_FAILED` | an unexpected error during a rebuild; the message carries the cause |
+| `SOURCE_INDEX_INVALID` | HTTP 409: the retained source index is invalid; repair it before source-dependent tuning. Answered by the tuning options, and by a re-chunk or a re-embed with chunking parameters before any job is created (#389). Reindex and re-embed from stored chunks remain available. |
 | `IMPORT_FAILED` | an unexpected error during import; the message carries the cause |
+| `INTERRUPTED` | the API restarted while the export, import or tune job was queued or running; start it again (#23) |
 
 ---
 
@@ -742,15 +1063,14 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E9 | `retrieve.py --top-k 10` overrides the baked default |
 | E10 | `retrieve.py` exits 3 with one sentence when the stack is down |
 | E11 | Import into a clean instance reproduces chunk count and answers equivalently |
-| E12 | Import refuses `EMBEDDING_MISMATCH` when the target uses a different embedding model |
-| E30 | Export refuses `EMBEDDING_MISMATCH` before streaming/bundling when the stored collection model is unknown, named-vector, or differs from the configured model; vectors are never relabeled from current environment settings |
+| E12 | Import refuses `EMBEDDING_MISMATCH` when the target uses a different embedding model, naming both models and both dimension counts, and offers no re-embedding (#390) |
 | E13 | A truncated package fails `PACKAGE_CORRUPT` naming the file |
 | E14 | `on_conflict=abort` fails; `rename` imports under a new name; `replace` succeeds |
 | E15 | Failed new-target builds remove partial collections; failed destructive replacement retains and names verified recovery data and sidecars |
-| E16 | Re-chunking marks the collection's gold-standard sessions `stale` |
-| E17 | Re-chunking a `chunks-only` or partially retained collection fails `SOURCES_REQUIRED` before staging; re-embed with new chunking parameters uses the same coverage guard |
+| E16 | Re-chunking and failed destructive cutover mark sessions under both supported first-character collection aliases `stale`; the reported count includes both spellings, and stored provenance is unchanged |
+| E17 | Re-chunking a `chunks-only`, partially retained or ambiguously retained collection (a name retained under more than one digest, or a name with more than one chunk set) fails `SOURCES_REQUIRED` before staging; re-embed with new chunking parameters uses the same coverage guard. A second name for the same retained content is covered: re-chunking emits one chunk set per (digest, name) pair, under the full logical name (#22). Only pairs whose name has stored chunks are rebuilt: a name the index lists without stored chunks is skipped, and the index keeps it (#311). When no listed name has stored chunks there is nothing to rebuild: the tuning options don't offer re-chunking and say why, and the request is refused up front, HTTP 409 `SOURCES_REQUIRED`, with no job (#328); a Weaviate error during that check answers HTTP 503 `SERVICE_UNAVAILABLE`, with no job (#340) |
 | E18 | `replace` reports the number of orphaned sessions |
-| E19 | Package `README.md` states the collection name, fidelity and encryption warning |
+| E19 | Package `README.md` states the collection name, fidelity and file name as delivered, and carries the encryption section (the "Encryption" heading, the `.tar.gz.age` form and that a `.tar.gz` package is not encrypted) (#27) |
 | E20 | `docker compose up -d` still starts five services, with `./exports` mounted |
 | E21 | Importing a `with-models` package into an instance lacking the embedding model installs it and it appears in `ollama list` |
 | E22 | Importing a package without bundled models into such an instance fails `EMBEDDING_MODEL_MISSING` |
@@ -760,12 +1080,25 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E26 | Importing when the installed embedding model's files don't match their checksums fails `MODEL_INTEGRITY_FAILED`, leaves the model's files untouched and says to restore or re-pull it |
 | E27 | With a namespaced `LLM_MODEL` (`user/model`), an import of a package without bundled models succeeds and notes the model |
 | E28 | Digest-valid malformed retrieval settings are refused before live mutation in all conflict modes; valid historical settings round-trip, a legacy out-of-range integer `ef` imports as `null` with a note, and generated script defaults/metadata remain encoded typed literals. On export, a saved legacy out-of-range integer `ef` is written to the package as `null` with a warning and the saved settings are left alone; other invalid saved settings fail the export before any chunk is read, with an error naming the failing fields and the Retrieval page, and no package is published |
-| E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths |
+| E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths; import and replace-mode recovery ignore unindexed source blobs; invalid-index tune options return `SOURCE_INDEX_INVALID`, and an invalid-index re-chunk or re-embed with chunking parameters is refused with HTTP 409 `SOURCE_INDEX_INVALID` before any job is created (#389), while record-only tuning still works; missing-blob exports pass import preflight, with `null` for the chunks of the missing blob; a chunk whose non-null `source_sha256` isn't in the package's source index fails `PACKAGE_CORRUPT` naming `chunks.jsonl`, before live mutation (#509) |
+| E30 | Export refuses `EMBEDDING_MISMATCH` before streaming/bundling when the stored collection model is unknown, named-vector, or differs from the configured model; vectors are never relabeled from current environment settings |
+| E31 | Export, import and tune job records survive an API restart: a completed export reads back unchanged, and an export interrupted by the restart answers `200` with `status: failed`, `error_code: INTERRUPTED` and its `chunks_written` kept; an import interrupted by the restart answers the same (#309); tune likewise, by `test_jobstore.py` |
+| E32 | Re-ingesting a changed file replaces its chunks and its retained source: one digest names it and the replaced blob is gone; re-chunking afterwards brings back only the new version, under each of its names (#22) |
+| E33 | An import whose manifest `files` map lists a key outside the package (an absolute key or a `..` key), with the outside file's real digest or a wrong one, fails `PACKAGE_CORRUPT` with `detail` `{"file": "manifest.json"}` and nothing else; the job reveals neither the outside path nor its digest, and no collection is created (#371) |
+| E34 | A model is bundled whole or not at all: when any of its files can't be copied, none of its files stay in the package or its `files` map, it is left out of `bundled_models`, and a warning names it, while another model before or after it is still bundled whole; when every model fails, the package has no `models/` folder and `models_bundled` is false. A model named for both embedding and the LLM, compared by name and tag (`x` and `x:latest`), is copied once (#449, #494), by `test_retrieval_import.py` |
+| E35 | Digest-valid malformed ingest settings (invalid JSON, a non-object, a wrong type or an invalid value) are refused `PACKAGE_CORRUPT`, naming `ingest_config.json`, before live mutation in all conflict modes, leaving the existing collection's settings unchanged; valid settings, including ones with missing or unknown fields, numeric strings and a `chunk_size`/`min_chunk_size` from before the chunk bounds, import and `GET /ingest/config/{collection}` returns them for the import target (#510), by `test_retrieval_import.py` |
+| E36 | An export holds its collection's writer guard for its whole run: a re-ingest that tries to commit mid-export waits, and the package holds the old chunks with the old source bytes, every non-null `source_sha256` naming a blob in it; gold-standard generation is refused `COLLECTION_BUSY` and guarded writers wait meanwhile; an export started while another writer holds the guard reads `queued`; the guard is released when the export completes, fails or is cancelled (#509); a cancelled export ends `failed` with an `error` saying so, and the cancellation still propagates (#521), by `test_export_snapshot.py` |
+| E37 | An export with a `passphrase` writes `<stem>.tar.gz.age`, an age v1 scrypt file at work factor 18 whose decryption satisfies §4.1 to §4.5 and that the listing shows `encrypted: true` with null metadata; the export and import jobs report `encrypted` and hold no passphrase (#27), by `test_export_encryption.py` and suite 05 |
+| E38 | Importing an encrypted package with a wrong passphrase fails `DECRYPT_FAILED` (`reason` `passphrase`), and a damaged or truncated file fails `DECRYPT_FAILED` or `PACKAGE_UNREADABLE` and a scrypt work factor above 20 (21 included) or not one or two decimal digits (thousands of digits included) fails `DECRYPT_FAILED` before any key derivation; a file cut inside the payload nonce fails `DECRYPT_FAILED`, with no collection, marker, setting, session or package file changed and no work directory left; the right passphrase imports it with every chunk (#27), by `test_export_encryption.py` and suite 05 |
+| E39 | `POST /import` refuses an encrypted package without a passphrase `400 PASSPHRASE_REQUIRED` and a passphrase for any other package `400 PASSPHRASE_NOT_EXPECTED`, before any job; `POST /export` refuses a passphrase outside 12 to 1024 characters, and both refuse one with no UTF-8 form (a lone surrogate), `422 INVALID_PARAMETER` without echoing it; one bad encrypted file never fails `GET /packages` (#27) |
+| E40 | The age implementation passes every applicable C2SP CCTV age testkit vector, and its output decrypts with an independent decryption written from the age specification (#27), by `test_export_encryption.py` |
+| E41 | A package of more than `max_package_members` entries, directories included, fails `PACKAGE_TOO_MANY_MEMBERS`, folders implied by member paths counting once each (a directory member's own folder as its entry; a name with a `..` component is refused `PACKAGE_UNREADABLE` before its folders are counted), and one whose members add up to more than `max_package_expanded_bytes` fails `PACKAGE_TOO_LARGE`, each with its message and `detail`, for `.tar.gz` and `.tar.gz.age` packages alike; a package exactly at a cap imports; a member with a negative size is refused `PACKAGE_UNREADABLE` before its size is counted, and a sparse file (old GNU type `S`, PAX sparse 0.0, 0.1 or 1.0) is refused `PACKAGE_UNREADABLE`; a `.tar.gz` refusal extracts nothing and reads no header after the refusing member, a `.tar.gz.age` refusal leaves at most the cap's bytes, and the job creates no collection and leaves no work directory (#317), by `test_package_limits.py` with caps of 1 MiB and 20 entries set through the environment |
 
 ---
 
 ## 14. Deferred
 
-Incremental export, encryption and signing, corpus merging, cross-vector-store
+Incremental export, signing, key-pair (non-passphrase) encryption, encryption on
+by default (a follow-up for LAN access, #26), corpus merging, cross-vector-store
 migration, gold-standard remapping after re-chunk, and HTTP transport as an
 alternative to the mounted directory.

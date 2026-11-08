@@ -5,36 +5,69 @@
 // chunking-strategy selector, `input[type=text]` missed an input with no type
 // attribute, and a row's delete link matched a class test meant for the modal's
 // confirm button.
-const { sleep, makeReporter, launch, session, bodyText, clickByText } = require('./lib');
+const { sleep, makeReporter, launch, session, credentialsFor, bodyText, setValue, clickByText, readNav, chooseFromMenu } = require('./lib');
 
 const BASE = process.env.RAG_UI_BASE || 'http://proxy';
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic'];
+// nginx's refusal of a login beyond its rate (#577), as the login page shows it.
+const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again.';
 
 (async () => {
   const browser = await launch();
   const r = makeReporter();
+  await require('./chunking_config').runChunkingConfigTests(browser, BASE, r);
 
   await require('./query_config').runQueryConfigTests(browser, BASE, r);
+  await require('./qa_page').runQaPageTests(browser, BASE, r);
 
-  // ── role persistence ───────────────────────────────────────────────────────
-  r.section('§10.4 role selection');
+  await require('./health_page').runHealthPageTests(browser, BASE, r);
+  await require('./transfer_page').runTransferPageTests(browser, BASE, r);
+
+  await require('./goldstandard_page').runGoldStandardPageTests(browser, BASE, r);
+
+  await require('./ui_controls').runUiControlTests(browser, BASE, r);
+
+  await require('./ui_pages').runUiPageTests(browser, BASE, r);
+
+  // ── login, persistence and logout against the real API (#25) ─────────────
+  r.section('§10.4 login and session');
   {
     const s = await session(browser, BASE, null);
-    await s.page.goto(BASE + '/', { waitUntil: 'networkidle2' });
-    await sleep(1200);
-    const picked = await s.page.evaluate(() => {
-      const b = [...document.querySelectorAll('button')].find(x => /Engineer/i.test(x.textContent));
-      if (!b) return false; b.click(); return true;
-    });
-    r.check('a role can be chosen on the landing page', picked);
-    const stored = await s.page.evaluate(() => sessionStorage.getItem('rag_role'));
-    r.check('the choice is persisted', !!stored, String(stored));
-    for (const p of ['/qa', '/collections', '/health', '/qa']) {
-      await s.page.goto(BASE + p, { waitUntil: 'networkidle2' }); await sleep(700);
+    await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' });
+    r.check('logged out, the UI shows the login page', /Log in to continue/.test(await bodyText(s.page)) && new URL(s.page.url()).pathname === '/login');
+    const { username, password } = credentialsFor('engineer');
+    const submit = async () => {                    // a failed login clears the password: both are set each time
+      await setValue(s.page, "() => document.querySelector('#login-username')", username);
+      await setValue(s.page, "() => document.querySelector('#login-password')", password);
+      await clickByText(s.page, 'Log in');
+      await s.page.waitForFunction(() => (location.pathname === '/qa' && document.querySelectorAll('nav a').length > 0)
+        || document.querySelector('p[role=alert]'), { timeout: 10000 }).catch(() => {});
+    };
+    await submit();
+    // nginx allows 10 logins a minute per address, a burst of 5 (#577), and refills a slot every 6 s:
+    // a form login it refuses is submitted once more after 6.5 s, as browser/lib.js's login waits.
+    if (await s.page.evaluate(() => document.querySelector('p[role=alert]')?.textContent.trim()) === LOGIN_RATE_LIMITED) {
+      await sleep(6500);
+      await submit();
     }
-    const after = await s.page.evaluate(() => sessionStorage.getItem('rag_role'));
-    const navPresent = await s.page.evaluate(() => document.querySelectorAll('nav a').length > 0);
-    r.check('the role survives navigation', after === stored && navPresent);
+    await s.page.waitForFunction(() => location.pathname === '/qa' && document.querySelectorAll('nav a').length > 0, { timeout: 10000 }).catch(() => {});
+    const badge = await s.page.evaluate(() => document.querySelector('nav button[data-menu=account] span.bg-blue-100')?.textContent.trim());
+    r.check('logging in through the form opens /qa as the account\'s role', badge === 'AI Engineer', String(badge));
+    const cookies = await s.page.cookies();
+    const cookie = cookies.find(c => c.name === 'rag_session');
+    r.check('the session is an HttpOnly, SameSite=Strict cookie, not script-readable',
+      !!cookie && cookie.httpOnly && cookie.sameSite === 'Strict' && !(await s.page.evaluate(() => document.cookie)).includes('rag_session'));
+    r.check('nothing about the user or role is kept in browser storage',
+      await s.page.evaluate(() => sessionStorage.length === 0 && localStorage.length === 0));
+    for (const p of ['/qa', '/collections', '/health', '/qa']) {
+      await s.page.goto(BASE + p, { waitUntil: 'networkidle2' }); await sleep(500);
+    }
+    const pages = (await readNav(s.page).catch(() => ({ pages: [] }))).pages;  // the Engineer's 12: Q&A and the menus' 11 (#616, Prepare #638)
+    r.check('the session survives navigation and reloads', pages.length === 12, JSON.stringify(pages));
+    await chooseFromMenu(s.page, 'account', 'Log out').catch(() => {});
+    await s.page.waitForFunction(() => location.pathname === '/login', { timeout: 10000 }).catch(() => {});
+    const me = await s.page.evaluate(async () => (await fetch('/api/auth/me')).status);
+    r.check('Log out ends the session at the API and returns to the login page', me === 401 && new URL(s.page.url()).pathname === '/login', `me=${me}`);
     await s.ctx.close();
   }
 
@@ -45,6 +78,8 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     const suffix = require('crypto').randomBytes(4).toString('hex');
     const emptyId = 'gs_' + suffix, currentId = 'gs_' + require('crypto').randomBytes(4).toString('hex');
     const missingId = 'gs_' + require('crypto').randomBytes(4).toString('hex');
+    const histId = 'gs_' + require('crypto').randomBytes(4).toString('hex');
+    const histBodies = [];
     const common = { collection: 'OwnedHistoricalBrowserFixture', status: 'completed', pairs_total: 0, pairs_completed: 0, pairs: [] };
     let exports = 0;
     await s.page.setRequestInterception(true);
@@ -58,6 +93,16 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
       }
       if (path === '/api/goldstandard/session/' + missingId) {
         return request.respond({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: { code: 'SESSION_NOT_FOUND', message: 'Unknown fixture session.' } }) });
+      }
+      if (path === '/api/goldstandard/session/' + histId) {
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...common, session_id: histId, pairs_total: 1, pairs_completed: 1, stale: true, stale_reason: 'Synthetic rechunk with pairs', stale_at: '2026-09-28T00:02:00+00:00', pairs: [{ pair_id: 'hist', question: 'Owned historical question', answer: 'Inert', contexts: ['Inert'], ground_truth: 'Inert', source_file: 'inert.txt', chunk_index: 0, status: 'approved' }] }) });
+      }
+      if (path === '/api/goldstandard/save' && JSON.parse(request.postData() || '{}').session_id === histId) {
+        histBodies.push(JSON.parse(request.postData()));
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ filename: 'owned_hist.json', pairs_saved: 1, pairs_excluded: 0, download_url: '/api/goldstandard/download/owned_hist.json', historical: true, session_validity: { stale: true } }) });
+      }
+      if (path === '/api/goldstandard/download/owned_hist.json') {
+        return request.respond({ status: 200, contentType: 'application/json', body: '[]' });
       }
       if (path === '/api/goldstandard/save') {
         exports++; await sleep(500);
@@ -84,6 +129,21 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
       r.check('duplicate clicks issue one export and failure clears pending state', exports===1 && await s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Export Approved'); return b && !b.disabled && document.body.innerText.includes('Synthetic export failure.'); }));
       await load(missingId);
       r.check('a failed retained lookup clears prior pairs and export controls', /Unknown fixture session/.test(await bodyText(s.page)) && await s.page.evaluate(() => ![...document.querySelectorAll('button')].some(b=>/Export.*Approved/.test(b.textContent)) && !document.body.innerText.includes('Owned synthetic question')));
+      await load(histId);
+      const histButton = () => s.page.evaluate(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='Export Historical Approved'); return b ? { disabled: b.disabled } : null; });
+      const histBox = () => s.page.evaluate(() => { const c=[...document.querySelectorAll('label')].find(l=>/export historical pairs/.test(l.textContent)); const i=c && c.querySelector('input[type=checkbox]'); return i ? i.checked : null; });
+      const hist = await bodyText(s.page);
+      const lockedButton = await histButton();
+      r.check('a stale session with pairs shows the warning and a locked historical export', /Historical evaluation data/.test(hist) && /Synthetic rechunk with pairs/.test(hist) && lockedButton && lockedButton.disabled && (await histBox()) === false, JSON.stringify(lockedButton));
+      await s.page.evaluate(() => { const c=[...document.querySelectorAll('label')].find(l=>/export historical pairs/.test(l.textContent)); c.querySelector('input[type=checkbox]').click(); });
+      await sleep(100);
+      r.check('ticking the historical choice enables export', (await histButton())?.disabled === false);
+      await load(histId);
+      r.check('refreshing the session resets the historical choice', (await histBox()) === false && (await histButton())?.disabled === true);
+      await s.page.evaluate(() => { const c=[...document.querySelectorAll('label')].find(l=>/export historical pairs/.test(l.textContent)); c.querySelector('input[type=checkbox]').click(); });
+      await sleep(100);
+      await clickByText(s.page, 'Export Historical Approved'); await sleep(400);
+      r.check('historical export sends allow_historical:true and labels the result', histBodies.length === 1 && histBodies[0].allow_historical === true && /Historical data; not a current collection baseline/.test(await bodyText(s.page)), JSON.stringify(histBodies));
       r.check('historical UI fixtures cause no React page errors', !s.errors.some(error=>error.startsWith('pageerror:')));
     } finally { await s.ctx.close(); } // All synthetic responses/context owned here.
   }
@@ -93,8 +153,9 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
   {
     const s = await session(browser, BASE, 'end_user');
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(1500);
-    const links = await s.page.evaluate(() => [...document.querySelectorAll('nav a')].map(a => a.textContent.trim()));
-    r.check('End User sees only Q&A in the nav', links.length === 1 && /Q&A/.test(links[0]), JSON.stringify(links));
+    const shown = await readNav(s.page).catch(e => ({ pages: [], menus: [], error: String(e) }));
+    r.check('End User sees only Q&A in the nav, and no Data, Tune or Admin menu',
+      JSON.stringify(shown.pages) === '["Q&A"]' && JSON.stringify(shown.menus.map(m => m.key)) === '["account"]', JSON.stringify(shown));
     await s.page.goto(BASE + '/collections', { waitUntil: 'networkidle2' }); await sleep(1200);
     const landed = await s.page.evaluate(() => location.pathname);
     r.check('End User cannot reach a gated route directly', landed === '/qa', `landed on ${landed}`);
@@ -103,8 +164,8 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
   {
     const s = await session(browser, BASE, 'engineer');
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(1500);
-    const links = await s.page.evaluate(() => [...document.querySelectorAll('nav a')].map(a => a.textContent.trim()));
-    for (const want of ['Q&A', 'Import', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health']) {
+    const links = (await readNav(s.page).catch(() => ({ pages: [] }))).pages;  // through the menus (#616)
+    for (const want of ['Q&A', 'Import', 'Prepare', 'Chunking', 'Retrieval', 'Gold Standard', 'Transfer', 'Collections', 'Health', 'Users', 'Service keys', 'Audit']) {
       r.check(`Engineer nav includes ${want}`, links.includes(want), JSON.stringify(links));
     }
     await s.ctx.close();
@@ -268,8 +329,338 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
       await sleep(900);
       r.check('a wrong name sends no DELETE',
               s.api.filter(x => x.method === 'DELETE').length === before);
+
+      // A refused delete (409 while a job runs, #40) is shown in the dialog. The
+      // page-level error line sits behind the overlay, where it read as nothing.
+      // The DELETE is answered here, so no collection is touched.
+      const busyMessage = "An ingest job is running for this collection ('Owned', job 0wned40). Delete the collection after the job finishes.";
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        if (request.method() === 'DELETE' && new URL(request.url()).pathname.startsWith('/api/collections/')) {
+          return request.respond({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: { code: 'COLLECTION_BUSY', message: busyMessage, detail: { job_kind: 'ingest', job_id: '0wned40' } } }) });
+        }
+        return request.continue();
+      });
+      const target = await s.page.evaluate(() => {
+        const el = [...document.querySelectorAll('input')].find(i => !i.type || i.type === 'text');
+        const name = el.placeholder;
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, name);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        return name;
+      });
+      await sleep(200);
+      const deletes = s.api.filter(x => x.method === 'DELETE').length;
+      await s.page.evaluate(() => {
+        const btn = [...document.querySelectorAll('button')]
+          .find(b => b.textContent.trim() === 'Delete' && b.className.includes('bg-red-600'));
+        if (btn && !btn.disabled) btn.click();
+      });
+      await sleep(900);
+      const refused = await s.page.evaluate(() => {
+        const dialog = [...document.querySelectorAll('h2')].find(h => h.textContent.trim() === 'Delete Collection');
+        const box = dialog && dialog.parentElement;
+        const alert = box && box.querySelector('[role=alert]');
+        return { open: !!dialog, alert: alert ? alert.textContent : null };
+      });
+      r.check('a refused delete sends one DELETE', s.api.filter(x => x.method === 'DELETE').length === deletes + 1);
+      r.check('a refused delete keeps the dialog open and shows the message in it',
+              refused.open && refused.alert === busyMessage, JSON.stringify(refused));
+      const listed = await s.page.evaluate(t => [...document.querySelectorAll('tbody td')].some(td => td.textContent.trim() === t), target);
+      r.check('the refused collection is still listed', listed, target);
+      await clickByText(s.page, 'Cancel'); await sleep(200);
+      await s.page.evaluate(() => {
+        const b = [...document.querySelectorAll('button')].find(x => x.textContent.trim() === 'Delete');
+        if (b) b.click();
+      });
+      await sleep(300);
+      r.check('cancelling clears the message for the next attempt',
+              await s.page.evaluate(() => !document.querySelector('[role=alert]')));
     }
     await s.ctx.close();
+  }
+
+  // ── refused creates and failed collection lists (#379) ───────────────────
+  // A refused create went to the page-level error line behind the modal's
+  // overlay, so it looked like nothing happened, and a failed GET /collections
+  // was swallowed, so an outage looked like "no collections". The POSTs and the
+  // failing lists are answered here, so no collection is created.
+  r.section('refused creates and failed collection lists (#379)');
+  {
+    const LIST_FAIL = 'Synthetic list failure (#379).';
+    const LIST_MESSAGE = 'Could not load the collections: ' + LIST_FAIL;
+    const EXISTS = "Collection 'VfyRefused379' already exists.";
+    const listFailure = { status: 503, contentType: 'application/json', body: JSON.stringify({ error: { code: 'SERVICE_UNAVAILABLE', message: LIST_FAIL, detail: null } }) };
+    const refusal = { status: 409, contentType: 'application/json', body: JSON.stringify({ error: { code: 'COLLECTION_EXISTS', message: EXISTS, detail: null } }) };
+    const accepted = { status: 201, contentType: 'application/json', body: JSON.stringify({ name: 'VfyRefused379', status: 'created' }) };
+    // Each alert's text without its buttons: the Q&A and Gold Standard alerts
+    // hold a Retry button (#575), and the message is what is checked here.
+    const alerts = page => page.evaluate(() => [...document.querySelectorAll('[role=alert]')].map(a => {
+      const c = a.cloneNode(true);
+      c.querySelectorAll('button').forEach(b => b.remove());
+      return c.textContent.trim();
+    }));
+    // The New Collection modal, and the alert inside it, if any.
+    const modal = page => page.evaluate(() => {
+      const h = [...document.querySelectorAll('h2')].find(x => x.textContent.trim() === 'New Collection');
+      const box = h && h.parentElement;
+      const alert = box && box.querySelector('[role=alert]');
+      return { open: !!h, alert: alert ? alert.textContent.trim() : null };
+    });
+    // Answers GET and POST /api/collections as the test's current modes say.
+    async function stub(s) {
+      const mode = { list: 'pass', post: 'refuse' };
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        if (new URL(request.url()).pathname !== '/api/collections') return request.continue();
+        if (request.method() === 'GET' && mode.list === 'fail') return request.respond(listFailure);
+        if (request.method() === 'POST') return request.respond(mode.post === 'refuse' ? refusal : accepted);
+        return request.continue();
+      });
+      return mode;
+    }
+    const posts = s => s.api.filter(x => x.method === 'POST' && x.url === '/api/collections').length;
+
+    // A failed list on each page that loads one.
+    for (const path of ['/collections', '/import', '/qa', '/goldstandard']) {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const mode = await stub(s);
+        mode.list = 'fail';
+        await s.page.goto(BASE + path, { waitUntil: 'networkidle2' }); await sleep(1500);
+        const shown = await alerts(s.page);
+        r.check(`${path}: a failed collection list is shown as an alert`, shown.includes(LIST_MESSAGE), JSON.stringify(shown));
+        r.check(`${path}: a failed collection list causes no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // Collections page: a refused create, then a successful one, which also
+    // reloads the list and clears the failed-list message.
+    {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const mode = await stub(s);
+        mode.list = 'fail';
+        await s.page.goto(BASE + '/collections', { waitUntil: 'networkidle2' }); await sleep(1500);
+        await clickByText(s.page, '+ New Collection'); await sleep(300);
+        await setValue(s.page, "() => document.querySelector('input[placeholder=Name]')", 'VfyRefused379');
+        const before = posts(s);
+        await clickByText(s.page, 'Create'); await sleep(900);
+        const refused = await modal(s.page);
+        r.check('Collections: a refused create sends one POST', posts(s) === before + 1);
+        r.check('Collections: a refused create keeps the modal open and shows the message in it',
+                refused.open && refused.alert === EXISTS, JSON.stringify(refused));
+        await clickByText(s.page, 'Cancel'); await sleep(200);
+        await clickByText(s.page, '+ New Collection'); await sleep(300);
+        const reopened = await modal(s.page);
+        r.check('Collections: cancelling clears the message for the next attempt', reopened.open && reopened.alert === null, JSON.stringify(reopened));
+        await clickByText(s.page, 'Create'); await sleep(900);
+        mode.post = 'accept'; mode.list = 'pass';
+        await clickByText(s.page, 'Create'); await sleep(1500);
+        const done = await modal(s.page);
+        r.check('Collections: a successful create closes the modal', !done.open, JSON.stringify(done));
+        const after = await alerts(s.page);
+        r.check('Collections: the next successful list clears the failed-list message', !after.includes(LIST_MESSAGE), JSON.stringify(after));
+        await clickByText(s.page, '+ New Collection'); await sleep(300);
+        const fresh = await modal(s.page);
+        r.check('Collections: a successful create clears the message for the next attempt', fresh.open && fresh.alert === null, JSON.stringify(fresh));
+        r.check('Collections create fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // Import page "+ New": a refused create, then a successful one whose list
+    // reload fails, which is a list error, not a refused create. The new
+    // collection stays selected and shown in the selector (#430).
+    {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const mode = await stub(s);
+        await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+        await clickByText(s.page, '+ New'); await sleep(300);
+        await setValue(s.page, "() => document.querySelector('input[placeholder=\"Collection name\"]')", 'VfyRefused379');
+        const before = posts(s);
+        await clickByText(s.page, 'Create'); await sleep(900);
+        const refused = await modal(s.page);
+        r.check('Import: a refused create sends one POST', posts(s) === before + 1);
+        r.check('Import: a refused create keeps the modal open and shows the message in it',
+                refused.open && refused.alert === EXISTS, JSON.stringify(refused));
+        await clickByText(s.page, 'Cancel'); await sleep(200);
+        await clickByText(s.page, '+ New'); await sleep(300);
+        const reopened = await modal(s.page);
+        r.check('Import: cancelling clears the message for the next attempt', reopened.open && reopened.alert === null, JSON.stringify(reopened));
+        await setValue(s.page, "() => document.querySelector('input[placeholder=\"Collection name\"]')", 'VfyRefused379');
+        await clickByText(s.page, 'Create'); await sleep(900);
+        mode.post = 'accept'; mode.list = 'fail';
+        await clickByText(s.page, 'Create'); await sleep(1500);
+        const done = await modal(s.page);
+        const after = await alerts(s.page);
+        r.check('Import: a successful create closes the modal even when the list reload fails', !done.open, JSON.stringify(done));
+        r.check('Import: a failed reload after a create is shown as a failed list', after.includes(LIST_MESSAGE), JSON.stringify(after));
+        const selected = await s.page.evaluate(() => {
+          const label = [...document.querySelectorAll('label')].find(x => x.textContent.trim() === 'Collection');
+          const select = label && label.parentElement.querySelector('select');
+          return select ? { value: select.value, shown: select.selectedIndex >= 0 ? select.options[select.selectedIndex].text : null } : null;
+        });
+        r.check('Import: a create whose list reload fails leaves the new collection selected and shown (#430)',
+                !!selected && selected.value === 'VfyRefused379' && selected.shown === 'VfyRefused379', JSON.stringify(selected));
+        await clickByText(s.page, '+ New'); await sleep(300);
+        const fresh = await modal(s.page);
+        r.check('Import: a successful create clears the message for the next attempt', fresh.open && fresh.alert === null, JSON.stringify(fresh));
+        r.check('Import create fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+  }
+
+  // ── retrying a failed collection list (#575) ─────────────────────────────
+  // The Q&A and Gold Standard pages load the collection list once on opening;
+  // the failed-list alert's Retry loads it again. A successful Retry clears the
+  // message and selects the first collection only if none is chosen, so a
+  // collection chosen on the Retrieval page stays selected on Q&A. On a freshly
+  // opened page the first Retry fails again, with another reason, so the alert
+  // must show that reason with its Retry button before the next Retry succeeds
+  // (#593). The list and the retrieval settings are answered here, so the cases
+  // don't depend on the stack's collections and create nothing.
+  r.section('retrying a failed collection list (#575)');
+  {
+    const FAIL = 'Synthetic list failure (#575).';
+    const MESSAGE = 'Could not load the collections: ' + FAIL;
+    // A Retry that fails again shows its own reason, which only that Retry's
+    // error handler can put in the alert (#593).
+    const FAIL_AGAIN = 'Synthetic list failure on Retry (#593).';
+    const MESSAGE_AGAIN = 'Could not load the collections: ' + FAIL_AGAIN;
+    const FIRST = 'VfyRetry575A', SECOND = 'VfyRetry575B';
+    const info = name => ({ name, object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', created_at: null, hnsw_config: null });
+    const failed503 = message => ({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: { code: 'SERVICE_UNAVAILABLE', message, detail: null } }) });
+    const failure = failed503(FAIL), failureAgain = failed503(FAIL_AGAIN);
+    const listed = { status: 200, contentType: 'application/json', body: JSON.stringify({ collections: [info(FIRST), info(SECOND)] }) };
+    // Answers GET /api/collections as mode.list says, and the retrieval settings.
+    async function stub(s) {
+      const mode = { list: 'pass' };
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        const path = new URL(request.url()).pathname;
+        if (request.method() === 'GET' && path === '/api/collections') return request.respond(mode.list === 'fail' ? failure : mode.list === 'fail-again' ? failureAgain : listed);
+        if (request.method() === 'GET' && path.startsWith('/api/retrieval/config/')) {
+          const name = decodeURIComponent(path.split('/').pop());
+          return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collection: name, retrieval_mode: 'hnsw', top_k: 5, alpha: 0.75, ef: null, response_format: 'engineer', is_default: true }) });
+        }
+        return request.continue();
+      });
+      return mode;
+    }
+    const lists = s => s.api.filter(x => x.method === 'GET' && x.url === '/api/collections').length;
+    // The failed-list alert, if shown, and whether it holds a Retry button.
+    const listAlert = (page, message = MESSAGE) => page.evaluate(m => {
+      for (const a of document.querySelectorAll('[role=alert]')) {
+        const c = a.cloneNode(true);
+        c.querySelectorAll('button').forEach(b => b.remove());
+        if (c.textContent.trim() === m) return { retry: [...a.querySelectorAll('button')].some(b => b.textContent.trim() === 'Retry') };
+      }
+      return null;
+    }, message);
+    const retryShown = page => page.evaluate(() => [...document.querySelectorAll('button')].some(b => b.textContent.trim() === 'Retry'));
+    // The collection selector: on Q&A (and Retrieval) the first select, on Gold
+    // Standard the one next to the Collection label.
+    const selection = (page, gold) => page.evaluate(g => {
+      let select = document.querySelector('select');
+      if (g) {
+        const label = [...document.querySelectorAll('label')].find(x => x.textContent.trim() === 'Collection');
+        select = label && label.parentElement.querySelector('select');
+      }
+      return select ? { value: select.value, options: [...select.options].map(o => o.value) } : null;
+    }, gold);
+    const noPageErrors = (s, name) => r.check(`${name}: the Retry cases cause no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+
+    // A fresh page with nothing chosen: a Retry that fails again keeps the alert
+    // and its Retry button (#593), and a later Retry selects the first collection.
+    // No case checks that Gold Standard keeps a collection already chosen before
+    // a Retry (#593): its collection is page-local, starts empty and is set only
+    // by this list load and by the selector, which has no options while the list
+    // has failed, so that state can't be reached through the page.
+    for (const [name, path, gold] of [['Q&A', '/qa', false], ['Gold Standard', '/goldstandard', true]]) {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const mode = await stub(s);
+        mode.list = 'fail';
+        await s.page.goto(BASE + path, { waitUntil: 'networkidle2' }); await sleep(1500);
+        const failed = await listAlert(s.page);
+        r.check(`${name}: the failed-list alert has a Retry button (#575)`, !!failed && failed.retry, JSON.stringify(failed));
+        mode.list = 'fail-again';
+        await clickByText(s.page, 'Retry'); await sleep(1200);
+        const again = await listAlert(s.page, MESSAGE_AGAIN);
+        r.check(`${name}: a Retry that fails again shows the new reason and keeps the Retry button (#593)`, !!again && again.retry, JSON.stringify(again));
+        const before = lists(s);
+        mode.list = 'pass';
+        await clickByText(s.page, 'Retry'); await sleep(1200);
+        r.check(`${name}: Retry loads the collection list again`, lists(s) === before + 1, `${lists(s) - before} more`);
+        const after = await listAlert(s.page);
+        r.check(`${name}: a successful Retry clears the message and the Retry button`, after === null && !(await retryShown(s.page)), JSON.stringify(after));
+        const sel = await selection(s.page, gold);
+        r.check(`${name}: a successful Retry with nothing chosen selects the first collection`,
+                !!sel && sel.value === FIRST && sel.options.join() === [FIRST, SECOND].join(), JSON.stringify(sel));
+        noPageErrors(s, name);
+      } finally { await s.ctx.close(); }
+    }
+
+    // Q&A with a collection chosen on the Retrieval page: the client-side
+    // navigation keeps the choice, and a successful Retry keeps it selected.
+    {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const mode = await stub(s);
+        await s.page.goto(BASE + '/retrieval', { waitUntil: 'networkidle2' }); await sleep(1500);
+        await setValue(s.page, "() => document.querySelector('select')", SECOND); await sleep(500);
+        mode.list = 'fail';
+        await clickByText(s.page, 'Q&A'); await sleep(1500);
+        const failed = await listAlert(s.page);
+        r.check('Q&A after Retrieval: the failed-list alert has a Retry button (#575)', !!failed && failed.retry, JSON.stringify(failed));
+        mode.list = 'pass';
+        await clickByText(s.page, 'Retry'); await sleep(1200);
+        const after = await listAlert(s.page);
+        r.check('Q&A after Retrieval: a successful Retry clears the message', after === null, JSON.stringify(after));
+        const sel = await selection(s.page, false);
+        r.check('Q&A after Retrieval: a successful Retry keeps the collection chosen on the Retrieval page',
+                !!sel && sel.value === SECOND, JSON.stringify(sel));
+        noPageErrors(s, 'Q&A after Retrieval');
+      } finally { await s.ctx.close(); }
+    }
+  }
+
+  // ── the created name as stored (#372) ──────────────────────────────────────
+  // Weaviate capitalises a collection's first letter, and the list shows that
+  // name. The Import page selected the typed name, which matched no option, so
+  // React showed the first option instead while uploads went to the typed name.
+  // /api/collections is answered here, the list with a decoy first, so that
+  // fallback can't pass the check; nothing is created on the stack.
+  r.section('the created name as stored (#372)');
+  {
+    const TYPED = 'vfySpelling372', STORED = 'VfySpelling372', DECOY = 'VfyDecoy372';
+    const info = name => ({ name, object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', created_at: null, hnsw_config: null });
+    const s = await session(browser, BASE, 'engineer');
+    try {
+      await s.page.setRequestInterception(true);
+      let created = false;
+      s.page.on('request', request => {
+        if (new URL(request.url()).pathname !== '/api/collections') return request.continue();
+        if (request.method() === 'POST') {
+          created = true;
+          return request.respond({ status: 201, contentType: 'application/json', body: JSON.stringify({ name: STORED, status: 'created' }) });
+        }
+        const list = created ? [info(DECOY), info(STORED)] : [info(DECOY)];
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: list }) });
+      });
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      await clickByText(s.page, '+ New'); await sleep(300);
+      await setValue(s.page, "() => document.querySelector('input[placeholder=\"Collection name\"]')", TYPED);
+      await clickByText(s.page, 'Create'); await sleep(1500);
+      const selected = await s.page.evaluate(() => {
+        const label = [...document.querySelectorAll('label')].find(x => x.textContent.trim() === 'Collection');
+        const select = label && label.parentElement.querySelector('select');
+        return select ? { value: select.value, options: [...select.options].map(o => o.value) } : null;
+      });
+      r.check('Import: after "+ New", the selector holds the created collection as stored',
+              !!selected && selected.value === STORED, JSON.stringify(selected));
+      r.check('Import stored-name fixture causes no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+    } finally { await s.ctx.close(); }
   }
 
   // ── upload size limit ──────────────────────────────────────────────────────
@@ -303,6 +694,442 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     await s.ctx.close();
   }
 
+  // ── import file types (#291) ───────────────────────────────────────────────
+  // The picker offers JSON Lines, plain and gzipped, and the hint names it.
+  r.section('import file types');
+  {
+    const s = await session(browser, BASE, 'developer');
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const accept = await s.page.evaluate(() => {
+        const input = document.querySelector('#file-input');
+        return input ? input.getAttribute('accept') : null;
+      });
+      r.check('the file picker accepts .jsonl and .jsonl.gz',
+              accept === '.pdf,.docx,.txt,.md,.csv,.json,.jsonl,.jsonl.gz,.zip', String(accept));
+      const hint = await bodyText(s.page);
+      r.check('the drop zone hint names JSONL among the types',
+              hint.includes('PDF, DOCX, TXT, MD, CSV, JSON, JSONL, ZIP · up to 512 MB per upload'),
+              hint.slice(0, 200));
+    } finally {
+      await s.ctx.close();
+    }
+  }
+
+  // ── corpus preparation rules (#615) ────────────────────────────────────────
+  // The Import page offers the rules as a download: a static file of the UI
+  // build, served through the proxy. test_corpus_rules.py checks its limits.
+  r.section('corpus preparation rules');
+  {
+    const s = await session(browser, BASE, 'developer');
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const link = await s.page.evaluate(() => {
+        const a = [...document.querySelectorAll('a')]
+          .find(x => x.textContent.trim() === 'Download corpus preparation rules (.md)');
+        return a ? { path: new URL(a.href).pathname, download: a.getAttribute('download') } : null;
+      });
+      r.check('the Import page links to the corpus preparation rules as a download',
+              !!link && link.path === '/corpus-preparation-rules.md'
+                && link.download === 'corpus-preparation-rules.md', JSON.stringify(link));
+      const served = await s.page.evaluate(async () => {
+        const response = await fetch('/corpus-preparation-rules.md');
+        return { status: response.status, start: (await response.text()).slice(0, 60) };
+      });
+      r.check('the rules file is served as markdown through the proxy',
+              served.status === 200 && served.start.startsWith('# Preparing files for rag-docker ingest\n'),
+              JSON.stringify(served));
+    } finally {
+      await s.ctx.close();
+    }
+  }
+
+  // ── import errors (#290) ───────────────────────────────────────────────────
+  // A truncated ZIP once ended in a plain-text 500 that the page could only
+  // show as "HTTP 500", and a failing status poll was ignored.
+  r.section('import error messages');
+  {
+    const fs = require('fs');
+    const truncated = '/tmp/vfy-truncated.zip';
+    // A local file header and nothing after it: no central directory.
+    fs.writeFileSync(truncated, Buffer.concat([Buffer.from('PK\x03\x04', 'latin1'), Buffer.alloc(64, 0x61)]));
+    const s = await session(browser, BASE, 'developer');
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(truncated);
+      await sleep(300);
+      const clicked = await clickByText(s.page, 'Start Ingest');
+      await sleep(2500);
+      const text = await bodyText(s.page);
+      r.check("a truncated ZIP shows the API's message, not HTTP 500",
+              clicked && text.includes("is damaged and can't be read") && !text.includes('HTTP 500'),
+              clicked ? text.slice(0, 200) : 'Start Ingest button not found');
+    } finally {
+      fs.unlinkSync(truncated);
+      await s.ctx.close();
+    }
+  }
+  {
+    const fs = require('fs');
+    const small = '/tmp/vfy-poll.txt';
+    fs.writeFileSync(small, 'Polling fixture.\n');
+    const s = await session(browser, BASE, 'developer');
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST')
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: 'vfypoll1', status: 'queued', files_queued: 1, collection: 'x' }) });
+      if (path === '/api/ingest/job/vfypoll1')
+        return request.respond({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: { code: 'X', message: 'Synthetic status failure.', detail: null } }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const clicked = await clickByText(s.page, 'Start Ingest');
+      await sleep(4500);
+      const text = await bodyText(s.page);
+      r.check('a failing status poll is shown, not ignored',
+              clicked && text.includes("Could not check the import's progress: Synthetic status failure."),
+              clicked ? text.slice(0, 200) : 'Start Ingest button not found');
+      r.check('import error fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')));
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
+  }
+  // A poll error is cleared by a new ingest and by the next successful poll
+  // (#298). Job A's polls always fail; job B's first poll fails, then it
+  // completes. Polls run every 3 s.
+  {
+    const fs = require('fs');
+    const small = '/tmp/vfy-poll-clear.txt';
+    fs.writeFileSync(small, 'Polling fixture.\n');
+    const s = await session(browser, BASE, 'developer');
+    const failure = JSON.stringify({ error: { code: 'X', message: 'Synthetic status failure.', detail: null } });
+    let uploads = 0, pollsB = 0;
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST') {
+        uploads += 1;
+        const job = uploads === 1 ? 'vfyclrA' : 'vfyclrB';
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: job, status: 'queued', files_queued: 1, collection: 'x' }) });
+      }
+      if (path === '/api/ingest/job/vfyclrA')
+        return request.respond({ status: 500, contentType: 'application/json', body: failure });
+      if (path === '/api/ingest/job/vfyclrB') {
+        pollsB += 1;
+        if (pollsB === 1) return request.respond({ status: 500, contentType: 'application/json', body: failure });
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: 'vfyclrB', status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 2, chunks_replaced: 0, errors: [], skipped: [] }) });
+      }
+      return request.continue();
+    });
+    const shown = text => text.includes("Could not check the import's progress: Synthetic status failure.");
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const first = await clickByText(s.page, 'Start Ingest');
+      await sleep(4500);                       // job A's first poll has failed
+      const before = shown(await bodyText(s.page));
+      const second = await clickByText(s.page, 'Start Ingest');
+      await sleep(1000);                       // job B accepted, not yet polled
+      const afterNew = await bodyText(s.page);
+      r.check('a new ingest clears a poll error',
+              first && second && before && uploads === 2 && !shown(afterNew),
+              `clicked=${first},${second} shown-before=${before} uploads=${uploads} after: ${afterNew.slice(0, 160)}`);
+      await sleep(2700);                       // job B's first poll has failed
+      const failedAgain = shown(await bodyText(s.page));
+      await sleep(3000);                       // job B's second poll has succeeded
+      const afterPoll = await bodyText(s.page);
+      r.check('the next successful poll clears a poll error',
+              failedAgain && pollsB >= 2 && !shown(afterPoll),
+              `shown-after-B's-first-poll=${failedAgain} B-polls=${pollsB} after: ${afterPoll.slice(0, 160)}`);
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
+  }
+
+  // ── import job feedback (#394) ─────────────────────────────────────────────
+  // The job ID was never shown, nothing appeared until the first poll 3 s
+  // after the upload was accepted, and "Start Ingest" with no collection
+  // selected did nothing. The collection list, the upload and the polls are
+  // stubbed: the first poll fails, later ones answer a running job.
+  r.section('import job feedback (#394)');
+  {
+    const fs = require('fs');
+    const small = '/tmp/vfy-job-feedback.txt';
+    fs.writeFileSync(small, 'Job feedback fixture.\n');
+    const jobId = 'vfyjob394';
+    const QUEUED = 'Waiting for the first progress update queued';
+    const NO_COLLECTION = 'Choose a collection to import into first. Use + New to create one.';
+    const POLL_FAIL = "Could not check the import's progress: Synthetic status failure.";
+    const polls = s => s.api.filter(x => x.method === 'GET' && x.url === '/api/ingest/job/' + jobId).length;
+    const uploads = s => s.api.filter(x => x.method === 'POST' && x.url === '/api/ingest/upload').length;
+    async function stub(s, names) {
+      let answered = 0;
+      const list = names.map(name => ({ name, object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', created_at: null }));
+      await s.page.setRequestInterception(true);
+      s.page.on('request', request => {
+        const path = new URL(request.url()).pathname;
+        if (path === '/api/collections' && request.method() === 'GET')
+          return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: list }) });
+        if (path === '/api/ingest/upload' && request.method() === 'POST')
+          return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'VfyJob394' }) });
+        if (path === '/api/ingest/job/' + jobId) {
+          answered += 1;
+          if (answered === 1)
+            return request.respond({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: { code: 'X', message: 'Synthetic status failure.', detail: null } }) });
+          return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'running', files_total: 1, files_completed: 0, files_failed: 0, chunks_stored: 0, errors: [], skipped: [] }) });
+        }
+        return request.continue();
+      });
+    }
+    try {
+      {
+        const s = await session(browser, BASE, 'developer');
+        try {
+          await stub(s, ['VfyJob394']);
+          await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+          const input = await s.page.$('#file-input');
+          await input.uploadFile(small);
+          await sleep(300);
+          const clicked = await clickByText(s.page, 'Start Ingest');
+          await sleep(1000);                     // accepted, not yet polled
+          const accepted = await bodyText(s.page);
+          r.check('the job ID and a queued panel show as soon as the upload is accepted, before any poll',
+                  clicked && uploads(s) === 1 && polls(s) === 0 && accepted.includes('Job ID: ' + jobId) && accepted.includes(QUEUED),
+                  `clicked=${clicked} uploads=${uploads(s)} polls=${polls(s)} text: ${accepted.slice(0, 240)}`);
+          await sleep(3500);                     // the first poll has failed
+          const failed = await bodyText(s.page);
+          r.check('a failed first poll keeps the job ID and the queued panel, with the poll error',
+                  polls(s) === 1 && failed.includes('Job ID: ' + jobId) && failed.includes(QUEUED) && failed.includes(POLL_FAIL),
+                  `polls=${polls(s)} text: ${failed.slice(0, 300)}`);
+          await sleep(3000);                     // the second poll has answered
+          const running = await bodyText(s.page);
+          r.check('the first answered poll replaces the queued panel with progress, and the job ID stays',
+                  polls(s) >= 2 && running.includes('Files: 0/1') && running.includes('running') &&
+                  !running.includes('Waiting for the first progress update') && running.includes('Job ID: ' + jobId),
+                  `polls=${polls(s)} text: ${running.slice(0, 300)}`);
+          r.check('import job feedback fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+        } finally { await s.ctx.close(); }
+      }
+      {
+        const s = await session(browser, BASE, 'developer');
+        try {
+          await stub(s, []);
+          await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+          const input = await s.page.$('#file-input');
+          await input.uploadFile(small);
+          await sleep(300);
+          const clicked = await clickByText(s.page, 'Start Ingest');
+          await sleep(900);
+          const text = await bodyText(s.page);
+          r.check('"Start Ingest" with no collection selected says so and sends no upload',
+                  clicked && uploads(s) === 0 && text.includes(NO_COLLECTION),
+                  `clicked=${clicked} uploads=${uploads(s)} text: ${text.slice(0, 240)}`);
+          r.check('the no-collection fixture causes no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+        } finally { await s.ctx.close(); }
+      }
+      // The job ID lifecycle of SPECIFICATIONS.md §7.4 (#458): it stays shown
+      // after the job ends, an upload the API refuses leaves it as it was, and a
+      // later accepted upload replaces it. Uploads answer job A, a refusal, then
+      // job B; A's polls answer a completed job.
+      {
+        const JOB_A = 'vfyjob458a', JOB_B = 'vfyjob458b';
+        const REFUSAL = 'Synthetic upload refusal.';
+        const pollsA = s => s.api.filter(x => x.method === 'GET' && x.url === '/api/ingest/job/' + JOB_A).length;
+        const s = await session(browser, BASE, 'developer');
+        try {
+          let sent = 0;
+          const list = [{ name: 'VfyJob458', object_count: 0, index_type: 'hnsw', distance_metric: 'cosine', created_at: null }];
+          const job = (id, status, done, stored) => JSON.stringify({ job_id: id, status, files_total: 1, files_completed: done, files_failed: 0, chunks_stored: stored, errors: [], skipped: [] });
+          await s.page.setRequestInterception(true);
+          s.page.on('request', request => {
+            const path = new URL(request.url()).pathname;
+            if (path === '/api/collections' && request.method() === 'GET')
+              return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ collections: list }) });
+            if (path === '/api/ingest/upload' && request.method() === 'POST') {
+              sent += 1;
+              if (sent === 2)
+                return request.respond({ status: 400, contentType: 'application/json', body: JSON.stringify({ error: { code: 'X', message: REFUSAL, detail: null } }) });
+              return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: sent === 1 ? JOB_A : JOB_B, status: 'queued', files_queued: 1, collection: 'VfyJob458' }) });
+            }
+            if (path === '/api/ingest/job/' + JOB_A)
+              return request.respond({ status: 200, contentType: 'application/json', body: job(JOB_A, 'completed', 1, 2) });
+            if (path === '/api/ingest/job/' + JOB_B)
+              return request.respond({ status: 200, contentType: 'application/json', body: job(JOB_B, 'running', 0, 0) });
+            return request.continue();
+          });
+          await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+          const input = await s.page.$('#file-input');
+          await input.uploadFile(small);
+          await sleep(300);
+          const first = await clickByText(s.page, 'Start Ingest');
+          await sleep(4500);                     // A's first poll has answered completed
+          const ended = await bodyText(s.page);
+          r.check('the job ID stays shown after the job ends',
+                  first && uploads(s) === 1 && pollsA(s) >= 1 && ended.includes('Files: 1/1') && ended.includes('completed') &&
+                  ended.includes('Job ID: ' + JOB_A),
+                  `clicked=${first} uploads=${uploads(s)} polls=${pollsA(s)} text: ${ended.slice(0, 300)}`);
+          const second = await clickByText(s.page, 'Start Ingest');
+          await sleep(1000);                     // the upload has been refused
+          const refused = await bodyText(s.page);
+          r.check('an upload the API refuses leaves the job ID unchanged',
+                  second && uploads(s) === 2 && refused.includes(REFUSAL) && refused.includes('Job ID: ' + JOB_A),
+                  `clicked=${second} uploads=${uploads(s)} text: ${refused.slice(0, 300)}`);
+          const third = await clickByText(s.page, 'Start Ingest');
+          await sleep(1000);                     // job B accepted, not yet polled
+          const replaced = await bodyText(s.page);
+          r.check('a later accepted upload replaces the job ID',
+                  third && uploads(s) === 3 && replaced.includes('Job ID: ' + JOB_B) && !replaced.includes(JOB_A),
+                  `clicked=${third} uploads=${uploads(s)} text: ${replaced.slice(0, 300)}`);
+          r.check('the job ID lifecycle fixture causes no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+        } finally { await s.ctx.close(); }
+      }
+    } finally {
+      fs.unlinkSync(small);
+    }
+  }
+
+  // ── re-ingest progress (#22) ───────────────────────────────────────────────
+  // The progress panel reports replaced chunks, and the skipped heading no
+  // longer claims every skip is an unsupported type: a later file with the
+  // same name in one upload is skipped too. Job responses are stubbed.
+  r.section('re-ingest progress');
+  for (const [replaced, label] of [[3, 'Replaced 3 chunks from a previous version'], [1, 'Replaced 1 chunk from a previous version'], [0, null]]) {
+    const fs = require('fs');
+    const small = '/tmp/vfy-reingest.txt';
+    fs.writeFileSync(small, 'Re-ingest fixture.\n');
+    const jobId = 'vfyrein' + replaced;
+    const skippedEntry = "u.zip:a/r.txt (replaced by r.txt later in this upload, same name 'a/r.txt')";
+    // A file over the per-file limits is stored as parts and listed in `split` (#621).
+    const splitEntry = "big.jsonl: split into 2 parts, stored as 'big.jsonl (part 1)' to 'big.jsonl (part 2)'";
+    const split = replaced === 3 ? [splitEntry] : [];
+    const s = await session(browser, BASE, 'developer');
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST')
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'x' }) });
+      if (path === '/api/ingest/job/' + jobId)
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'completed', files_total: 1, files_completed: 1, files_failed: 0, chunks_stored: 2, errors: [], skipped: [skippedEntry], chunks_replaced: replaced, split }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const clicked = await clickByText(s.page, 'Start Ingest');
+      await sleep(4500);
+      const text = await bodyText(s.page);
+      if (label) {
+        r.check(`chunks_replaced=${replaced} is shown as "${label}"`, clicked && text.includes(label),
+                clicked ? text.slice(0, 240) : 'Start Ingest button not found');
+      } else {
+        r.check('chunks_replaced=0 shows no replacement line', clicked && text.includes('Chunks stored: 2') && !text.includes('Replaced '),
+                clicked ? text.slice(0, 240) : 'Start Ingest button not found');
+        r.check('the skipped heading is a plain "1 file skipped:" with the entry\'s own reason',
+                text.includes('1 file skipped:') && !text.includes('not a supported type:') && text.includes(skippedEntry),
+                text.slice(0, 300));
+      }
+      if (replaced === 3)
+        r.check('a split file is listed under "1 file split into parts:" with its part names (#621)',
+                text.includes('1 file split into parts:') && text.includes(splitEntry), text.slice(0, 400));
+      if (replaced === 0)
+        r.check('an empty split list shows no split heading (#621)', clicked && !text.includes('split into parts'),
+                text.slice(0, 300));
+      r.check(`re-ingest progress fixture (${replaced}) causes no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')));
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
+  }
+
+  // ── ingest write counts and a delete in progress (#302) ──────────────────
+  // The progress panel shows submitted, accepted and stored chunks only when
+  // they differ; a clean job and an older record without the counts look as
+  // before. An upload refused while its collection is being deleted shows the
+  // API's message. Responses are stubbed.
+  r.section('ingest write counts');
+  const countCases = [
+    ['differing counts', { chunks_submitted: 10, chunks_accepted: 10, chunks_stored: 0, status: 'failed', files_completed: 0, files_failed: 1 }, 'Submitted 10 · accepted 10 · stored 0'],
+    ['equal counts', { chunks_submitted: 2, chunks_accepted: 2, chunks_stored: 2, status: 'completed', files_completed: 1, files_failed: 0 }, null],
+    ['a record without the counts', { chunks_stored: 5, status: 'completed', files_completed: 1, files_failed: 0 }, null],
+  ];
+  for (const [label, fields, line] of countCases) {
+    const fs = require('fs');
+    const small = '/tmp/vfy-counts.txt';
+    fs.writeFileSync(small, 'Write counts fixture.\n');
+    const jobId = 'vfycnt' + countCases.findIndex(c => c[0] === label);
+    const s = await session(browser, BASE, 'developer');
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST')
+        return request.respond({ status: 202, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, status: 'queued', files_queued: 1, collection: 'x' }) });
+      if (path === '/api/ingest/job/' + jobId)
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ job_id: jobId, files_total: 1, errors: [], skipped: [], chunks_replaced: 0, ...fields }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const clicked = await clickByText(s.page, 'Start Ingest');
+      await sleep(4500);
+      const text = await bodyText(s.page);
+      if (line) {
+        r.check(`${label}: the panel shows "${line}"`, clicked && text.includes(line),
+                clicked ? text.slice(0, 240) : 'Start Ingest button not found');
+      } else {
+        r.check(`${label}: the panel shows no submitted/accepted line`,
+                clicked && text.includes(`Chunks stored: ${fields.chunks_stored}`) && !text.includes('Submitted '),
+                clicked ? text.slice(0, 240) : 'Start Ingest button not found');
+      }
+      r.check(`write counts fixture (${label}) causes no React page errors`, !s.errors.some(e => e.startsWith('pageerror:')));
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
+  }
+  {
+    const fs = require('fs');
+    const small = '/tmp/vfy-deleting.txt';
+    fs.writeFileSync(small, 'Deleting fixture.\n');
+    const message = "Collection 'VfyGone' is being deleted. Start the job again once the delete finishes; the collection must be created again first.";
+    const s = await session(browser, BASE, 'developer');
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/ingest/upload' && request.method() === 'POST')
+        return request.respond({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: { code: 'COLLECTION_DELETING', message, detail: { collection: 'VfyGone' } } }) });
+      return request.continue();
+    });
+    try {
+      await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+      const input = await s.page.$('#file-input');
+      await input.uploadFile(small);
+      await sleep(300);
+      const clicked = await clickByText(s.page, 'Start Ingest');
+      await sleep(1500);
+      const text = await bodyText(s.page);
+      r.check('an upload refused with 409 COLLECTION_DELETING shows its message', clicked && text.includes(message),
+              clicked ? text.slice(0, 300) : 'Start Ingest button not found');
+    } finally {
+      fs.unlinkSync(small);
+      await s.ctx.close();
+    }
+  }
+
   // ── health dashboard ───────────────────────────────────────────────────────
   r.section('§10.4 health dashboard');
   {
@@ -327,6 +1154,101 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     }
     r.check('no console errors on the health page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
     await s.ctx.close();
+  }
+
+  // ── degraded and unreachable health (#375) ─────────────────────────────────
+  // /health answers 503 with its per-service body when a dependency is down. The
+  // page must show that body, red for the failing service, keep loading the
+  // latency metrics, and say so when health can't be read at all. Each load is
+  // driven by hand through the captured 30s refresh, with the answers stubbed.
+  r.section('degraded and unreachable health (#375)');
+  {
+    const s = await session(browser, BASE, 'engineer');
+    await s.page.evaluateOnNewDocument(() => {
+      const original = window.setInterval;
+      window.setInterval = (fn, delay, ...args) => {
+        if (delay === 30000) { window.__ownedHealthRefresh = fn; return 45002; }
+        return original(fn, delay, ...args);
+      };
+    });
+    const service = (status, latency_ms, model) => model ? { status, latency_ms, model } : { status, latency_ms };
+    const healthBody = (status, embed) => ({
+      status,
+      services: {
+        weaviate: service('ok', 11),
+        ollama: { llm: service('ok', 22, 'phi3.5'), embed: service(embed, 33, 'nomic-embed-text') },
+      },
+      resources: { memory: { status: 'ok', allocated_gb: 11.67, recommended_minimum_gb: 12.0 } },
+    });
+    const proxyPage = code => `<html><head><title>${code}</title></head><body><center><h1>${code}</h1></center><hr><center>nginx</center></body></html>`;
+    const metricsBody = n => ({
+      total_records: n,
+      retrieval_latency: { p50: 10, p95: 20, p99: 30 },
+      llm_latency: { p50: 100, p95: 200, p99: 300 },
+      total_latency: { p50: 110, p95: 220, p99: 330 },
+      history: Array.from({ length: n }, (_, i) => ({ timestamp: new Date(Date.UTC(2026, 9, 1, 0, 0, i)).toISOString(), collection: 'OwnedFixture', retrieval_mode: 'hybrid', retrieval_ms: 10, llm_ms: 100, total_ms: 110 })),
+    });
+    let mode = 'degraded', loads = 0;
+    await s.page.setRequestInterception(true);
+    s.page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path === '/api/health') {
+        if (mode === 'refused') return request.abort('connectionrefused');
+        if (mode === 'proxy502') return request.respond({ status: 502, contentType: 'text/html', body: proxyPage('502 Bad Gateway') });
+        if (mode === 'html503') return request.respond({ status: 503, contentType: 'text/html', body: proxyPage('503 Service Temporarily Unavailable') });
+        const degraded = mode === 'degraded';
+        return request.respond({ status: degraded ? 503 : 200, contentType: 'application/json', body: JSON.stringify(healthBody(degraded ? 'degraded' : 'ok', degraded ? 'error' : 'ok')) });
+      }
+      if (path === '/api/metrics/latency') {
+        loads++;
+        return request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify(metricsBody(loads)) });
+      }
+      return request.continue();
+    });
+    // Each service card's label and dot colour; the latency tiles have no dot.
+    const cards = () => s.page.evaluate(() => [...document.querySelectorAll('span.rounded-full.w-2')].map(dot => ({
+      label: (dot.parentElement.textContent || '').trim(),
+      red: dot.classList.contains('bg-red-500'), green: dot.classList.contains('bg-green-500'),
+    })));
+    const colours = list => list.map(c => `${c.label}=${c.red ? 'red' : c.green ? 'green' : '?'}`).join(', ');
+    const healthAlert = text => (text.match(/Service health could not be read:.{0,80}/) || [''])[0];
+    const refresh = async next => { mode = next; await s.page.evaluate(() => window.__ownedHealthRefresh()); await sleep(700); };
+    const metricsShown = (text, n) => text.includes(`Latency Trends (${n} queries in ring buffer)`);
+    try {
+      await s.page.goto(BASE + '/health', { waitUntil: 'networkidle2' }); await sleep(700);
+      let text = await bodyText(s.page), list = await cards();
+      const by = label => list.find(c => c.label.startsWith(label)) || {};
+      r.check('a degraded 503 shows the failing service red', list.length === 3 && by('Embed').red, colours(list));
+      r.check('a degraded 503 shows the services that are ok green', by('Weaviate').green && by('LLM').green, colours(list));
+      r.check('a degraded 503 shows each service latency', ['11ms', '22ms', '33ms'].every(ms => text.includes(ms)), text.slice(0, 200));
+      r.check('a degraded 503 is not reported as unreadable', !healthAlert(text), healthAlert(text));
+      r.check('latency metrics load while health answers 503', metricsShown(text, 1), text.slice(0, 300));
+
+      await refresh('ok'); list = await cards(); text = await bodyText(s.page);
+      r.check('a 200 shows every service green', list.length === 3 && list.every(c => c.green), colours(list));
+
+      await refresh('proxy502'); list = await cards(); text = await bodyText(s.page);
+      r.check('an API down behind the proxy (502) shows a message',
+              /Service health could not be read: The API is not responding/.test(text), text.slice(0, 300));
+      r.check('a failed health load removes the earlier green cards', list.length === 0, colours(list));
+      r.check('latency metrics load while the health call fails', metricsShown(text, 3), text.slice(0, 300));
+
+      await refresh('ok'); list = await cards(); text = await bodyText(s.page);
+      r.check('the next good health load clears the message and shows the cards',
+              !healthAlert(text) && list.length === 3 && list.every(c => c.green), healthAlert(text) || colours(list));
+
+      await refresh('refused'); list = await cards(); text = await bodyText(s.page);
+      r.check('an unreachable API shows a message',
+              /Service health could not be read: The API could not be reached/.test(text), text.slice(0, 300));
+      r.check('an unreachable API shows no service cards', list.length === 0, colours(list));
+      r.check('latency metrics load while the API is unreachable for health', metricsShown(text, 5), text.slice(0, 300));
+
+      await refresh('html503'); list = await cards(); text = await bodyText(s.page);
+      r.check('a 503 without a health body shows a message, not cards',
+              /Service health could not be read: HTTP 503/.test(text) && list.length === 0, text.slice(0, 300));
+      r.check('degraded and unreachable health cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')),
+              s.errors.filter(e => e.startsWith('pageerror:')).slice(0, 2).join(' | '));
+    } finally { await s.ctx.close(); }
   }
 
   // ── owned session-recovery diagnostic HTTP fixtures ───────────────────────
@@ -463,6 +1385,275 @@ const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
     }
     r.check('no console errors on the help page', s.errors.length === 0, s.errors.slice(0, 2).join(' | '));
     await s.ctx.close();
+  }
+
+  // ── running and recent jobs (#617) ────────────────────────────────────────
+  // Each page lists the caller's running and recent jobs, read from the API when
+  // the page opens, and opens the newest by itself; leaving the page and coming
+  // back finds the job again. The first check uses the real API; the rest stub
+  // the lists and lookups so states and timing are fixed.
+  r.section('running and recent jobs (#617)');
+  {
+    const fs = require('fs');
+    const crypto = require('crypto');
+    const json = body => ({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+    const now = Date.now();
+    const at = secondsAgo => new Date(now - secondsAgo * 1000).toISOString();
+    const opened = page => page.evaluate(() =>
+      [...document.querySelectorAll('section[aria-label="Running and recent jobs"] button[aria-current="true"]')]
+        .map(b => b.innerText.replace(/\s+/g, ' ').trim()));
+    const rows = page => page.evaluate(() =>
+      [...document.querySelectorAll('section[aria-label="Running and recent jobs"] li button')]
+        .map(b => b.innerText.replace(/\s+/g, ' ').trim()));
+    const clickRowAt = (page, n) => page.evaluate(i => {
+      const b = document.querySelectorAll('section[aria-label="Running and recent jobs"] li button')[i];
+      if (!b) return false; b.click(); return true;
+    }, n);
+    const clickRow = (page, text) => page.evaluate(t => {
+      const b = [...document.querySelectorAll('section[aria-label="Running and recent jobs"] li button')]
+        .find(x => x.innerText.includes(t));
+      if (!b) return false; b.click(); return true;
+    }, text);
+    const leaveAndReturn = async (page, path) => {
+      await page.goto(BASE + '/qa', { waitUntil: 'networkidle2' }); await sleep(500);
+      await page.goto(BASE + path, { waitUntil: 'networkidle2' }); await sleep(1500);
+    };
+
+    // Import, real API: start an ingest, leave at once, come back.
+    {
+      const small = '/tmp/vfy-jobs-617.txt';
+      fs.writeFileSync(small, 'A note for the running and recent jobs check.\n'.repeat(20));
+      const s = await session(browser, BASE, 'developer');
+      try {
+        const name = await s.page.evaluate(async n => {
+          const res = await fetch('/api/collections', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: n, index_type: 'hnsw', distance_metric: 'cosine' }) });
+          return res.ok ? (await res.json()).name : null;
+        }, 'VfyUiJobs' + crypto.randomBytes(3).toString('hex'));
+        await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+        await setValue(s.page, `() => [...document.querySelectorAll('select')].find(x => [...x.options].some(o => o.value === ${JSON.stringify(name)}))`, name);
+        const input = await s.page.$('#file-input');
+        await input.uploadFile(small);
+        await sleep(300);
+        // The job ID from the upload's answer: the page may already show an
+        // earlier job it opened by itself.
+        const accepted = s.page.waitForResponse(res => new URL(res.url()).pathname === '/api/ingest/upload', { timeout: 30000 })
+          .then(res => res.json()).catch(() => ({}));
+        const clicked = await clickByText(s.page, 'Start Ingest');
+        const jobId = (await accepted).job_id;
+        await leaveAndReturn(s.page, '/import');
+        const back = await bodyText(s.page);
+        const open = await opened(s.page);
+        r.check('Import: an ingest started, the page left and opened again, is listed and opened by itself',
+          !!name && clicked && !!jobId && back.includes('Job ID: ' + jobId) && open.length === 1 && open[0].includes(name)
+            && open[0].startsWith('Ingest'),
+          `name=${name} clicked=${clicked} job=${jobId} open=${JSON.stringify(open)} text: ${back.slice(0, 200)}`);
+        await s.page.waitForFunction(() => /Files: 1\/1/.test(document.body.innerText) &&
+          [...document.querySelectorAll('span')].some(x => x.textContent.trim() === 'completed'), { timeout: 180000 }).catch(() => {});
+        const done = await bodyText(s.page);
+        r.check('Import: the job found again shows its result once it has finished',
+          done.includes('Job ID: ' + jobId) && done.includes('Files: 1/1') && /completed/.test(done), done.slice(0, 300));
+        r.check('Import: nothing about jobs is kept in browser storage',
+          await s.page.evaluate(() => sessionStorage.length === 0 && localStorage.length === 0));
+      } finally { await s.ctx.close(); fs.unlinkSync(small); }
+    }
+
+    // Import, stubbed: a running job and a finished one; the running one opens,
+    // survives leaving the page, then ends; clicking the other switches.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        let finished = false;
+        const job = (id, status, done) => ({ job_id: id, status, files_total: 2, files_completed: done, files_failed: 0,
+          chunks_stored: done * 3, errors: [], skipped: [] });
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (path === '/api/ingest/jobs') return request.respond(json({ jobs: [
+            { ...job('vfy617a', finished ? 'completed' : 'running', finished ? 2 : 1), collection: 'StubRunning617', files: ['a.txt', 'b.txt'],
+              owner: { name: 'vfy-developer', kind: 'user' }, created_at: at(60), finished_at: finished ? at(1) : null },
+            { ...job('vfy617b', 'completed', 2), collection: 'StubFinished617', files: ['c.txt'],
+              owner: { name: 'vfy-developer', kind: 'user' }, created_at: at(3600), finished_at: at(3500) }] }));
+          if (path === '/api/ingest/job/vfy617a') return request.respond(json(job('vfy617a', finished ? 'completed' : 'running', finished ? 2 : 1)));
+          if (path === '/api/ingest/job/vfy617b') return request.respond(json(job('vfy617b', 'completed', 2)));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+        const listed = await rows(s.page);
+        r.check('Import: the list shows kind, collection, status, progress and start time for each job',
+          listed.length === 2 && /^Ingest StubRunning617 running 1\/2 files Started /.test(listed[0])
+            && /^Ingest StubFinished617 completed 2\/2 files Started /.test(listed[1]), JSON.stringify(listed));
+        r.check('Import: the newest running job opens by itself',
+          (await opened(s.page)).join() .includes('StubRunning617') && (await bodyText(s.page)).includes('Job ID: vfy617a'));
+        r.check('Import: a Developer sees no owner column',
+          await s.page.evaluate(() => document.querySelectorAll('.job-owner').length === 0));
+        await leaveAndReturn(s.page, '/import');
+        r.check('Import: after leaving and coming back the running job is open again',
+          (await bodyText(s.page)).includes('Job ID: vfy617a') && (await opened(s.page)).join().includes('StubRunning617'));
+        finished = true;
+        await sleep(4000);
+        const ended = await bodyText(s.page);
+        r.check('Import: its result shows once it has finished', ended.includes('Files: 2/2') && ended.includes('Job ID: vfy617a'), ended.slice(0, 300));
+        const clicked = await clickRow(s.page, 'StubFinished617');
+        await sleep(300);
+        r.check('Import: clicking another row switches to that job',
+          clicked && (await bodyText(s.page)).includes('Job ID: vfy617b') && (await opened(s.page)).join().includes('StubFinished617'));
+        r.check('Import list fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // Gold Standard, stubbed: a generating session opens, survives leaving the
+    // page, then completes; clicking another row loads it.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        let finished = false;
+        const pair = n => ({ pair_id: 'p' + n, question: `Stub question ${n}?`, answer: 'Inert', contexts: ['Inert'],
+          ground_truth: 'Inert', source_file: 'inert.txt', chunk_index: n, status: 'pending' });
+        const G1 = 'gs_617a0001', G2 = 'gs_617a0002';
+        const one = () => ({ session_id: G1, collection: 'StubGenerating617', status: finished ? 'completed' : 'generating',
+          pairs_total: 2, pairs_attempted: finished ? 2 : 1, pairs_completed: finished ? 2 : 1, pairs_failed: 0, errors: [],
+          pairs: finished ? [pair(1), pair(2)] : [pair(1)] });
+        const two = { session_id: G2, collection: 'StubGenerated617', status: 'completed', pairs_total: 1, pairs_attempted: 1,
+          pairs_completed: 1, pairs_failed: 0, errors: [], pairs: [pair(3)] };
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          const listed = ({ pairs, ...rest }) => ({ ...rest, owner: { name: 'vfy-developer', kind: 'user' } });
+          if (path === '/api/goldstandard/sessions') return request.respond(json({ sessions: [
+            { ...listed(one()), created_at: at(60), finished_at: finished ? at(1) : null },
+            { ...listed(two), created_at: at(7200), finished_at: at(7000) }] }));
+          if (path === '/api/goldstandard/session/' + G1) return request.respond(json(one()));
+          if (path === '/api/goldstandard/session/' + G2) return request.respond(json(two));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/goldstandard', { waitUntil: 'networkidle2' }); await sleep(1500);
+        const first = await bodyText(s.page);
+        r.check('Gold Standard: the generating session is listed and opens by itself',
+          first.includes('Generating… 1/2 pairs') && first.includes('Session ' + G1) && (await opened(s.page)).join().includes('StubGenerating617')
+            && (await rows(s.page)).length === 2, first.slice(0, 300));
+        await leaveAndReturn(s.page, '/goldstandard');
+        r.check('Gold Standard: after leaving and coming back the generation is open again',
+          (await bodyText(s.page)).includes('Generating… 1/2 pairs'));
+        finished = true;
+        await sleep(3000);
+        const ended = await bodyText(s.page);
+        r.check('Gold Standard: its outcome shows once the generation has finished',
+          ended.includes('Generation completed: 2 of 2 pairs generated.') && ended.includes('Stub question 2?'), ended.slice(0, 300));
+        const clicked = await clickRow(s.page, 'StubGenerated617');
+        await sleep(800);
+        const other = await bodyText(s.page);
+        r.check('Gold Standard: clicking another row loads that session',
+          clicked && other.includes('Session ' + G2) && other.includes('Stub question 3?')
+            && await s.page.evaluate(id => document.getElementById('retained-session').value === id, G2), other.slice(0, 300));
+        r.check('Gold Standard list fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // Transfer, stubbed: one list for both kinds; each panel opens its own
+    // newest job; a running export survives leaving the page, then ends.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        let finished = false;
+        const exportJob = (id, done) => ({ job_id: id, status: done ? 'completed' : 'running', collection: 'StubExport617',
+          chunks_written: done ? 9 : 5, filename: done ? `ragpkg-${id}.tar.gz` : null, size_bytes: done ? 2048 : null,
+          source_document_count: done ? 1 : null, fidelity: done ? 'with-sources' : null, models_bundled: done ? false : null,
+          retrieve_script: done ? true : null, warnings: [], error: null, error_code: null, error_detail: null });
+        const importJob = { job_id: 'vfy617i', status: 'completed', filename: 'ragpkg-stub617.tar.gz', on_conflict: 'rename',
+          collection: 'StubImported617', original_collection: 'StubImported617', chunks_written: 4, fidelity: 'with-sources',
+          renamed: false, notes: [], restored_sessions: [], error: null, error_code: null, error_detail: null };
+        const mine = { name: 'vfy-developer', kind: 'user' };
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (path === '/api/export/jobs') return request.respond(json({ jobs: [
+            { ...exportJob('vfy617e', finished), owner: mine, created_at: at(30), finished_at: finished ? at(1) : null },
+            { ...exportJob('vfy617d', true), owner: mine, created_at: at(9000), finished_at: at(8900) }] }));
+          if (path === '/api/import/jobs') return request.respond(json({ jobs: [
+            { ...importJob, owner: mine, created_at: at(600), finished_at: at(500) }] }));
+          if (path === '/api/export/job/vfy617e') return request.respond(json(exportJob('vfy617e', finished)));
+          if (path === '/api/import/job/vfy617i') return request.respond(json(importJob));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' }); await sleep(1500);
+        const listed = await rows(s.page);
+        const text = await bodyText(s.page);
+        r.check('Transfer: one list holds exports and imports, newest first, with their kind',
+          listed.length === 3 && listed[0].startsWith('Export StubExport617 running') && listed[1].startsWith('Import ragpkg-stub617.tar.gz completed')
+            && listed[2].startsWith('Export StubExport617 completed'), JSON.stringify(listed));
+        r.check('Transfer: the newest export opens in the export panel and the newest import in the import panel',
+          text.includes('Writing… 5 chunks so far.') && text.includes('Imported as StubImported617') && (await opened(s.page)).length === 2,
+          text.slice(0, 400));
+        await leaveAndReturn(s.page, '/transfer');
+        r.check('Transfer: after leaving and coming back the running export is open again',
+          (await bodyText(s.page)).includes('Writing… 5 chunks so far.'));
+        finished = true;
+        await sleep(3000);
+        const ended = await bodyText(s.page);
+        r.check('Transfer: the export\'s result shows once it has finished',
+          ended.includes('ragpkg-vfy617e.tar.gz') && ended.includes('Imported as StubImported617'), ended.slice(0, 400));
+        // Rows: the export that just ended, the import, then the older export.
+        const clicked = await clickRowAt(s.page, 2);
+        await sleep(300);
+        r.check('Transfer: clicking an export row opens it in the export panel, leaving the import panel as it was',
+          clicked && (await bodyText(s.page)).includes('ragpkg-vfy617d.tar.gz') && (await bodyText(s.page)).includes('Imported as StubImported617'));
+        r.check('Transfer list fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // An Engineer sees the owner of each job: a user, an API key, or unknown.
+    {
+      const s = await session(browser, BASE, 'engineer');
+      try {
+        const job = (id, owner) => ({ job_id: id, status: 'completed', files_total: 1, files_completed: 1, files_failed: 0,
+          chunks_stored: 1, errors: [], skipped: [], collection: 'StubOwners617', files: ['a.txt'], owner,
+          created_at: at(Number(id.slice(-1)) * 10), finished_at: at(1) });
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          if (new URL(request.url()).pathname === '/api/ingest/jobs') return request.respond(json({ jobs: [
+            job('own1', { name: 'vfy-developer', kind: 'user' }), job('own2', { name: 'vfy-s-svc', kind: 'service' }), job('own3', null)] }));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/import', { waitUntil: 'networkidle2' }); await sleep(1500);
+        const owners = await s.page.evaluate(() => [...document.querySelectorAll('.job-owner')].map(x => x.textContent.trim()));
+        r.check('Import as an Engineer: each row shows its owner, an API key\'s marked, an unknown one as "owner unknown"',
+          JSON.stringify(owners) === JSON.stringify(['vfy-developer', 'vfy-s-svc (API key)', 'owner unknown']), JSON.stringify(owners));
+        r.check('nothing about jobs is kept in browser storage after the list checks',
+          await s.page.evaluate(() => sessionStorage.length === 0 && localStorage.length === 0));
+      } finally { await s.ctx.close(); }
+    }
+  }
+
+  // ── nginx's login rate limit on the login page (#577) ─────────────────────
+  // Last in suite 06: it uses up the browser address's burst, so any login
+  // after it would wait for a slot.
+  r.section('login rate limit on the login page (#577)');
+  {
+    const s = await session(browser, BASE, null);
+    try {
+      await s.page.goto(BASE + '/login', { waitUntil: 'networkidle2' });
+      const suffix = require('crypto').randomBytes(3).toString('hex');
+      const seen = [];
+      for (let n = 0; n < 12; n++) {
+        await setValue(s.page, "() => document.querySelector('#login-username')", `vfy-ui-rate-${n}-${suffix}`);
+        await setValue(s.page, "() => document.querySelector('#login-password')", 'not-a-password-' + suffix);
+        const answer = s.page.waitForResponse(res => new URL(res.url()).pathname === '/api/auth/login', { timeout: 15000 });
+        await clickByText(s.page, 'Log in');
+        const res = await answer;
+        await s.page.waitForFunction(() => document.querySelector('button[type=submit]')?.textContent.trim() === 'Log in'
+          && document.querySelector('p[role=alert]'), { timeout: 10000 }).catch(() => {});
+        const alert = await s.page.evaluate(() => document.querySelector('p[role=alert]')?.textContent.trim() || '');
+        seen.push(`${res.status()}:${alert.slice(0, 30)}`);
+        if (res.status() === 429) {
+          r.check('a login nginx refuses shows its LOGIN_RATE_LIMITED message on the login page',
+            alert === LOGIN_RATE_LIMITED && new URL(s.page.url()).pathname === '/login', seen.join(' | '));
+          break;
+        }
+        if (n === 11) r.check('a login nginx refuses shows its LOGIN_RATE_LIMITED message on the login page', false,
+          '12 failed logins were never refused: ' + seen.join(' | '));
+      }
+    } finally { await s.ctx.close(); }
   }
 
   await browser.close();

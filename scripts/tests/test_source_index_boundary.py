@@ -47,6 +47,87 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         self.assertEqual(sources.load_index("Valid")["documents"].keys(), {digest})
         self.assertEqual(sources.blob_path("Valid", digest).read_bytes(), content)
 
+    def test_manifest_verified_blob_is_hashed_only_once(self):
+        content = b"retained source"
+        digest = hashlib.sha256(content).hexdigest()
+        blob = self.package / "sources" / digest
+        blob.write_bytes(content)
+        (blob.parent / "index.json").write_text(json.dumps(self.index(digest)))
+        manifest = {"fidelity": "with-sources", "files": {
+            f"sources/{digest}": f"sha256:{digest}"}}
+        with patch.object(packager, "sha256_file", wraps=packager.sha256_file) as hashed:
+            packager.verify_digests(self.package, manifest)
+            importer._validate_package_sources(self.package, manifest)
+        hashed.assert_called_once_with(blob)
+
+    def test_verified_manifest_cannot_bless_a_wrong_source_identity(self):
+        content = b"other bytes authenticated by the manifest"
+        digest = hashlib.sha256(b"claimed source").hexdigest()
+        blob = self.package / "sources" / digest
+        blob.write_bytes(content)
+        (blob.parent / "index.json").write_text(json.dumps(self.index(digest)))
+        manifest = {"fidelity": "with-sources", "files": {
+            f"sources/{digest}": "sha256:" + hashlib.sha256(content).hexdigest()}}
+        packager.verify_digests(self.package, manifest)
+        with patch.object(packager, "sha256_file", side_effect=AssertionError("second hash")):
+            with self.assertRaises(PackageError) as raised:
+                importer._validate_package_sources(self.package, manifest)
+        self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
+
+    def test_tampered_listed_blob_fails_before_source_validation_or_live_work(self):
+        digest = hashlib.sha256(b"claimed source").hexdigest()
+        (self.package / "sources" / digest).write_bytes(b"tampered")
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        manifest = {"fidelity": "with-sources", "files": {
+            f"sources/{digest}": f"sha256:{digest}"}}
+        job = {"status": "queued"}
+        with patch.object(settings, "upload_dir", str(self.root)), \
+             patch.object(importer, "_jobs", {"owned": job}), \
+             patch.object(importer, "_active", {"owned.tar.gz"}), \
+             patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager, "open_package", return_value=(self.package, manifest)), \
+             patch.object(importer, "_validate_package_sources") as validate, \
+             patch.object(importer, "_ensure_models") as models, \
+             patch.object(importer.wc, "get_client") as backend:
+            importer._run("owned", "owned.tar.gz", "replace")
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["error_code"], "PACKAGE_CORRUPT")
+        validate.assert_not_called()
+        models.assert_not_called()
+        backend.assert_not_called()
+
+    def test_restore_ignores_unindexed_blobs_and_indexless_source_folders(self):
+        real = b"retained source"
+        digest = hashlib.sha256(real).hexdigest()
+        future = b"future legitimate source"
+        future_digest = hashlib.sha256(future).hexdigest()
+        src = self.package / "sources"
+        (src / digest).write_bytes(real)
+        (src / future_digest).write_bytes(b"unindexed unrelated bytes")
+        (src / "index.json").write_text(json.dumps(self.index(digest)))
+        importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+        importer._restore_sidecars("Imported", self.package, "Original", [])
+        dest = sources.collection_dir("Imported")
+        self.assertEqual({p.name for p in dest.iterdir()}, {digest, "index.json"})
+        self.assertEqual((dest / digest).read_bytes(), real)
+        (src / "index.json").unlink()
+        importer._validate_package_sources(self.package, {"fidelity": "chunks-only"})
+        importer._restore_sidecars("Indexless", self.package, "Original", [])
+        self.assertFalse(sources.collection_dir("Indexless").exists())
+
+    def test_record_only_tuning_does_not_read_invalid_sources(self):
+        from services import tuning
+        for operation in ("reindex", "reembed"):
+            with self.subTest(operation=operation), \
+                 patch.object(tuning, "_jobs", {"owned": {}}), \
+                 patch.object(tuning.sources, "has_sources", side_effect=AssertionError("sources read")), \
+                 patch.object(tuning, "_existing_chunks", return_value=[]), \
+                 patch.object(tuning, "_existing_records", return_value=[]), \
+                 patch.object(tuning, "_rebuild", return_value=0), \
+                 patch.object(tuning.goldstandard, "mark_stale", return_value=0):
+                tuning._run("owned", "Invalid", operation, {})
+                self.assertEqual(tuning._jobs["owned"]["status"], "completed")
+
     def test_import_rejects_paths_before_restoring_sources(self):
         for key in (str(self.outside), "../outside.txt", "a/b", "index.json"):
             with self.subTest(key=key):
@@ -183,6 +264,14 @@ class SourceIndexBoundaryTests(unittest.TestCase):
             self.assertEqual(set(index["documents"]), {available})
             self.assertTrue(any(name.endswith(f"/sources/{available}") for name in names))
             self.assertFalse(any(name.endswith(f"/sources/{missing}") for name in names))
+        # The package that omitted the missing blob passes the import's own
+        # checks 1-3 and the retained-source check (the PR's "remains importable").
+        opened = self.root / "reopened"
+        opened.mkdir()
+        pkg, manifest = packager.open_package(self.root / result["filename"], opened)
+        packager.verify_digests(pkg, manifest)
+        self.assertEqual(manifest["fidelity"], "with-sources")
+        importer._validate_package_sources(pkg, manifest)
 
     def test_tune_options_reports_invalid_index_as_typed_error(self):
         from routers import tuning as tuning_router
@@ -204,12 +293,202 @@ class SourceIndexBoundaryTests(unittest.TestCase):
         with patch.dict(ingest_pipeline._jobs, {job_id: job}, clear=True), \
              patch.object(ingest_pipeline, "_parse_file", return_value=("accepted text", [])), \
              patch.object(ingest_pipeline.wc, "_insert_chunks_sync") as insert, \
+             patch.object(ingest_pipeline.wc, "_source_has_chunks_sync", return_value=False), \
              patch.object(ingest_pipeline.sources, "store", side_effect=ValueError("Invalid retained source index")):
             ingest_pipeline._process_job_sync(job_id, [upload], self.root,
                                               "Invalid", "fixed", 150, 0, 0.85, 0)
         insert.assert_called_once()
         self.assertEqual((job["status"], job["files_completed"], job["files_failed"],
                           job["chunks_stored"]), ("completed", 1, 0, 1))
+
+    def chunks_file(self, package, *digests):
+        """chunks.jsonl with one record per digest (None writes a null link)."""
+        records = [{"id": f"00000000-0000-4000-8000-00000000000{i}", "vector": [0.5],
+                    "properties": {"content": f"chunk {i}", "source_file": "document.txt"},
+                    "source_sha256": digest} for i, digest in enumerate(digests)]
+        (package / "chunks.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+
+    def test_export_writes_null_for_a_chunk_whose_blob_is_missing(self):
+        # #509: every chunk's source_sha256 names a blob in the package, or is null.
+        content = b"available source"
+        available = hashlib.sha256(content).hexdigest()
+        missing = hashlib.sha256(b"missing source").hexdigest()
+        retained = sources.collection_dir("Linked")
+        retained.mkdir(parents=True)
+        (retained / available).write_bytes(content)
+        (retained / "index.json").write_text(json.dumps({
+            "version": 1, "documents": {
+                available: {"filenames": ["available.txt"]},
+                missing: {"filenames": ["missing.txt"]},
+            }}))
+        stored = [Mock(uuid=f"00000000-0000-4000-8000-00000000000{i}", vector=[0.5],
+                       properties={"content": name, "source_file": name})
+                  for i, name in enumerate(("available.txt", "missing.txt"))]
+        backend = Mock()
+        backend.collections.get.return_value.iterator.return_value = iter(stored)
+        with patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager.wc, "get_client", return_value=backend), \
+             patch.object(packager.wc, "_collection_config_sync", return_value={"embedding_model": settings.embed_model}), \
+             patch.object(packager.wc, "_meta_sync", return_value={}), \
+             patch.object(packager, "_ingest_config", return_value=None), \
+             patch.object(packager, "_export_retrieval_settings", return_value=({}, True)), \
+             patch.object(packager, "_goldstandard_sessions", return_value=[]):
+            result = packager.build("Linked")
+        self.assertTrue(any("1 chunk(s) could not be linked" in w for w in result["warnings"]))
+        opened = self.root / "linked"
+        opened.mkdir()
+        pkg, manifest = packager.open_package(self.root / result["filename"], opened)
+        links = [r["source_sha256"] for r in packager.iter_chunks_file(pkg)]
+        self.assertEqual(links, [available, None])
+        packager.verify_digests(pkg, manifest)
+        importer._validate_package_sources(pkg, manifest)
+
+    def test_import_refuses_a_chunk_naming_a_source_not_in_the_package(self):
+        content = b"retained source"
+        digest = hashlib.sha256(content).hexdigest()
+        absent = hashlib.sha256(b"a source the package does not carry").hexdigest()
+        (self.package / "sources" / digest).write_bytes(content)
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        self.chunks_file(self.package, digest, None, digest)
+        importer._validate_package_sources(self.package, {"fidelity": "with-sources"})
+        bare = self.root / "chunks-only"
+        bare.mkdir()
+        self.chunks_file(bare, None, None)
+        importer._validate_package_sources(bare, {"fidelity": "chunks-only"})
+        cases = ((self.package, "with-sources", (digest, absent), 2),
+                 (self.package, "with-sources", (None, 7), 2),
+                 (bare, "chunks-only", (None, None, digest), 3))
+        for package, fidelity, links, line in cases:
+            with self.subTest(fidelity=fidelity, links=links):
+                self.chunks_file(package, *links)
+                with self.assertRaises(PackageError) as raised:
+                    importer._validate_package_sources(package, {"fidelity": fidelity})
+                self.assertEqual(raised.exception.code, "PACKAGE_CORRUPT")
+                self.assertEqual(raised.exception.detail, {"file": "chunks.jsonl", "line": line})
+
+    def test_unresolvable_chunk_source_fails_before_embedding_or_live_work(self):
+        content = b"retained source"
+        digest = hashlib.sha256(content).hexdigest()
+        (self.package / "sources" / digest).write_bytes(content)
+        (self.package / "sources" / "index.json").write_text(json.dumps(self.index(digest)))
+        self.chunks_file(self.package, hashlib.sha256(b"elsewhere").hexdigest())
+        manifest = {"fidelity": "with-sources", "files": {}}
+        job = {"status": "queued"}
+        with patch.object(settings, "upload_dir", str(self.root)), \
+             patch.object(importer, "_jobs", {"owned": job}), \
+             patch.object(importer, "_active", {"owned.tar.gz"}), \
+             patch.object(packager, "exports_dir", return_value=self.root), \
+             patch.object(packager, "open_package", return_value=(self.package, manifest)), \
+             patch.object(importer, "_check_embedding") as check_embedding, \
+             patch.object(importer, "_ensure_models") as models, \
+             patch.object(importer.wc, "get_client") as backend:
+            importer._run("owned", "owned.tar.gz", "replace")
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["error_code"], "PACKAGE_CORRUPT")
+        self.assertEqual(job["error_detail"], {"file": "chunks.jsonl", "line": 1})
+        check_embedding.assert_not_called()
+        models.assert_not_called()
+        backend.assert_not_called()
+
+
+class ManifestFilesBoundaryTests(unittest.TestCase):
+    """Check 3 never hashes a file outside the package (#371)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.package = self.root / "package"
+        self.package.mkdir()
+        chunks = b'{"id": "chunk"}\n'
+        (self.package / "chunks.jsonl").write_bytes(chunks)
+        self.chunks_digest = "sha256:" + hashlib.sha256(chunks).hexdigest()
+        self.outside = self.root / "outside.txt"
+        self.outside.write_bytes(b"controlled outside sentinel")
+        self.outside_hex = hashlib.sha256(self.outside.read_bytes()).hexdigest()
+        (self.package / "link").symlink_to(self.root, target_is_directory=True)
+
+    def manifest(self, key, digest):
+        return {"files": {"chunks.jsonl": self.chunks_digest, key: digest}}
+
+    def assert_refused(self, manifest):
+        with patch.object(packager, "sha256_file", wraps=packager.sha256_file) as hashed:
+            with self.assertRaises(PackageError) as raised:
+                packager.verify_digests(self.package, manifest)
+        error = raised.exception
+        self.assertEqual((error.code, error.detail), ("PACKAGE_CORRUPT", {"file": "manifest.json"}))
+        self.assertNotIn(self.outside_hex, error.message + json.dumps(error.detail))
+        self.assertNotIn("outside.txt", error.message + json.dumps(error.detail))
+        hashed.assert_not_called()
+
+    def test_valid_contained_keys_pass_and_mismatch_is_unchanged(self):
+        (self.package / "sources").mkdir()
+        (self.package / "sources" / "blob").write_bytes(b"blob")
+        manifest = {"files": {"chunks.jsonl": self.chunks_digest,
+                              "sources/blob": "sha256:" + hashlib.sha256(b"blob").hexdigest()}}
+        with patch.object(packager, "sha256_file", wraps=packager.sha256_file) as hashed:
+            packager.verify_digests(self.package, manifest)
+        self.assertEqual(sorted(call.args[0] for call in hashed.call_args_list),
+                         [self.package / "chunks.jsonl", self.package / "sources" / "blob"])
+        wrong = "sha256:" + "0" * 64
+        with self.assertRaises(PackageError) as raised:
+            packager.verify_digests(self.package, {"files": {"chunks.jsonl": wrong}})
+        self.assertEqual((raised.exception.code, raised.exception.detail), (
+            "PACKAGE_CORRUPT",
+            {"file": "chunks.jsonl", "expected": wrong, "actual": self.chunks_digest}))
+
+    def test_outside_keys_are_refused_before_hashing(self):
+        keys = (str(self.outside), "../outside.txt", "a/../../outside.txt", "link/outside.txt",
+                "link")
+        for key in keys:
+            for digest in ("sha256:" + self.outside_hex, "sha256:" + "0" * 64):
+                with self.subTest(key=key, digest=digest):
+                    self.assert_refused(self.manifest(key, digest))
+
+    def test_non_normalised_keys_are_refused(self):
+        for key in ("", ".", "./chunks.jsonl", "a//b", "chunks.jsonl/", "a/./b",
+                    "chunks.jsonl\x00"):
+            with self.subTest(key=key):
+                self.assert_refused(self.manifest(key, self.chunks_digest))
+
+    def assert_missing(self, key):
+        with patch.object(packager, "sha256_file", wraps=packager.sha256_file) as hashed:
+            with self.assertRaises(PackageError) as raised:
+                packager.verify_digests(self.package, self.manifest(key, "sha256:" + "0" * 64))
+        error = raised.exception
+        self.assertEqual((error.code, error.detail), ("PACKAGE_CORRUPT", {"file": key}))
+        self.assertIn("listed in the manifest but missing", error.message)
+        self.assertNotIn(self.package / key, [call.args[0] for call in hashed.call_args_list])
+
+    def test_listed_missing_and_directory_keys_are_refused_as_missing(self):
+        # Both keys pass the containment check, so they are refused naming the key
+        # itself, not manifest.json, and never hashed.
+        (self.package / "sources").mkdir()
+        for key in ("sources/missing", "sources"):
+            with self.subTest(key=key):
+                self.assert_missing(key)
+
+    def test_import_job_reports_no_outside_digest_and_touches_nothing(self):
+        for key in (str(self.outside), "../outside.txt"):
+            with self.subTest(key=key):
+                job = {"status": "queued"}
+                validate, check_embedding, ensure_models, backend = Mock(), Mock(), Mock(), Mock()
+                with patch.object(settings, "upload_dir", str(self.root)), \
+                     patch.object(importer, "_jobs", {"owned": job}), \
+                     patch.object(importer, "_active", {"owned.tar.gz"}), \
+                     patch.object(importer.packager, "exports_dir", return_value=self.root), \
+                     patch.object(importer.packager, "open_package", return_value=(
+                         self.package, self.manifest(key, "sha256:" + "0" * 64))), \
+                     patch.object(importer, "_validate_package_sources", validate), \
+                     patch.object(importer, "_check_embedding", check_embedding), \
+                     patch.object(importer, "_ensure_models", ensure_models), \
+                     patch.object(importer.wc, "get_client", backend):
+                    importer._run("owned", "owned.tar.gz", "replace")
+                self.assertEqual((job["status"], job["error_code"], job["error_detail"]),
+                                 ("failed", "PACKAGE_CORRUPT", {"file": "manifest.json"}))
+                self.assertNotIn(self.outside_hex, json.dumps(job))
+                for seam in (validate, check_embedding, ensure_models, backend):
+                    seam.assert_not_called()
 
 
 if __name__ == "__main__":

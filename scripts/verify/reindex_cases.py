@@ -128,7 +128,7 @@ class ReindexTests(unittest.TestCase):
         def parse(path):parsed.set();return 'Owned later upload',[]
         def insert(name,chunks):self.backend.data[name].append({'id':str(uuid.uuid4()),'vector':[.125,0.,-.25],'properties':chunks[0]})
         job={'status':'queued','chunks_stored':0,'files_completed':0,'files_failed':0,'files_total':1,'errors':[]}
-        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_verify_records',side_effect=paused_verify),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned later upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
+        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_verify_records',side_effect=paused_verify),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned later upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(tuning.wc,'_source_has_chunks_sync',return_value=False),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
             path=Path(temp)/'owned.txt';path.write_text('Owned later upload')
             reindex=pool.submit(self.run_job);self.assertTrue(entered.wait(2))
             def start_ingest():
@@ -147,7 +147,7 @@ class ReindexTests(unittest.TestCase):
         def parse(path):parsed.set();assert release.wait(3);return 'Owned active upload',[]
         def insert(name,chunks):self.backend.data[name].append({'id':str(uuid.uuid4()),'vector':[.125,0.,-.25],'properties':chunks[0]})
         job={'status':'queued','chunks_stored':0,'files_completed':0,'files_failed':0,'files_total':1,'errors':[]}
-        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_existing_records',side_effect=read),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned active upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
+        with tempfile.TemporaryDirectory() as temp,patch.object(tuning,'_existing_records',side_effect=read),patch.object(ingest,'_jobs',{'owned_ingest':job}),patch.object(ingest,'_parse_file',side_effect=parse),patch.object(ingest,'do_chunk',return_value=['Owned active upload']),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=insert),patch.object(tuning.wc,'_source_has_chunks_sync',return_value=False),patch.object(ingest.sources,'store'),ThreadPoolExecutor() as pool:
             path=Path(temp)/'owned.txt';path.write_text('Owned active upload')
             upload=pool.submit(ingest._process_job_sync,'owned_ingest',[path],Path(temp),'OwnedReindex','fixed',150,0,.5,40)
             self.assertTrue(parsed.wait(2))
@@ -234,9 +234,11 @@ class ReindexTests(unittest.TestCase):
         self.assertTrue(all(name.startswith('OwnedReindex') for name,_,_,_ in self.backend.created))
     def test_alias_jobs_share_the_same_active_identity(self):
         import asyncio
-        from unittest.mock import AsyncMock
+        from services import jobstore
         async def check():
-            with patch.object(tuning,'_active',set()),patch.object(tuning.asyncio,'to_thread',new=AsyncMock(return_value=None)):
+            # The start stores its record through JobStore.create() in a thread
+            # (#309), so asyncio.to_thread stays real; the worker is stubbed.
+            with patch.object(tuning,'_active',set()),patch.object(tuning,'_jobs',jobstore.JobStore('tune')),patch.object(tuning,'_run'):
                 identity=await tuning.start_tune_job('ownedReindex','reindex',{})
                 self.assertEqual(tuning._jobs[identity]['collection'],'OwnedReindex')
                 with self.assertRaises(RuntimeError):await tuning.start_tune_job('OwnedReindex','reindex',{})

@@ -5,14 +5,20 @@ import LatencyCharts from '../components/LatencyCharts'
 export default function HealthPage() {
   const [health, setHealth] = useState<HealthResult | null>(null)
   const [metrics, setMetrics] = useState<MetricsResult | null>(null)
+  const [healthError, setHealthError] = useState<string | null>(null)
 
   const [sessionIssues, setSessionIssues] = useState<{ filename: string; code: string; message: string }[]>([])
   const [diagnosticError, setDiagnosticError] = useState(false)
 
   const [diagnosticPending, setDiagnosticPending] = useState(true)
   const diagnosticTicket = useRef(0)
+  // Each load is numbered; a result is shown only if no later load's result
+  // already is, so a slow older response can't replace a newer one (#415).
+  const loadCount = useRef(0)
+  const healthShown = useRef(0)
+  const metricsShown = useRef(0)
 
-  async function load() {
+  function load() {
     const ticket = ++diagnosticTicket.current
     setDiagnosticPending(true)
     api.getSessionDiagnostics().then(result => {
@@ -24,11 +30,20 @@ export default function HealthPage() {
     }).finally(() => {
       if (ticket === diagnosticTicket.current) setDiagnosticPending(false)
     })
-    try {
-      const [h, m] = await Promise.all([api.getHealth(), api.getMetrics()])
-      setHealth(h)
-      setMetrics(m)
-    } catch { /* ignore */ }
+    // Health and metrics load separately: a degraded or unreachable API must not
+    // stop the latency charts, and no stale green cards stay up (#375).
+    const n = ++loadCount.current
+    api.getHealth().then(h => {
+      if (n < healthShown.current) return
+      healthShown.current = n; setHealth(h); setHealthError(null)
+    }).catch(e => {
+      if (n < healthShown.current) return
+      healthShown.current = n; setHealth(null); setHealthError(e instanceof Error ? e.message : String(e))
+    })
+    api.getMetrics().then(m => {
+      if (n < metricsShown.current) return
+      metricsShown.current = n; setMetrics(m)
+    }).catch(() => { /* keep the last metrics shown */ })
   }
 
   useEffect(() => {
@@ -52,6 +67,7 @@ export default function HealthPage() {
         <h2 className="font-semibold">{diagnosticPending ? "Previous evaluation session recovery results — refresh pending" : "Evaluation session recovery needs attention"}</h2>
         {sessionIssues.map(issue => <p key={issue.filename} className="text-sm mt-2">{issue.filename}: {issue.code} — {issue.message}</p>)}
       </div>}
+      {healthError && <p role="alert" className="text-red-700 mb-4">Service health could not be read: {healthError}</p>}
       {health && (
         <div className="grid grid-cols-3 gap-4 mb-8">
           <div className="bg-white border rounded p-4">

@@ -14,6 +14,7 @@ import re
 from pathlib import Path
 
 from config import settings
+from models.schemas import StoredIngestConfig
 from services import settings_store
 
 log = logging.getLogger(__name__)
@@ -66,6 +67,18 @@ def resolve(collection: str) -> tuple[dict, bool]:
     merged = {"collection": collection, **DEFAULTS, **saved}
     merged["collection"] = collection
     return merged, False
+
+
+def validate(config: dict, collection: str) -> dict:
+    """Check package settings against the save contract, bound to `collection` (#510).
+
+    Missing fields take the defaults and unknown fields are dropped, as on API
+    saves. A chunk_size or min_chunk_size from before the #53 bounds is kept as
+    it is. Raises ValueError for anything else the API would not save.
+    """
+    if not isinstance(config, dict):
+        raise ValueError("Ingest settings must be an object")
+    return {"collection": collection, **StoredIngestConfig.model_validate(config).model_dump()}
 
 
 def save(config: dict) -> dict:

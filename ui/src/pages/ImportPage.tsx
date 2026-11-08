@@ -1,8 +1,15 @@
-import { useState, useEffect } from 'react'
-import { api, CollectionInfo, JobStatus, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB } from '../api/client'
-import { useRole } from '../context/RoleContext'
+import { useState, useEffect, useRef } from 'react'
+import { Link } from 'react-router-dom'
+import { api, CollectionInfo, IngestJobEntry, JobStatus, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB } from '../api/client'
+import { useRole } from '../context/AuthContext'
 import StrategyExplainer from '../components/StrategyExplainer'
 import ProgressPanel from '../components/ProgressPanel'
+import JobList, { newestToOpen, useJobList } from '../components/JobList'
+
+// Statuses an ingest job never leaves; polling stops at any of them.
+const TERMINAL = ['completed', 'failed', 'partial', 'cancelled']
+const ingestRunning = (j: { status: string }) => !TERMINAL.includes(j.status)
+const loadIngestJobs = () => api.listIngestJobs().then(r => r.jobs)
 
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic']
 
@@ -18,32 +25,90 @@ export default function ImportPage() {
   const [similarityThreshold, setSimilarityThreshold] = useState(0.85)
   const [jobId, setJobId] = useState('')
   const [job, setJob] = useState<JobStatus | null>(null)
+  // The job being polled: the one shown, while it runs (#617).
+  const [pollId, setPollId] = useState('')
+  // Set once the page has opened or started a job itself, so the job list's
+  // first answer no longer opens one (#617).
+  const touched = useRef(false)
+  const jobs = useJobList<IngestJobEntry>(loadIngestJobs, ingestRunning)
+  // The status the upload was accepted with, shown with the job ID until the
+  // first poll answers, so the page responds at once rather than 3 s later (#394).
+  const [queuedStatus, setQueuedStatus] = useState('')
   const [error, setError] = useState('')
+  // A failed status poll, shown instead of ignored (#290). Polling carries on,
+  // and the next successful poll clears it.
+  const [pollError, setPollError] = useState('')
   const [showNewColModal, setShowNewColModal] = useState(false)
   const [newColName, setNewColName] = useState('')
   const [newColIndexType, setNewColIndexType] = useState('hnsw')
+  // A refused create is shown inside the "+ New" modal, where the page-level
+  // line was hidden behind its overlay, and a failed list is shown, not
+  // swallowed (#379).
+  const [newColError, setNewColError] = useState('')
+  const [listError, setListError] = useState('')
 
   const showOverlap = strategy !== 'semantic' && strategy !== 'context_aware'
   const showSimilarity = strategy === 'semantic' && role === 'engineer'
 
-  useEffect(() => {
-    api.getCollections().then(r => {
+  // Resolves to the list, or null when it could not be read; a failure keeps
+  // the options already shown.
+  async function loadCollections(): Promise<CollectionInfo[] | null> {
+    try {
+      const r = await api.getCollections()
       setCollections(r.collections)
-      if (r.collections.length > 0) setCollection(r.collections[0].name)
-    }).catch(() => {})
+      setListError('')
+      return r.collections
+    } catch (e: unknown) {
+      setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`)
+      return null
+    }
+  }
+
+  useEffect(() => {
+    loadCollections().then(list => {
+      if (list && list.length > 0) setCollection(list[0].name)
+    })
   }, [])
 
   useEffect(() => {
-    if (!jobId) return
+    if (!pollId) return
     const interval = setInterval(async () => {
       try {
-        const j = await api.getJobStatus(jobId)
+        const j = await api.getJobStatus(pollId)
         setJob(j)
-        if (j.status === 'completed' || j.status === 'failed' || j.status === 'partial') clearInterval(interval)
-      } catch { /* ignore */ }
+        setPollError('')
+        if (!ingestRunning(j)) {
+          clearInterval(interval)
+          jobs.reload()
+        }
+      } catch (e: unknown) {
+        setPollError(`Could not check the import's progress: ${e instanceof Error ? e.message : String(e)}`)
+      }
     }, 3000)
     return () => clearInterval(interval)
-  }, [jobId])
+    // jobs.reload is stable
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pollId])
+
+  // Shows a listed job as a started one is shown, polling it while it runs (#617).
+  function openJob(entry: IngestJobEntry) {
+    touched.current = true
+    setJobId(entry.job_id)
+    setJob(entry)
+    setQueuedStatus('')
+    setPollError('')
+    setPollId(ingestRunning(entry) ? entry.job_id : '')
+  }
+
+  // On the list's first answer, the newest running job, else the newest one,
+  // opens by itself, unless the page has already opened or started one.
+  useEffect(() => {
+    if (!jobs.loaded || touched.current) return
+    touched.current = true
+    const entry = newestToOpen(jobs.entries, ingestRunning)
+    if (entry) openJob(entry)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobs.loaded])
 
   function handleDrop(e: React.DragEvent) {
     e.preventDefault()
@@ -52,26 +117,55 @@ export default function ImportPage() {
 
   async function createCollection() {
     if (!newColName.trim()) return
+    // The name as the API stored it, which is the one the list shows: a typed
+    // lowercase first letter matched no option (#372).
+    let created: string
     try {
-      await api.createCollection({
+      created = (await api.createCollection({
         name: newColName,
         index_type: newColIndexType,
         distance_metric: 'cosine',
         hnsw_config: { efConstruction: 128, maxConnections: 64, ef: 64 },
-      })
-      const r = await api.getCollections()
-      setCollections(r.collections)
-      setCollection(newColName)
-      setShowNewColModal(false)
-      setNewColName('')
+      })).name
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
+      setNewColError(e instanceof Error ? e.message : String(e))
+      return
     }
+    // The create succeeded, so a failed reload is a list error, not a refusal.
+    setShowNewColModal(false)
+    setNewColName('')
+    setNewColError('')
+    await loadCollections()
+    // A failed reload keeps the options already shown, which lack the new
+    // collection; the selector would then show another one while uploads go to
+    // the new one. Add it, so the selector shows it (#430). The next successful
+    // load replaces the options.
+    setCollections(prev => prev.some(c => c.name === created) ? prev : [...prev, {
+      name: created, object_count: 0, index_type: newColIndexType, distance_metric: 'cosine', created_at: null,
+    }])
+    setCollection(created)
+  }
+
+  function openNewCol() {
+    setNewColError('')
+    setShowNewColModal(true)
+  }
+
+  function closeNewCol() {
+    setShowNewColModal(false)
+    setNewColError('')
   }
 
   async function startIngest() {
-    if (!files.length || !collection) return
+    if (!files.length) return
     setError('')
+    setPollError('')
+    // With no collection selected (none exist, or the list failed to load),
+    // say so instead of doing nothing (#394).
+    if (!collection) {
+      setError('Choose a collection to import into first. Use + New to create one.')
+      return
+    }
     // Refuse before sending: the proxy would reject it anyway, but only after
     // the browser had started pushing hundreds of MB, and a connection the
     // proxy closes mid-upload can surface as a bare network error.
@@ -91,8 +185,12 @@ export default function ImportPage() {
     form.append('min_chunk_size', String(minChunkSize))
     try {
       const res = await api.uploadFiles(form)
+      touched.current = true
       setJobId(res.job_id)
+      setQueuedStatus(res.status)
       setJob(null)
+      setPollId(res.job_id)
+      jobs.reload()
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -109,10 +207,21 @@ export default function ImportPage() {
         onClick={() => document.getElementById('file-input')?.click()}
       >
         <p className="text-gray-500">Drop files here or click to browse</p>
-        <p className="text-xs text-gray-400 mt-1">PDF, DOCX, TXT, MD, CSV, JSON, ZIP · up to {MAX_UPLOAD_MB} MB per upload</p>
-        <input id="file-input" type="file" multiple className="hidden" accept=".pdf,.docx,.txt,.md,.csv,.json,.zip"
+        <p className="text-xs text-gray-400 mt-1">PDF, DOCX, TXT, MD, CSV, JSON, JSONL, ZIP · up to {MAX_UPLOAD_MB} MB per upload</p>
+        <input id="file-input" type="file" multiple className="hidden" accept=".pdf,.docx,.txt,.md,.csv,.json,.jsonl,.jsonl.gz,.zip"
           onChange={e => setFiles(prev => [...prev, ...Array.from(e.target.files || [])])} />
       </div>
+      {/* A static file of the UI build (ui/public), so it is in every install,
+          offline ones included. scripts/tests/test_corpus_rules.py checks its
+          limits against the app's (#615). */}
+      <p className="text-xs text-gray-500 mb-4">
+        Preparing a large corpus? Read the limits and how to stay under them first:{' '}
+        <a href="/corpus-preparation-rules.md" download="corpus-preparation-rules.md"
+          className="text-blue-600 hover:underline">Download corpus preparation rules (.md)</a>
+        {' · '}
+        {/* The preparation area (#638): raw documents made rules-compliant on the instance. */}
+        <Link to="/prepare" className="text-blue-600 hover:underline">Prepare documents first</Link>
+      </p>
 
       {files.length > 0 && (
         <ul className="mb-4 space-y-1">
@@ -131,8 +240,9 @@ export default function ImportPage() {
           <select value={collection} onChange={e => setCollection(e.target.value)} className="border rounded px-3 py-2 text-sm flex-1">
             {collections.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
           </select>
-          <button onClick={() => setShowNewColModal(true)} className="text-sm border rounded px-3 py-2 hover:bg-gray-50">+ New</button>
+          <button onClick={openNewCol} className="text-sm border rounded px-3 py-2 hover:bg-gray-50">+ New</button>
         </div>
+        {listError && <p role="alert" className="text-red-600 text-sm mt-2">{listError}</p>}
       </div>
 
       <div className="mb-2">
@@ -170,7 +280,24 @@ export default function ImportPage() {
         Start Ingest
       </button>
       {error && <p className="text-red-600 text-sm mt-2">{error}</p>}
+      {jobId && <p className="text-sm text-gray-600 mt-2">Job ID: <span className="font-mono">{jobId}</span></p>}
+      {jobId && !job && (
+        <div className="mt-4 p-4 border rounded bg-gray-50 flex justify-between text-sm">
+          <span>Waiting for the first progress update</span>
+          <span className="text-blue-600">{queuedStatus}</span>
+        </div>
+      )}
       {job && <ProgressPanel job={job} />}
+      {pollError && <p className="text-red-600 text-sm mt-2">{pollError}</p>}
+
+      <div className="mt-6">
+        <JobList error={jobs.error} loaded={jobs.loaded} showOwner={role === 'engineer'}
+          rows={jobs.entries.map(entry => ({
+            key: entry.job_id, kind: 'Ingest', target: entry.collection ?? '-', status: entry.status,
+            progress: `${entry.files_completed}/${entry.files_total} files`, createdAt: entry.created_at,
+            owner: entry.owner, open: entry.job_id === jobId, onOpen: () => openJob(entry),
+          }))} />
+      </div>
 
       {showNewColModal && (
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
@@ -181,8 +308,9 @@ export default function ImportPage() {
               <option value="hnsw">HNSW (Approximate)</option>
               <option value="flat">Flat (Exact KNN)</option>
             </select>
+            {newColError && <p role="alert" className="text-red-600 text-sm mb-4">{newColError}</p>}
             <div className="flex justify-end gap-2">
-              <button onClick={() => setShowNewColModal(false)} className="text-sm text-gray-500 hover:text-gray-700">Cancel</button>
+              <button onClick={closeNewCol} className="text-sm text-gray-500 hover:text-gray-700">Cancel</button>
               <button onClick={createCollection} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">Create</button>
             </div>
           </div>

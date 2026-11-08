@@ -6,12 +6,17 @@ job-polling shape so both live behind one prefix-free router.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from models.schemas import (
+    ExportJobEntry,
+    ExportJobList,
     ExportJobStatusResponse,
+    ImportJobEntry,
+    ImportJobList,
     ExportRequest,
     ExportStartResponse,
     ImportJobStatusResponse,
@@ -20,22 +25,41 @@ from models.schemas import (
     PackageListResponse,
     PackageSummary,
 )
-from services import exporter, importer, packager
+from services import age_stream, audit, exporter, importer, job_lists, packager
 from services import weaviate_client as wc
-from utils import api_error
+from services.collection_writes import CollectionDeletingError
+from utils import api_error, collection_check_unavailable, collection_deleting_error
 
 router = APIRouter()
+_log = logging.getLogger(__name__)
 
 
 @router.post("/export", response_model=ExportStartResponse, status_code=202)
-async def start_export(body: ExportRequest):
-    if not await wc.collection_exists(body.collection):
+async def start_export(body: ExportRequest, request: Request = None):
+    # The audit record's parameters (#29): whether it is encrypted, never the passphrase.
+    audit.note(collection=body.collection, include_models=body.include_models, encrypted=body.passphrase is not None)
+    try:
+        exists = await wc.collection_exists(body.collection)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#366).
+        _log.exception("Could not check whether %r exists for an export", body.collection)
+        return collection_check_unavailable(body.collection, "No job was started")
+    if not exists:
         # Checked before a job exists, so a typo does not leave a failed job
         # lying around for the user to interpret.
         return api_error(404, "COLLECTION_NOT_FOUND",
                          f"Collection '{body.collection}' not found.")
     try:
-        job_id = await exporter.start_export_job(body.collection, body.include_models)
+        job_id = await exporter.start_export_job(
+            body.collection, body.include_models,
+            body.passphrase.get_secret_value() if body.passphrase is not None else None,
+            owner=job_lists.job_owner(request))
+    except CollectionDeletingError:
+        return collection_deleting_error(body.collection)
+    except exporter.ExportStartingError:
+        # The running start hasn't stored its record yet, so no job_id to name (#338).
+        return api_error(409, "EXPORT_STARTING",
+                         f"An export of '{body.collection}' is starting; retry shortly.")
     except RuntimeError as exc:
         # start_export_job puts the already-running job id in the exception.
         return api_error(
@@ -44,6 +68,15 @@ async def start_export(body: ExportRequest):
             detail={"job_id": str(exc)},
         )
     return ExportStartResponse(job_id=job_id, status="queued", collection=body.collection)
+
+
+@router.get("/export/jobs", response_model=ExportJobList)
+async def list_export_jobs(request: Request):
+    """The caller's running and recent exports (#617; see services/job_lists)."""
+    principal = request.state.auth
+    def build():
+        return job_lists.entries(ExportJobEntry, job_lists.job_items(exporter.job_records()), principal)
+    return ExportJobList(jobs=await asyncio.to_thread(build))
 
 
 @router.get("/export/job/{job_id}", response_model=ExportJobStatusResponse)
@@ -55,17 +88,33 @@ async def export_job_status(job_id: str):
 
 
 @router.post("/import", response_model=ImportStartResponse, status_code=202)
-async def start_import(body: ImportRequest):
+async def start_import(body: ImportRequest, request: Request = None):
+    # The audit record's parameters (#29); the collection is added when the job ends.
+    audit.note(package=body.filename, on_conflict=body.on_conflict, encrypted=body.passphrase is not None)
     # Everything else — unreadable archive, bad digest, embedding mismatch,
     # name collision — is reported through the job, because it is only knowable
     # after reading the package, which takes long enough to need a job.
+    passphrase = body.passphrase.get_secret_value() if body.passphrase is not None else None
     try:
-        job_id = await importer.start_import_job(body.filename, body.on_conflict)
+        job_id = await importer.start_import_job(body.filename, body.on_conflict, passphrase,
+                                                 owner=job_lists.job_owner(request))
+    except importer.PassphraseError as exc:
+        # Decided by the filename before any job exists (#27).
+        return api_error(400, exc.code, str(exc), detail={"filename": body.filename})
     except RuntimeError as exc:
         return api_error(409, "IMPORT_IN_PROGRESS",
                          f"An import of '{exc}' is already running.",
                          detail={"filename": str(exc)})
     return ImportStartResponse(job_id=job_id, status="queued", filename=body.filename)
+
+
+@router.get("/import/jobs", response_model=ImportJobList)
+async def list_import_jobs(request: Request):
+    """The caller's running and recent imports (#617; see services/job_lists)."""
+    principal = request.state.auth
+    def build():
+        return job_lists.entries(ImportJobEntry, job_lists.job_items(importer.job_records()), principal)
+    return ImportJobList(jobs=await asyncio.to_thread(build))
 
 
 @router.get("/import/job/{job_id}", response_model=ImportJobStatusResponse)
@@ -78,12 +127,27 @@ async def import_job_status(job_id: str):
 
 def _list_packages_sync() -> list[dict]:
     out = []
-    for p in sorted(packager.exports_dir().glob("ragpkg-*.tar.gz")):
+    root = packager.exports_dir()
+    for p in sorted([*root.glob("ragpkg-*.tar.gz"), *root.glob("ragpkg-*" + age_stream.ENCRYPTED_SUFFIX)]):
+        if age_stream.is_encrypted_name(p.name):
+            # No metadata without the passphrase, and no scrypt to list (#27).
+            try:
+                with p.open("rb") as fh:
+                    readable = age_stream.check_header(fh)
+                size = p.stat().st_size
+            except Exception:                         # noqa: BLE001
+                # One bad file never breaks the listing of the others.
+                readable, size = False, 0
+            out.append({"filename": p.name, "size_bytes": size,
+                        "collection": None, "chunk_count": None, "fidelity": None,
+                        "created_at": None, "readable": readable, "encrypted": True})
+            continue
         try:
-            manifest = packager.read_manifest(p)
+            fields = packager.listing_fields(packager.read_manifest(p))
         except Exception:
-            # A file that is not a readable package still belongs in the listing;
-            # import will report precisely why it cannot be used.
+            # A file that is not a readable package, or whose manifest has a
+            # wrongly typed field (#451), still belongs in the listing; import
+            # will report precisely why it cannot be used.
             out.append({"filename": p.name, "size_bytes": p.stat().st_size,
                         "collection": None, "chunk_count": None,
                         "fidelity": None, "created_at": None, "readable": False})
@@ -91,10 +155,7 @@ def _list_packages_sync() -> list[dict]:
         out.append({
             "filename": p.name,
             "size_bytes": p.stat().st_size,
-            "collection": manifest.get("collection", {}).get("name"),
-            "chunk_count": manifest.get("collection", {}).get("chunk_count"),
-            "fidelity": manifest.get("fidelity"),
-            "created_at": manifest.get("created_at"),
+            **fields,
             "readable": True,
         })
     return out

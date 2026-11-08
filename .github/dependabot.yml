@@ -33,3 +33,9 @@ updates:
       # the 5-minute limit; 0.3.14 answers in 3-33s). Upgrade by hand and run
       # the full scripts/verify/all.sh. See closed PR #15.
       - dependency-name: "ollama/ollama"
+      # Weaviate also publishes single-platform tags such as
+      # 1.40.2-9858973.arm64, which sort above the plain multi-arch 1.40.2 and
+      # which a versions rule cannot single out (see closed PR #527). Upgrade
+      # by hand to the plain X.Y.Z tag and run the full verify suite
+      # (bash scripts/verify/stack.sh run). See #530.
+      - dependency-name: "semitechnologies/weaviate"

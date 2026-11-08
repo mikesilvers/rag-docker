@@ -2,7 +2,7 @@ services:
   weaviate:
     # 1.27.0 is the minimum supported by weaviate-client 4.23.1 (pinned in
     # api/requirements.txt); 1.25.x fails at connect with WeaviateStartUpError.
-    image: semitechnologies/weaviate:1.39.6
+    image: semitechnologies/weaviate:1.40.2
     environment:
       QUERY_DEFAULTS_LIMIT: 25
       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
@@ -10,6 +10,12 @@ services:
       ENABLE_MODULES: 'text2vec-ollama'
       TEXT2VEC_OLLAMA_APIENDPOINT: http://ollama:11434
       TEXT2VEC_OLLAMA_MODEL: nomic-embed-text
+      # Auto-schema (on by default) made an insert into a deleted collection
+      # recreate it, with inferred properties, no vectorizer and no app
+      # registration (issue #40). Every collection is created explicitly with
+      # the fixed properties, so nothing needs it; an insert into a missing
+      # collection now fails instead.
+      AUTOSCHEMA_ENABLED: 'false'
       # Weaviate 1.25 persists Raft cluster state keyed by node identity. Without
       # a fixed CLUSTER_HOSTNAME it derives that identity from the container, so
       # the IP recorded in weaviate_data no longer matches after `compose down`
@@ -86,13 +92,57 @@ services:
       SOURCES_DIR: /app/sources
       EXPORTS_DIR: /app/exports
       OLLAMA_MODELS_DIR: /ollama
+      # The sentence-transformers model is pre-cached in the api image at
+      # build time (api/Dockerfile). Without these flags the Hugging Face
+      # libraries still try to reach huggingface.co on first load and, when
+      # the site is unreachable, retry each model file five times -- stalling
+      # the first semantic ingest for minutes (issue #618). Pin them to the
+      # local cache so offline installs and air-gapped hosts load instantly.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
       # Shown by /health and compared against the memory Docker actually
       # provides. Raise this if you allocate more to Docker Desktop.
       RECOMMENDED_MEMORY_GB: 12
+      # The most one upload's ZIPs may expand to in all, gzipped members'
+      # output included (2 GiB); over it the upload is refused (#298).
+      MAX_ZIP_EXPANDED_BYTES: 2147483648
+      # The most entries one ZIP may hold, and the most a member of 1 MiB or
+      # more may expand relative to its compressed size; over either the
+      # upload is refused (#28).
+      MAX_ZIP_MEMBERS: 5000
+      MAX_ZIP_MEMBER_RATIO: 200
+      # The most an imported package's members may add up to (16 GiB) and the
+      # most entries it may hold, folders included; over either the import
+      # fails (#317).
+      MAX_PACKAGE_EXPANDED_BYTES: 17179869184
+      MAX_PACKAGE_MEMBERS: 100000
+      # Marks the session cookie Secure (#25). false for this loopback HTTP
+      # profile, where a Secure cookie would never be sent back. LAN mode's
+      # docker-compose.lan.yml serves TLS and sets it true (#26). Exactly true
+      # or false.
+      AUTH_COOKIE_SECURE: "false"
+      # The audit log (#29), in the ingest_uploads volume under audit/ and read
+      # on the AI Engineer's Audit page. Whether a query's question text is
+      # recorded: exactly true or false, off by default. audit.jsonl is rotated
+      # at AUDIT_LOG_MAX_BYTES (at least 4096) and AUDIT_LOG_KEEP rotated files
+      # (1-1000) are kept, the oldest deleted. LAN mode keeps these settings.
+      AUDIT_LOG_QUESTIONS: "false"
+      AUDIT_LOG_MAX_BYTES: "10485760"
+      AUDIT_LOG_KEEP: "10"
+      # The preparation area (#638): raw documents and their prepared parts, in
+      # the rag_preparation volume until deleted. MAX_PREPARATION_BYTES (20 GiB)
+      # is the most they may hold together, checked before each upload and each
+      # prepared part is written; writes running at once may pass it briefly.
+      PREPARATION_DIR: /app/preparation
+      MAX_PREPARATION_BYTES: "21474836480"
     volumes:
       - ingest_uploads:/app/uploads
+      # Accounts, sessions and the login throttle (#25), one SQLite file.
+      - auth_data:/app/auth_data
       # Retained source documents; grows with the corpus.
       - rag_sources:/app/sources
+      # The preparation area (#638): raw and prepared documents until deleted.
+      - rag_preparation:/app/preparation
       # Bind mount, deliberately: an export is only useful if the user can
       # reach the file from the host without going through Docker.
       - ./exports:/app/exports
@@ -122,10 +172,13 @@ services:
   proxy:
     image: nginx:1.29-alpine
     ports:
-      # This unauthenticated workbench is local to the host by default.
+      # The workbench is local to the host by default. LAN mode (#26) is the
+      # opt-in docker-compose.lan.yml, which replaces this with TLS on port 443.
       - "127.0.0.1:8080:80"
     volumes:
       - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+      # The routes, shared with LAN mode's nginx.lan.conf (#26).
+      - ./proxy/locations.conf:/etc/nginx/rag/locations.conf:ro
     networks: [rag-internal]
     depends_on: [ui, api]
 
@@ -144,6 +197,8 @@ volumes:
   ollama_models:
   ingest_uploads:
   rag_sources:
+  rag_preparation:
+  auth_data:
 
 networks:
   rag-internal:

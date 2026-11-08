@@ -9,6 +9,7 @@ from unittest.mock import patch
 import httpx
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import exporter,goldstandard as gs,importer,weaviate_client as wc
 
 
@@ -81,7 +82,7 @@ with tempfile.TemporaryDirectory(prefix='owned-import-session-') as directory:
     with patch.object(settings,'upload_dir',str(root/'uploads')),patch.object(settings,'sources_dir',str(root/'sources')),patch.object(settings,'exports_dir',str(root/'exports')),patch.object(gs,'_sessions',{}),patch.object(wc,'_create_collection_sync',side_effect=record_create):
         async def run():
             global neighbor_created
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-fixture') as client:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned-fixture'), base_url='http://owned-fixture') as client:
                 await bounded_poll_cases()
                 assert not await asyncio.to_thread(wc._collection_exists_sync,collection),'Owned name already exists'
                 assert not await asyncio.to_thread(wc._collection_exists_sync,protected_neighbor),'Protected fixture name already exists'

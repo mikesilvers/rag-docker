@@ -41,6 +41,7 @@ Record `headRefOid` as the **reviewed SHA**, and `origin/develop` as the **devel
 
 - Linked issues are `closingIssuesReferences` plus any `Part of #n` / `Refs #n` in the body.
 - **No linked issue:** stop for this PR. Tell the user which open issues look closest and why, and ask which one is the source of truth. Do not guess, and do not review against the PR's own description. Post nothing, and set no statuses.
+- **Triage gate (before any claim):** at this PR's turn, fetch the current labels of every linked issue with `gh issue view N --json number,labels`. Include `closingIssuesReferences` and `Part of #n` / `Refs #n`; do not rely on an earlier queue snapshot. If any linked issue has `Triage`, skip this PR without claiming it, dispatching reviews, or setting statuses. Record `skipped: linked issue #N carries Triage` in the local queue history and report it to the user. A failed issue/label lookup leaves eligibility unknown: stop before claiming and report the lookup failure. Resume only after labels can be read and no linked issue carries `Triage`.
 - **More than one linked issue:** review against all of them, and name each in the dispatch.
 - **`Part of #n`:** note what the PR says it leaves for later. Specialists mark those requirements `deferred (Part of)` (see `reference.md`).
 
@@ -132,35 +133,12 @@ It runs code, so the same rule as testing applies: for a cross-repository PR, on
 
 First reset the merged worktree to the evaluated commit (`git -C <bundle>/merged checkout -- . && git -C <bundle>/merged clean -fdq -e node_modules`), because the testing reviewer may have left test edits there.
 
-The whole check runs as **one script that holds the verify lock** from before `up` until after `down`, so no other verify run can remove the project under the smoke checks (#154). `stack.sh` sees that the lock is already held (`RAG_VERIFY_LOCK_HELD`) and neither takes nor releases it. Write the script to the bundle:
-
-```bash
-cat > <bundle>/build-check.sh <<'EOF'
-set -u
-main=$(git worktree list --porcelain | awk 'NR==1 {print $2}')
-# The trusted harness: the main checkout's must be develop's ("The verify project" in reference.md).
-git -C "$main" fetch -q origin develop || { echo "STOP: could not fetch develop"; exit 1; }
-git -C "$main" diff --quiet origin/develop -- scripts/verify/stack.sh scripts/verify/lock.sh docker-compose.verify.yml docker-compose.yml || { echo "STOP: the harness isn't develop's"; exit 1; }
-# Held until this script exits; exits 3 if another verify run holds it.
-. "$main/scripts/verify/lock.sh"
-smoke() { for i in $(seq 1 60); do c=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$1"); [ "$c" = 200 ] && { echo "200 after ${i}s"; return 0; }; sleep 1; done; echo "$c: no 200 in 60 s"; return 1; }
-rc=0
-if bash "$main/scripts/verify/stack.sh" up --checkout <bundle>/merged --pull; then
-  smoke http://localhost:8081/api/health || rc=1
-  smoke http://localhost:8081/ || rc=1
-  curl -s http://localhost:8081/api/health | python3 -c 'import json,sys; print(json.load(sys.stdin))' || rc=1
-else
-  echo "stack.sh up failed"; rc=1
-fi
-bash "$main/scripts/verify/stack.sh" down || rc=1
-exit "$rc"
-EOF
-```
+The whole check runs as **one script that holds the verify lock** from before `up` until after `down`, so no other verify run can remove the project under the smoke checks (#154). `stack.sh` sees that the lock is already held (`RAG_VERIFY_LOCK_HELD`) and neither takes nor releases it. The script is `{skills}/rag-pr-review/build-check.sh`, the maintainer's copy (`{skills}` as in step 7), and takes the bundle path as its first argument. Run it as it is: never copy it into the bundle or rewrite it.
 
 Run it in the background and wait for it as "Waiting for long runs" in `.claude/skills/rag-pr-review-tests/SKILL.md` says, with this script's log and pid file in place of `verify-all.*`:
 
 ```bash
-(bash <bundle>/build-check.sh; echo "build-check exit=$?") > <bundle>/build-check.log 2>&1 & echo $! > <bundle>/build-check.pid
+(bash {skills}/rag-pr-review/build-check.sh <bundle>; echo "build-check exit=$?") > <bundle>/build-check.log 2>&1 & echo $! > <bundle>/build-check.pid
 ```
 
 Then read the finished log:
@@ -200,7 +178,7 @@ Either way, the script has already torn the verify project down: confirm it as "
 
 ### 10. Report to the user
 
-For each PR: the verdict per check, the High findings in one line each, any check Tests scored as flaky or environmental (with how many times it failed, so the user can overrule it), whether it's ready to merge, the develop SHA it was evaluated against, and a link to the recap. It is ready only when Coding, Security, Tests and Build all passed and no High is open. Merging is the user's call; tell them the evaluation holds only while `develop` is still at that SHA, so nothing else should merge into `develop` first. If the head moved during the evaluation, ask whether to evaluate the new commit. For a PR by `joefeser` with Medium or Low findings, also offer the follow-up issue once it merges (see "Maintainer follow-ups" in `reference.md`).
+For each PR: the verdict per check, the High findings in one line each, any check Tests scored as flaky or environmental (with how many times it failed, so the user can overrule it), whether it's ready to merge, the develop SHA it was evaluated against, and a link to the recap. It is ready only when Coding, Security, Tests and Build all passed and no High is open. This skill never merges: the maintainer merges, except an agent's own tier-1 bug fix that passes every check in "Merging into `develop`" in `CLAUDE.md`. Tell the user the evaluation holds only while `develop` is still at that SHA, so nothing else should merge into `develop` first. If the head moved during the evaluation, ask whether to evaluate the new commit. For a PR by `joefeser` with Medium or Low findings, also offer the follow-up issue once it merges (see "Maintainer follow-ups" in `reference.md`).
 
 ## Common mistakes
 

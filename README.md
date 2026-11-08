@@ -1,15 +1,17 @@
 # RAG Platform
 
+[![Verify](https://github.com/mikesilvers/rag-docker/actions/workflows/verify.yml/badge.svg?branch=develop)](https://github.com/mikesilvers/rag-docker/actions/workflows/verify.yml)
+
 A self-contained, Dockerized Retrieval-Augmented Generation (RAG) platform. Upload documents, ask questions, and generate evaluation datasets — all running locally with no external API keys required.
 
 ## What's included
 
 | Component | Technology | Purpose |
 |---|---|---|
-| Vector store | Weaviate 1.39.6 | Stores and retrieves document chunks |
+| Vector store | Weaviate 1.40.2 | Stores and retrieves document chunks |
 | LLM + embeddings | Ollama 0.3.14 | Runs phi3.5 (chat) and nomic-embed-text (embeddings) locally |
 | API | FastAPI + Python 3.11 | RAG pipeline, ingest, gold standard generation |
-| UI | React 18 + Vite + Tailwind | Three-role web interface |
+| UI | React 18 + Vite + Tailwind | Web interface with login and three roles |
 | Proxy | nginx 1.29 | Routes traffic; listens on port 80 in-container, published on host port 8080 |
 
 ## Prerequisites
@@ -19,7 +21,7 @@ A self-contained, Dockerized Retrieval-Augmented Generation (RAG) platform. Uplo
 - **20 GB disk minimum allocated to Docker, 32 GB recommended** — see [Storage requirements](#storage-requirements) below. Check your current limit before building — a small virtual disk (8 GB or so) cannot hold this stack, and the build fails partway through with a confusing error.
 - Port **8080** free on the host — `docker-compose.yml` publishes the proxy as `127.0.0.1:8080:80`, bound to host loopback on supported engines
 
-Check the daemon version with `docker version --format '{{.Server.Version}}'`. Docker documents that engines older than 28.0.0 allow same-network hosts to reach localhost-published ports; upgrade the engine before using this unauthenticated workbench. See [Docker port publishing](https://docs.docker.com/engine/network/port-publishing/#publishing-ports). This default assumes Docker's standard bridge/NAT configuration; custom direct-routing settings are outside this local profile.
+Check the daemon version with `docker version --format '{{.Server.Version}}'`. Docker documents that engines older than 28.0.0 allow same-network hosts to reach localhost-published ports; upgrade the engine before using this local workbench. See [Docker port publishing](https://docs.docker.com/engine/network/port-publishing/#publishing-ports). This default assumes Docker's standard bridge/NAT configuration; custom direct-routing settings are outside this local profile.
 
 No API keys, no cloud accounts, no Python or Node installs required on your machine.
 
@@ -46,6 +48,7 @@ Three things scale with your corpus rather than with the stack:
 
 - the **Weaviate index** and its vectors,
 - **retained source documents** (`rag_sources`), which hold one copy of every ingested file so a collection can be exported at `with-sources` fidelity and re-chunked later,
+- the **preparation area** (`rag_preparation`, at most `MAX_PREPARATION_BYTES`, 20 GiB by default), which keeps raw documents and their prepared parts until you delete them,
 - **export packages** in `./exports`, which live on the *host* filesystem rather than Docker's virtual disk. A package is roughly the size of the corpus it came from, and about 2.3 GB larger if exported with `include_models: true`.
 
 So budget the figures above **plus the size of your document corpus** — counted twice if you keep exports of it alongside the live collections.
@@ -54,7 +57,7 @@ So budget the figures above **plus the size of your document corpus** — counte
 
 To change the disk allocation: **Docker Desktop → Settings → Resources → Virtual disk limit**, then apply and restart. On Docker Engine (Linux) there is no virtual disk — the limit is simply free space on `/var/lib/docker`.
 
-Reclaim space at any time with `docker builder prune` (build cache only) or `docker system prune -a` (also removes unused images, forcing a full rebuild).
+To free the space a rebuild leaves behind, see [Freeing space after an update](#freeing-space-after-an-update).
 
 ## Quick start
 
@@ -69,7 +72,10 @@ docker compose up -d
 # 3. Watch Ollama download the models (first run only — ~5 minutes)
 docker compose logs -f ollama
 
-# 4. Open the UI once all services are healthy
+# 4. Create the first AI Engineer (first start only); it prints a one-time password
+docker compose exec api python -m auth bootstrap <username>
+
+# 5. Open the UI once all services are healthy, log in and choose a new password
 open http://localhost:8080       # macOS
 # or visit http://localhost:8080 in your browser
 ```
@@ -96,27 +102,392 @@ so the model wait begins several minutes in — the stack is not stuck.
 
 On subsequent starts everything is immediate: the images are built and the model weights are cached in the `ollama_models` Docker volume.
 
-## Roles
+## Accounts and roles
 
-The landing page asks you to choose a role. Role is stored in `sessionStorage` and persists across page refreshes within the same browser tab.
+Everyone logs in with their own account, and each account has one role (#25).
+The API enforces the role on every request; the UI only hides what the role
+can't use.
 
 | Role | Access |
 |---|---|
 | **End User** | Q&A only |
-| **Developer** | Q&A, Import, Chunking, Retrieval, Gold Standard |
-| **AI Engineer** | All of the above + Collections management + Health dashboard |
+| **Developer** | Q&A, Import, Chunking, Retrieval, Gold Standard, Transfer |
+| **AI Engineer** | All of the above + Collections management (deleting collections) + Health dashboard + tuning + Users (account management) + Service keys (API keys for programs) + Audit (the audit log) |
+
+Endpoint by endpoint (paths under `/api`):
+
+| Needs | Endpoints |
+|---|---|
+| nothing | `GET /health`, `GET /auth/status`, `POST /auth/login` |
+| any logged-in user | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password` |
+| End User | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
+| Developer | creating a collection; ingest (upload, job status, settings); saving retrieval settings; gold standard (generate, sessions, pairs, regenerate, save, download); export, import, their job status, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
+| AI Engineer | `DELETE /collections/{name}`; `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/job/{id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; the API docs (`/docs`, `/redoc`, `/openapi.json`); account management (`GET` and `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `/role`, `/disable`, `/enable`); service keys (`GET` and `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `/disable`, `/enable`, `/keys`, `/keys/{key_id}/revoke`); the audit log (`GET /audit`, `GET /audit.csv`), in a browser session only |
+
+Without a session the API answers `401 AUTH_REQUIRED`; with a role that is too
+low, `403 FORBIDDEN`. Programs use service API keys instead of a session
+([Service keys](#service-keys)). Jobs and gold-standard sessions belong to no particular
+user: anyone with the role may poll or open them.
+
+### Managing accounts
+
+An operator creates the first AI Engineer on the machine running the stack,
+with the `python -m auth` command in the api container. After that, AI
+Engineers manage accounts on the **Users** page: create an account, reset a
+password, change a role, disable and enable. The operator command stays
+available for the same changes and for recovery. There is no
+self-registration and no email recovery.
+
+```bash
+docker compose exec api python -m auth bootstrap <username>          # the first AI Engineer, once
+docker compose exec api python -m auth create-user <username> <role> # end_user, developer or engineer
+docker compose exec api python -m auth reset-password <username>
+docker compose exec api python -m auth set-role <username> <role>
+docker compose exec api python -m auth disable <username>
+docker compose exec api python -m auth enable <username>
+docker compose exec api python -m auth list
+```
+
+`bootstrap`, `create-user` and `reset-password` print a generated password once,
+on the terminal only; it is never logged. The user must change it at their
+first login, from the page the UI shows them. Usernames are 3-32 characters of
+lowercase letters, digits, `.`, `_` and `-` (case doesn't matter); passwords are
+12-256 characters, not the username, and a change must pick a password other
+than the current one. Passwords are stored only as scrypt hashes. The last
+enabled AI Engineer can't be disabled or demoted. If you are locked out of your
+account (a lost password, a disabled account), `create-user`, `enable` or
+`reset-password` gets you back in; these don't lift a login throttle (below),
+which ends by itself after 15 minutes.
+Disabling a user or resetting their password ends their sessions at once; a
+role change applies to their next request.
+
+On the Users page, creating an account or resetting a password shows the
+generated password once, to the AI Engineer, who passes it on; the user
+changes it at first login. An AI Engineer's own password is changed with
+"Change password" (it needs the current one), not reset on the Users page.
+Accounts are disabled, never deleted, so a username always means the same
+person. The last enabled AI Engineer can't be demoted or disabled here either.
+Each change made on the Users page is one line in `docker compose logs api`,
+naming the AI Engineer, the change and the account, never a password, and one
+[audit log](#audit-log) record.
+
+### Sessions
+
+The browser keeps the session in an HttpOnly, `SameSite=Strict` cookie, which
+page scripts can't read. A session ends after 12 hours without a request or 7
+days after login, and survives an API restart and closing the browser. Five
+failed logins for a username from one address within 15 minutes throttle that
+pair for 15 minutes (`429 LOGIN_THROTTLED`); a wrong current password on the
+password-change page counts the same way. Every failure answers the same
+`LOGIN_FAILED`, whether or not the account exists. Behind Docker's port
+publishing every browser on the host may reach the API from the same address,
+so in practice the throttle is per username. The proxy also allows at most 10 logins a minute from one
+address, with a burst of 5 (`429 LOGIN_RATE_LIMITED`, "Too many login attempts. Wait a minute and try
+again."). A change (POST, PATCH, DELETE) sent with the cookie must
+come from this same origin, or it is refused `403 CROSS_ORIGIN_REFUSED`. Each
+login, success or failure, is one line in `docker compose logs api`, with the
+username and address and never the password.
+
+### Service keys
+
+Programs (a nightly import, a script, later the MCP server) call the API with a
+service API key instead of logging in. A key belongs to a **service
+principal**: an account for a program, with a name and one role (End User,
+Developer or AI Engineer), that can't log in to the browser. Keys are issued
+only to service principals, never to people.
+
+AI Engineers manage them on the **Service keys** page: create a principal,
+change its role, disable or enable it, issue keys and revoke them. A new key
+is shown once, on that page; the API stores only its SHA-256, so a lost key
+can't be shown again, only replaced. A key looks like `rag_<12-character id>_<43
+characters>`; the id names it in the list and in the log. Send it in the
+`Authorization` header, never in a URL:
+
+```bash
+curl -H "Authorization: Bearer $RAG_KEY" http://localhost:8080/api/collections
+```
+
+- A key can do what its principal's role allows at the time of each request: a
+  role change applies at once. It can't manage accounts, principals or keys,
+  log out or change a password, whatever the role (`403 KEY_NOT_ALLOWED`), so a
+  leaked key can't mint new credentials. `GET /auth/me` tells a program which
+  principal and role its key has.
+- Every key expires. Choose its lifetime in whole days when issuing it, 1 to
+  365, 90 by default. It can't be extended.
+- **Rotating** a key: issue a new key for the same principal, switch the
+  service over to it, then revoke the old one. Both keys work until then.
+- **Revoking** a key stops it at once. Revoked and expired keys stay listed and
+  never work again.
+- **Disabling** a principal stops all its keys until it is enabled again;
+  enabling makes its unrevoked, unexpired keys work again, so after a leak,
+  revoke the leaked key too. If no AI Engineer can log in, the operator command
+  can disable a principal: `docker compose exec api python -m auth disable <name>`.
+- An invalid, expired or revoked key, or one of a disabled principal, gets
+  `401 KEY_INVALID`. A request with an `Authorization` header is judged by that
+  header only, even if it also carries a session cookie. Key requests need no
+  `Origin` header.
+- Principals share the username rule and the name pool with people, and are
+  disabled, never deleted, so a name always means the same account. They don't
+  appear on the Users page. The operator command's `list` shows them as
+  `service account`; `set-role`, `disable` and `enable` work on them, and
+  `reset-password` refuses them (they have no password). The command can't
+  issue keys.
+- Each change on the Service keys page is one line in `docker compose logs api`,
+  naming the AI Engineer, the principal and the key id, never the key.
+  It is also an [audit log](#audit-log) record.
+
+### Audit log
+
+The audit log records who did what, to which data, and with what result (#29).
+AI Engineers read it on the **Audit** page: filter by time (UTC), actor,
+action, collection and result, page back through older records, and download
+the matching records as CSV. Opening the page and downloading the CSV are
+recorded too.
+
+**What is recorded.** Logins (successful, failed and throttled; repeated
+failures for one username from one address within a minute are one record and
+then one more with their count), logouts and
+password changes; queries; creating and deleting collections; saving ingest
+and retrieval settings; ingest, export, import and tuning jobs, once when
+started and once when they end (succeeded, failed or interrupted by a
+restart); saving and downloading gold-standard files; every change and
+refusal on the Users and Service keys pages; every `python -m auth` action
+but `list` (actor `operator`); reads of the audit log; and each API start.
+Each record names the actor (a username, a service principal with the key id,
+`operator` or `system`), their role at the time, the client address, the
+collection or account acted on, the result with the HTTP status, and the
+action's parameters: a query's settings, the names, count and total size of
+uploaded files, whether an export is encrypted and its package name, a new
+role, a key id. A refusal is recorded when the API knows who was refused (a
+`403`); requests without a valid session or key aren't. Browsing (other `GET`
+requests and job polling) isn't recorded.
+
+**What never is.** Passwords (typed, current, new or generated), session
+cookies, API keys, export passphrases, answers and document text. A query's
+question text is left out unless the operator sets `AUDIT_LOG_QUESTIONS` to
+`true` in `docker-compose.yml` (exactly `true` or `false`; the default is
+`false`). Some clients want questions logged and others don't; the Audit page
+says which applies, and each API start records it. There is no switch in the
+UI.
+
+**Where it is.** `audit.jsonl` (JSON Lines, one record per line) in the
+`ingest_uploads` volume, under `audit/`, readable only inside the api
+container. When it reaches `AUDIT_LOG_MAX_BYTES` (10 MiB) it is renamed
+`audit.jsonl.1`, older files move up by one, and the oldest beyond
+`AUDIT_LOG_KEEP` (10) is deleted; nothing else removes or edits a record.
+At a few hundred bytes a record that is tens of thousands of actions; copy the
+CSV, or the folder, to keep more. Whole-instance backup (#38) isn't built yet;
+when it is, it is to include this folder. To read the files directly:
+
+```bash
+docker compose exec api sh -c 'cat /app/uploads/audit/audit.jsonl'
+```
+
+**From a script.** `GET /api/audit` answers a page of records, newest first
+(`limit`, at most 1000, default 100), with `next_before` to pass as `before`
+for the next page; `GET /api/audit.csv` answers every match. Both take
+`from`, `to` (ISO 8601), `actor`, `action`, `collection` and `result`, and
+need an AI Engineer's browser session: an API key gets `403 KEY_NOT_ALLOWED`,
+so a leaked key can't read the log.
+
+**If a record can't be written** (a full disk, say), the action still
+happens: the API writes an `ERROR` line to `docker compose logs api`, and the
+Audit page shows how many records were lost since the API started.
+
+**Addresses.** The client address is the one nginx saw. On Docker Desktop
+that isn't the client's own: every browser, on this Mac or, in LAN mode, on
+other machines, shows the same Docker address (see [Things to
+know](#things-to-know)). The actor tells people apart; on Docker Engine on
+Linux the address normally does too.
+
+The `docker compose logs api` lines for logins and account changes are
+unchanged; the audit log is the durable record.
+
+### Calling the API from the command line
+
+Log in once with a cookie jar only you can read, then send the jar, and an
+`Origin` header for changes, with every request:
+
+```bash
+umask 077
+read -rs -p 'Password: ' RAG_PW; echo
+# printf is a shell builtin, so the password never appears in the process list.
+# (A password containing " or \ needs JSON escaping.)
+printf '{"username": "alice", "password": "%s"}' "$RAG_PW" \
+  | curl -s -c ~/.rag-session -H 'Content-Type: application/json' --data-binary @- \
+      http://localhost:8080/api/auth/login
+unset RAG_PW
+
+curl -b ~/.rag-session http://localhost:8080/api/collections
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/auth/logout
+```
+
+The curl examples below assume you are logged in this way. `GET /health` needs
+no session.
+
+### Upgrading from the role picker
+
+Before #25 the landing page let anyone pick a role and the API checked nothing.
+After upgrading, the API refuses everything but `/health` until an operator
+runs `docker compose exec api python -m auth bootstrap <username>`; until then
+the UI shows that command. Then create an account for each person with
+`create-user`. The role picker and the "Switch Role" button are gone, and
+nothing about the role is kept in the browser. Accounts live in the new
+`auth_data` volume.
+
+**Recreate the proxy when you upgrade.** `proxy/nginx.conf` now forwards the
+browser's `Host` with its port, which the API's same-origin check compares with
+`Origin`. The file is a single-file bind mount, so a running proxy keeps the old
+copy: until it is recreated, every change the UI sends (a query, an upload,
+logout, a password change) is refused `403 CROSS_ORIGIN_REFUSED`, although the
+login itself works. Update as in
+[Updating to a newer version](#updating-to-a-newer-version): its rebuild step
+recreates the proxy.
+
+A package's `retrieve.py` now logs in: `python3 retrieve.py --username alice
+"question"` asks for the password (or reads it with `--password-stdin`). A
+`retrieve.py` from a package exported before this change sends no login, so the
+API refuses it with `AUTH_REQUIRED`; export the collection again for one that
+logs in.
+
+## Sharing with your office
+
+By default the workbench answers only on the machine running Docker: the proxy
+is published on `127.0.0.1:8080`, over plain HTTP. LAN mode (#26) lets other
+machines on your network use it, over TLS. It is opt-in: without
+`docker-compose.lan.yml` nothing changes.
+
+In LAN mode:
+
+- the proxy publishes HTTPS on every network interface of this machine, port
+  443, and nothing else. `http://localhost:8080` stops answering, and there is
+  no plain-HTTP port or redirect;
+- the session cookie is marked `Secure`, so browsers send it only over TLS;
+- the API refuses to start unless an enabled AI Engineer account exists and the
+  cookie is `Secure`. It then exits with one line in `docker compose logs api`
+  saying why, and the proxy doesn't start, so nothing is published.
+
+### 1. Create the first AI Engineer in the default mode
+
+LAN mode won't start without one, so set the system up first, as in the
+[Quick start](#quick-start):
+
+```bash
+docker compose up -d
+docker compose exec api python -m auth bootstrap <your-username>
+```
+
+Log in at `http://localhost:8080` and choose your new password. Create the
+other accounts now or later from the Users page.
+
+### 2. Choose a certificate
+
+Browsers check that the certificate names the address they typed. Pick one of:
+
+- **A self-signed certificate (the default).** Name every way clients will
+  reach this machine in `RAG_LAN_HOSTNAMES`, comma-separated, in your shell or
+  in a `.env` file next to `docker-compose.yml`:
+
+  ```bash
+  RAG_LAN_HOSTNAMES=office-mac.local,192.168.1.20
+  ```
+
+  On first start the `tls-init` step generates a certificate for those names
+  plus `localhost`, valid for 825 days, and keeps it in the `lan_certs` volume.
+  It is reused on later starts, and replaced when it expires or the names
+  change. Browsers warn that it isn't trusted: compare the SHA-256 fingerprint
+  the browser shows with the one `docker compose logs tls-init` prints before
+  you accept it, once per browser.
+- **Your own certificate.** Put the certificate (with its chain, server
+  certificate first) and its unencrypted key in `proxy/certs/cert.pem` and
+  `proxy/certs/key.pem`. git ignores everything in that folder. When both files
+  are there they are used, and `RAG_LAN_HOSTNAMES` isn't needed. A key that
+  doesn't match the certificate stops the start; an expired certificate is used,
+  with a warning in `docker compose logs tls-init`.
+- **mkcert, for a small office.** [mkcert](https://github.com/FiloSottile/mkcert)
+  makes a local certificate authority and certificates signed by it, so
+  browsers that trust that authority show no warning:
+
+  ```bash
+  mkcert -install                  # creates the local authority on this machine
+  mkcert -cert-file proxy/certs/cert.pem -key-file proxy/certs/key.pem \
+    office-mac.local 192.168.1.20 localhost
+  mkcert -CAROOT                   # the folder holding rootCA.pem
+  ```
+
+  Install `rootCA.pem` (never `rootCA-key.pem`, which can sign certificates for
+  any site) as a trusted root on each client machine: on a Mac, open it in
+  Keychain Access, then set it to "Always Trust".
+
+After changing the certificate files or `RAG_LAN_HOSTNAMES` on a running LAN
+stack, run the `up` command below again, then restart the proxy so nginx loads
+the new pair:
+`docker compose -f docker-compose.yml -f docker-compose.lan.yml restart proxy`.
+
+### 3. Start in LAN mode
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.lan.yml up -d
+```
+
+Use the same two `-f` options for every `docker compose` command while in LAN
+mode (or `export COMPOSE_FILE=docker-compose.yml:docker-compose.lan.yml`).
+Clients open `https://office-mac.local/` (one of your names). Port 443 taken?
+Set `RAG_LAN_PORT=8443` the same way as the names and open
+`https://office-mac.local:8443/`.
+
+Allow incoming connections to Docker in the host firewall if it asks; the
+firewall, not this project, decides which networks can reach the port.
+
+### Going back to the default
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.lan.yml down
+docker compose up -d
+```
+
+Accounts, collections and everything else are kept (`down` without `-v`).
+The `tls-init` container and the `lan_certs` volume stay unused until you
+switch again.
+
+### Things to know
+
+- **No HSTS.** The proxy doesn't send `Strict-Transport-Security`. With a
+  self-signed or mkcert certificate, HSTS would turn a later certificate change
+  into a browser error with no way past it.
+- **Client addresses on Docker Desktop.** The login throttle locks a username
+  for 15 minutes after 5 failures from one client address. Measured on Docker
+  Desktop for Mac (#26): nginx doesn't see the client's own address. A request
+  to the port through this Mac's LAN address arrived from `192.168.65.1`
+  (Docker Desktop's address for the host) and one through `localhost` from the
+  Docker network's gateway. Other machines' connections take the same port
+  forwarding, so expect them to share one address: then 5 wrong passwords for a
+  username, from anyone on the network, lock that username for everyone for 15
+  minutes. The proxy's login rate limit, 10 a minute per client address with a
+  burst of 5, is then one limit shared by the whole network. Docker Engine on
+  Linux normally keeps the real client address.
+- **The audit log's addresses.** For the same reason, every record of the
+  [audit log](#audit-log) from another machine shows that one address; its
+  actor names who acted.
+- **Engine 28.0.0 or newer** is still required, as for the default mode.
 
 ## Workflow
 
 ### 1. Create a collection
 
-**AI Engineers** can manage collections from the dedicated **Collections** page. **Developers** can create a collection inline from the Import page using the **+ New** button next to the collection selector.
+**AI Engineers** can manage collections, including deleting them, from the dedicated **Collections** page. **Developers** can create a collection inline from the Import page using the **+ New** button next to the collection selector.
 
 A collection is a named vector index that holds chunks from one or more documents. Choose HNSW (approximate, fast) or Flat (exact, slower at scale).
 
 ### 2. Ingest documents
 
-Navigate to **Import**, drop in your files (PDF, DOCX, TXT, MD, CSV, JSON, or ZIP), choose a collection, and click **Start Ingest**. The page polls for progress automatically.
+Navigate to **Data → Import**, drop in your files (PDF, DOCX, TXT, MD, CSV, JSON, JSON Lines (`.jsonl`, `.jsonl.gz`), or ZIP), choose a collection, and click **Start Ingest**. A ZIP may also contain gzipped JSON (`.json.gz`) files. The page polls for progress automatically. Preparing a large corpus? The Import page's **Download corpus preparation rules (.md)** link gives the ingest limits (per upload, per ZIP, per file, per line and per chunk), how JSON and JSON Lines are measured, safe targets and a checklist, in one markdown file for whoever prepares the data, or for the tool they use.
+
+You don't have to stay on the page while a job runs. The Import, Gold Standard and Transfer pages each show a **Running and recent jobs** list, read from the server whenever the page opens, so coming back to it (after visiting another page, reloading, in another tab or after logging in again) shows the running job's progress, or its result once it has finished. The newest job opens by itself; click another row to switch. The list holds your own jobs that are running or finished in the last 24 hours (at most 20 finished ones); an AI Engineer sees everyone's, with who started each.
+
+**Documents that break the corpus rules?** **Data → Prepare** makes raw documents follow them on this instance, without downloading and uploading them again. Upload the raw files (the same types and ZIP limits as Import), then **Prepare**: the code extracts the text, splits it into parts within the rules' limits, normalises the encoding and converts JSON to JSON Lines; the local LLM only removes page headers, footers, page numbers and boilerplate from PDF, DOCX, TXT and Markdown, and writes a title and short summary for each of their parts. It never rewrites text: where its cleaning would remove too much, or a long line, that part of the document keeps the code-only text, and the page shows the fallback and why. CSV, JSON and JSON Lines are prepared by code only, with no LLM call: each part's title is the file name and part number, and its summary gives the record count, the field names and the first and last records' keys. Review each document's parts in **Preview**, then **Import selected** or **Import all prepared** into a collection, with the usual chunk settings; this starts an ordinary ingest job. Raw and prepared documents stay until you delete them, and each can be downloaded. Preparation uses the same local LLM as Q&A and ingest's embeddings, so on a CPU-only machine a long document takes a while, and either is slower while the other runs.
+
+Uploading a file again under the same name replaces its earlier chunks (even if the content is unchanged); files inside a ZIP are named by their path in the archive, so `a/report.pdf` and `b/report.pdf` stay separate documents. macOS metadata in a ZIP (the `__MACOSX/` folder and `._*` files the Finder adds) is not ingested; the job lists it under skipped files.
 
 Supported chunking strategies:
 
@@ -130,7 +501,7 @@ Supported chunking strategies:
 
 ### 3. Configure retrieval
 
-Navigate to **Retrieval** to choose a retrieval mode and top-K value for a collection. Settings are saved **per collection on the server**, so they survive a restart, are shared by every browser, and travel with a RAG export. The Q&A page loads the settings for whichever collection you have selected.
+Navigate to **Tune → Retrieval** to choose a retrieval mode and top-K value for a collection. Settings are saved **per collection on the server**, so they survive a restart, are shared by every browser, and travel with a RAG export. The Q&A page loads the settings for whichever collection you have selected.
 
 | Mode | Description |
 |---|---|
@@ -142,15 +513,15 @@ The API accepts `hnsw` and `flat` as aliases for Vector; selecting either does n
 
 ### 4. Ask questions
 
-Navigate to **Q&A**, select a collection, type your question, and press **Ask** (or Ctrl+Enter). Toggle **Show source citations** to see which chunks were used.
+Navigate to **Q&A**, select a collection, type your question, and press **Ask** (or Ctrl+Enter). Changing the collection clears the answer on screen, and an answer still on its way for the previous collection is not shown. Toggle **Show source citations** to see which chunks were used.
 
 ### 5. Generate gold standard data
 
-Navigate to **Gold Standard**, choose a collection and sample size, and click **Generate Pairs**. The platform samples chunks and uses the LLM to generate question/answer pairs. Review each pair (approve, edit, reject, or regenerate), then export to a RAGAS-compatible JSON file.
+Navigate to **Tune → Gold Standard**, choose a collection and sample size, and click **Generate Pairs**. The platform samples chunks and uses the LLM to generate question/answer pairs. The page shows how the generation ended, including pairs that failed and why. Review each pair (approve, edit, reject, or regenerate), then export to a RAGAS-compatible JSON file.
 
 ## Health check
 
-Navigate to **Health** (AI Engineer role) to see live status and latency for Weaviate, the LLM, and the embedding model. Latency charts populate after the first few Q&A queries.
+Navigate to **Admin → Health** (AI Engineer role) to see live status and latency for Weaviate, the LLM, and the embedding model. Latency charts populate after the first few Q&A queries.
 
 You can also hit the API directly:
 
@@ -202,13 +573,137 @@ docker compose down -v
 docker compose logs -f api
 docker compose logs -f ollama
 
-# Rebuild after code changes
-docker compose build api ui
-docker compose up -d
+# Rebuild and restart after pulling new code (see "Updating to a newer version")
+docker compose up -d --build --force-recreate
 
 # Check service health
 docker compose ps
 ```
+
+**Recreate the proxy after pulling a change to it.** The proxy's configuration files, `proxy/nginx.conf`,
+`proxy/locations.conf` and LAN mode's `proxy/nginx.lan.conf`, are each mounted as a single file. `git pull`
+replaces a changed file instead of rewriting it, so a running proxy keeps reading the old copy, and
+`docker compose up -d` alone doesn't recreate it. After pulling a change to any of them, run
+`docker compose up -d --force-recreate proxy` (in LAN mode with its two `-f` options). The [update steps](#updating-to-a-newer-version) do this. Until then, for example,
+`POST /api/goldstandard/regenerate` (regenerating a gold-standard pair) keeps the old configuration's generic
+300 s read timeout and can end in a 504 from the proxy (#278).
+
+## Updating to a newer version
+
+Run these commands in the `rag-docker` folder. Your collections, accounts and downloaded models are kept: they live in Docker volumes that these steps don't touch. There are two ways to get the new code: the latest release, for normal use, or `develop`, for testing.
+
+### 1. Get the new code
+
+Pick one of the two.
+
+**The latest release (normal use)**
+
+```bash
+# Download the newest branches and release tags
+git fetch origin --tags
+# Switch to the release branch (a fresh clone starts on develop)
+git switch main
+# Bring it up to date
+git pull
+# Print the newest release tag
+git tag --sort=-v:refname | head -n 1
+# Print the release this folder is on
+git describe --tags
+```
+
+When the last two print the same name, for example `v1.1.0`, you have the latest release.
+
+**Testing new code (`develop`), for testing only**
+
+`develop` holds work that isn't in a release yet. Use it to try new code, not for normal use.
+
+```bash
+# Switch to the development branch
+git switch develop
+# Bring it up to date
+git pull
+```
+
+Both ways continue with the same steps below.
+
+### 2. Rebuild and restart
+
+```bash
+# Rebuild api and ui, download any newer images, recreate every container (data is kept)
+docker compose up -d --build --force-recreate
+```
+
+Recreating every container includes the proxy, so it reads the new configuration files. In LAN mode ([Sharing with your office](#sharing-with-your-office)) use the same two `-f` options:
+
+```bash
+# Rebuild api and ui, download any newer images, recreate every container (data is kept)
+docker compose -f docker-compose.yml -f docker-compose.lan.yml up -d --build --force-recreate
+```
+
+The rebuild takes a few minutes; the api image alone takes about 3 minutes from scratch.
+
+### 3. Check that it is back
+
+```bash
+# List the services and their state
+docker compose ps
+# Ask the API whether it is healthy
+curl http://localhost:8080/api/health
+```
+
+It is ready when weaviate, ollama and api show `healthy`, and ui and proxy `running`. The first start after an update can take up to about 3 minutes.
+
+In LAN mode:
+
+```bash
+# List the services and their state
+docker compose -f docker-compose.yml -f docker-compose.lan.yml ps
+# Ask the API whether it is healthy
+curl -k https://office-mac.local/api/health
+```
+
+Use one of your `RAG_LAN_HOSTNAMES` in place of `office-mac.local`. `-k` accepts the self-signed certificate. If you set `RAG_LAN_PORT`, add `:<port>` after the name.
+
+### 4. Reload the browser
+
+Reload every open tab of the workbench (Cmd+Shift+R on a Mac, Ctrl+Shift+R elsewhere) so it loads the new UI: a tab left open keeps running the old one.
+
+### Freeing space after an update
+
+A rebuild leaves the old images and build cache behind.
+
+```bash
+# Show how much space images, containers, volumes and build cache take, and how much can be reclaimed (changes nothing)
+docker system df
+# Remove old images that are no longer tagged, such as the api and ui images a rebuild replaced
+docker image prune
+# Remove leftover build cache (a later build may take a little longer)
+docker builder prune
+```
+
+Both prune commands ask `y/N` before deleting and never touch volumes, so your data is safe.
+
+Optional, to also remove old versions of the ollama, weaviate and nginx images: run this only while the stack is running, as step 3 shows.
+
+```bash
+# Remove every image that no container uses
+docker image prune -a
+```
+
+With the stack stopped (`docker compose down`), it deletes the stack's own images too: the next start downloads about 3.5 GB again and rebuilds api and ui. It also removes the images of any other project that has no container at the time.
+
+### Don't run these
+
+These delete your collections, accounts, uploads and the downloaded models:
+
+```bash
+# Deletes all of this stack's volumes
+docker compose down -v
+# Deletes every volume no container uses: after `docker compose down`, all of this stack's (--all is the same)
+docker volume prune -a
+```
+
+Don't run `docker volume prune` or `docker system prune --volumes` either. On Docker before 23.0 they delete every volume no container uses, which after `docker compose down` is all of this stack's. Docker 23.0 and later limits them to anonymous volumes, but no clean-up here needs them.
 
 ## GPU acceleration (optional)
 
@@ -238,43 +733,67 @@ All API settings are environment variables in `docker-compose.yml`:
 | `OLLAMA_HOST` | `ollama` | Ollama hostname (internal) |
 | `UPLOAD_DIR` | `/app/uploads` | Container path for uploads and session data |
 | `RECOMMENDED_MEMORY_GB` | `12` | Memory recommendation reported by `/health`. Raise it if you allocate more to Docker; no rebuild needed |
+| `MAX_ZIP_EXPANDED_BYTES` | `2147483648` (2 GiB) | The most one upload's ZIPs may expand to in all, gzipped members' output included. Over it the upload is refused with `ARCHIVE_TOO_LARGE` |
+| `MAX_ZIP_MEMBERS` | `5000` | The most entries one ZIP may hold, folders included. Over it the upload is refused with `ARCHIVE_TOO_MANY_MEMBERS` |
+| `MAX_ZIP_MEMBER_RATIO` | `200` | The most a ZIP member of 1 MiB or more may expand relative to its compressed size. Over it the upload is refused with `ARCHIVE_RATIO_TOO_HIGH` |
+| `MAX_PACKAGE_EXPANDED_BYTES` | `17179869184` (16 GiB) | The most an imported package's files may add up to when unpacked. Over it the import fails with `PACKAGE_TOO_LARGE` |
+| `MAX_PACKAGE_MEMBERS` | `100000` | The most entries an imported package may hold, folders included. Over it the import fails with `PACKAGE_TOO_MANY_MEMBERS` |
+| `AUTH_COOKIE_SECURE` | `false` | Marks the session cookie `Secure`. Exactly `true` or `false`; anything else stops the API. Leave it `false` for the loopback HTTP profile, where a Secure cookie would never be sent back. `docker-compose.lan.yml` sets it `true` for LAN mode's TLS (#26) |
+| `RAG_LAN_MODE` | `false` | LAN mode (#26), set `true` only by `docker-compose.lan.yml`. Exactly `true` or `false`; anything else stops the API. When `true` the API refuses to start unless `AUTH_COOKIE_SECURE` is `true` and an enabled AI Engineer exists. See [Sharing with your office](#sharing-with-your-office) |
+| `AUTH_DIR` | `/app/auth_data` | Container path of the accounts store, the `auth_data` volume |
+| `AUDIT_LOG_QUESTIONS` | `false` | Whether the [audit log](#audit-log) records a query's question text. Exactly `true` or `false`; anything else stops the API |
+| `AUDIT_LOG_MAX_BYTES` | `10485760` (10 MiB) | The size at which `audit.jsonl` is rotated; at least 4096 |
+| `AUDIT_LOG_KEEP` | `10` | How many rotated audit files are kept (1-1000); the oldest beyond them is deleted |
+| `PREPARATION_DIR` | `/app/preparation` | Container path of the preparation area, the `rag_preparation` volume |
+| `MAX_PREPARATION_BYTES` | `21474836480` (20 GiB) | The most the preparation area may hold, raw and prepared documents together; at least 1048576. Checked before each upload and each prepared part is written; uploads and preparation running at the same time may pass it briefly. Over it, `PREPARATION_STORAGE_FULL` |
+| `HF_HUB_OFFLINE` | `1` | Keeps the image's pre-cached sentence-transformers model from contacting huggingface.co; set to `0` only if you change the model and want it downloaded at runtime |
+| `TRANSFORMERS_OFFLINE` | `1` | Same offline enforcement for the transformers library; keep `1` to use the pre-cached model with no runtime network call |
+
+LAN mode reads two more settings from your shell or a `.env` file next to `docker-compose.yml`, used by `docker-compose.lan.yml`:
+
+| Variable | Default | Description |
+|---|---|---|
+| `RAG_LAN_HOSTNAMES` | empty | The names and IP addresses clients use to reach this machine, comma-separated. The self-signed certificate names them plus `localhost`. Required unless `proxy/certs/` holds your own `cert.pem` and `key.pem` |
+| `RAG_LAN_PORT` | `443` | The host port LAN mode publishes HTTPS on, on every interface |
 
 To swap the LLM (e.g. to `llama3.2`), update `LLM_MODEL` in `docker-compose.yml` and add the model name to `ollama/entrypoint.sh`.
 
-**Upload size limit.** One upload (all files in it together, or one ZIP) can be at most **512 MB**. The proxy enforces it with `client_max_body_size` in `proxy/nginx.conf`. To change it, edit that value and `MAX_UPLOAD_MB` in `ui/src/api/client.ts` (the Import page uses it to warn before sending), then rebuild the UI and recreate the proxy:
+**Upload size limit.** One upload (all files in it together, or one ZIP) can be at most **512 MB**. The proxy enforces it with `client_max_body_size` in `proxy/locations.conf`. To change it, edit that value and `MAX_UPLOAD_MB` in `ui/src/api/client.ts` (the Import page uses it to warn before sending), then rebuild the UI and recreate the proxy:
 
 ```bash
 docker compose build ui
 docker compose up -d --force-recreate ui proxy
 ```
 
-`--force-recreate` matters for the proxy. `nginx.conf` is mounted as a single file, and most editors save by replacing the file, so a running container keeps reading the old copy until it is recreated.
+`--force-recreate` matters for the proxy. `locations.conf` is mounted as a single file, and most editors save by replacing the file, so a running container keeps reading the old copy until it is recreated.
 
 ## Data persistence
 
-Four named Docker volumes persist data across restarts:
+Six named Docker volumes persist data across restarts:
 
 | Volume | Contents |
 |---|---|
 | `weaviate_data` | Vector index and all ingested chunks |
 | `ollama_models` | Downloaded model weights |
-| `ingest_uploads` | Ingest configs, gold standard sessions, exported JSON files, metrics ring buffer |
+| `ingest_uploads` | Ingest configs, gold standard sessions, exported gold-standard JSON files (`goldstandard_exports/`), metrics ring buffer (`metrics.jsonl`, bounded to 1,000 lines), the audit log (`audit/`, #29) |
 | `rag_sources` | Original uploaded documents, content-addressed per collection. Grows with your corpus |
+| `rag_preparation` | The preparation area (#638): raw documents uploaded on **Data → Prepare** and their prepared parts, until deleted. At most `MAX_PREPARATION_BYTES`. Not part of collection export packages |
+| `auth_data` | Accounts, password hashes, sessions and the login throttle (`auth.db`, SQLite, #25) |
 
-Run `docker compose down -v` to delete all volumes and start fresh.
+Run `docker compose down -v` to delete all volumes and start fresh. Updating keeps every volume; see [Don't run these](#dont-run-these) for the commands that delete them.
 
 ## Project structure
 
 ```
 rag-docker/
-├── package.sh            # Builds a source-only zip (~150 KB; target needs internet)
+├── package.sh            # Builds a source-only zip (~1.3 MB; target needs internet)
 ├── package-offline.sh    # Builds a self-contained offline bundle (~4.6 GB)
 ├── install-offline.sh    # Installs from that bundle with no network access
 ├── api/                  # FastAPI backend
 │   ├── Dockerfile
 │   ├── .dockerignore
 │   ├── requirements.in   # Direct dependencies — edit this one
-│   ├── requirements.txt  # Generated lock — all 156 packages pinned; do not hand-edit
+│   ├── requirements.txt  # Generated lock — all packages pinned; do not hand-edit
 │   ├── main.py
 │   ├── config.py
 │   ├── utils.py
@@ -295,9 +814,13 @@ rag-docker/
 ├── ollama/
 │   └── entrypoint.sh     # Pulls models on first start
 ├── proxy/
-│   └── nginx.conf        # Routes /api/ to API, / to UI
+│   ├── nginx.conf        # The default server: HTTP on port 80
+│   ├── nginx.lan.conf    # LAN mode's server: TLS on port 443 (#26)
+│   ├── locations.conf    # Routes /api/ to API, / to UI; shared by both
+│   └── certs/            # Your own LAN mode certificate, if any (ignored by git)
 ├── exports/              # Export packages land here (bind mount)
-└── docker-compose.yml
+├── docker-compose.yml
+└── docker-compose.lan.yml # LAN mode, opt-in (#26)
 ```
 
 ## Exporting and importing a RAG
@@ -314,15 +837,15 @@ the originals were retained) the source documents themselves.
 
 ```bash
 # start an export
-curl -X POST http://localhost:8080/api/export \
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/export \
   -H 'Content-Type: application/json' \
   -d '{"collection": "Policies"}'
 
 # poll it
-curl http://localhost:8080/api/export/job/<job_id>
+curl -b ~/.rag-session http://localhost:8080/api/export/job/<job_id>
 
 # list what is in ./exports
-curl http://localhost:8080/api/packages
+curl -b ~/.rag-session http://localhost:8080/api/packages
 ```
 
 The package lands in `./exports/` on the host, named
@@ -330,10 +853,17 @@ The package lands in `./exports/` on the host, named
 `README.md` explaining what it contains, how to import it and how to run its
 `retrieve.py`.
 
-Two things worth knowing before you move one:
+Three things worth knowing before you move one:
 
-- **Packages are not encrypted.** A `with-sources` package contains the original
-  documents byte for byte. Treat the file as you would the corpus.
+- **Packages are not encrypted unless you give a passphrase.** A `with-sources`
+  package contains the original documents byte for byte. Treat a plain `.tar.gz`
+  as you would the corpus, or encrypt it (below).
+- **An export holds its collection's writer guard.** Chunks and original
+  documents come from one point in time, so ingest, re-chunking and other writes to
+  that collection wait until the export finishes, and gold-standard generation for
+  it answers busy. Queries and other collections are not affected. Saved settings
+  and gold-standard sessions can still change meanwhile, so the package's copies of
+  them may be newer than its chunks.
 - **The embedding model must match.** Vectors made by a different embedding
   model are meaningless in this vector space, not merely different, so import
   refuses the mismatch rather than warning about it.
@@ -342,15 +872,48 @@ Two things worth knowing before you move one:
 are never included when you package the project with `package.sh` or
 `package-offline.sh` — the directory ships, the corpus does not.
 
-To import one, drop the `.tar.gz` into `./exports/` on the target machine and:
+### Encrypting a package
+
+Add a `passphrase` (12 to 1024 characters) to the export, or tick **Encrypt with a
+passphrase** on the Transfer page:
 
 ```bash
-curl -X POST http://localhost:8080/api/import \
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/export \
+  -H 'Content-Type: application/json' \
+  -d '{"collection": "Policies", "passphrase": "<a long passphrase>"}'
+```
+
+The package is then written as `ragpkg-...tar.gz.age`: an
+[age](https://age-encryption.org) file encrypted with that passphrase (scrypt).
+The archive is encrypted as it is written, so it is never held in memory and no
+unencrypted archive is written. While the export runs, though, the package's
+files are staged unencrypted in a hidden `./exports/.build-*` folder, which is
+removed when the export ends (or at the next start-up if the API was killed).
+Since `./exports/` is a host folder, anyone who can read it during an export can
+read those files; moving the staging out of it is a follow-up.
+Import needs the same passphrase, and `age -d` opens the file as well. Import
+accepts a scrypt work factor of at most 20 (about 1 GiB of memory to derive the
+key) and refuses a higher one as `DECRYPT_FAILED` before deriving anything; age's
+own default, 18, which export uses, is well within it. The
+passphrase is never stored, logged or returned, and it can't be recovered: send it
+by a different channel than the file. Once a package is decrypted or imported, its
+contents are plaintext again on that machine.
+
+To import one, drop the package into `./exports/` on the target machine and:
+
+```bash
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/import \
   -H 'Content-Type: application/json' \
   -d '{"filename": "ragpkg-policies-...tar.gz", "on_conflict": "abort"}'
 
-curl http://localhost:8080/api/import/job/<job_id>
+curl -b ~/.rag-session http://localhost:8080/api/import/job/<job_id>
 ```
+
+An encrypted package needs its passphrase in the same request
+(`"passphrase": "..."`); without it the import is refused `400
+PASSPHRASE_REQUIRED`, and a passphrase sent for an unencrypted package is refused
+`400 PASSPHRASE_NOT_EXPECTED`. A wrong passphrase, or a damaged encrypted file,
+fails the import job with `DECRYPT_FAILED` before anything is touched.
 
 `on_conflict` is required and has no default, because the wrong choice can
 delete a collection:
@@ -359,18 +922,25 @@ delete a collection:
 |---|---|
 | `abort` | fail if a collection of that name already exists |
 | `rename` | import alongside it as `<name>_imported_<id8>` |
-| `replace` | overwrite it — but only after the incoming package has been proven to import cleanly, so a failed replace leaves the original intact |
+| `replace` | overwrite it — but only after the incoming package has been proven to import cleanly. A failure before the existing collection is deleted leaves it as it was; a failure while the final copy is being built can leave the name missing or partial, with the incoming data kept in a recovery collection named in the error (`recovered_as`) |
 
 The package is validated before anything touches the database: the archive must
 be readable, the format understood, every digest must match, and the embedding
 model must be the one this instance runs. Chunk UUIDs are preserved, so
 gold-standard sessions keep pointing at the right chunks after the move.
 Retained-source indexes and blobs are validated before the embedding check;
-invalid source metadata fails with `PACKAGE_CORRUPT` before any live mutation.
+invalid source metadata fails with `PACKAGE_CORRUPT` before any live mutation. So
+does a chunk whose `source_sha256` names a source the package doesn't carry
+(#509). Packages from older exports that skipped a missing source blob are refused
+this way; export the collection again.
 
 Evaluation-session metadata is also validated before importing models or
 changing a collection. Invalid session JSON, identities or schemas fail the
 import with `PACKAGE_CORRUPT`, naming the sidecar; they are not silently skipped.
+The package's retrieval and chunking settings are checked at the same point:
+settings the API wouldn't save fail the import with `PACKAGE_CORRUPT`, naming
+`retrieval_config.json` or `ingest_config.json`. Chunk sizes saved before the
+current 50-6000 bounds are still imported as they are.
 
 ### Carrying the models too
 
@@ -380,7 +950,7 @@ meaningless rather than merely different. For a machine that has never pulled
 anything, export with the models included:
 
 ```bash
-curl -X POST http://localhost:8080/api/export \
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/export \
   -H 'Content-Type: application/json' \
   -d '{"collection": "Policies", "include_models": true}'
 ```
@@ -400,26 +970,36 @@ Once a collection is in, it can be rebuilt in place:
 
 ```bash
 # re-split the original documents differently (needs with-sources)
-curl -X POST http://localhost:8080/api/tune/rechunk \
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/tune/rechunk \
   -H 'Content-Type: application/json' \
   -d '{"collection": "Policies", "chunking_strategy": "fixed", "chunk_size": 600}'
 
 # regenerate vectors, leaving chunk boundaries alone
-curl -X POST http://localhost:8080/api/tune/reembed -d '{"collection": "Policies"}' \
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/tune/reembed -d '{"collection": "Policies"}' \
   -H 'Content-Type: application/json'
 
 # switch index type or distance metric, reusing the existing vectors
-curl -X POST http://localhost:8080/api/tune/reindex \
+curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/tune/reindex \
   -H 'Content-Type: application/json' \
   -d '{"collection": "Policies", "index_type": "flat", "distance_metric": "cosine"}'
 ```
 
 `GET /api/tune/<collection>` says which of these the collection can do — a
 `chunks-only` collection cannot be re-chunked, because the originals are not
-there to re-split.
+there to re-split. Nor can a collection where a stored file has no single
+retained original (a file uploaded more than once under the same name, or the
+same content uploaded under a second name), or where a retained original is
+missing from disk.
 
-Each rebuild is staged and swapped in only once it succeeds, so a failure leaves
-the collection as it was.
+Each rebuild verifies a staging copy before cutover. A failure before cutover
+leaves the original collection, and the stale markers of its gold-standard
+sessions, as they were; a marker that can't be rolled back leaves its session
+historical, and Health reports it. A failure during final replacement can leave
+its name missing or partial, with a retained recovery copy and historical
+sessions. After cutover, stale marking is best-effort: a session whose file and
+pending marker both can't be written is historical only until the API restarts.
+Retained sessions can be loaded by ID. Historical export returns
+`409 HISTORICAL_SESSION` until the user explicitly opts in.
 
 **Gold-standard sessions are flagged, never deleted.** Re-chunking or re-embedding
 changes which chunks exist, so any evaluation pairs built against the old ones no
@@ -444,6 +1024,10 @@ reads its model volume, to copy the models. That guards against accidents,
 not hostile code: a branch's scripts run on your host with full access to
 Docker. Exits non-zero if any check fails, so it can gate a commit.
 
+Every pull request to `develop` or `main` also runs it in GitHub Actions, with
+`RAG_SKIP_SLOW=1` (`.github/workflows/verify.yml`, the badge above). See
+"Continuous integration" in `scripts/verify/README.md`.
+
 These are integration tests on purpose. Every defect this project has produced
 was invisible to a unit test of the same function: a parser dependency missing
 from the image, an endpoint returning 200 where it should have refused, vectors
@@ -453,22 +1037,13 @@ surviving a vectorizer. See `scripts/verify/README.md`.
 
 Both services pin their dependencies, so a rebuild six months from now installs the same versions as today.
 
-**Python (`api/`)** — `requirements.in` holds the direct dependencies; `requirements.txt` is the generated lock with all 156 packages pinned — those 9 plus everything they pull in — and is what the Dockerfile installs. To change a dependency:
+**Python (`api/`)** — `requirements.in` holds the direct dependencies; `requirements.txt` is the generated lock with all packages pinned — direct dependencies plus their transitive dependencies — and is what the Dockerfile installs. To change a dependency:
 
-```bash
-# 1. edit api/requirements.in, then rebuild so pip re-resolves
-docker compose build api
-
-# 2. regenerate the lock — keeps the header, drops the CPU-index packages
-docker run --rm rag-docker-api pip freeze \
-  | grep -viE '^(torch|torchvision)==' \
-  | LC_ALL=C sort > /tmp/pins.txt
-awk '/^[a-zA-Z0-9]/{exit} {print}' api/requirements.txt > /tmp/header.txt
-cat /tmp/header.txt /tmp/pins.txt > api/requirements.txt
-
-# 3. rebuild to confirm the lock installs cleanly, then commit both files
-docker compose build api
-```
+Follow the resolve-against-current-image procedure at the top of
+`api/requirements.in`: resolve changes with `pip install --dry-run --report`,
+update the sorted lock with the resolved pins, rebuild, then compare the image's
+`pip freeze` (excluding torch/torchvision) against the lock. Editing the input
+and rebuilding alone does not resolve changes because Docker installs the lock.
 
 `LC_ALL=C` keeps the ordering stable across machines, so re-locking produces a clean diff instead of a reshuffle.
 
@@ -501,7 +1076,7 @@ internet access.
 
 | | `package.sh` | `package-offline.sh` |
 |---|---|---|
-| Archive size | ~150 KB | **~4.6 GB** |
+| Archive size | ~1.3 MB | **~4.6 GB** |
 | Contains | source only | source + all 5 images + model weights |
 | Target needs internet | **yes** (~8–10 GB downloaded) | **no** |
 | First-run time on target | 10–20 min (downloads + build) | a few min (decompress + load only) |
@@ -519,12 +1094,15 @@ the target machine.
 #### 1. Package it
 
 ```bash
-bash package.sh              # writes rag-docker.zip (~150 KB)
+bash package.sh              # writes rag-docker.zip (~1.3 MB)
 ```
 
-The script excludes `.DS_Store`, `node_modules/`, `__pycache__/`, `dist/`, any
-`.env`, and previous archives. Run it with `bash package.sh`, not `./package.sh`,
-so it does not depend on its own executable bit.
+The zip holds exactly the files git tracks in the current commit (`HEAD`), built
+with `git archive`. Untracked and ignored files never go in (`.env` files,
+`node_modules/`, offline tars, previous archives, `.claude/`, `dev-docs/`, the
+contents of `ingest-inbox/` and `exports/`), and neither do uncommitted changes,
+so commit first. Run it in a git checkout of the project, with `bash package.sh`,
+not `./package.sh`, so it does not depend on its own executable bit.
 
 #### 2. What the target Mac needs
 
@@ -572,7 +1150,9 @@ been downloaded:
 bash package-offline.sh              # writes rag-docker-offline.tar (~4.6 GB)
 ```
 
-It runs `docker save` on all five images (~2.5 GB compressed) and exports the
+Its source tree is the same as `package.sh`'s: the files git tracks in the
+current commit, so run it in a git checkout too. It runs `docker save` on all
+five images (~2.5 GB compressed) and exports the
 Ollama model weights from the `ollama_models` volume (~2.2 GB). Expect a few
 minutes; saving the image layers is the slow part.
 
@@ -617,7 +1197,7 @@ The fix is to pull each base image individually first, which shows real layer-by
 
 ```bash
 docker compose down
-docker pull semitechnologies/weaviate:1.39.6
+docker pull semitechnologies/weaviate:1.40.2
 docker pull nginx:1.29-alpine
 docker pull ollama/ollama:0.3.14
 ```
@@ -652,10 +1232,12 @@ If this fails after Docker restarts, Docker's internal networking is broken — 
 
 **LLM answers are garbage or time out** — Answers come back in mixed scripts or as fragments of unrelated instructions, run to thousands of characters, or time out, while `/api/health` still reports the LLM as ok. Ollama's model runner has degraded; it does not recover on its own. Restart it with `docker compose restart ollama`. `scripts/verify/all.sh` checks for this before its LLM suites and stops with the same advice.
 
-**Port 8080 already in use** — The proxy publishes on host loopback port 8080 (`docker-compose.yml`, the `proxy` service: `"127.0.0.1:8080:80"`). Change the middle number to any free port, for example `"127.0.0.1:9090:80"`, then access the UI at `http://localhost:9090`. Keep the `127.0.0.1` host address and container port 80.
+**Port 8080 already in use** — The proxy publishes on host loopback port 8080 (`docker-compose.yml`, the `proxy` service: `"127.0.0.1:8080:80"`). Change the middle number to any free port, for example `"127.0.0.1:9090:80"`, then access the UI at `http://localhost:9090`. Keep the `127.0.0.1` host address and container port 80. In LAN mode the port is 443 on every interface instead; set `RAG_LAN_PORT` to use another (see [Sharing with your office](#sharing-with-your-office)).
 
-**Sharing with your office** — The default binding is now local to the Docker host. An existing installation accessed from another computer will stop accepting those connections after its proxy is recreated. This workbench currently has no API authentication; authenticated LAN access with TLS is tracked in issue #26 and is not yet provided. Keep the loopback binding for the current local setup.
-**Upload fails with "larger than the 512 MB limit" or HTTP 413** — The upload is over the proxy's limit (see [Configuration](#configuration)). The limit covers the whole request, so split a large batch into several uploads, or raise the limit. Before issue #21 the proxy used nginx's 1 MB default, so a 413 on an ordinary PDF means the proxy is running an old `nginx.conf`: run `docker compose up -d --force-recreate proxy`.
+**Other computers can't reach the workbench** — By default it answers only on the Docker host (`127.0.0.1`). To share it on your network, use LAN mode: see [Sharing with your office](#sharing-with-your-office).
+
+**LAN mode doesn't start** — `docker compose -f docker-compose.yml -f docker-compose.lan.yml logs api tls-init` says why in one line: no enabled AI Engineer yet (create one in the default mode first), `AUTH_COOKIE_SECURE` not `true`, `RAG_LAN_HOSTNAMES` empty or holding something that isn't a name or address, or a `proxy/certs` key that doesn't match its certificate.
+**Upload fails with "larger than the 512 MB limit" or HTTP 413** — The upload is over the proxy's limit (see [Configuration](#configuration)). The limit covers the whole request, so split a large batch into several uploads, or raise the limit. Before issue #21 the proxy used nginx's 1 MB default, so a 413 on an ordinary PDF means the proxy is running an old configuration: run `docker compose up -d --force-recreate proxy`.
 
 **Build fails with `ERROR: Could not install packages due to an OSError: [Errno 28] No space left on device`** — Docker's virtual disk is full, not your host disk — the two are reported separately, and `df -h` on the host will look fine. A virtual disk of 8 GB or so cannot hold ~6.5 GB of images plus build cache, so the build runs out of room partway through `pip install`. Check the real numbers with:
 
@@ -707,20 +1289,262 @@ Raise it in **Docker Desktop → Settings → Resources → Memory**, then resta
 
 | You send | Result |
 |---|---|
-| create `myDocs` | stored and listed as **`MyDocs`** |
+| create `myDocs` | stored and listed as **`MyDocs`**; the API answers `MyDocs` |
 | reference `myDocs` | accepted — the first letter is normalised for you |
 | reference `MyDocs` | accepted — the stored name |
 | reference `mydocs` | **404 `COLLECTION_NOT_FOUND`** — interior case must match |
 | reference `MYDOCS` | **404 `COLLECTION_NOT_FOUND`** |
 
-So a lowercase first letter is fine, but `mydocs` will not find `MyDocs`. If you get a 404 for a collection you are sure exists, run `curl http://localhost:8080/api/collections` and copy the name exactly as listed.
+So a lowercase first letter is fine, but `mydocs` will not find `MyDocs`. The API applies the same rule to every collection name it receives, so the collection's settings, retained originals, gold-standard sessions and query metrics are all kept under `MyDocs` whichever of the two spellings you use (#372). State saved under a lowercase-first spelling before that change is not migrated: re-ingest the documents and save the settings again to put them under the stored name. If you get a 404 for a collection you are sure exists, run `curl -b ~/.rag-session http://localhost:8080/api/collections` (logged in as in "Calling the API from the command line") and copy the name exactly as listed.
 
 To check the behaviour yourself without waiting on the LLM, use the ingest endpoint — it validates the collection name and returns immediately:
 
 ```bash
-curl -s -X POST http://localhost:8080/api/collections \
+curl -s -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/collections \
   -H 'Content-Type: application/json' -d '{"name":"myDocs"}'
-curl -s http://localhost:8080/api/collections      # -> "MyDocs"
-curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/api/ingest/upload \
+curl -s -b ~/.rag-session http://localhost:8080/api/collections      # -> "MyDocs"
+curl -s -b ~/.rag-session -H 'Origin: http://localhost:8080' -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/api/ingest/upload \
   -F 'collection=mydocs' -F 'files=@/dev/null;type=text/plain'   # -> 404
 ```
+
+Overlap uses exact character windows, including internal whitespace-only windows, so boundaries can split words. Per-file limits are 10,000 chunks and 10 million parsed characters; overlap also caps duplicated output at 10 million characters. At default 1000/200 sizing, more than 8,000,200 characters exceeds the window limit. A file over these limits is not refused: it is stored as parts `<name> (part 1)`, `<name> (part 2)` and so on, each inside them (JSON and JSON Lines between records, text between paragraphs, a CSV between rows with its header in every part, the header counted in every part's size; a CSV whose header is over half a part fails instead of being split). A split file may store at most ten times its own size in chunk text, overlap and repeated headers included; over that it fails whole, the job lists it under `split`, and uploading the name again replaces every part (#621). One JSON or JSON Lines record over 10 million characters, or over 10,000 chunks on its own, still fails, because a record is never split. These limits bound the work per part independently of the upload byte limit.
+
+## Optional backend telemetry
+
+The API includes a private OpenTelemetry SDK lifecycle (#282), disabled by
+default. This foundation does not yet instrument requests/jobs, bridge Python
+logging, or install a collector (#283–#285). Existing application logs retain
+their existing content and behavior; the policy below applies only to OTLP.
+
+To enable it, inject these variables into the **API container** using your own
+Compose override or deployment environment. Compose does not automatically pass
+host variables through. No destination or secret is supplied by this repository.
+
+| Variable | Default / accepted values |
+|---|---|
+| `RAG_OTEL_ENABLED` | `false`; exact `true` or `false` |
+| `RAG_OTEL_ENDPOINT` | Required when enabled; HTTP(S) origin, e.g. `http://collector:4318`; no userinfo, path, query or fragment |
+| `RAG_OTEL_PROTOCOL` | `http/protobuf` only; gRPC is rejected |
+| `RAG_OTEL_HEADERS_FILE` | Optional mounted UTF-8 JSON regular file containing `Authorization` and/or `X-Api-Key`; max 8 KiB, max 2 KiB per value |
+| `RAG_OTEL_CA_FILE` | Optional mounted PEM CA bundle (a regular file) for an HTTPS endpoint; max 1 MiB; replaces the bundled roots |
+| `RAG_OTEL_SERVICE_NAME` | `rag-api` |
+| `RAG_OTEL_SERVICE_VERSION` | `1.2.0` |
+| `RAG_OTEL_ENVIRONMENT` | `development` |
+| `RAG_OTEL_TRACES`, `RAG_OTEL_LOGS`, `RAG_OTEL_METRICS` | Each `true`; exact booleans |
+| `RAG_OTEL_SAMPLE_RATIO` | `1.0`; finite 0–1, root-independent ratio sampling |
+| `RAG_OTEL_QUEUE_SIZE` | `256`; integer 1–4096 per trace/log queue |
+| `RAG_OTEL_BATCH_SIZE` | `64`; integer 1–512, no larger than queue |
+| `RAG_OTEL_TIMEOUT_MS` | `1000`; integer 100–10000 per transport attempt |
+| `RAG_OTEL_INTERVAL_MS` | `5000`; integer 1000–60000 for batching/metric export |
+| `RAG_OTEL_SHUTDOWN_MS` | `3000`; integer 100–30000 per lifecycle call |
+
+Service metadata is explicitly operator-selected public telemetry data: use
+non-sensitive identifiers (1–64 ASCII letters, digits, dots, underscores or
+hyphens, starting with a letter/digit). Do not put customer names or secrets in
+these fields. Headers belong in an uncommitted mounted secret file, never in
+service metadata. Credential headers require HTTPS, including loopback destinations;
+HTTP is accepted only without credentials. Header names are case-insensitive and
+duplicate names (including repeated JSON keys) are rejected. Exporter transport ignores ambient proxies/netrc and uses TLS
+verification; redirects are refused. TLS verification trusts the bundled roots,
+or, when `RAG_OTEL_CA_FILE` is set, only the certificates in that file, for a
+collector behind a private CA; to trust both, put both in the file. The file is
+checked once at startup (it must exist, be a regular file, be readable, be at
+most 1 MiB and load as a CA bundle) and requests re-reads it on new connections. It requires an
+HTTPS endpoint. An enabled runtime rejects a process-level
+`OTEL_SDK_DISABLED` value that the SDK recognizes as true (case-insensitive,
+ignoring surrounding whitespace), before reading secrets or creating exporters.
+Remove that setting or set it to false to enable RAG telemetry. Explicit bootstrap
+configuration mappings cannot override this process-level conflict. Disabled RAG
+telemetry remains a no-op regardless of that setting. The runtime never mutates
+the process environment. Other `OTEL_*` variables are not a supported
+configuration interface for this private runtime.
+
+Disabled mode creates no providers, workers or exporters and does not read the
+secret or CA file. Invalid enabled configuration fails API startup with field-only
+errors. No global OTel provider or root logging handler is installed. Manual
+request, worker and dependency instrumentation uses `app.state.telemetry.tracer`,
+`.logger` and `.meter`, with `force_flush()` and `shutdown()` for lifecycle.
+Raw SDK providers are internal implementation details and are not part of the
+supported runtime API. This encapsulation is not a security boundary against
+Python private-state access.
+
+Before trace/log queueing and again at the final protobuf transport boundary,
+the runtime drops arbitrary text and rebuilds queued scope/resource metadata,
+context and log limits without retaining exception objects. The runtime logger
+copies supplied plain records and both wrapper layers before SDK normalization
+or exception expansion, preserving caller-owned inputs. Keyword emission is
+also supported. Approved string attributes are snapshotted before SDK delegation;
+forbidden mutable values are discarded rather than recursively copied. Callers
+must not mutate mappings during snapshot construction. Non-mapping attributes
+become empty. Every form receives fixed limits before SDK processing (16
+attributes, 128 characters); ambient log or general attribute limits cannot
+truncate approved values or cause emission errors. Wire resources contain
+only the three explicit
+service fields; scope is `rag.telemetry`. Request names use the fixed registered
+HTTP method and route template, with `rag.request` for unmatched routes. Dynamic
+path values and query strings are never recorded. Other names are finite
+`rag.*` operation/stage names and `ollama.*` / `weaviate.*` dependency names
+listed in `api/services/telemetry.py`; unknown names become `rag.operation`.
+Attributes are finite operation, outcome (ok/error/cancelled/partial), error type
+(timeout/connection/validation/internal), registered method-and-route,
+HTTP status class (1xx–5xx or unknown), method, dependency and tuning operation values. Raw exception messages,
+job/session identifiers, model names, customer names and content are excluded.
+All other attributes, span events, trace state, status descriptions, log severity
+text and arbitrary log bodies are removed. Only the fixed completion bodies
+documented below survive; other bodies become `rag.operation`.
+At most one link survives, containing only fixed-size nonzero trace/span IDs and
+a sampled flag. Trace/span IDs remain correlation fields, never authentication.
+The operational metric allowlist and finite dimensions are documented below.
+The private meter validates values before SDK aggregation; instrument-specific
+views and the final export boundary enforce its schema. An explicit always-off
+exemplar filter prevents original measurement attributes from entering SDK
+exemplar reservoirs, even with ambient `OTEL_METRICS_EXEMPLAR_FILTER=always_on`.
+Export removes arbitrary
+descriptions and exemplars and preserves only fixed declared units. The original
+dimensionless `rag.telemetry.check` remains a one-point synthetic schema probe.
+All points in a metric are validated before admitting the record. Histograms
+require at most 31 finite, strictly increasing boundaries, consistent bucket
+totals and finite optional sum/min/max with min no greater than max. Invalid
+records cannot reserve a name or consume valid metric capacity.
+Do not pass content into instrumentation even though the exporter excludes it:
+active SDK spans may retain inputs until completion.
+
+The pinned SDK and OTLP HTTP exporter are version 1.45.1. Bounded batch queues
+drop oldest pending records under load. Each export makes one HTTP attempt;
+HTTP failures, redirects and network exceptions become fixed diagnostics with
+no endpoint, headers or response body. No retries occur. Application work never
+waits for export. Flush/shutdown wait at most the configured lifecycle deadline
+and return whether processing completed, **not** proof of collector delivery.
+A single daemon lifecycle worker per runtime continues cleanup after a timeout;
+repeated calls reuse it. Requests timeouts cannot cancel OS DNS resolution or
+force-stop a stalled system call, so a timed-out export may finish later. There
+are no additional workers per record or per repeated lifecycle call. API cleanup
+runs on both startup failure and normal shutdown. Collector provisioning and
+deployed end-to-end acceptance remain separate work.
+
+
+### Request and worker tracing (#283)
+
+Each request starts a locally sampled trace. One strictly valid version-00 W3C
+`traceparent` can supply a correlation link; duplicated, malformed, oversized,
+zero-ID and unsupported-version headers are ignored. Caller sampled flags do
+not control local sampling. Valid flag bytes span 00–ff; only the sampled bit
+is retained on the link. `tracestate` and `baggage` are ignored. Headers never
+change application identity, permissions, service metadata or response headers.
+
+Query spans cover reformulation, retrieval and synthesis. Ingest covers parsing,
+chunking, storage and source retention. Export/import, tuning and gold-standard
+generation/regeneration have operation spans and narrower stages. Explicit
+Ollama and Weaviate spans surround application-owned calls, iterator consumption
+and batch flushes. Weaviate-managed embedding remains part of its dependency
+latency; the API cannot report an internal model span for that work.
+
+At each job admission, the runtime and local parent span context are captured.
+The worker starts its child span during actual execution, including raw executor
+threads and async task/thread handoffs. This child may outlive its already-ended
+request parent; it retains the same trace ID after the 202 response. Concurrent
+jobs keep separate contexts, and thread context is restored after execution.
+Application job/session IDs are not exported. Caught and partial failures mark
+safe outcomes without changing existing responses or durable job accounting.
+
+Tracing preserves existing shutdown and cancellation behavior. Cancelling a
+waiter does not stop a running thread; that thread's span ends when its actual
+work exits. Async cancellation and existing timeouts close their spans. The API
+does not gain a worker drain, new retry or new deadline. Forced process death or
+workers surviving telemetry shutdown can lose their final spans; traces are not
+a durable execution ledger. Collector provisioning and deployed acceptance remain
+a separate story.
+
+
+### Operational metrics and correlated logs (#284)
+
+The private meter records executions independently of trace sampling or the
+traces flag. No automatic HTTP/client instrumentation is installed. Request,
+job and dependency measurements have separate denominators; nested stage spans
+do not increment these counts. Every completed execution, including failure or
+cancellation, contributes one count and one monotonic duration in seconds.
+
+| Instrument | Type / unit | Finite dimensions |
+| --- | --- | --- |
+| `rag.api.requests` | Counter / `{request}` | `http.route`, `http.method`, `http.status_class`, `rag.outcome` |
+| `rag.api.duration` | Histogram / `s` | Same as API requests |
+| `rag.api.active` | UpDownCounter / `{request}` | `http.method` |
+| `rag.dependency.calls` | Counter / `{call}` | `rag.dependency`, `rag.outcome` |
+| `rag.dependency.duration` | Histogram / `s` | Same as dependency calls |
+| `rag.dependency.errors` | Counter / `{error}` | `rag.dependency`, `error.type` |
+| `rag.job.completed` | Counter / `{job}` | `rag.operation`, `rag.outcome` |
+| `rag.job.duration` | Histogram / `s` | Same as job completions |
+| `rag.job.active` | UpDownCounter / `{job}` | `rag.operation` |
+
+Routes are the finite METHOD plus route-template strings in `ROUTES` in
+`api/services/telemetry.py`, or `unmatched`. Raw paths are never dimensions.
+Methods are GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, TRACE, CONNECT or
+`unknown`. Status classes are 1xx–5xx or `unknown` when no response start was
+observed. Outcomes are `ok`, `error` or `cancelled`; partial job results count as
+`error` and remain `partial` in logs and durable job status. HTTP 4xx/5xx count
+as errors. Dependency errors exclude cancellation; their error type is
+`timeout`, `connection`, `validation` or `internal`. Jobs cover ingest, export,
+import, tuning and evaluation generation. Dependency operations are the finite
+`ollama.*` and `weaviate.*` names in the same source registry. Iterator duration
+covers its entire consumption lifetime, including time between pulls; premature
+close is cancellation. Iterator construction captures the originating runtime,
+parent span and job token; factory execution and pulls remain lazy and rebind
+that context without leaking it across yields. An unconsumed iterator emits
+nothing. Model token usage is not available and is not invented.
+
+Histograms use explicit boundaries in seconds: 0.005, 0.01, 0.025, 0.05, 0.1,
+0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300 (plus the implicit overflow bucket).
+All valid finite series survive export regardless of the trace/log batch size.
+Malformed, duplicate or excess points reject their entire metric record before
+admission; later valid records remain eligible, including the same metric name.
+Compatible same-name records merge their distinct approved series across scopes
+and resources; repeated identities keep the first snapshot without summing.
+Later records with incompatible kinds, temporality or monotonicity are rejected.
+No valid disjoint series is truncated. SDK aggregation cannot
+allocate a series for arbitrary values under permitted keys. Job IDs, user IDs,
+collection names, filenames, prompts, raw exceptions and trace exemplars never
+become metric dimensions.
+
+Active instruments report process-local concurrency as the sum of increments
+and decrements. They start at actual scope entry and settle at scope exit.
+Cancelling a thread's waiter does not finish its running worker. A task cancelled
+before execution has no started/completed measurement. Process death resets
+active state and cannot synthesize historical completions. Existing job status
+and `/metrics/latency` contracts are unchanged.
+
+If an active-instrument SDK factory or update fails, its mutation state is
+unknown. That entire active instrument is suppressed for the runtime lifetime,
+including subsequent measurements and later wire exports. There is no retry or
+invented reset; other instruments and completion logs continue. This sacrifices
+active-instrument availability until restart, and does not reconstruct correct
+concurrency or remove previously exported backend history or in-flight exports.
+Local validation rejection does not suppress a healthy instrument.
+
+The private `SafeMeter` is a restricted finite-schema interface. It supports
+only the counter, histogram and up/down factories listed above. Unknown names
+and wrong factory/name combinations return inert instruments; gauge and
+observable factories are unsupported. It does not promise general SDK Meter
+compatibility or arbitrary custom metrics.
+
+Explicit structured completion logs use `rag.api.completed`,
+`rag.dependency.completed` or `rag.job.completed` bodies, INFO for successful
+work and WARN otherwise. Finite attributes carry outcomes and categories;
+trace/span IDs correlate with the owning scope. Each job execution generates a
+32-character random hexadecimal `rag.job_token`, inherited by its dependency
+logs and restored after execution. This token is never a durable/application
+job or session ID, metric dimension, authorization value or durable lookup key.
+Concurrent jobs receive separate tokens. With tracing disabled, operation logs
+still emit, with absent trace/span IDs. Logs can be disabled independently.
+Existing application log messages are not forwarded to OTLP: exception text,
+credentials, document content and arbitrary bodies remain excluded. Telemetry
+measurement or logger failures do not change application results.
+
+### Optional local Collector and offline acceptance (#285)
+
+[Collector setup](telemetry/README.md) provides the explicit Compose overlay and
+profile, private HTTP/protobuf receiver, bounded local diagnostics, optional OTLP
+destination with runtime secret injection, and optional offline image packaging.
+The default five-service stack still disables application telemetry. Collector
+health is independent of API health. Run the full disposable suite both normally
+and with `--telemetry` to exercise actual query/job exports, content exclusions,
+concurrency, restart and receiver outages with measured overhead.

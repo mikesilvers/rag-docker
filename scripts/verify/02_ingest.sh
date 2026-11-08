@@ -5,7 +5,7 @@ REPO_ROOT="$(cd ../.. && pwd)"
 FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
 # Regenerate when the newest fixture is missing, so a directory left by an
 # older run does not hide a check behind a missing file.
-[ -f "$FIX/large.pdf" ] || python3 ./fixtures.py "$FIX" >/dev/null
+[ -f "$FIX/zip_high_ratio.zip" ] || python3 ./fixtures.py "$FIX" >/dev/null
 
 require_stack
 # Run the independent text-storage window acceptance without model work.
@@ -18,11 +18,18 @@ ingest() {
   local collection="$1" strategy="$2" size="$3" minsize="$4"; shift 4
   local args=() f
   for f in "$@"; do args+=(-F "files=@$f"); done
-  curl -s -m 600 -X POST "$API/ingest/upload" \
+  local http_status curl_status
+  http_status=$(curl -s -m 600 -o /tmp/vfy_job.json -w '%{http_code}' -X POST "$API/ingest/upload" \
     -F "collection=$collection" -F "strategy=$strategy" -F "chunk_size=$size" \
-    -F "chunk_overlap=60" -F "min_chunk_size=$minsize" "${args[@]}" > /tmp/vfy_job.json
+    -F "chunk_overlap=60" -F "min_chunk_size=$minsize" "${args[@]}")
+  curl_status=$?
   local job; job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_job.json'))['job_id'])" 2>/dev/null)
-  [ -n "$job" ] || { printf '{}' > /tmp/vfy_job.json; return 1; }
+  if [ "$curl_status" -ne 0 ] || [[ "$http_status" != 2?? ]] || [ -z "$job" ]; then
+    printf 'Upload failed: curl exit=%s HTTP=%s; response body follows:\n' "$curl_status" "$http_status" >&2
+    cat /tmp/vfy_job.json >&2
+    printf '\n' >&2
+    return 1
+  fi
   wait_for_job "/ingest/job/$job" 900 >/dev/null
   api_get "/ingest/job/$job" > /tmp/vfy_job.json
 }
@@ -61,6 +68,274 @@ python3 -c "
 import json,sys; d=json.load(open('/tmp/vfy_job.json'))
 sys.exit(0 if all('unsupported type' in s for s in d.get('skipped',[])) else 1)"
 check "each skip names the unsupported extension" $?
+
+# ── unreadable archives and gzipped JSON members (#290) ──────────────────────
+# Controlled cases: truncated archives, wrong member offsets, bad CRCs (also in
+# skipped members), unsupported compression, encryption and unwritable members;
+# which JSON Lines inputs are queued; gzip corruption, size bound and
+# unparseable JSON.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_ingest_errors.py)
+check "upload unpacking errors and gzipped JSON regressions" $?
+
+# A truncated ZIP, like an incomplete download, once ended in a bare HTTP 500.
+code=$(curl -s -m 120 -o /tmp/vfy_trunc.json -w '%{http_code}' -X POST "$API/ingest/upload" \
+  -F "collection=$C" -F "strategy=fixed" -F "files=@$FIX/truncated.zip")
+read -r err_code names_file <<<"$(python3 -c "
+import json
+try: e=json.load(open('/tmp/vfy_trunc.json'))['error']
+except Exception: print('not-json no'); raise SystemExit
+print(e['code'], 'yes' if \"'truncated.zip' is damaged and can't be read\" in e['message'] else 'no')")"
+[ "$code" = 400 ] && [ "$err_code" = ARCHIVE_UNREADABLE ] && [ "$names_file" = yes ]
+check "a truncated ZIP is refused with a readable 400 naming it" $? \
+  "HTTP=$code code=$err_code names-file=$names_file"
+
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 200 40 "$FIX/gz_batch.zip"
+read -r status completed gz_errors <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], len(d['errors']))")"
+[ "$status" = completed ] && [ "$completed" = 3 ] && [ "$gz_errors" = 0 ]
+check "a ZIP's .json, .json.gz and .jsonl.gz members all ingest" $? \
+  "status=$status completed=$completed errors=$gz_errors (want completed 3)"
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_job.json'))
+sys.exit(0 if d.get('skipped', []) == [\"gz_batch.zip:notes.txt.gz (unsupported type '.gz')\"] else 1)"
+check "only the other gzip member is skipped, as unsupported" $?
+
+# ── the expansion cap on an upload's ZIPs (#298) ────────────────────────────
+# Controlled cases with a 1 MiB cap set through the environment: declared
+# sizes, counted bytes, gzip output, several ZIPs in one upload, and ZIP work
+# running off the event loop.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app -e MAX_ZIP_EXPANDED_BYTES=1048576 \
+  api python - < scripts/tests/test_zip_expansion.py)
+check "ZIP expansion cap and off-loop regressions (1 MiB cap from env)" $?
+
+# docker-compose.yml sets the cap (#319), and the API reads that value.
+cap_env=$(cd "$REPO_ROOT" && docker compose exec -T api python -c \
+  'import os; from config import settings; print(os.environ.get("MAX_ZIP_EXPANDED_BYTES"), settings.max_zip_expanded_bytes)' | tr -d '\r')
+[ "$cap_env" = "2147483648 2147483648" ]
+check "docker-compose.yml sets MAX_ZIP_EXPANDED_BYTES to 2 GiB and the API uses it" $? "env and setting: $cap_env"
+
+# The default 2 GiB cap through the proxy. Prints "<HTTP> <code> <message ok>".
+too_large() {
+  local name="$1" code
+  code=$(curl -s -m 300 -o /tmp/vfy_cap.json -w '%{http_code}' -X POST "$API/ingest/upload" \
+    -F "collection=$C" -F "strategy=fixed" -F "files=@$FIX/$name")
+  python3 - "$code" "$name" <<'ENDPY'
+import json, sys
+code, name = sys.argv[1], sys.argv[2]
+want = (f"'{name}' expands to more than 2,048 MB when unpacked, the most one upload's ZIPs "
+        f"can expand to, so nothing from it was imported. Split it into smaller zips and "
+        f"upload them in separate imports.")
+try:
+    e = json.load(open('/tmp/vfy_cap.json'))['error']
+except Exception:
+    print(code, 'not-json', 'no'); raise SystemExit
+ok = e['message'] == want and e['detail'] == {'file': name, 'members': [], 'members_omitted': 0}
+print(code, e['code'], 'yes' if ok else 'no')
+ENDPY
+}
+read -r code err_code text_ok <<<"$(too_large zip_over_declared.zip)"
+[ "$code" = 400 ] && [ "$err_code" = ARCHIVE_TOO_LARGE ] && [ "$text_ok" = yes ]
+check "a ZIP declaring more than 2 GiB is refused with ARCHIVE_TOO_LARGE" $? \
+  "HTTP=$code code=$err_code exact-message=$text_ok"
+
+# While a gzip member's output is counted, other requests are still answered.
+# A smoke check: the count takes about a second, so the controlled test above
+# is the one that tells off-loop from on-loop work.
+too_large zip_over_gzip.zip > /tmp/vfy_cap_result.txt &
+upload_pid=$!
+probes=0; slow=0; worst=0
+while kill -0 "$upload_pid" 2>/dev/null; do
+  read -r pcode ptime <<<"$(curl -s -m 10 -o /dev/null -w '%{http_code} %{time_total}' "$API/ingest/job/vfy-none")"
+  probes=$((probes + 1))
+  if [ "$pcode" != 404 ] || python3 -c "import sys; sys.exit(0 if float('$ptime') >= 1.0 else 1)"; then
+    slow=$((slow + 1))
+  fi
+  worst=$(python3 -c "print(max(float('$worst'), float('$ptime')))")
+done
+wait "$upload_pid"
+read -r code err_code text_ok < /tmp/vfy_cap_result.txt
+[ "$code" = 400 ] && [ "$err_code" = ARCHIVE_TOO_LARGE ] && [ "$text_ok" = yes ]
+check "a ZIP whose gzip member expands past 2 GiB is refused with ARCHIVE_TOO_LARGE" $? \
+  "HTTP=$code code=$err_code exact-message=$text_ok"
+[ "$slow" = 0 ] && [ "$probes" -gt 0 ]
+check "job polls are answered while a ZIP is being counted" $? \
+  "$probes probes, $slow slow or failed, slowest ${worst}s"
+
+# ── the member-count and ratio caps, escaping members, detail bound (#28) ─────
+# Controlled cases with a member cap of 20 set through the environment: the
+# count and what counts, the ratio rule, declared and read sizes, precedence,
+# members whose path leaves the archive, and the bound on detail.members.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app -e MAX_ZIP_MEMBERS=20 \
+  api python - < scripts/tests/test_zip_limits.py)
+check "ZIP member-count, ratio and escaping-member regressions (cap of 20 from env)" $?
+
+limits_env=$(cd "$REPO_ROOT" && docker compose exec -T api python -c \
+  'import os; from config import settings as s; print(os.environ.get("MAX_ZIP_MEMBERS"), s.max_zip_members, os.environ.get("MAX_ZIP_MEMBER_RATIO"), s.max_zip_member_ratio)' | tr -d '\r')
+[ "$limits_env" = "5000 5000 200 200" ]
+check "docker-compose.yml sets MAX_ZIP_MEMBERS 5000 and MAX_ZIP_MEMBER_RATIO 200 and the API uses them" $? \
+  "env and settings: $limits_env"
+
+# Both through the proxy at the defaults. Prints "<HTTP> <code> <exact ok>".
+zip_limit() {
+  local name="$1" code
+  code=$(curl -s -m 120 -o /tmp/vfy_limit.json -w '%{http_code}' -X POST "$API/ingest/upload" \
+    -F "collection=$C" -F "strategy=fixed" -F "files=@$FIX/$name")
+  python3 - "$code" "$name" <<'ENDPY'
+import json, sys
+code, name = sys.argv[1], sys.argv[2]
+if name == "zip_many_members.zip":
+    want = (f"'{name}' holds 5,001 entries, more than 5,000, the most one zip may hold, so "
+            f"nothing from it was imported. Split it into smaller zips and upload them in "
+            f"separate imports.")
+    members = []
+else:
+    want = (f"'{name}' can't be imported: its member 'zeros.txt' expands to more than 200 "
+            f"times its compressed size, which is refused as a possible zip bomb, so nothing "
+            f"from it was imported. Remove that file from the zip, or upload it on its own, "
+            f"and upload again.")
+    members = [{"member": "zeros.txt", "reason": "expands to more than 200 times its compressed size"}]
+try:
+    e = json.load(open('/tmp/vfy_limit.json'))['error']
+except Exception:
+    print(code, 'not-json', 'no'); raise SystemExit
+ok = e['message'] == want and e['detail'] == {'file': name, 'members': members, 'members_omitted': 0}
+print(code, e['code'], 'yes' if ok else 'no')
+ENDPY
+}
+read -r code err_code text_ok <<<"$(zip_limit zip_many_members.zip)"
+[ "$code" = 400 ] && [ "$err_code" = ARCHIVE_TOO_MANY_MEMBERS ] && [ "$text_ok" = yes ]
+check "a ZIP of 5,001 entries is refused with ARCHIVE_TOO_MANY_MEMBERS" $? \
+  "HTTP=$code code=$err_code exact-message=$text_ok"
+read -r code err_code text_ok <<<"$(zip_limit zip_high_ratio.zip)"
+[ "$code" = 400 ] && [ "$err_code" = ARCHIVE_RATIO_TOO_HIGH ] && [ "$text_ok" = yes ]
+check "a ZIP member expanding more than 200 times is refused with ARCHIVE_RATIO_TOO_HIGH" $? \
+  "HTTP=$code code=$err_code exact-message=$text_ok"
+
+# ── ordinary JSON as readable text (#295) ────────────────────────────────────
+# Controlled cases: every conversion rule, file key order, non-ASCII text,
+# element-schema rehydration, empty files and invalid JSON.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_json_ingest.py)
+check "ordinary JSON conversion regressions" $?
+
+# The stored chunks once held pretty-printed JSON with escaped non-ASCII text.
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 1000 0 "$FIX/plain.json"
+read -r status chunks <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['chunks_stored'])")"
+[ "$status" = completed ] && [ "$chunks" -gt 0 ]
+check "an ordinary nested JSON file ingests" $? "status=$status chunks=$chunks"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C" <<'ENDPY'
+import sys
+from services import weaviate_client as wc
+try:
+    collection = wc.get_client().collections.get(sys.argv[1])
+    text = "\n".join(o.properties["content"] for o in collection.iterator())
+finally:
+    wc.close_client()
+wanted = ["title: Remote work policy", "meta.author: Zoë Müller", "tags: policy, remote"]
+missing = [w for w in wanted if w not in text]
+syntax = [c for c in ("{", '"', "\\u") if c in text]
+if missing or syntax:
+    print(f"missing={missing} json-syntax={syntax}", file=sys.stderr)
+    sys.exit(1)
+ENDPY
+)
+check "its chunks hold key: value text with non-ASCII kept" $?
+
+# JSON input, records and text are bounded (#300): each over-limit file fails
+# alone with its own reason, and the good file beside them is stored.
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 1000 0 "$FIX/json_over_size.json" "$FIX/json_many_records.json" \
+  "$FIX/json_over_size_gz.zip" "$FIX/json_over_size_member.zip" "$FIX/plain.json"
+read -r status chunks errors_ok <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+want = {
+    'json_over_size.json: is larger than 30,000,000 bytes, the most one JSON file can hold; '
+    'split the file or convert it to JSON Lines',
+    'json_many_records.json: has more than 1,000,000 records, the most one file can hold; '
+    'split the file',
+    'json_over_size_gz.zip:big.json.gz: decompresses to more than 30,000,000 bytes, the most '
+    'one JSON file can hold; split the file or convert it to JSON Lines',
+    'json_over_size_member.zip:big.json: is larger than 30,000,000 bytes, the most one JSON '
+    'file can hold; split the file or convert it to JSON Lines',
+}
+ok = len(d['errors']) == 4 and set(d['errors']) == want
+if not ok:
+    import sys; print(repr(d['errors']), file=sys.stderr)
+print(d['status'], d['chunks_stored'], 'yes' if ok else 'no')")"
+[ "$status" = partial ] && [ "$chunks" -gt 0 ] && [ "$errors_ok" = yes ]
+check "over-size, over-cap, over-size .json.gz and over-size ZIP-member JSON fail alone with their reasons" $? \
+  "status=$status chunks=$chunks exact-errors=$errors_ok"
+
+# ── JSON Lines (#291) ────────────────────────────────────────────────────────
+# Controlled cases: conversion per line, blank and malformed lines, the line
+# and text limits, bounded reading, gzip errors, rechunk of a retained file.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_jsonl_ingest.py)
+check "JSON Lines regressions" $?
+
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 1000 0 "$FIX/records.jsonl" "$FIX/records.jsonl.gz"
+read -r status completed chunks <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], d['files_completed'], d['chunks_stored'])")"
+[ "$status" = completed ] && [ "$completed" = 2 ] && [ "$chunks" -ge 2 ]
+check "a direct .jsonl and a direct .jsonl.gz both ingest" $? \
+  "status=$status completed=$completed chunks=$chunks"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$C" <<'ENDPY'
+import sys
+from services import weaviate_client as wc
+try:
+    collection = wc.get_client().collections.get(sys.argv[1])
+    objects = [o.properties for o in collection.iterator()]
+finally:
+    wc.close_client()
+wanted = ("bill: HR-1\ntitle: Remote work act\nsponsor.name: Zoë Müller\n\n"
+          "bill: HR-2\ntitle: Expense filing act\ntags: finance, deadline")
+problems = []
+for name in ("records.jsonl", "records.jsonl.gz"):
+    mine = sorted((o for o in objects if o["source_file"] == name), key=lambda o: o["chunk_index"])
+    text = "".join(o["content"] for o in mine)
+    if text != wanted:
+        problems.append(f"{name}: text {text!r}")
+    if {o["source_type"] for o in mine} != {"jsonl"}:
+        problems.append(f"{name}: source_type {sorted({o['source_type'] for o in mine})}")
+if problems:
+    print("; ".join(problems), file=sys.stderr)
+    sys.exit(1)
+ENDPY
+)
+check "their chunks hold one key: value record per line, source_type jsonl" $?
+
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 1000 0 "$FIX/bad.jsonl"
+read -r status first_error <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+print(d['status'], 'yes' if d['errors'] == ['bad.jsonl: line 2 is not valid JSON: Expecting value at column 10'] else repr(d['errors']))")"
+stored=$(api_get "/collections" | python3 -c "
+import json,sys
+print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$C'][0])")
+[ "$status" = failed ] && [ "$first_error" = yes ] && [ "$stored" = 0 ]
+check "a malformed line fails the file with its line number and stores nothing" $? \
+  "status=$status error=$first_error stored=$stored"
+
+# A JSON Lines file holds at most 1,000,000 lines, records with no text
+# included (#314): a few KB of gzipped `{}` lines fails and stores nothing.
+drop_collection "$C"; make_collection "$C"
+ingest "$C" fixed 1000 0 "$FIX/jsonl_many_records.jsonl.gz"
+read -r status cap_error <<<"$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_job.json'))
+want = ['jsonl_many_records.jsonl.gz: was decompressed, but it has more than 1,000,000 records, '
+        'the most one file can hold; split the file']
+print(d['status'], 'yes' if d['errors'] == want else repr(d['errors']))")"
+stored=$(api_get "/collections" | python3 -c "
+import json,sys
+print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$C'][0])")
+[ "$status" = failed ] && [ "$cap_error" = yes ] && [ "$stored" = 0 ]
+check "a JSON Lines file over 1,000,000 lines fails with the record cap and stores nothing" $? \
+  "status=$status error=$cap_error stored=$stored"
 
 # ── upload size limit at the proxy ───────────────────────────────────────────
 # nginx refuses request bodies over `client_max_body_size` (default 1 MB) with
@@ -122,6 +397,54 @@ import json; d=json.load(open('/tmp/vfy_job.json')); import sys
 sys.exit(0 if d['chunks_stored'] == 1 else 1)"
 check "chunks below min_chunk_size are merged" $? "stored $(python3 -c "import json;print(json.load(open('/tmp/vfy_job.json'))['chunks_stored'])") chunk(s), wanted 1"
 
+# Chunker limits and insert batching (#386), with the backends mocked, in an
+# isolated container with the repository mounted.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_chunk_limits.py)
+check "chunker per-file limits, 6,000-character ceiling and semantic floor (#111)" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_insert_chunks.py)
+check "chunk inserts are batched and retried while the index isn't ready" $?
+# Embedding writes (#613): a write that leaves vectors to text2vec-ollama uses
+# bounded batches, and only objects whose embedding timed out are sent again;
+# controlled, then on the real Weaviate and Ollama.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_embed_batching.py)
+check "embedding writes are bounded and resend only timed-out embeddings (#613)" $?
+EB="${PREFIX}EmbedBatch"
+drop_collection "$EB"; make_collection "$EB"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$EB" <<'ENDPY'
+import sys
+from unittest.mock import patch
+from services import batch_write
+from services import weaviate_client as wc
+try:
+    collection = wc.get_client().collections.get(sys.argv[1])
+    rows = [{"properties": {"content": f"Embedding batch check {i}. " + "lorem ipsum dolor " * 40,
+                            "source_file": "embed_batch.txt", "source_type": "txt", "chunk_index": i,
+                            "chunk_strategy": "fixed", "chunk_size": 1000, "chunk_overlap": 0}}
+            for i in range(45)]
+    batch = collection.batch
+    with patch.object(batch, "fixed_size", wraps=batch.fixed_size) as fixed, \
+            patch.object(batch, "dynamic", wraps=batch.dynamic) as dynamic:
+        stored = batch_write.insert(collection, rows, exact=False, cleanup_owned=True)
+    calls = [c.kwargs for c in fixed.call_args_list]
+finally:
+    wc.close_client()
+print(f"stored={stored} fixed_size={calls} dynamic={dynamic.call_count}")
+ok = (stored == 45 and dynamic.call_count == 0
+      and calls == [{"batch_size": 20, "concurrent_requests": 1}])
+sys.exit(0 if ok else 1)
+ENDPY
+) >/tmp/vfy_embed_batch.log 2>&1
+check "45 vectorless chunks are embedded by the real Ollama in bounded batches and all stored (#613)" $? \
+  "$(tail -1 /tmp/vfy_embed_batch.log)"
+drop_collection "$EB"
+# The corpus preparation rules the Import page offers state the app's own
+# ingest limits, read from the same constants, settings and proxy (#615).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_corpus_rules.py)
+check "the corpus preparation rules state the app's ingest limits (#615)" $?
+# Their chunk counts hold for the real chunker, for every strategy (#615).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_corpus_rules_estimates.py)
+check "the corpus preparation rules' chunk counts hold for every strategy (#615)" $?
+
 # ── one bad file must not fail the batch ─────────────────────────────────────
 drop_collection "$C"; make_collection "$C"
 ingest "$C" fixed 300 50 "$FIX/broken.pdf" "$FIX/policies.txt" "$FIX/tiny.txt"
@@ -136,6 +459,364 @@ import json,sys; d=json.load(open('/tmp/vfy_job.json'))
 sys.exit(0 if any('broken.pdf' in e for e in d['errors']) else 1)"
 check "the failure names the offending file" $?
 
+# ── re-ingesting a name replaces its chunks (#22) ────────────────────────────
+# Re-ingesting used to add a second chunk set beside the first, so answers could
+# cite a superseded version; ZIP members were named by basename, so a/report.txt
+# and b/report.txt merged. Controlled cases: same-name inputs in one upload,
+# ZIP path normalisation, insert-before-delete, stale marking, retention and
+# rechunk coverage.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_reingest.py)
+check "re-ingest: same-name inputs, replacement order, retention and rechunk regressions" $?
+
+RI="${PREFIX}Reingest"
+RIFIX=$(mktemp -d)
+python3 - "$FIX/policies.txt" "$RIFIX" <<'ENDPY'
+import pathlib, sys, zipfile
+v1, out = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+(out / "v2").mkdir()
+(out / "v2" / "policies.txt").write_text(
+    "Parking Permits. Facilities issue parking permits each January, and a permit "
+    "is valid for one named vehicle only.\n\n"
+    "Visitor Badges. Reception prints a visitor badge on arrival, and badges are "
+    "returned at the end of the day.\n")
+with zipfile.ZipFile(out / "folders.zip", "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("a/report.txt", "Alpha report. The cafeteria opens at seven every weekday.")
+    z.writestr("b/report.txt", "Beta report. The library closes at nine on Fridays.")
+assert "Travel Booking" in v1.read_text()
+ENDPY
+# What the collection holds: (source_file, content) pairs, and the retained index.
+ri_state() {
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$RI") <<'ENDPY'
+import json, sys
+from services import sources, weaviate_client as wc
+try:
+    coll = wc.get_client().collections.get(sys.argv[1])
+    chunks = sorted([o.properties["source_file"], o.properties["content"]] for o in coll.iterator())
+    d = sources.collection_dir(sys.argv[1])
+    blobs = sorted(p.name for p in d.iterdir() if p.name != "index.json") if d.is_dir() else []
+    print(json.dumps({"chunks": chunks, "index": sources.load_index(sys.argv[1])["documents"],
+                      "blobs": blobs}))
+finally:
+    wc.close_client()
+ENDPY
+}
+drop_collection "$RI"; make_collection "$RI"
+ingest "$RI" fixed 200 40 "$FIX/policies.txt"
+n1=$(jfield "['chunks_stored']" < /tmp/vfy_job.json)
+ingest "$RI" fixed 200 40 "$FIX/policies.txt"
+cp /tmp/vfy_job.json /tmp/vfy_ri_again.json
+ri_state > /tmp/vfy_ri_state.json
+python3 - "$n1" <<'ENDPY'
+import json, sys
+n1 = int(sys.argv[1]); job = json.load(open('/tmp/vfy_ri_again.json')); st = json.load(open('/tmp/vfy_ri_state.json'))
+print(job["status"], job.get("chunks_replaced"), len(st["chunks"]), n1)
+sys.exit(0 if n1 > 0 and job["status"] == "completed" and job.get("chunks_replaced") == n1
+         and len(st["chunks"]) == n1 else 1)
+ENDPY
+check "ingesting the same file twice keeps one chunk set and reports chunks_replaced" $? \
+  "$(cat /tmp/vfy_ri_again.json | head -c 300)"
+
+ingest "$RI" fixed 200 40 "$RIFIX/v2/policies.txt"
+cp /tmp/vfy_job.json /tmp/vfy_ri_v2.json
+ri_state > /tmp/vfy_ri_state.json
+python3 - "$n1" "$RIFIX/v2/policies.txt" <<'ENDPY'
+import hashlib, json, sys
+n1 = int(sys.argv[1]); v2 = hashlib.sha256(open(sys.argv[2], "rb").read()).hexdigest()
+job = json.load(open('/tmp/vfy_ri_v2.json')); st = json.load(open('/tmp/vfy_ri_state.json'))
+texts = " ".join(c for _, c in st["chunks"])
+checks = {
+    "completed": job["status"] == "completed",
+    "replaced all of v1": job.get("chunks_replaced") == n1,
+    "holds only v2's chunks": len(st["chunks"]) == job["chunks_stored"],
+    "v1 text gone": "Travel Booking" not in texts,
+    "v2 text present": "Parking Permits" in texts,
+    "one digest names it": [d for d, e in st["index"].items() if "policies.txt" in e["filenames"]] == [v2],
+    "v1 blob gone": st["blobs"] == [v2],
+}
+print({k: v for k, v in checks.items() if not v} or "ok")
+sys.exit(0 if all(checks.values()) else 1)
+ENDPY
+check "a modified file replaces its chunks and its retained original" $? "$(head -c 300 /tmp/vfy_ri_v2.json)"
+
+ingest "$RI" fixed 200 40 "$RIFIX/folders.zip"
+ri_state > /tmp/vfy_ri_state.json
+python3 - <<'ENDPY'
+import json, sys
+st = json.load(open('/tmp/vfy_ri_state.json'))
+names = {n: c for n, c in st["chunks"]}
+ok = ("Alpha report" in names.get("a/report.txt", "")
+      and "Beta report" in names.get("b/report.txt", "") and "report.txt" not in names)
+print(sorted(names))
+sys.exit(0 if ok else 1)
+ENDPY
+check "ZIP members with one basename in two folders stay two documents, named by path" $?
+
+# A Finder "Compress" ZIP (#378): __MACOSX/finder/._report.txt is the file's
+# AppleDouble resource fork with the same suffix, and was queued as a document.
+python3 - "$RIFIX/finder.zip" <<'ENDPY'
+import sys, zipfile
+double = b"\x00\x05\x16\x07\x00\x02\x00\x00" + b"Mac OS X        " + b"\x00" * 58
+with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED) as z:
+    for name, data in [("finder/", b""), ("finder/report.txt",
+                        b"Finder report. The pool closes at eight on Sundays."),
+                       ("__MACOSX/", b""), ("__MACOSX/finder/", b""),
+                       ("__MACOSX/finder/._report.txt", double)]:
+        z.writestr(zipfile.ZipInfo(name), data)
+ENDPY
+ingest "$RI" fixed 200 40 "$RIFIX/finder.zip"
+cp /tmp/vfy_job.json /tmp/vfy_ri_finder.json
+ri_state > /tmp/vfy_ri_state.json
+python3 - <<'ENDPY'
+import json, sys
+job = json.load(open('/tmp/vfy_ri_finder.json')); st = json.load(open('/tmp/vfy_ri_state.json'))
+names = {n: c for n, c in st["chunks"]}
+checks = {
+    "completed": job["status"] == "completed",
+    "no errors": job["errors"] == [],
+    "one file": job["files_total"] == 1,
+    "skipped names the AppleDouble member": job["skipped"] == [
+        "finder.zip:__MACOSX/finder/._report.txt (macOS metadata (AppleDouble), not a document)"],
+    "real file stored": "Finder report" in names.get("finder/report.txt", ""),
+    "no metadata stored": not any("__MACOSX" in n or "/._" in n for n in names),
+}
+print({k: v for k, v in checks.items() if not v} or "ok", sorted(names))
+sys.exit(0 if all(checks.values()) else 1)
+ENDPY
+check "a Finder ZIP stores its file, not the __MACOSX AppleDouble member, which is listed in skipped" $? \
+  "$(head -c 300 /tmp/vfy_ri_finder.json)"
+
+# Two parts with one filename: the second's bytes are stored, the first reported.
+ingest "$RI" fixed 200 40 "$FIX/policies.txt;filename=dupe.txt" "$RIFIX/v2/policies.txt;filename=dupe.txt"
+cp /tmp/vfy_job.json /tmp/vfy_ri_dupe.json
+ri_state > /tmp/vfy_ri_state.json
+python3 - <<'ENDPY'
+import json, sys
+job = json.load(open('/tmp/vfy_ri_dupe.json')); st = json.load(open('/tmp/vfy_ri_state.json'))
+texts = " ".join(c for n, c in st["chunks"] if n == "dupe.txt")
+ok = (job["files_total"] == 1 and job["skipped"] == [
+          "dupe.txt (replaced by dupe.txt later in this upload, same name 'dupe.txt')"]
+      and "Parking Permits" in texts and "Travel Booking" not in texts)
+print(job["files_total"], job["skipped"])
+sys.exit(0 if ok else 1)
+ENDPY
+check "the same name twice in one upload ingests the last and reports the first" $? \
+  "$(head -c 300 /tmp/vfy_ri_dupe.json)"
+
+# Gold-standard sessions are marked stale only when a re-ingest replaces earlier
+# chunks, never for a brand-new name (#22). A real session, not a mocked marker.
+RIGS="gs_$(python3 -c 'import uuid; print(uuid.uuid4().hex[:8])')"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$RI" "$RIGS") <<'ENDPY'
+import sys
+from services import goldstandard as gs
+pairs = [{"pair_id": "ri_pair", "question": "Q", "answer": "A", "contexts": ["C"],
+          "ground_truth": "T", "source_file": "policies.txt", "chunk_index": 0, "status": "approved"}]
+gs.store_session({"session_id": sys.argv[2], "collection": sys.argv[1], "status": "completed",
+                  "pairs_total": 1, "pairs_completed": 1, "pairs": pairs})
+ENDPY
+check "re-ingest: a synthetic gold-standard session is planted for the collection" $?
+# The API reads sessions written by another process at its next scan.
+api_get "/goldstandard/diagnostics" >/dev/null
+printf 'Fresh document. The gym opens at six.\n' > "$RIFIX/fresh.txt"
+ingest "$RI" fixed 200 40 "$RIFIX/fresh.txt"
+api_get "/goldstandard/session/$RIGS" > /tmp/vfy_ri_gs.json
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_ri_gs.json')); j=json.load(open('/tmp/vfy_job.json'))
+print(d.get('stale'), d.get('stale_reason'), j['status'], j.get('chunks_replaced'))
+sys.exit(0 if d.get('stale') is False and j['status']=='completed' and j.get('chunks_replaced')==0 else 1)"
+check "ingesting a brand-new name leaves gold-standard sessions current" $? "$(head -c 300 /tmp/vfy_ri_gs.json)"
+ingest "$RI" fixed 200 40 "$FIX/policies.txt"
+api_get "/goldstandard/session/$RIGS" > /tmp/vfy_ri_gs.json
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_ri_gs.json')); j=json.load(open('/tmp/vfy_job.json'))
+r=d.get('stale_reason') or ''
+print(d.get('stale'), r, j['status'], j.get('chunks_replaced'))
+sys.exit(0 if d.get('stale') is True and 're-ingested' in r and 'policies.txt' in r
+         and j['status']=='completed' and j.get('chunks_replaced',0)>0 else 1)"
+check "a replacing re-ingest marks the collection's gold-standard sessions stale, naming the file" $? \
+  "$(head -c 300 /tmp/vfy_ri_gs.json)"
+
+# Two concurrent uploads of one name (#22): the job that runs last wins, each
+# job is applied whole, and arrival order is not promised, so either may win.
+for v in 1 2; do
+  src="$FIX/policies.txt"; [ "$v" = 2 ] && src="$RIFIX/v2/policies.txt"
+  curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$RI" -F "strategy=fixed" \
+    -F "chunk_size=200" -F "chunk_overlap=60" -F "min_chunk_size=40" \
+    -F "files=@$src;filename=race.txt" > "/tmp/vfy_ri_race$v.json" &
+done
+wait
+for v in 1 2; do
+  rj=$(jfield "['job_id']" < "/tmp/vfy_ri_race$v.json")
+  [ -n "$rj" ] && wait_for_job "/ingest/job/$rj" 900 >/dev/null
+  api_get "/ingest/job/$rj" > "/tmp/vfy_ri_race$v.done.json"
+done
+ri_state > /tmp/vfy_ri_state.json
+python3 - "$FIX/policies.txt" "$RIFIX/v2/policies.txt" <<'ENDPY'
+import hashlib, json, sys
+sha = [hashlib.sha256(open(p, "rb").read()).hexdigest() for p in sys.argv[1:3]]
+jobs = [json.load(open(f"/tmp/vfy_ri_race{v}.done.json")) for v in (1, 2)]
+st = json.load(open("/tmp/vfy_ri_state.json"))
+texts = [c for n, c in st["chunks"] if n == "race.txt"]
+joined = " ".join(texts)
+v1, v2 = "Travel Booking" in joined, "Parking Permits" in joined
+win = 0 if v1 else 1
+digests = [d for d, e in st["index"].items() if "race.txt" in e["filenames"]]
+checks = {
+    "both completed": all(j.get("status") == "completed" for j in jobs),
+    "exactly one version present": v1 != v2,
+    "winner's whole chunk set": len(texts) == jobs[win].get("chunks_stored"),
+    "winner replaced the loser's set": jobs[win].get("chunks_replaced") == jobs[1 - win].get("chunks_stored"),
+    "one digest, the winner's": digests == [sha[win]],
+}
+print({k: v for k, v in checks.items() if not v} or "ok", [j.get("status") for j in jobs])
+sys.exit(0 if all(checks.values()) else 1)
+ENDPY
+check "two concurrent uploads of one name leave exactly one job's version, whole" $?
+drop_collection "$RI"
+rm -rf "$RIFIX"
+
+# ── replacing a name touches only that name (#622) ───────────────────────────
+# source_file is word-tokenized, so Weaviate's equal("report.pdf") also matches
+# a/report.pdf and Report.PDF, and uploading report.pdf deleted their chunks.
+EX="${PREFIX}Exact"
+EXFIX=$(mktemp -d)
+python3 - "$FIX/policies.pdf" "$EXFIX/folder.zip" <<'ENDPY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[2], "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("a/report.pdf", open(sys.argv[1], "rb").read())
+ENDPY
+# Each stored name's chunk contents, sorted.
+ex_state() {
+  (cd "$REPO_ROOT" && docker compose exec -T api python - "$EX") <<'ENDPY'
+import json, sys
+from services import weaviate_client as wc
+try:
+    names = {}
+    for o in wc.get_client().collections.get(sys.argv[1]).iterator():
+        names.setdefault(o.properties["source_file"], []).append(o.properties["content"])
+    print(json.dumps({n: sorted(c) for n, c in names.items()}))
+finally:
+    wc.close_client()
+ENDPY
+}
+drop_collection "$EX"; make_collection "$EX"
+ingest "$EX" fixed 200 40 "$EXFIX/folder.zip"
+ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=Report.PDF"
+ex_state > /tmp/vfy_ex_before.json
+ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=report.pdf"
+cp /tmp/vfy_job.json /tmp/vfy_ex_job1.json
+ex_state > /tmp/vfy_ex_first.json
+ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=report.pdf"
+cp /tmp/vfy_job.json /tmp/vfy_ex_job2.json
+ex_state > /tmp/vfy_ex_second.json
+python3 - <<'ENDPY'
+import json, sys
+load = lambda name: json.load(open(f"/tmp/vfy_ex_{name}.json"))
+before, first, second = load("before"), load("first"), load("second")
+job1, job2 = load("job1"), load("job2")
+others = ("a/report.pdf", "Report.PDF")
+checks = {
+    "both uploads completed": job1["status"] == job2["status"] == "completed",
+    "the first report.pdf replaced nothing": job1.get("chunks_replaced") == 0,
+    "a/report.pdf and Report.PDF were stored": all(before.get(n) for n in others),
+    "the first report.pdf upload kept them": all(first.get(n) == before.get(n) for n in others),
+    "the re-upload kept them": all(second.get(n) == before.get(n) for n in others),
+    "the re-upload replaced the first report.pdf set":
+        bool(first.get("report.pdf")) and job2.get("chunks_replaced") == len(first["report.pdf"]),
+    "one report.pdf set remains": len(second.get("report.pdf", [])) == job2.get("chunks_stored"),
+}
+print({k: v for k, v in checks.items() if not v} or "ok",
+      {n: len(c) for n, c in second.items()}, job1.get("chunks_replaced"), job2.get("chunks_replaced"))
+sys.exit(0 if all(checks.values()) else 1)
+ENDPY
+check "re-uploading report.pdf replaces only report.pdf: a/report.pdf and Report.PDF keep all their chunks (#622)" $? \
+  "$(head -c 300 /tmp/vfy_ex_job1.json)"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" page < scripts/verify/exact_source.py)
+check "replacing a name on the page path selects exactly that name in real Weaviate (#622)" $?
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" walk < scripts/verify/exact_source.py)
+check "replacing a name on the walk path, past 10,000 word matches, selects exactly that name (#622)" $?
+drop_collection "$EX"
+rm -rf "$EXFIX"
+
+# ── a file over the per-file limits is stored as parts (#621) ────────────────
+# Controlled cases: the reviewer's 13,000 records, files over 10,000,000
+# characters, family replacement, all or nothing, cuts, CSV, Markdown, encoding,
+# overlap sizing, re-chunk, export links.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_split_parts.py)
+check "files over the per-file limits are split into parts: regressions (#621)" $?
+# The same in the real Weaviate and ingest worker, on a scratch collection
+# without a vectorizer (embedding 13,000 chunks takes this project about an
+# hour): the reviewer's 13,000 records, a 10,519,499-character .txt, a smaller
+# re-upload replacing every part, and a bad line after part 1 storing nothing.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" < scripts/verify/split_parts.py)
+check "files over the per-file limits are stored as parts in the real Weaviate, replaced whole, all or nothing (#621)" $?
+
+# Reviewer (PR #630): the same through the API and the proxy. The collection is
+# made in Weaviate without a vectorizer, so the 13,000 chunks store in seconds;
+# the upload, the worker and the job record are the real ones.
+SPL="${PREFIX}SplitApi"
+SPLFIX=$(mktemp -d)
+drop_collection "$SPL"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$SPL" <<'PY'
+import sys
+from weaviate.classes.config import Configure, VectorDistances
+from services import weaviate_client as wc
+wc.get_client().collections.create(
+    name=sys.argv[1], vectorizer_config=Configure.Vectorizer.none(),
+    vector_index_config=Configure.VectorIndex.hnsw(distance_metric=VectorDistances.COSINE),
+    properties=wc.COLLECTION_PROPERTIES)
+wc.close_client()
+PY
+)
+python3 - "$SPLFIX" <<'PY'
+import json, sys
+from pathlib import Path
+row = lambda i: json.dumps({"t": f"{i:07d} " + "x" * 589}) + "\n"
+Path(sys.argv[1], "big").mkdir()
+Path(sys.argv[1], "small").mkdir()
+Path(sys.argv[1], "big", "big.jsonl").write_text("".join(row(i) for i in range(13_000)))
+Path(sys.argv[1], "small", "big.jsonl").write_text("".join(row(i) for i in range(3)))
+PY
+split_upload() {
+  curl -s -m 600 -o /tmp/vfy_split_job.json -X POST "$API/ingest/upload" -F "collection=$SPL" \
+    -F "strategy=context_aware" -F "chunk_size=1000" -F "chunk_overlap=0" -F "min_chunk_size=0" \
+    -F "files=@$1" || return 1
+  local job; job=$(jfield "['job_id']" < /tmp/vfy_split_job.json) || return 1
+  wait_for_job "/ingest/job/$job" 900 >/dev/null
+  api_get "/ingest/job/$job" > /tmp/vfy_split_job.json
+}
+split_count() {
+  api_get "/collections" | python3 -c "
+import json,sys
+print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$SPL'][0])"
+}
+split_upload "$SPLFIX/big/big.jsonl"
+count=$(split_count)
+python3 - "$count" <<'PY'
+import json, sys
+job = json.load(open("/tmp/vfy_split_job.json"))
+n = len(job.get("split") or []) and int(job["split"][0].split("split into ")[1].split(" ")[0])
+ok = (job["status"] == "completed" and job["files_completed"] == 1 and job["errors"] == []
+      and job["chunks_stored"] == 13_000 and int(sys.argv[1]) == 13_000 and n >= 2
+      and job["split"] == [f"big.jsonl: split into {n} parts, stored as 'big.jsonl (part 1)' "
+                           f"to 'big.jsonl (part {n})'"])
+print({k: job.get(k) for k in ("status", "files_completed", "chunks_stored", "split", "errors")}, sys.argv[1])
+sys.exit(0 if ok else 1)
+PY
+check "reviewer: 13,000 records uploaded through the API complete as parts, listed in the job's split (#621)" $?
+split_upload "$SPLFIX/small/big.jsonl"
+count=$(split_count)
+python3 - "$count" <<'PY'
+import json, sys
+job = json.load(open("/tmp/vfy_split_job.json"))
+ok = (job["status"] == "completed" and job.get("split") == [] and job["chunks_replaced"] == 13_000
+      and int(sys.argv[1]) == job["chunks_stored"] > 0)
+print({k: job.get(k) for k in ("status", "chunks_stored", "chunks_replaced", "split")}, sys.argv[1])
+sys.exit(0 if ok else 1)
+PY
+check "reviewer: re-uploading the name through the API replaces every part (#621)" $?
+drop_collection "$SPL"
+rm -rf "$SPLFIX" /tmp/vfy_split_job.json
+
 # ── job status transitions ───────────────────────────────────────────────────
 # `queued` is only observable when the executor is saturated, so this asserts
 # the terminal transition and that the POST reports the initial state.
@@ -147,6 +828,282 @@ job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_start.json'))['job_
 check_eq "a new job starts as 'queued'" "$initial" "queued"
 final=$(wait_for_job "/ingest/job/$job" 900)
 check_eq "job reaches 'completed'" "$final" "completed"
+# Submitted, accepted and stored chunks are counted apart (#302); a clean job's
+# three counts agree, and stored is the checked count it always was.
+read -r n_sub n_acc n_sto <<<"$(api_get "/ingest/job/$job" | python3 -c "
+import json,sys; d=json.load(sys.stdin); print(d.get('chunks_submitted'), d.get('chunks_accepted'), d.get('chunks_stored'))")"
+[ "$n_sub" = "$n_sto" ] && [ "$n_acc" = "$n_sto" ] && [ "${n_sto:-0}" -gt 0 ] 2>/dev/null
+check "a clean job reports chunks_submitted = chunks_accepted = chunks_stored" $? \
+  "submitted=$n_sub accepted=$n_acc stored=$n_sto"
+
+# ── deleting a collection while an ingest job runs (#40) ─────────────────────
+# A DELETE sent during a job used to wait for it and then remove what it stored,
+# and one that ran before a queued job let that job's inserts recreate the
+# collection (Weaviate auto-schema). Controlled cases: every job kind, both
+# request orderings, and the job's report when its collection disappears.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_delete_busy.py)
+check "delete-while-busy: job kinds, request orderings and the job's report" $?
+# Confirmation, a delete in progress refusing new jobs, and a cancelled
+# generation start (#302); then the job write counts and the MCP delete tool.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_write_counts.py)
+check "ingest jobs count submitted, accepted and stored chunks apart" $?
+python3 "$REPO_ROOT/scripts/tests/test_mcp_delete.py"
+check "MCP rag_delete_collection sends confirm=true and still takes only a name" $?
+# One spelling for per-collection state (#372): every route takes a collection
+# name as Weaviate stores it, so a lowercase first letter keys nothing apart.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_spelling.py)
+check "routes key per-collection state by the stored collection name (#372)" $?
+
+# DELETE needs ?confirm=true, checked before the collection is looked up (#302).
+CC="${PREFIX}Confirm"
+drop_collection "$CC"; make_collection "$CC"
+confirm_code() {   # HTTP status and error code of a DELETE with this query
+  _rag_require_lock_owner
+  local http; http=$(curl -s -m 120 -o /tmp/vfy_confirm.json -w '%{http_code}' -X DELETE "$API/collections/$1$2")
+  printf '%s %s' "$http" "$(python3 -c "
+import json
+try: print(json.load(open('/tmp/vfy_confirm.json'))['error']['code'])
+except Exception: print('-')")"
+}
+check_eq "DELETE without confirm is 400 CONFIRMATION_REQUIRED" "$(confirm_code "$CC" "")" "400 CONFIRMATION_REQUIRED"
+check_eq "DELETE with confirm=false is 400 CONFIRMATION_REQUIRED" "$(confirm_code "$CC" "?confirm=false")" "400 CONFIRMATION_REQUIRED"
+check_eq "a refused DELETE leaves the collection in place" "$(api_get "/collections" | python3 -c "
+import json,sys; print(any(c['name']=='$CC' for c in json.load(sys.stdin)['collections']))")" "True"
+check_eq "DELETE of a missing collection without confirm is 400, not 404" \
+  "$(confirm_code "${PREFIX}ConfirmMissing" "")" "400 CONFIRMATION_REQUIRED"
+check_eq "DELETE with confirm=TRUE (any case) deletes" "$(confirm_code "$CC" "?confirm=TRUE" | cut -d' ' -f1)" "200"
+check_eq "the confirmed delete removed the collection" "$(api_get "/collections" | python3 -c "
+import json,sys; print(any(c['name']=='$CC' for c in json.load(sys.stdin)['collections']))")" "False"
+
+DC="${PREFIX}DeleteBusy"
+drop_collection "$DC"; make_collection "$DC"
+object_count() {   # the collection's object count, or "absent"
+  api_get "/collections" | python3 -c "
+import json,sys
+found=[c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name']=='$1']
+print(found[0] if found else 'absent')"
+}
+# About 180 chunks at chunk_size 300: some tens of seconds of embedding, so the
+# job is still running when the DELETE follows the upload.
+busy_dir=$(mktemp -d)
+python3 - "$busy_dir/slow.txt" <<'ENDPY'
+import random, sys
+random.seed(40)
+words = "policy remote office travel expense claim review approval budget quarter report".split()
+paragraphs = (" ".join(random.choice(words) for _ in range(60)) for _ in range(150))
+open(sys.argv[1], "w").write("\n\n".join(paragraphs))
+ENDPY
+curl -s -m 600 -o /tmp/vfy_busy_start.json -X POST "$API/ingest/upload" -F "collection=$DC" \
+  -F "strategy=fixed" -F "chunk_size=300" -F "min_chunk_size=50" -F "files=@$busy_dir/slow.txt"
+rm -rf "$busy_dir"
+busy_job=$(jfield "['job_id']" < /tmp/vfy_busy_start.json)
+before=$(object_count "$DC")
+code=$(curl -s -m 120 -o /tmp/vfy_busy_delete.json -w '%{http_code}' -X DELETE "$API/collections/$DC?confirm=true")
+state=$(api_get "/ingest/job/$busy_job" | jfield "['status']")
+after=$(object_count "$DC")
+read -r err_code err_kind err_job <<<"$(python3 -c "
+import json
+try: e=json.load(open('/tmp/vfy_busy_delete.json'))['error']
+except Exception: print('not-json - -'); raise SystemExit
+print(e['code'], e['detail']['job_kind'], e['detail']['job_id'])")"
+[ "$code" = 409 ] && [ "$err_code" = COLLECTION_BUSY ] && [ "$err_kind" = ingest ] \
+  && [ "$err_job" = "$busy_job" ] && { [ "$state" = queued ] || [ "$state" = running ]; }
+check "DELETE during a running ingest job is refused with 409 COLLECTION_BUSY naming it" $? \
+  "HTTP=$code code=$err_code kind=$err_kind job=$err_job (job $busy_job was $state)"
+[ "$after" != absent ] && [ "$before" != absent ] && [ "$after" -ge "$before" ]
+check "the refused DELETE leaves the collection and its objects in place" $? \
+  "objects before=$before after=$after"
+final=$(wait_for_job "/ingest/job/$busy_job" 900)
+api_get "/ingest/job/$busy_job" > /tmp/vfy_busy_job.json
+[ "$final" = completed ]
+check "the ingest job still completes" $? \
+  "got '$final', wanted 'completed'; $(python3 -c "
+import json
+try: j=json.load(open('/tmp/vfy_busy_job.json'))
+except Exception: print('job record unreadable'); raise SystemExit
+print('files_failed=%s errors=%s' % (j.get('files_failed'), json.dumps(j.get('errors'))[:300]))")"
+code=$(curl -s -m 120 -o /dev/null -w '%{http_code}' -X DELETE "$API/collections/$DC?confirm=true")
+check_eq "DELETE after the job completes succeeds" "$code" "200"
+sleep 10
+check_eq "the deleted collection is still gone 10 s later" "$(object_count "$DC")" "absent"
+
+# ── job records survive an API restart (#23) ─────────────────────────────────
+# Controlled cases: unbound stores, throttled and immediate writes, failed
+# writes, startup marking of interrupted jobs, corrupt files and retention.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_jobstore.py)
+check "job store: persistence, throttling, startup marking and retention" $?
+
+# ── running and recent jobs (#617) ───────────────────────────────────────────
+# Units in the API image with no network: owners and timestamps recorded, who
+# sees what, the 24-hour window and the cap, sessions, packages. Then the lists
+# on the stack: a Developer's and a Developer-role key's ingests, the
+# Developer's export and import, each listed for its owner and the Engineer
+# only. The stack check creates a principal, so it runs only on the verify project.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_job_lists.py)
+check "job lists: owners and timestamps, visibility, window, cap, sessions, packages" $?
+if [ -z "$(volume_removal_refusal_reason)" ]; then
+  _rag_require_lock_owner
+  python3 ./job_lists.py --operator
+  check "GET /ingest/jobs, /export/jobs, /import/jobs list each caller's own jobs, and everyone's for the Engineer" $?
+else
+  skip "job lists on the stack: not the verify project"
+fi
+# A killed job's leftovers (#377): ingest staging in UPLOAD_DIR, and an export's
+# `.build-*` directory and `.*.tar.gz.partial` archive in EXPORTS_DIR.
+(cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_startup_sweep.py)
+check "startup sweep: ingest staging and export build leftovers, exact names, links never followed" $?
+
+# With auto-schema off, an insert into a deleted collection fails and creates
+# nothing, instead of recreating it with inferred properties and no vectorizer.
+(cd "$REPO_ROOT" && docker compose exec -T api python - "${PREFIX}NoAutoSchema" <<'ENDPY'
+import sys
+from services import weaviate_client as wc
+name = sys.argv[1]
+try:
+    client = wc.get_client()
+    if client.collections.exists(name):
+        client.collections.delete(name)
+    wc._create_collection_sync(name, "hnsw", "cosine", {})
+    wc._delete_collection_sync(name)
+    try:
+        wc._insert_chunks_sync(name, [{"content": "must not recreate", "source_file": "x.txt",
+                                       "chunk_index": 0}])
+    except Exception:
+        pass
+    else:
+        print("the insert into a deleted collection succeeded", file=sys.stderr)
+        sys.exit(1)
+    if client.collections.exists(name):
+        client.collections.delete(name)
+        print("the insert recreated the deleted collection", file=sys.stderr)
+        sys.exit(1)
+finally:
+    wc.close_client()
+ENDPY
+) >/tmp/vfy_autoschema.txt 2>&1
+check "an insert into a deleted collection fails and does not recreate it" $? \
+  "$(tail -1 /tmp/vfy_autoschema.txt)"
+
+# ── job status survives an API restart (#23; opt-in: restarts the API) ───────
+# Before #23 every job answered 404 after a restart. A job that finished must
+# read back unchanged, one interrupted after storing a file must read `partial`
+# with the interruption message, and one interrupted before storing any file
+# must read `failed` with it (#309). `--timeout 0`: with the default 10 s stop
+# timeout the worker could finish the job during shutdown.
+JR="${PREFIX}JobRestart"
+JN="${PREFIX}JobRestartNone"
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "ingest job status across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+elif [ -n "$restart_refusal" ]; then
+  check "ingest job status across an API restart" 1 "$restart_refusal"
+else
+  drop_collection "$JR"; make_collection "$JR"
+  drop_collection "$JN"; make_collection "$JN"
+  ingest "$JR" fixed 300 50 "$FIX/policies.txt"
+  done_job=$(jfield "['job_id']" < /tmp/vfy_job.json)
+  api_get "/ingest/job/$done_job" > /tmp/vfy_restart_done.json
+  # policies.txt stores in seconds; the slow file then embeds for tens of seconds.
+  slow_dir=$(mktemp -d)
+  python3 - "$slow_dir/slow.txt" <<'ENDPY'
+import random, sys
+random.seed(23)
+words = "policy remote office travel expense claim review approval budget quarter report".split()
+paragraphs = (" ".join(random.choice(words) for _ in range(60)) for _ in range(150))
+open(sys.argv[1], "w").write("\n\n".join(paragraphs))
+ENDPY
+  curl -s -m 600 -o /tmp/vfy_restart_start.json -X POST "$API/ingest/upload" -F "collection=$JR" \
+    -F "strategy=fixed" -F "chunk_size=300" -F "min_chunk_size=50" \
+    -F "files=@$FIX/policies.txt" -F "files=@$slow_dir/slow.txt"
+  slow_job=$(jfield "['job_id']" < /tmp/vfy_restart_start.json)
+  state=""
+  for _ in $(seq 1 600); do
+    api_get "/ingest/job/$slow_job" > /tmp/vfy_restart_before.json
+    state=$(python3 -c "
+import json; d=json.load(open('/tmp/vfy_restart_before.json'))
+print(d['status'] + ('-stored' if d['files_completed'] >= 1 else ''))" 2>/dev/null)
+    case "$state" in running-stored|completed*|partial*|failed*) break ;; esac
+    sleep 0.5
+  done
+  if [ "$state" != running-stored ]; then
+    rm -rf "$slow_dir"
+    check "an ingest is running with a file stored before the restart" 1 "last status '$state'; nothing restarted"
+  else
+    # Only the slow file, so nothing is stored before the restart (#309).
+    curl -s -m 600 -o /tmp/vfy_restart_none_start.json -X POST "$API/ingest/upload" -F "collection=$JN" \
+      -F "strategy=fixed" -F "chunk_size=300" -F "min_chunk_size=50" -F "files=@$slow_dir/slow.txt"
+    rm -rf "$slow_dir"
+    none_job=$(jfield "['job_id']" < /tmp/vfy_restart_none_start.json)
+    sleep 2
+    api_get "/ingest/job/$none_job" > /tmp/vfy_restart_none_before.json
+    # The running jobs' upload staging, which the restart kills in place (#377).
+    staged=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/uploads/ingest-* 2>/dev/null' | sort)
+    check "the interrupted ingests have ingest-* staging for the restart to sweep" \
+      "$([ -n "$staged" ] && echo 0 || echo 1)" "no /app/uploads/ingest-* while the jobs ran"
+    _rag_require_lock_owner
+    (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
+    for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+    left=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c '
+      for p in "$@"; do if [ -e "$p" ] || [ -L "$p" ]; then echo "$p"; fi; done; echo checked' sh $staged)
+    check "the restart removes the interrupted ingests' upload staging" \
+      "$([ -n "$staged" ] && [ "$left" = checked ] && echo 0 || echo 1)" "still there: $left"
+    api_get "/ingest/job/$done_job" > /tmp/vfy_restart_done_after.json
+    python3 -c "
+import json,sys
+sys.exit(0 if json.load(open('/tmp/vfy_restart_done.json')) == json.load(open('/tmp/vfy_restart_done_after.json')) else 1)"
+    check "a completed ingest job reads back unchanged after a restart" $?
+    code=$(curl -s -m 120 -o /tmp/vfy_restart_after.json -w '%{http_code}' "$API/ingest/job/$slow_job")
+    python3 - "$code" <<'ENDPY'
+import json, sys
+before = json.load(open('/tmp/vfy_restart_before.json'))
+after = json.load(open('/tmp/vfy_restart_after.json'))
+ok = (sys.argv[1] == "200" and after.get("status") == "partial"
+      and any(e.startswith("Interrupted: the API restarted while this job was running.")
+              for e in after.get("errors", []))
+      and after.get("files_completed") == before["files_completed"])
+print(sys.argv[1], after.get("status"), after.get("files_completed"), after.get("errors"))
+sys.exit(0 if ok else 1)
+ENDPY
+    check "an interrupted ingest reads back 200 'partial' with the interruption message" $? \
+      "$(head -c 300 /tmp/vfy_restart_after.json)"
+    code=$(curl -s -m 120 -o /tmp/vfy_restart_none_after.json -w '%{http_code}' "$API/ingest/job/$none_job")
+    python3 - "$code" <<'ENDPY'
+import json, sys
+try:
+    before = json.load(open('/tmp/vfy_restart_none_before.json'))
+    after = json.load(open('/tmp/vfy_restart_none_after.json'))
+except (OSError, ValueError):
+    sys.exit(1)
+ok = (before.get("status") in ("queued", "running") and before.get("files_completed") == 0
+      and sys.argv[1] == "200" and after.get("status") == "failed"
+      and any(e.startswith("Interrupted: the API restarted while this job was running.")
+              for e in after.get("errors", []))
+      and after.get("files_completed") == 0)
+print(before.get("status"), sys.argv[1], after.get("status"), after.get("files_completed"), after.get("errors"))
+sys.exit(0 if ok else 1)
+ENDPY
+    check "an ingest interrupted before storing a file reads back 200 'failed' with the message" $? \
+      "before: $(head -c 200 /tmp/vfy_restart_none_before.json); after: $(head -c 300 /tmp/vfy_restart_none_after.json)"
+    # The audit log (#29, #577): the restart's marking wrote each interrupted
+    # job's end record. The shell's curl is the harness Engineer's.
+    api_get "/audit?action=ingest&result=interrupted&limit=1000" > /tmp/vfy_restart_audit.json
+    python3 - "$slow_job" "$none_job" <<'ENDPY'
+import json, sys
+try:
+    records = json.load(open('/tmp/vfy_restart_audit.json'))["records"]
+except (OSError, ValueError, KeyError):
+    sys.exit(1)
+counts = {job: sum(1 for r in records if r.get("job_id") == job) for job in sys.argv[1:]}
+print(counts)
+sys.exit(0 if all(n == 1 for n in counts.values()) else 1)
+ENDPY
+    check "each interrupted ingest has one 'interrupted' audit record with its job id (#577)" $? \
+      "$(head -c 300 /tmp/vfy_restart_audit.json)"
+  fi
+  drop_collection "$JR"
+  drop_collection "$JN"
+fi
 
 drop_collection "$C"
 cleanup_prefixed

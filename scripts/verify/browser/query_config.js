@@ -1,7 +1,7 @@
 // Deferred responses exercise the real provider, Retrieval page, and Q&A page.
 // All API calls are intercepted before application startup; no backend is used.
 const assert = require('node:assert/strict');
-const { makeReporter, setValue, clickByText } = require('./lib');
+const { sleep, makeReporter, setValue, clickByText, stubAuth } = require('./lib');
 
 const A = { collection: 'FixtureA', retrieval_mode: 'hybrid', top_k: 11, alpha: 0.25, ef: null, response_format: 'engineer', is_default: false };
 const B = { ...A, collection: 'FixtureB', retrieval_mode: 'semantic', top_k: 23, alpha: 0.6 };
@@ -13,7 +13,6 @@ async function fixture(browser, base) {
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.evaluateOnNewDocument((a, b) => {
-    sessionStorage.setItem('rag_role', JSON.stringify({ role: 'engineer' }));
     const realFetch = window.fetch.bind(window);
     const requests = [];
     window.queryConfigFixture = { requests };
@@ -35,7 +34,7 @@ async function fixture(browser, base) {
       }
       if (path === '/api/query') {
         entry.done = true;
-        return Promise.resolve(response({ answer: 'Fixture answer', citations: [], retrieval_latency_ms: 1, llm_latency_ms: 1 }));
+        return Promise.resolve(response(window.queryConfigFixture.queryResult || { answer: 'Fixture answer', citations: [], retrieval_latency_ms: 1, llm_latency_ms: 1 }));
       }
       if (path.startsWith('/api/retrieval/config')) {
         return new Promise(resolve => { entry.resolve = (data, status) => { entry.done = true; resolve(new Response(JSON.stringify(data), { status })); }; });
@@ -43,6 +42,8 @@ async function fixture(browser, base) {
       return Promise.reject(new Error('Unexpected fixture API call: ' + method + ' ' + path));
     };
   }, A, B);
+  // The engineer, as GET /api/auth/me answers it, without a backend (#25).
+  await stubAuth(page, 'engineer');
   await page.goto(base + '/retrieval', { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => document.body.innerText.includes('Top-K Results: 11') && !document.body.innerText.includes('Loading saved settings'));
   return { ctx, page, errors };
@@ -192,6 +193,90 @@ async function runQueryConfigTests(browser, base, reporter) {
       await assertQuery(page, saved);
     }]);
   }
+  // Testing reviewer cases (#205): superseded saves in one selection, and the confirmation timer.
+  const shows = (page, text) => page.evaluate(t => document.body.innerText.includes(t), text);
+  cases.push(['superseded save shows no confirmation; only the latest save shows Saved!', async page => {
+    await save(page);
+    await setValue(page, '() => document.querySelector("input[type=range]")', '17');
+    await save(page);
+    await pending(page, '/api/retrieval/config', 'POST', 2);
+    const current = { ...A, top_k: 17 };
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    assert.equal(await shows(page, 'Saved!'), false, 'the superseded save showed "Saved!"');
+    await release(page, '/api/retrieval/config', current, { method: 'POST' });
+    assert.equal(await shows(page, 'Saved!'), true, 'the latest save showed no "Saved!"');
+    await assertSettings(page, current);
+    await assertQuery(page, current);
+  }]);
+  cases.push(['superseded save failure is not shown; the latest success confirms', async page => {
+    await save(page);
+    await setValue(page, '() => document.querySelector("input[type=range]")', '17');
+    await save(page);
+    await pending(page, '/api/retrieval/config', 'POST', 2);
+    const current = { ...A, top_k: 17 };
+    await release(page, '/api/retrieval/config', { error: { message: 'Superseded save failed' } }, { method: 'POST', status: 500 });
+    assert.equal(await shows(page, 'Superseded save failed'), false, "the superseded save's failure was shown");
+    await release(page, '/api/retrieval/config', current, { method: 'POST' });
+    assert.equal(await shows(page, 'Superseded save failed'), false, "the superseded save's failure was shown");
+    assert.equal(await shows(page, 'Saved!'), true, 'the latest save showed no "Saved!"');
+    await assertSettings(page, current);
+    await assertQuery(page, current);
+  }]);
+  cases.push(["an earlier save's confirmation timer does not clear a later save's Saved!", async page => {
+    await save(page);
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    assert.equal(await shows(page, 'Saved!'), true, 'the first save showed no "Saved!"');
+    const first = Date.now();
+    await sleep(2000);
+    const current = { ...A, top_k: 17 };
+    await setValue(page, '() => document.querySelector("input[type=range]")', '17');
+    await save(page);
+    await release(page, '/api/retrieval/config', current, { method: 'POST' });
+    assert.equal(await shows(page, 'Saved!'), true, 'the second save showed no "Saved!"');
+    await sleep(Math.max(0, first + 3600 - Date.now()));
+    assert.equal(await shows(page, 'Saved!'), true, "the first save's timer cleared the second save's \"Saved!\"");
+    await page.waitForFunction(() => !document.body.innerText.includes('Saved!'), { timeout: 5000 });
+  }]);
+  cases.push(['a late older success cannot republish an acknowledged save over new edits', async page => {
+    await save(page);
+    await setValue(page, '() => document.querySelector("input[type=range]")', '13');
+    await save(page);
+    await setValue(page, '() => document.querySelector("input[type=range]")', '17');
+    await save(page);
+    await pending(page, '/api/retrieval/config', 'POST', 3);
+    await release(page, '/api/retrieval/config', { error: { message: 'Newest failed' } }, { method: 'POST', status: 500, last: true });
+    await release(page, '/api/retrieval/config', { ...A, top_k: 13 }, { method: 'POST', last: true });
+    await assertSettings(page, { ...A, top_k: 13 });
+    await setValue(page, '() => document.querySelector("input[type=range]")', '19');
+    await release(page, '/api/retrieval/config', A, { method: 'POST' });
+    await assertSettings(page, { ...A, top_k: 19 });
+    assert.equal(await page.evaluate(() => document.body.innerText.includes('Saved!')), false);
+  }]);
+  // #376: a citation's score is a number (higher is better) or null when Weaviate gave none.
+  cases.push(['citations show a numeric score and n/a for a null score', async page => {
+    await page.evaluate(() => {
+      window.queryConfigFixture.queryResult = {
+        answer: 'Fixture answer', retrieval_latency_ms: 1, llm_latency_ms: 1, chunks_retrieved: 2,
+        citations: [
+          { source_file: 'scored.txt', chunk_index: 3, score: 0.9123, excerpt: 'Scored excerpt' },
+          { source_file: 'unscored.txt', chunk_index: 4, score: null, excerpt: 'Unscored excerpt' },
+        ],
+      };
+    });
+    assert.equal(await clickByText(page, 'Q&A'), true);
+    await page.waitForSelector('textarea');
+    await page.evaluate(() => {
+      const box = [...document.querySelectorAll('label')].find(l => l.innerText.includes('Show source citations')).querySelector('input');
+      if (!box.checked) box.click();
+    });
+    await setValue(page, '() => document.querySelector("textarea")', 'Which sources?');
+    assert.equal(await clickByText(page, 'Ask'), true);
+    await page.waitForFunction(() => document.body.innerText.includes('Unscored excerpt') || document.body.innerText.includes('Fixture answer'));
+    await sleep(200);
+    const text = await page.evaluate(() => document.body.innerText);
+    assert.match(text, /chunk 3 \S score 0\.912\b/, 'the numeric score is not shown with 3 decimals');
+    assert.match(text, /chunk 4 \S score n\/a/, 'the null score is not shown as n/a');
+  }]);
   for (const [name, test] of cases) {
     let s;
     try {

@@ -7,25 +7,31 @@ from drifting.
 Format reference: RAG_EXPORT_SPECIFICATIONS.md §4.
 """
 from __future__ import annotations
+from services import telemetry
 
+import fnmatch
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
+import stat
 import tarfile
 import tempfile
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator
 
 from pydantic import ValidationError
 
 from config import settings
 from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
+from services import age_stream
 from services import goldstandard
 from services import ingest_config
 from services import model_bundle
+from services import parts
 from services import retrieval_config
 from services import sources
 from services import weaviate_client as wc
@@ -45,6 +51,66 @@ def exports_dir() -> Path:
     p = Path(settings.exports_dir)
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+# ── Leftovers of a killed job (#377) ─────────────────────────────────────────
+# A build removes its staging directory and temporary archive in a `finally`,
+# which a hard kill skips: each killed export left them in ./exports for good,
+# hidden and root-owned, about 2.3 GB with models. Matched by exact name pattern
+# and by kind, never by age; anything else in the folder is left alone.
+_BUILD_DIR = ".build-*"
+# An encrypted export is written as `.<stem>.tar.gz.age.partial` (#27).
+_PARTIAL_ARCHIVES = (".*.tar.gz.partial", ".*.tar.gz.age.partial")
+
+
+def remove_leftover(entry: Path, *, directory: bool = False,
+                    regular_file: bool = False) -> int | None:
+    """Remove one thing a killed job left behind and return the bytes it held.
+
+    `directory` and `regular_file` say what its name promises. Anything else,
+    a symlink included, is kept, and no link is followed: not to check it, size
+    it or remove it. None when it was kept or could not be removed (logged).
+    """
+    try:
+        info = entry.lstat()
+        if directory and stat.S_ISDIR(info.st_mode):
+            size = 0
+            for parent, _dirs, files in os.walk(entry):     # does not follow links
+                for name in files:
+                    found = os.lstat(os.path.join(parent, name))
+                    if stat.S_ISREG(found.st_mode):
+                        size += found.st_size
+            # Removes links inside without following them, and refuses a link.
+            shutil.rmtree(entry)
+            return size
+        if regular_file and stat.S_ISREG(info.st_mode):
+            entry.unlink()
+            return info.st_size
+        return None
+    except OSError:
+        _log.exception("Could not remove %s", entry)
+        return None
+
+
+def sweep_build_leftovers() -> list[str]:
+    """Remove the staging directories and temporary archives of killed exports.
+
+    Startup only, before this process can have an export of its own running.
+    A missing exports folder is not created.
+    """
+    root = Path(settings.exports_dir)
+    removed: list[str] = []
+    if not root.is_dir():
+        return removed
+    for entry in sorted(root.iterdir()):
+        as_dir = fnmatch.fnmatchcase(entry.name, _BUILD_DIR)
+        as_file = any(fnmatch.fnmatchcase(entry.name, p) for p in _PARTIAL_ARCHIVES)
+        if not (as_dir or as_file):
+            continue
+        size = remove_leftover(entry, directory=as_dir, regular_file=as_file)
+        if size is not None:
+            removed.append(f"{entry.name} ({size // (1024 * 1024)} MB)")
+    return removed
 
 
 # ── Naming (spec §4.1) ────────────────────────────────────────────────────────
@@ -82,22 +148,26 @@ def _json_default(value: Any) -> Any:
 
 # ── Reading the collection (spec §4.5) ────────────────────────────────────────
 
-def read_chunks(collection: str) -> Iterator[dict]:
+def read_chunks(collection: str, documents: dict | None = None) -> Iterator[dict]:
     """One record per chunk, streamed. Never materialises the collection.
 
     A 100k-chunk corpus is roughly 880 MB of JSON, so nothing here accumulates.
+    `documents` is the retained sources the package ships, by digest; a chunk
+    links only to one of those (#509). None loads the whole index.
     """
     client = wc.get_client()
     col = client.collections.get(collection)
+    if documents is None:
+        documents = sources.load_index(collection)["documents"]
 
     # digests_for_filename() reloads the index on every call, which would be
     # O(chunks x documents). Build the reverse map once.
     by_filename: dict[str, list[str]] = {}
-    for digest, entry in sources.load_index(collection)["documents"].items():
+    for digest, entry in documents.items():
         for name in entry.get("filenames", []):
             by_filename.setdefault(name, []).append(digest)
 
-    for obj in col.iterator(include_vector=True):
+    for obj in telemetry.iterate(col.iterator, include_vector=True):
         vector = obj.vector
         # Verified against the live stack: iterator() yields a dict keyed by
         # vector name, not a bare list. Code written for a list breaks here.
@@ -107,7 +177,10 @@ def read_chunks(collection: str) -> Iterator[dict]:
         props = dict(obj.properties or {})
         # source_sha256 is a sibling field, not a stored property: spec §4.5
         # keeps the eight chunk properties unchanged. Resolve it from retention.
-        digests = by_filename.get(props.get("source_file"), [])
+        # A part `<name> (part N)` links to its original `<name>` (#621).
+        source_file = props.get("source_file")
+        listed = parts.resolve(source_file, by_filename) if isinstance(source_file, str) else None
+        digests = by_filename.get(listed, []) if listed is not None else []
         yield {
             "id": str(obj.uuid),
             "vector": vector,
@@ -137,6 +210,20 @@ class _Builder:
     def add_json(self, rel: str, data: Any) -> Path:
         return self.add(rel, lambda p: p.write_text(
             json.dumps(data, indent=2, sort_keys=True, default=_json_default)))
+
+    def discard(self, rels: list[str]) -> None:
+        """Remove files already written, and directories that leaves empty."""
+        for rel in rels:
+            self.files.pop(rel, None)
+            target = self.root / rel
+            target.unlink(missing_ok=True)
+            parent = target.parent
+            while parent != self.root:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
 
 
 def _resolve_includes(text: str, depth: int = 0) -> str:
@@ -203,9 +290,9 @@ def _export_retrieval_settings(collection: str, warnings: list[str]) -> tuple[di
     with a warning; the saved file itself is left alone.
     """
     try:
-        cfg, is_default = retrieval_config.resolve(collection)
+        cfg, is_default = retrieval_config.merged(collection)
         cfg, cleared = retrieval_config.normalize(cfg, collection)
-    except TypeError as exc:          # resolve(): the saved JSON is not an object
+    except TypeError as exc:          # merged(): the saved JSON is not an object
         problems, cause = "the settings file is not a JSON object", exc
     except ValidationError as exc:
         problems = "; ".join(f"{'.'.join(map(str, error['loc']))}: {error['msg']}"
@@ -232,7 +319,9 @@ def _goldstandard_sessions(collection: str) -> list[dict]:
     # Preserve export's detached on-disk snapshots. The cache contains live
     # generation/edit objects, which must not change during JSON serialization.
     # Disk reads still share schema, identity and regular-file validation.
-    return [session for session in goldstandard._sessions_on_disk()
+    # Who generated a session and when stay on this install (#617).
+    return [{key: value for key, value in session.items() if key not in goldstandard.LOCAL_FIELDS}
+            for session in goldstandard._sessions_on_disk()
             if session["collection"] == collection]
 
 
@@ -261,16 +350,53 @@ def _retrieve_section(has_script: bool, cfg: dict, collection: str) -> str:
             f"answer style `{cfg['response_format']}`.")
 
 
+def _add_members(tar: tarfile.TarFile, stage: Path, stem: str) -> None:
+    tar.add(stage, arcname=stem, recursive=False)
+    tar.add(stage / "manifest.json", arcname=f"{stem}/manifest.json")
+    for entry in sorted(os.listdir(stage)):
+        if entry != "manifest.json":
+            tar.add(stage / entry, arcname=f"{stem}/{entry}")
+
+
+def _write_archive(stage: Path, stem: str, dest: Path, passphrase: str | None = None) -> None:
+    """Archive the staged package as `<stem>/`, with manifest.json first (#383).
+
+    The directory entry, then the manifest, then everything else in the sorted
+    order `tar.add(stage, arcname=stem)` gives, so the listing can stop reading
+    at the manifest instead of decompressing chunks.jsonl to reach it.
+
+    With a passphrase the same tar.gz stream goes through the age encryptor on
+    its way to `dest` (#27): no plaintext archive is written, and only one
+    64 KiB chunk is held at a time, so a package of several GB streams.
+    """
+    if passphrase is None:
+        with tarfile.open(dest, "w:gz") as tar:
+            _add_members(tar, stage, stem)
+        return
+    with dest.open("wb") as fh:
+        encryptor = age_stream.Encryptor(fh, passphrase)
+        with tarfile.open(fileobj=encryptor, mode="w|gz") as tar:
+            _add_members(tar, stage, stem)
+        # Writes the final chunk; an exception above skips it, and build()
+        # removes the partial file.
+        encryptor.close()
+
+
+@telemetry.traced("rag.package")
 def build(
     collection: str,
     include_models: bool = False,
     progress: Callable[[int], None] | None = None,
+    passphrase: str | None = None,
 ) -> dict:
     """Write one package and return a summary. Blocking; run it in a thread.
 
     Assembly order matters (spec §6.2): content first, digests as we go, then
     the manifest from those digests, then README.md and retrieve.py which embed
     the manifest digest. Manifest last is what makes <id8> derivable.
+
+    With a passphrase the package is written encrypted, as `<stem>.tar.gz.age`
+    (#27). The passphrase is used, never stored or logged.
     """
     created = datetime.now(timezone.utc)
     created_at = created.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -299,6 +425,19 @@ def build(
                 {"collection": collection, "stored_model": stored_model,
                  "configured_model": settings.embed_model})
 
+        # The source index is read once, before the chunk stream, and both the
+        # chunk links and sources/ come from it (#509). The exporter holds the
+        # writer guard, so no guarded writer changes it meanwhile. A blob missing
+        # on disk is not shipped, and chunks naming it get a null source_sha256.
+        index = sources.load_index(collection)
+        shipped = {}
+        for digest, entry in index["documents"].items():
+            blob = sources.blob_path(collection, digest)
+            if not blob.exists():
+                warnings.append(f"retained source {digest[:12]} is missing on disk")
+                continue
+            shipped[digest] = entry
+
         # 1. chunks.jsonl — streamed, one line at a time.
         chunk_count = 0
         dimensions: int | None = None
@@ -308,7 +447,7 @@ def build(
         def write_chunks(path: Path) -> None:
             nonlocal chunk_count, dimensions, first_props, unresolved
             with path.open("w", encoding="utf-8") as fh:
-                for record in read_chunks(collection):
+                for record in read_chunks(collection, shipped):
                     if dimensions is None and record["vector"]:
                         dimensions = len(record["vector"])
                     if first_props is None:
@@ -340,15 +479,7 @@ def build(
         for session in _goldstandard_sessions(collection):
             b.add_json(f"goldstandard/{session['session_id']}.json", session)
 
-        # 5. sources, when they exist
-        index = sources.load_index(collection)
-        shipped = {}
-        for digest, entry in index["documents"].items():
-            blob = sources.blob_path(collection, digest)
-            if not blob.exists():
-                warnings.append(f"retained source {digest[:12]} is missing on disk")
-                continue
-            shipped[digest] = entry
+        # 5. sources, when they exist, from the index read before the chunks
         fidelity = "with-sources" if shipped else "chunks-only"
         source_document_count = len(shipped)
         if fidelity == "with-sources":
@@ -358,22 +489,38 @@ def build(
                 b.add(f"sources/{digest}", lambda p, s=blob: shutil.copyfile(s, p))
 
         # 5b. bundled models, resolved through each model's manifest
-        models_bundled = False
+        bundled: list[str] = []
         if include_models:
-            wanted = [settings.embed_model, settings.llm_model]
+            # Models are compared by name and tag, so `x` and `x:latest` are one
+            # model, copied once (#494). Each copy then has its own
+            # models/<name>/<tag>/ folder (#487), so removing a failed copy
+            # never removes another model's files.
+            wanted: dict[str, str] = {}
+            for model in (settings.embed_model, settings.llm_model):
+                try:
+                    key = model_bundle.model_ref(model)
+                except ValueError:
+                    key = model  # no path in the store; export_model refuses it below
+                wanted.setdefault(key, model)
             if not model_bundle.store_available():
                 warnings.append(
                     "models were requested but the Ollama model store is not mounted; "
                     "the package was built without them")
             else:
-                for model in wanted:
+                for model in wanted.values():
+                    attempted: list[str] = []
                     try:
                         for rel, source in model_bundle.export_model(model, stage):
+                            attempted.append(rel)
                             b.add(rel, lambda p, s=source: shutil.copyfile(s, p))
                     except (OSError, ValueError) as exc:
+                        # Import treats a model whose manifest.json is in the
+                        # package as bundled, so leave no part of it behind (#449).
+                        b.discard(attempted)
                         warnings.append(f"model '{model}' could not be bundled: {exc}")
                     else:
-                        models_bundled = True
+                        bundled.append(model_bundle.model_ref(model))
+        models_bundled = bool(bundled)
 
         if unresolved:
             warnings.append(
@@ -419,9 +566,9 @@ def build(
             # What the package actually carries, not what was asked for: a
             # request that could not be honoured is recorded in `warnings`.
             "models_bundled": models_bundled,
-            "bundled_models": sorted(
-                {settings.embed_model.split(":")[0], settings.llm_model.split(":")[0]}
-            ) if models_bundled else [],
+            # Only the models whose files were all added; a model that failed
+            # is recorded in `warnings` instead.
+            "bundled_models": sorted(set(bundled)),
             # False means the collection had no saved retrieval settings, so a
             # script would have carried stock defaults while implying tuned ones.
             "retrieve_script": has_saved_retrieval,
@@ -434,19 +581,8 @@ def build(
 
         # 7. the generated pair, which embed <id8>
         stem = package_stem(collection, created, id8)
-        filename = f"{stem}.tar.gz"
-
-        contents_extra = ""
-        if models_bundled:
-            contents_extra += ("models/                 Ollama model files, so the "
-                               "target needs no registry\n")
-        if fidelity == "with-sources":
-            contents_extra = ("sources/                the original documents, "
-                              "content-addressed\n")
-        if any(k.startswith("goldstandard/") for k in manifest["files"]):
-            contents_extra += "goldstandard/           evaluation sessions for this collection\n"
-        if has_saved_retrieval:
-            contents_extra += "retrieve.py             a standalone query script for this collection\n"
+        # The README and retrieve.py name the file as delivered (#27).
+        filename = f"{stem}{age_stream.ENCRYPTED_SUFFIX if passphrase is not None else '.tar.gz'}"
 
         if has_saved_retrieval:
             (stage / "retrieve.py").write_text(_render_retrieve(collection, retrieval_cfg, {
@@ -469,15 +605,15 @@ def build(
             "CREATED_AT": created_at,
             "ID8": id8,
             "PACKAGE_FILENAME": filename,
+            "IMPORT_PASSPHRASE": (', "passphrase": "<the passphrase>"'
+                                  if passphrase is not None else ""),
             "RETRIEVE_SECTION": _retrieve_section(has_saved_retrieval, retrieval_cfg, collection),
-            "CONTENTS_EXTRA": contents_extra,
         }))
 
         # 8. archive under a temporary name, then rename, so a partial file is
         #    never mistaken for a package.
-        tmp_archive = out_dir / f".{stem}.tar.gz.partial"
-        with tarfile.open(tmp_archive, "w:gz") as tar:
-            tar.add(stage, arcname=stem)
+        tmp_archive = out_dir / f".{filename}.partial"
+        _write_archive(stage, stem, tmp_archive, passphrase)
         final = out_dir / filename
         tmp_archive.replace(final)
         tmp_archive = None
@@ -491,6 +627,7 @@ def build(
             "models_bundled": models_bundled,
             "retrieve_script": has_saved_retrieval,
             "id8": id8,
+            "encrypted": passphrase is not None,
             "warnings": warnings,
         }
     finally:
@@ -511,62 +648,293 @@ class PackageError(Exception):
         self.detail = detail
 
 
+# The listing reads only the manifest (#383). It holds one `files` entry per file
+# in the package, so 16 MiB is far more than any real package needs; a larger
+# manifest is refused unread and the package is listed as unreadable.
+MANIFEST_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _is_top_manifest(name: str) -> bool:
+    """True for `<top-level directory>/manifest.json`, not one deeper down."""
+    parts = PurePosixPath(name).parts
+    return len(parts) == 2 and parts[1] == "manifest.json"
+
+
 def read_manifest(archive: Path) -> dict:
-    """Read manifest.json out of a package without extracting the whole archive."""
+    """Read the top-level manifest.json out of a package, for the listing.
+
+    Members are read one at a time and nothing after the manifest is touched,
+    so a package is not decompressed in full (#383). New packages put the
+    manifest first; in older ones chunks.jsonl comes before it and is read past.
+    Raises when the package has no readable manifest, or one larger than
+    MANIFEST_MAX_BYTES or not a JSON object.
+    """
     with tarfile.open(archive, "r:gz") as tar:
-        for member in tar.getmembers():
-            if Path(member.name).name == "manifest.json" and member.isfile():
-                fh = tar.extractfile(member)
-                if fh is None:
-                    break
-                return json.loads(fh.read().decode("utf-8"))
+        while (member := tar.next()) is not None:
+            if not (_is_top_manifest(member.name) and member.isfile()):
+                continue
+            if member.size > MANIFEST_MAX_BYTES:
+                raise ValueError(f"manifest.json is {member.size} bytes, over the "
+                                 f"{MANIFEST_MAX_BYTES}-byte limit")
+            fh = tar.extractfile(member)
+            if fh is None:
+                break
+            manifest = json.loads(fh.read(member.size).decode("utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("manifest.json is not a JSON object")
+            return manifest
     raise ValueError("no manifest.json in package")
 
 
-def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
-    """Extract, refusing any member that would land outside dest.
+def listing_fields(manifest: dict) -> dict:
+    """The four values the listing shows, from a manifest read_manifest returned.
+
+    An absent or null value is listed as None. A value of the wrong JSON type
+    (spec §4.4) raises instead of being coerced, so the package is listed as
+    unreadable rather than the whole listing failing (#451).
+    """
+    collection = manifest.get("collection")
+    if collection is None:
+        collection = {}
+    elif not isinstance(collection, dict):
+        raise ValueError("manifest collection is not a JSON object")
+    fields = {"collection": collection.get("name"),
+              "chunk_count": collection.get("chunk_count"),
+              "fidelity": manifest.get("fidelity"),
+              "created_at": manifest.get("created_at")}
+    for key in ("collection", "fidelity", "created_at"):
+        if fields[key] is not None and not isinstance(fields[key], str):
+            raise ValueError(f"manifest {key} is not a string")
+    count = fields["chunk_count"]
+    if count is not None and (not isinstance(count, int) or isinstance(count, bool)):
+        raise ValueError("manifest chunk_count is not an integer")
+    return fields
+
+
+def _check_member(member: tarfile.TarInfo, dest: Path, root: Path) -> None:
+    """Refuse a link, anything but a file or directory, a path outside dest, a path with a
+    `..` component, a negative size, or a sparse file.
+
+    tarfile makes a member's missing parent folders from its path as written, so a
+    `..` lets a path that resolves inside dest name folders outside it, which would
+    be made and never removed (#597). No package this project writes has a `..`.
+
+    tarfile writes every chunk of a sparse file's map before it truncates the
+    file to its size, so a sparse file's size doesn't bound what extracting it
+    writes (#317). No package this project writes is sparse.
+    """
+    if member.issym() or member.islnk():
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            f"Package contains a link ('{member.name}'), which is not allowed.",
+            {"member": member.name})
+    if not (member.isfile() or member.isdir()):
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            "Package contains a non-regular archive member.",
+            {"member": member.name})
+    target = (dest / member.name).resolve()
+    if target != root and root not in target.parents:
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            f"Package contains a path outside the archive ('{member.name}').",
+            {"member": member.name})
+    if ".." in member.name.split("/"):
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            f"Package contains a path with a '..' component ('{member.name}'), which is not "
+            f"allowed.",
+            {"member": member.name})
+    if member.size < 0:
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            f"Package contains an entry with a negative size ('{member.name}').",
+            {"member": member.name})
+    if member.sparse is not None:
+        raise PackageError(
+            "PACKAGE_UNREADABLE",
+            f"Package contains a sparse file ('{member.name}'), which is not allowed.",
+            {"member": member.name})
+
+
+def _limit_text(limit: int) -> str:
+    """A cap for a message: whole MiB as MB, anything else in bytes."""
+    mib = 1024 * 1024
+    if limit >= mib and limit % mib == 0:
+        return f"{limit // mib:,} MB"
+    return f"{limit:,} bytes"
+
+
+class _Budget:
+    """The member-count and expanded-size caps on one package's TAR (#317).
+
+    A small .tar.gz can expand enough to fill the disk the work directory is
+    on. Every member is counted as its header is read, and so is every folder
+    extraction would make for it that no earlier member made: tarfile makes
+    the missing parent folders of each path, which no header counts. Folders
+    are read from the name as written, as os.makedirs makes them; a name with a
+    `..` component is refused before its folders are counted (#597). A member's
+    header size is added to a running total; for a member that isn't sparse
+    (sparse files are refused) it is exactly what extraction writes, so the
+    total bounds what is written. Equal to a cap is within it.
+    """
+
+    def __init__(self, archive_name: str, dest: Path):
+        self.archive_name = archive_name
+        self.max_members = settings.max_package_members
+        self.max_bytes = settings.max_package_expanded_bytes
+        self.members = 0
+        self.size = 0
+        # Folders as nested dicts, from the filesystem root. The work directory
+        # and its ancestors exist; every node added later has been counted, so
+        # the tree holds no more than the cap's entries.
+        self._root: dict = {}
+        self._work = [self._root]
+        for part in os.path.abspath(dest).split("/"):
+            if part:
+                self._work.append(self._work[-1].setdefault(part, {}))
+
+    def count(self, member: tarfile.TarInfo) -> None:
+        self._entry()
+
+    def folders(self, member: tarfile.TarInfo) -> None:
+        """Count each folder extracting the member would make that is not made yet.
+
+        A directory member's own folder is its entry, already counted.
+        """
+        parts = member.name.split("/")
+        stack = [self._root] if member.name.startswith("/") else list(self._work)
+        last = len(parts) - 1
+        for i, part in enumerate(parts if member.isdir() else parts[:-1]):
+            if part in ("", "."):
+                continue
+            child = stack[-1].get(part)
+            if child is None:
+                child = stack[-1][part] = {}
+                if not (i == last and member.isdir()):
+                    self._entry()
+            stack.append(child)
+
+    def _entry(self) -> None:
+        self.members += 1
+        if self.members > self.max_members:
+            raise PackageError(
+                "PACKAGE_TOO_MANY_MEMBERS",
+                f"'{self.archive_name}' holds more than {self.max_members:,} entries, the "
+                f"most a package may hold (MAX_PACKAGE_MEMBERS), so nothing from it was "
+                f"imported.",
+                {"limit": self.max_members})
+
+    def add(self, member: tarfile.TarInfo) -> None:
+        self.size += member.size
+        if self.size > self.max_bytes:
+            raise PackageError(
+                "PACKAGE_TOO_LARGE",
+                f"'{self.archive_name}' expands to more than {_limit_text(self.max_bytes)} "
+                f"when unpacked, the most a package may expand to "
+                f"(MAX_PACKAGE_EXPANDED_BYTES), so nothing from it was imported.",
+                {"limit": self.max_bytes, "member": member.name})
+
+
+def _admit(member: tarfile.TarInfo, dest: Path, root: Path, budget: _Budget) -> None:
+    """Count the member, check it, count its new folders, then add its size.
+
+    The first failure refuses the package.
+    """
+    budget.count(member)
+    _check_member(member, dest, root)
+    budget.folders(member)
+    budget.add(member)
+
+
+def _safe_extract(tar: tarfile.TarFile, dest: Path, name: str) -> None:
+    """Extract, refusing a package over the caps or any member that would land outside dest.
 
     A package is a file someone was handed, so it is untrusted input. Python
     3.12 has `filter="data"` for this; doing it explicitly keeps the guarantee
-    on 3.11 and makes the refusal auditable.
+    on 3.11 and makes the refusal auditable. Headers are read one at a time and
+    each is checked as it is read, so a refusal stops reading there, holds at
+    most the caps' worth of headers, and leaves dest empty (#317).
     """
     root = dest.resolve()
-    for member in tar.getmembers():
-        if member.issym() or member.islnk():
-            raise PackageError(
-                "PACKAGE_UNREADABLE",
-                f"Package contains a link ('{member.name}'), which is not allowed.",
-                {"member": member.name})
-        if not (member.isfile() or member.isdir()):
-            raise PackageError(
-                "PACKAGE_UNREADABLE",
-                "Package contains a non-regular archive member.",
-                {"member": member.name})
-        target = (dest / member.name).resolve()
-        if target != root and root not in target.parents:
-            raise PackageError(
-                "PACKAGE_UNREADABLE",
-                f"Package contains a path outside the archive ('{member.name}').",
-                {"member": member.name})
+    budget = _Budget(name, dest)
+    for member in tar:
+        _admit(member, dest, root, budget)
     tar.extractall(dest)
 
 
-def open_package(archive: Path, dest: Path) -> tuple[Path, dict]:
+def _safe_extract_stream(tar: tarfile.TarFile, dest: Path, name: str) -> None:
+    """The same checks for a tar read as a stream, one member at a time (#27).
+
+    A stream can't be read twice, so each member is checked, and counted
+    against the caps (#317), just before it is extracted. A refusal part-way
+    leaves only the job's own work directory holding the members before it,
+    within the caps, and the job removes that directory.
+    """
+    root = dest.resolve()
+    budget = _Budget(name, dest)
+    for member in tar:
+        _admit(member, dest, root, budget)
+        tar.extract(member, dest)
+
+
+# Why an encrypted package could not be decrypted, for `error_detail.reason`.
+_DECRYPT_REASONS = {"work_factor": "work_factor", "passphrase": "passphrase",
+                    "hmac": "header", "payload": "payload", "nonce": "payload"}
+
+
+def _extract_encrypted(archive: Path, dest: Path, passphrase: str) -> None:
+    """Check 1 for a `.tar.gz.age` package: decrypt it as a stream into the tar
+    reader, then authenticate the rest of the file to its end (#27).
+
+    No decrypted copy of the archive is written. Every failure comes before
+    check 2, so nothing outside the work directory has been touched.
+    """
+    try:
+        with archive.open("rb") as fh:
+            decryptor = age_stream.open_decrypt(fh, passphrase)
+            with tarfile.open(fileobj=decryptor, mode="r|gz") as tar:
+                _safe_extract_stream(tar, dest, archive.name)
+            # tarfile stops at the end-of-archive blocks; the final chunk, and
+            # anything after it, still has to be authenticated.
+            decryptor.drain()
+    except age_stream.AgeError as exc:
+        if exc.kind in ("header", "recipient"):
+            raise PackageError(
+                "PACKAGE_UNREADABLE",
+                f"'{archive.name}' is not a passphrase-encrypted age file.",
+                {"reason": str(exc)}) from None
+        raise PackageError(
+            "DECRYPT_FAILED",
+            f"'{archive.name}' could not be decrypted: the passphrase is wrong or "
+            "the file is damaged.",
+            {"reason": _DECRYPT_REASONS[exc.kind]}) from None
+
+
+@telemetry.traced("rag.package")
+def open_package(archive: Path, dest: Path, passphrase: str | None = None) -> tuple[Path, dict]:
     """Checks 1 and 2 of spec §6.2: readable archive, understood format.
 
-    Returns (package root directory, manifest).
+    A `.tar.gz.age` package is decrypted with `passphrase` as it is unpacked
+    (#27); everything from check 2 on reads the decrypted files, as for an
+    unencrypted package. Returns (package root directory, manifest).
     """
     if not archive.is_file():
         raise PackageError("PACKAGE_UNREADABLE",
                            f"No package named '{archive.name}' in the exports directory.")
+    encrypted = age_stream.is_encrypted_name(archive.name)
     try:
-        with tarfile.open(archive, "r:gz") as tar:
-            _safe_extract(tar, dest)
+        if encrypted:
+            _extract_encrypted(archive, dest, passphrase or "")
+        else:
+            with tarfile.open(archive, "r:gz") as tar:
+                _safe_extract(tar, dest, archive.name)
     except PackageError:
         raise
     except (tarfile.TarError, OSError, EOFError) as exc:
         raise PackageError("PACKAGE_UNREADABLE",
-                           f"'{archive.name}' is not a readable .tar.gz archive.",
+                           f"'{archive.name}' is not a readable "
+                           f"{'encrypted ' if encrypted else ''}.tar.gz archive.",
                            {"reason": f"{type(exc).__name__}: {exc}"}) from exc
 
     roots = [p for p in dest.iterdir() if p.is_dir()]
@@ -598,9 +966,39 @@ def open_package(archive: Path, dest: Path) -> tuple[Path, dict]:
     return pkg, manifest
 
 
+def _contained_file_key(root: Path, rel: str) -> bool:
+    """True when a manifest `files` key names a file inside the package.
+
+    The manifest is untrusted: an absolute key, a `..` key or a key through a
+    link would otherwise make check 3 hash a file outside the package and
+    report its digest (#371). `root` is the resolved package directory.
+    """
+    if not rel or rel.startswith("/") or ".." in rel.split("/"):
+        return False
+    if PurePosixPath(rel).as_posix() != rel:
+        return False
+    try:
+        target = (root / rel).resolve()
+    except (OSError, ValueError, RuntimeError):
+        return False
+    return root in target.parents
+
+
+@telemetry.traced("rag.validate")
 def verify_digests(pkg: Path, manifest: dict) -> None:
-    """Check 3 of spec §6.2. Names the first file that fails."""
-    for rel, expected in sorted(manifest.get("files", {}).items()):
+    """Check 3 of spec §6.2. Names the first file that fails.
+
+    Every key is checked to be inside the package before anything is hashed.
+    """
+    files = manifest.get("files", {})
+    root = pkg.resolve()
+    if not all(_contained_file_key(root, rel) for rel in files):
+        raise PackageError(
+            "PACKAGE_CORRUPT",
+            "The manifest lists a file outside the package; the package is damaged "
+            "or was modified after export.",
+            {"file": "manifest.json"})
+    for rel, expected in sorted(files.items()):
         target = pkg / rel
         if not target.is_file():
             raise PackageError("PACKAGE_CORRUPT",

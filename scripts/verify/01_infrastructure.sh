@@ -8,6 +8,62 @@ require_stack
 C="${PREFIX}Infra"
 
 section "§10.5 Infrastructure"
+# Synthetic loopback receiver inside an isolated container; no collector or
+# external network is needed and no request payload from the stack is captured.
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_telemetry.py)
+check "OTel configuration, safe OTLP export and bounded lifecycle" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_tracing.py)
+check "OTel request, worker and dependency trace continuity" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_telemetry_operations.py)
+check "OTel operational metrics and sanitized correlated logs" $?
+# Collector evidence and packaging regressions run in both default and enabled
+# modes. Compose needs the host Docker CLI; Packager needs Git for its scratch
+# checkout. Neither class starts services (Packager stubs Docker).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_telemetry_capture.py)
+check "OTel capture evidence, identity and transition regressions" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo/scripts/tests "$(docker compose images -q api)" python -m unittest test_collector.Offline test_collector.Installer)
+check "OTel offline identity and installer regressions" $?
+python3 "$REPO_ROOT/scripts/tests/test_collector.py" Compose Packager
+check "OTel Compose isolation, verification configuration and package regressions" $?
+python3 "$REPO_ROOT/scripts/tests/test_service_inventory.py"
+check "exact default/telemetry infrastructure inventory policy" $?
+python3 "$REPO_ROOT/scripts/tests/test_telemetry_implementation.py"
+check "OTel embedded implementation stays synchronized" $?
+# Both distribution scripts in a scratch git repository, docker stubbed (#384).
+python3 "$REPO_ROOT/scripts/tests/test_package_archives.py"
+check "Distribution archives hold only the tracked files of HEAD (#384)" $?
+python3 "$REPO_ROOT/scripts/tests/test_suite_registration.py"
+check "the verify suites run the test files #386 registered" $?
+python3 "$REPO_ROOT/scripts/tests/test_dependency_floors.py"
+check "pinned dependencies are at or above their patched versions (#522)" $?
+python3 "$REPO_ROOT/scripts/tests/test_weaviate_pin.py"
+check "the Weaviate pin is the same everywhere and Dependabot leaves it alone (#530)" $?
+python3 "$REPO_ROOT/scripts/tests/test_ci_workflow.py"
+check "the CI workflow runs the verify suite on every pull request (#24)" $?
+# Through the app with Weaviate and Ollama mocked, in the same isolated container (#373).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_error_envelope.py)
+check "API errors answer in the JSON envelope, dependency failures 503 (#373)" $?
+# The same envelope through the proxy on the running stack (#373).
+check_eq "an unknown API route answers 404 through the proxy (#373)" \
+  "$(api_code "$API/no-such-route-373")" "404"
+check_eq "  ... in the envelope, code NOT_FOUND" \
+  "$(api_get /no-such-route-373 | jfield "['error']['code']")" "NOT_FOUND"
+# One PUT, read for its status, its Allow header and its envelope code (#456).
+wrong_method=$(api_request -i -X PUT "$API/query" | tr -d '\r')
+check_eq "a wrong method answers 405 through the proxy (#373)" \
+  "$(printf '%s\n' "$wrong_method" | awk 'NR==1 {print $2}')" "405"
+check_eq "  ... with its Allow header, POST" \
+  "$(printf '%s\n' "$wrong_method" | awk 'tolower($1)=="allow:" {print $2}')" "POST"
+check_eq "  ... in the envelope, code METHOD_NOT_ALLOWED" \
+  "$(printf '%s\n' "$wrong_method" | sed '1,/^$/d' | jfield "['error']['code']")" "METHOD_NOT_ALLOWED"
+# /health's 503 body for a missing model or an unreachable dependency, which the
+# Health page reads to show the failing services (#375).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_health.py)
+check "/health answers 503 with the per-service body when a dependency is down (#375)" $?
+# The collection registry is written atomically and kept when it can't be read (#388).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_registry.py)
+check "the collection registry is written atomically and kept when unreadable (#388)" $?
+
 RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
 export RAG_INFRA_TMP
 # Also release the verify lock: this trap replaces the one lock.sh set.
@@ -42,13 +98,13 @@ ENDPY
 check "resolved Compose publishes only the proxy on host loopback" $?
 
 # ── cross-origin access, as SECURITY.md describes it ─────────────────────────
-# SECURITY.md says a web page open in a browser on this machine can call the
-# API, because CORS allows any origin (#25 tracks tightening it). Check that
-# this is still true, so the policy and the code can't drift apart silently:
-# when #25 changes CORS, this check and SECURITY.md change together.
-cors=$(curl -s -D - -o /dev/null -m 10 -H "Origin: http://other.example" "$API/health" \
+# SECURITY.md says the API has no CORS (#25): a page from another origin can't
+# read its answers, and a cookie-authenticated change from one is refused (see
+# 17_auth.sh). Check that no answer carries Access-Control-Allow-Origin, so the
+# policy and the code can't drift apart silently.
+cors=$(command curl -s -D - -o /dev/null -m 10 -H "Origin: http://other.example" "$API/health" \
   | tr -d '\r' | awk -F': ' 'tolower($1)=="access-control-allow-origin"{print $2}')
-check_eq "the API allows any origin, as SECURITY.md describes (#25)" "$cors" "*"
+check_eq "the API sends no Access-Control-Allow-Origin, as SECURITY.md describes (#25)" "$cors" ""
 
 (cd "$REPO_ROOT" && python3 - <<'ENDPY'
 import json, subprocess
@@ -80,9 +136,18 @@ for svc in api weaviate; do
   check_eq "$svc publishes nothing to the host" "$published" "0"
 done
 
-# ── five services, all reporting healthy where a healthcheck exists ──────────
-running=$( (cd "$REPO_ROOT" && docker compose ps --services --filter status=running) | grep -c .)
-check_eq "five services are running" "$running" "5"
+# ── exact service inventory for this guarded verification mode ──────────────
+# The default is exactly api/ollama/proxy/ui/weaviate. Only --telemetry adds
+# otel-collector and otel-capture; arbitrary five/seven services cannot pass.
+verify_service_inventory() {
+  (cd "$REPO_ROOT" && docker compose ps --services --filter status=running) > "$RAG_INFRA_TMP/vfy_running_services" || return 1
+  (cd "$REPO_ROOT" && docker compose ps --all --services) > "$RAG_INFRA_TMP/vfy_all_services" || return 1
+  python3 "$REPO_ROOT/scripts/verify/service_inventory.py" \
+    "$RAG_INFRA_TMP/vfy_compose.json" "$RAG_INFRA_TMP/vfy_running_services" "$RAG_INFRA_TMP/vfy_all_services" \
+    --mode "${RAG_VERIFY_TELEMETRY:-0}" --project "${COMPOSE_PROJECT_NAME:-}" --profiles "${COMPOSE_PROFILES:-}"
+}
+verify_service_inventory
+check "exact configured and running service inventory for verification mode" $?
 unhealthy=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Status}}') | grep -c 'unhealthy' || true)
 check_eq "no service reports unhealthy" "$unhealthy" "0"
 
@@ -116,8 +181,13 @@ check "the memory status agrees with the reported allocation" $?
 
 # Raise the recommendation past the actual allocation (in-process only --
 # neither the running server nor docker-compose.yml is touched) and confirm
-# the status flips and a note is attached.
-(cd "$REPO_ROOT" && docker compose exec -T api env RECOMMENDED_MEMORY_GB=13 python3 -c "
+# the status flips and a note is attached. The override comes from the
+# allocation /health reported, never a constant: a fixed 13 GB stayed 'ok' on
+# any host giving Docker 12.35 GB or more (#536).
+python3 "$REPO_ROOT/scripts/tests/test_memory_override.py"
+check "the memory override always exceeds the reported allocation (#536)" $?
+mem_override=$(python3 "$REPO_ROOT/scripts/verify/memory_override.py" "$RAG_INFRA_TMP/vfy_health.json")
+(cd "$REPO_ROOT" && docker compose exec -T api env RECOMMENDED_MEMORY_GB="$mem_override" python3 -c "
 import json
 from config import Settings
 from services import system_info
@@ -181,6 +251,8 @@ elif [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then
   # Wait up to twice the limit, so a slow restart is still timed (#130).
   elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
   restart_timing_check "$restart_limit" "$elapsed"
+  verify_service_inventory
+  check "exact service inventory survives restart" $?
   api_get "/collections" > "$RAG_INFRA_TMP/vfy_after.json"
   python3 -c "
 import json,sys,os
@@ -270,7 +342,9 @@ ENDPY
   (cd "$REPO_ROOT" && docker compose -p "$project" down >/dev/null 2>&1 && docker compose -p "$project" up -d >/dev/null 2>&1)
   elapsed=$(wait_healthy_timed "$started" $((restart_limit * 2)))
   [ -n "$elapsed" ]
-  check "healthy again after a restart from the snapshot" $? "not healthy after $((restart_limit * 2))s"
+  check "healthy again after a restart from the snapshot (took ${elapsed:-unknown}s)" $? "not healthy after $((restart_limit * 2))s"
+  verify_service_inventory
+  check "exact service inventory survives snapshot restart" $?
   # Weaviate logs the snapshot it started from on "raft node constructed".
   restored=$( (cd "$REPO_ROOT" && docker compose -p "$project" logs weaviate 2>/dev/null) | python3 -c "
 import json, sys
@@ -312,6 +386,11 @@ finally:
     wc.close_client()
 '))
 check_eq "no abandoned owned scratch collections" "$staging" "0"
+
+# Ingest, query, metrics and health API paths (#399). Last: its opt-in first-start
+# check removes the project's volumes.
+bash ./16_api_paths.sh
+check "API path checks (16_api_paths.sh, #399)" $?
 
 drop_collection "$C"
 cleanup_prefixed

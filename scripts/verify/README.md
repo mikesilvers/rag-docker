@@ -8,9 +8,87 @@ verify project, never the live stack (#152).
 bash scripts/verify/stack.sh run                    # everything, ~20 min plus start-up
 RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run    # skip LLM work, ~8 min, start-up included
 bash scripts/verify/stack.sh run 02 04              # only the named suites
+bash scripts/verify/stack.sh run --lan              # LAN mode, TLS on loopback only (#26)
 ```
 
 Exits non-zero if any check fails.
+
+## Test accounts (#25)
+
+Every API route but `/health` and the login needs a session, so the suites log in.
+`require_stack` (in `lib.sh`) runs `auth_setup.py ensure`, which makes sure the verify project
+has one account per role, `vfy-engineer`, `vfy-developer` and `vfy-end-user`, whose passwords it
+knows:
+
+- On a project that isn't set up yet it runs `python -m auth bootstrap vfy-engineer` in the api
+  container; a missing account is created with `create-user`, and one whose stored password no
+  longer works (a new verify project, say) gets `reset-password`. Each generated password is
+  replaced at first login with a fresh random one, as the API requires.
+- The operator command runs only when the target is the verify project as `stack.sh` sets it up
+  (`COMPOSE_PROJECT_NAME=rag-verify` and the overlay in `COMPOSE_FILE`, the same condition as
+  removing its volumes). Anywhere else a password that doesn't work is a failure, never a reset.
+- The passwords live only in `$RAG_AUTH_DIR/credentials` (default
+  `${TMPDIR:-/tmp}/rag-verify-auth-<uid>`): mode 0600, in a folder of mode 0700 that is the user's
+  own (a symlink, a file or someone else's folder there is refused), outside the checkout. They
+  are never printed, put on a command line or in the environment, or written to the `export`
+  lines `stack.sh up` prints (which CI copies into its job environment). They reach the API only
+  in request bodies, and the browser checks on standard input.
+
+nginx allows 10 logins a minute per client address with a burst of 5 (#577), and every harness
+request comes from one address, so the harness waits for a slot instead of failing: a login nginx
+refuses with `429 LOGIN_RATE_LIMITED` is sent again every 6.5 s for up to 5 minutes, by
+`auth_setup.request` and `paced` (used by `auth_stack.py`'s `code`, `audit_stack.py` and
+`lan_stack.py`) and by `browser/lib.js`'s `login`; `browser/ui_criteria.js`'s §10.4 login through
+the login form is submitted once more after 6.5 s when the page shows nginx's refusal. The API's
+own `429 LOGIN_THROTTLED` and every other answer reach the check at once. Suites that log in often
+take longer for it.
+
+`require_stack` then logs `vfy-engineer` in, into the curl cookie jar
+`$RAG_AUTH_DIR/engineer.jar` (0600), exported as `RAG_AUTH_JAR`. `lib.sh` defines `curl` as a
+function that adds that jar and an `Origin` matching `RAG_API` (the API refuses a
+cookie-authenticated change without one), so every curl in a suite, and the `api_*` helpers,
+send the session. A check that needs no session, another role or another origin calls `command
+curl`. `auth_jar <role>` logs another role in. The host-side Python helpers that call the API
+read the jar through `auth_headers.py`; in-process checks in the API image use
+`auth.testing.headers()`, a real account and session in a temporary store, never a bypass.
+
+`17_auth.sh` checks authentication itself: the endpoint/role matrix for no session and each
+role (written out in `auth_stack.py`, not read from the API), login, logout, cookies, origin
+rules, throttling, nginx's login rate limit (logins sent without waiting until one is refused
+`429 LOGIN_RATE_LIMITED` in the error envelope, and no audit record for the refused ones), the
+operator command's effect on existing sessions (on throwaway `vfy-t-*`
+accounts), an Engineer's account administration through the API (on a throwaway account; the
+generated passwords must not reach the API log), service API keys (throwaway `vfy-s-*`
+principals created through the API by the harness Engineer: the matrix with a key of each role
+and no `Origin`, rotation, revocation, expiry, a disabled principal, invalid keys; the keys stay in
+memory, are never printed and must not reach the API log), idle expiry, and that the API log holds
+no harness secret.
+
+`19_audit.sh` checks the audit log (#29), reading it through `GET /audit` as the harness
+Engineer: who may read it (End User, Developer and an engineer-role key refused), the records of
+the API's start, a login, a failed login and a logout, a query (without its question text), a
+collection created, ingested into, exported with a passphrase and deleted (a throwaway
+`VfyAudit*` collection; the ingest and export each recorded as accepted and ended with the same
+job id; the package is removed afterwards), a Developer's refused delete, an Engineer's principal
+and key administration (a throwaway `vfy-s-*` principal), filters, paging and the CSV, and that no
+harness password, session token, key, typed password or passphrase reaches the audit files, which
+it reads in the api container, that parallel failed logins (5, nginx's login burst) appended alongside the operator
+command are each recorded once on whole lines, and that three failed logins for one username are one record at once
+and, when the 60-second window closes, one record with `details.count` and `last_attempt` (#577).
+`../tests/test_audit.py` covers the rest in the API image, among it the counting of repeated failed logins, ids
+that stay in order across processes and a clock that steps back, the telemetry route list and the Audit page's
+action list (#577).
+
+`21_prepare.sh` checks document preparation (#638, SPECIFICATIONS.md §3.1.11 and §10.8). It runs
+`../tests/test_prepare.py` in the API image with no network and a stub LLM (windows and the fidelity check,
+the LLM's limits, titles and summaries, the labels of CSV and JSON parts, normalisation, parts and names, JSON to JSON Lines, the storage limit,
+jobs, cancel and restart, busy documents, import, downloads, routes), then checks the verify project through
+`prepare_stack.py` as the harness Developer: the role matrix of every `/prepare` route, an upload with a ZIP,
+ZIP refusals with ingest's codes, the raw download and the space used, deletes, import refusals, an unknown
+job's cancel and the audit records. In a full run (not `RAG_SKIP_SLOW=1`) it prepares three small files with
+the local LLM, one job at a time, checks that the cleaned text holds only source lines in order and that the
+CSV and JSON Lines come back unchanged, labelled from their data, imports them into a throwaway `VfyPrepare*` collection and downloads a
+prepared part. Its `vfy-prepare-*` documents and its collections are removed at the end.
 
 ## Entry point and verify project
 
@@ -22,8 +100,8 @@ against" below).
 
 | Command | What it does |
 |---|---|
-| `stack.sh run [--checkout DIR] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
-| `stack.sh up [--checkout DIR] [--pull]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. |
+| `stack.sh run [--checkout DIR] [--telemetry \| --lan] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
+| `stack.sh up [--checkout DIR] [--pull] [--lan]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. |
 | `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
 
 `--checkout` is the checkout to build and test; the default is the one holding
@@ -83,11 +161,52 @@ What makes it separate from the live stack:
   stops the orphaned suite instead: `lock.sh` trusts an inherited
   `RAG_VERIFY_LOCK_HELD` only while the lock's pid is that shell or one of its
   ancestors, and `lib.sh`'s API helpers (`api_get`, `api_post`, `api_code`,
-  `api_post_code`, `drop_collection`, `make_collection` and every
+  `api_post_code`, `api_request`, `drop_collection`, `make_collection` and every
   `wait_for_job` poll) repeat that check before each request and end the
   suite, exit 3, when it fails. Not re-checked: direct `curl` and
   `docker compose exec` calls in the suites, and the Python helpers, which
   end on their own timeouts (up to 900 s).
+
+### LAN mode (#26)
+
+`stack.sh run --lan` (and `up --lan`) runs the verify project in LAN mode
+without exposing the host:
+
+1. It comes up in its default configuration, checked by the guard as usual.
+2. It creates the first Engineer, `vfy-engineer`, with the operator command,
+   as the README tells users to before switching (the project is always new
+   here). The generated password is discarded unseen; `auth_setup.py` resets
+   it later like any password it doesn't know.
+3. It switches `COMPOSE_FILE` to the base file, the checkout's
+   `docker-compose.lan.yml`, this checkout's `docker-compose.verify.yml` and
+   `docker-compose.lan.verify.yml`. That harness-only overlay replaces the
+   override's `0.0.0.0:443` with `127.0.0.1:<verify port>:443`, gives `tls-init`
+   the verify image and sets `RAG_LAN_HOSTNAMES` to reserved test names
+   (`vfy-lan.invalid`, `192.0.2.10`).
+4. The guard checks that configuration, with rule (c) wanting exactly
+   `proxy:127.0.0.1:<verify port>->443/tcp`; every other rule is unchanged, for
+   `tls-init` too. Then `up --no-build --wait` recreates what changed.
+5. It copies the certificate `tls-init` generated from the proxy to
+   `${TMPDIR:-/tmp}/rag-verify-<uid>/lan-cert.pem` (0600) and exports
+   `RAG_API=https://localhost:<port>/api`, and that file as `CURL_CA_BUNDLE`,
+   `SSL_CERT_FILE` and `RAG_VERIFY_LAN_CERT`, so curl and Python trust it, and
+   only it, with the name `localhost`. `RAG_VERIFY_LAN=1` tells the suites.
+
+Without suite names a `--lan` run runs `18_lan` only: the other suites expect
+the default configuration (suite 01's binding and service-inventory checks
+would fail by design). `--lan` can't be combined with `--telemetry`.
+
+`18_lan.sh` runs in every run. It always checks the real override with
+`lan_config.py` (`docker compose config` of the base file plus
+`docker-compose.lan.yml`, under the project name `rag-lan-config`, with no
+`.env`; nothing is created) and runs `../tests/test_lan_mode.py` in the API
+image. Only in a `--lan` run does it check the running LAN project through
+`lan_stack.py`: HTTPS with the generated certificate, TLS versions and HTTP/2,
+the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
+the API's refusal in one-off containers (`docker compose run --rm
+--no-deps`, no ports) and nginx's login rate limit (logins sent without
+waiting until one is refused `429 LOGIN_RATE_LIMITED`, #577); it also prints
+the client address nginx recorded.
 
 **Memory.** The verify project runs next to the live stack on the same Docker
 VM. With 12 GB allocated, both fit while one LLM is loaded; when both stacks
@@ -111,26 +230,73 @@ also its default. `stack.sh` sets both for the verify project.
 their own deployment on purpose. The documented commands and the PR review
 never use it. Restarts never reach the live project, even with it: with
 `RAG_ALLOW_RESTART=1`, the restart checks in `01_infrastructure.sh`,
-`04_goldstandard.sh` and `05_transfer.sh` run only when `COMPOSE_PROJECT_NAME`
+`02_ingest.sh`, `03_query.sh`, `04_goldstandard.sh`, `05_transfer.sh` and `16_api_paths.sh` run only when `COMPOSE_PROJECT_NAME`
 is set and isn't `rag-docker`; otherwise they fail with the reason and restart
+nothing. The first-start check in `16_api_paths.sh` removes the project's
+volumes (`down -v`), so it asks more (#465, `volume_removal_refusal_reason` in
+`lib.sh`): `COMPOSE_PROJECT_NAME` must be `rag-verify` and `COMPOSE_FILE` must
+include `docker-compose.verify.yml`, whose model volume is external and kept, as
+`stack.sh` sets them. Otherwise that check fails with the reason and removes
 nothing.
 
 `python3 scripts/tests/test_verify_stack.py` checks `stack.sh`, the
 configuration check and both refusals, with Docker replaced by a stub, so it
 needs no stack.
 
+## Continuous integration
+
+`.github/workflows/verify.yml` runs the suite on GitHub Actions for every pull
+request to `develop` or `main` (#24), on `ubuntu-latest`, with `RAG_SKIP_SLOW=1`.
+It uses the same verify project as a local run and never sets
+`RAG_VERIFY_LIVE`; nothing in it changes the refusals above. The badge at the
+top of the main `README.md` shows its result on `develop`.
+
+- **Up, suites, logs, down.** `stack.sh run` removes the project before its
+  logs could be saved, so the workflow takes the `up` route: `stack.sh up`
+  (which waits for every service and for `/api/health`), `all.sh` with the
+  environment `up` prints, then the logs, then `stack.sh down`. The logs and
+  `down` steps run whether the earlier steps passed or not.
+- **The `compose-logs` artifact.** Every run uploads `docker compose logs` of
+  every service, with timestamps, and `docker compose ps -a`, also when `up`
+  failed.
+- **The model cache.** Even with `RAG_SKIP_SLOW=1`, ingest needs the embedding
+  model, so Ollama starts with both models (about 2.5 GB). The cache key is
+  built from the models `ollama/entrypoint.sh` pulls
+  (`ollama-models-phi3.5-nomic-embed-text`). On a hit, the cached models are
+  copied into `rag-verify-ollama-models` before `up`, and Ollama pulls
+  nothing. On a miss, Ollama pulls them; after `down`, the workflow copies the
+  volume's `models/` folder out, only once every model's manifest is there,
+  and saves it under that key. Ollama's key pair, kept beside `models/`, is
+  never cached. Both copies run in the ollama image `docker-compose.yml` pins,
+  with no network. GitHub scopes a cache saved by a pull request run to that
+  pull request, so a pull request reuses it on later pushes and re-runs; the
+  next pull request pulls the models once again.
+- **Permissions.** The workflow can only read the repository
+  (`contents: read`), uses no secrets, and leaves no token in the checkout.
+  Its actions are GitHub's own, each pinned to a full commit SHA. Pull
+  requests from outside contributors run only after the maintainer approves
+  them.
+
+`python3 scripts/tests/test_ci_workflow.py`, run by `01_infrastructure.sh`,
+checks these rules on the workflow file. The workflow's own run on the pull
+request is its real test.
+
 ## Settings publication regressions
 
 With API dependencies installed, run
 `python3 scripts/tests/test_settings_persistence.py` for deterministic ingest and
 retrieval save contention, unique temporary paths, first-save directory races,
-and failed serialization/create/write/close/replace preservation. The test also
+failed serialization/create/write/close/replace preservation, and the folder
+fsync after the replacement, including import publication and a failed folder
+fsync (#445). The test also
 checks affected embedded sources against `IMPLEMENTATION.md`. It uses disposable
 directories and does not connect to Weaviate or Ollama.
 
 `07_settings.sh` runs the controlled persistence cases inside the disposable
 verify-project API container, then runs its HTTP validation and round-trip checks. This coverage complements the required full
 verification run; it does not establish full-stack acceptance by itself.
+
+Suite 04 also registers `test_chunk_sampling.py` through `09_sampling.sh`, including guard release before model generation and after sampling/publication failures.
 
 Suite 07 also runs `scripts/tests/test_settings_implementation.py` on the host
 (no API dependencies), and 15 rounds of 12 concurrent live saves per ingest and
@@ -140,7 +306,11 @@ retrieval route. The persistence cases cover failed import-config publication.
 
 Run `python3 scripts/tests/test_session_implementation.py` from the repository root to check that the embedded session/import/package service examples retain the current validated implementation.
 
-`05_transfer.sh` registers the four controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_retrieval_import.py` and `test_batch_recovery.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links.
+Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).
+
+`05_transfer.sh` registers the nine controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py`, `test_package_listing.py` and `test_export_encryption.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work.
+
+`scripts/tests/test_export_snapshot.py` (#509, API container) drives `exporter._run` with the real `packager.build` and retained-source store and a mocked Weaviate backend whose iterator reads the stored chunks one at a time. A re-ingest that tries to commit new chunks and a new `doc.txt` source after the first chunk is streamed waits for the export: the package holds the old chunk text and the old source bytes and index, every chunk's `source_sha256` names a blob in `sources/`, and the re-ingest lands after the build. During an export, gold-standard generation preparation answers `COLLECTION_BUSY` (409) and a guarded chunk insert waits; an export started while another writer holds the guard reads `queued` until it is released; and the guard is free again after an export that succeeds, is refused (`PackageError`), fails or is cancelled. An export whose build is cancelled, or ended by another non-`Exception`, reads `failed` with an `error` naming the exception and saying it was cancelled, and the exception still propagates (#521). Orderings use events and the guard's waiter count. On the code before #509 the re-ingest, generation, insert, queued and guard-held checks fail; on the code before #521 the cancelled-status checks fail.
 
 `scripts/tests/test_session_import.py` exercises the real package reader and
 evaluation persistence with disposable fixtures. Model and database mutation
@@ -171,7 +341,11 @@ uv run --no-project --python 3.11 \
 `scripts/tests/test_retrieval_import.py` adds controlled digest-valid malformed
 retrieval package rejection before model, backend, recovery, or sidecar mutation;
 historical defaults/coercion and `ef` round trips; and generated Python literal
-regressions. Run it with the same API dependencies as the session import test.
+regressions. Its `IngestImportTests` do the same for `ingest_config.json`
+(E35, #510): malformed ingest settings are refused `PACKAGE_CORRUPT` in every
+conflict mode before any live change, and valid ones, including chunk sizes from
+before the #53 bounds, are restored from the checked snapshot and read back
+through `GET /ingest/config`. Run it with the same API dependencies as the session import test.
 `05_transfer.sh` registers it and `retrieval_settings.py` (E28), which submits
 15 malformed settings imports across abort/rename/replace and verifies live
 collection counts and saved settings are unchanged. The normal rename import
@@ -184,10 +358,414 @@ packages are written under a `.part` name and renamed into place, because on
 Docker Desktop the API can read a freshly written bind-mounted file as empty. Controlled tests complement,
 and do not replace, this live acceptance.
 
+`15_transfer_paths.sh` (#387), run by `05_transfer.sh`, covers transfer and tuning paths that
+had no check. It runs five controlled tests, then live checks on a collection of its own.
+`scripts/tests/test_package_refusals.py` (API container) checks that `open_package` refuses a
+missing file, a file that isn't gzip and a truncated archive (`PACKAGE_UNREADABLE`), a symlink,
+a hardlink and a `../` member, naming the member and extracting nothing, an archive with two
+top-level directories, and a package with no manifest, a manifest that isn't JSON or a newer
+`package_format` (`PACKAGE_FORMAT_UNSUPPORTED`). It also checks that a member with a `..`
+component that resolves inside the package, whether or not it names a folder outside the work
+directory, is refused `PACKAGE_UNREADABLE` for a `.tar.gz` and a `.tar.gz.age` package without
+any of its folders being made, and that dots within a component are allowed (#597). Through
+`importer._run`, with Weaviate and the
+model checks mocked, a digest-valid package naming a collection Weaviate can't use is
+`PACKAGE_FORMAT_UNSUPPORTED` before any lookup, and one with a `chunks.jsonl` line that isn't
+JSON, a bad UUID, properties that aren't an object, a missing or short vector, or a chunk count
+above or below the manifest's is `PACKAGE_CORRUPT` before any collection is created, with
+`abort` and `rename`. `scripts/tests/test_package_limits.py` (API container, with caps of
+1 MiB and 20 entries set through `MAX_PACKAGE_EXPANDED_BYTES` and `MAX_PACKAGE_MEMBERS`, #317)
+checks that a `.tar.gz` and a `.tar.gz.age` package exactly at each cap open, and that one entry
+or one byte over is refused `PACKAGE_TOO_MANY_MEMBERS` or `PACKAGE_TOO_LARGE` with the exact
+message and `detail`; a negative-size entry before an over-cap file is refused
+`PACKAGE_UNREADABLE`; a sparse file in each of the four formats (old GNU `S`, PAX 0.0, 0.1,
+1.0) is refused `PACKAGE_UNREADABLE`; folders implied by a file's path count as entries
+(at the cap it opens, one folder over is refused `PACKAGE_TOO_MANY_MEMBERS`), while a name with
+a `..` component is refused `PACKAGE_UNREADABLE` before its folders are counted and a folder with
+its own entry counts once; a `.tar.gz` refusal extracts nothing and reads no header past the refusing
+entry, a `.tar.gz.age` refusal leaves at most the cap's bytes, and through `importer._run` each
+refusal fails the job with no collection created and no work directory left. The suite then
+checks that `docker-compose.yml`'s values (16 GiB, 100,000) reach the API.
+`scripts/tests/test_transfer_paths.py` (API container, through the app)
+checks that a missing, `null` or unknown `on_conflict` is 422 `INVALID_PARAMETER`, a second
+import of a running file 409 `IMPORT_IN_PROGRESS`, unknown export, import and tune job ids 404
+`JOB_NOT_FOUND`, that a query is answered while an export build is held in its worker thread,
+`GET /packages` with a readable and an unreadable package, the help page's "its own number of"
+fallback when the embedding probe fails and `HELP_RENDER_FAILED` for a missing partial or an
+unsubstituted placeholder, 409 `TUNE_IN_PROGRESS` for a second tune start under either
+spelling, and a re-chunk that produces no chunks failing `SOURCES_REQUIRED` before any rebuild.
+`scripts/tests/test_retrieve_script.py` (API container) renders `retrieve.py` with the exporter
+and runs it with `python -I -S` against a stub API: standard-library imports only, the baked
+defaults sent, every flag overriding its default, and the exit codes of
+`RAG_EXPORT_SPECIFICATIONS.md` section 5.1 (2 bad usage; 3 refused connection, 502/503/504 and
+timeout; 4 enveloped `COLLECTION_NOT_FOUND`; 5 bare 404, other errors and non-JSON), each
+failure one `error:` sentence and a hint. `scripts/tests/test_distribution.py` (host, standard
+library) builds `package.sh`'s zip and `package-offline.sh`'s bundle from a copy of the tracked
+tree with excluded files planted and reads them back, runs `package-offline.sh` and
+`install-offline.sh` with `docker` and `sleep` replaced by logging stubs (nothing is saved,
+loaded or started), and checks the bundled image list against
+`docker compose config --images`. The copy is a real git repository with the tracked files
+committed (git ignoring the user's and the system's configuration), because both scripts
+archive `HEAD` with `git archive` (#384); the excluded files are planted untracked, as in a
+real checkout, so the tests show `git archive` leaves them out, a top-level `.env.<suffix>`
+such as `.env.local` included (SPECIFICATIONS.md section 11.2 excludes `.env*`). Its
+`install-offline.sh` wait test records that the wait counts running services, not healthy ones.
+
+The live checks: unknown job ids, `on_conflict` 422s, `GET /packages` with a junk
+`ragpkg-*.tar.gz`, seventeen crafted copies of the suite's package written by
+`transfer_packages.py` (one per refusal above) and a missing file, each refused with its code
+and no collection created, a malformed copy refused by `replace` with the collection intact,
+the package's bytes, size and mtime unchanged by a `rename` import, the same chunks and scores
+from the original and the import for vector, hybrid and near-text retrieval (E11; `/query`
+rewrites the question with the LLM first, so answers are not compared), an export with models
+requested and the model store setting pointed at a missing folder (warning,
+`models_bundled: false`, no `models/`), the packaged `retrieve.py` exiting 3 against a closed
+port (E10) and, unless `RAG_SKIP_SLOW=1`, answering with the baked top-k and with `--top-k 2`
+(E8, E9) and from the import, and a re-chunk after the retained original is replaced with blank
+text failing `SOURCES_REQUIRED`. `sweep_stale_workdirs` (TR:C30) is covered by
+`test_startup_sweep.py`.
+
+`scripts/tests/test_import_embedding.py` (#390) runs import check 4 for real (E12):
+an import job of a digest-valid package embedded with another model is refused
+`EMBEDDING_MISMATCH` before any model, backend or sidecar step, naming both models
+and both dimension counts (or saying this instance's count couldn't be read), with
+no promise of re-embedding; a same-name package of another width is refused too.
+It also checks that a model installed from a package is confirmed through Ollama's
+model list: reported, not reported, and Ollama unreachable. Only Ollama is
+replaced. `05_transfer.sh` runs it in the verify project's API container.
+
+`scripts/tests/test_import_guard.py` (#391) runs concurrent import jobs with
+Weaviate mocked: two spellings of one package file (`./x.tar.gz`, `a/../x.tar.gz`)
+answer 409 `IMPORT_IN_PROGRESS`; a second import into a target another import is
+building fails `IMPORT_IN_PROGRESS` naming the collection, whatever either job's
+`on_conflict`, never builds, and leaves the first job's in-progress marker in place;
+imports into different targets run side by side; a `rename` claims its new name and
+frees the original. With the target created at the start of the build, as Weaviate
+does, a second `abort`, `rename` or `replace` import is still refused
+`IMPORT_IN_PROGRESS`, so the claim is checked to come before the existence check; a
+refused job's `POST /import` answers 202 and registers nothing against the
+collection; a target is free again after its import fails; and a start whose first
+job record can't be stored releases the package name. `05_transfer.sh` runs it in
+the verify project's API container.
+
+`scripts/tests/test_ingest_errors.py` (#290) checks that damaged or unreadable ZIPs are
+refused as a whole with readable 400s naming their unreadable members (truncated archive,
+wrong member offsets, bad CRC, also in a member that would be skipped, unsupported
+compression, encrypted member, filesystem error), unexpected errors with a JSON 500 and a
+logged traceback, which inputs are queued (JSON Lines direct and as members, #291; a direct
+`.json.gz` and other gzip types skipped), and that gzipped JSON members are decompressed
+within their limit with clear per-file errors. Since #298 it also checks a ZIP with damaged and
+unsupported members together (`ARCHIVE_UNREADABLE`, generic remedy), `UPLOAD_WRITE_FAILED` when
+saving the upload itself fails, names with a newline logged escaped in every ingest log line that
+carries one, the retained `media_type` of gzipped files (`application/gzip`), and rechunk of a
+retained `.json.gz`. Weaviate and source retention are mocked. `02_ingest.sh` runs it
+in the verify project's API container, then checks a truncated ZIP and a ZIP of
+`.json`, `.json.gz` and `.jsonl.gz` members through the proxy. `browser/ui_criteria.js`
+(suite 06) checks that the Import page shows the API's message for a truncated ZIP and a
+failing status poll, and that a new ingest and the next successful poll clear that error.
+Since #394 it also checks, with the list, upload and polls stubbed, that the job ID and a
+queued panel show as soon as an upload is accepted, before the first poll, and stay through a
+failed poll; that the first answered poll replaces the panel while the job ID stays; and that
+"Start Ingest" with no collection selected says so and sends nothing. Since #458 it also checks
+that the job ID stays shown after the job ends, is left as it was by an upload the API refuses,
+and is replaced by a later accepted upload.
+
+`scripts/tests/test_zip_expansion.py` (#298) checks the total expanded-size cap on an
+upload's ZIPs with a 1 MiB cap set through `MAX_ZIP_EXPANDED_BYTES` (`02_ingest.sh` passes it
+to the container; the test sets it when absent): declared sizes over the cap refused before
+any member is read, a total at the cap accepted and one byte over refused, one total for every
+ZIP in the upload, counting when declared sizes understate, `.json.gz` and `.jsonl.gz` output
+counted (concatenated streams and zero padding too), a corrupt gzip accepted and a truncated
+one counted, a direct `.jsonl.gz` not counted, the cap passed after an unreadable member, no
+member read and gzip counting stopped within one block once the cap is passed, gzip headers
+that zlib refuses but the job reads (FHCRC with a bogus CRC, a reserved flag bit) still
+counted, the count equal to what the job's gzip reader produces, zero padding and a long gzip
+file name read in blocks, bytes read ahead past a stream's end counted once, the cap still
+stopping a read through that buffer, ZIP damage found during the gzip count refused as
+`ARCHIVE_UNREADABLE`, the exact message and `detail`, the 2 GiB default, and that ZIP work runs
+in a worker thread while the event loop serves other work. `02_ingest.sh` runs it in the API
+container, checks that the API takes the 2 GiB cap from `docker-compose.yml`'s
+`MAX_ZIP_EXPANDED_BYTES`, then, at the default cap, sends `zip_over_declared.zip` (declares
+2,049 MiB) and `zip_over_gzip.zip` (a gzip member expanding to 2,112 MiB) through the proxy,
+checks each is refused with `ARCHIVE_TOO_LARGE` and the exact message, and that job polls sent
+while the second is counted are answered within a second (a smoke check; the controlled test is
+the one that tells off-loop from on-loop work). Cases there that use a large member of one
+repeated byte only to reach the total store it uncompressed, so the ratio cap (#28) doesn't
+refuse it first.
+
+`scripts/tests/test_zip_limits.py` (#28) checks the member-count and compression-ratio caps
+with a member cap of 20 set through `MAX_ZIP_MEMBERS` (`02_ingest.sh` passes it to the
+container; the test sets it when absent): the settings and their 5,000 and 200 defaults, 20
+entries accepted and 21 refused before any member is read, folders, unsupported files, macOS
+metadata and members leaving the archive all counted, the count per ZIP and winning over
+damage, 5,001 entries refused at the default; the ratio rule (under 1 MiB exempt, exactly the
+ratio accepted), a declared ratio refused before anything is read, a stored member and gzip
+output not counted toward the ratio, a member refused while read within a block of passing the
+ratio, the expansion cap winning over the ratio and the ratio over an earlier unreadable member;
+the count winning over the declared total, and the total over the ratio while a member is read
+(#534); members whose path leaves the archive validated (a corrupt one refuses the ZIP, an
+encrypted one makes it `ARCHIVE_UNSUPPORTED`), counted, never staged and listed in `skipped`;
+and `detail.members` bounded to the ten members the message names, with `members_omitted`
+(0 at exactly ten). `02_ingest.sh` runs it in the API container, checks
+that the API takes `MAX_ZIP_MEMBERS` 5,000 and `MAX_ZIP_MEMBER_RATIO` 200 from
+`docker-compose.yml`, then sends `zip_many_members.zip` (5,001 entries) and
+`zip_high_ratio.zip` (2 MiB of zeros, Deflate) through the proxy and checks each is refused
+with `ARCHIVE_TOO_MANY_MEMBERS` or `ARCHIVE_RATIO_TOO_HIGH` and the exact message and `detail`.
+
+`scripts/tests/test_json_ingest.py` (#295) checks that ordinary JSON becomes readable
+`key: value` text: dotted and indexed paths, scalar arrays on one line, file key order,
+non-ASCII text and numbers as written, one element per top-level record, empty values and
+files giving no chunks, element-schema files still rehydrated, a byte-order mark accepted,
+converted text bounded by the chunker's per-file limit (a long key over many values fails
+fast with bounded memory), and readable errors for invalid JSON in `.json` files and
+`.json.gz` members. For #300 it also checks the bounds on what one JSON file may cost: the
+blank lines between records charged to the text limit (exactly at the limit, and one dropped
+record refunded), the 1,000,000-record cap (records with no text not counted; a file of
+1,000,001 tiny records fails fast with a bounded peak and builds no elements; an
+element-schema file's items counted too, items with no text included, before `partition_json`
+runs, and the cap applied at and one past the edge when a retained element file is rechunked,
+#321), the 30,000,000-byte input limit at and one past the edge (element-schema files and a
+byte-order mark included), a `.json.gz` member that stops decompressing at that limit, the
+exact messages, a job where over-limit files fail alone, the traced peak of deep long keys and
+of an over-long scalar array, and that an element-schema file's first parse is freed before
+`partition_json` runs. `02_ingest.sh` runs it in the API container, then ingests a nested
+`plain.json` through the proxy and reads its stored chunks back to confirm they hold that text.
+It then uploads `json_over_size.json` (30,000,001 bytes), `json_many_records.json` (1,000,001
+records), `json_over_size_gz.zip` (a `.json.gz` member one byte over the limit when
+decompressed), `json_over_size_member.zip` (a `.json` member one byte over the limit) and
+`plain.json` together, and checks that the job is `partial`, each over-limit file fails with
+its exact message, and `plain.json` is stored.
+
+`scripts/tests/test_jsonl_ingest.py` (#291) checks that JSON Lines (`.jsonl`, `.jsonl.gz`)
+becomes one `key: value` record per line, separated by blank lines, with one element per
+record: object, array and scalar lines, lines with no text dropped, CRLF, a byte-order mark,
+no final newline, trailing blank lines accepted and U+2028 kept inside its line. Every line
+error names its line and only the first is reported (blank, invalid JSON, `NaN`, deep nesting,
+non-UTF-8 with its byte offset); the 10,000,000-byte line limit and the 10,000,000-character
+text limit are checked at and one past their edges, and a file far over the limit stops
+being read at the line that passes it, with a small traced peak. The line limit counts neither
+the line ending nor line 1's byte-order mark (#314): it is checked at and one past its edge
+with `\n` and `\r\n` endings, with and without the mark, and a CRLF file gives the same
+errors as an LF one. Lines 1 to 5 bytes over the limit, at the edge of the read window, fail
+on their own line with `\n`, `\r\n` or no ending, with and without the mark. The
+1,000,000-line cap (#314) is checked at and one past its edge, with
+blank lines and lines with no text counting, and reading stops at the line past it. Gzip: the
+same text as plain, the `was decompressed, but` prefix (line, line-limit, text-limit and cap
+errors), corrupt, truncated and over-size data. It also checks `source_type` `jsonl`, a job
+that stores nothing for a bad file beside a good one, job-level outcomes (#314: empty files
+complete with 0 chunks under every strategy, a file over the 10,000-chunk limit or the cap
+fails and stores nothing, `context_aware` keeps one chunk per record), and rechunk of a
+retained `.jsonl.gz`. `02_ingest.sh` runs it in the API container, then ingests a direct
+`records.jsonl` and `records.jsonl.gz` through the proxy and reads their records back, checks
+that `bad.jsonl` (malformed line 2) fails naming the line and stores nothing, and that
+`jsonl_many_records.jsonl.gz` (1,000,001 `{}` lines, a few KB gzipped) fails with the
+record-cap message and stores nothing.
+`browser/ui_criteria.js` (suite 06) checks that the Import page's file picker accepts
+`.jsonl` and `.jsonl.gz` and that its hint names JSONL.
+
+`scripts/tests/test_delete_busy.py` (#40) checks that `DELETE /collections/{name}` answers
+`409 COLLECTION_BUSY`, naming the job, while an ingest, export, import, tune or gold-standard
+generation job is active, and that each kind's registration ends before its status turns
+terminal. The request orderings are arranged with events: a job registered before the
+delete, one registered while the delete waits for the writer guard (refused within a
+second, not after the job), one registered once it holds the guard, and a job admitted
+after a completed delete, which fails with "collection '<name>' was deleted while this job
+was running" at its first store. Weaviate is mocked. `02_ingest.sh` runs it in the API
+container, then deletes a collection while a real ingest is still embedding (`409`, data
+in place), again after the job completes (`200`, still gone 10 s later), and checks that an
+insert into a deleted collection fails without recreating it (auto-schema is off).
+
+`test_delete_busy.py` also covers #302. A `DELETE` without `?confirm=true` (case-insensitive)
+answers `400 CONFIRMATION_REQUIRED` before the collection is looked up. A `DELETE` held inside
+its backend delete refuses new jobs: the ingest, export, tune and generate routes answer
+`409 COLLECTION_DELETING` and leave nothing behind, generation without its one-second guard
+wait, and an import of the collection ends `failed` with that code, with `abort` even before the
+backend collection is gone, and at registration when the delete starts after its first check,
+while a `rename` import of a collection still present completes under its new name; a delete
+still waiting for another writer is not in progress, and one that waits behind a writer with no
+job deletes once it lets go. A gold-standard start cancelled mid-preparation ends its
+registration and leaves its session `cancelled`, and one whose preparation fails settles
+nothing. Import-replace's own delete runs through `importer._run`.
+`scripts/tests/test_write_counts.py` (#302, API container) checks `chunks_submitted` and
+`chunks_accepted`: the writer's counts on each kind of failure, a retried file counted once, job
+totals, a clean job's counts equal after each file's insert, and `null` on an older record.
+`scripts/tests/test_mcp_delete.py` runs on the host with the MCP SDK stubbed and checks
+`rag_delete_collection` sends `confirm=true` with `name` still its only input, and that
+`rag_ingest_status` passes the write counts through unchanged. `02_ingest.sh` runs all three,
+then checks on the live verify stack the `400` cases, a `confirm=TRUE` delete, and that a clean
+job's three counts agree.
+`browser/ui_criteria.js` (suite 06) stubs job responses to check the Import page's
+"Submitted N · accepted N · stored N" line appears only when the counts differ, and an upload
+answered `409 COLLECTION_DELETING` to check its message is shown.
+
+`scripts/tests/test_job_lists.py` (#617, API image, no network) checks the running and recent job
+lists: new records get `created_at`, `finished_at` on their first terminal status or when marked
+interrupted, and ingest records `collection`, `files` and `owner`; who sees which job (a Developer
+its own, a key its principal's, an Engineer everyone's including owner-less records); running jobs
+always listed, finished ones from the last 24 hours, the newest 20; a pre-#617 record's last-saved
+time standing in for `finished_at`; the order; sessions (generating, finished, without
+`finished_at`, imported); the routes, their role, a malformed record left out, the lookups by ID
+unchanged, the owner each start route hands its service; and no session `owner` or times in a
+package or after an import. `02_ingest.sh` runs it, then `job_lists.py --operator` on the verify
+project: the harness Developer and a throwaway `vfy-s-*` Developer-role key each ingest a file into
+a throwaway `VfyJobs*` collection and see only their own job, with owner, collection, files and
+times; the Engineer sees both; the Developer's export and import are listed for it and the
+Engineer, not the key. `browser/ui_criteria.js` (suite 06) checks the pages' Running and recent
+jobs lists: a real ingest found again after leaving the Import page, then stubbed lists for a
+running ingest, generation and export that open by themselves, survive leaving the page and show
+their result, row switching, one job per Transfer panel, and the Engineer's owner column.
+
+`scripts/tests/test_jobstore.py` (#23) checks the job store that keeps ingest, export, import
+and tune job records across an API restart: an unbound store (no lifespan) is a plain dict
+that writes nothing; status changes and terminal records are written at once, owner-only;
+10,000 progress updates cause a handful of writes and the last one still reaches the disk; a
+failed write raises nothing and keeps the previous file; ids can't name another path; startup
+marks `queued`/`running` records interrupted (ingest `partial` or `failed`, the others
+`failed` with `INTERRUPTED`), keeps unreadable files and logs them, and keeps the newest 200;
+a real lifespan run marks a stored running export. While the API runs (#309), storing a
+record past the limit removes the finished records saved longest ago, from memory and disk,
+never a `queued` or `running` one, in the order of each record's own last write; and each of
+the four job starts writes its first record from a worker thread, and when cancelled during
+that write releases its guards and leaves no record (or, for ingest, upload folder), also when
+that abandoned write fails (logged). A second export of a collection started during the
+first one's write waits for it, then answers with the first job's id, which can be read, or,
+if the first start was cancelled or its write failed, starts its own (#326); it answers at
+once when the record is already stored, holds nothing if cancelled while it waits, and
+exports of other collections never wait. The wait is bounded (#338): past it, the second
+start gives up holding nothing and the route answers `409 EXPORT_STARTING` with no job id.
+The bound counts once, from the second start's first wait: when the first start's write fails
+and another start takes the slot, waiting again on that one doesn't restart it (#347).
+`02_ingest.sh` runs it in the API container. With
+`RAG_ALLOW_RESTART=1`, `02_ingest.sh` also restarts the API
+(`docker compose restart --timeout 0 api`) while two uploads are part-way and checks that a
+completed job reads back unchanged, the one that stored a file reads `partial` and the one
+that stored none reads `failed`, both with the interruption message, and that each of those two has
+one `interrupted` audit record with its job id (#577); `05_transfer.sh` does the
+same for a completed export, an export interrupted part-way through a synthetic 30,000-chunk
+collection (`failed`, `INTERRUPTED`, `chunks_written` kept) and an import of that collection
+interrupted part-way (`failed`, `INTERRUPTED`). Tune has no live restart check: no tune
+operation runs reliably long enough to interrupt, so `test_jobstore.py` covers it.
+
+`scripts/tests/test_startup_sweep.py` (#377) checks the startup sweeps of what a killed job
+leaves behind, in disposable folders. In `UPLOAD_DIR`, ingest staging is created as
+`ingest-*` and removed with the `import-*`, `rechunk-*` and `batch-verify-*` work directories;
+in `EXPORTS_DIR`, `.build-*` directories and `.*.tar.gz.partial` files are removed. Only those
+names, and only a real directory or regular file as the name says: completed packages,
+`ingest_configs/`, look-alike names, a file where a directory is expected and the reverse, and
+anything in a sub-folder are kept. A symlink is never followed, at the top or inside a
+removed directory, and sizes don't count what links point at. A failed removal is logged and
+not reported as removed, and a missing exports folder is not created. A real lifespan run in a
+child process removes both kinds and logs them by name and size. A second one, whose export
+sweep fails, logs the error and still starts, with the ingest staging removed (#423).
+`02_ingest.sh` runs it in the API container. With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` checks
+that its two killed ingests' `ingest-*` staging existed before its restart and is gone after it
+(#423), and `05_transfer.sh` checks after its export restart that the interrupted export's build
+directory and temporary archive are gone, without removing anything itself, and that the
+completed package from the top of the suite is still there.
+
+`scripts/tests/test_reingest.py` (#22) checks that re-ingesting a name replaces it and that
+same-named inputs don't collide. Admission: a name twice in one request keeps the last bytes,
+repeated ZIP entries, the same path in two ZIPs and a direct upload against a top-level member
+keep the last and list each earlier one in `skipped`; members in different folders stay
+separate, `a/../b.txt` and `./c.txt` are queued with their real bytes under their normalised
+names, paths leaving the archive are dropped, and labels keep the archive's own spelling.
+macOS metadata in a ZIP (#378): a Finder-style ZIP queues its file and lists the
+`__MACOSX/` AppleDouble member in `skipped`, a `._*` file beside its file and any other
+`__MACOSX/` member are skipped the same way, names that only look like them are queued, and a
+ZIP of nothing else is refused with `NO_SUPPORTED_FILES`. These members are still validated
+(#455): a damaged `__MACOSX/` member refuses the ZIP with `ARCHIVE_UNREADABLE` and their bytes
+count toward the expansion cap; `./__MACOSX/._r.txt`, `x/../__MACOSX/notes.txt` and
+`d/./._e.txt` are matched by their normalised names and listed under the archive's spelling;
+and a direct upload named `._notes.txt` is still queued. The
+job: new names mark nothing; a replacement marks gold-standard sessions stale once, naming
+the replaced files, before any insert, and deletes earlier chunks only after the insert; a
+marking failure fails only that file and changes nothing; a failed lookup of the later files
+is reported as the lookup, not the marking, and also changes nothing (#311); a failed insert keeps the earlier
+version; a removal failure keeps the new chunks and reports `partial`; a deleted collection is
+reported at the first lookup (#40). Also exact-name selection (#622): only the name's own
+chunks are deleted or counted among word matches such as `a/report.pdf`, `Report.PDF` and
+`report.pdf (part 1)`, over 10,000 word matches the collection is walked instead of queried,
+a name has chunks only when stored exactly, and a non-default rule selects what it accepts;
+the deletion by ID in batches of at most 10,000, never empty, and its bound, refused before
+deleting; the precondition and final count,
+retention releasing the name (also when the blob write fails, keeping shared digests), and
+rechunk coverage and per-(digest, name) rebuilds, rebuilding only names with stored chunks
+while a missing blob is still refused (#311), also for one blob under 50 names with one
+stored and a digest with none (only the stored name is parsed). A collection whose retained
+names have no stored chunks is refused as having nothing to rebuild, before staging and, for
+a rechunk or a re-embed with chunking parameters, before any job is created, with the route
+answering 409 (#328). That check runs only for those two, after the `TUNE_IN_PROGRESS` and
+`COLLECTION_DELETING` guards; a re-index and a collection with a stored listed name still
+start a job. An invalid retained source index (a non-digest key, a non-object document or a
+linked index) refuses those two before any job is created, with 409 `SOURCE_INDEX_INVALID`,
+the guards released and Weaviate never read, while a re-index and a re-embed without chunking
+parameters still start; the guards answer first, leaving the other tune's guard held. These
+are checked over HTTP through the app (#389). A Weaviate error during the check answers 503
+`SERVICE_UNAVAILABLE` with no job, the guards released and the cause logged, not sent (#340),
+also when the connection itself fails and for a re-embed with chunking parameters through its
+route, while a re-embed without them still starts. A Weaviate error checking that the
+collection exists answers 503 from each tune start, with no job, and `GET /tune/{collection}`
+answers 503 when either that check or its re-chunk check can't read Weaviate (#349).
+The same existence check in `POST /query`, `POST /goldstandard/generate`, `POST /collections`,
+`DELETE /collections/{name}`, `POST /ingest/upload` and `POST /export` answers 503
+`SERVICE_UNAVAILABLE` when Weaviate fails, naming the collection, with the cause logged, not
+sent, and nothing run, created or saved; a collection Weaviate reports missing is still 404
+`COLLECTION_NOT_FOUND` there, and one it reports present is still 409 `COLLECTION_EXISTS` at
+create (#366).
+Each of those 503s, the tune ones included, is also checked over HTTP through the app, so
+the JSON 503 reaches the client (#369), also the tune starts' re-chunk check one (#409).
+Weaviate and sessions are mocked.
+`02_ingest.sh` runs it in the API container, then, through the proxy, ingests a file twice
+(one chunk set, `chunks_replaced`), a changed version (only its text remains, one digest
+names it, the old blob is gone), a ZIP with `a/report.txt` and `b/report.txt`, a Finder-style
+ZIP (it completes with no errors, stores only its file and lists the AppleDouble member in
+`skipped`, #378), and two parts with one filename. With a real gold-standard session planted for the collection, it checks
+that ingesting a new name leaves the session current and a replacing re-ingest marks it
+stale, naming the file. Two concurrent uploads of one name must leave exactly one job's
+version, whole: its chunk set, its digest, and `chunks_replaced` equal to the other job's
+chunks. Replacing a name touches only that name (#622): with `a/report.pdf` (in a ZIP) and
+`Report.PDF` stored, uploading `report.pdf` replaces nothing and uploading it again replaces
+only its first set, and the other two keep exactly their chunks. `exact_source.py` then checks
+the same selection in real Weaviate on a scratch collection without a vectorizer, on both
+paths: a few word matches read in one query, and over 10,000 walked.
+`browser/ui_criteria.js` (suite 06) stubs the job response and checks that the Import
+page shows "Replaced N chunk(s) from a previous version" only when `chunks_replaced` is above
+0, and the plain "N file(s) skipped:" heading with each entry's own reason.
+
+`scripts/tests/test_split_parts.py` (#621) checks that a file over the per-file limits is
+stored as parts `<name> (part N)` instead of failing, with Weaviate replaced by an in-memory
+collection that keeps the replacement helpers' contract (`accept` included): 13,000 JSON Lines
+records of 600 characters under `context_aware`, and a `.jsonl`, a `.txt` and a `.json` over
+10,000,000 characters (each failing on the code before #621); a file within the limits stored
+as before; replacement of a name's whole family (a smaller, an unsplit and a newly split
+re-upload) with neighbours such as `a/data.jsonl` and `Data.jsonl` untouched; a bad line, a
+failed insert and a failed removal after part 1 (nothing stored, the earlier version whole);
+a record over the chunk cap; the cuts, CSV headers, Markdown fences, a streamed Latin-1 file
+and one no encoding reads, `overlap` sizing, the halving re-split and the `semantic` sentence
+limit; re-chunk coverage and rebuild, export links, and `ChunkLimitError`. `split_parts.py` then
+runs the same in the real ingest worker and Weaviate, on a scratch collection without a
+vectorizer (embedding 13,000 chunks through Ollama takes this project about an hour): the
+13,000-record file (`context_aware`) and a 10,519,499-character `.txt` (`fixed` 6,000) are
+stored as numbered parts with the job's `split` entry, re-uploading the `.txt` within the
+limits replaces every part and leaves the `.jsonl`'s parts untouched, and a bad line after
+part 1 fails the file and stores nothing. `overlap_chunks.py` (suite 08) stores a
+20,000-character file at 1,000/999 as two parts, each inside both window limits, that restore
+it exactly, and `browser/ui_criteria.js` checks the progress panel's "1 file split into
+parts:" list.
+`05_transfer.sh` (E32) replaces a file, adds a second name for the new content, re-chunks,
+and checks that only the new text comes back, under both names. It also adds a name with no
+stored chunks to the retained index first, and checks that the rechunk doesn't rebuild it and
+the index still lists it (E17, #311). It then ingests a whitespace-only file, which is retained with no
+chunks, and checks that `GET /tune` doesn't offer re-chunking and gives the nothing-to-rebuild
+note, and that `POST /tune/rechunk` and `/tune/reembed` with chunking fields answer 409
+`SOURCES_REQUIRED` with no job (#328).
+
 `scripts/tests/test_settings_validation.py` checks that invalid settings are
-refused before backend, model or staging work, with every backend mocked. Its
-embedded-source check reads `IMPLEMENTATION.md`, so mount the whole repository
-(on the verify project, with the exports from `stack.sh up`, as above):
+refused before backend, model or staging work, with every backend mocked.
+`07_settings.sh` runs it in the API image with the repository mounted read-only
+and no network (#386). Its embedded-source check reads `IMPLEMENTATION.md`, so
+to run it by hand mount the whole repository (on the verify project, with the
+exports from `stack.sh up`, as above):
 
 ```bash
 docker compose run --rm --no-deps -v "$PWD:/repo:ro" -w /repo \
@@ -223,7 +801,7 @@ Run the controlled regressions with the API dependencies installed:
 python -m unittest discover -s scripts/tests -p 'test_batch*.py'
 ```
 
-`05_transfer.sh` runs `test_batch_recovery.py` in the API container, so `all.sh` covers it; `test_batch_implementation.py` is run by hand.
+`05_transfer.sh` runs `test_batch_recovery.py` in the API container, `test_batch_recovery_fixture.py` in a new container from the API image, and `test_batch_implementation.py` on the host, so `all.sh` covers all three. The fixture test runs with `docker run --rm --network none` on the API image, with the repository mounted read-only, rather than `docker compose exec`, because it loads `scripts/verify/batch_recovery.py`, which it finds from its own `__file__`: the API container has no `scripts/` tree, and a script piped to `python -` has `<stdin>` as its `__file__`, not a path.
 
 `batch_recovery.py` is the fault acceptance. It uses real Weaviate, synthetic
 collections and the real embedding model. It injects final-create failures into
@@ -271,29 +849,94 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
-| `02_ingest.sh` | §10.1 — six types, ZIP, five strategies, merge rule, partial failure |
+| `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
+| `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384), run in a checkout reached through a symlink, and ignore the user's system and global git config (#447); embedded copies; registered by suite 01 |
+| `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415), registered by suite 01 |
+| `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
+| `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health` reports, so the status flips to `below_recommended` on any host (#536) |
+| `../tests/test_memory_override.py` | host-side, standard library: the derived override makes `system_info.memory_info` report `below_recommended` with a note for allocations below and above the 12.35 GB a fixed 13 GB could flip, and no override without a usable allocation (#536); embedded copies; registered by suite 01 |
+| `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command, account administration, service API keys; registers `../tests/test_auth.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
+| `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
+| `auth_stack.py` | the stack checks of `17_auth.sh`, one per subcommand (#25) |
+| `auth_headers.py` | the suite's session as `Cookie` and `Origin` headers, for the host-side Python helpers (#25) |
+| `19_audit.sh` | §10.7 — the audit log (#29): who may read it, the records of logins, queries, collections, jobs, refusals and administration, filters, paging and the CSV, no secrets in the files, concurrent writers; registers `../tests/test_audit.py`; opt-in restart check |
+| `audit_stack.py` | the stack checks of `19_audit.sh`, one per subcommand (#29) |
+| `../tests/test_audit.py` | API image, no network: record shape, rotation and retention, concurrent writers (threads and a second process), the three settings, write failures, job records, the middleware's rules, `GET /audit` and the CSV, the operator command's records, embedded copies (#29) |
+| `18_lan.sh` | §2.5 and §10.5 — LAN mode (#26): the real override resolved without starting it; registers `../tests/test_lan_mode.py`; with `stack.sh run --lan`, the running LAN project on loopback |
+| `lan_config.py` | host-side, standard library: `docker-compose.lan.yml` as `docker compose config` resolves it, at the default port and `RAG_LAN_PORT=8443` (#26) |
+| `lan_stack.py` | the stack checks of `18_lan.sh` in a `--lan` run, one per subcommand (#26) |
+| `../tests/test_lan_mode.py` | API image, no network: `RAG_LAN_MODE` parsing, the startup refusal (also through `import main`), the certificate step, both nginx configurations, embedded copies (#26) |
+| `docker-compose.lan.verify.yml` | the harness overlay of a `--lan` run: TLS on loopback at the verify port, the verify image for `tls-init`, reserved test names (#26) |
+| `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
+| `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
+| `../tests/test_ollama_entrypoint.py` | `ollama/entrypoint.sh` with stub commands, on the host: skip present models, timed pull, retries (#399), registered by `16_api_paths.sh` |
+| `02_ingest.sh` | §10.1 — six types, ZIP, unreadable archives and `.json.gz` members, the ZIP expansion cap, ordinary JSON text and its input, record and text limits, JSON Lines, five strategies, merge rule, partial failure |
 | `03_query.sh` | §10.2 — four retrieval modes, citations, latencies, answer style |
-| `08_overlap.sh` | called by suite02 (and thus all.sh); real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
-| `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds and pre-storage output limits |
-| `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, export schema |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E29; destructive replace fidelity, live metadata and model checks, controlled regressions and source drift |
+| `../tests/test_metrics.py` | controlled metrics-file regressions (#374): a failed write keeps the answer, the bound, crash-safe compaction, reload after a restart; registered by suite 03 |
+| `../tests/test_citation_score.py` | controlled citation-score regressions (#376): each metric's distance-to-score conversion, best first, missing values and unknown metrics as `null`, a failed metric read as the 503, the metric read on every query; registered by suite 03 |
+| `citation_score.py` | helper for suite 03 (#376), run in the API container: citation scores of known vectors on a real Weaviate for each distance metric, and after a collection is recreated with another metric |
+| `08_overlap.sh` | called by suite02 (and thus all.sh); runs `test_overlap_chunks.py` in the API image with the repository mounted read-only and no network; real parser/ingest/Weaviate text-storage check on an owned fixture with vectorization disabled; optional `RAG_OVERLAP_REAL_EMBEDDING=1` model acceptance |
+| `overlap_chunks.py` | helper for suite08; asserts nonempty text/windows, exact coverage/overlap, tail bounds, and a file over the output limits stored as parts inside them (#621) |
+| `../tests/test_overlap_chunks.py` | controlled overlap-window, per-file limit, ingest-worker and tuning-budget (parts, #621) regressions and the `IMPLEMENTATION.md` mirror check, registered by suite08 (#340) |
+| `04_goldstandard.sh` | §10.3 — generation, the 409 and 422 guards, review 404 codes and empty-edit refusal (#381), export schema, export name refusals (#370) |
+| `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
+| `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
+| `../tests/test_session_validity.py` | controlled retained-session validity, historical export guard, durable pre-replacement stale markers, their rollback on abort and the real tuning abort branch (#93, #275), registered by `10_validity.sh` |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E40, encrypted packages (#27); destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
+| `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
+| `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
+| `../tests/test_zip_limits.py` | controlled ZIP member-count (cap of 20 from env), ratio, escaping-member and `detail` bound regressions (#28), registered by ingest |
+| `../tests/test_json_ingest.py` | controlled ordinary-JSON conversion regressions, registered by ingest |
+| `../tests/test_jsonl_ingest.py` | controlled JSON Lines reading, conversion, limit and gzip regressions, registered by ingest |
+| `../tests/test_delete_busy.py` | controlled delete-while-busy registry, request-ordering and job-report regressions, registered by ingest |
+| `../tests/test_jobstore.py` | controlled job-record persistence, throttling, startup marking and retention regressions, registered by ingest |
+| `../tests/test_reingest.py` | controlled re-ingest replacement, exact-name selection (#622), same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
+| `../tests/test_split_parts.py` | controlled regressions for files over the per-file limits stored as parts (#621): the reviewer's 13,000 records, files over 10,000,000 characters, family replacement, all or nothing, cuts, CSV, Markdown, encoding, `overlap` sizing, re-chunk and export links, registered by ingest |
+| `split_parts.py` | helper for ingest (#621), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, files over the per-file limits are stored as parts, a smaller re-upload replaces every part, and a bad line after part 1 stores nothing; the collection is removed afterwards |
+| `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`) and over 10,000 (`walk`); the collection is removed afterwards |
+| `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
-| `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal and export read-boundary regressions, registered by transfer |
+| `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, registered by transfer |
+| `../tests/test_export_snapshot.py` | controlled export writer-guard regressions: a mid-export re-ingest can't change the package, busy and waiting writers, guard release (#509), a cancelled export's status (#521), registered by transfer |
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
+| `../tests/test_batch_recovery_fixture.py` | controlled check that the import package `batch_recovery.py`'s `write_import_package` writes passes the importer's real digest and source checks; run in the API image with no network and the repository mounted read-only, registered by transfer |
+| `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`, and so is a manifest with a wrongly typed listed value (#451); run in the API image with no network, registered by transfer |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
-| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page |
-| `14_reindex.sh` | exact-record reindex: 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
+| `../tests/test_batch_implementation.py` | host-side: exact embedded source checks for `api/main.py`, the Weaviate client, the batch-write, recovery, import and tuning services and their verify scripts, and the restart-recovery block of `05_transfer.sh` with stubbed commands (refused-prefix skip, `RAG_ALLOW_RESTART`, the #152 refusal), registered by transfer |
+| `../tests/test_chunk_limits.py` / `../tests/test_insert_chunks.py` | controlled chunker per-file limits, chunk ceiling and semantic floor (#111) / insert batching and the "index not ready" retry, registered by ingest in the API image with the repository mounted (#386) |
+| `../tests/test_embed_batching.py` | controlled embedding writes (#613): a write that leaves vectors to Weaviate's `text2vec-ollama` uses `fixed_size(20, 1)` batches and one with every vector `dynamic()`; only objects whose embed request timed out in Weaviate are sent again, at most twice, with the write counts and rollback unchanged, and no other failure is retried. Registered by ingest in the API image with the repository mounted, after which ingest writes 45 vectorless chunks to a scratch `<prefix>EmbedBatch` collection on the real Weaviate and Ollama and checks they are all stored, through `fixed_size(20, 1)` and never `dynamic()`; the collection is removed afterwards |
+| `../tests/test_corpus_rules.py` | controlled: the corpus preparation rules the Import page offers (`ui/public/corpus-preparation-rules.md`) state every ingest limit as the chunker, the ingest pipeline, the settings defaults, the chunk-setting bounds, `docker-compose.yml` and the proxy define it, and no other number (#615), registered by ingest in the API image with the repository mounted |
+| `../tests/test_corpus_rules_estimates.py` | controlled: the chunk counts the corpus preparation rules give hold for the real chunker for every strategy, on files built at the rules' targets, which are never refused for the text or chunk limits (#615), registered by ingest in the API image with the repository mounted |
+| `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
+| `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
+| `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
+| `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
+| `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
+| `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530), registered by infrastructure |
+| `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
+| `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
+| `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
+| `../tests/test_transfer_paths.py` | controlled transfer and tuning route regressions through the app, registered by suite 15 |
+| `../tests/test_retrieve_script.py` | controlled `retrieve.py` defaults, flags and exit codes against a stub API, registered by suite 15 |
+| `../tests/test_distribution.py` | `package.sh`, `package-offline.sh` and `install-offline.sh` with stubbed `docker`, and the image list, on the host, registered by suite 15 |
+| `06_ui.sh` + `browser/` | §10.4 — roles, gating, explainer, delete guard, help page, Import page file types, the Import page's corpus preparation rules download (#615), the page controls of #400 (see "UI control browser checks") and, last, the login page against nginx's real login rate limit (#577) |
+| `14_reindex.sh` | exact-record reindex: a host check that the embedded sources match the real files (`../tests/test_reindex_preservation.py`), 24 record/cutover/vectorizer/concurrency cases, fourteen writer/import/recovery cases, four async lifecycle/parent-cleanup cases, two polling-deadline cases and 44 real Weaviate/handler/restart checks with a refused embedding endpoint; run by `05_transfer.sh` |
 | `reindex_cases.py` / `reindex.py` | owned controlled cases / actual backend and ASGI job handlers; only scoped synthetic fixtures, canonical local session IDs and exact successful-creation ownership. Verifier collection names deliberately lie outside the parent prefix-sweep namespace. Polling is bounded to 300s, cleanup settlement to 30s; a still-active job reports its ID/status and preserves a durable exact-name fixture receipt/directory before standalone exit; inspection must confirm terminal writer state before exact-name cleanup |
 | `compose_target.py` | refuses a remote or mismatched API/Compose target before the new acceptance suite runs |
-| `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store |
+| `model_integrity.py` | bundled-model byte checks with the pulled embedding model, using a temporary package/store; registered by transfer (#386) |
 | `validate_package.py` | one export package against `RAG_EXPORT_SPECIFICATIONS.md` §4 |
 | `09_sampling.sh` | called by suite04 (and thus all.sh), including slow-skip runs; owned synthetic UUID selection without model calls |
+| `../tests/test_goldstandard_api_paths.py` | controlled empty-collection session outcome, model reply parser, regenerate 409 `GENERATION_IN_PROGRESS` while generating and 502 `PAIR_GENERATION_FAILED` with the pair unchanged (#398), registered by `09_sampling.sh` |
 | `chunk_sampling.py` | standalone inside disposable API: `python - < scripts/verify/chunk_sampling.py`; real SDK seeded selection on owned synthetic UUIDs with supplied vectors, no model calls |
 
 `10_validity.sh` is called by suite05 (and thus all.sh). It runs
 `session_validity.py` inside the disposable API, using an owned real collection,
 synthetic retained pairs and in-process HTTP without startup sweeps or model calls.
 It checks warning metadata, actual deletion marking and explicit historical export.
+It then runs `../tests/test_session_validity.py` in the API container: controlled
+validity, durable stale-marker and rollback regressions (#275). Last, it runs
+`../tests/test_goldstandard_exports.py` in the API container and checks
+through the proxy that download refuses other upload state with 400 (#370).
 
 ## Environment
 
@@ -305,11 +948,12 @@ It checks warning metadata, actual deletion marking and explicit historical expo
 | `RAG_EXPORTS_DIR` | `<checkout>/exports` | the host folder behind the API's `/app/exports`; `stack.sh` sets it to the verify project's own folder |
 | `RAG_VERIFY_LIVE` | `0` | `1` lets `all.sh` and the suites run against the live `rag-docker` stack, with a warning. Never used by the documented commands or the PR review, and never enables a restart of the live stack |
 | `RAG_SKIP_SLOW` | `0` | `1` skips everything that needs an LLM call |
-| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, and the batch recovery acceptance in `05_transfer.sh`); never the `rag-docker` project |
+| `RAG_ALLOW_RESTART` | `0` | `1` allows suites to restart the stack (persistence checks, job status across a restart in `02_ingest.sh` and `05_transfer.sh`, the query metrics reload in `03_query.sh`, the batch recovery acceptance in `05_transfer.sh`, retrieval settings and metrics across a restart and the first start from empty volumes in `16_api_paths.sh`, a session and a login lockout across a restart in `17_auth.sh`, and audit records across a restart in `19_audit.sh`); never the `rag-docker` project |
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
 | `RAG_NETWORK` | detected | compose network for the browser container |
+| `RAG_AUTH_DIR` | `${TMPDIR:-/tmp}/rag-verify-auth-<uid>` | the folder of the test accounts' credentials and cookie jars (#25) |
 
 ## Writing a check
 
@@ -338,8 +982,11 @@ Two rules the hard way:
 
 ## Bundled-model integrity
 
-On the verify project (`bash scripts/verify/stack.sh up`, then paste the
-`export` lines it prints), whose model copy holds the embedding model, run:
+`05_transfer.sh` runs `model_integrity.py` in the verify project's API
+container, and `test_model_bundle.py` in the API image with the repository
+mounted (#386). To run them by hand, on the verify project
+(`bash scripts/verify/stack.sh up`, then paste the `export` lines it prints),
+whose model copy holds the embedding model, run:
 
 ```bash
 docker compose exec -T api python - < scripts/verify/model_integrity.py
@@ -358,6 +1005,13 @@ containment, interrupted publication and concurrent blob publication:
 ```bash
 python -m unittest discover -s scripts/tests -p 'test_model_bundle.py'
 ```
+
+`05_transfer.sh` also checks that a model installed from a bundle is reported
+by Ollama's real `/api/tags` (#452): only when the api and ollama containers
+both mount `rag-verify-ollama-models`, it installs the embedding model's own
+files under the throwaway name `vfy-install-alias:latest`, which writes one
+manifest into the verify model copy, and removes that manifest whether the
+check passes or fails.
 
 ## Cleaning up
 
@@ -406,3 +1060,382 @@ The standalone runner uses the existing browser verification dependency
 `puppeteer-core` (also available in the verification browser image); set
 `NODE_PATH` if it is installed outside normal Node module resolution. This
 isolated fixture run does not replace the full verification suite (`stack.sh run`).
+
+## Deferred Chunking configuration checks
+
+`browser/chunking_config.js`, registered in `06_ui.sh` through `ui_criteria.js`,
+uses the rendered page with deferred API responses. Ten cases cover late loads,
+failed loads, A→B→A selection, stale save completions, pending saves across
+selection changes, duplicate-save prevention, late responses against current
+edits and errors, the saved notice on a collection change, a configuration
+returned for another collection, and a failed collections list. Each affected save checks
+its actual collection and chunk-size payload. These fixtures make no backend
+writes and complement the live settings suite.
+
+## Health page refresh checks
+
+`browser/health_page.js` (#415), registered in `06_ui.sh` through `ui_criteria.js`,
+stubs every API call the Health page makes and holds each health and metrics answer
+until the check releases it, driving each refresh through the captured 30 s timer. Ten
+cases cover a failed metrics call (an API error, and no answer) keeping the charts last
+shown; a 200 without a health body (JSON of another shape, an empty body, text) and a 503
+carrying the API's error envelope, each shown as "Service health could not be read:" with
+no cards; and late responses from an older refresh, which never replace a newer health
+result (success or failure) or newer charts, while a late metrics result after a newer
+failed one is still shown. Every case also fails on a React page error. These fixtures
+make no backend calls; like the other modules, the file runs standalone with
+`RAG_UI_BASE` and `RAG_CHROMIUM_PATH`.
+
+## Q&A page answer checks
+
+`browser/qa_page.js` (#511), registered in `06_ui.sh` through `ui_criteria.js`, stubs every
+API call the Q&A page makes and holds each query's answer until the check releases it. Eight
+cases: an answer, and a failure, for collection A released after the switch to B show nothing
+under B; an answer released after A→B→A is not shown; with a query on A and a newer one on B
+in flight, A's answer arriving last does not replace B's; a second Ctrl+Enter while a question
+is being answered sends no query; changing the collection clears an answer (with its citations
+and latency) and an error already shown; and after the switch Ask is enabled at once and asks
+B. All eight fail on the code before #511. Like the other modules, it runs on its own against
+a UI with no backend:
+
+```bash
+RAG_UI_BASE=http://127.0.0.1:3000 RAG_CHROMIUM_PATH=/path/to/chromium node scripts/verify/browser/qa_page.js
+```
+
+## Export encryption (#27)
+
+`api/services/age_stream.py` writes and reads the age v1 passphrase format on the locked
+`cryptography`: `Encryptor` is the writable file `packager._write_archive` streams the tar.gz
+into (`tarfile` mode `w|gz`), holding back each full chunk until it knows whether it is the
+last; `open_decrypt` parses the header, refuses a work factor above 20 before scrypt, unwraps
+the file key under a process-wide lock, checks the header MAC and returns `Decryptor`, the
+readable file `packager.open_package` unpacks in `tarfile` mode `r|gz`, checking each member
+before extracting it, then drains to authenticate the rest. A `.tar.gz.age` name selects the
+encrypted path everywhere: the listing (header check only), the import refusals in
+`importer.start_import_job` (`PassphraseError`, mapped to 400 by the router) and check 1. The
+passphrase travels as a function argument to the worker thread and is never put in a job
+record; the request models hold it as `SecretStr`.
+
+`scripts/tests/test_export_encryption.py`, run by `05_transfer.sh` in the API image with no
+network, checks the module against the vendored C2SP CCTV vectors
+(`scripts/tests/fixtures/age-testkit`, with their source in `SOURCE`) and an independent
+decryption written from the specification, and the export, import, listing, refusals and
+secrecy rules above. Suite 05 then exports the transfer collection encrypted, validates it
+with `validate_package.py` in the API container (`RAG_PACKAGE_PASSPHRASE`), and checks a wrong
+passphrase, both refusals and a round trip on the live verify stack.
+
+## Transfer page polling and failure checks
+
+`browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
+Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
+20 ms (#382). Seventeen cases: for each half, a failed poll (a proxy 502) is shown and retried
+with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
+show the last error and enable the button again, and a new start clears the message; a poll in
+flight when the page is left schedules no further poll. An export start answered after the page
+is left starts no polling. A 409 `SOURCE_INDEX_INVALID`, 503 or 404 from `/tune` is labelled
+"Fidelity: unknown", a good lookup shows the fidelity, and a late answer for a collection no
+longer selected is ignored. A failed export shows its `error_code`, and a failed package list
+is shown without the empty-folder hint until a good Refresh. Three cases cover encryption (#27):
+an export passphrase holds Export until it has 12 characters and matches its confirmation, is
+sent only when the box is checked, and both fields clear once the export starts; an encrypted
+package is labelled, asks for its passphrase, sends it and clears it, and a plain package sends
+none. Like `query_config.js`, it can run
+on its own against a UI with no backend (`RAG_UI_BASE`, `RAG_CHROMIUM_PATH`):
+
+```bash
+node scripts/verify/browser/transfer_page.js
+```
+
+## Gold Standard page details
+
+`browser/goldstandard_page.js`, registered in `06_ui.sh` through `ui_criteria.js`,
+answers every `/api/` call from the Gold Standard page by request interception
+(#393). It checks that the export filename is pre-filled as
+`{collection}_{YYYYMMDD_HHMMSS}.json` after a generation and after a lookup, made
+safe and shortened to 128 characters as the API's default is; that Export opens the
+download URL with the filename encoded; that a review row expands to the first 300
+characters of the context followed by `…`, then its answer and its ground truth (a
+fixture pair whose two differ, so one cannot stand in for the other); that a session with
+no collection pre-fills `export_{YYYYMMDD_HHMMSS}.json` and a collection with no safe
+characters pre-fills `_{YYYYMMDD_HHMMSS}.json`, as the API names them; and that a sample
+size of 0, 101, 2.5 or an empty field disables Generate with a message and sends no
+request, while 1 and 100 enable it. Its #380 half
+checks how a generation ends and the guards on actions in flight: the outcome shown for a
+completed, partially failed, failed, cancelled and empty-collection session (headline, failed
+pairs, distinct reasons with counts, at most five); a poll answered 503 or 404 stops, shows
+the message, enables Generate and is cleared by Load / refresh; a second Generate click in the
+window before the first poll sends no request and asks no confirm; Regenerate is disabled for
+the running pair only and repeated clicks send one request; and a refused edit (422) keeps the
+modal open with the typed values and the message, and each edit sends only the changed fields.
+A second
+Chromium, launched without Puppeteer's `--disable-popup-blocking`, clicks Export for
+real: a save answered in 1 s opens the download tab, and a control opens none. The
+control holds its save answer until the page reports
+`navigator.userActivation.isActive` is false (polled every 100 ms, at most 15 s), so it
+follows Chromium's user-activation window, not a fixed delay, and it fails unless the
+activation was still active when the save request arrived. That tab sends one
+read-only download request for the fixture name to the stack under test, which
+refuses it as an invalid export name. It runs on its own too, like
+`query_config.js`:
+
+```bash
+RAG_UI_BASE=http://127.0.0.1:3000 RAG_CHROMIUM_PATH=/path/to/chromium \
+node scripts/verify/browser/goldstandard_page.js
+```
+
+## UI control browser checks
+
+`browser/ui_controls.js` and `browser/ui_pages.js`, registered in `06_ui.sh` through
+`ui_criteria.js` (#400), check the page controls that had no browser check. They share
+`browser/stub.js`, which opens the built UI in a fresh browser context and answers every
+`/api/` request itself; a request a case did not stub is answered 599 and fails the case, so
+nothing reaches the backend or a model. 67 cases:
+
+- `ui_controls.js`: the Collections table (columns, a dash for a null created date) and create
+  modal (HNSW slider defaults, bounds and labels, Flat hiding them, the create payload); the Import
+  queue, slider visibility per strategy and role, Chunk Size pulling Overlap down, the upload
+  form fields and the "+ New" modal; the nav's menus per role, their keyboard and screen-reader
+  behaviour and the current-page highlight (#616), and the redirects of a Developer and an End
+  User; the login page, logout, the setup-required page, the forced and voluntary password change
+  and the return to login on a 401 (#25), with `GET /api/auth/me` answered from the case's role; the Q&A box
+  (Ctrl+Enter, plain Enter, Ask disabled while empty or loading), the citations toggle, markdown,
+  the latency and error lines and the End User view with `response_format`; the Retrieval page's
+  saved and default texts, alpha slider and Save while loading; and the client's handling of
+  nginx's HTML 413, 502, 504 and 500 pages, a non-JSON 200 and a JSON message.
+- `ui_pages.js`: Gold Standard generate (selector, sample size, progress, confirm) and review
+  (summary bar, approve, reject, regenerate, edit, failed action, export enabled); the Transfer
+  export controls (collection selector, fidelity line, include-models payload, progress and
+  result), the package list, the empty hint, Refresh, conflict choice and import failure display;
+  the Help page error state and its links to and from Transfer; and the Health latency stat row,
+  chart and empty state.
+
+The Transfer polling and `/tune` failure labels stay with `transfer_page.js` (#382). Like
+`query_config.js`, each module can run on its own against a UI with no backend:
+
+```bash
+RAG_UI_BASE=http://127.0.0.1:3000 RAG_CHROMIUM_PATH=/path/to/chromium node scripts/verify/browser/ui_controls.js
+RAG_UI_BASE=http://127.0.0.1:3000 RAG_CHROMIUM_PATH=/path/to/chromium node scripts/verify/browser/ui_pages.js
+```
+
+Suite 05 also runs `scripts/tests/test_batch_recovery_fixture.py` in a network-isolated container from the built API image, with the repository mounted read-only so its sibling fixture is available.
+
+Suite 01 also runs `scripts/tests/test_error_envelope.py` in the built API image with
+`--network none` and the repository mounted read-only (#373). It sends each request through
+the app with Weaviate and Ollama mocked, and checks that an unknown route answers 404
+`NOT_FOUND`, a wrong method 405 `METHOD_NOT_ALLOWED` with its `Allow` header and an unhandled
+error 500 `INTERNAL_ERROR`, all in the JSON envelope; that `GET /collections` answers 503
+`SERVICE_UNAVAILABLE` when Weaviate fails, and `POST /query` when an Ollama call (connect
+error, timeout or error status) or a Weaviate query fails after the existence check, with no
+metrics record; that a missing help template answers 500 `HELP_RENDER_FAILED`; and that
+`CREATE_FAILED` and `DELETE_FAILED` send a fixed message. Each cause is logged, not sent.
+It also checks (#411) that other HTTP errors keep FastAPI's own answer (a malformed
+multipart upload is FastAPI's 400 with `detail`, not the envelope), that the engineer-format
+synthesis failing is the Ollama 503 (and that it used the engineer system prompt), that an
+Ollama failure in the reformulation or the synthesis in `hybrid` and `semantic` modes still
+names Ollama only (#456), that a Weaviate failure in `hybrid` and `semantic`
+modes names Ollama too (Weaviate embeds the question through it there), and that a help
+template `RuntimeError` answers `HELP_RENDER_FAILED` with its own message. Suite 01 then
+checks the envelope through the proxy on the running stack: an unknown route answers 404
+`NOT_FOUND`, and `PUT /query` answers 405 with `Allow: POST` and the code
+`METHOD_NOT_ALLOWED` (#456), the request going through the lock-checked `api_request` helper.
+
+Suite 02 runs `scripts/tests/test_collection_spelling.py` the same way (#372). With Weaviate
+and the job workers mocked, it sends each route that takes a collection name a lowercase-first
+spelling (`myDocs`) and checks that the registry, the 201 and 202 answers, the ingest and
+retrieval settings files, the query metric and the metrics filter, retained originals found by
+`GET /tune`, and the export, tune, ingest and generation workers all get the stored name
+(`MyDocs`). It fails on the code before #372. Suite 05 then, on the verify stack, creates and
+ingests under a lowercase-first name, reads the tuning options and exports under the stored
+name, re-chunks under the lowercase name and, unless `RAG_SKIP_SLOW=1`, checks a query's
+metrics under both spellings.
+
+Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health`
+through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
+client check mocked, and checks the 503 `degraded` body: the LLM or embedding model missing
+from Ollama's list (that service `error`, the rest `ok`), Ollama unreachable (both models
+`error`), Weaviate not ready or unreachable (Weaviate `error`), Weaviate and Ollama down
+together (all three `error`), each with its latency, model names and `resources`; and 200
+`ok` when everything is up, also with memory below the recommendation or unreadable
+(`resources.memory.status` `below_recommended` or `unknown`; memory is advisory, #415). `browser/ui_criteria.js` (suite 06)
+stubs `/api/health` and checks that the Health page shows a degraded 503 body with the failing
+service red and the others green, that a proxy 502, a refused connection and a 503 without a
+health body each show "Service health could not be read:" with the reason and remove the
+earlier cards, that the next good load clears it, and that the latency metrics load on every
+refresh whatever health answers.
+
+Suite 01 also runs `scripts/tests/test_collection_registry.py` the same way (#388). It points
+`UPLOAD_DIR` at a temporary folder and checks that a save replaces
+`collection_registry.json` through a uniquely named, fsynced temporary file instead of
+rewriting it in place (a hard link to the old file keeps its bytes), leaving no temporary file;
+that a failed fsync (a full volume), a failed replace or a registry that can't be serialized
+leaves the old file whole and no temporary file; and that a registry that can't be read (not
+JSON, a JSON array, not UTF-8, a folder at its path) is kept unchanged and logged while
+`POST /collections` still answers 201, `DELETE /collections/{name}` 200 and `GET /collections`
+200 with `created_at` `null`, with updates resuming once the file is readable again. It also
+checks creates, deletes of both spellings and 20 concurrent creates on a readable registry, and
+the `IMPLEMENTATION.md` copy of `api/routers/collections.py`. It also checks (#445) that a save
+fsyncs the registry's folder after the replace and closes it, that a failed folder fsync fails
+the save with the new file in place and no temporary file, and that API startup (the lifespan,
+in a child process with the backend sweeps mocked) removes `.collection_registry.json.*.tmp`
+leftovers while keeping the registry, other files, files in subfolders and what a link points
+to, logging a leftover it can't remove.
+
+Suite 01 ends by running `16_api_paths.sh` (#399), for API paths no other check covered. It
+runs `scripts/tests/test_api_paths.py` the same way as `test_health.py`, with `UPLOAD_DIR` a
+temporary folder: an upload with no supported file answers 400 `NO_SUPPORTED_FILES` with the
+exact message listing a direct file and a ZIP member it skipped, and leaves no job, staging
+folder or registration; an unknown ingest job answers 404 `JOB_NOT_FOUND`; a `/query` body
+with only `question` and `collection` reaches the pipeline with the defaults (`hnsw`, `top_k`
+5, `alpha` 0.75, no citations, `end_user`), and through the real pipeline runs a top-5 vector
+search with the end-user prompt; the reformulation, end-user and engineer prompts and their
+`[i] ...` contexts equal the SPECIFICATIONS.md §6.1-§6.3 blocks, read from the file; a
+successful query records one metric; a saved retrieval config missing newer keys is filled
+from the defaults, and one that isn't JSON, can't be read, holds JSON that isn't an object
+(an array, a number, a string, a boolean) or has a field of the wrong type (also a fractional
+or nested `top_k`) gives the defaults with `is_default: true` and a warning, while coercible
+and out-of-range values are still served as saved (#439); so do a `NaN` or infinite `alpha`
+and a saved `is_default` key, which answered `"alpha": null` and 500 before #477, while a
+finite `alpha` of 1.5 is served as saved. `GET /metrics/latency` is
+checked for its statistics against hand-worked percentiles, its exact-match `collection` and
+`retrieval_mode` filters, and `history_limit` (default 100, 0, 500, 501 refused with 422). A
+Weaviate client check that hangs makes `/health` give up on it after 4 s, and an unreadable
+`/proc/meminfo` reports memory `unknown` with a note while `/health` stays 200. On the host,
+`scripts/tests/test_ollama_entrypoint.py` runs `ollama/entrypoint.sh` with stub `ollama`,
+`timeout` and `sleep` commands: models already listed are not pulled, a missing one is pulled
+as `timeout 7200 ollama pull`, a failed or timed-out pull is retried after 15 s, and the fifth
+failure exits 1 with its error. Then, on the verify stack: the upload and job errors through
+the proxy; a new collection's schema has BM25 off for `source_file`, `source_type` and
+`chunk_strategy` and refuses an insert with an undeclared property; the running proxy's
+loaded configuration (`nginx -T`) reads `/api/` for 300 s and connects for 10 s; the metrics
+route's shape, `history_limit=0` and the 422. Unless `RAG_SKIP_SLOW=1`, a query with the
+defaults on a text of more than five chunks retrieves 5 chunks without citations and records
+one `hnsw` metric with its latencies. With `RAG_ALLOW_RESTART=1`, a saved retrieval config
+and that metric read back unchanged after the API restarts, and then a first start: `down -v`
+(the model copy is external and kept) and `up -d --wait` must bring every service healthy
+within 300 s, reporting the time, and start with no collections. That is SPECIFICATIONS.md's
+criterion, a first start from empty data volumes with the models already present; the model
+pull from an empty volume is a recorded manual measurement, not timed here (#465). The first
+start runs only on `rag-verify` with the overlay in `COMPOSE_FILE` (see "The live stack is
+refused"); host tests in `test_verify_stack.py` run this suite with Docker stubbed and check
+that it removes no volumes otherwise. It removes the verify project's data, so it runs last in
+suite 01.
+
+Suite 03 also runs `scripts/tests/test_metrics.py` in the built API image with
+`--network none` and the repository mounted read-only (#374), also in a `RAG_SKIP_SLOW=1` run.
+It points `UPLOAD_DIR` at a temporary folder and checks that `POST /query`, sent through the
+app with Weaviate and the pipeline mocked, still answers 200 with its answer when the metrics
+record can't be written (an unusable file, a full volume, an `UPLOAD_DIR` that can't be
+created), with the failure logged naming the metrics file and the record still counted by
+`GET /metrics/latency`; that a line left unfinished by a failed write doesn't cost the next
+record; that an append bringing `metrics.jsonl` to 1,000 lines compacts it and the newest
+records are kept; that a compaction whose temporary write or replace fails leaves the old file
+whole and no temporary file, and is tried again; that 1,100 concurrent records all land; and
+that a restart restores the last 500 records, loads a file within the bound without rewriting
+it, reads a 40 MB legacy file with a peak under 8 MiB and compacts it, loads nothing from a
+last 1 MiB with no line break, removes temporary files a crash left, and starts when the file
+can't be read or compacted or `UPLOAD_DIR` can't be created. It also checks the
+`IMPLEMENTATION.md` copy of `api/services/metrics.py`. With `RAG_ALLOW_RESTART=1`, suite 03
+also restarts the API after its LLM queries and checks that `GET /metrics/latency` reports
+the same records afterwards (#374); a `RAG_SKIP_SLOW=1` run has no queries to reload and
+doesn't reach it.
+
+Suite 03 also checks citation scores (#376), also in a `RAG_SKIP_SLOW=1` run.
+`scripts/tests/test_citation_score.py` runs in the built API image with `--network none`, with
+the Weaviate client and Ollama mocked: for `hnsw`/`flat` and `semantic` queries the score is
+`1 - distance` for cosine, `-distance` for dot and `1 / (1 + distance)` for l2-squared, highest
+first; a missing distance, a missing hybrid score and a config with no metric or an unknown
+one give `null` (a distance of 0 is a real value); the metric is read again on every query; a
+failed metric read answers 503 `SERVICE_UNAVAILABLE` in each distance mode; the pipeline
+rounds numbers and passes `null` through, and `/query` returns it. It also checks the
+`IMPLEMENTATION.md` copies of the changed files. `citation_score.py` then runs in the verify
+project's API container: it creates owned cosine, dot and l2-squared collections, inserts known
+vectors, asks `/query` in the `hnsw` and `flat` modes with the models controlled, and checks the
+scores against the expected similarities; then it deletes the cosine collection, recreates it
+with l2-squared, and checks the next query uses the new metric. With models, the suite checks
+that in each of the four modes the citation scores are numbers, highest first.
+`browser/query_config.js` (suite 06) checks that the Q&A page shows a score with 3 decimals and
+`n/a` for a `null` score.
+
+Retrieval deferred cases also cover superseded success/error notices, notice timer
+ownership, both orders of an acknowledged success and newer failure, and a
+three-save race that must not republish the same result over new edits.
+
+### Optional telemetry foundation (#282)
+
+Suite 01 runs `scripts/tests/test_telemetry.py` in the built API image with
+`--network none`; its real OTLP/protobuf receiver uses container loopback only.
+Checks cover SDK traces/logs/metrics, sentinel privacy across schema surfaces,
+configuration/no-op behavior, overload and bounded lifecycle failure. It also
+checks embedded copies with `scripts/tests/test_telemetry_implementation.py`.
+Suite 01 also runs `scripts/tests/test_tracing.py` for #283 in the same isolated
+API image. Synthetic real ASGI and service launchers exercise all five background
+job families, raw executor/task/thread propagation, correlation after 202,
+concurrent isolation, partial/handled errors, generation failure reporting,
+regeneration timeout, async cancellation and a surviving thread waiter. Tests
+cover actual Ollama client errors, iterator/batch boundaries, finite routes,
+untrusted headers, disabled/failing telemetry and sanitized OTLP links. Backend
+operations are faked; no collector setup or full deployed end-to-end claim is
+made by these offline tests.
+
+
+### Operational telemetry (#284)
+
+Suite 01 also runs `scripts/tests/test_telemetry_operations.py` in the built API
+image with `--network none`. Real SDK aggregation and a container-local OTLP
+receiver check exact counts/durations/active values, repeated IDs without new
+series, preserved multiple points, fixed correlated logs, cancellation and
+sampled-out/disabled tracing. Actual ingest/export/import/tuning/evaluation
+launchers use synthetic dependencies to prove handled outcomes preserve durable
+status. No live application content, external model or hosted collector is used.
+Exporter error and malformed-wire cases check bounded failure isolation;
+collector deployment acceptance remains #285.
+
+## Optional Collector acceptance (#285)
+
+```sh
+bash scripts/verify/stack.sh run
+bash scripts/verify/stack.sh run --telemetry
+# Targeted enabled acceptance, after the same guarded disposable startup:
+bash scripts/verify/stack.sh run --telemetry 15
+```
+
+Run these serially. The default run's registered `15_telemetry` suite verifies
+the API is disabled and explicitly reports enabled capture as unexercised.
+The enabled full run uses trusted overlays, the pinned private Collector and a
+bounded private protobuf receiver using the API image. Only the proxy publishes
+a host port. Narrow guard additions allow resource/log bounds only on these two
+services; live image, network, mount and port restrictions remain enforced.
+
+The suite recreates the disposable API through a guarded `telemetry-mode`
+command under the inherited lock to compare enabled/disabled settings. It submits
+real synthetic uploads, queries and concurrent export jobs; inspects actual
+received traces/metrics/logs, parent relationships, correlation and planted
+sentinels; stops/restarts only disposable services; and tests a slow receiver.
+Capture is memory-bounded (16 MiB, 1000 batches, 1 MiB/request, 16 handlers); overflow
+fails inspection. Raw payloads are synthetic and temporary. Summary output records
+five warm-ups and 20 timed health requests plus one query/two jobs per mode,
+latency distributions, sampled container stats and shutdown timing. Health timings
+include host guard overhead; samples are observations, not performance SLOs.
+`RAG_SKIP_SLOW=1` explicitly skips model-dependent enabled acceptance and cannot
+satisfy full telemetry acceptance. No real backend account or external egress is
+needed once dependencies/images/models are available.
+
+Suite 01 always runs capture/evidence regressions and offline/installer/package
+regressions in the built API image with network disabled, in both default and
+telemetry-enabled runs. Compose-only collector checks run on the host without
+starting services. Exact inventory and embedded-source checks also remain
+mandatory in suite 01.
+
+Standalone focused checks: `python3 scripts/tests/test_collector.py` (host stdlib and Compose
+configuration only), `python scripts/tests/test_telemetry_capture.py` (locked API
+dependencies), and the existing verify-stack tests. These complement, not replace,
+both full runs.
+
+Verification telemetry assets are absolute harness-owned paths, including when
+`--checkout` selects another source tree. Their exact read-only bind identities
+are checked; this preserves harness provenance, not a hostile-code sandbox.
+Protocol, version and export budgets are fixed in the verification overlay,
+independent of ambient operator telemetry variables. Before disabled-mode counting,
+the old API, Collector queues and capture handlers terminate; a fresh Collector
+and capture process isolate the zero-traffic observation from earlier exports.
+Malformed capture shapes fail as incomplete evidence, never partial success.

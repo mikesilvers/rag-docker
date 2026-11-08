@@ -6,6 +6,8 @@ bindings=$(cd ../.. && docker compose port proxy 80) || exit 2
 python3 ./compose_target.py "$API" "$bindings" || exit 2
 require_stack
 section "Exact-record reindex"
+python3 ../../scripts/tests/test_reindex_preservation.py
+check "reindex embedded sources match runtime" $?
 (cd ../.. && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_collection_writes.py)
 check "collection writer barrier regressions" $?
 # Transport only these three controlled sources into a temporary API directory.

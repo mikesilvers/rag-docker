@@ -1,14 +1,17 @@
 """Overlap window invariants on inert synthetic text and the ingest worker."""
 import os
+import hashlib
+import json
 import runpy
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.environ.get('RAG_TEST_API_DIR') or str(Path(__file__).resolve().parents[2] / 'api'))
-from services import chunker, ingest_pipeline
+from services import chunker, ingest_pipeline, tuning
 
 NEEDS_REPOSITORY = 'needs the whole repository mounted (see scripts/verify/README.md)'
 
@@ -35,6 +38,77 @@ class OverlapTests(unittest.TestCase):
         bound = size + max(0, min(size, minimum - 1) - overlap)
         self.assertTrue(all(len(c) <= bound for c in chunks))
         return chunks
+
+    def test_default_strategy_boundary_at_the_per_file_window_cap(self):
+        # At the project's own defaults (chunk_size=1000, chunk_overlap=200),
+        # the 10,000-window cap is reached at exactly 8,000,200 characters:
+        # windows = 1 + ceil((L - 1000) / 800). A file this size or smaller
+        # ingested successfully before this PR (CharacterTextSplitter had no
+        # size cap); one character over now fails every default-strategy
+        # ingest of it, not just paragraph-less ones. See chunker.py's
+        # MAX_OVERLAP_WINDOWS and the coding review's Medium finding on this
+        # regression.
+        boundary = 8_000_200
+        chunks = chunker.chunk_overlap('x' * boundary, 1000, 200, 100)
+        self.assertEqual(len(chunks), chunker.MAX_OVERLAP_WINDOWS)
+        with self.assertRaisesRegex(ValueError, 'per-file limit'):
+            chunker.chunk_overlap('x' * (boundary + 1), 1000, 200, 100)
+
+    def test_internal_whitespace_run_can_produce_a_blank_stored_window(self):
+        # SPECIFICATIONS.md documents that "blank-only input yields no chunks"
+        # but says nothing about a single window inside otherwise-nonblank
+        # text. The old splitter stripped and dropped blank chunks
+        # (`_enforce_min_chunk_size` filters `c.strip()`); raw character
+        # windows keep every slice, so a long enough internal whitespace run
+        # is stored as a chunk that is entirely blank. This pins down and
+        # documents that behavior change rather than leaving it implicit.
+        text = 'a' * 50 + ' ' * 2000 + 'b' * 50
+        chunks = self.check_windows(text, size=200, overlap=20, minimum=50)
+        self.assertTrue(any(c.strip() == '' for c in chunks),
+                         'expected at least one whitespace-only window; '
+                         'chunk lengths were ' + str([len(c) for c in chunks]))
+
+    def test_tuning_rechunk_over_budget_rebuilds_as_parts(self):
+        # #621: a re-chunk whose new settings take a retained original over
+        # chunk_overlap's per-file limits rebuilds it as parts, each inside them,
+        # instead of failing the tuning job.
+        # 1000/800 (PR #630): 1000/999 stores about 1,000 times a split file's
+        # size and is now refused by the ten-times cap; 800 stores about 5 times.
+        records = ''.join(json.dumps({'body': 'x' * 990}) + '\n' for _ in range(2500)).encode()
+        with tempfile.TemporaryDirectory() as directory:
+            src_dir = Path(directory)
+            digest = hashlib.sha256(records).hexdigest()
+            (src_dir / digest).write_bytes(records)
+            job_id = 'tune-budget-test'
+            tuning._jobs[job_id] = {'job_id': job_id}
+            params = {'chunking': {'strategy': 'overlap', 'chunk_size': 1000,
+                                    'chunk_overlap': 800, 'similarity_threshold': 0.85,
+                                    'min_chunk_size': 100}}
+            with patch.object(tuning.settings, 'upload_dir', directory), \
+                 patch.object(tuning.sources, 'has_sources', return_value=True), \
+                 patch.object(tuning.sources, 'load_index',
+                               return_value={'documents': {digest: {'filenames': ['big.jsonl']}}}), \
+                 patch.object(tuning.sources, 'collection_dir', return_value=src_dir), \
+                 patch.object(tuning, '_rebuild', return_value=0) as rebuild, \
+                 patch.object(tuning.wc, 'get_client') as get_client:
+                # big.jsonl is stored as one part, so the rebuild has something
+                # to rebuild (#311, #328): a part counts for its original.
+                get_client.return_value.collections.get.return_value.iterator.return_value = [
+                    SimpleNamespace(properties={'source_file': 'big.jsonl (part 1)', 'chunk_index': 0})]
+                tuning._run(job_id, 'ReviewTuneBudget', 'rechunk', params)
+            job = tuning._jobs.pop(job_id)
+            rebuild.assert_called_once()
+            properties = rebuild.call_args.args[1]
+            names = sorted({p['source_file'] for p in properties})
+            self.assertGreaterEqual(len(names), 2, names)
+            self.assertEqual(names, sorted(f'big.jsonl (part {n})' for n in range(1, len(names) + 1)))
+            for name in names:
+                windows = [p for p in properties if p['source_file'] == name]
+                self.assertLessEqual(len(windows), chunker.MAX_OVERLAP_WINDOWS)
+                self.assertEqual([p['chunk_index'] for p in windows], list(range(len(windows))))
+                self.assertLessEqual(sum(len(p['content']) for p in windows),
+                                     chunker.MAX_OVERLAP_OUTPUT_CHARACTERS)
+
 
     def test_long_token_has_bounded_windows_and_exact_coverage(self):
         chunks = self.check_windows('x' * 10000)
@@ -100,23 +174,33 @@ class OverlapTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'characters'):
                 chunker.chunk_overlap('x'*56,10,5,0)
 
-    def test_over_budget_file_fails_before_storage_and_other_file_continues(self):
+    def test_over_budget_file_is_stored_as_parts_and_other_file_continues(self):
+        # #621: a file whose overlap output would pass the per-file limits is
+        # split into parts, each inside them, instead of failing.
         with tempfile.TemporaryDirectory() as directory:
-            root=Path(directory);bad=root/'over-budget.txt';bad.write_text('inert')
-            good=root/'accepted.txt';good.write_text('inert')
+            root=Path(directory);bad=root/'over-budget.jsonl'
+            # 1000/800 (PR #630): 1000/999 would store about 1,000 times its size.
+            bad.write_text(''.join(json.dumps({'body':'x'*990})+'\n' for _ in range(2500)))
+            good=root/'accepted.jsonl';good.write_text(json.dumps({'body':'inert text'})+'\n')
             job_id='overlap-budget-test'
-            job={'status':'queued','files_total':2,'files_completed':0,'files_failed':0,'chunks_stored':0,'errors':[]}
+            job={'status':'queued','files_total':2,'files_completed':0,'files_failed':0,'chunks_stored':0,'errors':[],'split':[]}
             ingest_pipeline._jobs[job_id]=job
             try:
-                with patch.object(ingest_pipeline,'_parse_file',side_effect=[('x'*100000,[]),('inert text',[])]), \
-                     patch.object(ingest_pipeline.wc,'_insert_chunks_sync') as store, \
+                with patch.object(ingest_pipeline.wc,'_insert_chunks_sync') as store, \
+                     patch.object(ingest_pipeline.wc, '_source_has_chunks_sync', return_value=False), \
                      patch.object(ingest_pipeline.sources,'store') as retained:
-                    ingest_pipeline._process_job_sync(job_id,[bad,good],root,'ReviewOverlap','overlap',1000,999,0.85,100)
-                    store.assert_called_once();retained.assert_called_once()
-                    self.assertEqual(store.call_args.args[1][0]['source_file'],'accepted.txt')
-                self.assertEqual(job['status'],'partial',job)
-                self.assertEqual((job['files_completed'],job['files_failed'],job['chunks_stored']),(1,1,1))
-                self.assertIn('over-budget.txt',job['errors'][0]);self.assertIn('per-file limit',job['errors'][0])
+                    ingest_pipeline._process_job_sync(job_id,[bad,good],root,'ReviewOverlap','overlap',1000,800,0.85,100)
+                    names=[call.args[1][0]['source_file'] for call in store.call_args_list]
+                    self.assertGreaterEqual(len(names),3,names)
+                    self.assertEqual(names,[f'over-budget.jsonl (part {n})' for n in range(1,len(names))]+['accepted.jsonl'])
+                    for call in store.call_args_list:
+                        self.assertLessEqual(len(call.args[1]),chunker.MAX_OVERLAP_WINDOWS)
+                        self.assertLessEqual(sum(len(c['content']) for c in call.args[1]),chunker.MAX_OVERLAP_OUTPUT_CHARACTERS)
+                    self.assertEqual([c.args[1] for c in retained.call_args_list],['over-budget.jsonl','accepted.jsonl'])
+                self.assertEqual(job['status'],'completed',job)
+                self.assertEqual((job['files_completed'],job['files_failed']),(2,0))
+                self.assertEqual(job['split'],[f"over-budget.jsonl: split into {len(names)-1} parts, stored as "
+                                               f"'over-budget.jsonl (part 1)' to 'over-budget.jsonl (part {len(names)-1})'"])
             finally:ingest_pipeline._jobs.pop(job_id,None)
 
     def test_live_helper_rejects_empty_parser_output_instead_of_vacuous_success(self):
@@ -154,6 +238,7 @@ class OverlapTests(unittest.TestCase):
             with patch.dict(ingest_pipeline._jobs, {job_id:job}, clear=True), \
                  patch.object(ingest_pipeline, '_parse_file', return_value=(text,None)), \
                  patch.object(ingest_pipeline.wc, '_insert_chunks_sync') as store, \
+                 patch.object(ingest_pipeline.wc, '_source_has_chunks_sync', return_value=False), \
                  patch.object(ingest_pipeline.sources, 'store'):
                 ingest_pipeline._process_job_sync(job_id,[source],Path(directory),'ReviewOverlap','overlap',1000,200,0.85,100)
             self.assertEqual(job['status'], 'completed', job)

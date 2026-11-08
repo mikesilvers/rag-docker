@@ -1,5 +1,6 @@
 ```
 ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz
+ragpkg-<collection>-<YYYYMMDDTHHMMSSZ>-<id8>.tar.gz.age    (exported with a passphrase)
 ```
 
 The collection name in the filename is lowercased and stripped of punctuation,

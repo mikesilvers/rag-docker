@@ -33,6 +33,15 @@ A check **fails** when it has at least one High finding. Medium and Low findings
 
 ## The issue is the source of truth
 
+At each PR's turn, before claiming it, check the current labels of every linked
+issue (`closingIssuesReferences` plus `Part of #N` / `Refs #N` in the body).
+If any linked issue carries `Triage`, do not claim or evaluate the PR and do not
+set commit statuses. Record the PR as skipped in the local queue history, naming
+the issue, and report that skip to the user. Recheck at the next turn; an earlier
+snapshot is not acceptance. If fetching any issue or its labels fails, stop
+before claiming because eligibility is unknown. Do not infer maintainer acceptance
+from the absence of a workflow run or from an unreadable issue.
+
 Before reviewing, turn the linked issue(s) into a numbered **requirements list** (R1, R2, …). Take it from the issue's problem statement, fix, tests, acceptance criteria and any recorded **Decision** section. The Decision section overrides earlier text in the issue.
 
 Then list every changed file and hunk from `diff.patch` (H1, H2, …).
@@ -239,7 +248,7 @@ The checks listed above as flaky or environmental are for your information: they
 - …
 </details>
 
-_One evaluation per commit. A new commit gets its own evaluation. Ready to merge only when Coding, Security, Tests and Build all pass; merging is the maintainer's decision._
+_One evaluation per commit. A new commit gets its own evaluation. Ready to merge only when Coding, Security, Tests and Build all pass; merging is the maintainer's decision, except an agent's own tier-1 bug fix that passes every check in `CLAUDE.md` "Merging into `develop`"._
 ```
 
 The status is `READY TO MERGE` only when all four checks passed and no High is open. It's `NOT READY` for any other outcome.

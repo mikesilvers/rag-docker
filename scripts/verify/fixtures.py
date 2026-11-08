@@ -9,6 +9,7 @@ pulled from a document library.
 """
 from __future__ import annotations
 
+import gzip
 import json
 import pathlib
 import random
@@ -143,6 +144,93 @@ def write(target: pathlib.Path) -> None:
         for name in ("policies.txt", "policies.md", "policies.pdf",
                      "notes.xyz", "notes.rtf"):
             z.write(target / name, arcname=name)
+
+    # Issue #290. A ZIP cut before its central directory, like an incomplete
+    # download: it once ended the upload in a bare HTTP 500.
+    with zipfile.ZipFile(target / "truncated.zip", "w", zipfile.ZIP_STORED) as z:
+        z.write(target / "policies.txt", arcname="policies.txt")
+    data = (target / "truncated.zip").read_bytes()
+    (target / "truncated.zip").write_bytes(data[:data.index(b"PK\x01\x02")])
+    # Gzipped JSON and JSON Lines members are decompressed and ingested (#290,
+    # #291); other gzip types are skipped as unsupported.
+    with zipfile.ZipFile(target / "gz_batch.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(target / "policies.json", arcname="policies.json")
+        z.writestr("bills/policies2.json.gz",
+                   gzip.compress((target / "policies.json").read_bytes(), mtime=0))
+        z.writestr("records.jsonl.gz", gzip.compress(b'{"a": 1}\n', mtime=0))
+        z.writestr("notes.txt.gz", gzip.compress(b"unsupported\n", mtime=0))
+
+    # Issue #295. Ordinary nested JSON with non-ASCII text, stored as readable
+    # `key: value` lines rather than pretty-printed JSON with escaped characters.
+    (target / "plain.json").write_text(json.dumps({
+        "title": "Remote work policy",
+        "body": "Remote work needs written manager approval.",
+        "meta": {"author": "Zoë Müller"},
+        "tags": ["policy", "remote"],
+    }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # Issue #291. JSON Lines: one record per line, converted like ordinary JSON,
+    # plain and gzipped; a line with no text adds nothing. bad.jsonl has a
+    # malformed second line, which fails the whole file.
+    records = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in (
+        {"bill": "HR-1", "title": "Remote work act", "sponsor": {"name": "Zoë Müller"}},
+        {},
+        {"bill": "HR-2", "title": "Expense filing act", "tags": ["finance", "deadline"]},
+    ))
+    (target / "records.jsonl").write_text(records, encoding="utf-8")
+    (target / "records.jsonl.gz").write_bytes(gzip.compress(records.encode("utf-8"), mtime=0))
+    (target / "bad.jsonl").write_text('{"bill": "HR-3"}\n{"bill": }\n{"bill": "HR-4"}\n',
+                                      encoding="utf-8")
+    # Issue #314. A JSON Lines file holds at most 1,000,000 lines, every line
+    # counting: jsonl_many_records.jsonl.gz is 1,000,001 records with no text
+    # (about 3 MB decompressed, a few KB gzipped), which fails the file.
+    (target / "jsonl_many_records.jsonl.gz").write_bytes(gzip.compress(b"{}\n" * 1_000_001, mtime=0))
+
+    # Issue #298. An upload's ZIPs may expand to at most 2 GiB in all. Both
+    # files are about 2 MB. zip_over_declared.zip honestly declares a member of
+    # 2,049 MiB of zeros, refused before anything is read (about 3 s to write).
+    # zip_over_gzip.zip declares only its 2 MB gzip member, but that member,
+    # 33 concatenated gzip streams of 64 MiB of zeros, decompresses to
+    # 2,112 MiB: it is refused while its output is counted.
+    zeros = bytes(1024 * 1024)
+    member = zipfile.ZipInfo("zeros.bin", date_time=(2026, 1, 1, 0, 0, 0))
+    member.compress_type = zipfile.ZIP_DEFLATED
+    with zipfile.ZipFile(target / "zip_over_declared.zip", "w") as z:
+        with z.open(member, "w", force_zip64=True) as out:
+            for _ in range(2049):
+                out.write(zeros)
+    stream = gzip.compress(bytes(64 * 1024 * 1024), mtime=0)
+    with zipfile.ZipFile(target / "zip_over_gzip.zip", "w", zipfile.ZIP_STORED) as z:
+        z.writestr("big.json.gz", stream * 33)
+
+    # Issue #300. JSON files are parsed whole, so their input is limited to
+    # 30,000,000 bytes, and a file may keep at most 1,000,000 records.
+    # json_over_size.json is valid JSON one byte over the limit (spaces after
+    # the value); json_many_records.json is 1,000,001 tiny records (about
+    # 4 MB); json_over_size_gz.zip holds a .json.gz member that decompresses
+    # to one byte over the limit.
+    over = b'{"k": "v"}'
+    over += b" " * (30_000_001 - len(over))
+    (target / "json_over_size.json").write_bytes(over)
+    (target / "json_many_records.json").write_text("[" + ",".join(["[1]"] * 1_000_001) + "]")
+    with zipfile.ZipFile(target / "json_over_size_gz.zip", "w", zipfile.ZIP_STORED) as z:
+        z.writestr("big.json.gz", gzip.compress(over, mtime=0))
+    # Reviewer test (#300): the input limit applies to a plain .json ZIP member.
+    # Stored: 30 MB of spaces deflates past the ZIP ratio cap (#28), which would
+    # refuse the upload before the job reaches the JSON limit this tests.
+    with zipfile.ZipFile(target / "json_over_size_member.zip", "w", zipfile.ZIP_STORED) as z:
+        z.writestr("big.json", over)
+
+    # Issue #28. One ZIP may hold at most 5,000 entries, and a member of 1 MiB
+    # or more may expand at most 200 times its compressed size.
+    # zip_many_members.zip holds 5,001 empty entries (about 500 KB);
+    # zip_high_ratio.zip holds 2 MiB of zeros, deflated to a few KB. Written
+    # last: 02_ingest.sh regenerates the fixtures when this one is missing.
+    with zipfile.ZipFile(target / "zip_many_members.zip", "w", zipfile.ZIP_STORED) as z:
+        for i in range(5001):
+            z.writestr(f"m{i:04}.txt", b"")
+    with zipfile.ZipFile(target / "zip_high_ratio.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("zeros.txt", bytes(2 * 1024 * 1024))
 
 
 if __name__ == "__main__":

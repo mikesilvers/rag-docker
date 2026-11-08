@@ -6,6 +6,12 @@ sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).reso
 from services import collection_writes as writes
 
 class WriterTests(unittest.TestCase):
+    def test_aliases_preserve_other_case_and_remove_duplicates(self):
+        self.assertEqual(writes.aliases('ownedCorpus'), ('OwnedCorpus', 'ownedCorpus'))
+        self.assertEqual(writes.aliases('OwnedCorpus'), ('OwnedCorpus', 'ownedCorpus'))
+        self.assertNotEqual(writes.aliases('OwnedCorpus'), writes.aliases('Ownedcorpus'))
+        self.assertEqual(writes.aliases(''), ('',))
+
     def test_same_collection_waits_until_complete_guard_releases(self):
         attempted=threading.Event();entered=threading.Event()
         def worker():
@@ -219,11 +225,11 @@ class DeletedRecoveryTests(unittest.TestCase):
                 registry = {'OwnedRecovery': 'canonical', 'ownedRecovery': 'alias', 'Ownedrecovery': 'neighbor'}
                 with self.subTest(caller=caller, fails=fails), \
                      patch.object(route.wc, 'collection_exists', new=AsyncMock(return_value=True)), \
-                     patch.object(route.wc, 'delete_collection', new=AsyncMock(side_effect=OSError('owned') if fails else None, return_value=3)), \
+                     patch.object(route.wc, 'delete_collection_when_idle', new=AsyncMock(side_effect=OSError('owned') if fails else None, return_value=3)), \
                      patch.object(route, '_registry_lock', asyncio.Lock()), \
                      patch.object(route, '_load_registry', return_value=registry), \
                      patch.object(route, '_save_registry') as save:
-                    asyncio.run(route.delete_collection(caller))
+                    asyncio.run(route.delete_collection(caller, confirm='true'))
                     if fails:
                         save.assert_not_called()
                         self.assertEqual(len(registry), 3)

@@ -44,7 +44,7 @@ class LifecycleTests(unittest.TestCase):
         client=SimpleNamespace(collections=SimpleNamespace(get=collection,exists=lambda name:canonical(name) in backend,delete=lambda name:backend.pop(canonical(name))))
         def check(condition,label):self.assertTrue(condition,label);checks.append(label)
         async def run(directory):
-            async with ns['httpx'].AsyncClient(transport=ns['httpx'].ASGITransport(app=ns['app']),base_url='http://owned') as api:
+            async with ns['httpx'].AsyncClient(transport=ns['httpx'].ASGITransport(app=ns['app']),headers=ns['auth_testing'].headers(base_url='http://owned'), base_url='http://owned') as api:
                 await ns['collection_deletion_checks'](api,client,'OwnedVerifier',directory,check)
         from routers import collections as collections_router
         with tempfile.TemporaryDirectory() as directory,patch.object(ns['settings'],'upload_dir',directory),patch.object(ns['settings'],'sources_dir',str(Path(directory)/'sources')),patch.object(ns['gs'],'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None),patch.object(collections_router,'_REGISTRY_FILE',None),patch.object(ns['wc'],'get_client',return_value=client),patch.object(ns['wc'],'_create_collection_sync',side_effect=create):

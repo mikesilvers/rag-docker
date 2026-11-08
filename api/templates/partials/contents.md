@@ -1,6 +1,6 @@
 ```
 manifest.json           what this package is; authoritative
-collection.json         schema, index type, distance metric, HNSW parameters
+collection.json         schema, stored embedding_model, index type, distance metric, HNSW parameters
 chunks.jsonl            one JSON object per chunk, with its vector
 ingest_config.json      chunking settings, if the collection had any saved
 retrieval_config.json   the retrieval settings the collection was tuned with

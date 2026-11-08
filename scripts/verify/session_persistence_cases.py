@@ -8,6 +8,7 @@ sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).reso
 import httpx
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs
 
 
@@ -18,7 +19,7 @@ def child_env():
     return {**os.environ,'PYTHONPATH':os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__ != '<stdin>' else '/app')}
 
 def client():
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app,raise_app_exceptions=False),base_url='http://owned-review')
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app,raise_app_exceptions=False),headers=auth_testing.headers(base_url='http://owned-review'), base_url='http://owned-review')
 
 class PersistenceTests(unittest.TestCase):
     def setUp(self):
@@ -32,6 +33,146 @@ class PersistenceTests(unittest.TestCase):
 
     def restart(self):
         gs._sessions={};gs.load_sessions_from_disk();return gs.get_session(self.data['session_id'])
+
+    def test_startup_settles_interrupted_generation_durably_in_fresh_process(self):
+        self.data.update(status='generating', pairs_total=5, pairs_attempted=2, stale=True, stale_reason='Old corpus')
+        gs.store_session(self.data)
+        script = """
+import asyncio, json, sys
+from unittest.mock import patch, AsyncMock
+from config import settings
+settings.upload_dir = sys.argv[1]
+from main import app, lifespan
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
+from services import goldstandard as gs, weaviate_client as wc, importer, packager
+async def run():
+    with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), patch.object(importer, 'sweep_interrupted_imports', return_value=[]), patch.object(importer, 'sweep_stale_workdirs', return_value=[]), patch.object(packager, 'sweep_build_leftovers', return_value=[]):
+        async with lifespan(app):
+            print(json.dumps(gs.get_session('gs_450abcde')))
+asyncio.run(run())
+"""
+        first = json.loads(subprocess.check_output([sys.executable, '-c', script, self.tmp.name], env=child_env(), text=True))
+        second = json.loads(subprocess.check_output([sys.executable, '-c', script, self.tmp.name], env=child_env(), text=True))
+        self.assertEqual(first, second)
+        self.assertEqual(first['status'], 'failed')
+        for field in ('pairs', 'pairs_total', 'pairs_attempted', 'pairs_completed', 'stale', 'stale_reason'):
+            self.assertEqual(first[field], self.data[field])
+        self.assertTrue(any('interrupted by API restart' in error for error in first['errors']))
+        self.assertEqual(json.loads(gs._session_path(self.data['session_id']).read_text()), first)
+
+    def test_startup_write_failure_is_visible_and_ordinary_scans_leave_workers_alone(self):
+        self.data['status'] = 'generating'
+        gs.store_session(self.data)
+        gs.session_diagnostics()
+        self.assertEqual(gs.get_session(self.data['session_id'])['status'], 'generating')
+        before = gs._session_path(self.data['session_id']).read_bytes()
+        with patch.object(gs.os, 'replace', side_effect=OSError('Owned startup write fault')):
+            gs.reconcile_interrupted_generations()
+        current = gs.get_session(self.data['session_id'])
+        self.assertEqual(current['status'], 'failed')
+        self.assertEqual(current['persistence_error']['code'], 'SESSION_WRITE_FAILED')
+        self.assertEqual(current['pairs'], self.data['pairs'])
+        self.assertEqual(gs._session_path(self.data['session_id']).read_bytes(), before)
+        gs._sessions = {}
+        gs.load_sessions_from_disk()
+        gs.reconcile_interrupted_generations()
+        on_disk = json.loads(gs._session_path(self.data['session_id']).read_text())
+        self.assertEqual(on_disk['status'], 'failed')
+        self.assertTrue(any('interrupted by API restart' in e for e in on_disk['errors']))
+        self.assertEqual(gs.get_session(self.data['session_id']), on_disk)
+
+    def test_startup_settles_only_interrupted_session_keeping_edits_and_flags(self):
+        done_before = gs._session_path(self.data['session_id']).read_bytes()
+        live = fixture(); live['session_id'] = 'gs_450fedcb'
+        live['pairs'][0].update(status='edited', question='Reviewer edit')
+        live.update(status='generating', pairs_total=4, pairs_attempted=2,
+                    pairs_failed=0, stale=True, stale_reason='Old corpus',
+                    stale_at='2026-01-01T00:00:00+00:00', orphaned=True,
+                    orphaned_reason='Collection deleted', orphaned_at='2026-01-02T00:00:00+00:00')
+        gs.store_session(live)
+        gs._sessions = {}; gs.load_sessions_from_disk()
+        gs.reconcile_interrupted_generations()
+        self.assertEqual(gs._session_path(self.data['session_id']).read_bytes(), done_before)
+        settled = json.loads(gs._session_path(live['session_id']).read_text())
+        self.assertEqual(settled['status'], 'failed')
+        for field in ('pairs', 'pairs_total', 'pairs_attempted', 'pairs_completed',
+                      'pairs_failed', 'stale', 'stale_reason', 'stale_at',
+                      'orphaned', 'orphaned_reason', 'orphaned_at'):
+            self.assertEqual(settled[field], live[field], field)
+        self.assertEqual(settled['errors'], ['Generation interrupted by API restart. Retained pairs are available for review; start a new generation for missing pairs.'])
+        self.assertNotIn('persistence_error', settled)
+        gs._sessions = {}; gs.load_sessions_from_disk()
+        self.assertEqual(gs.get_session(live['session_id']), settled)
+        new_pair = {**live['pairs'][1], 'question': 'Regenerated'}
+        with patch.object(gs, '_generate_pair', new=AsyncMock(return_value=new_pair)):
+            result = asyncio.run(gs.regenerate_pair(live['session_id'], live['pairs'][1]['pair_id']))
+        self.assertEqual(result['question'], 'Regenerated')
+        stored = json.loads(gs._session_path(live['session_id']).read_text())
+        self.assertEqual(stored['pairs'], [live['pairs'][0], new_pair])
+
+    def test_reconcile_refuses_to_run_while_generation_workers_exist(self):
+        self.data['status'] = 'generating'; gs.store_session(self.data)
+        before = gs._session_path(self.data['session_id']).read_bytes()
+        with patch.object(gs, '_tasks', {object()}):
+            with self.assertRaisesRegex(RuntimeError, 'before workers start'):
+                gs.reconcile_interrupted_generations()
+        self.assertEqual(gs.get_session(self.data['session_id']), self.data)
+        self.assertEqual(gs._session_path(self.data['session_id']).read_bytes(), before)
+
+    def test_generation_accounts_for_partial_and_total_model_failure(self):
+        for succeeds in (True, False):
+            with self.subTest(succeeds=succeeds):
+                data=fixture(); data.update(status='generating', pairs=[], pairs_total=2,
+                                           pairs_completed=0, pairs_attempted=0, pairs_failed=0, errors=[])
+                gs.store_session(data)
+                effects=[fixture()['pairs'][0] if succeeds else ValueError('Invalid first pair'),
+                         httpx.ReadTimeout('')]
+                with patch.object(gs, '_generate_pair', new=AsyncMock(side_effect=effects)):
+                    asyncio.run(gs._run_generation(data['session_id'], [{'content':'a'}, {'content':'b'}]))
+                result=json.loads(gs._session_path(data['session_id']).read_text())
+                self.assertEqual(result['status'], 'completed' if succeeds else 'failed')
+                self.assertEqual(result['pairs_completed'], len(result['pairs']))
+                self.assertEqual(result['pairs_completed'], int(succeeds))
+                self.assertEqual(result['pairs_completed']+result['pairs_failed'], 2)
+                self.assertEqual(result['pairs_attempted'], 2)
+                self.assertEqual(len(result['errors']), result['pairs_failed'])
+                self.assertTrue(all(reason.strip() for reason in result['errors']))
+
+    def test_regeneration_deadline_returns_typed_error_and_preserves_pair(self):
+        before=gs._session_path(self.data['session_id']).read_bytes()
+        cancelled=[]
+        async def delayed(chunk):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(True)
+        async def run():
+            with patch.object(gs, '_generate_pair', side_effect=delayed), patch.object(gs, '_REGENERATION_TIMEOUT_SECONDS', 0.01):
+                async with client() as c:
+                    return await c.post('/goldstandard/regenerate', json={'session_id':self.data['session_id'], 'pair_id':'p_0'})
+        response=asyncio.run(run())
+        self.assertEqual(response.status_code, 504, response.text)
+        self.assertEqual(response.json()['error']['code'], 'PAIR_GENERATION_TIMEOUT')
+        self.assertEqual(cancelled, [True])
+        self.assertEqual(gs.get_session(self.data['session_id']), self.data)
+        self.assertEqual(gs._session_path(self.data['session_id']).read_bytes(), before)
+
+    def test_regeneration_retains_validation_and_transport_retry_budget(self):
+        valid=json.dumps({'question':'Regenerated', 'answer':'Answer', 'ground_truth':'Truth'})
+        replies=[httpx.ReadTimeout(''), 'invalid', httpx.ReadTimeout(''), 'invalid', httpx.ReadTimeout(''), valid]
+        with patch.object(gs.ollama, 'chat', new=AsyncMock(side_effect=replies)) as chat:
+            result=asyncio.run(gs.regenerate_pair(self.data['session_id'], 'p_0'))
+        self.assertEqual(chat.await_count, 6)
+        self.assertEqual(result['question'], 'Regenerated')
+        self.assertEqual(result['pair_id'], 'p_0')
+        stored=json.loads(gs._session_path(self.data['session_id']).read_text())
+        self.assertEqual(stored['pairs'][1], self.data['pairs'][1])
+        self.assertEqual(stored['pairs'][0], result)
+
+    def test_startup_leaves_completed_sessions_unchanged(self):
+        before = gs._session_path(self.data['session_id']).read_bytes()
+        gs.reconcile_interrupted_generations()
+        self.assertEqual(gs._session_path(self.data['session_id']).read_bytes(), before)
 
     def test_parallel_acknowledged_fields_survive_restart(self):
         data=fixture();data["pairs"]=[{**data["pairs"][0],"pair_id":"p_"+str(i)} for i in range(8)];data.update(pairs_total=8,pairs_completed=8);gs.store_session(data)
@@ -180,7 +321,7 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
                 finally:release.set()
                 result=await task;self.assertEqual(result['pairs_saved'],1)
         asyncio.run(run())
-        self.assertEqual(json.loads((Path(self.tmp.name)/'snapshot.json').read_text())[0]['answer'],'Original')
+        self.assertEqual(json.loads((Path(self.tmp.name)/gs.EXPORT_DIRNAME/'snapshot.json').read_text())[0]['answer'],'Original')
         self.assertEqual(self.restart()['pairs'][0]['answer'],'Later acknowledged edit')
 
     def test_scan_of_missing_storage_does_not_create_directory(self):
@@ -250,12 +391,12 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         with patch.object(gs,'_save_session_sync',side_effect=OSError('Owned marker write fault')):
             self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned completed deletion'),0)
         async def request():
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as client:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned-review'), base_url='http://owned-review') as client:
                 return await client.post('/goldstandard/save',json={'session_id':self.data['session_id'],'filename':'owned-review.json'})
         response=asyncio.run(request())
         self.assertEqual(response.status_code,409,response.text)
         self.assertEqual(response.json()['error']['code'],'HISTORICAL_SESSION')
-        self.assertFalse((Path(self.tmp.name)/'owned-review.json').exists())
+        self.assertFalse((Path(self.tmp.name)/gs.EXPORT_DIRNAME/'owned-review.json').exists())
 
     def test_generation_commit_failure_retains_code_after_followup_status_writes(self):
         async def run():
@@ -288,10 +429,14 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
                 await task
         asyncio.run(run());self.assertEqual(self.restart()['status'],'failed')
 
+    def test_unexpected_generation_failure_reason_names_its_type(self):
+        asyncio.run(gs._record_generation_failure(self.data['session_id'], KeyError('pairs')))
+        self.assertIn("KeyError: 'pairs'", self.restart()['errors'])
+
     async def generate(self,pair):
         # The real task, done-callback and reporter run; only the model and sampling are owned.
         chunk={'content':'Inert','source_file':'inert.txt','chunk_index':0}
-        with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[chunk])),patch.object(gs,'_generate_pair',side_effect=pair),patch.object(gs,'_tasks',set()):
+        with patch.object(gs.wc,'_sample_chunks_sync',new=MagicMock(return_value=[chunk])),patch.object(gs,'_generate_pair',side_effect=pair),patch.object(gs,'_tasks',set()):
             sid=(await gs.start_generation('OwnedPersistence',1,None))['session_id']
             deadline=time.monotonic()+5
             while gs._tasks:
@@ -300,7 +445,7 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         return sid
 
     async def fetch(self,sid):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned-review'), base_url='http://owned-review') as client:
             return await client.get('/goldstandard/session/'+sid)
 
     def test_persistent_replace_failure_ends_generation_failed(self):
@@ -330,8 +475,7 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         sid,response=asyncio.run(run());state=gs.get_session(sid)
         self.assertEqual(state['status'],'failed')
         self.assertEqual((response.status_code,response.json()['status']),(200,'failed'),response.text)
-        # Untyped on develop; #127 types the same fault as SESSION_WRITE_FAILED.
-        self.assertTrue(any('not a regular file' in e or 'SESSION_WRITE_FAILED' in e for e in state['errors']),state['errors'])
+        self.assertTrue(any('SESSION_WRITE_FAILED' in e for e in state['errors']),state['errors'])
 
     def test_cancelled_generation_with_failing_final_write_ends_failed(self):
         fault=threading.Event();original=gs.os.replace
@@ -372,12 +516,44 @@ asyncio.run(gs.update_pair('gs_450abcde','p_0',{'answer':'Interrupted edit'}))
         self.assertEqual(seen,[True])
         self.assertEqual(gs.get_session(initial['session_id'])['status'],'failed')
 
-    def test_successful_tuning_not_misreported_when_stale_marker_write_fails(self):
+    def test_uncertain_failure_report_keeps_both_reasons(self):
+        original=gs.GoldStandardError('SESSION_WRITE_FAILED','Original generation write failed',500)
+        report=gs.GoldStandardError('SESSION_DURABILITY_UNCERTAIN','Reporter replace completed but sync failed',500)
+        gs._publish_generation_failure(self.data['session_id'],original,report)
+        current=gs.get_session(self.data['session_id'])
+        self.assertEqual(current['persistence_error']['code'],'SESSION_DURABILITY_UNCERTAIN')
+        self.assertTrue(any('SESSION_WRITE_FAILED' in message for message in current['errors']))
+        self.assertTrue(any('SESSION_DURABILITY_UNCERTAIN' in message for message in current['errors']))
+
+    def test_cached_generation_failure_is_saved_by_next_successful_write(self):
+        # Reviewer (#136 spec sentence): the cache runs ahead of disk until a later successful write saves it.
+        fault=threading.Event();original=gs.os.replace
+        def replace(src,dst):
+            if fault.is_set():raise OSError('Owned persistent replace fault')
+            return original(src,dst)
+        async def pair(chunk):fault.set();return fixture()['pairs'][0]
+        async def run():
+            with patch.object(gs.os,'replace',side_effect=replace):return await self.generate(pair)
+        sid=asyncio.run(run())
+        self.assertEqual(json.loads(gs._session_path(sid).read_text())['status'],'generating')
+        self.assertEqual(gs.mark_stale('OwnedPersistence','Owned later write'),2)
+        gs._sessions={};gs.load_sessions_from_disk();state=gs.get_session(sid)
+        self.assertEqual(state['status'],'failed',state)
+        self.assertEqual(state['persistence_error']['code'],'SESSION_WRITE_FAILED')
+        self.assertTrue(state['stale'])
+
+    def test_cache_fallback_does_not_recreate_a_removed_session(self):
+        # Reviewer: a session gone from the cache must not be resurrected by the fallback.
+        before=gs._store_revision
+        gs._publish_generation_failure('gs_450abcd2',RuntimeError('Owned failure'),OSError('Owned write fault'))
+        self.assertIsNone(gs.get_session('gs_450abcd2'));self.assertEqual(gs._store_revision,before)
+
+    def test_tuning_aborts_when_both_historical_marker_writes_fail(self):
         from services import tuning
         job={'status':'queued'};jobid='owned-marker-job'
         with patch.dict(tuning._jobs,{jobid:job}),patch.object(tuning.sources,'has_sources',return_value=False),patch.object(tuning,'_existing_chunks',return_value=[{'content':'Inert'}]),patch.object(tuning,'_rebuild',side_effect=lambda *args,**kwargs:(kwargs['before_replace'](),1)[1]) as rebuild,patch.object(gs.os,'replace',side_effect=OSError('Owned marker failure')):
             tuning._run(jobid,'OwnedPersistence','reembed',{})
-        rebuild.assert_called_once();self.assertEqual(job['status'],'completed');self.assertEqual(job['chunks_written'],1)
+        rebuild.assert_called_once();self.assertEqual(job['status'],'failed');self.assertEqual(job.get('chunks_written',0),0)
         self.assertEqual(gs.session_diagnostics()[0]['code'],'SESSION_WRITE_FAILED')
 
 
@@ -460,11 +636,12 @@ with patch.object(gs,'_save_session_sync',side_effect=OSError('Owned marker writ
         second="""import sys,asyncio,json,httpx
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs
 settings.upload_dir=sys.argv[1]
 gs.load_sessions_from_disk()
 async def run():
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-review') as c:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned-review'), base_url='http://owned-review') as c:
         r=await c.post('/goldstandard/save',json={'session_id':'gs_450abcde','filename':'owned-restart.json'})
         return r.status_code,r.json()
 print(json.dumps({'export':list(asyncio.run(run())),'diagnostics':gs.session_diagnostics()}))
@@ -572,6 +749,46 @@ print(json.dumps({'export':list(asyncio.run(run())),'diagnostics':gs.session_dia
             self.assertEqual(gs.get_session(self.data['session_id'])['pairs'][0]['answer'],'Changed')
         bad=gs._sessions_dir()/'gs_450bad00.json';bad.write_text('{')
         self.assertEqual(len(gs.session_diagnostics()),1);bad.unlink();self.assertEqual(gs.session_diagnostics(),[])
+
+    # Reviewer additions for #127.
+    def test_session_and_pending_marker_files_are_owner_only(self):
+        self.assertEqual(gs._session_path(self.data['session_id']).stat().st_mode&0o777,0o600)
+        with self.fail_session_file_replace():
+            gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+        self.assertEqual(self.pending().stat().st_mode&0o777,0o600)
+
+    def test_pending_marker_after_restart_is_saved_by_next_write(self):
+        with self.fail_session_file_replace():
+            gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+        state=self.restart();self.assertTrue(state['orphaned']);self.assertTrue(self.pending().is_file())
+        asyncio.run(gs.update_pair(self.data['session_id'],'p_0',{'answer':'Later edit'}))
+        stored=json.loads(gs._session_path(self.data['session_id']).read_text())
+        self.assertTrue(stored['orphaned']);self.assertEqual(stored['orphaned_reason'],'Owned completed deletion')
+        self.assertFalse(self.pending().exists());self.assertEqual(gs.session_diagnostics(),[])
+
+    def test_symlinked_pending_storage_is_refused_and_guard_holds(self):
+        outside=Path(self.tmp.name)/'outside';outside.mkdir()
+        self.pending().parent.symlink_to(outside,target_is_directory=True)
+        with self.fail_session_file_replace():
+            self.assertEqual(gs.mark_orphaned('OwnedPersistence','Owned completed deletion'),0)
+        self.assertEqual(list(outside.iterdir()),[])
+        with self.assertRaises(gs.GoldStandardError) as error:asyncio.run(gs.save_session(self.data['session_id'],'owned.json'))
+        self.assertEqual(error.exception.code,'HISTORICAL_SESSION')
+        issues={i['filename']:i for i in gs.session_diagnostics()}
+        self.assertIn('until restart',issues['gs_450abcde.json']['message'])
+        self.assertEqual(issues['pending_markers']['code'],'SESSION_READ_FAILED')
+
+    def test_pending_marker_without_session_file_is_ignored(self):
+        self.pending().parent.mkdir()
+        (self.pending().parent/'gs_450dead0.json').write_text(json.dumps({'session_id':'gs_450dead0','orphaned':True,'orphaned_reason':'Owned','orphaned_at':None}))
+        self.restart();self.assertIsNone(gs.get_session('gs_450dead0'));self.assertEqual(gs.session_diagnostics(),[])
+
+    def test_durability_uncertain_marker_keeps_its_own_wording(self):
+        with patch.object(gs,'_sync_directory',side_effect=OSError('Owned directory sync fault')):
+            gs.mark_orphaned('OwnedPersistence','Owned completed deletion')
+        self.assertTrue(json.loads(gs._session_path(self.data['session_id']).read_text())['orphaned'])
+        issue=gs.session_diagnostics()[0];self.assertEqual(issue['code'],'SESSION_DURABILITY_UNCERTAIN')
+        self.assertNotIn('pending marker',issue['message'])
 
 if __name__ == '__main__':
     unittest.main()

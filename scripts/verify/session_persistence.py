@@ -9,6 +9,7 @@ from unittest.mock import patch
 import httpx
 from config import settings
 from main import app
+from auth import testing as auth_testing  # a real session in a temporary store (#25)
 from services import goldstandard as gs,weaviate_client as wc
 
 collection=os.environ.get('RAG_TEST_PREFIX','Vfy')+'Persistence'+uuid.uuid4().hex[:10]
@@ -16,7 +17,7 @@ created=False
 with tempfile.TemporaryDirectory(prefix='session-persistence-live-') as directory,patch.object(settings,'upload_dir',directory):
     async def run():
         global created
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://owned-fixture') as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),headers=auth_testing.headers(base_url='http://owned-fixture'), base_url='http://owned-fixture') as client:
             created=True
             response=await client.post('/collections',json={'name':collection});assert response.status_code==201,response.text
             coll=wc.get_client().collections.get(collection)
@@ -67,7 +68,7 @@ with tempfile.TemporaryDirectory(prefix='session-persistence-live-') as director
                 if Path(dst).stem==sid:raise OSError('Owned deletion marker failure')
                 return original_replace(src,dst)
             with patch.object(gs.os,'replace',side_effect=marker_fault):
-                deleted=await client.delete('/collections/'+collection)
+                deleted=await client.delete('/collections/'+collection+'?confirm=true')
             assert deleted.status_code==200 and deleted.json()['objects_deleted']==2,deleted.text
             assert not wc._collection_exists_sync(collection)
             from routers import collections as collection_routes

@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock,patch
+from unittest.mock import AsyncMock,MagicMock,patch
 sys.path.insert(0,os.environ.get('RAG_TEST_API_DIR') or (str(Path(__file__).resolve().parents[2]/'api') if __file__!='<stdin>' else '/app'))
 from config import settings
 from services import goldstandard as gs,importer
@@ -34,7 +34,7 @@ class IdentityTests(unittest.TestCase):
             self.assertEqual(session['imported_from']['session_id'],self.original['session_id']);self.assertEqual(session['imported_from']['collection'],'OwnedOriginal')
         identities=[self.original['session_id']]+[s['session_id'] for s in imported];self.assertEqual(len(set(identities)),3);self.assertEqual(self.path.read_bytes(),before)
         for i,sid in enumerate(identities):
-            result=asyncio.run(gs.save_session(sid,'owned-export'+str(i)+'.json'));rows=json.loads((Path(self.tmp.name)/result['filename']).read_text())
+            result=asyncio.run(gs.save_session(sid,'owned-export'+str(i)+'.json'));rows=json.loads((Path(self.tmp.name)/gs.EXPORT_DIRNAME/result['filename']).read_text())
             self.assertEqual(rows[0]['answer'],'Newer human review' if i==0 else 'Original answer');self.assertEqual(set(rows[0]),{'question','answer','contexts','ground_truth'})
         gs._sessions={};gs.load_sessions_from_disk();self.assertEqual({gs.get_session(sid)['collection'] for sid in identities},{'OwnedOriginal','OwnedRenamedOne','OwnedRenamedTwo'})
 
@@ -98,7 +98,7 @@ class IdentityTests(unittest.TestCase):
     def test_generation_start_uses_the_same_namespace_without_overwriting_collision(self):
         before=self.path.read_bytes()
         async def run():
-            with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()),patch.object(gs.uuid,'uuid4',side_effect=[SimpleNamespace(hex='460abcde'+'0'*24),SimpleNamespace(hex='460abcdf'+'0'*24)]):
+            with patch.object(gs.wc,'_sample_chunks_sync',new=MagicMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()),patch.object(gs.uuid,'uuid4',side_effect=[SimpleNamespace(hex='460abcde'+'0'*24),SimpleNamespace(hex='460abcdf'+'0'*24)]):
                 result=await gs.start_generation('OwnedGeneration',1,None)
                 await asyncio.gather(*list(gs._tasks))
             self.assertEqual(result['session_id'],'gs_460abcdf')
@@ -176,7 +176,7 @@ class IdentityTests(unittest.TestCase):
     def test_reviewer_generation_identity_inspection_failure_is_session_write_failed_503(self):
         before=self.path.read_bytes()
         async def run():
-            with patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()) as generate,patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure')):
+            with patch.object(gs.wc,'_sample_chunks_sync',new=MagicMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()) as generate,patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure')):
                 with self.assertRaises(gs.GoldStandardError) as caught:await gs.start_generation('OwnedGeneration',1,None)
                 generate.assert_not_called()
             return caught.exception
@@ -211,7 +211,7 @@ class IdentityTests(unittest.TestCase):
         from models.schemas import GenerateRequest
         before=self.path.read_bytes()
         async def run():
-            with patch.object(route.wc,'collection_exists',new=AsyncMock(return_value=True)),patch.object(gs.wc,'sample_chunks',new=AsyncMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()) as generate,patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure')):
+            with patch.object(route.wc,'collection_exists',new=AsyncMock(return_value=True)),patch.object(gs.wc,'_sample_chunks_sync',new=MagicMock(return_value=[])),patch.object(gs,'_run_generation',new=AsyncMock()) as generate,patch.object(Path,'lstat',side_effect=PermissionError('Owned identity inspection failure')):
                 response=await route.generate(GenerateRequest(collection='OwnedGeneration',sample_size=1,seed=None))
                 generate.assert_not_called()
             return response

@@ -124,6 +124,40 @@ def prepare(prefix, state_path):
         else:
             raise AssertionError('tuning final-create fault reported success')
 
+    # Reviewer cases (PR #247): a hard stop during the final tuning write,
+    # once after a partial write and once after a complete one. KeyboardInterrupt
+    # bypasses the job's own exception handling, as an abrupt exit would.
+    state['killed'] = []
+    real_insert = batch_write.insert
+    for suffix, complete in (('TuneKillPartial', False), ('TuneKillDone', True)):
+        name = collection(suffix)
+        sources.store(name, 'synthetic.txt', b'synthetic retained source')
+        session = goldstandard._store_generated_session({
+            'session_id': 'gs_00000000', 'collection': name, 'status': 'completed',
+            'pairs_total': 0, 'pairs_completed': 0, 'pairs': []})
+        def interrupted(target, records, *args, _name=name, _complete=complete, **kwargs):
+            if getattr(target, 'name', None) != _name:
+                return real_insert(target, records, *args, **kwargs)
+            written = list(records() if callable(records) else records)
+            kwargs.pop('expected_count', None)
+            real_insert(target, written if _complete else written[:1], *args, **kwargs)
+            raise KeyboardInterrupt('controlled hard stop during the final tuning write')
+        with patch.object(batch_write, 'insert', side_effect=interrupted):
+            try:
+                tuning._rebuild(name, [row['properties'] for row in rows], None, None, None)
+            except KeyboardInterrupt:
+                pass
+            else:
+                raise AssertionError('interrupted tuning final write reported success')
+        record = next(json.loads(p.read_text()) for p in recovery._root().glob('*.json')
+                      if json.loads(p.read_text()).get('target') == name)
+        expected = list(packager.read_chunks(record['staging']))
+        require(len(expected) == 2, 'interrupted tuning retains every verified record: ' + suffix)
+        state['recoveries'].append({'record': record, 'rows': expected})
+        state['killed'].append({'name': name, 'staging': record['staging'], 'complete': complete,
+                                'sessions': [session['session_id']]})
+        save()
+
     import_name = collection('Import')
     package = Path(settings.upload_dir) / (prefix + '-package')
     package.mkdir()
@@ -191,6 +225,33 @@ def check(state):
             'startup finishes interrupted recovery journal cleanup')
     require(not (recovery._root() / cleanup_record['operation_id']).exists(),
             'startup removes remaining cleanup metadata')
+    for entry in state.get('killed', []):
+        name = entry['name']
+        require(client.collections.exists(name) and client.collections.exists(entry['staging']),
+                'interrupted tuning keeps target and recovery after restart: ' + name)
+        session = json.loads(goldstandard._session_path(entry['sessions'][0]).read_text())
+        if entry['complete']:
+            require(not session.get('stale'), 'a fully written tuning target keeps its sessions current: ' + name)
+        else:
+            require(session.get('stale') is True and 'interrupted tuning' in (session.get('stale_reason') or ''),
+                    'startup marks the sessions of a partially written tuning target stale: ' + name)
+        record = json.loads((recovery._root() / (entry['staging'].rsplit('__tuning_', 1)[1] + '.json')).read_text())
+        require(record['state'] == 'recovery' and record.get('cutover_pending') is False
+                and record.get('cutover_checked') == ('complete' if entry['complete'] else 'stale'),
+                'interrupted tuning durably retires its startup check: ' + name)
+        require(client.collections.get(name).config.get().description == 'rag-tune:' + record['operation_id'],
+                'the replacement target carries the operation instance token: ' + name)
+    partial = next((e for e in state.get('killed', []) if not e['complete']), None)
+    if partial:
+        fresh = goldstandard._store_generated_session({
+            'session_id': 'gs_00000000', 'collection': partial['name'], 'status': 'completed',
+            'pairs_total': 0, 'pairs_completed': 0, 'pairs': []})
+        partial['sessions'].append(fresh['session_id'])
+        Path(settings.upload_dir, state['prefix'] + '-acceptance.json').write_text(json.dumps(state, indent=2))
+        recovery.sweep(client)  # the next startup's check, run in this process
+        later = json.loads(goldstandard._session_path(fresh['session_id']).read_text())
+        require(not later.get('stale'),
+                'a later startup does not re-flag a session created after the interruption was reported')
 
 
 def cleanup(state, state_path):
@@ -204,6 +265,9 @@ def cleanup(state, state_path):
             sources.delete(name)
             wc.ingest_config.delete(name)
             wc.retrieval_config.delete(name)
+    for entry in state.get('killed', []):
+        for sid in entry['sessions']:
+            goldstandard._session_path(sid).unlink(missing_ok=True)
     for archive in state['archives']:
         Path(archive).unlink(missing_ok=True)
     import shutil

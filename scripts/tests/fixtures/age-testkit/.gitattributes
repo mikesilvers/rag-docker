@@ -1,0 +1,2 @@
+# Test vectors are byte-exact; some hold CR bytes on purpose (#27).
+* -text -diff

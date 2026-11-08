@@ -8,3 +8,7 @@ class DocumentationTests(unittest.TestCase):
         for name in names:
             lang='bash' if name.endswith('.sh') else 'markdown' if name.endswith('.md') else 'python';fence='````' if name.endswith('.md') else '```';header='### '+name+'\n\n'+fence+lang+'\n';a=text.index(header)+len(header);b=text.index('\n'+fence+'\n',a)
             with self.subTest(file=name):self.assertEqual(text[a:b],(root/name).read_text().rstrip('\n'))
+
+
+if __name__ == "__main__":
+    unittest.main()

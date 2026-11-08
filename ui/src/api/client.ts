@@ -1,6 +1,6 @@
 const BASE = '/api'
 
-// The proxy's request-body limit: `client_max_body_size` in proxy/nginx.conf.
+// The proxy's request-body limit: `client_max_body_size` in proxy/locations.conf.
 // It covers a whole request, so a multi-file upload counts every file. Kept
 // here only so the Import page can warn before sending; nginx enforces it.
 // Change both together.
@@ -15,6 +15,24 @@ const PROXY_ERRORS: Record<number, string> = {
   504: 'The API took too long to respond.',
 }
 
+// An API error, with the API's error code when the answer carried one.
+export class ApiError extends Error {
+  status: number
+  code: string | null
+  constructor(message: string, status: number, code: string | null) {
+    super(message)
+    this.status = status
+    this.code = code
+  }
+}
+
+// The session ended (401 AUTH_REQUIRED) or a generated password must be changed
+// first (403 PASSWORD_CHANGE_REQUIRED), whichever call noticed it (#25). The
+// auth context listens and shows the login or password page.
+type AuthListener = (code: 'AUTH_REQUIRED' | 'PASSWORD_CHANGE_REQUIRED') => void
+let authListener: AuthListener | null = null
+export function onAuthProblem(listener: AuthListener | null) { authListener = listener }
+
 async function request<T>(method: string, path: string, body?: unknown, isFormData = false): Promise<T> {
   const headers: Record<string, string> = isFormData ? {} : { 'Content-Type': 'application/json' }
   const res = await fetch(`${BASE}${path}`, {
@@ -28,21 +46,109 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
   let data: any = null
   try { data = text ? JSON.parse(text) : null } catch { /* not JSON; handled below */ }
   if (!res.ok) {
-    throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
+    const code: string | null = typeof data?.error?.code === 'string' ? data.error.code : null
+    if (code === 'AUTH_REQUIRED' || code === 'PASSWORD_CHANGE_REQUIRED') authListener?.(code)
+    throw new ApiError(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`, res.status, code)
   }
   if (data === null && text) throw new Error('The server sent a response the UI could not read.')
   return data as T
 }
 
+function isHealthResult(data: any): data is HealthResult {
+  const service = (s: any) => !!s && typeof s === 'object' && typeof s.status === 'string'
+  return service(data?.services?.weaviate) && service(data?.services?.ollama?.llm) && service(data?.services?.ollama?.embed)
+}
+
+// GET /health answers 503 with the same per-service body when a dependency is
+// down. request() throws on any non-2xx, so the Health page never saw which
+// service failed and could not show it red (#375). This call accepts a 200 or
+// a 503 that carries that body; every other error is thrown as request() would,
+// and a 200 without it is unreadable (#415).
+async function getHealthResult(): Promise<HealthResult> {
+  let res: Response
+  try {
+    res = await fetch(`${BASE}/health`)
+  } catch {
+    // fetch rejects only when no answer arrived; its own text ("Failed to fetch") says nothing.
+    throw new Error('The API could not be reached. Check that the stack is running.')
+  }
+  const text = await res.text()
+  let data: any = null
+  try { data = text ? JSON.parse(text) : null } catch { /* not JSON; handled below */ }
+  if ((res.ok || res.status === 503) && isHealthResult(data)) return data
+  if (!res.ok) {
+    throw new Error(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`)
+  }
+  // Another JSON shape, text or an empty body: the page would throw while
+  // rendering the cards, or show nothing at all (#415).
+  throw new Error('The server sent a response the UI could not read.')
+}
+
 export const api = {
+  // Accounts and sessions (#25). The session is an HttpOnly cookie the browser
+  // sends with every same-origin request; the UI never sees or stores it.
+  authStatus: () => request<{ setup_required: boolean }>('GET', '/auth/status'),
+  me: () => request<AuthUser>('GET', '/auth/me'),
+  login: (username: string, password: string) => request<AuthUser>('POST', '/auth/login', { username, password }),
+  logout: () => request<{ status: string }>('POST', '/auth/logout'),
+  changePassword: (current_password: string, new_password: string) =>
+    request<{ status: string } & AuthUser>('POST', '/auth/password', { current_password, new_password }),
+  // Account administration, Engineers only (#25). A generated password is in
+  // the answer to a create or a reset, once; the page shows it and keeps it nowhere.
+  listUsers: () => request<{ users: AdminUser[] }>('GET', '/auth/users'),
+  createUser: (username: string, role: Role) =>
+    request<{ user: AdminUser; password: string }>('POST', '/auth/users', { username, role }),
+  resetUserPassword: (username: string) =>
+    request<{ user: AdminUser; password: string }>('POST', `/auth/users/${encodeURIComponent(username)}/reset-password`),
+  setUserRole: (username: string, role: Role) =>
+    request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/role`, { role }),
+  disableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/disable`),
+  enableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/enable`),
+  // Service principals and their API keys (Engineers only, #25 PR 3).
+  listPrincipals: () => request<{ principals: ServicePrincipal[] }>('GET', '/auth/service-principals'),
+  createPrincipal: (name: string, role: Role) =>
+    request<{ principal: ServicePrincipal }>('POST', '/auth/service-principals', { name, role }),
+  setPrincipalRole: (name: string, role: Role) =>
+    request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/role`, { role }),
+  disablePrincipal: (name: string) =>
+    request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/disable`),
+  enablePrincipal: (name: string) =>
+    request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/enable`),
+  issueKey: (name: string, label: string, days: number) =>
+    request<{ principal: ServicePrincipal; key: ServiceKey; secret: string }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/keys`, { label, days }),
+  revokeKey: (name: string, keyId: string) =>
+    request<{ principal: ServicePrincipal }>('POST', `/auth/service-principals/${encodeURIComponent(name)}/keys/${encodeURIComponent(keyId)}/revoke`),
+  // The audit log (#29), for Engineers: a page of records, newest first.
+  listAudit: (filters: AuditFilters, before?: string) =>
+    request<AuditPage>('GET', `/audit${auditQuery(filters, before ? { before } : {})}`),
+
   getCollections: () => request<{ collections: CollectionInfo[] }>('GET', '/collections'),
-  createCollection: (body: CreateCollectionBody) => request('POST', '/collections', body),
+  // Answers with the name as stored, first letter capitalised (#372).
+  createCollection: (body: CreateCollectionBody) => request<{ name: string; status: string }>('POST', '/collections', body),
   deleteCollection: (name: string) => request('DELETE', `/collections/${name}?confirm=true`),
 
   // Ingest — form field is "strategy"; job status URL is /ingest/job/{id}; config POST is /ingest/config
   uploadFiles: (form: FormData) => request<{ job_id: string; status: string; files_queued: number; collection: string }>('POST', '/ingest/upload', form, true),
   getJobStatus: (jobId: string) => request<JobStatus>('GET', `/ingest/job/${jobId}`),
+  // The caller's running and recent jobs (#617); an Engineer gets everyone's.
+  listIngestJobs: () => request<{ jobs: IngestJobEntry[] }>('GET', '/ingest/jobs'),
   getIngestConfig: (collection: string) => request<IngestConfig>('GET', `/ingest/config/${collection}`),
+
+  // Document preparation (#638): the preparation area on the instance.
+  uploadForPreparation: (form: FormData) =>
+    request<{ documents: PreparedDocument[]; skipped: string[] }>('POST', '/prepare/upload', form, true),
+  listPrepared: () => request<PreparedList>('GET', '/prepare/documents'),
+  getPrepared: (id: string) => request<PreparedDocument>('GET', `/prepare/documents/${encodeURIComponent(id)}`),
+  deletePrepared: (id: string) => request<null>('DELETE', `/prepare/documents/${encodeURIComponent(id)}`),
+  deletePreparedOutput: (id: string) => request<null>('DELETE', `/prepare/documents/${encodeURIComponent(id)}/prepared`),
+  startPreparation: (ids: string[] | 'all') =>
+    request<{ job_id: string; status: string; documents_queued: number }>('POST', '/prepare/jobs',
+      ids === 'all' ? { all: true } : { document_ids: ids }),
+  getPrepareJob: (jobId: string) => request<PrepareJob>('GET', `/prepare/job/${encodeURIComponent(jobId)}`),
+  listPrepareJobs: () => request<{ jobs: PrepareJob[] }>('GET', '/prepare/jobs'),
+  cancelPrepareJob: (jobId: string) => request<{ job_id: string; status: string }>('POST', `/prepare/job/${encodeURIComponent(jobId)}/cancel`),
+  importPrepared: (body: PrepareImportBody) =>
+    request<{ job_id: string; status: string; files_queued: number; collection: string }>('POST', '/prepare/import', body),
   saveIngestConfig: (body: SaveIngestConfigBody) => request<IngestConfig>('POST', '/ingest/config', body),
 
   // Retrieval settings are stored per collection by the API, not in the browser.
@@ -53,6 +159,7 @@ export const api = {
 
   generateGoldStandard: (body: GenerateBody) => request<GenerateResult>('POST', '/goldstandard/generate', body),
   getSession: (sessionId: string) => request<Session>('GET', `/goldstandard/session/${encodeURIComponent(sessionId)}`),
+  listGenerations: () => request<{ sessions: GenerationEntry[] }>('GET', '/goldstandard/sessions'),
   patchPair: (sessionId: string, pairId: string, body: PatchPairBody) => request<GoldPair>('PATCH', `/goldstandard/session/${encodeURIComponent(sessionId)}/pair/${encodeURIComponent(pairId)}`, body),
   regeneratePair: (body: { session_id: string; pair_id: string }) => request<GoldPair>('POST', '/goldstandard/regenerate', body),
   saveSession: (body: { session_id: string; filename?: string; allow_historical?: boolean }) => request<SaveResult>('POST', '/goldstandard/save', body),
@@ -63,16 +170,26 @@ export const api = {
   getExportJob: (jobId: string) => request<ExportJob>('GET', `/export/job/${jobId}`),
   startImport: (body: ImportBody) => request<ImportStart>('POST', '/import', body),
   getImportJob: (jobId: string) => request<ImportJob>('GET', `/import/job/${jobId}`),
+  listExportJobs: () => request<{ jobs: ExportJobEntry[] }>('GET', '/export/jobs'),
+  listImportJobs: () => request<{ jobs: ImportJobEntry[] }>('GET', '/import/jobs'),
   getPackages: () => request<{ packages: PackageSummary[] }>('GET', '/packages'),
   getTuneOptions: (collection: string) => request<TuneOptions>('GET', `/tune/${collection}`),
   getTransferHelp: () => request<{ topic: string; markdown: string }>('GET', '/help/transfer'),
 
   getMetrics: () => request<MetricsResult>('GET', '/metrics/latency'),
   getSessionDiagnostics: () => request<{ issues: { filename: string; code: string; message: string }[] }>('GET', '/goldstandard/diagnostics'),
-  getHealth: () => request<HealthResult>('GET', '/health'),
+  getHealth: () => getHealthResult(),
 }
 
 // Types
+export type Role = 'engineer' | 'developer' | 'end_user'
+export interface AuthUser { username: string; role: Role; must_change_password: boolean; kind?: 'user' | 'service' }
+export interface AdminUser { username: string; role: Role; enabled: boolean; must_change_password: boolean; created_at: string }
+export interface ServiceKey {
+  id: string; label: string; created_at: string; expires_at: string
+  revoked_at: string | null; last_used_at: string | null; status: 'active' | 'expired' | 'revoked'
+}
+export interface ServicePrincipal { name: string; role: Role; enabled: boolean; created_at: string; keys: ServiceKey[] }
 export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
   hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null
@@ -82,8 +199,17 @@ export interface CreateCollectionBody {
 }
 export interface JobStatus {
   job_id: string; status: string; files_total: number; files_completed: number; files_failed: number; chunks_stored: number; errors: string[]
-  // Files that could not be parsed at all — never counted in files_total.
+  // Files that could not be parsed at all, or that a later file with the same
+  // name replaced in the upload (#22) — never counted in files_total.
   skipped?: string[]
+  // Files over the per-file limits, stored as parts (#621)
+  split?: string[]
+  // Earlier chunks of the same names this job removed (#22).
+  chunks_replaced?: number
+  // Chunks sent to Weaviate and those it acknowledged (#302); null on records
+  // written before the fields existed. chunks_stored counts the checked ones.
+  chunks_submitted?: number | null
+  chunks_accepted?: number | null
 }
 export interface IngestConfig {
   collection: string; chunking_strategy: string; chunk_size: number; chunk_overlap: number; similarity_threshold: number | null; min_chunk_size: number; is_default: boolean
@@ -101,7 +227,7 @@ export interface SaveRetrievalConfigBody {
   collection: string; retrieval_mode: string; top_k: number; alpha: number; ef: number | null; response_format: string
 }
 export interface Citation {
-  source_file: string; chunk_index: number; score: number; excerpt: string
+  source_file: string; chunk_index: number; score: number | null; excerpt: string
 }
 export interface QueryResult {
   answer: string; citations: Citation[] | null; retrieval_latency_ms: number; llm_latency_ms: number; chunks_retrieved: number
@@ -139,15 +265,18 @@ export interface MetricsResult {
   total_latency: LatencyStats
   history: LatencyRecord[]
 }
-export interface ExportBody { collection: string; include_models: boolean }
+// passphrase: only for an encrypted export (#27), 12 to 1024 characters.
+export interface ExportBody { collection: string; include_models: boolean; passphrase?: string }
 export interface ExportStart { job_id: string; status: string; collection: string }
 export interface ExportJob {
   job_id: string; status: string; collection: string; chunks_written: number
   filename: string | null; size_bytes: number | null; source_document_count: number | null
   fidelity: string | null; models_bundled: boolean | null; retrieve_script: boolean | null
-  warnings: string[]; error: string | null
+  warnings: string[]; error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
+  encrypted?: boolean
 }
-export interface ImportBody { filename: string; on_conflict: string }
+// passphrase: required for a .tar.gz.age package and refused for any other (#27).
+export interface ImportBody { filename: string; on_conflict: string; passphrase?: string }
 export interface ImportStart { job_id: string; status: string; filename: string }
 export interface ImportJob {
   job_id: string; status: string; filename: string; on_conflict: string
@@ -155,10 +284,45 @@ export interface ImportJob {
   fidelity: string | null; renamed: boolean; notes: string[]
   restored_sessions?: { source_session_id: string; session_id: string; collection: string }[]
   error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
+  encrypted?: boolean
 }
+// Running and recent jobs (#617). owner is null for a job recorded before
+// owners were, which only an Engineer sees ("owner unknown").
+export interface JobOwner { name: string; kind: 'user' | 'service' }
+export interface ListedTimes { owner: JobOwner | null; created_at: string | null; finished_at: string | null }
+export interface IngestJobEntry extends JobStatus, ListedTimes { collection: string | null; files: string[] }
+export interface ExportJobEntry extends ExportJob, ListedTimes {}
+export interface ImportJobEntry extends ImportJob, ListedTimes {}
+export interface GenerationEntry extends ListedTimes {
+  session_id: string; collection: string; status: string; pairs_total: number; pairs_attempted: number
+  pairs_completed: number; pairs_failed: number; errors: string[]
+}
+export type AuditResult = 'success' | 'refused' | 'error' | 'accepted' | 'succeeded' | 'failed' | 'interrupted'
+export interface AuditRecord {
+  id: string; time: string; actor: string | null; actor_kind: string; role: Role | null; key_id: string | null
+  client_ip: string | null; action: string; collection: string | null; target: string | null
+  result: AuditResult; status_code: number | null; job_id: string | null; details: Record<string, unknown>
+}
+export interface AuditPage { records: AuditRecord[]; next_before: string | null; failed_writes: number; question_text_logged: boolean }
+// Empty strings mean "any"; from and to are ISO 8601 times (UTC).
+export interface AuditFilters { from: string; to: string; actor: string; action: string; collection: string; result: string }
+
+function auditQuery(filters: AuditFilters, extra: Record<string, string>): string {
+  const params = new URLSearchParams()
+  for (const [name, value] of Object.entries({ ...filters, ...extra })) if (value) params.set(name, value)
+  const text = params.toString()
+  return text ? `?${text}` : ''
+}
+
+// The CSV of every record matching the filters; a plain link, sent with the session cookie.
+export function auditCsvUrl(filters: AuditFilters): string {
+  return `${BASE}/audit.csv${auditQuery(filters, {})}`
+}
+
 export interface PackageSummary {
   filename: string; size_bytes: number; collection: string | null
   chunk_count: number | null; fidelity: string | null; created_at: string | null; readable: boolean
+  encrypted?: boolean
 }
 export interface TuneOptions {
   collection: string; fidelity: string; source_document_count: number
@@ -184,4 +348,31 @@ export interface HealthResult {
       note?: string
     }
   }
+}
+
+// Document preparation (#638).
+export const preparedRawUrl = (id: string) => `${BASE}/prepare/documents/${encodeURIComponent(id)}/raw`
+export const preparedOutputUrl = (id: string) => `${BASE}/prepare/documents/${encodeURIComponent(id)}/prepared`
+export interface PreparedFallback { window: number | null; reason: string }
+export interface PreparedPart {
+  name: string; bytes: number; characters: number; records?: number
+  title: string | null; summary: string | null; summary_error: string | null
+  fallback: boolean; fallbacks: PreparedFallback[]; preview?: string
+}
+export interface PreparedDocument {
+  id: string; name: string; raw_type: string; raw_bytes: number; owner: JobOwner | null; created_at: string
+  status: 'raw' | 'queued' | 'preparing' | 'prepared' | 'failed'; prepared_at: string | null; prepared_bytes: number
+  parts: PreparedPart[]; fallback: boolean; code_only_by_type: boolean; last_error: string | null
+  imports: { collection: string; job_id: string; at: string }[]
+}
+export interface PreparedList { documents: PreparedDocument[]; used_bytes: number; limit_bytes: number }
+export interface PrepareJob {
+  job_id: string; status: string; documents_total: number; documents_completed: number; documents_failed: number
+  document_ids: string[]; names: string[]; errors: string[]
+  current: { document_id: string; name: string; windows_done: number; windows_total: number } | null
+  owner: JobOwner | null; created_at: string | null; finished_at?: string | null
+}
+export interface PrepareImportBody {
+  collection: string; document_ids?: string[]; all?: boolean; strategy: string; chunk_size: number
+  chunk_overlap: number; similarity_threshold: number; min_chunk_size: number
 }
