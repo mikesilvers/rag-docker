@@ -473,13 +473,17 @@ location = /api/goldstandard/regenerate {
 # LOGIN_RATE_LIMITED itself, in the API's error envelope so the login page
 # shows the message, and the API never sees the attempt. The API's own 429
 # LOGIN_THROTTLED passes through: error_page applies only to nginx's answers.
-# Otherwise proxied exactly as /api/ below.
+# Otherwise proxied as /api/ below, except the request body. Login is the only
+# route that reads a body before authentication, so it gets a 16k limit (the
+# largest login LoginRequest allows, a 256-character username and a
+# 1,024-character password, fits easily) and nginx's default buffering instead
+# of /api/'s 512m streamed uploads; a larger body is refused 413 by nginx
+# before the API reads it (#663).
 location = /api/auth/login {
     limit_req zone=login burst=5 nodelay;
     limit_req_status 429;
     error_page 429 = @login_rate_limited;
-    client_max_body_size 512m;
-    proxy_request_buffering off;
+    client_max_body_size 16k;
     proxy_pass http://api/auth/login;
     proxy_set_header Host $http_host;
     proxy_set_header X-Real-IP $remote_addr;
@@ -23961,7 +23965,9 @@ read the jar through `auth_headers.py`; in-process checks in the API image use
 `17_auth.sh` checks authentication itself: the endpoint/role matrix for no session and each
 role (written out in `auth_stack.py`, not read from the API), login, logout, cookies, origin
 rules, throttling, nginx's login rate limit (logins sent without waiting until one is refused
-`429 LOGIN_RATE_LIMITED` in the error envelope, and no audit record for the refused ones), the
+`429 LOGIN_RATE_LIMITED` in the error envelope, and no audit record for the refused ones), nginx's
+16k login body limit (a larger login body is refused `413` before the API; one at the field limits
+reaches it, #663), the
 operator command's effect on existing sessions (on throwaway `vfy-t-*`
 accounts), an Engineer's account administration through the API (on a throwaway account; the
 generated passwords must not reach the API log), service API keys (throwaway `vfy-s-*`
@@ -26858,6 +26864,8 @@ stack throttle
 check "five failed logins lock the username and address for 15 minutes" $?
 stack login-rate-limit
 check "nginx refuses logins beyond 10 a minute per address (burst 5) with 429 LOGIN_RATE_LIMITED; the API never sees them" $?
+stack login-body-limit
+check "nginx refuses a login body over 16k with 413 before the API; a login at the field limits reaches the API" $?
 stack bootstrap-refused
 check "bootstrap is refused once set up; an invalid username is a usage error" $?
 stack no-secrets-logged
@@ -27362,6 +27370,24 @@ def check_login_rate_limit(operator_ok):
                "a login the API answered wasn't recorded once")
     finally:
         request("POST", "/auth/logout", token=admin)
+
+
+def check_login_body_limit(operator_ok):
+    """#663: nginx refuses a login body over 16k with its own 413 before the API
+    reads it; a login at LoginRequest's caps (256 and 1,024 characters) still
+    reaches the API. nginx checks Content-Length when it picks the location,
+    before the rate limit, so the refused request takes no rate-limit slot."""
+    big = {"username": "vfy-body-" + secrets.token_hex(3), "password": "x" * 17000}
+    status, raw, headers = code("POST", "/auth/login", big, paced=False)
+    content_type = headers.get("Content-Type", "")
+    expect(status == 413, "a {}-byte login body answered {} {}".format(
+        len(json.dumps(big)), status, error_code(raw)))
+    expect(error_code(raw) is None and not content_type.startswith("application/json"),
+           "the 413 came from the API, not nginx ({})".format(content_type))
+    name = ("vfy-caps-" + secrets.token_hex(3)).ljust(256, "a")
+    status, raw, _ = code("POST", "/auth/login", {"username": name, "password": "y" * 1024})
+    expect(status == 401 and error_code(raw) == "LOGIN_FAILED",
+           "a login at the field limits answered {} {}".format(status, error_code(raw)))
 
 
 def check_throttle(operator_ok):
@@ -29672,13 +29698,20 @@ class NginxTests(unittest.TestCase):
         lines = directives(block)
         for line in ("limit_req zone=login burst=5 nodelay;", "limit_req_status 429;",
                      "error_page 429 = @login_rate_limited;", "proxy_pass http://api/auth/login;",
-                     "proxy_set_header X-Real-IP $remote_addr;"):
+                     "proxy_set_header X-Real-IP $remote_addr;", "client_max_body_size 16k;"):
             self.assertIn(line, lines)
+        # #663: login reads a body before authentication, so it has a small,
+        # buffered body limit, not /api/'s 512m streamed uploads.
+        self.assertEqual([l for l in lines if l.startswith("proxy_request_buffering")], [])
         api = self.locations[self.locations.index("location /api/ {"):]
         api = directives(api[:api.index("\n}\n")])
-        self.assertEqual([l for l in lines if not l.startswith(("location", "limit_req", "error_page", "proxy_pass"))],
-                         [l for l in api if not l.startswith(("location", "proxy_pass"))],
-                         "the login location proxies differently from /api/")
+        self.assertIn("client_max_body_size 512m;", api)
+        self.assertIn("proxy_request_buffering off;", api)
+        body = ("client_max_body_size", "proxy_request_buffering")
+        login_only = ("location", "limit_req", "error_page", "proxy_pass") + body
+        self.assertEqual([l for l in lines if not l.startswith(login_only)],
+                         [l for l in api if not l.startswith(("location", "proxy_pass") + body)],
+                         "the login location proxies differently from /api/ beyond its body limit")
         named = self.locations[self.locations.index("location @login_rate_limited {"):]
         body = re.search(r"return 429 '([^']*)';", named).group(1)
         message = "Too many login attempts. Wait a minute and try again."

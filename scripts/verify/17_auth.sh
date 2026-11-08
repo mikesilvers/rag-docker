@@ -79,6 +79,8 @@ stack throttle
 check "five failed logins lock the username and address for 15 minutes" $?
 stack login-rate-limit
 check "nginx refuses logins beyond 10 a minute per address (burst 5) with 429 LOGIN_RATE_LIMITED; the API never sees them" $?
+stack login-body-limit
+check "nginx refuses a login body over 16k with 413 before the API; a login at the field limits reaches the API" $?
 stack bootstrap-refused
 check "bootstrap is refused once set up; an invalid username is a usage error" $?
 stack no-secrets-logged
