@@ -55030,7 +55030,7 @@ services:
     environment:
       RAG_OTEL_ENABLED: "${RAG_VERIFY_OTEL_ENABLED:-true}"
       RAG_OTEL_PROTOCOL: http/protobuf
-      RAG_OTEL_SERVICE_VERSION: "1.1.0"
+      RAG_OTEL_SERVICE_VERSION: "1.2.0"
       RAG_OTEL_QUEUE_SIZE: "256"
       RAG_OTEL_BATCH_SIZE: "64"
       RAG_OTEL_ENDPOINT: http://otel-collector:4318
