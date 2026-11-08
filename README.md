@@ -754,15 +754,23 @@ Follow these steps once, to move an instance from 1.1.0 to 1.2.0. The first star
    P=rag-docker
    # Make the folder for the backups
    mkdir -p backups
-   # Copy each volume into a .tgz in ./backups, through a throwaway container
+   # Copy each volume into a .tgz in ./backups, through a throwaway container.
+   # A volume that doesn't exist (a wrong P) is reported and skipped, not created.
    for v in weaviate_data ingest_uploads rag_sources; do
-     docker run --rm -v "${P}_$v":/data:ro -v "$PWD/backups":/backup alpine tar czf "/backup/$v-v1.1.0.tgz" -C /data .
+     docker volume inspect "${P}_$v" >/dev/null &&
+       docker run --rm -v "${P}_$v":/data:ro -v "$PWD/backups":/backup alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf tar czf "/backup/$v-v1.1.0.tgz" -C /data .
    done
    # Check that the three files are there
    ls -l backups
+   # Check that each backup reads back, and count what it holds
+   for v in weaviate_data ingest_uploads rag_sources; do
+     gzip -t "backups/$v-v1.1.0.tgz" && echo "$v: $(tar tzf "backups/$v-v1.1.0.tgz" | wc -l | tr -d ' ') entries"
+   done
    ```
 
-   The throwaway container is `alpine`; Docker downloads it (a few MB) if this machine doesn't have it. The backups stay in `backups/` as untracked files: switching to another branch or tag leaves them in place, and they don't go into packages.
+   Go on only if the last loop prints a line for each of the three volumes and no error. `no such volume` means `P` is wrong: set it again and rerun the block. `1 entries` means that volume is empty (the backup holds only `./`); if it should hold data, `P` names another project's volumes, so stop and check it.
+
+   The throwaway container is alpine 3.24.4, pinned by its digest; Docker downloads it (a few MB) if this machine doesn't have it. git ignores the `backups/` folder: switching to another branch or tag leaves the backups in place, and they don't go into packages.
 
 3. **Check your local compose override, if you keep one.** Carry over the new settings in `docker-compose.yml`, all with working defaults: `MAX_ZIP_EXPANDED_BYTES`, `MAX_ZIP_MEMBERS`, `MAX_ZIP_MEMBER_RATIO`, `MAX_PACKAGE_EXPANDED_BYTES`, `MAX_PACKAGE_MEMBERS`, `AUTH_COOKIE_SECURE`, `AUDIT_LOG_QUESTIONS`, `AUDIT_LOG_MAX_BYTES`, `AUDIT_LOG_KEEP`, `PREPARATION_DIR`, `MAX_PREPARATION_BYTES`, `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE`. If it publishes the proxy on an address other than `127.0.0.1`, switch to LAN mode (`docker-compose.lan.yml`) instead. Do that after step 6: LAN mode won't start without an AI Engineer.
 
@@ -835,7 +843,7 @@ Follow these steps once, to move an instance from 1.1.0 to 1.2.0. The first star
 
 **If the upgrade fails**
 
-Go back to 1.1.0 and restore the backup. The restore empties each existing volume and fills it from its backup, so what changed in those volumes after the backup is lost.
+Go back to 1.1.0 and restore the backup. The block checks every backup and every volume first, and empties nothing unless all three print `OK`. If one prints `FAILED`, nothing was changed: fix `P` (after a `no such volume` error) or the backup file the error names, and run the block again. The restore empties each existing volume and fills it from its backup, so what changed in those volumes after the backup is lost.
 
 ```bash
 # Remove the containers. The volumes are kept.
@@ -844,12 +852,24 @@ docker compose down
 git checkout v1.1.0
 # Set the prefix you saw in step 2
 P=rag-docker
-# Empty each volume and restore it from its backup
+# Check every backup and every volume first. Nothing is emptied yet.
+ok=yes
 for v in weaviate_data ingest_uploads rag_sources; do
-  docker run --rm -v "${P}_$v":/data -v "$PWD/backups":/backup:ro alpine sh -c "find /data -mindepth 1 -delete && tar xzf /backup/$v-v1.1.0.tgz -C /data"
+  if gzip -t "backups/$v-v1.1.0.tgz" && tar tzf "backups/$v-v1.1.0.tgz" >/dev/null && docker volume inspect "${P}_$v" >/dev/null; then
+    echo "$v: OK"
+  else
+    echo "$v: FAILED"; ok=no
+  fi
 done
-# Rebuild and start 1.1.0
-docker compose up -d --build --force-recreate
+# Only if all three passed: empty each volume, restore it from its backup, and start 1.1.0
+if [ "$ok" = yes ]; then
+  for v in weaviate_data ingest_uploads rag_sources; do
+    docker run --rm -v "${P}_$v":/data -v "$PWD/backups":/backup:ro alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf sh -c "find /data -mindepth 1 -delete && tar xzf /backup/$v-v1.1.0.tgz -C /data"
+  done
+  docker compose up -d --build --force-recreate
+else
+  echo "Nothing was emptied or restored."
+fi
 ```
 
 In LAN mode, stop with `docker compose -f docker-compose.yml -f docker-compose.lan.yml down` instead of `docker compose down`. Never use `down -v`.
