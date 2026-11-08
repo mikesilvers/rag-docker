@@ -29,6 +29,8 @@ lan() { _rag_require_lock_owner; python3 ./lan_stack.py "$1"; }
 section "LAN mode on the verify project (TLS on loopback only)"
 lan https
 check "HTTPS answers with the generated certificate: localhost and the test names, 825 days" $?
+lan hosts
+check "only localhost, 127.0.0.1 and the certificate's names are served; another Host gets 421 (#664)" $?
 lan tls
 check "TLS 1.2 and 1.3 connect, TLS 1.1 is refused, ALPN picks HTTP/2" $?
 lan bindings

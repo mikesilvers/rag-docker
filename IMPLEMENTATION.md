@@ -431,6 +431,16 @@ http {
     # (README "Sharing with your office"), and then this limit is shared too.
     limit_req_zone $binary_remote_addr zone=login:1m rate=10r/m;
 
+    # The hosts this proxy answers for (#664). Any other Host, such as a page
+    # on a DNS-rebinding domain, gets 421. $host has no port, so 8080, the
+    # verify project's port and any other published port all match.
+    map $host $rag_host_allowed {
+        hostnames;
+        default   0;
+        localhost 1;
+        127.0.0.1 1;
+    }
+
     upstream api {
         server api:8000;
     }
@@ -441,6 +451,11 @@ http {
 
     server {
         listen 80;
+
+        # Only the hosts in the map above (#664).
+        if ($rag_host_allowed = 0) {
+            return 421;
+        }
 
         # The routes live in locations.conf, shared with LAN mode's nginx.lan.conf (#26).
         include /etc/nginx/rag/locations.conf;
@@ -538,6 +553,7 @@ location / {
 # docker-compose.lan.yml. One TLS server on container port 443 and nothing on
 # port 80: no plain-HTTP listener and no redirect, so the only way in is TLS.
 # The routes are the default server's, from the shared locations.conf.
+# It answers only for localhost, 127.0.0.1 and the certificate's names (#664).
 events {
     worker_connections 1024;
 }
@@ -552,6 +568,19 @@ http {
     # (README "Sharing with your office"), and then this limit is shared too.
     limit_req_zone $binary_remote_addr zone=login:1m rate=10r/m;
 
+    # The hosts this proxy answers for (#664). Any other Host, such as a page
+    # on a DNS-rebinding domain, gets 421. $host has no port, so RAG_LAN_PORT,
+    # the verify project's port and any other published port all match. The
+    # hosts are localhost, 127.0.0.1 and the names of the certificate served.
+    map $host $rag_host_allowed {
+        hostnames;
+        default   0;
+        localhost 1;
+        127.0.0.1 1;
+        # The certificate's other names, written by tls-init (api/tls_cert.py).
+        include /etc/nginx/certs/hosts.map;
+    }
+
     upstream api {
         server api:8000;
     }
@@ -563,6 +592,11 @@ http {
     server {
         listen 443 ssl;
         http2 on;
+
+        # Only the hosts in the map above (#664).
+        if ($rag_host_allowed = 0) {
+            return 421;
+        }
 
         # The active pair the tls-init step left in the lan_certs volume (read-only
         # here): your own from proxy/certs, or the self-signed one it generated.
@@ -1117,6 +1151,14 @@ into a fresh folder and `live` is switched with one rename, so nginx never
 finds a certificate beside a key that doesn't match it; older pairs are then
 removed.
 
+The hosts the proxy answers for (#664): on every successful run the step also
+writes /certs/hosts.map, which nginx.lan.conf includes in its map of accepted
+hosts. It lists the active certificate's names other than localhost and
+127.0.0.1 (nginx.lan.conf has those two already): DNS names in lower case,
+wildcards (*.example.com) as nginx wildcards, IPv6 addresses in brackets. A
+name that is none of these is left out, with a warning, so nothing else can
+reach nginx's configuration. The file is replaced with one rename.
+
 It prints one line naming the certificate (source, names, expiry, SHA-256
 fingerprint, which is what a browser shows when asked to trust it) and exits
 0, or prints one line on standard error and exits 1; the proxy then doesn't
@@ -1145,6 +1187,12 @@ LIVE = "live"
 SELF_SIGNED = "self-signed"
 BYO = "byo"
 _LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+HOSTS = "hosts.map"
+# Accepted by nginx.lan.conf itself; a second entry for either would be a
+# duplicate key, which stops nginx.
+ALWAYS = ("localhost", "127.0.0.1")
+# The map block's own parameter names: a key spelled like one needs a leading \.
+MAP_WORDS = {"default", "hostnames", "include", "volatile"}
 
 
 class CertError(Exception):
@@ -1283,6 +1331,52 @@ def self_signed(names: list[str], now: datetime.datetime) -> tuple[bytes, bytes]
                               serialization.NoEncryption()))
 
 
+# ── the hosts the proxy answers for (#664) ───────────────────────────────────
+
+def _dns(name: str) -> bool:
+    return len(name) <= 253 and all(_LABEL.match(label) for label in name.split("."))
+
+
+def map_key(name: str) -> str | None:
+    """`name` as a key of nginx's `map ... { hostnames; }`, or None if it can't be one safely."""
+    try:
+        address = ipaddress.ip_address(name)
+    except ValueError:
+        pass
+    else:
+        return f"[{address}]" if address.version == 6 else str(address)
+    if name.startswith("*.") and _dns(name[2:]):
+        return name
+    if not _dns(name):
+        return None
+    return "\\" + name if name in MAP_WORDS else name
+
+
+def write_hosts(out_dir: Path, cert: x509.Certificate, err) -> None:
+    """Write hosts.map for `cert`'s names, through a temporary file and one rename."""
+    keys: list[str] = []
+    for name in sorted(_cert_names(cert)):
+        if name in ALWAYS:
+            continue
+        key = map_key(name)
+        if key is None:
+            print(f"tls-init: warning: {name!r} is left out of the names the proxy answers for: it is neither a "
+                  f"DNS name nor an IP address", file=err, flush=True)
+        elif key not in keys:
+            keys.append(key)
+    text = ("# Written by tls-init (api/tls_cert.py): the certificate's names besides localhost and 127.0.0.1.\n"
+            + "".join(f"{key} 1;\n" for key in keys))
+    temp = out_dir / f".hosts-{secrets.token_hex(8)}"
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(text)
+    os.chmod(temp, 0o644)
+    os.replace(temp, out_dir / HOSTS)
+    for old in out_dir.iterdir():
+        if old.name.startswith(".hosts-"):
+            old.unlink(missing_ok=True)
+
+
 # ── the step ─────────────────────────────────────────────────────────────────
 
 def run(byo_dir: Path, out_dir: Path, hostnames: str | None, now: datetime.datetime | None = None,
@@ -1312,6 +1406,7 @@ def _step(byo_dir: Path, out_dir: Path, hostnames: str | None, now: datetime.dat
                   f"{cert.not_valid_after_utc:%Y-%m-%d}; browsers will refuse it", file=err, flush=True)
         if _read_live(out_dir) != (BYO, cert_bytes, key_bytes):
             install(out_dir, cert_bytes, key_bytes, BYO)
+        write_hosts(out_dir, cert, err)
         return f"using your certificate from proxy/certs: {describe(cert)}"
 
     names = wanted_names(hostnames)
@@ -1322,10 +1417,12 @@ def _step(byo_dir: Path, out_dir: Path, hostnames: str | None, now: datetime.dat
         except CertError:
             cert = None
         if cert is not None and cert.not_valid_after_utc > now and _cert_names(cert) == set(names):
+            write_hosts(out_dir, cert, err)
             return f"reusing the self-signed certificate: {describe(cert)}"
     cert_bytes, key_bytes = self_signed(names, now)
     install(out_dir, cert_bytes, key_bytes, SELF_SIGNED)
     cert, _ = load_pair(cert_bytes, key_bytes)
+    write_hosts(out_dir, cert, err)
     return f"generated a self-signed certificate: {describe(cert)}"
 
 
@@ -24113,8 +24210,9 @@ would fail by design). `--lan` can't be combined with `--telemetry`.
 `docker-compose.lan.yml`, under the project name `rag-lan-config`, with no
 `.env`; nothing is created) and runs `../tests/test_lan_mode.py` in the API
 image. Only in a `--lan` run does it check the running LAN project through
-`lan_stack.py`: HTTPS with the generated certificate, TLS versions and HTTP/2,
-the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
+`lan_stack.py`: HTTPS with the generated certificate, the hosts nginx answers
+for (localhost, 127.0.0.1 and the test names; another `Host` gets 421, #664),
+TLS versions and HTTP/2, the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
 the API's refusal in one-off containers (`docker compose run --rm
 --no-deps`, no ports) and nginx's login rate limit (logins sent without
 waiting until one is refused `429 LOGIN_RATE_LIMITED`, #577); it also prints
@@ -24760,7 +24858,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `settings_validation.py` | standalone, on the verify project after `stack.sh up`: `RAG_API=http://localhost:8081/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
-| `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
+| `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps; the proxy answers `Host` localhost and 127.0.0.1 and refuses another with 421 (#664) |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
 | `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384), run in a checkout reached through a symlink, and ignore the user's system and global git config (#447); embedded copies; registered by suite 01 |
 | `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415), registered by suite 01 |
@@ -24864,7 +24962,7 @@ through the proxy that download refuses other upload state with 400 (#370).
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
-| `RAG_NETWORK` | detected | compose network for the browser container |
+| `RAG_UI_BASE` | `http://localhost` | the address `06_ui.sh`'s browser opens. The browser runs in the proxy container's network namespace, so `localhost` is the proxy and the `Host` is one the proxy answers for (#664); `RAG_NETWORK` is no longer used |
 | `RAG_AUTH_DIR` | `${TMPDIR:-/tmp}/rag-verify-auth-<uid>` | the folder of the test accounts' credentials and cookie jars (#25) |
 
 ## Writing a check
@@ -28858,6 +28956,8 @@ lan() { _rag_require_lock_owner; python3 ./lan_stack.py "$1"; }
 section "LAN mode on the verify project (TLS on loopback only)"
 lan https
 check "HTTPS answers with the generated certificate: localhost and the test names, 825 days" $?
+lan hosts
+check "only localhost, 127.0.0.1 and the certificate's names are served; another Host gets 421 (#664)" $?
 lan tls
 check "TLS 1.2 and 1.3 connect, TLS 1.1 is refused, ALPN picks HTTP/2" $?
 lan bindings
@@ -28993,7 +29093,7 @@ if __name__ == "__main__":
 ```python
 """LAN mode on the verify project (#26). Host-side, standard library, Python 3.9+.
 
-    python3 lan_stack.py https|tls|bindings|cookie|origin|refusals|rate-limit|address
+    python3 lan_stack.py https|hosts|tls|bindings|cookie|origin|refusals|rate-limit|address
 
 Run by 18_lan.sh in a `stack.sh run --lan`, which brings the verify project up
 in LAN mode with TLS on 127.0.0.1:<verify port> only, copies the certificate
@@ -29004,6 +29104,9 @@ printing what failed:
   https     /api/health over TLS, verified against that certificate and the
             name localhost; the certificate names exactly localhost and the
             harness's test names and is valid for 825 days
+  hosts     over that TLS connection, Host localhost, 127.0.0.1 and the test
+            names (one in upper case) get the API's answer, and another Host
+            gets nginx's 421 at /api/health and at / (#664)
   tls       TLS 1.2 and 1.3 connect, TLS 1.1 is refused, ALPN picks HTTP/2
   bindings  the project's only published port is the proxy's
             127.0.0.1:<port>->443/tcp, and plain HTTP to it gets no API answer
@@ -29107,6 +29210,29 @@ def check_https():
     assert names == NAMES, "the certificate names {}, not {}".format(sorted(names), sorted(NAMES))
     valid = ssl.cert_time_to_seconds(peer["notAfter"]) - ssl.cert_time_to_seconds(peer["notBefore"])
     assert valid == VALID_S, "the certificate is valid for {} s, not {} (825 days)".format(valid, VALID_S)
+
+
+def status_for(host, path):
+    """The status of GET `path` over verified TLS to localhost, sent with Host `host`."""
+    conn = http.client.HTTPSConnection("localhost", port(), context=context(), timeout=60)
+    try:
+        conn.request("GET", path, headers={"Host": host})
+        response = conn.getresponse()
+        response.read()
+        return response.status
+    finally:
+        conn.close()
+
+
+def check_hosts():
+    for name in ("localhost", "127.0.0.1", "vfy-lan.invalid", "VFY-LAN.INVALID", "192.0.2.10"):
+        host = "{}:{}".format(name, port())
+        status = status_for(host, "/api/health")
+        assert status == 200, "Host {} got {}, not 200".format(host, status)
+    host = "rebind.invalid:{}".format(port())
+    for path in ("/api/health", "/"):
+        status = status_for(host, path)
+        assert status == 421, "Host {} got {} at {}, not 421".format(host, status, path)
 
 
 def handshake(ctx, alpn=None):
@@ -29247,9 +29373,9 @@ def check_address():
           "API)".format(seen[-1] if seen else "(none found)"))
 
 
-CHECKS = {"https": check_https, "tls": check_tls, "bindings": check_bindings, "cookie": check_cookie,
-          "origin": check_origin, "refusals": check_refusals, "rate-limit": check_rate_limit,
-          "address": check_address}
+CHECKS = {"https": check_https, "hosts": check_hosts, "tls": check_tls, "bindings": check_bindings,
+          "cookie": check_cookie, "origin": check_origin, "refusals": check_refusals,
+          "rate-limit": check_rate_limit, "address": check_address}
 
 
 def main(argv):
@@ -29465,6 +29591,10 @@ class CertTestCase(unittest.TestCase):
         return ([n for n in san.get_values_for_type(x509.DNSName)],
                 [str(a) for a in san.get_values_for_type(x509.IPAddress)])
 
+    def hosts(self):
+        """hosts.map's entries (#664), without its comment line."""
+        return [line for line in (self.out / "hosts.map").read_text().splitlines() if not line.startswith("#")]
+
 
 class SelfSignedTests(CertTestCase):
     """S4.3-S4.6."""
@@ -29564,6 +29694,27 @@ class SelfSignedTests(CertTestCase):
         self.regenerated(out)
         self.assertEqual(self.live()[2], "self-signed")
 
+    def test_hosts_map_follows_the_names(self):
+        # #664: the names the proxy answers for, besides localhost and 127.0.0.1.
+        code, _, err = self.step("Office.Example,192.168.1.20,::1")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(self.hosts(), ["192.168.1.20 1;", "[::1] 1;", "office.example 1;"])
+        self.assertEqual((self.out / "hosts.map").stat().st_mode & 0o777, 0o644)
+        (self.out / "hosts.map").unlink()
+        code, out, _ = self.step("office.example,192.168.1.20,::1")
+        self.assertIn("reusing the self-signed certificate", out)
+        self.assertEqual(self.hosts(), ["192.168.1.20 1;", "[::1] 1;", "office.example 1;"], "rewritten on reuse")
+        self.step("files.example")
+        self.assertEqual(self.hosts(), ["files.example 1;"])
+        self.assertEqual([p.name for p in self.out.iterdir() if p.name.startswith(".hosts-")], [])
+
+    def test_a_refusal_leaves_hosts_map(self):
+        self.step()
+        before = self.hosts()
+        code, _, _ = self.step("bad_name")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.hosts(), before)
+
     def test_a_failed_write_leaves_the_live_pair(self):
         self.step()
         before = os.readlink(self.out / "live")
@@ -29631,6 +29782,28 @@ class BringYourOwnTests(CertTestCase):
                 self.assertIn(part, err)
                 self.assertFalse((self.out / "live").exists())
 
+    def test_hosts_map_from_your_certificate(self):
+        # #664: the certificate's own names, in nginx's forms; localhost and
+        # 127.0.0.1 are nginx.lan.conf's.
+        self.put(*certificate(["files.example", "*.files.example", "fe80::1", "127.0.0.1", "localhost",
+                               "default", "HOSTNAMES.example"]))
+        code, _, err = self.step(hostnames=None)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(sorted(self.hosts()), sorted(["*.files.example 1;", "[fe80::1] 1;", "\\default 1;",
+                                                       "files.example 1;", "hostnames.example 1;"]))
+
+    def test_unsafe_names_are_left_out_with_a_warning(self):
+        self.put(*certificate(["files.example", "bad_name.example", "a b", "x;y", "*.*.example", "*"]))
+        code, out, err = self.step(hostnames=None)
+        self.assertEqual(code, 0)
+        self.assertIn("using your certificate from proxy/certs", out)
+        self.assertEqual(self.hosts(), ["files.example 1;"])
+        warnings = err.splitlines()
+        self.assertEqual(len(warnings), 5, err)
+        for name in ("bad_name.example", "a b", "x;y", "*.*.example", "'*'"):
+            self.assertIn(name, err)
+        self.assertTrue(all(line.startswith("tls-init: warning: ") for line in warnings))
+
     def test_an_expired_certificate_is_used_with_a_warning(self):
         self.put(*certificate(["files.example"], days=-1))
         code, out, err = self.step()
@@ -29686,6 +29859,26 @@ class NginxTests(unittest.TestCase):
                          ["location = /api/goldstandard/regenerate {", "location = /api/auth/login {",
                           "location @login_rate_limited {", "location /api/ {", "location / {"])
         self.assertEqual(lines.count("proxy_set_header Host $http_host;"), 3)
+
+    def test_only_listed_hosts_are_served(self):
+        # #664: a map of the accepted hosts, and a server-level 421 for any other.
+        for name, text in (("nginx.conf", self.default), ("nginx.lan.conf", self.lan)):
+            with self.subTest(file=name):
+                block = text[text.index("map $host $rag_host_allowed {"):]
+                block = directives(block[:block.index("\n    }\n")])
+                want = ["map $host $rag_host_allowed {", "hostnames;", "default   0;", "localhost 1;", "127.0.0.1 1;"]
+                if name == "nginx.lan.conf":
+                    want.append("include /etc/nginx/certs/hosts.map;")
+                self.assertEqual(block, want)
+                self.assertEqual(directives(text).count("map $host $rag_host_allowed {"), 1)
+                server = directives(text[text.index("    server {"):])
+                guard = ["if ($rag_host_allowed = 0) {", "return 421;", "}"]
+                at = server.index(guard[0])
+                self.assertEqual(server[at:at + 3], guard)
+                self.assertLess(at, server.index("include /etc/nginx/rag/locations.conf;"))
+                self.assertNotIn("server_name", "\n".join(directives(text)),
+                                 "a request without Host must keep an empty $host")
+        self.assertNotIn("rag_host_allowed", self.locations)
 
     def test_logins_are_rate_limited_per_address(self):
         # #577: both servers define the zone; the login location uses it and
@@ -33954,6 +34147,18 @@ check "resolved Compose publishes only the proxy on host loopback" $?
 cors=$(command curl -s -D - -o /dev/null -m 10 -H "Origin: http://other.example" "$API/health" \
   | tr -d '\r' | awk -F': ' 'tolower($1)=="access-control-allow-origin"{print $2}')
 check_eq "the API sends no Access-Control-Allow-Origin, as SECURITY.md describes (#25)" "$cors" ""
+
+# ── the hosts the proxy answers for (#664) ───────────────────────────────────
+# Only localhost and 127.0.0.1, at any port. Any other Host, such as a page on
+# a DNS-rebinding domain, gets 421 from nginx before the UI or the API sees it.
+for host in "localhost:$EXPECTED_PORT" "127.0.0.1:$EXPECTED_PORT"; do
+  code=$(command curl -s -o /dev/null -m 10 -w '%{http_code}' -H "Host: $host" "$API/health")
+  check_eq "the proxy answers Host $host (#664)" "$code" "200"
+done
+for path in /api/health /; do
+  code=$(command curl -s -o /dev/null -m 10 -w '%{http_code}' -H "Host: rebind.invalid:$EXPECTED_PORT" "${API%/api}$path")
+  check_eq "the proxy refuses another Host with 421 at $path (#664)" "$code" "421"
+done
 
 (cd "$REPO_ROOT" && python3 - <<'ENDPY'
 import json, subprocess
@@ -38919,13 +39124,12 @@ REPO_ROOT="$(cd ../.. && pwd)"
 require_stack
 
 IMAGE="rag-verify-browser:latest"
-NETWORK="${RAG_NETWORK:-}"
-if [ -z "$NETWORK" ]; then
-  NETWORK=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Name}}' | head -1) )
-  NETWORK=$(docker inspect "$NETWORK" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null)
-fi
-if [ -z "$NETWORK" ]; then
-  printf '    could not determine the compose network; set RAG_NETWORK\n'
+# The browser runs in the proxy container's network namespace and opens
+# http://localhost, so its requests carry a Host the proxy answers for (#664):
+# as http://proxy on the compose network they would get 421.
+PROXY=$( (cd "$REPO_ROOT" && docker compose ps -q proxy) )
+if [ -z "$PROXY" ]; then
+  printf '    could not find the proxy container\n'
   exit 2
 fi
 
@@ -38942,8 +39146,8 @@ drop_collection "$C"; make_collection "$C"
 # The test accounts' credentials go in on standard input (#25), never on a
 # command line or in the environment; browser/lib.js reads them once.
 _rag_require_lock_owner
-docker run --rm -i --network "$NETWORK" \
-  -e RAG_UI_BASE="${RAG_UI_BASE:-http://proxy}" \
+docker run --rm -i --network "container:$PROXY" \
+  -e RAG_UI_BASE="${RAG_UI_BASE:-http://localhost}" \
   -e RAG_SKIP_SLOW="$SKIP_SLOW" -e RAG_AUTH_STDIN=1 \
   -v "$PWD/browser":/w:ro -w /w "$IMAGE" node ui_criteria.js < "$RAG_AUTH_DIR/credentials"
 rc=$?
@@ -39686,7 +39890,7 @@ if (require.main === module) {
 // confirm button.
 const { sleep, makeReporter, launch, session, credentialsFor, bodyText, setValue, clickByText, readNav, chooseFromMenu } = require('./lib');
 
-const BASE = process.env.RAG_UI_BASE || 'http://proxy';
+const BASE = process.env.RAG_UI_BASE || 'http://localhost';
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic'];
 // nginx's refusal of a login beyond its rate (#577), as the login page shows it.
 const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again.';

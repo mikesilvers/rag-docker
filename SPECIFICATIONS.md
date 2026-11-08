@@ -217,6 +217,12 @@ networks:
 TLS server on container port 443, §2.5) both include `proxy/locations.conf`, which holds the routes, so the two
 servers route identically.
 
+**Accepted hosts (#664).** Each server answers only for the hosts in its `map $host $rag_host_allowed` (`hostnames`
+matching, so the port doesn't count): `localhost` and `127.0.0.1`, plus, in LAN mode, the certificate's names (§2.5).
+Any other host gets `421 Misdirected Request` from a server-level `return`, before any route, so neither the UI nor
+the API sees the request; that closes DNS rebinding. Neither server has a `server_name`, so an HTTP/1.0 request
+without `Host` has an empty host and gets 421 too (HTTP/1.1 without `Host` keeps nginx's own 400).
+
 | Path prefix | Routes to | Notes |
 |---|---|---|
 | `/api/goldstandard/regenerate` (exact) | `http://api:8000/goldstandard/regenerate` | The same headers as `/api/`. Read timeout 1860 s, longer than the API's 1800 s regeneration deadline (§3.1.5), so the API's own answer, its 504 `PAIR_GENERATION_TIMEOUT` included, reaches the client |
@@ -299,7 +305,16 @@ intermediate cipher list for TLS 1.2, `ssl_prefer_server_ciphers off`, session t
 
 The active pair lives in `lan_certs` as `live`, a symlink to a `pair-<random>` folder (`cert.pem`, `key.pem` mode
 0600, `source`), switched with one rename, so a failed step never leaves a certificate beside a key that doesn't match
-it. The step prints one line with the source, names, expiry and SHA-256 fingerprint, or one line on standard error
+it.
+
+**Accepted LAN hosts (#664).** On every successful run the step also writes `lan_certs/hosts.map` (mode 0644,
+replaced with one rename), which `nginx.lan.conf` includes in its map of accepted hosts (§2.2): one `<name> 1;` line
+per name of the active certificate other than `localhost` and `127.0.0.1`. With the self-signed certificate those
+are `RAG_LAN_HOSTNAMES`; with your own, its subject-alternative-name DNS names and IP addresses. DNS names are
+lower-cased, a wildcard (`*.example.com`) stays an nginx wildcard, which matches any depth below the name, an IPv6
+address is written in brackets, and a name spelled like a `map` parameter (`default`, `hostnames`, `include`,
+`volatile`) gets nginx's leading `\`. A name that is none of these is left out, with a `tls-init: warning:` line on
+standard error, and the step still succeeds. The proxy reads the file when it starts. The step prints one line with the source, names, expiry and SHA-256 fingerprint, or one line on standard error
 when it refuses; then the proxy doesn't start. `proxy/certs/` is tracked through `.gitkeep`; everything else in it is
 ignored by git.
 

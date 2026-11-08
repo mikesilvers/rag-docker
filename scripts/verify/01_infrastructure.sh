@@ -106,6 +106,18 @@ cors=$(command curl -s -D - -o /dev/null -m 10 -H "Origin: http://other.example"
   | tr -d '\r' | awk -F': ' 'tolower($1)=="access-control-allow-origin"{print $2}')
 check_eq "the API sends no Access-Control-Allow-Origin, as SECURITY.md describes (#25)" "$cors" ""
 
+# ── the hosts the proxy answers for (#664) ───────────────────────────────────
+# Only localhost and 127.0.0.1, at any port. Any other Host, such as a page on
+# a DNS-rebinding domain, gets 421 from nginx before the UI or the API sees it.
+for host in "localhost:$EXPECTED_PORT" "127.0.0.1:$EXPECTED_PORT"; do
+  code=$(command curl -s -o /dev/null -m 10 -w '%{http_code}' -H "Host: $host" "$API/health")
+  check_eq "the proxy answers Host $host (#664)" "$code" "200"
+done
+for path in /api/health /; do
+  code=$(command curl -s -o /dev/null -m 10 -w '%{http_code}' -H "Host: rebind.invalid:$EXPECTED_PORT" "${API%/api}$path")
+  check_eq "the proxy refuses another Host with 421 at $path (#664)" "$code" "421"
+done
+
 (cd "$REPO_ROOT" && python3 - <<'ENDPY'
 import json, subprocess
 ids = subprocess.check_output(['docker', 'compose', 'ps', '-q'], text=True).split()
