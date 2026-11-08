@@ -43,9 +43,16 @@ def bounds(annotated):
     return ge, le
 
 
-def proxy_body_limits_mb():
+def proxy_body_limits():
+    """{location: client_max_body_size} for each location of the proxy that sets one."""
     text = (ROOT / 'proxy/locations.conf').read_text()
-    return [int(n) for n in re.findall(r'^\s*client_max_body_size\s+(\d+)m;', text, re.M)]
+    return dict(re.findall(r'^location\s+([^{]+?)\s*\{[^}]*?^\s*client_max_body_size\s+(\S+);', text, re.M))
+
+
+def proxy_upload_mb():
+    """The upload limit: /api/'s client_max_body_size, in MB. The login location's
+    small limit (#663) is not an upload limit and is left out."""
+    return int(re.fullmatch(r'(\d+)m', proxy_body_limits()['/api/']).group(1))
 
 
 def compose_zip_settings():
@@ -76,7 +83,7 @@ def zip_default(name):
 
 def expected():
     """{phrase the file must contain: the number(s) it accounts for}."""
-    upload_mb = proxy_body_limits_mb()[0]
+    upload_mb = proxy_upload_mb()
     expanded = zip_default('max_zip_expanded_bytes')
     members = zip_default('max_zip_members')
     ratio = zip_default('max_zip_member_ratio')
@@ -187,9 +194,13 @@ class CorpusRulesTests(unittest.TestCase):
         for name in ('max_zip_expanded_bytes', 'max_zip_members', 'max_zip_member_ratio'):
             with self.subTest(setting=name):
                 self.assertEqual(compose.get(name), zip_default(name))
-        limits = proxy_body_limits_mb()
-        self.assertGreaterEqual(len(limits), 2, limits)
-        self.assertEqual(set(limits), {client_upload_mb()}, limits)
+        # The upload limit (/api/) is the UI's. The login location has its own
+        # 16k limit (#663, also asserted in test_lan_mode.py); no other
+        # location sets one.
+        limits = proxy_body_limits()
+        self.assertEqual(set(limits), {'/api/', '= /api/auth/login'}, limits)
+        self.assertEqual(proxy_upload_mb(), client_upload_mb(), limits)
+        self.assertEqual(limits['= /api/auth/login'], '16k', limits)
 
 
 def language_count(text, size, overlap):
