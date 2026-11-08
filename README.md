@@ -335,6 +335,9 @@ the UI shows that command. Then create an account for each person with
 nothing about the role is kept in the browser. Accounts live in the new
 `auth_data` volume.
 
+For the full upgrade steps (backup, rebuild, bootstrap), see
+[Upgrading from 1.1.0 to 1.2.0](#upgrading-from-110-to-120).
+
 **Recreate the proxy when you upgrade.** `proxy/nginx.conf` now forwards the
 browser's `Host` with its port, which the API's same-origin check compares with
 `Origin`. The file is a single-file bind mount, so a running proxy keeps the old
@@ -592,6 +595,8 @@ replaces a changed file instead of rewriting it, so a running proxy keeps readin
 
 Run these commands in the `rag-docker` folder. Your collections, accounts and downloaded models are kept: they live in Docker volumes that these steps don't touch. There are two ways to get the new code: the latest release, for normal use, or `develop`, for testing.
 
+Coming from 1.1.0? Follow [Upgrading from 1.1.0 to 1.2.0](#upgrading-from-110-to-120) first: it includes these steps.
+
 ### 1. Get the new code
 
 Pick one of the two.
@@ -704,6 +709,132 @@ docker volume prune -a
 ```
 
 Don't run `docker volume prune` or `docker system prune --volumes` either. On Docker before 23.0 they delete every volume no container uses, which after `docker compose down` is all of this stack's. Docker 23.0 and later limits them to anonymous volumes, but no clean-up here needs them.
+
+### Upgrading from 1.1.0 to 1.2.0
+
+Follow these steps once, to move an instance from 1.1.0 to 1.2.0. The first start of 1.2.0 converts the Weaviate data, so the backup comes first. Run every command in the `rag-docker` folder.
+
+**Before updating (still on 1.1.0)**
+
+1. **Stop the stack.**
+
+   ```bash
+   # Stop the stack. Never use `down -v`, which deletes the volumes.
+   docker compose stop
+   ```
+
+   See [Don't run these](#dont-run-these).
+
+2. **Back up the volumes.** Weaviate goes from 1.39.6 to 1.40.2 (#541), and the first start converts the data in `weaviate_data`. Back up `ingest_uploads` and `rag_sources` too. `ollama_models` holds only downloaded models, so it doesn't need a backup.
+
+   Check the volume prefix first. The volume names start with the compose project name, usually the folder name: `rag-docker_weaviate_data`. Set `P` to the prefix you see.
+
+   ```bash
+   # Find the volume names. The prefix is the compose project, usually the folder name: rag-docker_weaviate_data
+   docker volume ls --filter name=_weaviate_data
+   # Set the prefix you saw
+   P=rag-docker
+   # Make the folder for the backups
+   mkdir -p backups
+   # Copy each volume into a .tgz in ./backups, through a throwaway container
+   for v in weaviate_data ingest_uploads rag_sources; do
+     docker run --rm -v "${P}_$v":/data:ro -v "$PWD/backups":/backup alpine tar czf "/backup/$v-v1.1.0.tgz" -C /data .
+   done
+   # Check that the three files are there
+   ls -l backups
+   ```
+
+   The throwaway container is `alpine`; Docker downloads it (a few MB) if this machine doesn't have it. The backups stay in `backups/` as untracked files: switching to another branch or tag leaves them in place, and they don't go into packages.
+
+3. **Check your local compose override, if you keep one.** Carry over the new settings in `docker-compose.yml`, all with working defaults: `MAX_ZIP_EXPANDED_BYTES`, `MAX_ZIP_MEMBERS`, `MAX_ZIP_MEMBER_RATIO`, `MAX_PACKAGE_EXPANDED_BYTES`, `MAX_PACKAGE_MEMBERS`, `AUTH_COOKIE_SECURE`, `AUDIT_LOG_QUESTIONS`, `AUDIT_LOG_MAX_BYTES`, `AUDIT_LOG_KEEP`, `PREPARATION_DIR`, `MAX_PREPARATION_BYTES`, `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE`. If it publishes the proxy on an address other than `127.0.0.1`, switch to LAN mode (`docker-compose.lan.yml`) instead. Do that after step 6: LAN mode won't start without an AI Engineer.
+
+**Update**
+
+4. **Get the new code.**
+
+   ```bash
+   # Download the newest branches and release tags
+   git fetch origin --tags
+   # Switch to the release branch (a fresh clone starts on develop)
+   git switch main
+   # Bring it up to date
+   git pull
+   # Print the release this folder is on
+   git describe --tags
+   ```
+
+   It prints `v1.2.0` or a later release. These steps apply either way.
+
+5. **Rebuild and recreate every container.**
+
+   ```bash
+   # Rebuild api and ui, download any newer images, recreate every container (data is kept)
+   docker compose up -d --build --force-recreate
+   ```
+
+   `--force-recreate` is required: the proxy must be recreated (#539, #554, #586), or it refuses every change the UI sends with `403 CROSS_ORIGIN_REFUSED`. This first start converts the Weaviate data.
+
+6. **Create the first AI Engineer, then the accounts and keys.** Until then the API refuses everything but `/health`.
+
+   ```bash
+   # Create the first AI Engineer; it prints a one-time password
+   docker compose exec api python -m auth bootstrap <your-username>
+   ```
+
+   Log in at `http://localhost:8080` and choose a new password. Create the other accounts with `create-user` or on the Users page ([Managing accounts](#managing-accounts)), and service keys for programs on the Service keys page ([Service keys](#service-keys)).
+
+   Switching to LAN mode (step 3)? Do it now, as in [Sharing with your office](#sharing-with-your-office):
+
+   ```bash
+   # Rebuild and recreate every container in LAN mode
+   docker compose -f docker-compose.yml -f docker-compose.lan.yml up -d --build --force-recreate
+   ```
+
+7. **Check that it is back.**
+
+   ```bash
+   # List the services and their state
+   docker compose ps
+   # Ask the API whether it is healthy
+   curl http://localhost:8080/api/health
+   ```
+
+   In LAN mode, use the commands in [Check that it is back](#3-check-that-it-is-back). Then reload every open tab of the workbench (Cmd+Shift+R on a Mac, Ctrl+Shift+R elsewhere).
+
+**After updating**
+
+8. **Scripts and packages.**
+   - A `retrieve.py` from a package exported before 1.2.0 gets `AUTH_REQUIRED`. Export the collection again.
+   - Other scripts and integrations that called the API without logging in now need an account login ([Calling the API from the command line](#calling-the-api-from-the-command-line)) or a service API key ([Service keys](#service-keys)). CORS is gone.
+   - Packages exported by 1.2.0 put the bundled models in a new layout, which a 1.1.0 instance can't read. Encrypted packages need 1.2.0 to import.
+
+9. **Data notes.**
+   - Per-collection state saved under a lowercase-first spelling of a collection name isn't migrated or read (#448). Re-ingest and save the settings again to put it under the stored name.
+   - Duplicate chunk sets from before the upgrade stay until that file is ingested again (#310).
+   - Job records from before the upgrade have no owner and are shown only to AI Engineers, as "owner unknown" (#626).
+   - Auto-schema is now off (#301), so an insert into a missing collection fails instead of recreating it.
+   - The new volumes `auth_data` and `rag_preparation` are created automatically on the first start. `rag_preparation` isn't in any backup yet.
+
+**If the upgrade fails**
+
+Go back to 1.1.0 and restore the backup. The restore empties each existing volume and fills it from its backup, so what changed in those volumes after the backup is lost.
+
+```bash
+# Remove the containers. The volumes are kept.
+docker compose down
+# Switch back to the 1.1.0 release
+git checkout v1.1.0
+# Set the prefix you saw in step 2
+P=rag-docker
+# Empty each volume and restore it from its backup
+for v in weaviate_data ingest_uploads rag_sources; do
+  docker run --rm -v "${P}_$v":/data -v "$PWD/backups":/backup:ro alpine sh -c "find /data -mindepth 1 -delete && tar xzf /backup/$v-v1.1.0.tgz -C /data"
+done
+# Rebuild and start 1.1.0
+docker compose up -d --build --force-recreate
+```
+
+In LAN mode, stop with `docker compose -f docker-compose.yml -f docker-compose.lan.yml down` instead of `docker compose down`. Never use `down -v`.
 
 ## GPU acceleration (optional)
 
