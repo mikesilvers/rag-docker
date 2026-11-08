@@ -201,8 +201,9 @@ would fail by design). `--lan` can't be combined with `--telemetry`.
 `docker-compose.lan.yml`, under the project name `rag-lan-config`, with no
 `.env`; nothing is created) and runs `../tests/test_lan_mode.py` in the API
 image. Only in a `--lan` run does it check the running LAN project through
-`lan_stack.py`: HTTPS with the generated certificate, TLS versions and HTTP/2,
-the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
+`lan_stack.py`: HTTPS with the generated certificate, the hosts nginx answers
+for (localhost, 127.0.0.1 and the test names; another `Host` gets 421, #664),
+TLS versions and HTTP/2, the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
 the API's refusal in one-off containers (`docker compose run --rm
 --no-deps`, no ports) and nginx's login rate limit (logins sent without
 waiting until one is refused `429 LOGIN_RATE_LIMITED`, #577); it also prints
@@ -848,7 +849,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `settings_validation.py` | standalone, on the verify project after `stack.sh up`: `RAG_API=http://localhost:8081/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
 | `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
-| `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
+| `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps; the proxy answers `Host` localhost and 127.0.0.1 and refuses another with 421 (#664) |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
 | `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384), run in a checkout reached through a symlink, and ignore the user's system and global git config (#447); embedded copies; registered by suite 01 |
 | `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415), registered by suite 01 |
@@ -952,7 +953,7 @@ through the proxy that download refuses other upload state with 400 (#370).
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
-| `RAG_NETWORK` | detected | compose network for the browser container |
+| `RAG_UI_BASE` | `http://localhost` | the address `06_ui.sh`'s browser opens. The browser runs in the proxy container's network namespace, so `localhost` is the proxy and the `Host` is one the proxy answers for (#664); `RAG_NETWORK` is no longer used |
 | `RAG_AUTH_DIR` | `${TMPDIR:-/tmp}/rag-verify-auth-<uid>` | the folder of the test accounts' credentials and cookie jars (#25) |
 
 ## Writing a check

@@ -7,7 +7,7 @@
 // confirm button.
 const { sleep, makeReporter, launch, session, credentialsFor, bodyText, setValue, clickByText, readNav, chooseFromMenu } = require('./lib');
 
-const BASE = process.env.RAG_UI_BASE || 'http://proxy';
+const BASE = process.env.RAG_UI_BASE || 'http://localhost';
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic'];
 // nginx's refusal of a login beyond its rate (#577), as the login page shows it.
 const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again.';

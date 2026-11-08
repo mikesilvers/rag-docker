@@ -1,6 +1,6 @@
 """LAN mode on the verify project (#26). Host-side, standard library, Python 3.9+.
 
-    python3 lan_stack.py https|tls|bindings|cookie|origin|refusals|rate-limit|address
+    python3 lan_stack.py https|hosts|tls|bindings|cookie|origin|refusals|rate-limit|address
 
 Run by 18_lan.sh in a `stack.sh run --lan`, which brings the verify project up
 in LAN mode with TLS on 127.0.0.1:<verify port> only, copies the certificate
@@ -11,6 +11,9 @@ printing what failed:
   https     /api/health over TLS, verified against that certificate and the
             name localhost; the certificate names exactly localhost and the
             harness's test names and is valid for 825 days
+  hosts     over that TLS connection, Host localhost, 127.0.0.1 and the test
+            names (one in upper case) get the API's answer, and another Host
+            gets nginx's 421 at /api/health and at / (#664)
   tls       TLS 1.2 and 1.3 connect, TLS 1.1 is refused, ALPN picks HTTP/2
   bindings  the project's only published port is the proxy's
             127.0.0.1:<port>->443/tcp, and plain HTTP to it gets no API answer
@@ -114,6 +117,29 @@ def check_https():
     assert names == NAMES, "the certificate names {}, not {}".format(sorted(names), sorted(NAMES))
     valid = ssl.cert_time_to_seconds(peer["notAfter"]) - ssl.cert_time_to_seconds(peer["notBefore"])
     assert valid == VALID_S, "the certificate is valid for {} s, not {} (825 days)".format(valid, VALID_S)
+
+
+def status_for(host, path):
+    """The status of GET `path` over verified TLS to localhost, sent with Host `host`."""
+    conn = http.client.HTTPSConnection("localhost", port(), context=context(), timeout=60)
+    try:
+        conn.request("GET", path, headers={"Host": host})
+        response = conn.getresponse()
+        response.read()
+        return response.status
+    finally:
+        conn.close()
+
+
+def check_hosts():
+    for name in ("localhost", "127.0.0.1", "vfy-lan.invalid", "VFY-LAN.INVALID", "192.0.2.10"):
+        host = "{}:{}".format(name, port())
+        status = status_for(host, "/api/health")
+        assert status == 200, "Host {} got {}, not 200".format(host, status)
+    host = "rebind.invalid:{}".format(port())
+    for path in ("/api/health", "/"):
+        status = status_for(host, path)
+        assert status == 421, "Host {} got {} at {}, not 421".format(host, status, path)
 
 
 def handshake(ctx, alpn=None):
@@ -254,9 +280,9 @@ def check_address():
           "API)".format(seen[-1] if seen else "(none found)"))
 
 
-CHECKS = {"https": check_https, "tls": check_tls, "bindings": check_bindings, "cookie": check_cookie,
-          "origin": check_origin, "refusals": check_refusals, "rate-limit": check_rate_limit,
-          "address": check_address}
+CHECKS = {"https": check_https, "hosts": check_hosts, "tls": check_tls, "bindings": check_bindings,
+          "cookie": check_cookie, "origin": check_origin, "refusals": check_refusals,
+          "rate-limit": check_rate_limit, "address": check_address}
 
 
 def main(argv):

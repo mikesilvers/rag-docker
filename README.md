@@ -360,6 +360,12 @@ is published on `127.0.0.1:8080`, over plain HTTP. LAN mode (#26) lets other
 machines on your network use it, over TLS. It is opt-in: without
 `docker-compose.lan.yml` nothing changes.
 
+The proxy also checks the name in each request (#664). By default it answers
+only `http://localhost:8080` and `http://127.0.0.1:8080`; another name for this
+machine, even one that points at `127.0.0.1`, gets `421 Misdirected Request`.
+That stops a web page on a DNS-rebinding domain from reaching the workbench
+through your browser.
+
 In LAN mode:
 
 - the proxy publishes HTTPS on every network interface of this machine, port
@@ -422,9 +428,19 @@ Browsers check that the certificate names the address they typed. Pick one of:
   any site) as a trusted root on each client machine: on a Mac, open it in
   Keychain Access, then set it to "Always Trust".
 
+**The names the proxy answers for (#664).** In LAN mode the proxy answers only
+for the names in its certificate, plus `localhost` and `127.0.0.1`: with the
+self-signed certificate, the names in `RAG_LAN_HOSTNAMES`; with your own, the
+DNS names and IP addresses it is issued for (a wildcard such as
+`*.office.example` covers every name under `office.example`). A request for any
+other name, such as an address you didn't list or a DNS-rebinding page's
+domain, gets `421 Misdirected Request`. To add a name, add it to
+`RAG_LAN_HOSTNAMES` or to your certificate. `docker compose logs tls-init` warns
+about a certificate name it can't use.
+
 After changing the certificate files or `RAG_LAN_HOSTNAMES` on a running LAN
 stack, run the `up` command below again, then restart the proxy so nginx loads
-the new pair:
+the new pair and names:
 `docker compose -f docker-compose.yml -f docker-compose.lan.yml restart proxy`.
 
 ### 3. Start in LAN mode

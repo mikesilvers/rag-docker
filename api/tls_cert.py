@@ -22,6 +22,14 @@ into a fresh folder and `live` is switched with one rename, so nginx never
 finds a certificate beside a key that doesn't match it; older pairs are then
 removed.
 
+The hosts the proxy answers for (#664): on every successful run the step also
+writes /certs/hosts.map, which nginx.lan.conf includes in its map of accepted
+hosts. It lists the active certificate's names other than localhost and
+127.0.0.1 (nginx.lan.conf has those two already): DNS names in lower case,
+wildcards (*.example.com) as nginx wildcards, IPv6 addresses in brackets. A
+name that is none of these is left out, with a warning, so nothing else can
+reach nginx's configuration. The file is replaced with one rename.
+
 It prints one line naming the certificate (source, names, expiry, SHA-256
 fingerprint, which is what a browser shows when asked to trust it) and exits
 0, or prints one line on standard error and exits 1; the proxy then doesn't
@@ -50,6 +58,12 @@ LIVE = "live"
 SELF_SIGNED = "self-signed"
 BYO = "byo"
 _LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+HOSTS = "hosts.map"
+# Accepted by nginx.lan.conf itself; a second entry for either would be a
+# duplicate key, which stops nginx.
+ALWAYS = ("localhost", "127.0.0.1")
+# The map block's own parameter names: a key spelled like one needs a leading \.
+MAP_WORDS = {"default", "hostnames", "include", "volatile"}
 
 
 class CertError(Exception):
@@ -188,6 +202,52 @@ def self_signed(names: list[str], now: datetime.datetime) -> tuple[bytes, bytes]
                               serialization.NoEncryption()))
 
 
+# ── the hosts the proxy answers for (#664) ───────────────────────────────────
+
+def _dns(name: str) -> bool:
+    return len(name) <= 253 and all(_LABEL.match(label) for label in name.split("."))
+
+
+def map_key(name: str) -> str | None:
+    """`name` as a key of nginx's `map ... { hostnames; }`, or None if it can't be one safely."""
+    try:
+        address = ipaddress.ip_address(name)
+    except ValueError:
+        pass
+    else:
+        return f"[{address}]" if address.version == 6 else str(address)
+    if name.startswith("*.") and _dns(name[2:]):
+        return name
+    if not _dns(name):
+        return None
+    return "\\" + name if name in MAP_WORDS else name
+
+
+def write_hosts(out_dir: Path, cert: x509.Certificate, err) -> None:
+    """Write hosts.map for `cert`'s names, through a temporary file and one rename."""
+    keys: list[str] = []
+    for name in sorted(_cert_names(cert)):
+        if name in ALWAYS:
+            continue
+        key = map_key(name)
+        if key is None:
+            print(f"tls-init: warning: {name!r} is left out of the names the proxy answers for: it is neither a "
+                  f"DNS name nor an IP address", file=err, flush=True)
+        elif key not in keys:
+            keys.append(key)
+    text = ("# Written by tls-init (api/tls_cert.py): the certificate's names besides localhost and 127.0.0.1.\n"
+            + "".join(f"{key} 1;\n" for key in keys))
+    temp = out_dir / f".hosts-{secrets.token_hex(8)}"
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(text)
+    os.chmod(temp, 0o644)
+    os.replace(temp, out_dir / HOSTS)
+    for old in out_dir.iterdir():
+        if old.name.startswith(".hosts-"):
+            old.unlink(missing_ok=True)
+
+
 # ── the step ─────────────────────────────────────────────────────────────────
 
 def run(byo_dir: Path, out_dir: Path, hostnames: str | None, now: datetime.datetime | None = None,
@@ -217,6 +277,7 @@ def _step(byo_dir: Path, out_dir: Path, hostnames: str | None, now: datetime.dat
                   f"{cert.not_valid_after_utc:%Y-%m-%d}; browsers will refuse it", file=err, flush=True)
         if _read_live(out_dir) != (BYO, cert_bytes, key_bytes):
             install(out_dir, cert_bytes, key_bytes, BYO)
+        write_hosts(out_dir, cert, err)
         return f"using your certificate from proxy/certs: {describe(cert)}"
 
     names = wanted_names(hostnames)
@@ -227,10 +288,12 @@ def _step(byo_dir: Path, out_dir: Path, hostnames: str | None, now: datetime.dat
         except CertError:
             cert = None
         if cert is not None and cert.not_valid_after_utc > now and _cert_names(cert) == set(names):
+            write_hosts(out_dir, cert, err)
             return f"reusing the self-signed certificate: {describe(cert)}"
     cert_bytes, key_bytes = self_signed(names, now)
     install(out_dir, cert_bytes, key_bytes, SELF_SIGNED)
     cert, _ = load_pair(cert_bytes, key_bytes)
+    write_hosts(out_dir, cert, err)
     return f"generated a self-signed certificate: {describe(cert)}"
 
 

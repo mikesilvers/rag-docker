@@ -192,6 +192,10 @@ class CertTestCase(unittest.TestCase):
         return ([n for n in san.get_values_for_type(x509.DNSName)],
                 [str(a) for a in san.get_values_for_type(x509.IPAddress)])
 
+    def hosts(self):
+        """hosts.map's entries (#664), without its comment line."""
+        return [line for line in (self.out / "hosts.map").read_text().splitlines() if not line.startswith("#")]
+
 
 class SelfSignedTests(CertTestCase):
     """S4.3-S4.6."""
@@ -291,6 +295,27 @@ class SelfSignedTests(CertTestCase):
         self.regenerated(out)
         self.assertEqual(self.live()[2], "self-signed")
 
+    def test_hosts_map_follows_the_names(self):
+        # #664: the names the proxy answers for, besides localhost and 127.0.0.1.
+        code, _, err = self.step("Office.Example,192.168.1.20,::1")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(self.hosts(), ["192.168.1.20 1;", "[::1] 1;", "office.example 1;"])
+        self.assertEqual((self.out / "hosts.map").stat().st_mode & 0o777, 0o644)
+        (self.out / "hosts.map").unlink()
+        code, out, _ = self.step("office.example,192.168.1.20,::1")
+        self.assertIn("reusing the self-signed certificate", out)
+        self.assertEqual(self.hosts(), ["192.168.1.20 1;", "[::1] 1;", "office.example 1;"], "rewritten on reuse")
+        self.step("files.example")
+        self.assertEqual(self.hosts(), ["files.example 1;"])
+        self.assertEqual([p.name for p in self.out.iterdir() if p.name.startswith(".hosts-")], [])
+
+    def test_a_refusal_leaves_hosts_map(self):
+        self.step()
+        before = self.hosts()
+        code, _, _ = self.step("bad_name")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.hosts(), before)
+
     def test_a_failed_write_leaves_the_live_pair(self):
         self.step()
         before = os.readlink(self.out / "live")
@@ -358,6 +383,28 @@ class BringYourOwnTests(CertTestCase):
                 self.assertIn(part, err)
                 self.assertFalse((self.out / "live").exists())
 
+    def test_hosts_map_from_your_certificate(self):
+        # #664: the certificate's own names, in nginx's forms; localhost and
+        # 127.0.0.1 are nginx.lan.conf's.
+        self.put(*certificate(["files.example", "*.files.example", "fe80::1", "127.0.0.1", "localhost",
+                               "default", "HOSTNAMES.example"]))
+        code, _, err = self.step(hostnames=None)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(sorted(self.hosts()), sorted(["*.files.example 1;", "[fe80::1] 1;", "\\default 1;",
+                                                       "files.example 1;", "hostnames.example 1;"]))
+
+    def test_unsafe_names_are_left_out_with_a_warning(self):
+        self.put(*certificate(["files.example", "bad_name.example", "a b", "x;y", "*.*.example", "*"]))
+        code, out, err = self.step(hostnames=None)
+        self.assertEqual(code, 0)
+        self.assertIn("using your certificate from proxy/certs", out)
+        self.assertEqual(self.hosts(), ["files.example 1;"])
+        warnings = err.splitlines()
+        self.assertEqual(len(warnings), 5, err)
+        for name in ("bad_name.example", "a b", "x;y", "*.*.example", "'*'"):
+            self.assertIn(name, err)
+        self.assertTrue(all(line.startswith("tls-init: warning: ") for line in warnings))
+
     def test_an_expired_certificate_is_used_with_a_warning(self):
         self.put(*certificate(["files.example"], days=-1))
         code, out, err = self.step()
@@ -413,6 +460,26 @@ class NginxTests(unittest.TestCase):
                          ["location = /api/goldstandard/regenerate {", "location = /api/auth/login {",
                           "location @login_rate_limited {", "location /api/ {", "location / {"])
         self.assertEqual(lines.count("proxy_set_header Host $http_host;"), 3)
+
+    def test_only_listed_hosts_are_served(self):
+        # #664: a map of the accepted hosts, and a server-level 421 for any other.
+        for name, text in (("nginx.conf", self.default), ("nginx.lan.conf", self.lan)):
+            with self.subTest(file=name):
+                block = text[text.index("map $host $rag_host_allowed {"):]
+                block = directives(block[:block.index("\n    }\n")])
+                want = ["map $host $rag_host_allowed {", "hostnames;", "default   0;", "localhost 1;", "127.0.0.1 1;"]
+                if name == "nginx.lan.conf":
+                    want.append("include /etc/nginx/certs/hosts.map;")
+                self.assertEqual(block, want)
+                self.assertEqual(directives(text).count("map $host $rag_host_allowed {"), 1)
+                server = directives(text[text.index("    server {"):])
+                guard = ["if ($rag_host_allowed = 0) {", "return 421;", "}"]
+                at = server.index(guard[0])
+                self.assertEqual(server[at:at + 3], guard)
+                self.assertLess(at, server.index("include /etc/nginx/rag/locations.conf;"))
+                self.assertNotIn("server_name", "\n".join(directives(text)),
+                                 "a request without Host must keep an empty $host")
+        self.assertNotIn("rag_host_allowed", self.locations)
 
     def test_logins_are_rate_limited_per_address(self):
         # #577: both servers define the zone; the login location uses it and
