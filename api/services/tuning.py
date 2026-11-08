@@ -164,6 +164,15 @@ class ServiceUnavailableError(Exception):
     the tuning options (#349)."""
 
 
+class TuneInProgressError(RuntimeError):
+    """This collection is already being tuned. Its own type, so the router
+    never answers another RuntimeError as TUNE_IN_PROGRESS (#657)."""
+
+    def __init__(self, collection: str) -> None:
+        super().__init__(collection)
+        self.collection = collection
+
+
 # A collection whose retained originals all lack stored chunks (every file
 # produced none at ingest) has nothing to rebuild, since a rebuild emits only
 # stored names (#311). It isn't offered re-chunking, and a request is refused
@@ -566,7 +575,7 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
     job_id = str(uuid.uuid4())[:8]
     with _lock:
         if collection in _active:
-            raise RuntimeError(collection)
+            raise TuneInProgressError(collection)
         _active.add(collection)
     # Lets DELETE /collections refuse while this job rebuilds the collection
     # (#40). Before the job record, so a refusal during a delete leaves none (#302).

@@ -5249,6 +5249,12 @@ class UploadRejected(Exception):
                        "members_omitted": max(0, len(members) - _MAX_NAMED_MEMBERS)}
 
 
+class NoSupportedFiles(ValueError):
+    """An upload with no supported file. The ingest router answers this type
+    alone as NO_SUPPORTED_FILES, so no other ValueError's text reaches the
+    client under that code (#657). Still a ValueError, as it was before."""
+
+
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
 
@@ -6435,7 +6441,10 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
     remedy = "Re-create the zip and upload it again."
     try:
         archive = zipfile.ZipFile(dest, "r")
-    except (zipfile.BadZipFile, OSError) as exc:
+    except (zipfile.BadZipFile, OSError, ValueError) as exc:
+        # ValueError: a member name flagged UTF-8 that isn't valid UTF-8 raises
+        # UnicodeDecodeError while the directory is read. The archive can't be
+        # read, and the codec's text is not sent (#657).
         raise _rejected(
             "ARCHIVE_UNREADABLE",
             f"'{safe_name}' is damaged and can't be read, so nothing from it was imported. "
@@ -6636,7 +6645,7 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
     if not file_paths:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         detail = "; ".join(skipped)
-        raise ValueError(
+        raise NoSupportedFiles(
             "No supported files found in upload."
             + (f" Skipped: {detail}" if detail else ""))
 
@@ -12254,6 +12263,16 @@ class ExportStartingError(Exception):
     START_WAIT, so there is no job to name yet (#338)."""
 
 
+class ExportInProgressError(RuntimeError):
+    """An export of this collection is already running; `job_id` names it. Its
+    own type, so the router never answers another RuntimeError as
+    EXPORT_IN_PROGRESS (#657)."""
+
+    def __init__(self, job_id: str) -> None:
+        super().__init__(job_id)
+        self.job_id = job_id
+
+
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
 
@@ -12338,7 +12357,7 @@ async def start_export_job(collection: str, include_models: bool = False,
     A passphrase makes the package encrypted (#27). It is handed to the worker
     as an argument only: the job record says `encrypted`, never the passphrase.
 
-    Raises RuntimeError carrying the running job id if one is already in flight
+    Raises ExportInProgressError carrying the running job id if one is already in flight
     for this collection; that job's record is always stored by then (#326).
     Raises ExportStartingError if that start hasn't stored it within START_WAIT.
     """
@@ -12353,7 +12372,7 @@ async def start_export_job(collection: str, include_models: bool = False,
                 break
             starting = _starting.get(running)
         if starting is None:
-            raise RuntimeError(running)
+            raise ExportInProgressError(running)
         # That start hasn't stored its record yet: wait until it has, or has
         # released the slot, then look again (#326). Holds nothing meanwhile, and
         # gives up once START_WAIT has passed since the first wait (#338).
@@ -12498,6 +12517,15 @@ class PassphraseError(Exception):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+class ImportInProgressError(RuntimeError):
+    """An import of this package file is already running. Its own type, so the
+    router never answers another RuntimeError as IMPORT_IN_PROGRESS (#657)."""
+
+    def __init__(self, filename: str) -> None:
+        super().__init__(filename)
+        self.filename = filename
 
 
 def get_job(job_id: str) -> dict | None:
@@ -13406,7 +13434,7 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
     job_id = str(uuid.uuid4())[:8]
     with _lock:
         if key in _active:
-            raise RuntimeError(filename)
+            raise ImportInProgressError(filename)
         _active.add(key)
 
     # The first write is durable, so it runs off the event loop (#309). A start
@@ -13926,6 +13954,15 @@ class ServiceUnavailableError(Exception):
     the tuning options (#349)."""
 
 
+class TuneInProgressError(RuntimeError):
+    """This collection is already being tuned. Its own type, so the router
+    never answers another RuntimeError as TUNE_IN_PROGRESS (#657)."""
+
+    def __init__(self, collection: str) -> None:
+        super().__init__(collection)
+        self.collection = collection
+
+
 # A collection whose retained originals all lack stored chunks (every file
 # produced none at ingest) has nothing to rebuild, since a rebuild emits only
 # stored names (#311). It isn't offered re-chunking, and a request is refused
@@ -14328,7 +14365,7 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
     job_id = str(uuid.uuid4())[:8]
     with _lock:
         if collection in _active:
-            raise RuntimeError(collection)
+            raise TuneInProgressError(collection)
         _active.add(collection)
     # Lets DELETE /collections refuse while this job rebuilds the collection
     # (#40). Before the job record, so a refusal during a delete leaves none (#302).
@@ -14540,8 +14577,12 @@ async def transfer_help():
     dimensions = await _embedding_dimensions()
     try:
         markdown = packager.render_help(dimensions)
-    except RuntimeError as exc:
-        return api_error(500, "HELP_RENDER_FAILED", str(exc))
+    except RuntimeError:
+        # A template that can't be filled in. The cause is logged, not sent (#657).
+        _log.exception("Could not render the help page from its templates")
+        return api_error(500, "HELP_RENDER_FAILED",
+                         "The help page could not be rendered: a help template is "
+                         "invalid. The API log has the details.")
     except OSError:
         # A template file missing or unreadable. Its path is logged, not sent (#373).
         _log.exception("Could not read a help template")
@@ -14896,7 +14937,8 @@ async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
         return collection_deleting_error(collection)
     except ingest_pipeline.UploadRejected as exc:
         return api_error(exc.status, exc.code, exc.message, detail=exc.detail)
-    except ValueError as exc:
+    except ingest_pipeline.NoSupportedFiles as exc:
+        # Only this type: any other error reaches ingest_upload's handler (#657).
         return api_error(400, "NO_SUPPORTED_FILES", str(exc))
 
     return IngestUploadResponse(
@@ -15385,12 +15427,13 @@ async def start_export(body: ExportRequest, request: Request = None):
         # The running start hasn't stored its record yet, so no job_id to name (#338).
         return api_error(409, "EXPORT_STARTING",
                          f"An export of '{body.collection}' is starting; retry shortly.")
-    except RuntimeError as exc:
-        # start_export_job puts the already-running job id in the exception.
+    except exporter.ExportInProgressError as exc:
+        # The exception names the running job; any other error is not this
+        # answer, and its text is not sent (#657).
         return api_error(
             409, "EXPORT_IN_PROGRESS",
             f"An export of '{body.collection}' is already running.",
-            detail={"job_id": str(exc)},
+            detail={"job_id": exc.job_id},
         )
     return ExportStartResponse(job_id=job_id, status="queued", collection=body.collection)
 
@@ -15426,10 +15469,10 @@ async def start_import(body: ImportRequest, request: Request = None):
     except importer.PassphraseError as exc:
         # Decided by the filename before any job exists (#27).
         return api_error(400, exc.code, str(exc), detail={"filename": body.filename})
-    except RuntimeError as exc:
+    except importer.ImportInProgressError as exc:
         return api_error(409, "IMPORT_IN_PROGRESS",
-                         f"An import of '{exc}' is already running.",
-                         detail={"filename": str(exc)})
+                         f"An import of '{exc.filename}' is already running.",
+                         detail={"filename": exc.filename})
     return ImportStartResponse(job_id=job_id, status="queued", filename=body.filename)
 
 
@@ -15555,10 +15598,10 @@ async def _start(collection: str, operation: str, params: dict):
                          "could not be read. No job was started; try again when Weaviate "
                          "is available.",
                          detail={"collection": collection})
-    except RuntimeError as exc:
+    except tuning.TuneInProgressError as exc:
         return api_error(409, "TUNE_IN_PROGRESS",
-                         f"'{exc}' is already being tuned.",
-                         detail={"collection": str(exc)})
+                         f"'{exc.collection}' is already being tuned.",
+                         detail={"collection": exc.collection})
     return TuneStartResponse(job_id=job_id, status="queued",
                              collection=collection, operation=operation)
 
@@ -25244,7 +25287,7 @@ synthesis failing is the Ollama 503 (and that it used the engineer system prompt
 Ollama failure in the reformulation or the synthesis in `hybrid` and `semantic` modes still
 names Ollama only (#456), that a Weaviate failure in `hybrid` and `semantic`
 modes names Ollama too (Weaviate embeds the question through it there), and that a help
-template `RuntimeError` answers `HELP_RENDER_FAILED` with its own message. Suite 01 then
+template `RuntimeError` answers `HELP_RENDER_FAILED` with a fixed message, the cause logged (#657). Suite 01 then
 checks the envelope through the proxy on the running stack: an unknown route answers 404
 `NOT_FOUND`, and `PUT /query` answers 405 with `Allow: POST` and the code
 `METHOD_NOT_ALLOWED` (#456), the request going through the lock-checked `api_request` helper.

@@ -224,6 +224,44 @@ class UploadErrorTests(unittest.TestCase):
         self.assertIn("'Coll'", record.getMessage())
         self.assertIn("a.txt", record.getMessage())
 
+    def test_zip_with_an_undecodable_name_is_archive_unreadable(self):
+        # The member name is flagged UTF-8 but isn't: zipfile raises
+        # UnicodeDecodeError, a ValueError, while reading the directory. It used
+        # to answer NO_SUPPORTED_FILES with the codec's text (#657).
+        data = patch_header(zip_bytes([("a.txt", "text")]), 6, 8, 0x800, set_bits=True)
+        out = bytearray(data)
+        out[data.index(b"PK\x01\x02") + 46] = 0xFF        # the name's first byte
+        with self.assertLogs("services.ingest_pipeline", "WARNING"):
+            status, body = self.post(upload("names.zip", bytes(out)))
+        self.assert_refused(status, body, "ARCHIVE_UNREADABLE",
+                            "'names.zip' is damaged and can't be read, so nothing from it was imported",
+                            "Re-create the zip")
+        self.assertEqual(body["error"]["detail"], {"file": "names.zip", "members": [],
+                                                   "members_omitted": 0})
+        text = json.dumps(body).lower()
+        self.assertNotIn("codec", text)
+        self.assertNotIn("utf-8", text)
+
+    def test_an_unexpected_value_error_is_a_json_500_not_no_supported_files(self):
+        # Only NoSupportedFiles is NO_SUPPORTED_FILES; another ValueError's text
+        # is logged, not sent (#657).
+        boom = ValueError("SENTINEL library text")
+        with patch.object(ingest_pipeline, "start_ingest_job", AsyncMock(side_effect=boom)), \
+                self.assertLogs("routers.ingest", "ERROR") as logs:
+            status, body = self.post(upload("a.txt", b"text"))
+        self.assertEqual(status, 500, body)
+        self.assertEqual(body["error"]["code"], "INGEST_FAILED")
+        self.assertNotIn("SENTINEL", json.dumps(body))
+        self.assertIsNotNone(logs.records[0].exc_info)
+
+    def test_no_supported_files_is_still_a_400_with_its_message(self):
+        status, body = self.post(upload("notes.xyz", b"unsupported"))
+        self.assert_refused(status, body, "NO_SUPPORTED_FILES")
+        self.assertEqual(body["error"]["message"],
+                         "No supported files found in upload. Skipped: notes.xyz "
+                         "(unsupported type '.xyz')")
+        self.assertIsNone(body["error"]["detail"])
+
     def test_json_gz_and_jsonl_members_are_queued_and_other_gz_skipped(self):
         data = zip_bytes([("docs/a.json", JSON_DOC),
                           ("docs/b.json.gz", gzip.compress(JSON_DOC.encode())),

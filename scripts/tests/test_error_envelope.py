@@ -273,13 +273,17 @@ class HelpTests(EnvelopeTestCase):
         self.assertNotIn(empty.name, response.text)
         self.assertIn(empty.name, logged(logs))
 
-    def test_a_template_runtime_error_keeps_its_own_message(self):
-        with patch.object(packager, "render_help",
-                          side_effect=RuntimeError("Template has an unknown placeholder.")), \
-                patch.object(ollama_client, "embed", AsyncMock(return_value=[0.0] * 3)):
+    def test_a_template_runtime_error_is_a_fixed_message_logged_not_sent(self):
+        # It used to send the error's own text (#657).
+        with patch.object(packager, "render_help", side_effect=RuntimeError(CAUSE)), \
+                patch.object(ollama_client, "embed", AsyncMock(return_value=[0.0] * 3)), \
+                self.assertLogs("routers.help", "ERROR") as logs:
             response = self.client.get("/help/transfer")
         self.assert_error(response, 500, "HELP_RENDER_FAILED",
-                          "Template has an unknown placeholder.")
+                          "The help page could not be rendered: a help template is invalid. "
+                          "The API log has the details.")
+        self.assertNotIn(CAUSE, response.text)
+        self.assertIn(CAUSE, logged(logs))
 
 
 class CreateDeleteTests(EnvelopeTestCase):

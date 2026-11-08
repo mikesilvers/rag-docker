@@ -93,7 +93,8 @@ async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
         return collection_deleting_error(collection)
     except ingest_pipeline.UploadRejected as exc:
         return api_error(exc.status, exc.code, exc.message, detail=exc.detail)
-    except ValueError as exc:
+    except ingest_pipeline.NoSupportedFiles as exc:
+        # Only this type: any other error reaches ingest_upload's handler (#657).
         return api_error(400, "NO_SUPPORTED_FILES", str(exc))
 
     return IngestUploadResponse(
