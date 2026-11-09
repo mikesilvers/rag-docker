@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -42,7 +42,7 @@ NOW = time.time()
 
 
 def iso(seconds_ago: float) -> str:
-    return (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).isoformat()
+    return datetime.fromtimestamp(NOW - seconds_ago, timezone.utc).isoformat()
 
 
 def owner(name="dev", kind="user"):
@@ -133,7 +133,7 @@ class SelectTests(unittest.TestCase):
         return [(r, r["status"] == "running", job_lists._parse(r.get("finished_at"))) for r in records]
 
     def ids(self, items, principal):
-        return [r["job_id"] for r in job_lists.select(items, principal, time.time())]
+        return [r["job_id"] for r in job_lists.select(items, principal, NOW)]
 
     def test_developer_sees_only_own_jobs_and_engineer_sees_all(self):
         items = self.items(
@@ -194,7 +194,7 @@ class SelectTests(unittest.TestCase):
                     {"session_id": "legacy", "status": "completed"}]
         items = job_lists.session_items(sessions)
         self.assertEqual([(i[1], i[2] is not None) for i in items], [(True, False), (False, True), (False, False)])
-        listed = job_lists.select([(dict(s, owner=owner()), r, f) for s, r, f in items], DEV, time.time())
+        listed = job_lists.select([(dict(s, owner=owner()), r, f) for s, r, f in items], DEV, NOW)
         # "gen" has neither a start nor a finish time, so it sorts last (S3.6).
         self.assertEqual([s["session_id"] for s in listed], ["done", "gen"])
 

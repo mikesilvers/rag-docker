@@ -7,6 +7,9 @@ compose pin must be a plain release tag: the architecture-suffixed tags
 the pin must name the same tag, and Dependabot must ignore every Weaviate update,
 because a version rule cannot keep it off the suffixed tags (#527, #530).
 
+It also checks that the nginx tag SPECIFICATIONS.md states, in its compose copy
+and its 11.3 offline image list, is the proxy's tag in docker-compose.yml (#665).
+
 Standard library only; no Docker or stack needed.
 Run: python3 scripts/tests/test_weaviate_pin.py
 """
@@ -17,15 +20,18 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 IMAGE = 'semitechnologies/weaviate'
 TAG = re.compile(re.escape(IMAGE) + r':([^\s`"\',)]+)')
+NGINX = 'nginx'
+# The proxy image reference only, not paths such as proxy/nginx.conf:/etc/nginx/nginx.conf.
+NGINX_TAG = re.compile(r'(?<![\w/.-])' + NGINX + r':([^\s`"\',)]+)')
 
 
 def read(name):
     return (ROOT / name).read_text()
 
 
-def compose_tag():
-    match = re.search(r'^\s+image: ' + re.escape(IMAGE) + r':(\S+)\s*$', read('docker-compose.yml'), re.M)
-    assert match, 'docker-compose.yml pins no ' + IMAGE + ' image'
+def compose_tag(image=IMAGE):
+    match = re.search(r'^\s+image: ' + re.escape(image) + r':(\S+)\s*$', read('docker-compose.yml'), re.M)
+    assert match, 'docker-compose.yml pins no ' + image + ' image'
     return match.group(1)
 
 
@@ -63,6 +69,15 @@ def stated_pins():
     return places
 
 
+def spec_nginx_pins():
+    """(where, text that states the proxy's nginx tag) for each place in SPECIFICATIONS.md (#665)."""
+    spec = read('SPECIFICATIONS.md')
+    return [('SPECIFICATIONS.md compose copy', '\n'.join(
+                line for line in spec.splitlines() if re.match(r'^\s+image: ' + NGINX + ':', line))),
+            ('SPECIFICATIONS.md 11.3 image list', section(spec, '### 11.3 Offline bundle contents',
+                                                          '### 11.4 Offline install procedure'))]
+
+
 def entry(text, ecosystem):
     """The lines of one `updates` entry of dependabot.yml."""
     lines = text.splitlines()
@@ -87,6 +102,13 @@ class WeaviatePinTests(unittest.TestCase):
             with self.subTest(where=where):
                 self.assertEqual(sorted(set(TAG.findall(text))), [tag],
                                  '{} names another Weaviate tag than docker-compose.yml'.format(where))
+
+    def test_spec_states_the_compose_nginx_tag(self):
+        tag = compose_tag(NGINX)
+        for where, text in spec_nginx_pins():
+            with self.subTest(where=where):
+                self.assertEqual(sorted(set(NGINX_TAG.findall(text))), [tag],
+                                 '{} names another nginx tag than docker-compose.yml, or none'.format(where))
 
     def test_dependabot_ignores_every_weaviate_update(self):
         block = entry(read('.github/dependabot.yml'), 'docker-compose')
