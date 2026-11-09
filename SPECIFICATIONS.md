@@ -2296,6 +2296,11 @@ sidecars are then kept across restarts and named in the job error
 (`RAG_EXPORT_SPECIFICATIONS.md` §7.4). Vectors are copied out of
 the staging collection rather than regenerated, so the corpus is embedded once.
 
+A re-chunk parses and chunks every retained original and holds all of the new chunks in the
+API's memory until the rebuild has staged them; re-embedding and re-indexing likewise hold the
+whole collection. Split files can store up to ten times their own size (§5.1.1), so a very
+large collection can run the API container out of memory. Bounding this is tracked in #690.
+
 Any operation that changes chunk identity marks the collection's gold-standard
 sessions `stale`. `/tune/reindex` does not, because chunk identity is unchanged.
 
@@ -2502,11 +2507,15 @@ as it is: the upload, ZIP, `.json` size, JSON Lines line and record count limits
     10,000,000 characters (under `context_aware` the records' or elements' text alone, otherwise
     the joined text with the breaks between them);
   - a `.txt`, `.md` or `.csv` file of at most 10,000,000 bytes;
-  - a larger `.txt`, `.md` or `.csv` whose raw paragraphs, lines or rows (a CSV row by its
-    cells' text) total at most 10,000,000 characters. That raw measure can be more than the
-    parsed text (indentation, Markdown link targets, `NA` cells), so such a file may be stored
-    as parts even when its parsed text would fit; measuring the raw units keeps memory bounded,
-    as the whole file is never parsed just to measure it.
+  - a larger `.txt` or `.md` whose raw paragraphs or lines total at most 10,000,000
+    characters. That raw measure can be more than the parsed text (indentation, Markdown link
+    targets), so such a file may be stored as parts even when its parsed text would fit;
+    measuring the raw units keeps memory bounded, as the whole file is never parsed just to
+    measure it;
+  - a larger `.csv` whose rows as written, separators, needed quotes and line endings
+    included (the header row too), total at most 10,000,000 characters. A CSV over that is
+    always split, so no CSV is parsed whole past about 10,000,000 characters, however sparse
+    (maintainer's decision on #631, reversing PR #630's measure by the cells' text for CSV).
   The estimates above only size the parts of a file that is split.
 - A file split into parts may store at most ten times its own size in chunk text (all its
   parts' chunks, repeated CSV headers and overlap included). Its own size is its bytes as

@@ -8,7 +8,7 @@ replaces all of them.
 from __future__ import annotations
 
 import re
-from typing import Mapping
+from collections.abc import Container
 
 _PART = re.compile(r" \(part ([1-9][0-9]*)\)\Z")
 
@@ -29,9 +29,10 @@ def in_family(stored: str, name: str) -> bool:
     return stored == name or base_of(stored) == name
 
 
-def resolve(stored: str, listed: Mapping[str, object]) -> str | None:
+def resolve(stored: str, listed: Container[str]) -> str | None:
     """The retained name whose original `stored` came from: `stored` itself when it
-    is listed, else the name it is a part of when that is listed, else None."""
+    is listed, else the name it is a part of when that is listed, else None.
+    `listed` is a set or mapping of retained names."""
     if stored in listed:
         return stored
     base = base_of(stored)
