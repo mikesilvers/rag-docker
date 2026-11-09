@@ -468,8 +468,8 @@ class FakeSourceCollection:
         self.calls.append(("fetch", (limit, include_vector, tuple(return_properties))))
         return SimpleNamespace(objects=list(self.objects[:limit]))
 
-    def iterator(self, include_vector=None, return_properties=None):
-        self.calls.append(("walk", (include_vector, tuple(return_properties))))
+    def iterator(self, include_vector=None, return_properties=None, cache_size=None):
+        self.calls.append(("walk", (include_vector, tuple(return_properties), cache_size)))
         for obj in list(self.objects):
             self.taken += 1
             yield obj
@@ -587,7 +587,8 @@ class ExactSourceTests(unittest.TestCase):
         coll = FakeSourceCollection(objects, count=10_001)
         self.assertEqual(self.replace(coll), 0)
         self.assertEqual(coll.kinds(), ["count", "walk", "count", "walk"])
-        self.assertEqual(coll.calls[1][1], (False, ("source_file", "created_at")))
+        # The walk reads pages as large as one query returns, not the client's 100 (#628).
+        self.assertEqual(coll.calls[1][1], (False, ("source_file", "created_at"), wc._QUERY_MAXIMUM_RESULTS))
         coll = FakeSourceCollection(objects, count=10_000)
         self.assertEqual(self.replace(coll), 0)
         self.assertEqual(coll.kinds(), ["count", "fetch", "count", "fetch"])
