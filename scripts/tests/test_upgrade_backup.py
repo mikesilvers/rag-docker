@@ -1,4 +1,4 @@
-"""Host-only check of the README's 1.1.0 → 1.2.0 backup and rollback commands (#679).
+"""Host-only check of the README's 1.1.0 → 1.2.0 backup and rollback commands (#679, #693).
 
 Reads the command blocks of "Upgrading from 1.1.0 to 1.2.0" in README.md and checks
 that the helper image is pinned by version and digest, that no block holds a `#`
@@ -8,14 +8,18 @@ the blocks as written, under bash, `zsh -c` and interactive `zsh -i` with commen
 off, with stub `docker`, `git` and `curl` first on PATH and no rc files read. The
 stub's named volumes are folders, and `docker run` runs the container's command
 with the host's own tar and find, after mapping the mounts to the test's temp
-directory; it refuses any other absolute path. So the checks the blocks make before
-they write are exercised for real:
+directory. It accepts only mounts inside that directory and only the README's two
+container commands (the backup's `tar czf` and the restore's `find -delete && tar
+xzf`), and refuses anything else. So the checks the blocks make before they write
+are exercised for real:
 
 - the backup skips a volume that doesn't exist (a wrong prefix) instead of creating
-  it, and reports each archive's entry count only for a volume that exists;
-- the rollback checks every archive and every volume before it empties any, and
-  empties nothing, nor starts the stack, if one check fails; a failed restore stops
-  before the stack is started.
+  it, and reports each archive's entry count only for a volume that exists; each
+  copy goes to a `.tmp` file that replaces the archive only once `gzip -t` passes,
+  so a failed or corrupt copy prints `backup FAILED` and leaves an earlier archive;
+- the rollback is gated on `git checkout v1.1.0` and checks every archive and every
+  volume before it empties any, and empties nothing, nor starts the stack, if the
+  checkout or one check fails; a failed restore stops before the stack is started.
 
 Standard library only; no Docker or stack needed.
 Run: python3 scripts/tests/test_upgrade_backup.py
@@ -47,6 +51,21 @@ def log(entry):
     with open(os.path.join(stub, 'calls'), 'a') as f:
         f.write(json.dumps(entry) + '\n')
 
+def refuse(reason):
+    sys.stderr.write('stub docker: refused, %s\n' % reason)
+    log({'refused': reason})
+    sys.exit(REFUSED_CODE)
+
+def inside(path):
+    return path.startswith(stub + '/')
+
+# The container may run only the README's two commands, with every mount inside the
+# temp directory, so an edited README can never send `find ... -delete` or `tar x`
+# to a real host path, whatever its spelling (`..`, `~`, `$HOME`, `-C/etc`, `>`).
+FILE = r'[A-Za-z0-9_-][A-Za-z0-9_.-]*'
+BACKUP_FILE = re.compile(r'/backup/(' + FILE + ')')
+RESTORE = re.compile(r'find /data -mindepth 1 -delete && tar xzf /backup/(' + FILE + r') -C /data')
+
 args = sys.argv[1:]
 log({'argv': args})
 if args[:2] == ['volume', 'inspect']:
@@ -61,40 +80,55 @@ if args[:1] == ['run']:
         if rest[i] == '-v':
             spec = rest[i + 1].split(':')
             source, target = spec[0], spec[1]
-            if not source.startswith('/'):
+            named = not source.startswith('/')
+            path = os.path.realpath(os.path.join(vols, source) if named else source)
+            if not inside(path):
+                refuse('mount source outside the test directory: ' + rest[i + 1])
+            if named:
                 names.append(source)
-                path = os.path.join(vols, source)
                 if not os.path.isdir(path):
                     os.makedirs(path)
                     log({'created': source})
-                source = path
-            mounts[target] = os.path.realpath(source)
+            mounts[target] = path
             i += 2
         else:
             i += 1
     command = rest[i + 1:]
-    if mounts:
-        pattern = re.compile(r'(?<![^\s"\'])(' + '|'.join(re.escape(t) for t in mounts) + r')(?=[/\s"\']|$)')
-        command = [pattern.sub(lambda m: mounts[m.group(1)], part) for part in command]
-    # Refuse any absolute path the mounts didn't map into the temp directory, so an
-    # edited README can never send `find ... -delete` to a real host path.
-    for part in command:
-        for path in re.findall(r'(?<![^\s"\'=])/[^\s"\';&|]*', part):
-            if not (path == stub or path.startswith(stub + '/')):
-                sys.stderr.write('stub docker: refused, unmapped path %s\n' % path)
-                log({'refused': path})
-                sys.exit(REFUSED_CODE)
+    if '/data' not in mounts or '/backup' not in mounts:
+        refuse('/data and /backup must both be mounted: ' + ' '.join(sorted(mounts)))
+    backup_file = BACKUP_FILE.fullmatch(command[2]) if len(command) == 6 else None
+    restore = RESTORE.fullmatch(command[2]) if len(command) == 3 and command[:2] == ['sh', '-c'] else None
+    if backup_file and command[:2] == ['tar', 'czf'] and command[3:] == ['-C', '/data', '.']:
+        archive = os.path.join(mounts['/backup'], backup_file.group(1))
+        run = ['tar', 'czf', archive, '-C', mounts['/data'], '.']
+    elif restore:
+        archive = os.path.join(mounts['/backup'], restore.group(1))
+        run = ['sh', '-c', 'find "$1" -mindepth 1 -delete && tar xzf "$2" -C "$1"', 'sh', mounts['/data'], archive]
+    else:
+        refuse('not one of the README command shapes: ' + json.dumps(command))
     if os.environ.get('STUB_FAIL_RUN') in names:
         log({'failed': os.environ['STUB_FAIL_RUN']})
         sys.exit(1)
-    sys.exit(subprocess.call(command))
+    status = subprocess.call(run)
+    if status == 0 and run[1] == 'czf' and os.environ.get('STUB_CORRUPT_RUN') in names:
+        with open(archive, 'r+b') as f:
+            data = bytearray(f.read())
+            data[len(data) // 2] ^= 0xff
+            f.seek(0)
+            f.write(bytes(data))
+        log({'corrupted': os.environ['STUB_CORRUPT_RUN']})
+    sys.exit(status)
 sys.exit(0)
 '''.replace('REFUSED_CODE', str(REFUSED))
 
 STUB_LOGGER = r'''
 import json, os, sys
+name = os.path.basename(sys.argv[0])
 with open(os.path.join(os.environ['STUB_DIR'], 'calls'), 'a') as f:
-    f.write(json.dumps({os.path.basename(sys.argv[0]): sys.argv[1:]}) + '\n')
+    f.write(json.dumps({name: sys.argv[1:]}) + '\n')
+if name == 'git' and sys.argv[1:2] == ['checkout'] and os.environ.get('STUB_FAIL_GIT'):
+    sys.stderr.write('error: stub git: checkout failed\n')
+    sys.exit(1)
 '''
 
 
@@ -187,31 +221,79 @@ class StubTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, str(self.dir))
         self.stub = self.dir / 'docker'
         self.stub.write_text(STUB_DOCKER)
-        (self.dir / 'vols').mkdir()
+        self.volume = self.dir / 'vols' / 'rdtest_x'
+        self.volume.mkdir(parents=True)
+        (self.volume / 'f').write_text('x')
+        self.backups = self.dir / 'backups'
+        self.backups.mkdir()
 
     def run_stub(self, *args):
         env = dict(os.environ, STUB_DIR=str(self.dir))
+        for name in ('STUB_FAIL_RUN', 'STUB_CORRUPT_RUN'):
+            env.pop(name, None)
         return subprocess.run([sys.executable, str(self.stub)] + list(args), env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
 
+    def run_mounted(self, *command, data='rdtest_x:/data', backup=None):
+        backup = backup or str(self.backups) + ':/backup'
+        return self.run_stub('run', '--rm', '-v', data, '-v', backup, 'alpine', *command)
+
+    def make_archive(self):
+        source = self.dir / 'source'
+        source.mkdir()
+        (source / 'restored').write_text('from the archive')
+        subprocess.check_call(['tar', 'czf', str(self.backups / 'v.tgz'), '-C', str(source), '.'])
+
+    def assert_refused(self, result):
+        self.assertEqual(result.returncode, REFUSED, result.stdout + result.stderr)
+        self.assertIn('stub docker: refused, ', result.stderr)
+        self.assertEqual(tree(str(self.volume)), {'f': b'x'}, 'a refused command changed the volume')
+
+    def test_refuses_each_bypass_of_the_old_path_check(self):
+        """The spellings #686's security review found the textual check let through."""
+        self.make_archive()
+        for command in (['sh', '-c', 'find /data/../../.. -mindepth 1 -delete'],
+                        ['sh', '-c', 'find ~ -mindepth 1 -delete'],
+                        ['sh', '-c', 'find "$HOME" -delete'],
+                        ['sh', '-c', 'find .. -delete'],
+                        ['tar', 'xzf', '/backup/v.tgz', '-C/etc'],
+                        ['sh', '-c', 'echo x >/etc/foo']):
+            with self.subTest(command=command):
+                self.assert_refused(self.run_mounted(*command))
+
+    def test_refuses_a_parent_folder_as_the_archive(self):
+        self.assert_refused(self.run_mounted(
+            'sh', '-c', 'find /data -mindepth 1 -delete && tar xzf /backup/.. -C /data'))
+
     def test_refuses_a_path_it_did_not_map(self):
-        result = self.run_stub('run', '--rm', '-v', 'rdtest_x:/data', 'alpine', 'sh', '-c',
-                               'find /nonexistent-rd679 -mindepth 1 -delete')
-        self.assertEqual(result.returncode, REFUSED, result.stderr)
-        self.assertIn('refused, unmapped path /nonexistent-rd679', result.stderr)
+        self.assert_refused(self.run_mounted(
+            'sh', '-c', 'find /nonexistent-rd679 -mindepth 1 -delete && tar xzf /backup/v.tgz -C /nonexistent-rd679'))
 
     def test_refuses_a_mount_target_the_command_does_not_use(self):
-        result = self.run_stub('run', '--rm', '-v', 'rdtest_x:/volume', 'alpine', 'sh', '-c',
-                               'find /data -mindepth 1 -delete')
-        self.assertEqual(result.returncode, REFUSED, result.stderr)
+        self.assert_refused(self.run_mounted(
+            'sh', '-c', 'find /data -mindepth 1 -delete && tar xzf /backup/v.tgz -C /data', data='rdtest_x:/volume'))
 
-    def test_runs_a_mapped_command(self):
-        (self.dir / 'vols' / 'rdtest_x').mkdir()
-        (self.dir / 'vols' / 'rdtest_x' / 'f').write_text('x')
-        result = self.run_stub('run', '--rm', '-v', 'rdtest_x:/data', 'alpine', 'sh', '-c',
-                               'find /data -mindepth 1 -delete')
+    def test_refuses_a_bind_mount_from_outside_the_test_directory(self):
+        result = self.run_mounted('tar', 'czf', '/backup/v.tgz', '-C', '/data', '.', data='/etc:/data')
+        self.assert_refused(result)
+        self.assertEqual(os.listdir(str(self.backups)), [])
+        self.assertEqual(os.listdir(str(self.dir / 'vols')), ['rdtest_x'])
+
+    def test_refuses_a_volume_name_that_leaves_the_test_directory(self):
+        self.assert_refused(self.run_mounted('tar', 'czf', '/backup/v.tgz', '-C', '/data', '.',
+                                             data='../../../../../../tmp:/data'))
+
+    def test_runs_the_readme_backup_command(self):
+        result = self.run_mounted('tar', 'czf', '/backup/v.tgz', '-C', '/data', '.')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(os.listdir(str(self.dir / 'vols' / 'rdtest_x')), [])
+        listing = subprocess.check_output(['tar', 'tzf', str(self.backups / 'v.tgz')], universal_newlines=True)
+        self.assertIn('f', [line.strip('./') for line in listing.splitlines()])
+
+    def test_runs_the_readme_restore_command(self):
+        self.make_archive()
+        result = self.run_mounted('sh', '-c', 'find /data -mindepth 1 -delete && tar xzf /backup/v.tgz -C /data')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(tree(str(self.volume)), {'restored': b'from the archive'})
 
 
 class CommandTests(unittest.TestCase):
@@ -239,7 +321,7 @@ class CommandTests(unittest.TestCase):
         self.work.mkdir()
         self.env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ['PATH'],
                         STUB_DIR=str(self.dir), PWD=str(self.work))
-        for name in ('BASH_ENV', 'ENV', 'STUB_FAIL_RUN'):
+        for name in ('BASH_ENV', 'ENV', 'STUB_FAIL_RUN', 'STUB_CORRUPT_RUN', 'STUB_FAIL_GIT'):
             self.env.pop(name, None)
         rng = random.Random(679)
         for v in VOLUMES:
@@ -292,6 +374,10 @@ class CommandTests(unittest.TestCase):
     def archives(self):
         return {p.name: p.read_bytes() for p in (self.work / 'backups').iterdir()}
 
+    def assert_no_temporary_file(self):
+        left = [p.name for p in (self.work / 'backups').iterdir() if p.name.endswith('.tmp')]
+        self.assertEqual(left, [], 'a .tmp file was left in backups/')
+
     def change_volumes(self):
         for v in VOLUMES:
             (self.volume(v) / 'sub' / 'note.txt').unlink()
@@ -313,6 +399,8 @@ class CommandTests(unittest.TestCase):
             match = re.search(r'^' + v + r': (\d+) entries$', result.stdout, re.M)
             self.assertTrue(match, result.stdout + result.stderr)
             self.assertGreater(int(match.group(1)), 1)
+        self.assertNotIn('backup FAILED', result.stdout)
+        self.assert_no_temporary_file()
 
     def test_backup_of_an_empty_volume_counts_one_entry(self):
         shutil.rmtree(str(self.volume('ingest_uploads')))
@@ -327,6 +415,8 @@ class CommandTests(unittest.TestCase):
         self.assertFalse(any(name.startswith('wrongprefix') for name in os.listdir(str(self.dir / 'vols'))))
         self.assertNotIn('entries', result.stdout)
         self.assertIn('no such volume', result.stderr)
+        for v in VOLUMES:
+            self.assertIn(v + ': backup FAILED', result.stdout)
 
     def test_backup_rerun_with_a_wrong_prefix_counts_no_old_archive(self):
         self.backup()
@@ -335,6 +425,35 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(self.docker_runs(log), [])
         self.assertNotIn('entries', result.stdout)
         self.assertEqual(self.archives(), before, 'the old archives changed')
+
+    def assert_rerun_keeps_the_archive(self, **env):
+        self.backup()
+        before = self.archives()
+        self.change_volumes()
+        result, _log = self.run_block(backup_block(), **env)
+        after = self.archives()
+        self.assertEqual(after['ingest_uploads-v1.1.0.tgz'], before['ingest_uploads-v1.1.0.tgz'],
+                         'a failed copy replaced the earlier archive')
+        for v in ('weaviate_data', 'rag_sources'):
+            self.assertNotEqual(after[v + '-v1.1.0.tgz'], before[v + '-v1.1.0.tgz'], v + ' was not backed up again')
+        self.assertIn('ingest_uploads: backup FAILED', result.stdout)
+        self.assertNotIn('weaviate_data: backup FAILED', result.stdout)
+        self.assertNotIn('rag_sources: backup FAILED', result.stdout)
+        self.assert_no_temporary_file()
+
+    def test_backup_rerun_keeps_the_archive_when_a_copy_fails(self):
+        self.assert_rerun_keeps_the_archive(STUB_FAIL_RUN=PREFIX + '_ingest_uploads')
+
+    def test_backup_rerun_keeps_the_archive_when_a_copy_is_corrupt(self):
+        self.assert_rerun_keeps_the_archive(STUB_CORRUPT_RUN=PREFIX + '_ingest_uploads')
+
+    def test_backup_with_a_corrupt_first_copy_writes_no_archive(self):
+        result, log = self.run_block(backup_block(), STUB_CORRUPT_RUN=PREFIX + '_ingest_uploads')
+        self.assertIn({'corrupted': PREFIX + '_ingest_uploads'}, log)
+        self.assertEqual(sorted(self.archives()), ['rag_sources-v1.1.0.tgz', 'weaviate_data-v1.1.0.tgz'])
+        self.assertIn('ingest_uploads: backup FAILED', result.stdout)
+        self.assertNotRegex(result.stdout, r'(?m)^ingest_uploads: \d+ entries$')
+        self.assertRegex(result.stdout, r'(?m)^weaviate_data: \d+ entries$')
 
     # Rollback
 
@@ -349,7 +468,19 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(len(self.docker_runs(log)), 3)
         self.assertEqual(len(self.compose_up(log)), 1)
         self.assertIn({'git': ['checkout', 'v1.1.0']}, log)
+        self.assertIn('git checkout v1.1.0: OK', result.stdout)
         self.assertEqual(self.created(log), [])
+
+    def test_rollback_with_a_failing_checkout_empties_nothing(self):
+        self.backup()
+        self.change_volumes()
+        before = self.snapshot()
+        result, log = self.run_block(rollback_block(), STUB_FAIL_GIT='1')
+        self.assertIn({'git': ['checkout', 'v1.1.0']}, log)
+        self.assert_nothing_restored(result, log, before)
+        self.assertIn('git checkout v1.1.0: FAILED', result.stdout)
+        for v in VOLUMES:
+            self.assertIn(v + ': OK', result.stdout)
 
     def test_rollback_with_a_corrupt_archive_empties_nothing(self):
         self.backup()
