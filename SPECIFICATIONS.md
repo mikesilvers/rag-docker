@@ -4284,7 +4284,7 @@ so a model left in it (phi3.5, after an upgrade to 1.2.1) goes in too.
 
 The image list MUST match the images `docker compose config` resolves. It is
 `rag-docker-api:latest`, `rag-docker-ui:latest`,
-`semitechnologies/weaviate:1.40.2`, `ollama/ollama:0.3.14`, `nginx:1.27-alpine`.
+`semitechnologies/weaviate:1.40.2`, `ollama/ollama:0.3.14`, `nginx:1.29-alpine`.
 A stale entry here silently ships a superseded server.
 
 ### 11.4 Offline install procedure
