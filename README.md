@@ -111,7 +111,7 @@ can't use.
 | Role | Access |
 |---|---|
 | **End User** | Q&A only |
-| **Developer** | Q&A, Import, Chunking, Retrieval, Gold Standard, Transfer |
+| **Developer** | Q&A, Import, Prepare, Chunking, Retrieval, Gold Standard, Transfer |
 | **AI Engineer** | All of the above + Collections management (deleting collections) + Health dashboard + tuning + Users (account management) + Service keys (API keys for programs) + Audit (the audit log) |
 
 Endpoint by endpoint (paths under `/api`):
@@ -121,7 +121,7 @@ Endpoint by endpoint (paths under `/api`):
 | nothing | `GET /health`, `GET /auth/status`, `POST /auth/login` |
 | any logged-in user | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password` |
 | End User | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
-| Developer | creating a collection; ingest (upload, job status, settings); saving retrieval settings; gold standard (generate, sessions, pairs, regenerate, save, download); export, import, their job status, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
+| Developer | creating a collection; ingest (upload, job status, settings); document preparation (`POST /prepare/upload`; `GET /prepare/documents`; `GET` and `DELETE /prepare/documents/{document_id}`; `GET /prepare/documents/{document_id}/raw`; `GET` and `DELETE /prepare/documents/{document_id}/prepared`; `POST` and `GET /prepare/jobs`; `GET /prepare/job/{job_id}`; `POST /prepare/job/{job_id}/cancel`; `POST /prepare/import`); saving retrieval settings; gold standard (generate, sessions, pairs, regenerate, save, download); export, import, their job status, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
 | AI Engineer | `DELETE /collections/{name}`; `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/job/{id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; the API docs (`/docs`, `/redoc`, `/openapi.json`); account management (`GET` and `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `/role`, `/disable`, `/enable`); service keys (`GET` and `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `/disable`, `/enable`, `/keys`, `/keys/{key_id}/revoke`); the audit log (`GET /audit`, `GET /audit.csv`), in a browser session only |
 
 Without a session the API answers `401 AUTH_REQUIRED`; with a role that is too
