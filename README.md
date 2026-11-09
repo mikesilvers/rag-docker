@@ -734,10 +734,9 @@ Follow these steps once, to move an instance from 1.1.0 to 1.2.0. The first star
 
 **Before updating (still on 1.1.0)**
 
-1. **Stop the stack.**
+1. **Stop the stack.** Never use `down -v`: it deletes the volumes.
 
    ```bash
-   # Stop the stack. Never use `down -v`, which deletes the volumes.
    docker compose stop
    ```
 
@@ -747,24 +746,19 @@ Follow these steps once, to move an instance from 1.1.0 to 1.2.0. The first star
 
    Check the volume prefix first. The volume names start with the compose project name, usually the folder name: `rag-docker_weaviate_data`. Set `P` to the prefix you see.
 
+   The block lists the volume names, sets `P`, makes the `backups/` folder, and copies each volume into a `.tgz` in `backups/` through a throwaway container. A volume that doesn't exist (a wrong `P`) is reported and skipped, not created. It then lists the files, and checks that each backup reads back and counts what it holds.
+
    ```bash
-   # Find the volume names. The prefix is the compose project, usually the folder name: rag-docker_weaviate_data
    docker volume ls --filter name=_weaviate_data
-   # Set the prefix you saw
    P=rag-docker
-   # Make the folder for the backups
    mkdir -p backups
-   # Copy each volume into a .tgz in ./backups, through a throwaway container.
-   # A volume that doesn't exist (a wrong P) is reported and skipped, not created.
    for v in weaviate_data ingest_uploads rag_sources; do
      docker volume inspect "${P}_$v" >/dev/null &&
        docker run --rm -v "${P}_$v":/data:ro -v "$PWD/backups":/backup alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf tar czf "/backup/$v-v1.1.0.tgz" -C /data .
    done
-   # Check that the three files are there
    ls -l backups
-   # Check that each backup reads back, and count what it holds
    for v in weaviate_data ingest_uploads rag_sources; do
-     gzip -t "backups/$v-v1.1.0.tgz" && echo "$v: $(tar tzf "backups/$v-v1.1.0.tgz" | wc -l | tr -d ' ') entries"
+     docker volume inspect "${P}_$v" >/dev/null && gzip -t "backups/$v-v1.1.0.tgz" && echo "$v: $(tar tzf "backups/$v-v1.1.0.tgz" | wc -l | tr -d ' ') entries"
    done
    ```
 
@@ -776,52 +770,43 @@ Follow these steps once, to move an instance from 1.1.0 to 1.2.0. The first star
 
 **Update**
 
-4. **Get the new code.**
+4. **Get the new code.** The block downloads the newest branches and release tags, switches to the release branch `main` (a fresh clone starts on `develop`), brings it up to date, and prints the release this folder is on.
 
    ```bash
-   # Download the newest branches and release tags
    git fetch origin --tags
-   # Switch to the release branch (a fresh clone starts on develop)
    git switch main
-   # Bring it up to date
    git pull
-   # Print the release this folder is on
    git describe --tags
    ```
 
    It prints `v1.2.0` or a later release. These steps apply either way.
 
-5. **Rebuild and recreate every container.**
+5. **Rebuild and recreate every container.** This rebuilds api and ui, downloads any newer images and recreates every container. The data is kept.
 
    ```bash
-   # Rebuild api and ui, download any newer images, recreate every container (data is kept)
    docker compose up -d --build --force-recreate
    ```
 
    `--force-recreate` is required: the proxy must be recreated (#539, #554, #586), or it refuses every change the UI sends with `403 CROSS_ORIGIN_REFUSED`. This first start converts the Weaviate data.
 
-6. **Create the first AI Engineer, then the accounts and keys.** Until then the API refuses everything but `/health`.
+6. **Create the first AI Engineer, then the accounts and keys.** Until then the API refuses everything but `/health`. This creates the first AI Engineer and prints a one-time password:
 
    ```bash
-   # Create the first AI Engineer; it prints a one-time password
    docker compose exec api python -m auth bootstrap <your-username>
    ```
 
    Log in at `http://localhost:8080` and choose a new password. Create the other accounts with `create-user` or on the Users page ([Managing accounts](#managing-accounts)), and service keys for programs on the Service keys page ([Service keys](#service-keys)).
 
-   Switching to LAN mode (step 3)? Do it now, as in [Sharing with your office](#sharing-with-your-office):
+   Switching to LAN mode (step 3)? Do it now, as in [Sharing with your office](#sharing-with-your-office): rebuild and recreate every container in LAN mode.
 
    ```bash
-   # Rebuild and recreate every container in LAN mode
    docker compose -f docker-compose.yml -f docker-compose.lan.yml up -d --build --force-recreate
    ```
 
-7. **Check that it is back.**
+7. **Check that it is back.** The first command lists the services and their state; the second asks the API whether it is healthy.
 
    ```bash
-   # List the services and their state
    docker compose ps
-   # Ask the API whether it is healthy
    curl http://localhost:8080/api/health
    ```
 
@@ -843,16 +828,15 @@ Follow these steps once, to move an instance from 1.1.0 to 1.2.0. The first star
 
 **If the upgrade fails**
 
-Go back to 1.1.0 and restore the backup. The block checks every backup and every volume first, and empties nothing unless all three print `OK`. If one prints `FAILED`, nothing was changed: fix `P` (after a `no such volume` error) or the backup file the error names, and run the block again. The restore empties each existing volume and fills it from its backup, so what changed in those volumes after the backup is lost.
+Go back to 1.1.0 and restore the backup. The block removes the containers (the volumes are kept), switches back to the 1.1.0 release and sets the prefix you saw in step 2. It then checks every backup and every volume, and empties nothing unless all three print `OK`. Only then does it empty each volume, restore it from its backup, and start 1.1.0. The restore empties each existing volume and fills it from its backup, so what changed in those volumes after the backup is lost.
+
+- `FAILED`: nothing was changed. Fix `P` (after a `no such volume` error) or the backup file the error names, and run the block again.
+- `restore FAILED`: the restore stopped at that volume, which may be partly restored, and 1.1.0 isn't started. The backups are unchanged. Fix the cause (disk space, for example) and run the block again.
 
 ```bash
-# Remove the containers. The volumes are kept.
 docker compose down
-# Switch back to the 1.1.0 release
 git checkout v1.1.0
-# Set the prefix you saw in step 2
 P=rag-docker
-# Check every backup and every volume first. Nothing is emptied yet.
 ok=yes
 for v in weaviate_data ingest_uploads rag_sources; do
   if gzip -t "backups/$v-v1.1.0.tgz" && tar tzf "backups/$v-v1.1.0.tgz" >/dev/null && docker volume inspect "${P}_$v" >/dev/null; then
@@ -861,14 +845,17 @@ for v in weaviate_data ingest_uploads rag_sources; do
     echo "$v: FAILED"; ok=no
   fi
 done
-# Only if all three passed: empty each volume, restore it from its backup, and start 1.1.0
+restored=no
 if [ "$ok" = yes ]; then
+  restored=yes
   for v in weaviate_data ingest_uploads rag_sources; do
-    docker run --rm -v "${P}_$v":/data -v "$PWD/backups":/backup:ro alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf sh -c "find /data -mindepth 1 -delete && tar xzf /backup/$v-v1.1.0.tgz -C /data"
+    docker run --rm -v "${P}_$v":/data -v "$PWD/backups":/backup:ro alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf sh -c "find /data -mindepth 1 -delete && tar xzf /backup/$v-v1.1.0.tgz -C /data" || { echo "$v: restore FAILED"; restored=no; break; }
   done
-  docker compose up -d --build --force-recreate
 else
   echo "Nothing was emptied or restored."
+fi
+if [ "$restored" = yes ]; then
+  docker compose up -d --build --force-recreate
 fi
 ```
 
