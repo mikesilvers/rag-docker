@@ -17,14 +17,13 @@ import sys
 import tempfile
 import unittest
 import uuid
-from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api"))
 
-from services import chunker, goldstandard, ingest_pipeline, packager, sources, tuning
+from services import chunker, goldstandard, ingest_pipeline, packager, tuning
 from services import weaviate_client as wc
 
 CAP = chunker.MAX_CHUNKS_PER_FILE

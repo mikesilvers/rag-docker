@@ -23,7 +23,6 @@ import asyncio
 import copy
 import logging
 import math
-import mimetypes
 import shutil
 import tempfile
 import threading

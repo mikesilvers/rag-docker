@@ -96,7 +96,7 @@ class OverlapTests(unittest.TestCase):
                 get_client.return_value.collections.get.return_value.iterator.return_value = [
                     SimpleNamespace(properties={'source_file': 'big.jsonl (part 1)', 'chunk_index': 0})]
                 tuning._run(job_id, 'ReviewTuneBudget', 'rechunk', params)
-            job = tuning._jobs.pop(job_id)
+            tuning._jobs.pop(job_id)
             rebuild.assert_called_once()
             properties = rebuild.call_args.args[1]
             names = sorted({p['source_file'] for p in properties})

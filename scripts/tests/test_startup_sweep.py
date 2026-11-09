@@ -12,7 +12,6 @@ process, so this process's module state stays untouched.
 """
 import asyncio
 import os
-import shutil
 import subprocess
 import sys
 import tempfile

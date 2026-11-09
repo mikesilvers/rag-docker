@@ -3,7 +3,7 @@
 Pairs and vectors are synthetic; package/model metadata and import/export jobs
 are real. No generation call or startup sweep runs in this process.
 """
-import asyncio,copy,hashlib,json,os,subprocess,sys,tarfile,tempfile,threading,uuid
+import asyncio,hashlib,json,os,subprocess,sys,tarfile,tempfile,threading,uuid
 from pathlib import Path
 from unittest.mock import patch
 import httpx

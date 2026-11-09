@@ -422,7 +422,7 @@ class RecoveryTests(unittest.TestCase):
         self.cols.interrupt = True
         with self.assertRaises(KeyboardInterrupt):
             self.rebuild()
-        record = self.recovery_record()
+        self.recovery_record()
         self.cols.interrupt = False
         self.cols.create('Corpus', description='new user collection')
         with patch.object(tuning.goldstandard, 'mark_stale') as stale:
@@ -491,7 +491,7 @@ class RecoveryTests(unittest.TestCase):
         self.assertTrue(self.cols.exists(record['staging']))
 
     def test_unreadable_cutover_stays_pending_until_check_can_finish(self):
-        record = self.interrupted_cutover()
+        self.interrupted_cutover()
         self.cols.get('Corpus').fault = 'read'
         recovery.sweep(self.client)
         self.assertTrue(self.recovery_record()['cutover_pending'])

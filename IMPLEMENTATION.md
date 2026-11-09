@@ -7380,7 +7380,6 @@ decides where parts go and whether there is room (a best-effort cap).
 from __future__ import annotations
 
 import asyncio
-import codecs
 import csv
 import gzip
 import json
@@ -8340,7 +8339,6 @@ import shutil
 import tempfile
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 from config import settings
@@ -13831,7 +13829,6 @@ import asyncio
 import copy
 import logging
 import math
-import mimetypes
 import shutil
 import tempfile
 import threading
@@ -14862,14 +14859,10 @@ async def delete_collection(name: CollectionName, confirm: str | None = None):
 ```python
 from __future__ import annotations
 import asyncio
-import json
 import logging
-import re
-from pathlib import Path
 from fastapi import APIRouter, Form, Request, UploadFile, File
 from pydantic import ValidationError
 
-from config import settings
 from models.schemas import (CollectionName, IngestConfig, IngestConfigResponse,
                             IngestJobEntry, IngestJobList, IngestUploadResponse,
                             JobStatusResponse)
@@ -15392,7 +15385,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from pathlib import Path
 
 from fastapi import APIRouter, Request
 
@@ -29474,7 +29466,6 @@ Stores and certificate folders are temporary; nothing is started or published.
 import ast
 import datetime
 import io
-import ipaddress
 import json
 import os
 import re
@@ -43761,7 +43752,7 @@ if __name__=='__main__':unittest.main()
 Pairs and vectors are synthetic; package/model metadata and import/export jobs
 are real. No generation call or startup sweep runs in this process.
 """
-import asyncio,copy,hashlib,json,os,subprocess,sys,tarfile,tempfile,threading,uuid
+import asyncio,hashlib,json,os,subprocess,sys,tarfile,tempfile,threading,uuid
 from pathlib import Path
 from unittest.mock import patch
 import httpx
@@ -44212,7 +44203,7 @@ class ReindexTests(unittest.TestCase):
                 # Existing controlled rebuild fixture executes the real rebuild;
                 # rechunk uses inert parsed properties without changing traversal.
                 with patch.object(tuning.sources,'has_sources',return_value=True),patch.object(tuning,'_chunks_from_sources',return_value=[r['properties'] for r in self.original]),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=lambda name,props:self.backend.data.__setitem__(name,__import__('copy').deepcopy(self.original))):
-                    job=self.run_job(operation)
+                    self.run_job(operation)
                 begin.assert_called_once();self.assertEqual(begin.call_args.args[:2],('OwnedReindex','tune'))
                 self.assertEqual(set(self.backend.data),{'OwnedReindex'})
     def test_reembed_retains_its_explicit_regeneration_path(self):
@@ -54268,7 +54259,7 @@ def records(snapshot, signal):
 def inspect(snapshot, requests):
     try:
         return inspect_records(snapshot, requests)
-    except (TypeError, AttributeError, KeyError) as exc:
+    except (TypeError, AttributeError, KeyError):
         raise AssertionError('invalid capture evidence shape') from None
 
 
@@ -54445,7 +54436,7 @@ def main():
         runtime = json.loads(subprocess.check_output(['docker', 'inspect', cid]))[0]
         assert not runtime['HostConfig']['PortBindings']
         assert runtime['Config']['Labels']['com.docker.compose.project'] == 'rag-verify'
-    actual = compose('exec', '-T', 'api', 'python', '-c',
+    compose('exec', '-T', 'api', 'python', '-c',
         'import os; assert os.environ["RAG_OTEL_ENABLED"] == "true"; assert os.environ["RAG_OTEL_ENDPOINT"] == "http://otel-collector:4318"')
     collections = ['VfyOtel'+uuid.uuid4().hex[:12] for _ in range(2)]
     report = {'workload': '5 warm-up +20 timed health requests,1 real query,2 concurrent export jobs per mode',
@@ -55106,7 +55097,6 @@ if __name__ == '__main__':
 
 ```python
 """Receiver and decoded evidence assertions, run with the locked API dependencies."""
-import base64
 import importlib.util
 import json
 import copy
