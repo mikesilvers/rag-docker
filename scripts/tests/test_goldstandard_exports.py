@@ -10,7 +10,6 @@ HTTP without startup sweeps. Nothing reaches Weaviate or Ollama.
 import asyncio
 import json
 import os
-import re
 import sys
 import tempfile
 import unittest

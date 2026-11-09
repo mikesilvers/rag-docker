@@ -9,7 +9,6 @@ The real script runs with stub `ollama`, `timeout` and `sleep` commands first on
 nothing is downloaded and nothing waits. The stubs log every call, so each test reads
 back what the script ran.
 """
-import os
 import shutil
 import subprocess
 import tempfile

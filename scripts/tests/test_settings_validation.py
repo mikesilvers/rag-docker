@@ -10,7 +10,7 @@ import unittest
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 api_dir = os.environ.get('RAG_TEST_API_DIR')
 sys.path.insert(0, api_dir or str(Path(__file__).resolve().parents[2] / 'api'))
 from fastapi.testclient import TestClient
@@ -19,8 +19,8 @@ from pydantic.fields import FieldInfo
 from config import settings
 from main import app
 from auth import testing as auth_testing  # a real session in a temporary store (#25)
-from models.schemas import CreateCollectionRequest, HnswConfig, IngestConfig, QueryRequest, RechunkRequest, ReembedRequest, SaveRetrievalConfigBody
-from routers import collections, ingest, tuning as tuning_router, query, retrieval_config as retrieval_router
+from models.schemas import CreateCollectionRequest, HnswConfig, IngestConfig, QueryRequest, RechunkRequest, ReembedRequest
+from routers import ingest, tuning as tuning_router, query
 from services import weaviate_client as wc, chunker, rag_pipeline, ingest_config, retrieval_config, ingest_pipeline, packager
 
 OVERLAP_RULE = 'chunk_overlap must be smaller than chunk_size for overlap/language'
