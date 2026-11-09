@@ -24984,6 +24984,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
+| `../tests/test_upgrade_backup.py` | host-only: the README's 1.1.0 → 1.2.0 upgrade blocks, run as written under bash, `zsh -c` and interactive zsh with comments off, against stub `docker`, `git` and `curl` that refuse any unmapped host path: no block holds a `#` comment line; the backup skips a missing volume (a wrong prefix) and counts only existing volumes' archives; the rollback checks every archive (`gzip -t`, `tar tzf`) and volume before it empties any, and a failed restore stops before `compose up`; alpine is pinned by version and digest; git ignores `backups/` (#679), registered by infrastructure |
 | `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
 | `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
@@ -34141,6 +34142,8 @@ python3 "$REPO_ROOT/scripts/tests/test_dependency_floors.py"
 check "pinned dependencies are at or above their patched versions (#522)" $?
 python3 "$REPO_ROOT/scripts/tests/test_weaviate_pin.py"
 check "the Weaviate pin is the same everywhere and Dependabot leaves it alone (#530)" $?
+python3 "$REPO_ROOT/scripts/tests/test_upgrade_backup.py"
+check "the README's 1.1.0 backup and rollback commands check before they write, and pin alpine (#679)" $?
 python3 "$REPO_ROOT/scripts/tests/test_ci_workflow.py"
 check "the CI workflow runs the verify suite on every pull request (#24)" $?
 # Through the app with Weaviate and Ollama mocked, in the same isolated container (#373).

@@ -38,6 +38,8 @@ python3 "$REPO_ROOT/scripts/tests/test_dependency_floors.py"
 check "pinned dependencies are at or above their patched versions (#522)" $?
 python3 "$REPO_ROOT/scripts/tests/test_weaviate_pin.py"
 check "the Weaviate pin is the same everywhere and Dependabot leaves it alone (#530)" $?
+python3 "$REPO_ROOT/scripts/tests/test_upgrade_backup.py"
+check "the README's 1.1.0 backup and rollback commands check before they write, and pin alpine (#679)" $?
 python3 "$REPO_ROOT/scripts/tests/test_ci_workflow.py"
 check "the CI workflow runs the verify suite on every pull request (#24)" $?
 # Through the app with Weaviate and Ollama mocked, in the same isolated container (#373).
