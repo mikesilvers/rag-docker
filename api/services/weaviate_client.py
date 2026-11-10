@@ -423,8 +423,12 @@ def _exact_source_objects(coll, name: str, accept=None):
             filters=words, limit=_QUERY_MAXIMUM_RESULTS, include_vector=False,
             return_properties=_SOURCE_PROPERTIES).objects
     else:
+        # The client walks 100 objects per request by default; one query already
+        # returns QUERY_MAXIMUM_RESULTS of these two-property objects, so each
+        # page of the walk takes that many (#628).
         objects = telemetry.iterate(coll.iterator, include_vector=False,
-                                    return_properties=_SOURCE_PROPERTIES)
+                                    return_properties=_SOURCE_PROPERTIES,
+                                    cache_size=_QUERY_MAXIMUM_RESULTS)
     try:
         for obj in objects:
             value = (obj.properties or {}).get("source_file")

@@ -3805,8 +3805,12 @@ def _exact_source_objects(coll, name: str, accept=None):
             filters=words, limit=_QUERY_MAXIMUM_RESULTS, include_vector=False,
             return_properties=_SOURCE_PROPERTIES).objects
     else:
+        # The client walks 100 objects per request by default; one query already
+        # returns QUERY_MAXIMUM_RESULTS of these two-property objects, so each
+        # page of the walk takes that many (#628).
         objects = telemetry.iterate(coll.iterator, include_vector=False,
-                                    return_properties=_SOURCE_PROPERTIES)
+                                    return_properties=_SOURCE_PROPERTIES,
+                                    cache_size=_QUERY_MAXIMUM_RESULTS)
     try:
         for obj in objects:
             value = (obj.properties or {}).get("source_file")
@@ -24788,9 +24792,11 @@ stale, naming the file. Two concurrent uploads of one name must leave exactly on
 version, whole: its chunk set, its digest, and `chunks_replaced` equal to the other job's
 chunks. Replacing a name touches only that name (#622): with `a/report.pdf` (in a ZIP) and
 `Report.PDF` stored, uploading `report.pdf` replaces nothing and uploading it again replaces
-only its first set, and the other two keep exactly their chunks. `exact_source.py` then checks
-the same selection in real Weaviate on a scratch collection without a vectorizer, on both
-paths: a few word matches read in one query, and over 10,000 walked.
+only its first set, and the other two keep exactly their chunks; the first upload leaves a
+planted gold-standard session current. `exact_source.py` then checks the same selection in
+real Weaviate on a scratch collection without a vectorizer, on both paths: a few word matches
+read in one query, and over 10,000 walked; and over 10,000 earlier chunks of the name are
+all deleted, in batches.
 `browser/ui_criteria.js` (suite 06) stubs the job response and checks that the Import
 page shows "Replaced N chunk(s) from a previous version" only when `chunks_replaced` is above
 0, and the plain "N file(s) skipped:" heading with each entry's own reason.
@@ -24956,7 +24962,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_reingest.py` | controlled re-ingest replacement, exact-name selection (#622), same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
 | `../tests/test_split_parts.py` | controlled regressions for files over the per-file limits stored as parts (#621): the reviewer's 13,000 records, files over 10,000,000 characters, family replacement, all or nothing, cuts, CSV, Markdown, encoding, `overlap` sizing, re-chunk and export links, registered by ingest |
 | `split_parts.py` | helper for ingest (#621), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, files over the per-file limits are stored as parts, a smaller re-upload replaces every part, and a bad line after part 1 stores nothing; the collection is removed afterwards |
-| `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`) and over 10,000 (`walk`); the collection is removed afterwards |
+| `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`), over 10,000 (`walk`), and over 10,000 earlier chunks of the name itself, deleted in batches of 10,000 (`bulk`); the collection is removed afterwards |
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, registered by transfer |
@@ -35590,8 +35596,28 @@ drop_collection "$EX"; make_collection "$EX"
 ingest "$EX" fixed 200 40 "$EXFIX/folder.zip"
 ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=Report.PDF"
 ex_state > /tmp/vfy_ex_before.json
+# A gold-standard session for the collection: the first report.pdf replaces
+# nothing, so it must not mark it stale (#622, #22).
+EXGS="gs_$(python3 -c 'import uuid; print(uuid.uuid4().hex[:8])')"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$EX" "$EXGS") <<'ENDPY'
+import sys
+from services import goldstandard as gs
+pairs = [{"pair_id": "ex_pair", "question": "Q", "answer": "A", "contexts": ["C"],
+          "ground_truth": "T", "source_file": "Report.PDF", "chunk_index": 0, "status": "approved"}]
+gs.store_session({"session_id": sys.argv[2], "collection": sys.argv[1], "status": "completed",
+                  "pairs_total": 1, "pairs_completed": 1, "pairs": pairs})
+ENDPY
+check "exact name: a synthetic gold-standard session is planted for the collection" $?
+api_get "/goldstandard/diagnostics" >/dev/null
 ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=report.pdf"
 cp /tmp/vfy_job.json /tmp/vfy_ex_job1.json
+api_get "/goldstandard/session/$EXGS" > /tmp/vfy_ex_gs.json
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_ex_gs.json')); j=json.load(open('/tmp/vfy_ex_job1.json'))
+print(d.get('stale'), d.get('stale_reason'), j['status'], j.get('chunks_replaced'))
+sys.exit(0 if d.get('stale') is False and j['status']=='completed' else 1)"
+check "uploading report.pdf beside a/report.pdf and Report.PDF leaves gold-standard sessions current (#622)" $? \
+  "$(head -c 300 /tmp/vfy_ex_gs.json)"
 ex_state > /tmp/vfy_ex_first.json
 ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=report.pdf"
 cp /tmp/vfy_job.json /tmp/vfy_ex_job2.json
@@ -35622,6 +35648,8 @@ check "re-uploading report.pdf replaces only report.pdf: a/report.pdf and Report
 check "replacing a name on the page path selects exactly that name in real Weaviate (#622)" $?
 (cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" walk < scripts/verify/exact_source.py)
 check "replacing a name on the walk path, past 10,000 word matches, selects exactly that name (#622)" $?
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" bulk < scripts/verify/exact_source.py)
+check "replacing a name with over 10,000 earlier chunks deletes them all, in batches, and only them (#622)" $?
 drop_collection "$EX"
 rm -rf "$EXFIX"
 
@@ -35996,6 +36024,128 @@ fi
 drop_collection "$C"
 cleanup_prefixed
 summary
+```
+
+### scripts/verify/exact_source.py
+
+```python
+"""Replacing a name selects exactly that name in real Weaviate (#622).
+
+Runs in the verify project's API container, against its Weaviate:
+
+    docker compose exec -T api python - <prefix> page|walk|bulk < scripts/verify/exact_source.py
+
+`source_file` is word-tokenized, so Weaviate's equal("report.pdf") also matches
+`a/report.pdf`, `Report.PDF` and `report.pdf (part 1)`. The scratch collection
+uses the real chunk properties without a vectorizer, so no embedding is needed:
+- page: a few names share report.pdf's words, under 10,000 matches, so the
+  matches are read in one query and filtered exactly;
+- walk: over 10,000 objects share them, so the whole collection is walked;
+- bulk: the name itself has over 10,000 earlier chunks, so they are deleted by
+  UUID in more than one batch.
+The collection is removed afterwards. Exits 0 only if every expectation holds.
+"""
+import sys
+import uuid
+import warnings
+from datetime import datetime, timedelta, timezone
+
+from weaviate.classes.config import Configure
+from weaviate.classes.data import DataObject
+from weaviate.classes.query import Filter
+
+from services import weaviate_client as wc
+
+warnings.simplefilter("ignore", DeprecationWarning)
+
+prefix, mode = sys.argv[1], sys.argv[2]
+NAME = f"{prefix}ExactSource"
+EARLIER = datetime(2026, 1, 1, tzinfo=timezone.utc)
+problems = []
+
+
+def expect(ok, what):
+    if not ok:
+        problems.append(what)
+
+
+def add(coll, name, when, n):
+    """Store n objects under name, created_at as ingest writes it; their UUIDs."""
+    ids = []
+    for start in range(0, n, 1000):
+        objects = [DataObject(properties={"source_file": name, "content": f"{name} {i}",
+                                          "chunk_index": i, "created_at": when.isoformat()},
+                              uuid=uuid.uuid4())
+                   for i in range(start, min(n, start + 1000))]
+        result = coll.data.insert_many(objects)
+        if result.errors:
+            raise RuntimeError(f"insert failed: {list(result.errors.values())[:3]}")
+        ids += [str(o.uuid) for o in objects]
+    return set(ids)
+
+
+def by_name(coll):
+    names = {}
+    for obj in coll.iterator(return_properties=["source_file"]):
+        names.setdefault(obj.properties["source_file"], set()).add(str(obj.uuid))
+    return names
+
+
+client = wc.get_client()
+try:
+    if client.collections.exists(NAME):
+        client.collections.delete(NAME)
+    coll = client.collections.create(NAME, vectorizer_config=Configure.Vectorizer.none(),
+                                     properties=wc.COLLECTION_PROPERTIES)
+    created = datetime.now(timezone.utc)
+    if mode == "page":
+        others = {name: add(coll, name, EARLIER, n) for name, n in (
+            ("a/report.pdf", 3), ("Report.PDF", 3), ("notes/report.pdf", 2), ("report.pdf (part 1)", 2))}
+        expect(not wc._source_has_chunks_sync(NAME, "report.pdf"),
+               "report.pdf has chunks before it is stored")
+        add(coll, "report.pdf", EARLIER - timedelta(days=1), 4)
+        new = add(coll, "report.pdf", created, 3)
+        expect(wc._source_has_chunks_sync(NAME, "report.pdf"), "report.pdf has no chunks once stored")
+        deleted = wc._delete_earlier_chunks_sync(NAME, "report.pdf", created, 3)
+        expect(deleted == 4, f"deleted {deleted} earlier chunks, not 4")
+    elif mode == "walk":
+        others = {"a/report.pdf": add(coll, "a/report.pdf", EARLIER, 10_005)}
+        add(coll, "report.pdf", EARLIER - timedelta(days=1), 2)
+        new = add(coll, "report.pdf", created, 2)
+        words = coll.aggregate.over_all(filters=Filter.by_property("source_file").equal("report.pdf"),
+                                        total_count=True).total_count
+        expect(words > 10_000, f"only {words} word matches; the walk isn't exercised")
+        expect(wc._source_has_chunks_sync(NAME, "report.pdf"), "report.pdf has no chunks")
+        expect(not wc._source_has_chunks_sync(NAME, "Report.PDF"), "Report.PDF has chunks, unstored")
+        deleted = wc._delete_earlier_chunks_sync(NAME, "report.pdf", created, 2)
+        expect(deleted == 2, f"deleted {deleted} earlier chunks, not 2")
+    elif mode == "bulk":
+        # More earlier chunks of the exact name than one delete removes: the
+        # by-UUID deletes run in two batches, 10,000 and 3 (#622).
+        others = {name: add(coll, name, EARLIER, n) for name, n in (
+            ("a/report.pdf", 3), ("Report.PDF", 2))}
+        add(coll, "report.pdf", EARLIER - timedelta(days=1), 10_003)
+        new = add(coll, "report.pdf", created, 2)
+        deleted = wc._delete_earlier_chunks_sync(NAME, "report.pdf", created, 2)
+        expect(deleted == 10_003, f"deleted {deleted} earlier chunks, not 10003")
+    else:
+        raise SystemExit(f"unknown mode {mode!r}")
+    after = by_name(coll)
+    expect(after.get("report.pdf") == new, "report.pdf doesn't hold exactly its new chunks")
+    for name, ids in others.items():
+        kept = len(after.get(name, set()) & ids)
+        expect(after.get(name) == ids, f"{name} kept {kept} of its {len(ids)} chunks")
+except Exception as exc:  # noqa: BLE001
+    problems.append(f"{type(exc).__name__}: {exc}")
+finally:
+    try:
+        if client.collections.exists(NAME):
+            client.collections.delete(NAME)
+    finally:
+        wc.close_client()
+
+print("; ".join(problems) if problems else f"{mode}: ok")
+sys.exit(1 if problems else 0)
 ```
 
 ### scripts/verify/compose_target.py
