@@ -22980,14 +22980,17 @@ export default function TransferPage() {
   const [importPollError, setImportPollError] = useState('')
 
   // Polling handles are kept so a job that finishes, or a page that unmounts,
-  // does not leave a timer running against a job nobody is watching. The job
-  // id being polled is kept too: a poll that answers after the page unmounted,
-  // or after it stopped watching that job, schedules nothing and changes nothing.
+  // does not leave a timer running against a job nobody is watching. Each
+  // panel's poll chain has a number, and only the current one acts: a poll that
+  // answers after the page unmounted, after the panel stopped watching, or after
+  // a newer chain started (reopening the polled job while its poll is in
+  // flight, say) schedules nothing and changes nothing, so there is never more
+  // than one chain per panel (#629).
   const alive = useRef(true)
   const exportTimer = useRef<number | null>(null)
   const importTimer = useRef<number | null>(null)
-  const exportPoll = useRef<string | null>(null)
-  const importPoll = useRef<string | null>(null)
+  const exportPoll = useRef(0)
+  const importPoll = useRef(0)
 
   const loadPackages = useCallback(() => {
     api.getPackages().then(r => {
@@ -23005,8 +23008,8 @@ export default function TransferPage() {
     loadPackages()
     return () => {
       alive.current = false
-      exportPoll.current = null
-      importPoll.current = null
+      exportPoll.current += 1
+      importPoll.current += 1
       if (exportTimer.current) window.clearTimeout(exportTimer.current)
       if (importTimer.current) window.clearTimeout(importTimer.current)
     }
@@ -23028,56 +23031,56 @@ export default function TransferPage() {
     return () => { current = false }
   }, [collection])
 
-  function pollExport(jobId: string, failures = 0) {
+  function pollExport(jobId: string, chain: number, failures = 0) {
     api.getExportJob(jobId).then(job => {
-      if (exportPoll.current !== jobId) return
+      if (exportPoll.current !== chain) return
       setExportJob(job)
       setExportPollError('')
       if (job.status === 'completed' || job.status === 'failed') {
-        exportPoll.current = null
+        exportPoll.current += 1
         setExportWatching(false)
         loadPackages()
         exportJobs.reload()
       } else {
-        exportTimer.current = window.setTimeout(() => pollExport(jobId), POLL_MS)
+        exportTimer.current = window.setTimeout(() => pollExport(jobId, chain), POLL_MS)
       }
     }, (e: unknown) => {
-      if (exportPoll.current !== jobId) return
+      if (exportPoll.current !== chain) return
       if (failures + 1 >= POLL_ATTEMPTS) {
-        exportPoll.current = null
+        exportPoll.current += 1
         setExportWatching(false)
         setExportPollError(`Stopped checking the export's progress after ${POLL_ATTEMPTS} failed attempts; the export may still be running. Last error: ${message(e)}`)
       } else {
         setExportPollError(`Could not check the export's progress, retrying: ${message(e)}`)
-        exportTimer.current = window.setTimeout(() => pollExport(jobId, failures + 1), POLL_MS)
+        exportTimer.current = window.setTimeout(() => pollExport(jobId, chain, failures + 1), POLL_MS)
       }
     })
   }
 
-  function pollImport(jobId: string, failures = 0) {
+  function pollImport(jobId: string, chain: number, failures = 0) {
     api.getImportJob(jobId).then(job => {
-      if (importPoll.current !== jobId) return
+      if (importPoll.current !== chain) return
       setImportJob(job)
       setImportPollError('')
       if (job.status !== 'completed' && job.status !== 'failed') {
-        importTimer.current = window.setTimeout(() => pollImport(jobId), POLL_MS)
+        importTimer.current = window.setTimeout(() => pollImport(jobId, chain), POLL_MS)
         return
       }
-      importPoll.current = null
+      importPoll.current += 1
       setImportWatching(false)
       importJobs.reload()
       if (job.status === 'completed') {
         api.getCollections().then(r => setCollections(r.collections)).catch(() => {})
       }
     }, (e: unknown) => {
-      if (importPoll.current !== jobId) return
+      if (importPoll.current !== chain) return
       if (failures + 1 >= POLL_ATTEMPTS) {
-        importPoll.current = null
+        importPoll.current += 1
         setImportWatching(false)
         setImportPollError(`Stopped checking the import's progress after ${POLL_ATTEMPTS} failed attempts; the import may still be running. Last error: ${message(e)}`)
       } else {
         setImportPollError(`Could not check the import's progress, retrying: ${message(e)}`)
-        importTimer.current = window.setTimeout(() => pollImport(jobId, failures + 1), POLL_MS)
+        importTimer.current = window.setTimeout(() => pollImport(jobId, chain, failures + 1), POLL_MS)
       }
     })
   }
@@ -23088,12 +23091,11 @@ export default function TransferPage() {
     if (exportTimer.current) window.clearTimeout(exportTimer.current)
     setExportError(''); setExportPollError('')
     setExportJob(entry)
+    const chain = ++exportPoll.current
     if (transferRunning(entry)) {
-      exportPoll.current = entry.job_id
       setExportWatching(true)
-      pollExport(entry.job_id)
+      pollExport(entry.job_id, chain)
     } else {
-      exportPoll.current = null
       setExportWatching(false)
     }
   }
@@ -23103,12 +23105,11 @@ export default function TransferPage() {
     if (importTimer.current) window.clearTimeout(importTimer.current)
     setImportError(''); setImportPollError('')
     setImportJob(entry)
+    const chain = ++importPoll.current
     if (transferRunning(entry)) {
-      importPoll.current = entry.job_id
       setImportWatching(true)
-      pollImport(entry.job_id)
+      pollImport(entry.job_id, chain)
     } else {
-      importPoll.current = null
       setImportWatching(false)
     }
   }
@@ -23140,9 +23141,9 @@ export default function TransferPage() {
       exportTouched.current = true
       exportJobs.reload()
       if (exportTimer.current) window.clearTimeout(exportTimer.current)
-      exportPoll.current = r.job_id
+      const chain = ++exportPoll.current
       setExportWatching(true)
-      pollExport(r.job_id)
+      pollExport(r.job_id, chain)
     } catch (e: unknown) {
       setExportError(message(e))
     }
@@ -23159,9 +23160,9 @@ export default function TransferPage() {
       importTouched.current = true
       importJobs.reload()
       if (importTimer.current) window.clearTimeout(importTimer.current)
-      importPoll.current = r.job_id
+      const chain = ++importPoll.current
       setImportWatching(true)
-      pollImport(r.job_id)
+      pollImport(r.job_id, chain)
     } catch (e: unknown) {
       setImportError(message(e))
     }
@@ -41815,6 +41816,61 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
         r.check('Transfer: clicking an export row opens it in the export panel, leaving the import panel as it was',
           clicked && (await bodyText(s.page)).includes('ragpkg-vfy617d.tar.gz') && (await bodyText(s.page)).includes('Imported as StubImported617'));
         r.check('Transfer list fixtures cause no React page errors', !s.errors.some(e => e.startsWith('pageerror:')), s.errors.slice(0, 2).join(' | '));
+      } finally { await s.ctx.close(); }
+    }
+
+    // Transfer, stubbed: reopening the job a panel is polling, while its poll is
+    // in flight, keeps one poll chain (#629). Each lookup answers after 1 s, so
+    // one chain polls at most 3 times in 7 s (answer, then 2 s wait); a second
+    // chain for the same job would make it at least 4.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        const mine = { name: 'vfy-developer', kind: 'user' };
+        const exportJob = { job_id: 'vfy629e', status: 'running', collection: 'StubExport629', chunks_written: 3,
+          filename: null, size_bytes: null, source_document_count: null, fidelity: null, models_bundled: null,
+          retrieve_script: null, warnings: [], error: null, error_code: null, error_detail: null };
+        const importJob = { job_id: 'vfy629i', status: 'running', filename: 'ragpkg-stub629.tar.gz', on_conflict: 'rename',
+          collection: null, original_collection: null, chunks_written: 2, fidelity: null, renamed: false, notes: [],
+          restored_sessions: [], error: null, error_code: null, error_detail: null };
+        const lookups = { '/api/export/job/vfy629e': [], '/api/import/job/vfy629i': [] };
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (path === '/api/export/jobs') return request.respond(json({ jobs: [
+            { ...exportJob, owner: mine, created_at: at(60), finished_at: null }] }));
+          if (path === '/api/import/jobs') return request.respond(json({ jobs: [
+            { ...importJob, owner: mine, created_at: at(30), finished_at: null }] }));
+          if (path in lookups) {
+            const lookup = { start: Date.now(), answered: false };
+            lookups[path].push(lookup);
+            setTimeout(() => {
+              lookup.answered = true;
+              request.respond(json(path.includes('/export/') ? exportJob : importJob)).catch(() => {});
+            }, 1000);
+            return;
+          }
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' });
+        // Waits for a new lookup of the job, then clicks the job's row while it
+        // is in flight: still unanswered once the click has happened.
+        const reopen = async (path, text) => {
+          const before = lookups[path].length;
+          for (let i = 0; i < 100 && lookups[path].length === before; i++) await sleep(50);
+          const inflight = lookups[path][lookups[path].length - 1];
+          const clickedAt = Date.now();
+          const clicked = await clickRow(s.page, text);
+          return { path, clickedAt, inFlight: !!inflight && lookups[path].length > before && clicked && !inflight.answered };
+        };
+        const exported = await reopen('/api/export/job/vfy629e', 'StubExport629');
+        const imported = await reopen('/api/import/job/vfy629i', 'ragpkg-stub629.tar.gz');
+        await sleep(imported.clickedAt + 7200 - Date.now());
+        for (const [kind, click] of [['export', exported], ['import', imported]]) {
+          const count = lookups[click.path].filter(l => l.start >= click.clickedAt && l.start <= click.clickedAt + 7000).length;
+          r.check(`Transfer: reopening the polled ${kind} while its poll is in flight keeps one poll chain (#629)`,
+            click.inFlight && count <= 3, `inFlight=${click.inFlight} lookups in 7 s=${count}`);
+        }
       } finally { await s.ctx.close(); }
     }
 

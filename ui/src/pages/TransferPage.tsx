@@ -86,14 +86,17 @@ export default function TransferPage() {
   const [importPollError, setImportPollError] = useState('')
 
   // Polling handles are kept so a job that finishes, or a page that unmounts,
-  // does not leave a timer running against a job nobody is watching. The job
-  // id being polled is kept too: a poll that answers after the page unmounted,
-  // or after it stopped watching that job, schedules nothing and changes nothing.
+  // does not leave a timer running against a job nobody is watching. Each
+  // panel's poll chain has a number, and only the current one acts: a poll that
+  // answers after the page unmounted, after the panel stopped watching, or after
+  // a newer chain started (reopening the polled job while its poll is in
+  // flight, say) schedules nothing and changes nothing, so there is never more
+  // than one chain per panel (#629).
   const alive = useRef(true)
   const exportTimer = useRef<number | null>(null)
   const importTimer = useRef<number | null>(null)
-  const exportPoll = useRef<string | null>(null)
-  const importPoll = useRef<string | null>(null)
+  const exportPoll = useRef(0)
+  const importPoll = useRef(0)
 
   const loadPackages = useCallback(() => {
     api.getPackages().then(r => {
@@ -111,8 +114,8 @@ export default function TransferPage() {
     loadPackages()
     return () => {
       alive.current = false
-      exportPoll.current = null
-      importPoll.current = null
+      exportPoll.current += 1
+      importPoll.current += 1
       if (exportTimer.current) window.clearTimeout(exportTimer.current)
       if (importTimer.current) window.clearTimeout(importTimer.current)
     }
@@ -134,56 +137,56 @@ export default function TransferPage() {
     return () => { current = false }
   }, [collection])
 
-  function pollExport(jobId: string, failures = 0) {
+  function pollExport(jobId: string, chain: number, failures = 0) {
     api.getExportJob(jobId).then(job => {
-      if (exportPoll.current !== jobId) return
+      if (exportPoll.current !== chain) return
       setExportJob(job)
       setExportPollError('')
       if (job.status === 'completed' || job.status === 'failed') {
-        exportPoll.current = null
+        exportPoll.current += 1
         setExportWatching(false)
         loadPackages()
         exportJobs.reload()
       } else {
-        exportTimer.current = window.setTimeout(() => pollExport(jobId), POLL_MS)
+        exportTimer.current = window.setTimeout(() => pollExport(jobId, chain), POLL_MS)
       }
     }, (e: unknown) => {
-      if (exportPoll.current !== jobId) return
+      if (exportPoll.current !== chain) return
       if (failures + 1 >= POLL_ATTEMPTS) {
-        exportPoll.current = null
+        exportPoll.current += 1
         setExportWatching(false)
         setExportPollError(`Stopped checking the export's progress after ${POLL_ATTEMPTS} failed attempts; the export may still be running. Last error: ${message(e)}`)
       } else {
         setExportPollError(`Could not check the export's progress, retrying: ${message(e)}`)
-        exportTimer.current = window.setTimeout(() => pollExport(jobId, failures + 1), POLL_MS)
+        exportTimer.current = window.setTimeout(() => pollExport(jobId, chain, failures + 1), POLL_MS)
       }
     })
   }
 
-  function pollImport(jobId: string, failures = 0) {
+  function pollImport(jobId: string, chain: number, failures = 0) {
     api.getImportJob(jobId).then(job => {
-      if (importPoll.current !== jobId) return
+      if (importPoll.current !== chain) return
       setImportJob(job)
       setImportPollError('')
       if (job.status !== 'completed' && job.status !== 'failed') {
-        importTimer.current = window.setTimeout(() => pollImport(jobId), POLL_MS)
+        importTimer.current = window.setTimeout(() => pollImport(jobId, chain), POLL_MS)
         return
       }
-      importPoll.current = null
+      importPoll.current += 1
       setImportWatching(false)
       importJobs.reload()
       if (job.status === 'completed') {
         api.getCollections().then(r => setCollections(r.collections)).catch(() => {})
       }
     }, (e: unknown) => {
-      if (importPoll.current !== jobId) return
+      if (importPoll.current !== chain) return
       if (failures + 1 >= POLL_ATTEMPTS) {
-        importPoll.current = null
+        importPoll.current += 1
         setImportWatching(false)
         setImportPollError(`Stopped checking the import's progress after ${POLL_ATTEMPTS} failed attempts; the import may still be running. Last error: ${message(e)}`)
       } else {
         setImportPollError(`Could not check the import's progress, retrying: ${message(e)}`)
-        importTimer.current = window.setTimeout(() => pollImport(jobId, failures + 1), POLL_MS)
+        importTimer.current = window.setTimeout(() => pollImport(jobId, chain, failures + 1), POLL_MS)
       }
     })
   }
@@ -194,12 +197,11 @@ export default function TransferPage() {
     if (exportTimer.current) window.clearTimeout(exportTimer.current)
     setExportError(''); setExportPollError('')
     setExportJob(entry)
+    const chain = ++exportPoll.current
     if (transferRunning(entry)) {
-      exportPoll.current = entry.job_id
       setExportWatching(true)
-      pollExport(entry.job_id)
+      pollExport(entry.job_id, chain)
     } else {
-      exportPoll.current = null
       setExportWatching(false)
     }
   }
@@ -209,12 +211,11 @@ export default function TransferPage() {
     if (importTimer.current) window.clearTimeout(importTimer.current)
     setImportError(''); setImportPollError('')
     setImportJob(entry)
+    const chain = ++importPoll.current
     if (transferRunning(entry)) {
-      importPoll.current = entry.job_id
       setImportWatching(true)
-      pollImport(entry.job_id)
+      pollImport(entry.job_id, chain)
     } else {
-      importPoll.current = null
       setImportWatching(false)
     }
   }
@@ -246,9 +247,9 @@ export default function TransferPage() {
       exportTouched.current = true
       exportJobs.reload()
       if (exportTimer.current) window.clearTimeout(exportTimer.current)
-      exportPoll.current = r.job_id
+      const chain = ++exportPoll.current
       setExportWatching(true)
-      pollExport(r.job_id)
+      pollExport(r.job_id, chain)
     } catch (e: unknown) {
       setExportError(message(e))
     }
@@ -265,9 +266,9 @@ export default function TransferPage() {
       importTouched.current = true
       importJobs.reload()
       if (importTimer.current) window.clearTimeout(importTimer.current)
-      importPoll.current = r.job_id
+      const chain = ++importPoll.current
       setImportWatching(true)
-      pollImport(r.job_id)
+      pollImport(r.job_id, chain)
     } catch (e: unknown) {
       setImportError(message(e))
     }
