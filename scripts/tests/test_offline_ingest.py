@@ -13,10 +13,14 @@ chunking, in a fresh container from the api image with no network:
 lookup and every connect on a non-Unix socket is recorded and refused, from
 before the API is imported, so a dial-out whose error is swallowed is caught
 too. Weaviate, source retention and gold-standard marking are in-memory fakes.
-On the image before #695 the jobs fail with "Failed to download spaCy model".
+Besides .txt and .md, one file of each other supported type (.pdf, .docx, .csv,
+.json, from scripts/verify/fixtures.py) is ingested the same way. On the image
+before #695 the .txt, .md, .pdf and .docx jobs fail with "Failed to download
+spaCy model".
 """
 import importlib.metadata
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -81,12 +85,15 @@ MARKDOWN = (
 
 
 class OfflineIngestTests(unittest.TestCase):
-    def run_job(self, name, text, strategy="fixed", chunk_size=150, minimum=40):
+    def run_job(self, name, text, strategy="fixed", chunk_size=150, minimum=40, content=None):
         stored = []
         tmp = Path(tempfile.mkdtemp())  # the job removes it when it ends
         path = tmp / "0" / name
         path.parent.mkdir()
-        path.write_text(text, encoding="utf-8")
+        if content is None:
+            path.write_text(text, encoding="utf-8")
+        else:
+            path.write_bytes(content)
         job_id = "o" + uuid.uuid4().hex[:7]
         ingest_pipeline._jobs[job_id] = {
             "job_id": job_id, "status": "queued", "files_total": 1,
@@ -98,7 +105,7 @@ class OfflineIngestTests(unittest.TestCase):
                           side_effect=lambda collection, chunks: stored.extend(chunks)), \
                 patch.object(wc, "_source_has_chunks_sync", return_value=False), \
                 patch.object(wc, "_delete_earlier_chunks_sync", return_value=0), \
-                patch.object(wc, "_delete_new_family_sync", return_value=0, create=True), \
+                patch.object(wc, "_delete_new_family_sync", return_value=0), \
                 patch.object(wc, "_collection_exists_sync", return_value=True), \
                 patch.object(goldstandard, "mark_stale"), \
                 patch.object(ingest_pipeline.sources, "store"):
@@ -130,6 +137,23 @@ class OfflineIngestTests(unittest.TestCase):
         self.assertEqual(job["status"], "completed", job["errors"])
         self.assertEqual(job["errors"], [])
         self.assertGreater(len(stored), 0)
+        self.assertNoNetwork()
+
+    def test_every_supported_type_is_ingested_offline(self):
+        # The suites' corpus (fixtures.py): one file of each other supported
+        # type, so a dial-out outside text partitioning is caught too.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "verify"))
+        import fixtures
+        corpus = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, corpus, True)
+        fixtures.write(corpus)
+        for name in ("policies.pdf", "policies.docx", "policies.csv", "policies.json"):
+            with self.subTest(name=name):
+                job, stored = self.run_job(name, "", chunk_size=400, minimum=1,
+                                           content=(corpus / name).read_bytes())
+                self.assertEqual(job["status"], "completed", job["errors"])
+                self.assertEqual(job["errors"], [])
+                self.assertGreater(len(stored), 0)
         self.assertNoNetwork()
 
 
