@@ -104,13 +104,6 @@ class RecordTimestampTests(TempUploadCase):
         on_disk = json.loads((self.root / "jobs" / "export" / "r1.json").read_text())
         self.assertEqual((on_disk["created_at"], on_disk["finished_at"]), (created, finished))
 
-    def test_finished_at_boundary_of_the_window(self):
-        inside = {"job_id": "in", "status": "completed", "owner": owner()}
-        outside = {"job_id": "out", "status": "completed", "owner": owner()}
-        listed = job_lists.select([(inside, False, NOW - job_lists.WINDOW_S),
-                                   (outside, False, NOW - job_lists.WINDOW_S - 1)], DEV, NOW)
-        self.assertEqual([r["job_id"] for r in listed], ["in"])
-
     def test_interrupted_at_startup_gets_finished_at(self):
         directory = self.root / "jobs" / "import"
         directory.mkdir(parents=True)
@@ -179,6 +172,13 @@ class SelectTests(unittest.TestCase):
             {"job_id": "recent", "status": "failed", "owner": owner(), "finished_at": iso(23 * 3600)},
             {"job_id": "old", "status": "failed", "owner": owner(), "finished_at": iso(25 * 3600)})
         self.assertEqual(self.ids(items, DEV), ["recent"])
+
+    def test_finished_at_boundary_of_the_window(self):
+        inside = {"job_id": "in", "status": "completed", "owner": owner()}
+        outside = {"job_id": "out", "status": "completed", "owner": owner()}
+        listed = job_lists.select([(inside, False, NOW - job_lists.WINDOW_S),
+                                   (outside, False, NOW - job_lists.WINDOW_S - 1)], DEV, NOW)
+        self.assertEqual([r["job_id"] for r in listed], ["in"])
 
     def test_a_finish_time_after_the_clock_is_listed(self):
         # The API's clock stepped back: a just-finished job stays listed (#629).
