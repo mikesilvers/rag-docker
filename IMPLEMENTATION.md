@@ -4463,7 +4463,7 @@ replaces all of them.
 from __future__ import annotations
 
 import re
-from typing import Mapping
+from collections.abc import Container
 
 _PART = re.compile(r" \(part ([1-9][0-9]*)\)\Z")
 
@@ -4484,9 +4484,10 @@ def in_family(stored: str, name: str) -> bool:
     return stored == name or base_of(stored) == name
 
 
-def resolve(stored: str, listed: Mapping[str, object]) -> str | None:
+def resolve(stored: str, listed: Container[str]) -> str | None:
     """The retained name whose original `stored` came from: `stored` itself when it
-    is listed, else the name it is a part of when that is listed, else None."""
+    is listed, else the name it is a part of when that is listed, else None.
+    `listed` is a set or mapping of retained names."""
     if stored in listed:
         return stored
     base = base_of(stored)
@@ -4727,31 +4728,63 @@ def cut_unit(unit: Unit, limit: int, dialect: Any = None) -> list[Unit]:
     return [Unit(p) for p in pieces]
 
 
+_CUT_AT = (" ", "\t", "\r")
+
+
+def _paragraph(lines: list[str]) -> Iterator[Unit]:
+    """The paragraph read so far as a unit, unless it holds no text: no unit is
+    ever empty or only whitespace (#631)."""
+    text = "".join(lines).rstrip("\n")
+    if text.strip():
+        yield Unit(text)
+
+
 def _text_units(stream: Iterable[str] | Any, markdown: bool, limit: int) -> Iterator[Unit]:
     """Paragraphs, the text between blank lines; for Markdown, a blank line inside
     a fenced code block doesn't end one. A paragraph is given out in pieces when
-    it passes `limit`, cut at a line break, so one is never held whole."""
+    it passes `limit`, cut at a line break, so one is never held whole. A line
+    longer than `limit` is read in pieces cut after their last whitespace, as
+    _cut_text cuts, and hard at `limit` only when a piece has none (#631); a piece
+    that continues a line is never taken as a blank line or a fence. A continuation
+    piece of only whitespace is dropped, and no unit is empty or only whitespace."""
     lines: list[str] = []
     size = 0
     fence = False
+    carry = ""    # the rest of a line cut at whitespace, read again first
+    fresh = True  # the next piece starts a line
     while True:
-        line = stream.readline(limit)
+        line = carry + stream.readline(limit - len(carry))
+        carry = ""
         if not line:
             break
-        if markdown and line.lstrip().startswith(("```", "~~~")):
-            fence = not fence
-        if not line.strip() and not fence:
-            if lines:
-                yield Unit("".join(lines).rstrip("\n"))
-                lines, size = [], 0
+        start = fresh
+        # A line end in either newline mode: preparation reads with newline="".
+        fresh = line.endswith(("\n", "\r"))
+        if not fresh and len(line) >= limit:
+            cut = max(line.rfind(ws, 1) for ws in _CUT_AT)
+            if cut > 0:
+                line, carry = line[:cut + 1], line[cut + 1:]
+        if start:
+            if markdown and line.lstrip().startswith(("```", "~~~")):
+                fence = not fence
+            if not line.strip() and not fence:
+                if lines:
+                    yield from _paragraph(lines)
+                    lines, size = [], 0
+                continue
+        elif not line.strip():
+            # Only whitespace continuing a line, in practice its line end read on its
+            # own after a line of exactly `limit` characters: not part of the paragraph,
+            # and not a blank line either (#631). `fresh` already says whether it
+            # ended the line.
             continue
         if lines and size + len(line) > limit:
-            yield Unit("".join(lines).rstrip("\n"))
+            yield from _paragraph(lines)
             lines, size = [], 0
         lines.append(line)
         size += len(line)
     if lines:
-        yield Unit("".join(lines).rstrip("\n"))
+        yield from _paragraph(lines)
 
 
 def _csv_dialect(stream: Any) -> Any:
@@ -4765,14 +4798,15 @@ def _csv_dialect(stream: Any) -> Any:
 
 def _text_measure(unit: Unit) -> int:
     """The raw measure of a unit, deciding whether a .txt, .md or .csv over
-    10,000,000 bytes is tried whole: its text, and a CSV row by its cells' text
-    (empty cells and separators not counted, since a sparse CSV's bytes can be
-    many times its text). It is not the parsed text and can be more (indentation,
-    Markdown link targets, NA cells), so such a file may be split although its
-    parsed text would fit; measuring raw units keeps memory bounded (maintainer's
-    decision, PR #630)."""
-    if unit.cells is not None:
-        return sum(len(cell.strip()) for cell in unit.cells)
+    10,000,000 bytes is tried whole: a paragraph's text, and a CSV row's text as
+    written (its separators, needed quotes and line ending included), the text a
+    part is sized in. A CSV's rows are not measured by their cells' text: that let
+    a sparse CSV be parsed whole however large (maintainer's decision on #631,
+    reversing PR #630's for CSV); measured as written, the parse and its number
+    of cells stay bounded by the text limit. For .txt and .md it is not the parsed
+    text and can be more (indentation, Markdown link targets), so such a file may
+    be split although its parsed text would fit; measuring raw units keeps memory
+    bounded (maintainer's decision, PR #630)."""
     return len(unit.text)
 
 
@@ -4806,7 +4840,6 @@ class _Source:
         self.dialect = None
         self._stream = None
         self.own_size: int | None = None
-        self.header_cells: list[str] = []
         if ftype == "jsonl":
             self.units = (Unit(t, "record", o) for o, t, _ in ip._jsonl_units(path))
         elif ftype == "json":
@@ -4823,7 +4856,6 @@ class _Source:
             if ftype == "csv":
                 self.dialect = _csv_dialect(self._stream)
                 self.header, self.units = _csv_units(self._stream, self.dialect)
-                self.header_cells = next(csv.reader([self.header], self.dialect), [])
             else:
                 self.units = _text_units(self._stream, ftype == "md", limit)
         # What a part's units may hold: a CSV's header is repeated at the start
@@ -4850,11 +4882,17 @@ class _Source:
 
     def own(self) -> int:
         """The file's own size, which its stored chunk text is measured against:
-        its bytes; a gzip file's decompressed bytes; a PDF's or DOCX's text."""
+        its bytes; a gzip file's decompressed bytes, counted no further than its
+        reader's bound (#631); a PDF's or DOCX's text."""
         if self.own_size is None:
             size = self.path.stat().st_size
             if self.path.name.lower().endswith(".gz"):
                 import gzip
+                from services import ingest_pipeline as ip
+                # The reader fails a file past its bound, so counting further
+                # would only spend the work the bound exists to prevent.
+                bound = (ip.MAX_JSON_INPUT_BYTES if ip._is_json_gz(self.path.name)
+                         else ip.MAX_GZIP_DECOMPRESSED_BYTES)
                 try:
                     size = 0
                     with gzip.open(self.path, "rb") as gz:
@@ -4863,6 +4901,8 @@ class _Source:
                             if not block:
                                 break
                             size += len(block)
+                            if size > bound:
+                                break
                 except (OSError, EOFError):
                     size = self.path.stat().st_size
             self.own_size = size
@@ -4990,7 +5030,7 @@ def split_file(path: Path, settings: Settings, parse: Callable | None = None,
         if not fits:
             probe = _Source(path, ftype, settings, limit, parse, chunk)
             try:
-                total = sum(len(cell.strip()) for cell in probe.header_cells)
+                total = len(probe.header)
                 fits = True
                 for unit in probe.units:
                     total += _text_measure(unit)
@@ -5935,6 +5975,15 @@ class _FileFailed(Exception):
     """A file that failed, with the reason its error gives (#621)."""
 
 
+_NOTHING_STORED = "; nothing from it was stored"
+
+
+def _nothing_stored(reason: str) -> str:
+    """`reason` ending once in `; nothing from it was stored`: some reasons, such
+    as the gzip limit's, already end with it (#631)."""
+    return reason if reason.endswith(_NOTHING_STORED) else reason + _NOTHING_STORED
+
+
 def _undo_new_chunks(job: dict, collection: str, name: str, created_at: datetime,
                      exc: BaseException, kind: str, part_count: int, stored: int) -> _FileFailed:
     """A file failed while its chunks were being stored: remove what this ingest
@@ -5954,7 +6003,9 @@ def _undo_new_chunks(job: dict, collection: str, name: str, created_at: datetime
     elif kind == "part" and not whole:
         reason = f"part {part_count}: {reason}"
     if not (stored or ((split or whole) and part_count)):
-        return _FileFailed(reason)
+        # Nothing was stored, so nothing is removed; a file being stored in parts
+        # still says so, part 1 included (SPECIFICATIONS.md §3.1.3, #631).
+        return _FileFailed(_nothing_stored(reason) if split else reason)
     try:
         removed = wc._delete_new_family_sync(collection, name, created_at)
         problem = None
@@ -5967,7 +6018,7 @@ def _undo_new_chunks(job: dict, collection: str, name: str, created_at: datetime
         left = max(stored - removed, 0)
         return _FileFailed(f"{reason}; {left} new chunks could not be removed ({problem}); "
                            f"upload it again to retry")
-    return _FileFailed(f"{reason}; nothing from it was stored" if split else reason)
+    return _FileFailed(_nothing_stored(reason) if split else reason)
 
 
 def _remove_earlier(collection: str, name: str, created_at: datetime,

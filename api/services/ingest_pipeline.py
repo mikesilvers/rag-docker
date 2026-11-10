@@ -734,6 +734,15 @@ class _FileFailed(Exception):
     """A file that failed, with the reason its error gives (#621)."""
 
 
+_NOTHING_STORED = "; nothing from it was stored"
+
+
+def _nothing_stored(reason: str) -> str:
+    """`reason` ending once in `; nothing from it was stored`: some reasons, such
+    as the gzip limit's, already end with it (#631)."""
+    return reason if reason.endswith(_NOTHING_STORED) else reason + _NOTHING_STORED
+
+
 def _undo_new_chunks(job: dict, collection: str, name: str, created_at: datetime,
                      exc: BaseException, kind: str, part_count: int, stored: int) -> _FileFailed:
     """A file failed while its chunks were being stored: remove what this ingest
@@ -753,7 +762,9 @@ def _undo_new_chunks(job: dict, collection: str, name: str, created_at: datetime
     elif kind == "part" and not whole:
         reason = f"part {part_count}: {reason}"
     if not (stored or ((split or whole) and part_count)):
-        return _FileFailed(reason)
+        # Nothing was stored, so nothing is removed; a file being stored in parts
+        # still says so, part 1 included (SPECIFICATIONS.md §3.1.3, #631).
+        return _FileFailed(_nothing_stored(reason) if split else reason)
     try:
         removed = wc._delete_new_family_sync(collection, name, created_at)
         problem = None
@@ -766,7 +777,7 @@ def _undo_new_chunks(job: dict, collection: str, name: str, created_at: datetime
         left = max(stored - removed, 0)
         return _FileFailed(f"{reason}; {left} new chunks could not be removed ({problem}); "
                            f"upload it again to retry")
-    return _FileFailed(f"{reason}; nothing from it was stored" if split else reason)
+    return _FileFailed(_nothing_stored(reason) if split else reason)
 
 
 def _remove_earlier(collection: str, name: str, created_at: datetime,

@@ -17,6 +17,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -276,6 +277,32 @@ class AllOrNothingTests(JobCase):
         self.assertEqual(job["errors"], [
             "data.jsonl: part 2: Weaviate rejected the batch; 10000 new chunks could not be "
             "removed (Weaviate failed to delete 10000 new chunk(s)); upload it again to retry"])
+
+    def test_part_1_failing_before_anything_is_stored_says_nothing_was_stored(self):
+        # #631: SPECIFICATIONS.md §3.1.3's suffix on part 1 too. 17,000 records are
+        # over the text limit, so the file is split with no whole attempt.
+        def broken(*args, **kwargs):
+            raise ValueError("chunker broke")
+
+        with patch.object(ingest_pipeline, "do_chunk", side_effect=broken):
+            job, backend = self.run_job([("data.jsonl", records(17_000, 600))], "context_aware")
+        self.assertEqual(job["status"], "failed", job)
+        self.assertEqual(job["errors"],
+                         ["data.jsonl: part 1: chunker broke; nothing from it was stored"])
+        self.assertEqual(backend.chunks, [])
+        self.assertEqual(job["chunks_stored"], 0)
+
+    def test_the_suffix_is_not_doubled(self):
+        # #631: the gzip limit's reason already ends with the suffix.
+        from services import splitter
+        job = {"chunks_stored": 5}
+        exc = splitter.PartError(2, ingest_pipeline._gzip_too_large())
+        with patch.object(wc, "_delete_new_family_sync", return_value=5, create=True):
+            failed = ingest_pipeline._undo_new_chunks(job, "Coll", "big.jsonl.gz",
+                                                      datetime.now(), exc, "part", 1, 5)
+        self.assertEqual(str(failed), "part 2: decompresses to more than 512 MB, the limit for "
+                                      "one compressed file; nothing from it was stored")
+        self.assertEqual(job["chunks_stored"], 0)
 
     def test_the_semantic_sentence_limit_fails_a_part_and_is_not_split_further(self):
         from services import splitter
@@ -927,12 +954,35 @@ class SplitOnlyWhenRefusedTests(JobCase):
             with self.subTest(strategy=strategy):
                 self.assertEqual(self.kinds("s.csv", data, strategy, 200), ["whole"])
 
-    def test_a_csv_over_the_text_limit_in_bytes_but_not_in_text_is_stored_whole(self):
+    def test_a_sparse_csv_over_the_text_limit_as_written_is_split(self):
+        # #631 (maintainer's decision, reversing PR #630's for CSV): a CSV over
+        # 10,000,000 bytes is measured by its rows as written, separators included,
+        # not by its cells' text, so this sparse CSV is split rather than parsed whole.
         data = self.sparse_csv(250_000)
         self.assertGreater(len(data), TEXT)
         job, backend = self.run_job([("wide.csv", data)], "fixed", 1000)
+        self.assertEqual((job["status"], job["errors"]), ("completed", []), job)
+        self.assertEqual(len(job["split"]), 1, job["split"])
+        self.assertEqual(self.assert_parts(backend, "wide.csv"), 2)
+
+    def test_a_sparse_csv_over_the_text_limit_is_never_parsed_whole(self):
+        from services import splitter
+
+        def parse(_):
+            raise AssertionError("parsed whole")
+
+        path = self.write("wide.csv", self.sparse_csv(250_000))
+        kinds = [kind for kind, _ in splitter.split_file(
+            path, splitter.Settings("fixed", 1000, 0, 0.85, 0), parse=parse)]
+        self.assertEqual(kinds, ["part", "part"])
+
+    def test_a_csv_over_the_limit_in_bytes_but_not_as_written_is_stored_whole(self):
+        data = "id,text\n" + "".join(f"{i},{chr(0x20ac) * 30}\n" for i in range(110_000))
+        self.assertGreater(len(data.encode()), TEXT)
+        self.assertLess(len(data), TEXT)
+        job, backend = self.run_job([("euro.csv", data)], "fixed", 1000)
         self.assertEqual((job["status"], job["errors"], job["split"]), ("completed", [], []), job)
-        self.assertEqual(backend.names(), ["wide.csv"])
+        self.assertEqual(backend.names(), ["euro.csv"])
 
     def test_text_between_one_part_estimate_and_the_text_limit_is_stored_whole(self):
         # The band case: 5,000,200 characters at context_aware/500 is over
@@ -1119,6 +1169,166 @@ class ReviewerMultibyteTextTests(JobCase):
         job, backend = self.run_job([("euro.txt", data)], "fixed", 1000)
         self.assertEqual((job["status"], job["errors"], job["split"]), ("completed", [], []), job)
         self.assertEqual(backend.names(), ["euro.txt"])
+
+
+class ReviewerJsonWholeMeasureTests(JobCase):
+    """PR #630 testing review (98b74b4): the whole-file measure for JSON Lines,
+    through the real parse and chunker. Under context_aware the chunker counts the
+    records' text alone (10,000,000 characters here), so the file is stored whole;
+    under fixed it counts the joined text, blank lines included, and splits it."""
+
+    def test_jsonl_of_exactly_the_text_limit_is_whole_under_context_aware_split_under_fixed(self):
+        data = records(10_000, 1000)
+        text, elements = ingest_pipeline._parse_file(
+            (lambda p: (p.write_text(data), p)[1])(Path(tempfile.mkdtemp()) / "edge.jsonl"))
+        self.assertEqual(sum(len(str(el)) for el in elements), TEXT)
+        self.assertGreater(len(text), TEXT)
+        job, backend = self.run_job([("edge.jsonl", data)], "context_aware", 6000)
+        self.assertEqual((job["status"], job["errors"], job["split"]), ("completed", [], []), job)
+        self.assertEqual(backend.names(), ["edge.jsonl"])
+        job, backend = self.run_job([("edge.jsonl", data)], "fixed", 6000)
+        self.assertEqual((job["status"], job["errors"]), ("completed", []), job)
+        self.assertEqual(len(job["split"]), 1, job["split"])
+        self.assertTrue(all(n.startswith("edge.jsonl (part ") for n in backend.names()),
+                        backend.names())
+
+
+class GzipOwnSizeBoundTests(unittest.TestCase):
+    """#631: a gzip file's own size, for the ten-times cap, is counted no further
+    than its reader's bound, so measuring never decompresses past it."""
+
+    BOUND = 1024 * 1024
+
+    def own(self, name, data, ftype, constant):
+        import gzip
+        from services import splitter
+        path = Path(tempfile.mkdtemp()) / name
+        path.write_bytes(gzip.compress(data.encode()))
+        with patch.object(ingest_pipeline, constant, self.BOUND):
+            source = splitter._Source(path, ftype, splitter.Settings("fixed", 1000, 0, 0.85, 0),
+                                      TEXT, ingest_pipeline._parse_file, chunker.chunk)
+            try:
+                return source.own()
+            finally:
+                source.close()
+
+    def check(self, size, full):
+        self.assertGreater(size, self.BOUND)
+        self.assertLessEqual(size, 2 * self.BOUND)
+        self.assertLess(size, full)
+
+    def test_a_jsonl_gz_is_counted_to_its_bound(self):
+        data = records(3_000, 1000)  # about 3 MiB
+        self.check(self.own("big.jsonl.gz", data, "jsonl", "MAX_GZIP_DECOMPRESSED_BYTES"),
+                   len(data.encode()))
+
+    def test_a_json_gz_is_counted_to_its_bound(self):
+        data = json.dumps([{"t": "x" * 1000}] * 3_000)
+        self.check(self.own("big.json.gz", data, "json", "MAX_JSON_INPUT_BYTES"),
+                   len(data.encode()))
+
+
+class LongLineCutTests(unittest.TestCase):
+    """#631: a .txt or .md line longer than a part is cut after whitespace, as
+    _cut_text cuts, and hard only when it has none (SPECIFICATIONS.md §5.1.1)."""
+
+    @staticmethod
+    def units(text, limit, markdown=False):
+        from services import splitter
+        return [u.text for u in splitter._text_units(io.StringIO(text), markdown, limit)]
+
+    def test_a_line_of_words_is_cut_after_whitespace(self):
+        text = " ".join(f"w{i:05d}" for i in range(2000))
+        self.assertEqual(len(text), 13_999)
+        units = self.units(text, 100)
+        self.assertEqual("".join(units), text)
+        self.assertTrue(all(len(u) <= 100 for u in units))
+        self.assertTrue(all(u.endswith(" ") for u in units[:-1]), units)
+        self.assertGreater(len(units), 100)
+
+    def test_a_line_with_no_whitespace_is_cut_hard(self):
+        self.assertEqual(self.units("x" * 250, 100), ["x" * 100, "x" * 100, "x" * 50])
+
+    def test_a_piece_continuing_a_line_is_not_a_fence(self):
+        text = "a" * 18 + " ```b\n\nccc\n"
+        self.assertEqual(self.units(text, 20, markdown=True), ["a" * 18 + " ", "```b", "ccc"])
+
+    def test_an_unclosed_fence_ending_in_blank_lines_gives_no_empty_unit(self):
+        # PR #692 review (090230f): no unit is ever empty or only whitespace (#631).
+        self.assertEqual(self.units("```\n" + "a" * 19 + "\n\n", 20, markdown=True),
+                         ["```", "a" * 19])
+
+
+class ReviewerLongLineTests(JobCase):
+    """PR #692 testing review (090230f): a line of exactly a part's limit, cut at
+    the limit, leaves its line end to be read alone. It must not become a unit of
+    its own, or an empty part (#631)."""
+
+    @staticmethod
+    def units(text, limit, markdown=False, newline="\n"):
+        from services import splitter
+        return [u.text for u in splitter._text_units(io.StringIO(text, newline=newline),
+                                                     markdown, limit)]
+
+    def test_a_line_of_exactly_the_limit_before_a_blank_line_gives_no_empty_unit(self):
+        units = self.units("x" * 20 + "\n\n" + "y" * 20 + "\n", 20)
+        self.assertTrue(all(u.strip() for u in units), units)
+        self.assertEqual("".join(units), "x" * 20 + "y" * 20)
+
+    def test_no_part_is_empty_when_lines_fill_a_part_exactly(self):
+        # fixed/100: a part holds 1,000,000 characters. Eleven lines of exactly that,
+        # each followed by a blank line, are eleven parts of 10,000 chunks each.
+        from services import splitter
+        path = Path(tempfile.mkdtemp()) / "long.txt"
+        path.write_text(("x" * 1_000_000 + "\n\n") * 11)
+        parts = [chunks for _, chunks in splitter.split_file(
+            path, splitter.Settings("fixed", 100, 0, 0.85, 0))]
+        self.assertEqual([len(c) for c in parts], [10_000] * 11)
+
+    def test_a_piece_ending_in_a_carriage_return_is_a_whole_line(self):
+        # Preparation reads with newline="" (#638): "\r" alone ends a line, so the
+        # next "\r" is a blank line between two paragraphs.
+        self.assertEqual(len(self.units("aaaa\r\rbbbb\r", 100, newline="")), 2)
+
+
+class ReviewerCsvHeaderMeasureTests(JobCase):
+    """PR #692 testing review (090230f): a large CSV's measure counts its header
+    row as written as well as its rows (#631)."""
+
+    def test_the_header_row_tips_a_csv_over_the_text_limit(self):
+        from services import splitter
+
+        def parse(_):
+            raise AssertionError("parsed whole")
+
+        header = ",".join(f"h{i:04d}" for i in range(400)) + "\n"  # 2,400 characters
+        row = "r" * 999 + "\n"
+        rows = (TEXT - 1_000) // len(row)
+        data = header + row * rows
+        self.assertLessEqual(rows * len(row), TEXT)
+        self.assertGreater(len(data), TEXT)
+        path = Path(tempfile.mkdtemp()) / "head.csv"
+        path.write_text(data)
+        kinds = {kind for kind, _ in splitter.split_file(
+            path, splitter.Settings("fixed", 1000, 0, 0.85, 0), parse=parse)}
+        self.assertEqual(kinds, {"part"})
+
+
+class LongLinePartCountTests(JobCase):
+    """PR #692 testing review (090230f): lines of exactly a part's room, each
+    followed by a blank line, are one part each, and the job counts only the parts
+    it stored (#631). On 090230f this gave 6 parts, every other one of 0 chunks."""
+
+    def test_lines_of_exactly_a_part_are_one_part_each(self):
+        # fixed/100: a part holds 1,000,000 characters.
+        job, backend = self.run_job([("long.txt", ("x" * 1_000_000 + "\n\n") * 3)], "fixed", 100)
+        self.assertEqual(job["status"], "completed", job)
+        self.assertEqual(job["errors"], [])
+        self.assertEqual(job["split"], ["long.txt: split into 3 parts, stored as "
+                                        "'long.txt (part 1)' to 'long.txt (part 3)'"])
+        self.assertEqual(self.assert_parts(backend, "long.txt"), 3)
+        for n in (1, 2, 3):
+            self.assertEqual(len(backend.of(f"long.txt (part {n})")), 10_000, n)
 
 
 if __name__ == "__main__":
