@@ -1761,8 +1761,10 @@ files' names as the client sent them, in upload order.
 "owner unknown" (`owner: null`).
 
 **Which jobs.** Every running job (an ingest, export or import whose status isn't terminal; a session
-whose status is `generating`) is listed. A finished job is listed when its finish time lies in the 24
-hours before the request; of those, only the 20 with the newest finish time, per list and caller.
+whose status is `generating`) is listed. A finished job is listed when its finish time is no more than
+24 hours before the request; a finish time later than the request (after the API's clock steps back)
+is listed too, so a just-finished job doesn't vanish (#629). Of those, only the 20 with the newest
+finish time, per list and caller.
 The finish time is `finished_at`; a finished ingest, export or import record from before #617 uses
 the time its record file was last saved, and a finished session without `finished_at` is not listed.
 `GET /goldstandard/sessions` lists only sessions generated on this install: one with

@@ -180,6 +180,13 @@ class SelectTests(unittest.TestCase):
             {"job_id": "old", "status": "failed", "owner": owner(), "finished_at": iso(25 * 3600)})
         self.assertEqual(self.ids(items, DEV), ["recent"])
 
+    def test_a_finish_time_after_the_clock_is_listed(self):
+        # The API's clock stepped back: a just-finished job stays listed (#629).
+        listed = job_lists.select([({"job_id": "ahead", "status": "completed", "owner": owner()}, False, NOW + 3600)],
+                                  DEV, NOW)
+        self.assertEqual([r["job_id"] for r in listed], ["ahead"])
+        self.assertAlmostEqual(job_lists._parse(listed[0]["finished_at"]), NOW + 3600, delta=1)
+
     def test_order_newest_first_by_created_at_else_finish(self):
         items = self.items(
             {"job_id": "a", "status": "completed", "owner": owner(), "created_at": iso(300), "finished_at": iso(10)},
