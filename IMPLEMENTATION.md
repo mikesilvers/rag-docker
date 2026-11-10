@@ -41967,6 +41967,60 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
       } finally { await s.ctx.close(); }
     }
 
+    // Transfer, stubbed: leaving the page through the app's own navigation,
+    // while a lookup is in flight, stops both panels' polling (#629). Each
+    // lookup answers after 1 s; an answer that still polled would start a new
+    // lookup within about 3 s of leaving.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        const mine = { name: 'vfy-developer', kind: 'user' };
+        const exportJob = { job_id: 'vfy629le', status: 'running', collection: 'StubLeave629', chunks_written: 3,
+          filename: null, size_bytes: null, source_document_count: null, fidelity: null, models_bundled: null,
+          retrieve_script: null, warnings: [], error: null, error_code: null, error_detail: null };
+        const importJob = { job_id: 'vfy629li', status: 'running', filename: 'ragpkg-leave629.tar.gz', on_conflict: 'rename',
+          collection: null, original_collection: null, chunks_written: 2, fidelity: null, renamed: false, notes: [],
+          restored_sessions: [], error: null, error_code: null, error_detail: null };
+        const lookups = { '/api/export/job/vfy629le': [], '/api/import/job/vfy629li': [] };
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (path === '/api/export/jobs') return request.respond(json({ jobs: [
+            { ...exportJob, owner: mine, created_at: at(60), finished_at: null }] }));
+          if (path === '/api/import/jobs') return request.respond(json({ jobs: [
+            { ...importJob, owner: mine, created_at: at(30), finished_at: null }] }));
+          if (path in lookups) {
+            const lookup = { start: Date.now(), answered: false };
+            lookups[path].push(lookup);
+            setTimeout(() => {
+              lookup.answered = true;
+              request.respond(json(path.includes('/export/') ? exportJob : importJob)).catch(() => {});
+            }, 1000);
+            return;
+          }
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' });
+        const exports = lookups['/api/export/job/vfy629le'];
+        const before = exports.length;
+        for (let i = 0; i < 100 && exports.length === before; i++) await sleep(50);
+        const inflight = exports[exports.length - 1];
+        const clicked = await s.page.evaluate(() => {
+          window.__vfy629Leave = true;
+          const a = document.querySelector('nav a[href="/qa"]');
+          if (!a) return false; a.click(); return true;
+        });
+        const leftAt = Date.now();
+        const inFlight = clicked && exports.length > before && !!inflight && !inflight.answered;
+        await sleep(5000);
+        const after = Object.values(lookups).flat().filter(l => l.start > leftAt + 100).length;
+        const where = await s.page.evaluate(() => ({ path: location.pathname, marker: window.__vfy629Leave === true }));
+        r.check('Transfer: leaving the page stops polling, with a lookup in flight (#629)',
+          inFlight && where.path === '/qa' && where.marker && after === 0,
+          `inFlight=${inFlight} path=${where.path} sameDocument=${where.marker} lookups after=${after}`);
+      } finally { await s.ctx.close(); }
+    }
+
     // An Engineer sees the owner of each job: a user, an API key, or unknown.
     {
       const s = await session(browser, BASE, 'engineer');
