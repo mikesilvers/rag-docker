@@ -113,6 +113,43 @@ need = ('question','answer','ground_truth','contexts')
 sys.exit(0 if d['pairs'] and all(all(p.get(f) for f in need) for p in d['pairs']) else 1)"
 check "every pair has question, answer, ground_truth and contexts" $?
 
+# ── the generation list (#617) ───────────────────────────────────────────────
+# A real generation records who started it and when, through the real start
+# path: listed for its owner (the harness Engineer) with owner, created_at and
+# finished_at, never for another Developer, and absent from the lookup by ID.
+api_get "/goldstandard/sessions" > /tmp/vfy_gen_list.json
+DEVJAR=$(auth_jar developer) || DEVJAR=""
+if [ -n "$DEVJAR" ]; then
+  RAG_AUTH_JAR="$DEVJAR" api_get "/goldstandard/sessions" > /tmp/vfy_gen_list_dev.json
+else
+  echo '{}' > /tmp/vfy_gen_list_dev.json
+fi
+python3 - "$SID" <<'ENDPY'
+import json, sys
+sid = sys.argv[1]
+mine = {s["session_id"]: s for s in json.load(open("/tmp/vfy_gen_list.json")).get("sessions", [])}
+dev = json.load(open("/tmp/vfy_gen_list_dev.json"))
+lookup = json.load(open("/tmp/vfy_sess.json"))
+entry = mine.get(sid)
+problems = []
+if entry is None:
+    problems.append("the session isn't listed for the Engineer who started it: %s" % sorted(mine))
+else:
+    if entry.get("owner") != {"name": "vfy-engineer", "kind": "user"}:
+        problems.append("owner %r" % entry.get("owner"))
+    if not entry.get("created_at") or not entry.get("finished_at"):
+        problems.append("created_at %r finished_at %r" % (entry.get("created_at"), entry.get("finished_at")))
+    if entry.get("status") != "completed":
+        problems.append("status %r" % entry.get("status"))
+if "sessions" not in dev or any(s["session_id"] == sid for s in dev["sessions"]):
+    problems.append("the Developer's list: %s" % json.dumps(dev)[:200])
+if any(k in lookup for k in ("owner", "created_at", "finished_at")):
+    problems.append("the lookup by ID gained the new fields")
+print("; ".join(problems))
+sys.exit(1 if problems else 0)
+ENDPY
+check "GET /goldstandard/sessions lists a real generation for its owner only, with owner and times (#617)" $?
+
 # ── the PATCH audit rule ─────────────────────────────────────────────────────
 if [ "$actual" -lt 1 ]; then
   drop_collection "$C"
