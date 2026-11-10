@@ -746,7 +746,7 @@ Follow these steps once, to move an instance from 1.1.0 to 1.2.0. The first star
 
    Check the volume prefix first. The volume names start with the compose project name, usually the folder name: `rag-docker_weaviate_data`. Set `P` to the prefix you see.
 
-   The block lists the volume names, sets `P`, makes the `backups/` folder, and copies each volume into a `.tgz` in `backups/` through a throwaway container. A volume that doesn't exist (a wrong `P`) is reported and skipped, not created. It then lists the files, and checks that each backup reads back and counts what it holds.
+   The block lists the volume names, sets `P`, makes the `backups/` folder, and copies each volume through a throwaway container into a `.tmp` file in `backups/`, which replaces that volume's `.tgz` only once `gzip -t` reads it back. A volume that doesn't exist (a wrong `P`) is reported and skipped, not created. It then lists the files, and checks that each backup reads back and counts what it holds.
 
    ```bash
    docker volume ls --filter name=_weaviate_data
@@ -754,7 +754,10 @@ Follow these steps once, to move an instance from 1.1.0 to 1.2.0. The first star
    mkdir -p backups
    for v in weaviate_data ingest_uploads rag_sources; do
      docker volume inspect "${P}_$v" >/dev/null &&
-       docker run --rm -v "${P}_$v":/data:ro -v "$PWD/backups":/backup alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf tar czf "/backup/$v-v1.1.0.tgz" -C /data .
+       docker run --rm -v "${P}_$v":/data:ro -v "$PWD/backups":/backup alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf tar czf "/backup/$v-v1.1.0.tgz.tmp" -C /data . &&
+       gzip -t "backups/$v-v1.1.0.tgz.tmp" &&
+       mv -f "backups/$v-v1.1.0.tgz.tmp" "backups/$v-v1.1.0.tgz" ||
+       { echo "$v: backup FAILED"; rm -f "backups/$v-v1.1.0.tgz.tmp"; }
    done
    ls -l backups
    for v in weaviate_data ingest_uploads rag_sources; do
@@ -762,7 +765,7 @@ Follow these steps once, to move an instance from 1.1.0 to 1.2.0. The first star
    done
    ```
 
-   Go on only if the last loop prints a line for each of the three volumes and no error. `no such volume` means `P` is wrong: set it again and rerun the block. `1 entries` means that volume is empty (the backup holds only `./`); if it should hold data, `P` names another project's volumes, so stop and check it.
+   Go on only if the last loop prints a line for each of the three volumes and no error. `backup FAILED` means that copy didn't complete, and an earlier backup of that volume is unchanged: fix the cause (a wrong `P`, or disk space) and rerun the block. `no such volume` means `P` is wrong: set it again and rerun the block. `1 entries` means that volume is empty (the backup holds only `./`); if it should hold data, `P` names another project's volumes, so stop and check it.
 
    The throwaway container is alpine 3.24.4, pinned by its digest; Docker downloads it (a few MB) if this machine doesn't have it. git ignores the `backups/` folder: switching to another branch or tag leaves the backups in place, and they don't go into packages.
 
@@ -828,16 +831,20 @@ Follow these steps once, to move an instance from 1.1.0 to 1.2.0. The first star
 
 **If the upgrade fails**
 
-Go back to 1.1.0 and restore the backup. The block removes the containers (the volumes are kept), switches back to the 1.1.0 release and sets the prefix you saw in step 2. It then checks every backup and every volume, and empties nothing unless all three print `OK`. Only then does it empty each volume, restore it from its backup, and start 1.1.0. The restore empties each existing volume and fills it from its backup, so what changed in those volumes after the backup is lost.
+Go back to 1.1.0 and restore the backup. The block removes the containers (the volumes are kept), sets the prefix you saw in step 2 and switches back to the 1.1.0 release. It then checks every backup and every volume, and empties nothing unless the checkout and all three volumes print `OK`. Only then does it empty each volume, restore it from its backup, and start 1.1.0. The restore empties each existing volume and fills it from its backup, so what changed in those volumes after the backup is lost.
 
-- `FAILED`: nothing was changed. Fix `P` (after a `no such volume` error) or the backup file the error names, and run the block again.
+- `FAILED`: nothing was changed. Fix what the line names and run the block again: `P` (after a `no such volume` error), the backup file the error names, or, for `git checkout v1.1.0: FAILED`, what git reports (a local change to a tracked file, for example).
 - `restore FAILED`: the restore stopped at that volume, which may be partly restored, and 1.1.0 isn't started. The backups are unchanged. Fix the cause (disk space, for example) and run the block again.
 
 ```bash
 docker compose down
-git checkout v1.1.0
 P=rag-docker
 ok=yes
+if git checkout v1.1.0; then
+  echo "git checkout v1.1.0: OK"
+else
+  echo "git checkout v1.1.0: FAILED"; ok=no
+fi
 for v in weaviate_data ingest_uploads rag_sources; do
   if gzip -t "backups/$v-v1.1.0.tgz" && tar tzf "backups/$v-v1.1.0.tgz" >/dev/null && docker volume inspect "${P}_$v" >/dev/null; then
     echo "$v: OK"
