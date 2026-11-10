@@ -16,6 +16,7 @@ skipped without them. `15_transfer_paths.sh` runs it.
 """
 import gzip
 import io
+import json
 import os
 import re
 import shlex
@@ -46,6 +47,11 @@ PLANTED_TAR = {"old-bundle.tar": "archive", "offline/stale-images.tar.gz": "old"
 GIT_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
            "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
            "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.invalid"}
+# The commit runs with automatic maintenance off (#696). Otherwise `git commit` starts a detached
+# `git maintenance run --auto`, whose repack (git 2.54) can still be writing into `.git` when the
+# temporary directory is removed, and the cleanup fails with "Directory not empty".
+# `gc.auto=0` does not stop it.
+NO_AUTO_MAINTENANCE = ["-c", "maintenance.auto=false"]
 TOP_LEVEL_ENV = ".env.local"
 
 STUB_DOCKER = r"""#!/bin/bash
@@ -101,6 +107,22 @@ def entrypoint_models():
     return re.findall(r"^pull_with_retry ([A-Za-z0-9._:-]*)$", text, re.M)
 
 
+def background_git(trace):
+    """The `git maintenance` and `git gc` commands a trace2 event file shows git starting (#696)."""
+    if not trace.exists():
+        return []
+    started = []
+    for line in trace.read_text().splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        argv = event.get("argv") or []
+        if event.get("event") == "child_start" and argv[1:2] in (["maintenance"], ["gc"]):
+            started.append(" ".join(argv))
+    return started
+
+
 def tracked_files():
     out = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z"], capture_output=True)
     if out.returncode != 0:
@@ -139,14 +161,20 @@ class Workspace(unittest.TestCase):
                 shutil.copy2(ROOT / name, target)
         # package.sh and package-offline.sh run `git archive HEAD`: make the copy a repository
         # with the tracked files committed, then plant the excluded files (untracked) on top.
+        # The commit is traced, so the check below sees any background git work it starts (#696).
         git = dict(os.environ, **GIT_ENV)
+        trace = self.temp / "git-commit-trace.json"
         listed = "\0".join(name for name in files if (ROOT / name).is_file()) + "\0"
-        for args, data in ((["init", "-q", "--template="], None),
-                           (["add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], listed),
-                           (["commit", "-q", "-m", "tracked files"], None)):
+        for args, data, extra in ((["init", "-q", "--template="], None, {}),
+                                  (["add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                                   listed, {}),
+                                  ([*NO_AUTO_MAINTENANCE, "commit", "-q", "-m", "tracked files"],
+                                   None, {"GIT_TRACE2_EVENT": str(trace)})):
             done = subprocess.run(["git", "-C", str(tree), *args], input=data, text=True,
-                                  capture_output=True, env=git)
+                                  capture_output=True, env=dict(git, **extra))
             self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(background_git(trace), [], "git commit started background git work, "
+                         "which races the temporary directory's removal (#696)")
         for name, text in planted.items():
             (tree / name).parent.mkdir(parents=True, exist_ok=True)
             (tree / name).write_text(text)

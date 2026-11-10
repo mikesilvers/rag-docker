@@ -24524,9 +24524,13 @@ tree with excluded files planted and reads them back, runs `package-offline.sh` 
 loaded or started), and checks the bundled image list against
 `docker compose config --images`. The copy is a real git repository with the tracked files
 committed (git ignoring the user's and the system's configuration), because both scripts
-archive `HEAD` with `git archive` (#384); the excluded files are planted untracked, as in a
-real checkout, so the tests show `git archive` leaves them out, a top-level `.env.<suffix>`
-such as `.env.local` included (SPECIFICATIONS.md section 11.2 excludes `.env*`). Its
+archive `HEAD` with `git archive` (#384). The commit runs with git's automatic maintenance
+off, and the test checks, from git's trace, that it started no `git maintenance` or `git gc`:
+a detached repack still writing into `.git` while the temporary directory was removed failed
+the cleanup with `Directory not empty` (#696). The excluded files are planted untracked, as
+in a real checkout, so the tests show `git archive` leaves them out, a top-level
+`.env.<suffix>` such as `.env.local` included (SPECIFICATIONS.md section 11.2 excludes
+`.env*`). Its
 `install-offline.sh` wait test records that the wait counts running services, not healthy ones.
 
 The live checks: unknown job ids, `on_conflict` 422s, `GET /packages` with a junk
