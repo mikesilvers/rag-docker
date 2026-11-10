@@ -2519,11 +2519,15 @@ as it is: the upload, ZIP, `.json` size, JSON Lines line and record count limits
   The estimates above only size the parts of a file that is split.
 - A file split into parts may store at most ten times its own size in chunk text (all its
   parts' chunks, repeated CSV headers and overlap included). Its own size is its bytes as
-  uploaded, a gzipped file's decompressed bytes, or a `.pdf`'s or `.docx`'s extracted text.
-  The running total is checked before each part is stored; going over fails the whole file
-  through the all-or-nothing rollback, with `<file>: it would store N characters of chunks,
-  more than 10 times its own size (M characters); use less chunk_overlap, shorten repeated
-  headers or keys, or split the file` and no part number. A re-chunk that goes over fails
+  uploaded, a gzipped file's decompressed bytes, counted only up to its reader's bound
+  (30,000,000 bytes for a `.json.gz`, 512 MB for a `.jsonl.gz`; #631), or a `.pdf`'s or
+  `.docx`'s extracted text. The running total is checked before each part is stored; going
+  over fails the whole file through the all-or-nothing rollback, with `<file>: it would store
+  N characters of chunks, more than 10 times its own size (M characters); use less
+  chunk_overlap, shorten repeated headers or keys, or split the file` and no part number.
+  Since the count stops at that bound, a `.jsonl.gz` that decompresses past 512 MB may fail
+  with this error before its reader's 512 MB error; either way the whole file fails and
+  nothing is stored. A re-chunk that goes over fails
   whole, with the collection unchanged. A file stored whole is never refused by it
   (maintainer's decision, PR #630 security review).
 - A CSV's header row is repeated at the start of every part, so parts are sized with it: the
@@ -3564,7 +3568,18 @@ now lives once, in `api/services/ingest_config.py`.
       part 1 stores nothing; and
       `overlap_chunks.py` stores a 20,000-character file at 1,000/999 as two parts that
       restore it exactly. `browser/ui_criteria.js` (suite 06) checks the progress panel's
-      "1 file split into parts:" list and that an empty one shows nothing.*
+      "1 file split into parts:" list and that an empty one shows nothing. #631 changed
+      four of these rules, each tested in `test_split_parts.py`: a `.csv` over 10,000,000
+      bytes is measured by its rows as written, header included
+      (`test_a_sparse_csv_over_the_text_limit_as_written_is_split` and
+      `..._is_never_parsed_whole`, `test_a_csv_over_the_limit_in_bytes_but_not_as_written_is_stored_whole`,
+      `ReviewerCsvHeaderMeasureTests`); a gzipped file's own size is counted only up to its
+      reader's bound (`GzipOwnSizeBoundTests`); a `.txt` or `.md` line longer than a part is
+      cut after whitespace, and no unit or part is ever empty (`LongLineCutTests`,
+      `ReviewerLongLineTests`, `LongLinePartCountTests`); and part 1 failing before anything
+      is stored ends `; nothing from it was stored`, never twice (the two suffix tests in
+      `AllOrNothingTests`). #630's reviewer's JSON Lines whole-measure test is added too
+      (`ReviewerJsonWholeMeasureTests`).*
 - [x] ZIP batch upload extracts and processes all supported files; unsupported files are skipped with a warning.
       *A ZIP of 8 files yielded 6 processed, 2 skipped — but silently, with
       nothing naming what was dropped. **Fixed**: the job now carries a `skipped`

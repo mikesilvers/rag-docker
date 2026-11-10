@@ -17,6 +17,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1251,6 +1252,83 @@ class LongLineCutTests(unittest.TestCase):
     def test_a_piece_continuing_a_line_is_not_a_fence(self):
         text = "a" * 18 + " ```b\n\nccc\n"
         self.assertEqual(self.units(text, 20, markdown=True), ["a" * 18 + " ", "```b", "ccc"])
+
+    def test_an_unclosed_fence_ending_in_blank_lines_gives_no_empty_unit(self):
+        # PR #692 review (090230f): no unit is ever empty or only whitespace (#631).
+        self.assertEqual(self.units("```\n" + "a" * 19 + "\n\n", 20, markdown=True),
+                         ["```", "a" * 19])
+
+
+class ReviewerLongLineTests(JobCase):
+    """PR #692 testing review (090230f): a line of exactly a part's limit, cut at
+    the limit, leaves its line end to be read alone. It must not become a unit of
+    its own, or an empty part (#631)."""
+
+    @staticmethod
+    def units(text, limit, markdown=False, newline="\n"):
+        from services import splitter
+        return [u.text for u in splitter._text_units(io.StringIO(text, newline=newline),
+                                                     markdown, limit)]
+
+    def test_a_line_of_exactly_the_limit_before_a_blank_line_gives_no_empty_unit(self):
+        units = self.units("x" * 20 + "\n\n" + "y" * 20 + "\n", 20)
+        self.assertTrue(all(u.strip() for u in units), units)
+        self.assertEqual("".join(units), "x" * 20 + "y" * 20)
+
+    def test_no_part_is_empty_when_lines_fill_a_part_exactly(self):
+        # fixed/100: a part holds 1,000,000 characters. Eleven lines of exactly that,
+        # each followed by a blank line, are eleven parts of 10,000 chunks each.
+        from services import splitter
+        path = Path(tempfile.mkdtemp()) / "long.txt"
+        path.write_text(("x" * 1_000_000 + "\n\n") * 11)
+        parts = [chunks for _, chunks in splitter.split_file(
+            path, splitter.Settings("fixed", 100, 0, 0.85, 0))]
+        self.assertEqual([len(c) for c in parts], [10_000] * 11)
+
+    def test_a_piece_ending_in_a_carriage_return_is_a_whole_line(self):
+        # Preparation reads with newline="" (#638): "\r" alone ends a line, so the
+        # next "\r" is a blank line between two paragraphs.
+        self.assertEqual(len(self.units("aaaa\r\rbbbb\r", 100, newline="")), 2)
+
+
+class ReviewerCsvHeaderMeasureTests(JobCase):
+    """PR #692 testing review (090230f): a large CSV's measure counts its header
+    row as written as well as its rows (#631)."""
+
+    def test_the_header_row_tips_a_csv_over_the_text_limit(self):
+        from services import splitter
+
+        def parse(_):
+            raise AssertionError("parsed whole")
+
+        header = ",".join(f"h{i:04d}" for i in range(400)) + "\n"  # 2,400 characters
+        row = "r" * 999 + "\n"
+        rows = (TEXT - 1_000) // len(row)
+        data = header + row * rows
+        self.assertLessEqual(rows * len(row), TEXT)
+        self.assertGreater(len(data), TEXT)
+        path = Path(tempfile.mkdtemp()) / "head.csv"
+        path.write_text(data)
+        kinds = {kind for kind, _ in splitter.split_file(
+            path, splitter.Settings("fixed", 1000, 0, 0.85, 0), parse=parse)}
+        self.assertEqual(kinds, {"part"})
+
+
+class LongLinePartCountTests(JobCase):
+    """PR #692 testing review (090230f): lines of exactly a part's room, each
+    followed by a blank line, are one part each, and the job counts only the parts
+    it stored (#631). On 090230f this gave 6 parts, every other one of 0 chunks."""
+
+    def test_lines_of_exactly_a_part_are_one_part_each(self):
+        # fixed/100: a part holds 1,000,000 characters.
+        job, backend = self.run_job([("long.txt", ("x" * 1_000_000 + "\n\n") * 3)], "fixed", 100)
+        self.assertEqual(job["status"], "completed", job)
+        self.assertEqual(job["errors"], [])
+        self.assertEqual(job["split"], ["long.txt: split into 3 parts, stored as "
+                                        "'long.txt (part 1)' to 'long.txt (part 3)'"])
+        self.assertEqual(self.assert_parts(backend, "long.txt"), 3)
+        for n in (1, 2, 3):
+            self.assertEqual(len(backend.of(f"long.txt (part {n})")), 10_000, n)
 
 
 if __name__ == "__main__":

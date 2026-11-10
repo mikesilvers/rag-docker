@@ -4731,13 +4731,22 @@ def cut_unit(unit: Unit, limit: int, dialect: Any = None) -> list[Unit]:
 _CUT_AT = (" ", "\t", "\r")
 
 
+def _paragraph(lines: list[str]) -> Iterator[Unit]:
+    """The paragraph read so far as a unit, unless it holds no text: no unit is
+    ever empty or only whitespace (#631)."""
+    text = "".join(lines).rstrip("\n")
+    if text.strip():
+        yield Unit(text)
+
+
 def _text_units(stream: Iterable[str] | Any, markdown: bool, limit: int) -> Iterator[Unit]:
     """Paragraphs, the text between blank lines; for Markdown, a blank line inside
     a fenced code block doesn't end one. A paragraph is given out in pieces when
     it passes `limit`, cut at a line break, so one is never held whole. A line
     longer than `limit` is read in pieces cut after their last whitespace, as
     _cut_text cuts, and hard at `limit` only when a piece has none (#631); a piece
-    that continues a line is never taken as a blank line or a fence."""
+    that continues a line is never taken as a blank line or a fence. A continuation
+    piece of only whitespace is dropped, and no unit is empty or only whitespace."""
     lines: list[str] = []
     size = 0
     fence = False
@@ -4760,16 +4769,22 @@ def _text_units(stream: Iterable[str] | Any, markdown: bool, limit: int) -> Iter
                 fence = not fence
             if not line.strip() and not fence:
                 if lines:
-                    yield Unit("".join(lines).rstrip("\n"))
+                    yield from _paragraph(lines)
                     lines, size = [], 0
                 continue
+        elif not line.strip():
+            # Only whitespace continuing a line, in practice its line end read on its
+            # own after a line of exactly `limit` characters: not part of the paragraph,
+            # and not a blank line either (#631). `fresh` already says whether it
+            # ended the line.
+            continue
         if lines and size + len(line) > limit:
-            yield Unit("".join(lines).rstrip("\n"))
+            yield from _paragraph(lines)
             lines, size = [], 0
         lines.append(line)
         size += len(line)
     if lines:
-        yield Unit("".join(lines).rstrip("\n"))
+        yield from _paragraph(lines)
 
 
 def _csv_dialect(stream: Any) -> Any:
