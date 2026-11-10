@@ -207,6 +207,9 @@ targets stays one document under its own name:
 | Chunks, counted as in section 4 | at most 8,000 chunks (80 % of the limit) | 10,000 chunks |
 | `overlap` only: text across the chunks, counted as in section 4 | at most 8,000,000 characters (80 % of the limit) | 10,000,000 characters |
 | Records or lines | under the limit | 1,000,000 records |
+| A `.json` file, or a `.json.gz` once decompressed | under the limit; over it, the file fails and is not split | 30,000,000 bytes |
+| One JSON Lines line | under the limit; over it, the file fails and is not split | 10,000,000 bytes |
+| A `.jsonl.gz` once decompressed | under the limit; over it, the file fails and is not split | 512 MB |
 
 The app's parts are cut where the limits fall. Split a file yourself when you want to choose
 where it is cut, or what the parts are called:
@@ -224,7 +227,9 @@ where it is cut, or what the parts are called:
    depends on them.
 2. Trim the fields you don't need (section 3).
 3. Decide whether a file over the targets (section 5) may be split by the app, or split it
-   yourself.
+   yourself. A file over a byte limit fails instead of being split: a `.json` over
+   30,000,000 bytes, a JSON Lines line over 10,000,000 bytes, or a `.jsonl.gz` over 512 MB
+   once decompressed.
 4. Give every file a distinct name.
 5. Keep each upload under 512 MB, and its ZIPs under 2 GiB once expanded and 5,000 entries
    each.
