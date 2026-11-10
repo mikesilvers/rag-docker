@@ -104,6 +104,10 @@ services:
       # local cache so offline installs and air-gapped hosts load instantly.
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
+      # Stops unstructured's usage telemetry, which otherwise sends a request
+      # when it is imported and on every partition call, so ingest never
+      # dials out (issue #695). Also set as ENV in api/Dockerfile.
+      DO_NOT_TRACK: "1"
       # Shown by /health and compared against the memory Docker actually
       # provides. Raise this if you allocate more to Docker Desktop.
       RECOMMENDED_MEMORY_GB: 12

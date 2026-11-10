@@ -935,6 +935,7 @@ All API settings are environment variables in `docker-compose.yml`:
 | `MAX_PREPARATION_BYTES` | `21474836480` (20 GiB) | The most the preparation area may hold, raw and prepared documents together; at least 1048576. Checked before each upload and each prepared part is written; uploads and preparation running at the same time may pass it briefly. Over it, `PREPARATION_STORAGE_FULL` |
 | `HF_HUB_OFFLINE` | `1` | Keeps the image's pre-cached sentence-transformers model from contacting huggingface.co; set to `0` only if you change the model and want it downloaded at runtime |
 | `TRANSFORMERS_OFFLINE` | `1` | Same offline enforcement for the transformers library; keep `1` to use the pre-cached model with no runtime network call |
+| `DO_NOT_TRACK` | `1` | Stops the Unstructured library's usage telemetry, which otherwise sends a request when it loads and on every document it parses; keep `1` so ingest makes no call to the internet (#695) |
 
 LAN mode reads two more settings from your shell or a `.env` file next to `docker-compose.yml`, used by `docker-compose.lan.yml`:
 

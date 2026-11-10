@@ -147,6 +147,10 @@ services:
       # local cache so offline installs and air-gapped hosts load instantly.
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
+      # Stops unstructured's usage telemetry, which otherwise sends a request
+      # when it is imported and on every partition call, so ingest never
+      # dials out (issue #695). Also set as ENV in api/Dockerfile.
+      DO_NOT_TRACK: "1"
       # Shown by /health and compared against the memory Docker actually
       # provides. Raise this if you allocate more to Docker Desktop.
       RECOMMENDED_MEMORY_GB: 12
@@ -690,6 +694,27 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Pre-cache sentence-transformers model at build time
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
 
+# Install the spaCy model unstructured's text partitioning loads (#695). Without
+# it, unstructured downloads the wheel from GitHub on the first .txt or .md
+# ingest, which needs DNS and internet access from inside the container and
+# fails on an offline install. The version and SHA-256 are the ones the locked
+# unstructured pins (unstructured/nlp/tokenize.py); pip refuses a download whose
+# hash differs. Like torch, the model is not in requirements.txt. When a re-lock
+# moves unstructured, update both here: the check below fails the build if the
+# model is not the version unstructured expects, or does not load.
+RUN pip install --no-cache-dir --no-deps \
+    "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl#sha256=1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85" \
+ && DO_NOT_TRACK=1 python -c "import sys, importlib.metadata as m, spacy, unstructured.nlp.tokenize as t; have = m.version('en_core_web_sm'); sys.exit(f'en_core_web_sm {have} installed, unstructured expects {t._SPACY_MODEL_VERSION}') if have != t._SPACY_MODEL_VERSION else spacy.load('en_core_web_sm')"
+
+# Default to the pre-cached model at runtime: the image already carries it, so
+# the Hugging Face libraries must never dial out on first load. Build-time
+# pre-caching above stays unaffected (ENV applies at runtime, not during the RUN).
+# DO_NOT_TRACK stops unstructured's usage telemetry, which otherwise sends a
+# request when it is imported and on every partition call (#695).
+ENV HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    DO_NOT_TRACK=1
+
 COPY . .
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
@@ -904,7 +929,8 @@ zstandard==0.25.0
 #      api/requirements.txt, keeping it LC_ALL=C sorted.
 #   3. docker compose build api   # confirm the lock installs cleanly
 #   4. docker run --rm rag-docker-api pip freeze \
-#        | grep -viE '^(torch|torchvision)==' | LC_ALL=C sort > /tmp/pins.txt
+#        | grep -viE '^(torch|torchvision)==|^en[-_]core[-_]web[-_]sm( @|==)' \
+#        | LC_ALL=C sort > /tmp/pins.txt
 #      diff that against requirements.txt to confirm nothing else moved.
 #   5. commit BOTH files together
 #
@@ -922,6 +948,11 @@ zstandard==0.25.0
 # torch and torchvision are not listed here. They arrive transitively via
 # sentence-transformers and unstructured, and api/Dockerfile installs them from
 # the PyTorch CPU index first to avoid ~4.1 GB of unusable NVIDIA CUDA packages.
+#
+# The spaCy model en_core_web_sm is not listed here or in the lock either.
+# api/Dockerfile installs it from its pinned URL and SHA-256, the version the
+# locked unstructured expects, so text ingest never downloads it (#695). The
+# freeze in step 4 leaves it out; bump it in api/Dockerfile with unstructured.
 # ---------------------------------------------------------------------------
 
 fastapi>=0.111                    # resolved: 0.141.1
@@ -25034,6 +25065,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
 | `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
+| `../tests/test_offline_ingest.py` | API image, no network: real ingest jobs of every supported type (`.txt`, `.md`, and `.pdf`, `.docx`, `.csv`, `.json` from `fixtures.py`; backends faked) complete with every name lookup and non-Unix connect refused and recorded from before the API is imported, so nothing may dial out; `DO_NOT_TRACK` is set and the bundled spaCy model `en_core_web_sm` is the version `unstructured` expects (#695); registered by `20_offline_model.sh` |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
