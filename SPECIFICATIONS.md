@@ -2004,7 +2004,7 @@ Regenerate the lock from the repo root using the procedure at the top of
 `api/requirements.in`: resolve the edited inputs against the current API image
 with `pip install --dry-run --report`, incorporate the resolved pins into the
 sorted lock, rebuild, and compare the resulting image's `pip freeze` (excluding
-torch/torchvision) to the lock. Editing the input and rebuilding alone does not
+torch, torchvision and `en_core_web_sm`) to the lock. Editing the input and rebuilding alone does not
 resolve new dependencies, because the Dockerfile installs only the lock.
 
 `LC_ALL=C` keeps ordering stable so a re-lock produces a clean diff.
@@ -2019,6 +2019,23 @@ build first satisfies the requirement so the lock install leaves it alone, takin
 the image from 7.6 GB to 2.8 GB. The two pins are therefore **excluded from the
 lock**: their `+cpu` local versions are not published on PyPI, so listing them
 would break the build.
+
+**The spaCy model is installed separately too (#695).** Unstructured's text
+partitioning (`.txt`, and `.md` through its HTML parser) loads the spaCy model
+`en_core_web_sm`; when it is missing, Unstructured downloads it from GitHub on
+first use, which needs DNS and internet access from inside the container and
+fails on an offline install. `api/Dockerfile` therefore installs it at build
+time, after the lock, from its release URL pinned to version 3.8.0 and SHA-256
+`1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85`, the wheel the
+locked `unstructured` 0.27.5 expects; pip refuses a download with another hash.
+The same step fails the build when the installed version differs from the one
+`unstructured` expects (`unstructured.nlp.tokenize._SPACY_MODEL_VERSION`) or the
+model doesn't load, so a re-lock that moves `unstructured` must move the model
+with it. It is not in the lock, and the offline bundle carries it inside the api
+image. The api service also sets `DO_NOT_TRACK=1` (in `docker-compose.yml` and as
+`ENV` in `api/Dockerfile`), which stops Unstructured's usage telemetry: without
+it, Unstructured sends a request when it is imported and on every partition
+call.
 
 **Build contexts must carry a `.dockerignore`.** Both `api/` and `ui/` have one.
 For `ui/` this is load-bearing rather than tidiness: the Dockerfile runs
@@ -3492,6 +3509,8 @@ now lives once, in `api/services/ingest_config.py`.
 
 - [x] A first `semantic` ingest makes no huggingface.co request: the api container sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`, and the pre-cached `all-MiniLM-L6-v2` model loads from the image cache with the endpoint unroutable (#618).
       *`scripts/verify/20_offline_model.sh` checks the offline flags are set and honoured (`huggingface_hub.constants.HF_HUB_OFFLINE`), then loads the model with `HF_ENDPOINT` pointed at an unroutable address and requires it within 60 s; it fails on `develop` ("offline flags: None None False") and passes with the offline flags (model loaded in 0.1 s in the review run).*
+- [x] A text ingest makes no network call: the api image carries the spaCy model `en_core_web_sm` 3.8.0 that Unstructured's text partitioning loads, so it is never downloaded at runtime, and `DO_NOT_TRACK=1` stops Unstructured's telemetry. A `.txt` and a `.md` ingest succeed in a container with no network (#695).
+      *`scripts/tests/test_offline_ingest.py`, run by `scripts/verify/20_offline_model.sh` in a fresh container from the api image with `--network none`, runs real ingest jobs (Weaviate, source retention and gold-standard marking faked) of the twelve-paragraph text suite 01 ingests (fixed 150, minimum 40) and of a Markdown file, refusing and recording every name lookup and non-Unix connect from before the API is imported. Both jobs complete, the text with more than five chunks, and nothing is recorded; it also checks `DO_NOT_TRACK` and that the installed model is the version `unstructured` expects. On the image before #695 both jobs fail with "Failed to download spaCy model ... network call blocked by test_offline_ingest: getaddrinfo 'github.com'"; with `DO_NOT_TRACK` emptied, the lookups of `packages.unstructured.io` are recorded and fail it.*
 - [x] Single file upload (all six types) completes without error and stores chunks in Weaviate.
       *One file of each type. `.md` failed — `unstructured[pdf,docx,csv]` omitted
       the `md` extra, so Markdown ingestion had never worked. **Fixed**: added the

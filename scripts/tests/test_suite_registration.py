@@ -1,9 +1,10 @@
 """Host-only check that the verify suites run the test files #386 registered.
 
 Each file below used to exist with no suite running it, or (test_corpus_rules.py
-and test_corpus_rules_estimates.py, #615) is run the same way. This reads the suite
-scripts and checks that a command line runs the file and that its exit status
-goes straight to `check`. Standard library only; no Docker or stack needed.
+and test_corpus_rules_estimates.py, #615; test_offline_ingest.py, #695) is run
+the same way. This reads the suite scripts and checks that a command line runs
+the file and that its exit status goes straight to `check`. Standard library
+only; no Docker or stack needed.
 
 Run: python3 scripts/tests/test_suite_registration.py
 """
@@ -26,6 +27,7 @@ REGISTERED = (
     ('scripts/tests/test_retrieval_controls.py', '11_retrieval.sh', True),
     ('scripts/tests/test_export_encryption.py', '05_transfer.sh', True),
     ('scripts/tests/test_prepare.py', '21_prepare.sh', True),
+    ('scripts/tests/test_offline_ingest.py', '20_offline_model.sh', True),
 )
 
 
