@@ -247,7 +247,7 @@ def records(snapshot, signal):
 def inspect(snapshot, requests):
     try:
         return inspect_records(snapshot, requests)
-    except (TypeError, AttributeError, KeyError) as exc:
+    except (TypeError, AttributeError, KeyError):
         raise AssertionError('invalid capture evidence shape') from None
 
 
@@ -424,7 +424,7 @@ def main():
         runtime = json.loads(subprocess.check_output(['docker', 'inspect', cid]))[0]
         assert not runtime['HostConfig']['PortBindings']
         assert runtime['Config']['Labels']['com.docker.compose.project'] == 'rag-verify'
-    actual = compose('exec', '-T', 'api', 'python', '-c',
+    compose('exec', '-T', 'api', 'python', '-c',
         'import os; assert os.environ["RAG_OTEL_ENABLED"] == "true"; assert os.environ["RAG_OTEL_ENDPOINT"] == "http://otel-collector:4318"')
     collections = ['VfyOtel'+uuid.uuid4().hex[:12] for _ in range(2)]
     report = {'workload': '5 warm-up +20 timed health requests,1 real query,2 concurrent export jobs per mode',

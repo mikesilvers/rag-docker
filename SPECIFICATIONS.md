@@ -3709,9 +3709,11 @@ now lives once, in `api/services/ingest_config.py`.
       the first blob is gone). With a real gold-standard session planted, it checks that a
       new name leaves the session current and a replacing re-ingest marks it stale, naming
       the file. It also stores `a/report.pdf`, `Report.PDF` and `report.pdf` and uploads
-      `report.pdf` again: the other two keep all their chunks, and `exact_source.py` checks
-      exact selection on both paths, under and over 10,000 word matches, in real Weaviate
-      (#622). `browser/ui_criteria.js` (suite 06) checks the Import page's "Replaced N
+      `report.pdf` again: the first upload leaves a session planted for them current, the
+      other two keep all their chunks, and `exact_source.py` checks exact selection on both
+      paths, under and over 10,000 word matches, and the batched deletion of over 10,000
+      earlier chunks, in real Weaviate (#622). `browser/ui_criteria.js` (suite 06) checks the
+      Import page's "Replaced N
       chunks from a previous version" line, hidden at 0, and the plain "N files skipped:"
       heading. `test_reingest.py` also checks that a failed lookup of the later files is
       reported as the lookup, not as the marking (#311).*
@@ -4293,7 +4295,7 @@ so a model left in it (phi3.5, after an upgrade to 1.2.1) goes in too.
 
 The image list MUST match the images `docker compose config` resolves. It is
 `rag-docker-api:latest`, `rag-docker-ui:latest`,
-`semitechnologies/weaviate:1.40.2`, `ollama/ollama:0.3.14`, `nginx:1.27-alpine`.
+`semitechnologies/weaviate:1.40.2`, `ollama/ollama:0.3.14`, `nginx:1.29-alpine`.
 A stale entry here silently ships a superseded server.
 
 ### 11.4 Offline install procedure

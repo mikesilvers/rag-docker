@@ -728,9 +728,11 @@ stale, naming the file. Two concurrent uploads of one name must leave exactly on
 version, whole: its chunk set, its digest, and `chunks_replaced` equal to the other job's
 chunks. Replacing a name touches only that name (#622): with `a/report.pdf` (in a ZIP) and
 `Report.PDF` stored, uploading `report.pdf` replaces nothing and uploading it again replaces
-only its first set, and the other two keep exactly their chunks. `exact_source.py` then checks
-the same selection in real Weaviate on a scratch collection without a vectorizer, on both
-paths: a few word matches read in one query, and over 10,000 walked.
+only its first set, and the other two keep exactly their chunks; the first upload leaves a
+planted gold-standard session current. `exact_source.py` then checks the same selection in
+real Weaviate on a scratch collection without a vectorizer, on both paths: a few word matches
+read in one query, and over 10,000 walked; and over 10,000 earlier chunks of the name are
+all deleted, in batches.
 `browser/ui_criteria.js` (suite 06) stubs the job response and checks that the Import
 page shows "Replaced N chunk(s) from a previous version" only when `chunks_replaced` is above
 0, and the plain "N file(s) skipped:" heading with each entry's own reason.
@@ -896,7 +898,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_reingest.py` | controlled re-ingest replacement, exact-name selection (#622), same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
 | `../tests/test_split_parts.py` | controlled regressions for files over the per-file limits stored as parts (#621): the reviewer's 13,000 records, files over 10,000,000 characters, family replacement, all or nothing, cuts, CSV, Markdown, encoding, `overlap` sizing, re-chunk and export links, registered by ingest |
 | `split_parts.py` | helper for ingest (#621), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, files over the per-file limits are stored as parts, a smaller re-upload replaces every part, and a bad line after part 1 stores nothing; the collection is removed afterwards |
-| `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`) and over 10,000 (`walk`); the collection is removed afterwards |
+| `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`), over 10,000 (`walk`), and over 10,000 earlier chunks of the name itself, deleted in batches of 10,000 (`bulk`); the collection is removed afterwards |
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, registered by transfer |
@@ -915,7 +917,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
-| `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530), registered by infrastructure |
+| `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
+| `../tests/test_upgrade_backup.py` | host-only: the README's 1.1.0 → 1.2.0 upgrade blocks, run as written under bash, `zsh -c` and interactive zsh with comments off, against stub `docker`, `git` and `curl`; the stub docker accepts only mounts inside its temp directory and only the README's two container commands: no block holds a `#` comment line; the backup skips a missing volume (a wrong prefix) and counts only existing volumes' archives, and writes each copy to a `.tmp` file that replaces the archive only once `gzip -t` passes, so a failed or corrupt copy prints `backup FAILED` and keeps an earlier archive; the rollback is gated on `git checkout v1.1.0` and checks every archive (`gzip -t`, `tar tzf`) and volume before it empties any, and a failed restore stops before `compose up`; alpine is pinned by version and digest; git ignores `backups/` (#679, #693), registered by infrastructure |
 | `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
 | `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |

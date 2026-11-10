@@ -19,6 +19,8 @@ exports/*
 # Read-only drop directory for file ingestion.
 ingest-inbox/*
 !ingest-inbox/.gitkeep
+# Volume backups made by the README's "Upgrading from 1.1.0 to 1.2.0" (#679).
+backups/
 
 # ── Secrets ──────────────────────────────────────────────────────────────────
 # Your own certificate and key for LAN mode (#26); the folder itself is kept so

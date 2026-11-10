@@ -257,7 +257,7 @@ class ReindexTests(unittest.TestCase):
                 # Existing controlled rebuild fixture executes the real rebuild;
                 # rechunk uses inert parsed properties without changing traversal.
                 with patch.object(tuning.sources,'has_sources',return_value=True),patch.object(tuning,'_chunks_from_sources',return_value=[r['properties'] for r in self.original]),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=lambda name,props:self.backend.data.__setitem__(name,__import__('copy').deepcopy(self.original))):
-                    job=self.run_job(operation)
+                    self.run_job(operation)
                 begin.assert_called_once();self.assertEqual(begin.call_args.args[:2],('OwnedReindex','tune'))
                 self.assertEqual(set(self.backend.data),{'OwnedReindex'})
     def test_reembed_retains_its_explicit_regeneration_path(self):

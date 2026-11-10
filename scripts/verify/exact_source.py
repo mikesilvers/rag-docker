@@ -2,14 +2,16 @@
 
 Runs in the verify project's API container, against its Weaviate:
 
-    docker compose exec -T api python - <prefix> page|walk < scripts/verify/exact_source.py
+    docker compose exec -T api python - <prefix> page|walk|bulk < scripts/verify/exact_source.py
 
 `source_file` is word-tokenized, so Weaviate's equal("report.pdf") also matches
 `a/report.pdf`, `Report.PDF` and `report.pdf (part 1)`. The scratch collection
 uses the real chunk properties without a vectorizer, so no embedding is needed:
 - page: a few names share report.pdf's words, under 10,000 matches, so the
   matches are read in one query and filtered exactly;
-- walk: over 10,000 objects share them, so the whole collection is walked.
+- walk: over 10,000 objects share them, so the whole collection is walked;
+- bulk: the name itself has over 10,000 earlier chunks, so they are deleted by
+  UUID in more than one batch.
 The collection is removed afterwards. Exits 0 only if every expectation holds.
 """
 import sys
@@ -86,6 +88,15 @@ try:
         expect(not wc._source_has_chunks_sync(NAME, "Report.PDF"), "Report.PDF has chunks, unstored")
         deleted = wc._delete_earlier_chunks_sync(NAME, "report.pdf", created, 2)
         expect(deleted == 2, f"deleted {deleted} earlier chunks, not 2")
+    elif mode == "bulk":
+        # More earlier chunks of the exact name than one delete removes: the
+        # by-UUID deletes run in two batches, 10,000 and 3 (#622).
+        others = {name: add(coll, name, EARLIER, n) for name, n in (
+            ("a/report.pdf", 3), ("Report.PDF", 2))}
+        add(coll, "report.pdf", EARLIER - timedelta(days=1), 10_003)
+        new = add(coll, "report.pdf", created, 2)
+        deleted = wc._delete_earlier_chunks_sync(NAME, "report.pdf", created, 2)
+        expect(deleted == 10_003, f"deleted {deleted} earlier chunks, not 10003")
     else:
         raise SystemExit(f"unknown mode {mode!r}")
     after = by_name(coll)

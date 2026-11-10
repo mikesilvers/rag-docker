@@ -23,7 +23,6 @@ import shutil
 import tempfile
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 from config import settings

@@ -27,7 +27,6 @@ decides where parts go and whether there is room (a best-effort cap).
 from __future__ import annotations
 
 import asyncio
-import codecs
 import csv
 import gzip
 import json
