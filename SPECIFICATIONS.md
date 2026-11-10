@@ -1761,8 +1761,10 @@ files' names as the client sent them, in upload order.
 "owner unknown" (`owner: null`).
 
 **Which jobs.** Every running job (an ingest, export or import whose status isn't terminal; a session
-whose status is `generating`) is listed. A finished job is listed when its finish time lies in the 24
-hours before the request; of those, only the 20 with the newest finish time, per list and caller.
+whose status is `generating`) is listed. A finished job is listed when its finish time is no more than
+24 hours before the request; a finish time later than the request (after the API's clock steps back)
+is listed too, so a just-finished job doesn't vanish (#629). Of those, only the 20 with the newest
+finish time, per list and caller.
 The finish time is `finished_at`; a finished ingest, export or import record from before #617 uses
 the time its record file was last saved, and a finished session without `finished_at` is not listed.
 `GET /goldstandard/sessions` lists only sessions generated on this install: one with
@@ -3789,6 +3791,13 @@ now lives once, in `api/services/ingest_config.py`.
       (a Developer, a Developer-role key and the Engineer), both run by `02_ingest.sh`; the four
       routes are in `auth_stack.py`'s matrix (`17_auth.sh`).*
 
+- [x] A finished job whose finish time is later than the API's clock (after the clock steps back) is
+      listed by the four job lists, within the 24-hour lower bound (#629, §3.1.10).
+      *`scripts/tests/test_job_lists.py` (API image, run by `02_ingest.sh`):
+      `test_a_finish_time_after_the_clock_is_listed` lists a finish time an hour ahead, with that
+      `finished_at`; `test_finished_at_boundary_of_the_window` lists one exactly 24 hours before the
+      request and drops one a second earlier.*
+
 - [x] A write with any record left to `text2vec-ollama` uses `fixed_size(batch_size=20, concurrent_requests=1)` and one whose records all carry vectors `dynamic()`; only objects whose embedding timed out in Weaviate are sent again, at most twice; no other failure is retried; a chunk sent again counts once in `chunks_submitted` (#613).
       *`scripts/tests/test_embed_batching.py` (13 tests, run by `02_ingest.sh` in the API image) checks
       both batch kinds, the resend, its limit, the write counts and rollback, that no other failure is
@@ -4070,6 +4079,11 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       each owner (`(API key)`, `owner unknown`), a Developer no owner column; browser storage stays
       empty.
       *`scripts/verify/browser/ui_criteria.js` (suite 06), section "running and recent jobs (#617)".*
+
+- [x] Each Transfer panel polls its job on one chain (#629, §7.15): reopening the job a panel is
+      polling, while its lookup is in flight, starts no second chain.
+      *`scripts/verify/browser/ui_criteria.js` (suite 06), section "running and recent jobs (#617)",
+      the checks marked (#629), for the export and the import panel.*
 
 ### 10.5 Infrastructure
 

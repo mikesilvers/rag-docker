@@ -1602,6 +1602,208 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
       } finally { await s.ctx.close(); }
     }
 
+    // Transfer, stubbed: reopening the job a panel is polling, while its poll is
+    // in flight, keeps one poll chain (#629). Each lookup answers after 1 s, so
+    // one chain polls at most 3 times in 7 s (answer, then 2 s wait); a second
+    // chain for the same job would make it at least 4.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        const mine = { name: 'vfy-developer', kind: 'user' };
+        const exportJob = { job_id: 'vfy629e', status: 'running', collection: 'StubExport629', chunks_written: 3,
+          filename: null, size_bytes: null, source_document_count: null, fidelity: null, models_bundled: null,
+          retrieve_script: null, warnings: [], error: null, error_code: null, error_detail: null };
+        const importJob = { job_id: 'vfy629i', status: 'running', filename: 'ragpkg-stub629.tar.gz', on_conflict: 'rename',
+          collection: null, original_collection: null, chunks_written: 2, fidelity: null, renamed: false, notes: [],
+          restored_sessions: [], error: null, error_code: null, error_detail: null };
+        const lookups = { '/api/export/job/vfy629e': [], '/api/import/job/vfy629i': [] };
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (path === '/api/export/jobs') return request.respond(json({ jobs: [
+            { ...exportJob, owner: mine, created_at: at(60), finished_at: null }] }));
+          if (path === '/api/import/jobs') return request.respond(json({ jobs: [
+            { ...importJob, owner: mine, created_at: at(30), finished_at: null }] }));
+          if (path in lookups) {
+            const lookup = { start: Date.now(), answered: false };
+            lookups[path].push(lookup);
+            setTimeout(() => {
+              lookup.answered = true;
+              request.respond(json(path.includes('/export/') ? exportJob : importJob)).catch(() => {});
+            }, 1000);
+            return;
+          }
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' });
+        // Waits for a new lookup of the job, then clicks the job's row while it
+        // is in flight: still unanswered once the click has happened.
+        const reopen = async (path, text) => {
+          const before = lookups[path].length;
+          for (let i = 0; i < 100 && lookups[path].length === before; i++) await sleep(50);
+          const inflight = lookups[path][lookups[path].length - 1];
+          const clickedAt = Date.now();
+          const clicked = await clickRow(s.page, text);
+          return { path, clickedAt, inFlight: !!inflight && lookups[path].length > before && clicked && !inflight.answered };
+        };
+        const exported = await reopen('/api/export/job/vfy629e', 'StubExport629');
+        const imported = await reopen('/api/import/job/vfy629i', 'ragpkg-stub629.tar.gz');
+        await sleep(imported.clickedAt + 7200 - Date.now());
+        for (const [kind, click] of [['export', exported], ['import', imported]]) {
+          const count = lookups[click.path].filter(l => l.start >= click.clickedAt && l.start <= click.clickedAt + 7000).length;
+          r.check(`Transfer: reopening the polled ${kind} while its poll is in flight keeps one poll chain (#629)`,
+            click.inFlight && count <= 3, `inFlight=${click.inFlight} lookups in 7 s=${count}`);
+        }
+      } finally { await s.ctx.close(); }
+    }
+
+    // Transfer, stubbed: a poll that fails retries on the same chain, and
+    // opening another export stops the running export's chain (#629). The
+    // first two lookups of the running export fail; the third answers.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        const mine = { name: 'vfy-developer', kind: 'user' };
+        const job = (id, done, collection) => ({ job_id: id, status: done ? 'completed' : 'running', collection,
+          chunks_written: done ? 9 : 3, filename: done ? `ragpkg-${id}.tar.gz` : null, size_bytes: done ? 2048 : null,
+          source_document_count: done ? 1 : null, fidelity: done ? 'with-sources' : null, models_bundled: done ? false : null,
+          retrieve_script: done ? true : null, warnings: [], error: null, error_code: null, error_detail: null });
+        const lookups = [];
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (path === '/api/export/jobs') return request.respond(json({ jobs: [
+            { ...job('vfy629r', false, 'StubRetry629'), owner: mine, created_at: at(60), finished_at: null },
+            { ...job('vfy629f', true, 'StubDone629'), owner: mine, created_at: at(9000), finished_at: at(8900) }] }));
+          if (path === '/api/import/jobs') return request.respond(json({ jobs: [] }));
+          if (path === '/api/export/job/vfy629r') {
+            lookups.push(Date.now());
+            if (lookups.length <= 2) return request.respond({ status: 500, contentType: 'application/json',
+              body: JSON.stringify({ error: { code: 'STUB_OUTAGE', message: 'stub outage 629' } }) });
+            return request.respond(json(job('vfy629r', false, 'StubRetry629')));
+          }
+          if (path === '/api/export/job/vfy629f') return request.respond(json(job('vfy629f', true, 'StubDone629')));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' }); await sleep(500);
+        const failing = await bodyText(s.page);
+        for (let i = 0; i < 100 && lookups.length < 3; i++) await sleep(100);
+        await sleep(500);
+        const recovered = await bodyText(s.page);
+        r.check('Transfer: a failed export poll shows the retry message and retries on the same chain (#629)',
+          failing.includes("Could not check the export's progress, retrying") && failing.includes('stub outage 629')
+            && lookups.length >= 3 && !recovered.includes("Could not check the export's progress")
+            && recovered.includes('Writing… 3 chunks so far.'),
+          `lookups=${lookups.length} first=${failing.slice(0, 200)}`);
+        const clicked = await clickRow(s.page, 'StubDone629');
+        const clickedAt = Date.now();
+        await sleep(5000);
+        const after = lookups.filter(t => t > clickedAt + 100).length;
+        r.check('Transfer: opening another export stops polling the running one (#629)',
+          clicked && after === 0 && (await bodyText(s.page)).includes('ragpkg-vfy629f.tar.gz'), `clicked=${clicked} lookups after=${after}`);
+      } finally { await s.ctx.close(); }
+    }
+
+    // The same for the import panel (#629): the first two lookups of the
+    // running import fail, the third answers; then an older import is opened.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        const mine = { name: 'vfy-developer', kind: 'user' };
+        const job = (id, done, filename) => ({ job_id: id, status: done ? 'completed' : 'running', filename, on_conflict: 'rename',
+          collection: done ? 'StubDone629i' : null, original_collection: done ? 'StubDone629i' : null, chunks_written: done ? 4 : 2,
+          fidelity: done ? 'with-sources' : null, renamed: false, notes: [], restored_sessions: [], error: null, error_code: null,
+          error_detail: null });
+        const lookups = [];
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (path === '/api/export/jobs') return request.respond(json({ jobs: [] }));
+          if (path === '/api/import/jobs') return request.respond(json({ jobs: [
+            { ...job('vfy629ir', false, 'ragpkg-retry629.tar.gz'), owner: mine, created_at: at(60), finished_at: null },
+            { ...job('vfy629if', true, 'ragpkg-done629.tar.gz'), owner: mine, created_at: at(9000), finished_at: at(8900) }] }));
+          if (path === '/api/import/job/vfy629ir') {
+            lookups.push(Date.now());
+            if (lookups.length <= 2) return request.respond({ status: 500, contentType: 'application/json',
+              body: JSON.stringify({ error: { code: 'STUB_OUTAGE', message: 'stub outage 629' } }) });
+            return request.respond(json(job('vfy629ir', false, 'ragpkg-retry629.tar.gz')));
+          }
+          if (path === '/api/import/job/vfy629if') return request.respond(json(job('vfy629if', true, 'ragpkg-done629.tar.gz')));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' }); await sleep(500);
+        const failing = await bodyText(s.page);
+        for (let i = 0; i < 100 && lookups.length < 3; i++) await sleep(100);
+        await sleep(500);
+        const recovered = await bodyText(s.page);
+        r.check('Transfer: a failed import poll shows the retry message and retries on the same chain (#629)',
+          failing.includes("Could not check the import's progress, retrying") && failing.includes('stub outage 629')
+            && lookups.length >= 3 && !recovered.includes("Could not check the import's progress")
+            && recovered.includes('Importing… 2 chunks so far.'),
+          `lookups=${lookups.length} first=${failing.slice(0, 200)}`);
+        const clicked = await clickRow(s.page, 'ragpkg-done629.tar.gz');
+        const clickedAt = Date.now();
+        await sleep(5000);
+        const after = lookups.filter(t => t > clickedAt + 100).length;
+        r.check('Transfer: opening another import stops polling the running one (#629)',
+          clicked && after === 0 && (await bodyText(s.page)).includes('Imported as StubDone629i'), `clicked=${clicked} lookups after=${after}`);
+      } finally { await s.ctx.close(); }
+    }
+
+    // Transfer, stubbed: leaving the page through the app's own navigation,
+    // while a lookup is in flight, stops both panels' polling (#629). Each
+    // lookup answers after 1 s; an answer that still polled would start a new
+    // lookup within about 3 s of leaving.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        const mine = { name: 'vfy-developer', kind: 'user' };
+        const exportJob = { job_id: 'vfy629le', status: 'running', collection: 'StubLeave629', chunks_written: 3,
+          filename: null, size_bytes: null, source_document_count: null, fidelity: null, models_bundled: null,
+          retrieve_script: null, warnings: [], error: null, error_code: null, error_detail: null };
+        const importJob = { job_id: 'vfy629li', status: 'running', filename: 'ragpkg-leave629.tar.gz', on_conflict: 'rename',
+          collection: null, original_collection: null, chunks_written: 2, fidelity: null, renamed: false, notes: [],
+          restored_sessions: [], error: null, error_code: null, error_detail: null };
+        const lookups = { '/api/export/job/vfy629le': [], '/api/import/job/vfy629li': [] };
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (path === '/api/export/jobs') return request.respond(json({ jobs: [
+            { ...exportJob, owner: mine, created_at: at(60), finished_at: null }] }));
+          if (path === '/api/import/jobs') return request.respond(json({ jobs: [
+            { ...importJob, owner: mine, created_at: at(30), finished_at: null }] }));
+          if (path in lookups) {
+            const lookup = { start: Date.now(), answered: false };
+            lookups[path].push(lookup);
+            setTimeout(() => {
+              lookup.answered = true;
+              request.respond(json(path.includes('/export/') ? exportJob : importJob)).catch(() => {});
+            }, 1000);
+            return;
+          }
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' });
+        const exports = lookups['/api/export/job/vfy629le'];
+        const before = exports.length;
+        for (let i = 0; i < 100 && exports.length === before; i++) await sleep(50);
+        const inflight = exports[exports.length - 1];
+        const clicked = await s.page.evaluate(() => {
+          window.__vfy629Leave = true;
+          const a = document.querySelector('nav a[href="/qa"]');
+          if (!a) return false; a.click(); return true;
+        });
+        const leftAt = Date.now();
+        const inFlight = clicked && exports.length > before && !!inflight && !inflight.answered;
+        await sleep(5000);
+        const after = Object.values(lookups).flat().filter(l => l.start > leftAt + 100).length;
+        const where = await s.page.evaluate(() => ({ path: location.pathname, marker: window.__vfy629Leave === true }));
+        r.check('Transfer: leaving the page stops polling, with a lookup in flight (#629)',
+          inFlight && where.path === '/qa' && where.marker && after === 0,
+          `inFlight=${inFlight} path=${where.path} sameDocument=${where.marker} lookups after=${after}`);
+      } finally { await s.ctx.close(); }
+    }
+
     // An Engineer sees the owner of each job: a user, an API key, or unknown.
     {
       const s = await session(browser, BASE, 'engineer');

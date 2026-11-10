@@ -93,6 +93,17 @@ class RecordTimestampTests(TempUploadCase):
         store["e1"].update(status="failed", error="later")
         self.assertEqual(store["e1"]["finished_at"], first)
 
+    def test_a_replaced_record_keeps_its_timestamps(self):
+        store = self.bound("export")
+        store["r1"] = {"job_id": "r1", "status": "queued"}
+        store["r1"]["status"] = "completed"
+        created, finished = store["r1"]["created_at"], store["r1"]["finished_at"]
+        time.sleep(0.01)
+        store["r1"] = {"job_id": "r1", "status": "failed", "error": "replaced"}
+        self.assertEqual((store["r1"]["created_at"], store["r1"]["finished_at"]), (created, finished))
+        on_disk = json.loads((self.root / "jobs" / "export" / "r1.json").read_text())
+        self.assertEqual((on_disk["created_at"], on_disk["finished_at"]), (created, finished))
+
     def test_interrupted_at_startup_gets_finished_at(self):
         directory = self.root / "jobs" / "import"
         directory.mkdir(parents=True)
@@ -161,6 +172,20 @@ class SelectTests(unittest.TestCase):
             {"job_id": "recent", "status": "failed", "owner": owner(), "finished_at": iso(23 * 3600)},
             {"job_id": "old", "status": "failed", "owner": owner(), "finished_at": iso(25 * 3600)})
         self.assertEqual(self.ids(items, DEV), ["recent"])
+
+    def test_finished_at_boundary_of_the_window(self):
+        inside = {"job_id": "in", "status": "completed", "owner": owner()}
+        outside = {"job_id": "out", "status": "completed", "owner": owner()}
+        listed = job_lists.select([(inside, False, NOW - job_lists.WINDOW_S),
+                                   (outside, False, NOW - job_lists.WINDOW_S - 1)], DEV, NOW)
+        self.assertEqual([r["job_id"] for r in listed], ["in"])
+
+    def test_a_finish_time_after_the_clock_is_listed(self):
+        # The API's clock stepped back: a just-finished job stays listed (#629).
+        listed = job_lists.select([({"job_id": "ahead", "status": "completed", "owner": owner()}, False, NOW + 3600)],
+                                  DEV, NOW)
+        self.assertEqual([r["job_id"] for r in listed], ["ahead"])
+        self.assertAlmostEqual(job_lists._parse(listed[0]["finished_at"]), NOW + 3600, delta=1)
 
     def test_order_newest_first_by_created_at_else_finish(self):
         items = self.items(
