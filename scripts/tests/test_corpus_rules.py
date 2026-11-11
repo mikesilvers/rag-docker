@@ -163,6 +163,24 @@ def prose(markdown):
     return re.sub(r'^```.*?^```[ \t]*$', '', markdown, flags=re.M | re.S)
 
 
+def byte_limits():
+    """(type, phrase) of each byte limit that fails a file rather than split it
+    (#627), in the order checklist step 3 names them. The backticks keep
+    `.json` from matching inside `.json.gz` or `.jsonl.gz`."""
+    return [
+        ('`.json`', f'{ingest_pipeline.MAX_JSON_INPUT_BYTES:,} bytes'),
+        ('JSON Lines line', f'{ingest_pipeline.MAX_JSONL_LINE_BYTES:,} bytes'),
+        ('`.jsonl.gz`', f'{ingest_pipeline.MAX_GZIP_DECOMPRESSED_BYTES // MIB} MB'),
+    ]
+
+
+def section(markdown, number):
+    """Section `## <number>. ` up to the next `## ` heading (not `### `)."""
+    match = re.search(rf'^## {number}\. .*?(?=^## |\Z)', markdown, flags=re.M | re.S)
+    assert match, f'no section {number}'
+    return match.group(0)
+
+
 class CorpusRulesTests(unittest.TestCase):
     def setUp(self):
         self.text = RULES.read_text()
@@ -188,6 +206,34 @@ class CorpusRulesTests(unittest.TestCase):
             with self.subTest(number=found):
                 self.assertIn(int(found.replace(',', '')), accounted,
                               f'{found} in {RULES.name} is not one of the app\'s limits')
+
+    def test_section_5_and_step_3_state_byte_limits(self):
+        # Someone working from section 5 and the checklist alone must see the
+        # byte limits that fail a file even under the text target (#627). Each
+        # limit is matched with its type, so the upload limit's "512 MB" can't
+        # stand in for the .jsonl.gz one.
+        rows = [line for line in section(self.text, 5).splitlines() if line.startswith('|')]
+        checklist = section(self.text, 6)
+        step = re.search(r'^3\. .*?(?=^4\. )', checklist, flags=re.M | re.S)
+        self.assertTrue(step, 'checklist step 3 not found')
+        step = ' '.join(step.group(0).split())
+        limits = byte_limits()
+        start = 0
+        for i, (kind, phrase) in enumerate(limits):
+            with self.subTest(place='section 5 table', type=kind):
+                matching = [row for row in rows if kind in row]
+                self.assertEqual(len(matching), 1, f'section 5 rows naming {kind}: {matching}')
+                self.assertEqual(matching[0].strip().strip('|').split('|')[-1].strip(), phrase)
+            with self.subTest(place='checklist step 3', type=kind):
+                at = step.find(kind, start)
+                self.assertNotEqual(at, -1, f'step 3 does not name {kind} after position {start}')
+                if at == -1:
+                    continue
+                end = step.find(limits[i + 1][0], at) if i + 1 < len(limits) else -1
+                span = step[at:end if end != -1 else len(step)]
+                self.assertTrue(re.search(r'(?<![\d,])' + re.escape(phrase), span),
+                                f'step 3 does not give {kind} its limit "{phrase}": {span!r}')
+                start = at + len(kind)
 
     def test_operator_settings_agree(self):
         compose = compose_zip_settings()
