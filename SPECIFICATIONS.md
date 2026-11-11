@@ -1808,7 +1808,10 @@ Accepted: `.pdf .docx .txt .md .csv .json .jsonl .jsonl.gz` and `.zip` (with `.j
 and validated exactly as `POST /ingest/upload` (§3.1.3: the 512 MB request limit, every ZIP limit and code,
 `NO_SUPPORTED_FILES`, `UPLOAD_WRITE_FAILED`; skipped files listed with ingest's reason). Each supported file or
 ZIP member becomes one document, status `raw`, named by its file name or its path in the archive; the ZIP
-itself isn't kept. Two documents may share a name. A refused upload keeps nothing; anything unexpected is
+itself isn't kept. Two inputs of one upload with the same name (two files, two ZIP members, or a file and a
+member), which ingest would replace, refuse it with `409 DUPLICATE_NAMES`, naming each such name and its inputs
+(`<zip>:<member>` for a member), at most 10 names then `and N more` (`detail.names`: every one); documents from
+separate uploads may share a name (#640). A refused upload keeps nothing; anything unexpected is
 `500 PREPARE_FAILED`.
 
 **Documents.** `GET /prepare/documents`: `{"documents", "used_bytes", "limit_bytes"}`, newest first. `GET
@@ -4283,7 +4286,8 @@ and checks the verify project through `prepare_stack.py` (P1-P11).
       output, cancel and restart; one job at a time; busy documents; the routes' roles and audit actions; and
       the prepared download of several parts as a ZIP (U1-U13); an import whose parts total more than 512 MB
       refused `IMPORT_TOO_LARGE` before the collection check and before anything is staged, for a selection and
-      for all (#640); CSV and JSON parts labelled from their data:
+      for all; two inputs of one upload with one name refused `DUPLICATE_NAMES` with nothing kept, while ingest
+      still keeps the last (#640); CSV and JSON parts labelled from their data:
       titles for one and several parts and the 150-character cut, `1 record.` and a part with no records,
       fields, more than 20 fields, keys of every
       kind and their fallbacks by document position, the 40-character cut, the 80-word limit, and no LLM call

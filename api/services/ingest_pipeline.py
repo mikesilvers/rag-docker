@@ -1152,12 +1152,15 @@ class _Queue:
     can overwrite another's bytes on disk, and the parser still sees the file's
     own extension. When a later input has the same logical name, the earlier one
     is dropped and reported in `skipped`: the last one wins, never silently.
+    `duplicates` records each name given more than once with its inputs in order,
+    for a caller that refuses them instead (document preparation, #640).
     """
 
     def __init__(self, tmp_dir: Path, skipped: list[str]) -> None:
         self.tmp_dir = tmp_dir
         self.skipped = skipped
         self.entries: dict[str, tuple[Path, str]] = {}
+        self.duplicates: dict[str, list[str]] = {}
         self._slots = 0
 
     def slot(self, basename: str) -> Path:
@@ -1169,6 +1172,7 @@ class _Queue:
     def add(self, path: Path, logical: str, label: str) -> None:
         earlier = self.entries.pop(logical, None)
         if earlier is not None:
+            self.duplicates.setdefault(logical, [earlier[1]]).append(label)
             earlier[0].unlink(missing_ok=True)
             self.skipped.append(
                 f"{earlier[1]} (replaced by {label} later in this upload, same name '{logical}')")

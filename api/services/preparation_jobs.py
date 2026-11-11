@@ -4,7 +4,8 @@ SPECIFICATIONS.md §3.1.11.
 
 - **Upload.** Files are staged and validated exactly as ingest stages them
   (`ingest_pipeline.stage_uploads`: ZIP limits, supported types), then each
-  becomes a `raw` document. The space check is best-effort: made once, before
+  becomes a `raw` document. Two inputs with one name refuse the upload, where
+  ingest keeps the last (#640). The space check is best-effort: made once, before
   the files are written to the area, with nothing reserved.
 - **Jobs.** A job (kind `prepare` in the job store) prepares its documents one
   at a time. One job runs at a time on the instance; later ones wait, oldest
@@ -92,6 +93,23 @@ def job_records() -> list[tuple[str, dict, float | None]]:
 
 # ── upload ───────────────────────────────────────────────────────────────────
 
+# How many duplicated names a refused upload's message lists before "and N more".
+_MAX_NAMED_DUPLICATES = 10
+
+
+def _duplicate_upload(duplicates: dict[str, list[str]]) -> DuplicateNames:
+    """Two or more inputs of one upload with the same name (#640): ingest would
+    keep the last and drop the others; preparation keeps none and says which."""
+    names = list(duplicates)
+    listed = "; ".join(f"'{name}' ({', '.join(duplicates[name])})"
+                       for name in names[:_MAX_NAMED_DUPLICATES])
+    if len(names) > _MAX_NAMED_DUPLICATES:
+        listed += f" and {len(names) - _MAX_NAMED_DUPLICATES} more"
+    return DuplicateNames(
+        f"Files in this upload share a name: {listed}. Rename them, or upload them "
+        f"separately; nothing was uploaded.", detail={"names": names})
+
+
 async def upload(files: list[Any], owner: dict | None) -> tuple[list[dict], list[str]]:
     """Stage, validate and store an upload's files as `raw` documents. Nothing
     is kept when any step fails."""
@@ -99,6 +117,8 @@ async def upload(files: list[Any], owner: dict | None) -> tuple[list[dict], list
     created: list[dict] = []
     try:
         queue, skipped = await ingest_pipeline.stage_uploads(files, tmp_dir)
+        if queue.duplicates:
+            raise _duplicate_upload(queue.duplicates)
         if not queue.entries:
             detail = "; ".join(skipped)
             raise NoSupportedFiles("No supported files found in upload."

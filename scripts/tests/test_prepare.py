@@ -909,6 +909,54 @@ class RouteTests(JobCase):
         self.assertEqual(self.client.get("/prepare/documents").json()["documents"], [])
         self.assertEqual(list((self.root / "uploads").glob("prepare-*")), [])
 
+    def test_duplicate_names_in_one_upload_are_refused_and_nothing_is_kept(self):
+        # #640: ingest keeps the last input of a name; a preparation upload is
+        # refused instead, naming the name and every input that has it.
+        many = [(f"n{i}.txt", b"x") for i in range(11)]
+        cases = [
+            ("two files", [("a.txt", b"One.\n"), ("a.txt", b"Two.\n")], "'a.txt' (a.txt, a.txt)"),
+            ("a file and a member", [("a.txt", b"One.\n"), ("b.zip", self.zip_bytes({"a.txt": "Two."}))],
+             "'a.txt' (a.txt, b.zip:a.txt)"),
+            ("three inputs", [("a.txt", b"One.\n"), ("b.zip", self.zip_bytes({"a.txt": "Two."})),
+                              ("c.zip", self.zip_bytes({"a.txt": "Three.", "d/e.md": "Own."}))],
+             "'a.txt' (a.txt, b.zip:a.txt, c.zip:a.txt)"),
+            ("eleven names", many + many, "'n9.txt' (n9.txt, n9.txt) and 1 more"),
+        ]
+        for label, files, listed in cases:
+            with self.subTest(label):
+                answer = self.upload(files)
+                self.assertEqual(answer.status_code, 409, answer.text)
+                error = answer.json()["error"]
+                self.assertEqual(error["code"], "DUPLICATE_NAMES")
+                self.assertTrue(error["message"].startswith("Files in this upload share a name: '"),
+                                error["message"])
+                self.assertTrue(error["message"].endswith(
+                    f"{listed}. Rename them, or upload them separately; nothing was uploaded."),
+                    error["message"])
+                self.assertEqual(self.client.get("/prepare/documents").json()["documents"], [])
+                self.assertEqual(list((self.root / "uploads").glob("prepare-*")), [])
+        self.assertEqual(error["detail"], {"names": [f"n{i}.txt" for i in range(11)]})
+        self.assertNotIn("n10.txt", error["message"])
+        with self.subTest("checked before the space"):
+            with patch.object(settings, "max_preparation_bytes", 1024 * 1024):
+                answer = self.upload([("a.txt", b"x" * (1024 * 1024 + 1))] * 2)
+            self.assertEqual(answer.json()["error"]["code"], "DUPLICATE_NAMES")
+            self.assertEqual(self.client.get("/prepare/documents").json()["documents"], [])
+        with self.subTest("separate uploads may share a name"):
+            for data in (b"One.\n", b"Two.\n"):
+                self.assertEqual(self.upload([("a.txt", data)]).status_code, 201)
+            names = [d["name"] for d in self.client.get("/prepare/documents").json()["documents"]]
+            self.assertEqual(names, ["a.txt", "a.txt"])
+
+    def test_ingest_still_replaces_an_earlier_input_of_the_same_name(self):
+        # #640 changes preparation only: ingest's staging keeps the last input.
+        tmp = Path(tempfile.mkdtemp(dir=self.root))
+        files = [SimpleNamespace(filename="a.txt", file=io.BytesIO(data)) for data in (b"One.\n", b"Two.\n")]
+        queue, skipped = asyncio.run(ingest_pipeline.stage_uploads(files, tmp))
+        [(path, label)] = queue.entries.values()
+        self.assertEqual(path.read_bytes(), b"Two.\n")
+        self.assertEqual(skipped, ["a.txt (replaced by a.txt later in this upload, same name 'a.txt')"])
+
     def test_job_routes_refusals(self):
         self.assertEqual(self.client.post("/prepare/jobs", json={}).status_code, 422)
         self.assertEqual(self.client.post("/prepare/jobs", json={"document_ids": []}).json()["error"]["code"],
