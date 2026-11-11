@@ -1939,6 +1939,7 @@ Standard error codes:
 | `COLLECTION_DELETING` | 409 | A new ingest, export, tune or generation job refused while a delete of its collection is in progress (an import job fails with it) |
 | `EXPORT_STARTING` | 409 | An export of the collection is still storing its first record after 30 s; no `job_id`; retry shortly |
 | `INVALID_FILE_TYPE` | 422 | Uploaded file type not supported |
+| `DUPLICATE_NAMES` | 409 | Document preparation (§3.1.11): two selected documents have parts with one name (import), or two inputs of one upload have one name (upload, #640) |
 | `IMPORT_TOO_LARGE` | 409 | A preparation import (§3.1.11) whose selected parts total more than 512 MB, one upload's limit; nothing is staged; import in smaller selections |
 | `JOB_NOT_FOUND` | 404 | Ingest job ID not found |
 | `SERVICE_UNAVAILABLE` | 503 | Weaviate or Ollama unreachable |
