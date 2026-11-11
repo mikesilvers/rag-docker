@@ -825,7 +825,7 @@ async def prepare_document(raw: Path, name: str, raw_type: str, chat: Chat,
     return await _prepare_text(raw, raw_type, name, llm, should_stop, write_part, progress)
 
 
-def _no_text(name: str) -> ValueError:
+def _no_text() -> ValueError:
     return ValueError("has no text to prepare")
 
 
@@ -858,7 +858,7 @@ async def _prepare_text(raw: Path, raw_type: str, name: str, llm: LLM, should_st
             return iter_parts(raw, raw_type)
     count, total = await asyncio.to_thread(_count_text_windows, source(), should_stop)
     if not count:
-        raise _no_text(name)
+        raise _no_text()
     too_large = total > MAX_WINDOWS
     done = 0
     progress(done, total)
@@ -951,7 +951,7 @@ async def _prepare_records(raw: Path, raw_type: str, name: str, kind: str,
         entries.append(entry)
         index += 1
     if not entries:
-        raise _no_text(name)
+        raise _no_text()
     count = len(entries)
     for number, (entry, part_name) in enumerate(zip(entries, part_names(name, kind, count)), 1):
         entry["name"] = part_name

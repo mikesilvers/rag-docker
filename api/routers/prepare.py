@@ -239,7 +239,7 @@ async def import_documents(body: PrepareImportRequest, request: Request = None):
     collection = body.collection
     audit.note(collection=collection)
     try:
-        selected = await jobs.import_documents(body, None)
+        selected = await jobs.import_documents(body)
     except store.AreaError as exc:
         return _error(exc)
     audit.note(names=selected["names"])

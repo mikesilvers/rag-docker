@@ -825,7 +825,7 @@ class JobTests(JobCase):
             with self.assertRaises(store.DocumentBusy):
                 store.delete(a["id"])
             with self.assertRaises(store.DocumentBusy):
-                await jobs.import_documents(SimpleNamespace(document_ids=[a["id"]]), OWNER)
+                await jobs.import_documents(SimpleNamespace(document_ids=[a["id"]]))
             gate.set()
             await self.finish(first["job_id"])
             await self.finish(second["job_id"])

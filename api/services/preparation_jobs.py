@@ -324,7 +324,7 @@ class _Part:
         self.size = None
 
 
-async def import_documents(body: Any, owner: dict | None) -> dict:
+async def import_documents(body: Any) -> dict:
     """Start one ingest job with every part of the selected prepared documents."""
 
     def select() -> tuple[list[dict], list[str]]:
