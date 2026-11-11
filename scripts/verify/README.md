@@ -81,6 +81,15 @@ and, when the 60-second window closes, one record with `details.count` and `last
 that stay in order across processes and a clock that steps back, the telemetry route list and the Audit page's
 action list (#577).
 
+`20_offline_model.sh` checks that the api runs without the internet (#618, #695). In the
+running api container, `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE` must be `1` and the Hugging
+Face library must report offline mode, and the pre-cached sentence-transformers model
+`all-MiniLM-L6-v2` must load in under 60 seconds with `HF_ENDPOINT` pointed at an unroutable
+address (#618); `DO_NOT_TRACK` must be `1` (#695). It then runs `../tests/test_offline_ingest.py`
+in a fresh container from the api image with no network: real ingest jobs of every supported
+type, and a preparation of a `.txt` and a `.md` with a stub LLM, must succeed while every name
+lookup and non-Unix connect is refused (#695, #640).
+
 `21_prepare.sh` checks document preparation (#638, SPECIFICATIONS.md §3.1.11 and §10.8). It runs
 `../tests/test_prepare.py` in the API image with no network and a stub LLM (windows and the fidelity check,
 the LLM's limits, titles and summaries, the labels of CSV and JSON parts, normalisation, parts and names, JSON to JSON Lines, the storage limit,
@@ -104,7 +113,7 @@ against" below).
 | Command | What it does |
 |---|---|
 | `stack.sh run [--checkout DIR] [--telemetry \| --lan] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
-| `stack.sh up [--checkout DIR] [--pull] [--lan]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. |
+| `stack.sh up [--checkout DIR] [--pull] [--telemetry \| --lan]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT` and `RAG_VERIFY_OTEL_ENABLED`. |
 | `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
 
 `--checkout` is the checkout to build and test; the default is the one holding
@@ -245,7 +254,8 @@ nothing.
 
 `python3 scripts/tests/test_verify_stack.py` checks `stack.sh`, the
 configuration check and both refusals, with Docker replaced by a stub, so it
-needs no stack.
+needs no stack. Two of its tests read `docker-compose.yml` with PyYAML, so they
+need PyYAML on the host; without it they are skipped.
 
 ## Continuous integration
 
@@ -921,6 +931,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
 | `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
+| `20_offline_model.sh` | the Hugging Face libraries run offline in the api container (#618): the pre-cached sentence-transformers model loads with no Hugging Face call; `DO_NOT_TRACK` is `1` in the running api container (#695); registers `../tests/test_offline_ingest.py` (#695, #640) |
 | `../tests/test_offline_ingest.py` | API image, no network: real ingest jobs of every supported type (`.txt`, `.md`, and `.pdf`, `.docx`, `.csv`, `.json` from `fixtures.py`; backends faked) complete with every name lookup and non-Unix connect refused and recorded from before the API is imported, so nothing may dial out; `DO_NOT_TRACK` is set and the bundled spaCy model `en_core_web_sm` is the version `unstructured` expects (#695); a `.txt` and a `.md` are also prepared with a stub LLM, their parts checked by the real parser (#640); registered by `20_offline_model.sh` |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
