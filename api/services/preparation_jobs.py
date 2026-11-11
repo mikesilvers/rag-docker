@@ -4,7 +4,8 @@ SPECIFICATIONS.md §3.1.11.
 
 - **Upload.** Files are staged and validated exactly as ingest stages them
   (`ingest_pipeline.stage_uploads`: ZIP limits, supported types), then each
-  becomes a `raw` document. The space check is best-effort: made once, before
+  becomes a `raw` document. Two inputs with one name refuse the upload, where
+  ingest keeps the last (#640). The space check is best-effort: made once, before
   the files are written to the area, with nothing reserved.
 - **Jobs.** A job (kind `prepare` in the job store) prepares its documents one
   at a time. One job runs at a time on the instance; later ones wait, oldest
@@ -13,17 +14,18 @@ SPECIFICATIONS.md §3.1.11.
   progress and the ones not reached go back to their earlier state.
 - **Import.** The selected documents' parts go to one ordinary ingest job,
   copied from the area into its staging and stored under their part names. The
-  documents are busy only while the import is admitted.
+  documents are busy only while the import is admitted. One import's parts may
+  hold at most MAX_IMPORT_BYTES in all, one upload's limit (#640).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import shutil
 import tempfile
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 from config import settings
@@ -60,6 +62,27 @@ class NoSupportedFiles(store.AreaError):
     status, code = 400, "NO_SUPPORTED_FILES"
 
 
+class ImportTooLarge(store.AreaError):
+    status, code = 409, "IMPORT_TOO_LARGE"
+
+
+# The most one import's parts may hold in all (#640): the request limit of one
+# upload (`client_max_body_size 512m`, proxy/locations.conf), so an import
+# stages no more than an ingest upload can. Without it, "Import all" could copy
+# the whole area, up to MAX_PREPARATION_BYTES, into one ingest staging.
+MAX_IMPORT_BYTES = 512 * 1024 * 1024
+
+
+def _import_too_large(total: int) -> ImportTooLarge:
+    # Rounded up, so a selection just over the limit never reads 512.0 MB.
+    megabytes = math.ceil(total * 10 / (1024 * 1024)) / 10
+    return ImportTooLarge(
+        f"The selected documents' prepared parts total {megabytes:,.1f} MB; one import can be "
+        f"at most {MAX_IMPORT_BYTES // (1024 * 1024)} MB, the same as one upload. Import them "
+        f"in smaller selections.",
+        detail={"selected_bytes": total, "limit_bytes": MAX_IMPORT_BYTES})
+
+
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
 
@@ -70,6 +93,23 @@ def job_records() -> list[tuple[str, dict, float | None]]:
 
 # ── upload ───────────────────────────────────────────────────────────────────
 
+# How many duplicated names a refused upload's message lists before "and N more".
+_MAX_NAMED_DUPLICATES = 10
+
+
+def _duplicate_upload(duplicates: dict[str, list[str]]) -> DuplicateNames:
+    """Two or more inputs of one upload with the same name (#640): ingest would
+    keep the last and drop the others; preparation keeps none and says which."""
+    names = list(duplicates)
+    listed = "; ".join(f"'{name}' ({', '.join(duplicates[name])})"
+                       for name in names[:_MAX_NAMED_DUPLICATES])
+    if len(names) > _MAX_NAMED_DUPLICATES:
+        listed += f" and {len(names) - _MAX_NAMED_DUPLICATES} more"
+    return DuplicateNames(
+        f"Files in this upload share a name: {listed}. Rename them, or upload them "
+        f"separately; nothing was uploaded.", detail={"names": names})
+
+
 async def upload(files: list[Any], owner: dict | None) -> tuple[list[dict], list[str]]:
     """Stage, validate and store an upload's files as `raw` documents. Nothing
     is kept when any step fails."""
@@ -77,6 +117,8 @@ async def upload(files: list[Any], owner: dict | None) -> tuple[list[dict], list
     created: list[dict] = []
     try:
         queue, skipped = await ingest_pipeline.stage_uploads(files, tmp_dir)
+        if queue.duplicates:
+            raise _duplicate_upload(queue.duplicates)
         if not queue.entries:
             detail = "; ".join(skipped)
             raise NoSupportedFiles("No supported files found in upload."
@@ -302,7 +344,7 @@ class _Part:
         self.size = None
 
 
-async def import_documents(body: Any, owner: dict | None) -> dict:
+async def import_documents(body: Any) -> dict:
     """Start one ingest job with every part of the selected prepared documents."""
 
     def select() -> tuple[list[dict], list[str]]:
@@ -330,6 +372,9 @@ async def import_documents(body: Any, owner: dict | None) -> dict:
                 f"Two selected documents have parts with the same name: "
                 f"{', '.join(duplicates[:10])}. Import them separately.",
                 detail={"names": duplicates})
+        total = sum(part.get("bytes") or 0 for r in records for part in r.get("parts") or [])
+        if total > MAX_IMPORT_BYTES:
+            raise _import_too_large(total)
         return records, names
 
     records, names = await asyncio.to_thread(select)

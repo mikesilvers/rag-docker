@@ -12,7 +12,6 @@ process, so this process's module state stays untouched.
 """
 import asyncio
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -87,6 +86,31 @@ class WorkdirSweepTests(SweepTestCase):
         for path in keep:
             self.assertTrue(path.exists(), path)
         for name in ("ingest-link", "import-link", "ingest-file-link"):
+            self.assertTrue((self.uploads / name).is_symlink(), name)
+        self.assert_outside_intact()
+
+    def test_preparation_temporary_files_are_removed_as_files(self):
+        # The multi-part prepared download and a decompressed .json.gz (#640).
+        write(self.uploads / "prepare-ab12.zip", size=2 * MB)
+        write(self.uploads / "prepare-cd34.json", size=MB)
+        write(self.uploads / "prepare-ef56" / "x.txt", text="x")
+        write(self.uploads / "prepare-q.zip" / "f.txt", text="a directory, removed as before")
+        self.assertEqual(importer.sweep_stale_workdirs(),
+                         ["prepare-ab12.zip (2 MB)", "prepare-cd34.json (1 MB)",
+                          "prepare-ef56 (0 MB)", "prepare-q.zip (0 MB)"])
+        self.assertEqual(list(self.uploads.iterdir()), [])
+
+    def test_only_preparation_temporary_files_of_those_names_are_removed(self):
+        keep = [write(self.uploads / "prepare-x.txt", text="another suffix"),
+                write(self.uploads / "prepare-y.jsonl", text="another suffix"),
+                write(self.uploads / "sub" / "prepare-z.zip", text="not at the top"),
+                write(self.uploads / "xprepare-w.zip", text="another prefix")]
+        (self.uploads / "prepare-link.zip").symlink_to(self.outside / "file.bin")
+        (self.uploads / "prepare-dirlink.json").symlink_to(self.outside / "dir")
+        self.assertEqual(importer.sweep_stale_workdirs(), [])
+        for path in keep:
+            self.assertTrue(path.exists(), path)
+        for name in ("prepare-link.zip", "prepare-dirlink.json"):
             self.assertTrue((self.uploads / name).is_symlink(), name)
         self.assert_outside_intact()
 

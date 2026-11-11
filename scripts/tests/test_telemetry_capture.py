@@ -1,5 +1,4 @@
 """Receiver and decoded evidence assertions, run with the locked API dependencies."""
-import base64
 import importlib.util
 import json
 import copy

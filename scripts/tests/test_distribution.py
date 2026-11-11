@@ -16,12 +16,12 @@ skipped without them. `15_transfer_paths.sh` runs it.
 """
 import gzip
 import io
+import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
-import sys
 import tarfile
 import tempfile
 import unittest
@@ -47,6 +47,11 @@ PLANTED_TAR = {"old-bundle.tar": "archive", "offline/stale-images.tar.gz": "old"
 GIT_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
            "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
            "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.invalid"}
+# The commit runs with automatic maintenance off (#696). Otherwise `git commit` starts a detached
+# `git maintenance run --auto`, whose repack (git 2.54) can still be writing into `.git` when the
+# temporary directory is removed, and the cleanup fails with "Directory not empty".
+# `gc.auto=0` does not stop it.
+NO_AUTO_MAINTENANCE = ["-c", "maintenance.auto=false"]
 TOP_LEVEL_ENV = ".env.local"
 
 STUB_DOCKER = r"""#!/bin/bash
@@ -73,10 +78,13 @@ case "$1" in
     for arg in "$@"; do
       case "$arg" in *:/out)
         out="${arg%:/out}"; mkdir -p "$STUB_MODELS/models"; echo weights > "$STUB_MODELS/models/blob"
-        tar czf "$out/ollama_models.tar.gz" -C "$STUB_MODELS" . ;;
+        tar czf "$out/ollama_models.tar.gz" -C "$STUB_MODELS" .
+        exit 0 ;;
       esac
     done
-    exit 0 ;;
+    # The model check: it prints the models whose manifest is missing.
+    for m in $STUB_MISSING_MODELS; do echo "$m"; done
+    exit "${STUB_CHECK_RC:-0}" ;;
 esac
 echo "stub docker: unexpected call: $*" >&2
 exit 99
@@ -91,6 +99,28 @@ def offline_images():
     text = (ROOT / "package-offline.sh").read_text()
     block = re.search(r"^IMAGES=\(\n(.*?)^\)", text, re.S | re.M).group(1)
     return [line.strip() for line in block.splitlines() if line.strip()]
+
+
+def entrypoint_models():
+    """The models ollama/entrypoint.sh pulls, read as package-offline.sh and the CI cache read them."""
+    text = (ROOT / "ollama" / "entrypoint.sh").read_text()
+    return re.findall(r"^pull_with_retry ([A-Za-z0-9._:-]*)$", text, re.M)
+
+
+def background_git(trace):
+    """The `git maintenance` and `git gc` commands a trace2 event file shows git starting (#696)."""
+    if not trace.exists():
+        return []
+    started = []
+    for line in trace.read_text().splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        argv = event.get("argv") or []
+        if event.get("event") == "child_start" and argv[1:2] in (["maintenance"], ["gc"]):
+            started.append(" ".join(argv))
+    return started
 
 
 def tracked_files():
@@ -131,14 +161,20 @@ class Workspace(unittest.TestCase):
                 shutil.copy2(ROOT / name, target)
         # package.sh and package-offline.sh run `git archive HEAD`: make the copy a repository
         # with the tracked files committed, then plant the excluded files (untracked) on top.
+        # The commit is traced, so the check below sees any background git work it starts (#696).
         git = dict(os.environ, **GIT_ENV)
+        trace = self.temp / "git-commit-trace.json"
         listed = "\0".join(name for name in files if (ROOT / name).is_file()) + "\0"
-        for args, data in ((["init", "-q", "--template="], None),
-                           (["add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], listed),
-                           (["commit", "-q", "-m", "tracked files"], None)):
+        for args, data, extra in ((["init", "-q", "--template="], None, {}),
+                                  (["add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                                   listed, {}),
+                                  ([*NO_AUTO_MAINTENANCE, "commit", "-q", "-m", "tracked files"],
+                                   None, {"GIT_TRACE2_EVENT": str(trace)})):
             done = subprocess.run(["git", "-C", str(tree), *args], input=data, text=True,
-                                  capture_output=True, env=git)
+                                  capture_output=True, env=dict(git, **extra))
             self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(background_git(trace), [], "git commit started background git work, "
+                         "which races the temporary directory's removal (#696)")
         for name, text in planted.items():
             (tree / name).parent.mkdir(parents=True, exist_ok=True)
             (tree / name).write_text(text)
@@ -240,6 +276,42 @@ class OfflinePackageTests(Workspace):
         self.assertIn("ERROR: volume 'rag-docker_ollama_models' not found.", result.stderr)
         self.assertFalse(out.exists())
         self.assertEqual([c for c in self.calls() if c[0] in ("save", "run")], [])
+
+
+    def test_the_model_check_reads_the_entrypoint_names_from_the_volume_read_only(self):
+        result, _out, _files = self.build({})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        models = entrypoint_models()
+        self.assertIn("llama3.1:8b", models)
+        runs = [c for c in self.calls() if c[0] == "run"]
+        self.assertEqual(len(runs), 2)
+        check, export = runs
+        self.assertEqual(check[-len(models) - 1:], ["sh"] + models)
+        for arg in ("--network", "none", "rag-docker_ollama_models:/models:ro", "ollama/ollama:0.3.14"):
+            self.assertIn(arg, check)
+        self.assertFalse(any(a.endswith(":/out") for a in check))
+        self.assertTrue(any(a.endswith(":/out") for a in export))
+        # The check comes before anything is saved.
+        calls = self.calls()
+        self.assertLess(calls.index(check), next(i for i, c in enumerate(calls) if c[0] == "save"))
+
+    def test_a_missing_model_stops_before_anything_is_saved(self):
+        # An install from before #647 holds phi3.5, not llama3.1:8b.
+        result, out, _files = self.build({}, STUB_MISSING_MODELS="llama3.1:8b")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ERROR: volume 'rag-docker_ollama_models' doesn't hold llama3.1:8b. "
+                      "Start the stack once (docker compose up -d)", result.stderr)
+        self.assertFalse(out.exists())
+        self.assertEqual([c for c in self.calls() if c[0] == "save"], [])
+        self.assertEqual(len([c for c in self.calls() if c[0] == "run"]), 1)
+
+    def test_a_failed_model_check_stops_before_anything_is_saved(self):
+        result, out, _files = self.build({}, STUB_CHECK_RC="1")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ERROR: could not read the models in volume 'rag-docker_ollama_models'.",
+                      result.stderr)
+        self.assertFalse(out.exists())
+        self.assertEqual([c for c in self.calls() if c[0] == "save"], [])
 
 
 class ImageListTests(unittest.TestCase):

@@ -77,6 +77,15 @@ class PassphraseError(Exception):
         self.code = code
 
 
+class ImportInProgressError(RuntimeError):
+    """An import of this package file is already running. Its own type, so the
+    router never answers another RuntimeError as IMPORT_IN_PROGRESS (#657)."""
+
+    def __init__(self, filename: str) -> None:
+        super().__init__(filename)
+        self.filename = filename
+
+
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
 
@@ -178,6 +187,10 @@ def _mark_finished(collection: str) -> None:
 # tests, a with-models package would leave 2.3 GB behind each time, and an
 # ingest up to 512 MB of upload plus 2 GiB of extracted ZIP members.
 _WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-", "ingest-", "prepare-")
+# Document preparation also writes two temporary files there (#640): the ZIP of
+# a multi-part prepared download (prepare-*.zip) and a decompressed .json.gz
+# (prepare-*.json). They are removed as regular files, besides as directories.
+_PREPARE_FILE_SUFFIXES = (".zip", ".json")
 
 
 def sweep_stale_workdirs() -> list[str]:
@@ -189,7 +202,9 @@ def sweep_stale_workdirs() -> list[str]:
     for entry in sorted(root.iterdir()):
         if not entry.name.startswith(_WORKDIR_PREFIXES):
             continue
-        size = packager.remove_leftover(entry, directory=True)
+        prepare_file = (entry.name.startswith("prepare-")
+                        and entry.name.endswith(_PREPARE_FILE_SUFFIXES))
+        size = packager.remove_leftover(entry, directory=True, regular_file=prepare_file)
         if size is not None:
             removed.append(f"{entry.name} ({size // (1024 * 1024)} MB)")
     return removed
@@ -983,7 +998,7 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
     job_id = str(uuid.uuid4())[:8]
     with _lock:
         if key in _active:
-            raise RuntimeError(filename)
+            raise ImportInProgressError(filename)
         _active.add(key)
 
     # The first write is durable, so it runs off the event loop (#309). A start

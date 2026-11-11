@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from pathlib import Path
 
 from fastapi import APIRouter, Request
 
@@ -60,12 +59,13 @@ async def start_export(body: ExportRequest, request: Request = None):
         # The running start hasn't stored its record yet, so no job_id to name (#338).
         return api_error(409, "EXPORT_STARTING",
                          f"An export of '{body.collection}' is starting; retry shortly.")
-    except RuntimeError as exc:
-        # start_export_job puts the already-running job id in the exception.
+    except exporter.ExportInProgressError as exc:
+        # The exception names the running job; any other error is not this
+        # answer, and its text is not sent (#657).
         return api_error(
             409, "EXPORT_IN_PROGRESS",
             f"An export of '{body.collection}' is already running.",
-            detail={"job_id": str(exc)},
+            detail={"job_id": exc.job_id},
         )
     return ExportStartResponse(job_id=job_id, status="queued", collection=body.collection)
 
@@ -101,10 +101,10 @@ async def start_import(body: ImportRequest, request: Request = None):
     except importer.PassphraseError as exc:
         # Decided by the filename before any job exists (#27).
         return api_error(400, exc.code, str(exc), detail={"filename": body.filename})
-    except RuntimeError as exc:
+    except importer.ImportInProgressError as exc:
         return api_error(409, "IMPORT_IN_PROGRESS",
-                         f"An import of '{exc}' is already running.",
-                         detail={"filename": str(exc)})
+                         f"An import of '{exc.filename}' is already running.",
+                         detail={"filename": exc.filename})
     return ImportStartResponse(job_id=job_id, status="queued", filename=body.filename)
 
 

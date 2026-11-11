@@ -84,11 +84,11 @@ services:
     networks: [rag-internal]
     healthcheck:
       # The ollama image has no curl/wget; the CLI is the only probe available.
-      test: ["CMD-SHELL", "ollama list | grep -q phi3.5 && ollama list | grep -q nomic-embed-text"]
+      test: ["CMD-SHELL", "ollama list | grep -q llama3.1:8b && ollama list | grep -q nomic-embed-text"]
       interval: 20s
       timeout: 15s
       retries: 20
-      start_period: 120s
+      start_period: 1800s   # a first download of ~5.2 GB on a slow link (#647); see 2.3
     # Optional GPU support (uncomment on GPU host):
     # deploy:
     #   resources:
@@ -108,7 +108,7 @@ services:
       WEAVIATE_PORT: 8080
       OLLAMA_HOST: ollama
       OLLAMA_PORT: 11434
-      LLM_MODEL: phi3.5
+      LLM_MODEL: llama3.1:8b
       EMBED_MODEL: nomic-embed-text
       UPLOAD_DIR: /app/uploads
       SOURCES_DIR: /app/sources
@@ -217,6 +217,12 @@ networks:
 TLS server on container port 443, §2.5) both include `proxy/locations.conf`, which holds the routes, so the two
 servers route identically.
 
+**Accepted hosts (#664).** Each server answers only for the hosts in its `map $host $rag_host_allowed` (`hostnames`
+matching, so the port doesn't count): `localhost` and `127.0.0.1`, plus, in LAN mode, the certificate's names (§2.5).
+Any other host gets `421 Misdirected Request` from a server-level `return`, before any route, so neither the UI nor
+the API sees the request; that closes DNS rebinding. Neither server has a `server_name`, so an HTTP/1.0 request
+without `Host` has an empty host and gets 421 too (HTTP/1.1 without `Host` keeps nginx's own 400).
+
 | Path prefix | Routes to | Notes |
 |---|---|---|
 | `/api/goldstandard/regenerate` (exact) | `http://api:8000/goldstandard/regenerate` | The same headers as `/api/`. Read timeout 1860 s, longer than the API's 1800 s regeneration deadline (§3.1.5), so the API's own answer, its 504 `PAIR_GENERATION_TIMEOUT` included, reaches the client |
@@ -233,8 +239,9 @@ ollama serve &
 OLLAMA_PID=$!
 # Wait for server to be ready
 until ollama list > /dev/null 2>&1; do sleep 2; done   # no curl in this image
-# Pull models if not already cached in volume
-ollama pull phi3.5
+# Pull models if not already cached in volume (a model counts as cached only when
+# a NAME in `ollama list` is exactly its name, or its name with :latest)
+ollama pull llama3.1:8b
 ollama pull nomic-embed-text
 wait $OLLAMA_PID
 ```
@@ -243,19 +250,19 @@ The Ollama healthcheck is extended to verify both models are present, not merely
 
 ```yaml
 healthcheck:
-  test: ["CMD-SHELL", "ollama list | grep -q phi3.5 && ollama list | grep -q nomic-embed-text"]
+  test: ["CMD-SHELL", "ollama list | grep -q llama3.1:8b && ollama list | grep -q nomic-embed-text"]
   interval: 20s
   timeout: 15s
   retries: 20
-  start_period: 120s
+  start_period: 1800s
 ```
 
-`start_period: 120s` gives the model pull time to complete on first run before health retries begin counting as failures. The API service's `depends_on: { ollama: service_healthy }` ensures no API traffic flows until both models are confirmed present.
+`start_period: 1800s` gives the model pull time to complete on first run before health retries begin counting as failures: about 5.2 GB (#647), so a link down to about 23 Mbps finishes inside it, and ollama is marked unhealthy only after about 37 minutes. Docker still runs the check every 20 s during the start period and marks the container healthy at the first pass, so a start with the models present is as fast as before. `scripts/verify/stack.sh` waits up to two 900 s rounds for the stack, which together cover the start period. The API service's `depends_on: { ollama: service_healthy }` ensures no API traffic flows until both models are confirmed present.
 
 ### 2.4 Startup Sequence
 
 1. Weaviate starts with a 180-second healthcheck start period for cold Raft replay → healthcheck passes (ready endpoint returns 200)
-2. Ollama starts → pulls models (phi3.5, nomic-embed-text) → healthcheck passes
+2. Ollama starts → pulls models (llama3.1:8b, nomic-embed-text) → healthcheck passes
 3. API starts → verifies both downstream connections → healthcheck passes
 4. UI starts (static build, no runtime deps)
 5. Nginx proxy starts
@@ -299,7 +306,16 @@ intermediate cipher list for TLS 1.2, `ssl_prefer_server_ciphers off`, session t
 
 The active pair lives in `lan_certs` as `live`, a symlink to a `pair-<random>` folder (`cert.pem`, `key.pem` mode
 0600, `source`), switched with one rename, so a failed step never leaves a certificate beside a key that doesn't match
-it. The step prints one line with the source, names, expiry and SHA-256 fingerprint, or one line on standard error
+it.
+
+**Accepted LAN hosts (#664).** On every successful run the step also writes `lan_certs/hosts.map` (mode 0644,
+replaced with one rename), which `nginx.lan.conf` includes in its map of accepted hosts (§2.2): one `<name> 1;` line
+per name of the active certificate other than `localhost` and `127.0.0.1`. With the self-signed certificate those
+are `RAG_LAN_HOSTNAMES`; with your own, its subject-alternative-name DNS names and IP addresses. DNS names are
+lower-cased, a wildcard (`*.example.com`) stays an nginx wildcard, which matches any depth below the name, an IPv6
+address is written in brackets, and a name spelled like a `map` parameter (`default`, `hostnames`, `include`,
+`volatile`) gets nginx's leading `\`. A name that is none of these is left out, with a `tls-init: warning:` line on
+standard error, and the step still succeeds. The proxy reads the file when it starts. The step prints one line with the source, names, expiry and SHA-256 fingerprint, or one line on standard error
 when it refuses; then the proxy doesn't start. `proxy/certs/` is tracked through `.gitkeep`; everything else in it is
 ignored by git.
 
@@ -308,7 +324,8 @@ on Docker Desktop for Mac: a request through the host's LAN address arrives from
 `localhost` from the Docker network's gateway, not from the client's own address.
 
 **Login rate limit (#577).** Both servers define `limit_req_zone $binary_remote_addr zone=login:1m rate=10r/m;`,
-and `locations.conf` limits `POST /api/auth/login` (an exact location, otherwise proxied as `/api/`) with
+and `locations.conf` limits `POST /api/auth/login` (an exact location, otherwise proxied as `/api/` except its
+body: at most 16k, buffered; a larger one is refused `413` by nginx before the API reads it, #663) with
 `limit_req zone=login burst=5 nodelay;`. Beyond it nginx answers `429` itself, `application/json`,
 `{"error":{"code":"LOGIN_RATE_LIMITED","message":"Too many login attempts. Wait a minute and try again.","detail":null}}`,
 which the login page shows; the API never sees the attempt, so it writes no audit record. The API's own answers
@@ -353,7 +370,7 @@ GET /health
   "services": {
     "weaviate": { "status": "ok", "latency_ms": 1 },
     "ollama": {
-      "llm": { "status": "ok", "latency_ms": 5, "model": "phi3.5" },
+      "llm": { "status": "ok", "latency_ms": 5, "model": "llama3.1:8b" },
       "embed": { "status": "ok", "latency_ms": 5, "model": "nomic-embed-text" }
     }
   },
@@ -636,7 +653,7 @@ unreadable member, is refused as a whole; nothing is repaired or recovered.
 | Status | `code` | When |
 |---|---|---|
 | 400 | `NO_SUPPORTED_FILES` | nothing in the upload is a supported type; the message lists what was skipped |
-| 400 | `ARCHIVE_UNREADABLE` | the ZIP is damaged: it can't be opened (truncated, e.g. an incomplete download, or a bad central directory), or a member can't be read (wrong offset, bad local header, bad CRC, truncated data) |
+| 400 | `ARCHIVE_UNREADABLE` | the ZIP is damaged: it can't be opened (truncated, e.g. an incomplete download, or a bad central directory) or its directory can't be decoded (a member name flagged UTF-8 that isn't valid UTF-8, #657), or a member can't be read (wrong offset, bad local header, bad CRC, truncated data) |
 | 400 | `ARCHIVE_UNSUPPORTED` | no member is damaged, but one is password-protected or uses a compression method the server can't read (e.g. Deflate64) |
 | 400 | `ARCHIVE_TOO_LARGE` | the upload's ZIPs expand to more than `max_zip_expanded_bytes` in all (2 GiB by default; below) |
 | 400 | `ARCHIVE_TOO_MANY_MEMBERS` | one ZIP holds more than `max_zip_members` entries (5,000 by default; below, #28) |
@@ -1072,10 +1089,10 @@ Ollama are available."
 not returned. Any other failure in the pipeline answers `500 INTERNAL_ERROR` (§3.2).
 
 **RAG pipeline (internal steps):**
-1. Reformat user question for retrieval using Phi-3.5 Mini (Section 6.1 prompt).
+1. Reformat user question for retrieval using the LLM, `llama3.1:8b` by default (Section 6.1 prompt).
 2. Embed reformulated question — **only for `hnsw` and `flat` modes**: call Ollama `/api/embeddings` directly; for `hybrid` and `semantic` modes, Weaviate handles query embedding internally via `text2vec-ollama`.
 3. Retrieve top_k chunks from Weaviate using the specified retrieval mode and its parameters.
-4. Pass original question + retrieved chunks to Phi-3.5 Mini for synthesis (Section 6.2 or 6.3 prompt).
+4. Pass original question + retrieved chunks to the LLM for synthesis (Section 6.2 or 6.3 prompt).
 5. Format response according to `response_format`.
 
 ---
@@ -1744,8 +1761,10 @@ files' names as the client sent them, in upload order.
 "owner unknown" (`owner: null`).
 
 **Which jobs.** Every running job (an ingest, export or import whose status isn't terminal; a session
-whose status is `generating`) is listed. A finished job is listed when its finish time lies in the 24
-hours before the request; of those, only the 20 with the newest finish time, per list and caller.
+whose status is `generating`) is listed. A finished job is listed when its finish time is no more than
+24 hours before the request; a finish time later than the request (after the API's clock steps back)
+is listed too, so a just-finished job doesn't vanish (#629). Of those, only the 20 with the newest
+finish time, per list and caller.
 The finish time is `finished_at`; a finished ingest, export or import record from before #617 uses
 the time its record file was last saved, and a finished session without `finished_at` is not listed.
 `GET /goldstandard/sessions` lists only sessions generated on this install: one with
@@ -1789,7 +1808,10 @@ Accepted: `.pdf .docx .txt .md .csv .json .jsonl .jsonl.gz` and `.zip` (with `.j
 and validated exactly as `POST /ingest/upload` (§3.1.3: the 512 MB request limit, every ZIP limit and code,
 `NO_SUPPORTED_FILES`, `UPLOAD_WRITE_FAILED`; skipped files listed with ingest's reason). Each supported file or
 ZIP member becomes one document, status `raw`, named by its file name or its path in the archive; the ZIP
-itself isn't kept. Two documents may share a name. A refused upload keeps nothing; anything unexpected is
+itself isn't kept. Two inputs of one upload with the same name (two files, two ZIP members, or a file and a
+member), which ingest would replace, refuse it with `409 DUPLICATE_NAMES`, naming each such name and its inputs
+(`<zip>:<member>` for a member), at most 10 names then `and N more` (`detail.names`: every one); documents from
+separate uploads may share a name (#640). A refused upload keeps nothing; anything unexpected is
 `500 PREPARE_FAILED`.
 
 **Documents.** `GET /prepare/documents`: `{"documents", "used_bytes", "limit_bytes"}`, newest first. `GET
@@ -1880,8 +1902,12 @@ output; a document with earlier output stays `prepared` with it and records the 
 document), and `strategy`, `chunk_size`, `chunk_overlap`, `similarity_threshold`, `min_chunk_size` with
 ingest's defaults and validation (`422 INVALID_PARAMETER`). Checked in order, before anything is staged: the
 body, the selection (`400 NO_DOCUMENTS`, `404 DOCUMENT_NOT_FOUND`, `409 DOCUMENT_BUSY`, `409
-DOCUMENT_NOT_PREPARED`, two parts with one name `409 DUPLICATE_NAMES`), then the collection as ingest checks it
-(`404 COLLECTION_NOT_FOUND`, `409 COLLECTION_DELETING`, `503 SERVICE_UNAVAILABLE`). Accepted: one ordinary
+DOCUMENT_NOT_PREPARED`, two parts with one name `409 DUPLICATE_NAMES`, parts over 512 MB in all `409
+IMPORT_TOO_LARGE`), then the collection as ingest checks it (`404 COLLECTION_NOT_FOUND`, `409
+COLLECTION_DELETING`, `503 SERVICE_UNAVAILABLE`). One import's parts may hold at most 512 MB (536,870,912 bytes)
+in all, one upload's request limit (§3.1.3), for a selection and for `all` alike; over it nothing is staged and
+the message gives the selected size and the limit and asks for smaller selections (`detail`: `selected_bytes`,
+`limit_bytes`; #640). Accepted: one ordinary
 ingest job with every part, copied from the area into its staging and stored under the part's name, folders
 included; the answer and the job are `POST /ingest/upload`'s (§3.1.3, §5.1.1). The documents are busy only
 while the import is admitted; each records the import. Nothing is deleted.
@@ -1913,6 +1939,8 @@ Standard error codes:
 | `COLLECTION_DELETING` | 409 | A new ingest, export, tune or generation job refused while a delete of its collection is in progress (an import job fails with it) |
 | `EXPORT_STARTING` | 409 | An export of the collection is still storing its first record after 30 s; no `job_id`; retry shortly |
 | `INVALID_FILE_TYPE` | 422 | Uploaded file type not supported |
+| `DUPLICATE_NAMES` | 409 | Document preparation (§3.1.11): two selected documents have parts with one name (import), or two inputs of one upload have one name (upload, #640) |
+| `IMPORT_TOO_LARGE` | 409 | A preparation import (§3.1.11) whose selected parts total more than 512 MB, one upload's limit; nothing is staged; import in smaller selections |
 | `JOB_NOT_FOUND` | 404 | Ingest job ID not found |
 | `SERVICE_UNAVAILABLE` | 503 | Weaviate or Ollama unreachable |
 | `NOT_FOUND` | 404 | No API route matches the path |
@@ -1987,7 +2015,7 @@ Regenerate the lock from the repo root using the procedure at the top of
 `api/requirements.in`: resolve the edited inputs against the current API image
 with `pip install --dry-run --report`, incorporate the resolved pins into the
 sorted lock, rebuild, and compare the resulting image's `pip freeze` (excluding
-torch/torchvision) to the lock. Editing the input and rebuilding alone does not
+torch, torchvision and `en_core_web_sm`) to the lock. Editing the input and rebuilding alone does not
 resolve new dependencies, because the Dockerfile installs only the lock.
 
 `LC_ALL=C` keeps ordering stable so a re-lock produces a clean diff.
@@ -2002,6 +2030,23 @@ build first satisfies the requirement so the lock install leaves it alone, takin
 the image from 7.6 GB to 2.8 GB. The two pins are therefore **excluded from the
 lock**: their `+cpu` local versions are not published on PyPI, so listing them
 would break the build.
+
+**The spaCy model is installed separately too (#695).** Unstructured's text
+partitioning (`.txt`, and `.md` through its HTML parser) loads the spaCy model
+`en_core_web_sm`; when it is missing, Unstructured downloads it from GitHub on
+first use, which needs DNS and internet access from inside the container and
+fails on an offline install. `api/Dockerfile` therefore installs it at build
+time, after the lock, from its release URL pinned to version 3.8.0 and SHA-256
+`1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85`, the wheel the
+locked `unstructured` 0.27.5 expects; pip refuses a download with another hash.
+The same step fails the build when the installed version differs from the one
+`unstructured` expects (`unstructured.nlp.tokenize._SPACY_MODEL_VERSION`) or the
+model doesn't load, so a re-lock that moves `unstructured` must move the model
+with it. It is not in the lock, and the offline bundle carries it inside the api
+image. The api service also sets `DO_NOT_TRACK=1` (in `docker-compose.yml` and as
+`ENV` in `api/Dockerfile`), which stops Unstructured's usage telemetry: without
+it, Unstructured sends a request when it is imported and on every partition
+call.
 
 **Build contexts must carry a `.dockerignore`.** Both `api/` and `ui/` have one.
 For `ui/` this is load-bearing rather than tidiness: the Dockerfile runs
@@ -2279,6 +2324,11 @@ sidecars are then kept across restarts and named in the job error
 (`RAG_EXPORT_SPECIFICATIONS.md` §7.4). Vectors are copied out of
 the staging collection rather than regenerated, so the corpus is embedded once.
 
+A re-chunk parses and chunks every retained original and holds all of the new chunks in the
+API's memory until the rebuild has staged them; re-embedding and re-indexing likewise hold the
+whole collection. Split files can store up to ten times their own size (§5.1.1), so a very
+large collection can run the API container out of memory. Bounding this is tracked in #690.
+
 Any operation that changes chunk identity marks the collection's gold-standard
 sessions `stale`. `/tune/reindex` does not, because chunk identity is unchanged.
 
@@ -2485,19 +2535,27 @@ as it is: the upload, ZIP, `.json` size, JSON Lines line and record count limits
     10,000,000 characters (under `context_aware` the records' or elements' text alone, otherwise
     the joined text with the breaks between them);
   - a `.txt`, `.md` or `.csv` file of at most 10,000,000 bytes;
-  - a larger `.txt`, `.md` or `.csv` whose raw paragraphs, lines or rows (a CSV row by its
-    cells' text) total at most 10,000,000 characters. That raw measure can be more than the
-    parsed text (indentation, Markdown link targets, `NA` cells), so such a file may be stored
-    as parts even when its parsed text would fit; measuring the raw units keeps memory bounded,
-    as the whole file is never parsed just to measure it.
+  - a larger `.txt` or `.md` whose raw paragraphs or lines total at most 10,000,000
+    characters. That raw measure can be more than the parsed text (indentation, Markdown link
+    targets), so such a file may be stored as parts even when its parsed text would fit;
+    measuring the raw units keeps memory bounded, as the whole file is never parsed just to
+    measure it;
+  - a larger `.csv` whose rows as written, separators, needed quotes and line endings
+    included (the header row too), total at most 10,000,000 characters. A CSV over that is
+    always split, so no CSV is parsed whole past about 10,000,000 characters, however sparse
+    (maintainer's decision on #631, reversing PR #630's measure by the cells' text for CSV).
   The estimates above only size the parts of a file that is split.
 - A file split into parts may store at most ten times its own size in chunk text (all its
   parts' chunks, repeated CSV headers and overlap included). Its own size is its bytes as
-  uploaded, a gzipped file's decompressed bytes, or a `.pdf`'s or `.docx`'s extracted text.
-  The running total is checked before each part is stored; going over fails the whole file
-  through the all-or-nothing rollback, with `<file>: it would store N characters of chunks,
-  more than 10 times its own size (M characters); use less chunk_overlap, shorten repeated
-  headers or keys, or split the file` and no part number. A re-chunk that goes over fails
+  uploaded, a gzipped file's decompressed bytes, counted only up to its reader's bound
+  (30,000,000 bytes for a `.json.gz`, 512 MB for a `.jsonl.gz`; #631), or a `.pdf`'s or
+  `.docx`'s extracted text. The running total is checked before each part is stored; going
+  over fails the whole file through the all-or-nothing rollback, with `<file>: it would store
+  N characters of chunks, more than 10 times its own size (M characters); use less
+  chunk_overlap, shorten repeated headers or keys, or split the file` and no part number.
+  Since the count stops at that bound, a `.jsonl.gz` that decompresses past 512 MB may fail
+  with this error before its reader's 512 MB error; either way the whole file fails and
+  nothing is stored. A re-chunk that goes over fails
   whole, with the collection unchanged. A file stored whole is never refused by it
   (maintainer's decision, PR #630 security review).
 - A CSV's header row is repeated at the start of every part, so parts are sized with it: the
@@ -2623,7 +2681,7 @@ file, asking whether its name already has chunks (#22, §3.1.3), fails.
 
 ## 6. LLM Prompt Specifications
 
-All prompts use Ollama's `/api/chat` endpoint with `model: phi3.5`.
+All prompts use Ollama's `/api/chat` endpoint with `model: llama3.1:8b` (the `LLM_MODEL` setting; phi3.5 until 1.2.1, #647).
 
 ### 6.1 Query Reformulation Prompt
 
@@ -3253,7 +3311,7 @@ Optional telemetry (#282) is configured by API container environment settings, n
 | `RAG_OTEL_HEADERS_FILE` | none | Mounted JSON regular file with `Authorization` and/or `X-Api-Key`; at most 8 KiB, 2 KiB per value; requires an HTTPS endpoint |
 | `RAG_OTEL_CA_FILE` | none (bundled roots) | Mounted PEM CA bundle (a regular file); at most 1 MiB; must load as a CA bundle; replaces the bundled roots; requires an HTTPS endpoint (#356) |
 | `RAG_OTEL_SERVICE_NAME` | `rag-api` | 1–64 ASCII letters, digits, `.`, `_` or `-`, starting with a letter or digit |
-| `RAG_OTEL_SERVICE_VERSION` | `1.2.0` | As `RAG_OTEL_SERVICE_NAME` |
+| `RAG_OTEL_SERVICE_VERSION` | `1.2.1` | As `RAG_OTEL_SERVICE_NAME` |
 | `RAG_OTEL_ENVIRONMENT` | `development` | As `RAG_OTEL_SERVICE_NAME` |
 | `RAG_OTEL_TRACES`, `RAG_OTEL_LOGS`, `RAG_OTEL_METRICS` | `true` | Exact `true` or `false` |
 | `RAG_OTEL_SAMPLE_RATIO` | `1.0` | Finite 0–1 |
@@ -3461,7 +3519,9 @@ now lives once, in `api/services/ingest_config.py`.
       *`test_settings_validation.py` saves and reads back both edges, rejects 49, 6001 and a minimum of 6001 without changing the saved configuration, and checks a saved 16000/8000 configuration is returned and exported unclamped but refused by save, rechunk and reembed. `07_settings.sh` checks both edges and their neighbours against the live stack.*
 
 - [x] A first `semantic` ingest makes no huggingface.co request: the api container sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`, and the pre-cached `all-MiniLM-L6-v2` model loads from the image cache with the endpoint unroutable (#618).
-      *`scripts/verify/20_offline_model.sh` checks the offline flags are set and honoured (`huggingface_hub.constants.HF_HUB_OFFLINE`), then loads the model with `HF_ENDPOINT` pointed at an unroutable address and requires it within 60 s; it fails on `develop` ("offline flags: None None False") and passes with the offline flags (model loaded in 0.1 s in the review run).*
+      *`scripts/verify/20_offline_model.sh` checks the offline flags are set and honoured (`huggingface_hub.constants.HF_HUB_OFFLINE`), then loads the model with `HF_ENDPOINT` pointed at an unroutable address and requires it within 60 s. The endpoint is passed with `docker compose exec -e`, so it is set before `huggingface_hub` is imported (the library reads it once, at import), and the script requires `huggingface_hub.constants.ENDPOINT` to equal it before loading (#636); it fails on `develop` ("offline flags: None None False") and passes with the offline flags (model loaded in 0.1 s in the review run).*
+- [x] A text ingest makes no network call: the api image carries the spaCy model `en_core_web_sm` 3.8.0 that Unstructured's text partitioning loads, so it is never downloaded at runtime, and `DO_NOT_TRACK=1` stops Unstructured's telemetry. A `.txt` and a `.md` ingest succeed in a container with no network (#695).
+      *`scripts/tests/test_offline_ingest.py`, run by `scripts/verify/20_offline_model.sh` in a fresh container from the api image with `--network none`, runs real ingest jobs (Weaviate, source retention and gold-standard marking faked) of the twelve-paragraph text suite 01 ingests (fixed 150, minimum 40) and of a Markdown file, refusing and recording every name lookup and non-Unix connect from before the API is imported. Both jobs complete, the text with more than five chunks, and nothing is recorded; it also checks `DO_NOT_TRACK` and that the installed model is the version `unstructured` expects. On the image before #695 both jobs fail with "Failed to download spaCy model ... network call blocked by test_offline_ingest: getaddrinfo 'github.com'"; with `DO_NOT_TRACK` emptied, the lookups of `packages.unstructured.io` are recorded and fail it. It also prepares a `.txt` and a `.md` (#638) with a stub LLM: each gives one part, written and checked by the real `check_part`, which reads a part with ingest's parser (`partition_md`), and nothing is recorded (#640); with `DO_NOT_TRACK` emptied, that case records the `packages.unstructured.io` lookups too.*
 - [x] Single file upload (all six types) completes without error and stores chunks in Weaviate.
       *One file of each type. `.md` failed — `unstructured[pdf,docx,csv]` omitted
       the `md` extra, so Markdown ingestion had never worked. **Fixed**: added the
@@ -3538,7 +3598,18 @@ now lives once, in `api/services/ingest_config.py`.
       part 1 stores nothing; and
       `overlap_chunks.py` stores a 20,000-character file at 1,000/999 as two parts that
       restore it exactly. `browser/ui_criteria.js` (suite 06) checks the progress panel's
-      "1 file split into parts:" list and that an empty one shows nothing.*
+      "1 file split into parts:" list and that an empty one shows nothing. #631 changed
+      four of these rules, each tested in `test_split_parts.py`: a `.csv` over 10,000,000
+      bytes is measured by its rows as written, header included
+      (`test_a_sparse_csv_over_the_text_limit_as_written_is_split` and
+      `..._is_never_parsed_whole`, `test_a_csv_over_the_limit_in_bytes_but_not_as_written_is_stored_whole`,
+      `ReviewerCsvHeaderMeasureTests`); a gzipped file's own size is counted only up to its
+      reader's bound (`GzipOwnSizeBoundTests`); a `.txt` or `.md` line longer than a part is
+      cut after whitespace, and no unit or part is ever empty (`LongLineCutTests`,
+      `ReviewerLongLineTests`, `LongLinePartCountTests`); and part 1 failing before anything
+      is stored ends `; nothing from it was stored`, never twice (the two suffix tests in
+      `AllOrNothingTests`). #630's reviewer's JSON Lines whole-measure test is added too
+      (`ReviewerJsonWholeMeasureTests`).*
 - [x] ZIP batch upload extracts and processes all supported files; unsupported files are skipped with a warning.
       *A ZIP of 8 files yielded 6 processed, 2 skipped — but silently, with
       nothing naming what was dropped. **Fixed**: the job now carries a `skipped`
@@ -3683,9 +3754,11 @@ now lives once, in `api/services/ingest_config.py`.
       the first blob is gone). With a real gold-standard session planted, it checks that a
       new name leaves the session current and a replacing re-ingest marks it stale, naming
       the file. It also stores `a/report.pdf`, `Report.PDF` and `report.pdf` and uploads
-      `report.pdf` again: the other two keep all their chunks, and `exact_source.py` checks
-      exact selection on both paths, under and over 10,000 word matches, in real Weaviate
-      (#622). `browser/ui_criteria.js` (suite 06) checks the Import page's "Replaced N
+      `report.pdf` again: the first upload leaves a session planted for them current, the
+      other two keep all their chunks, and `exact_source.py` checks exact selection on both
+      paths, under and over 10,000 word matches, and the batched deletion of over 10,000
+      earlier chunks, in real Weaviate (#622). `browser/ui_criteria.js` (suite 06) checks the
+      Import page's "Replaced N
       chunks from a previous version" line, hidden at 0, and the plain "N files skipped:"
       heading. `test_reingest.py` also checks that a failed lookup of the later files is
       reported as the lookup, not as the marking (#311).*
@@ -3726,6 +3799,13 @@ now lives once, in `api/services/ingest_config.py`.
       *`scripts/tests/test_job_lists.py` (API image) and `scripts/verify/job_lists.py` on the stack
       (a Developer, a Developer-role key and the Engineer), both run by `02_ingest.sh`; the four
       routes are in `auth_stack.py`'s matrix (`17_auth.sh`).*
+
+- [x] A finished job whose finish time is later than the API's clock (after the clock steps back) is
+      listed by the four job lists, within the 24-hour lower bound (#629, §3.1.10).
+      *`scripts/tests/test_job_lists.py` (API image, run by `02_ingest.sh`):
+      `test_a_finish_time_after_the_clock_is_listed` lists a finish time an hour ahead, with that
+      `finished_at`; `test_finished_at_boundary_of_the_window` lists one exactly 24 hours before the
+      request and drops one a second earlier.*
 
 - [x] A write with any record left to `text2vec-ollama` uses `fixed_size(batch_size=20, concurrent_requests=1)` and one whose records all carry vectors `dynamic()`; only objects whose embedding timed out in Weaviate are sent again, at most twice; no other failure is retried; a chunk sent again counts once in `chunks_submitted` (#613).
       *`scripts/tests/test_embed_batching.py` (13 tests, run by `02_ingest.sh` in the API image) checks
@@ -4009,6 +4089,11 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       empty.
       *`scripts/verify/browser/ui_criteria.js` (suite 06), section "running and recent jobs (#617)".*
 
+- [x] Each Transfer panel polls its job on one chain (#629, §7.15): reopening the job a panel is
+      polling, while its lookup is in flight, starts no second chain.
+      *`scripts/verify/browser/ui_criteria.js` (suite 06), section "running and recent jobs (#617)",
+      the checks marked (#629), for the export and the import panel.*
+
 ### 10.5 Infrastructure
 
 - [x] A restart restores a Raft snapshot and its later operations, preserving objects and deleted collections; the check reports elapsed restart seconds.
@@ -4017,8 +4102,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Job records persist under `{UPLOAD_DIR}/jobs/{kind}/`: status changes and terminal records are written at once and atomically, progress at most once a second but never left unwritten, a failed write never fails the job, startup marks jobs left `queued` or `running` as interrupted, unreadable records are kept and logged, and the newest 200 per kind are kept, at startup and while the API runs, never removing an unfinished job (#23, #309). The first record is written off the event loop, and a start cancelled during it leaves no record or guard (#309).
   *Evidence: `test_jobstore.py` (35 cases in the API image, run by `02_ingest.sh`), including a real lifespan run over a stored running job, the four job starts and their cancellation, retention ordered by real writes, an abandoned first write that fails, a second export start waiting for the first one's record (#326), and that wait's error paths and its bound with `EXPORT_STARTING` (#338); with `RAG_ALLOW_RESTART=1`, live restarts of ingest (`partial` and `failed`), export and import jobs.*
 
-- [x] At startup, before the first request, what a killed job left behind is removed (#377): an interrupted ingest's upload staging (`{UPLOAD_DIR}/ingest-*`), and an interrupted export's `.build-*` directory and `.<stem>.tar.gz.partial` archive (`.<stem>.tar.gz.age.partial` for an encrypted export, #27) in `EXPORTS_DIR`. Only those names at the top of each folder, and only a real directory or regular file as the name says, are removed: completed packages, look-alike names and anything in a sub-folder are kept, and a symlink is never followed. What is removed is logged by name and size; a removal that fails is logged and not reported as removed. An export sweep that fails is logged and startup carries on, with the ingest staging still swept (#423).
-  *Evidence: `test_startup_sweep.py` (13 cases in the API image, run by `02_ingest.sh`), including a real lifespan run that removes both kinds and logs them, and one whose export sweep raises: the error is logged, the API still starts and the ingest staging is removed (#423). With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` checks that its two killed ingests' `ingest-*` staging existed before the restart and is gone after it (#423), and `05_transfer.sh` that the killed export's build directory and temporary archive are gone after its restart, with the completed package kept.*
+- [x] At startup, before the first request, what a killed job left behind is removed (#377): an interrupted ingest's upload staging (`{UPLOAD_DIR}/ingest-*`), document preparation's temporary files (`{UPLOAD_DIR}/prepare-*.zip` and `prepare-*.json`, regular files only; #640), and an interrupted export's `.build-*` directory and `.<stem>.tar.gz.partial` archive (`.<stem>.tar.gz.age.partial` for an encrypted export, #27) in `EXPORTS_DIR`. Only those names at the top of each folder, and only a real directory or regular file as the name says, are removed: completed packages, look-alike names and anything in a sub-folder are kept, and a symlink is never followed. What is removed is logged by name and size; a removal that fails is logged and not reported as removed. An export sweep that fails is logged and startup carries on, with the ingest staging still swept (#423).
+  *Evidence: `test_startup_sweep.py` (15 cases in the API image, run by `02_ingest.sh`), including preparation's `prepare-*.zip` and `prepare-*.json` files removed while other suffixes, links and sub-folders are kept (#640), a real lifespan run that removes both kinds and logs them, and one whose export sweep raises: the error is logged, the API still starts and the ingest staging is removed (#423). With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` checks that its two killed ingests' `ingest-*` staging existed before the restart and is gone after it (#423), and `05_transfer.sh` that the killed export's build directory and temporary archive are gone after its restart, with the completed package kept.*
 
 
 - [x] Weaviate cold startup has a 180-second healthcheck start period; restart limits reject invalid or overlong values before arithmetic.
@@ -4070,8 +4155,10 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   *Evidence: `scripts/tests/test_verify_stack.py` (the LAN guard rule and its refused variants, the `--lan` argument refusals and the Docker calls of `up --lan` in order); the `stack.sh run --lan` on the #26 pull request.*
 - [x] Optional OpenTelemetry foundation (#282, #356): disabled by default with no providers, exporters or file reads; an invalid enabled configuration (§8), including a `RAG_OTEL_HEADERS_FILE` or `RAG_OTEL_CA_FILE` that is not a regular file, fails startup with field-only errors, its bounds accepted at their edges and refused beyond them; private providers leave the global OTel providers and root logging unchanged; only schema-approved fields reach OTLP; bounded queues, one-attempt export and bounded lifecycle waits keep a collector that answers with an error, refuses the connection or hangs from holding application work; an optional `RAG_OTEL_CA_FILE` is validated at startup and is the only trust store for HTTPS export when set.
   *Evidence: `scripts/tests/test_telemetry.py` in the built API image with `--network none` (suite 01) against loopback OTLP receivers, including an HTTPS receiver signed by a test-generated private CA; `scripts/tests/test_telemetry_implementation.py` keeps the embedded copies in step.*
-- [x] Every API error answers in the JSON envelope (#373): an unknown route `404 NOT_FOUND`, a wrong method `405 METHOD_NOT_ALLOWED` with its `Allow` header, and an unhandled error `500 INTERNAL_ERROR`. `GET /collections` answers 503 `SERVICE_UNAVAILABLE` when Weaviate can't be read, a missing or unreadable help template answers 500 `HELP_RENDER_FAILED`, and `CREATE_FAILED` and `DELETE_FAILED` send a fixed message with `detail` `null`. In each case the cause is logged, not returned. A help template that fails to render (`RuntimeError`) answers 500 `HELP_RENDER_FAILED` with its own message, and other HTTP errors (FastAPI's 400 for a body it can't parse) keep FastAPI's own `{"detail": ...}` answer (#411).
+- [x] Every API error answers in the JSON envelope (#373): an unknown route `404 NOT_FOUND`, a wrong method `405 METHOD_NOT_ALLOWED` with its `Allow` header, and an unhandled error `500 INTERNAL_ERROR`. `GET /collections` answers 503 `SERVICE_UNAVAILABLE` when Weaviate can't be read, a missing or unreadable help template answers 500 `HELP_RENDER_FAILED`, and `CREATE_FAILED` and `DELETE_FAILED` send a fixed message with `detail` `null`. In each case the cause is logged, not returned. A help template that fails to render (`RuntimeError`) answers 500 `HELP_RENDER_FAILED` with a fixed message, the cause logged, not returned (#657), and other HTTP errors (FastAPI's 400 for a body it can't parse) keep FastAPI's own `{"detail": ...}` answer (#411).
   *Evidence: `scripts/tests/test_error_envelope.py` in the built API image with `--network none` (suite 01) sends each request through the app with Weaviate and Ollama mocked; it fails on the code before #373. Suite 01 also checks through the proxy on the running stack that an unknown route answers 404 `NOT_FOUND`, and a wrong method answers 405 with `Allow: POST` and `METHOD_NOT_ALLOWED` (#411, #456).*
+- [x] No library exception text reaches a client through a broad `ValueError` or `RuntimeError` handler (#657, CodeQL #7). Only the ingest pipeline's own "no supported files" exception answers 400 `NO_SUPPORTED_FILES`, with its message; any other error from the ingest start is 500 `INGEST_FAILED`, logged, its text not sent. A ZIP whose directory can't be decoded (a member name flagged UTF-8 that isn't valid UTF-8) is 400 `ARCHIVE_UNREADABLE` with the fixed message, not the codec's text. Only the exporter's, importer's and tuning's own already-running exceptions answer 409 `EXPORT_IN_PROGRESS`, `IMPORT_IN_PROGRESS` and `TUNE_IN_PROGRESS`, with the same messages and `detail` as before; any other `RuntimeError` from those starts is 500 `INTERNAL_ERROR`, its text not sent. A help template `RuntimeError` is 500 `HELP_RENDER_FAILED` with a fixed message, the cause logged.
+  *Evidence: `scripts/tests/test_ingest_errors.py` (suite 02, the undecodable-name ZIP, an unexpected `ValueError`, and an upload with no supported file), `scripts/tests/test_transfer_paths.py` (suite 15, the three already-running answers, a plain `RuntimeError` from each start, and the help templates that can't render) and `scripts/tests/test_error_envelope.py` (suite 01, a help `RuntimeError` logged, not sent). The new checks fail on the code before #657.*
 - [x] `package.sh` and `package-offline.sh` archives hold exactly the files git tracks in the current commit (`HEAD`), with no untracked or ignored file and no uncommitted change, and both scripts refuse to run unless their directory is the top level of a git checkout (§11.2, #384).
   *Evidence: `scripts/tests/test_package_archives.py`, run on the host by suite 01 as the check `Distribution archives hold only the tracked files of HEAD (#384)`, runs both scripts in a scratch git repository with `docker` stubbed: untracked and ignored files and an uncommitted edit stay out of the zip and the offline bundle, executable bits are kept, both scripts refuse in an extracted copy and in a subdirectory of a checkout before calling docker, and a checkout reached through a symlink is not refused. The scratch repository and both scripts read no system or global git config, checked with a global config whose failing hook and `export-ignore` attributes would otherwise break or change the result (#447).*
 - [x] Every pull request to `develop` or `main` runs the verification suite in CI (#24): `.github/workflows/verify.yml` on `ubuntu-latest`, with `RAG_SKIP_SLOW=1`, on the disposable verify project (`stack.sh up`, `all.sh`, `stack.sh down`, never `RAG_VERIFY_LIVE`). It always uploads the compose logs as an artifact and caches the Ollama models under a key built from the model names `ollama/entrypoint.sh` pulls. It runs with `contents: read` only and no secrets, and pins every action, all GitHub's own, to a full commit SHA. The README shows its status badge.
@@ -4187,7 +4274,8 @@ and checks the verify project through `prepare_stack.py` (P1-P11).
       settings (422) (P6); cancelling an unknown job is 404 (P7).
 - [x] Uploads, downloads and deletes are audited with names and no document text (P8).
 - [x] With the LLM (full runs): a `.txt` becomes `.md` whose lines are source lines in order, with the title
-      header when there is a title; the `.csv` and `.jsonl` come back unchanged and code-only, with the title and
+      header when there is a title, and every cleaning window without a fallback lost at most 20 % of its
+      characters, measured on the windows rebuilt from the source (#640); the `.csv` and `.jsonl` come back unchanged and code-only, with the title and
       summary from their data and `summary_error` null (P9); an import into
       an unknown collection is 404 and one into a new collection completes and is recorded on each document
       (P10); the prepared download is the part, and deleting the prepared output returns the document to `raw`
@@ -4198,11 +4286,44 @@ and checks the verify project through `prepare_stack.py` (P1-P11).
       never cut, names and the checks of a written part; JSON to JSON Lines with numbers as written; the storage
       limit refusing an upload, a job start and a part; replacing output, a failed re-run keeping the earlier
       output, cancel and restart; one job at a time; busy documents; the routes' roles and audit actions; and
-      the prepared download of several parts as a ZIP (U1-U13); CSV and JSON parts labelled from their data:
+      the prepared download of several parts as a ZIP (U1-U13); an import whose parts total more than 512 MB
+      refused `IMPORT_TOO_LARGE` before the collection check and before anything is staged, for a selection and
+      for all; two inputs of one upload with one name refused `DUPLICATE_NAMES` with nothing kept, while ingest
+      still keeps the last (#640); CSV and JSON parts labelled from their data:
       titles for one and several parts and the 150-character cut, `1 record.` and a part with no records,
       fields, more than 20 fields, keys of every
       kind and their fallbacks by document position, the 40-character cut, the 80-word limit, and no LLM call
       or model check for all five types, with the model missing or the LLM failing (U14).
+
+### 10.9 Ingest through the web UI (#641)
+
+`scripts/verify/22_ui_ingest.sh` drives the real Import and Prepare pages in a headless browser
+(`browser/ui_ingest.js`), logged in as the harness Engineer, with no request stubbed, each case into a new
+collection; `ui_ingest_check.py` checks what the pages showed, the API's job records, the Collections page and
+the documents and phrases read from the verify project's Weaviate (`ui_ingest_weaviate.py`).
+
+- [x] A clean `.pdf`, `.docx`, `.txt`, `.md`, `.csv`, `.json` and `.jsonl`, each uploaded on the Import page
+      into a new collection, ends `completed` with no file error and no error on the page; the Collections page
+      shows the collection with at least one chunk, Weaviate holds exactly that document, and a known phrase
+      of it is in one of its chunks.
+- [x] A ZIP of mixed types with a `.json.gz` member, uploaded with a `.jsonl.gz` in one Start Ingest, does the
+      same into one collection: every member by its archive path and the `.jsonl.gz`, each with its phrase
+      (a `.json.gz` is ingested only from a ZIP, §3.1.3).
+- [x] A `.txt` of over 10,000 pieces at the `fixed` strategy's chunk size 50, with the minimum chunk size at
+      6,000 (the page's selector and sliders), is split (#621): the page and the job list it as split,
+      Weaviate holds `<name> (part 1)` to `(part N)`, N ≥ 2, the first paragraph's phrase in part 1 and the
+      last's in part N, and the Collections page shows at least its characters other than white space
+      divided by 6,000.
+- [x] With the LLM (full runs): a `.txt` and a `.csv` uploaded on the Prepare page, prepared with Prepare
+      selected (the job `completed`, no error shown, both `prepared`) and imported with Import selected into a
+      new collection, end with the import job `completed` and no error shown; Weaviate holds exactly the
+      prepared parts, each document's phrase in one of its parts' chunks (#638).
+- [x] A broken PDF ends its job `failed` with an error line naming the file; an unsupported type and an
+      over-limit ZIP are refused with a red message naming the file and the reason; each leaves its
+      collection empty (the Collections page and Weaviate) and no job running, the two refused uploads no
+      job at all.
+      *Evidence: `22_ui_ingest.sh`, one check per case and condition. Each check was shown to fail when its
+      condition breaks, a job answer stubbed to fail among them, in a run of a changed copy of the suite.*
 
 ## 11. Host Requirements and Distribution
 
@@ -4212,8 +4333,8 @@ and checks the verify project through `prepare_stack.py` (P1-P11).
 |---|---|---|
 | Hardware | Apple Silicon (arm64) | All images resolve arm64 natively; torch is installed from the CPU index, which publishes linux/aarch64 wheels |
 | Docker Desktop | installed and running, Engine 28.0.0+ | The only host dependency. No Python, Node or compiler is required |
-| **Docker memory** | **12 GB, plus 2 GB swap** | phi3.5 is ~6 GB resident. At 10 GB, full verification runs still hit Ollama timeouts under memory pressure; below that the model is evicted and reloaded between calls and generation times out with `httpx.ReadTimeout`. Swap absorbs short spikes. Leave macOS at least 4 GB: on a 16 GB Mac, 12 GB is the practical ceiling |
-| Docker disk | 20 GB minimum, 32 GB recommended | ~6.5 GB images + ~2.5 GB model weights + build cache |
+| **Docker memory** | **12 GB, plus 2 GB swap** | llama3.1:8b is ~6 GB resident. At 10 GB, full verification runs still hit Ollama timeouts under memory pressure; below that the model is evicted and reloaded between calls and generation times out with `httpx.ReadTimeout`. Swap absorbs short spikes. Leave macOS at least 4 GB: on a 16 GB Mac, 12 GB is the practical ceiling |
+| Docker disk | 20 GB minimum, 32 GB recommended | ~6.5 GB images + ~5.2 GB model weights + build cache |
 | Free host port | 8080 | `proxy` publishes `127.0.0.1:8080:80` |
 
 Memory and swap are set in **Docker Desktop → Settings → Resources**, not in
@@ -4230,10 +4351,10 @@ stale backend leaves the VM unreachable and the daemon never comes up.
 
 | | `package.sh` | `package-offline.sh` |
 |---|---|---|
-| Archive | ~1.3 MB zip | ~4.6 GB tar |
+| Archive | ~1.3 MB zip | ~7.7 GB tar |
 | Contains | source only | source + all 5 images + model weights |
-| Target needs internet | **yes** (~8–10 GB downloaded) | **no** |
-| Docker disk on target | 20 GB | ~12 GB (no build cache needed) |
+| Target needs internet | **yes** (~11–13 GB downloaded) | **no** |
+| Docker disk on target | 20 GB | ~15 GB (no build cache needed) |
 
 Both archives MUST hold exactly the files git tracks in the current commit
 (`HEAD`), built with `git archive`, so nothing untracked or ignored goes in:
@@ -4254,12 +4375,18 @@ rag-docker/
 ├── install-offline.sh
 └── offline/
     ├── images.tar.gz            # docker save of all 5 images (~2.5 GB)
-    └── ollama_models.tar.gz     # phi3.5 + nomic-embed-text (~2.2 GB)
+    └── ollama_models.tar.gz     # llama3.1:8b + nomic-embed-text (~5.2 GB)
 ```
+
+Before saving any image, `package-offline.sh` MUST check that the
+`ollama_models` volume holds a manifest for every model `ollama/entrypoint.sh`
+pulls, and stop naming the missing ones otherwise (#647): a bundle without one
+would make the offline target try to download it. It exports the whole volume,
+so a model left in it (phi3.5, after an upgrade to 1.2.1) goes in too.
 
 The image list MUST match the images `docker compose config` resolves. It is
 `rag-docker-api:latest`, `rag-docker-ui:latest`,
-`semitechnologies/weaviate:1.40.2`, `ollama/ollama:0.3.14`, `nginx:1.27-alpine`.
+`semitechnologies/weaviate:1.40.2`, `ollama/ollama:0.3.14`, `nginx:1.29-alpine`.
 A stale entry here silently ships a superseded server.
 
 ### 11.4 Offline install procedure

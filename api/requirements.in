@@ -16,7 +16,8 @@
 #      api/requirements.txt, keeping it LC_ALL=C sorted.
 #   3. docker compose build api   # confirm the lock installs cleanly
 #   4. docker run --rm rag-docker-api pip freeze \
-#        | grep -viE '^(torch|torchvision)==' | LC_ALL=C sort > /tmp/pins.txt
+#        | grep -viE '^(torch|torchvision)==|^en[-_]core[-_]web[-_]sm( @|==)' \
+#        | LC_ALL=C sort > /tmp/pins.txt
 #      diff that against requirements.txt to confirm nothing else moved.
 #   5. commit BOTH files together
 #
@@ -34,6 +35,11 @@
 # torch and torchvision are not listed here. They arrive transitively via
 # sentence-transformers and unstructured, and api/Dockerfile installs them from
 # the PyTorch CPU index first to avoid ~4.1 GB of unusable NVIDIA CUDA packages.
+#
+# The spaCy model en_core_web_sm is not listed here or in the lock either.
+# api/Dockerfile installs it from its pinned URL and SHA-256, the version the
+# locked unstructured expects, so text ingest never downloads it (#695). The
+# freeze in step 4 leaves it out; bump it in api/Dockerfile with unstructured.
 # ---------------------------------------------------------------------------
 
 fastapi>=0.111                    # resolved: 0.141.1

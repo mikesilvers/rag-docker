@@ -213,6 +213,14 @@ class PolicyTests(unittest.TestCase):
             routes = [key for key, name in audit.ACTIONS.items() if name == action]
             self.assertEqual(len(routes), shared.get(action, 1), action)
 
+    def test_the_job_lists_are_not_audited(self):
+        # The running and recent job lists (#617) are reads, never recorded (#629).
+        for key in (("GET", "/ingest/jobs"), ("GET", "/export/jobs"), ("GET", "/import/jobs"),
+                    ("GET", "/goldstandard/sessions")):
+            with self.subTest(route=key):
+                self.assertIn(key, policy.ACCESS)
+                self.assertNotIn(key, audit.ACTIONS)
+
 
 class MiddlewareTests(AuditTestCase):
     def setUp(self):

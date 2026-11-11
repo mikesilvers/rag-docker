@@ -232,6 +232,158 @@ def write(target: pathlib.Path) -> None:
     with zipfile.ZipFile(target / "zip_high_ratio.zip", "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("zeros.txt", bytes(2 * 1024 * 1024))
 
+    write_ui_ingest(target / "ui_ingest", target)
+
+
+# Issue #641. 22_ui_ingest.sh ingests these through the web UI, one new
+# collection per case, and finds each phrase in the collection's chunks in
+# Weaviate. Every phrase is plain words, unique to its document.
+UI_PHRASES = {
+    "vfy-ui.pdf": "Cobalt heron ledger seven",
+    "vfy-ui.docx": "Amber falcon register nine",
+    "vfy-ui.txt": "Silver otter journal four",
+    "vfy-ui.md": "Crimson lynx almanac two",
+    "vfy-ui.csv": "Jade badger inventory six",
+    "vfy-ui.json": "Ivory marten catalogue three",
+    "vfy-ui.jsonl": "Copper wren dossier eight",
+    "mixed/notes.txt": "Violet stoat bulletin one",
+    "mixed/guide.md": "Scarlet ibis handbook five",
+    "mixed/table.csv": "Indigo vole tally ten",
+    "mixed/report.pdf": "Bronze egret survey eleven",
+    "mixed/memo.docx": "Teal ferret minute twelve",
+    "mixed/records.jsonl": "Olive pika roster thirteen",
+    "mixed/bills/bills.json.gz": "Saffron newt docket fourteen",
+    "vfy-ui-records.jsonl.gz": "Cerise gecko ledger fifteen",
+    "vfy-ui-prep-notes.txt": "Pewter crane quarterly review",
+    "vfy-ui-prep-table.csv": "Garnet tapir supply audit",
+}
+# The large file's phrases, at most 20 characters and repeated back to back,
+# so some 50-character chunk holds one whole.
+UI_LARGE_FIRST = "Quartz hare alpha"
+UI_LARGE_LAST = "Umber yak omega"
+UI_PREFIX = "VfyUiIngest"
+
+
+def _fixed_zip(data: bytes) -> bytes:
+    """A ZIP's members again, each dated 1980-01-01, so the bytes are the same
+    on every run (_docx dates them with the time of writing)."""
+    import io
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(data)) as src, \
+            zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+        for info in src.infolist():
+            member = zipfile.ZipInfo(info.filename, date_time=(1980, 1, 1, 0, 0, 0))
+            member.compress_type = zipfile.ZIP_DEFLATED
+            dst.writestr(member, src.read(info))
+    return out.getvalue()
+
+
+def _ui_documents(name: str, phrase: str) -> bytes:
+    """One small document of the type `name` names, holding `phrase`."""
+    sentence = f"The {phrase} entry is kept with these policies."
+    paras = [PARAGRAPHS[0], sentence, PARAGRAPHS[2]]
+    ext = name.rsplit(".", 1)[-1] if not name.endswith(".gz") else name[:-3].rsplit(".", 1)[-1]
+    if ext == "pdf":
+        data = _pdf(paras)
+    elif ext == "docx":
+        data = _fixed_zip(_docx(" ".join(paras)))
+    elif ext == "txt":
+        data = ("\n\n".join(paras) + "\n").encode()
+    elif ext == "md":
+        data = ("# Policies\n\n" + "\n\n".join(paras) + "\n").encode()
+    elif ext == "csv":
+        data = ("policy,detail\n" + "".join(f'p{i},"{p}"\n' for i, p in enumerate(paras))).encode()
+    elif ext == "json":
+        data = json.dumps([{"policy": f"p{i}", "detail": p} for i, p in enumerate(paras)],
+                          indent=2).encode()
+    elif ext == "jsonl":
+        data = "".join(json.dumps({"policy": f"p{i}", "detail": p}) + "\n"
+                       for i, p in enumerate(paras)).encode()
+    else:
+        raise ValueError(name)
+    return gzip.compress(data, mtime=0) if name.endswith(".gz") else data
+
+
+def write_ui_ingest(out: pathlib.Path, fixtures: pathlib.Path) -> None:
+    """The files and manifest.json of 22_ui_ingest.sh (#641)."""
+    out.mkdir(parents=True, exist_ok=True)
+    cases = []
+    # Every supported type, one new collection each.
+    for ext in ("pdf", "docx", "txt", "md", "csv", "json", "jsonl"):
+        name = f"vfy-ui.{ext}"
+        (out / name).write_bytes(_ui_documents(name, UI_PHRASES[name]))
+        cases.append({"name": f"type .{ext}", "kind": "ingest",
+                      "collection": UI_PREFIX + ext.capitalize(), "files": [name],
+                      "documents": {name: UI_PHRASES[name]}, "min_chunks": 1})
+    # A ZIP of mixed types, a .json.gz among its members (a .json.gz is only
+    # ingested from a ZIP), and a .jsonl.gz beside it, in one upload.
+    members = [m for m in UI_PHRASES if m.startswith("mixed/")]
+    with zipfile.ZipFile(out / "vfy-ui-mixed.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        for member in members:
+            z.writestr(zipfile.ZipInfo(member, date_time=(1980, 1, 1, 0, 0, 0)),
+                       _ui_documents(member, UI_PHRASES[member]))
+    (out / "vfy-ui-records.jsonl.gz").write_bytes(
+        _ui_documents("vfy-ui-records.jsonl.gz", UI_PHRASES["vfy-ui-records.jsonl.gz"]))
+    mixed = members + ["vfy-ui-records.jsonl.gz"]
+    cases.append({"name": "archives and mixes", "kind": "ingest", "collection": UI_PREFIX + "Mixed",
+                  "files": ["vfy-ui-mixed.zip", "vfy-ui-records.jsonl.gz"],
+                  "documents": {m: UI_PHRASES[m] for m in mixed}, "min_chunks": len(mixed)})
+    # Over 10,000 pieces at the fixed strategy's chunk size 50, so it is split
+    # into parts (#621), and a minimum chunk size of 6,000 merges the pieces, so
+    # only about a hundred chunks are embedded. A chunk holds at most 6,000
+    # characters, hence the minimum count. The first phrase is only in the first
+    # paragraph, the last only in the last.
+    filler = [(" ".join(PARAGRAPHS) * 2)[:999] + "." for _ in range(560)]
+    large = "\n\n".join([" ".join([UI_LARGE_FIRST] * 60)] + filler
+                         + [" ".join([UI_LARGE_LAST] * 60)]) + "\n"
+    (out / "vfy-ui-large.txt").write_text(large)
+    cases.append({"name": "large file", "kind": "ingest", "collection": UI_PREFIX + "Large",
+                  "files": ["vfy-ui-large.txt"],
+                  "settings": {"strategy": "fixed", "chunk_size": 50, "min_chunk_size": 6000},
+                  "documents": {}, "split": {"file": "vfy-ui-large.txt", "first": UI_LARGE_FIRST,
+                                             "last": UI_LARGE_LAST},
+                  "min_chunks": -(-len("".join(large.split())) // 6000)})
+    # Prepared with the local LLM, then imported (#638). The phrase is in three
+    # body lines, so the cleaning can't drop every one.
+    notes = UI_PHRASES["vfy-ui-prep-notes.txt"]
+    (out / "vfy-ui-prep-notes.txt").write_text("\n".join([
+        "Facilities Committee Notes",
+        "",
+        f"The committee opened the {notes} and agreed the agenda for the session.",
+        "Members reviewed the cleaning contract and asked for a revised schedule by March.",
+        f"The {notes} found the storage rooms in good order and the fire doors working.",
+        "The budget for new chairs was approved and the order will be placed next week.",
+        f"Actions from the {notes} are assigned to the facilities manager.",
+        "The next meeting is on the first Monday of the month in the main hall.",
+    ]) + "\n")
+    table = UI_PHRASES["vfy-ui-prep-table.csv"]
+    (out / "vfy-ui-prep-table.csv").write_text(
+        "item,team,note\nchairs,facilities,ordered\nlamps,facilities,fitted\n"
+        f"keys,security,{table}\ndesks,facilities,delivered\n")
+    cases.append({"name": "prepare and import", "kind": "prepare",
+                  "collection": UI_PREFIX + "Prepared",
+                  "files": ["vfy-ui-prep-notes.txt", "vfy-ui-prep-table.csv"],
+                  "documents": {n: UI_PHRASES[n] for n in ("vfy-ui-prep-notes.txt",
+                                                           "vfy-ui-prep-table.csv")},
+                  "slow": True})
+    # One negative case per refusal: each must show a clear message and leave
+    # nothing in its collection and no job running.
+    (out / "vfy-ui-broken.pdf").write_bytes((fixtures / "broken.pdf").read_bytes())
+    (out / "vfy-ui-notes.xyz").write_text("unsupported\n")
+    (out / "vfy-ui-over-limit.zip").write_bytes((fixtures / "zip_over_declared.zip").read_bytes())
+    for name, collection, file, words, job in (
+            ("broken PDF", "BadPdf", "vfy-ui-broken.pdf", ["vfy-ui-broken.pdf:"], True),
+            ("unsupported type", "BadType", "vfy-ui-notes.xyz",
+             ["No supported files", "vfy-ui-notes.xyz"], False),
+            ("over-limit ZIP", "BigZip", "vfy-ui-over-limit.zip",
+             ["vfy-ui-over-limit.zip", "expands to more than"], False)):
+        cases.append({"name": name, "kind": "refused", "collection": UI_PREFIX + collection,
+                      "files": [file], "message": words, "job": job})
+    for case in cases:
+        case.setdefault("settings", {})
+        case.setdefault("slow", False)
+    (out / "manifest.json").write_text(json.dumps({"cases": cases}, indent=2) + "\n")
+
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
@@ -239,4 +391,5 @@ if __name__ == "__main__":
     out = pathlib.Path(sys.argv[1])
     write(out)
     for path in sorted(out.iterdir()):
-        print(f"  {path.name:16s} {path.stat().st_size:7d} bytes")
+        if path.is_file():
+            print(f"  {path.name:16s} {path.stat().st_size:7d} bytes")

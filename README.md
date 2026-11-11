@@ -9,7 +9,7 @@ A self-contained, Dockerized Retrieval-Augmented Generation (RAG) platform. Uplo
 | Component | Technology | Purpose |
 |---|---|---|
 | Vector store | Weaviate 1.40.2 | Stores and retrieves document chunks |
-| LLM + embeddings | Ollama 0.3.14 | Runs phi3.5 (chat) and nomic-embed-text (embeddings) locally |
+| LLM + embeddings | Ollama 0.3.14 | Runs llama3.1:8b (chat) and nomic-embed-text (embeddings) locally |
 | API | FastAPI + Python 3.11 | RAG pipeline, ingest, gold standard generation |
 | UI | React 18 + Vite + Tailwind | Web interface with login and three roles |
 | Proxy | nginx 1.29 | Routes traffic; listens on port 80 in-container, published on host port 8080 |
@@ -17,7 +17,7 @@ A self-contained, Dockerized Retrieval-Augmented Generation (RAG) platform. Uplo
 ## Prerequisites
 
 - **Docker Desktop with Engine 28.0.0 or newer** (or Docker Engine 28.0.0+ with Compose v2) — [install](https://docs.docker.com/get-docker/)
-- **12 GB RAM and 2 GB swap allocated to Docker** (Docker Desktop → Settings → Resources → Memory and Swap). phi3.5 alone is ~6 GB resident; at 10 GB, full verification runs still hit Ollama timeouts under memory pressure, and below that the model is repeatedly evicted and reloaded and queries time out. Swap turns a short spike into a slowdown instead of a failure. Leave macOS at least 4 GB: on a 16 GB Mac, 12 GB is the practical ceiling. `/health` reports what Docker actually has against this recommendation
+- **12 GB RAM and 2 GB swap allocated to Docker** (Docker Desktop → Settings → Resources → Memory and Swap). llama3.1:8b alone is ~6 GB resident; at 10 GB, full verification runs still hit Ollama timeouts under memory pressure, and below that the model is repeatedly evicted and reloaded and queries time out. Swap turns a short spike into a slowdown instead of a failure. Leave macOS at least 4 GB: on a 16 GB Mac, 12 GB is the practical ceiling. `/health` reports what Docker actually has against this recommendation
 - **20 GB disk minimum allocated to Docker, 32 GB recommended** — see [Storage requirements](#storage-requirements) below. Check your current limit before building — a small virtual disk (8 GB or so) cannot hold this stack, and the build fails partway through with a confusing error.
 - Port **8080** free on the host — `docker-compose.yml` publishes the proxy as `127.0.0.1:8080:80`, bound to host loopback on supported engines
 
@@ -37,12 +37,12 @@ All of this lives inside Docker's virtual disk, not your host filesystem. Measur
 | `weaviate` image | 200 MB | first pull |
 | `nginx` image | 50 MB | first pull |
 | **Images after a full build** | **~6.5 GB** | |
-| Model weights (phi3.5 2.2 GB, nomic-embed-text 274 MB) | ~2.5 GB | first run, into the `ollama_models` volume |
-| **Total steady state** | **~9.0 GB** | |
+| Model weights (llama3.1:8b 4.9 GB, nomic-embed-text 274 MB) | ~5.2 GB | first run, into the `ollama_models` volume |
+| **Total steady state** | **~11.7 GB** | |
 
 Build cache adds several GB on top, though much of it shares layers with the images rather than duplicating them. A rebuild also holds the old and new image layers at once until you prune.
 
-**Allocate 20 GB minimum.** That covers the steady-state ~9.0 GB plus build cache and rebuild headroom. **32 GB is recommended** if you plan to ingest a meaningful document corpus, since the Weaviate index, the uploaded files and the retained originals all grow on top of everything above.
+**Allocate 20 GB minimum.** That covers the steady-state ~11.7 GB plus build cache and rebuild headroom. **32 GB is recommended** if you plan to ingest a meaningful document corpus, since the Weaviate index, the uploaded files and the retained originals all grow on top of everything above.
 
 Three things scale with your corpus rather than with the stack:
 
@@ -69,7 +69,7 @@ cd rag-docker
 # 2. Start the stack
 docker compose up -d
 
-# 3. Watch Ollama download the models (first run only — ~5 minutes)
+# 3. Watch Ollama download the models (first run only — ~8 minutes)
 docker compose logs -f ollama
 
 # 4. Create the first AI Engineer (first start only); it prints a one-time password
@@ -94,9 +94,9 @@ bandwidth-bound, so a slower link stretches them proportionally.
 | ~1min | Weaviate starts — its image is only 120 MB, so it is ready well before the others |
 | ~4min | api image finishes building. That build measures **~3 min from scratch**: apt 32s, pip install 97s, sentence-transformers pre-cache 19s. The ui image finishes sooner |
 | ~5min | The 3.2 GB ollama image finishes pulling; the container starts and immediately begins downloading models |
-| ~10min | phi3.5 (2.2 GB) and nomic-embed-text (274 MB) finish; ollama passes its healthcheck and api, ui and nginx start |
+| ~13min | llama3.1:8b (4.9 GB) and nomic-embed-text (274 MB) finish; ollama passes its healthcheck and api, ui and nginx start |
 
-**Total first run: roughly 10–20 minutes**, dominated by downloads rather than CPU.
+**Total first run: roughly 15–25 minutes**, dominated by downloads rather than CPU. The ollama health check waits up to 30 minutes for the first download (enough down to about 23 Mbps), so api, ui and nginx simply start later on a slow link. Only a slower download makes `docker compose up` stop with ollama unhealthy; the download carries on, so wait for it in `docker compose logs -f ollama`, then run `docker compose up -d` again.
 Note that nothing can pull models until the ollama image itself has downloaded,
 so the model wait begins several minutes in — the stack is not stuck.
 
@@ -111,7 +111,7 @@ can't use.
 | Role | Access |
 |---|---|
 | **End User** | Q&A only |
-| **Developer** | Q&A, Import, Chunking, Retrieval, Gold Standard, Transfer |
+| **Developer** | Q&A, Import, Prepare, Chunking, Retrieval, Gold Standard, Transfer |
 | **AI Engineer** | All of the above + Collections management (deleting collections) + Health dashboard + tuning + Users (account management) + Service keys (API keys for programs) + Audit (the audit log) |
 
 Endpoint by endpoint (paths under `/api`):
@@ -121,7 +121,7 @@ Endpoint by endpoint (paths under `/api`):
 | nothing | `GET /health`, `GET /auth/status`, `POST /auth/login` |
 | any logged-in user | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password` |
 | End User | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
-| Developer | creating a collection; ingest (upload, job status, settings); saving retrieval settings; gold standard (generate, sessions, pairs, regenerate, save, download); export, import, their job status, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
+| Developer | creating a collection; ingest (upload, job status, settings); document preparation (`POST /prepare/upload`; `GET /prepare/documents`; `GET` and `DELETE /prepare/documents/{document_id}`; `GET /prepare/documents/{document_id}/raw`; `GET` and `DELETE /prepare/documents/{document_id}/prepared`; `POST` and `GET /prepare/jobs`; `GET /prepare/job/{job_id}`; `POST /prepare/job/{job_id}/cancel`; `POST /prepare/import`); saving retrieval settings; gold standard (generate, sessions, pairs, regenerate, save, download); export, import, their job status, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
 | AI Engineer | `DELETE /collections/{name}`; `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/job/{id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; the API docs (`/docs`, `/redoc`, `/openapi.json`); account management (`GET` and `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `/role`, `/disable`, `/enable`); service keys (`GET` and `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `/disable`, `/enable`, `/keys`, `/keys/{key_id}/revoke`); the audit log (`GET /audit`, `GET /audit.csv`), in a browser session only |
 
 Without a session the API answers `401 AUTH_REQUIRED`; with a role that is too
@@ -360,6 +360,12 @@ is published on `127.0.0.1:8080`, over plain HTTP. LAN mode (#26) lets other
 machines on your network use it, over TLS. It is opt-in: without
 `docker-compose.lan.yml` nothing changes.
 
+The proxy also checks the name in each request (#664). By default it answers
+only `http://localhost:8080` and `http://127.0.0.1:8080`; another name for this
+machine, even one that points at `127.0.0.1`, gets `421 Misdirected Request`.
+That stops a web page on a DNS-rebinding domain from reaching the workbench
+through your browser.
+
 In LAN mode:
 
 - the proxy publishes HTTPS on every network interface of this machine, port
@@ -422,9 +428,19 @@ Browsers check that the certificate names the address they typed. Pick one of:
   any site) as a trusted root on each client machine: on a Mac, open it in
   Keychain Access, then set it to "Always Trust".
 
+**The names the proxy answers for (#664).** In LAN mode the proxy answers only
+for the names in its certificate, plus `localhost` and `127.0.0.1`: with the
+self-signed certificate, the names in `RAG_LAN_HOSTNAMES`; with your own, the
+DNS names and IP addresses it is issued for (a wildcard such as
+`*.office.example` covers every name under `office.example`). A request for any
+other name, such as an address you didn't list or a DNS-rebinding page's
+domain, gets `421 Misdirected Request`. To add a name, add it to
+`RAG_LAN_HOSTNAMES` or to your certificate. `docker compose logs tls-init` warns
+about a certificate name it can't use.
+
 After changing the certificate files or `RAG_LAN_HOSTNAMES` on a running LAN
 stack, run the `up` command below again, then restart the proxy so nginx loads
-the new pair:
+the new pair and names:
 `docker compose -f docker-compose.yml -f docker-compose.lan.yml restart proxy`.
 
 ### 3. Start in LAN mode
@@ -488,7 +504,7 @@ Navigate to **Data → Import**, drop in your files (PDF, DOCX, TXT, MD, CSV, JS
 
 You don't have to stay on the page while a job runs. The Import, Gold Standard and Transfer pages each show a **Running and recent jobs** list, read from the server whenever the page opens, so coming back to it (after visiting another page, reloading, in another tab or after logging in again) shows the running job's progress, or its result once it has finished. The newest job opens by itself; click another row to switch. The list holds your own jobs that are running or finished in the last 24 hours (at most 20 finished ones); an AI Engineer sees everyone's, with who started each.
 
-**Documents that break the corpus rules?** **Data → Prepare** makes raw documents follow them on this instance, without downloading and uploading them again. Upload the raw files (the same types and ZIP limits as Import), then **Prepare**: the code extracts the text, splits it into parts within the rules' limits, normalises the encoding and converts JSON to JSON Lines; the local LLM only removes page headers, footers, page numbers and boilerplate from PDF, DOCX, TXT and Markdown, and writes a title and short summary for each of their parts. It never rewrites text: where its cleaning would remove too much, or a long line, that part of the document keeps the code-only text, and the page shows the fallback and why. CSV, JSON and JSON Lines are prepared by code only, with no LLM call: each part's title is the file name and part number, and its summary gives the record count, the field names and the first and last records' keys. Review each document's parts in **Preview**, then **Import selected** or **Import all prepared** into a collection, with the usual chunk settings; this starts an ordinary ingest job. Raw and prepared documents stay until you delete them, and each can be downloaded. Preparation uses the same local LLM as Q&A and ingest's embeddings, so on a CPU-only machine a long document takes a while, and either is slower while the other runs.
+**Documents that break the corpus rules?** **Data → Prepare** makes raw documents follow them on this instance, without downloading and uploading them again. Upload the raw files (the same types and ZIP limits as Import), then **Prepare**: the code extracts the text, splits it into parts within the rules' limits, normalises the encoding and converts JSON to JSON Lines; the local LLM only removes page headers, footers, page numbers and boilerplate from PDF, DOCX, TXT and Markdown, and writes a title and short summary for each of their parts. It never rewrites text: where its cleaning would remove too much, or a long line, that part of the document keeps the code-only text, and the page shows the fallback and why. CSV, JSON and JSON Lines are prepared by code only, with no LLM call: each part's title is the file name and part number, and its summary gives the record count, the field names and the first and last records' keys. Review each document's parts in **Preview**, then **Import selected** or **Import all prepared** into a collection, with the usual chunk settings; this starts an ordinary ingest job. One import can hold at most 512 MB of prepared parts, the same as one upload; import a larger set in smaller selections. Raw and prepared documents stay until you delete them, and each can be downloaded. Preparation uses the same local LLM as Q&A and ingest's embeddings, so on a CPU-only machine a long document takes a while, and either is slower while the other runs.
 
 Uploading a file again under the same name replaces its earlier chunks (even if the content is unchanged); files inside a ZIP are named by their path in the archive, so `a/report.pdf` and `b/report.pdf` stay separate documents. macOS metadata in a ZIP (the `__MACOSX/` folder and `._*` files the Finder adds) is not ingested; the job lists it under skipped files.
 
@@ -596,6 +612,8 @@ replaces a changed file instead of rewriting it, so a running proxy keeps readin
 Run these commands in the `rag-docker` folder. Your collections, accounts and downloaded models are kept: they live in Docker volumes that these steps don't touch. There are two ways to get the new code: the latest release, for normal use, or `develop`, for testing.
 
 Coming from 1.1.0? Follow [Upgrading from 1.1.0 to 1.2.0](#upgrading-from-110-to-120) first: it includes these steps.
+
+Coming from 1.2.0? Read [Upgrading to 1.2.1](#upgrading-to-121-the-new-answering-model) first: the first start downloads a new answering model.
 
 ### 1. Get the new code
 
@@ -716,10 +734,9 @@ Follow these steps once, to move an instance from 1.1.0 to 1.2.0. The first star
 
 **Before updating (still on 1.1.0)**
 
-1. **Stop the stack.**
+1. **Stop the stack.** Never use `down -v`: it deletes the volumes.
 
    ```bash
-   # Stop the stack. Never use `down -v`, which deletes the volumes.
    docker compose stop
    ```
 
@@ -729,73 +746,70 @@ Follow these steps once, to move an instance from 1.1.0 to 1.2.0. The first star
 
    Check the volume prefix first. The volume names start with the compose project name, usually the folder name: `rag-docker_weaviate_data`. Set `P` to the prefix you see.
 
+   The block lists the volume names, sets `P`, makes the `backups/` folder, and copies each volume through a throwaway container into a `.tmp` file in `backups/`, which replaces that volume's `.tgz` only once `gzip -t` reads it back. A volume that doesn't exist (a wrong `P`) is reported and skipped, not created. It then lists the files, and checks that each backup reads back and counts what it holds.
+
    ```bash
-   # Find the volume names. The prefix is the compose project, usually the folder name: rag-docker_weaviate_data
    docker volume ls --filter name=_weaviate_data
-   # Set the prefix you saw
    P=rag-docker
-   # Make the folder for the backups
    mkdir -p backups
-   # Copy each volume into a .tgz in ./backups, through a throwaway container
    for v in weaviate_data ingest_uploads rag_sources; do
-     docker run --rm -v "${P}_$v":/data:ro -v "$PWD/backups":/backup alpine tar czf "/backup/$v-v1.1.0.tgz" -C /data .
+     docker volume inspect "${P}_$v" >/dev/null &&
+       docker run --rm -v "${P}_$v":/data:ro -v "$PWD/backups":/backup alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf tar czf "/backup/$v-v1.1.0.tgz.tmp" -C /data . &&
+       gzip -t "backups/$v-v1.1.0.tgz.tmp" &&
+       mv -f "backups/$v-v1.1.0.tgz.tmp" "backups/$v-v1.1.0.tgz" ||
+       { echo "$v: backup FAILED"; rm -f "backups/$v-v1.1.0.tgz.tmp"; }
    done
-   # Check that the three files are there
    ls -l backups
+   for v in weaviate_data ingest_uploads rag_sources; do
+     docker volume inspect "${P}_$v" >/dev/null && gzip -t "backups/$v-v1.1.0.tgz" && echo "$v: $(tar tzf "backups/$v-v1.1.0.tgz" | wc -l | tr -d ' ') entries"
+   done
    ```
 
-   The throwaway container is `alpine`; Docker downloads it (a few MB) if this machine doesn't have it. The backups stay in `backups/` as untracked files: switching to another branch or tag leaves them in place, and they don't go into packages.
+   Go on only if the last loop prints a line for each of the three volumes and no error. `backup FAILED` means that copy didn't complete, and an earlier backup of that volume is unchanged: fix the cause (a wrong `P`, or disk space) and rerun the block. `no such volume` means `P` is wrong: set it again and rerun the block. `1 entries` means that volume is empty (the backup holds only `./`); if it should hold data, `P` names another project's volumes, so stop and check it.
+
+   The throwaway container is alpine 3.24.4, pinned by its digest; Docker downloads it (a few MB) if this machine doesn't have it. git ignores the `backups/` folder: switching to another branch or tag leaves the backups in place, and they don't go into packages.
 
 3. **Check your local compose override, if you keep one.** Carry over the new settings in `docker-compose.yml`, all with working defaults: `MAX_ZIP_EXPANDED_BYTES`, `MAX_ZIP_MEMBERS`, `MAX_ZIP_MEMBER_RATIO`, `MAX_PACKAGE_EXPANDED_BYTES`, `MAX_PACKAGE_MEMBERS`, `AUTH_COOKIE_SECURE`, `AUDIT_LOG_QUESTIONS`, `AUDIT_LOG_MAX_BYTES`, `AUDIT_LOG_KEEP`, `PREPARATION_DIR`, `MAX_PREPARATION_BYTES`, `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE`. If it publishes the proxy on an address other than `127.0.0.1`, switch to LAN mode (`docker-compose.lan.yml`) instead. Do that after step 6: LAN mode won't start without an AI Engineer.
 
 **Update**
 
-4. **Get the new code.**
+4. **Get the new code.** The block downloads the newest branches and release tags, switches to the release branch `main` (a fresh clone starts on `develop`), brings it up to date, and prints the release this folder is on.
 
    ```bash
-   # Download the newest branches and release tags
    git fetch origin --tags
-   # Switch to the release branch (a fresh clone starts on develop)
    git switch main
-   # Bring it up to date
    git pull
-   # Print the release this folder is on
    git describe --tags
    ```
 
    It prints `v1.2.0` or a later release. These steps apply either way.
 
-5. **Rebuild and recreate every container.**
+5. **Rebuild and recreate every container.** This rebuilds api and ui, downloads any newer images and recreates every container. The data is kept.
 
    ```bash
-   # Rebuild api and ui, download any newer images, recreate every container (data is kept)
    docker compose up -d --build --force-recreate
    ```
 
    `--force-recreate` is required: the proxy must be recreated (#539, #554, #586), or it refuses every change the UI sends with `403 CROSS_ORIGIN_REFUSED`. This first start converts the Weaviate data.
 
-6. **Create the first AI Engineer, then the accounts and keys.** Until then the API refuses everything but `/health`.
+6. **Create the first AI Engineer, then the accounts and keys.** Until then the API refuses everything but `/health`. This creates the first AI Engineer and prints a one-time password:
 
    ```bash
-   # Create the first AI Engineer; it prints a one-time password
    docker compose exec api python -m auth bootstrap <your-username>
    ```
 
    Log in at `http://localhost:8080` and choose a new password. Create the other accounts with `create-user` or on the Users page ([Managing accounts](#managing-accounts)), and service keys for programs on the Service keys page ([Service keys](#service-keys)).
 
-   Switching to LAN mode (step 3)? Do it now, as in [Sharing with your office](#sharing-with-your-office):
+   Switching to LAN mode (step 3)? Do it now, as in [Sharing with your office](#sharing-with-your-office): rebuild and recreate every container in LAN mode.
 
    ```bash
-   # Rebuild and recreate every container in LAN mode
    docker compose -f docker-compose.yml -f docker-compose.lan.yml up -d --build --force-recreate
    ```
 
-7. **Check that it is back.**
+7. **Check that it is back.** The first command lists the services and their state; the second asks the API whether it is healthy.
 
    ```bash
-   # List the services and their state
    docker compose ps
-   # Ask the API whether it is healthy
    curl http://localhost:8080/api/health
    ```
 
@@ -817,24 +831,66 @@ Follow these steps once, to move an instance from 1.1.0 to 1.2.0. The first star
 
 **If the upgrade fails**
 
-Go back to 1.1.0 and restore the backup. The restore empties each existing volume and fills it from its backup, so what changed in those volumes after the backup is lost.
+Go back to 1.1.0 and restore the backup. The block removes the containers (the volumes are kept), sets the prefix you saw in step 2 and switches back to the 1.1.0 release. It then checks every backup and every volume, and empties nothing unless the checkout and all three volumes print `OK`. Only then does it empty each volume, restore it from its backup, and start 1.1.0. The restore empties each existing volume and fills it from its backup, so what changed in those volumes after the backup is lost.
+
+- `FAILED`: nothing was changed. Fix what the line names and run the block again: `P` (after a `no such volume` error), the backup file the error names, or, for `git checkout v1.1.0: FAILED`, what git reports (a local change to a tracked file, for example).
+- `restore FAILED`: the restore stopped at that volume, which may be partly restored, and 1.1.0 isn't started. The backups are unchanged. Fix the cause (disk space, for example) and run the block again.
 
 ```bash
-# Remove the containers. The volumes are kept.
 docker compose down
-# Switch back to the 1.1.0 release
-git checkout v1.1.0
-# Set the prefix you saw in step 2
 P=rag-docker
-# Empty each volume and restore it from its backup
+ok=yes
+if git checkout v1.1.0; then
+  echo "git checkout v1.1.0: OK"
+else
+  echo "git checkout v1.1.0: FAILED"; ok=no
+fi
 for v in weaviate_data ingest_uploads rag_sources; do
-  docker run --rm -v "${P}_$v":/data -v "$PWD/backups":/backup:ro alpine sh -c "find /data -mindepth 1 -delete && tar xzf /backup/$v-v1.1.0.tgz -C /data"
+  if gzip -t "backups/$v-v1.1.0.tgz" && tar tzf "backups/$v-v1.1.0.tgz" >/dev/null && docker volume inspect "${P}_$v" >/dev/null; then
+    echo "$v: OK"
+  else
+    echo "$v: FAILED"; ok=no
+  fi
 done
-# Rebuild and start 1.1.0
-docker compose up -d --build --force-recreate
+restored=no
+if [ "$ok" = yes ]; then
+  restored=yes
+  for v in weaviate_data ingest_uploads rag_sources; do
+    docker run --rm -v "${P}_$v":/data -v "$PWD/backups":/backup:ro alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf sh -c "find /data -mindepth 1 -delete && tar xzf /backup/$v-v1.1.0.tgz -C /data" || { echo "$v: restore FAILED"; restored=no; break; }
+  done
+else
+  echo "Nothing was emptied or restored."
+fi
+if [ "$restored" = yes ]; then
+  docker compose up -d --build --force-recreate
+fi
 ```
 
 In LAN mode, stop with `docker compose -f docker-compose.yml -f docker-compose.lan.yml down` instead of `docker compose down`. Never use `down -v`.
+
+### Upgrading to 1.2.1: the new answering model
+
+1.2.1 answers with `llama3.1:8b` instead of `phi3.5` (#647). In tests on CPU, phi3.5 fell into runs of empty or garbled answers and often named committees or sponsors that weren't in the retrieved text; llama3.1:8b gave no empty or garbled answers, and one wrong answer in 240.
+
+- **The first start downloads it.** The first start of 1.2.1 downloads `llama3.1:8b`, about 4.9 GB, into the `ollama_models` volume. The stack answers once the download is done.
+- **Answers take longer.** About 50 s per answer on CPU, against about 37 s for phi3.5. Memory stays about the same: the model is about 6 GB resident, within the 12 GB Docker allocation.
+- **Download it first, if you like.** While 1.2.0 still runs, before you get the new code:
+
+  ```bash
+  # Download the new model into the running stack's model volume (about 4.9 GB)
+  docker compose exec ollama ollama pull llama3.1:8b
+  ```
+
+  The first start of 1.2.1 then finds it and downloads nothing.
+- **On a slow link.** The first start waits up to 30 minutes for the download (enough down to about 23 Mbps) before api, ui and nginx start. Only a slower download makes `docker compose up` stop and report ollama as unhealthy. The download carries on. Watch it with `docker compose logs -f ollama`, and once it reads `ollama: llama3.1:8b ready.`, run `docker compose up -d` again.
+- **phi3.5 stays in the volume.** Nothing uses it after the update, and it takes about 2.2 GB. Once 1.2.1 answers questions, remove it:
+
+  ```bash
+  # Remove the old answering model from the model volume (frees about 2.2 GB)
+  docker compose exec ollama ollama rm phi3.5
+  ```
+
+  `package-offline.sh` bundles the whole model volume, so remove phi3.5 before building an offline bundle, or the bundle carries it too.
 
 ## GPU acceleration (optional)
 
@@ -858,7 +914,7 @@ All API settings are environment variables in `docker-compose.yml`:
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_MODEL` | `phi3.5` | Ollama model name for chat |
+| `LLM_MODEL` | `llama3.1:8b` | Ollama model name for chat |
 | `EMBED_MODEL` | `nomic-embed-text` | Ollama model name for embeddings |
 | `WEAVIATE_HOST` | `weaviate` | Weaviate hostname (internal) |
 | `OLLAMA_HOST` | `ollama` | Ollama hostname (internal) |
@@ -879,6 +935,7 @@ All API settings are environment variables in `docker-compose.yml`:
 | `MAX_PREPARATION_BYTES` | `21474836480` (20 GiB) | The most the preparation area may hold, raw and prepared documents together; at least 1048576. Checked before each upload and each prepared part is written; uploads and preparation running at the same time may pass it briefly. Over it, `PREPARATION_STORAGE_FULL` |
 | `HF_HUB_OFFLINE` | `1` | Keeps the image's pre-cached sentence-transformers model from contacting huggingface.co; set to `0` only if you change the model and want it downloaded at runtime |
 | `TRANSFORMERS_OFFLINE` | `1` | Same offline enforcement for the transformers library; keep `1` to use the pre-cached model with no runtime network call |
+| `DO_NOT_TRACK` | `1` | Stops the Unstructured library's usage telemetry, which otherwise sends a request when it loads and on every document it parses; keep `1` so ingest makes no call to the internet (#695) |
 
 LAN mode reads two more settings from your shell or a `.env` file next to `docker-compose.yml`, used by `docker-compose.lan.yml`:
 
@@ -1086,7 +1143,7 @@ curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localho
   -d '{"collection": "Policies", "include_models": true}'
 ```
 
-That takes the package from roughly 80 KB to ~2.3 GB, because it carries the
+That takes the package from roughly 80 KB to ~5.2 GB, because it carries the
 embedding model and the LLM as Ollama's own manifest and blob files. On import,
 a model already present is left alone, provided its files match their checksums;
 a missing one is installed from the package and verified before the collection
@@ -1242,9 +1299,9 @@ not `./package.sh`, so it does not depend on its own executable bit.
 | Hardware | Apple Silicon (arm64) |
 | Docker Desktop | installed and running, Engine 28.0.0+ |
 | Docker disk | 20 GB minimum, 32 GB recommended |
-| Docker memory | 12 GB, plus 2 GB swap (phi3.5 is ~6 GB resident) |
+| Docker memory | 12 GB, plus 2 GB swap (llama3.1:8b is ~6 GB resident) |
 | Free host port | 8080 |
-| Network | ~8–10 GB downloaded on first run |
+| Network | ~11–13 GB downloaded on first run |
 
 No Python, Node, compiler or model files are needed on the target machine. Everything is built inside Docker.
 
@@ -1278,14 +1335,19 @@ Build the bundle on a machine where the stack already works and the models have
 been downloaded:
 
 ```bash
-bash package-offline.sh              # writes rag-docker-offline.tar (~4.6 GB)
+bash package-offline.sh              # writes rag-docker-offline.tar (~7.7 GB)
 ```
 
 Its source tree is the same as `package.sh`'s: the files git tracks in the
 current commit, so run it in a git checkout too. It runs `docker save` on all
 five images (~2.5 GB compressed) and exports the
-Ollama model weights from the `ollama_models` volume (~2.2 GB). Expect a few
-minutes; saving the image layers is the slow part.
+Ollama model weights from the `ollama_models` volume (~5.2 GB). Expect a few
+minutes; saving the image layers is the slow part. It stops if the volume doesn't
+hold every model the stack pulls (an install from before 1.2.1 may hold only
+phi3.5): start the stack once so the missing model downloads, then run it again.
+It exports the whole volume, so a model left in it, such as phi3.5, goes into
+the bundle too; see [Upgrading to 1.2.1](#upgrading-to-121-the-new-answering-model)
+to remove it first.
 
 Move the file to the target Mac, then:
 
@@ -1299,8 +1361,8 @@ bash install-offline.sh
 project's volume, and runs `docker compose up -d --no-build`. Nothing is pulled
 and nothing is compiled. The target needs only Docker Desktop, running with Engine 28.0.0 or newer.
 
-**Requirements on the target:** Apple Silicon, Docker Desktop with Engine 28.0.0+, ~12 GB of Docker
-disk, ~10 GB of free space on the host filesystem for the archive plus its
+**Requirements on the target:** Apple Silicon, Docker Desktop with Engine 28.0.0+, ~15 GB of Docker
+disk, ~16 GB of free space on the host filesystem for the archive plus its
 extraction, and port 8080 free. No Python, Node, compiler or network needed.
 
 The bundle deliberately omits the Weaviate index and uploaded files — those are
@@ -1315,7 +1377,7 @@ docker compose logs ollama | grep 'already present'
 curl http://localhost:8080/api/health
 ```
 
-The Ollama log should read `phi3.5 already present, skipping pull` — that
+The Ollama log should read `llama3.1:8b already present, skipping pull` — that
 confirms the weights came from the bundle rather than the network.
 
 ## Troubleshooting
@@ -1359,7 +1421,7 @@ If this fails after Docker restarts, Docker's internal networking is broken — 
 
 **4. Disconnect any active VPN** — VPNs frequently block Docker's connection to Docker Hub. Disconnect, retry the pull, then reconnect once all images are cached.
 
-**Ollama health check is stuck after images are pulled** — The model download phase (`ollama pull phi3.5` etc.) is in progress. Run `docker compose logs -f ollama` to watch. If the internet drops mid-download, the entrypoint script detects the stall via a 2-hour per-attempt timeout, kills the hung pull, and retries automatically up to 5 times. Ollama resumes partial downloads so retries pick up where they left off.
+**Ollama health check is stuck after images are pulled** — The model download phase (`ollama pull llama3.1:8b` etc.) is in progress. Run `docker compose logs -f ollama` to watch. The health check gives the first download up to 30 minutes before it marks ollama unhealthy; if `docker compose up` stopped on that, run it again once the log reads `ollama: llama3.1:8b ready.` If the internet drops mid-download, the entrypoint script detects the stall via a 2-hour per-attempt timeout, kills the hung pull, and retries automatically up to 5 times. Ollama resumes partial downloads so retries pick up where they left off.
 
 **LLM answers are garbage or time out** — Answers come back in mixed scripts or as fragments of unrelated instructions, run to thousands of characters, or time out, while `/api/health` still reports the LLM as ok. Ollama's model runner has degraded; it does not recover on its own. Restart it with `docker compose restart ollama`. `scripts/verify/all.sh` checks for this before its LLM suites and stops with the same advice.
 
@@ -1405,7 +1467,7 @@ This discards ingested documents; re-ingest after it comes back up. The `ollama_
 docker compose exec <service> sh -c 'command -v curl wget'
 ```
 
-**Queries time out, or `httpx.ReadTimeout` appears in the api log** — Almost always memory. phi3.5 is ~6 GB resident, so on a Docker allocation below the recommended 12 GB the model can be evicted and reloaded between calls and generation never completes. Note the Ollama healthcheck cannot detect this: it runs `ollama list`, which succeeds while generation is wedged.
+**Queries time out, or `httpx.ReadTimeout` appears in the api log** — Almost always memory. llama3.1:8b is ~6 GB resident, so on a Docker allocation below the recommended 12 GB the model can be evicted and reloaded between calls and generation never completes. Note the Ollama healthcheck cannot detect this: it runs `ollama list`, which succeeds while generation is wedged.
 
 Check what Docker actually has, and what is loaded:
 
@@ -1459,7 +1521,7 @@ host variables through. No destination or secret is supplied by this repository.
 | `RAG_OTEL_HEADERS_FILE` | Optional mounted UTF-8 JSON regular file containing `Authorization` and/or `X-Api-Key`; max 8 KiB, max 2 KiB per value |
 | `RAG_OTEL_CA_FILE` | Optional mounted PEM CA bundle (a regular file) for an HTTPS endpoint; max 1 MiB; replaces the bundled roots |
 | `RAG_OTEL_SERVICE_NAME` | `rag-api` |
-| `RAG_OTEL_SERVICE_VERSION` | `1.2.0` |
+| `RAG_OTEL_SERVICE_VERSION` | `1.2.1` |
 | `RAG_OTEL_ENVIRONMENT` | `development` |
 | `RAG_OTEL_TRACES`, `RAG_OTEL_LOGS`, `RAG_OTEL_METRICS` | Each `true`; exact booleans |
 | `RAG_OTEL_SAMPLE_RATIO` | `1.0`; finite 0–1, root-independent ratio sampling |

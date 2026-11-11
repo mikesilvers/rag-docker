@@ -11,7 +11,6 @@ Runs with the API's dependencies, inside the verify project's API container
 
 Weaviate, Ollama and the model store are mocked; nothing reaches a backend.
 """
-import hashlib
 import io
 import json
 import os

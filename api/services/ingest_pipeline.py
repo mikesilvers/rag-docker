@@ -70,6 +70,12 @@ class UploadRejected(Exception):
                        "members_omitted": max(0, len(members) - _MAX_NAMED_MEMBERS)}
 
 
+class NoSupportedFiles(ValueError):
+    """An upload with no supported file. The ingest router answers this type
+    alone as NO_SUPPORTED_FILES, so no other ValueError's text reaches the
+    client under that code (#657). Still a ValueError, as it was before."""
+
+
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
 
@@ -728,6 +734,15 @@ class _FileFailed(Exception):
     """A file that failed, with the reason its error gives (#621)."""
 
 
+_NOTHING_STORED = "; nothing from it was stored"
+
+
+def _nothing_stored(reason: str) -> str:
+    """`reason` ending once in `; nothing from it was stored`: some reasons, such
+    as the gzip limit's, already end with it (#631)."""
+    return reason if reason.endswith(_NOTHING_STORED) else reason + _NOTHING_STORED
+
+
 def _undo_new_chunks(job: dict, collection: str, name: str, created_at: datetime,
                      exc: BaseException, kind: str, part_count: int, stored: int) -> _FileFailed:
     """A file failed while its chunks were being stored: remove what this ingest
@@ -747,7 +762,9 @@ def _undo_new_chunks(job: dict, collection: str, name: str, created_at: datetime
     elif kind == "part" and not whole:
         reason = f"part {part_count}: {reason}"
     if not (stored or ((split or whole) and part_count)):
-        return _FileFailed(reason)
+        # Nothing was stored, so nothing is removed; a file being stored in parts
+        # still says so, part 1 included (SPECIFICATIONS.md §3.1.3, #631).
+        return _FileFailed(_nothing_stored(reason) if split else reason)
     try:
         removed = wc._delete_new_family_sync(collection, name, created_at)
         problem = None
@@ -760,7 +777,7 @@ def _undo_new_chunks(job: dict, collection: str, name: str, created_at: datetime
         left = max(stored - removed, 0)
         return _FileFailed(f"{reason}; {left} new chunks could not be removed ({problem}); "
                            f"upload it again to retry")
-    return _FileFailed(f"{reason}; nothing from it was stored" if split else reason)
+    return _FileFailed(_nothing_stored(reason) if split else reason)
 
 
 def _remove_earlier(collection: str, name: str, created_at: datetime,
@@ -1135,12 +1152,15 @@ class _Queue:
     can overwrite another's bytes on disk, and the parser still sees the file's
     own extension. When a later input has the same logical name, the earlier one
     is dropped and reported in `skipped`: the last one wins, never silently.
+    `duplicates` records each name given more than once with its inputs in order,
+    for a caller that refuses them instead (document preparation, #640).
     """
 
     def __init__(self, tmp_dir: Path, skipped: list[str]) -> None:
         self.tmp_dir = tmp_dir
         self.skipped = skipped
         self.entries: dict[str, tuple[Path, str]] = {}
+        self.duplicates: dict[str, list[str]] = {}
         self._slots = 0
 
     def slot(self, basename: str) -> Path:
@@ -1152,6 +1172,7 @@ class _Queue:
     def add(self, path: Path, logical: str, label: str) -> None:
         earlier = self.entries.pop(logical, None)
         if earlier is not None:
+            self.duplicates.setdefault(logical, [earlier[1]]).append(label)
             earlier[0].unlink(missing_ok=True)
             self.skipped.append(
                 f"{earlier[1]} (replaced by {label} later in this upload, same name '{logical}')")
@@ -1256,7 +1277,10 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
     remedy = "Re-create the zip and upload it again."
     try:
         archive = zipfile.ZipFile(dest, "r")
-    except (zipfile.BadZipFile, OSError) as exc:
+    except (zipfile.BadZipFile, OSError, ValueError) as exc:
+        # ValueError: a member name flagged UTF-8 that isn't valid UTF-8 raises
+        # UnicodeDecodeError while the directory is read. The archive can't be
+        # read, and the codec's text is not sent (#657).
         raise _rejected(
             "ARCHIVE_UNREADABLE",
             f"'{safe_name}' is damaged and can't be read, so nothing from it was imported. "
@@ -1457,7 +1481,7 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
     if not file_paths:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         detail = "; ".join(skipped)
-        raise ValueError(
+        raise NoSupportedFiles(
             "No supported files found in upload."
             + (f" Skipped: {detail}" if detail else ""))
 

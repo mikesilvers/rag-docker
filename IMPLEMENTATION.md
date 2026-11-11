@@ -105,11 +105,15 @@ services:
     networks: [rag-internal]
     healthcheck:
       # The ollama image has no curl/wget; the CLI is the only probe available.
-      test: ["CMD-SHELL", "ollama list | grep -q phi3.5 && ollama list | grep -q nomic-embed-text"]
+      test: ["CMD-SHELL", "ollama list | grep -q llama3.1:8b && ollama list | grep -q nomic-embed-text"]
       interval: 20s
       timeout: 15s
       retries: 20
-      start_period: 120s
+      # The first start downloads the models, about 5.2 GB (#647); failed checks
+      # don't count until this has passed, so a slow link doesn't make
+      # `docker compose up` fail. A start with the models present still turns
+      # healthy at the first passing check, 20 s in.
+      start_period: 1800s
     # Optional GPU support (uncomment on GPU host):
     # deploy:
     #   resources:
@@ -129,7 +133,7 @@ services:
       WEAVIATE_PORT: 8080
       OLLAMA_HOST: ollama
       OLLAMA_PORT: 11434
-      LLM_MODEL: phi3.5
+      LLM_MODEL: llama3.1:8b
       EMBED_MODEL: nomic-embed-text
       UPLOAD_DIR: /app/uploads
       SOURCES_DIR: /app/sources
@@ -143,6 +147,10 @@ services:
       # local cache so offline installs and air-gapped hosts load instantly.
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
+      # Stops unstructured's usage telemetry, which otherwise sends a request
+      # when it is imported and on every partition call, so ingest never
+      # dials out (issue #695). Also set as ENV in api/Dockerfile.
+      DO_NOT_TRACK: "1"
       # Shown by /health and compared against the memory Docker actually
       # provides. Raise this if you allocate more to Docker Desktop.
       RECOMMENDED_MEMORY_GB: 12
@@ -382,14 +390,28 @@ until ollama list > /dev/null 2>&1; do
   sleep 2
 done
 
+# Is the model downloaded? `ollama list` prints NAME as "<name>:<tag>", with
+# ":latest" added to a name pulled without a tag; its columns are separated by
+# tabs or spaces, so `read` splits them. The NAME must match exactly: another
+# variant of a tagged name (llama3.1:8b-instruct-q8_0 for llama3.1:8b) is a
+# different model and doesn't count (#647).
+model_present() {
+    local name rest
+    while read -r name rest; do
+        if [ "${name}" = "$1" ] || [ "${name}" = "$1:latest" ]; then
+            return 0
+        fi
+    done < <(ollama list)
+    return 1
+}
+
 # Pull a model with retry. Ollama resumes partial downloads so retries are cheap.
 # timeout 7200 (2 hours) kills a truly hung connection while allowing slow downloads.
 pull_with_retry() {
     local model="$1"
 
-    # Skip if already downloaded. `ollama list` prints NAME as "<model>:latest",
-    # so anchor the match to the start of the line.
-    if ollama list | grep -q "^${model}"; then
+    # Skip if already downloaded.
+    if model_present "${model}"; then
         echo "ollama: ${model} already present, skipping pull."
         return 0
     fi
@@ -408,7 +430,7 @@ pull_with_retry() {
     echo "ollama: ${model} ready."
 }
 
-pull_with_retry phi3.5
+pull_with_retry llama3.1:8b
 pull_with_retry nomic-embed-text
 
 wait $OLLAMA_PID
@@ -431,6 +453,16 @@ http {
     # (README "Sharing with your office"), and then this limit is shared too.
     limit_req_zone $binary_remote_addr zone=login:1m rate=10r/m;
 
+    # The hosts this proxy answers for (#664). Any other Host, such as a page
+    # on a DNS-rebinding domain, gets 421. $host has no port, so 8080, the
+    # verify project's port and any other published port all match.
+    map $host $rag_host_allowed {
+        hostnames;
+        default   0;
+        localhost 1;
+        127.0.0.1 1;
+    }
+
     upstream api {
         server api:8000;
     }
@@ -441,6 +473,11 @@ http {
 
     server {
         listen 80;
+
+        # Only the hosts in the map above (#664).
+        if ($rag_host_allowed = 0) {
+            return 421;
+        }
 
         # The routes live in locations.conf, shared with LAN mode's nginx.lan.conf (#26).
         include /etc/nginx/rag/locations.conf;
@@ -473,13 +510,17 @@ location = /api/goldstandard/regenerate {
 # LOGIN_RATE_LIMITED itself, in the API's error envelope so the login page
 # shows the message, and the API never sees the attempt. The API's own 429
 # LOGIN_THROTTLED passes through: error_page applies only to nginx's answers.
-# Otherwise proxied exactly as /api/ below.
+# Otherwise proxied as /api/ below, except the request body. Login is the only
+# route that reads a body before authentication, so it gets a 16k limit (the
+# largest login LoginRequest allows, a 256-character username and a
+# 1,024-character password, fits easily) and nginx's default buffering instead
+# of /api/'s 512m streamed uploads; a larger body is refused 413 by nginx
+# before the API reads it (#663).
 location = /api/auth/login {
     limit_req zone=login burst=5 nodelay;
     limit_req_status 429;
     error_page 429 = @login_rate_limited;
-    client_max_body_size 512m;
-    proxy_request_buffering off;
+    client_max_body_size 16k;
     proxy_pass http://api/auth/login;
     proxy_set_header Host $http_host;
     proxy_set_header X-Real-IP $remote_addr;
@@ -534,6 +575,7 @@ location / {
 # docker-compose.lan.yml. One TLS server on container port 443 and nothing on
 # port 80: no plain-HTTP listener and no redirect, so the only way in is TLS.
 # The routes are the default server's, from the shared locations.conf.
+# It answers only for localhost, 127.0.0.1 and the certificate's names (#664).
 events {
     worker_connections 1024;
 }
@@ -548,6 +590,19 @@ http {
     # (README "Sharing with your office"), and then this limit is shared too.
     limit_req_zone $binary_remote_addr zone=login:1m rate=10r/m;
 
+    # The hosts this proxy answers for (#664). Any other Host, such as a page
+    # on a DNS-rebinding domain, gets 421. $host has no port, so RAG_LAN_PORT,
+    # the verify project's port and any other published port all match. The
+    # hosts are localhost, 127.0.0.1 and the names of the certificate served.
+    map $host $rag_host_allowed {
+        hostnames;
+        default   0;
+        localhost 1;
+        127.0.0.1 1;
+        # The certificate's other names, written by tls-init (api/tls_cert.py).
+        include /etc/nginx/certs/hosts.map;
+    }
+
     upstream api {
         server api:8000;
     }
@@ -559,6 +614,11 @@ http {
     server {
         listen 443 ssl;
         http2 on;
+
+        # Only the hosts in the map above (#664).
+        if ($rag_host_allowed = 0) {
+            return 421;
+        }
 
         # The active pair the tls-init step left in the lan_certs volume (read-only
         # here): your own from proxy/certs, or the self-signed one it generated.
@@ -633,6 +693,27 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Pre-cache sentence-transformers model at build time
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
+# Install the spaCy model unstructured's text partitioning loads (#695). Without
+# it, unstructured downloads the wheel from GitHub on the first .txt or .md
+# ingest, which needs DNS and internet access from inside the container and
+# fails on an offline install. The version and SHA-256 are the ones the locked
+# unstructured pins (unstructured/nlp/tokenize.py); pip refuses a download whose
+# hash differs. Like torch, the model is not in requirements.txt. When a re-lock
+# moves unstructured, update both here: the check below fails the build if the
+# model is not the version unstructured expects, or does not load.
+RUN pip install --no-cache-dir --no-deps \
+    "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl#sha256=1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85" \
+ && DO_NOT_TRACK=1 python -c "import sys, importlib.metadata as m, spacy, unstructured.nlp.tokenize as t; have = m.version('en_core_web_sm'); sys.exit(f'en_core_web_sm {have} installed, unstructured expects {t._SPACY_MODEL_VERSION}') if have != t._SPACY_MODEL_VERSION else spacy.load('en_core_web_sm')"
+
+# Default to the pre-cached model at runtime: the image already carries it, so
+# the Hugging Face libraries must never dial out on first load. Build-time
+# pre-caching above stays unaffected (ENV applies at runtime, not during the RUN).
+# DO_NOT_TRACK stops unstructured's usage telemetry, which otherwise sends a
+# request when it is imported and on every partition call (#695).
+ENV HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    DO_NOT_TRACK=1
 
 COPY . .
 
@@ -848,7 +929,8 @@ zstandard==0.25.0
 #      api/requirements.txt, keeping it LC_ALL=C sorted.
 #   3. docker compose build api   # confirm the lock installs cleanly
 #   4. docker run --rm rag-docker-api pip freeze \
-#        | grep -viE '^(torch|torchvision)==' | LC_ALL=C sort > /tmp/pins.txt
+#        | grep -viE '^(torch|torchvision)==|^en[-_]core[-_]web[-_]sm( @|==)' \
+#        | LC_ALL=C sort > /tmp/pins.txt
 #      diff that against requirements.txt to confirm nothing else moved.
 #   5. commit BOTH files together
 #
@@ -866,6 +948,11 @@ zstandard==0.25.0
 # torch and torchvision are not listed here. They arrive transitively via
 # sentence-transformers and unstructured, and api/Dockerfile installs them from
 # the PyTorch CPU index first to avoid ~4.1 GB of unusable NVIDIA CUDA packages.
+#
+# The spaCy model en_core_web_sm is not listed here or in the lock either.
+# api/Dockerfile installs it from its pinned URL and SHA-256, the version the
+# locked unstructured expects, so text ingest never downloads it (#695). The
+# freeze in step 4 leaves it out; bump it in api/Dockerfile with unstructured.
 # ---------------------------------------------------------------------------
 
 fastapi>=0.111                    # resolved: 0.141.1
@@ -930,7 +1017,7 @@ class Settings(BaseSettings):
     weaviate_port: int = 8080
     ollama_host: str = "localhost"
     ollama_port: int = 11434
-    llm_model: str = "phi3.5"
+    llm_model: str = "llama3.1:8b"
     embed_model: str = "nomic-embed-text"
     upload_dir: str = "/app/uploads"
     # Retained original documents, content-addressed per collection. Kept in
@@ -1113,6 +1200,14 @@ into a fresh folder and `live` is switched with one rename, so nginx never
 finds a certificate beside a key that doesn't match it; older pairs are then
 removed.
 
+The hosts the proxy answers for (#664): on every successful run the step also
+writes /certs/hosts.map, which nginx.lan.conf includes in its map of accepted
+hosts. It lists the active certificate's names other than localhost and
+127.0.0.1 (nginx.lan.conf has those two already): DNS names in lower case,
+wildcards (*.example.com) as nginx wildcards, IPv6 addresses in brackets. A
+name that is none of these is left out, with a warning, so nothing else can
+reach nginx's configuration. The file is replaced with one rename.
+
 It prints one line naming the certificate (source, names, expiry, SHA-256
 fingerprint, which is what a browser shows when asked to trust it) and exits
 0, or prints one line on standard error and exits 1; the proxy then doesn't
@@ -1141,6 +1236,12 @@ LIVE = "live"
 SELF_SIGNED = "self-signed"
 BYO = "byo"
 _LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+HOSTS = "hosts.map"
+# Accepted by nginx.lan.conf itself; a second entry for either would be a
+# duplicate key, which stops nginx.
+ALWAYS = ("localhost", "127.0.0.1")
+# The map block's own parameter names: a key spelled like one needs a leading \.
+MAP_WORDS = {"default", "hostnames", "include", "volatile"}
 
 
 class CertError(Exception):
@@ -1279,6 +1380,52 @@ def self_signed(names: list[str], now: datetime.datetime) -> tuple[bytes, bytes]
                               serialization.NoEncryption()))
 
 
+# ── the hosts the proxy answers for (#664) ───────────────────────────────────
+
+def _dns(name: str) -> bool:
+    return len(name) <= 253 and all(_LABEL.match(label) for label in name.split("."))
+
+
+def map_key(name: str) -> str | None:
+    """`name` as a key of nginx's `map ... { hostnames; }`, or None if it can't be one safely."""
+    try:
+        address = ipaddress.ip_address(name)
+    except ValueError:
+        pass
+    else:
+        return f"[{address}]" if address.version == 6 else str(address)
+    if name.startswith("*.") and _dns(name[2:]):
+        return name
+    if not _dns(name):
+        return None
+    return "\\" + name if name in MAP_WORDS else name
+
+
+def write_hosts(out_dir: Path, cert: x509.Certificate, err) -> None:
+    """Write hosts.map for `cert`'s names, through a temporary file and one rename."""
+    keys: list[str] = []
+    for name in sorted(_cert_names(cert)):
+        if name in ALWAYS:
+            continue
+        key = map_key(name)
+        if key is None:
+            print(f"tls-init: warning: {name!r} is left out of the names the proxy answers for: it is neither a "
+                  f"DNS name nor an IP address", file=err, flush=True)
+        elif key not in keys:
+            keys.append(key)
+    text = ("# Written by tls-init (api/tls_cert.py): the certificate's names besides localhost and 127.0.0.1.\n"
+            + "".join(f"{key} 1;\n" for key in keys))
+    temp = out_dir / f".hosts-{secrets.token_hex(8)}"
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(text)
+    os.chmod(temp, 0o644)
+    os.replace(temp, out_dir / HOSTS)
+    for old in out_dir.iterdir():
+        if old.name.startswith(".hosts-"):
+            old.unlink(missing_ok=True)
+
+
 # ── the step ─────────────────────────────────────────────────────────────────
 
 def run(byo_dir: Path, out_dir: Path, hostnames: str | None, now: datetime.datetime | None = None,
@@ -1308,6 +1455,7 @@ def _step(byo_dir: Path, out_dir: Path, hostnames: str | None, now: datetime.dat
                   f"{cert.not_valid_after_utc:%Y-%m-%d}; browsers will refuse it", file=err, flush=True)
         if _read_live(out_dir) != (BYO, cert_bytes, key_bytes):
             install(out_dir, cert_bytes, key_bytes, BYO)
+        write_hosts(out_dir, cert, err)
         return f"using your certificate from proxy/certs: {describe(cert)}"
 
     names = wanted_names(hostnames)
@@ -1318,10 +1466,12 @@ def _step(byo_dir: Path, out_dir: Path, hostnames: str | None, now: datetime.dat
         except CertError:
             cert = None
         if cert is not None and cert.not_valid_after_utc > now and _cert_names(cert) == set(names):
+            write_hosts(out_dir, cert, err)
             return f"reusing the self-signed certificate: {describe(cert)}"
     cert_bytes, key_bytes = self_signed(names, now)
     install(out_dir, cert_bytes, key_bytes, SELF_SIGNED)
     cert, _ = load_pair(cert_bytes, key_bytes)
+    write_hosts(out_dir, cert, err)
     return f"generated a self-signed certificate: {describe(cert)}"
 
 
@@ -3686,8 +3836,12 @@ def _exact_source_objects(coll, name: str, accept=None):
             filters=words, limit=_QUERY_MAXIMUM_RESULTS, include_vector=False,
             return_properties=_SOURCE_PROPERTIES).objects
     else:
+        # The client walks 100 objects per request by default; one query already
+        # returns QUERY_MAXIMUM_RESULTS of these two-property objects, so each
+        # page of the walk takes that many (#628).
         objects = telemetry.iterate(coll.iterator, include_vector=False,
-                                    return_properties=_SOURCE_PROPERTIES)
+                                    return_properties=_SOURCE_PROPERTIES,
+                                    cache_size=_QUERY_MAXIMUM_RESULTS)
     try:
         for obj in objects:
             value = (obj.properties or {}).get("source_file")
@@ -4340,7 +4494,7 @@ replaces all of them.
 from __future__ import annotations
 
 import re
-from typing import Mapping
+from collections.abc import Container
 
 _PART = re.compile(r" \(part ([1-9][0-9]*)\)\Z")
 
@@ -4361,9 +4515,10 @@ def in_family(stored: str, name: str) -> bool:
     return stored == name or base_of(stored) == name
 
 
-def resolve(stored: str, listed: Mapping[str, object]) -> str | None:
+def resolve(stored: str, listed: Container[str]) -> str | None:
     """The retained name whose original `stored` came from: `stored` itself when it
-    is listed, else the name it is a part of when that is listed, else None."""
+    is listed, else the name it is a part of when that is listed, else None.
+    `listed` is a set or mapping of retained names."""
     if stored in listed:
         return stored
     base = base_of(stored)
@@ -4604,31 +4759,63 @@ def cut_unit(unit: Unit, limit: int, dialect: Any = None) -> list[Unit]:
     return [Unit(p) for p in pieces]
 
 
+_CUT_AT = (" ", "\t", "\r")
+
+
+def _paragraph(lines: list[str]) -> Iterator[Unit]:
+    """The paragraph read so far as a unit, unless it holds no text: no unit is
+    ever empty or only whitespace (#631)."""
+    text = "".join(lines).rstrip("\n")
+    if text.strip():
+        yield Unit(text)
+
+
 def _text_units(stream: Iterable[str] | Any, markdown: bool, limit: int) -> Iterator[Unit]:
     """Paragraphs, the text between blank lines; for Markdown, a blank line inside
     a fenced code block doesn't end one. A paragraph is given out in pieces when
-    it passes `limit`, cut at a line break, so one is never held whole."""
+    it passes `limit`, cut at a line break, so one is never held whole. A line
+    longer than `limit` is read in pieces cut after their last whitespace, as
+    _cut_text cuts, and hard at `limit` only when a piece has none (#631); a piece
+    that continues a line is never taken as a blank line or a fence. A continuation
+    piece of only whitespace is dropped, and no unit is empty or only whitespace."""
     lines: list[str] = []
     size = 0
     fence = False
+    carry = ""    # the rest of a line cut at whitespace, read again first
+    fresh = True  # the next piece starts a line
     while True:
-        line = stream.readline(limit)
+        line = carry + stream.readline(limit - len(carry))
+        carry = ""
         if not line:
             break
-        if markdown and line.lstrip().startswith(("```", "~~~")):
-            fence = not fence
-        if not line.strip() and not fence:
-            if lines:
-                yield Unit("".join(lines).rstrip("\n"))
-                lines, size = [], 0
+        start = fresh
+        # A line end in either newline mode: preparation reads with newline="".
+        fresh = line.endswith(("\n", "\r"))
+        if not fresh and len(line) >= limit:
+            cut = max(line.rfind(ws, 1) for ws in _CUT_AT)
+            if cut > 0:
+                line, carry = line[:cut + 1], line[cut + 1:]
+        if start:
+            if markdown and line.lstrip().startswith(("```", "~~~")):
+                fence = not fence
+            if not line.strip() and not fence:
+                if lines:
+                    yield from _paragraph(lines)
+                    lines, size = [], 0
+                continue
+        elif not line.strip():
+            # Only whitespace continuing a line, in practice its line end read on its
+            # own after a line of exactly `limit` characters: not part of the paragraph,
+            # and not a blank line either (#631). `fresh` already says whether it
+            # ended the line.
             continue
         if lines and size + len(line) > limit:
-            yield Unit("".join(lines).rstrip("\n"))
+            yield from _paragraph(lines)
             lines, size = [], 0
         lines.append(line)
         size += len(line)
     if lines:
-        yield Unit("".join(lines).rstrip("\n"))
+        yield from _paragraph(lines)
 
 
 def _csv_dialect(stream: Any) -> Any:
@@ -4642,14 +4829,15 @@ def _csv_dialect(stream: Any) -> Any:
 
 def _text_measure(unit: Unit) -> int:
     """The raw measure of a unit, deciding whether a .txt, .md or .csv over
-    10,000,000 bytes is tried whole: its text, and a CSV row by its cells' text
-    (empty cells and separators not counted, since a sparse CSV's bytes can be
-    many times its text). It is not the parsed text and can be more (indentation,
-    Markdown link targets, NA cells), so such a file may be split although its
-    parsed text would fit; measuring raw units keeps memory bounded (maintainer's
-    decision, PR #630)."""
-    if unit.cells is not None:
-        return sum(len(cell.strip()) for cell in unit.cells)
+    10,000,000 bytes is tried whole: a paragraph's text, and a CSV row's text as
+    written (its separators, needed quotes and line ending included), the text a
+    part is sized in. A CSV's rows are not measured by their cells' text: that let
+    a sparse CSV be parsed whole however large (maintainer's decision on #631,
+    reversing PR #630's for CSV); measured as written, the parse and its number
+    of cells stay bounded by the text limit. For .txt and .md it is not the parsed
+    text and can be more (indentation, Markdown link targets), so such a file may
+    be split although its parsed text would fit; measuring raw units keeps memory
+    bounded (maintainer's decision, PR #630)."""
     return len(unit.text)
 
 
@@ -4683,7 +4871,6 @@ class _Source:
         self.dialect = None
         self._stream = None
         self.own_size: int | None = None
-        self.header_cells: list[str] = []
         if ftype == "jsonl":
             self.units = (Unit(t, "record", o) for o, t, _ in ip._jsonl_units(path))
         elif ftype == "json":
@@ -4700,7 +4887,6 @@ class _Source:
             if ftype == "csv":
                 self.dialect = _csv_dialect(self._stream)
                 self.header, self.units = _csv_units(self._stream, self.dialect)
-                self.header_cells = next(csv.reader([self.header], self.dialect), [])
             else:
                 self.units = _text_units(self._stream, ftype == "md", limit)
         # What a part's units may hold: a CSV's header is repeated at the start
@@ -4727,11 +4913,17 @@ class _Source:
 
     def own(self) -> int:
         """The file's own size, which its stored chunk text is measured against:
-        its bytes; a gzip file's decompressed bytes; a PDF's or DOCX's text."""
+        its bytes; a gzip file's decompressed bytes, counted no further than its
+        reader's bound (#631); a PDF's or DOCX's text."""
         if self.own_size is None:
             size = self.path.stat().st_size
             if self.path.name.lower().endswith(".gz"):
                 import gzip
+                from services import ingest_pipeline as ip
+                # The reader fails a file past its bound, so counting further
+                # would only spend the work the bound exists to prevent.
+                bound = (ip.MAX_JSON_INPUT_BYTES if ip._is_json_gz(self.path.name)
+                         else ip.MAX_GZIP_DECOMPRESSED_BYTES)
                 try:
                     size = 0
                     with gzip.open(self.path, "rb") as gz:
@@ -4740,6 +4932,8 @@ class _Source:
                             if not block:
                                 break
                             size += len(block)
+                            if size > bound:
+                                break
                 except (OSError, EOFError):
                     size = self.path.stat().st_size
             self.own_size = size
@@ -4867,7 +5061,7 @@ def split_file(path: Path, settings: Settings, parse: Callable | None = None,
         if not fits:
             probe = _Source(path, ftype, settings, limit, parse, chunk)
             try:
-                total = sum(len(cell.strip()) for cell in probe.header_cells)
+                total = len(probe.header)
                 fits = True
                 for unit in probe.units:
                     total += _text_measure(unit)
@@ -5146,6 +5340,12 @@ class UploadRejected(Exception):
         # unreadable members can't make the reply as large (#28).
         self.detail = {"file": file, "members": members[:_MAX_NAMED_MEMBERS],
                        "members_omitted": max(0, len(members) - _MAX_NAMED_MEMBERS)}
+
+
+class NoSupportedFiles(ValueError):
+    """An upload with no supported file. The ingest router answers this type
+    alone as NO_SUPPORTED_FILES, so no other ValueError's text reaches the
+    client under that code (#657). Still a ValueError, as it was before."""
 
 
 def get_job(job_id: str) -> dict | None:
@@ -5806,6 +6006,15 @@ class _FileFailed(Exception):
     """A file that failed, with the reason its error gives (#621)."""
 
 
+_NOTHING_STORED = "; nothing from it was stored"
+
+
+def _nothing_stored(reason: str) -> str:
+    """`reason` ending once in `; nothing from it was stored`: some reasons, such
+    as the gzip limit's, already end with it (#631)."""
+    return reason if reason.endswith(_NOTHING_STORED) else reason + _NOTHING_STORED
+
+
 def _undo_new_chunks(job: dict, collection: str, name: str, created_at: datetime,
                      exc: BaseException, kind: str, part_count: int, stored: int) -> _FileFailed:
     """A file failed while its chunks were being stored: remove what this ingest
@@ -5825,7 +6034,9 @@ def _undo_new_chunks(job: dict, collection: str, name: str, created_at: datetime
     elif kind == "part" and not whole:
         reason = f"part {part_count}: {reason}"
     if not (stored or ((split or whole) and part_count)):
-        return _FileFailed(reason)
+        # Nothing was stored, so nothing is removed; a file being stored in parts
+        # still says so, part 1 included (SPECIFICATIONS.md §3.1.3, #631).
+        return _FileFailed(_nothing_stored(reason) if split else reason)
     try:
         removed = wc._delete_new_family_sync(collection, name, created_at)
         problem = None
@@ -5838,7 +6049,7 @@ def _undo_new_chunks(job: dict, collection: str, name: str, created_at: datetime
         left = max(stored - removed, 0)
         return _FileFailed(f"{reason}; {left} new chunks could not be removed ({problem}); "
                            f"upload it again to retry")
-    return _FileFailed(f"{reason}; nothing from it was stored" if split else reason)
+    return _FileFailed(_nothing_stored(reason) if split else reason)
 
 
 def _remove_earlier(collection: str, name: str, created_at: datetime,
@@ -6213,12 +6424,15 @@ class _Queue:
     can overwrite another's bytes on disk, and the parser still sees the file's
     own extension. When a later input has the same logical name, the earlier one
     is dropped and reported in `skipped`: the last one wins, never silently.
+    `duplicates` records each name given more than once with its inputs in order,
+    for a caller that refuses them instead (document preparation, #640).
     """
 
     def __init__(self, tmp_dir: Path, skipped: list[str]) -> None:
         self.tmp_dir = tmp_dir
         self.skipped = skipped
         self.entries: dict[str, tuple[Path, str]] = {}
+        self.duplicates: dict[str, list[str]] = {}
         self._slots = 0
 
     def slot(self, basename: str) -> Path:
@@ -6230,6 +6444,7 @@ class _Queue:
     def add(self, path: Path, logical: str, label: str) -> None:
         earlier = self.entries.pop(logical, None)
         if earlier is not None:
+            self.duplicates.setdefault(logical, [earlier[1]]).append(label)
             earlier[0].unlink(missing_ok=True)
             self.skipped.append(
                 f"{earlier[1]} (replaced by {label} later in this upload, same name '{logical}')")
@@ -6334,7 +6549,10 @@ def _extract_zip(dest: Path, safe_name: str, queue: _Queue, budget: _ExpansionBu
     remedy = "Re-create the zip and upload it again."
     try:
         archive = zipfile.ZipFile(dest, "r")
-    except (zipfile.BadZipFile, OSError) as exc:
+    except (zipfile.BadZipFile, OSError, ValueError) as exc:
+        # ValueError: a member name flagged UTF-8 that isn't valid UTF-8 raises
+        # UnicodeDecodeError while the directory is read. The archive can't be
+        # read, and the codec's text is not sent (#657).
         raise _rejected(
             "ARCHIVE_UNREADABLE",
             f"'{safe_name}' is damaged and can't be read, so nothing from it was imported. "
@@ -6535,7 +6753,7 @@ async def _admit_ingest_job(job_id: str, files: list[Any], collection: str, stra
     if not file_paths:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         detail = "; ".join(skipped)
-        raise ValueError(
+        raise NoSupportedFiles(
             "No supported files found in upload."
             + (f" Skipped: {detail}" if detail else ""))
 
@@ -7252,7 +7470,6 @@ decides where parts go and whether there is room (a best-effort cap).
 from __future__ import annotations
 
 import asyncio
-import codecs
 import csv
 import gzip
 import json
@@ -7333,7 +7550,7 @@ _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 def normalise_text(text: str) -> str:
     """UTF-8 text without a byte-order mark, LF line endings, NFC, and no NUL or
     other C0 control character except tab and newline, nor DEL."""
-    if text.startswith("﻿"):
+    if text.startswith("\ufeff"):
         text = text[1:]
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = unicodedata.normalize("NFC", text)
@@ -7446,9 +7663,11 @@ class _CsvRows:
     Two limits (PR #639 review): a row is refused when, normalised, it is longer
     than `limit`, what a part can hold for it; and reading stops as soon as a
     row's raw text passes twice that, so an unclosed quote or a file with no line
-    break can't grow a row without bound. Normalising only shortens a row (CRLF
-    becomes LF, control characters go, NFC composes), so no row that fits is
-    refused by the raw bound."""
+    break can't grow a row without bound. Normalising usually shortens a row
+    (CRLF becomes LF, control characters go), so the raw bound refuses a row
+    that would fit only when normalising would remove more than half of it,
+    which only a row made mostly of control characters does. NFC can also
+    lengthen a row; the normalised check catches that."""
 
     def __init__(self, stream: Any, dialect: Any, limit: int) -> None:
         self.stream = stream
@@ -8049,7 +8268,7 @@ async def prepare_document(raw: Path, name: str, raw_type: str, chat: Chat,
     return await _prepare_text(raw, raw_type, name, llm, should_stop, write_part, progress)
 
 
-def _no_text(name: str) -> ValueError:
+def _no_text() -> ValueError:
     return ValueError("has no text to prepare")
 
 
@@ -8082,7 +8301,7 @@ async def _prepare_text(raw: Path, raw_type: str, name: str, llm: LLM, should_st
             return iter_parts(raw, raw_type)
     count, total = await asyncio.to_thread(_count_text_windows, source(), should_stop)
     if not count:
-        raise _no_text(name)
+        raise _no_text()
     too_large = total > MAX_WINDOWS
     done = 0
     progress(done, total)
@@ -8175,7 +8394,7 @@ async def _prepare_records(raw: Path, raw_type: str, name: str, kind: str,
         entries.append(entry)
         index += 1
     if not entries:
-        raise _no_text(name)
+        raise _no_text()
     count = len(entries)
     for number, (entry, part_name) in enumerate(zip(entries, part_names(name, kind, count)), 1):
         entry["name"] = part_name
@@ -8193,7 +8412,8 @@ SPECIFICATIONS.md §3.1.11.
 
 - **Upload.** Files are staged and validated exactly as ingest stages them
   (`ingest_pipeline.stage_uploads`: ZIP limits, supported types), then each
-  becomes a `raw` document. The space check is best-effort: made once, before
+  becomes a `raw` document. Two inputs with one name refuse the upload, where
+  ingest keeps the last (#640). The space check is best-effort: made once, before
   the files are written to the area, with nothing reserved.
 - **Jobs.** A job (kind `prepare` in the job store) prepares its documents one
   at a time. One job runs at a time on the instance; later ones wait, oldest
@@ -8202,17 +8422,18 @@ SPECIFICATIONS.md §3.1.11.
   progress and the ones not reached go back to their earlier state.
 - **Import.** The selected documents' parts go to one ordinary ingest job,
   copied from the area into its staging and stored under their part names. The
-  documents are busy only while the import is admitted.
+  documents are busy only while the import is admitted. One import's parts may
+  hold at most MAX_IMPORT_BYTES in all, one upload's limit (#640).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import shutil
 import tempfile
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 from config import settings
@@ -8249,6 +8470,27 @@ class NoSupportedFiles(store.AreaError):
     status, code = 400, "NO_SUPPORTED_FILES"
 
 
+class ImportTooLarge(store.AreaError):
+    status, code = 409, "IMPORT_TOO_LARGE"
+
+
+# The most one import's parts may hold in all (#640): the request limit of one
+# upload (`client_max_body_size 512m`, proxy/locations.conf), so an import
+# stages no more than an ingest upload can. Without it, "Import all" could copy
+# the whole area, up to MAX_PREPARATION_BYTES, into one ingest staging.
+MAX_IMPORT_BYTES = 512 * 1024 * 1024
+
+
+def _import_too_large(total: int) -> ImportTooLarge:
+    # Rounded up, so a selection just over the limit never reads 512.0 MB.
+    megabytes = math.ceil(total * 10 / (1024 * 1024)) / 10
+    return ImportTooLarge(
+        f"The selected documents' prepared parts total {megabytes:,.1f} MB; one import can be "
+        f"at most {MAX_IMPORT_BYTES // (1024 * 1024)} MB, the same as one upload. Import them "
+        f"in smaller selections.",
+        detail={"selected_bytes": total, "limit_bytes": MAX_IMPORT_BYTES})
+
+
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
 
@@ -8259,6 +8501,23 @@ def job_records() -> list[tuple[str, dict, float | None]]:
 
 # ── upload ───────────────────────────────────────────────────────────────────
 
+# How many duplicated names a refused upload's message lists before "and N more".
+_MAX_NAMED_DUPLICATES = 10
+
+
+def _duplicate_upload(duplicates: dict[str, list[str]]) -> DuplicateNames:
+    """Two or more inputs of one upload with the same name (#640): ingest would
+    keep the last and drop the others; preparation keeps none and says which."""
+    names = list(duplicates)
+    listed = "; ".join(f"'{name}' ({', '.join(duplicates[name])})"
+                       for name in names[:_MAX_NAMED_DUPLICATES])
+    if len(names) > _MAX_NAMED_DUPLICATES:
+        listed += f" and {len(names) - _MAX_NAMED_DUPLICATES} more"
+    return DuplicateNames(
+        f"Files in this upload share a name: {listed}. Rename them, or upload them "
+        f"separately; nothing was uploaded.", detail={"names": names})
+
+
 async def upload(files: list[Any], owner: dict | None) -> tuple[list[dict], list[str]]:
     """Stage, validate and store an upload's files as `raw` documents. Nothing
     is kept when any step fails."""
@@ -8266,6 +8525,8 @@ async def upload(files: list[Any], owner: dict | None) -> tuple[list[dict], list
     created: list[dict] = []
     try:
         queue, skipped = await ingest_pipeline.stage_uploads(files, tmp_dir)
+        if queue.duplicates:
+            raise _duplicate_upload(queue.duplicates)
         if not queue.entries:
             detail = "; ".join(skipped)
             raise NoSupportedFiles("No supported files found in upload."
@@ -8491,7 +8752,7 @@ class _Part:
         self.size = None
 
 
-async def import_documents(body: Any, owner: dict | None) -> dict:
+async def import_documents(body: Any) -> dict:
     """Start one ingest job with every part of the selected prepared documents."""
 
     def select() -> tuple[list[dict], list[str]]:
@@ -8519,6 +8780,9 @@ async def import_documents(body: Any, owner: dict | None) -> dict:
                 f"Two selected documents have parts with the same name: "
                 f"{', '.join(duplicates[:10])}. Import them separately.",
                 detail={"names": duplicates})
+        total = sum(part.get("bytes") or 0 for r in records for part in r.get("parts") or [])
+        if total > MAX_IMPORT_BYTES:
+            raise _import_too_large(total)
         return records, names
 
     records, names = await asyncio.to_thread(select)
@@ -11986,8 +12250,10 @@ let a page find its jobs again after the user left it. What they list:
   #617 with no owner ("owner unknown"). Anyone else sees only jobs whose
   `owner` names them: the same name and kind, so a user's own jobs, or an API
   key's principal's. The lookups by ID are not scoped; only these lists are.
-- **Which.** Every running job, and the finished ones whose finish time lies in
-  the last 24 hours, at most the newest 20 of those per list and caller.
+- **Which.** Every running job, and the finished ones whose finish time is no
+  more than 24 hours before the request, a finish time later than the request
+  (after the clock steps back) included; at most the newest 20 of those per
+  list and caller.
 - **Finish time.** A record's `finished_at`; for a job record from before #617,
   the time its record was last saved. A finished session without
   `finished_at` is not listed.
@@ -12057,7 +12323,9 @@ def select(items, principal, now: float) -> list[dict]:
             continue
         if is_running:
             running.append((record, None))
-        elif finish is not None and now - WINDOW_S <= finish <= now:
+        # No upper bound: a finish time ahead of the clock (a clock stepped
+        # back) still lists a just-finished job (#629).
+        elif finish is not None and now - WINDOW_S <= finish:
             finished.append((record, finish))
     finished.sort(key=lambda pair: pair[1], reverse=True)
     kept = running + finished[:FINISHED_CAP]
@@ -12153,6 +12421,16 @@ class ExportStartingError(Exception):
     START_WAIT, so there is no job to name yet (#338)."""
 
 
+class ExportInProgressError(RuntimeError):
+    """An export of this collection is already running; `job_id` names it. Its
+    own type, so the router never answers another RuntimeError as
+    EXPORT_IN_PROGRESS (#657)."""
+
+    def __init__(self, job_id: str) -> None:
+        super().__init__(job_id)
+        self.job_id = job_id
+
+
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
 
@@ -12237,7 +12515,7 @@ async def start_export_job(collection: str, include_models: bool = False,
     A passphrase makes the package encrypted (#27). It is handed to the worker
     as an argument only: the job record says `encrypted`, never the passphrase.
 
-    Raises RuntimeError carrying the running job id if one is already in flight
+    Raises ExportInProgressError carrying the running job id if one is already in flight
     for this collection; that job's record is always stored by then (#326).
     Raises ExportStartingError if that start hasn't stored it within START_WAIT.
     """
@@ -12252,7 +12530,7 @@ async def start_export_job(collection: str, include_models: bool = False,
                 break
             starting = _starting.get(running)
         if starting is None:
-            raise RuntimeError(running)
+            raise ExportInProgressError(running)
         # That start hasn't stored its record yet: wait until it has, or has
         # released the slot, then look again (#326). Holds nothing meanwhile, and
         # gives up once START_WAIT has passed since the first wait (#338).
@@ -12399,6 +12677,15 @@ class PassphraseError(Exception):
         self.code = code
 
 
+class ImportInProgressError(RuntimeError):
+    """An import of this package file is already running. Its own type, so the
+    router never answers another RuntimeError as IMPORT_IN_PROGRESS (#657)."""
+
+    def __init__(self, filename: str) -> None:
+        super().__init__(filename)
+        self.filename = filename
+
+
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
 
@@ -12500,6 +12787,10 @@ def _mark_finished(collection: str) -> None:
 # tests, a with-models package would leave 2.3 GB behind each time, and an
 # ingest up to 512 MB of upload plus 2 GiB of extracted ZIP members.
 _WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-", "ingest-", "prepare-")
+# Document preparation also writes two temporary files there (#640): the ZIP of
+# a multi-part prepared download (prepare-*.zip) and a decompressed .json.gz
+# (prepare-*.json). They are removed as regular files, besides as directories.
+_PREPARE_FILE_SUFFIXES = (".zip", ".json")
 
 
 def sweep_stale_workdirs() -> list[str]:
@@ -12511,7 +12802,9 @@ def sweep_stale_workdirs() -> list[str]:
     for entry in sorted(root.iterdir()):
         if not entry.name.startswith(_WORKDIR_PREFIXES):
             continue
-        size = packager.remove_leftover(entry, directory=True)
+        prepare_file = (entry.name.startswith("prepare-")
+                        and entry.name.endswith(_PREPARE_FILE_SUFFIXES))
+        size = packager.remove_leftover(entry, directory=True, regular_file=prepare_file)
         if size is not None:
             removed.append(f"{entry.name} ({size // (1024 * 1024)} MB)")
     return removed
@@ -13305,7 +13598,7 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
     job_id = str(uuid.uuid4())[:8]
     with _lock:
         if key in _active:
-            raise RuntimeError(filename)
+            raise ImportInProgressError(filename)
         _active.add(key)
 
     # The first write is durable, so it runs off the event loop (#309). A start
@@ -13684,7 +13977,6 @@ import asyncio
 import copy
 import logging
 import math
-import mimetypes
 import shutil
 import tempfile
 import threading
@@ -13823,6 +14115,15 @@ def _listed_names(documents: dict) -> set[str]:
 class ServiceUnavailableError(Exception):
     """Weaviate couldn't be read for the up-front re-chunk check (#340) or for
     the tuning options (#349)."""
+
+
+class TuneInProgressError(RuntimeError):
+    """This collection is already being tuned. Its own type, so the router
+    never answers another RuntimeError as TUNE_IN_PROGRESS (#657)."""
+
+    def __init__(self, collection: str) -> None:
+        super().__init__(collection)
+        self.collection = collection
 
 
 # A collection whose retained originals all lack stored chunks (every file
@@ -14227,7 +14528,7 @@ async def start_tune_job(collection: str, operation: str, params: dict) -> str:
     job_id = str(uuid.uuid4())[:8]
     with _lock:
         if collection in _active:
-            raise RuntimeError(collection)
+            raise TuneInProgressError(collection)
         _active.add(collection)
     # Lets DELETE /collections refuse while this job rebuilds the collection
     # (#40). Before the job record, so a refusal during a delete leaves none (#302).
@@ -14439,8 +14740,12 @@ async def transfer_help():
     dimensions = await _embedding_dimensions()
     try:
         markdown = packager.render_help(dimensions)
-    except RuntimeError as exc:
-        return api_error(500, "HELP_RENDER_FAILED", str(exc))
+    except RuntimeError:
+        # A template that can't be filled in. The cause is logged, not sent (#657).
+        _log.exception("Could not render the help page from its templates")
+        return api_error(500, "HELP_RENDER_FAILED",
+                         "The help page could not be rendered: a help template is "
+                         "invalid. The API log has the details.")
     except OSError:
         # A template file missing or unreadable. Its path is logged, not sent (#373).
         _log.exception("Could not read a help template")
@@ -14702,14 +15007,10 @@ async def delete_collection(name: CollectionName, confirm: str | None = None):
 ```python
 from __future__ import annotations
 import asyncio
-import json
 import logging
-import re
-from pathlib import Path
 from fastapi import APIRouter, Form, Request, UploadFile, File
 from pydantic import ValidationError
 
-from config import settings
 from models.schemas import (CollectionName, IngestConfig, IngestConfigResponse,
                             IngestJobEntry, IngestJobList, IngestUploadResponse,
                             JobStatusResponse)
@@ -14795,7 +15096,8 @@ async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
         return collection_deleting_error(collection)
     except ingest_pipeline.UploadRejected as exc:
         return api_error(exc.status, exc.code, exc.message, detail=exc.detail)
-    except ValueError as exc:
+    except ingest_pipeline.NoSupportedFiles as exc:
+        # Only this type: any other error reaches ingest_upload's handler (#657).
         return api_error(400, "NO_SUPPORTED_FILES", str(exc))
 
     return IngestUploadResponse(
@@ -15082,7 +15384,7 @@ async def import_documents(body: PrepareImportRequest, request: Request = None):
     collection = body.collection
     audit.note(collection=collection)
     try:
-        selected = await jobs.import_documents(body, None)
+        selected = await jobs.import_documents(body)
     except store.AreaError as exc:
         return _error(exc)
     audit.note(names=selected["names"])
@@ -15231,7 +15533,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from pathlib import Path
 
 from fastapi import APIRouter, Request
 
@@ -15284,12 +15585,13 @@ async def start_export(body: ExportRequest, request: Request = None):
         # The running start hasn't stored its record yet, so no job_id to name (#338).
         return api_error(409, "EXPORT_STARTING",
                          f"An export of '{body.collection}' is starting; retry shortly.")
-    except RuntimeError as exc:
-        # start_export_job puts the already-running job id in the exception.
+    except exporter.ExportInProgressError as exc:
+        # The exception names the running job; any other error is not this
+        # answer, and its text is not sent (#657).
         return api_error(
             409, "EXPORT_IN_PROGRESS",
             f"An export of '{body.collection}' is already running.",
-            detail={"job_id": str(exc)},
+            detail={"job_id": exc.job_id},
         )
     return ExportStartResponse(job_id=job_id, status="queued", collection=body.collection)
 
@@ -15325,10 +15627,10 @@ async def start_import(body: ImportRequest, request: Request = None):
     except importer.PassphraseError as exc:
         # Decided by the filename before any job exists (#27).
         return api_error(400, exc.code, str(exc), detail={"filename": body.filename})
-    except RuntimeError as exc:
+    except importer.ImportInProgressError as exc:
         return api_error(409, "IMPORT_IN_PROGRESS",
-                         f"An import of '{exc}' is already running.",
-                         detail={"filename": str(exc)})
+                         f"An import of '{exc.filename}' is already running.",
+                         detail={"filename": exc.filename})
     return ImportStartResponse(job_id=job_id, status="queued", filename=body.filename)
 
 
@@ -15454,10 +15756,10 @@ async def _start(collection: str, operation: str, params: dict):
                          "could not be read. No job was started; try again when Weaviate "
                          "is available.",
                          detail={"collection": collection})
-    except RuntimeError as exc:
+    except tuning.TuneInProgressError as exc:
         return api_error(409, "TUNE_IN_PROGRESS",
-                         f"'{exc}' is already being tuned.",
-                         detail={"collection": str(exc)})
+                         f"'{exc.collection}' is already being tuned.",
+                         detail={"collection": exc.collection})
     return TuneStartResponse(job_id=job_id, status="queued",
                              collection=collection, operation=operation)
 
@@ -19181,7 +19483,7 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
 ```json
 {
   "name": "rag-ui",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "scripts": {
     "dev": "vite",
@@ -19189,11 +19491,11 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
     "preview": "vite preview"
   },
   "dependencies": {
-    "lucide-react": "^1.61.0",
+    "lucide-react": "^1.64.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^9.0.1",
-    "react-router-dom": "^7.18.4",
+    "react-router-dom": "^7.18.5",
     "recharts": "^3.10.1",
     "remark-gfm": "^4.0.0"
   },
@@ -19202,8 +19504,8 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
     "@types/react": "^18.3.5",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
-    "autoprefixer": "^10.6.1",
-    "postcss": "^8.5.31",
+    "autoprefixer": "^10.6.2",
+    "postcss": "^8.5.32",
     "tailwindcss": "^3.4.11",
     "typescript": "^7.0.2",
     "vite": "^6.4.4"
@@ -22736,14 +23038,17 @@ export default function TransferPage() {
   const [importPollError, setImportPollError] = useState('')
 
   // Polling handles are kept so a job that finishes, or a page that unmounts,
-  // does not leave a timer running against a job nobody is watching. The job
-  // id being polled is kept too: a poll that answers after the page unmounted,
-  // or after it stopped watching that job, schedules nothing and changes nothing.
+  // does not leave a timer running against a job nobody is watching. Each
+  // panel's poll chain has a number, and only the current one acts: a poll that
+  // answers after the page unmounted, after the panel stopped watching, or after
+  // a newer chain started (reopening the polled job while its poll is in
+  // flight, say) schedules nothing and changes nothing, so there is never more
+  // than one chain per panel (#629).
   const alive = useRef(true)
   const exportTimer = useRef<number | null>(null)
   const importTimer = useRef<number | null>(null)
-  const exportPoll = useRef<string | null>(null)
-  const importPoll = useRef<string | null>(null)
+  const exportPoll = useRef(0)
+  const importPoll = useRef(0)
 
   const loadPackages = useCallback(() => {
     api.getPackages().then(r => {
@@ -22761,8 +23066,8 @@ export default function TransferPage() {
     loadPackages()
     return () => {
       alive.current = false
-      exportPoll.current = null
-      importPoll.current = null
+      exportPoll.current += 1
+      importPoll.current += 1
       if (exportTimer.current) window.clearTimeout(exportTimer.current)
       if (importTimer.current) window.clearTimeout(importTimer.current)
     }
@@ -22784,56 +23089,56 @@ export default function TransferPage() {
     return () => { current = false }
   }, [collection])
 
-  function pollExport(jobId: string, failures = 0) {
+  function pollExport(jobId: string, chain: number, failures = 0) {
     api.getExportJob(jobId).then(job => {
-      if (exportPoll.current !== jobId) return
+      if (exportPoll.current !== chain) return
       setExportJob(job)
       setExportPollError('')
       if (job.status === 'completed' || job.status === 'failed') {
-        exportPoll.current = null
+        exportPoll.current += 1
         setExportWatching(false)
         loadPackages()
         exportJobs.reload()
       } else {
-        exportTimer.current = window.setTimeout(() => pollExport(jobId), POLL_MS)
+        exportTimer.current = window.setTimeout(() => pollExport(jobId, chain), POLL_MS)
       }
     }, (e: unknown) => {
-      if (exportPoll.current !== jobId) return
+      if (exportPoll.current !== chain) return
       if (failures + 1 >= POLL_ATTEMPTS) {
-        exportPoll.current = null
+        exportPoll.current += 1
         setExportWatching(false)
         setExportPollError(`Stopped checking the export's progress after ${POLL_ATTEMPTS} failed attempts; the export may still be running. Last error: ${message(e)}`)
       } else {
         setExportPollError(`Could not check the export's progress, retrying: ${message(e)}`)
-        exportTimer.current = window.setTimeout(() => pollExport(jobId, failures + 1), POLL_MS)
+        exportTimer.current = window.setTimeout(() => pollExport(jobId, chain, failures + 1), POLL_MS)
       }
     })
   }
 
-  function pollImport(jobId: string, failures = 0) {
+  function pollImport(jobId: string, chain: number, failures = 0) {
     api.getImportJob(jobId).then(job => {
-      if (importPoll.current !== jobId) return
+      if (importPoll.current !== chain) return
       setImportJob(job)
       setImportPollError('')
       if (job.status !== 'completed' && job.status !== 'failed') {
-        importTimer.current = window.setTimeout(() => pollImport(jobId), POLL_MS)
+        importTimer.current = window.setTimeout(() => pollImport(jobId, chain), POLL_MS)
         return
       }
-      importPoll.current = null
+      importPoll.current += 1
       setImportWatching(false)
       importJobs.reload()
       if (job.status === 'completed') {
         api.getCollections().then(r => setCollections(r.collections)).catch(() => {})
       }
     }, (e: unknown) => {
-      if (importPoll.current !== jobId) return
+      if (importPoll.current !== chain) return
       if (failures + 1 >= POLL_ATTEMPTS) {
-        importPoll.current = null
+        importPoll.current += 1
         setImportWatching(false)
         setImportPollError(`Stopped checking the import's progress after ${POLL_ATTEMPTS} failed attempts; the import may still be running. Last error: ${message(e)}`)
       } else {
         setImportPollError(`Could not check the import's progress, retrying: ${message(e)}`)
-        importTimer.current = window.setTimeout(() => pollImport(jobId, failures + 1), POLL_MS)
+        importTimer.current = window.setTimeout(() => pollImport(jobId, chain, failures + 1), POLL_MS)
       }
     })
   }
@@ -22844,12 +23149,11 @@ export default function TransferPage() {
     if (exportTimer.current) window.clearTimeout(exportTimer.current)
     setExportError(''); setExportPollError('')
     setExportJob(entry)
+    const chain = ++exportPoll.current
     if (transferRunning(entry)) {
-      exportPoll.current = entry.job_id
       setExportWatching(true)
-      pollExport(entry.job_id)
+      pollExport(entry.job_id, chain)
     } else {
-      exportPoll.current = null
       setExportWatching(false)
     }
   }
@@ -22859,12 +23163,11 @@ export default function TransferPage() {
     if (importTimer.current) window.clearTimeout(importTimer.current)
     setImportError(''); setImportPollError('')
     setImportJob(entry)
+    const chain = ++importPoll.current
     if (transferRunning(entry)) {
-      importPoll.current = entry.job_id
       setImportWatching(true)
-      pollImport(entry.job_id)
+      pollImport(entry.job_id, chain)
     } else {
-      importPoll.current = null
       setImportWatching(false)
     }
   }
@@ -22896,9 +23199,9 @@ export default function TransferPage() {
       exportTouched.current = true
       exportJobs.reload()
       if (exportTimer.current) window.clearTimeout(exportTimer.current)
-      exportPoll.current = r.job_id
+      const chain = ++exportPoll.current
       setExportWatching(true)
-      pollExport(r.job_id)
+      pollExport(r.job_id, chain)
     } catch (e: unknown) {
       setExportError(message(e))
     }
@@ -22915,9 +23218,9 @@ export default function TransferPage() {
       importTouched.current = true
       importJobs.reload()
       if (importTimer.current) window.clearTimeout(importTimer.current)
-      importPoll.current = r.job_id
+      const chain = ++importPoll.current
       setImportWatching(true)
-      pollImport(r.job_id)
+      pollImport(r.job_id, chain)
     } catch (e: unknown) {
       setImportError(message(e))
     }
@@ -23961,7 +24264,9 @@ read the jar through `auth_headers.py`; in-process checks in the API image use
 `17_auth.sh` checks authentication itself: the endpoint/role matrix for no session and each
 role (written out in `auth_stack.py`, not read from the API), login, logout, cookies, origin
 rules, throttling, nginx's login rate limit (logins sent without waiting until one is refused
-`429 LOGIN_RATE_LIMITED` in the error envelope, and no audit record for the refused ones), the
+`429 LOGIN_RATE_LIMITED` in the error envelope, and no audit record for the refused ones), nginx's
+16k login body limit (a larger login body is refused `413` before the API; one at the field limits
+reaches it, #663), the
 operator command's effect on existing sessions (on throwaway `vfy-t-*`
 accounts), an Engineer's account administration through the API (on a throwaway account; the
 generated passwords must not reach the API log), service API keys (throwaway `vfy-s-*`
@@ -23985,6 +24290,15 @@ and, when the 60-second window closes, one record with `details.count` and `last
 that stay in order across processes and a clock that steps back, the telemetry route list and the Audit page's
 action list (#577).
 
+`20_offline_model.sh` checks that the api runs without the internet (#618, #695). In the
+running api container, `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE` must be `1` and the Hugging
+Face library must report offline mode, and the pre-cached sentence-transformers model
+`all-MiniLM-L6-v2` must load in under 60 seconds with `HF_ENDPOINT` pointed at an unroutable
+address (#618); `DO_NOT_TRACK` must be `1` (#695). It then runs `../tests/test_offline_ingest.py`
+in a fresh container from the api image with no network: real ingest jobs of every supported
+type, and a preparation of a `.txt` and a `.md` with a stub LLM, must succeed while every name
+lookup and non-Unix connect is refused (#695, #640).
+
 `21_prepare.sh` checks document preparation (#638, SPECIFICATIONS.md §3.1.11 and §10.8). It runs
 `../tests/test_prepare.py` in the API image with no network and a stub LLM (windows and the fidelity check,
 the LLM's limits, titles and summaries, the labels of CSV and JSON parts, normalisation, parts and names, JSON to JSON Lines, the storage limit,
@@ -23992,9 +24306,33 @@ jobs, cancel and restart, busy documents, import, downloads, routes), then check
 `prepare_stack.py` as the harness Developer: the role matrix of every `/prepare` route, an upload with a ZIP,
 ZIP refusals with ingest's codes, the raw download and the space used, deletes, import refusals, an unknown
 job's cancel and the audit records. In a full run (not `RAG_SKIP_SLOW=1`) it prepares three small files with
-the local LLM, one job at a time, checks that the cleaned text holds only source lines in order and that the
+the local LLM, one job at a time, checks that the cleaned text holds only source lines in order, that every
+cleaning window without a fallback lost at most 20 % of its characters (#640), and that the
 CSV and JSON Lines come back unchanged, labelled from their data, imports them into a throwaway `VfyPrepare*` collection and downloads a
 prepared part. Its `vfy-prepare-*` documents and its collections are removed at the end.
+
+`22_ui_ingest.sh` ingests through the web UI end to end (#641, SPECIFICATIONS.md §10.9), as a user does:
+`browser/ui_ingest.js` drives the real Import and Prepare pages in the browser image, logged in as the
+harness Engineer, with no request stubbed or intercepted, each case into a new collection made with the
+page's "+ New". The cases, files and known phrases are the fixtures' `ui_ingest/manifest.json`
+(`fixtures.py`): a clean `.pdf`, `.docx`, `.txt`, `.md`, `.csv`, `.json` and `.jsonl`, one collection
+each; a ZIP of mixed types with a `.json.gz` member and a `.jsonl.gz` beside it in one upload (a `.json.gz`
+is ingested only from a ZIP); a `.txt` of over 10,000 pieces at the `fixed` strategy's chunk size 50,
+split into parts (#621), whose minimum chunk size of 6,000 merges the pieces so only about a hundred
+chunks are embedded; and, in a full run only, a `.txt` and a `.csv` prepared on the Prepare page with the local LLM and
+imported with Import selected (#638). For each, `ui_ingest_check.py` checks that the page followed the job
+to `completed` with no error shown and the API's job record has no file error, that the Collections page
+shows at least the expected chunks, and, from the verify project's Weaviate (`ui_ingest_weaviate.py`, run
+in the api container), that the collection holds exactly the expected documents and a known phrase of each
+in one of its chunks; the split file's parts are numbered 1 to N with the first and last phrases in the
+first and last parts. Three bad files fail cleanly: a broken PDF (its job `failed`, an error line naming it),
+an unsupported type (`No supported files`) and an over-limit ZIP (`expands to more than`) each show a red
+message naming the file, and leave their collection empty and no job running, the two refused uploads no
+job at all. Its `VfyUiIngest*` collections and `vfy-ui-*` prepared documents are removed at the start and the
+end. Cost, measured 2026-11-11 on a Mac with 12 GB for Docker: about 3 min 40 s in a `RAG_SKIP_SLOW=1` run
+and 4 min 10 s in a full run (the Prepare case about 25 s), most of it the large file's embedding (about
+2.5 min). Splitting it through `overlap` at chunk size 50 instead embedded about 11,200 chunks and took
+26.5 min, which is why it uses `fixed` with the merge.
 
 ## Entry point and verify project
 
@@ -24007,7 +24345,7 @@ against" below).
 | Command | What it does |
 |---|---|
 | `stack.sh run [--checkout DIR] [--telemetry \| --lan] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
-| `stack.sh up [--checkout DIR] [--pull] [--lan]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. |
+| `stack.sh up [--checkout DIR] [--pull] [--telemetry \| --lan]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT` and `RAG_VERIFY_OTEL_ENABLED`. |
 | `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
 
 `--checkout` is the checkout to build and test; the default is the one holding
@@ -24107,8 +24445,9 @@ would fail by design). `--lan` can't be combined with `--telemetry`.
 `docker-compose.lan.yml`, under the project name `rag-lan-config`, with no
 `.env`; nothing is created) and runs `../tests/test_lan_mode.py` in the API
 image. Only in a `--lan` run does it check the running LAN project through
-`lan_stack.py`: HTTPS with the generated certificate, TLS versions and HTTP/2,
-the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
+`lan_stack.py`: HTTPS with the generated certificate, the hosts nginx answers
+for (localhost, 127.0.0.1 and the test names; another `Host` gets 421, #664),
+TLS versions and HTTP/2, the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
 the API's refusal in one-off containers (`docker compose run --rm
 --no-deps`, no ports) and nginx's login rate limit (logins sent without
 waiting until one is refused `429 LOGIN_RATE_LIMITED`, #577); it also prints
@@ -24147,7 +24486,8 @@ nothing.
 
 `python3 scripts/tests/test_verify_stack.py` checks `stack.sh`, the
 configuration check and both refusals, with Docker replaced by a stub, so it
-needs no stack.
+needs no stack. Two of its tests read `docker-compose.yml` with PyYAML, so they
+need PyYAML on the host; without it they are skipped.
 
 ## Continuous integration
 
@@ -24166,9 +24506,9 @@ top of the main `README.md` shows its result on `develop`.
   every service, with timestamps, and `docker compose ps -a`, also when `up`
   failed.
 - **The model cache.** Even with `RAG_SKIP_SLOW=1`, ingest needs the embedding
-  model, so Ollama starts with both models (about 2.5 GB). The cache key is
+  model, so Ollama starts with both models (about 5.2 GB). The cache key is
   built from the models `ollama/entrypoint.sh` pulls
-  (`ollama-models-phi3.5-nomic-embed-text`). On a hit, the cached models are
+  (`ollama-models-llama3.1:8b-nomic-embed-text`). On a hit, the cached models are
   copied into `rag-verify-ollama-models` before `up`, and Ollama pulls
   nothing. On a miss, Ollama pulls them; after `down`, the workflow copies the
   volume's `models/` folder out, only once every model's manifest is there,
@@ -24312,9 +24652,13 @@ tree with excluded files planted and reads them back, runs `package-offline.sh` 
 loaded or started), and checks the bundled image list against
 `docker compose config --images`. The copy is a real git repository with the tracked files
 committed (git ignoring the user's and the system's configuration), because both scripts
-archive `HEAD` with `git archive` (#384); the excluded files are planted untracked, as in a
-real checkout, so the tests show `git archive` leaves them out, a top-level `.env.<suffix>`
-such as `.env.local` included (SPECIFICATIONS.md section 11.2 excludes `.env*`). Its
+archive `HEAD` with `git archive` (#384). The commit runs with git's automatic maintenance
+off, and the test checks, from git's trace, that it started no `git maintenance` or `git gc`:
+a detached repack still writing into `.git` while the temporary directory was removed failed
+the cleanup with `Directory not empty` (#696). The excluded files are planted untracked, as
+in a real checkout, so the tests show `git archive` leaves them out, a top-level
+`.env.<suffix>` such as `.env.local` included (SPECIFICATIONS.md section 11.2 excludes
+`.env*`). Its
 `install-offline.sh` wait test records that the wait counts running services, not healthy ones.
 
 The live checks: unknown job ids, `on_conflict` 422s, `GET /packages` with a junk
@@ -24554,7 +24898,8 @@ operation runs reliably long enough to interrupt, so `test_jobstore.py` covers i
 
 `scripts/tests/test_startup_sweep.py` (#377) checks the startup sweeps of what a killed job
 leaves behind, in disposable folders. In `UPLOAD_DIR`, ingest staging is created as
-`ingest-*` and removed with the `import-*`, `rechunk-*` and `batch-verify-*` work directories;
+`ingest-*` and removed with the `import-*`, `rechunk-*`, `batch-verify-*` and `prepare-*` work
+directories, and document preparation's `prepare-*.zip` and `prepare-*.json` temporary files (#640);
 in `EXPORTS_DIR`, `.build-*` directories and `.*.tar.gz.partial` files are removed. Only those
 names, and only a real directory or regular file as the name says: completed packages,
 `ingest_configs/`, look-alike names, a file where a directory is expected and the reverse, and
@@ -24631,9 +24976,11 @@ stale, naming the file. Two concurrent uploads of one name must leave exactly on
 version, whole: its chunk set, its digest, and `chunks_replaced` equal to the other job's
 chunks. Replacing a name touches only that name (#622): with `a/report.pdf` (in a ZIP) and
 `Report.PDF` stored, uploading `report.pdf` replaces nothing and uploading it again replaces
-only its first set, and the other two keep exactly their chunks. `exact_source.py` then checks
-the same selection in real Weaviate on a scratch collection without a vectorizer, on both
-paths: a few word matches read in one query, and over 10,000 walked.
+only its first set, and the other two keep exactly their chunks; the first upload leaves a
+planted gold-standard session current. `exact_source.py` then checks the same selection in
+real Weaviate on a scratch collection without a vectorizer, on both paths: a few word matches
+read in one query, and over 10,000 walked; and over 10,000 earlier chunks of the name are
+all deleted, in batches.
 `browser/ui_criteria.js` (suite 06) stubs the job response and checks that the Import
 page shows "Replaced N chunk(s) from a previous version" only when `chunks_replaced` is above
 0, and the plain "N file(s) skipped:" heading with each entry's own reason.
@@ -24753,8 +25100,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `07_settings.sh` | registered live settings validation suite; invokes the standalone helper |
 | `settings_validation.py` | standalone, on the verify project after `stack.sh up`: `RAG_API=http://localhost:8081/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
-| `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
-| `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
+| `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only; `ui_ingest/` holds the files and `manifest.json` of suite 22 (#641) |
+| `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps; the proxy answers `Host` localhost and 127.0.0.1 and refuses another with 421 (#664) |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
 | `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384), run in a checkout reached through a symlink, and ignore the user's system and global git config (#447); embedded copies; registered by suite 01 |
 | `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415), registered by suite 01 |
@@ -24799,7 +25146,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_reingest.py` | controlled re-ingest replacement, exact-name selection (#622), same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
 | `../tests/test_split_parts.py` | controlled regressions for files over the per-file limits stored as parts (#621): the reviewer's 13,000 records, files over 10,000,000 characters, family replacement, all or nothing, cuts, CSV, Markdown, encoding, `overlap` sizing, re-chunk and export links, registered by ingest |
 | `split_parts.py` | helper for ingest (#621), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, files over the per-file limits are stored as parts, a smaller re-upload replaces every part, and a bad line after part 1 stores nothing; the collection is removed afterwards |
-| `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`) and over 10,000 (`walk`); the collection is removed afterwards |
+| `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`), over 10,000 (`walk`), and over 10,000 earlier chunks of the name itself, deleted in batches of 10,000 (`bulk`); the collection is removed afterwards |
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, registered by transfer |
@@ -24816,9 +25163,17 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
 | `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
+| `20_offline_model.sh` | the Hugging Face libraries run offline in the api container (#618): the pre-cached sentence-transformers model loads with no Hugging Face call; `DO_NOT_TRACK` is `1` in the running api container (#695); registers `../tests/test_offline_ingest.py` (#695, #640) |
+| `../tests/test_offline_ingest.py` | API image, no network: real ingest jobs of every supported type (`.txt`, `.md`, and `.pdf`, `.docx`, `.csv`, `.json` from `fixtures.py`; backends faked) complete with every name lookup and non-Unix connect refused and recorded from before the API is imported, so nothing may dial out; `DO_NOT_TRACK` is set and the bundled spaCy model `en_core_web_sm` is the version `unstructured` expects (#695); a `.txt` and a `.md` are also prepared with a stub LLM, their parts checked by the real parser (#640); registered by `20_offline_model.sh` |
+| `22_ui_ingest.sh` | §10.9 — ingest through the web UI (#641): every supported type, a ZIP of mixed types, a file split into parts and (full runs) a Prepare and Import, each into a new collection with no stub; a broken PDF, an unsupported type and an over-limit ZIP fail cleanly |
+| `browser/ui_ingest.js` | the browser side of suite 22: the Import and Prepare pages driven as a user does, the observations printed as one JSON line (#641) |
+| `ui_ingest_weaviate.py` | helper for suite 22, run in the API container: the `VfyUiIngest*` collections' documents and chunk text, read only (#641) |
+| `ui_ingest_check.py` | the checks of suite 22, one per subcommand, on the host, and its cleanup (#641) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
-| `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530), registered by infrastructure |
+| `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
+| `../tests/test_upgrade_backup.py` | host-only: the README's 1.1.0 → 1.2.0 upgrade blocks, run as written under bash, `zsh -c` and interactive zsh with comments off, against stub `docker`, `git` and `curl`; the stub docker accepts only mounts inside its temp directory and only the README's two container commands: no block holds a `#` comment line; the backup skips a missing volume (a wrong prefix) and counts only existing volumes' archives, and writes each copy to a `.tmp` file that replaces the archive only once `gzip -t` passes, so a failed or corrupt copy prints `backup FAILED` and keeps an earlier archive; the rollback is gated on `git checkout v1.1.0` and checks every archive (`gzip -t`, `tar tzf`) and volume before it empties any, and a failed restore stops before `compose up`; alpine is pinned by version and digest; git ignores `backups/` (#679, #693), registered by infrastructure |
+| `../tests/test_version_agreement.py` | host-only: the first-party version strings agree with each other, not with a fixed version: `ui/package.json`, the root versions in `ui/package-lock.json`, `mcp/mcpapp.py`, the two `service.version` defaults in `api/services/telemetry.py` and `RAG_OTEL_SERVICE_VERSION` in `docker-compose.telemetry.yml` and `docker-compose.telemetry.verify.yml` (#605, #656), registered by infrastructure |
 | `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
 | `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
@@ -24858,7 +25213,7 @@ through the proxy that download refuses other upload state with 400 (#370).
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
-| `RAG_NETWORK` | detected | compose network for the browser container |
+| `RAG_UI_BASE` | `http://localhost` | the address `06_ui.sh`'s browser opens. The browser runs in the proxy container's network namespace, so `localhost` is the proxy and the `Host` is one the proxy answers for (#664); `RAG_NETWORK` is no longer used |
 | `RAG_AUTH_DIR` | `${TMPDIR:-/tmp}/rag-verify-auth-<uid>` | the folder of the test accounts' credentials and cookie jars (#25) |
 
 ## Writing a check
@@ -25140,7 +25495,7 @@ synthesis failing is the Ollama 503 (and that it used the engineer system prompt
 Ollama failure in the reformulation or the synthesis in `hybrid` and `semantic` modes still
 names Ollama only (#456), that a Weaviate failure in `hybrid` and `semantic`
 modes names Ollama too (Weaviate embeds the question through it there), and that a help
-template `RuntimeError` answers `HELP_RENDER_FAILED` with its own message. Suite 01 then
+template `RuntimeError` answers `HELP_RENDER_FAILED` with a fixed message, the cause logged (#657). Suite 01 then
 checks the envelope through the proxy on the running stack: an unknown route answers 404
 `NOT_FOUND`, and `PUT /query` answers 405 with `Allow: POST` and the code
 `METHOD_NOT_ALLOWED` (#456), the request going through the lock-checked `api_request` helper.
@@ -25403,7 +25758,7 @@ printf '\nBuilding fixtures in %s\n' "$FIX"
 rm -rf "$FIX"; python3 ./fixtures.py "$FIX" >/dev/null
 export RAG_FIXTURES="$FIX"
 
-ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit 20_offline_model 21_prepare)
+ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit 20_offline_model 21_prepare 22_ui_ingest)
 if [ "$#" -gt 0 ]; then
   SUITES=()
   for want in "$@"; do
@@ -26858,6 +27213,8 @@ stack throttle
 check "five failed logins lock the username and address for 15 minutes" $?
 stack login-rate-limit
 check "nginx refuses logins beyond 10 a minute per address (burst 5) with 429 LOGIN_RATE_LIMITED; the API never sees them" $?
+stack login-body-limit
+check "nginx refuses a login body over 16k with 413 before the API; a login at the field limits reaches the API" $?
 stack bootstrap-refused
 check "bootstrap is refused once set up; an invalid username is a usage error" $?
 stack no-secrets-logged
@@ -27362,6 +27719,24 @@ def check_login_rate_limit(operator_ok):
                "a login the API answered wasn't recorded once")
     finally:
         request("POST", "/auth/logout", token=admin)
+
+
+def check_login_body_limit(operator_ok):
+    """#663: nginx refuses a login body over 16k with its own 413 before the API
+    reads it; a login at LoginRequest's caps (256 and 1,024 characters) still
+    reaches the API. nginx checks Content-Length when it picks the location,
+    before the rate limit, so the refused request takes no rate-limit slot."""
+    big = {"username": "vfy-body-" + secrets.token_hex(3), "password": "x" * 17000}
+    status, raw, headers = code("POST", "/auth/login", big, paced=False)
+    content_type = headers.get("Content-Type", "")
+    expect(status == 413, "a {}-byte login body answered {} {}".format(
+        len(json.dumps(big)), status, error_code(raw)))
+    expect(error_code(raw) is None and not content_type.startswith("application/json"),
+           "the 413 came from the API, not nginx ({})".format(content_type))
+    name = ("vfy-caps-" + secrets.token_hex(3)).ljust(256, "a")
+    status, raw, _ = code("POST", "/auth/login", {"username": name, "password": "y" * 1024})
+    expect(status == 401 and error_code(raw) == "LOGIN_FAILED",
+           "a login at the field limits answered {} {}".format(status, error_code(raw)))
 
 
 def check_throttle(operator_ok):
@@ -28195,7 +28570,7 @@ if [ "$SKIP_SLOW" = "1" ]; then
   skip "P9-P11 prepare, import and download with the LLM" "RAG_SKIP_SLOW=1"
 else
   stack prepare
-  check "P9 the .txt becomes cleaned Markdown of source lines in order with its header; the .csv and .jsonl are unchanged and labelled from their data" $?
+  check "P9 the .txt becomes cleaned Markdown of source lines in order with its header, every window without a fallback losing at most 20 % of its characters; the .csv and .jsonl are unchanged and labelled from their data" $?
   stack import
   check "P10 an unknown collection is 404; the import into a new collection completes and is recorded" $?
   p10_collection=$(python3 -c 'import prepare_stack as p; print(p.state().get("collection", ""))')
@@ -28301,6 +28676,11 @@ PAGES = "\n".join(
            f"forward to the next session." for n in range(6)]
         + [f"Page {page}", ""])) + "\n"
 CSV = "name,team\nAda,core\nBo,docs\nCy,ops\n"
+# The cleaning windows and the fidelity rule of api/services/preparation.py
+# (WINDOW_CHARACTERS, MAX_REMOVED_SHARE), for P9's live check of the rule (#640).
+# test_prepare.py's test_p9_uses_preparations_window_rule checks they match.
+WINDOW_CHARACTERS = 3000
+MAX_REMOVED_SHARE = 0.20
 JSONL = '{"id": 1, "text": "first record"}\n{"id": 2, "text": "second record"}\n'
 
 
@@ -28508,9 +28888,48 @@ def check_audit(fix):
 
 # ── with the LLM (full runs only) ────────────────────────────────────────────
 
+def text_windows(lines):
+    """The cleaning windows of a part's lines, as preparation.windows() groups them:
+    whole lines in order while their characters (each line's length + 1) fit in
+    WINDOW_CHARACTERS; a longer line is a window of its own. Each window is the
+    list of its line indexes."""
+    out, current, size = [], [], 0
+    for index, line in enumerate(lines):
+        if len(line) + 1 > WINDOW_CHARACTERS:
+            if current:
+                out.append(current)
+                current, size = [], 0
+            out.append([index])
+            continue
+        if current and size + len(line) + 1 > WINDOW_CHARACTERS:
+            out.append(current)
+            current, size = [], 0
+        current.append(index)
+        size += len(line) + 1
+    if current:
+        out.append(current)
+    return out
+
+
+def removed_too_much(source, kept, fallbacks):
+    """The first window without a fallback whose removed lines hold more than
+    MAX_REMOVED_SHARE of its characters, as (number, removed, characters), or None.
+    `kept` is the set of source line indexes the prepared text kept (#640)."""
+    fell_back = {f["window"] for f in fallbacks if f.get("window") is not None}
+    for number, window in enumerate(text_windows(source), 1):
+        if number in fell_back:
+            continue
+        characters = sum(len(source[i]) + 1 for i in window)
+        removed = sum(len(source[i]) + 1 for i in window if i not in kept)
+        if removed > MAX_REMOVED_SHARE * characters:
+            return number, removed, characters
+    return None
+
+
 def check_prepare(fix):
-    """P9: preparing the .txt, the .csv and the .jsonl; the .csv and .jsonl are
-    labelled from their data."""
+    """P9: preparing the .txt, the .csv and the .jsonl; the .txt keeps only source
+    lines, in order, and every window without a fallback lost at most 20 % of its
+    characters (#640); the .csv and .jsonl are labelled from their data."""
     token = role_token("developer")
     ids = state()["ids"]
     status, body, _ = send("POST", "/prepare/jobs", token, body={"document_ids": list(ids.values())})
@@ -28524,21 +28943,26 @@ def check_prepare(fix):
     status, content, _ = send("GET", "/prepare/documents/{}/prepared".format(txt["id"]), token, raw=True)
     expect(status == 200, "prepared download {}".format(status))
     text = content.decode("utf-8")
-    lines = text.split("\n")
+    lines = text.rstrip("\n").split("\n")
     if part["title"]:
         header = "# {}".format(part["title"])
         expect(lines[0] == header and lines[2] == "Summary (generated): {}".format(part["summary"]),
                "no header: {!r}".format(lines[:3]))
         lines = lines[4:]
-    source = PAGES.split("\n")
+    # The part's text as preparation reads the .txt: its paragraphs joined by
+    # one blank line, then cut into the windows the LLM saw.
+    source = "\n\n".join(block.strip("\n") for block in PAGES.split("\n\n")
+                          if block.strip()).split("\n")
     position = 0
+    kept = set()
     for line in lines:
-        if not line:
-            continue
         try:
             position = source.index(line, position) + 1
         except ValueError:
             raise CheckFailed("a line that isn't a source line, in order: {!r}".format(line))
+        kept.add(position - 1)
+    lost = removed_too_much(source, kept, part["fallbacks"])
+    expect(lost is None, "window {} lost {} of {} characters, more than 20 %".format(*(lost or (0, 0, 0))))
     for reason in (f["reason"] for f in part["fallbacks"]):
         expect(reason in ("removed-too-much", "removed-long-line", "unusable-answer", "llm-timeout",
                           "llm-error", "llm-unavailable", "too-large-for-llm"), "reason {}".format(reason))
@@ -28634,6 +29058,761 @@ def main(argv):
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
+```
+
+### scripts/verify/22_ui_ingest.sh
+
+```bash
+#!/usr/bin/env bash
+# Ingest through the web UI, end to end (#641): SPECIFICATIONS.md §10.9.
+#
+# A real browser (browser/ui_ingest.js), logged in as the harness Engineer, with
+# nothing stubbed, ingests on the Import page every supported type into a new
+# collection each, a ZIP of mixed types with a .jsonl.gz, and a file over the
+# part limit; prepares two files on the Prepare page with the local LLM and
+# imports them into a new collection (full runs only); and sends a broken PDF,
+# an unsupported type and an over-limit ZIP, each into a new collection. Then
+# ui_ingest_check.py checks each collection: the job ended with no error and the
+# page showed none, the Collections page's count, and the document names and a
+# known phrase per document read from the verify project's Weaviate
+# (ui_ingest_weaviate.py, in the api container); the refusals: a clear message,
+# nothing in the collection and no job left running. The cases and phrases are
+# the fixtures' ui_ingest/manifest.json (fixtures.py). Its collections are
+# VfyUiIngest*, its prepared documents vfy-ui-*; both are removed at the end.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
+[ -f "$FIX/ui_ingest/manifest.json" ] || python3 ./fixtures.py "$FIX" >/dev/null
+MANIFEST="$FIX/ui_ingest/manifest.json"
+require_stack
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/rag-verify-ui-ingest.XXXXXX")
+# Also release the verify lock: this trap replaces the one lock.sh set.
+trap 'rm -rf "$WORK"; _rag_lock_release 2>/dev/null || true' EXIT
+RESULTS="$WORK/results.json"
+DUMP="$WORK/weaviate.json"
+
+IMAGE="rag-verify-browser:latest"
+# The browser runs in the proxy container's network namespace and opens
+# http://localhost, as in 06_ui.sh (#664).
+PROXY=$( (cd "$REPO_ROOT" && docker compose ps -q proxy) )
+if [ -z "$PROXY" ]; then
+  printf '    could not find the proxy container\n'
+  exit 2
+fi
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  printf '    building the browser image (first run only)...\n'
+  docker build -q -t "$IMAGE" ./browser >/dev/null || { printf '    image build failed\n'; exit 2; }
+fi
+
+uicheck() { _rag_require_lock_owner; python3 ./ui_ingest_check.py "$@"; }
+uicheck cleanup >/dev/null 2>&1
+
+section "The flows in the browser (Import and Prepare pages, no stubs)"
+# The credentials go in on standard input (#25), as in 06_ui.sh.
+_rag_require_lock_owner
+started=$(date +%s)
+docker run --rm -i --network "container:$PROXY" \
+  -e RAG_UI_BASE="${RAG_UI_BASE:-http://localhost}" \
+  -e RAG_SKIP_SLOW="$SKIP_SLOW" -e RAG_AUTH_STDIN=1 \
+  -v "$PWD/browser":/w:ro -v "$FIX/ui_ingest":/fixtures:ro -w /w "$IMAGE" \
+  node ui_ingest.js < "$RAG_AUTH_DIR/credentials" > "$WORK/browser.out"
+rc=$?
+grep -v '^UI_INGEST_RESULT ' "$WORK/browser.out"
+grep '^UI_INGEST_RESULT ' "$WORK/browser.out" | tail -n 1 | sed 's/^UI_INGEST_RESULT //' > "$RESULTS"
+printf '    the browser took %ds\n' "$(( $(date +%s) - started ))"
+[ "$rc" = 0 ] && [ -s "$RESULTS" ] && uicheck browser "$MANIFEST" "$RESULTS"
+check "the browser ran every case and read the Collections page" $?
+
+(cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/ui_ingest_weaviate.py > "$DUMP")
+check "the suite's collections were read from the verify project's Weaviate" $?
+
+while IFS=$'\t' read -r kind slow name; do
+  section "$name"
+  if [ "$slow" = slow ] && [ "$SKIP_SLOW" = "1" ]; then
+    skip "$name: prepare, import and check the collection" "RAG_SKIP_SLOW=1"
+    continue
+  fi
+  run() { uicheck "$1" "$name" "$MANIFEST" "$RESULTS" "$DUMP"; }
+  if [ "$kind" = refused ]; then
+    run message
+    check "$name: the page shows a clear message naming the file" $?
+    run nothing-left
+    check "$name: nothing is left in the collection and no job is left running" $?
+    continue
+  fi
+  if [ "$kind" = prepare ]; then
+    run prepared
+    check "$name: the preparation completed with no error shown, every document prepared" $?
+  fi
+  run job
+  check "$name: the job completed with no file error, and the page showed none" $?
+  run contents
+  check "$name: the Collections page shows at least the expected chunks" $?
+  run names
+  check "$name: Weaviate holds exactly the expected documents" $?
+  run retrieval
+  check "$name: each document's known phrase is in one of its chunks" $?
+  if [ "$kind" = split ]; then
+    run split
+    check "$name: the page and the job show it split, Weaviate holds parts 1 to N" $?
+  fi
+done < <(python3 ./ui_ingest_check.py cases "$MANIFEST")
+
+section "Cleanup"
+uicheck cleanup
+uicheck cleanup-check
+check "the suite's collections and prepared documents are removed" $?
+
+summary
+```
+
+### scripts/verify/ui_ingest_check.py
+
+```python
+"""The checks of 22_ui_ingest.sh (#641), one per subcommand. Host-side, standard
+library, Python 3.9+.
+
+    python3 ui_ingest_check.py cases MANIFEST
+    python3 ui_ingest_check.py CHECK CASE MANIFEST RESULTS DUMP
+    python3 ui_ingest_check.py cleanup|cleanup-check
+
+MANIFEST is the fixtures' ui_ingest/manifest.json, RESULTS the observations
+browser/ui_ingest.js printed (what the pages showed and the API's job records),
+DUMP what ui_ingest_weaviate.py read from the verify project's Weaviate. A check
+exits 0 when it holds and 1 when it doesn't, the reason on standard error.
+Document names and phrases are checked against Weaviate only. `cleanup` deletes
+the suite's VfyUiIngest* collections and vfy-ui-* prepared documents through the
+API as the harness Engineer; `cleanup-check` fails while any is left.
+SPECIFICATIONS.md §10.9.
+"""
+import json
+import sys
+
+import prepare_stack
+from auth_stack import role_token
+
+PREFIX = "VfyUiIngest"
+DOCUMENT_PREFIX = "vfy-ui-"
+TERMINAL = ("completed", "failed", "partial", "cancelled", "interrupted")
+
+
+class Failed(Exception):
+    pass
+
+
+def expect(ok, reason):
+    if not ok:
+        raise Failed(reason)
+
+
+def norm(text):
+    """Every run of white space as one space."""
+    return " ".join(text.split())
+
+
+def found(phrase, chunks):
+    want = norm(phrase)
+    return any(want in norm(chunk) for chunk in chunks)
+
+
+def load(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError) as error:
+        raise Failed("could not read {}: {}".format(path, error)) from None
+
+
+class Case:
+    def __init__(self, name, manifest, results, dump):
+        cases = {c["name"]: c for c in load(manifest)["cases"]}
+        expect(name in cases, "no case {!r} in the manifest".format(name))
+        self.spec = cases[name]
+        self.results = load(results)
+        self.obs = self.results["cases"].get(name)
+        expect(self.obs is not None, "the browser recorded nothing for this case")
+        expect(not self.obs.get("skipped"), "the case was skipped")
+        self.collection = self.spec["collection"]
+        self.dump = load(dump)["collections"].get(self.collection) if dump else None
+
+    def ran(self):
+        """The browser got through every step of the case."""
+        expect("failed_step" not in self.obs, "the case stopped at '{}': {}".format(
+            self.obs.get("failed_step"), self.obs.get("error")))
+
+    def documents(self):
+        expect(self.dump is not None, "Weaviate has no collection {}".format(self.collection))
+        return self.dump["documents"]
+
+    def expected(self):
+        """{document name: phrase} for the names check; None when the case is split."""
+        if self.spec["kind"] == "prepare":
+            records = self.obs.get("records") or {}
+            out = {}
+            for raw, phrase in self.spec["documents"].items():
+                parts = (records.get(raw) or {}).get("parts")
+                expect(parts, "no prepared parts recorded for {}".format(raw))
+                for part in parts:
+                    out[part] = phrase
+            return out
+        return dict(self.spec["documents"])
+
+
+def page_count(case):
+    counts = case.results.get("collections") or {}
+    expect(case.collection in counts, "the Collections page doesn't list {}".format(case.collection))
+    return counts[case.collection]
+
+
+def parts_of(name, documents):
+    """The part numbers of `name` among the documents; any other name is returned too."""
+    numbers, others = [], []
+    for doc in documents:
+        if doc.startswith(name + " (part ") and doc.endswith(")") and doc[len(name) + 7:-1].isdigit():
+            numbers.append(int(doc[len(name) + 7:-1]))
+        else:
+            others.append(doc)
+    return sorted(numbers), others
+
+
+# ── checks ────────────────────────────────────────────────────────────────────
+
+def check_job(case):
+    """The upload was accepted, the page followed its job to `completed` and shows no
+    error, and the API's record has no file error."""
+    case.ran()
+    upload = case.obs.get("upload") or {}
+    expect(upload.get("status") == 202, "the upload answered {} {}".format(upload.get("status"), upload.get("body")))
+    job_id = (upload.get("body") or {}).get("job_id")
+    page = case.obs.get("page") or {}
+    expect(job_id and page.get("job_id") == job_id, "the page shows job {}, the upload started {}".format(
+        page.get("job_id"), job_id))
+    expect(page.get("status") == "completed", "the page shows the job {}".format(page.get("status")))
+    expect(not page.get("errors"), "the page lists errors: {}".format(page.get("errors")))
+    expect(not page.get("red"), "the page shows: {}".format(page.get("red")))
+    record = (case.obs.get("record") or {}).get("body") or {}
+    expect(record.get("status") == "completed", "the API's job record is {}".format(record.get("status")))
+    expect(record.get("files_failed") == 0 and record.get("errors") == [],
+           "the API's job record has files_failed {} and errors {}".format(record.get("files_failed"), record.get("errors")))
+
+
+def check_contents(case):
+    """The Collections page shows at least the case's minimum of chunks."""
+    case.ran()
+    minimum = case.spec.get("min_chunks") or len(case.expected())
+    count = page_count(case)
+    expect(count >= minimum, "the Collections page shows {} objects, at least {} expected".format(count, minimum))
+
+
+def check_names(case):
+    """The collection's documents in Weaviate are exactly the expected ones."""
+    case.ran()
+    documents = sorted(case.documents())
+    if "split" in case.spec:
+        name = case.spec["split"]["file"]
+        numbers, others = parts_of(name, documents)
+        expect(not others and len(numbers) >= 2 and numbers == list(range(1, len(numbers) + 1)),
+               "the documents are {}, the parts of {} expected".format(documents, name))
+        return
+    want = sorted(case.expected())
+    expect(documents == want, "Weaviate holds {}, expected {}".format(documents, want))
+
+
+def check_retrieval(case):
+    """Every expected document's phrase is in one of its chunks."""
+    case.ran()
+    documents = case.documents()
+    if "split" in case.spec:
+        split = case.spec["split"]
+        numbers, _ = parts_of(split["file"], documents)
+        expect(numbers, "no part of {} in Weaviate".format(split["file"]))
+        first = "{} (part {})".format(split["file"], numbers[0])
+        last = "{} (part {})".format(split["file"], numbers[-1])
+        expect(numbers[0] == 1 and found(split["first"], documents[first]),
+               "{!r} is not in {}".format(split["first"], first))
+        expect(len(numbers) > 1 and found(split["last"], documents[last]),
+               "{!r} is not in {}".format(split["last"], last))
+        return
+    if case.spec["kind"] == "prepare":
+        # A prepared document's phrase may be in any of its parts.
+        records = case.obs.get("records") or {}
+        missing = [raw for raw, phrase in sorted(case.spec["documents"].items())
+                   if not any(found(phrase, documents.get(part, []))
+                              for part in (records.get(raw) or {}).get("parts") or [])]
+    else:
+        missing = [name for name, phrase in sorted(case.expected().items())
+                   if not found(phrase, documents.get(name, []))]
+    expect(not missing, "no chunk holds the phrase of {}".format(missing))
+
+
+def check_split(case):
+    """The page and the job record name the file split into parts; Weaviate holds parts 1 to N, N >= 2."""
+    case.ran()
+    name = case.spec["split"]["file"]
+    page = case.obs.get("page") or {}
+    # Each entry is the API's sentence about one file, starting with its name.
+    expect(any(e.startswith(name + ":") for e in page.get("split") or []),
+           "the page's split list is {}".format(page.get("split")))
+    record = (case.obs.get("record") or {}).get("body") or {}
+    expect(any(e.startswith(name + ":") for e in record.get("split") or []),
+           "the job record's split is {}".format(record.get("split")))
+    numbers, _ = parts_of(name, case.documents())
+    expect(len(numbers) >= 2 and numbers == list(range(1, len(numbers) + 1)),
+           "the parts in Weaviate are {}".format(numbers))
+
+
+def check_prepared(case):
+    """The preparation showed its job completed with no error, every document prepared."""
+    upload = case.obs.get("prepare_upload") or {}
+    expect(upload.get("status") == 201, "the Prepare upload answered {} {}".format(upload.get("status"), upload.get("body")))
+    prep = case.obs.get("preparation")
+    expect(prep is not None, "the case stopped at '{}' before the preparation ended: {}".format(
+        case.obs.get("failed_step"), case.obs.get("error")))
+    expect(prep.get("shows_job") and prep.get("status") == "completed",
+           "the preparation section shows {}".format(prep.get("status")))
+    expect(not prep.get("errors"), "the preparation section lists errors: {}".format(prep.get("errors")))
+    rows = prep.get("rows") or {}
+    for raw in case.spec["documents"]:
+        row = rows.get(raw)
+        expect(row and row.get("status") == "prepared" and not row.get("last_error"),
+               "{}'s row shows {}".format(raw, row))
+
+
+def check_message(case):
+    """The page shows a clear message naming the file and the reason."""
+    case.ran()
+    page = case.obs.get("page") or {}
+    upload = case.obs.get("upload") or {}
+    if case.spec["job"]:
+        expect(upload.get("status") == 202, "the upload answered {}".format(upload.get("status")))
+        expect(page.get("status") == "failed", "the page shows the job {}".format(page.get("status")))
+        shown = page.get("errors") or []
+        expect(any(e.startswith(case.spec["message"][0]) for e in shown),
+               "no error line starts with {!r}: {}".format(case.spec["message"][0], shown))
+    else:
+        expect(upload.get("status") == 400, "the upload answered {}".format(upload.get("status")))
+        shown = page.get("red") or []
+        expect(any(all(word in m for word in case.spec["message"]) for m in shown),
+               "no red message holds {}: {}".format(case.spec["message"], shown))
+
+
+def check_nothing_left(case):
+    """The collection holds nothing, and no job of it is running (none at all after a refused upload)."""
+    case.ran()
+    expect(page_count(case) == 0, "the Collections page shows {} objects".format(page_count(case)))
+    expect(case.dump is not None and case.dump["count"] == 0,
+           "Weaviate holds {}".format(None if case.dump is None else case.dump["count"]))
+    expect(case.obs.get("jobs_status") == 200, "the job list answered {}".format(case.obs.get("jobs_status")))
+    jobs = case.obs.get("jobs") or []
+    running = [j for j in jobs if j["status"] not in TERMINAL]
+    expect(not running, "jobs still running: {}".format(running))
+    if not case.spec["job"]:
+        expect(not jobs, "the refused upload left jobs: {}".format(jobs))
+
+
+CHECKS = {"job": check_job, "contents": check_contents, "names": check_names,
+          "retrieval": check_retrieval, "split": check_split, "prepared": check_prepared,
+          "message": check_message, "nothing-left": check_nothing_left}
+
+
+def browser(manifest, results):
+    """The browser recorded every case; a slow case is skipped only under RAG_SKIP_SLOW=1."""
+    data = load(results)
+    for case in load(manifest)["cases"]:
+        obs = data["cases"].get(case["name"])
+        expect(obs is not None, "nothing recorded for {}".format(case["name"]))
+        if obs.get("skipped"):
+            expect(case["slow"] and data.get("skip_slow"), "{} was skipped".format(case["name"]))
+    expect(isinstance(data.get("collections"), dict), "the Collections page wasn't read")
+
+
+def ours(token):
+    status, body, _ = prepare_stack.send("GET", "/collections", token)
+    expect(status == 200, "GET /collections answered {}".format(status))
+    collections = [c["name"] for c in body["collections"] if c["name"].startswith(PREFIX)]
+    status, body, _ = prepare_stack.send("GET", "/prepare/documents", token)
+    expect(status == 200, "GET /prepare/documents answered {}".format(status))
+    documents = [d for d in body["documents"] if d["name"].startswith(DOCUMENT_PREFIX)]
+    return collections, documents
+
+
+def cleanup(check):
+    token = role_token("engineer")
+    collections, documents = ours(token)
+    if check:
+        expect(not collections and not documents, "left: {} {}".format(collections, [d["name"] for d in documents]))
+        return
+    for name in collections:
+        prepare_stack.send("DELETE", "/collections/{}?confirm=true".format(name), token)
+    for doc in documents:
+        prepare_stack.send("DELETE", "/prepare/documents/" + doc["id"], token)
+
+
+def main(argv):
+    try:
+        if argv[:1] == ["cases"] and len(argv) == 2:
+            for case in load(argv[1])["cases"]:
+                kind = "split" if "split" in case else case["kind"]
+                print("{}\t{}\t{}".format(kind, "slow" if case["slow"] else "-", case["name"]))
+        elif argv[:1] == ["browser"] and len(argv) == 3:
+            browser(argv[1], argv[2])
+        elif argv[:1] in (["cleanup"], ["cleanup-check"]) and len(argv) == 1:
+            cleanup(argv[0] == "cleanup-check")
+        elif len(argv) == 5 and argv[0] in CHECKS:
+            CHECKS[argv[0]](Case(argv[1], argv[2], argv[3], argv[4]))
+        else:
+            print(__doc__, file=sys.stderr)
+            return 2
+    except Failed as failure:
+        print("    " + str(failure), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+```
+
+### scripts/verify/ui_ingest_weaviate.py
+
+```python
+"""The UI ingest suite's collections as Weaviate holds them (#641).
+
+Run by 22_ui_ingest.sh in the verify project's api container:
+
+    docker compose exec -T api python - < scripts/verify/ui_ingest_weaviate.py
+
+Prints JSON: for every collection whose name starts with VfyUiIngest, its object
+count and, per source_file, the content of its chunks in chunk_index order. It
+only reads. ui_ingest_check.py checks the documents' names and phrases against it.
+"""
+import json
+
+from services import weaviate_client as wc
+
+PREFIX = "VfyUiIngest"
+
+try:
+    client = wc.get_client()
+    out = {}
+    for name in sorted(client.collections.list_all(simple=True)):
+        if not name.startswith(PREFIX):
+            continue
+        documents, count = {}, 0
+        for obj in client.collections.get(name).iterator(
+                return_properties=["source_file", "chunk_index", "content"]):
+            count += 1
+            p = obj.properties
+            documents.setdefault(p["source_file"], []).append((p["chunk_index"], p["content"]))
+        out[name] = {"count": count,
+                     "documents": {source: [text for _, text in sorted(chunks, key=lambda c: c[0])]
+                                   for source, chunks in documents.items()}}
+    print(json.dumps({"collections": out}))
+finally:
+    wc.close_client()
+```
+
+### scripts/verify/browser/ui_ingest.js
+
+```javascript
+// Ingest through the web UI, end to end (#641), run by 22_ui_ingest.sh.
+//
+// A real browser, logged in as the harness Engineer through the real API, uses
+// the Import and Prepare pages as a user does: a new collection per case with
+// "+ New", the files through the page's file input, Start Ingest (or Upload,
+// Prepare selected and Import selected), and the page's own polling until the
+// job ends. Nothing is stubbed or intercepted. The script only observes: what
+// the pages show, the answers to the page's own requests, and the API's job and
+// prepared-document records, read with fetch in the logged-in page. The cases
+// come from the fixtures' ui_ingest/manifest.json, mounted at /fixtures.
+//
+// It prints one line `UI_INGEST_RESULT <json>` with the observations, which
+// ui_ingest_check.py turns into checks. A case that can't go on records the step
+// and why, and the run moves to the next case. Exit 1 only when the run itself
+// can't start (browser, login, manifest).
+const fs = require('fs');
+const { launch, session, setValue, clickByText, sleep } = require('./lib');
+
+const BASE = process.env.RAG_UI_BASE || 'http://localhost';
+const SKIP_SLOW = process.env.RAG_SKIP_SLOW === '1';
+const FIXTURES = '/fixtures';
+const TERMINAL = ['completed', 'failed', 'partial', 'cancelled', 'interrupted'];
+const MINUTE = 60000;
+
+class Step extends Error {
+  constructor(step, message) { super(message); this.step = step; }
+}
+
+// Runs `fn`; a failure is rethrown as the named step.
+async function step(name, fn) {
+  try { return await fn(); } catch (e) {
+    if (e instanceof Step) throw e;
+    throw new Step(name, e && e.message ? e.message.replace(/\s+/g, ' ').slice(0, 300) : String(e));
+  }
+}
+
+// A request the logged-in page sends itself: { status, body }.
+const apiGet = (page, path) => page.evaluate(async p => {
+  const res = await fetch(p);
+  let body = null;
+  try { body = await res.json(); } catch { /* not JSON */ }
+  return { status: res.status, body };
+}, path);
+
+// What the page shows now. `scope` is a CSS selector the progress panel and the
+// Job ID line are looked for in; red messages are read page-wide.
+const observe = (page, scope) => page.evaluate(sel => {
+  const root = document.querySelector(sel) || document;
+  const text = e => (e.textContent || '').replace(/\s+/g, ' ').trim();
+  const idLine = [...root.querySelectorAll('p')].find(p => text(p).startsWith('Job ID:'));
+  const panel = [...root.querySelectorAll('div.mt-4.p-4.border.rounded.bg-gray-50')]
+    .find(d => text(d).startsWith('Files:'));
+  let status = null, errors = [], split = [], skipped = [];
+  if (panel) {
+    const spans = panel.querySelectorAll(':scope > div:first-child > span');
+    status = spans.length >= 3 ? text(spans[2]) : null;
+    errors = [...panel.querySelectorAll('ul.text-red-600 li')].map(text);
+    split = [...panel.querySelectorAll('[data-testid=split-files] li')].map(text);
+    skipped = [...panel.querySelectorAll('div.text-amber-700 li')].map(text);
+  }
+  const red = [...document.querySelectorAll('p.text-red-600, [role=alert]')].map(text).filter(Boolean);
+  return {
+    job_id: idLine ? text(idLine.querySelector('.font-mono') || idLine).replace(/^Job ID:\s*/, '') : null,
+    status, errors, split, skipped, red: [...new Set(red)],
+  };
+}, scope);
+
+// waitForFunction for up to `minutes`, in rounds of two minutes: one round is a
+// single DevTools call, which puppeteer ends after 180 s (protocolTimeout).
+async function waitLong(page, minutes, fn, ...args) {
+  const deadline = Date.now() + minutes * MINUTE;
+  for (;;) {
+    const round = Math.min(2 * MINUTE, deadline - Date.now());
+    try {
+      return await page.waitForFunction(fn, { timeout: Math.max(round, 1000), polling: 1000 }, ...args);
+    } catch (e) {
+      if (!(e && e.name === 'TimeoutError') || Date.now() >= deadline) throw e;
+    }
+  }
+}
+
+// The progress panel in `scope` shows job `id` with a status it never leaves.
+async function waitForJob(page, scope, id, minutes) {
+  await step('wait for the job to end', () => waitLong(page, minutes, (sel, jobId, terminal) => {
+    const root = document.querySelector(sel) || document;
+    const text = e => (e.textContent || '').replace(/\s+/g, ' ').trim();
+    const idLine = [...root.querySelectorAll('p')].find(p => text(p).startsWith('Job ID:'));
+    if (!idLine || !text(idLine).endsWith(jobId)) return false;
+    const panel = [...root.querySelectorAll('div.mt-4.p-4.border.rounded.bg-gray-50')]
+      .find(d => text(d).startsWith('Files:'));
+    const spans = panel ? panel.querySelectorAll(':scope > div:first-child > span') : [];
+    return spans.length >= 3 && terminal.includes(text(spans[2]));
+  }, scope, id, TERMINAL));
+}
+
+// "+ New" in `scope`, the name typed in the modal, Create; the scope's
+// collection selector then shows the new collection.
+async function newCollection(page, scope, name) {
+  await step('new collection', async () => {
+    const opened = await page.evaluate(sel => {
+      const b = [...document.querySelector(sel).querySelectorAll('button')].find(x => x.textContent.trim() === '+ New');
+      if (!b) return false; b.click(); return true;
+    }, scope);
+    if (!opened) throw new Error('no "+ New" button');
+    await page.waitForSelector('input[placeholder="Collection name"]', { timeout: 10000 });
+    await setValue(page, `() => document.querySelector('input[placeholder="Collection name"]')`, name);
+    if (!await clickByText(page, 'Create')) throw new Error('no Create button');
+    await page.waitForFunction((sel, n) => document.querySelector(sel)?.querySelector('select')?.value === n,
+      { timeout: 15000 }, scope, name);
+  });
+}
+
+// The page's file input gets the case's files; the page then lists each.
+async function chooseFiles(page, inputId, files) {
+  await step('choose files', async () => {
+    const input = await page.$('#' + inputId);
+    if (!input) throw new Error('no #' + inputId);
+    await input.uploadFile(...files.map(f => `${FIXTURES}/${f}`));
+    await page.waitForFunction(names => {
+      const shown = [...document.querySelectorAll('li span')].map(s => s.textContent.trim());
+      return names.every(n => shown.includes(n));
+    }, { timeout: 10000 }, files);
+  });
+}
+
+// Clicks `label` and returns the answer to the page's own POST to `path`.
+async function send(page, label, path) {
+  return step('send: ' + label, async () => {
+    const answer = page.waitForResponse(r => r.request().method() === 'POST' && new URL(r.url()).pathname === path,
+      { timeout: 5 * MINUTE });
+    if (!await clickByText(page, label)) throw new Error(`no "${label}" button`);
+    const res = await answer;
+    let body = null;
+    try { body = await res.json(); } catch { /* not JSON */ }
+    return { status: res.status(), body };
+  });
+}
+
+// The API's record of job `id`, and the jobs of `collection` in the job list.
+async function jobRecords(page, id, collection) {
+  const record = id ? await apiGet(page, `/api/ingest/job/${encodeURIComponent(id)}`) : null;
+  const list = await apiGet(page, '/api/ingest/jobs');
+  const jobs = (list.body && Array.isArray(list.body.jobs) ? list.body.jobs : [])
+    .filter(j => j.collection === collection).map(j => ({ job_id: j.job_id, status: j.status }));
+  return { record, jobs, jobs_status: list.status };
+}
+
+// Sets a slider by its label's text and returns what the label then shows.
+async function slider(page, label, value) {
+  return page.evaluate((l, v) => {
+    const lab = [...document.querySelectorAll('label')].find(x => x.textContent.trim().startsWith(l + ':'));
+    const input = lab?.parentElement?.querySelector('input[type=range]');
+    if (!input) return null;
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, String(v));
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    return true;
+  }, label, value);
+}
+
+const sliderLabels = page => page.evaluate(() => [...document.querySelectorAll('label')]
+  .map(l => l.textContent.trim()).filter(t => /^(Chunk Size|Overlap|Min Chunk Size):/.test(t)));
+
+// Import page: a new collection, the files, Start Ingest, the job to its end.
+async function ingestCase(page, c, out) {
+  await step('open the Import page', () => page.goto(BASE + '/import', { waitUntil: 'networkidle2' }));
+  await newCollection(page, 'main', c.collection);
+  if (c.settings.chunk_size !== undefined) {
+    await step('set the strategy and the sliders', async () => {
+      const found = await page.evaluate(v => !![...document.querySelectorAll('main select')]
+        .find(x => [...x.options].some(o => o.value === v)), c.settings.strategy);
+      if (!found) throw new Error('no Chunking Strategy selector');
+      await setValue(page, `() => [...document.querySelectorAll('main select')].find(x => [...x.options].some(o => o.value === ${JSON.stringify(c.settings.strategy)}))`, c.settings.strategy);
+      await sleep(300);
+      if (!await slider(page, 'Chunk Size', c.settings.chunk_size)) throw new Error('no Chunk Size slider');
+      if (!await slider(page, 'Min Chunk Size', c.settings.min_chunk_size)) throw new Error('no Min Chunk Size slider');
+      await sleep(300);
+    });
+    out.sliders = await sliderLabels(page);
+    out.strategy = await page.evaluate(v => [...document.querySelectorAll('main select')]
+      .find(x => [...x.options].some(o => o.value === v))?.value, c.settings.strategy);
+  }
+  await chooseFiles(page, 'file-input', c.files);
+  out.upload = await send(page, 'Start Ingest', '/api/ingest/upload');
+  const id = out.upload.status === 202 && out.upload.body ? out.upload.body.job_id : null;
+  if (id) {
+    await waitForJob(page, 'main', id, c.settings.chunk_size !== undefined ? 20 : 10);
+  } else {
+    await step('wait for the message', () => page.waitForFunction(
+      () => [...document.querySelectorAll('p.text-red-600, [role=alert]')].some(e => e.textContent.trim()),
+      { timeout: 15000 }));
+  }
+  out.page = await observe(page, 'main');
+  Object.assign(out, await jobRecords(page, id, c.collection));
+}
+
+// Prepare page: Upload, Prepare selected, then Import selected into a new collection.
+async function prepareCase(page, c, out) {
+  await step('open the Prepare page', () => page.goto(BASE + '/prepare', { waitUntil: 'networkidle2' }));
+  await chooseFiles(page, 'prepare-file-input', c.files);
+  out.prepare_upload = await send(page, 'Upload', '/api/prepare/upload');
+  const ids = await step('find the uploaded documents', async () => {
+    await page.waitForFunction(names => names.every(n => [...document.querySelectorAll('tr[data-document]')]
+      .some(r => r.cells[1] && r.cells[1].firstChild && r.cells[1].firstChild.textContent === n)),
+    { timeout: 30000 }, c.files);
+    return page.evaluate(names => Object.fromEntries(names.map(n => [n,
+      [...document.querySelectorAll('tr[data-document]')].filter(r => r.cells[1].firstChild.textContent === n)
+        .map(r => r.dataset.document).pop()])), c.files);
+  });
+  out.document_ids = ids;
+  await step('tick the documents', async () => {
+    for (const name of c.files) {
+      const box = await page.$(`input[aria-label="Select ${name}"]`);
+      if (!box) throw new Error('no checkbox for ' + name);
+      await box.click();
+    }
+  });
+  out.prepare_start = await send(page, 'Prepare selected', '/api/prepare/jobs');
+  const prepareId = out.prepare_start.body ? out.prepare_start.body.job_id : null;
+  if (out.prepare_start.status !== 202 || !prepareId) throw new Step('prepare', `the start answered ${out.prepare_start.status}`);
+  await step('wait for the preparation to end', () => waitLong(page, 20, (jobId, terminal) => {
+    const s = document.querySelector('section[aria-label="Preparation progress"]');
+    if (!s || !s.textContent.includes(jobId)) return false;
+    const status = s.querySelector(':scope > div:first-child > span.text-blue-600');
+    return !!status && terminal.includes(status.textContent.trim());
+  }, prepareId, TERMINAL));
+  await sleep(1000);      // the list is read again when the job ends
+  out.preparation = await page.evaluate((jobId, names) => {
+    const text = e => (e.textContent || '').replace(/\s+/g, ' ').trim();
+    const s = document.querySelector('section[aria-label="Preparation progress"]');
+    const heads = [...document.querySelectorAll('section[aria-label="Prepared documents"] thead th')].map(text);
+    const col = heads.indexOf('Status');
+    const rows = {};
+    for (const r of document.querySelectorAll('tr[data-document]')) {
+      const name = r.cells[1].firstChild.textContent;
+      if (!names.includes(name)) continue;
+      const err = r.cells[1].querySelector('div.text-red-600');
+      rows[name] = { status: col >= 0 ? text(r.cells[col]) : null, last_error: err ? text(err) : null };
+    }
+    return {
+      job_id: jobId, shows_job: !!s && s.textContent.includes(jobId),
+      status: s ? text(s.querySelector(':scope > div:first-child > span.text-blue-600')) : null,
+      errors: s ? [...s.querySelectorAll('ul.text-red-600 li')].map(text) : [], rows,
+    };
+  }, prepareId, c.files);
+  out.records = {};
+  for (const [name, id] of Object.entries(ids)) {
+    const r = await apiGet(page, `/api/prepare/documents/${encodeURIComponent(id)}`);
+    out.records[name] = { status: r.status, parts: r.body && Array.isArray(r.body.parts) ? r.body.parts.map(p => p.name) : null };
+  }
+  const scope = 'section[aria-label="Import prepared documents"]';
+  await newCollection(page, scope, c.collection);
+  out.upload = await send(page, 'Import selected', '/api/prepare/import');
+  const id = out.upload.status === 202 && out.upload.body ? out.upload.body.job_id : null;
+  if (!id) throw new Step('import', `the import answered ${out.upload.status}`);
+  await waitForJob(page, scope, id, 10);
+  out.page = await observe(page, scope);
+  Object.assign(out, await jobRecords(page, id, c.collection));
+}
+
+(async () => {
+  const manifest = JSON.parse(fs.readFileSync(`${FIXTURES}/manifest.json`, 'utf8'));
+  const browser = await launch();
+  const result = { skip_slow: SKIP_SLOW, cases: {}, collections: null };
+  let exit = 0;
+  try {
+    const s = await session(browser, BASE, 'engineer');
+    s.page.setDefaultTimeout(60000);
+    for (const c of manifest.cases) {
+      const out = { collection: c.collection };
+      result.cases[c.name] = out;
+      if (c.slow && SKIP_SLOW) { out.skipped = true; console.log(`    case ${c.name}: skipped (RAG_SKIP_SLOW=1)`); continue; }
+      const started = Date.now();
+      try {
+        await (c.kind === 'prepare' ? prepareCase : ingestCase)(s.page, c, out);
+      } catch (e) {
+        out.failed_step = e instanceof Step ? e.step : 'unexpected';
+        out.error = e && e.message ? e.message.replace(/\s+/g, ' ').slice(0, 300) : String(e);
+        try { out.page = out.page || await observe(s.page, 'main'); } catch { /* the page is gone */ }
+      }
+      out.seconds = Math.round((Date.now() - started) / 1000);
+      const ended = out.upload && out.upload.status !== 202 ? `upload answered ${out.upload.status}`
+        : 'job ' + (out.page && out.page.status);
+      console.log(`    case ${c.name}: ${out.failed_step ? 'stopped at ' + out.failed_step + ': ' + out.error : ended} (${out.seconds} s)`);
+    }
+    await s.page.goto(BASE + '/collections', { waitUntil: 'networkidle2' });
+    await sleep(500);
+    result.collections = await s.page.evaluate(() => Object.fromEntries([...document.querySelectorAll('tbody tr')]
+      .map(r => [r.cells[0].textContent.trim(), Number(r.cells[1].textContent.trim())])));
+    await s.ctx.close();
+  } catch (e) {
+    console.log(`    the run could not go on: ${e && e.message ? e.message.replace(/\s+/g, ' ').slice(0, 300) : e}`);
+    exit = 1;
+  }
+  await browser.close();
+  console.log('UI_INGEST_RESULT ' + JSON.stringify(result));
+  process.exit(exit);
+})().catch(e => { console.log(`    the run could not start: ${e && e.message ? e.message : e}`); process.exit(1); });
 ```
 
 ### scripts/verify/job_lists.py
@@ -28832,6 +30011,8 @@ lan() { _rag_require_lock_owner; python3 ./lan_stack.py "$1"; }
 section "LAN mode on the verify project (TLS on loopback only)"
 lan https
 check "HTTPS answers with the generated certificate: localhost and the test names, 825 days" $?
+lan hosts
+check "only localhost, 127.0.0.1 and the certificate's names are served; another Host gets 421 (#664)" $?
 lan tls
 check "TLS 1.2 and 1.3 connect, TLS 1.1 is refused, ALPN picks HTTP/2" $?
 lan bindings
@@ -28967,7 +30148,7 @@ if __name__ == "__main__":
 ```python
 """LAN mode on the verify project (#26). Host-side, standard library, Python 3.9+.
 
-    python3 lan_stack.py https|tls|bindings|cookie|origin|refusals|rate-limit|address
+    python3 lan_stack.py https|hosts|tls|bindings|cookie|origin|refusals|rate-limit|address
 
 Run by 18_lan.sh in a `stack.sh run --lan`, which brings the verify project up
 in LAN mode with TLS on 127.0.0.1:<verify port> only, copies the certificate
@@ -28978,6 +30159,9 @@ printing what failed:
   https     /api/health over TLS, verified against that certificate and the
             name localhost; the certificate names exactly localhost and the
             harness's test names and is valid for 825 days
+  hosts     over that TLS connection, Host localhost, 127.0.0.1 and the test
+            names (one in upper case) get the API's answer, and another Host
+            gets nginx's 421 at /api/health and at / (#664)
   tls       TLS 1.2 and 1.3 connect, TLS 1.1 is refused, ALPN picks HTTP/2
   bindings  the project's only published port is the proxy's
             127.0.0.1:<port>->443/tcp, and plain HTTP to it gets no API answer
@@ -29081,6 +30265,29 @@ def check_https():
     assert names == NAMES, "the certificate names {}, not {}".format(sorted(names), sorted(NAMES))
     valid = ssl.cert_time_to_seconds(peer["notAfter"]) - ssl.cert_time_to_seconds(peer["notBefore"])
     assert valid == VALID_S, "the certificate is valid for {} s, not {} (825 days)".format(valid, VALID_S)
+
+
+def status_for(host, path):
+    """The status of GET `path` over verified TLS to localhost, sent with Host `host`."""
+    conn = http.client.HTTPSConnection("localhost", port(), context=context(), timeout=60)
+    try:
+        conn.request("GET", path, headers={"Host": host})
+        response = conn.getresponse()
+        response.read()
+        return response.status
+    finally:
+        conn.close()
+
+
+def check_hosts():
+    for name in ("localhost", "127.0.0.1", "vfy-lan.invalid", "VFY-LAN.INVALID", "192.0.2.10"):
+        host = "{}:{}".format(name, port())
+        status = status_for(host, "/api/health")
+        assert status == 200, "Host {} got {}, not 200".format(host, status)
+    host = "rebind.invalid:{}".format(port())
+    for path in ("/api/health", "/"):
+        status = status_for(host, path)
+        assert status == 421, "Host {} got {} at {}, not 421".format(host, status, path)
 
 
 def handshake(ctx, alpn=None):
@@ -29221,9 +30428,9 @@ def check_address():
           "API)".format(seen[-1] if seen else "(none found)"))
 
 
-CHECKS = {"https": check_https, "tls": check_tls, "bindings": check_bindings, "cookie": check_cookie,
-          "origin": check_origin, "refusals": check_refusals, "rate-limit": check_rate_limit,
-          "address": check_address}
+CHECKS = {"https": check_https, "hosts": check_hosts, "tls": check_tls, "bindings": check_bindings,
+          "cookie": check_cookie, "origin": check_origin, "refusals": check_refusals,
+          "rate-limit": check_rate_limit, "address": check_address}
 
 
 def main(argv):
@@ -29260,7 +30467,6 @@ Stores and certificate folders are temporary; nothing is started or published.
 import ast
 import datetime
 import io
-import ipaddress
 import json
 import os
 import re
@@ -29439,6 +30645,10 @@ class CertTestCase(unittest.TestCase):
         return ([n for n in san.get_values_for_type(x509.DNSName)],
                 [str(a) for a in san.get_values_for_type(x509.IPAddress)])
 
+    def hosts(self):
+        """hosts.map's entries (#664), without its comment line."""
+        return [line for line in (self.out / "hosts.map").read_text().splitlines() if not line.startswith("#")]
+
 
 class SelfSignedTests(CertTestCase):
     """S4.3-S4.6."""
@@ -29538,6 +30748,27 @@ class SelfSignedTests(CertTestCase):
         self.regenerated(out)
         self.assertEqual(self.live()[2], "self-signed")
 
+    def test_hosts_map_follows_the_names(self):
+        # #664: the names the proxy answers for, besides localhost and 127.0.0.1.
+        code, _, err = self.step("Office.Example,192.168.1.20,::1")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(self.hosts(), ["192.168.1.20 1;", "[::1] 1;", "office.example 1;"])
+        self.assertEqual((self.out / "hosts.map").stat().st_mode & 0o777, 0o644)
+        (self.out / "hosts.map").unlink()
+        code, out, _ = self.step("office.example,192.168.1.20,::1")
+        self.assertIn("reusing the self-signed certificate", out)
+        self.assertEqual(self.hosts(), ["192.168.1.20 1;", "[::1] 1;", "office.example 1;"], "rewritten on reuse")
+        self.step("files.example")
+        self.assertEqual(self.hosts(), ["files.example 1;"])
+        self.assertEqual([p.name for p in self.out.iterdir() if p.name.startswith(".hosts-")], [])
+
+    def test_a_refusal_leaves_hosts_map(self):
+        self.step()
+        before = self.hosts()
+        code, _, _ = self.step("bad_name")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.hosts(), before)
+
     def test_a_failed_write_leaves_the_live_pair(self):
         self.step()
         before = os.readlink(self.out / "live")
@@ -29605,6 +30836,28 @@ class BringYourOwnTests(CertTestCase):
                 self.assertIn(part, err)
                 self.assertFalse((self.out / "live").exists())
 
+    def test_hosts_map_from_your_certificate(self):
+        # #664: the certificate's own names, in nginx's forms; localhost and
+        # 127.0.0.1 are nginx.lan.conf's.
+        self.put(*certificate(["files.example", "*.files.example", "fe80::1", "127.0.0.1", "localhost",
+                               "default", "HOSTNAMES.example"]))
+        code, _, err = self.step(hostnames=None)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(sorted(self.hosts()), sorted(["*.files.example 1;", "[fe80::1] 1;", "\\default 1;",
+                                                       "files.example 1;", "hostnames.example 1;"]))
+
+    def test_unsafe_names_are_left_out_with_a_warning(self):
+        self.put(*certificate(["files.example", "bad_name.example", "a b", "x;y", "*.*.example", "*"]))
+        code, out, err = self.step(hostnames=None)
+        self.assertEqual(code, 0)
+        self.assertIn("using your certificate from proxy/certs", out)
+        self.assertEqual(self.hosts(), ["files.example 1;"])
+        warnings = err.splitlines()
+        self.assertEqual(len(warnings), 5, err)
+        for name in ("bad_name.example", "a b", "x;y", "*.*.example", "'*'"):
+            self.assertIn(name, err)
+        self.assertTrue(all(line.startswith("tls-init: warning: ") for line in warnings))
+
     def test_an_expired_certificate_is_used_with_a_warning(self):
         self.put(*certificate(["files.example"], days=-1))
         code, out, err = self.step()
@@ -29661,6 +30914,26 @@ class NginxTests(unittest.TestCase):
                           "location @login_rate_limited {", "location /api/ {", "location / {"])
         self.assertEqual(lines.count("proxy_set_header Host $http_host;"), 3)
 
+    def test_only_listed_hosts_are_served(self):
+        # #664: a map of the accepted hosts, and a server-level 421 for any other.
+        for name, text in (("nginx.conf", self.default), ("nginx.lan.conf", self.lan)):
+            with self.subTest(file=name):
+                block = text[text.index("map $host $rag_host_allowed {"):]
+                block = directives(block[:block.index("\n    }\n")])
+                want = ["map $host $rag_host_allowed {", "hostnames;", "default   0;", "localhost 1;", "127.0.0.1 1;"]
+                if name == "nginx.lan.conf":
+                    want.append("include /etc/nginx/certs/hosts.map;")
+                self.assertEqual(block, want)
+                self.assertEqual(directives(text).count("map $host $rag_host_allowed {"), 1)
+                server = directives(text[text.index("    server {"):])
+                guard = ["if ($rag_host_allowed = 0) {", "return 421;", "}"]
+                at = server.index(guard[0])
+                self.assertEqual(server[at:at + 3], guard)
+                self.assertLess(at, server.index("include /etc/nginx/rag/locations.conf;"))
+                self.assertNotIn("server_name", "\n".join(directives(text)),
+                                 "a request without Host must keep an empty $host")
+        self.assertNotIn("rag_host_allowed", self.locations)
+
     def test_logins_are_rate_limited_per_address(self):
         # #577: both servers define the zone; the login location uses it and
         # answers nginx's own refusals in the API's error envelope.
@@ -29672,13 +30945,20 @@ class NginxTests(unittest.TestCase):
         lines = directives(block)
         for line in ("limit_req zone=login burst=5 nodelay;", "limit_req_status 429;",
                      "error_page 429 = @login_rate_limited;", "proxy_pass http://api/auth/login;",
-                     "proxy_set_header X-Real-IP $remote_addr;"):
+                     "proxy_set_header X-Real-IP $remote_addr;", "client_max_body_size 16k;"):
             self.assertIn(line, lines)
+        # #663: login reads a body before authentication, so it has a small,
+        # buffered body limit, not /api/'s 512m streamed uploads.
+        self.assertEqual([l for l in lines if l.startswith("proxy_request_buffering")], [])
         api = self.locations[self.locations.index("location /api/ {"):]
         api = directives(api[:api.index("\n}\n")])
-        self.assertEqual([l for l in lines if not l.startswith(("location", "limit_req", "error_page", "proxy_pass"))],
-                         [l for l in api if not l.startswith(("location", "proxy_pass"))],
-                         "the login location proxies differently from /api/")
+        self.assertIn("client_max_body_size 512m;", api)
+        self.assertIn("proxy_request_buffering off;", api)
+        body = ("client_max_body_size", "proxy_request_buffering")
+        login_only = ("location", "limit_req", "error_page", "proxy_pass") + body
+        self.assertEqual([l for l in lines if not l.startswith(login_only)],
+                         [l for l in api if not l.startswith(("location", "proxy_pass") + body)],
+                         "the login location proxies differently from /api/ beyond its body limit")
         named = self.locations[self.locations.index("location @login_rate_limited {"):]
         body = re.search(r"return 429 '([^']*)';", named).group(1)
         message = "Too many login attempts. Wait a minute and try again."
@@ -31226,6 +32506,7 @@ The LLM is a stub; nothing reaches Ollama or Weaviate. The preparation area and
 the upload folder are temporary. Routes go through `main.app` with real sessions
 in a temporary account store (`auth.testing`), without the lifespan.
 """
+import ast
 import asyncio
 import gzip
 import io
@@ -31691,7 +32972,7 @@ class RecordLabelTests(AreaCase):
 
 class NormaliseTests(unittest.TestCase):
     def test_bom_line_endings_nfc_and_control_characters(self):
-        raw = "﻿a\r\nb\rc\x00d\x07e\tf\x7fg\x0cÉ"
+        raw = "\ufeffa\r\nb\rc\x00d\x07e\tf\x7fg\x0cÉ"
         self.assertEqual(preparation.normalise_text(raw), "a\nb\ncde\tfgÉ")
 
 
@@ -32041,7 +33322,7 @@ class JobTests(JobCase):
             with self.assertRaises(store.DocumentBusy):
                 store.delete(a["id"])
             with self.assertRaises(store.DocumentBusy):
-                await jobs.import_documents(SimpleNamespace(document_ids=[a["id"]]), OWNER)
+                await jobs.import_documents(SimpleNamespace(document_ids=[a["id"]]))
             gate.set()
             await self.finish(first["job_id"])
             await self.finish(second["job_id"])
@@ -32125,6 +33406,54 @@ class RouteTests(JobCase):
         self.assertEqual(self.client.get("/prepare/documents").json()["documents"], [])
         self.assertEqual(list((self.root / "uploads").glob("prepare-*")), [])
 
+    def test_duplicate_names_in_one_upload_are_refused_and_nothing_is_kept(self):
+        # #640: ingest keeps the last input of a name; a preparation upload is
+        # refused instead, naming the name and every input that has it.
+        many = [(f"n{i}.txt", b"x") for i in range(11)]
+        cases = [
+            ("two files", [("a.txt", b"One.\n"), ("a.txt", b"Two.\n")], "'a.txt' (a.txt, a.txt)"),
+            ("a file and a member", [("a.txt", b"One.\n"), ("b.zip", self.zip_bytes({"a.txt": "Two."}))],
+             "'a.txt' (a.txt, b.zip:a.txt)"),
+            ("three inputs", [("a.txt", b"One.\n"), ("b.zip", self.zip_bytes({"a.txt": "Two."})),
+                              ("c.zip", self.zip_bytes({"a.txt": "Three.", "d/e.md": "Own."}))],
+             "'a.txt' (a.txt, b.zip:a.txt, c.zip:a.txt)"),
+            ("eleven names", many + many, "'n9.txt' (n9.txt, n9.txt) and 1 more"),
+        ]
+        for label, files, listed in cases:
+            with self.subTest(label):
+                answer = self.upload(files)
+                self.assertEqual(answer.status_code, 409, answer.text)
+                error = answer.json()["error"]
+                self.assertEqual(error["code"], "DUPLICATE_NAMES")
+                self.assertTrue(error["message"].startswith("Files in this upload share a name: '"),
+                                error["message"])
+                self.assertTrue(error["message"].endswith(
+                    f"{listed}. Rename them, or upload them separately; nothing was uploaded."),
+                    error["message"])
+                self.assertEqual(self.client.get("/prepare/documents").json()["documents"], [])
+                self.assertEqual(list((self.root / "uploads").glob("prepare-*")), [])
+        self.assertEqual(error["detail"], {"names": [f"n{i}.txt" for i in range(11)]})
+        self.assertNotIn("n10.txt", error["message"])
+        with self.subTest("checked before the space"):
+            with patch.object(settings, "max_preparation_bytes", 1024 * 1024):
+                answer = self.upload([("a.txt", b"x" * (1024 * 1024 + 1))] * 2)
+            self.assertEqual(answer.json()["error"]["code"], "DUPLICATE_NAMES")
+            self.assertEqual(self.client.get("/prepare/documents").json()["documents"], [])
+        with self.subTest("separate uploads may share a name"):
+            for data in (b"One.\n", b"Two.\n"):
+                self.assertEqual(self.upload([("a.txt", data)]).status_code, 201)
+            names = [d["name"] for d in self.client.get("/prepare/documents").json()["documents"]]
+            self.assertEqual(names, ["a.txt", "a.txt"])
+
+    def test_ingest_still_replaces_an_earlier_input_of_the_same_name(self):
+        # #640 changes preparation only: ingest's staging keeps the last input.
+        tmp = Path(tempfile.mkdtemp(dir=self.root))
+        files = [SimpleNamespace(filename="a.txt", file=io.BytesIO(data)) for data in (b"One.\n", b"Two.\n")]
+        queue, skipped = asyncio.run(ingest_pipeline.stage_uploads(files, tmp))
+        [(path, label)] = queue.entries.values()
+        self.assertEqual(path.read_bytes(), b"Two.\n")
+        self.assertEqual(skipped, ["a.txt (replaced by a.txt later in this upload, same name 'a.txt')"])
+
     def test_job_routes_refusals(self):
         self.assertEqual(self.client.post("/prepare/jobs", json={}).status_code, 422)
         self.assertEqual(self.client.post("/prepare/jobs", json={"document_ids": []}).json()["error"]["code"],
@@ -32183,7 +33512,52 @@ class RouteTests(JobCase):
         self.prepared([("a.txt", b"One.\n"), ("a.md", b"Two.\n")])
         with patch.object(jobs.wc, "collection_exists", AsyncMock(return_value=True)):
             answer = self.client.post("/prepare/import", json={"collection": "Docs", "all": True})
-        self.assertEqual(answer.json()["error"]["code"], "DUPLICATE_NAMES")
+            self.assertEqual(answer.json()["error"]["code"], "DUPLICATE_NAMES")
+            # The size is checked after the names (#640).
+            with patch.object(jobs, "MAX_IMPORT_BYTES", 0):
+                answer = self.client.post("/prepare/import", json={"collection": "Docs", "all": True})
+            self.assertEqual(answer.json()["error"]["code"], "DUPLICATE_NAMES")
+
+    def test_an_import_over_the_cap_is_refused_before_anything_is_staged(self):
+        # #640: one import's parts hold at most one upload's 512 MB, checked with
+        # the selection, before the collection, and nothing is staged.
+        docs = self.prepared([("one.txt", b"One.\n"), ("two.csv", b"a,b\n1,2\n")])
+        ids = [d["id"] for d in docs]
+        total = sum(part["bytes"] for i in ids for part in store.get(i)["parts"])
+        exists = AsyncMock(return_value=True)
+        start = AsyncMock(return_value="ing00009")
+        busy = []
+        real_mark = store.mark_busy
+        with patch.object(jobs.wc, "collection_exists", exists), \
+                patch.object(jobs.ingest_pipeline, "start_ingest_job", start), \
+                patch.object(jobs.store, "mark_busy", lambda *a: busy.append(a) or real_mark(*a)), \
+                patch.object(jobs, "MAX_IMPORT_BYTES", total - 1):
+            for body in ({"all": True}, {"document_ids": ids}):
+                with self.subTest(body=body):
+                    answer = self.client.post("/prepare/import", json={"collection": "Docs", **body})
+                    self.assertEqual(answer.status_code, 409, answer.text)
+                    error = answer.json()["error"]
+                    self.assertEqual(error["code"], "IMPORT_TOO_LARGE")
+                    self.assertEqual(error["detail"], {"selected_bytes": total, "limit_bytes": total - 1})
+                    self.assertIn("Import them in smaller selections.", error["message"])
+            exists.assert_not_called()
+            start.assert_not_called()
+            self.assertEqual(busy, [])
+            for i in ids:
+                self.assertEqual(store.get(i)["imports"], [])
+                self.assertFalse(store.is_busy(i))
+            with patch.object(jobs, "MAX_IMPORT_BYTES", total):
+                answer = self.client.post("/prepare/import", json={"collection": "Docs", "all": True})
+            self.assertEqual(answer.status_code, 202, answer.text)
+            start.assert_called_once()
+
+    def test_the_import_cap_is_512_mb_and_its_message(self):
+        self.assertEqual(jobs.MAX_IMPORT_BYTES, 536_870_912)
+        self.assertEqual(
+            jobs._import_too_large(536_870_913).message,
+            "The selected documents' prepared parts total 512.1 MB; one import can be at most "
+            "512 MB, the same as one upload. Import them in smaller selections.")
+        self.assertIn("total 20,480.0 MB;", jobs._import_too_large(20 * 1024 ** 3).message)
 
     def test_prepared_download_is_one_file_or_a_zip_of_parts(self):
         [single] = self.prepared([("s.csv", b"a\n1\n")])
@@ -32237,6 +33611,18 @@ class WiringTests(unittest.TestCase):
         for action in ("prepare.upload", "prepare.start", "prepare.cancel", "prepare.import",
                        "prepare.download", "prepare.delete"):
             self.assertIn(f"'{action}'", page)
+
+    def test_p9_uses_preparations_window_rule(self):
+        # prepare_stack.py runs on the host with the standard library, so it keeps
+        # its own copy of the window size and the 20 % rule for P9 (#640); it
+        # imports the verify harness, so it is read here, not imported.
+        tree = ast.parse((ROOT / "scripts/verify/prepare_stack.py").read_text())
+        found = {target.id: ast.literal_eval(node.value) for node in tree.body
+                 if isinstance(node, ast.Assign) for target in node.targets
+                 if isinstance(target, ast.Name)
+                 and target.id in ("WINDOW_CHARACTERS", "MAX_REMOVED_SHARE")}
+        self.assertEqual(found, {"WINDOW_CHARACTERS": preparation.WINDOW_CHARACTERS,
+                                 "MAX_REMOVED_SHARE": preparation.MAX_REMOVED_SHARE})
 
 
 # ── reviewer's additions (#638 testing review) ──────────────────────────────
@@ -33611,6 +34997,158 @@ def write(target: pathlib.Path) -> None:
     with zipfile.ZipFile(target / "zip_high_ratio.zip", "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("zeros.txt", bytes(2 * 1024 * 1024))
 
+    write_ui_ingest(target / "ui_ingest", target)
+
+
+# Issue #641. 22_ui_ingest.sh ingests these through the web UI, one new
+# collection per case, and finds each phrase in the collection's chunks in
+# Weaviate. Every phrase is plain words, unique to its document.
+UI_PHRASES = {
+    "vfy-ui.pdf": "Cobalt heron ledger seven",
+    "vfy-ui.docx": "Amber falcon register nine",
+    "vfy-ui.txt": "Silver otter journal four",
+    "vfy-ui.md": "Crimson lynx almanac two",
+    "vfy-ui.csv": "Jade badger inventory six",
+    "vfy-ui.json": "Ivory marten catalogue three",
+    "vfy-ui.jsonl": "Copper wren dossier eight",
+    "mixed/notes.txt": "Violet stoat bulletin one",
+    "mixed/guide.md": "Scarlet ibis handbook five",
+    "mixed/table.csv": "Indigo vole tally ten",
+    "mixed/report.pdf": "Bronze egret survey eleven",
+    "mixed/memo.docx": "Teal ferret minute twelve",
+    "mixed/records.jsonl": "Olive pika roster thirteen",
+    "mixed/bills/bills.json.gz": "Saffron newt docket fourteen",
+    "vfy-ui-records.jsonl.gz": "Cerise gecko ledger fifteen",
+    "vfy-ui-prep-notes.txt": "Pewter crane quarterly review",
+    "vfy-ui-prep-table.csv": "Garnet tapir supply audit",
+}
+# The large file's phrases, at most 20 characters and repeated back to back,
+# so some 50-character chunk holds one whole.
+UI_LARGE_FIRST = "Quartz hare alpha"
+UI_LARGE_LAST = "Umber yak omega"
+UI_PREFIX = "VfyUiIngest"
+
+
+def _fixed_zip(data: bytes) -> bytes:
+    """A ZIP's members again, each dated 1980-01-01, so the bytes are the same
+    on every run (_docx dates them with the time of writing)."""
+    import io
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(data)) as src, \
+            zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+        for info in src.infolist():
+            member = zipfile.ZipInfo(info.filename, date_time=(1980, 1, 1, 0, 0, 0))
+            member.compress_type = zipfile.ZIP_DEFLATED
+            dst.writestr(member, src.read(info))
+    return out.getvalue()
+
+
+def _ui_documents(name: str, phrase: str) -> bytes:
+    """One small document of the type `name` names, holding `phrase`."""
+    sentence = f"The {phrase} entry is kept with these policies."
+    paras = [PARAGRAPHS[0], sentence, PARAGRAPHS[2]]
+    ext = name.rsplit(".", 1)[-1] if not name.endswith(".gz") else name[:-3].rsplit(".", 1)[-1]
+    if ext == "pdf":
+        data = _pdf(paras)
+    elif ext == "docx":
+        data = _fixed_zip(_docx(" ".join(paras)))
+    elif ext == "txt":
+        data = ("\n\n".join(paras) + "\n").encode()
+    elif ext == "md":
+        data = ("# Policies\n\n" + "\n\n".join(paras) + "\n").encode()
+    elif ext == "csv":
+        data = ("policy,detail\n" + "".join(f'p{i},"{p}"\n' for i, p in enumerate(paras))).encode()
+    elif ext == "json":
+        data = json.dumps([{"policy": f"p{i}", "detail": p} for i, p in enumerate(paras)],
+                          indent=2).encode()
+    elif ext == "jsonl":
+        data = "".join(json.dumps({"policy": f"p{i}", "detail": p}) + "\n"
+                       for i, p in enumerate(paras)).encode()
+    else:
+        raise ValueError(name)
+    return gzip.compress(data, mtime=0) if name.endswith(".gz") else data
+
+
+def write_ui_ingest(out: pathlib.Path, fixtures: pathlib.Path) -> None:
+    """The files and manifest.json of 22_ui_ingest.sh (#641)."""
+    out.mkdir(parents=True, exist_ok=True)
+    cases = []
+    # Every supported type, one new collection each.
+    for ext in ("pdf", "docx", "txt", "md", "csv", "json", "jsonl"):
+        name = f"vfy-ui.{ext}"
+        (out / name).write_bytes(_ui_documents(name, UI_PHRASES[name]))
+        cases.append({"name": f"type .{ext}", "kind": "ingest",
+                      "collection": UI_PREFIX + ext.capitalize(), "files": [name],
+                      "documents": {name: UI_PHRASES[name]}, "min_chunks": 1})
+    # A ZIP of mixed types, a .json.gz among its members (a .json.gz is only
+    # ingested from a ZIP), and a .jsonl.gz beside it, in one upload.
+    members = [m for m in UI_PHRASES if m.startswith("mixed/")]
+    with zipfile.ZipFile(out / "vfy-ui-mixed.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        for member in members:
+            z.writestr(zipfile.ZipInfo(member, date_time=(1980, 1, 1, 0, 0, 0)),
+                       _ui_documents(member, UI_PHRASES[member]))
+    (out / "vfy-ui-records.jsonl.gz").write_bytes(
+        _ui_documents("vfy-ui-records.jsonl.gz", UI_PHRASES["vfy-ui-records.jsonl.gz"]))
+    mixed = members + ["vfy-ui-records.jsonl.gz"]
+    cases.append({"name": "archives and mixes", "kind": "ingest", "collection": UI_PREFIX + "Mixed",
+                  "files": ["vfy-ui-mixed.zip", "vfy-ui-records.jsonl.gz"],
+                  "documents": {m: UI_PHRASES[m] for m in mixed}, "min_chunks": len(mixed)})
+    # Over 10,000 pieces at the fixed strategy's chunk size 50, so it is split
+    # into parts (#621), and a minimum chunk size of 6,000 merges the pieces, so
+    # only about a hundred chunks are embedded. A chunk holds at most 6,000
+    # characters, hence the minimum count. The first phrase is only in the first
+    # paragraph, the last only in the last.
+    filler = [(" ".join(PARAGRAPHS) * 2)[:999] + "." for _ in range(560)]
+    large = "\n\n".join([" ".join([UI_LARGE_FIRST] * 60)] + filler
+                         + [" ".join([UI_LARGE_LAST] * 60)]) + "\n"
+    (out / "vfy-ui-large.txt").write_text(large)
+    cases.append({"name": "large file", "kind": "ingest", "collection": UI_PREFIX + "Large",
+                  "files": ["vfy-ui-large.txt"],
+                  "settings": {"strategy": "fixed", "chunk_size": 50, "min_chunk_size": 6000},
+                  "documents": {}, "split": {"file": "vfy-ui-large.txt", "first": UI_LARGE_FIRST,
+                                             "last": UI_LARGE_LAST},
+                  "min_chunks": -(-len("".join(large.split())) // 6000)})
+    # Prepared with the local LLM, then imported (#638). The phrase is in three
+    # body lines, so the cleaning can't drop every one.
+    notes = UI_PHRASES["vfy-ui-prep-notes.txt"]
+    (out / "vfy-ui-prep-notes.txt").write_text("\n".join([
+        "Facilities Committee Notes",
+        "",
+        f"The committee opened the {notes} and agreed the agenda for the session.",
+        "Members reviewed the cleaning contract and asked for a revised schedule by March.",
+        f"The {notes} found the storage rooms in good order and the fire doors working.",
+        "The budget for new chairs was approved and the order will be placed next week.",
+        f"Actions from the {notes} are assigned to the facilities manager.",
+        "The next meeting is on the first Monday of the month in the main hall.",
+    ]) + "\n")
+    table = UI_PHRASES["vfy-ui-prep-table.csv"]
+    (out / "vfy-ui-prep-table.csv").write_text(
+        "item,team,note\nchairs,facilities,ordered\nlamps,facilities,fitted\n"
+        f"keys,security,{table}\ndesks,facilities,delivered\n")
+    cases.append({"name": "prepare and import", "kind": "prepare",
+                  "collection": UI_PREFIX + "Prepared",
+                  "files": ["vfy-ui-prep-notes.txt", "vfy-ui-prep-table.csv"],
+                  "documents": {n: UI_PHRASES[n] for n in ("vfy-ui-prep-notes.txt",
+                                                           "vfy-ui-prep-table.csv")},
+                  "slow": True})
+    # One negative case per refusal: each must show a clear message and leave
+    # nothing in its collection and no job running.
+    (out / "vfy-ui-broken.pdf").write_bytes((fixtures / "broken.pdf").read_bytes())
+    (out / "vfy-ui-notes.xyz").write_text("unsupported\n")
+    (out / "vfy-ui-over-limit.zip").write_bytes((fixtures / "zip_over_declared.zip").read_bytes())
+    for name, collection, file, words, job in (
+            ("broken PDF", "BadPdf", "vfy-ui-broken.pdf", ["vfy-ui-broken.pdf:"], True),
+            ("unsupported type", "BadType", "vfy-ui-notes.xyz",
+             ["No supported files", "vfy-ui-notes.xyz"], False),
+            ("over-limit ZIP", "BigZip", "vfy-ui-over-limit.zip",
+             ["vfy-ui-over-limit.zip", "expands to more than"], False)):
+        cases.append({"name": name, "kind": "refused", "collection": UI_PREFIX + collection,
+                      "files": [file], "message": words, "job": job})
+    for case in cases:
+        case.setdefault("settings", {})
+        case.setdefault("slow", False)
+    (out / "manifest.json").write_text(json.dumps({"cases": cases}, indent=2) + "\n")
+
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
@@ -33618,7 +35156,8 @@ if __name__ == "__main__":
     out = pathlib.Path(sys.argv[1])
     write(out)
     for path in sorted(out.iterdir()):
-        print(f"  {path.name:16s} {path.stat().st_size:7d} bytes")
+        if path.is_file():
+            print(f"  {path.name:16s} {path.stat().st_size:7d} bytes")
 ```
 
 ### scripts/verify/validate_package.py
@@ -33854,6 +35393,10 @@ python3 "$REPO_ROOT/scripts/tests/test_dependency_floors.py"
 check "pinned dependencies are at or above their patched versions (#522)" $?
 python3 "$REPO_ROOT/scripts/tests/test_weaviate_pin.py"
 check "the Weaviate pin is the same everywhere and Dependabot leaves it alone (#530)" $?
+python3 "$REPO_ROOT/scripts/tests/test_upgrade_backup.py"
+check "the README's 1.1.0 backup and rollback commands check before they write, and pin alpine (#679)" $?
+python3 "$REPO_ROOT/scripts/tests/test_version_agreement.py"
+check "the first-party version strings name the same release (#605)" $?
 python3 "$REPO_ROOT/scripts/tests/test_ci_workflow.py"
 check "the CI workflow runs the verify suite on every pull request (#24)" $?
 # Through the app with Weaviate and Ollama mocked, in the same isolated container (#373).
@@ -33921,6 +35464,18 @@ check "resolved Compose publishes only the proxy on host loopback" $?
 cors=$(command curl -s -D - -o /dev/null -m 10 -H "Origin: http://other.example" "$API/health" \
   | tr -d '\r' | awk -F': ' 'tolower($1)=="access-control-allow-origin"{print $2}')
 check_eq "the API sends no Access-Control-Allow-Origin, as SECURITY.md describes (#25)" "$cors" ""
+
+# ── the hosts the proxy answers for (#664) ───────────────────────────────────
+# Only localhost and 127.0.0.1, at any port. Any other Host, such as a page on
+# a DNS-rebinding domain, gets 421 from nginx before the UI or the API sees it.
+for host in "localhost:$EXPECTED_PORT" "127.0.0.1:$EXPECTED_PORT"; do
+  code=$(command curl -s -o /dev/null -m 10 -w '%{http_code}' -H "Host: $host" "$API/health")
+  check_eq "the proxy answers Host $host (#664)" "$code" "200"
+done
+for path in /api/health /; do
+  code=$(command curl -s -o /dev/null -m 10 -w '%{http_code}' -H "Host: rebind.invalid:$EXPECTED_PORT" "${API%/api}$path")
+  check_eq "the proxy refuses another Host with 421 at $path (#664)" "$code" "421"
+done
 
 (cd "$REPO_ROOT" && python3 - <<'ENDPY'
 import json, subprocess
@@ -35297,8 +36852,28 @@ drop_collection "$EX"; make_collection "$EX"
 ingest "$EX" fixed 200 40 "$EXFIX/folder.zip"
 ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=Report.PDF"
 ex_state > /tmp/vfy_ex_before.json
+# A gold-standard session for the collection: the first report.pdf replaces
+# nothing, so it must not mark it stale (#622, #22).
+EXGS="gs_$(python3 -c 'import uuid; print(uuid.uuid4().hex[:8])')"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$EX" "$EXGS") <<'ENDPY'
+import sys
+from services import goldstandard as gs
+pairs = [{"pair_id": "ex_pair", "question": "Q", "answer": "A", "contexts": ["C"],
+          "ground_truth": "T", "source_file": "Report.PDF", "chunk_index": 0, "status": "approved"}]
+gs.store_session({"session_id": sys.argv[2], "collection": sys.argv[1], "status": "completed",
+                  "pairs_total": 1, "pairs_completed": 1, "pairs": pairs})
+ENDPY
+check "exact name: a synthetic gold-standard session is planted for the collection" $?
+api_get "/goldstandard/diagnostics" >/dev/null
 ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=report.pdf"
 cp /tmp/vfy_job.json /tmp/vfy_ex_job1.json
+api_get "/goldstandard/session/$EXGS" > /tmp/vfy_ex_gs.json
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_ex_gs.json')); j=json.load(open('/tmp/vfy_ex_job1.json'))
+print(d.get('stale'), d.get('stale_reason'), j['status'], j.get('chunks_replaced'))
+sys.exit(0 if d.get('stale') is False and j['status']=='completed' else 1)"
+check "uploading report.pdf beside a/report.pdf and Report.PDF leaves gold-standard sessions current (#622)" $? \
+  "$(head -c 300 /tmp/vfy_ex_gs.json)"
 ex_state > /tmp/vfy_ex_first.json
 ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=report.pdf"
 cp /tmp/vfy_job.json /tmp/vfy_ex_job2.json
@@ -35329,6 +36904,8 @@ check "re-uploading report.pdf replaces only report.pdf: a/report.pdf and Report
 check "replacing a name on the page path selects exactly that name in real Weaviate (#622)" $?
 (cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" walk < scripts/verify/exact_source.py)
 check "replacing a name on the walk path, past 10,000 word matches, selects exactly that name (#622)" $?
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" bulk < scripts/verify/exact_source.py)
+check "replacing a name with over 10,000 earlier chunks deletes them all, in batches, and only them (#622)" $?
 drop_collection "$EX"
 rm -rf "$EXFIX"
 
@@ -35703,6 +37280,128 @@ fi
 drop_collection "$C"
 cleanup_prefixed
 summary
+```
+
+### scripts/verify/exact_source.py
+
+```python
+"""Replacing a name selects exactly that name in real Weaviate (#622).
+
+Runs in the verify project's API container, against its Weaviate:
+
+    docker compose exec -T api python - <prefix> page|walk|bulk < scripts/verify/exact_source.py
+
+`source_file` is word-tokenized, so Weaviate's equal("report.pdf") also matches
+`a/report.pdf`, `Report.PDF` and `report.pdf (part 1)`. The scratch collection
+uses the real chunk properties without a vectorizer, so no embedding is needed:
+- page: a few names share report.pdf's words, under 10,000 matches, so the
+  matches are read in one query and filtered exactly;
+- walk: over 10,000 objects share them, so the whole collection is walked;
+- bulk: the name itself has over 10,000 earlier chunks, so they are deleted by
+  UUID in more than one batch.
+The collection is removed afterwards. Exits 0 only if every expectation holds.
+"""
+import sys
+import uuid
+import warnings
+from datetime import datetime, timedelta, timezone
+
+from weaviate.classes.config import Configure
+from weaviate.classes.data import DataObject
+from weaviate.classes.query import Filter
+
+from services import weaviate_client as wc
+
+warnings.simplefilter("ignore", DeprecationWarning)
+
+prefix, mode = sys.argv[1], sys.argv[2]
+NAME = f"{prefix}ExactSource"
+EARLIER = datetime(2026, 1, 1, tzinfo=timezone.utc)
+problems = []
+
+
+def expect(ok, what):
+    if not ok:
+        problems.append(what)
+
+
+def add(coll, name, when, n):
+    """Store n objects under name, created_at as ingest writes it; their UUIDs."""
+    ids = []
+    for start in range(0, n, 1000):
+        objects = [DataObject(properties={"source_file": name, "content": f"{name} {i}",
+                                          "chunk_index": i, "created_at": when.isoformat()},
+                              uuid=uuid.uuid4())
+                   for i in range(start, min(n, start + 1000))]
+        result = coll.data.insert_many(objects)
+        if result.errors:
+            raise RuntimeError(f"insert failed: {list(result.errors.values())[:3]}")
+        ids += [str(o.uuid) for o in objects]
+    return set(ids)
+
+
+def by_name(coll):
+    names = {}
+    for obj in coll.iterator(return_properties=["source_file"]):
+        names.setdefault(obj.properties["source_file"], set()).add(str(obj.uuid))
+    return names
+
+
+client = wc.get_client()
+try:
+    if client.collections.exists(NAME):
+        client.collections.delete(NAME)
+    coll = client.collections.create(NAME, vectorizer_config=Configure.Vectorizer.none(),
+                                     properties=wc.COLLECTION_PROPERTIES)
+    created = datetime.now(timezone.utc)
+    if mode == "page":
+        others = {name: add(coll, name, EARLIER, n) for name, n in (
+            ("a/report.pdf", 3), ("Report.PDF", 3), ("notes/report.pdf", 2), ("report.pdf (part 1)", 2))}
+        expect(not wc._source_has_chunks_sync(NAME, "report.pdf"),
+               "report.pdf has chunks before it is stored")
+        add(coll, "report.pdf", EARLIER - timedelta(days=1), 4)
+        new = add(coll, "report.pdf", created, 3)
+        expect(wc._source_has_chunks_sync(NAME, "report.pdf"), "report.pdf has no chunks once stored")
+        deleted = wc._delete_earlier_chunks_sync(NAME, "report.pdf", created, 3)
+        expect(deleted == 4, f"deleted {deleted} earlier chunks, not 4")
+    elif mode == "walk":
+        others = {"a/report.pdf": add(coll, "a/report.pdf", EARLIER, 10_005)}
+        add(coll, "report.pdf", EARLIER - timedelta(days=1), 2)
+        new = add(coll, "report.pdf", created, 2)
+        words = coll.aggregate.over_all(filters=Filter.by_property("source_file").equal("report.pdf"),
+                                        total_count=True).total_count
+        expect(words > 10_000, f"only {words} word matches; the walk isn't exercised")
+        expect(wc._source_has_chunks_sync(NAME, "report.pdf"), "report.pdf has no chunks")
+        expect(not wc._source_has_chunks_sync(NAME, "Report.PDF"), "Report.PDF has chunks, unstored")
+        deleted = wc._delete_earlier_chunks_sync(NAME, "report.pdf", created, 2)
+        expect(deleted == 2, f"deleted {deleted} earlier chunks, not 2")
+    elif mode == "bulk":
+        # More earlier chunks of the exact name than one delete removes: the
+        # by-UUID deletes run in two batches, 10,000 and 3 (#622).
+        others = {name: add(coll, name, EARLIER, n) for name, n in (
+            ("a/report.pdf", 3), ("Report.PDF", 2))}
+        add(coll, "report.pdf", EARLIER - timedelta(days=1), 10_003)
+        new = add(coll, "report.pdf", created, 2)
+        deleted = wc._delete_earlier_chunks_sync(NAME, "report.pdf", created, 2)
+        expect(deleted == 10_003, f"deleted {deleted} earlier chunks, not 10003")
+    else:
+        raise SystemExit(f"unknown mode {mode!r}")
+    after = by_name(coll)
+    expect(after.get("report.pdf") == new, "report.pdf doesn't hold exactly its new chunks")
+    for name, ids in others.items():
+        kept = len(after.get(name, set()) & ids)
+        expect(after.get(name) == ids, f"{name} kept {kept} of its {len(ids)} chunks")
+except Exception as exc:  # noqa: BLE001
+    problems.append(f"{type(exc).__name__}: {exc}")
+finally:
+    try:
+        if client.collections.exists(NAME):
+            client.collections.delete(NAME)
+    finally:
+        wc.close_client()
+
+print("; ".join(problems) if problems else f"{mode}: ok")
+sys.exit(1 if problems else 0)
 ```
 
 ### scripts/verify/compose_target.py
@@ -36461,6 +38160,43 @@ import json,sys; d=json.load(open('/tmp/vfy_sess.json'))
 need = ('question','answer','ground_truth','contexts')
 sys.exit(0 if d['pairs'] and all(all(p.get(f) for f in need) for p in d['pairs']) else 1)"
 check "every pair has question, answer, ground_truth and contexts" $?
+
+# ── the generation list (#617) ───────────────────────────────────────────────
+# A real generation records who started it and when, through the real start
+# path: listed for its owner (the harness Engineer) with owner, created_at and
+# finished_at, never for another Developer, and absent from the lookup by ID.
+api_get "/goldstandard/sessions" > /tmp/vfy_gen_list.json
+DEVJAR=$(auth_jar developer) || DEVJAR=""
+if [ -n "$DEVJAR" ]; then
+  RAG_AUTH_JAR="$DEVJAR" api_get "/goldstandard/sessions" > /tmp/vfy_gen_list_dev.json
+else
+  echo '{}' > /tmp/vfy_gen_list_dev.json
+fi
+python3 - "$SID" <<'ENDPY'
+import json, sys
+sid = sys.argv[1]
+mine = {s["session_id"]: s for s in json.load(open("/tmp/vfy_gen_list.json")).get("sessions", [])}
+dev = json.load(open("/tmp/vfy_gen_list_dev.json"))
+lookup = json.load(open("/tmp/vfy_sess.json"))
+entry = mine.get(sid)
+problems = []
+if entry is None:
+    problems.append("the session isn't listed for the Engineer who started it: %s" % sorted(mine))
+else:
+    if entry.get("owner") != {"name": "vfy-engineer", "kind": "user"}:
+        problems.append("owner %r" % entry.get("owner"))
+    if not entry.get("created_at") or not entry.get("finished_at"):
+        problems.append("created_at %r finished_at %r" % (entry.get("created_at"), entry.get("finished_at")))
+    if entry.get("status") != "completed":
+        problems.append("status %r" % entry.get("status"))
+if "sessions" not in dev or any(s["session_id"] == sid for s in dev["sessions"]):
+    problems.append("the Developer's list: %s" % json.dumps(dev)[:200])
+if any(k in lookup for k in ("owner", "created_at", "finished_at")):
+    problems.append("the lookup by ID gained the new fields")
+print("; ".join(problems))
+sys.exit(1 if problems else 0)
+ENDPY
+check "GET /goldstandard/sessions lists a real generation for its owner only, with owner and times (#617)" $?
 
 # ── the PATCH audit rule ─────────────────────────────────────────────────────
 if [ "$actual" -lt 1 ]; then
@@ -38886,13 +40622,12 @@ REPO_ROOT="$(cd ../.. && pwd)"
 require_stack
 
 IMAGE="rag-verify-browser:latest"
-NETWORK="${RAG_NETWORK:-}"
-if [ -z "$NETWORK" ]; then
-  NETWORK=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Name}}' | head -1) )
-  NETWORK=$(docker inspect "$NETWORK" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null)
-fi
-if [ -z "$NETWORK" ]; then
-  printf '    could not determine the compose network; set RAG_NETWORK\n'
+# The browser runs in the proxy container's network namespace and opens
+# http://localhost, so its requests carry a Host the proxy answers for (#664):
+# as http://proxy on the compose network they would get 421.
+PROXY=$( (cd "$REPO_ROOT" && docker compose ps -q proxy) )
+if [ -z "$PROXY" ]; then
+  printf '    could not find the proxy container\n'
   exit 2
 fi
 
@@ -38909,8 +40644,8 @@ drop_collection "$C"; make_collection "$C"
 # The test accounts' credentials go in on standard input (#25), never on a
 # command line or in the environment; browser/lib.js reads them once.
 _rag_require_lock_owner
-docker run --rm -i --network "$NETWORK" \
-  -e RAG_UI_BASE="${RAG_UI_BASE:-http://proxy}" \
+docker run --rm -i --network "container:$PROXY" \
+  -e RAG_UI_BASE="${RAG_UI_BASE:-http://localhost}" \
   -e RAG_SKIP_SLOW="$SKIP_SLOW" -e RAG_AUTH_STDIN=1 \
   -v "$PWD/browser":/w:ro -w /w "$IMAGE" node ui_criteria.js < "$RAG_AUTH_DIR/credentials"
 rc=$?
@@ -39653,7 +41388,7 @@ if (require.main === module) {
 // confirm button.
 const { sleep, makeReporter, launch, session, credentialsFor, bodyText, setValue, clickByText, readNav, chooseFromMenu } = require('./lib');
 
-const BASE = process.env.RAG_UI_BASE || 'http://proxy';
+const BASE = process.env.RAG_UI_BASE || 'http://localhost';
 const STRATEGIES = ['fixed', 'overlap', 'language', 'context_aware', 'semantic'];
 // nginx's refusal of a login beyond its rate (#577), as the login page shows it.
 const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again.';
@@ -41248,6 +42983,208 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
       } finally { await s.ctx.close(); }
     }
 
+    // Transfer, stubbed: reopening the job a panel is polling, while its poll is
+    // in flight, keeps one poll chain (#629). Each lookup answers after 1 s, so
+    // one chain polls at most 3 times in 7 s (answer, then 2 s wait); a second
+    // chain for the same job would make it at least 4.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        const mine = { name: 'vfy-developer', kind: 'user' };
+        const exportJob = { job_id: 'vfy629e', status: 'running', collection: 'StubExport629', chunks_written: 3,
+          filename: null, size_bytes: null, source_document_count: null, fidelity: null, models_bundled: null,
+          retrieve_script: null, warnings: [], error: null, error_code: null, error_detail: null };
+        const importJob = { job_id: 'vfy629i', status: 'running', filename: 'ragpkg-stub629.tar.gz', on_conflict: 'rename',
+          collection: null, original_collection: null, chunks_written: 2, fidelity: null, renamed: false, notes: [],
+          restored_sessions: [], error: null, error_code: null, error_detail: null };
+        const lookups = { '/api/export/job/vfy629e': [], '/api/import/job/vfy629i': [] };
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (path === '/api/export/jobs') return request.respond(json({ jobs: [
+            { ...exportJob, owner: mine, created_at: at(60), finished_at: null }] }));
+          if (path === '/api/import/jobs') return request.respond(json({ jobs: [
+            { ...importJob, owner: mine, created_at: at(30), finished_at: null }] }));
+          if (path in lookups) {
+            const lookup = { start: Date.now(), answered: false };
+            lookups[path].push(lookup);
+            setTimeout(() => {
+              lookup.answered = true;
+              request.respond(json(path.includes('/export/') ? exportJob : importJob)).catch(() => {});
+            }, 1000);
+            return;
+          }
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' });
+        // Waits for a new lookup of the job, then clicks the job's row while it
+        // is in flight: still unanswered once the click has happened.
+        const reopen = async (path, text) => {
+          const before = lookups[path].length;
+          for (let i = 0; i < 100 && lookups[path].length === before; i++) await sleep(50);
+          const inflight = lookups[path][lookups[path].length - 1];
+          const clickedAt = Date.now();
+          const clicked = await clickRow(s.page, text);
+          return { path, clickedAt, inFlight: !!inflight && lookups[path].length > before && clicked && !inflight.answered };
+        };
+        const exported = await reopen('/api/export/job/vfy629e', 'StubExport629');
+        const imported = await reopen('/api/import/job/vfy629i', 'ragpkg-stub629.tar.gz');
+        await sleep(imported.clickedAt + 7200 - Date.now());
+        for (const [kind, click] of [['export', exported], ['import', imported]]) {
+          const count = lookups[click.path].filter(l => l.start >= click.clickedAt && l.start <= click.clickedAt + 7000).length;
+          r.check(`Transfer: reopening the polled ${kind} while its poll is in flight keeps one poll chain (#629)`,
+            click.inFlight && count <= 3, `inFlight=${click.inFlight} lookups in 7 s=${count}`);
+        }
+      } finally { await s.ctx.close(); }
+    }
+
+    // Transfer, stubbed: a poll that fails retries on the same chain, and
+    // opening another export stops the running export's chain (#629). The
+    // first two lookups of the running export fail; the third answers.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        const mine = { name: 'vfy-developer', kind: 'user' };
+        const job = (id, done, collection) => ({ job_id: id, status: done ? 'completed' : 'running', collection,
+          chunks_written: done ? 9 : 3, filename: done ? `ragpkg-${id}.tar.gz` : null, size_bytes: done ? 2048 : null,
+          source_document_count: done ? 1 : null, fidelity: done ? 'with-sources' : null, models_bundled: done ? false : null,
+          retrieve_script: done ? true : null, warnings: [], error: null, error_code: null, error_detail: null });
+        const lookups = [];
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (path === '/api/export/jobs') return request.respond(json({ jobs: [
+            { ...job('vfy629r', false, 'StubRetry629'), owner: mine, created_at: at(60), finished_at: null },
+            { ...job('vfy629f', true, 'StubDone629'), owner: mine, created_at: at(9000), finished_at: at(8900) }] }));
+          if (path === '/api/import/jobs') return request.respond(json({ jobs: [] }));
+          if (path === '/api/export/job/vfy629r') {
+            lookups.push(Date.now());
+            if (lookups.length <= 2) return request.respond({ status: 500, contentType: 'application/json',
+              body: JSON.stringify({ error: { code: 'STUB_OUTAGE', message: 'stub outage 629' } }) });
+            return request.respond(json(job('vfy629r', false, 'StubRetry629')));
+          }
+          if (path === '/api/export/job/vfy629f') return request.respond(json(job('vfy629f', true, 'StubDone629')));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' }); await sleep(500);
+        const failing = await bodyText(s.page);
+        for (let i = 0; i < 100 && lookups.length < 3; i++) await sleep(100);
+        await sleep(500);
+        const recovered = await bodyText(s.page);
+        r.check('Transfer: a failed export poll shows the retry message and retries on the same chain (#629)',
+          failing.includes("Could not check the export's progress, retrying") && failing.includes('stub outage 629')
+            && lookups.length >= 3 && !recovered.includes("Could not check the export's progress")
+            && recovered.includes('Writing… 3 chunks so far.'),
+          `lookups=${lookups.length} first=${failing.slice(0, 200)}`);
+        const clicked = await clickRow(s.page, 'StubDone629');
+        const clickedAt = Date.now();
+        await sleep(5000);
+        const after = lookups.filter(t => t > clickedAt + 100).length;
+        r.check('Transfer: opening another export stops polling the running one (#629)',
+          clicked && after === 0 && (await bodyText(s.page)).includes('ragpkg-vfy629f.tar.gz'), `clicked=${clicked} lookups after=${after}`);
+      } finally { await s.ctx.close(); }
+    }
+
+    // The same for the import panel (#629): the first two lookups of the
+    // running import fail, the third answers; then an older import is opened.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        const mine = { name: 'vfy-developer', kind: 'user' };
+        const job = (id, done, filename) => ({ job_id: id, status: done ? 'completed' : 'running', filename, on_conflict: 'rename',
+          collection: done ? 'StubDone629i' : null, original_collection: done ? 'StubDone629i' : null, chunks_written: done ? 4 : 2,
+          fidelity: done ? 'with-sources' : null, renamed: false, notes: [], restored_sessions: [], error: null, error_code: null,
+          error_detail: null });
+        const lookups = [];
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (path === '/api/export/jobs') return request.respond(json({ jobs: [] }));
+          if (path === '/api/import/jobs') return request.respond(json({ jobs: [
+            { ...job('vfy629ir', false, 'ragpkg-retry629.tar.gz'), owner: mine, created_at: at(60), finished_at: null },
+            { ...job('vfy629if', true, 'ragpkg-done629.tar.gz'), owner: mine, created_at: at(9000), finished_at: at(8900) }] }));
+          if (path === '/api/import/job/vfy629ir') {
+            lookups.push(Date.now());
+            if (lookups.length <= 2) return request.respond({ status: 500, contentType: 'application/json',
+              body: JSON.stringify({ error: { code: 'STUB_OUTAGE', message: 'stub outage 629' } }) });
+            return request.respond(json(job('vfy629ir', false, 'ragpkg-retry629.tar.gz')));
+          }
+          if (path === '/api/import/job/vfy629if') return request.respond(json(job('vfy629if', true, 'ragpkg-done629.tar.gz')));
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' }); await sleep(500);
+        const failing = await bodyText(s.page);
+        for (let i = 0; i < 100 && lookups.length < 3; i++) await sleep(100);
+        await sleep(500);
+        const recovered = await bodyText(s.page);
+        r.check('Transfer: a failed import poll shows the retry message and retries on the same chain (#629)',
+          failing.includes("Could not check the import's progress, retrying") && failing.includes('stub outage 629')
+            && lookups.length >= 3 && !recovered.includes("Could not check the import's progress")
+            && recovered.includes('Importing… 2 chunks so far.'),
+          `lookups=${lookups.length} first=${failing.slice(0, 200)}`);
+        const clicked = await clickRow(s.page, 'ragpkg-done629.tar.gz');
+        const clickedAt = Date.now();
+        await sleep(5000);
+        const after = lookups.filter(t => t > clickedAt + 100).length;
+        r.check('Transfer: opening another import stops polling the running one (#629)',
+          clicked && after === 0 && (await bodyText(s.page)).includes('Imported as StubDone629i'), `clicked=${clicked} lookups after=${after}`);
+      } finally { await s.ctx.close(); }
+    }
+
+    // Transfer, stubbed: leaving the page through the app's own navigation,
+    // while a lookup is in flight, stops both panels' polling (#629). Each
+    // lookup answers after 1 s; an answer that still polled would start a new
+    // lookup within about 3 s of leaving.
+    {
+      const s = await session(browser, BASE, 'developer');
+      try {
+        const mine = { name: 'vfy-developer', kind: 'user' };
+        const exportJob = { job_id: 'vfy629le', status: 'running', collection: 'StubLeave629', chunks_written: 3,
+          filename: null, size_bytes: null, source_document_count: null, fidelity: null, models_bundled: null,
+          retrieve_script: null, warnings: [], error: null, error_code: null, error_detail: null };
+        const importJob = { job_id: 'vfy629li', status: 'running', filename: 'ragpkg-leave629.tar.gz', on_conflict: 'rename',
+          collection: null, original_collection: null, chunks_written: 2, fidelity: null, renamed: false, notes: [],
+          restored_sessions: [], error: null, error_code: null, error_detail: null };
+        const lookups = { '/api/export/job/vfy629le': [], '/api/import/job/vfy629li': [] };
+        await s.page.setRequestInterception(true);
+        s.page.on('request', request => {
+          const path = new URL(request.url()).pathname;
+          if (path === '/api/export/jobs') return request.respond(json({ jobs: [
+            { ...exportJob, owner: mine, created_at: at(60), finished_at: null }] }));
+          if (path === '/api/import/jobs') return request.respond(json({ jobs: [
+            { ...importJob, owner: mine, created_at: at(30), finished_at: null }] }));
+          if (path in lookups) {
+            const lookup = { start: Date.now(), answered: false };
+            lookups[path].push(lookup);
+            setTimeout(() => {
+              lookup.answered = true;
+              request.respond(json(path.includes('/export/') ? exportJob : importJob)).catch(() => {});
+            }, 1000);
+            return;
+          }
+          return request.continue();
+        });
+        await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' });
+        const exports = lookups['/api/export/job/vfy629le'];
+        const before = exports.length;
+        for (let i = 0; i < 100 && exports.length === before; i++) await sleep(50);
+        const inflight = exports[exports.length - 1];
+        const clicked = await s.page.evaluate(() => {
+          window.__vfy629Leave = true;
+          const a = document.querySelector('nav a[href="/qa"]');
+          if (!a) return false; a.click(); return true;
+        });
+        const leftAt = Date.now();
+        const inFlight = clicked && exports.length > before && !!inflight && !inflight.answered;
+        await sleep(5000);
+        const after = Object.values(lookups).flat().filter(l => l.start > leftAt + 100).length;
+        const where = await s.page.evaluate(() => ({ path: location.pathname, marker: window.__vfy629Leave === true }));
+        r.check('Transfer: leaving the page stops polling, with a lookup in flight (#629)',
+          inFlight && where.path === '/qa' && where.marker && after === 0,
+          `inFlight=${inFlight} path=${where.path} sameDocument=${where.marker} lookups after=${after}`);
+      } finally { await s.ctx.close(); }
+    }
+
     // An Engineer sees the owner of each job: a user, an API key, or unknown.
     {
       const s = await session(browser, BASE, 'engineer');
@@ -41820,10 +43757,13 @@ Self-contained bundle (~4.6 GB) for an air-gapped target: source plus
 #     built with `git archive`, exactly as package.sh does. Untracked and
 #     ignored files and uncommitted changes are left out (#384).
 #   * all five Docker images, pre-built (docker save)
-#   * the Ollama model weights (phi3.5 + nomic-embed-text)
+#   * the Ollama model weights (llama3.1:8b + nomic-embed-text), the whole
+#     model volume: a model left in it, such as phi3.5 from before 1.2.1, is
+#     carried too
 #
-# Measured at 4.6 GB (2.5 GB images + 2.2 GB model weights) with both models
-# present. Build it on a machine where the stack already works,
+# About 7.7 GB (2.5 GB images + 5.2 GB model weights) with both models present,
+# estimated from the parts (4.6 GB was measured when the LLM was the 2.2 GB
+# phi3.5). Build it on a machine where the stack already works,
 # then move the file to the target Mac and run install-offline.sh there.
 
 set -euo pipefail
@@ -41867,6 +43807,27 @@ PROJECT="$(docker compose config --format json | tr -d ' \n' | sed -n 's/^{"name
 MODELVOL="${PROJECT}_ollama_models"
 docker volume inspect "$MODELVOL" >/dev/null 2>&1 \
   || { echo "ERROR: volume '$MODELVOL' not found. Start the stack once so the models download." >&2; exit 1; }
+
+# The volume must hold every model ollama/entrypoint.sh pulls, or the offline
+# target would try to download the missing one (#647: an install from before
+# llama3.1:8b became the default holds only phi3.5). The names are read as the
+# CI model cache reads them; a manifest without a tag is under "latest".
+MODELS="$(sed -n 's/^pull_with_retry \([A-Za-z0-9._:-]*\)$/\1/p' ollama/entrypoint.sh | tr '\n' ' ')"
+[ -n "$MODELS" ] || { echo "ERROR: no pull_with_retry lines in ollama/entrypoint.sh." >&2; exit 1; }
+# shellcheck disable=SC2086  # one argument per model name
+MISSING="$(docker run --rm --network none --entrypoint sh \
+  -v "$MODELVOL":/models:ro \
+  ollama/ollama:0.3.14 \
+  -c 'for m in "$@"; do
+        n=${m%%:*}; t=latest
+        case "$m" in *:*) t=${m#*:} ;; esac
+        [ -f "/models/models/manifests/registry.ollama.ai/library/$n/$t" ] || echo "$m"
+      done' sh $MODELS)" \
+  || { echo "ERROR: could not read the models in volume '$MODELVOL'." >&2; exit 1; }
+if [ -n "$MISSING" ]; then
+  echo "ERROR: volume '$MODELVOL' doesn't hold $(echo $MISSING). Start the stack once (docker compose up -d) and wait until ollama is healthy, so the models download, then run package-offline.sh again." >&2
+  exit 1
+fi
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
@@ -42062,6 +44023,8 @@ class PackageArchiveTests(unittest.TestCase):
         self.repo.mkdir()
         for name in SCRIPTS + ('.gitignore',):
             shutil.copy(ROOT / name, self.repo / name)
+        # package-offline.sh reads the model names from the entrypoint (#647).
+        write(self.repo / 'ollama' / 'entrypoint.sh', (ROOT / 'ollama' / 'entrypoint.sh').read_text())
         write(self.repo / 'install-offline.sh', '#!/usr/bin/env bash\necho install\n', 0o755)
         write(self.repo / 'README.md', COMMITTED_README)
         write(self.repo / 'ingest-inbox' / '.gitkeep', '')
@@ -43434,7 +45397,7 @@ if __name__=='__main__':unittest.main()
 Pairs and vectors are synthetic; package/model metadata and import/export jobs
 are real. No generation call or startup sweep runs in this process.
 """
-import asyncio,copy,hashlib,json,os,subprocess,sys,tarfile,tempfile,threading,uuid
+import asyncio,hashlib,json,os,subprocess,sys,tarfile,tempfile,threading,uuid
 from pathlib import Path
 from unittest.mock import patch
 import httpx
@@ -43885,7 +45848,7 @@ class ReindexTests(unittest.TestCase):
                 # Existing controlled rebuild fixture executes the real rebuild;
                 # rechunk uses inert parsed properties without changing traversal.
                 with patch.object(tuning.sources,'has_sources',return_value=True),patch.object(tuning,'_chunks_from_sources',return_value=[r['properties'] for r in self.original]),patch.object(tuning.wc,'_insert_chunks_sync',side_effect=lambda name,props:self.backend.data.__setitem__(name,__import__('copy').deepcopy(self.original))):
-                    job=self.run_job(operation)
+                    self.run_job(operation)
                 begin.assert_called_once();self.assertEqual(begin.call_args.args[:2],('OwnedReindex','tune'))
                 self.assertEqual(set(self.backend.data),{'OwnedReindex'})
     def test_reembed_retains_its_explicit_regeneration_path(self):
@@ -48936,6 +50899,26 @@ function prepareCases() {
       await waitFor(s.page, () => [...document.querySelectorAll('[role=alert]')].some(a => a.textContent.includes('Not prepared: scan.pdf.')), 'the refusal alert');
       assert.equal(callsTo(s, 'POST', '/api/prepare/import')[1].body.all, true);
     } },
+    { name: 'An import over 512 MB and an upload with duplicate names show the API\'s message as an alert (#640)', open: (() => {
+      const TOO_LARGE = "The selected documents' prepared parts total 600.0 MB; one import can be at most 512 MB, the same as one upload. Import them in smaller selections.";
+      const DUPLICATE = "Files in this upload share a name: 'a.txt' (a.txt, b.zip:a.txt). Rename them, or upload them separately; nothing was uploaded.";
+      return open('developer', {
+        'POST /api/prepare/import': apiError(409, 'IMPORT_TOO_LARGE', TOO_LARGE),
+        'POST /api/prepare/upload': apiError(409, 'DUPLICATE_NAMES', DUPLICATE),
+      });
+    })(), async run(s) {
+      await waitText(s.page, 'minutes.txt');
+      await fillNth(s.page, 'select', 0, B);
+      await press(s.page, 'Import all prepared');
+      await waitFor(s.page, () => [...document.querySelectorAll('[role=alert]')].some(a => a.textContent.includes('total 600.0 MB; one import can be at most 512 MB') && a.textContent.includes('Import them in smaller selections.')), 'the IMPORT_TOO_LARGE alert');
+      assert.equal(callsTo(s, 'POST', '/api/prepare/import').length, 1);
+      const input = await s.page.$('#prepare-file-input');
+      await input.uploadFile(...tempFiles(['a.txt', 'b.zip']));
+      await waitText(s.page, 'b.zip');
+      await press(s.page, 'Upload');
+      await waitFor(s.page, () => [...document.querySelectorAll('[role=alert]')].some(a => a.textContent.includes("share a name: 'a.txt' (a.txt, b.zip:a.txt)")), 'the DUPLICATE_NAMES alert');
+      assert.equal(callsTo(s, 'POST', '/api/prepare/upload').length, 1);
+    } },
     { name: 'The Import page links to the Prepare page ("Prepare documents first")', open: { role: 'developer', path: '/import', routes: routes() }, async run(s) {
       await waitText(s.page, 'Prepare documents first');
       await s.page.evaluate(() => [...document.querySelectorAll('a')].find(a => a.textContent.trim() === 'Prepare documents first').click());
@@ -49846,7 +51829,7 @@ class Config:
     endpoint: str = field(default="", repr=False)
     headers: dict = field(default_factory=dict, repr=False)
     service: str = "rag-api"
-    version: str = "1.2.0"
+    version: str = "1.2.1"
     environment: str = "development"
     traces: bool = True
     logs: bool = True
@@ -49947,7 +51930,7 @@ class Config:
         if batch > queue:
             raise TelemetryConfigError("RAG_OTEL_BATCH_SIZE exceeds RAG_OTEL_QUEUE_SIZE")
         return cls(True, endpoint.rstrip("/"), headers,
-                   identifier("SERVICE_NAME", "rag-api"), identifier("SERVICE_VERSION", "1.2.0"),
+                   identifier("SERVICE_NAME", "rag-api"), identifier("SERVICE_VERSION", "1.2.1"),
                    identifier("ENVIRONMENT", "development"),
                    boolean("TRACES", True), boolean("LOGS", True), boolean("METRICS", True),
                    number("SAMPLE_RATIO", 1, 0, 1, False), queue, batch,
@@ -51216,7 +53199,7 @@ class TelemetryTests(unittest.TestCase):
                 self.assertNotIn(SECRET.encode(), body)
             traces = ExportTraceServiceRequest.FromString(by_path['/v1/traces'])
             resource = {a.key: a.value.string_value for a in traces.resource_spans[0].resource.attributes}
-            self.assertEqual(resource, {'service.name':'rag-api', 'service.version':'1.2.0', 'deployment.environment.name':'development'})
+            self.assertEqual(resource, {'service.name':'rag-api', 'service.version':'1.2.1', 'deployment.environment.name':'development'})
             span = traces.resource_spans[0].scope_spans[0].spans[0]
             self.assertEqual(span.name, 'rag.operation')
             self.assertFalse(span.events);self.assertFalse(span.links);self.assertFalse(span.status.message)
@@ -51306,7 +53289,7 @@ class TelemetryTests(unittest.TestCase):
                 processor = runtime._providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
                 self.assertEqual(len(processor._queue), 2)
                 for queued in processor._queue:
-                    self.assertEqual(dict(queued.resource.attributes), {'service.name':'rag-api', 'service.version':'1.2.0', 'deployment.environment.name':'development'})
+                    self.assertEqual(dict(queued.resource.attributes), {'service.name':'rag-api', 'service.version':'1.2.1', 'deployment.environment.name':'development'})
                     self.assertFalse(queued.resource.schema_url)
                     self.assertEqual(queued.instrumentation_scope.name, 'rag.telemetry')
                     self.assertFalse(queued.instrumentation_scope.version)
@@ -53941,7 +55924,7 @@ def records(snapshot, signal):
 def inspect(snapshot, requests):
     try:
         return inspect_records(snapshot, requests)
-    except (TypeError, AttributeError, KeyError) as exc:
+    except (TypeError, AttributeError, KeyError):
         raise AssertionError('invalid capture evidence shape') from None
 
 
@@ -54118,7 +56101,7 @@ def main():
         runtime = json.loads(subprocess.check_output(['docker', 'inspect', cid]))[0]
         assert not runtime['HostConfig']['PortBindings']
         assert runtime['Config']['Labels']['com.docker.compose.project'] == 'rag-verify'
-    actual = compose('exec', '-T', 'api', 'python', '-c',
+    compose('exec', '-T', 'api', 'python', '-c',
         'import os; assert os.environ["RAG_OTEL_ENABLED"] == "true"; assert os.environ["RAG_OTEL_ENDPOINT"] == "http://otel-collector:4318"')
     collections = ['VfyOtel'+uuid.uuid4().hex[:12] for _ in range(2)]
     report = {'workload': '5 warm-up +20 timed health requests,1 real query,2 concurrent export jobs per mode',
@@ -54669,6 +56652,8 @@ class Packager(unittest.TestCase):
             with self.subTest(telemetry=telemetry), tempfile.TemporaryDirectory() as folder:
                 root=Path(folder);(root/'bin').mkdir();(root/'scripts').mkdir()
                 shutil.copy(ROOT/'package-offline.sh',root/'package-offline.sh')
+                # package-offline.sh reads the model names from the entrypoint (#647).
+                (root/'ollama').mkdir();shutil.copy(ROOT/'ollama/entrypoint.sh',root/'ollama/entrypoint.sh')
                 (root/'scripts/collector_offline.py').write_text("from pathlib import Path\nimport sys\nPath(sys.argv[2],'collector.tar').touch()\n")
                 stub=root/'bin/docker'
                 stub.write_text("""#!/usr/bin/env python3
@@ -54685,7 +56670,7 @@ if args[:1]==['run']:
                 git = ['git', '-c', 'core.hooksPath=/dev/null',
                        '-c', 'commit.gpgsign=false', '-c', 'user.name=Test',
                        '-c', 'user.email=test@example.invalid']
-                for args in (['init', '-q'], ['add', 'package-offline.sh', 'scripts'],
+                for args in (['init', '-q'], ['add', 'package-offline.sh', 'scripts', 'ollama'],
                              ['commit', '-qm', 'fixture']):
                     subprocess.run(git + args, cwd=root, check=True,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -54777,7 +56762,6 @@ if __name__ == '__main__':
 
 ```python
 """Receiver and decoded evidence assertions, run with the locked API dependencies."""
-import base64
 import importlib.util
 import json
 import copy
@@ -55030,7 +57014,7 @@ services:
     environment:
       RAG_OTEL_ENABLED: "${RAG_VERIFY_OTEL_ENABLED:-true}"
       RAG_OTEL_PROTOCOL: http/protobuf
-      RAG_OTEL_SERVICE_VERSION: "1.2.0"
+      RAG_OTEL_SERVICE_VERSION: "1.2.1"
       RAG_OTEL_QUEUE_SIZE: "256"
       RAG_OTEL_BATCH_SIZE: "64"
       RAG_OTEL_ENDPOINT: http://otel-collector:4318
@@ -55085,10 +57069,13 @@ volumes:
 #     built with `git archive`, exactly as package.sh does. Untracked and
 #     ignored files and uncommitted changes are left out (#384).
 #   * all five Docker images, pre-built (docker save)
-#   * the Ollama model weights (phi3.5 + nomic-embed-text)
+#   * the Ollama model weights (llama3.1:8b + nomic-embed-text), the whole
+#     model volume: a model left in it, such as phi3.5 from before 1.2.1, is
+#     carried too
 #
-# Measured at 4.6 GB (2.5 GB images + 2.2 GB model weights) with both models
-# present. Build it on a machine where the stack already works,
+# About 7.7 GB (2.5 GB images + 5.2 GB model weights) with both models present,
+# estimated from the parts (4.6 GB was measured when the LLM was the 2.2 GB
+# phi3.5). Build it on a machine where the stack already works,
 # then move the file to the target Mac and run install-offline.sh there.
 
 set -euo pipefail
@@ -55132,6 +57119,27 @@ PROJECT="$(docker compose config --format json | tr -d ' \n' | sed -n 's/^{"name
 MODELVOL="${PROJECT}_ollama_models"
 docker volume inspect "$MODELVOL" >/dev/null 2>&1 \
   || { echo "ERROR: volume '$MODELVOL' not found. Start the stack once so the models download." >&2; exit 1; }
+
+# The volume must hold every model ollama/entrypoint.sh pulls, or the offline
+# target would try to download the missing one (#647: an install from before
+# llama3.1:8b became the default holds only phi3.5). The names are read as the
+# CI model cache reads them; a manifest without a tag is under "latest".
+MODELS="$(sed -n 's/^pull_with_retry \([A-Za-z0-9._:-]*\)$/\1/p' ollama/entrypoint.sh | tr '\n' ' ')"
+[ -n "$MODELS" ] || { echo "ERROR: no pull_with_retry lines in ollama/entrypoint.sh." >&2; exit 1; }
+# shellcheck disable=SC2086  # one argument per model name
+MISSING="$(docker run --rm --network none --entrypoint sh \
+  -v "$MODELVOL":/models:ro \
+  ollama/ollama:0.3.14 \
+  -c 'for m in "$@"; do
+        n=${m%%:*}; t=latest
+        case "$m" in *:*) t=${m#*:} ;; esac
+        [ -f "/models/models/manifests/registry.ollama.ai/library/$n/$t" ] || echo "$m"
+      done' sh $MODELS)" \
+  || { echo "ERROR: could not read the models in volume '$MODELVOL'." >&2; exit 1; }
+if [ -n "$MISSING" ]; then
+  echo "ERROR: volume '$MODELVOL' doesn't hold $(echo $MISSING). Start the stack once (docker compose up -d) and wait until ollama is healthy, so the models download, then run package-offline.sh again." >&2
+  exit 1
+fi
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
@@ -56116,7 +58124,7 @@ import sys
 import tempfile
 import time
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -56140,7 +58148,7 @@ NOW = time.time()
 
 
 def iso(seconds_ago: float) -> str:
-    return (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).isoformat()
+    return datetime.fromtimestamp(NOW - seconds_ago, timezone.utc).isoformat()
 
 
 def owner(name="dev", kind="user"):
@@ -56191,6 +58199,17 @@ class RecordTimestampTests(TempUploadCase):
         store["e1"].update(status="failed", error="later")
         self.assertEqual(store["e1"]["finished_at"], first)
 
+    def test_a_replaced_record_keeps_its_timestamps(self):
+        store = self.bound("export")
+        store["r1"] = {"job_id": "r1", "status": "queued"}
+        store["r1"]["status"] = "completed"
+        created, finished = store["r1"]["created_at"], store["r1"]["finished_at"]
+        time.sleep(0.01)
+        store["r1"] = {"job_id": "r1", "status": "failed", "error": "replaced"}
+        self.assertEqual((store["r1"]["created_at"], store["r1"]["finished_at"]), (created, finished))
+        on_disk = json.loads((self.root / "jobs" / "export" / "r1.json").read_text())
+        self.assertEqual((on_disk["created_at"], on_disk["finished_at"]), (created, finished))
+
     def test_interrupted_at_startup_gets_finished_at(self):
         directory = self.root / "jobs" / "import"
         directory.mkdir(parents=True)
@@ -56231,7 +58250,7 @@ class SelectTests(unittest.TestCase):
         return [(r, r["status"] == "running", job_lists._parse(r.get("finished_at"))) for r in records]
 
     def ids(self, items, principal):
-        return [r["job_id"] for r in job_lists.select(items, principal, time.time())]
+        return [r["job_id"] for r in job_lists.select(items, principal, NOW)]
 
     def test_developer_sees_only_own_jobs_and_engineer_sees_all(self):
         items = self.items(
@@ -56259,6 +58278,20 @@ class SelectTests(unittest.TestCase):
             {"job_id": "recent", "status": "failed", "owner": owner(), "finished_at": iso(23 * 3600)},
             {"job_id": "old", "status": "failed", "owner": owner(), "finished_at": iso(25 * 3600)})
         self.assertEqual(self.ids(items, DEV), ["recent"])
+
+    def test_finished_at_boundary_of_the_window(self):
+        inside = {"job_id": "in", "status": "completed", "owner": owner()}
+        outside = {"job_id": "out", "status": "completed", "owner": owner()}
+        listed = job_lists.select([(inside, False, NOW - job_lists.WINDOW_S),
+                                   (outside, False, NOW - job_lists.WINDOW_S - 1)], DEV, NOW)
+        self.assertEqual([r["job_id"] for r in listed], ["in"])
+
+    def test_a_finish_time_after_the_clock_is_listed(self):
+        # The API's clock stepped back: a just-finished job stays listed (#629).
+        listed = job_lists.select([({"job_id": "ahead", "status": "completed", "owner": owner()}, False, NOW + 3600)],
+                                  DEV, NOW)
+        self.assertEqual([r["job_id"] for r in listed], ["ahead"])
+        self.assertAlmostEqual(job_lists._parse(listed[0]["finished_at"]), NOW + 3600, delta=1)
 
     def test_order_newest_first_by_created_at_else_finish(self):
         items = self.items(
@@ -56292,7 +58325,7 @@ class SelectTests(unittest.TestCase):
                     {"session_id": "legacy", "status": "completed"}]
         items = job_lists.session_items(sessions)
         self.assertEqual([(i[1], i[2] is not None) for i in items], [(True, False), (False, True), (False, False)])
-        listed = job_lists.select([(dict(s, owner=owner()), r, f) for s, r, f in items], DEV, time.time())
+        listed = job_lists.select([(dict(s, owner=owner()), r, f) for s, r, f in items], DEV, NOW)
         # "gen" has neither a start nor a finish time, so it sorts last (S3.6).
         self.assertEqual([s["session_id"] for s in listed], ["done", "gen"])
 

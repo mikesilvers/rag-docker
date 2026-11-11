@@ -7,8 +7,10 @@ let a page find its jobs again after the user left it. What they list:
   #617 with no owner ("owner unknown"). Anyone else sees only jobs whose
   `owner` names them: the same name and kind, so a user's own jobs, or an API
   key's principal's. The lookups by ID are not scoped; only these lists are.
-- **Which.** Every running job, and the finished ones whose finish time lies in
-  the last 24 hours, at most the newest 20 of those per list and caller.
+- **Which.** Every running job, and the finished ones whose finish time is no
+  more than 24 hours before the request, a finish time later than the request
+  (after the clock steps back) included; at most the newest 20 of those per
+  list and caller.
 - **Finish time.** A record's `finished_at`; for a job record from before #617,
   the time its record was last saved. A finished session without
   `finished_at` is not listed.
@@ -78,7 +80,9 @@ def select(items, principal, now: float) -> list[dict]:
             continue
         if is_running:
             running.append((record, None))
-        elif finish is not None and now - WINDOW_S <= finish <= now:
+        # No upper bound: a finish time ahead of the clock (a clock stepped
+        # back) still lists a just-finished job (#629).
+        elif finish is not None and now - WINDOW_S <= finish:
             finished.append((record, finish))
     finished.sort(key=lambda pair: pair[1], reverse=True)
     kept = running + finished[:FINISHED_CAP]

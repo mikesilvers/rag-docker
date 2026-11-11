@@ -11,10 +11,13 @@
 #     built with `git archive`, exactly as package.sh does. Untracked and
 #     ignored files and uncommitted changes are left out (#384).
 #   * all five Docker images, pre-built (docker save)
-#   * the Ollama model weights (phi3.5 + nomic-embed-text)
+#   * the Ollama model weights (llama3.1:8b + nomic-embed-text), the whole
+#     model volume: a model left in it, such as phi3.5 from before 1.2.1, is
+#     carried too
 #
-# Measured at 4.6 GB (2.5 GB images + 2.2 GB model weights) with both models
-# present. Build it on a machine where the stack already works,
+# About 7.7 GB (2.5 GB images + 5.2 GB model weights) with both models present,
+# estimated from the parts (4.6 GB was measured when the LLM was the 2.2 GB
+# phi3.5). Build it on a machine where the stack already works,
 # then move the file to the target Mac and run install-offline.sh there.
 
 set -euo pipefail
@@ -58,6 +61,27 @@ PROJECT="$(docker compose config --format json | tr -d ' \n' | sed -n 's/^{"name
 MODELVOL="${PROJECT}_ollama_models"
 docker volume inspect "$MODELVOL" >/dev/null 2>&1 \
   || { echo "ERROR: volume '$MODELVOL' not found. Start the stack once so the models download." >&2; exit 1; }
+
+# The volume must hold every model ollama/entrypoint.sh pulls, or the offline
+# target would try to download the missing one (#647: an install from before
+# llama3.1:8b became the default holds only phi3.5). The names are read as the
+# CI model cache reads them; a manifest without a tag is under "latest".
+MODELS="$(sed -n 's/^pull_with_retry \([A-Za-z0-9._:-]*\)$/\1/p' ollama/entrypoint.sh | tr '\n' ' ')"
+[ -n "$MODELS" ] || { echo "ERROR: no pull_with_retry lines in ollama/entrypoint.sh." >&2; exit 1; }
+# shellcheck disable=SC2086  # one argument per model name
+MISSING="$(docker run --rm --network none --entrypoint sh \
+  -v "$MODELVOL":/models:ro \
+  ollama/ollama:0.3.14 \
+  -c 'for m in "$@"; do
+        n=${m%%:*}; t=latest
+        case "$m" in *:*) t=${m#*:} ;; esac
+        [ -f "/models/models/manifests/registry.ollama.ai/library/$n/$t" ] || echo "$m"
+      done' sh $MODELS)" \
+  || { echo "ERROR: could not read the models in volume '$MODELVOL'." >&2; exit 1; }
+if [ -n "$MISSING" ]; then
+  echo "ERROR: volume '$MODELVOL' doesn't hold $(echo $MISSING). Start the stack once (docker compose up -d) and wait until ollama is healthy, so the models download, then run package-offline.sh again." >&2
+  exit 1
+fi
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT

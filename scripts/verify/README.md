@@ -55,7 +55,9 @@ read the jar through `auth_headers.py`; in-process checks in the API image use
 `17_auth.sh` checks authentication itself: the endpoint/role matrix for no session and each
 role (written out in `auth_stack.py`, not read from the API), login, logout, cookies, origin
 rules, throttling, nginx's login rate limit (logins sent without waiting until one is refused
-`429 LOGIN_RATE_LIMITED` in the error envelope, and no audit record for the refused ones), the
+`429 LOGIN_RATE_LIMITED` in the error envelope, and no audit record for the refused ones), nginx's
+16k login body limit (a larger login body is refused `413` before the API; one at the field limits
+reaches it, #663), the
 operator command's effect on existing sessions (on throwaway `vfy-t-*`
 accounts), an Engineer's account administration through the API (on a throwaway account; the
 generated passwords must not reach the API log), service API keys (throwaway `vfy-s-*`
@@ -79,6 +81,15 @@ and, when the 60-second window closes, one record with `details.count` and `last
 that stay in order across processes and a clock that steps back, the telemetry route list and the Audit page's
 action list (#577).
 
+`20_offline_model.sh` checks that the api runs without the internet (#618, #695). In the
+running api container, `HF_HUB_OFFLINE` and `TRANSFORMERS_OFFLINE` must be `1` and the Hugging
+Face library must report offline mode, and the pre-cached sentence-transformers model
+`all-MiniLM-L6-v2` must load in under 60 seconds with `HF_ENDPOINT` pointed at an unroutable
+address (#618); `DO_NOT_TRACK` must be `1` (#695). It then runs `../tests/test_offline_ingest.py`
+in a fresh container from the api image with no network: real ingest jobs of every supported
+type, and a preparation of a `.txt` and a `.md` with a stub LLM, must succeed while every name
+lookup and non-Unix connect is refused (#695, #640).
+
 `21_prepare.sh` checks document preparation (#638, SPECIFICATIONS.md §3.1.11 and §10.8). It runs
 `../tests/test_prepare.py` in the API image with no network and a stub LLM (windows and the fidelity check,
 the LLM's limits, titles and summaries, the labels of CSV and JSON parts, normalisation, parts and names, JSON to JSON Lines, the storage limit,
@@ -86,9 +97,33 @@ jobs, cancel and restart, busy documents, import, downloads, routes), then check
 `prepare_stack.py` as the harness Developer: the role matrix of every `/prepare` route, an upload with a ZIP,
 ZIP refusals with ingest's codes, the raw download and the space used, deletes, import refusals, an unknown
 job's cancel and the audit records. In a full run (not `RAG_SKIP_SLOW=1`) it prepares three small files with
-the local LLM, one job at a time, checks that the cleaned text holds only source lines in order and that the
+the local LLM, one job at a time, checks that the cleaned text holds only source lines in order, that every
+cleaning window without a fallback lost at most 20 % of its characters (#640), and that the
 CSV and JSON Lines come back unchanged, labelled from their data, imports them into a throwaway `VfyPrepare*` collection and downloads a
 prepared part. Its `vfy-prepare-*` documents and its collections are removed at the end.
+
+`22_ui_ingest.sh` ingests through the web UI end to end (#641, SPECIFICATIONS.md §10.9), as a user does:
+`browser/ui_ingest.js` drives the real Import and Prepare pages in the browser image, logged in as the
+harness Engineer, with no request stubbed or intercepted, each case into a new collection made with the
+page's "+ New". The cases, files and known phrases are the fixtures' `ui_ingest/manifest.json`
+(`fixtures.py`): a clean `.pdf`, `.docx`, `.txt`, `.md`, `.csv`, `.json` and `.jsonl`, one collection
+each; a ZIP of mixed types with a `.json.gz` member and a `.jsonl.gz` beside it in one upload (a `.json.gz`
+is ingested only from a ZIP); a `.txt` of over 10,000 pieces at the `fixed` strategy's chunk size 50,
+split into parts (#621), whose minimum chunk size of 6,000 merges the pieces so only about a hundred
+chunks are embedded; and, in a full run only, a `.txt` and a `.csv` prepared on the Prepare page with the local LLM and
+imported with Import selected (#638). For each, `ui_ingest_check.py` checks that the page followed the job
+to `completed` with no error shown and the API's job record has no file error, that the Collections page
+shows at least the expected chunks, and, from the verify project's Weaviate (`ui_ingest_weaviate.py`, run
+in the api container), that the collection holds exactly the expected documents and a known phrase of each
+in one of its chunks; the split file's parts are numbered 1 to N with the first and last phrases in the
+first and last parts. Three bad files fail cleanly: a broken PDF (its job `failed`, an error line naming it),
+an unsupported type (`No supported files`) and an over-limit ZIP (`expands to more than`) each show a red
+message naming the file, and leave their collection empty and no job running, the two refused uploads no
+job at all. Its `VfyUiIngest*` collections and `vfy-ui-*` prepared documents are removed at the start and the
+end. Cost, measured 2026-11-11 on a Mac with 12 GB for Docker: about 3 min 40 s in a `RAG_SKIP_SLOW=1` run
+and 4 min 10 s in a full run (the Prepare case about 25 s), most of it the large file's embedding (about
+2.5 min). Splitting it through `overlap` at chunk size 50 instead embedded about 11,200 chunks and took
+26.5 min, which is why it uses `fixed` with the merge.
 
 ## Entry point and verify project
 
@@ -101,7 +136,7 @@ against" below).
 | Command | What it does |
 |---|---|
 | `stack.sh run [--checkout DIR] [--telemetry \| --lan] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
-| `stack.sh up [--checkout DIR] [--pull] [--lan]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. |
+| `stack.sh up [--checkout DIR] [--pull] [--telemetry \| --lan]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT` and `RAG_VERIFY_OTEL_ENABLED`. |
 | `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
 
 `--checkout` is the checkout to build and test; the default is the one holding
@@ -201,8 +236,9 @@ would fail by design). `--lan` can't be combined with `--telemetry`.
 `docker-compose.lan.yml`, under the project name `rag-lan-config`, with no
 `.env`; nothing is created) and runs `../tests/test_lan_mode.py` in the API
 image. Only in a `--lan` run does it check the running LAN project through
-`lan_stack.py`: HTTPS with the generated certificate, TLS versions and HTTP/2,
-the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
+`lan_stack.py`: HTTPS with the generated certificate, the hosts nginx answers
+for (localhost, 127.0.0.1 and the test names; another `Host` gets 421, #664),
+TLS versions and HTTP/2, the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
 the API's refusal in one-off containers (`docker compose run --rm
 --no-deps`, no ports) and nginx's login rate limit (logins sent without
 waiting until one is refused `429 LOGIN_RATE_LIMITED`, #577); it also prints
@@ -241,7 +277,8 @@ nothing.
 
 `python3 scripts/tests/test_verify_stack.py` checks `stack.sh`, the
 configuration check and both refusals, with Docker replaced by a stub, so it
-needs no stack.
+needs no stack. Two of its tests read `docker-compose.yml` with PyYAML, so they
+need PyYAML on the host; without it they are skipped.
 
 ## Continuous integration
 
@@ -260,9 +297,9 @@ top of the main `README.md` shows its result on `develop`.
   every service, with timestamps, and `docker compose ps -a`, also when `up`
   failed.
 - **The model cache.** Even with `RAG_SKIP_SLOW=1`, ingest needs the embedding
-  model, so Ollama starts with both models (about 2.5 GB). The cache key is
+  model, so Ollama starts with both models (about 5.2 GB). The cache key is
   built from the models `ollama/entrypoint.sh` pulls
-  (`ollama-models-phi3.5-nomic-embed-text`). On a hit, the cached models are
+  (`ollama-models-llama3.1:8b-nomic-embed-text`). On a hit, the cached models are
   copied into `rag-verify-ollama-models` before `up`, and Ollama pulls
   nothing. On a miss, Ollama pulls them; after `down`, the workflow copies the
   volume's `models/` folder out, only once every model's manifest is there,
@@ -406,9 +443,13 @@ tree with excluded files planted and reads them back, runs `package-offline.sh` 
 loaded or started), and checks the bundled image list against
 `docker compose config --images`. The copy is a real git repository with the tracked files
 committed (git ignoring the user's and the system's configuration), because both scripts
-archive `HEAD` with `git archive` (#384); the excluded files are planted untracked, as in a
-real checkout, so the tests show `git archive` leaves them out, a top-level `.env.<suffix>`
-such as `.env.local` included (SPECIFICATIONS.md section 11.2 excludes `.env*`). Its
+archive `HEAD` with `git archive` (#384). The commit runs with git's automatic maintenance
+off, and the test checks, from git's trace, that it started no `git maintenance` or `git gc`:
+a detached repack still writing into `.git` while the temporary directory was removed failed
+the cleanup with `Directory not empty` (#696). The excluded files are planted untracked, as
+in a real checkout, so the tests show `git archive` leaves them out, a top-level
+`.env.<suffix>` such as `.env.local` included (SPECIFICATIONS.md section 11.2 excludes
+`.env*`). Its
 `install-offline.sh` wait test records that the wait counts running services, not healthy ones.
 
 The live checks: unknown job ids, `on_conflict` 422s, `GET /packages` with a junk
@@ -648,7 +689,8 @@ operation runs reliably long enough to interrupt, so `test_jobstore.py` covers i
 
 `scripts/tests/test_startup_sweep.py` (#377) checks the startup sweeps of what a killed job
 leaves behind, in disposable folders. In `UPLOAD_DIR`, ingest staging is created as
-`ingest-*` and removed with the `import-*`, `rechunk-*` and `batch-verify-*` work directories;
+`ingest-*` and removed with the `import-*`, `rechunk-*`, `batch-verify-*` and `prepare-*` work
+directories, and document preparation's `prepare-*.zip` and `prepare-*.json` temporary files (#640);
 in `EXPORTS_DIR`, `.build-*` directories and `.*.tar.gz.partial` files are removed. Only those
 names, and only a real directory or regular file as the name says: completed packages,
 `ingest_configs/`, look-alike names, a file where a directory is expected and the reverse, and
@@ -725,9 +767,11 @@ stale, naming the file. Two concurrent uploads of one name must leave exactly on
 version, whole: its chunk set, its digest, and `chunks_replaced` equal to the other job's
 chunks. Replacing a name touches only that name (#622): with `a/report.pdf` (in a ZIP) and
 `Report.PDF` stored, uploading `report.pdf` replaces nothing and uploading it again replaces
-only its first set, and the other two keep exactly their chunks. `exact_source.py` then checks
-the same selection in real Weaviate on a scratch collection without a vectorizer, on both
-paths: a few word matches read in one query, and over 10,000 walked.
+only its first set, and the other two keep exactly their chunks; the first upload leaves a
+planted gold-standard session current. `exact_source.py` then checks the same selection in
+real Weaviate on a scratch collection without a vectorizer, on both paths: a few word matches
+read in one query, and over 10,000 walked; and over 10,000 earlier chunks of the name are
+all deleted, in batches.
 `browser/ui_criteria.js` (suite 06) stubs the job response and checks that the Import
 page shows "Replaced N chunk(s) from a previous version" only when `chunks_replaced` is above
 0, and the plain "N file(s) skipped:" heading with each entry's own reason.
@@ -847,8 +891,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `07_settings.sh` | registered live settings validation suite; invokes the standalone helper |
 | `settings_validation.py` | standalone, on the verify project after `stack.sh up`: `RAG_API=http://localhost:8081/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
-| `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
-| `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps |
+| `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only; `ui_ingest/` holds the files and `manifest.json` of suite 22 (#641) |
+| `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps; the proxy answers `Host` localhost and 127.0.0.1 and refuses another with 421 (#664) |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
 | `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384), run in a checkout reached through a symlink, and ignore the user's system and global git config (#447); embedded copies; registered by suite 01 |
 | `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415), registered by suite 01 |
@@ -893,7 +937,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_reingest.py` | controlled re-ingest replacement, exact-name selection (#622), same-name upload, macOS ZIP metadata, retention and rechunk-coverage regressions, registered by ingest |
 | `../tests/test_split_parts.py` | controlled regressions for files over the per-file limits stored as parts (#621): the reviewer's 13,000 records, files over 10,000,000 characters, family replacement, all or nothing, cuts, CSV, Markdown, encoding, `overlap` sizing, re-chunk and export links, registered by ingest |
 | `split_parts.py` | helper for ingest (#621), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, files over the per-file limits are stored as parts, a smaller re-upload replaces every part, and a bad line after part 1 stores nothing; the collection is removed afterwards |
-| `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`) and over 10,000 (`walk`); the collection is removed afterwards |
+| `exact_source.py` | helper for ingest (#622), run in the API container: on a scratch collection without a vectorizer in the real Weaviate, replacing `report.pdf` deletes only its earlier chunks and `_source_has_chunks_sync` answers by exact name, with a few word matches (`page`), over 10,000 (`walk`), and over 10,000 earlier chunks of the name itself, deleted in batches of 10,000 (`bulk`); the collection is removed afterwards |
 | `../tests/test_collection_spelling.py` | controlled regressions for per-collection state keyed by the stored collection name (#372), registered by ingest |
 | `../tests/test_session_import.py` | controlled import/persistence/generation regressions, registered by transfer |
 | `../tests/test_source_index_boundary.py` | controlled source-index identity, early import refusal, unresolvable chunk-source refusal and export read-boundary regressions, registered by transfer |
@@ -910,9 +954,17 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
 | `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
+| `20_offline_model.sh` | the Hugging Face libraries run offline in the api container (#618): the pre-cached sentence-transformers model loads with no Hugging Face call; `DO_NOT_TRACK` is `1` in the running api container (#695); registers `../tests/test_offline_ingest.py` (#695, #640) |
+| `../tests/test_offline_ingest.py` | API image, no network: real ingest jobs of every supported type (`.txt`, `.md`, and `.pdf`, `.docx`, `.csv`, `.json` from `fixtures.py`; backends faked) complete with every name lookup and non-Unix connect refused and recorded from before the API is imported, so nothing may dial out; `DO_NOT_TRACK` is set and the bundled spaCy model `en_core_web_sm` is the version `unstructured` expects (#695); a `.txt` and a `.md` are also prepared with a stub LLM, their parts checked by the real parser (#640); registered by `20_offline_model.sh` |
+| `22_ui_ingest.sh` | §10.9 — ingest through the web UI (#641): every supported type, a ZIP of mixed types, a file split into parts and (full runs) a Prepare and Import, each into a new collection with no stub; a broken PDF, an unsupported type and an over-limit ZIP fail cleanly |
+| `browser/ui_ingest.js` | the browser side of suite 22: the Import and Prepare pages driven as a user does, the observations printed as one JSON line (#641) |
+| `ui_ingest_weaviate.py` | helper for suite 22, run in the API container: the `VfyUiIngest*` collections' documents and chunk text, read only (#641) |
+| `ui_ingest_check.py` | the checks of suite 22, one per subcommand, on the host, and its cleanup (#641) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
-| `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530), registered by infrastructure |
+| `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
+| `../tests/test_upgrade_backup.py` | host-only: the README's 1.1.0 → 1.2.0 upgrade blocks, run as written under bash, `zsh -c` and interactive zsh with comments off, against stub `docker`, `git` and `curl`; the stub docker accepts only mounts inside its temp directory and only the README's two container commands: no block holds a `#` comment line; the backup skips a missing volume (a wrong prefix) and counts only existing volumes' archives, and writes each copy to a `.tmp` file that replaces the archive only once `gzip -t` passes, so a failed or corrupt copy prints `backup FAILED` and keeps an earlier archive; the rollback is gated on `git checkout v1.1.0` and checks every archive (`gzip -t`, `tar tzf`) and volume before it empties any, and a failed restore stops before `compose up`; alpine is pinned by version and digest; git ignores `backups/` (#679, #693), registered by infrastructure |
+| `../tests/test_version_agreement.py` | host-only: the first-party version strings agree with each other, not with a fixed version: `ui/package.json`, the root versions in `ui/package-lock.json`, `mcp/mcpapp.py`, the two `service.version` defaults in `api/services/telemetry.py` and `RAG_OTEL_SERVICE_VERSION` in `docker-compose.telemetry.yml` and `docker-compose.telemetry.verify.yml` (#605, #656), registered by infrastructure |
 | `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
 | `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
@@ -952,7 +1004,7 @@ through the proxy that download refuses other upload state with 400 (#370).
 | `RAG_RESTART_LIMIT_S` | `240` | seconds `01_infrastructure.sh`'s restart check allows from `down` to a healthy `/health`: Weaviate's `start_period` plus 60. The result line reports the measured time on a pass and on a fail (#130) |
 | `RAG_GS_SAMPLE` | `3` | gold-standard pairs to generate |
 | `RAG_FORMAT_TRIALS` | `3` | paired trials for the answer-length comparison |
-| `RAG_NETWORK` | detected | compose network for the browser container |
+| `RAG_UI_BASE` | `http://localhost` | the address `06_ui.sh`'s browser opens. The browser runs in the proxy container's network namespace, so `localhost` is the proxy and the `Host` is one the proxy answers for (#664); `RAG_NETWORK` is no longer used |
 | `RAG_AUTH_DIR` | `${TMPDIR:-/tmp}/rag-verify-auth-<uid>` | the folder of the test accounts' credentials and cookie jars (#25) |
 
 ## Writing a check
@@ -1234,7 +1286,7 @@ synthesis failing is the Ollama 503 (and that it used the engineer system prompt
 Ollama failure in the reformulation or the synthesis in `hybrid` and `semantic` modes still
 names Ollama only (#456), that a Weaviate failure in `hybrid` and `semantic`
 modes names Ollama too (Weaviate embeds the question through it there), and that a help
-template `RuntimeError` answers `HELP_RENDER_FAILED` with its own message. Suite 01 then
+template `RuntimeError` answers `HELP_RENDER_FAILED` with a fixed message, the cause logged (#657). Suite 01 then
 checks the envelope through the proxy on the running stack: an unknown route answers 404
 `NOT_FOUND`, and `PUT /query` answers 405 with `Allow: POST` and the code
 `METHOD_NOT_ALLOWED` (#456), the request going through the lock-checked `api_request` helper.

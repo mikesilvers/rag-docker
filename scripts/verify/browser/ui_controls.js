@@ -1150,6 +1150,26 @@ function prepareCases() {
       await waitFor(s.page, () => [...document.querySelectorAll('[role=alert]')].some(a => a.textContent.includes('Not prepared: scan.pdf.')), 'the refusal alert');
       assert.equal(callsTo(s, 'POST', '/api/prepare/import')[1].body.all, true);
     } },
+    { name: 'An import over 512 MB and an upload with duplicate names show the API\'s message as an alert (#640)', open: (() => {
+      const TOO_LARGE = "The selected documents' prepared parts total 600.0 MB; one import can be at most 512 MB, the same as one upload. Import them in smaller selections.";
+      const DUPLICATE = "Files in this upload share a name: 'a.txt' (a.txt, b.zip:a.txt). Rename them, or upload them separately; nothing was uploaded.";
+      return open('developer', {
+        'POST /api/prepare/import': apiError(409, 'IMPORT_TOO_LARGE', TOO_LARGE),
+        'POST /api/prepare/upload': apiError(409, 'DUPLICATE_NAMES', DUPLICATE),
+      });
+    })(), async run(s) {
+      await waitText(s.page, 'minutes.txt');
+      await fillNth(s.page, 'select', 0, B);
+      await press(s.page, 'Import all prepared');
+      await waitFor(s.page, () => [...document.querySelectorAll('[role=alert]')].some(a => a.textContent.includes('total 600.0 MB; one import can be at most 512 MB') && a.textContent.includes('Import them in smaller selections.')), 'the IMPORT_TOO_LARGE alert');
+      assert.equal(callsTo(s, 'POST', '/api/prepare/import').length, 1);
+      const input = await s.page.$('#prepare-file-input');
+      await input.uploadFile(...tempFiles(['a.txt', 'b.zip']));
+      await waitText(s.page, 'b.zip');
+      await press(s.page, 'Upload');
+      await waitFor(s.page, () => [...document.querySelectorAll('[role=alert]')].some(a => a.textContent.includes("share a name: 'a.txt' (a.txt, b.zip:a.txt)")), 'the DUPLICATE_NAMES alert');
+      assert.equal(callsTo(s, 'POST', '/api/prepare/upload').length, 1);
+    } },
     { name: 'The Import page links to the Prepare page ("Prepare documents first")', open: { role: 'developer', path: '/import', routes: routes() }, async run(s) {
       await waitText(s.page, 'Prepare documents first');
       await s.page.evaluate(() => [...document.querySelectorAll('a')].find(a => a.textContent.trim() === 'Prepare documents first').click());

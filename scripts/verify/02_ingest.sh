@@ -702,8 +702,28 @@ drop_collection "$EX"; make_collection "$EX"
 ingest "$EX" fixed 200 40 "$EXFIX/folder.zip"
 ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=Report.PDF"
 ex_state > /tmp/vfy_ex_before.json
+# A gold-standard session for the collection: the first report.pdf replaces
+# nothing, so it must not mark it stale (#622, #22).
+EXGS="gs_$(python3 -c 'import uuid; print(uuid.uuid4().hex[:8])')"
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$EX" "$EXGS") <<'ENDPY'
+import sys
+from services import goldstandard as gs
+pairs = [{"pair_id": "ex_pair", "question": "Q", "answer": "A", "contexts": ["C"],
+          "ground_truth": "T", "source_file": "Report.PDF", "chunk_index": 0, "status": "approved"}]
+gs.store_session({"session_id": sys.argv[2], "collection": sys.argv[1], "status": "completed",
+                  "pairs_total": 1, "pairs_completed": 1, "pairs": pairs})
+ENDPY
+check "exact name: a synthetic gold-standard session is planted for the collection" $?
+api_get "/goldstandard/diagnostics" >/dev/null
 ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=report.pdf"
 cp /tmp/vfy_job.json /tmp/vfy_ex_job1.json
+api_get "/goldstandard/session/$EXGS" > /tmp/vfy_ex_gs.json
+python3 -c "
+import json,sys; d=json.load(open('/tmp/vfy_ex_gs.json')); j=json.load(open('/tmp/vfy_ex_job1.json'))
+print(d.get('stale'), d.get('stale_reason'), j['status'], j.get('chunks_replaced'))
+sys.exit(0 if d.get('stale') is False and j['status']=='completed' else 1)"
+check "uploading report.pdf beside a/report.pdf and Report.PDF leaves gold-standard sessions current (#622)" $? \
+  "$(head -c 300 /tmp/vfy_ex_gs.json)"
 ex_state > /tmp/vfy_ex_first.json
 ingest "$EX" fixed 200 40 "$FIX/policies.pdf;filename=report.pdf"
 cp /tmp/vfy_job.json /tmp/vfy_ex_job2.json
@@ -734,6 +754,8 @@ check "re-uploading report.pdf replaces only report.pdf: a/report.pdf and Report
 check "replacing a name on the page path selects exactly that name in real Weaviate (#622)" $?
 (cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" walk < scripts/verify/exact_source.py)
 check "replacing a name on the walk path, past 10,000 word matches, selects exactly that name (#622)" $?
+(cd "$REPO_ROOT" && docker compose exec -T api python - "$PREFIX" bulk < scripts/verify/exact_source.py)
+check "replacing a name with over 10,000 earlier chunks deletes them all, in batches, and only them (#622)" $?
 drop_collection "$EX"
 rm -rf "$EXFIX"
 
