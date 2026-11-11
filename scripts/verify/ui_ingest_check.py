@@ -176,9 +176,12 @@ def check_split(case):
     case.ran()
     name = case.spec["split"]["file"]
     page = case.obs.get("page") or {}
-    expect(name in (page.get("split") or []), "the page's split list is {}".format(page.get("split")))
+    # Each entry is the API's sentence about one file, starting with its name.
+    expect(any(e.startswith(name + ":") for e in page.get("split") or []),
+           "the page's split list is {}".format(page.get("split")))
     record = (case.obs.get("record") or {}).get("body") or {}
-    expect(name in (record.get("split") or []), "the job record's split is {}".format(record.get("split")))
+    expect(any(e.startswith(name + ":") for e in record.get("split") or []),
+           "the job record's split is {}".format(record.get("split")))
     numbers, _ = parts_of(name, case.documents())
     expect(len(numbers) >= 2 and numbers == list(range(1, len(numbers) + 1)),
            "the parts in Weaviate are {}".format(numbers))

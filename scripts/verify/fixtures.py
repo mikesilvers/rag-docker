@@ -328,18 +328,21 @@ def write_ui_ingest(out: pathlib.Path, fixtures: pathlib.Path) -> None:
     cases.append({"name": "archives and mixes", "kind": "ingest", "collection": UI_PREFIX + "Mixed",
                   "files": ["vfy-ui-mixed.zip", "vfy-ui-records.jsonl.gz"],
                   "documents": {m: UI_PHRASES[m] for m in mixed}, "min_chunks": len(mixed)})
-    # Over 10,000 windows at chunk size 50 with no overlap, so it is split into
-    # parts (#621): the first phrase only in the first paragraph, the last only
-    # in the last.
+    # Over 10,000 pieces at the fixed strategy's chunk size 50, so it is split
+    # into parts (#621), and a minimum chunk size of 6,000 merges the pieces, so
+    # only about a hundred chunks are embedded. A chunk holds at most 6,000
+    # characters, hence the minimum count. The first phrase is only in the first
+    # paragraph, the last only in the last.
     filler = [(" ".join(PARAGRAPHS) * 2)[:999] + "." for _ in range(560)]
     large = "\n\n".join([" ".join([UI_LARGE_FIRST] * 60)] + filler
                          + [" ".join([UI_LARGE_LAST] * 60)]) + "\n"
     (out / "vfy-ui-large.txt").write_text(large)
     cases.append({"name": "large file", "kind": "ingest", "collection": UI_PREFIX + "Large",
-                  "files": ["vfy-ui-large.txt"], "settings": {"chunk_size": 50, "min_chunk_size": 0},
+                  "files": ["vfy-ui-large.txt"],
+                  "settings": {"strategy": "fixed", "chunk_size": 50, "min_chunk_size": 6000},
                   "documents": {}, "split": {"file": "vfy-ui-large.txt", "first": UI_LARGE_FIRST,
                                              "last": UI_LARGE_LAST},
-                  "min_chunks": 10_001})
+                  "min_chunks": -(-len("".join(large.split())) // 6000)})
     # Prepared with the local LLM, then imported (#638). The phrase is in three
     # body lines, so the cleaning can't drop every one.
     notes = UI_PHRASES["vfy-ui-prep-notes.txt"]

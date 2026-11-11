@@ -30,7 +30,7 @@ class Step extends Error {
 async function step(name, fn) {
   try { return await fn(); } catch (e) {
     if (e instanceof Step) throw e;
-    throw new Step(name, e && e.message ? e.message.split('\n')[0] : String(e));
+    throw new Step(name, e && e.message ? e.message.replace(/\s+/g, ' ').slice(0, 300) : String(e));
   }
 }
 
@@ -65,9 +65,23 @@ const observe = (page, scope) => page.evaluate(sel => {
   };
 }, scope);
 
+// waitForFunction for up to `minutes`, in rounds of two minutes: one round is a
+// single DevTools call, which puppeteer ends after 180 s (protocolTimeout).
+async function waitLong(page, minutes, fn, ...args) {
+  const deadline = Date.now() + minutes * MINUTE;
+  for (;;) {
+    const round = Math.min(2 * MINUTE, deadline - Date.now());
+    try {
+      return await page.waitForFunction(fn, { timeout: Math.max(round, 1000), polling: 1000 }, ...args);
+    } catch (e) {
+      if (!(e && e.name === 'TimeoutError') || Date.now() >= deadline) throw e;
+    }
+  }
+}
+
 // The progress panel in `scope` shows job `id` with a status it never leaves.
 async function waitForJob(page, scope, id, minutes) {
-  await step('wait for the job to end', () => page.waitForFunction((sel, jobId, terminal) => {
+  await step('wait for the job to end', () => waitLong(page, minutes, (sel, jobId, terminal) => {
     const root = document.querySelector(sel) || document;
     const text = e => (e.textContent || '').replace(/\s+/g, ' ').trim();
     const idLine = [...root.querySelectorAll('p')].find(p => text(p).startsWith('Job ID:'));
@@ -76,7 +90,7 @@ async function waitForJob(page, scope, id, minutes) {
       .find(d => text(d).startsWith('Files:'));
     const spans = panel ? panel.querySelectorAll(':scope > div:first-child > span') : [];
     return spans.length >= 3 && terminal.includes(text(spans[2]));
-  }, { timeout: minutes * MINUTE, polling: 1000 }, scope, id, TERMINAL));
+  }, scope, id, TERMINAL));
 }
 
 // "+ New" in `scope`, the name typed in the modal, Create; the scope's
@@ -151,18 +165,25 @@ async function ingestCase(page, c, out) {
   await step('open the Import page', () => page.goto(BASE + '/import', { waitUntil: 'networkidle2' }));
   await newCollection(page, 'main', c.collection);
   if (c.settings.chunk_size !== undefined) {
-    await step('set the sliders', async () => {
+    await step('set the strategy and the sliders', async () => {
+      const found = await page.evaluate(v => !![...document.querySelectorAll('main select')]
+        .find(x => [...x.options].some(o => o.value === v)), c.settings.strategy);
+      if (!found) throw new Error('no Chunking Strategy selector');
+      await setValue(page, `() => [...document.querySelectorAll('main select')].find(x => [...x.options].some(o => o.value === ${JSON.stringify(c.settings.strategy)}))`, c.settings.strategy);
+      await sleep(300);
       if (!await slider(page, 'Chunk Size', c.settings.chunk_size)) throw new Error('no Chunk Size slider');
       if (!await slider(page, 'Min Chunk Size', c.settings.min_chunk_size)) throw new Error('no Min Chunk Size slider');
       await sleep(300);
     });
     out.sliders = await sliderLabels(page);
+    out.strategy = await page.evaluate(v => [...document.querySelectorAll('main select')]
+      .find(x => [...x.options].some(o => o.value === v))?.value, c.settings.strategy);
   }
   await chooseFiles(page, 'file-input', c.files);
   out.upload = await send(page, 'Start Ingest', '/api/ingest/upload');
   const id = out.upload.status === 202 && out.upload.body ? out.upload.body.job_id : null;
   if (id) {
-    await waitForJob(page, 'main', id, c.settings.chunk_size !== undefined ? 30 : 10);
+    await waitForJob(page, 'main', id, c.settings.chunk_size !== undefined ? 20 : 10);
   } else {
     await step('wait for the message', () => page.waitForFunction(
       () => [...document.querySelectorAll('p.text-red-600, [role=alert]')].some(e => e.textContent.trim()),
@@ -196,12 +217,12 @@ async function prepareCase(page, c, out) {
   out.prepare_start = await send(page, 'Prepare selected', '/api/prepare/jobs');
   const prepareId = out.prepare_start.body ? out.prepare_start.body.job_id : null;
   if (out.prepare_start.status !== 202 || !prepareId) throw new Step('prepare', `the start answered ${out.prepare_start.status}`);
-  await step('wait for the preparation to end', () => page.waitForFunction((jobId, terminal) => {
+  await step('wait for the preparation to end', () => waitLong(page, 20, (jobId, terminal) => {
     const s = document.querySelector('section[aria-label="Preparation progress"]');
     if (!s || !s.textContent.includes(jobId)) return false;
     const status = s.querySelector(':scope > div:first-child > span.text-blue-600');
     return !!status && terminal.includes(status.textContent.trim());
-  }, { timeout: 20 * MINUTE, polling: 2000 }, prepareId, TERMINAL));
+  }, prepareId, TERMINAL));
   await sleep(1000);      // the list is read again when the job ends
   out.preparation = await page.evaluate((jobId, names) => {
     const text = e => (e.textContent || '').replace(/\s+/g, ' ').trim();
@@ -253,12 +274,13 @@ async function prepareCase(page, c, out) {
         await (c.kind === 'prepare' ? prepareCase : ingestCase)(s.page, c, out);
       } catch (e) {
         out.failed_step = e instanceof Step ? e.step : 'unexpected';
-        out.error = e && e.message ? e.message.split('\n')[0] : String(e);
+        out.error = e && e.message ? e.message.replace(/\s+/g, ' ').slice(0, 300) : String(e);
         try { out.page = out.page || await observe(s.page, 'main'); } catch { /* the page is gone */ }
       }
       out.seconds = Math.round((Date.now() - started) / 1000);
-      console.log(`    case ${c.name}: ${out.failed_step ? 'stopped at ' + out.failed_step + ': ' + out.error
-        : (out.page && out.page.status) || (out.upload && out.upload.status)} (${out.seconds} s)`);
+      const ended = out.upload && out.upload.status !== 202 ? `upload answered ${out.upload.status}`
+        : 'job ' + (out.page && out.page.status);
+      console.log(`    case ${c.name}: ${out.failed_step ? 'stopped at ' + out.failed_step + ': ' + out.error : ended} (${out.seconds} s)`);
     }
     await s.page.goto(BASE + '/collections', { waitUntil: 'networkidle2' });
     await sleep(500);
@@ -266,7 +288,7 @@ async function prepareCase(page, c, out) {
       .map(r => [r.cells[0].textContent.trim(), Number(r.cells[1].textContent.trim())])));
     await s.ctx.close();
   } catch (e) {
-    console.log(`    the run could not go on: ${e && e.message ? e.message.split('\n')[0] : e}`);
+    console.log(`    the run could not go on: ${e && e.message ? e.message.replace(/\s+/g, ' ').slice(0, 300) : e}`);
     exit = 1;
   }
   await browser.close();
