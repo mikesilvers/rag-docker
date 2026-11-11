@@ -8415,12 +8415,14 @@ SPECIFICATIONS.md §3.1.11.
   progress and the ones not reached go back to their earlier state.
 - **Import.** The selected documents' parts go to one ordinary ingest job,
   copied from the area into its staging and stored under their part names. The
-  documents are busy only while the import is admitted.
+  documents are busy only while the import is admitted. One import's parts may
+  hold at most MAX_IMPORT_BYTES in all, one upload's limit (#640).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import shutil
 import tempfile
 import uuid
@@ -8459,6 +8461,27 @@ class DuplicateNames(store.AreaError):
 
 class NoSupportedFiles(store.AreaError):
     status, code = 400, "NO_SUPPORTED_FILES"
+
+
+class ImportTooLarge(store.AreaError):
+    status, code = 409, "IMPORT_TOO_LARGE"
+
+
+# The most one import's parts may hold in all (#640): the request limit of one
+# upload (`client_max_body_size 512m`, proxy/locations.conf), so an import
+# stages no more than an ingest upload can. Without it, "Import all" could copy
+# the whole area, up to MAX_PREPARATION_BYTES, into one ingest staging.
+MAX_IMPORT_BYTES = 512 * 1024 * 1024
+
+
+def _import_too_large(total: int) -> ImportTooLarge:
+    # Rounded up, so a selection just over the limit never reads 512.0 MB.
+    megabytes = math.ceil(total * 10 / (1024 * 1024)) / 10
+    return ImportTooLarge(
+        f"The selected documents' prepared parts total {megabytes:,.1f} MB; one import can be "
+        f"at most {MAX_IMPORT_BYTES // (1024 * 1024)} MB, the same as one upload. Import them "
+        f"in smaller selections.",
+        detail={"selected_bytes": total, "limit_bytes": MAX_IMPORT_BYTES})
 
 
 def get_job(job_id: str) -> dict | None:
@@ -8731,6 +8754,9 @@ async def import_documents(body: Any, owner: dict | None) -> dict:
                 f"Two selected documents have parts with the same name: "
                 f"{', '.join(duplicates[:10])}. Import them separately.",
                 detail={"names": duplicates})
+        total = sum(part.get("bytes") or 0 for r in records for part in r.get("parts") or [])
+        if total > MAX_IMPORT_BYTES:
+            raise _import_too_large(total)
         return records, names
 
     records, names = await asyncio.to_thread(select)
@@ -32566,7 +32592,52 @@ class RouteTests(JobCase):
         self.prepared([("a.txt", b"One.\n"), ("a.md", b"Two.\n")])
         with patch.object(jobs.wc, "collection_exists", AsyncMock(return_value=True)):
             answer = self.client.post("/prepare/import", json={"collection": "Docs", "all": True})
-        self.assertEqual(answer.json()["error"]["code"], "DUPLICATE_NAMES")
+            self.assertEqual(answer.json()["error"]["code"], "DUPLICATE_NAMES")
+            # The size is checked after the names (#640).
+            with patch.object(jobs, "MAX_IMPORT_BYTES", 0):
+                answer = self.client.post("/prepare/import", json={"collection": "Docs", "all": True})
+            self.assertEqual(answer.json()["error"]["code"], "DUPLICATE_NAMES")
+
+    def test_an_import_over_the_cap_is_refused_before_anything_is_staged(self):
+        # #640: one import's parts hold at most one upload's 512 MB, checked with
+        # the selection, before the collection, and nothing is staged.
+        docs = self.prepared([("one.txt", b"One.\n"), ("two.csv", b"a,b\n1,2\n")])
+        ids = [d["id"] for d in docs]
+        total = sum(part["bytes"] for i in ids for part in store.get(i)["parts"])
+        exists = AsyncMock(return_value=True)
+        start = AsyncMock(return_value="ing00009")
+        busy = []
+        real_mark = store.mark_busy
+        with patch.object(jobs.wc, "collection_exists", exists), \
+                patch.object(jobs.ingest_pipeline, "start_ingest_job", start), \
+                patch.object(jobs.store, "mark_busy", lambda *a: busy.append(a) or real_mark(*a)), \
+                patch.object(jobs, "MAX_IMPORT_BYTES", total - 1):
+            for body in ({"all": True}, {"document_ids": ids}):
+                with self.subTest(body=body):
+                    answer = self.client.post("/prepare/import", json={"collection": "Docs", **body})
+                    self.assertEqual(answer.status_code, 409, answer.text)
+                    error = answer.json()["error"]
+                    self.assertEqual(error["code"], "IMPORT_TOO_LARGE")
+                    self.assertEqual(error["detail"], {"selected_bytes": total, "limit_bytes": total - 1})
+                    self.assertIn("Import them in smaller selections.", error["message"])
+            exists.assert_not_called()
+            start.assert_not_called()
+            self.assertEqual(busy, [])
+            for i in ids:
+                self.assertEqual(store.get(i)["imports"], [])
+                self.assertFalse(store.is_busy(i))
+            with patch.object(jobs, "MAX_IMPORT_BYTES", total):
+                answer = self.client.post("/prepare/import", json={"collection": "Docs", "all": True})
+            self.assertEqual(answer.status_code, 202, answer.text)
+            start.assert_called_once()
+
+    def test_the_import_cap_is_512_mb_and_its_message(self):
+        self.assertEqual(jobs.MAX_IMPORT_BYTES, 536_870_912)
+        self.assertEqual(
+            jobs._import_too_large(536_870_913).message,
+            "The selected documents' prepared parts total 512.1 MB; one import can be at most "
+            "512 MB, the same as one upload. Import them in smaller selections.")
+        self.assertIn("total 20,480.0 MB;", jobs._import_too_large(20 * 1024 ** 3).message)
 
     def test_prepared_download_is_one_file_or_a_zip_of_parts(self):
         [single] = self.prepared([("s.csv", b"a\n1\n")])

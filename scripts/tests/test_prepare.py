@@ -967,7 +967,52 @@ class RouteTests(JobCase):
         self.prepared([("a.txt", b"One.\n"), ("a.md", b"Two.\n")])
         with patch.object(jobs.wc, "collection_exists", AsyncMock(return_value=True)):
             answer = self.client.post("/prepare/import", json={"collection": "Docs", "all": True})
-        self.assertEqual(answer.json()["error"]["code"], "DUPLICATE_NAMES")
+            self.assertEqual(answer.json()["error"]["code"], "DUPLICATE_NAMES")
+            # The size is checked after the names (#640).
+            with patch.object(jobs, "MAX_IMPORT_BYTES", 0):
+                answer = self.client.post("/prepare/import", json={"collection": "Docs", "all": True})
+            self.assertEqual(answer.json()["error"]["code"], "DUPLICATE_NAMES")
+
+    def test_an_import_over_the_cap_is_refused_before_anything_is_staged(self):
+        # #640: one import's parts hold at most one upload's 512 MB, checked with
+        # the selection, before the collection, and nothing is staged.
+        docs = self.prepared([("one.txt", b"One.\n"), ("two.csv", b"a,b\n1,2\n")])
+        ids = [d["id"] for d in docs]
+        total = sum(part["bytes"] for i in ids for part in store.get(i)["parts"])
+        exists = AsyncMock(return_value=True)
+        start = AsyncMock(return_value="ing00009")
+        busy = []
+        real_mark = store.mark_busy
+        with patch.object(jobs.wc, "collection_exists", exists), \
+                patch.object(jobs.ingest_pipeline, "start_ingest_job", start), \
+                patch.object(jobs.store, "mark_busy", lambda *a: busy.append(a) or real_mark(*a)), \
+                patch.object(jobs, "MAX_IMPORT_BYTES", total - 1):
+            for body in ({"all": True}, {"document_ids": ids}):
+                with self.subTest(body=body):
+                    answer = self.client.post("/prepare/import", json={"collection": "Docs", **body})
+                    self.assertEqual(answer.status_code, 409, answer.text)
+                    error = answer.json()["error"]
+                    self.assertEqual(error["code"], "IMPORT_TOO_LARGE")
+                    self.assertEqual(error["detail"], {"selected_bytes": total, "limit_bytes": total - 1})
+                    self.assertIn("Import them in smaller selections.", error["message"])
+            exists.assert_not_called()
+            start.assert_not_called()
+            self.assertEqual(busy, [])
+            for i in ids:
+                self.assertEqual(store.get(i)["imports"], [])
+                self.assertFalse(store.is_busy(i))
+            with patch.object(jobs, "MAX_IMPORT_BYTES", total):
+                answer = self.client.post("/prepare/import", json={"collection": "Docs", "all": True})
+            self.assertEqual(answer.status_code, 202, answer.text)
+            start.assert_called_once()
+
+    def test_the_import_cap_is_512_mb_and_its_message(self):
+        self.assertEqual(jobs.MAX_IMPORT_BYTES, 536_870_912)
+        self.assertEqual(
+            jobs._import_too_large(536_870_913).message,
+            "The selected documents' prepared parts total 512.1 MB; one import can be at most "
+            "512 MB, the same as one upload. Import them in smaller selections.")
+        self.assertIn("total 20,480.0 MB;", jobs._import_too_large(20 * 1024 ** 3).message)
 
     def test_prepared_download_is_one_file_or_a_zip_of_parts(self):
         [single] = self.prepared([("s.csv", b"a\n1\n")])

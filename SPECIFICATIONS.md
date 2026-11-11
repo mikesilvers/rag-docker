@@ -1899,8 +1899,12 @@ output; a document with earlier output stays `prepared` with it and records the 
 document), and `strategy`, `chunk_size`, `chunk_overlap`, `similarity_threshold`, `min_chunk_size` with
 ingest's defaults and validation (`422 INVALID_PARAMETER`). Checked in order, before anything is staged: the
 body, the selection (`400 NO_DOCUMENTS`, `404 DOCUMENT_NOT_FOUND`, `409 DOCUMENT_BUSY`, `409
-DOCUMENT_NOT_PREPARED`, two parts with one name `409 DUPLICATE_NAMES`), then the collection as ingest checks it
-(`404 COLLECTION_NOT_FOUND`, `409 COLLECTION_DELETING`, `503 SERVICE_UNAVAILABLE`). Accepted: one ordinary
+DOCUMENT_NOT_PREPARED`, two parts with one name `409 DUPLICATE_NAMES`, parts over 512 MB in all `409
+IMPORT_TOO_LARGE`), then the collection as ingest checks it (`404 COLLECTION_NOT_FOUND`, `409
+COLLECTION_DELETING`, `503 SERVICE_UNAVAILABLE`). One import's parts may hold at most 512 MB (536,870,912 bytes)
+in all, one upload's request limit (§3.1.3), for a selection and for `all` alike; over it nothing is staged and
+the message gives the selected size and the limit and asks for smaller selections (`detail`: `selected_bytes`,
+`limit_bytes`; #640). Accepted: one ordinary
 ingest job with every part, copied from the area into its staging and stored under the part's name, folders
 included; the answer and the job are `POST /ingest/upload`'s (§3.1.3, §5.1.1). The documents are busy only
 while the import is admitted; each records the import. Nothing is deleted.
@@ -1932,6 +1936,7 @@ Standard error codes:
 | `COLLECTION_DELETING` | 409 | A new ingest, export, tune or generation job refused while a delete of its collection is in progress (an import job fails with it) |
 | `EXPORT_STARTING` | 409 | An export of the collection is still storing its first record after 30 s; no `job_id`; retry shortly |
 | `INVALID_FILE_TYPE` | 422 | Uploaded file type not supported |
+| `IMPORT_TOO_LARGE` | 409 | A preparation import (§3.1.11) whose selected parts total more than 512 MB, one upload's limit; nothing is staged; import in smaller selections |
 | `JOB_NOT_FOUND` | 404 | Ingest job ID not found |
 | `SERVICE_UNAVAILABLE` | 503 | Weaviate or Ollama unreachable |
 | `NOT_FOUND` | 404 | No API route matches the path |
@@ -4276,7 +4281,9 @@ and checks the verify project through `prepare_stack.py` (P1-P11).
       never cut, names and the checks of a written part; JSON to JSON Lines with numbers as written; the storage
       limit refusing an upload, a job start and a part; replacing output, a failed re-run keeping the earlier
       output, cancel and restart; one job at a time; busy documents; the routes' roles and audit actions; and
-      the prepared download of several parts as a ZIP (U1-U13); CSV and JSON parts labelled from their data:
+      the prepared download of several parts as a ZIP (U1-U13); an import whose parts total more than 512 MB
+      refused `IMPORT_TOO_LARGE` before the collection check and before anything is staged, for a selection and
+      for all (#640); CSV and JSON parts labelled from their data:
       titles for one and several parts and the 150-character cut, `1 record.` and a part with no records,
       fields, more than 20 fields, keys of every
       kind and their fallbacks by document position, the 40-character cut, the 80-word limit, and no LLM call

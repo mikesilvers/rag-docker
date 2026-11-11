@@ -13,12 +13,14 @@ SPECIFICATIONS.md §3.1.11.
   progress and the ones not reached go back to their earlier state.
 - **Import.** The selected documents' parts go to one ordinary ingest job,
   copied from the area into its staging and stored under their part names. The
-  documents are busy only while the import is admitted.
+  documents are busy only while the import is admitted. One import's parts may
+  hold at most MAX_IMPORT_BYTES in all, one upload's limit (#640).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import shutil
 import tempfile
 import uuid
@@ -57,6 +59,27 @@ class DuplicateNames(store.AreaError):
 
 class NoSupportedFiles(store.AreaError):
     status, code = 400, "NO_SUPPORTED_FILES"
+
+
+class ImportTooLarge(store.AreaError):
+    status, code = 409, "IMPORT_TOO_LARGE"
+
+
+# The most one import's parts may hold in all (#640): the request limit of one
+# upload (`client_max_body_size 512m`, proxy/locations.conf), so an import
+# stages no more than an ingest upload can. Without it, "Import all" could copy
+# the whole area, up to MAX_PREPARATION_BYTES, into one ingest staging.
+MAX_IMPORT_BYTES = 512 * 1024 * 1024
+
+
+def _import_too_large(total: int) -> ImportTooLarge:
+    # Rounded up, so a selection just over the limit never reads 512.0 MB.
+    megabytes = math.ceil(total * 10 / (1024 * 1024)) / 10
+    return ImportTooLarge(
+        f"The selected documents' prepared parts total {megabytes:,.1f} MB; one import can be "
+        f"at most {MAX_IMPORT_BYTES // (1024 * 1024)} MB, the same as one upload. Import them "
+        f"in smaller selections.",
+        detail={"selected_bytes": total, "limit_bytes": MAX_IMPORT_BYTES})
 
 
 def get_job(job_id: str) -> dict | None:
@@ -329,6 +352,9 @@ async def import_documents(body: Any, owner: dict | None) -> dict:
                 f"Two selected documents have parts with the same name: "
                 f"{', '.join(duplicates[:10])}. Import them separately.",
                 detail={"names": duplicates})
+        total = sum(part.get("bytes") or 0 for r in records for part in r.get("parts") or [])
+        if total > MAX_IMPORT_BYTES:
+            raise _import_too_large(total)
         return records, names
 
     records, names = await asyncio.to_thread(select)
