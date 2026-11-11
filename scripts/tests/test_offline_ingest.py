@@ -17,7 +17,12 @@ Besides .txt and .md, one file of each other supported type (.pdf, .docx, .csv,
 .json, from scripts/verify/fixtures.py) is ingested the same way. On the image
 before #695 the .txt, .md, .pdf and .docx jobs fail with "Failed to download
 spaCy model".
+
+Document preparation (#638) checks each prepared .txt or .md part with the same
+parser, so a .txt and a .md are also prepared here, with a stub LLM, their
+parts written and checked by the real Markdown parser (#640).
 """
+import asyncio
 import importlib.metadata
 import os
 import shutil
@@ -63,7 +68,8 @@ socket.socket.connect_ex = _guarded_connect_ex
 
 sys.path.insert(0, os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api"))
 
-from services import goldstandard, ingest_pipeline  # noqa: E402
+from config import settings  # noqa: E402
+from services import goldstandard, ingest_pipeline, preparation  # noqa: E402
 from services import weaviate_client as wc  # noqa: E402
 
 # The text 16_api_paths.sh ingests in suite 01: twelve paragraphs, more than
@@ -154,6 +160,38 @@ class OfflineIngestTests(unittest.TestCase):
                 self.assertEqual(job["status"], "completed", job["errors"])
                 self.assertEqual(job["errors"], [])
                 self.assertGreater(len(stored), 0)
+        self.assertNoNetwork()
+
+    def test_text_and_markdown_are_prepared_offline(self):
+        # #640: a prepared part is checked with ingest's parser (preparation.
+        # check_part -> ingest_pipeline._parse_file -> partition_md), the parser
+        # #695 made offline. The LLM is a stub; nothing else is faked.
+        async def chat(system, user):
+            if system.startswith(preparation.CLEAN_SYSTEM):
+                return '{"remove": []}'
+            return '{"title": "Leave policy", "summary": "How leave is approved and recorded."}'
+
+        async def models():
+            return {settings.llm_model}
+
+        for name, text in (("minutes.txt", OVERTIME), ("policy.md", MARKDOWN)):
+            with self.subTest(name=name):
+                folder = Path(tempfile.mkdtemp())
+                self.addCleanup(shutil.rmtree, folder, True)
+                raw = folder / name
+                raw.write_text(text, encoding="utf-8")
+
+                async def write_part(index, suffix, data, folder=folder):
+                    path = folder / "{:03d}{}".format(index + 1, suffix)
+                    path.write_bytes(data)
+                    return path
+                result = asyncio.run(preparation.prepare_document(
+                    raw, name, Path(name).suffix, chat, models, lambda: False, write_part))
+                self.assertEqual(len(result.parts), 1)
+                [part] = result.parts
+                self.assertEqual(part["title"], "Leave policy")
+                self.assertGreater(part["characters"], len(text) // 2)
+                self.assertEqual(part["fallbacks"], [])
         self.assertNoNetwork()
 
 

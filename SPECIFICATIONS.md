@@ -1808,7 +1808,10 @@ Accepted: `.pdf .docx .txt .md .csv .json .jsonl .jsonl.gz` and `.zip` (with `.j
 and validated exactly as `POST /ingest/upload` (§3.1.3: the 512 MB request limit, every ZIP limit and code,
 `NO_SUPPORTED_FILES`, `UPLOAD_WRITE_FAILED`; skipped files listed with ingest's reason). Each supported file or
 ZIP member becomes one document, status `raw`, named by its file name or its path in the archive; the ZIP
-itself isn't kept. Two documents may share a name. A refused upload keeps nothing; anything unexpected is
+itself isn't kept. Two inputs of one upload with the same name (two files, two ZIP members, or a file and a
+member), which ingest would replace, refuse it with `409 DUPLICATE_NAMES`, naming each such name and its inputs
+(`<zip>:<member>` for a member), at most 10 names then `and N more` (`detail.names`: every one); documents from
+separate uploads may share a name (#640). A refused upload keeps nothing; anything unexpected is
 `500 PREPARE_FAILED`.
 
 **Documents.** `GET /prepare/documents`: `{"documents", "used_bytes", "limit_bytes"}`, newest first. `GET
@@ -1899,8 +1902,12 @@ output; a document with earlier output stays `prepared` with it and records the 
 document), and `strategy`, `chunk_size`, `chunk_overlap`, `similarity_threshold`, `min_chunk_size` with
 ingest's defaults and validation (`422 INVALID_PARAMETER`). Checked in order, before anything is staged: the
 body, the selection (`400 NO_DOCUMENTS`, `404 DOCUMENT_NOT_FOUND`, `409 DOCUMENT_BUSY`, `409
-DOCUMENT_NOT_PREPARED`, two parts with one name `409 DUPLICATE_NAMES`), then the collection as ingest checks it
-(`404 COLLECTION_NOT_FOUND`, `409 COLLECTION_DELETING`, `503 SERVICE_UNAVAILABLE`). Accepted: one ordinary
+DOCUMENT_NOT_PREPARED`, two parts with one name `409 DUPLICATE_NAMES`, parts over 512 MB in all `409
+IMPORT_TOO_LARGE`), then the collection as ingest checks it (`404 COLLECTION_NOT_FOUND`, `409
+COLLECTION_DELETING`, `503 SERVICE_UNAVAILABLE`). One import's parts may hold at most 512 MB (536,870,912 bytes)
+in all, one upload's request limit (§3.1.3), for a selection and for `all` alike; over it nothing is staged and
+the message gives the selected size and the limit and asks for smaller selections (`detail`: `selected_bytes`,
+`limit_bytes`; #640). Accepted: one ordinary
 ingest job with every part, copied from the area into its staging and stored under the part's name, folders
 included; the answer and the job are `POST /ingest/upload`'s (§3.1.3, §5.1.1). The documents are busy only
 while the import is admitted; each records the import. Nothing is deleted.
@@ -1932,6 +1939,8 @@ Standard error codes:
 | `COLLECTION_DELETING` | 409 | A new ingest, export, tune or generation job refused while a delete of its collection is in progress (an import job fails with it) |
 | `EXPORT_STARTING` | 409 | An export of the collection is still storing its first record after 30 s; no `job_id`; retry shortly |
 | `INVALID_FILE_TYPE` | 422 | Uploaded file type not supported |
+| `DUPLICATE_NAMES` | 409 | Document preparation (§3.1.11): two selected documents have parts with one name (import), or two inputs of one upload have one name (upload, #640) |
+| `IMPORT_TOO_LARGE` | 409 | A preparation import (§3.1.11) whose selected parts total more than 512 MB, one upload's limit; nothing is staged; import in smaller selections |
 | `JOB_NOT_FOUND` | 404 | Ingest job ID not found |
 | `SERVICE_UNAVAILABLE` | 503 | Weaviate or Ollama unreachable |
 | `NOT_FOUND` | 404 | No API route matches the path |
@@ -3512,7 +3521,7 @@ now lives once, in `api/services/ingest_config.py`.
 - [x] A first `semantic` ingest makes no huggingface.co request: the api container sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`, and the pre-cached `all-MiniLM-L6-v2` model loads from the image cache with the endpoint unroutable (#618).
       *`scripts/verify/20_offline_model.sh` checks the offline flags are set and honoured (`huggingface_hub.constants.HF_HUB_OFFLINE`), then loads the model with `HF_ENDPOINT` pointed at an unroutable address and requires it within 60 s; it fails on `develop` ("offline flags: None None False") and passes with the offline flags (model loaded in 0.1 s in the review run).*
 - [x] A text ingest makes no network call: the api image carries the spaCy model `en_core_web_sm` 3.8.0 that Unstructured's text partitioning loads, so it is never downloaded at runtime, and `DO_NOT_TRACK=1` stops Unstructured's telemetry. A `.txt` and a `.md` ingest succeed in a container with no network (#695).
-      *`scripts/tests/test_offline_ingest.py`, run by `scripts/verify/20_offline_model.sh` in a fresh container from the api image with `--network none`, runs real ingest jobs (Weaviate, source retention and gold-standard marking faked) of the twelve-paragraph text suite 01 ingests (fixed 150, minimum 40) and of a Markdown file, refusing and recording every name lookup and non-Unix connect from before the API is imported. Both jobs complete, the text with more than five chunks, and nothing is recorded; it also checks `DO_NOT_TRACK` and that the installed model is the version `unstructured` expects. On the image before #695 both jobs fail with "Failed to download spaCy model ... network call blocked by test_offline_ingest: getaddrinfo 'github.com'"; with `DO_NOT_TRACK` emptied, the lookups of `packages.unstructured.io` are recorded and fail it.*
+      *`scripts/tests/test_offline_ingest.py`, run by `scripts/verify/20_offline_model.sh` in a fresh container from the api image with `--network none`, runs real ingest jobs (Weaviate, source retention and gold-standard marking faked) of the twelve-paragraph text suite 01 ingests (fixed 150, minimum 40) and of a Markdown file, refusing and recording every name lookup and non-Unix connect from before the API is imported. Both jobs complete, the text with more than five chunks, and nothing is recorded; it also checks `DO_NOT_TRACK` and that the installed model is the version `unstructured` expects. On the image before #695 both jobs fail with "Failed to download spaCy model ... network call blocked by test_offline_ingest: getaddrinfo 'github.com'"; with `DO_NOT_TRACK` emptied, the lookups of `packages.unstructured.io` are recorded and fail it. It also prepares a `.txt` and a `.md` (#638) with a stub LLM: each gives one part, written and checked by the real `check_part`, which reads a part with ingest's parser (`partition_md`), and nothing is recorded (#640); with `DO_NOT_TRACK` emptied, that case records the `packages.unstructured.io` lookups too.*
 - [x] Single file upload (all six types) completes without error and stores chunks in Weaviate.
       *One file of each type. `.md` failed — `unstructured[pdf,docx,csv]` omitted
       the `md` extra, so Markdown ingestion had never worked. **Fixed**: added the
@@ -4093,8 +4102,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Job records persist under `{UPLOAD_DIR}/jobs/{kind}/`: status changes and terminal records are written at once and atomically, progress at most once a second but never left unwritten, a failed write never fails the job, startup marks jobs left `queued` or `running` as interrupted, unreadable records are kept and logged, and the newest 200 per kind are kept, at startup and while the API runs, never removing an unfinished job (#23, #309). The first record is written off the event loop, and a start cancelled during it leaves no record or guard (#309).
   *Evidence: `test_jobstore.py` (35 cases in the API image, run by `02_ingest.sh`), including a real lifespan run over a stored running job, the four job starts and their cancellation, retention ordered by real writes, an abandoned first write that fails, a second export start waiting for the first one's record (#326), and that wait's error paths and its bound with `EXPORT_STARTING` (#338); with `RAG_ALLOW_RESTART=1`, live restarts of ingest (`partial` and `failed`), export and import jobs.*
 
-- [x] At startup, before the first request, what a killed job left behind is removed (#377): an interrupted ingest's upload staging (`{UPLOAD_DIR}/ingest-*`), and an interrupted export's `.build-*` directory and `.<stem>.tar.gz.partial` archive (`.<stem>.tar.gz.age.partial` for an encrypted export, #27) in `EXPORTS_DIR`. Only those names at the top of each folder, and only a real directory or regular file as the name says, are removed: completed packages, look-alike names and anything in a sub-folder are kept, and a symlink is never followed. What is removed is logged by name and size; a removal that fails is logged and not reported as removed. An export sweep that fails is logged and startup carries on, with the ingest staging still swept (#423).
-  *Evidence: `test_startup_sweep.py` (13 cases in the API image, run by `02_ingest.sh`), including a real lifespan run that removes both kinds and logs them, and one whose export sweep raises: the error is logged, the API still starts and the ingest staging is removed (#423). With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` checks that its two killed ingests' `ingest-*` staging existed before the restart and is gone after it (#423), and `05_transfer.sh` that the killed export's build directory and temporary archive are gone after its restart, with the completed package kept.*
+- [x] At startup, before the first request, what a killed job left behind is removed (#377): an interrupted ingest's upload staging (`{UPLOAD_DIR}/ingest-*`), document preparation's temporary files (`{UPLOAD_DIR}/prepare-*.zip` and `prepare-*.json`, regular files only; #640), and an interrupted export's `.build-*` directory and `.<stem>.tar.gz.partial` archive (`.<stem>.tar.gz.age.partial` for an encrypted export, #27) in `EXPORTS_DIR`. Only those names at the top of each folder, and only a real directory or regular file as the name says, are removed: completed packages, look-alike names and anything in a sub-folder are kept, and a symlink is never followed. What is removed is logged by name and size; a removal that fails is logged and not reported as removed. An export sweep that fails is logged and startup carries on, with the ingest staging still swept (#423).
+  *Evidence: `test_startup_sweep.py` (15 cases in the API image, run by `02_ingest.sh`), including preparation's `prepare-*.zip` and `prepare-*.json` files removed while other suffixes, links and sub-folders are kept (#640), a real lifespan run that removes both kinds and logs them, and one whose export sweep raises: the error is logged, the API still starts and the ingest staging is removed (#423). With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` checks that its two killed ingests' `ingest-*` staging existed before the restart and is gone after it (#423), and `05_transfer.sh` that the killed export's build directory and temporary archive are gone after its restart, with the completed package kept.*
 
 
 - [x] Weaviate cold startup has a 180-second healthcheck start period; restart limits reject invalid or overlong values before arithmetic.
@@ -4265,7 +4274,8 @@ and checks the verify project through `prepare_stack.py` (P1-P11).
       settings (422) (P6); cancelling an unknown job is 404 (P7).
 - [x] Uploads, downloads and deletes are audited with names and no document text (P8).
 - [x] With the LLM (full runs): a `.txt` becomes `.md` whose lines are source lines in order, with the title
-      header when there is a title; the `.csv` and `.jsonl` come back unchanged and code-only, with the title and
+      header when there is a title, and every cleaning window without a fallback lost at most 20 % of its
+      characters, measured on the windows rebuilt from the source (#640); the `.csv` and `.jsonl` come back unchanged and code-only, with the title and
       summary from their data and `summary_error` null (P9); an import into
       an unknown collection is 404 and one into a new collection completes and is recorded on each document
       (P10); the prepared download is the part, and deleting the prepared output returns the document to `raw`
@@ -4276,7 +4286,10 @@ and checks the verify project through `prepare_stack.py` (P1-P11).
       never cut, names and the checks of a written part; JSON to JSON Lines with numbers as written; the storage
       limit refusing an upload, a job start and a part; replacing output, a failed re-run keeping the earlier
       output, cancel and restart; one job at a time; busy documents; the routes' roles and audit actions; and
-      the prepared download of several parts as a ZIP (U1-U13); CSV and JSON parts labelled from their data:
+      the prepared download of several parts as a ZIP (U1-U13); an import whose parts total more than 512 MB
+      refused `IMPORT_TOO_LARGE` before the collection check and before anything is staged, for a selection and
+      for all; two inputs of one upload with one name refused `DUPLICATE_NAMES` with nothing kept, while ingest
+      still keeps the last (#640); CSV and JSON parts labelled from their data:
       titles for one and several parts and the 150-character cut, `1 record.` and a part with no records,
       fields, more than 20 fields, keys of every
       kind and their fallbacks by document position, the 40-character cut, the 80-word limit, and no LLM call

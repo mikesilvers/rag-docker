@@ -10,6 +10,7 @@ The LLM is a stub; nothing reaches Ollama or Weaviate. The preparation area and
 the upload folder are temporary. Routes go through `main.app` with real sessions
 in a temporary account store (`auth.testing`), without the lifespan.
 """
+import ast
 import asyncio
 import gzip
 import io
@@ -475,7 +476,7 @@ class RecordLabelTests(AreaCase):
 
 class NormaliseTests(unittest.TestCase):
     def test_bom_line_endings_nfc_and_control_characters(self):
-        raw = "﻿a\r\nb\rc\x00d\x07e\tf\x7fg\x0cÉ"
+        raw = "\ufeffa\r\nb\rc\x00d\x07e\tf\x7fg\x0cÉ"
         self.assertEqual(preparation.normalise_text(raw), "a\nb\ncde\tfgÉ")
 
 
@@ -825,7 +826,7 @@ class JobTests(JobCase):
             with self.assertRaises(store.DocumentBusy):
                 store.delete(a["id"])
             with self.assertRaises(store.DocumentBusy):
-                await jobs.import_documents(SimpleNamespace(document_ids=[a["id"]]), OWNER)
+                await jobs.import_documents(SimpleNamespace(document_ids=[a["id"]]))
             gate.set()
             await self.finish(first["job_id"])
             await self.finish(second["job_id"])
@@ -909,6 +910,54 @@ class RouteTests(JobCase):
         self.assertEqual(self.client.get("/prepare/documents").json()["documents"], [])
         self.assertEqual(list((self.root / "uploads").glob("prepare-*")), [])
 
+    def test_duplicate_names_in_one_upload_are_refused_and_nothing_is_kept(self):
+        # #640: ingest keeps the last input of a name; a preparation upload is
+        # refused instead, naming the name and every input that has it.
+        many = [(f"n{i}.txt", b"x") for i in range(11)]
+        cases = [
+            ("two files", [("a.txt", b"One.\n"), ("a.txt", b"Two.\n")], "'a.txt' (a.txt, a.txt)"),
+            ("a file and a member", [("a.txt", b"One.\n"), ("b.zip", self.zip_bytes({"a.txt": "Two."}))],
+             "'a.txt' (a.txt, b.zip:a.txt)"),
+            ("three inputs", [("a.txt", b"One.\n"), ("b.zip", self.zip_bytes({"a.txt": "Two."})),
+                              ("c.zip", self.zip_bytes({"a.txt": "Three.", "d/e.md": "Own."}))],
+             "'a.txt' (a.txt, b.zip:a.txt, c.zip:a.txt)"),
+            ("eleven names", many + many, "'n9.txt' (n9.txt, n9.txt) and 1 more"),
+        ]
+        for label, files, listed in cases:
+            with self.subTest(label):
+                answer = self.upload(files)
+                self.assertEqual(answer.status_code, 409, answer.text)
+                error = answer.json()["error"]
+                self.assertEqual(error["code"], "DUPLICATE_NAMES")
+                self.assertTrue(error["message"].startswith("Files in this upload share a name: '"),
+                                error["message"])
+                self.assertTrue(error["message"].endswith(
+                    f"{listed}. Rename them, or upload them separately; nothing was uploaded."),
+                    error["message"])
+                self.assertEqual(self.client.get("/prepare/documents").json()["documents"], [])
+                self.assertEqual(list((self.root / "uploads").glob("prepare-*")), [])
+        self.assertEqual(error["detail"], {"names": [f"n{i}.txt" for i in range(11)]})
+        self.assertNotIn("n10.txt", error["message"])
+        with self.subTest("checked before the space"):
+            with patch.object(settings, "max_preparation_bytes", 1024 * 1024):
+                answer = self.upload([("a.txt", b"x" * (1024 * 1024 + 1))] * 2)
+            self.assertEqual(answer.json()["error"]["code"], "DUPLICATE_NAMES")
+            self.assertEqual(self.client.get("/prepare/documents").json()["documents"], [])
+        with self.subTest("separate uploads may share a name"):
+            for data in (b"One.\n", b"Two.\n"):
+                self.assertEqual(self.upload([("a.txt", data)]).status_code, 201)
+            names = [d["name"] for d in self.client.get("/prepare/documents").json()["documents"]]
+            self.assertEqual(names, ["a.txt", "a.txt"])
+
+    def test_ingest_still_replaces_an_earlier_input_of_the_same_name(self):
+        # #640 changes preparation only: ingest's staging keeps the last input.
+        tmp = Path(tempfile.mkdtemp(dir=self.root))
+        files = [SimpleNamespace(filename="a.txt", file=io.BytesIO(data)) for data in (b"One.\n", b"Two.\n")]
+        queue, skipped = asyncio.run(ingest_pipeline.stage_uploads(files, tmp))
+        [(path, label)] = queue.entries.values()
+        self.assertEqual(path.read_bytes(), b"Two.\n")
+        self.assertEqual(skipped, ["a.txt (replaced by a.txt later in this upload, same name 'a.txt')"])
+
     def test_job_routes_refusals(self):
         self.assertEqual(self.client.post("/prepare/jobs", json={}).status_code, 422)
         self.assertEqual(self.client.post("/prepare/jobs", json={"document_ids": []}).json()["error"]["code"],
@@ -967,7 +1016,52 @@ class RouteTests(JobCase):
         self.prepared([("a.txt", b"One.\n"), ("a.md", b"Two.\n")])
         with patch.object(jobs.wc, "collection_exists", AsyncMock(return_value=True)):
             answer = self.client.post("/prepare/import", json={"collection": "Docs", "all": True})
-        self.assertEqual(answer.json()["error"]["code"], "DUPLICATE_NAMES")
+            self.assertEqual(answer.json()["error"]["code"], "DUPLICATE_NAMES")
+            # The size is checked after the names (#640).
+            with patch.object(jobs, "MAX_IMPORT_BYTES", 0):
+                answer = self.client.post("/prepare/import", json={"collection": "Docs", "all": True})
+            self.assertEqual(answer.json()["error"]["code"], "DUPLICATE_NAMES")
+
+    def test_an_import_over_the_cap_is_refused_before_anything_is_staged(self):
+        # #640: one import's parts hold at most one upload's 512 MB, checked with
+        # the selection, before the collection, and nothing is staged.
+        docs = self.prepared([("one.txt", b"One.\n"), ("two.csv", b"a,b\n1,2\n")])
+        ids = [d["id"] for d in docs]
+        total = sum(part["bytes"] for i in ids for part in store.get(i)["parts"])
+        exists = AsyncMock(return_value=True)
+        start = AsyncMock(return_value="ing00009")
+        busy = []
+        real_mark = store.mark_busy
+        with patch.object(jobs.wc, "collection_exists", exists), \
+                patch.object(jobs.ingest_pipeline, "start_ingest_job", start), \
+                patch.object(jobs.store, "mark_busy", lambda *a: busy.append(a) or real_mark(*a)), \
+                patch.object(jobs, "MAX_IMPORT_BYTES", total - 1):
+            for body in ({"all": True}, {"document_ids": ids}):
+                with self.subTest(body=body):
+                    answer = self.client.post("/prepare/import", json={"collection": "Docs", **body})
+                    self.assertEqual(answer.status_code, 409, answer.text)
+                    error = answer.json()["error"]
+                    self.assertEqual(error["code"], "IMPORT_TOO_LARGE")
+                    self.assertEqual(error["detail"], {"selected_bytes": total, "limit_bytes": total - 1})
+                    self.assertIn("Import them in smaller selections.", error["message"])
+            exists.assert_not_called()
+            start.assert_not_called()
+            self.assertEqual(busy, [])
+            for i in ids:
+                self.assertEqual(store.get(i)["imports"], [])
+                self.assertFalse(store.is_busy(i))
+            with patch.object(jobs, "MAX_IMPORT_BYTES", total):
+                answer = self.client.post("/prepare/import", json={"collection": "Docs", "all": True})
+            self.assertEqual(answer.status_code, 202, answer.text)
+            start.assert_called_once()
+
+    def test_the_import_cap_is_512_mb_and_its_message(self):
+        self.assertEqual(jobs.MAX_IMPORT_BYTES, 536_870_912)
+        self.assertEqual(
+            jobs._import_too_large(536_870_913).message,
+            "The selected documents' prepared parts total 512.1 MB; one import can be at most "
+            "512 MB, the same as one upload. Import them in smaller selections.")
+        self.assertIn("total 20,480.0 MB;", jobs._import_too_large(20 * 1024 ** 3).message)
 
     def test_prepared_download_is_one_file_or_a_zip_of_parts(self):
         [single] = self.prepared([("s.csv", b"a\n1\n")])
@@ -1021,6 +1115,18 @@ class WiringTests(unittest.TestCase):
         for action in ("prepare.upload", "prepare.start", "prepare.cancel", "prepare.import",
                        "prepare.download", "prepare.delete"):
             self.assertIn(f"'{action}'", page)
+
+    def test_p9_uses_preparations_window_rule(self):
+        # prepare_stack.py runs on the host with the standard library, so it keeps
+        # its own copy of the window size and the 20 % rule for P9 (#640); it
+        # imports the verify harness, so it is read here, not imported.
+        tree = ast.parse((ROOT / "scripts/verify/prepare_stack.py").read_text())
+        found = {target.id: ast.literal_eval(node.value) for node in tree.body
+                 if isinstance(node, ast.Assign) for target in node.targets
+                 if isinstance(target, ast.Name)
+                 and target.id in ("WINDOW_CHARACTERS", "MAX_REMOVED_SHARE")}
+        self.assertEqual(found, {"WINDOW_CHARACTERS": preparation.WINDOW_CHARACTERS,
+                                 "MAX_REMOVED_SHARE": preparation.MAX_REMOVED_SHARE})
 
 
 # ── reviewer's additions (#638 testing review) ──────────────────────────────

@@ -88,7 +88,8 @@ jobs, cancel and restart, busy documents, import, downloads, routes), then check
 `prepare_stack.py` as the harness Developer: the role matrix of every `/prepare` route, an upload with a ZIP,
 ZIP refusals with ingest's codes, the raw download and the space used, deletes, import refusals, an unknown
 job's cancel and the audit records. In a full run (not `RAG_SKIP_SLOW=1`) it prepares three small files with
-the local LLM, one job at a time, checks that the cleaned text holds only source lines in order and that the
+the local LLM, one job at a time, checks that the cleaned text holds only source lines in order, that every
+cleaning window without a fallback lost at most 20 % of its characters (#640), and that the
 CSV and JSON Lines come back unchanged, labelled from their data, imports them into a throwaway `VfyPrepare*` collection and downloads a
 prepared part. Its `vfy-prepare-*` documents and its collections are removed at the end.
 
@@ -655,7 +656,8 @@ operation runs reliably long enough to interrupt, so `test_jobstore.py` covers i
 
 `scripts/tests/test_startup_sweep.py` (#377) checks the startup sweeps of what a killed job
 leaves behind, in disposable folders. In `UPLOAD_DIR`, ingest staging is created as
-`ingest-*` and removed with the `import-*`, `rechunk-*` and `batch-verify-*` work directories;
+`ingest-*` and removed with the `import-*`, `rechunk-*`, `batch-verify-*` and `prepare-*` work
+directories, and document preparation's `prepare-*.zip` and `prepare-*.json` temporary files (#640);
 in `EXPORTS_DIR`, `.build-*` directories and `.*.tar.gz.partial` files are removed. Only those
 names, and only a real directory or regular file as the name says: completed packages,
 `ingest_configs/`, look-alike names, a file where a directory is expected and the reverse, and
@@ -919,7 +921,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
 | `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
-| `../tests/test_offline_ingest.py` | API image, no network: real ingest jobs of every supported type (`.txt`, `.md`, and `.pdf`, `.docx`, `.csv`, `.json` from `fixtures.py`; backends faked) complete with every name lookup and non-Unix connect refused and recorded from before the API is imported, so nothing may dial out; `DO_NOT_TRACK` is set and the bundled spaCy model `en_core_web_sm` is the version `unstructured` expects (#695); registered by `20_offline_model.sh` |
+| `../tests/test_offline_ingest.py` | API image, no network: real ingest jobs of every supported type (`.txt`, `.md`, and `.pdf`, `.docx`, `.csv`, `.json` from `fixtures.py`; backends faked) complete with every name lookup and non-Unix connect refused and recorded from before the API is imported, so nothing may dial out; `DO_NOT_TRACK` is set and the bundled spaCy model `en_core_web_sm` is the version `unstructured` expects (#695); a `.txt` and a `.md` are also prepared with a stub LLM, their parts checked by the real parser (#640); registered by `20_offline_model.sh` |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |

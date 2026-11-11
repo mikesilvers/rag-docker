@@ -44,7 +44,7 @@ if [ "$SKIP_SLOW" = "1" ]; then
   skip "P9-P11 prepare, import and download with the LLM" "RAG_SKIP_SLOW=1"
 else
   stack prepare
-  check "P9 the .txt becomes cleaned Markdown of source lines in order with its header; the .csv and .jsonl are unchanged and labelled from their data" $?
+  check "P9 the .txt becomes cleaned Markdown of source lines in order with its header, every window without a fallback losing at most 20 % of its characters; the .csv and .jsonl are unchanged and labelled from their data" $?
   stack import
   check "P10 an unknown collection is 404; the import into a new collection completes and is recorded" $?
   p10_collection=$(python3 -c 'import prepare_stack as p; print(p.state().get("collection", ""))')

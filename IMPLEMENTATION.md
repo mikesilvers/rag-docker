@@ -6424,12 +6424,15 @@ class _Queue:
     can overwrite another's bytes on disk, and the parser still sees the file's
     own extension. When a later input has the same logical name, the earlier one
     is dropped and reported in `skipped`: the last one wins, never silently.
+    `duplicates` records each name given more than once with its inputs in order,
+    for a caller that refuses them instead (document preparation, #640).
     """
 
     def __init__(self, tmp_dir: Path, skipped: list[str]) -> None:
         self.tmp_dir = tmp_dir
         self.skipped = skipped
         self.entries: dict[str, tuple[Path, str]] = {}
+        self.duplicates: dict[str, list[str]] = {}
         self._slots = 0
 
     def slot(self, basename: str) -> Path:
@@ -6441,6 +6444,7 @@ class _Queue:
     def add(self, path: Path, logical: str, label: str) -> None:
         earlier = self.entries.pop(logical, None)
         if earlier is not None:
+            self.duplicates.setdefault(logical, [earlier[1]]).append(label)
             earlier[0].unlink(missing_ok=True)
             self.skipped.append(
                 f"{earlier[1]} (replaced by {label} later in this upload, same name '{logical}')")
@@ -7546,7 +7550,7 @@ _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 def normalise_text(text: str) -> str:
     """UTF-8 text without a byte-order mark, LF line endings, NFC, and no NUL or
     other C0 control character except tab and newline, nor DEL."""
-    if text.startswith("﻿"):
+    if text.startswith("\ufeff"):
         text = text[1:]
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = unicodedata.normalize("NFC", text)
@@ -7659,9 +7663,11 @@ class _CsvRows:
     Two limits (PR #639 review): a row is refused when, normalised, it is longer
     than `limit`, what a part can hold for it; and reading stops as soon as a
     row's raw text passes twice that, so an unclosed quote or a file with no line
-    break can't grow a row without bound. Normalising only shortens a row (CRLF
-    becomes LF, control characters go, NFC composes), so no row that fits is
-    refused by the raw bound."""
+    break can't grow a row without bound. Normalising usually shortens a row
+    (CRLF becomes LF, control characters go), so the raw bound refuses a row
+    that would fit only when normalising would remove more than half of it,
+    which only a row made mostly of control characters does. NFC can also
+    lengthen a row; the normalised check catches that."""
 
     def __init__(self, stream: Any, dialect: Any, limit: int) -> None:
         self.stream = stream
@@ -8262,7 +8268,7 @@ async def prepare_document(raw: Path, name: str, raw_type: str, chat: Chat,
     return await _prepare_text(raw, raw_type, name, llm, should_stop, write_part, progress)
 
 
-def _no_text(name: str) -> ValueError:
+def _no_text() -> ValueError:
     return ValueError("has no text to prepare")
 
 
@@ -8295,7 +8301,7 @@ async def _prepare_text(raw: Path, raw_type: str, name: str, llm: LLM, should_st
             return iter_parts(raw, raw_type)
     count, total = await asyncio.to_thread(_count_text_windows, source(), should_stop)
     if not count:
-        raise _no_text(name)
+        raise _no_text()
     too_large = total > MAX_WINDOWS
     done = 0
     progress(done, total)
@@ -8388,7 +8394,7 @@ async def _prepare_records(raw: Path, raw_type: str, name: str, kind: str,
         entries.append(entry)
         index += 1
     if not entries:
-        raise _no_text(name)
+        raise _no_text()
     count = len(entries)
     for number, (entry, part_name) in enumerate(zip(entries, part_names(name, kind, count)), 1):
         entry["name"] = part_name
@@ -8406,7 +8412,8 @@ SPECIFICATIONS.md §3.1.11.
 
 - **Upload.** Files are staged and validated exactly as ingest stages them
   (`ingest_pipeline.stage_uploads`: ZIP limits, supported types), then each
-  becomes a `raw` document. The space check is best-effort: made once, before
+  becomes a `raw` document. Two inputs with one name refuse the upload, where
+  ingest keeps the last (#640). The space check is best-effort: made once, before
   the files are written to the area, with nothing reserved.
 - **Jobs.** A job (kind `prepare` in the job store) prepares its documents one
   at a time. One job runs at a time on the instance; later ones wait, oldest
@@ -8415,12 +8422,14 @@ SPECIFICATIONS.md §3.1.11.
   progress and the ones not reached go back to their earlier state.
 - **Import.** The selected documents' parts go to one ordinary ingest job,
   copied from the area into its staging and stored under their part names. The
-  documents are busy only while the import is admitted.
+  documents are busy only while the import is admitted. One import's parts may
+  hold at most MAX_IMPORT_BYTES in all, one upload's limit (#640).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import shutil
 import tempfile
 import uuid
@@ -8461,6 +8470,27 @@ class NoSupportedFiles(store.AreaError):
     status, code = 400, "NO_SUPPORTED_FILES"
 
 
+class ImportTooLarge(store.AreaError):
+    status, code = 409, "IMPORT_TOO_LARGE"
+
+
+# The most one import's parts may hold in all (#640): the request limit of one
+# upload (`client_max_body_size 512m`, proxy/locations.conf), so an import
+# stages no more than an ingest upload can. Without it, "Import all" could copy
+# the whole area, up to MAX_PREPARATION_BYTES, into one ingest staging.
+MAX_IMPORT_BYTES = 512 * 1024 * 1024
+
+
+def _import_too_large(total: int) -> ImportTooLarge:
+    # Rounded up, so a selection just over the limit never reads 512.0 MB.
+    megabytes = math.ceil(total * 10 / (1024 * 1024)) / 10
+    return ImportTooLarge(
+        f"The selected documents' prepared parts total {megabytes:,.1f} MB; one import can be "
+        f"at most {MAX_IMPORT_BYTES // (1024 * 1024)} MB, the same as one upload. Import them "
+        f"in smaller selections.",
+        detail={"selected_bytes": total, "limit_bytes": MAX_IMPORT_BYTES})
+
+
 def get_job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
 
@@ -8471,6 +8501,23 @@ def job_records() -> list[tuple[str, dict, float | None]]:
 
 # ── upload ───────────────────────────────────────────────────────────────────
 
+# How many duplicated names a refused upload's message lists before "and N more".
+_MAX_NAMED_DUPLICATES = 10
+
+
+def _duplicate_upload(duplicates: dict[str, list[str]]) -> DuplicateNames:
+    """Two or more inputs of one upload with the same name (#640): ingest would
+    keep the last and drop the others; preparation keeps none and says which."""
+    names = list(duplicates)
+    listed = "; ".join(f"'{name}' ({', '.join(duplicates[name])})"
+                       for name in names[:_MAX_NAMED_DUPLICATES])
+    if len(names) > _MAX_NAMED_DUPLICATES:
+        listed += f" and {len(names) - _MAX_NAMED_DUPLICATES} more"
+    return DuplicateNames(
+        f"Files in this upload share a name: {listed}. Rename them, or upload them "
+        f"separately; nothing was uploaded.", detail={"names": names})
+
+
 async def upload(files: list[Any], owner: dict | None) -> tuple[list[dict], list[str]]:
     """Stage, validate and store an upload's files as `raw` documents. Nothing
     is kept when any step fails."""
@@ -8478,6 +8525,8 @@ async def upload(files: list[Any], owner: dict | None) -> tuple[list[dict], list
     created: list[dict] = []
     try:
         queue, skipped = await ingest_pipeline.stage_uploads(files, tmp_dir)
+        if queue.duplicates:
+            raise _duplicate_upload(queue.duplicates)
         if not queue.entries:
             detail = "; ".join(skipped)
             raise NoSupportedFiles("No supported files found in upload."
@@ -8703,7 +8752,7 @@ class _Part:
         self.size = None
 
 
-async def import_documents(body: Any, owner: dict | None) -> dict:
+async def import_documents(body: Any) -> dict:
     """Start one ingest job with every part of the selected prepared documents."""
 
     def select() -> tuple[list[dict], list[str]]:
@@ -8731,6 +8780,9 @@ async def import_documents(body: Any, owner: dict | None) -> dict:
                 f"Two selected documents have parts with the same name: "
                 f"{', '.join(duplicates[:10])}. Import them separately.",
                 detail={"names": duplicates})
+        total = sum(part.get("bytes") or 0 for r in records for part in r.get("parts") or [])
+        if total > MAX_IMPORT_BYTES:
+            raise _import_too_large(total)
         return records, names
 
     records, names = await asyncio.to_thread(select)
@@ -12735,6 +12787,10 @@ def _mark_finished(collection: str) -> None:
 # tests, a with-models package would leave 2.3 GB behind each time, and an
 # ingest up to 512 MB of upload plus 2 GiB of extracted ZIP members.
 _WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-", "ingest-", "prepare-")
+# Document preparation also writes two temporary files there (#640): the ZIP of
+# a multi-part prepared download (prepare-*.zip) and a decompressed .json.gz
+# (prepare-*.json). They are removed as regular files, besides as directories.
+_PREPARE_FILE_SUFFIXES = (".zip", ".json")
 
 
 def sweep_stale_workdirs() -> list[str]:
@@ -12746,7 +12802,9 @@ def sweep_stale_workdirs() -> list[str]:
     for entry in sorted(root.iterdir()):
         if not entry.name.startswith(_WORKDIR_PREFIXES):
             continue
-        size = packager.remove_leftover(entry, directory=True)
+        prepare_file = (entry.name.startswith("prepare-")
+                        and entry.name.endswith(_PREPARE_FILE_SUFFIXES))
+        size = packager.remove_leftover(entry, directory=True, regular_file=prepare_file)
         if size is not None:
             removed.append(f"{entry.name} ({size // (1024 * 1024)} MB)")
     return removed
@@ -15326,7 +15384,7 @@ async def import_documents(body: PrepareImportRequest, request: Request = None):
     collection = body.collection
     audit.note(collection=collection)
     try:
-        selected = await jobs.import_documents(body, None)
+        selected = await jobs.import_documents(body)
     except store.AreaError as exc:
         return _error(exc)
     audit.note(names=selected["names"])
@@ -24239,7 +24297,8 @@ jobs, cancel and restart, busy documents, import, downloads, routes), then check
 `prepare_stack.py` as the harness Developer: the role matrix of every `/prepare` route, an upload with a ZIP,
 ZIP refusals with ingest's codes, the raw download and the space used, deletes, import refusals, an unknown
 job's cancel and the audit records. In a full run (not `RAG_SKIP_SLOW=1`) it prepares three small files with
-the local LLM, one job at a time, checks that the cleaned text holds only source lines in order and that the
+the local LLM, one job at a time, checks that the cleaned text holds only source lines in order, that every
+cleaning window without a fallback lost at most 20 % of its characters (#640), and that the
 CSV and JSON Lines come back unchanged, labelled from their data, imports them into a throwaway `VfyPrepare*` collection and downloads a
 prepared part. Its `vfy-prepare-*` documents and its collections are removed at the end.
 
@@ -24806,7 +24865,8 @@ operation runs reliably long enough to interrupt, so `test_jobstore.py` covers i
 
 `scripts/tests/test_startup_sweep.py` (#377) checks the startup sweeps of what a killed job
 leaves behind, in disposable folders. In `UPLOAD_DIR`, ingest staging is created as
-`ingest-*` and removed with the `import-*`, `rechunk-*` and `batch-verify-*` work directories;
+`ingest-*` and removed with the `import-*`, `rechunk-*`, `batch-verify-*` and `prepare-*` work
+directories, and document preparation's `prepare-*.zip` and `prepare-*.json` temporary files (#640);
 in `EXPORTS_DIR`, `.build-*` directories and `.*.tar.gz.partial` files are removed. Only those
 names, and only a real directory or regular file as the name says: completed packages,
 `ingest_configs/`, look-alike names, a file where a directory is expected and the reverse, and
@@ -25070,7 +25130,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
 | `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
-| `../tests/test_offline_ingest.py` | API image, no network: real ingest jobs of every supported type (`.txt`, `.md`, and `.pdf`, `.docx`, `.csv`, `.json` from `fixtures.py`; backends faked) complete with every name lookup and non-Unix connect refused and recorded from before the API is imported, so nothing may dial out; `DO_NOT_TRACK` is set and the bundled spaCy model `en_core_web_sm` is the version `unstructured` expects (#695); registered by `20_offline_model.sh` |
+| `../tests/test_offline_ingest.py` | API image, no network: real ingest jobs of every supported type (`.txt`, `.md`, and `.pdf`, `.docx`, `.csv`, `.json` from `fixtures.py`; backends faked) complete with every name lookup and non-Unix connect refused and recorded from before the API is imported, so nothing may dial out; `DO_NOT_TRACK` is set and the bundled spaCy model `en_core_web_sm` is the version `unstructured` expects (#695); a `.txt` and a `.md` are also prepared with a stub LLM, their parts checked by the real parser (#640); registered by `20_offline_model.sh` |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
@@ -28471,7 +28531,7 @@ if [ "$SKIP_SLOW" = "1" ]; then
   skip "P9-P11 prepare, import and download with the LLM" "RAG_SKIP_SLOW=1"
 else
   stack prepare
-  check "P9 the .txt becomes cleaned Markdown of source lines in order with its header; the .csv and .jsonl are unchanged and labelled from their data" $?
+  check "P9 the .txt becomes cleaned Markdown of source lines in order with its header, every window without a fallback losing at most 20 % of its characters; the .csv and .jsonl are unchanged and labelled from their data" $?
   stack import
   check "P10 an unknown collection is 404; the import into a new collection completes and is recorded" $?
   p10_collection=$(python3 -c 'import prepare_stack as p; print(p.state().get("collection", ""))')
@@ -28577,6 +28637,11 @@ PAGES = "\n".join(
            f"forward to the next session." for n in range(6)]
         + [f"Page {page}", ""])) + "\n"
 CSV = "name,team\nAda,core\nBo,docs\nCy,ops\n"
+# The cleaning windows and the fidelity rule of api/services/preparation.py
+# (WINDOW_CHARACTERS, MAX_REMOVED_SHARE), for P9's live check of the rule (#640).
+# test_prepare.py's test_p9_uses_preparations_window_rule checks they match.
+WINDOW_CHARACTERS = 3000
+MAX_REMOVED_SHARE = 0.20
 JSONL = '{"id": 1, "text": "first record"}\n{"id": 2, "text": "second record"}\n'
 
 
@@ -28784,9 +28849,48 @@ def check_audit(fix):
 
 # ── with the LLM (full runs only) ────────────────────────────────────────────
 
+def text_windows(lines):
+    """The cleaning windows of a part's lines, as preparation.windows() groups them:
+    whole lines in order while their characters (each line's length + 1) fit in
+    WINDOW_CHARACTERS; a longer line is a window of its own. Each window is the
+    list of its line indexes."""
+    out, current, size = [], [], 0
+    for index, line in enumerate(lines):
+        if len(line) + 1 > WINDOW_CHARACTERS:
+            if current:
+                out.append(current)
+                current, size = [], 0
+            out.append([index])
+            continue
+        if current and size + len(line) + 1 > WINDOW_CHARACTERS:
+            out.append(current)
+            current, size = [], 0
+        current.append(index)
+        size += len(line) + 1
+    if current:
+        out.append(current)
+    return out
+
+
+def removed_too_much(source, kept, fallbacks):
+    """The first window without a fallback whose removed lines hold more than
+    MAX_REMOVED_SHARE of its characters, as (number, removed, characters), or None.
+    `kept` is the set of source line indexes the prepared text kept (#640)."""
+    fell_back = {f["window"] for f in fallbacks if f.get("window") is not None}
+    for number, window in enumerate(text_windows(source), 1):
+        if number in fell_back:
+            continue
+        characters = sum(len(source[i]) + 1 for i in window)
+        removed = sum(len(source[i]) + 1 for i in window if i not in kept)
+        if removed > MAX_REMOVED_SHARE * characters:
+            return number, removed, characters
+    return None
+
+
 def check_prepare(fix):
-    """P9: preparing the .txt, the .csv and the .jsonl; the .csv and .jsonl are
-    labelled from their data."""
+    """P9: preparing the .txt, the .csv and the .jsonl; the .txt keeps only source
+    lines, in order, and every window without a fallback lost at most 20 % of its
+    characters (#640); the .csv and .jsonl are labelled from their data."""
     token = role_token("developer")
     ids = state()["ids"]
     status, body, _ = send("POST", "/prepare/jobs", token, body={"document_ids": list(ids.values())})
@@ -28800,21 +28904,26 @@ def check_prepare(fix):
     status, content, _ = send("GET", "/prepare/documents/{}/prepared".format(txt["id"]), token, raw=True)
     expect(status == 200, "prepared download {}".format(status))
     text = content.decode("utf-8")
-    lines = text.split("\n")
+    lines = text.rstrip("\n").split("\n")
     if part["title"]:
         header = "# {}".format(part["title"])
         expect(lines[0] == header and lines[2] == "Summary (generated): {}".format(part["summary"]),
                "no header: {!r}".format(lines[:3]))
         lines = lines[4:]
-    source = PAGES.split("\n")
+    # The part's text as preparation reads the .txt: its paragraphs joined by
+    # one blank line, then cut into the windows the LLM saw.
+    source = "\n\n".join(block.strip("\n") for block in PAGES.split("\n\n")
+                          if block.strip()).split("\n")
     position = 0
+    kept = set()
     for line in lines:
-        if not line:
-            continue
         try:
             position = source.index(line, position) + 1
         except ValueError:
             raise CheckFailed("a line that isn't a source line, in order: {!r}".format(line))
+        kept.add(position - 1)
+    lost = removed_too_much(source, kept, part["fallbacks"])
+    expect(lost is None, "window {} lost {} of {} characters, more than 20 %".format(*(lost or (0, 0, 0))))
     for reason in (f["reason"] for f in part["fallbacks"]):
         expect(reason in ("removed-too-much", "removed-long-line", "unusable-answer", "llm-timeout",
                           "llm-error", "llm-unavailable", "too-large-for-llm"), "reason {}".format(reason))
@@ -31603,6 +31712,7 @@ The LLM is a stub; nothing reaches Ollama or Weaviate. The preparation area and
 the upload folder are temporary. Routes go through `main.app` with real sessions
 in a temporary account store (`auth.testing`), without the lifespan.
 """
+import ast
 import asyncio
 import gzip
 import io
@@ -32068,7 +32178,7 @@ class RecordLabelTests(AreaCase):
 
 class NormaliseTests(unittest.TestCase):
     def test_bom_line_endings_nfc_and_control_characters(self):
-        raw = "﻿a\r\nb\rc\x00d\x07e\tf\x7fg\x0cÉ"
+        raw = "\ufeffa\r\nb\rc\x00d\x07e\tf\x7fg\x0cÉ"
         self.assertEqual(preparation.normalise_text(raw), "a\nb\ncde\tfgÉ")
 
 
@@ -32418,7 +32528,7 @@ class JobTests(JobCase):
             with self.assertRaises(store.DocumentBusy):
                 store.delete(a["id"])
             with self.assertRaises(store.DocumentBusy):
-                await jobs.import_documents(SimpleNamespace(document_ids=[a["id"]]), OWNER)
+                await jobs.import_documents(SimpleNamespace(document_ids=[a["id"]]))
             gate.set()
             await self.finish(first["job_id"])
             await self.finish(second["job_id"])
@@ -32502,6 +32612,54 @@ class RouteTests(JobCase):
         self.assertEqual(self.client.get("/prepare/documents").json()["documents"], [])
         self.assertEqual(list((self.root / "uploads").glob("prepare-*")), [])
 
+    def test_duplicate_names_in_one_upload_are_refused_and_nothing_is_kept(self):
+        # #640: ingest keeps the last input of a name; a preparation upload is
+        # refused instead, naming the name and every input that has it.
+        many = [(f"n{i}.txt", b"x") for i in range(11)]
+        cases = [
+            ("two files", [("a.txt", b"One.\n"), ("a.txt", b"Two.\n")], "'a.txt' (a.txt, a.txt)"),
+            ("a file and a member", [("a.txt", b"One.\n"), ("b.zip", self.zip_bytes({"a.txt": "Two."}))],
+             "'a.txt' (a.txt, b.zip:a.txt)"),
+            ("three inputs", [("a.txt", b"One.\n"), ("b.zip", self.zip_bytes({"a.txt": "Two."})),
+                              ("c.zip", self.zip_bytes({"a.txt": "Three.", "d/e.md": "Own."}))],
+             "'a.txt' (a.txt, b.zip:a.txt, c.zip:a.txt)"),
+            ("eleven names", many + many, "'n9.txt' (n9.txt, n9.txt) and 1 more"),
+        ]
+        for label, files, listed in cases:
+            with self.subTest(label):
+                answer = self.upload(files)
+                self.assertEqual(answer.status_code, 409, answer.text)
+                error = answer.json()["error"]
+                self.assertEqual(error["code"], "DUPLICATE_NAMES")
+                self.assertTrue(error["message"].startswith("Files in this upload share a name: '"),
+                                error["message"])
+                self.assertTrue(error["message"].endswith(
+                    f"{listed}. Rename them, or upload them separately; nothing was uploaded."),
+                    error["message"])
+                self.assertEqual(self.client.get("/prepare/documents").json()["documents"], [])
+                self.assertEqual(list((self.root / "uploads").glob("prepare-*")), [])
+        self.assertEqual(error["detail"], {"names": [f"n{i}.txt" for i in range(11)]})
+        self.assertNotIn("n10.txt", error["message"])
+        with self.subTest("checked before the space"):
+            with patch.object(settings, "max_preparation_bytes", 1024 * 1024):
+                answer = self.upload([("a.txt", b"x" * (1024 * 1024 + 1))] * 2)
+            self.assertEqual(answer.json()["error"]["code"], "DUPLICATE_NAMES")
+            self.assertEqual(self.client.get("/prepare/documents").json()["documents"], [])
+        with self.subTest("separate uploads may share a name"):
+            for data in (b"One.\n", b"Two.\n"):
+                self.assertEqual(self.upload([("a.txt", data)]).status_code, 201)
+            names = [d["name"] for d in self.client.get("/prepare/documents").json()["documents"]]
+            self.assertEqual(names, ["a.txt", "a.txt"])
+
+    def test_ingest_still_replaces_an_earlier_input_of_the_same_name(self):
+        # #640 changes preparation only: ingest's staging keeps the last input.
+        tmp = Path(tempfile.mkdtemp(dir=self.root))
+        files = [SimpleNamespace(filename="a.txt", file=io.BytesIO(data)) for data in (b"One.\n", b"Two.\n")]
+        queue, skipped = asyncio.run(ingest_pipeline.stage_uploads(files, tmp))
+        [(path, label)] = queue.entries.values()
+        self.assertEqual(path.read_bytes(), b"Two.\n")
+        self.assertEqual(skipped, ["a.txt (replaced by a.txt later in this upload, same name 'a.txt')"])
+
     def test_job_routes_refusals(self):
         self.assertEqual(self.client.post("/prepare/jobs", json={}).status_code, 422)
         self.assertEqual(self.client.post("/prepare/jobs", json={"document_ids": []}).json()["error"]["code"],
@@ -32560,7 +32718,52 @@ class RouteTests(JobCase):
         self.prepared([("a.txt", b"One.\n"), ("a.md", b"Two.\n")])
         with patch.object(jobs.wc, "collection_exists", AsyncMock(return_value=True)):
             answer = self.client.post("/prepare/import", json={"collection": "Docs", "all": True})
-        self.assertEqual(answer.json()["error"]["code"], "DUPLICATE_NAMES")
+            self.assertEqual(answer.json()["error"]["code"], "DUPLICATE_NAMES")
+            # The size is checked after the names (#640).
+            with patch.object(jobs, "MAX_IMPORT_BYTES", 0):
+                answer = self.client.post("/prepare/import", json={"collection": "Docs", "all": True})
+            self.assertEqual(answer.json()["error"]["code"], "DUPLICATE_NAMES")
+
+    def test_an_import_over_the_cap_is_refused_before_anything_is_staged(self):
+        # #640: one import's parts hold at most one upload's 512 MB, checked with
+        # the selection, before the collection, and nothing is staged.
+        docs = self.prepared([("one.txt", b"One.\n"), ("two.csv", b"a,b\n1,2\n")])
+        ids = [d["id"] for d in docs]
+        total = sum(part["bytes"] for i in ids for part in store.get(i)["parts"])
+        exists = AsyncMock(return_value=True)
+        start = AsyncMock(return_value="ing00009")
+        busy = []
+        real_mark = store.mark_busy
+        with patch.object(jobs.wc, "collection_exists", exists), \
+                patch.object(jobs.ingest_pipeline, "start_ingest_job", start), \
+                patch.object(jobs.store, "mark_busy", lambda *a: busy.append(a) or real_mark(*a)), \
+                patch.object(jobs, "MAX_IMPORT_BYTES", total - 1):
+            for body in ({"all": True}, {"document_ids": ids}):
+                with self.subTest(body=body):
+                    answer = self.client.post("/prepare/import", json={"collection": "Docs", **body})
+                    self.assertEqual(answer.status_code, 409, answer.text)
+                    error = answer.json()["error"]
+                    self.assertEqual(error["code"], "IMPORT_TOO_LARGE")
+                    self.assertEqual(error["detail"], {"selected_bytes": total, "limit_bytes": total - 1})
+                    self.assertIn("Import them in smaller selections.", error["message"])
+            exists.assert_not_called()
+            start.assert_not_called()
+            self.assertEqual(busy, [])
+            for i in ids:
+                self.assertEqual(store.get(i)["imports"], [])
+                self.assertFalse(store.is_busy(i))
+            with patch.object(jobs, "MAX_IMPORT_BYTES", total):
+                answer = self.client.post("/prepare/import", json={"collection": "Docs", "all": True})
+            self.assertEqual(answer.status_code, 202, answer.text)
+            start.assert_called_once()
+
+    def test_the_import_cap_is_512_mb_and_its_message(self):
+        self.assertEqual(jobs.MAX_IMPORT_BYTES, 536_870_912)
+        self.assertEqual(
+            jobs._import_too_large(536_870_913).message,
+            "The selected documents' prepared parts total 512.1 MB; one import can be at most "
+            "512 MB, the same as one upload. Import them in smaller selections.")
+        self.assertIn("total 20,480.0 MB;", jobs._import_too_large(20 * 1024 ** 3).message)
 
     def test_prepared_download_is_one_file_or_a_zip_of_parts(self):
         [single] = self.prepared([("s.csv", b"a\n1\n")])
@@ -32614,6 +32817,18 @@ class WiringTests(unittest.TestCase):
         for action in ("prepare.upload", "prepare.start", "prepare.cancel", "prepare.import",
                        "prepare.download", "prepare.delete"):
             self.assertIn(f"'{action}'", page)
+
+    def test_p9_uses_preparations_window_rule(self):
+        # prepare_stack.py runs on the host with the standard library, so it keeps
+        # its own copy of the window size and the 20 % rule for P9 (#640); it
+        # imports the verify harness, so it is read here, not imported.
+        tree = ast.parse((ROOT / "scripts/verify/prepare_stack.py").read_text())
+        found = {target.id: ast.literal_eval(node.value) for node in tree.body
+                 if isinstance(node, ast.Assign) for target in node.targets
+                 if isinstance(target, ast.Name)
+                 and target.id in ("WINDOW_CHARACTERS", "MAX_REMOVED_SHARE")}
+        self.assertEqual(found, {"WINDOW_CHARACTERS": preparation.WINDOW_CHARACTERS,
+                                 "MAX_REMOVED_SHARE": preparation.MAX_REMOVED_SHARE})
 
 
 # ── reviewer's additions (#638 testing review) ──────────────────────────────
@@ -49734,6 +49949,26 @@ function prepareCases() {
       await press(s.page, 'Import all prepared');
       await waitFor(s.page, () => [...document.querySelectorAll('[role=alert]')].some(a => a.textContent.includes('Not prepared: scan.pdf.')), 'the refusal alert');
       assert.equal(callsTo(s, 'POST', '/api/prepare/import')[1].body.all, true);
+    } },
+    { name: 'An import over 512 MB and an upload with duplicate names show the API\'s message as an alert (#640)', open: (() => {
+      const TOO_LARGE = "The selected documents' prepared parts total 600.0 MB; one import can be at most 512 MB, the same as one upload. Import them in smaller selections.";
+      const DUPLICATE = "Files in this upload share a name: 'a.txt' (a.txt, b.zip:a.txt). Rename them, or upload them separately; nothing was uploaded.";
+      return open('developer', {
+        'POST /api/prepare/import': apiError(409, 'IMPORT_TOO_LARGE', TOO_LARGE),
+        'POST /api/prepare/upload': apiError(409, 'DUPLICATE_NAMES', DUPLICATE),
+      });
+    })(), async run(s) {
+      await waitText(s.page, 'minutes.txt');
+      await fillNth(s.page, 'select', 0, B);
+      await press(s.page, 'Import all prepared');
+      await waitFor(s.page, () => [...document.querySelectorAll('[role=alert]')].some(a => a.textContent.includes('total 600.0 MB; one import can be at most 512 MB') && a.textContent.includes('Import them in smaller selections.')), 'the IMPORT_TOO_LARGE alert');
+      assert.equal(callsTo(s, 'POST', '/api/prepare/import').length, 1);
+      const input = await s.page.$('#prepare-file-input');
+      await input.uploadFile(...tempFiles(['a.txt', 'b.zip']));
+      await waitText(s.page, 'b.zip');
+      await press(s.page, 'Upload');
+      await waitFor(s.page, () => [...document.querySelectorAll('[role=alert]')].some(a => a.textContent.includes("share a name: 'a.txt' (a.txt, b.zip:a.txt)")), 'the DUPLICATE_NAMES alert');
+      assert.equal(callsTo(s, 'POST', '/api/prepare/upload').length, 1);
     } },
     { name: 'The Import page links to the Prepare page ("Prepare documents first")', open: { role: 'developer', path: '/import', routes: routes() }, async run(s) {
       await waitText(s.page, 'Prepare documents first');

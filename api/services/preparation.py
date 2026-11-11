@@ -107,7 +107,7 @@ _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 def normalise_text(text: str) -> str:
     """UTF-8 text without a byte-order mark, LF line endings, NFC, and no NUL or
     other C0 control character except tab and newline, nor DEL."""
-    if text.startswith("﻿"):
+    if text.startswith("\ufeff"):
         text = text[1:]
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = unicodedata.normalize("NFC", text)
@@ -220,9 +220,11 @@ class _CsvRows:
     Two limits (PR #639 review): a row is refused when, normalised, it is longer
     than `limit`, what a part can hold for it; and reading stops as soon as a
     row's raw text passes twice that, so an unclosed quote or a file with no line
-    break can't grow a row without bound. Normalising only shortens a row (CRLF
-    becomes LF, control characters go, NFC composes), so no row that fits is
-    refused by the raw bound."""
+    break can't grow a row without bound. Normalising usually shortens a row
+    (CRLF becomes LF, control characters go), so the raw bound refuses a row
+    that would fit only when normalising would remove more than half of it,
+    which only a row made mostly of control characters does. NFC can also
+    lengthen a row; the normalised check catches that."""
 
     def __init__(self, stream: Any, dialect: Any, limit: int) -> None:
         self.stream = stream
@@ -823,7 +825,7 @@ async def prepare_document(raw: Path, name: str, raw_type: str, chat: Chat,
     return await _prepare_text(raw, raw_type, name, llm, should_stop, write_part, progress)
 
 
-def _no_text(name: str) -> ValueError:
+def _no_text() -> ValueError:
     return ValueError("has no text to prepare")
 
 
@@ -856,7 +858,7 @@ async def _prepare_text(raw: Path, raw_type: str, name: str, llm: LLM, should_st
             return iter_parts(raw, raw_type)
     count, total = await asyncio.to_thread(_count_text_windows, source(), should_stop)
     if not count:
-        raise _no_text(name)
+        raise _no_text()
     too_large = total > MAX_WINDOWS
     done = 0
     progress(done, total)
@@ -949,7 +951,7 @@ async def _prepare_records(raw: Path, raw_type: str, name: str, kind: str,
         entries.append(entry)
         index += 1
     if not entries:
-        raise _no_text(name)
+        raise _no_text()
     count = len(entries)
     for number, (entry, part_name) in enumerate(zip(entries, part_names(name, kind, count)), 1):
         entry["name"] = part_name
