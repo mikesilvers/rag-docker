@@ -187,6 +187,10 @@ def _mark_finished(collection: str) -> None:
 # tests, a with-models package would leave 2.3 GB behind each time, and an
 # ingest up to 512 MB of upload plus 2 GiB of extracted ZIP members.
 _WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-", "ingest-", "prepare-")
+# Document preparation also writes two temporary files there (#640): the ZIP of
+# a multi-part prepared download (prepare-*.zip) and a decompressed .json.gz
+# (prepare-*.json). They are removed as regular files, besides as directories.
+_PREPARE_FILE_SUFFIXES = (".zip", ".json")
 
 
 def sweep_stale_workdirs() -> list[str]:
@@ -198,7 +202,9 @@ def sweep_stale_workdirs() -> list[str]:
     for entry in sorted(root.iterdir()):
         if not entry.name.startswith(_WORKDIR_PREFIXES):
             continue
-        size = packager.remove_leftover(entry, directory=True)
+        prepare_file = (entry.name.startswith("prepare-")
+                        and entry.name.endswith(_PREPARE_FILE_SUFFIXES))
+        size = packager.remove_leftover(entry, directory=True, regular_file=prepare_file)
         if size is not None:
             removed.append(f"{entry.name} ({size // (1024 * 1024)} MB)")
     return removed
