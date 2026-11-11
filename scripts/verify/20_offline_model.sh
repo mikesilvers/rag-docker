@@ -26,9 +26,10 @@ dnt="$(cd "$REPO_ROOT" && docker compose exec -T api printenv DO_NOT_TRACK)"
 [ "$dnt" = "1" ]
 check "DO_NOT_TRACK is 1 in the running api container (#695; got '$dnt')" $?
 # Ingest never dials out (#695): real ingest jobs of every supported type
-# (.txt, .md, .pdf, .docx, .csv, .json), with the backends faked, in a fresh
+# (.txt, .md, .pdf, .docx, .csv, .json), with the backends faked, and a
+# preparation of a .txt and a .md with a stub LLM (#640), in a fresh
 # container from the api image with no network. Every name lookup and
 # non-Unix connect is refused and fails the test.
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_offline_ingest.py)
-check "an ingest of every supported type succeeds in a fresh api container with no network, and nothing dials out (#695)" $?
+check "an ingest of every supported type, and a preparation of a .txt and a .md, succeed in a fresh api container with no network, and nothing dials out (#695, #640)" $?
 summary
