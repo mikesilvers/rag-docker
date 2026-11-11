@@ -24311,6 +24311,29 @@ cleaning window without a fallback lost at most 20 % of its characters (#640), a
 CSV and JSON Lines come back unchanged, labelled from their data, imports them into a throwaway `VfyPrepare*` collection and downloads a
 prepared part. Its `vfy-prepare-*` documents and its collections are removed at the end.
 
+`22_ui_ingest.sh` ingests through the web UI end to end (#641, SPECIFICATIONS.md §10.9), as a user does:
+`browser/ui_ingest.js` drives the real Import and Prepare pages in the browser image, logged in as the
+harness Engineer, with no request stubbed or intercepted, each case into a new collection made with the
+page's "+ New". The cases, files and known phrases are the fixtures' `ui_ingest/manifest.json`
+(`fixtures.py`): a clean `.pdf`, `.docx`, `.txt`, `.md`, `.csv`, `.json` and `.jsonl`, one collection
+each; a ZIP of mixed types with a `.json.gz` member and a `.jsonl.gz` beside it in one upload (a `.json.gz`
+is ingested only from a ZIP); a `.txt` of over 10,000 pieces at the `fixed` strategy's chunk size 50,
+split into parts (#621), whose minimum chunk size of 6,000 merges the pieces so only about a hundred
+chunks are embedded; and, in a full run only, a `.txt` and a `.csv` prepared on the Prepare page with the local LLM and
+imported with Import selected (#638). For each, `ui_ingest_check.py` checks that the page followed the job
+to `completed` with no error shown and the API's job record has no file error, that the Collections page
+shows at least the expected chunks, and, from the verify project's Weaviate (`ui_ingest_weaviate.py`, run
+in the api container), that the collection holds exactly the expected documents and a known phrase of each
+in one of its chunks; the split file's parts are numbered 1 to N with the first and last phrases in the
+first and last parts. Three bad files fail cleanly: a broken PDF (its job `failed`, an error line naming it),
+an unsupported type (`No supported files`) and an over-limit ZIP (`expands to more than`) each show a red
+message naming the file, and leave their collection empty and no job running, the two refused uploads no
+job at all. Its `VfyUiIngest*` collections and `vfy-ui-*` prepared documents are removed at the start and the
+end. Cost, measured 2026-11-11 on a Mac with 12 GB for Docker: about 3 min 40 s in a `RAG_SKIP_SLOW=1` run
+and 4 min 10 s in a full run (the Prepare case about 25 s), most of it the large file's embedding (about
+2.5 min). Splitting it through `overlap` at chunk size 50 instead embedded about 11,200 chunks and took
+26.5 min, which is why it uses `fixed` with the merge.
+
 ## Entry point and verify project
 
 `stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
@@ -25077,7 +25100,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `07_settings.sh` | registered live settings validation suite; invokes the standalone helper |
 | `settings_validation.py` | standalone, on the verify project after `stack.sh up`: `RAG_API=http://localhost:8081/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
-| `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
+| `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only; `ui_ingest/` holds the files and `manifest.json` of suite 22 (#641) |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps; the proxy answers `Host` localhost and 127.0.0.1 and refuses another with 421 (#664) |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
 | `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384), run in a checkout reached through a symlink, and ignore the user's system and global git config (#447); embedded copies; registered by suite 01 |
@@ -25142,6 +25165,10 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
 | `20_offline_model.sh` | the Hugging Face libraries run offline in the api container (#618): the pre-cached sentence-transformers model loads with no Hugging Face call; `DO_NOT_TRACK` is `1` in the running api container (#695); registers `../tests/test_offline_ingest.py` (#695, #640) |
 | `../tests/test_offline_ingest.py` | API image, no network: real ingest jobs of every supported type (`.txt`, `.md`, and `.pdf`, `.docx`, `.csv`, `.json` from `fixtures.py`; backends faked) complete with every name lookup and non-Unix connect refused and recorded from before the API is imported, so nothing may dial out; `DO_NOT_TRACK` is set and the bundled spaCy model `en_core_web_sm` is the version `unstructured` expects (#695); a `.txt` and a `.md` are also prepared with a stub LLM, their parts checked by the real parser (#640); registered by `20_offline_model.sh` |
+| `22_ui_ingest.sh` | §10.9 — ingest through the web UI (#641): every supported type, a ZIP of mixed types, a file split into parts and (full runs) a Prepare and Import, each into a new collection with no stub; a broken PDF, an unsupported type and an over-limit ZIP fail cleanly |
+| `browser/ui_ingest.js` | the browser side of suite 22: the Import and Prepare pages driven as a user does, the observations printed as one JSON line (#641) |
+| `ui_ingest_weaviate.py` | helper for suite 22, run in the API container: the `VfyUiIngest*` collections' documents and chunk text, read only (#641) |
+| `ui_ingest_check.py` | the checks of suite 22, one per subcommand, on the host, and its cleanup (#641) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
@@ -25731,7 +25758,7 @@ printf '\nBuilding fixtures in %s\n' "$FIX"
 rm -rf "$FIX"; python3 ./fixtures.py "$FIX" >/dev/null
 export RAG_FIXTURES="$FIX"
 
-ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit 20_offline_model 21_prepare)
+ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit 20_offline_model 21_prepare 22_ui_ingest)
 if [ "$#" -gt 0 ]; then
   SUITES=()
   for want in "$@"; do
@@ -29031,6 +29058,757 @@ def main(argv):
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
+```
+
+### scripts/verify/22_ui_ingest.sh
+
+```bash
+#!/usr/bin/env bash
+# Ingest through the web UI, end to end (#641): SPECIFICATIONS.md §10.9.
+#
+# A real browser (browser/ui_ingest.js), logged in as the harness Engineer, with
+# nothing stubbed, ingests on the Import page every supported type into a new
+# collection each, a ZIP of mixed types with a .jsonl.gz, and a file over the
+# part limit; prepares two files on the Prepare page with the local LLM and
+# imports them into a new collection (full runs only); and sends a broken PDF,
+# an unsupported type and an over-limit ZIP, each into a new collection. Then
+# ui_ingest_check.py checks each collection: the job ended with no error and the
+# page showed none, the Collections page's count, and the document names and a
+# known phrase per document read from the verify project's Weaviate
+# (ui_ingest_weaviate.py, in the api container); the refusals: a clear message,
+# nothing in the collection and no job left running. The cases and phrases are
+# the fixtures' ui_ingest/manifest.json (fixtures.py). Its collections are
+# VfyUiIngest*, its prepared documents vfy-ui-*; both are removed at the end.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
+[ -f "$FIX/ui_ingest/manifest.json" ] || python3 ./fixtures.py "$FIX" >/dev/null
+MANIFEST="$FIX/ui_ingest/manifest.json"
+require_stack
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/rag-verify-ui-ingest.XXXXXX")
+trap 'rm -rf "$WORK"' EXIT
+RESULTS="$WORK/results.json"
+DUMP="$WORK/weaviate.json"
+
+IMAGE="rag-verify-browser:latest"
+# The browser runs in the proxy container's network namespace and opens
+# http://localhost, as in 06_ui.sh (#664).
+PROXY=$( (cd "$REPO_ROOT" && docker compose ps -q proxy) )
+if [ -z "$PROXY" ]; then
+  printf '    could not find the proxy container\n'
+  exit 2
+fi
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  printf '    building the browser image (first run only)...\n'
+  docker build -q -t "$IMAGE" ./browser >/dev/null || { printf '    image build failed\n'; exit 2; }
+fi
+
+uicheck() { _rag_require_lock_owner; python3 ./ui_ingest_check.py "$@"; }
+uicheck cleanup >/dev/null 2>&1
+
+section "The flows in the browser (Import and Prepare pages, no stubs)"
+# The credentials go in on standard input (#25), as in 06_ui.sh.
+_rag_require_lock_owner
+started=$(date +%s)
+docker run --rm -i --network "container:$PROXY" \
+  -e RAG_UI_BASE="${RAG_UI_BASE:-http://localhost}" \
+  -e RAG_SKIP_SLOW="$SKIP_SLOW" -e RAG_AUTH_STDIN=1 \
+  -v "$PWD/browser":/w:ro -v "$FIX/ui_ingest":/fixtures:ro -w /w "$IMAGE" \
+  node ui_ingest.js < "$RAG_AUTH_DIR/credentials" > "$WORK/browser.out"
+rc=$?
+grep -v '^UI_INGEST_RESULT ' "$WORK/browser.out"
+grep '^UI_INGEST_RESULT ' "$WORK/browser.out" | tail -n 1 | sed 's/^UI_INGEST_RESULT //' > "$RESULTS"
+printf '    the browser took %ds\n' "$(( $(date +%s) - started ))"
+[ "$rc" = 0 ] && [ -s "$RESULTS" ] && uicheck browser "$MANIFEST" "$RESULTS"
+check "the browser ran every case and read the Collections page" $?
+
+(cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/ui_ingest_weaviate.py > "$DUMP")
+check "the suite's collections were read from the verify project's Weaviate" $?
+
+while IFS=$'\t' read -r kind slow name; do
+  section "$name"
+  if [ "$slow" = slow ] && [ "$SKIP_SLOW" = "1" ]; then
+    skip "$name: prepare, import and check the collection" "RAG_SKIP_SLOW=1"
+    continue
+  fi
+  run() { uicheck "$1" "$name" "$MANIFEST" "$RESULTS" "$DUMP"; }
+  if [ "$kind" = refused ]; then
+    run message
+    check "$name: the page shows a clear message naming the file" $?
+    run nothing-left
+    check "$name: nothing is left in the collection and no job is left running" $?
+    continue
+  fi
+  if [ "$kind" = prepare ]; then
+    run prepared
+    check "$name: the preparation completed with no error shown, every document prepared" $?
+  fi
+  run job
+  check "$name: the job completed with no file error, and the page showed none" $?
+  run contents
+  check "$name: the Collections page shows at least the expected chunks" $?
+  run names
+  check "$name: Weaviate holds exactly the expected documents" $?
+  run retrieval
+  check "$name: each document's known phrase is in one of its chunks" $?
+  if [ "$kind" = split ]; then
+    run split
+    check "$name: the page and the job show it split, Weaviate holds parts 1 to N" $?
+  fi
+done < <(python3 ./ui_ingest_check.py cases "$MANIFEST")
+
+section "Cleanup"
+uicheck cleanup
+uicheck cleanup-check
+check "the suite's collections and prepared documents are removed" $?
+
+summary
+```
+
+### scripts/verify/ui_ingest_check.py
+
+```python
+"""The checks of 22_ui_ingest.sh (#641), one per subcommand. Host-side, standard
+library, Python 3.9+.
+
+    python3 ui_ingest_check.py cases MANIFEST
+    python3 ui_ingest_check.py CHECK CASE MANIFEST RESULTS DUMP
+    python3 ui_ingest_check.py cleanup|cleanup-check
+
+MANIFEST is the fixtures' ui_ingest/manifest.json, RESULTS the observations
+browser/ui_ingest.js printed (what the pages showed and the API's job records),
+DUMP what ui_ingest_weaviate.py read from the verify project's Weaviate. A check
+exits 0 when it holds and 1 when it doesn't, the reason on standard error.
+Document names and phrases are checked against Weaviate only. `cleanup` deletes
+the suite's VfyUiIngest* collections and vfy-ui-* prepared documents through the
+API as the harness Engineer; `cleanup-check` fails while any is left.
+SPECIFICATIONS.md §10.9.
+"""
+import json
+import sys
+
+import prepare_stack
+from auth_stack import role_token
+
+PREFIX = "VfyUiIngest"
+DOCUMENT_PREFIX = "vfy-ui-"
+TERMINAL = ("completed", "failed", "partial", "cancelled", "interrupted")
+
+
+class Failed(Exception):
+    pass
+
+
+def expect(ok, reason):
+    if not ok:
+        raise Failed(reason)
+
+
+def norm(text):
+    """Every run of white space as one space."""
+    return " ".join(text.split())
+
+
+def found(phrase, chunks):
+    want = norm(phrase)
+    return any(want in norm(chunk) for chunk in chunks)
+
+
+def load(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+class Case:
+    def __init__(self, name, manifest, results, dump):
+        cases = {c["name"]: c for c in load(manifest)["cases"]}
+        expect(name in cases, "no case {!r} in the manifest".format(name))
+        self.spec = cases[name]
+        self.results = load(results)
+        self.obs = self.results["cases"].get(name)
+        expect(self.obs is not None, "the browser recorded nothing for this case")
+        expect(not self.obs.get("skipped"), "the case was skipped")
+        self.collection = self.spec["collection"]
+        self.dump = load(dump)["collections"].get(self.collection) if dump else None
+
+    def ran(self):
+        """The browser got through every step of the case."""
+        expect("failed_step" not in self.obs, "the case stopped at '{}': {}".format(
+            self.obs.get("failed_step"), self.obs.get("error")))
+
+    def documents(self):
+        expect(self.dump is not None, "Weaviate has no collection {}".format(self.collection))
+        return self.dump["documents"]
+
+    def expected(self):
+        """{document name: phrase} for the names check; None when the case is split."""
+        if self.spec["kind"] == "prepare":
+            records = self.obs.get("records") or {}
+            out = {}
+            for raw, phrase in self.spec["documents"].items():
+                parts = (records.get(raw) or {}).get("parts")
+                expect(parts, "no prepared parts recorded for {}".format(raw))
+                for part in parts:
+                    out[part] = phrase
+            return out
+        return dict(self.spec["documents"])
+
+
+def page_count(case):
+    counts = case.results.get("collections") or {}
+    expect(case.collection in counts, "the Collections page doesn't list {}".format(case.collection))
+    return counts[case.collection]
+
+
+def parts_of(name, documents):
+    """The part numbers of `name` among the documents; any other name is returned too."""
+    numbers, others = [], []
+    for doc in documents:
+        if doc.startswith(name + " (part ") and doc.endswith(")") and doc[len(name) + 7:-1].isdigit():
+            numbers.append(int(doc[len(name) + 7:-1]))
+        else:
+            others.append(doc)
+    return sorted(numbers), others
+
+
+# ── checks ────────────────────────────────────────────────────────────────────
+
+def check_job(case):
+    """The upload was accepted, the page followed its job to `completed` and shows no
+    error, and the API's record has no file error."""
+    case.ran()
+    upload = case.obs.get("upload") or {}
+    expect(upload.get("status") == 202, "the upload answered {} {}".format(upload.get("status"), upload.get("body")))
+    job_id = (upload.get("body") or {}).get("job_id")
+    page = case.obs.get("page") or {}
+    expect(job_id and page.get("job_id") == job_id, "the page shows job {}, the upload started {}".format(
+        page.get("job_id"), job_id))
+    expect(page.get("status") == "completed", "the page shows the job {}".format(page.get("status")))
+    expect(not page.get("errors"), "the page lists errors: {}".format(page.get("errors")))
+    expect(not page.get("red"), "the page shows: {}".format(page.get("red")))
+    record = (case.obs.get("record") or {}).get("body") or {}
+    expect(record.get("status") == "completed", "the API's job record is {}".format(record.get("status")))
+    expect(record.get("files_failed") == 0 and record.get("errors") == [],
+           "the API's job record has files_failed {} and errors {}".format(record.get("files_failed"), record.get("errors")))
+
+
+def check_contents(case):
+    """The Collections page shows at least the case's minimum of chunks."""
+    case.ran()
+    minimum = case.spec.get("min_chunks") or len(case.expected())
+    count = page_count(case)
+    expect(count >= minimum, "the Collections page shows {} objects, at least {} expected".format(count, minimum))
+
+
+def check_names(case):
+    """The collection's documents in Weaviate are exactly the expected ones."""
+    case.ran()
+    documents = sorted(case.documents())
+    if "split" in case.spec:
+        name = case.spec["split"]["file"]
+        numbers, others = parts_of(name, documents)
+        expect(not others and len(numbers) >= 2 and numbers == list(range(1, len(numbers) + 1)),
+               "the documents are {}, the parts of {} expected".format(documents, name))
+        return
+    want = sorted(case.expected())
+    expect(documents == want, "Weaviate holds {}, expected {}".format(documents, want))
+
+
+def check_retrieval(case):
+    """Every expected document's phrase is in one of its chunks."""
+    case.ran()
+    documents = case.documents()
+    if "split" in case.spec:
+        split = case.spec["split"]
+        numbers, _ = parts_of(split["file"], documents)
+        expect(numbers, "no part of {} in Weaviate".format(split["file"]))
+        first = "{} (part {})".format(split["file"], numbers[0])
+        last = "{} (part {})".format(split["file"], numbers[-1])
+        expect(numbers[0] == 1 and found(split["first"], documents[first]),
+               "{!r} is not in {}".format(split["first"], first))
+        expect(len(numbers) > 1 and found(split["last"], documents[last]),
+               "{!r} is not in {}".format(split["last"], last))
+        return
+    if case.spec["kind"] == "prepare":
+        # A prepared document's phrase may be in any of its parts.
+        records = case.obs.get("records") or {}
+        missing = [raw for raw, phrase in sorted(case.spec["documents"].items())
+                   if not any(found(phrase, documents.get(part, []))
+                              for part in (records.get(raw) or {}).get("parts") or [])]
+    else:
+        missing = [name for name, phrase in sorted(case.expected().items())
+                   if not found(phrase, documents.get(name, []))]
+    expect(not missing, "no chunk holds the phrase of {}".format(missing))
+
+
+def check_split(case):
+    """The page and the job record name the file split into parts; Weaviate holds parts 1 to N, N >= 2."""
+    case.ran()
+    name = case.spec["split"]["file"]
+    page = case.obs.get("page") or {}
+    # Each entry is the API's sentence about one file, starting with its name.
+    expect(any(e.startswith(name + ":") for e in page.get("split") or []),
+           "the page's split list is {}".format(page.get("split")))
+    record = (case.obs.get("record") or {}).get("body") or {}
+    expect(any(e.startswith(name + ":") for e in record.get("split") or []),
+           "the job record's split is {}".format(record.get("split")))
+    numbers, _ = parts_of(name, case.documents())
+    expect(len(numbers) >= 2 and numbers == list(range(1, len(numbers) + 1)),
+           "the parts in Weaviate are {}".format(numbers))
+
+
+def check_prepared(case):
+    """The preparation showed its job completed with no error, every document prepared."""
+    upload = case.obs.get("prepare_upload") or {}
+    expect(upload.get("status") == 201, "the Prepare upload answered {} {}".format(upload.get("status"), upload.get("body")))
+    prep = case.obs.get("preparation")
+    expect(prep is not None, "the case stopped at '{}' before the preparation ended: {}".format(
+        case.obs.get("failed_step"), case.obs.get("error")))
+    expect(prep.get("shows_job") and prep.get("status") == "completed",
+           "the preparation section shows {}".format(prep.get("status")))
+    expect(not prep.get("errors"), "the preparation section lists errors: {}".format(prep.get("errors")))
+    rows = prep.get("rows") or {}
+    for raw in case.spec["documents"]:
+        row = rows.get(raw)
+        expect(row and row.get("status") == "prepared" and not row.get("last_error"),
+               "{}'s row shows {}".format(raw, row))
+
+
+def check_message(case):
+    """The page shows a clear message naming the file and the reason."""
+    case.ran()
+    page = case.obs.get("page") or {}
+    upload = case.obs.get("upload") or {}
+    if case.spec["job"]:
+        expect(upload.get("status") == 202, "the upload answered {}".format(upload.get("status")))
+        expect(page.get("status") == "failed", "the page shows the job {}".format(page.get("status")))
+        shown = page.get("errors") or []
+        expect(any(e.startswith(case.spec["message"][0]) for e in shown),
+               "no error line starts with {!r}: {}".format(case.spec["message"][0], shown))
+    else:
+        expect(upload.get("status") == 400, "the upload answered {}".format(upload.get("status")))
+        shown = page.get("red") or []
+        expect(any(all(word in m for word in case.spec["message"]) for m in shown),
+               "no red message holds {}: {}".format(case.spec["message"], shown))
+
+
+def check_nothing_left(case):
+    """The collection holds nothing, and no job of it is running (none at all after a refused upload)."""
+    case.ran()
+    expect(page_count(case) == 0, "the Collections page shows {} objects".format(page_count(case)))
+    expect(case.dump is not None and case.dump["count"] == 0,
+           "Weaviate holds {}".format(None if case.dump is None else case.dump["count"]))
+    expect(case.obs.get("jobs_status") == 200, "the job list answered {}".format(case.obs.get("jobs_status")))
+    jobs = case.obs.get("jobs") or []
+    running = [j for j in jobs if j["status"] not in TERMINAL]
+    expect(not running, "jobs still running: {}".format(running))
+    if not case.spec["job"]:
+        expect(not jobs, "the refused upload left jobs: {}".format(jobs))
+
+
+CHECKS = {"job": check_job, "contents": check_contents, "names": check_names,
+          "retrieval": check_retrieval, "split": check_split, "prepared": check_prepared,
+          "message": check_message, "nothing-left": check_nothing_left}
+
+
+def browser(manifest, results):
+    """The browser recorded every case; a slow case is skipped only under RAG_SKIP_SLOW=1."""
+    data = load(results)
+    for case in load(manifest)["cases"]:
+        obs = data["cases"].get(case["name"])
+        expect(obs is not None, "nothing recorded for {}".format(case["name"]))
+        if obs.get("skipped"):
+            expect(case["slow"] and data.get("skip_slow"), "{} was skipped".format(case["name"]))
+    expect(isinstance(data.get("collections"), dict), "the Collections page wasn't read")
+
+
+def ours(token):
+    status, body, _ = prepare_stack.send("GET", "/collections", token)
+    expect(status == 200, "GET /collections answered {}".format(status))
+    collections = [c["name"] for c in body["collections"] if c["name"].startswith(PREFIX)]
+    status, body, _ = prepare_stack.send("GET", "/prepare/documents", token)
+    expect(status == 200, "GET /prepare/documents answered {}".format(status))
+    documents = [d for d in body["documents"] if d["name"].startswith(DOCUMENT_PREFIX)]
+    return collections, documents
+
+
+def cleanup(check):
+    token = role_token("engineer")
+    collections, documents = ours(token)
+    if check:
+        expect(not collections and not documents, "left: {} {}".format(collections, [d["name"] for d in documents]))
+        return
+    for name in collections:
+        prepare_stack.send("DELETE", "/collections/{}?confirm=true".format(name), token)
+    for doc in documents:
+        prepare_stack.send("DELETE", "/prepare/documents/" + doc["id"], token)
+
+
+def main(argv):
+    try:
+        if argv[:1] == ["cases"] and len(argv) == 2:
+            for case in load(argv[1])["cases"]:
+                kind = "split" if "split" in case else case["kind"]
+                print("{}\t{}\t{}".format(kind, "slow" if case["slow"] else "-", case["name"]))
+        elif argv[:1] == ["browser"] and len(argv) == 3:
+            browser(argv[1], argv[2])
+        elif argv[:1] in (["cleanup"], ["cleanup-check"]) and len(argv) == 1:
+            cleanup(argv[0] == "cleanup-check")
+        elif len(argv) == 5 and argv[0] in CHECKS:
+            CHECKS[argv[0]](Case(argv[1], argv[2], argv[3], argv[4]))
+        else:
+            print(__doc__, file=sys.stderr)
+            return 2
+    except Failed as failure:
+        print("    " + str(failure), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+```
+
+### scripts/verify/ui_ingest_weaviate.py
+
+```python
+"""The UI ingest suite's collections as Weaviate holds them (#641).
+
+Run by 22_ui_ingest.sh in the verify project's api container:
+
+    docker compose exec -T api python - < scripts/verify/ui_ingest_weaviate.py
+
+Prints JSON: for every collection whose name starts with VfyUiIngest, its object
+count and, per source_file, the content of its chunks in chunk_index order. It
+only reads. ui_ingest_check.py checks the documents' names and phrases against it.
+"""
+import json
+
+from services import weaviate_client as wc
+
+PREFIX = "VfyUiIngest"
+
+try:
+    client = wc.get_client()
+    out = {}
+    for name in sorted(client.collections.list_all(simple=True)):
+        if not name.startswith(PREFIX):
+            continue
+        documents, count = {}, 0
+        for obj in client.collections.get(name).iterator(
+                return_properties=["source_file", "chunk_index", "content"]):
+            count += 1
+            p = obj.properties
+            documents.setdefault(p["source_file"], []).append((p["chunk_index"], p["content"]))
+        out[name] = {"count": count,
+                     "documents": {source: [text for _, text in sorted(chunks, key=lambda c: c[0])]
+                                   for source, chunks in documents.items()}}
+    print(json.dumps({"collections": out}))
+finally:
+    wc.close_client()
+```
+
+### scripts/verify/browser/ui_ingest.js
+
+```javascript
+// Ingest through the web UI, end to end (#641), run by 22_ui_ingest.sh.
+//
+// A real browser, logged in as the harness Engineer through the real API, uses
+// the Import and Prepare pages as a user does: a new collection per case with
+// "+ New", the files through the page's file input, Start Ingest (or Upload,
+// Prepare selected and Import selected), and the page's own polling until the
+// job ends. Nothing is stubbed or intercepted. The script only observes: what
+// the pages show, the answers to the page's own requests, and the API's job and
+// prepared-document records, read with fetch in the logged-in page. The cases
+// come from the fixtures' ui_ingest/manifest.json, mounted at /fixtures.
+//
+// It prints one line `UI_INGEST_RESULT <json>` with the observations, which
+// ui_ingest_check.py turns into checks. A case that can't go on records the step
+// and why, and the run moves to the next case. Exit 1 only when the run itself
+// can't start (browser, login, manifest).
+const fs = require('fs');
+const { launch, session, setValue, clickByText, sleep } = require('./lib');
+
+const BASE = process.env.RAG_UI_BASE || 'http://localhost';
+const SKIP_SLOW = process.env.RAG_SKIP_SLOW === '1';
+const FIXTURES = '/fixtures';
+const TERMINAL = ['completed', 'failed', 'partial', 'cancelled', 'interrupted'];
+const MINUTE = 60000;
+
+class Step extends Error {
+  constructor(step, message) { super(message); this.step = step; }
+}
+
+// Runs `fn`; a failure is rethrown as the named step.
+async function step(name, fn) {
+  try { return await fn(); } catch (e) {
+    if (e instanceof Step) throw e;
+    throw new Step(name, e && e.message ? e.message.replace(/\s+/g, ' ').slice(0, 300) : String(e));
+  }
+}
+
+// A request the logged-in page sends itself: { status, body }.
+const apiGet = (page, path) => page.evaluate(async p => {
+  const res = await fetch(p);
+  let body = null;
+  try { body = await res.json(); } catch { /* not JSON */ }
+  return { status: res.status, body };
+}, path);
+
+// What the page shows now. `scope` is a CSS selector the progress panel and the
+// Job ID line are looked for in; red messages are read page-wide.
+const observe = (page, scope) => page.evaluate(sel => {
+  const root = document.querySelector(sel) || document;
+  const text = e => (e.textContent || '').replace(/\s+/g, ' ').trim();
+  const idLine = [...root.querySelectorAll('p')].find(p => text(p).startsWith('Job ID:'));
+  const panel = [...root.querySelectorAll('div.mt-4.p-4.border.rounded.bg-gray-50')]
+    .find(d => text(d).startsWith('Files:'));
+  let status = null, errors = [], split = [], skipped = [];
+  if (panel) {
+    const spans = panel.querySelectorAll(':scope > div:first-child > span');
+    status = spans.length >= 3 ? text(spans[2]) : null;
+    errors = [...panel.querySelectorAll('ul.text-red-600 li')].map(text);
+    split = [...panel.querySelectorAll('[data-testid=split-files] li')].map(text);
+    skipped = [...panel.querySelectorAll('div.text-amber-700 li')].map(text);
+  }
+  const red = [...document.querySelectorAll('p.text-red-600, [role=alert]')].map(text).filter(Boolean);
+  return {
+    job_id: idLine ? text(idLine.querySelector('.font-mono') || idLine).replace(/^Job ID:\s*/, '') : null,
+    status, errors, split, skipped, red: [...new Set(red)],
+  };
+}, scope);
+
+// waitForFunction for up to `minutes`, in rounds of two minutes: one round is a
+// single DevTools call, which puppeteer ends after 180 s (protocolTimeout).
+async function waitLong(page, minutes, fn, ...args) {
+  const deadline = Date.now() + minutes * MINUTE;
+  for (;;) {
+    const round = Math.min(2 * MINUTE, deadline - Date.now());
+    try {
+      return await page.waitForFunction(fn, { timeout: Math.max(round, 1000), polling: 1000 }, ...args);
+    } catch (e) {
+      if (!(e && e.name === 'TimeoutError') || Date.now() >= deadline) throw e;
+    }
+  }
+}
+
+// The progress panel in `scope` shows job `id` with a status it never leaves.
+async function waitForJob(page, scope, id, minutes) {
+  await step('wait for the job to end', () => waitLong(page, minutes, (sel, jobId, terminal) => {
+    const root = document.querySelector(sel) || document;
+    const text = e => (e.textContent || '').replace(/\s+/g, ' ').trim();
+    const idLine = [...root.querySelectorAll('p')].find(p => text(p).startsWith('Job ID:'));
+    if (!idLine || !text(idLine).endsWith(jobId)) return false;
+    const panel = [...root.querySelectorAll('div.mt-4.p-4.border.rounded.bg-gray-50')]
+      .find(d => text(d).startsWith('Files:'));
+    const spans = panel ? panel.querySelectorAll(':scope > div:first-child > span') : [];
+    return spans.length >= 3 && terminal.includes(text(spans[2]));
+  }, scope, id, TERMINAL));
+}
+
+// "+ New" in `scope`, the name typed in the modal, Create; the scope's
+// collection selector then shows the new collection.
+async function newCollection(page, scope, name) {
+  await step('new collection', async () => {
+    const opened = await page.evaluate(sel => {
+      const b = [...document.querySelector(sel).querySelectorAll('button')].find(x => x.textContent.trim() === '+ New');
+      if (!b) return false; b.click(); return true;
+    }, scope);
+    if (!opened) throw new Error('no "+ New" button');
+    await page.waitForSelector('input[placeholder="Collection name"]', { timeout: 10000 });
+    await setValue(page, `() => document.querySelector('input[placeholder="Collection name"]')`, name);
+    if (!await clickByText(page, 'Create')) throw new Error('no Create button');
+    await page.waitForFunction((sel, n) => document.querySelector(sel)?.querySelector('select')?.value === n,
+      { timeout: 15000 }, scope, name);
+  });
+}
+
+// The page's file input gets the case's files; the page then lists each.
+async function chooseFiles(page, inputId, files) {
+  await step('choose files', async () => {
+    const input = await page.$('#' + inputId);
+    if (!input) throw new Error('no #' + inputId);
+    await input.uploadFile(...files.map(f => `${FIXTURES}/${f}`));
+    await page.waitForFunction(names => {
+      const shown = [...document.querySelectorAll('li span')].map(s => s.textContent.trim());
+      return names.every(n => shown.includes(n));
+    }, { timeout: 10000 }, files);
+  });
+}
+
+// Clicks `label` and returns the answer to the page's own POST to `path`.
+async function send(page, label, path) {
+  return step('send: ' + label, async () => {
+    const answer = page.waitForResponse(r => r.request().method() === 'POST' && new URL(r.url()).pathname === path,
+      { timeout: 5 * MINUTE });
+    if (!await clickByText(page, label)) throw new Error(`no "${label}" button`);
+    const res = await answer;
+    let body = null;
+    try { body = await res.json(); } catch { /* not JSON */ }
+    return { status: res.status(), body };
+  });
+}
+
+// The API's record of job `id`, and the jobs of `collection` in the job list.
+async function jobRecords(page, id, collection) {
+  const record = id ? await apiGet(page, `/api/ingest/job/${encodeURIComponent(id)}`) : null;
+  const list = await apiGet(page, '/api/ingest/jobs');
+  const jobs = (list.body && Array.isArray(list.body.jobs) ? list.body.jobs : [])
+    .filter(j => j.collection === collection).map(j => ({ job_id: j.job_id, status: j.status }));
+  return { record, jobs, jobs_status: list.status };
+}
+
+// Sets a slider by its label's text and returns what the label then shows.
+async function slider(page, label, value) {
+  return page.evaluate((l, v) => {
+    const lab = [...document.querySelectorAll('label')].find(x => x.textContent.trim().startsWith(l + ':'));
+    const input = lab?.parentElement?.querySelector('input[type=range]');
+    if (!input) return null;
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, String(v));
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    return true;
+  }, label, value);
+}
+
+const sliderLabels = page => page.evaluate(() => [...document.querySelectorAll('label')]
+  .map(l => l.textContent.trim()).filter(t => /^(Chunk Size|Overlap|Min Chunk Size):/.test(t)));
+
+// Import page: a new collection, the files, Start Ingest, the job to its end.
+async function ingestCase(page, c, out) {
+  await step('open the Import page', () => page.goto(BASE + '/import', { waitUntil: 'networkidle2' }));
+  await newCollection(page, 'main', c.collection);
+  if (c.settings.chunk_size !== undefined) {
+    await step('set the strategy and the sliders', async () => {
+      const found = await page.evaluate(v => !![...document.querySelectorAll('main select')]
+        .find(x => [...x.options].some(o => o.value === v)), c.settings.strategy);
+      if (!found) throw new Error('no Chunking Strategy selector');
+      await setValue(page, `() => [...document.querySelectorAll('main select')].find(x => [...x.options].some(o => o.value === ${JSON.stringify(c.settings.strategy)}))`, c.settings.strategy);
+      await sleep(300);
+      if (!await slider(page, 'Chunk Size', c.settings.chunk_size)) throw new Error('no Chunk Size slider');
+      if (!await slider(page, 'Min Chunk Size', c.settings.min_chunk_size)) throw new Error('no Min Chunk Size slider');
+      await sleep(300);
+    });
+    out.sliders = await sliderLabels(page);
+    out.strategy = await page.evaluate(v => [...document.querySelectorAll('main select')]
+      .find(x => [...x.options].some(o => o.value === v))?.value, c.settings.strategy);
+  }
+  await chooseFiles(page, 'file-input', c.files);
+  out.upload = await send(page, 'Start Ingest', '/api/ingest/upload');
+  const id = out.upload.status === 202 && out.upload.body ? out.upload.body.job_id : null;
+  if (id) {
+    await waitForJob(page, 'main', id, c.settings.chunk_size !== undefined ? 20 : 10);
+  } else {
+    await step('wait for the message', () => page.waitForFunction(
+      () => [...document.querySelectorAll('p.text-red-600, [role=alert]')].some(e => e.textContent.trim()),
+      { timeout: 15000 }));
+  }
+  out.page = await observe(page, 'main');
+  Object.assign(out, await jobRecords(page, id, c.collection));
+}
+
+// Prepare page: Upload, Prepare selected, then Import selected into a new collection.
+async function prepareCase(page, c, out) {
+  await step('open the Prepare page', () => page.goto(BASE + '/prepare', { waitUntil: 'networkidle2' }));
+  await chooseFiles(page, 'prepare-file-input', c.files);
+  out.prepare_upload = await send(page, 'Upload', '/api/prepare/upload');
+  const ids = await step('find the uploaded documents', async () => {
+    await page.waitForFunction(names => names.every(n => [...document.querySelectorAll('tr[data-document]')]
+      .some(r => r.cells[1] && r.cells[1].firstChild && r.cells[1].firstChild.textContent === n)),
+    { timeout: 30000 }, c.files);
+    return page.evaluate(names => Object.fromEntries(names.map(n => [n,
+      [...document.querySelectorAll('tr[data-document]')].filter(r => r.cells[1].firstChild.textContent === n)
+        .map(r => r.dataset.document).pop()])), c.files);
+  });
+  out.document_ids = ids;
+  await step('tick the documents', async () => {
+    for (const name of c.files) {
+      const box = await page.$(`input[aria-label="Select ${name}"]`);
+      if (!box) throw new Error('no checkbox for ' + name);
+      await box.click();
+    }
+  });
+  out.prepare_start = await send(page, 'Prepare selected', '/api/prepare/jobs');
+  const prepareId = out.prepare_start.body ? out.prepare_start.body.job_id : null;
+  if (out.prepare_start.status !== 202 || !prepareId) throw new Step('prepare', `the start answered ${out.prepare_start.status}`);
+  await step('wait for the preparation to end', () => waitLong(page, 20, (jobId, terminal) => {
+    const s = document.querySelector('section[aria-label="Preparation progress"]');
+    if (!s || !s.textContent.includes(jobId)) return false;
+    const status = s.querySelector(':scope > div:first-child > span.text-blue-600');
+    return !!status && terminal.includes(status.textContent.trim());
+  }, prepareId, TERMINAL));
+  await sleep(1000);      // the list is read again when the job ends
+  out.preparation = await page.evaluate((jobId, names) => {
+    const text = e => (e.textContent || '').replace(/\s+/g, ' ').trim();
+    const s = document.querySelector('section[aria-label="Preparation progress"]');
+    const heads = [...document.querySelectorAll('section[aria-label="Prepared documents"] thead th')].map(text);
+    const col = heads.indexOf('Status');
+    const rows = {};
+    for (const r of document.querySelectorAll('tr[data-document]')) {
+      const name = r.cells[1].firstChild.textContent;
+      if (!names.includes(name)) continue;
+      const err = r.cells[1].querySelector('div.text-red-600');
+      rows[name] = { status: col >= 0 ? text(r.cells[col]) : null, last_error: err ? text(err) : null };
+    }
+    return {
+      job_id: jobId, shows_job: !!s && s.textContent.includes(jobId),
+      status: s ? text(s.querySelector(':scope > div:first-child > span.text-blue-600')) : null,
+      errors: s ? [...s.querySelectorAll('ul.text-red-600 li')].map(text) : [], rows,
+    };
+  }, prepareId, c.files);
+  out.records = {};
+  for (const [name, id] of Object.entries(ids)) {
+    const r = await apiGet(page, `/api/prepare/documents/${encodeURIComponent(id)}`);
+    out.records[name] = { status: r.status, parts: r.body && Array.isArray(r.body.parts) ? r.body.parts.map(p => p.name) : null };
+  }
+  const scope = 'section[aria-label="Import prepared documents"]';
+  await newCollection(page, scope, c.collection);
+  out.upload = await send(page, 'Import selected', '/api/prepare/import');
+  const id = out.upload.status === 202 && out.upload.body ? out.upload.body.job_id : null;
+  if (!id) throw new Step('import', `the import answered ${out.upload.status}`);
+  await waitForJob(page, scope, id, 10);
+  out.page = await observe(page, scope);
+  Object.assign(out, await jobRecords(page, id, c.collection));
+}
+
+(async () => {
+  const manifest = JSON.parse(fs.readFileSync(`${FIXTURES}/manifest.json`, 'utf8'));
+  const browser = await launch();
+  const result = { skip_slow: SKIP_SLOW, cases: {}, collections: null };
+  let exit = 0;
+  try {
+    const s = await session(browser, BASE, 'engineer');
+    s.page.setDefaultTimeout(60000);
+    for (const c of manifest.cases) {
+      const out = { collection: c.collection };
+      result.cases[c.name] = out;
+      if (c.slow && SKIP_SLOW) { out.skipped = true; console.log(`    case ${c.name}: skipped (RAG_SKIP_SLOW=1)`); continue; }
+      const started = Date.now();
+      try {
+        await (c.kind === 'prepare' ? prepareCase : ingestCase)(s.page, c, out);
+      } catch (e) {
+        out.failed_step = e instanceof Step ? e.step : 'unexpected';
+        out.error = e && e.message ? e.message.replace(/\s+/g, ' ').slice(0, 300) : String(e);
+        try { out.page = out.page || await observe(s.page, 'main'); } catch { /* the page is gone */ }
+      }
+      out.seconds = Math.round((Date.now() - started) / 1000);
+      const ended = out.upload && out.upload.status !== 202 ? `upload answered ${out.upload.status}`
+        : 'job ' + (out.page && out.page.status);
+      console.log(`    case ${c.name}: ${out.failed_step ? 'stopped at ' + out.failed_step + ': ' + out.error : ended} (${out.seconds} s)`);
+    }
+    await s.page.goto(BASE + '/collections', { waitUntil: 'networkidle2' });
+    await sleep(500);
+    result.collections = await s.page.evaluate(() => Object.fromEntries([...document.querySelectorAll('tbody tr')]
+      .map(r => [r.cells[0].textContent.trim(), Number(r.cells[1].textContent.trim())])));
+    await s.ctx.close();
+  } catch (e) {
+    console.log(`    the run could not go on: ${e && e.message ? e.message.replace(/\s+/g, ' ').slice(0, 300) : e}`);
+    exit = 1;
+  }
+  await browser.close();
+  console.log('UI_INGEST_RESULT ' + JSON.stringify(result));
+  process.exit(exit);
+})().catch(e => { console.log(`    the run could not start: ${e && e.message ? e.message : e}`); process.exit(1); });
 ```
 
 ### scripts/verify/job_lists.py
@@ -34215,6 +34993,158 @@ def write(target: pathlib.Path) -> None:
     with zipfile.ZipFile(target / "zip_high_ratio.zip", "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("zeros.txt", bytes(2 * 1024 * 1024))
 
+    write_ui_ingest(target / "ui_ingest", target)
+
+
+# Issue #641. 22_ui_ingest.sh ingests these through the web UI, one new
+# collection per case, and finds each phrase in the collection's chunks in
+# Weaviate. Every phrase is plain words, unique to its document.
+UI_PHRASES = {
+    "vfy-ui.pdf": "Cobalt heron ledger seven",
+    "vfy-ui.docx": "Amber falcon register nine",
+    "vfy-ui.txt": "Silver otter journal four",
+    "vfy-ui.md": "Crimson lynx almanac two",
+    "vfy-ui.csv": "Jade badger inventory six",
+    "vfy-ui.json": "Ivory marten catalogue three",
+    "vfy-ui.jsonl": "Copper wren dossier eight",
+    "mixed/notes.txt": "Violet stoat bulletin one",
+    "mixed/guide.md": "Scarlet ibis handbook five",
+    "mixed/table.csv": "Indigo vole tally ten",
+    "mixed/report.pdf": "Bronze egret survey eleven",
+    "mixed/memo.docx": "Teal ferret minute twelve",
+    "mixed/records.jsonl": "Olive pika roster thirteen",
+    "mixed/bills/bills.json.gz": "Saffron newt docket fourteen",
+    "vfy-ui-records.jsonl.gz": "Cerise gecko ledger fifteen",
+    "vfy-ui-prep-notes.txt": "Pewter crane quarterly review",
+    "vfy-ui-prep-table.csv": "Garnet tapir supply audit",
+}
+# The large file's phrases, at most 20 characters and repeated back to back,
+# so some 50-character chunk holds one whole.
+UI_LARGE_FIRST = "Quartz hare alpha"
+UI_LARGE_LAST = "Umber yak omega"
+UI_PREFIX = "VfyUiIngest"
+
+
+def _fixed_zip(data: bytes) -> bytes:
+    """A ZIP's members again, each dated 1980-01-01, so the bytes are the same
+    on every run (_docx dates them with the time of writing)."""
+    import io
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(data)) as src, \
+            zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+        for info in src.infolist():
+            member = zipfile.ZipInfo(info.filename, date_time=(1980, 1, 1, 0, 0, 0))
+            member.compress_type = zipfile.ZIP_DEFLATED
+            dst.writestr(member, src.read(info))
+    return out.getvalue()
+
+
+def _ui_documents(name: str, phrase: str) -> bytes:
+    """One small document of the type `name` names, holding `phrase`."""
+    sentence = f"The {phrase} entry is kept with these policies."
+    paras = [PARAGRAPHS[0], sentence, PARAGRAPHS[2]]
+    ext = name.rsplit(".", 1)[-1] if not name.endswith(".gz") else name[:-3].rsplit(".", 1)[-1]
+    if ext == "pdf":
+        data = _pdf(paras)
+    elif ext == "docx":
+        data = _fixed_zip(_docx(" ".join(paras)))
+    elif ext == "txt":
+        data = ("\n\n".join(paras) + "\n").encode()
+    elif ext == "md":
+        data = ("# Policies\n\n" + "\n\n".join(paras) + "\n").encode()
+    elif ext == "csv":
+        data = ("policy,detail\n" + "".join(f'p{i},"{p}"\n' for i, p in enumerate(paras))).encode()
+    elif ext == "json":
+        data = json.dumps([{"policy": f"p{i}", "detail": p} for i, p in enumerate(paras)],
+                          indent=2).encode()
+    elif ext == "jsonl":
+        data = "".join(json.dumps({"policy": f"p{i}", "detail": p}) + "\n"
+                       for i, p in enumerate(paras)).encode()
+    else:
+        raise ValueError(name)
+    return gzip.compress(data, mtime=0) if name.endswith(".gz") else data
+
+
+def write_ui_ingest(out: pathlib.Path, fixtures: pathlib.Path) -> None:
+    """The files and manifest.json of 22_ui_ingest.sh (#641)."""
+    out.mkdir(parents=True, exist_ok=True)
+    cases = []
+    # Every supported type, one new collection each.
+    for ext in ("pdf", "docx", "txt", "md", "csv", "json", "jsonl"):
+        name = f"vfy-ui.{ext}"
+        (out / name).write_bytes(_ui_documents(name, UI_PHRASES[name]))
+        cases.append({"name": f"type .{ext}", "kind": "ingest",
+                      "collection": UI_PREFIX + ext.capitalize(), "files": [name],
+                      "documents": {name: UI_PHRASES[name]}, "min_chunks": 1})
+    # A ZIP of mixed types, a .json.gz among its members (a .json.gz is only
+    # ingested from a ZIP), and a .jsonl.gz beside it, in one upload.
+    members = [m for m in UI_PHRASES if m.startswith("mixed/")]
+    with zipfile.ZipFile(out / "vfy-ui-mixed.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        for member in members:
+            z.writestr(zipfile.ZipInfo(member, date_time=(1980, 1, 1, 0, 0, 0)),
+                       _ui_documents(member, UI_PHRASES[member]))
+    (out / "vfy-ui-records.jsonl.gz").write_bytes(
+        _ui_documents("vfy-ui-records.jsonl.gz", UI_PHRASES["vfy-ui-records.jsonl.gz"]))
+    mixed = members + ["vfy-ui-records.jsonl.gz"]
+    cases.append({"name": "archives and mixes", "kind": "ingest", "collection": UI_PREFIX + "Mixed",
+                  "files": ["vfy-ui-mixed.zip", "vfy-ui-records.jsonl.gz"],
+                  "documents": {m: UI_PHRASES[m] for m in mixed}, "min_chunks": len(mixed)})
+    # Over 10,000 pieces at the fixed strategy's chunk size 50, so it is split
+    # into parts (#621), and a minimum chunk size of 6,000 merges the pieces, so
+    # only about a hundred chunks are embedded. A chunk holds at most 6,000
+    # characters, hence the minimum count. The first phrase is only in the first
+    # paragraph, the last only in the last.
+    filler = [(" ".join(PARAGRAPHS) * 2)[:999] + "." for _ in range(560)]
+    large = "\n\n".join([" ".join([UI_LARGE_FIRST] * 60)] + filler
+                         + [" ".join([UI_LARGE_LAST] * 60)]) + "\n"
+    (out / "vfy-ui-large.txt").write_text(large)
+    cases.append({"name": "large file", "kind": "ingest", "collection": UI_PREFIX + "Large",
+                  "files": ["vfy-ui-large.txt"],
+                  "settings": {"strategy": "fixed", "chunk_size": 50, "min_chunk_size": 6000},
+                  "documents": {}, "split": {"file": "vfy-ui-large.txt", "first": UI_LARGE_FIRST,
+                                             "last": UI_LARGE_LAST},
+                  "min_chunks": -(-len("".join(large.split())) // 6000)})
+    # Prepared with the local LLM, then imported (#638). The phrase is in three
+    # body lines, so the cleaning can't drop every one.
+    notes = UI_PHRASES["vfy-ui-prep-notes.txt"]
+    (out / "vfy-ui-prep-notes.txt").write_text("\n".join([
+        "Facilities Committee Notes",
+        "",
+        f"The committee opened the {notes} and agreed the agenda for the session.",
+        "Members reviewed the cleaning contract and asked for a revised schedule by March.",
+        f"The {notes} found the storage rooms in good order and the fire doors working.",
+        "The budget for new chairs was approved and the order will be placed next week.",
+        f"Actions from the {notes} are assigned to the facilities manager.",
+        "The next meeting is on the first Monday of the month in the main hall.",
+    ]) + "\n")
+    table = UI_PHRASES["vfy-ui-prep-table.csv"]
+    (out / "vfy-ui-prep-table.csv").write_text(
+        "item,team,note\nchairs,facilities,ordered\nlamps,facilities,fitted\n"
+        f"keys,security,{table}\ndesks,facilities,delivered\n")
+    cases.append({"name": "prepare and import", "kind": "prepare",
+                  "collection": UI_PREFIX + "Prepared",
+                  "files": ["vfy-ui-prep-notes.txt", "vfy-ui-prep-table.csv"],
+                  "documents": {n: UI_PHRASES[n] for n in ("vfy-ui-prep-notes.txt",
+                                                           "vfy-ui-prep-table.csv")},
+                  "slow": True})
+    # One negative case per refusal: each must show a clear message and leave
+    # nothing in its collection and no job running.
+    (out / "vfy-ui-broken.pdf").write_bytes((fixtures / "broken.pdf").read_bytes())
+    (out / "vfy-ui-notes.xyz").write_text("unsupported\n")
+    (out / "vfy-ui-over-limit.zip").write_bytes((fixtures / "zip_over_declared.zip").read_bytes())
+    for name, collection, file, words, job in (
+            ("broken PDF", "BadPdf", "vfy-ui-broken.pdf", ["vfy-ui-broken.pdf:"], True),
+            ("unsupported type", "BadType", "vfy-ui-notes.xyz",
+             ["No supported files", "vfy-ui-notes.xyz"], False),
+            ("over-limit ZIP", "BigZip", "vfy-ui-over-limit.zip",
+             ["vfy-ui-over-limit.zip", "expands to more than"], False)):
+        cases.append({"name": name, "kind": "refused", "collection": UI_PREFIX + collection,
+                      "files": [file], "message": words, "job": job})
+    for case in cases:
+        case.setdefault("settings", {})
+        case.setdefault("slow", False)
+    (out / "manifest.json").write_text(json.dumps({"cases": cases}, indent=2) + "\n")
+
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
@@ -34222,7 +35152,8 @@ if __name__ == "__main__":
     out = pathlib.Path(sys.argv[1])
     write(out)
     for path in sorted(out.iterdir()):
-        print(f"  {path.name:16s} {path.stat().st_size:7d} bytes")
+        if path.is_file():
+            print(f"  {path.name:16s} {path.stat().st_size:7d} bytes")
 ```
 
 ### scripts/verify/validate_package.py

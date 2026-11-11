@@ -102,6 +102,29 @@ cleaning window without a fallback lost at most 20 % of its characters (#640), a
 CSV and JSON Lines come back unchanged, labelled from their data, imports them into a throwaway `VfyPrepare*` collection and downloads a
 prepared part. Its `vfy-prepare-*` documents and its collections are removed at the end.
 
+`22_ui_ingest.sh` ingests through the web UI end to end (#641, SPECIFICATIONS.md §10.9), as a user does:
+`browser/ui_ingest.js` drives the real Import and Prepare pages in the browser image, logged in as the
+harness Engineer, with no request stubbed or intercepted, each case into a new collection made with the
+page's "+ New". The cases, files and known phrases are the fixtures' `ui_ingest/manifest.json`
+(`fixtures.py`): a clean `.pdf`, `.docx`, `.txt`, `.md`, `.csv`, `.json` and `.jsonl`, one collection
+each; a ZIP of mixed types with a `.json.gz` member and a `.jsonl.gz` beside it in one upload (a `.json.gz`
+is ingested only from a ZIP); a `.txt` of over 10,000 pieces at the `fixed` strategy's chunk size 50,
+split into parts (#621), whose minimum chunk size of 6,000 merges the pieces so only about a hundred
+chunks are embedded; and, in a full run only, a `.txt` and a `.csv` prepared on the Prepare page with the local LLM and
+imported with Import selected (#638). For each, `ui_ingest_check.py` checks that the page followed the job
+to `completed` with no error shown and the API's job record has no file error, that the Collections page
+shows at least the expected chunks, and, from the verify project's Weaviate (`ui_ingest_weaviate.py`, run
+in the api container), that the collection holds exactly the expected documents and a known phrase of each
+in one of its chunks; the split file's parts are numbered 1 to N with the first and last phrases in the
+first and last parts. Three bad files fail cleanly: a broken PDF (its job `failed`, an error line naming it),
+an unsupported type (`No supported files`) and an over-limit ZIP (`expands to more than`) each show a red
+message naming the file, and leave their collection empty and no job running, the two refused uploads no
+job at all. Its `VfyUiIngest*` collections and `vfy-ui-*` prepared documents are removed at the start and the
+end. Cost, measured 2026-11-11 on a Mac with 12 GB for Docker: about 3 min 40 s in a `RAG_SKIP_SLOW=1` run
+and 4 min 10 s in a full run (the Prepare case about 25 s), most of it the large file's embedding (about
+2.5 min). Splitting it through `overlap` at chunk size 50 instead embedded about 11,200 chunks and took
+26.5 min, which is why it uses `fixed` with the merge.
+
 ## Entry point and verify project
 
 `stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
@@ -868,7 +891,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `07_settings.sh` | registered live settings validation suite; invokes the standalone helper |
 | `settings_validation.py` | standalone, on the verify project after `stack.sh up`: `RAG_API=http://localhost:8081/api python3 scripts/verify/settings_validation.py`; invalid settings, valid defaults and saved round trips on a unique disposable collection; no LLM work |
 | `lock.sh` | one verify run at a time: a second `all.sh` or suite exits 3 while another is running, because runs share collection names, scratch files and fixtures. An inherited lock is trusted only while its holder is an ancestor, so a suite orphaned by a dead run exits 3 instead of acting on a later run's project (#184). Tested by `scripts/tests/test_verify_lock.sh` |
-| `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only |
+| `fixtures.py` | the test corpus — six file types plus edge cases, stdlib only; `ui_ingest/` holds the files and `manifest.json` of suite 22 (#641) |
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps; the proxy answers `Host` localhost and 127.0.0.1 and refuses another with 421 (#664) |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
 | `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384), run in a checkout reached through a symlink, and ignore the user's system and global git config (#447); embedded copies; registered by suite 01 |
@@ -933,6 +956,10 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
 | `20_offline_model.sh` | the Hugging Face libraries run offline in the api container (#618): the pre-cached sentence-transformers model loads with no Hugging Face call; `DO_NOT_TRACK` is `1` in the running api container (#695); registers `../tests/test_offline_ingest.py` (#695, #640) |
 | `../tests/test_offline_ingest.py` | API image, no network: real ingest jobs of every supported type (`.txt`, `.md`, and `.pdf`, `.docx`, `.csv`, `.json` from `fixtures.py`; backends faked) complete with every name lookup and non-Unix connect refused and recorded from before the API is imported, so nothing may dial out; `DO_NOT_TRACK` is set and the bundled spaCy model `en_core_web_sm` is the version `unstructured` expects (#695); a `.txt` and a `.md` are also prepared with a stub LLM, their parts checked by the real parser (#640); registered by `20_offline_model.sh` |
+| `22_ui_ingest.sh` | §10.9 — ingest through the web UI (#641): every supported type, a ZIP of mixed types, a file split into parts and (full runs) a Prepare and Import, each into a new collection with no stub; a broken PDF, an unsupported type and an over-limit ZIP fail cleanly |
+| `browser/ui_ingest.js` | the browser side of suite 22: the Import and Prepare pages driven as a user does, the observations printed as one JSON line (#641) |
+| `ui_ingest_weaviate.py` | helper for suite 22, run in the API container: the `VfyUiIngest*` collections' documents and chunk text, read only (#641) |
+| `ui_ingest_check.py` | the checks of suite 22, one per subcommand, on the host, and its cleanup (#641) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
