@@ -107,7 +107,7 @@ _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 def normalise_text(text: str) -> str:
     """UTF-8 text without a byte-order mark, LF line endings, NFC, and no NUL or
     other C0 control character except tab and newline, nor DEL."""
-    if text.startswith("﻿"):
+    if text.startswith("\ufeff"):
         text = text[1:]
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = unicodedata.normalize("NFC", text)

@@ -475,7 +475,7 @@ class RecordLabelTests(AreaCase):
 
 class NormaliseTests(unittest.TestCase):
     def test_bom_line_endings_nfc_and_control_characters(self):
-        raw = "﻿a\r\nb\rc\x00d\x07e\tf\x7fg\x0cÉ"
+        raw = "\ufeffa\r\nb\rc\x00d\x07e\tf\x7fg\x0cÉ"
         self.assertEqual(preparation.normalise_text(raw), "a\nb\ncde\tfgÉ")
 
 

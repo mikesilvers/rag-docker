@@ -7546,7 +7546,7 @@ _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 def normalise_text(text: str) -> str:
     """UTF-8 text without a byte-order mark, LF line endings, NFC, and no NUL or
     other C0 control character except tab and newline, nor DEL."""
-    if text.startswith("﻿"):
+    if text.startswith("\ufeff"):
         text = text[1:]
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = unicodedata.normalize("NFC", text)
@@ -32100,7 +32100,7 @@ class RecordLabelTests(AreaCase):
 
 class NormaliseTests(unittest.TestCase):
     def test_bom_line_endings_nfc_and_control_characters(self):
-        raw = "﻿a\r\nb\rc\x00d\x07e\tf\x7fg\x0cÉ"
+        raw = "\ufeffa\r\nb\rc\x00d\x07e\tf\x7fg\x0cÉ"
         self.assertEqual(preparation.normalise_text(raw), "a\nb\ncde\tfgÉ")
 
 
