@@ -4273,7 +4273,8 @@ and checks the verify project through `prepare_stack.py` (P1-P11).
       settings (422) (P6); cancelling an unknown job is 404 (P7).
 - [x] Uploads, downloads and deletes are audited with names and no document text (P8).
 - [x] With the LLM (full runs): a `.txt` becomes `.md` whose lines are source lines in order, with the title
-      header when there is a title; the `.csv` and `.jsonl` come back unchanged and code-only, with the title and
+      header when there is a title, and every cleaning window without a fallback lost at most 20 % of its
+      characters, measured on the windows rebuilt from the source (#640); the `.csv` and `.jsonl` come back unchanged and code-only, with the title and
       summary from their data and `summary_error` null (P9); an import into
       an unknown collection is 404 and one into a new collection completes and is recorded on each document
       (P10); the prepared download is the part, and deleting the prepared output returns the document to `raw`

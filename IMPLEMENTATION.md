@@ -28529,7 +28529,7 @@ if [ "$SKIP_SLOW" = "1" ]; then
   skip "P9-P11 prepare, import and download with the LLM" "RAG_SKIP_SLOW=1"
 else
   stack prepare
-  check "P9 the .txt becomes cleaned Markdown of source lines in order with its header; the .csv and .jsonl are unchanged and labelled from their data" $?
+  check "P9 the .txt becomes cleaned Markdown of source lines in order with its header, every window without a fallback losing at most 20 % of its characters; the .csv and .jsonl are unchanged and labelled from their data" $?
   stack import
   check "P10 an unknown collection is 404; the import into a new collection completes and is recorded" $?
   p10_collection=$(python3 -c 'import prepare_stack as p; print(p.state().get("collection", ""))')
@@ -28635,6 +28635,10 @@ PAGES = "\n".join(
            f"forward to the next session." for n in range(6)]
         + [f"Page {page}", ""])) + "\n"
 CSV = "name,team\nAda,core\nBo,docs\nCy,ops\n"
+# The cleaning windows and the fidelity rule of api/services/preparation.py
+# (WINDOW_CHARACTERS, MAX_REMOVED_SHARE), for P9's live check of the rule (#640).
+WINDOW_CHARACTERS = 3000
+MAX_REMOVED_SHARE = 0.20
 JSONL = '{"id": 1, "text": "first record"}\n{"id": 2, "text": "second record"}\n'
 
 
@@ -28842,9 +28846,48 @@ def check_audit(fix):
 
 # ── with the LLM (full runs only) ────────────────────────────────────────────
 
+def text_windows(lines):
+    """The cleaning windows of a part's lines, as preparation.windows() groups them:
+    whole lines in order while their characters (each line's length + 1) fit in
+    WINDOW_CHARACTERS; a longer line is a window of its own. Each window is the
+    list of its line indexes."""
+    out, current, size = [], [], 0
+    for index, line in enumerate(lines):
+        if len(line) + 1 > WINDOW_CHARACTERS:
+            if current:
+                out.append(current)
+                current, size = [], 0
+            out.append([index])
+            continue
+        if current and size + len(line) + 1 > WINDOW_CHARACTERS:
+            out.append(current)
+            current, size = [], 0
+        current.append(index)
+        size += len(line) + 1
+    if current:
+        out.append(current)
+    return out
+
+
+def removed_too_much(source, kept, fallbacks):
+    """The first window without a fallback whose removed lines hold more than
+    MAX_REMOVED_SHARE of its characters, as (number, removed, characters), or None.
+    `kept` is the set of source line indexes the prepared text kept (#640)."""
+    fell_back = {f["window"] for f in fallbacks if f.get("window") is not None}
+    for number, window in enumerate(text_windows(source), 1):
+        if number in fell_back:
+            continue
+        characters = sum(len(source[i]) + 1 for i in window)
+        removed = sum(len(source[i]) + 1 for i in window if i not in kept)
+        if removed > MAX_REMOVED_SHARE * characters:
+            return number, removed, characters
+    return None
+
+
 def check_prepare(fix):
-    """P9: preparing the .txt, the .csv and the .jsonl; the .csv and .jsonl are
-    labelled from their data."""
+    """P9: preparing the .txt, the .csv and the .jsonl; the .txt keeps only source
+    lines, in order, and every window without a fallback lost at most 20 % of its
+    characters (#640); the .csv and .jsonl are labelled from their data."""
     token = role_token("developer")
     ids = state()["ids"]
     status, body, _ = send("POST", "/prepare/jobs", token, body={"document_ids": list(ids.values())})
@@ -28858,21 +28901,26 @@ def check_prepare(fix):
     status, content, _ = send("GET", "/prepare/documents/{}/prepared".format(txt["id"]), token, raw=True)
     expect(status == 200, "prepared download {}".format(status))
     text = content.decode("utf-8")
-    lines = text.split("\n")
+    lines = text.rstrip("\n").split("\n")
     if part["title"]:
         header = "# {}".format(part["title"])
         expect(lines[0] == header and lines[2] == "Summary (generated): {}".format(part["summary"]),
                "no header: {!r}".format(lines[:3]))
         lines = lines[4:]
-    source = PAGES.split("\n")
+    # The part's text as preparation reads the .txt: its paragraphs joined by
+    # one blank line, then cut into the windows the LLM saw.
+    source = "\n\n".join(block.strip("\n") for block in PAGES.split("\n\n")
+                          if block.strip()).split("\n")
     position = 0
+    kept = set()
     for line in lines:
-        if not line:
-            continue
         try:
             position = source.index(line, position) + 1
         except ValueError:
             raise CheckFailed("a line that isn't a source line, in order: {!r}".format(line))
+        kept.add(position - 1)
+    lost = removed_too_much(source, kept, part["fallbacks"])
+    expect(lost is None, "window {} lost {} of {} characters, more than 20 %".format(*(lost or (0, 0, 0))))
     for reason in (f["reason"] for f in part["fallbacks"]):
         expect(reason in ("removed-too-much", "removed-long-line", "unusable-answer", "llm-timeout",
                           "llm-error", "llm-unavailable", "too-large-for-llm"), "reason {}".format(reason))

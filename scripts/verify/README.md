@@ -88,7 +88,8 @@ jobs, cancel and restart, busy documents, import, downloads, routes), then check
 `prepare_stack.py` as the harness Developer: the role matrix of every `/prepare` route, an upload with a ZIP,
 ZIP refusals with ingest's codes, the raw download and the space used, deletes, import refusals, an unknown
 job's cancel and the audit records. In a full run (not `RAG_SKIP_SLOW=1`) it prepares three small files with
-the local LLM, one job at a time, checks that the cleaned text holds only source lines in order and that the
+the local LLM, one job at a time, checks that the cleaned text holds only source lines in order, that every
+cleaning window without a fallback lost at most 20 % of its characters (#640), and that the
 CSV and JSON Lines come back unchanged, labelled from their data, imports them into a throwaway `VfyPrepare*` collection and downloads a
 prepared part. Its `vfy-prepare-*` documents and its collections are removed at the end.
 
