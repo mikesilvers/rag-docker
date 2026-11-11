@@ -39,6 +39,7 @@ PAGES = "\n".join(
 CSV = "name,team\nAda,core\nBo,docs\nCy,ops\n"
 # The cleaning windows and the fidelity rule of api/services/preparation.py
 # (WINDOW_CHARACTERS, MAX_REMOVED_SHARE), for P9's live check of the rule (#640).
+# test_prepare.py's test_p9_uses_preparations_window_rule checks they match.
 WINDOW_CHARACTERS = 3000
 MAX_REMOVED_SHARE = 0.20
 JSONL = '{"id": 1, "text": "first record"}\n{"id": 2, "text": "second record"}\n'

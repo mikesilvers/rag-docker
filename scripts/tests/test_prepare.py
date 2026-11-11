@@ -10,6 +10,7 @@ The LLM is a stub; nothing reaches Ollama or Weaviate. The preparation area and
 the upload folder are temporary. Routes go through `main.app` with real sessions
 in a temporary account store (`auth.testing`), without the lifespan.
 """
+import ast
 import asyncio
 import gzip
 import io
@@ -1114,6 +1115,18 @@ class WiringTests(unittest.TestCase):
         for action in ("prepare.upload", "prepare.start", "prepare.cancel", "prepare.import",
                        "prepare.download", "prepare.delete"):
             self.assertIn(f"'{action}'", page)
+
+    def test_p9_uses_preparations_window_rule(self):
+        # prepare_stack.py runs on the host with the standard library, so it keeps
+        # its own copy of the window size and the 20 % rule for P9 (#640); it
+        # imports the verify harness, so it is read here, not imported.
+        tree = ast.parse((ROOT / "scripts/verify/prepare_stack.py").read_text())
+        found = {target.id: ast.literal_eval(node.value) for node in tree.body
+                 if isinstance(node, ast.Assign) for target in node.targets
+                 if isinstance(target, ast.Name)
+                 and target.id in ("WINDOW_CHARACTERS", "MAX_REMOVED_SHARE")}
+        self.assertEqual(found, {"WINDOW_CHARACTERS": preparation.WINDOW_CHARACTERS,
+                                 "MAX_REMOVED_SHARE": preparation.MAX_REMOVED_SHARE})
 
 
 # ── reviewer's additions (#638 testing review) ──────────────────────────────
