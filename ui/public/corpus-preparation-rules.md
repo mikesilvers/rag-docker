@@ -198,8 +198,9 @@ record or JSON Lines line once converted.
 
 ## 5. Keeping a file one document
 
-The app splits a file over the limits by itself, so you don't have to. A file under these
-targets stays one document under its own name:
+The app splits a file by itself only when it is over the text limit, the chunk limit or, for
+`overlap`, the text across the chunks. A file over any of the other limits below fails instead
+of being split. A file under these targets stays one document under its own name:
 
 | Per file | Target | Limit |
 |---|---|---|
