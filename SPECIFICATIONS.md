@@ -4295,6 +4295,36 @@ and checks the verify project through `prepare_stack.py` (P1-P11).
       kind and their fallbacks by document position, the 40-character cut, the 80-word limit, and no LLM call
       or model check for all five types, with the model missing or the LLM failing (U14).
 
+### 10.9 Ingest through the web UI (#641)
+
+`scripts/verify/22_ui_ingest.sh` drives the real Import and Prepare pages in a headless browser
+(`browser/ui_ingest.js`), logged in as the harness Engineer, with no request stubbed, each case into a new
+collection; `ui_ingest_check.py` checks what the pages showed, the API's job records, the Collections page and
+the documents and phrases read from the verify project's Weaviate (`ui_ingest_weaviate.py`).
+
+- [x] A clean `.pdf`, `.docx`, `.txt`, `.md`, `.csv`, `.json` and `.jsonl`, each uploaded on the Import page
+      into a new collection, ends `completed` with no file error and no error on the page; the Collections page
+      shows the collection with at least one chunk, Weaviate holds exactly that document, and a known phrase
+      of it is in one of its chunks.
+- [x] A ZIP of mixed types with a `.json.gz` member, uploaded with a `.jsonl.gz` in one Start Ingest, does the
+      same into one collection: every member by its archive path and the `.jsonl.gz`, each with its phrase
+      (a `.json.gz` is ingested only from a ZIP, §3.1.3).
+- [x] A `.txt` of over 10,000 pieces at the `fixed` strategy's chunk size 50, with the minimum chunk size at
+      6,000 (the page's selector and sliders), is split (#621): the page and the job list it as split,
+      Weaviate holds `<name> (part 1)` to `(part N)`, N ≥ 2, the first paragraph's phrase in part 1 and the
+      last's in part N, and the Collections page shows at least its characters other than white space
+      divided by 6,000.
+- [x] With the LLM (full runs): a `.txt` and a `.csv` uploaded on the Prepare page, prepared with Prepare
+      selected (the job `completed`, no error shown, both `prepared`) and imported with Import selected into a
+      new collection, end with the import job `completed` and no error shown; Weaviate holds exactly the
+      prepared parts, each document's phrase in one of its parts' chunks (#638).
+- [x] A broken PDF ends its job `failed` with an error line naming the file; an unsupported type and an
+      over-limit ZIP are refused with a red message naming the file and the reason; each leaves its
+      collection empty (the Collections page and Weaviate) and no job running, the two refused uploads no
+      job at all.
+      *Evidence: `22_ui_ingest.sh`, one check per case and condition. Each check was shown to fail when its
+      condition breaks, a job answer stubbed to fail among them, in a run of a changed copy of the suite.*
+
 ## 11. Host Requirements and Distribution
 
 ### 11.1 Host requirements
