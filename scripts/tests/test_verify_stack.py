@@ -19,6 +19,11 @@ import textwrap
 import time
 import unittest
 
+try:
+    import yaml  # PyYAML: only the two docker-compose.yml tests need it
+except ImportError:
+    yaml = None
+
 ROOT = Path(__file__).resolve().parents[2]
 VERIFY = ROOT / 'scripts/verify'
 STACK = VERIFY / 'stack.sh'
@@ -597,11 +602,11 @@ WEAVIATE_START_PERIOD_S = 180
 RESTART_LIMIT_DEFAULT_S = WEAVIATE_START_PERIOD_S + 60
 
 
+@unittest.skipUnless(yaml, 'needs PyYAML on the host to read docker-compose.yml')
 class WeaviateHealthcheckTests(unittest.TestCase):
     """#130: compose waits out Weaviate's cold start instead of failing its dependants."""
 
     def test_start_period_covers_the_measured_cold_start(self):
-        import yaml
         compose = yaml.safe_load((ROOT / 'docker-compose.yml').read_text())
         self.assertEqual(compose['services']['weaviate']['healthcheck'], {
             'test': ['CMD', 'wget', '-q', '--spider', 'http://localhost:8080/v1/.well-known/ready'],
@@ -612,11 +617,11 @@ class WeaviateHealthcheckTests(unittest.TestCase):
         })
 
 
+@unittest.skipUnless(yaml, 'needs PyYAML on the host to read docker-compose.yml')
 class WeaviateRaftSnapshotTests(unittest.TestCase):
     """issue #178: Weaviate snapshots its Raft log often, so a start replays only a short tail."""
 
     def test_snapshot_settings(self):
-        import yaml
         compose = yaml.safe_load((ROOT / 'docker-compose.yml').read_text())
         env = compose['services']['weaviate']['environment']
         self.assertEqual(env.get('RAFT_SNAPSHOT_THRESHOLD'), 128)
