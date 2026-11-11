@@ -7659,9 +7659,11 @@ class _CsvRows:
     Two limits (PR #639 review): a row is refused when, normalised, it is longer
     than `limit`, what a part can hold for it; and reading stops as soon as a
     row's raw text passes twice that, so an unclosed quote or a file with no line
-    break can't grow a row without bound. Normalising only shortens a row (CRLF
-    becomes LF, control characters go, NFC composes), so no row that fits is
-    refused by the raw bound."""
+    break can't grow a row without bound. Normalising usually shortens a row
+    (CRLF becomes LF, control characters go), so the raw bound refuses a row
+    that would fit only when normalising would remove more than half of it,
+    which only a row made mostly of control characters does. NFC can also
+    lengthen a row; the normalised check catches that."""
 
     def __init__(self, stream: Any, dialect: Any, limit: int) -> None:
         self.stream = stream
