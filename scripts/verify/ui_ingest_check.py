@@ -45,8 +45,11 @@ def found(phrase, chunks):
 
 
 def load(path):
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError) as error:
+        raise Failed("could not read {}: {}".format(path, error)) from None
 
 
 class Case:

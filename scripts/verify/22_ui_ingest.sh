@@ -22,7 +22,8 @@ MANIFEST="$FIX/ui_ingest/manifest.json"
 require_stack
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/rag-verify-ui-ingest.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT
+# Also release the verify lock: this trap replaces the one lock.sh set.
+trap 'rm -rf "$WORK"; _rag_lock_release 2>/dev/null || true' EXIT
 RESULTS="$WORK/results.json"
 DUMP="$WORK/weaviate.json"
 
