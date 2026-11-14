@@ -19,6 +19,10 @@ Always review a pull request with the project's `rag-pr-review` skill (`/rag-pr-
 - An issue stays open until **every** PR for it has merged. Use `Part of #N` on a PR that doesn't finish the issue, and `Closes #N` only on the PR that completes it: merging into `develop` closes the issue automatically.
 - Follow `CONTRIBUTING.md` and the PR template.
 
+## Planning a release
+
+Before a release's work starts, run the project's `rag-release-plan` skill on its Jira epic (`/rag-release-plan <epic key>`). Its first phase is read-only and ends with a review report that the maintainer approves. Nothing in Jira or GitHub changes before that approval. The procedure lives in `.claude/skills/rag-release-plan/`.
+
 ## Merging into `develop`
 
 The maintainer merges PRs into `develop`, with one exception: the agent that opened a PR may merge it, as the last step of its own cycle after `rag-pr-review`, when every check below passes. No other agent or session merges it. If that agent stops before merging, the maintainer merges. `rag-pr-review` itself never merges.
