@@ -6,14 +6,16 @@ Used by `SKILL.md`. Read it in full before starting.
 
 - **Jira:** only the Atlassian MCP v2 tools, `mcp__claude_ai_Atlassian_MCP__*`, with cloudId `57da3e84-ac5a-4b18-a502-3ecd19facf3b`. Load them with ToolSearch if they are deferred.
   - Primary tools: `getJiraIssue`, `searchJiraIssuesUsingJql`, `listJiraIssueComments`, `editJiraIssue`, `addOrEditJiraIssueComment`, `transitionJiraIssue`, `createJiraIssue`.
-  - Other operations are found with `discover` and run with the execute tool it names, with `cloudId` as a top-level argument: `createJiraIssueLink` and `uploadAttachmentToJiraIssue` (`executeWrite`), `listJiraIssueTransitions` (`executeRead`). Never guess an operation's name.
+  - Other operations are found with `discover` and run with the execute tool it names, with `cloudId` as a top-level argument: `createJiraIssueLink` and `uploadAttachmentToJiraIssue` (`executeWrite`), `listJiraIssueTransitions` and `getJiraProjectVersions` (`executeRead`), and `manageJiraProjectVersion` (`executeDestructive`, only on the maintainer's go-ahead). Never guess an operation's name.
 - **GitHub:** `gh` on `mikesilvers/rag-docker`.
 
 In phase 1 only the read tools are used: `getJiraIssue`, `searchJiraIssuesUsingJql`, `listJiraIssueComments`, `executeRead`, and `gh … view`, `gh pr diff`, `gh api` GETs.
 
 ## Jira is the source of truth
 
-The RD epic decides an item's release, not the GitHub `release:` label. When they disagree, the report says so and recommends syncing GitHub to Jira, unless the maintainer decides otherwise.
+A ticket's Fix Version (a Jira Release) says when it ships; its RD release epic stays its theme (lane table, gate, decisions). Four things agree: the Fix Version, the parent epic, the Jira label `release-v<x.y.z>` and the GitHub label `release: v<x.y.z>`. The labels stay, because Joe's bots and GitHub filters still use them.
+
+When the GitHub `release:` label disagrees with Jira, the report says so and recommends syncing GitHub to Jira, unless the maintainer decides otherwise. When the Jira fields disagree among themselves, the report lists each one with what each field says and recommends a fix, and the maintainer decides.
 
 Release epics carry the release in their Jira label (`release-v1.3.0`) and their summary (`rag-docker v1.3.0`).
 
@@ -32,12 +34,23 @@ Each RD work item:
 - **Jira labels:** `gh-<N>`, `rag-docker`, the release label `release-v<x.y.z>`, and GitHub's tier (`tier-1: bug`, `tier-2: pre-client`, …) and `security` labels mirrored. Once lanes are applied, also its lane label.
 - **Issue type** matches GitHub: `enhancement` → Feature, `bug` → Bug.
 - **Parent:** the release epic. Its GitHub issue carries the matching `release: v<x.y.z>` label.
+- **Fix Version:** the release's version, exactly one, matching the parent epic and the release labels.
 - **Decisions** are comments on the ticket, one per question, in this format:
 
   ```
   **Q (<yyyy-mm-dd>):** <the question, with its context>
   **A (Mike):** <the answer>
   ```
+
+## Fix Versions
+
+Each release has a Jira version (a Jira Release), named like the release (`v1.3.0`, `later`). Its description names its epic. Read the ids each time; don't keep them in this skill.
+
+**Find the release's version** (phase 1, read-only): `executeRead` with `name: "getJiraProjectVersions"`, `inputs: {projectIdOrKey: "RD"}` and `cloudId` as a top-level argument. Take the version whose description names the epic and whose name is the epic's release. The same call with `inputs: {versionId: "<id>"}` reads one version, with its `released` state.
+
+**Set a ticket's Fix Version** (phase 2): `editJiraIssue` with `additional_fields: {"fixVersions": [{"id": "<version id>"}]}`, in the same change as the parent and the labels.
+
+**Mark a version released** (after the release ships, only on the maintainer's go-ahead): `executeDestructive` with `name: "manageJiraProjectVersion"`, `inputs: {action: "release", versionId: "<id>"}` and `cloudId` as a top-level argument. Don't pass `moveUnfixedIssuesTo`.
 
 ## Closing, folding and splitting
 
@@ -57,7 +70,7 @@ Use `completed` for work that is done, and `"not planned"` for a duplicate or a 
 
 **Split.** Open a new GitHub issue and a new RD ticket for the part that splits off.
 - The GitHub issue gets the `release:` label of the release the maintainer approved for it. If the decision named no release, it gets no release label. It never gets `Triage`: that label means the issue came from someone other than the maintainer, and it blocks `rag-pr-review`.
-- The RD ticket follows "Ticket conventions": summary, description lines, labels, and as parent the epic the maintainer approved for it. If the decision named no release, ask which epic before creating the RD ticket.
+- The RD ticket follows "Ticket conventions": summary, description lines, labels, as parent the epic the maintainer approved for it, and as Fix Version that release's version ("Fix Versions"). If the decision named no release, ask which epic before creating the RD ticket; its Fix Version follows the answer.
 
 ## Lanes and links
 
@@ -95,9 +108,9 @@ In the Order column, `→` means "then", `·` separates independent chains, and 
 
 A Markdown file, `<EPIC>-release-plan.md`, in the session's scratchpad directory (or where the maintainer says, if no scratchpad is listed). Its parts, in order:
 
-1. **Title and sources:** `# <release> (<EPIC>) scope, dependencies and parallel work`; what was read (the epic's children, each GitHub issue or PR and its comments, Dependabot PR files and npm data, the next releases' epics) and the `develop` SHA; the epic's theme.
-2. **The items:** a table of every child (key, type, status, labels, assignee, GitHub link), with the counts: children, issues with the release label under another parent, children without it. List both of those groups.
-3. **Findings:** items done or stale, housekeeping gaps, overlaps and duplicates, each with its evidence.
+1. **Title and sources:** `# <release> (<EPIC>) scope, dependencies and parallel work`; what was read (the epic's children, each GitHub issue or PR and its comments, Dependabot PR files and npm data, the next releases' epics) and the `develop` SHA; the epic's theme; the release's version (name and id).
+2. **The items:** a table of every child (key, type, status, labels, Fix Version, assignee, GitHub link), with the counts: children, issues with the release label under another parent, children without it, issues with the release's Fix Version under another parent, children without it. List each of those groups.
+3. **Findings:** items done or stale, housekeeping gaps, tickets whose Fix Version, parent epic and release labels disagree (with what each field says), overlaps and duplicates, each with its evidence. Each disagreement gets a recommended fix in part 4 and a decision in part 8.
 4. **Recommended moves, closes, folds and splits:** a table of item, recommendation and why. Name each overridden placement by the maintainer, with its date.
 5. **What stays:** grouped, with the count. The counts add up: children = moved + closed + folded + stay.
 6. **Dependencies:** a table of item, depends on, kind (hard, soft, or a scope note), and why, with the evidence.
