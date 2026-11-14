@@ -18,6 +18,10 @@ Read, at the reviewed SHA:
 - the parts of `SPECIFICATIONS.md` / `RAG_EXPORT_SPECIFICATIONS.md` that the changed code implements;
 - for every changed file, the whole file, not only the hunk.
 
+## Project direction
+
+The fully contained Docker stack (Ollama in a container) stays the default, and nothing may be Mac-only. A change that replaces the contained default, or works only on macOS, is a finding, graded under `reference.md`'s severities like any other.
+
 ## Checklist by language
 
 Apply only the sections for languages the PR touches.
@@ -65,6 +69,8 @@ git diff -z --name-only --diff-filter=d <base>...<sha> -- '*.js' | xargs -0 -r -
 ```
 
 A failing build is a **High**.
+
+**No probe containers during a verify run.** Start no probe containers of your own (`docker run`, `docker compose`, an image built for a probe) while a verify run is going, that is while `/tmp/rag-verify.lock` exists and its `pid` is alive. You are dispatched alongside the tests reviewer, so expect one. Probe containers in the same Docker VM made Ollama run out of memory during a full run (PR #630).
 
 ## Your extra recap section
 
