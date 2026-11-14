@@ -2812,10 +2812,12 @@ LOOKUP_SIZE = 100
 # sends about 10 objects per /api/embed request and a batch's requests at once.
 # CPU-only Ollama serves them one at a time, and Weaviate gives up on each after
 # 50 s, so dynamic() batching (48 objects, 2 to 3 requests in flight) queued
-# about 10 requests and failed whole files (#613). Bounded batches keep about
-# two embed requests waiting; a request that still runs out of time fails its
+# about 10 requests and failed whole files (#613). A batch of 10 is one embed
+# request: with batches of 20, the second request of each pair still ran past
+# the 50 s on a CPU-only runner with 6,000-character chunks, and every batch
+# lost half its objects (#721). A request that still runs out of time fails its
 # objects unstored, and only those are sent again.
-EMBED_BATCH_SIZE = 20
+EMBED_BATCH_SIZE = 10
 EMBED_CONCURRENT_REQUESTS = 1
 EMBED_TIMEOUT_RETRIES = 2
 
@@ -25157,7 +25159,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `../tests/test_batch_implementation.py` | host-side: exact embedded source checks for `api/main.py`, the Weaviate client, the batch-write, recovery, import and tuning services and their verify scripts, and the restart-recovery block of `05_transfer.sh` with stubbed commands (refused-prefix skip, `RAG_ALLOW_RESTART`, the #152 refusal), registered by transfer |
 | `../tests/test_chunk_limits.py` / `../tests/test_insert_chunks.py` | controlled chunker per-file limits, chunk ceiling and semantic floor (#111) / insert batching and the "index not ready" retry, registered by ingest in the API image with the repository mounted (#386) |
-| `../tests/test_embed_batching.py` | controlled embedding writes (#613): a write that leaves vectors to Weaviate's `text2vec-ollama` uses `fixed_size(20, 1)` batches and one with every vector `dynamic()`; only objects whose embed request timed out in Weaviate are sent again, at most twice, with the write counts and rollback unchanged, and no other failure is retried. Registered by ingest in the API image with the repository mounted, after which ingest writes 45 vectorless chunks to a scratch `<prefix>EmbedBatch` collection on the real Weaviate and Ollama and checks they are all stored, through `fixed_size(20, 1)` and never `dynamic()`; the collection is removed afterwards |
+| `../tests/test_embed_batching.py` | controlled embedding writes (#613): a write that leaves vectors to Weaviate's `text2vec-ollama` uses `fixed_size(10, 1)` batches and one with every vector `dynamic()`; only objects whose embed request timed out in Weaviate are sent again, at most twice, with the write counts and rollback unchanged, and no other failure is retried. Registered by ingest in the API image with the repository mounted, after which ingest writes 45 vectorless chunks to a scratch `<prefix>EmbedBatch` collection on the real Weaviate and Ollama and checks they are all stored, through `fixed_size(20, 1)` and never `dynamic()`; the collection is removed afterwards |
 | `../tests/test_corpus_rules.py` | controlled: the corpus preparation rules the Import page offers (`ui/public/corpus-preparation-rules.md`) state every ingest limit as the chunker, the ingest pipeline, the settings defaults, the chunk-setting bounds, `docker-compose.yml` and the proxy define it, and no other number (#615), registered by ingest in the API image with the repository mounted |
 | `../tests/test_corpus_rules_estimates.py` | controlled: the chunk counts the corpus preparation rules give hold for the real chunker for every strategy, on files built at the rules' targets, which are never refused for the text or chunk limits (#615), registered by ingest in the API image with the repository mounted |
 | `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
@@ -36580,7 +36582,7 @@ finally:
     wc.close_client()
 print(f"stored={stored} fixed_size={calls} dynamic={dynamic.call_count}")
 ok = (stored == 45 and dynamic.call_count == 0
-      and calls == [{"batch_size": 20, "concurrent_requests": 1}])
+      and calls == [{"batch_size": 10, "concurrent_requests": 1}])
 sys.exit(0 if ok else 1)
 ENDPY
 ) >/tmp/vfy_embed_batch.log 2>&1
