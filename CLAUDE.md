@@ -49,7 +49,7 @@ The maintainer merges PRs into `develop`, with one exception: the coordinating s
 Just before merging, run every check again:
 
 1. **Clean evaluation:** the latest overall `rag-pr-review` status on the PR's current head, created by the authenticated account, is `success` (the command is in `.claude/skills/rag-pr-review/reference.md`, "Commit statuses").
-2. **CI `verify` green** on the current head, for every PR (`gh pr checks N`).
+2. **CI `verify` green** on the current head (`gh pr checks N`), except for a Markdown-only PR (every changed file is `*.md`, Claude skills included), which doesn't wait for it: CI still runs, and its result is reported.
 3. **`develop` unchanged:** after `git fetch origin develop`, `git rev-parse origin/develop` is still the develop SHA in that evaluation's claim status.
 4. **No comment or hold:** nothing is on the PR but `rag-pr-review` recap reviews (`gh pr view N --json comments`, `gh api repos/mikesilvers/rag-docker/pulls/N/reviews` and `.../pulls/N/comments`; a recap is a review by the authenticated account carrying `rag-pr-review:run:`, as in "Finding an existing recap" in `reference.md`, and its inline comments carry its `pull_request_review_id`), and the maintainer hasn't asked to hold it.
 
