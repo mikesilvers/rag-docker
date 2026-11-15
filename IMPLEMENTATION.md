@@ -19485,7 +19485,7 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
 ```json
 {
   "name": "rag-ui",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "private": true,
   "scripts": {
     "dev": "vite",
@@ -51831,7 +51831,7 @@ class Config:
     endpoint: str = field(default="", repr=False)
     headers: dict = field(default_factory=dict, repr=False)
     service: str = "rag-api"
-    version: str = "1.2.1"
+    version: str = "1.2.2"
     environment: str = "development"
     traces: bool = True
     logs: bool = True
@@ -51932,7 +51932,7 @@ class Config:
         if batch > queue:
             raise TelemetryConfigError("RAG_OTEL_BATCH_SIZE exceeds RAG_OTEL_QUEUE_SIZE")
         return cls(True, endpoint.rstrip("/"), headers,
-                   identifier("SERVICE_NAME", "rag-api"), identifier("SERVICE_VERSION", "1.2.1"),
+                   identifier("SERVICE_NAME", "rag-api"), identifier("SERVICE_VERSION", "1.2.2"),
                    identifier("ENVIRONMENT", "development"),
                    boolean("TRACES", True), boolean("LOGS", True), boolean("METRICS", True),
                    number("SAMPLE_RATIO", 1, 0, 1, False), queue, batch,
@@ -53201,7 +53201,7 @@ class TelemetryTests(unittest.TestCase):
                 self.assertNotIn(SECRET.encode(), body)
             traces = ExportTraceServiceRequest.FromString(by_path['/v1/traces'])
             resource = {a.key: a.value.string_value for a in traces.resource_spans[0].resource.attributes}
-            self.assertEqual(resource, {'service.name':'rag-api', 'service.version':'1.2.1', 'deployment.environment.name':'development'})
+            self.assertEqual(resource, {'service.name':'rag-api', 'service.version':'1.2.2', 'deployment.environment.name':'development'})
             span = traces.resource_spans[0].scope_spans[0].spans[0]
             self.assertEqual(span.name, 'rag.operation')
             self.assertFalse(span.events);self.assertFalse(span.links);self.assertFalse(span.status.message)
@@ -53291,7 +53291,7 @@ class TelemetryTests(unittest.TestCase):
                 processor = runtime._providers[0]._multi_log_record_processor._log_record_processors[0]._batch_processor
                 self.assertEqual(len(processor._queue), 2)
                 for queued in processor._queue:
-                    self.assertEqual(dict(queued.resource.attributes), {'service.name':'rag-api', 'service.version':'1.2.1', 'deployment.environment.name':'development'})
+                    self.assertEqual(dict(queued.resource.attributes), {'service.name':'rag-api', 'service.version':'1.2.2', 'deployment.environment.name':'development'})
                     self.assertFalse(queued.resource.schema_url)
                     self.assertEqual(queued.instrumentation_scope.name, 'rag.telemetry')
                     self.assertFalse(queued.instrumentation_scope.version)
@@ -57016,7 +57016,7 @@ services:
     environment:
       RAG_OTEL_ENABLED: "${RAG_VERIFY_OTEL_ENABLED:-true}"
       RAG_OTEL_PROTOCOL: http/protobuf
-      RAG_OTEL_SERVICE_VERSION: "1.2.1"
+      RAG_OTEL_SERVICE_VERSION: "1.2.2"
       RAG_OTEL_QUEUE_SIZE: "256"
       RAG_OTEL_BATCH_SIZE: "64"
       RAG_OTEL_ENDPOINT: http://otel-collector:4318
