@@ -128,8 +128,8 @@ class EmbedBatchingTests(unittest.TestCase):
     def test_vectorless_records_use_bounded_batches(self):
         collection = Collection()
         self.assertEqual(self.insert(collection, chunks(45)), 45)
-        self.assertEqual(collection.batch.opened, [("fixed_size", 20, 1)])
-        self.assertEqual((batch_write.EMBED_BATCH_SIZE, batch_write.EMBED_CONCURRENT_REQUESTS), (20, 1))
+        self.assertEqual(collection.batch.opened, [("fixed_size", 10, 1)])
+        self.assertEqual((batch_write.EMBED_BATCH_SIZE, batch_write.EMBED_CONCURRENT_REQUESTS), (10, 1))
 
     def test_records_with_vectors_keep_dynamic_batching(self):
         collection = Collection()
@@ -140,7 +140,7 @@ class EmbedBatchingTests(unittest.TestCase):
         collection = Collection()
         records = vectored(3) + [{"id": str(uuid.uuid4()), "properties": {"content": "no vector"}}]
         self.assertEqual(batch_write.insert(collection, records, exact=False), 4)
-        self.assertEqual(collection.batch.opened, [("fixed_size", 20, 1)])
+        self.assertEqual(collection.batch.opened, [("fixed_size", 10, 1)])
 
     def test_timed_out_embeddings_are_sent_again_alone(self):
         collection = Collection([fail(2)])
@@ -148,7 +148,7 @@ class EmbedBatchingTests(unittest.TestCase):
         first, second = collection.batch.sent
         self.assertEqual(len(first), 5)
         self.assertEqual(second, first[:2])
-        self.assertEqual(collection.batch.opened, [("fixed_size", 20, 1)] * 2)
+        self.assertEqual(collection.batch.opened, [("fixed_size", 10, 1)] * 2)
         self.assertEqual(sorted(collection.stores.values()), [1] * 5)
 
     def test_retries_stop_after_the_limit_and_the_write_fails_with_its_counts(self):

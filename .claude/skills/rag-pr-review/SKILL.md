@@ -48,11 +48,14 @@ Record `headRefOid` as the **reviewed SHA**, and `origin/develop` as the **devel
 ### 3. Check that it merges
 
 ```bash
-git merge-tree --write-tree origin/develop <reviewed-sha>
+git merge-tree --write-tree origin/develop <reviewed-sha> > <scratchpad>/pr-N-merge-tree.txt; echo "merge-tree exit=$?"
 ```
 
-- **Exit 0:** it merges cleanly. The first line of output is the merged tree; keep it for step 5.
-- **Conflicts (exit 1):** stop for this PR. Don't claim it and set no statuses. List the conflicting files (in the output after the tree line) for the user. The PR's creator updates their own PR; the maintainer doesn't resolve it. Offer the user a short draft asking the creator to merge the current `develop` and resolve those files; posting it is the user's call, because it notifies the creator.
+Read the exit code before the file. Never pipe merge-tree's output (into `head`, for example): a pipe returns the last command's exit code, so a conflict would look clean.
+
+- **Exit 0:** it merges cleanly. The file's first line is the merged tree; keep it for step 5.
+- **Conflicts (exit 1):** stop for this PR. Don't claim it and set no statuses. List the conflicting files (in the file after the tree line) for the user. The PR's creator updates their own PR; the maintainer doesn't resolve it. Offer the user a short draft asking the creator to merge the current `develop` and resolve those files; posting it is the user's call, because it notifies the creator.
+- **Any other exit code:** merge-tree itself failed. Stop for this PR: don't claim it, set no statuses, and tell the user what it printed.
 
 ### 4. Check and claim the commit
 
@@ -135,14 +138,16 @@ First reset the merged worktree to the evaluated commit (`git -C <bundle>/merged
 
 The whole check runs as **one script that holds the verify lock** from before `up` until after `down`, so no other verify run can remove the project under the smoke checks (#154). `stack.sh` sees that the lock is already held (`RAG_VERIFY_LOCK_HELD`) and neither takes nor releases it. The script is `{skills}/rag-pr-review/build-check.sh`, the maintainer's copy (`{skills}` as in step 7), and takes the bundle path as its first argument. Run it as it is: never copy it into the bundle or rewrite it.
 
-Run it in the background and wait for it as "Waiting for long runs" in `.claude/skills/rag-pr-review-tests/SKILL.md` says, with this script's log and pid file in place of `verify-all.*`:
+Run it from the main checkout, with the Docker CLI on PATH ("Machine setup" under "The verify project" in `reference.md`): without `docker` on PATH, the script does nothing. Run it in the background and wait for it as "Waiting for long runs" in `.claude/skills/rag-pr-review-tests/SKILL.md` says, with this script's log and pid file in place of `verify-all.*`:
 
 ```bash
-(bash {skills}/rag-pr-review/build-check.sh <bundle>; echo "build-check exit=$?") > <bundle>/build-check.log 2>&1 & echo $! > <bundle>/build-check.pid
+main=$(git worktree list --porcelain | awk 'NR==1 {print $2}')
+(cd "$main" && PATH="<docker-cli-dir>:$PATH" bash {skills}/rag-pr-review/build-check.sh <bundle>; echo "build-check exit=$?") > <bundle>/build-check.log 2>&1 & echo $! > <bundle>/build-check.pid
 ```
 
 Then read the finished log:
 
+- **`STOP: could not fetch develop` with a git lock error in the log** (such as `cannot lock ref`, or a `.lock` file that exists): another git process was fetching at the same time. Run the script once more, the same way. If it stops again, the next bullet applies.
 - **`STOP:` then `build-check exit=1`, with no `stack.sh` output:** the harness isn't `develop`'s, or `develop` couldn't be fetched. Nothing was built or started. Stop the evaluation, run nothing more, and tell the user.
 - **`Another verify run …` then `build-check exit=3`:** another verify run holds the lock, so the check didn't start. Wait for that run to end, then run the script again.
 - **Anything else** is the check's result. `stack.sh up` checks the resolved compose configuration (a refusal is FAILED, with the message it prints), builds every image from the merged worktree (`--pull`), starts the whole project and waits up to 15 minutes for every service with a healthcheck to report healthy (with one retry, #130), and confirms `/api/health` answers on the verify port. On a failed start it prints the last 50 log lines of each service that isn't up. The smoke checks go through the verify project's proxy on port 8081 and **retry for up to 60 seconds** each: services without a healthcheck (`ui`, `proxy`) take a moment to accept connections, and the first request can return 502. The health response must report Weaviate, the LLM and the embedding model as ok.
@@ -178,7 +183,7 @@ Either way, the script has already torn the verify project down: confirm it as "
 
 ### 10. Report to the user
 
-For each PR: the verdict per check, the High findings in one line each, any check Tests scored as flaky or environmental (with how many times it failed, so the user can overrule it), whether it's ready to merge, the develop SHA it was evaluated against, and a link to the recap. It is ready only when Coding, Security, Tests and Build all passed and no High is open. This skill never merges: the maintainer merges, except an agent's own tier-1 bug fix that passes every check in "Merging into `develop`" in `CLAUDE.md`. Tell the user the evaluation holds only while `develop` is still at that SHA, so nothing else should merge into `develop` first. If the head moved during the evaluation, ask whether to evaluate the new commit. For a PR by `joefeser` with Medium or Low findings, also offer the follow-up issue once it merges (see "Maintainer follow-ups" in `reference.md`).
+For each PR: the verdict per check, the High findings in one line each, any check Tests scored as flaky or environmental (with how many times it failed, so the user can overrule it), whether it's ready to merge, the develop SHA it was evaluated against, and a link to the recap. It is ready only when Coding, Security, Tests and Build all passed and no High is open. This skill never merges: merging is a separate step, only after the maintainer's go-ahead, as "Merging into `develop`" in `CLAUDE.md` says. Tell the user the evaluation holds only while `develop` is still at that SHA, so nothing else should merge into `develop` first. If the head moved during the evaluation, ask whether to evaluate the new commit. For a PR by `joefeser` with Medium or Low findings, also offer the follow-up issue once it merges (see "Maintainer follow-ups" in `reference.md`).
 
 ## Common mistakes
 

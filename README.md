@@ -1287,10 +1287,12 @@ bash package.sh              # writes rag-docker.zip (~1.3 MB)
 
 The zip holds exactly the files git tracks in the current commit (`HEAD`), built
 with `git archive`. Untracked and ignored files never go in (`.env` files,
-`node_modules/`, offline tars, previous archives, `.claude/`, `dev-docs/`, the
-contents of `ingest-inbox/` and `exports/`), and neither do uncommitted changes,
-so commit first. Run it in a git checkout of the project, with `bash package.sh`,
-not `./package.sh`, so it does not depend on its own executable bit.
+`node_modules/`, offline tars, previous archives, `dev-docs/`, the untracked
+parts of `.claude/` such as local settings and worktrees, the contents of
+`ingest-inbox/` and `exports/`), and neither do uncommitted changes, so commit
+first. The project skills tracked under `.claude/skills/` do go in. Run it in a
+git checkout of the project, with `bash package.sh`, not `./package.sh`, so it
+does not depend on its own executable bit.
 
 #### 2. What the target Mac needs
 
@@ -1521,7 +1523,7 @@ host variables through. No destination or secret is supplied by this repository.
 | `RAG_OTEL_HEADERS_FILE` | Optional mounted UTF-8 JSON regular file containing `Authorization` and/or `X-Api-Key`; max 8 KiB, max 2 KiB per value |
 | `RAG_OTEL_CA_FILE` | Optional mounted PEM CA bundle (a regular file) for an HTTPS endpoint; max 1 MiB; replaces the bundled roots |
 | `RAG_OTEL_SERVICE_NAME` | `rag-api` |
-| `RAG_OTEL_SERVICE_VERSION` | `1.2.1` |
+| `RAG_OTEL_SERVICE_VERSION` | `1.2.2` |
 | `RAG_OTEL_ENVIRONMENT` | `development` |
 | `RAG_OTEL_TRACES`, `RAG_OTEL_LOGS`, `RAG_OTEL_METRICS` | Each `true`; exact booleans |
 | `RAG_OTEL_SAMPLE_RATIO` | `1.0`; finite 0–1, root-independent ratio sampling |

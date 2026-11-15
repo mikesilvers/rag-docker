@@ -2645,8 +2645,9 @@ For each chunk, the API service creates a Weaviate object with all properties po
 
 Inserts use the weaviate-client v4 batch context manager (`with collection.batch.<mode>() as batch:
 batch.add_object(...)`). A write in which any record has no vector, so that Weaviate's
-`text2vec-ollama` embeds it (ingest), uses `fixed_size(batch_size=20, concurrent_requests=1)`
-(#613); a write in which every record carries its vector uses `dynamic()`. After a batch flushes, if
+`text2vec-ollama` embeds it (ingest), uses `fixed_size(batch_size=10, concurrent_requests=1)`
+(#613), one embed request per batch (#721); a write in which every record carries its vector uses
+`dynamic()`. After a batch flushes, if
 every object Weaviate rejected failed because its embed request timed out (the error message
 contains both `failed to vectorize` and `context deadline exceeded`) and names its UUID, only those
 objects are sent again, in a new batch of the same kind, at most twice; Weaviate stored none of
@@ -3311,7 +3312,7 @@ Optional telemetry (#282) is configured by API container environment settings, n
 | `RAG_OTEL_HEADERS_FILE` | none | Mounted JSON regular file with `Authorization` and/or `X-Api-Key`; at most 8 KiB, 2 KiB per value; requires an HTTPS endpoint |
 | `RAG_OTEL_CA_FILE` | none (bundled roots) | Mounted PEM CA bundle (a regular file); at most 1 MiB; must load as a CA bundle; replaces the bundled roots; requires an HTTPS endpoint (#356) |
 | `RAG_OTEL_SERVICE_NAME` | `rag-api` | 1–64 ASCII letters, digits, `.`, `_` or `-`, starting with a letter or digit |
-| `RAG_OTEL_SERVICE_VERSION` | `1.2.1` | As `RAG_OTEL_SERVICE_NAME` |
+| `RAG_OTEL_SERVICE_VERSION` | `1.2.2` | As `RAG_OTEL_SERVICE_NAME` |
 | `RAG_OTEL_ENVIRONMENT` | `development` | As `RAG_OTEL_SERVICE_NAME` |
 | `RAG_OTEL_TRACES`, `RAG_OTEL_LOGS`, `RAG_OTEL_METRICS` | `true` | Exact `true` or `false` |
 | `RAG_OTEL_SAMPLE_RATIO` | `1.0` | Finite 0–1 |
@@ -3807,14 +3808,14 @@ now lives once, in `api/services/ingest_config.py`.
       `finished_at`; `test_finished_at_boundary_of_the_window` lists one exactly 24 hours before the
       request and drops one a second earlier.*
 
-- [x] A write with any record left to `text2vec-ollama` uses `fixed_size(batch_size=20, concurrent_requests=1)` and one whose records all carry vectors `dynamic()`; only objects whose embedding timed out in Weaviate are sent again, at most twice; no other failure is retried; a chunk sent again counts once in `chunks_submitted` (#613).
+- [x] A write with any record left to `text2vec-ollama` uses `fixed_size(batch_size=10, concurrent_requests=1)` and one whose records all carry vectors `dynamic()`; only objects whose embedding timed out in Weaviate are sent again, at most twice; no other failure is retried; a chunk sent again counts once in `chunks_submitted` (#613, #721).
       *`scripts/tests/test_embed_batching.py` (13 tests, run by `02_ingest.sh` in the API image) checks
       both batch kinds, the resend, its limit, the write counts and rollback, that no other failure is
       retried on the first pass or on a resend, and weaviate-client's own `ErrorObject`; 10 of the 13
       fail against `batch_write.py` from before #645. `02_ingest.sh` then writes 45 vectorless
       chunks to a scratch collection on the real Weaviate and Ollama and checks they are all stored,
-      through `fixed_size(20, 1)` and never `dynamic()`. Both checks passed in PR #645's full verify
-      run on `41e2f5a`.*
+      through `fixed_size(10, 1)` and never `dynamic()`. Both checks passed in PR #645's full verify
+      run on `41e2f5a`, with the size 20 then; #721 made it 10.*
 
 ### 10.2 Query
 
@@ -4359,11 +4360,13 @@ stale backend leaves the VM unreachable and the daemon never comes up.
 Both archives MUST hold exactly the files git tracks in the current commit
 (`HEAD`), built with `git archive`, so nothing untracked or ignored goes in:
 not `.DS_Store`, `node_modules/`, `__pycache__/`, `dist/`, `.env*`, `*.tar`,
-`offline/`, previous archives, `.claude/` or `dev-docs/`, nor the contents of
-`ingest-inbox/` and `exports/` (their tracked `.gitkeep` keeps the directories).
-Uncommitted changes are not included. Both scripts MUST refuse to run unless
-their directory is the top level of a git checkout (#384). Neither carries the
-Weaviate index or uploaded files; those are created empty on first start.
+`offline/`, previous archives, `dev-docs/` or the untracked parts of `.claude/`
+(local settings, worktrees), nor the contents of `ingest-inbox/` and `exports/`
+(their tracked `.gitkeep` keeps the directories). The project skills tracked
+under `.claude/skills/` are included. Uncommitted changes are not included.
+Both scripts MUST refuse to run unless their directory is the top level of a
+git checkout (#384). Neither carries the Weaviate index or uploaded files; those
+are created empty on first start.
 
 ### 11.3 Offline bundle contents
 

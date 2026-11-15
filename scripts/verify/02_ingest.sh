@@ -430,7 +430,7 @@ finally:
     wc.close_client()
 print(f"stored={stored} fixed_size={calls} dynamic={dynamic.call_count}")
 ok = (stored == 45 and dynamic.call_count == 0
-      and calls == [{"batch_size": 20, "concurrent_requests": 1}])
+      and calls == [{"batch_size": 10, "concurrent_requests": 1}])
 sys.exit(0 if ok else 1)
 ENDPY
 ) >/tmp/vfy_embed_batch.log 2>&1

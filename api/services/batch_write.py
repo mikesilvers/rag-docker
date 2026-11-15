@@ -25,10 +25,12 @@ LOOKUP_SIZE = 100
 # sends about 10 objects per /api/embed request and a batch's requests at once.
 # CPU-only Ollama serves them one at a time, and Weaviate gives up on each after
 # 50 s, so dynamic() batching (48 objects, 2 to 3 requests in flight) queued
-# about 10 requests and failed whole files (#613). Bounded batches keep about
-# two embed requests waiting; a request that still runs out of time fails its
+# about 10 requests and failed whole files (#613). A batch of 10 is one embed
+# request: with batches of 20, the second request of each pair still ran past
+# the 50 s on a CPU-only runner with 6,000-character chunks, and every batch
+# lost half its objects (#721). A request that still runs out of time fails its
 # objects unstored, and only those are sent again.
-EMBED_BATCH_SIZE = 20
+EMBED_BATCH_SIZE = 10
 EMBED_CONCURRENT_REQUESTS = 1
 EMBED_TIMEOUT_RETRIES = 2
 

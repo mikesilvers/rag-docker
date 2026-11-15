@@ -40,8 +40,8 @@ documentation improvements are all welcome.
 - Say which verification run you did (full or `RAG_SKIP_SLOW=1`) and whether it
   passed.
 
-The maintainer merges pull requests. The one exception, for the maintainer's own
-agents' tier-1 bug fixes, is in [CLAUDE.md](CLAUDE.md#merging-into-develop).
+The maintainer merges pull requests. How the maintainer's own agents may merge a
+PR after the maintainer's go-ahead is in [CLAUDE.md](CLAUDE.md#merging-into-develop).
 Workflows on pull requests from forks run after the maintainer approves them.
 
 ## License
