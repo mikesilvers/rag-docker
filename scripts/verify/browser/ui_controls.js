@@ -603,6 +603,31 @@ function usersCases() {
     { name: 'A list that cannot be loaded says so', open: open({ 'GET /api/auth/users': apiError(500, 'INTERNAL_ERROR', 'Synthetic failure.') }), async run(s) {
       await waitText(s.page, 'Could not load the users: Synthetic failure.');
     } },
+    // The page re-reads the session after a change to the Engineer's own account:
+    // a demoted Engineer leaves the page, a disabled one is logged out. The stub
+    // answers as the API would once the change applies (reviewer, PR #550).
+    ...[['demotes themselves', 'role', { role: 'developer' }, '/qa', 'Ask a Question'],
+        ['disables themselves', 'disable', null, '/login', 'Log in to continue']].map(([what, action, body, where, landmark]) => {
+      const me = { role: 'engineer', enabled: true };
+      const gone = () => !me.enabled ? apiError(401, 'AUTH_REQUIRED', 'Log in to use this.') : null;
+      const notEngineer = () => me.role !== 'engineer' ? apiError(403, 'FORBIDDEN', 'This needs the engineer role.') : null;
+      return { name: `An Engineer who ${what} on the Users page is sent to ${where}`, open: open({
+        'GET /api/auth/me': () => gone() || json(200, { username: ME, role: me.role, must_change_password: false }),
+        'GET /api/auth/users': () => gone() || notEngineer() || json(200, { users: [row('vfy-developer', 'developer'), row(ME, me.role, { enabled: me.enabled }), row('vfy-eng2', 'engineer')] }),
+        [`POST /api/auth/users/${ME}/${action}`]: call => {
+          if (action === 'role') me.role = call.body.role; else me.enabled = false;
+          return json(200, { user: row(ME, me.role, { enabled: me.enabled }) });
+        },
+      }), async run(s) {
+        await waitText(s.page, 'vfy-eng2');
+        if (action === 'role') await fill(s.page, `select[aria-label="Role of ${ME}"]`, body.role);
+        else await rowPress(s.page, ME, 'Disable');
+        await waitPath(s.page, where);
+        await waitText(s.page, landmark);
+        assert.equal(callsTo(s, 'POST', `/api/auth/users/${ME}/${action}`).length, 1);
+        if (action === 'role') assert.equal((await nav(s.page)).includes('Users'), false);
+      } };
+    }),
   ];
 }
 
