@@ -230,14 +230,16 @@ class Packager(unittest.TestCase):
             with self.subTest(telemetry=telemetry), tempfile.TemporaryDirectory() as folder:
                 root=Path(folder);(root/'bin').mkdir();(root/'scripts').mkdir()
                 shutil.copy(ROOT/'package-offline.sh',root/'package-offline.sh')
-                # package-offline.sh reads the model names from the entrypoint (#647).
-                (root/'ollama').mkdir();shutil.copy(ROOT/'ollama/entrypoint.sh',root/'ollama/entrypoint.sh')
+                # package-offline.sh reads the model names the entrypoint pulls (#647),
+                # resolved from the compose settings by models.sh and compose-models.sh (#671).
+                (root/'ollama').mkdir()
+                for name in ('entrypoint.sh','models.sh','compose-models.sh'):shutil.copy(ROOT/'ollama'/name,root/'ollama'/name)
                 (root/'scripts/collector_offline.py').write_text("from pathlib import Path\nimport sys\nPath(sys.argv[2],'collector.tar').touch()\n")
                 stub=root/'bin/docker'
                 stub.write_text("""#!/usr/bin/env python3
 import sys,json,pathlib
 args=sys.argv[1:]
-if args[:2]==['compose','config']:print(json.dumps({'name':'fixture'}))
+if args[:2]==['compose','config']:print(json.dumps({'name':'fixture','services':{'ollama':{'environment':{'LLM_MODEL':'llama3.1:8b','BUILD_LLM_MODEL':'','ANSWER_LLM_MODEL':''}}}}))
 if args[:1]==['run']:
  for arg in args:
   if arg.endswith(':/out'):pathlib.Path(arg[:-5],'ollama_models.tar.gz').touch()

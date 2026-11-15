@@ -61,7 +61,12 @@ case "$1 $2" in
   "image inspect")
     for missing in $STUB_MISSING_IMAGES; do [ "$3" = "$missing" ] && exit 1; done; exit 0 ;;
   "volume inspect") [ -n "$STUB_NO_VOLUME" ] && exit 1; exit 0 ;;
-  "compose config") echo '{"name": "rag-docker", "services": {}}'; exit 0 ;;
+  # The ollama service's LLM settings (#671): the defaults docker-compose.yml sets,
+  # unless the test gives others.
+  "compose config")
+    printf '{"name": "rag-docker", "services": {"ollama": {"environment": {"LLM_MODEL": "%s", "BUILD_LLM_MODEL": "%s", "ANSWER_LLM_MODEL": "%s"}}}}\n' \
+      "${STUB_LLM_MODEL-llama3.1:8b}" "${STUB_BUILD_LLM_MODEL:-}" "${STUB_ANSWER_LLM_MODEL:-}"
+    exit 0 ;;
   "compose ps")
     if [ "$3" = "--services" ]; then
       i=0; while [ "$i" -lt "${STUB_RUNNING:-5}" ]; do echo "service$i"; i=$((i+1)); done
@@ -101,10 +106,13 @@ def offline_images():
     return [line.strip() for line in block.splitlines() if line.strip()]
 
 
-def entrypoint_models():
-    """The models ollama/entrypoint.sh pulls, read as package-offline.sh and the CI cache read them."""
-    text = (ROOT / "ollama" / "entrypoint.sh").read_text()
-    return re.findall(r"^pull_with_retry ([A-Za-z0-9._:-]*)$", text, re.M)
+def entrypoint_models(**settings):
+    """The models ollama/entrypoint.sh pulls with these LLM settings (#671): what
+    ollama/models.sh prints, the names package-offline.sh and the CI cache read."""
+    env = {"PATH": os.environ["PATH"], "LLM_MODEL": "llama3.1:8b", **settings}
+    out = subprocess.run(["bash", str(ROOT / "ollama" / "models.sh")], capture_output=True,
+                         text=True, env=env, timeout=60, check=True)
+    return out.stdout.split()
 
 
 def background_git(trace):
@@ -295,6 +303,24 @@ class OfflinePackageTests(Workspace):
         calls = self.calls()
         self.assertLess(calls.index(check), next(i for i, c in enumerate(calls) if c[0] == "save"))
 
+    def test_a_different_build_model_is_checked_too(self):
+        # The names come from the LLM settings compose gives the ollama service (#671).
+        result, _out, _files = self.build({}, STUB_BUILD_LLM_MODEL="qwen2.5:0.5b")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        models = entrypoint_models(BUILD_LLM_MODEL="qwen2.5:0.5b")
+        self.assertEqual(models, ["llama3.1:8b", "qwen2.5:0.5b", "nomic-embed-text"])
+        check = [c for c in self.calls() if c[0] == "run"][0]
+        self.assertEqual(check[-len(models) - 1:], ["sh"] + models)
+
+    def test_unreadable_model_settings_stop_before_anything_is_saved(self):
+        result, out, _files = self.build({}, STUB_BUILD_LLM_MODEL="bad name")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("BUILD_LLM_MODEL is not a model name", result.stderr)
+        self.assertIn("ERROR: could not read the model names (ollama/compose-models.sh).",
+                      result.stderr)
+        self.assertFalse(out.exists())
+        self.assertEqual([c for c in self.calls() if c[0] in ("save", "run")], [])
+
     def test_a_missing_model_stops_before_anything_is_saved(self):
         # An install from before #647 holds phi3.5, not llama3.1:8b.
         result, out, _files = self.build({}, STUB_MISSING_MODELS="llama3.1:8b")
@@ -329,6 +355,31 @@ class ImageListTests(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         resolved = sorted(line.strip() for line in out.stdout.splitlines() if line.strip())
         self.assertEqual(sorted(offline_images()), resolved)
+
+
+class ComposeModelsTests(unittest.TestCase):
+    def test_the_default_settings_resolve_to_todays_models(self):
+        # docker-compose.yml's own settings, read as package-offline.sh and the CI
+        # model cache read them (#671): unchanged from before the split.
+        if not shutil.which("docker"):
+            self.skipTest("needs the docker CLI")
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("COMPOSE_FILE", "COMPOSE_PROJECT_NAME", "COMPOSE_PROFILES")}
+        if subprocess.run(["docker", "compose", "version"], capture_output=True,
+                          env=env).returncode != 0:
+            self.skipTest("needs docker compose")
+        with tempfile.TemporaryDirectory() as folder:
+            # Only the tracked compose file, so a local docker-compose.override.yml
+            # can't change what is read.
+            for name in ("docker-compose.yml", "ollama/models.sh", "ollama/compose-models.sh"):
+                target = Path(folder) / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / name, target)
+            out = subprocess.run(["bash", "ollama/compose-models.sh"], capture_output=True,
+                                 text=True, cwd=folder, env=env, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.split(), ["llama3.1:8b", "nomic-embed-text"])
+        self.assertEqual(out.stdout.split(), entrypoint_models())
 
 
 class InstallOfflineTests(Workspace):

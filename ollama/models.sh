@@ -1,6 +1,6 @@
 #!/bin/bash
 # The Ollama models this stack needs (#671), from the three LLM settings
-# docker-compose.yml gives the ollama service (the x-llm-models block):
+# docker-compose.yml gives the ollama service (its environment):
 #
 #   the answer model  ANSWER_LLM_MODEL, else LLM_MODEL, else llama3.1:8b
 #   the build model   BUILD_LLM_MODEL,  else LLM_MODEL, else llama3.1:8b

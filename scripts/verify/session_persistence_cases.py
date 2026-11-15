@@ -160,7 +160,7 @@ asyncio.run(run())
     def test_regeneration_retains_validation_and_transport_retry_budget(self):
         valid=json.dumps({'question':'Regenerated', 'answer':'Answer', 'ground_truth':'Truth'})
         replies=[httpx.ReadTimeout(''), 'invalid', httpx.ReadTimeout(''), 'invalid', httpx.ReadTimeout(''), valid]
-        with patch.object(gs.ollama, 'chat', new=AsyncMock(side_effect=replies)) as chat:
+        with patch.object(gs.ollama, 'build_chat', new=AsyncMock(side_effect=replies)) as chat:
             result=asyncio.run(gs.regenerate_pair(self.data['session_id'], 'p_0'))
         self.assertEqual(chat.await_count, 6)
         self.assertEqual(result['question'], 'Regenerated')
