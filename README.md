@@ -466,8 +466,8 @@ docker compose up -d
 ```
 
 Accounts, collections and everything else are kept (`down` without `-v`).
-The `tls-init` container and the `lan_certs` volume stay unused until you
-switch again.
+`down` removes the LAN containers, `tls-init` included; the `lan_certs`
+volume is kept, unused until you switch again.
 
 ### Things to know
 

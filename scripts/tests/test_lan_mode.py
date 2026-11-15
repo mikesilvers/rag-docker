@@ -382,6 +382,25 @@ class BringYourOwnTests(CertTestCase):
                 self.assertIn(part, err)
                 self.assertFalse((self.out / "live").exists())
 
+    def test_an_encrypted_key_is_refused(self):
+        cert_bytes, key_bytes = certificate(["files.example"])
+        key = serialization.load_pem_private_key(key_bytes, password=None)
+        self.put(cert_bytes, key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                               serialization.BestAvailableEncryption(b"a passphrase")))
+        code, out, err = self.step()
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(len(err.splitlines()), 1, err)
+        self.assertIn("key.pem", err)
+        self.assertFalse((self.out / "live").exists())
+
+    def test_a_cert_pem_directory_is_refused(self):
+        (self.byo / "cert.pem").mkdir()
+        self.put(key_bytes=certificate(["files.example"])[1])
+        code, out, err = self.step()
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(len(err.splitlines()), 1, err)
+        self.assertFalse((self.out / "live").exists())
+
     def test_hosts_map_from_your_certificate(self):
         # #664: the certificate's own names, in nginx's forms; localhost and
         # 127.0.0.1 are nginx.lan.conf's.
@@ -444,6 +463,9 @@ class NginxTests(unittest.TestCase):
         self.assertIn("ssl_session_tickets off;", lines)
         for text in (self.lan, self.locations):
             self.assertNotIn("strict-transport-security", "\n".join(directives(text)).lower())
+
+    def test_no_version_in_responses(self):
+        self.assertIn("server_tokens off;", directives(self.lan))
 
     def test_both_servers_share_the_locations(self):
         include = "include /etc/nginx/rag/locations.conf;"

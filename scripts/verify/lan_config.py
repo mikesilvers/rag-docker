@@ -65,6 +65,12 @@ def problems(config, checkout, port):
     wait = (proxy.get("depends_on") or {}).get("tls-init") or {}
     if wait.get("condition") != "service_completed_successfully":
         found.append("the proxy doesn't wait for tls-init to complete successfully")
+    # Fail closed (§2.5): the ui starts only on a healthy api and the proxy only
+    # after the ui, so an API that refuses LAN mode leaves nothing published.
+    if ((services.get("ui") or {}).get("depends_on") or {}).get("api", {}).get("condition") != "service_healthy":
+        found.append("the ui doesn't wait for a healthy api, so the proxy could publish while the API refuses")
+    if "ui" not in (proxy.get("depends_on") or {}):
+        found.append("the proxy doesn't wait for the ui")
     expected = [
         ("proxy", "/etc/nginx/nginx.conf", "bind", os.path.join(checkout, "proxy", "nginx.lan.conf"), True),
         ("proxy", "/etc/nginx/rag/locations.conf", "bind", os.path.join(checkout, "proxy", "locations.conf"), True),

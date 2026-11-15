@@ -18,6 +18,46 @@ section "LAN units: setting, startup refusal, certificate step, nginx configurat
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_lan_mode.py)
 check "test_lan_mode.py registered regression checks" $?
 
+section "LAN refusal in the built API image, on the default verify project"
+# One-off api containers (no dependencies, removed afterwards) with LAN mode
+# switched on by environment: the real image and its settings parsing refuse to
+# start, with one line and no traceback, in every run, not only with --lan.
+_rag_require_lock_owner
+(cd "$REPO_ROOT" && python3 - <<'ENDPY'
+import secrets, subprocess, sys
+cases = [(["RAG_LAN_MODE=true", "AUTH_COOKIE_SECURE=false"], "LAN mode refused: AUTH_COOKIE_SECURE", True),
+         (["RAG_LAN_MODE=true", "AUTH_COOKIE_SECURE=true", "AUTH_DIR=/tmp/vfy-lan-empty-" + secrets.token_hex(4)],
+          "LAN mode refused: there is no enabled AI Engineer", True),
+         (["RAG_LAN_MODE=yes"], "RAG_LAN_MODE must be exactly true or false", False)]
+failed = False
+for env, expected, one_line in cases:
+    args = ["docker", "compose", "run", "--rm", "--no-deps", "-T"]
+    for item in env:
+        args += ["-e", item]
+    try:
+        result = subprocess.run(args + ["api"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, universal_newlines=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        print("    {}: the API kept running".format(" ".join(env)), file=sys.stderr)
+        failed = True
+        continue
+    lines = result.stdout.splitlines()
+    hits = [line for line in lines if expected in line]
+    problems = []
+    if result.returncode == 0:
+        problems.append("exit 0")
+    if not hits:
+        problems.append("no line with {!r}".format(expected))
+    if one_line and (len(hits) != 1 or any(line.startswith("Traceback") for line in lines)):
+        problems.append("not exactly one refusal line without a traceback")
+    if problems:
+        failed = True
+        print("    {}: {}; last lines {}".format(" ".join(env), ", ".join(problems), lines[-5:]), file=sys.stderr)
+sys.exit(1 if failed else 0)
+ENDPY
+)
+check "the API image refuses LAN mode with a non-Secure cookie or no Engineer (one line), and a non-boolean RAG_LAN_MODE" $?
+
 if [ "${RAG_VERIFY_LAN:-0}" != 1 ]; then
   skip "LAN mode on the running verify project" "run stack.sh run --lan"
   summary

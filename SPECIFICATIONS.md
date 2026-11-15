@@ -293,7 +293,8 @@ Engineer is created in the default mode before switching.
 
 **TLS server** (`proxy/nginx.lan.conf`): one server, `listen 443 ssl`, `http2 on`, TLS 1.2 and 1.3 only, Mozilla's
 intermediate cipher list for TLS 1.2, `ssl_prefer_server_ciphers off`, session tickets off, no
-`Strict-Transport-Security` header, the pair at `/etc/nginx/certs/live/{cert,key}.pem`, and the shared routes.
+`Strict-Transport-Security` header, `server_tokens off` (no nginx version in responses), the pair at
+`/etc/nginx/certs/live/{cert,key}.pem`, and the shared routes.
 
 **Certificate step** (`api/tls_cert.py`, run by `tls-init` on every start in LAN mode):
 
