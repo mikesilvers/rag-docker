@@ -30,7 +30,7 @@ After every step, save it in the work folder ("Work folder" in `reference.md`).
 
 ### 2. Dev-docs
 
-The three documents live in the work folder: `analysis.md`, `specifications.md` and `implementation-plan.md`. They are never committed to rag-docker. This replaces the `dev-docs/issue-<N>/<branch>/` location that CLAUDE.md still names.
+The three documents live in the work folder: `analysis.md`, `specifications.md` and `implementation-plan.md`. They are never committed to rag-docker. Existing `dev-docs/issue-*` folders in rag-docker stay where they are, as CLAUDE.md says.
 
 1. **Analysis:** what the brief and the source of truth ask for, and nothing more.
 2. **Specifications:** what the change must do, built from the analysis.
@@ -52,7 +52,7 @@ Each document goes through a review loop before the next one starts, and no code
 
 ### 4. Verify
 
-- **Never run `stack.sh`** (maintainer decision 2, 2026-11-14). The rag-pr-review tests reviewer runs the full suite, and its recap is the PR's verify record.
+- **Never run `stack.sh`** (maintainer decision 2, 2026-11-14). The rag-pr-review tests reviewer runs the full suite, and its recap is the PR's verify record. For a Markdown-only PR (every changed file is `*.md`), it takes the fast path instead, and CI `verify` on the PR's head is the full-run record ("Choosing the path" in `rag-pr-review-tests`).
 - Find the host tests that reach your change and run only those ("Finding host tests" in `reference.md`, with the machine notes there).
 - Keep what ran and its result, or the evidence that no host test reaches the change, for the PR.
 
@@ -83,7 +83,7 @@ For whoever handles a merged PR's findings: every Medium or Low finding from its
 | Putting the dev-docs in the rag-docker repository | They live in `~/repo/rag-docker-work/RD-<n>/`, never committed to rag-docker. |
 | Committing an empty dev-doc | Check the file has its content before committing. |
 | Starting with an open blocker, or in a lane someone else holds | Stop and return it. |
-| Running `stack.sh` or the full verify suite | Host tests only. The tests reviewer runs the full suite. |
+| Running `stack.sh` or the full verify suite | Host tests only. The tests reviewer runs the full suite, or the fast path for a Markdown-only PR. |
 | Guessing when something is unclear | Stop and return the question. |
 | Running `rag-pr-review` or merging | Stop after opening the PR. |
 | Adding `Triage` or a release label to a follow-up issue | Leave it unlabelled for the maintainer. |
