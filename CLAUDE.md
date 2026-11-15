@@ -39,7 +39,7 @@ Every fix starts in a fresh agent run with the `rag-fix` skill (`rag-fix RD-<n>`
 ## Verification
 
 - Fix agents run only the host tests their change touches, and never run `stack.sh`.
-- The rag-pr-review tests reviewer always runs the full `stack.sh run` (no `RAG_SKIP_SLOW`, no filter) on the PR merged with `develop`. Its recap summary is the PR's verify record.
+- The rag-pr-review tests reviewer runs the full `stack.sh run` (no `RAG_SKIP_SLOW`, no filter) on the PR merged with `develop`, and its recap summary is the PR's verify record. For a Markdown-only PR (every changed file is `*.md`, skills under `.claude/` included), it runs the host tests that read the changed files instead, and CI `verify` on the PR's head is the full-run record.
 - Verification runs only on the disposable verify project (`rag-verify`, port 8081), never on the live `rag-docker` stack. Never override the suites' refusal of the live stack with `RAG_VERIFY_LIVE=1`. See `scripts/verify/README.md`.
 
 ## Merging into `develop`
