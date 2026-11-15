@@ -31024,6 +31024,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -31210,6 +31212,46 @@ class StoreTests(StoreTestCase):
         with self.assertRaises(store.Refused):
             store.set_enabled("eng2", False)
 
+    def test_two_last_engineer_changes_at_once_leave_one_engineer(self):
+        # #551 item 3: the last-Engineer check runs inside the write transaction
+        # (BEGIN IMMEDIATE), so two changes started together can't both pass it.
+        # The check is slowed down here, so without the lock both would see two Engineers.
+        changes = {"demote": lambda name: store.set_role(name, "developer"),
+                   "disable": lambda name: store.set_enabled(name, False)}
+        real = store._is_last_engineer
+
+        def slow(conn, row):
+            found = real(conn, row)
+            time.sleep(0.2)
+            return found
+
+        for first, second in (("demote", "demote"), ("disable", "disable"), ("demote", "disable")):
+            with self.subTest(changes=(first, second)):
+                temp = tempfile.TemporaryDirectory()
+                self.addCleanup(temp.cleanup)
+                with patch.object(settings, "auth_dir", temp.name), patch.object(store, "_is_last_engineer", slow):
+                    self.make("eng1", "engineer")
+                    self.make("eng2", "engineer")
+                    start, results = threading.Barrier(2), {}
+
+                    def run(name, change):
+                        start.wait()
+                        try:
+                            changes[change](name)
+                            results[name] = "ok"
+                        except store.Refused as exc:
+                            results[name] = exc.code
+
+                    threads = [threading.Thread(target=run, args=("eng1", first)),
+                               threading.Thread(target=run, args=("eng2", second))]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join(30)
+                    self.assertEqual(sorted(results.values()), ["LAST_ENGINEER", "ok"], results)
+                    engineers = [u.username for u in store.list_users() if u.role == "engineer" and u.enabled]
+                    self.assertEqual(len(engineers), 1, engineers)
+
     def test_refusals_carry_a_code(self):
         # The admin routes answer by these codes (PR 2 of #25).
         self.make("eng", "engineer")
@@ -31280,6 +31322,16 @@ class PolicyTests(unittest.TestCase):
         routes = self.app_routes()
         self.assertEqual(sorted(routes - set(policy.ACCESS)), [], "routes with no policy entry")
         self.assertEqual(sorted(set(policy.ACCESS) - routes), [], "policy entries with no route")
+
+    def test_every_api_route_is_in_the_telemetry_route_vocabulary(self):
+        # #551 item 2 (and #553 item 3): a route missing from telemetry.ROUTES is
+        # labelled "unmatched" in spans and metrics. The routes come from the app,
+        # so a new one is checked without editing this test. FastAPI's own docs
+        # routes aren't API routes.
+        from services import telemetry
+        docs = {("GET", "/docs"), ("GET", "/docs/oauth2-redirect"), ("GET", "/redoc"), ("GET", "/openapi.json")}
+        missing = sorted(f"{m} {p}" for m, p in self.app_routes() - docs if f"{m} {p}" not in telemetry.ROUTES)
+        self.assertEqual(missing, [], "routes telemetry would label 'unmatched'")
 
     def test_the_matrix_is_the_agreed_one(self):
         counts = {}
