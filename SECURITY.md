@@ -93,6 +93,15 @@ request but `/health` and the login (#25).
   clients apart (see LAN mode above). It guards against mistakes and
   after-the-fact questions, not against someone with access to the Docker
   host, who can edit the files. See README "Audit log".
+- **Accepted hosts (#664).** The proxy answers only for `localhost` and
+  `127.0.0.1`, at any port, plus, in LAN mode, the names in its certificate.
+  Any other Host gets `421 Misdirected Request` from nginx before the UI or
+  the API sees the request, so a web page on a DNS-rebinding domain can't
+  reach the workbench through a user's browser.
+- **Login request size (#663).** The login route (`/api/auth/login`) is the
+  only route that reads a request body before authentication, so the proxy
+  accepts a body of at most 16k there; nginx refuses a larger one with `413`
+  before the API reads it.
 - **Not covered yet.** The MCP server's use of keys is #39. `GET /health` is
   open, for container healthchecks, and reports service status and host
   resources.
