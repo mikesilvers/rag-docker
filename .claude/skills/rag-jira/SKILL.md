@@ -7,7 +7,7 @@ description: Use when reading, creating, updating, moving, commenting on or clos
 
 These are the conventions for Jira project RD, where rag-docker's work and releases are tracked. Follow them whenever you read or change an RD ticket, open a GitHub issue for rag-docker, or record a question or decision.
 
-Read `reference.md` in this directory before acting. It holds the site and tools, the release table with version ids, the ticket format, the status ids, and the exact calls.
+Read `reference.md` in this directory before acting. It holds the site and tools, how to find a release's version, the ticket format, the status ids, and the exact calls.
 
 ## Rules throughout
 
@@ -63,7 +63,7 @@ Use `createJiraIssueLink` with `inwardIssue` as the blocker and `outwardIssue` a
 
 ### Ship a release
 
-Mark the version released with `manageJiraProjectVersion`, only on the maintainer's go-ahead ("Shipping a release").
+Only on the maintainer's go-ahead: set the ship date he gives as the release date (ask if he hasn't), ask where each unfinished ticket goes and move it first, then mark the version released with `manageJiraProjectVersion`. Never pass `moveUnfixedIssuesTo` ("Shipping a release"; the full procedure is in `rag-release-plan`).
 
 ## Joe's side
 
