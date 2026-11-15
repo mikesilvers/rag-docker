@@ -19493,7 +19493,6 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
     "preview": "vite preview"
   },
   "dependencies": {
-    "lucide-react": "^1.64.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^9.0.1",
