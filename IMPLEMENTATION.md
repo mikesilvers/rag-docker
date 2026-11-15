@@ -1011,7 +1011,9 @@ def collection_check_unavailable(name: str, outcome: str) -> JSONResponse:
 ### api/config.py
 
 ```python
-from pydantic import field_validator
+import sys
+
+from pydantic import ValidationError, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -1119,7 +1121,31 @@ class Settings(BaseSettings):
         env_file = ".env"
 
 
-settings = Settings()
+def refusal_lines(error: ValidationError) -> list[str]:
+    """One `Settings refused:` line per invalid setting (#555), without the values given."""
+    reasons: dict[str, list[str]] = {}
+    for item in error.errors(include_url=False, include_input=False):
+        name = ".".join(str(part) for part in item["loc"]).upper()
+        own = str(item["ctx"]["error"]) if item["type"] == "value_error" and "error" in item.get("ctx", {}) else ""
+        message = own or item["msg"]
+        reason = message if not name or name in message else f"{name}: {message}"
+        reasons.setdefault(name, []).append(reason)
+    return ["Settings refused: " + "; ".join(parts) for parts in reasons.values()]
+
+
+def _load() -> Settings:
+    # An invalid setting stops the API, and anything else importing this
+    # module, with one line per setting and no traceback (#555), like LAN
+    # mode's refusal: SystemExit isn't printed as a traceback.
+    try:
+        return Settings()
+    except ValidationError as error:
+        for line in refusal_lines(error):
+            print(line, file=sys.stderr, flush=True)
+        raise SystemExit(1) from None
+
+
+settings = _load()
 ```
 
 ### api/lan_mode.py
@@ -24450,9 +24476,9 @@ would fail by design). `--lan` can't be combined with `--telemetry`.
 `docker-compose.lan.yml`, under the project name `rag-lan-config`, with no
 `.env`; nothing is created) and runs `../tests/test_lan_mode.py` in the API
 image. It also checks, in one-off api containers of the default verify project
-(`docker compose run --rm --no-deps`), that the API refuses LAN mode with one
-line and no traceback for a non-Secure cookie or an empty account store, and
-refuses a non-boolean `RAG_LAN_MODE`. Only in a `--lan` run does it check the running LAN project through
+(`docker compose run --rm --no-deps`), that the API refuses with one line and
+no traceback for a non-Secure cookie in LAN mode, an empty account store in LAN
+mode and a non-boolean `RAG_LAN_MODE`. Only in a `--lan` run does it check the running LAN project through
 `lan_stack.py`: HTTPS with the generated certificate, the hosts nginx answers
 for (localhost, 127.0.0.1 and the test names; another `Host` gets 421, #664),
 TLS versions and HTTP/2, the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
@@ -30015,12 +30041,12 @@ section "LAN refusal in the built API image, on the default verify project"
 _rag_require_lock_owner
 (cd "$REPO_ROOT" && python3 - <<'ENDPY'
 import secrets, subprocess, sys
-cases = [(["RAG_LAN_MODE=true", "AUTH_COOKIE_SECURE=false"], "LAN mode refused: AUTH_COOKIE_SECURE", True),
+cases = [(["RAG_LAN_MODE=true", "AUTH_COOKIE_SECURE=false"], "LAN mode refused: AUTH_COOKIE_SECURE"),
          (["RAG_LAN_MODE=true", "AUTH_COOKIE_SECURE=true", "AUTH_DIR=/tmp/vfy-lan-empty-" + secrets.token_hex(4)],
-          "LAN mode refused: there is no enabled AI Engineer", True),
-         (["RAG_LAN_MODE=yes"], "RAG_LAN_MODE must be exactly true or false", False)]
+          "LAN mode refused: there is no enabled AI Engineer"),
+         (["RAG_LAN_MODE=yes"], "RAG_LAN_MODE must be exactly true or false")]
 failed = False
-for env, expected, one_line in cases:
+for env, expected in cases:
     args = ["docker", "compose", "run", "--rm", "--no-deps", "-T"]
     for item in env:
         args += ["-e", item]
@@ -30038,7 +30064,7 @@ for env, expected, one_line in cases:
         problems.append("exit 0")
     if not hits:
         problems.append("no line with {!r}".format(expected))
-    if one_line and (len(hits) != 1 or any(line.startswith("Traceback") for line in lines)):
+    if len(hits) != 1 or any(line.startswith("Traceback") for line in lines):
         problems.append("not exactly one refusal line without a traceback")
     if problems:
         failed = True
@@ -30046,7 +30072,7 @@ for env, expected, one_line in cases:
 sys.exit(1 if failed else 0)
 ENDPY
 )
-check "the API image refuses LAN mode with a non-Secure cookie or no Engineer (one line), and a non-boolean RAG_LAN_MODE" $?
+check "the API image refuses LAN mode with one line and no traceback: a non-Secure cookie, no Engineer, a non-boolean RAG_LAN_MODE" $?
 
 if [ "${RAG_VERIFY_LAN:-0}" != 1 ]; then
   skip "LAN mode on the running verify project" "run stack.sh run --lan"
@@ -30641,10 +30667,10 @@ class MainImportTests(unittest.TestCase):
         self.assertEqual(ast.unparse(body[0]), "import lan_mode")
         self.assertEqual(ast.unparse(body[1]), "lan_mode.enforce()")
 
-    def run_import(self, **env):
+    def run_import(self, module="main", **env):
         with tempfile.TemporaryDirectory() as folder:
             full = {**os.environ, "AUTH_DIR": folder, "PYTHONDONTWRITEBYTECODE": "1", **env}
-            return subprocess.run([sys.executable, "-c", "import main"], cwd=API_DIR, env=full,
+            return subprocess.run([sys.executable, "-c", f"import {module}"], cwd=API_DIR, env=full,
                                   capture_output=True, text=True, timeout=300)
 
     def test_lan_mode_without_a_secure_cookie_exits_with_one_line(self):
@@ -30663,9 +30689,23 @@ class MainImportTests(unittest.TestCase):
         self.assertIn("no enabled AI Engineer", lines[0])
 
     def test_an_invalid_value_stops_the_api(self):
+        # #555: any invalid setting stops startup with one line, no traceback.
         result = self.run_import(RAG_LAN_MODE="yes")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("RAG_LAN_MODE must be exactly true or false", result.stderr)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.splitlines(), ["Settings refused: RAG_LAN_MODE must be exactly true or false"])
+
+    def test_each_invalid_setting_is_one_line_without_its_value(self):
+        result = self.run_import(module="config", AUTH_COOKIE_SECURE="yes", WEAVIATE_PORT="not-a-port-7f3a")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        lines = result.stderr.splitlines()
+        self.assertEqual(len(lines), 2, result.stderr)
+        self.assertEqual(sum(l.startswith("Settings refused: AUTH_COOKIE_SECURE must be exactly true or false")
+                             for l in lines), 1, lines)
+        self.assertEqual(sum(l.startswith("Settings refused: WEAVIATE_PORT: ") for l in lines), 1, lines)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("not-a-port-7f3a", result.stdout + result.stderr)
 
 
 # ── the certificate step ─────────────────────────────────────────────────────

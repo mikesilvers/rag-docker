@@ -25,12 +25,12 @@ section "LAN refusal in the built API image, on the default verify project"
 _rag_require_lock_owner
 (cd "$REPO_ROOT" && python3 - <<'ENDPY'
 import secrets, subprocess, sys
-cases = [(["RAG_LAN_MODE=true", "AUTH_COOKIE_SECURE=false"], "LAN mode refused: AUTH_COOKIE_SECURE", True),
+cases = [(["RAG_LAN_MODE=true", "AUTH_COOKIE_SECURE=false"], "LAN mode refused: AUTH_COOKIE_SECURE"),
          (["RAG_LAN_MODE=true", "AUTH_COOKIE_SECURE=true", "AUTH_DIR=/tmp/vfy-lan-empty-" + secrets.token_hex(4)],
-          "LAN mode refused: there is no enabled AI Engineer", True),
-         (["RAG_LAN_MODE=yes"], "RAG_LAN_MODE must be exactly true or false", False)]
+          "LAN mode refused: there is no enabled AI Engineer"),
+         (["RAG_LAN_MODE=yes"], "RAG_LAN_MODE must be exactly true or false")]
 failed = False
-for env, expected, one_line in cases:
+for env, expected in cases:
     args = ["docker", "compose", "run", "--rm", "--no-deps", "-T"]
     for item in env:
         args += ["-e", item]
@@ -48,7 +48,7 @@ for env, expected, one_line in cases:
         problems.append("exit 0")
     if not hits:
         problems.append("no line with {!r}".format(expected))
-    if one_line and (len(hits) != 1 or any(line.startswith("Traceback") for line in lines)):
+    if len(hits) != 1 or any(line.startswith("Traceback") for line in lines):
         problems.append("not exactly one refusal line without a traceback")
     if problems:
         failed = True
@@ -56,7 +56,7 @@ for env, expected, one_line in cases:
 sys.exit(1 if failed else 0)
 ENDPY
 )
-check "the API image refuses LAN mode with a non-Secure cookie or no Engineer (one line), and a non-boolean RAG_LAN_MODE" $?
+check "the API image refuses LAN mode with one line and no traceback: a non-Secure cookie, no Engineer, a non-boolean RAG_LAN_MODE" $?
 
 if [ "${RAG_VERIFY_LAN:-0}" != 1 ]; then
   skip "LAN mode on the running verify project" "run stack.sh run --lan"

@@ -3339,6 +3339,11 @@ LAN mode (#26, §2.5) adds one API container setting and two read by `docker-com
 | `RAG_LAN_HOSTNAMES` | empty | Comma-separated DNS names and IP addresses for the self-signed certificate; required unless `proxy/certs` holds `cert.pem` and `key.pem` |
 | `RAG_LAN_PORT` | `443` | The host port of LAN mode's TLS publication, on every interface |
 
+An invalid API container setting (any setting of `api/config.py`, such as `AUTH_COOKIE_SECURE`, `RAG_LAN_MODE`,
+`AUDIT_LOG_QUESTIONS` or `MAX_ZIP_MEMBERS`) stops API startup: the API writes one line per invalid setting to standard
+error, `Settings refused: <reason>`, without the value given and with no traceback, and exits 1 (#555). Telemetry
+settings fail as described above.
+
 ---
 
 ## 9. File and Directory Structure
