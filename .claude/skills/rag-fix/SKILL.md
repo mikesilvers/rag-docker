@@ -30,7 +30,7 @@ After every step, save it in the work folder ("Work folder" in `reference.md`).
 
 ### 2. Dev-docs
 
-The three documents live in the work folder: `analysis.md`, `specifications.md` and `implementation-plan.md`. They are never committed to rag-docker. This replaces the `dev-docs/issue-<N>/<branch>/` location that CLAUDE.md still names.
+The three documents live in the work folder: `analysis.md`, `specifications.md` and `implementation-plan.md`. They are never committed to rag-docker. Existing `dev-docs/issue-*` folders in rag-docker stay where they are, as CLAUDE.md says.
 
 1. **Analysis:** what the brief and the source of truth ask for, and nothing more.
 2. **Specifications:** what the change must do, built from the analysis.
@@ -52,13 +52,13 @@ Each document goes through a review loop before the next one starts, and no code
 
 ### 4. Verify
 
-- **Never run `stack.sh`** (maintainer decision 2, 2026-11-14). The rag-pr-review tests reviewer runs the full suite, and its recap is the PR's verify record.
+- **Never run `stack.sh`** (maintainer decision 2, 2026-11-14). The rag-pr-review tests reviewer runs the full suite, and its recap is the PR's verify record. For a Markdown-only PR (every changed file is `*.md`), it takes the fast path instead, and CI `verify` on the PR's head is the full-run record ("Choosing the path" in `rag-pr-review-tests`).
 - Find the host tests that reach your change and run only those ("Finding host tests" in `reference.md`, with the machine notes there).
 - Keep what ran and its result, or the evidence that no host test reaches the change, for the PR.
 
 ### 5. Open the PR, then stop
 
-- Open one PR against `develop`, following CONTRIBUTING.md and the PR template. Its body states the verification from step 4 and carries the line `Agent-Session: <the same session URL>`. Leave the template's `stack.sh` checkboxes unticked, and write that the full run is the rag-pr-review tests reviewer's (maintainer decision 2).
+- Open one PR against `develop`, following CONTRIBUTING.md and the PR template. Its body states the verification from step 4 and carries the line `Agent-Session: <the same session URL>`. Leave the template's `stack.sh` checkboxes unticked (maintainer decision 2), and write which verify record applies: for a Markdown-only PR (every changed file is `*.md`), the tests reviewer's fast path, with CI `verify` on the PR's head as the full-run record; otherwise the tests reviewer's full run.
 - Save the step, then return what the brief asks for.
 - **Stop here.** `rag-pr-review` and merging are separate steps, run by the coordinating session.
 
@@ -83,7 +83,7 @@ For whoever handles a merged PR's findings: every Medium or Low finding from its
 | Putting the dev-docs in the rag-docker repository | They live in `~/repo/rag-docker-work/RD-<n>/`, never committed to rag-docker. |
 | Committing an empty dev-doc | Check the file has its content before committing. |
 | Starting with an open blocker, or in a lane someone else holds | Stop and return it. |
-| Running `stack.sh` or the full verify suite | Host tests only. The tests reviewer runs the full suite. |
+| Running `stack.sh` or the full verify suite | Host tests only. The tests reviewer runs the full suite, or the fast path for a Markdown-only PR. |
 | Guessing when something is unclear | Stop and return the question. |
 | Running `rag-pr-review` or merging | Stop after opening the PR. |
 | Adding `Triage` or a release label to a follow-up issue | Leave it unlabelled for the maintainer. |

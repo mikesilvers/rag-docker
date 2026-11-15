@@ -28,15 +28,17 @@ Before any run, decide the path from the files the PR changes. List every file t
 ```bash
 files=$(git -C <bundle>/worktree diff --name-only --no-renames <develop-sha>...<reviewed-sha>) \
   && [ -n "$files" ] \
-  && [ -z "$(printf '%s\n' "$files" | grep -v '\.md$')" ] \
+  && total=$(printf '%s\n' "$files" | wc -l | tr -d ' ') \
+  && md=$(printf '%s\n' "$files" | grep -c '\.md$') \
+  && [ -n "$md" ] && [ "$md" = "$total" ] \
   && echo "fast path" || echo "full path"
 printf '%s\n' "$files"
 ```
 
-The three dots give the PR's own changes since its merge base, and `--no-renames` lists a rename's old and new paths. The check fails closed: a failed `git diff` (a wrong SHA, for example) or an empty list gives the full path. It works the same in bash and zsh.
+The three dots give the PR's own changes since its merge base, and `--no-renames` lists a rename's old and new paths. The check fails closed: a failed `git diff` (a wrong SHA, for example), an empty list, or a count that fails (a `grep` that errors or prints nothing, for example) gives the full path. It works the same in bash and zsh.
 
 - **Fast path:** `git diff` succeeded, listed at least one path, and every listed path ends in `.md`, wherever it is, Claude skills under `.claude/` included. Follow "The fast path" below.
-- **Full path:** anything else: the listing failed or was empty, or a changed file is code, a script, a test, a Dockerfile, a compose file, a workflow, config, a lock file, or any other non-`.md` file. Follow the steps below as they stand.
+- **Full path:** anything else: the listing failed or was empty, the count failed, or a changed file is code, a script, a test, a Dockerfile, a compose file, a workflow, config, a lock file, or any other non-`.md` file. Follow the steps below as they stand.
 
 A Markdown file that the stack builds, starts or serves (for example `api/templates/partials/*.md` or `ui/public/corpus-preparation-rules.md`) doesn't change the path: the PR stays on the fast path.
 
