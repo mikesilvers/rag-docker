@@ -7615,7 +7615,7 @@ def recover() -> list[str]:
 ### api/services/preparation.py
 
 ```python
-"""Preparing one raw document (#638): code does the rule work, the LLM cleans.
+"""Preparing one raw document (#638): code does the rule work, the build LLM cleans.
 
 SPECIFICATIONS.md §3.1.11. In order, for one document:
 
@@ -7638,8 +7638,9 @@ SPECIFICATIONS.md §3.1.11. In order, for one document:
 5. **Check** each written part as ingest reads it, against the rules that don't
    depend on chunk settings.
 
-The LLM and the part writer are passed in, so tests use a stub and the job
-decides where parts go and whether there is room (a best-effort cap).
+"The LLM" here is the build model (BUILD_LLM_MODEL, else LLM_MODEL; #671): the
+job passes its chat and model list in, with the part writer, so tests use a stub
+and the job decides where parts go and whether there is room (a best-effort cap).
 """
 from __future__ import annotations
 
@@ -13836,7 +13837,7 @@ The manifest names every blob the model needs, so bundling resolves blobs
 weights, and on a machine with other models pulled it would be far worse.
 
 In a package each model gets its own folder, `models/<name>/<tag>/`, so two
-tags of one name (an embedding model `foo:a` and an LLM `foo:b`) never share
+tags of one name (an embedding model `foo:a` and an answer LLM `foo:b`) never share
 files. Packages built before #487 used `models/<name>/`; such a folder is used
 only for the one tag the package manifest gives that name.
 
@@ -14017,7 +14018,7 @@ def _legacy_tag(name: str, package_manifest) -> str | None:
     """The tag a pre-#487 `models/<name>/` folder holds, or None if unknown.
 
     Those packages didn't record it. The package manifest names the embedding
-    model and the LLM; when exactly one tag of `name` is among them, the folder
+    model and the (answer) LLM; when exactly one tag of `name` is among them, the folder
     holds that tag. Two tags of one name shared the folder, the last copy
     overwriting the first's manifest, so the folder can't be trusted for either.
     """
@@ -21760,7 +21761,7 @@ import JobList, { newestToOpen, useJobList } from '../components/JobList'
 
 // Document preparation (#638). Raw documents are uploaded to the preparation area
 // on the instance, prepared by a background job (the code does the corpus rules'
-// work, the local LLM only removes headers, footers and boilerplate and writes a
+// work, the build LLM only removes headers, footers and boilerplate and writes a
 // title and summary for PDF, DOCX, TXT and MD; CSV and JSON parts are labelled
 // from their data, #648), reviewed here, and imported into a collection through the
 // normal ingest path. They stay on the instance until deleted.
@@ -22015,7 +22016,7 @@ export default function PreparePage() {
       <h1 className="text-2xl font-bold mb-2">Prepare Documents</h1>
       <p className="text-sm text-gray-600 mb-4">
         Raw documents are made to follow the corpus rules here: the code extracts the text, splits it to the limits,
-        normalises it and converts JSON, and the local LLM only removes page headers, footers, page numbers and
+        normalises it and converts JSON, and the build LLM only removes page headers, footers, page numbers and
         boilerplate and writes a title and summary for PDF, DOCX, TXT and MD. CSV and JSON parts are labelled from
         their data, with no LLM call. Where its cleaning would lose content, the part keeps the
         code-only text and the fallback is shown. Documents stay on this instance until you delete them.
@@ -25977,7 +25978,7 @@ fi
 # question with a known answer first, unless LLM work is being skipped.
 if [ "${RAG_SKIP_SLOW:-0}" != "1" ]; then
   if ! sanity=$(cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/llm_sanity.py 2>&1); then
-    printf '\nThe LLM is not giving usable answers:\n  %s\n' "$sanity"
+    printf '\nThe answer LLM is not giving usable answers:\n  %s\n' "$sanity"
     printf 'Restart it and run again:  docker compose restart ollama\n'
     printf '(with the verify environment that scripts/verify/stack.sh up prints)\n\n'
     exit 2
@@ -28761,7 +28762,7 @@ if __name__ == "__main__":
 # The unit checks (U1-U14) run in the API image with no network and a stub LLM.
 # The stack checks (P1-P11) run on the verify project through prepare_stack.py,
 # one check each, as the harness Developer. P9-P11 prepare three small files with
-# the local LLM, one job at a time, so they run only in a full run
+# the build LLM, one job at a time, so they run only in a full run
 # (RAG_SKIP_SLOW unset). Documents this suite uploads are vfy-prepare-*, its
 # collections VfyPrepare*; both are removed at the end.
 cd "$(dirname "$0")" && . ./lib.sh
@@ -28796,9 +28797,9 @@ check "P7 cancelling an unknown job is 404" $?
 stack audit
 check "P8 the audit log records upload, download and delete with names and no document text" $?
 
-section "Preparation with the local LLM (P9-P11)"
+section "Preparation with the build LLM (P9-P11)"
 if [ "$SKIP_SLOW" = "1" ]; then
-  skip "P9-P11 prepare, import and download with the LLM" "RAG_SKIP_SLOW=1"
+  skip "P9-P11 prepare, import and download with the build LLM" "RAG_SKIP_SLOW=1"
 else
   stack prepare
   check "P9 the .txt becomes cleaned Markdown of source lines in order with its header, every window without a fallback losing at most 20 % of its characters; the .csv and .jsonl are unchanged and labelled from their data" $?
@@ -29181,7 +29182,7 @@ def check_prepare(fix):
                "no header: {!r}".format(lines[:3]))
         lines = lines[4:]
     # The part's text as preparation reads the .txt: its paragraphs joined by
-    # one blank line, then cut into the windows the LLM saw.
+    # one blank line, then cut into the windows the build LLM saw.
     source = "\n\n".join(block.strip("\n") for block in PAGES.split("\n\n")
                           if block.strip()).split("\n")
     position = 0
@@ -29300,7 +29301,7 @@ if __name__ == "__main__":
 # A real browser (browser/ui_ingest.js), logged in as the harness Engineer, with
 # nothing stubbed, ingests on the Import page every supported type into a new
 # collection each, a ZIP of mixed types with a .jsonl.gz, and a file over the
-# part limit; prepares two files on the Prepare page with the local LLM and
+# part limit; prepares two files on the Prepare page with the build LLM and
 # imports them into a new collection (full runs only); and sends a broken PDF,
 # an unsupported type and an over-limit ZIP, each into a new collection. Then
 # ui_ingest_check.py checks each collection: the job ended with no error and the
@@ -35529,7 +35530,7 @@ def write_ui_ingest(out: pathlib.Path, fixtures: pathlib.Path) -> None:
                   "documents": {}, "split": {"file": "vfy-ui-large.txt", "first": UI_LARGE_FIRST,
                                              "last": UI_LARGE_LAST},
                   "min_chunks": -(-len("".join(large.split())) // 6000)})
-    # Prepared with the local LLM, then imported (#638). The phrase is in three
+    # Prepared with the build LLM, then imported (#638). The phrase is in three
     # body lines, so the cleaning can't drop every one.
     notes = UI_PHRASES["vfy-ui-prep-notes.txt"]
     (out / "vfy-ui-prep-notes.txt").write_text("\n".join([
@@ -39716,7 +39717,7 @@ drop_collection "$iname"
 # ── models on import: damaged and namespaced (E26, E27) ──────────────────────
 # Runs the importer inside the API process with its settings patched. E26 copies
 # the embedding model into a temporary store and damages the copy; the live
-# model store is only read. E27 uses the live store and a namespaced LLM name.
+# model store is only read. E27 uses the live store and a namespaced answer LLM name.
 (cd "$REPO_ROOT" && docker compose exec -T api python - "$PKG") > /tmp/vfy_models.json 2>/tmp/vfy_models.err <<'ENDPY'
 import json, shutil, sys, tempfile, uuid
 from pathlib import Path
@@ -39765,7 +39766,7 @@ with tempfile.TemporaryDirectory(prefix="vfy-model-", dir=settings.upload_dir) a
         out["e26_untouched"] = (damaged.read_bytes() == b"ordinary damaged review bytes"
                                 and mp.read_bytes() == manifest_before)
 
-# E27: a namespaced LLM that Ollama doesn't report -> import completes with a note
+# E27: a namespaced answer LLM that Ollama doesn't report -> import completes with a note
 ns = "vfy-namespace/absent-llm"
 reports = getattr(importer, "_ollama_reports", None)
 if reports:                                              # real /api/tags; tag defaults to latest
@@ -40440,7 +40441,7 @@ check_eq "the package imports under a new name" "$istat" "completed"
 check_eq "the import leaves the package's bytes, size and mtime unchanged" "$(package_state)" "$state_before"
 
 # -- E11: the import retrieves what the original does -------------------------
-# /query rewrites each question with the LLM first, so two answers can differ even for
+# /query rewrites each question with the answer LLM first, so two answers can differ even for
 # identical collections; retrieval is compared directly, for each path /query uses.
 (cd "$REPO_ROOT" && docker compose exec -T api python - "$C" "$IMP" "$QUESTION") <<'ENDPY'
 import asyncio, sys
@@ -52205,7 +52206,7 @@ if __name__ == '__main__':
 ### scripts/verify/llm_sanity.py
 
 ```python
-"""Does the LLM still give sensible answers? Run inside the api container.
+"""Does the answer LLM (#671) still give sensible answers? Run inside the api container.
 
 A degraded Ollama runner can keep listing its models (so /health stays ok)
 while every chat reply is garbage: mixed scripts, fragments of unrelated

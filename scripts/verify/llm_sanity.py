@@ -1,4 +1,4 @@
-"""Does the LLM still give sensible answers? Run inside the api container.
+"""Does the answer LLM (#671) still give sensible answers? Run inside the api container.
 
 A degraded Ollama runner can keep listing its models (so /health stays ok)
 while every chat reply is garbage: mixed scripts, fragments of unrelated

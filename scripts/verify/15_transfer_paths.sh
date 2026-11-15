@@ -147,7 +147,7 @@ check_eq "the package imports under a new name" "$istat" "completed"
 check_eq "the import leaves the package's bytes, size and mtime unchanged" "$(package_state)" "$state_before"
 
 # -- E11: the import retrieves what the original does -------------------------
-# /query rewrites each question with the LLM first, so two answers can differ even for
+# /query rewrites each question with the answer LLM first, so two answers can differ even for
 # identical collections; retrieval is compared directly, for each path /query uses.
 (cd "$REPO_ROOT" && docker compose exec -T api python - "$C" "$IMP" "$QUESTION") <<'ENDPY'
 import asyncio, sys

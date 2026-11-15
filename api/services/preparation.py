@@ -1,4 +1,4 @@
-"""Preparing one raw document (#638): code does the rule work, the LLM cleans.
+"""Preparing one raw document (#638): code does the rule work, the build LLM cleans.
 
 SPECIFICATIONS.md §3.1.11. In order, for one document:
 
@@ -21,8 +21,9 @@ SPECIFICATIONS.md §3.1.11. In order, for one document:
 5. **Check** each written part as ingest reads it, against the rules that don't
    depend on chunk settings.
 
-The LLM and the part writer are passed in, so tests use a stub and the job
-decides where parts go and whether there is room (a best-effort cap).
+"The LLM" here is the build model (BUILD_LLM_MODEL, else LLM_MODEL; #671): the
+job passes its chat and model list in, with the part writer, so tests use a stub
+and the job decides where parts go and whether there is room (a best-effort cap).
 """
 from __future__ import annotations
 

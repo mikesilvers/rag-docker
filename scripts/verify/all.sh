@@ -39,7 +39,7 @@ fi
 # question with a known answer first, unless LLM work is being skipped.
 if [ "${RAG_SKIP_SLOW:-0}" != "1" ]; then
   if ! sanity=$(cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/llm_sanity.py 2>&1); then
-    printf '\nThe LLM is not giving usable answers:\n  %s\n' "$sanity"
+    printf '\nThe answer LLM is not giving usable answers:\n  %s\n' "$sanity"
     printf 'Restart it and run again:  docker compose restart ollama\n'
     printf '(with the verify environment that scripts/verify/stack.sh up prints)\n\n'
     exit 2

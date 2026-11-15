@@ -863,7 +863,7 @@ drop_collection "$iname"
 # ── models on import: damaged and namespaced (E26, E27) ──────────────────────
 # Runs the importer inside the API process with its settings patched. E26 copies
 # the embedding model into a temporary store and damages the copy; the live
-# model store is only read. E27 uses the live store and a namespaced LLM name.
+# model store is only read. E27 uses the live store and a namespaced answer LLM name.
 (cd "$REPO_ROOT" && docker compose exec -T api python - "$PKG") > /tmp/vfy_models.json 2>/tmp/vfy_models.err <<'ENDPY'
 import json, shutil, sys, tempfile, uuid
 from pathlib import Path
@@ -912,7 +912,7 @@ with tempfile.TemporaryDirectory(prefix="vfy-model-", dir=settings.upload_dir) a
         out["e26_untouched"] = (damaged.read_bytes() == b"ordinary damaged review bytes"
                                 and mp.read_bytes() == manifest_before)
 
-# E27: a namespaced LLM that Ollama doesn't report -> import completes with a note
+# E27: a namespaced answer LLM that Ollama doesn't report -> import completes with a note
 ns = "vfy-namespace/absent-llm"
 reports = getattr(importer, "_ollama_reports", None)
 if reports:                                              # real /api/tags; tag defaults to latest
