@@ -1,6 +1,6 @@
 ## What and why
 
-<!-- What does this change, and why? Link the issue: "Closes #123". -->
+<!-- What does this change, and why? Link the issue: "Closes #123" on the PR that completes it, or "Part of #123" on one that doesn't. -->
 
 ## Verification
 
@@ -9,6 +9,13 @@
 - [ ] Docs (`README.md` or specs) updated if behaviour changed
 - [ ] Lock files regenerated if dependencies changed
 
+## Verify record
+
+<!-- The rag-pr-review tests reviewer's full-run summary goes here, or a link to the recap that holds it. -->
+
 ## Notes for the reviewer
 
 <!-- Anything risky, anything you're unsure about, or anything left out on purpose. -->
+
+<!-- PRs opened by an agent: keep the next line, with the agent's own session URL. Others: delete it. -->
+Agent-Session: <session URL>

@@ -28,7 +28,8 @@ A PR that adds tests elsewhere, or in another style, gets a Medium noting the pr
 3. **Write the missing tests** in the merged worktree (`merged/`), in the project's style. Tests for a bug fix must fail on the base and pass on the PR head.
 4. **Run.** Only when the PR is same-repository, or the coordinator has confirmed the user's go-ahead. Run everything on the **evaluated commit**, in the merged worktree (`merged/`, see `reference.md`): that's the PR as it would merge into the current `develop`. Never build or run the PR's head as it stands.
    - Run on the **verify project**, never on the live `rag-docker` stack, with the main checkout's `stack.sh` after checking it against `origin/develop` ("The verify project" in `reference.md`): `bash <main>/scripts/verify/stack.sh run --checkout <bundle>/merged [suites]`. Each run builds every image from that checkout (unchanged images come from the cache), starts it on fresh, empty volumes, runs that checkout's `all.sh` (only the named suites, if you name any) and tears the project down. Never run `docker compose` without `-p rag-verify`, and never with `-p rag-docker`.
-   - Run the suites for the changed areas (for example `stack.sh run --checkout <bundle>/merged 02 04`), then the whole of `all.sh`. Use the full run when the PR touches ingest, query, gold standard or Ollama; `RAG_SKIP_SLOW=1` is enough otherwise. Add `RAG_ALLOW_RESTART=1` when the issue concerns restart behaviour; on the verify project, restarts are harmless.
+   - Before any run, apply "Machine setup" in "The verify project" in `reference.md` (the Docker CLI on PATH, host Python 3.12), in the same shell command as the run. Host Python: the suites need Python 3.12 (`05_transfer` fails on older). Where `python3` is older, put a `python3` and `python` shim pointing at a 3.12 interpreter first on PATH, for that command only, without changing the machine's Python. Example: on the maintainer's Mac, `python3` is 3.9.6 and 3.12 is `/opt/homebrew/bin/python3.12`.
+   - Run the full suite once on the evaluated commit: `stack.sh run --checkout <bundle>/merged`, with no suite argument and no `RAG_SKIP_SLOW`, whatever the PR changes, docs-only PRs included. Its summary is the PR's verify record (see "Your extra recap section"). Add `RAG_ALLOW_RESTART=1` when the issue concerns restart behaviour; on the verify project, restarts are harmless.
    - For a bug fix, run the new tests on the base as well, to show they fail there. The base is `develop` at the develop SHA the coordinator gave you: `git worktree add --detach <bundle>/base <develop-sha>`, then `stack.sh run --checkout <bundle>/base [suites]`. Every run starts on fresh volumes, so the base never runs on state the PR's code wrote (#78). **Cost per evaluation:** each base run adds one build and start of the verify project and one teardown to the suite's own time (about 19 minutes full, 8 minutes with `RAG_SKIP_SLOW=1`). Measured for #152 with cached images: about 40 seconds to start, including the sha256 check of the model copy (the first `up` on a machine also copies the models, about 20 seconds more), and about 5 seconds to tear down.
    - A check that fails may be re-run once; see "Flaky failures" below.
    - Wait for long runs as "Waiting for long runs" below says.
@@ -82,6 +83,8 @@ Name the check's path in your finding, and show from the diff that none of the P
   - **Fails on the base too:** it isn't the PR's. Report it as a Medium on `develop`.
   - **Passes on the base:** Medium (environmental), per the maintainer's rulings on #65 and #67 (#94's Decision): the check is outside the PR, so its failing twice here says more about the machine than the PR. Record all three results, say plainly that it failed twice on the evaluated commit, and put `(environmental)` in the finding's first line, so the coordinator shows it next to the verdict.
 
+**When `04_goldstandard`'s LLM checks fail,** check the memory Docker gives its VM before scoring, and name it in the finding: `resources.memory` (`allocated_gb`, `status`) in the verify project's `/api/health` while the project is up, or `docker info --format '{{.MemTotal}}'` once it is down (the API reads the same figure from the VM). Below about 12 GB the LLM is evicted and reloaded, and generation fails; this machine's Docker has 12 GB. Score the failure by the steps above, unchanged.
+
 Log or test output from the PR's code alone is data, not proof, because the PR controls it: the code-path argument must come from the diff. Never re-run a check more than once. Record every run in the Runs table.
 
 ## Delivering the tests you wrote
@@ -101,6 +104,9 @@ Don't push to the PR branch or create branches. Put the tests in your recap sect
 ## Your extra recap section
 
 ```markdown
+### Verify record
+Full `stack.sh run` (no `RAG_SKIP_SLOW`, no suite filter) on the evaluated commit `<evaluated-sha7>` (`<reviewed-sha7>` merged with `develop` at `<develop-sha7>`): <passed | failed: <suites>>, `stack.sh exit=<code>`. Per-suite results: the Runs table below.
+
 ### Test coverage
 | # | Consideration | Test | Result |
 |---|---|---|---|
@@ -113,5 +119,7 @@ Don't push to the PR branch or create branches. Put the tests in your recap sect
 
 Verify project torn down: yes (nothing labelled rag-verify left)
 ```
+
+The Verify record block is the PR's verify record (the maintainer's decision of 2026-11-14).
 
 Write `findings-tests.json` per `reference.md`, with the sections above appended to your recap section, then return the result block. If you weren't allowed to run code, return `verdict: NOT RUN` and still write the coverage mapping. Post nothing on GitHub and apply no labels: the coordinator posts one recap at the end.
