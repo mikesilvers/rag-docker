@@ -242,6 +242,11 @@ async def _work(queue: asyncio.Queue) -> None:
             _cancel_requested.discard(job_id)
 
 
+def _llm():
+    """The chat and model list preparation uses: the build model's (#671)."""
+    return ollama.build_chat, ollama.list_models
+
+
 async def _run(job_id: str) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
@@ -283,8 +288,9 @@ async def _run(job_id: str) -> None:
 
         try:
             raw = await asyncio.to_thread(store.raw_path, document_id)
+            chat, list_models = _llm()
             result = await preparation.prepare_document(
-                raw, name, record["raw_type"], ollama.chat, ollama.list_models,
+                raw, name, record["raw_type"], chat, list_models,
                 should_stop, write_part, progress)
             await asyncio.to_thread(store.commit, document_id, result.parts, result.fallback)
             job["documents_completed"] = job["documents_completed"] + 1

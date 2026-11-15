@@ -278,7 +278,7 @@ def render_help(embed_dimensions: int | str) -> str:
     return _render("help_transfer.md.tmpl", {
         "EMBED_MODEL": settings.embed_model,
         "EMBED_DIMENSIONS": embed_dimensions,
-        "LLM_MODEL": settings.llm_model,
+        "LLM_MODEL": settings.answer_model,
     })
 
 
@@ -496,7 +496,9 @@ def build(
             # models/<name>/<tag>/ folder (#487), so removing a failed copy
             # never removes another model's files.
             wanted: dict[str, str] = {}
-            for model in (settings.embed_model, settings.llm_model):
+            # Only the answer model: an imported collection is queried, never
+            # prepared, so the build model stays behind (#671).
+            for model in (settings.embed_model, settings.answer_model):
                 try:
                     key = model_bundle.model_ref(model)
                 except ValueError:
@@ -560,7 +562,10 @@ def build(
                 "model": settings.embed_model,
                 "dimensions": dimensions,
             },
-            "llm": {"model": settings.llm_model},
+            # `llm` is the answer model, kept for older readers (#671).
+            "llm": {"model": settings.answer_model},
+            "answer_llm": {"model": settings.answer_model},
+            "build_llm": {"model": settings.build_model},
             "chunking": chunking,
             "fidelity": fidelity,
             # What the package actually carries, not what was asked for: a

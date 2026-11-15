@@ -125,6 +125,19 @@ and 4 min 10 s in a full run (the Prepare case about 25 s), most of it the large
 2.5 min). Splitting it through `overlap` at chunk size 50 instead embedded about 11,200 chunks and took
 26.5 min, which is why it uses `fixed` with the merge.
 
+`23_llm_split.sh` checks that each task uses its own LLM (#671): preparation and gold standard
+generation the build model, query the answer model. It runs only in a full run (`RAG_SKIP_SLOW`
+unset); every other check stays on one model. It ingests the fixtures' `policies.txt` into
+`VfyLlmSplit`, then runs `llm_split.py` in the api container with `BUILD_LLM_MODEL=qwen2.5:0.5b`
+set for that process only, the answer model left as compose sets it, so neither the API nor the
+compose settings change. `llm_split.py` pulls `qwen2.5:0.5b` into the verify project's Ollama, then
+prepares a short text (`preparation.prepare_document`, with the chat and model list
+`preparation_jobs` uses), generates one gold standard pair (`goldstandard._generate_pair`) and runs
+one query (`rag_pipeline.run_query`) on the collection, recording the model Ollama reports in each
+chat reply. The checks: preparation and gold standard were answered only by `qwen2.5:0.5b`, query
+only by the answer model. Preparation writes to a temporary folder and the pair isn't stored; the
+small model is deleted from Ollama and the collection dropped at the end.
+
 ## Entry point and verify project
 
 `stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
@@ -298,8 +311,9 @@ top of the main `README.md` shows its result on `develop`.
   failed.
 - **The model cache.** Even with `RAG_SKIP_SLOW=1`, ingest needs the embedding
   model, so Ollama starts with both models (about 5.2 GB). The cache key is
-  built from the models `ollama/entrypoint.sh` pulls
-  (`ollama-models-llama3.1:8b-nomic-embed-text`). On a hit, the cached models are
+  built from the models `ollama/entrypoint.sh` pulls, the names
+  `ollama/compose-models.sh` resolves from the LLM settings compose gives the
+  ollama service (#671) (`ollama-models-llama3.1:8b-nomic-embed-text` by default). On a hit, the cached models are
   copied into `rag-verify-ollama-models` before `up`, and Ollama pulls
   nothing. On a miss, Ollama pulls them; after `down`, the workflow copies the
   volume's `models/` folder out, only once every model's manifest is there,
@@ -960,6 +974,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `browser/ui_ingest.js` | the browser side of suite 22: the Import and Prepare pages driven as a user does, the observations printed as one JSON line (#641) |
 | `ui_ingest_weaviate.py` | helper for suite 22, run in the API container: the `VfyUiIngest*` collections' documents and chunk text, read only (#641) |
 | `ui_ingest_check.py` | the checks of suite 22, one per subcommand, on the host, and its cleanup (#641) |
+| `23_llm_split.sh` | the build and answer models (#671), full runs only: with `BUILD_LLM_MODEL` set to a small model, preparation and gold standard use it and query uses the answer model |
+| `llm_split.py` | helper for suite 23, run in the API container: pulls the small model, runs the three tasks through the services' code and prints the models Ollama reports answering each (#671) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |

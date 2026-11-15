@@ -914,7 +914,9 @@ All API settings are environment variables in `docker-compose.yml`:
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_MODEL` | `llama3.1:8b` | Ollama model name for chat |
+| `LLM_MODEL` | `llama3.1:8b` | Ollama model name for the LLM: the default for both `BUILD_LLM_MODEL` and `ANSWER_LLM_MODEL` |
+| `BUILD_LLM_MODEL` | empty | The LLM that prepares documents and writes gold standard pairs. Empty means `LLM_MODEL` |
+| `ANSWER_LLM_MODEL` | empty | The LLM that answers questions. Empty means `LLM_MODEL`. Export with `include_models` bundles this one, never the build model |
 | `EMBED_MODEL` | `nomic-embed-text` | Ollama model name for embeddings |
 | `WEAVIATE_HOST` | `weaviate` | Weaviate hostname (internal) |
 | `OLLAMA_HOST` | `ollama` | Ollama hostname (internal) |
@@ -944,7 +946,7 @@ LAN mode reads two more settings from your shell or a `.env` file next to `docke
 | `RAG_LAN_HOSTNAMES` | empty | The names and IP addresses clients use to reach this machine, comma-separated. The self-signed certificate names them plus `localhost`. Required unless `proxy/certs/` holds your own `cert.pem` and `key.pem` |
 | `RAG_LAN_PORT` | `443` | The host port LAN mode publishes HTTPS on, on every interface |
 
-To swap the LLM (e.g. to `llama3.2`), update `LLM_MODEL` in `docker-compose.yml` and add the model name to `ollama/entrypoint.sh`.
+To swap the LLM (e.g. to `llama3.2`), set `LLM_MODEL`, or `BUILD_LLM_MODEL` or `ANSWER_LLM_MODEL` for one task only, in the `x-llm-models` block at the top of `docker-compose.yml`, then `docker compose up -d`. That block is the one place they are set: the api and the ollama service both read it, and Ollama pulls each distinct model when it starts.
 
 **Upload size limit.** One upload (all files in it together, or one ZIP) can be at most **512 MB**. The proxy enforces it with `client_max_body_size` in `proxy/locations.conf`. To change it, edit that value and `MAX_UPLOAD_MB` in `ui/src/api/client.ts` (the Import page uses it to warn before sending), then rebuild the UI and recreate the proxy:
 

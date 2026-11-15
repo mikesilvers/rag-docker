@@ -371,7 +371,9 @@ GET /health
     "weaviate": { "status": "ok", "latency_ms": 1 },
     "ollama": {
       "llm": { "status": "ok", "latency_ms": 5, "model": "llama3.1:8b" },
-      "embed": { "status": "ok", "latency_ms": 5, "model": "nomic-embed-text" }
+      "build_llm": { "status": "ok", "latency_ms": 5, "model": "llama3.1:8b" },
+      "embed": { "status": "ok", "latency_ms": 5, "model": "nomic-embed-text" },
+      "same_model": true
     }
   },
   "resources": {
@@ -385,6 +387,10 @@ GET /health
 ```
 
 **Response 503** if any downstream service is unreachable. Individual service `status` is `"ok"` or `"error"`.
+
+`llm` is the answer model (`ANSWER_LLM_MODEL`), `build_llm` the build model (`BUILD_LLM_MODEL`), each
+falling back to `LLM_MODEL` (#671); a missing one of either makes the response 503. `same_model` is true when
+they are one model (`x` and `x:latest` are); it never affects the status.
 
 **Weaviate is probed through the client, not over plain HTTP.** A bare `GET
 /v1/.well-known/ready` cannot detect a client/server version mismatch: the server

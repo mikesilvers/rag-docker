@@ -809,7 +809,7 @@ def _parse_gs_json(text: str) -> dict:
 
 
 async def _chat_once(system: str, user: str) -> str:
-    """One chat call, retried once if the transport fails.
+    """One call to the build model (#671), retried once if the transport fails.
 
     Ollama serialises requests per model, so generating while someone is
     querying can push a call past the client timeout. `httpx.ReadTimeout`
@@ -817,10 +817,10 @@ async def _chat_once(system: str, user: str) -> str:
     empty string. A transient timeout should cost a retry, not a pair.
     """
     try:
-        return await ollama.chat(system, user)
+        return await ollama.build_chat(system, user)
     except (httpx.TimeoutException, httpx.TransportError) as exc:
         log.warning("Ollama call failed (%s); retrying once", type(exc).__name__)
-        return await ollama.chat(system, user)
+        return await ollama.build_chat(system, user)
 
 
 # One initial attempt plus two reprompts. The model's failure mode is malformed

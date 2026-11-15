@@ -747,7 +747,7 @@ async def model_available(list_models: Callable[[], Awaitable[set[str]]]) -> boo
         models = await asyncio.wait_for(list_models(), 15)
     except Exception:                                       # noqa: BLE001
         return False
-    wanted = settings.llm_model
+    wanted = settings.build_model                          # preparation's LLM (#671)
     return wanted in models or f"{wanted}:latest" in models or (
         ":" not in wanted and any(m.split(":")[0] == wanted for m in models))
 

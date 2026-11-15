@@ -258,6 +258,8 @@ and on import.
   },
   "embedding": {"model": "nomic-embed-text", "dimensions": 768},
   "llm": {"model": "llama3.1:8b"},
+  "answer_llm": {"model": "llama3.1:8b"},
+  "build_llm": {"model": "llama3.1:8b"},
   "chunking": {"strategy": "overlap", "chunk_size": 1000, "chunk_overlap": 200},
   "fidelity": "with-sources",
   "models_bundled": false,
@@ -268,6 +270,12 @@ and on import.
 
 `collection.name` is authoritative. `embedding` is the field import checks
 hardest (§6.2).
+
+`answer_llm` and `build_llm` are the exporting instance's answer and build
+LLMs (#671); `llm` is the answer model, kept for older readers. Import reads
+none of them: it checks this instance's answer model, and the build model is
+for information only. `include_models` bundles the answer model, never the
+build model.
 
 `bundled_models` lists each model the package carries whole, as `name:tag`
 (a name with no tag is `name:latest`), sorted; it is `[]` when none is, and

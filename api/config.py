@@ -1,13 +1,23 @@
 from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
+# The LLM when LLM_MODEL isn't set (#647).
+DEFAULT_LLM_MODEL = "llama3.1:8b"
+
 
 class Settings(BaseSettings):
     weaviate_host: str = "localhost"
     weaviate_port: int = 8080
     ollama_host: str = "localhost"
     ollama_port: int = 11434
-    llm_model: str = "llama3.1:8b"
+    # Two LLMs (#671): the build model prepares documents and writes gold
+    # standard pairs; the answer model answers questions. Each is its own
+    # setting when set and not empty, else LLM_MODEL, else DEFAULT_LLM_MODEL.
+    # Code reads only the resolved `build_model` and `answer_model` below,
+    # never these three fields directly.
+    llm_model: str = DEFAULT_LLM_MODEL
+    build_llm_model: str = ""
+    answer_llm_model: str = ""
     embed_model: str = "nomic-embed-text"
     upload_dir: str = "/app/uploads"
     # Retained original documents, content-addressed per collection. Kept in
@@ -101,6 +111,16 @@ class Settings(BaseSettings):
         if not 1 <= value <= 1000:
             raise ValueError("AUDIT_LOG_KEEP must be 1 to 1000")
         return value
+
+    @property
+    def build_model(self) -> str:
+        """The LLM for preparation and gold standard generation (#671)."""
+        return self.build_llm_model or self.llm_model or DEFAULT_LLM_MODEL
+
+    @property
+    def answer_model(self) -> str:
+        """The LLM that answers questions (#671)."""
+        return self.answer_llm_model or self.llm_model or DEFAULT_LLM_MODEL
 
     class Config:
         env_file = ".env"

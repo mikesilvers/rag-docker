@@ -22,14 +22,14 @@ MAX_CHARS = 600
 try:
     resp = httpx.post(
         f"http://{settings.ollama_host}:{settings.ollama_port}/api/chat",
-        json={"model": settings.llm_model, "stream": False,
+        json={"model": settings.answer_model, "stream": False,
               "options": {"temperature": 0, "num_predict": 80},
               "messages": [{"role": "user", "content": QUESTION}]},
         timeout=TIMEOUT_S)
     resp.raise_for_status()
     answer = resp.json()["message"]["content"].strip()
 except Exception as exc:  # unreachable, timed out, or not JSON
-    print(f"no answer from {settings.llm_model}: {type(exc).__name__}: {exc}")
+    print(f"no answer from {settings.answer_model}: {type(exc).__name__}: {exc}")
     sys.exit(2)
 
 printable = sum(1 for ch in answer if ch.isascii() and (ch.isprintable() or ch in "\n\r\t"))
@@ -44,6 +44,6 @@ if "manager" not in answer.lower():
     problems.append("doesn't mention managers")
 
 if problems:
-    print(f"{settings.llm_model} looks degraded ({'; '.join(problems)}): {answer[:200]!r}")
+    print(f"{settings.answer_model} looks degraded ({'; '.join(problems)}): {answer[:200]!r}")
     sys.exit(1)
-print(f"{settings.llm_model} answers sensibly: {answer[:120]!r}")
+print(f"{settings.answer_model} answers sensibly: {answer[:120]!r}")
