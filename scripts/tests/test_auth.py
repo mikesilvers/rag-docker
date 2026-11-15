@@ -34,6 +34,7 @@ from config import settings
 from main import app
 from auth import keys, passwords, policy, store
 from auth.middleware import AuthMiddleware, same_origin
+from services import audit
 
 ORIGIN = "http://testserver"
 
@@ -761,19 +762,28 @@ class AdminRouteTests(StoreTestCase):
         self.assertEqual((login.status_code, login.json()["must_change_password"]), (200, True))
 
     def test_create_refusals(self):
-        for username in ("ab", "x" * 33, "has space", "semi;colon", ""):
+        for username in ("ab", "x" * 33, "has space", "semi;colon", "", "u" * 257):
             with self.subTest(username=username), self.assertLogs("auth", "WARNING") as logs:
                 response = self.admin("POST", "/auth/users", {"username": username, "role": "end_user"})
                 self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_USERNAME"))
                 self.assertIn("3-32 characters", response.json()["error"]["message"])
                 self.assertEqual(len(logs.records), 1)
+        # #551 item 4: an over-long username is refused like any other, and is
+        # logged and audited cut to its first 256 characters.
+        with patch.object(audit, "note") as note, self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users", {"username": "u" * 5000, "role": "end_user"})
+        self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_USERNAME"))
+        self.assertEqual(note.call_args.kwargs["target"], "u" * 256)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("u" * 256, logged(logs))
+        self.assertNotIn("u" * 257, logged(logs))
+        self.assertIsNone(store.get_user("u" * 5000))
         with self.assertLogs("auth", "WARNING") as logs:
             response = self.admin("POST", "/auth/users", {"username": "DEV", "role": "end_user"})
         self.assertEqual((response.status_code, self.code(response)), (409, "USER_EXISTS"))
         self.assertIn("create of 'dev' refused", logged(logs))
         self.assertEqual(store.get_user("dev").role, "developer")
-        for body in ({"username": "newbie", "role": "admin"}, {"username": "newbie"}, {"role": "end_user"},
-                     {"username": "u" * 257, "role": "end_user"}):
+        for body in ({"username": "newbie", "role": "admin"}, {"username": "newbie"}, {"role": "end_user"}):
             with self.subTest(body=body):
                 response = self.admin("POST", "/auth/users", body)
                 self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_PARAMETER"))
@@ -1262,11 +1272,20 @@ class PrincipalRouteTests(KeyTestCase):
 
     def test_refusals(self):
         self.admin("POST", "", {"name": "svc", "role": "developer"})
-        for name in ("ab", "x" * 33, "has space", ""):
+        for name in ("ab", "x" * 33, "has space", "", "x" * 257):
             with self.subTest(name=name), self.assertLogs("auth", "WARNING") as logs:
                 response = self.admin("POST", "", {"name": name, "role": "end_user"})
                 self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_USERNAME"))
                 self.assertEqual(len(logs.records), 1)
+        # #551 item 4: an over-long name is logged and audited cut to its first 256 characters.
+        with patch.object(audit, "note") as note, self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "", {"name": "x" * 5000, "role": "end_user"})
+        self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_USERNAME"))
+        self.assertEqual(note.call_args.kwargs["target"], "x" * 256)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("x" * 256, logged(logs))
+        self.assertNotIn("x" * 257, logged(logs))
+        self.assertIsNone(store.get_user("x" * 5000))
         for name in ("SVC", "dev"):
             with self.subTest(taken=name), self.assertLogs("auth", "WARNING") as logs:
                 response = self.admin("POST", "", {"name": name, "role": "end_user"})

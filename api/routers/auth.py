@@ -179,6 +179,15 @@ def _target(username: str) -> str | None:
     return passwords.normalize_username(username)
 
 
+# A refused name is logged and audited cut to this many characters: the
+# request models don't cap its length, so the route can answer INVALID_USERNAME (#551).
+_SHOWN_MAX = 256
+
+
+def _shown(name: str) -> str:
+    return name[:_SHOWN_MAX]
+
+
 def _refusal(actor: str, action: str, target: str, code: str, message: str):
     _log.warning("Admin %r: %s of %r refused: %s", actor, action, target, message)
     return api_error(_REFUSED_STATUS.get(code, 409), code, message)
@@ -209,9 +218,9 @@ def _create(username: str, role: str):
 async def create_user(body: UserCreateRequest, request: Request):
     actor = request.state.auth.username
     username = passwords.normalize_username(body.username)
-    audit.note(target=username or body.username, role=body.role)
+    audit.note(target=username or _shown(body.username), role=body.role)
     if username is None:
-        _log.warning("Admin %r: create of %r refused: invalid username", actor, body.username)
+        _log.warning("Admin %r: create of %r refused: invalid username", actor, _shown(body.username))
         return api_error(422, "INVALID_USERNAME", f"The username must be {passwords.USERNAME_RULE}.")
     try:
         user, password = await asyncio.to_thread(_create, username, body.role)
@@ -339,9 +348,9 @@ async def list_principals():
 async def create_principal(body: PrincipalCreateRequest, request: Request):
     actor = request.state.auth.username
     name = passwords.normalize_username(body.name)
-    audit.note(target=name or body.name, role=body.role)
+    audit.note(target=name or _shown(body.name), role=body.role)
     if name is None:
-        _log.warning("Admin %r: create of service principal %r refused: invalid name", actor, body.name)
+        _log.warning("Admin %r: create of service principal %r refused: invalid name", actor, _shown(body.name))
         return api_error(422, "INVALID_USERNAME", f"The name must be {passwords.USERNAME_RULE}.")
     try:
         principal = await asyncio.to_thread(store.create_principal, name, body.role)
