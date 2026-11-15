@@ -1604,7 +1604,7 @@ records cannot reserve a name or consume valid metric capacity.
 Do not pass content into instrumentation even though the exporter excludes it:
 active SDK spans may retain inputs until completion.
 
-The pinned SDK and OTLP HTTP exporter are version 1.45.1. Bounded batch queues
+The pinned SDK and OTLP HTTP exporter are version 1.45.2. Bounded batch queues
 drop oldest pending records under load. Each export makes one HTTP attempt;
 HTTP failures, redirects and network exceptions become fixed diagnostics with
 no endpoint, headers or response body. No retries occur. Application work never
