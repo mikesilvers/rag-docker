@@ -58,7 +58,7 @@ Each document goes through a review loop before the next one starts, and no code
 
 ### 5. Open the PR, then stop
 
-- Open one PR against `develop`, following CONTRIBUTING.md and the PR template. Its body states the verification from step 4 and carries the line `Agent-Session: <the same session URL>`. Leave the template's `stack.sh` checkboxes unticked, and write that the full run is the rag-pr-review tests reviewer's (maintainer decision 2).
+- Open one PR against `develop`, following CONTRIBUTING.md and the PR template. Its body states the verification from step 4 and carries the line `Agent-Session: <the same session URL>`. Leave the template's `stack.sh` checkboxes unticked (maintainer decision 2), and write which verify record applies: for a Markdown-only PR (every changed file is `*.md`), the tests reviewer's fast path, with CI `verify` on the PR's head as the full-run record; otherwise the tests reviewer's full run.
 - Save the step, then return what the brief asks for.
 - **Stop here.** `rag-pr-review` and merging are separate steps, run by the coordinating session.
 
