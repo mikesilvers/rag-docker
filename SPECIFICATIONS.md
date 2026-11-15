@@ -4360,11 +4360,13 @@ stale backend leaves the VM unreachable and the daemon never comes up.
 Both archives MUST hold exactly the files git tracks in the current commit
 (`HEAD`), built with `git archive`, so nothing untracked or ignored goes in:
 not `.DS_Store`, `node_modules/`, `__pycache__/`, `dist/`, `.env*`, `*.tar`,
-`offline/`, previous archives, `.claude/` or `dev-docs/`, nor the contents of
-`ingest-inbox/` and `exports/` (their tracked `.gitkeep` keeps the directories).
-Uncommitted changes are not included. Both scripts MUST refuse to run unless
-their directory is the top level of a git checkout (#384). Neither carries the
-Weaviate index or uploaded files; those are created empty on first start.
+`offline/`, previous archives, `dev-docs/` or the untracked parts of `.claude/`
+(local settings, worktrees), nor the contents of `ingest-inbox/` and `exports/`
+(their tracked `.gitkeep` keeps the directories). The project skills tracked
+under `.claude/skills/` are included. Uncommitted changes are not included.
+Both scripts MUST refuse to run unless their directory is the top level of a
+git checkout (#384). Neither carries the Weaviate index or uploaded files; those
+are created empty on first start.
 
 ### 11.3 Offline bundle contents
 

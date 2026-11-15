@@ -1287,10 +1287,12 @@ bash package.sh              # writes rag-docker.zip (~1.3 MB)
 
 The zip holds exactly the files git tracks in the current commit (`HEAD`), built
 with `git archive`. Untracked and ignored files never go in (`.env` files,
-`node_modules/`, offline tars, previous archives, `.claude/`, `dev-docs/`, the
-contents of `ingest-inbox/` and `exports/`), and neither do uncommitted changes,
-so commit first. Run it in a git checkout of the project, with `bash package.sh`,
-not `./package.sh`, so it does not depend on its own executable bit.
+`node_modules/`, offline tars, previous archives, `dev-docs/`, the untracked
+parts of `.claude/` such as local settings and worktrees, the contents of
+`ingest-inbox/` and `exports/`), and neither do uncommitted changes, so commit
+first. The project skills tracked under `.claude/skills/` do go in. Run it in a
+git checkout of the project, with `bash package.sh`, not `./package.sh`, so it
+does not depend on its own executable bit.
 
 #### 2. What the target Mac needs
 
