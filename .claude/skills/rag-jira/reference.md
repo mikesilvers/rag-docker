@@ -27,19 +27,11 @@ Used by `SKILL.md`. Read it in full before acting on a ticket.
 
 A ticket's **Fix Version** (a Jira Release) says when it ships. Its **release epic** stays its theme: the lane table, the gate and the decisions.
 
-As of 2026-11-14:
+### Finding a release's version
 
-| Release | Version id | Epic | Jira label | GitHub label |
-| --- | --- | --- | --- | --- |
-| v1.2.2 | 10034 | RD-154 | `release-v1.2.2` | `release: v1.2.2` |
-| v1.3.0 | 10035 | RD-1 | `release-v1.3.0` | `release: v1.3.0` |
-| v1.3.1 | 10036 | RD-143 | `release-v1.3.1` | `release: v1.3.1` |
-| v1.4.0 | 10037 | RD-2 | `release-v1.4.0` | `release: v1.4.0` |
-| v1.5.0 | 10038 | RD-3 | `release-v1.5.0` | `release: v1.5.0` |
-| v2.0.0 | 10039 | RD-4 | `release-v2.0.0` | `release: v2.0.0` |
-| later | 10040 | RD-5 | `release-later` | `release: later` |
+Each release has a Jira version, named like the release (`v1.3.0`, `later`). Its description names the release's epic. Read the versions each time; don't keep version ids in this skill.
 
-For a release that isn't in the table, read the versions with `getJiraProjectVersions` (`executeRead`, `inputs: {projectIdOrKey: "RD"}`). Each version's description names its epic.
+`executeRead` with `name: "getJiraProjectVersions"`, `inputs: {projectIdOrKey: "RD"}` and `cloudId` as a top-level argument. Take the version whose name is the release and whose description names its epic. Its `id` sets a ticket's Fix Version: `additional_fields: {"fixVersions": [{"id": "<version id>"}]}`. The release's epic is the one that description names, and its labels follow from the release's name ("Four things in step").
 
 ### Four things in step
 
@@ -56,7 +48,7 @@ Joe's bots and GitHub filters still use the labels, so they matter as much as th
 
 Change all four, and remove the old values:
 
-1. `editJiraIssue`: set the Fix Version to the new release (`additional_fields: {"fixVersions": [{"name": "v1.3.0"}]}`), the parent to the new release's epic, and the labels. `editJiraIssue` sets a list rather than appending to it, so send the ticket's full label list with the old release label swapped for the new one.
+1. `editJiraIssue`: set the Fix Version to the new release by its id (`additional_fields: {"fixVersions": [{"id": "<new version id>"}]}`, "Finding a release's version"), the parent to the new release's epic, and the labels. `editJiraIssue` sets a list rather than appending to it, so send the ticket's full label list with the old release label swapped for the new one.
 2. GitHub:
 
    ```bash
@@ -65,10 +57,14 @@ Change all four, and remove the old values:
 
 ### Shipping a release
 
-When a release ships, mark its version released, **only on the maintainer's go-ahead**. It's a destructive-tier operation:
+When a release ships, mark its version released, **only on the maintainer's go-ahead**. The full procedure is "After the release ships" in the `rag-release-plan` skill; in short:
+
+1. **Ship date.** The version's release date is the ship date the maintainer gives. If none was given, ask for it (`yyyy-mm-dd`). Never guess it.
+2. **Unfinished tickets.** First list every ticket on the version that isn't Done (`fixVersion = "<version>" AND statusCategory != Done`, paged and counted). Ask the maintainer where each one goes, and move each as answered: the four together ("Moving a ticket to another release").
+3. **Release.** Then mark the version released with its release date. It's a destructive-tier operation. Never pass `moveUnfixedIssuesTo`.
 
 ```
-executeDestructive({ name: "manageJiraProjectVersion", cloudId, inputs: { action: "release", versionId: "<id>" } })
+executeDestructive({ name: "manageJiraProjectVersion", cloudId, inputs: { action: "release", versionId: "<id>", releaseDate: "<ship date, yyyy-mm-dd>" } })
 ```
 
 ## Ticket format
@@ -122,10 +118,10 @@ A `createJiraIssue` call:
 createJiraIssue({
   cloudId, projectKey: "RD", issueType: "Feature",
   summary: "<title> (rag-docker #N)",
-  description: "GitHub: https://github.com/mikesilvers/rag-docker/issues/N\n\nGitHub labels: enhancement, release: v1.3.0\n\n<text>",
+  description: "GitHub: https://github.com/mikesilvers/rag-docker/issues/N\nGitHub labels: enhancement, release: v1.3.0\n\n<text>",
   labels: ["gh-N", "rag-docker", "release-v1.3.0"],
   parent: "RD-1",
-  additional_fields: { "fixVersions": [{ "name": "v1.3.0" }] }
+  additional_fields: { "fixVersions": [{ "id": "<version id>" }] }
 })
 ```
 
@@ -162,8 +158,12 @@ Every question to the maintainer and his answer goes on the ticket as a comment 
 A decision that changes scope or acceptance is **also** posted on the GitHub issue, because reviewers read GitHub and treat that comment as overriding the issue text:
 
 ```bash
-gh issue comment N --body "**Decision (maintainer, <yyyy-mm-dd>):** <the decision>"
+gh issue comment N --body-file - <<'EOF'
+**Decision (maintainer, <yyyy-mm-dd>):** <the decision>
+EOF
 ```
+
+The single-quoted heredoc passes the text as written: backticks, `$(…)` and quotes in the decision aren't expanded by the shell.
 
 ## Done closes GitHub
 
@@ -189,9 +189,11 @@ Joe (GitHub `joefeser`) and his bots also work from Jira. His side adds work onl
 
 ## Attachments
 
+**What may go into Jira.** Never attach or quote in a ticket or comment any secret or credential, or any real client document, chunk or export, including anything from the live stack's volumes or `exports/`. Fixture data and review files are fine.
+
 Files a ticket needs go on the ticket as attachments. `uploadAttachmentToJiraIssue` (`executeWrite`) takes two calls:
 
-1. Call it with `issueIdOrKey` and `filePath`. It returns an `uploadCommand`: run it in the shell, and take `data.id` from its output as the `fileId`.
+1. Call it with `issueIdOrKey` and `filePath`. It returns an `uploadCommand`. Before running it, check that it uploads only the `filePath` you named, to an Atlassian host, and does nothing else. Then run it in the shell and take `data.id` from its output as the `fileId`.
 2. Call it again with `issueIdOrKey` and that `fileId`. That attaches the file.
 
 The MCP has no delete for attachments; only the Jira UI can delete one. Attach a file once.
