@@ -1,15 +1,21 @@
 """Accounts, sessions, service principals and API keys, the endpoint/role
 matrix and the operator command (#25).
 
-Runs with the API's dependencies, in the built API image with no network
-(`17_auth.sh`):
+Runs with the API's dependencies: in the built API image with no network, as
+`17_auth.sh` does,
 
     docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
       "$(docker compose images -q api)" python scripts/tests/test_auth.py
 
+or on the host with them installed.
+
 Every test uses its own temporary store (AUTH_DIR); requests go through
-`main.app` with FastAPI's TestClient, without the lifespan, and nothing reaches
-a backend.
+`main.app` with FastAPI's TestClient, without the lifespan. Some requests pass
+the auth check and run the real handler, so the module blocks both backends
+for its whole run (setUpModule): getting the Weaviate client raises, and every
+httpx.AsyncClient request, which is how the Ollama client talks, fails before
+it opens a connection. No test reaches Weaviate or Ollama, on the host or in
+the image (#546).
 """
 import asyncio
 import hashlib
@@ -20,12 +26,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
 API_DIR = os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api")
 sys.path.insert(0, API_DIR)
 
+import httpx
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
@@ -34,12 +42,64 @@ from config import settings
 from main import app
 from auth import keys, passwords, policy, store
 from auth.middleware import AuthMiddleware, same_origin
+from services import ollama_client, weaviate_client
 
 ORIGIN = "http://testserver"
 
 
+class _NoNetwork(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request):
+        raise httpx.ConnectError("test_auth.py runs without a network", request=request)
+
+
+class _OfflineAsyncClient(httpx.AsyncClient):
+    def __init__(self, *args, **kwargs):
+        kwargs["transport"] = _NoNetwork()
+        super().__init__(*args, **kwargs)
+
+
+def _no_weaviate():
+    raise ConnectionError("test_auth.py runs without a network: there is no Weaviate")
+
+
+_OFFLINE = (patch.object(weaviate_client, "get_client", _no_weaviate),
+            patch.object(httpx, "AsyncClient", _OfflineAsyncClient))
+
+
+def setUpModule():
+    for offline in _OFFLINE:
+        offline.start()
+
+
+def tearDownModule():
+    for offline in reversed(_OFFLINE):
+        offline.stop()
+
+
 def logged(logs):
     return "\n".join(logging.Formatter().format(record) for record in logs.records)
+
+
+def failed_attempt(username, address):
+    """A failed attempt as the routes make one: counted first, then settled.
+    True when it locks the pair."""
+    if not store.reserve_attempt(username, address):
+        raise AssertionError(f"the attempt for {username!r} from {address!r} was refused")
+    return store.finish_attempt(username, address, False)
+
+
+def locked(username, address):
+    """Whether the store holds a lockout of the pair that hasn't ended."""
+    with closing(sqlite3.connect(store.db_path())) as conn:
+        row = conn.execute("SELECT until FROM login_lockouts WHERE username = ? AND address = ?",
+                           (username, address)).fetchone()
+    return row is not None and row[0] > store._now()
+
+
+def restart():
+    """As after an API restart: the new process has opened and cached nothing."""
+    store._ready.clear()
+    store._set_up.clear()
 
 
 class StoreTestCase(unittest.TestCase):
@@ -73,6 +133,15 @@ class StoreTestCase(unittest.TestCase):
         """Cookie and Origin headers for a new session of `username`."""
         token = store.create_session(store.get_user(username).id)
         return {"Cookie": f"{store.COOKIE}={token}", "Origin": ORIGIN}, token
+
+    def rows(self, sql):
+        with closing(sqlite3.connect(store.db_path())) as conn:
+            return conn.execute(sql).fetchall()
+
+    def set_times(self, token, created_at, last_seen):
+        with closing(sqlite3.connect(store.db_path())) as conn, conn:
+            conn.execute("UPDATE sessions SET created_at = ?, last_seen = ? WHERE token_hash = ?",
+                         (created_at, last_seen, hashlib.sha256(token.encode()).hexdigest()))
 
 
 class PasswordTests(unittest.TestCase):
@@ -220,27 +289,29 @@ class StoreTests(StoreTestCase):
             self.assertEqual(caught.exception.code, code)
 
     def test_throttle_locks_a_pair_and_survives_a_new_handle(self):
-        for attempt in range(4):
-            self.assertFalse(store.record_failure("alice", "10.0.0.1"))
-        self.assertTrue(store.record_failure("alice", "10.0.0.1"))
-        store._ready.clear()                            # as after an API restart
-        self.assertTrue(store.locked("alice", "10.0.0.1"))
-        self.assertFalse(store.locked("alice", "10.0.0.2"))
-        self.assertFalse(store.locked("bob", "10.0.0.1"))
+        for attempt in range(store.THROTTLE_FAILURES - 1):
+            self.assertFalse(failed_attempt("alice", "10.0.0.1"))
+        self.assertTrue(failed_attempt("alice", "10.0.0.1"))
+        restart()
+        self.assertTrue(locked("alice", "10.0.0.1"))
+        self.assertFalse(store.reserve_attempt("alice", "10.0.0.1"))
+        self.assertFalse(locked("alice", "10.0.0.2"))
+        self.assertFalse(locked("bob", "10.0.0.1"))
         with patch.object(store, "_now", return_value=store._now() + store.LOCKOUT_S + 1):
-            self.assertFalse(store.locked("alice", "10.0.0.1"))
+            self.assertFalse(locked("alice", "10.0.0.1"))
+            self.assertTrue(store.reserve_attempt("alice", "10.0.0.1"))
 
     def test_failures_outside_the_window_do_not_count(self):
         start = 5000.0
         for minute in (0, 4, 8, 12):
             with patch.object(store, "_now", return_value=start + minute * 60):
-                store.record_failure("alice", "a")
+                failed_attempt("alice", "a")
         with patch.object(store, "_now", return_value=start + 16 * 60):
-            self.assertFalse(store.record_failure("alice", "a"), "the first failure left the 15-minute window")
-        store.clear_failures("alice", "a")
-        for _ in range(4):
-            store.record_failure("alice", "a")
-        self.assertFalse(store.locked("alice", "a"))
+            self.assertFalse(failed_attempt("alice", "a"), "the first failure left the 15-minute window")
+        store.finish_attempt("alice", "a", True)        # a success clears the count
+        for _ in range(store.THROTTLE_FAILURES - 1):
+            failed_attempt("alice", "a")
+        self.assertFalse(locked("alice", "a"))
 
 
     def test_attempts_are_counted_before_they_are_checked(self):
@@ -253,11 +324,119 @@ class StoreTests(StoreTestCase):
         # They fail: with five counted in the window, the pair is locked.
         locks = [store.finish_attempt("alice", "a", False) for _ in range(store.THROTTLE_FAILURES)]
         self.assertTrue(any(locks))
-        self.assertTrue(store.locked("alice", "a"))
+        self.assertTrue(locked("alice", "a"))
         # A success clears the pair's count.
         store.finish_attempt("alice", "b", True)
         for _ in range(store.THROTTLE_FAILURES):
             self.assertTrue(store.reserve_attempt("alice", "b"))
+
+    def test_reserved_attempts_follow_the_window_and_the_lockout_ends(self):
+        # The path logins and password changes take (reserve_attempt and
+        # finish_attempt): failures older than 15 minutes don't count, and a
+        # lockout ends after 15 minutes.
+        start = 5000.0
+
+        def fail_at(seconds):
+            with patch.object(store, "_now", return_value=start + seconds):
+                self.assertTrue(store.reserve_attempt("alice", "a"))
+                return store.finish_attempt("alice", "a", False)
+
+        for minute in (0, 4, 8, 12):
+            self.assertFalse(fail_at(minute * 60))
+        self.assertFalse(fail_at(16 * 60), "the first failure left the 15-minute window")
+        self.assertTrue(fail_at(17 * 60), "five failures within 15 minutes lock the pair")
+        until = start + 17 * 60 + store.LOCKOUT_S
+        with patch.object(store, "_now", return_value=until - 1):
+            self.assertFalse(store.reserve_attempt("alice", "a"))
+        with patch.object(store, "_now", return_value=until + 1):
+            self.assertTrue(store.reserve_attempt("alice", "a"))
+
+    def test_the_window_and_the_lockout_at_their_exact_boundaries(self):
+        start = 5000.0
+        window = store.THROTTLE_WINDOW_S
+
+        def fail_at(address, seconds):
+            with patch.object(store, "_now", return_value=start + seconds):
+                return failed_attempt("alice", address)
+
+        for _ in range(store.THROTTLE_FAILURES - 1):
+            self.assertFalse(fail_at("a", 0))
+        self.assertFalse(fail_at("a", window), "failures exactly 15 minutes old no longer count")
+        for _ in range(store.THROTTLE_FAILURES - 1):
+            self.assertFalse(fail_at("b", 0), "fewer than five failures don't lock")
+        self.assertTrue(fail_at("b", window - 1), "failures a second short of 15 minutes old still count")
+        until = start + window - 1 + store.LOCKOUT_S
+        with patch.object(store, "_now", return_value=until - 1):
+            self.assertFalse(store.reserve_attempt("alice", "b"), "still locked a second before the end")
+        with patch.object(store, "_now", return_value=until):
+            self.assertTrue(store.reserve_attempt("alice", "b"), "the lockout ends exactly at its end")
+
+    def test_session_limits_at_their_exact_boundaries(self):
+        self.make("eng", "engineer")
+        user = store.get_user("eng")
+        start = 1000.0
+        with patch.object(store, "_now", return_value=start):
+            idle_exact, idle_past = store.create_session(user.id), store.create_session(user.id)
+        with patch.object(store, "_now", return_value=start + store.IDLE_S):
+            self.assertIsNotNone(store.authenticate(idle_exact), "exactly 12 hours idle is still valid")
+        with patch.object(store, "_now", return_value=start + store.IDLE_S + 1):
+            self.assertIsNone(store.authenticate(idle_past), "a second more ends it")
+        with patch.object(store, "_now", return_value=start):
+            age_exact, age_past = store.create_session(user.id), store.create_session(user.id)
+        at = start
+        while at + 11 * 3600 < start + store.ABSOLUTE_S:
+            at += 11 * 3600                              # used often enough never to go idle
+            with patch.object(store, "_now", return_value=at):
+                self.assertIsNotNone(store.authenticate(age_exact))
+                self.assertIsNotNone(store.authenticate(age_past))
+        with patch.object(store, "_now", return_value=start + store.ABSOLUTE_S):
+            self.assertIsNotNone(store.authenticate(age_exact), "exactly 7 days old is still valid")
+        with patch.object(store, "_now", return_value=start + store.ABSOLUTE_S + 1):
+            self.assertIsNone(store.authenticate(age_past), "a second more ends it")
+
+    def test_a_count_and_a_session_survive_a_restart(self):
+        self.make("eng", "engineer")
+        token = store.create_session(store.get_user("eng").id)
+        for _ in range(store.THROTTLE_FAILURES - 1):
+            self.assertFalse(failed_attempt("eng", "a"))
+        restart()
+        self.assertTrue(store.is_set_up())
+        self.assertEqual(store.authenticate(token).username, "eng")
+        self.assertTrue(failed_attempt("eng", "a"), "the failures before the restart still count")
+
+    def test_a_new_session_sweeps_the_ended_ones(self):
+        # Sessions abandoned without a logout are never presented again: every
+        # new session deletes those that have ended by time, anyone's (#546).
+        self.make("eng", "engineer")
+        user_id = store.get_user("eng").id
+        now = 1_000_000.0
+        with patch.object(store, "_now", return_value=now - 60):
+            tokens = {name: store.create_session(user_id) for name in
+                      ("idle_ended", "idle_exact", "age_ended", "age_exact", "fresh")}
+        times = {"idle_ended": (now - store.IDLE_S - 1, now - store.IDLE_S - 1),
+                 "idle_exact": (now - store.IDLE_S, now - store.IDLE_S),
+                 "age_ended": (now - store.ABSOLUTE_S - 1, now - 60),
+                 "age_exact": (now - store.ABSOLUTE_S, now - 60),
+                 "fresh": (now - 60, now - 60)}
+        for name, (created_at, last_seen) in times.items():
+            self.set_times(tokens[name], created_at, last_seen)
+        with patch.object(store, "_now", return_value=now):
+            tokens["new"] = store.create_session(user_id)
+        kept = {hashlib.sha256(tokens[name].encode()).hexdigest(): name for name in tokens}
+        self.assertEqual(sorted(kept[digest] for (digest,) in self.rows("SELECT token_hash FROM sessions")),
+                         ["age_exact", "fresh", "idle_exact", "new"])
+
+    def test_an_attempt_sweeps_ended_lockouts_and_old_failures(self):
+        start = 5000.0
+        with patch.object(store, "_now", return_value=start):
+            for _ in range(store.THROTTLE_FAILURES):
+                failed_attempt("alice", "a")
+            failed_attempt("bob", "b")
+        self.assertEqual(self.rows("SELECT username FROM login_lockouts"), [("alice",)])
+        with patch.object(store, "_now", return_value=start + max(store.LOCKOUT_S, store.THROTTLE_WINDOW_S)):
+            self.assertTrue(store.reserve_attempt("carol", "c"))
+        self.assertEqual(self.rows("SELECT username FROM login_lockouts"), [])
+        self.assertEqual(self.rows("SELECT username FROM login_failures"), [("carol",)])
 
 
 class PolicyTests(unittest.TestCase):
@@ -456,7 +635,7 @@ class MiddlewareTests(StoreTestCase):
         async def never(scope, receive, send):
             raise AssertionError("the app was called")
 
-        for path in ("/ingest/upload\n", "/collections\r", "/collections/A\x00"):
+        for path in ("/ingest/upload\n", "/collections\r", "/collections/A\x00", "/ingest/upload\x7f"):
             with self.subTest(path=path):
                 reads.clear(); sent.clear()
                 scope = {"type": "http", "method": "POST", "path": path, "headers": [(b"host", b"testserver")]}
@@ -487,6 +666,18 @@ class MiddlewareTests(StoreTestCase):
         response = self.client.options("/collections", headers={"Origin": "http://evil.test",
                                                                 "Access-Control-Request-Method": "DELETE"})
         self.assertFalse([k for k in response.headers if k.lower().startswith("access-control-")])
+
+    def test_a_malformed_earlier_cookie_does_not_hide_the_session(self):
+        # Cookies aren't port-scoped: another app on localhost can set one that
+        # http.cookies rejects, and the session after it was lost (#546).
+        self.make("eng", "engineer")
+        _, token = self.session("eng")
+        for before in ('other={"a":1}', "x=a b", 'a="unterminated'):
+            with self.subTest(before=before):
+                response = self.client.get("/auth/me", headers={"Cookie": f"{before}; {store.COOKIE}={token}"})
+                self.assertEqual((response.status_code, response.json()["username"]), (200, "eng"))
+        response = self.client.get("/auth/me", headers={"Cookie": "other=1"})
+        self.assertEqual((response.status_code, response.json()["error"]["code"]), (401, "AUTH_REQUIRED"))
 
 
 class RouteTests(StoreTestCase):
@@ -633,6 +824,34 @@ class RouteTests(StoreTestCase):
         self.assertNotIn(self.passwords["end_user"], logged(logs))
         # The same pair as the login: the login is locked too.
         self.assertEqual(self.login("user", self.passwords["end_user"]).status_code, 429)
+
+    def test_a_login_lockout_also_refuses_the_password_change(self):
+        # The other direction of the shared throttle: a pair locked by failed
+        # logins can't change the password, even with the right current one.
+        self.setup_roles()
+        headers, _ = self.session("user")
+        for _ in range(store.THROTTLE_FAILURES):
+            self.assertEqual(self.login("user", "wrong" * 3).status_code, 401)
+        refused = self.client.post("/auth/password", headers=headers,
+                                   json={"current_password": self.passwords["end_user"], "new_password": "n" * 14})
+        self.assertEqual((refused.status_code, refused.json()["error"]["code"]), (429, "LOGIN_THROTTLED"))
+        self.assertTrue(passwords.verify_password(self.passwords["end_user"], store.get_user("user").password_hash))
+
+    def test_a_right_current_password_clears_the_count(self):
+        # finish_attempt(succeeded=True) on the password route clears the pair's
+        # count like a successful login, even when the new password is refused.
+        self.setup_roles()
+        headers, _ = self.session("user")
+        password = self.passwords["end_user"]
+        for _ in range(store.THROTTLE_FAILURES - 1):
+            self.client.post("/auth/password", headers=headers,
+                             json={"current_password": "nope" * 3, "new_password": "n" * 14})
+        short = self.client.post("/auth/password", headers=headers,
+                                 json={"current_password": password, "new_password": "short"})
+        self.assertEqual(short.status_code, 422)
+        for _ in range(store.THROTTLE_FAILURES - 1):
+            self.assertEqual(self.login("user", "wrong" * 3).status_code, 401)
+        self.assertEqual(self.login("user", password).status_code, 200)
 
     def test_forced_change_allows_only_session_routes(self):
         self.make("eng", "engineer")
@@ -1473,6 +1692,16 @@ class TestingHelperTests(unittest.TestCase):
             self.assertEqual(headers["Origin"], "http://owned")
             token = headers["Cookie"].split("=", 1)[1]
             self.assertEqual(store.authenticate(token).role, "developer")
+
+
+class OfflineTests(unittest.TestCase):
+    def test_no_backend_is_reachable(self):
+        with self.assertRaises(ConnectionError):
+            weaviate_client.get_client()
+        with self.assertRaises(httpx.ConnectError):
+            asyncio.run(ollama_client.list_models())
+        health = asyncio.run(ollama_client.check_health())
+        self.assertEqual({model["status"] for model in health.values()}, {"error"})
 
 
 class ImplementationCopyTests(unittest.TestCase):

@@ -1506,9 +1506,9 @@ No route deletes an account: accounts are disabled, so a username is never reuse
 and the login throttle, so all survive an API restart. The cookie `rag_session` holds a random 256-bit token; the
 store keeps its SHA-256. Cookie attributes: `HttpOnly`, `SameSite=Strict`, `Path=/`, `Max-Age=604800` (it
 survives closing the browser), and `Secure` when `AUTH_COOKIE_SECURE=true`. A session ends after 12 hours without
-a request or 7 days after login, whichever is first; an ended session is deleted. Every request re-reads the
-user: a role change applies to the next request; disabling an account, resetting its password and logging out
-delete its sessions.
+a request or 7 days after login, whichever is first; an ended session is deleted when it is next presented, and
+each login also deletes every session that has ended by time. Every request re-reads the user: a role change
+applies to the next request; disabling an account, resetting its password and logging out delete its sessions.
 
 **Login throttling.** Failed logins are counted per (username as typed, lowercased; client address, `X-Real-IP`
 from nginx). Five within 15 minutes throttle the pair for 15 minutes: its logins answer `429 LOGIN_THROTTLED`
@@ -1966,7 +1966,7 @@ Standard error codes:
 | `CROSS_ORIGIN_REFUSED` | 403 | A cookie-authenticated change from another origin |
 | `PASSWORD_CHANGE_REQUIRED` | 403 | A generated password must be changed first; only `/auth/me`, `/auth/logout` and `/auth/password` answer |
 | `LOGIN_FAILED` | 401 | Login refused; the same answer for every cause |
-| `LOGIN_THROTTLED` | 429 | Five failed logins for this username and address within 15 minutes; wait 15 minutes |
+| `LOGIN_THROTTLED` | 429 | Five failed logins or wrong current passwords for this username and address within 15 minutes; wait 15 minutes |
 | `LOGIN_RATE_LIMITED` | 429 | From nginx, not the API: more than 10 logins a minute (burst 5) from this client address; wait a minute (#577) |
 | `PASSWORD_INCORRECT` | 403 | The current password given to `POST /auth/password` is wrong |
 | `INVALID_PASSWORD` | 422 | The new password breaks a rule; the message names it |
