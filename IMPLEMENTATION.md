@@ -820,14 +820,14 @@ olefile==0.47
 onnx==1.22.0
 onnxruntime==1.30.0
 opencv-python==5.0.0.93
-opentelemetry-api==1.45.1
-opentelemetry-exporter-http-transport==0.66b1
-opentelemetry-exporter-otlp-common==0.66b1
-opentelemetry-exporter-otlp-proto-common==1.45.1
-opentelemetry-exporter-otlp-proto-http==1.45.1
-opentelemetry-proto==1.45.1
-opentelemetry-sdk==1.45.1
-opentelemetry-semantic-conventions==0.66b1
+opentelemetry-api==1.45.2
+opentelemetry-exporter-http-transport==0.66b2
+opentelemetry-exporter-otlp-common==0.66b2
+opentelemetry-exporter-otlp-proto-common==1.45.2
+opentelemetry-exporter-otlp-proto-http==1.45.2
+opentelemetry-proto==1.45.2
+opentelemetry-sdk==1.45.2
+opentelemetry-semantic-conventions==0.66b2
 orjson==3.12.0
 packaging==26.3
 pandas==2.3.3
@@ -869,7 +869,7 @@ shellingham==1.5.4
 six==1.17.0
 smart_open==8.0.1
 sniffio==1.3.1
-soupsieve==2.9.2
+soupsieve==4.0
 spacy-legacy==3.0.12
 spacy-loggers==1.0.5
 spacy==3.8.16
@@ -967,8 +967,8 @@ sentence-transformers>=3.0        # resolved: 6.0.1
 python-multipart>=0.0.9           # resolved: 0.0.32
 
 # Private, optional OTLP HTTP/protobuf telemetry runtime (#282).
-opentelemetry-sdk==1.45.1
-opentelemetry-exporter-otlp-proto-http==1.45.1
+opentelemetry-sdk==1.45.2
+opentelemetry-exporter-otlp-proto-http==1.45.2
 
 # Passphrase encryption of export packages in the age format (#27). Already in
 # the lock as a transitive dependency; listed here because the API now imports
@@ -54170,7 +54170,7 @@ class EmbeddedTelemetryTests(unittest.TestCase):
         spec = (ROOT/'SPECIFICATIONS.md').read_text()
         inputs = (ROOT/'api/requirements.in').read_text().splitlines()
         lock = (ROOT/'api/requirements.txt').read_text().splitlines()
-        for dependency in ('opentelemetry-sdk==1.45.1', 'opentelemetry-exporter-otlp-proto-http==1.45.1'):
+        for dependency in ('opentelemetry-sdk==1.45.2', 'opentelemetry-exporter-otlp-proto-http==1.45.2'):
             self.assertIn(dependency, spec)
             self.assertIn(dependency, inputs)
             self.assertIn(dependency, lock)
