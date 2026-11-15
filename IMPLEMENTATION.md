@@ -19504,12 +19504,12 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
     "@tailwindcss/typography": "^0.5.15",
     "@types/react": "^18.3.5",
     "@types/react-dom": "^18.3.0",
-    "@vitejs/plugin-react": "^4.3.1",
+    "@vitejs/plugin-react": "^6.3.0",
     "autoprefixer": "^10.6.2",
     "postcss": "^8.5.32",
     "tailwindcss": "^3.4.11",
     "typescript": "^7.0.2",
-    "vite": "^6.4.4"
+    "vite": "^8.3.8"
   },
   "overrides": {
     "@tailwindcss/typography": {
