@@ -135,8 +135,8 @@ against" below).
 
 | Command | What it does |
 |---|---|
-| `stack.sh run [--checkout DIR] [--telemetry \| --lan] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
-| `stack.sh up [--checkout DIR] [--pull] [--telemetry \| --lan]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT` and `RAG_VERIFY_OTEL_ENABLED`. |
+| `stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] \| --lan] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
+| `stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] \| --lan]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT`, `RAG_VERIFY_OTEL_ENABLED` and `RAG_VERIFY_TELEMETRY_PIN`. `--telemetry-pin FILE` supplies a reviewed collector pin (see "Evaluating a collector pin change"). |
 | `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
 
 `--checkout` is the checkout to build and test; the default is the one holding
@@ -1491,3 +1491,33 @@ independent of ambient operator telemetry variables. Before disabled-mode counti
 the old API, Collector queues and capture handlers terminate; a fresh Collector
 and capture process isolate the zero-traffic observation from earlier exports.
 Malformed capture shapes fail as incomplete evidence, never partial success.
+
+### Evaluating a collector pin change (#532)
+
+The guard checks the `otel-collector` image against the harness's own
+`telemetry/image.json`, so a checkout that changes the collector pin (in
+`telemetry/image.json` or `docker-compose.telemetry.yml`) is refused by default,
+and no file in the checkout is ever read as a pin. To evaluate such a change,
+the evaluator supplies a reviewed pin with `--telemetry-pin FILE`, together with
+`--telemetry`, on `run` or `up`:
+
+```sh
+bash scripts/verify/stack.sh run --telemetry --telemetry-pin <bundle>/telemetry-pin.json --checkout <bundle>/merged 15
+```
+
+- The harness makes no registry lookup. Before the run, the evaluator checks the
+  PR's pin against the registry from the host (the tag resolves to the pinned
+  digest, and each architecture's config ID matches `image.json`), then copies
+  the PR's `telemetry/image.json` outside the checkout. If that check fails or
+  can't be done, there is no telemetry run.
+- `FILE` must be an existing file outside the checkout under test (after
+  resolving symlinks); otherwise `stack.sh` exits 2 before any Docker command.
+- Its `image` must be `<repository>:<tag>@sha256:<digest>` with the harness
+  pin's repository, so only the tag and digest can change. Anything else (an
+  unreadable file, another form, another repository) is refused by the guard,
+  and nothing is built.
+- The same pin applies to suite 15's `telemetry-mode` calls, which inherit it
+  as `RAG_VERIFY_TELEMETRY_PIN`. `up` and `run` set that variable only from
+  the option; an ambient value is ignored.
+
+Without the option, the harness's own pin applies, as before.

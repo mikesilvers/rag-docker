@@ -24345,8 +24345,8 @@ against" below).
 
 | Command | What it does |
 |---|---|
-| `stack.sh run [--checkout DIR] [--telemetry \| --lan] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
-| `stack.sh up [--checkout DIR] [--pull] [--telemetry \| --lan]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT` and `RAG_VERIFY_OTEL_ENABLED`. |
+| `stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] \| --lan] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
+| `stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] \| --lan]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT`, `RAG_VERIFY_OTEL_ENABLED` and `RAG_VERIFY_TELEMETRY_PIN`. `--telemetry-pin FILE` supplies a reviewed collector pin (see "Evaluating a collector pin change"). |
 | `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
 
 `--checkout` is the checkout to build and test; the default is the one holding
@@ -25701,6 +25701,36 @@ independent of ambient operator telemetry variables. Before disabled-mode counti
 the old API, Collector queues and capture handlers terminate; a fresh Collector
 and capture process isolate the zero-traffic observation from earlier exports.
 Malformed capture shapes fail as incomplete evidence, never partial success.
+
+### Evaluating a collector pin change (#532)
+
+The guard checks the `otel-collector` image against the harness's own
+`telemetry/image.json`, so a checkout that changes the collector pin (in
+`telemetry/image.json` or `docker-compose.telemetry.yml`) is refused by default,
+and no file in the checkout is ever read as a pin. To evaluate such a change,
+the evaluator supplies a reviewed pin with `--telemetry-pin FILE`, together with
+`--telemetry`, on `run` or `up`:
+
+```sh
+bash scripts/verify/stack.sh run --telemetry --telemetry-pin <bundle>/telemetry-pin.json --checkout <bundle>/merged 15
+```
+
+- The harness makes no registry lookup. Before the run, the evaluator checks the
+  PR's pin against the registry from the host (the tag resolves to the pinned
+  digest, and each architecture's config ID matches `image.json`), then copies
+  the PR's `telemetry/image.json` outside the checkout. If that check fails or
+  can't be done, there is no telemetry run.
+- `FILE` must be an existing file outside the checkout under test (after
+  resolving symlinks); otherwise `stack.sh` exits 2 before any Docker command.
+- Its `image` must be `<repository>:<tag>@sha256:<digest>` with the harness
+  pin's repository, so only the tag and digest can change. Anything else (an
+  unreadable file, another form, another repository) is refused by the guard,
+  and nothing is built.
+- The same pin applies to suite 15's `telemetry-mode` calls, which inherit it
+  as `RAG_VERIFY_TELEMETRY_PIN`. `up` and `run` set that variable only from
+  the option; an ambient value is ignored.
+
+Without the option, the harness's own pin applies, as before.
 ````
 
 ### scripts/verify/all.sh
@@ -25808,8 +25838,8 @@ exit "$overall"
 # Run the verification suite on a disposable compose project, never on the
 # live stack (#152).
 #
-#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry | --lan] [suite ...]
-#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull] [--lan]
+#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] | --lan] [suite ...]
+#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] | --lan]
 #   bash scripts/verify/stack.sh down
 #
 # `run` brings the verify project up, runs that checkout's all.sh against it
@@ -25854,6 +25884,15 @@ exit "$overall"
 # exactly proxy:127.0.0.1:<verify port>->443/tcp. The suites then reach it at
 # https://localhost:<port>/api and trust the certificate it generated, copied
 # into the private folder. Without suite names, a --lan run runs 18_lan.
+#
+# --telemetry checks the collector image against this checkout's own
+# telemetry/image.json, so a PR that changes the pin is refused. To evaluate
+# one, the evaluator checks the PR's pin against the registry, copies its
+# telemetry/image.json outside the checkout and passes it with
+# --telemetry-pin FILE (#532). The guard then expects that image, which may
+# change only the tag and digest of this checkout's pin, never the
+# repository. Nothing here contacts a registry, and no file in the checkout
+# is read as a pin.
 #
 # What this does not do: the suites, and anything else the checkout runs on the
 # host, still have full access to Docker. It keeps verification away from the
@@ -25909,6 +25948,8 @@ PULL=""
 TELEMETRY=0
 LAN=0
 OTEL_ENABLED=true
+PIN=""
+PIN_SET=0
 ARGS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -25918,6 +25959,9 @@ while [ "$#" -gt 0 ]; do
     --telemetry)
       [ "$CMD" != down ] || usage
       TELEMETRY=1; shift ;;
+    --telemetry-pin)
+      { [ "$CMD" = up ] || [ "$CMD" = run ]; } && [ "$#" -ge 2 ] || usage
+      PIN="$2"; PIN_SET=1; shift 2 ;;
     --lan)
       { [ "$CMD" = up ] || [ "$CMD" = run ]; } || usage
       LAN=1; shift ;;
@@ -25935,6 +25979,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ "$TELEMETRY" = 0 ] || [ "$LAN" = 0 ] || fail "--lan and --telemetry can't be combined."
+[ "$PIN_SET" = 0 ] || [ "$TELEMETRY" = 1 ] || fail "--telemetry-pin requires --telemetry."
 
 PORT="${RAG_VERIFY_PORT:-8081}"
 case "$PORT" in
@@ -25949,6 +25994,16 @@ if [ "$CMD" != down ]; then
   { [ -d "$CHECKOUT" ] && [ -f "$CHECKOUT/docker-compose.yml" ]; } \
     || fail "--checkout must be a checkout of this project (a folder with docker-compose.yml): $CHECKOUT"
   CHECKOUT="$(cd "$CHECKOUT" && pwd -P)"
+fi
+
+# The reviewed collector pin (#532): the evaluator's file, never the checkout's.
+if [ "$PIN_SET" = 1 ]; then
+  [ -f "$PIN" ] || fail "--telemetry-pin must name an existing file: $PIN"
+  PIN="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$PIN")" \
+    || fail "could not resolve the --telemetry-pin path."
+  case "$PIN" in
+    "$CHECKOUT"/*) fail "--telemetry-pin must be outside the checkout under test: $PIN" ;;
+  esac
 fi
 
 # The private folder, checked before any Docker command; up and run create it.
@@ -26007,6 +26062,10 @@ export RAG_VERIFY_TELEMETRY="$TELEMETRY"
 export RAG_VERIFY_OTEL_ENABLED="$OTEL_ENABLED"
 export RAG_VERIFY_HARNESS="$HARNESS"
 export RAG_VERIFY_CHECKOUT="$CHECKOUT"
+# telemetry-mode, run by a suite under the inherited lock, keeps the run's
+# reviewed pin; up and run take it only from --telemetry-pin.
+[ "$CMD" != telemetry-mode ] || PIN="${RAG_VERIFY_TELEMETRY_PIN:-}"
+export RAG_VERIFY_TELEMETRY_PIN="$PIN"
 if [ "$TELEMETRY" = 1 ]; then
   export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.telemetry.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.telemetry.verify.yml"
   export COMPOSE_PROFILES=telemetry
@@ -26140,7 +26199,7 @@ do_guard() {
     rm -f "$config"
     fail "docker compose config failed for $CHECKOUT."
   fi
-  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" "$HARNESS" "$GUARD_MODE" <<'GUARDPY'
+  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" "$HARNESS" "$GUARD_MODE" "$PIN" <<'GUARDPY'
 import json, os, sys
 
 checkout, exports, port, path = sys.argv[1:5]
@@ -26198,8 +26257,9 @@ for svc, service in services.items():
 if {'otel-collector', 'otel-capture'} & services.keys():
     import runpy
     harness = sys.argv[5] if len(sys.argv) > 5 else checkout
+    pin = sys.argv[7] if len(sys.argv) > 7 else ''
     guard = runpy.run_path(os.path.join(harness, 'scripts/verify/telemetry_guard.py'))
-    problems.extend(guard['check'](config, harness))
+    problems.extend(guard['check'](config, harness, pin or None))
 
 # (i) builds: only a context and a Dockerfile, both inside the checkout
 for svc, service in services.items():
@@ -26419,7 +26479,7 @@ do_up() {
     done
   fi
   if [ "$TELEMETRY" = 1 ]; then
-    for var in COMPOSE_PROFILES RAG_VERIFY_HARNESS RAG_VERIFY_CHECKOUT RAG_VERIFY_OTEL_ENABLED; do
+    for var in COMPOSE_PROFILES RAG_VERIFY_HARNESS RAG_VERIFY_CHECKOUT RAG_VERIFY_OTEL_ENABLED RAG_VERIFY_TELEMETRY_PIN; do
       printf 'export %s=%q\n' "$var" "${!var}"
     done
   fi
@@ -56192,18 +56252,49 @@ if __name__ == '__main__':
 """Additional service-specific restrictions for the optional disposable collector."""
 import json
 from pathlib import Path
+import re
 
 KEYS = {'profiles', 'mem_limit', 'cpus', 'stop_grace_period', 'read_only', 'logging'}
 SERVICES = {'otel-collector', 'otel-capture'}
 
 
-def check(config, root):
+def repository(image):
+    """The repository of <repository>:<tag>@sha256:<digest>, or None (#532)."""
+    match = re.fullmatch(r'(.+):([\w][\w.-]{0,127})@sha256:[0-9a-f]{64}', image)
+    return match.group(1) if match else None
+
+
+def collector_image(root, pin, problems):
+    """The collector image to expect: the harness's own pin, or a reviewed pin
+    the evaluator supplied with stack.sh --telemetry-pin (#532). A reviewed
+    pin may change only the tag and digest, never the repository."""
+    harness = json.loads((Path(root) / 'telemetry/image.json').read_text())['image']
+    if not pin:
+        return harness
+    try:
+        reviewed = json.loads(Path(pin).read_text())
+    except (OSError, ValueError):
+        reviewed = None
+    if not isinstance(reviewed, dict) or not isinstance(reviewed.get('image'), str):
+        problems.append("otel-collector: the reviewed telemetry pin can't be read")
+        return harness
+    image = reviewed['image']
+    if repository(image) is None:
+        problems.append('otel-collector: the reviewed telemetry pin is not <repository>:<tag>@sha256:<digest>')
+        return harness
+    if repository(image) != repository(harness):
+        problems.append("otel-collector: the reviewed telemetry pin's repository differs from the harness pin")
+        return harness
+    return image
+
+
+def check(config, root, pin=None):
     problems = []
     services = config['services']
-    pin = json.loads((Path(root) / 'telemetry/image.json').read_text())['image']
+    collector = collector_image(root, pin, problems)
     for name in SERVICES & services.keys():
         svc = services[name]
-        expected_image = pin if name == 'otel-collector' else 'rag-verify-api:latest'
+        expected_image = collector if name == 'otel-collector' else 'rag-verify-api:latest'
         if svc.get('image') != expected_image or 'build' in svc:
             problems.append(f'{name}: unexpected telemetry image/build')
         if (svc.get('profiles') != ['telemetry'] or str(svc.get('mem_limit')) != '268435456'
@@ -56694,10 +56785,11 @@ class Compose(unittest.TestCase):
         cls.config = json.loads(subprocess.check_output(cls.cmd, env=cls.env))
         cls.guard = re.findall(r"python3 - [^\n]*<<'GUARDPY'\n(.*?)\nGUARDPY", (ROOT/'scripts/verify/stack.sh').read_text(), re.S)[0]
 
-    def run_guard(self, config, checkout=ROOT):
+    def run_guard(self, config, checkout=ROOT, pin=''):
         with tempfile.NamedTemporaryFile(mode='w') as file:
             json.dump(config, file); file.flush()
-            return subprocess.run(['python3', '-', str(checkout), self.env['RAG_EXPORTS_DIR'], '18081', file.name, str(ROOT)],
+            return subprocess.run(['python3', '-', str(checkout), self.env['RAG_EXPORTS_DIR'], '18081', file.name, str(ROOT),
+                                   'default', pin],
                                   input=self.guard, text=True, capture_output=True)
 
     def test_optional_config_passes_full_guard(self):
@@ -56734,6 +56826,43 @@ class Compose(unittest.TestCase):
                 changed=copy.deepcopy(value)
                 next(v for v in changed['services'][service]['volumes'] if v['type']=='bind')['source']=str(checkout/'scripts/verify')
                 self.assertTrue(guard.check(changed,ROOT))
+
+    def test_reviewed_pin_changes_only_tag_and_digest(self):
+        # #532: a changed collector pin passes only with an evaluator-supplied
+        # reviewed pin of the harness pin's repository.
+        harness = json.loads((ROOT/'telemetry/image.json').read_text())['image']
+        repository = harness.split('@')[0].rsplit(':', 1)[0]
+        bumped = repository + ':0.999.0@sha256:' + 'b'*64
+        config = copy.deepcopy(self.config)
+        config['services']['otel-collector']['image'] = bumped
+        guard = load('guard', 'scripts/verify/telemetry_guard.py')
+        self.assertNotEqual(self.run_guard(config).returncode, 0)
+        self.assertTrue(guard.check(config, ROOT))
+        with tempfile.TemporaryDirectory() as folder:
+            def pin_file(name, value):
+                path = Path(folder)/name
+                path.write_text(json.dumps(value) if not isinstance(value, str) else value)
+                return str(path)
+            good = pin_file('good.json', {'image': bumped})
+            result = self.run_guard(config, pin=good)
+            self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+            self.assertEqual(guard.check(config, ROOT, good), [])
+            # The harness pin itself no longer matches once a reviewed pin is given.
+            self.assertTrue(guard.check(self.config, ROOT, good))
+            refused = {
+                'another repository': pin_file('other.json', {'image': 'ghcr.io/example/collector:0.999.0@sha256:'+'b'*64}),
+                'no digest': pin_file('nodigest.json', {'image': repository + ':0.999.0'}),
+                'no tag': pin_file('notag.json', {'image': repository + '@sha256:'+'b'*64}),
+                'not JSON': pin_file('broken.json', 'not json'),
+                'no image': pin_file('noimage.json', {'config_ids': {}}),
+                'missing file': str(Path(folder)/'missing.json'),
+            }
+            for case, pin in refused.items():
+                with self.subTest(case=case):
+                    self.assertNotEqual(self.run_guard(config, pin=pin).returncode, 0)
+                    self.assertTrue(guard.check(config, ROOT, pin))
+                    # A bad pin never lets the harness pin through either.
+                    self.assertTrue(guard.check(self.config, ROOT, pin))
 
     def test_unsafe_variants_still_refused(self):
         mutations = [

@@ -69,6 +69,9 @@ case-insensitively, including repeated JSON keys.
 ## Bounds, sampling and diagnosis
 
 Collector 0.164.0 is pinned by multi-platform digest in Compose and `image.json`.
+For 0.164.0, the arm64 config ID was confirmed by an offline packaging run
+(`scripts/collector_offline.py` package and prepare), and the amd64 config ID
+was read from the registry.
 Only Linux amd64/arm64 have trusted offline config-ID entries. The Collector is
 limited to 256 MiB and 0.5 CPU. Each signal pipeline uses a 192 MiB memory limiter
 (32 MiB spike allowance, checked each second) followed by maximum 128-record batches
