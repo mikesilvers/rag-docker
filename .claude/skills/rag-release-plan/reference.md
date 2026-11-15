@@ -50,7 +50,9 @@ Each release has a Jira version (a Jira Release), named like the release (`v1.3.
 
 **Set a ticket's Fix Version** (phase 2): `editJiraIssue` with `additional_fields: {"fixVersions": [{"id": "<version id>"}]}`, in the same change as the parent and the labels.
 
-**Mark a version released** (after the release ships, only on the maintainer's go-ahead): `executeDestructive` with `name: "manageJiraProjectVersion"`, `inputs: {action: "release", versionId: "<id>"}` and `cloudId` as a top-level argument. Don't pass `moveUnfixedIssuesTo`.
+**List a version's unfinished tickets** (read-only): `searchJiraIssuesUsingJql` with `fixVersion = "<version>" AND statusCategory != Done`, paged and counted.
+
+**Mark a version released** (after the release ships, only on the maintainer's go-ahead, and after its unfinished tickets are moved as the maintainer answered): `executeDestructive` with `name: "manageJiraProjectVersion"`, `inputs: {action: "release", versionId: "<id>", releaseDate: "<ship date, yyyy-mm-dd>"}` and `cloudId` as a top-level argument. Never pass `moveUnfixedIssuesTo`.
 
 ## Closing, folding and splitting
 
