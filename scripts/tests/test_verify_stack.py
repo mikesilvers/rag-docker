@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import shlex
 import subprocess
 import tempfile
 import textwrap
@@ -698,6 +699,11 @@ class StackArgumentTests(unittest.TestCase):
     """S7 and S8: bad arguments are refused before any Docker command."""
 
     def test_refusals_before_docker(self):
+        # A pin file outside the checkout, for the --telemetry-pin cases (#532).
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        pin = str(Path(folder.name) / 'pin.json')
+        Path(pin).write_text('{}')
         cases = [
             (['up'], {'RAG_VERIFY_PORT': '8080'}),
             (['up'], {'RAG_VERIFY_PORT': 'abc'}),
@@ -711,6 +717,15 @@ class StackArgumentTests(unittest.TestCase):
             (['down', '--lan'], {}),
             (['run', '--lan', '--telemetry'], {}),
             (['up', '--telemetry', '--lan'], {}),
+            (['run', '--telemetry-pin', pin], {}),
+            (['up', '--telemetry-pin', pin], {}),
+            (['down', '--telemetry-pin', pin], {}),
+            (['run', '--telemetry', '--telemetry-pin'], {}),
+            (['run', '--telemetry', '--telemetry-pin', '/nonexistent/pin.json'], {}),
+            (['run', '--lan', '--telemetry-pin', pin], {}),
+            (['run', '--telemetry', '--telemetry-pin', str(ROOT / 'telemetry/image.json')], {}),
+            (['up', '--telemetry', '--telemetry-pin', str(ROOT / 'telemetry')], {}),
+            (['telemetry-mode', '--telemetry', '--telemetry-pin', pin], {'RAG_VERIFY_LOCK_HELD': '1'}),
             (['bogus'], {}),
             ([], {}),
         ]
@@ -786,6 +801,24 @@ class StackDockerCallTests(unittest.TestCase):
         self.assertEqual(order, sorted(order), 'seed, guard, build, up must run in that order')
         self.assertIn('logs', [a for c in compose for a in c])
         self.assert_no_live_object(box.calls())
+
+    def test_up_telemetry_exports_only_the_option_pin(self):
+        # #532: up and run take the reviewed pin only from --telemetry-pin and
+        # export it, resolved, for telemetry-mode; an ambient value is ignored.
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        pin = Path(folder.name) / 'pin.json'
+        pin.write_text('{}')
+        for argv, expected in ((['--telemetry-pin', str(pin)], os.path.realpath(pin)), ([], '')):
+            with self.subTest(argv=argv):
+                box = Sandbox(self)
+                (box.root / 'config.json').write_text(json.dumps(passing_config(ROOT, box.exports)))
+                result = box.run(['bash', str(STACK), 'up', '--telemetry', *argv], STUB_UP_OK='1',
+                                 STUB_CURL_CODE='200', RAG_VERIFY_TELEMETRY_PIN='/elsewhere/pin.json')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                lines = [line for line in result.stdout.splitlines()
+                         if line.startswith('export RAG_VERIFY_TELEMETRY_PIN=')]
+                self.assertEqual(lines, ['export RAG_VERIFY_TELEMETRY_PIN=' + (shlex.quote(expected) if expected else "''")])
 
     def test_up_lan_bootstraps_then_switches_to_lan_mode(self):
         # #26: default up, the first Engineer, the LAN guard, the LAN up without a
