@@ -293,7 +293,8 @@ Engineer is created in the default mode before switching.
 
 **TLS server** (`proxy/nginx.lan.conf`): one server, `listen 443 ssl`, `http2 on`, TLS 1.2 and 1.3 only, Mozilla's
 intermediate cipher list for TLS 1.2, `ssl_prefer_server_ciphers off`, session tickets off, no
-`Strict-Transport-Security` header, the pair at `/etc/nginx/certs/live/{cert,key}.pem`, and the shared routes.
+`Strict-Transport-Security` header, `server_tokens off` (no nginx version in responses), the pair at
+`/etc/nginx/certs/live/{cert,key}.pem`, and the shared routes.
 
 **Certificate step** (`api/tls_cert.py`, run by `tls-init` on every start in LAN mode):
 
@@ -3337,6 +3338,11 @@ LAN mode (#26, §2.5) adds one API container setting and two read by `docker-com
 | `RAG_LAN_MODE` | `false` | Exactly `true` or `false`; anything else fails API startup. `true` only through `docker-compose.lan.yml`; then the API refuses to start unless `AUTH_COOKIE_SECURE` is `true` and an enabled human AI Engineer exists |
 | `RAG_LAN_HOSTNAMES` | empty | Comma-separated DNS names and IP addresses for the self-signed certificate; required unless `proxy/certs` holds `cert.pem` and `key.pem` |
 | `RAG_LAN_PORT` | `443` | The host port of LAN mode's TLS publication, on every interface |
+
+An invalid API container setting (any setting of `api/config.py`, such as `AUTH_COOKIE_SECURE`, `RAG_LAN_MODE`,
+`AUDIT_LOG_QUESTIONS` or `MAX_ZIP_MEMBERS`) stops API startup: the API writes one line per invalid setting to standard
+error, `Settings refused: <reason>`, without the value given and with no traceback, and exits 1 (#555). Telemetry
+settings fail as described above.
 
 ---
 

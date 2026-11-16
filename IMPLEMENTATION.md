@@ -584,6 +584,9 @@ http {
     include       /etc/nginx/mime.types;
     default_type  application/octet-stream;
 
+    # No nginx version in the Server header or on error pages (#555).
+    server_tokens off;
+
     # Logins per client address (#577): 10 a minute, a burst of 5, so failed
     # logins can't flood the audit log. Used by locations.conf's
     # /api/auth/login. On Docker Desktop every client may share one address
@@ -1008,7 +1011,9 @@ def collection_check_unavailable(name: str, outcome: str) -> JSONResponse:
 ### api/config.py
 
 ```python
-from pydantic import field_validator
+import sys
+
+from pydantic import ValidationError, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -1116,7 +1121,31 @@ class Settings(BaseSettings):
         env_file = ".env"
 
 
-settings = Settings()
+def refusal_lines(error: ValidationError) -> list[str]:
+    """One `Settings refused:` line per invalid setting (#555), without the values given."""
+    reasons: dict[str, list[str]] = {}
+    for item in error.errors(include_url=False, include_input=False):
+        name = ".".join(str(part) for part in item["loc"]).upper()
+        own = str(item["ctx"]["error"]) if item["type"] == "value_error" and "error" in item.get("ctx", {}) else ""
+        message = own or item["msg"]
+        reason = message if not name or name in message else f"{name}: {message}"
+        reasons.setdefault(name, []).append(reason)
+    return ["Settings refused: " + "; ".join(parts) for parts in reasons.values()]
+
+
+def _load() -> Settings:
+    # An invalid setting stops the API, and anything else importing this
+    # module, with one line per setting and no traceback (#555), like LAN
+    # mode's refusal: SystemExit isn't printed as a traceback.
+    try:
+        return Settings()
+    except ValidationError as error:
+        for line in refusal_lines(error):
+            print(line, file=sys.stderr, flush=True)
+        raise SystemExit(1) from None
+
+
+settings = _load()
 ```
 
 ### api/lan_mode.py
@@ -24445,7 +24474,10 @@ would fail by design). `--lan` can't be combined with `--telemetry`.
 `lan_config.py` (`docker compose config` of the base file plus
 `docker-compose.lan.yml`, under the project name `rag-lan-config`, with no
 `.env`; nothing is created) and runs `../tests/test_lan_mode.py` in the API
-image. Only in a `--lan` run does it check the running LAN project through
+image. It also checks, in one-off api containers of the default verify project
+(`docker compose run --rm --no-deps`), that the API refuses with one line and
+no traceback for a non-Secure cookie in LAN mode, an empty account store in LAN
+mode and a non-boolean `RAG_LAN_MODE`. Only in a `--lan` run does it check the running LAN project through
 `lan_stack.py`: HTTPS with the generated certificate, the hosts nginx answers
 for (localhost, 127.0.0.1 and the test names; another `Host` gets 421, #664),
 TLS versions and HTTP/2, the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
@@ -30001,6 +30033,46 @@ section "LAN units: setting, startup refusal, certificate step, nginx configurat
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_lan_mode.py)
 check "test_lan_mode.py registered regression checks" $?
 
+section "LAN refusal in the built API image, on the default verify project"
+# One-off api containers (no dependencies, removed afterwards) with LAN mode
+# switched on by environment: the real image and its settings parsing refuse to
+# start, with one line and no traceback, in every run, not only with --lan.
+_rag_require_lock_owner
+(cd "$REPO_ROOT" && python3 - <<'ENDPY'
+import secrets, subprocess, sys
+cases = [(["RAG_LAN_MODE=true", "AUTH_COOKIE_SECURE=false"], "LAN mode refused: AUTH_COOKIE_SECURE"),
+         (["RAG_LAN_MODE=true", "AUTH_COOKIE_SECURE=true", "AUTH_DIR=/tmp/vfy-lan-empty-" + secrets.token_hex(4)],
+          "LAN mode refused: there is no enabled AI Engineer"),
+         (["RAG_LAN_MODE=yes"], "RAG_LAN_MODE must be exactly true or false")]
+failed = False
+for env, expected in cases:
+    args = ["docker", "compose", "run", "--rm", "--no-deps", "-T"]
+    for item in env:
+        args += ["-e", item]
+    try:
+        result = subprocess.run(args + ["api"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, universal_newlines=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        print("    {}: the API kept running".format(" ".join(env)), file=sys.stderr)
+        failed = True
+        continue
+    lines = result.stdout.splitlines()
+    hits = [line for line in lines if expected in line]
+    problems = []
+    if result.returncode == 0:
+        problems.append("exit 0")
+    if not hits:
+        problems.append("no line with {!r}".format(expected))
+    if len(hits) != 1 or any(line.startswith("Traceback") for line in lines):
+        problems.append("not exactly one refusal line without a traceback")
+    if problems:
+        failed = True
+        print("    {}: {}; last lines {}".format(" ".join(env), ", ".join(problems), lines[-5:]), file=sys.stderr)
+sys.exit(1 if failed else 0)
+ENDPY
+)
+check "the API image refuses LAN mode with one line and no traceback: a non-Secure cookie, no Engineer, a non-boolean RAG_LAN_MODE" $?
+
 if [ "${RAG_VERIFY_LAN:-0}" != 1 ]; then
   skip "LAN mode on the running verify project" "run stack.sh run --lan"
   summary
@@ -30101,6 +30173,12 @@ def problems(config, checkout, port):
     wait = (proxy.get("depends_on") or {}).get("tls-init") or {}
     if wait.get("condition") != "service_completed_successfully":
         found.append("the proxy doesn't wait for tls-init to complete successfully")
+    # Fail closed (§2.5): the ui starts only on a healthy api and the proxy only
+    # after the ui, so an API that refuses LAN mode leaves nothing published.
+    if ((services.get("ui") or {}).get("depends_on") or {}).get("api", {}).get("condition") != "service_healthy":
+        found.append("the ui doesn't wait for a healthy api, so the proxy could publish while the API refuses")
+    if "ui" not in (proxy.get("depends_on") or {}):
+        found.append("the proxy doesn't wait for the ui")
     expected = [
         ("proxy", "/etc/nginx/nginx.conf", "bind", os.path.join(checkout, "proxy", "nginx.lan.conf"), True),
         ("proxy", "/etc/nginx/rag/locations.conf", "bind", os.path.join(checkout, "proxy", "locations.conf"), True),
@@ -30588,10 +30666,10 @@ class MainImportTests(unittest.TestCase):
         self.assertEqual(ast.unparse(body[0]), "import lan_mode")
         self.assertEqual(ast.unparse(body[1]), "lan_mode.enforce()")
 
-    def run_import(self, **env):
+    def run_import(self, module="main", **env):
         with tempfile.TemporaryDirectory() as folder:
             full = {**os.environ, "AUTH_DIR": folder, "PYTHONDONTWRITEBYTECODE": "1", **env}
-            return subprocess.run([sys.executable, "-c", "import main"], cwd=API_DIR, env=full,
+            return subprocess.run([sys.executable, "-c", f"import {module}"], cwd=API_DIR, env=full,
                                   capture_output=True, text=True, timeout=300)
 
     def test_lan_mode_without_a_secure_cookie_exits_with_one_line(self):
@@ -30610,9 +30688,23 @@ class MainImportTests(unittest.TestCase):
         self.assertIn("no enabled AI Engineer", lines[0])
 
     def test_an_invalid_value_stops_the_api(self):
+        # #555: any invalid setting stops startup with one line, no traceback.
         result = self.run_import(RAG_LAN_MODE="yes")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("RAG_LAN_MODE must be exactly true or false", result.stderr)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.splitlines(), ["Settings refused: RAG_LAN_MODE must be exactly true or false"])
+
+    def test_each_invalid_setting_is_one_line_without_its_value(self):
+        result = self.run_import(module="config", AUTH_COOKIE_SECURE="yes", WEAVIATE_PORT="not-a-port-7f3a")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        lines = result.stderr.splitlines()
+        self.assertEqual(len(lines), 2, result.stderr)
+        self.assertEqual(sum(l.startswith("Settings refused: AUTH_COOKIE_SECURE must be exactly true or false")
+                             for l in lines), 1, lines)
+        self.assertEqual(sum(l.startswith("Settings refused: WEAVIATE_PORT: ") for l in lines), 1, lines)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("not-a-port-7f3a", result.stdout + result.stderr)
 
 
 # ── the certificate step ─────────────────────────────────────────────────────
@@ -30837,6 +30929,25 @@ class BringYourOwnTests(CertTestCase):
                 self.assertIn(part, err)
                 self.assertFalse((self.out / "live").exists())
 
+    def test_an_encrypted_key_is_refused(self):
+        cert_bytes, key_bytes = certificate(["files.example"])
+        key = serialization.load_pem_private_key(key_bytes, password=None)
+        self.put(cert_bytes, key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                               serialization.BestAvailableEncryption(b"a passphrase")))
+        code, out, err = self.step()
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(len(err.splitlines()), 1, err)
+        self.assertIn("key.pem", err)
+        self.assertFalse((self.out / "live").exists())
+
+    def test_a_cert_pem_directory_is_refused(self):
+        (self.byo / "cert.pem").mkdir()
+        self.put(key_bytes=certificate(["files.example"])[1])
+        code, out, err = self.step()
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(len(err.splitlines()), 1, err)
+        self.assertFalse((self.out / "live").exists())
+
     def test_hosts_map_from_your_certificate(self):
         # #664: the certificate's own names, in nginx's forms; localhost and
         # 127.0.0.1 are nginx.lan.conf's.
@@ -30899,6 +31010,9 @@ class NginxTests(unittest.TestCase):
         self.assertIn("ssl_session_tickets off;", lines)
         for text in (self.lan, self.locations):
             self.assertNotIn("strict-transport-security", "\n".join(directives(text)).lower())
+
+    def test_no_version_in_responses(self):
+        self.assertIn("server_tokens off;", directives(self.lan))
 
     def test_both_servers_share_the_locations(self):
         include = "include /etc/nginx/rag/locations.conf;"
