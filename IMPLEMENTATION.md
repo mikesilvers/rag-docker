@@ -584,6 +584,9 @@ http {
     include       /etc/nginx/mime.types;
     default_type  application/octet-stream;
 
+    # No nginx version in the Server header or on error pages (#555).
+    server_tokens off;
+
     # Logins per client address (#577): 10 a minute, a burst of 5, so failed
     # logins can't flood the audit log. Used by locations.conf's
     # /api/auth/login. On Docker Desktop every client may share one address
@@ -820,14 +823,14 @@ olefile==0.47
 onnx==1.22.0
 onnxruntime==1.30.0
 opencv-python==5.0.0.93
-opentelemetry-api==1.45.1
-opentelemetry-exporter-http-transport==0.66b1
-opentelemetry-exporter-otlp-common==0.66b1
-opentelemetry-exporter-otlp-proto-common==1.45.1
-opentelemetry-exporter-otlp-proto-http==1.45.1
-opentelemetry-proto==1.45.1
-opentelemetry-sdk==1.45.1
-opentelemetry-semantic-conventions==0.66b1
+opentelemetry-api==1.45.2
+opentelemetry-exporter-http-transport==0.66b2
+opentelemetry-exporter-otlp-common==0.66b2
+opentelemetry-exporter-otlp-proto-common==1.45.2
+opentelemetry-exporter-otlp-proto-http==1.45.2
+opentelemetry-proto==1.45.2
+opentelemetry-sdk==1.45.2
+opentelemetry-semantic-conventions==0.66b2
 orjson==3.12.0
 packaging==26.3
 pandas==2.3.3
@@ -869,7 +872,7 @@ shellingham==1.5.4
 six==1.17.0
 smart_open==8.0.1
 sniffio==1.3.1
-soupsieve==2.9.2
+soupsieve==4.0
 spacy-legacy==3.0.12
 spacy-loggers==1.0.5
 spacy==3.8.16
@@ -967,8 +970,8 @@ sentence-transformers>=3.0        # resolved: 6.0.1
 python-multipart>=0.0.9           # resolved: 0.0.32
 
 # Private, optional OTLP HTTP/protobuf telemetry runtime (#282).
-opentelemetry-sdk==1.45.1
-opentelemetry-exporter-otlp-proto-http==1.45.1
+opentelemetry-sdk==1.45.2
+opentelemetry-exporter-otlp-proto-http==1.45.2
 
 # Passphrase encryption of export packages in the age format (#27). Already in
 # the lock as a transitive dependency; listed here because the API now imports
@@ -1008,7 +1011,9 @@ def collection_check_unavailable(name: str, outcome: str) -> JSONResponse:
 ### api/config.py
 
 ```python
-from pydantic import field_validator
+import sys
+
+from pydantic import ValidationError, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -1116,7 +1121,31 @@ class Settings(BaseSettings):
         env_file = ".env"
 
 
-settings = Settings()
+def refusal_lines(error: ValidationError) -> list[str]:
+    """One `Settings refused:` line per invalid setting (#555), without the values given."""
+    reasons: dict[str, list[str]] = {}
+    for item in error.errors(include_url=False, include_input=False):
+        name = ".".join(str(part) for part in item["loc"]).upper()
+        own = str(item["ctx"]["error"]) if item["type"] == "value_error" and "error" in item.get("ctx", {}) else ""
+        message = own or item["msg"]
+        reason = message if not name or name in message else f"{name}: {message}"
+        reasons.setdefault(name, []).append(reason)
+    return ["Settings refused: " + "; ".join(parts) for parts in reasons.values()]
+
+
+def _load() -> Settings:
+    # An invalid setting stops the API, and anything else importing this
+    # module, with one line per setting and no traceback (#555), like LAN
+    # mode's refusal: SystemExit isn't printed as a traceback.
+    try:
+        return Settings()
+    except ValidationError as error:
+        for line in refusal_lines(error):
+            print(line, file=sys.stderr, flush=True)
+        raise SystemExit(1) from None
+
+
+settings = _load()
 ```
 
 ### api/lan_mode.py
@@ -17592,10 +17621,13 @@ def authenticate_key(key: str | None) -> Principal | None:
 # ── sessions ─────────────────────────────────────────────────────────────────
 
 def create_session(user_id: int) -> str:
-    """A new session; returns the token for the cookie. Only its SHA-256 is stored."""
+    """A new session; returns the token for the cookie. Only its SHA-256 is stored.
+    Every session that has ended by time, anyone's, is deleted in the same
+    transaction, so sessions abandoned without a logout don't pile up (#546)."""
     token = secrets.token_urlsafe(32)
     now = _now()
     with _connect(write=True) as conn:
+        conn.execute("DELETE FROM sessions WHERE last_seen < ? OR created_at < ?", (now - IDLE_S, now - ABSOLUTE_S))
         conn.execute("INSERT INTO sessions (token_hash, user_id, created_at, last_seen) VALUES (?, ?, ?, ?)",
                      (_token_hash(token), user_id, now, now))
     return token
@@ -17639,31 +17671,6 @@ def change_password(principal: Principal, password: str) -> None:
 
 # ── login throttle ───────────────────────────────────────────────────────────
 
-def locked(username: str, address: str) -> bool:
-    with _connect() as conn:
-        row = conn.execute("SELECT until FROM login_lockouts WHERE username = ? AND address = ?",
-                           (username, address)).fetchone()
-    return row is not None and row["until"] > _now()
-
-
-def record_failure(username: str, address: str) -> bool:
-    """Count a failed login; True when it locks the pair."""
-    now = _now()
-    with _connect(write=True) as conn:
-        conn.execute("DELETE FROM login_failures WHERE at <= ?", (now - THROTTLE_WINDOW_S,))
-        conn.execute("DELETE FROM login_lockouts WHERE until <= ?", (now,))
-        conn.execute("INSERT INTO login_failures (username, address, at) VALUES (?, ?, ?)",
-                     (username, address, now))
-        count = conn.execute("SELECT COUNT(*) FROM login_failures WHERE username = ? AND address = ?",
-                             (username, address)).fetchone()[0]
-        if count < THROTTLE_FAILURES:
-            return False
-        conn.execute("INSERT OR REPLACE INTO login_lockouts (username, address, until) VALUES (?, ?, ?)",
-                     (username, address, now + LOCKOUT_S))
-        conn.execute("DELETE FROM login_failures WHERE username = ? AND address = ?", (username, address))
-    return True
-
-
 def reserve_attempt(username: str, address: str) -> bool:
     """Count an attempt before its password is checked; False when the pair is
     locked or already has its 5 counted attempts in the window (some of them
@@ -17701,11 +17708,6 @@ def finish_attempt(username: str, address: str, succeeded: bool) -> bool:
                      (username, address, now + LOCKOUT_S))
         conn.execute("DELETE FROM login_failures WHERE username = ? AND address = ?", (username, address))
     return True
-
-
-def clear_failures(username: str, address: str) -> None:
-    with _connect(write=True) as conn:
-        conn.execute("DELETE FROM login_failures WHERE username = ? AND address = ?", (username, address))
 ```
 
 ### api/auth/middleware.py
@@ -17742,11 +17744,10 @@ app; test_auth.py fails when any route lacks an entry.
 from __future__ import annotations
 
 import asyncio
-from http.cookies import CookieError, SimpleCookie
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
-from starlette.requests import Request
+from starlette.requests import Request, cookie_parser
 
 from utils import api_error
 
@@ -17776,13 +17777,10 @@ def session_token(scope) -> str | None:
     raw = _header(scope, b"cookie")
     if not raw:
         return None
-    cookies = SimpleCookie()
-    try:
-        cookies.load(raw)
-    except CookieError:
-        return None
-    morsel = cookies.get(store.COOKIE)
-    return morsel.value if morsel else None
+    # starlette's parser, as Request.cookies uses: a malformed earlier cookie
+    # (another app on localhost) doesn't hide the session, as it did with
+    # http.cookies.SimpleCookie (#546).
+    return cookie_parser(raw).get(store.COOKIE) or None
 
 
 def same_origin(scope) -> bool:
@@ -17919,8 +17917,10 @@ shown nowhere else, and the user must change it at their first login. Each
 action writes one line to standard error. Exit status: 0 done, 1 refused,
 2 usage error.
 
-The last enabled engineer can't be disabled or demoted. A lockout is recovered
-with create-user, enable or reset-password.
+The last enabled engineer can't be disabled or demoted. An account a user is
+locked out of (lost password, disabled) is recovered with create-user, enable
+or reset-password; these don't lift a login throttle, which ends by itself
+after 15 minutes.
 
 Service principals (API keys, PR 3) are created and given keys by Engineers in
 the app; this command issues no key. `list` shows principals too, marked
@@ -19502,7 +19502,6 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
     "preview": "vite preview"
   },
   "dependencies": {
-    "lucide-react": "^1.64.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^9.0.1",
@@ -24455,7 +24454,10 @@ would fail by design). `--lan` can't be combined with `--telemetry`.
 `lan_config.py` (`docker compose config` of the base file plus
 `docker-compose.lan.yml`, under the project name `rag-lan-config`, with no
 `.env`; nothing is created) and runs `../tests/test_lan_mode.py` in the API
-image. Only in a `--lan` run does it check the running LAN project through
+image. It also checks, in one-off api containers of the default verify project
+(`docker compose run --rm --no-deps`), that the API refuses with one line and
+no traceback for a non-Secure cookie in LAN mode, an empty account store in LAN
+mode and a non-boolean `RAG_LAN_MODE`. Only in a `--lan` run does it check the running LAN project through
 `lan_stack.py`: HTTPS with the generated certificate, the hosts nginx answers
 for (localhost, 127.0.0.1 and the test names; another `Host` gets 421, #664),
 TLS versions and HTTP/2, the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
@@ -30011,6 +30013,46 @@ section "LAN units: setting, startup refusal, certificate step, nginx configurat
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_lan_mode.py)
 check "test_lan_mode.py registered regression checks" $?
 
+section "LAN refusal in the built API image, on the default verify project"
+# One-off api containers (no dependencies, removed afterwards) with LAN mode
+# switched on by environment: the real image and its settings parsing refuse to
+# start, with one line and no traceback, in every run, not only with --lan.
+_rag_require_lock_owner
+(cd "$REPO_ROOT" && python3 - <<'ENDPY'
+import secrets, subprocess, sys
+cases = [(["RAG_LAN_MODE=true", "AUTH_COOKIE_SECURE=false"], "LAN mode refused: AUTH_COOKIE_SECURE"),
+         (["RAG_LAN_MODE=true", "AUTH_COOKIE_SECURE=true", "AUTH_DIR=/tmp/vfy-lan-empty-" + secrets.token_hex(4)],
+          "LAN mode refused: there is no enabled AI Engineer"),
+         (["RAG_LAN_MODE=yes"], "RAG_LAN_MODE must be exactly true or false")]
+failed = False
+for env, expected in cases:
+    args = ["docker", "compose", "run", "--rm", "--no-deps", "-T"]
+    for item in env:
+        args += ["-e", item]
+    try:
+        result = subprocess.run(args + ["api"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, universal_newlines=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        print("    {}: the API kept running".format(" ".join(env)), file=sys.stderr)
+        failed = True
+        continue
+    lines = result.stdout.splitlines()
+    hits = [line for line in lines if expected in line]
+    problems = []
+    if result.returncode == 0:
+        problems.append("exit 0")
+    if not hits:
+        problems.append("no line with {!r}".format(expected))
+    if len(hits) != 1 or any(line.startswith("Traceback") for line in lines):
+        problems.append("not exactly one refusal line without a traceback")
+    if problems:
+        failed = True
+        print("    {}: {}; last lines {}".format(" ".join(env), ", ".join(problems), lines[-5:]), file=sys.stderr)
+sys.exit(1 if failed else 0)
+ENDPY
+)
+check "the API image refuses LAN mode with one line and no traceback: a non-Secure cookie, no Engineer, a non-boolean RAG_LAN_MODE" $?
+
 if [ "${RAG_VERIFY_LAN:-0}" != 1 ]; then
   skip "LAN mode on the running verify project" "run stack.sh run --lan"
   summary
@@ -30111,6 +30153,12 @@ def problems(config, checkout, port):
     wait = (proxy.get("depends_on") or {}).get("tls-init") or {}
     if wait.get("condition") != "service_completed_successfully":
         found.append("the proxy doesn't wait for tls-init to complete successfully")
+    # Fail closed (§2.5): the ui starts only on a healthy api and the proxy only
+    # after the ui, so an API that refuses LAN mode leaves nothing published.
+    if ((services.get("ui") or {}).get("depends_on") or {}).get("api", {}).get("condition") != "service_healthy":
+        found.append("the ui doesn't wait for a healthy api, so the proxy could publish while the API refuses")
+    if "ui" not in (proxy.get("depends_on") or {}):
+        found.append("the proxy doesn't wait for the ui")
     expected = [
         ("proxy", "/etc/nginx/nginx.conf", "bind", os.path.join(checkout, "proxy", "nginx.lan.conf"), True),
         ("proxy", "/etc/nginx/rag/locations.conf", "bind", os.path.join(checkout, "proxy", "locations.conf"), True),
@@ -30598,10 +30646,10 @@ class MainImportTests(unittest.TestCase):
         self.assertEqual(ast.unparse(body[0]), "import lan_mode")
         self.assertEqual(ast.unparse(body[1]), "lan_mode.enforce()")
 
-    def run_import(self, **env):
+    def run_import(self, module="main", **env):
         with tempfile.TemporaryDirectory() as folder:
             full = {**os.environ, "AUTH_DIR": folder, "PYTHONDONTWRITEBYTECODE": "1", **env}
-            return subprocess.run([sys.executable, "-c", "import main"], cwd=API_DIR, env=full,
+            return subprocess.run([sys.executable, "-c", f"import {module}"], cwd=API_DIR, env=full,
                                   capture_output=True, text=True, timeout=300)
 
     def test_lan_mode_without_a_secure_cookie_exits_with_one_line(self):
@@ -30620,9 +30668,23 @@ class MainImportTests(unittest.TestCase):
         self.assertIn("no enabled AI Engineer", lines[0])
 
     def test_an_invalid_value_stops_the_api(self):
+        # #555: any invalid setting stops startup with one line, no traceback.
         result = self.run_import(RAG_LAN_MODE="yes")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("RAG_LAN_MODE must be exactly true or false", result.stderr)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.splitlines(), ["Settings refused: RAG_LAN_MODE must be exactly true or false"])
+
+    def test_each_invalid_setting_is_one_line_without_its_value(self):
+        result = self.run_import(module="config", AUTH_COOKIE_SECURE="yes", WEAVIATE_PORT="not-a-port-7f3a")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        lines = result.stderr.splitlines()
+        self.assertEqual(len(lines), 2, result.stderr)
+        self.assertEqual(sum(l.startswith("Settings refused: AUTH_COOKIE_SECURE must be exactly true or false")
+                             for l in lines), 1, lines)
+        self.assertEqual(sum(l.startswith("Settings refused: WEAVIATE_PORT: ") for l in lines), 1, lines)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("not-a-port-7f3a", result.stdout + result.stderr)
 
 
 # ── the certificate step ─────────────────────────────────────────────────────
@@ -30847,6 +30909,25 @@ class BringYourOwnTests(CertTestCase):
                 self.assertIn(part, err)
                 self.assertFalse((self.out / "live").exists())
 
+    def test_an_encrypted_key_is_refused(self):
+        cert_bytes, key_bytes = certificate(["files.example"])
+        key = serialization.load_pem_private_key(key_bytes, password=None)
+        self.put(cert_bytes, key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                               serialization.BestAvailableEncryption(b"a passphrase")))
+        code, out, err = self.step()
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(len(err.splitlines()), 1, err)
+        self.assertIn("key.pem", err)
+        self.assertFalse((self.out / "live").exists())
+
+    def test_a_cert_pem_directory_is_refused(self):
+        (self.byo / "cert.pem").mkdir()
+        self.put(key_bytes=certificate(["files.example"])[1])
+        code, out, err = self.step()
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(len(err.splitlines()), 1, err)
+        self.assertFalse((self.out / "live").exists())
+
     def test_hosts_map_from_your_certificate(self):
         # #664: the certificate's own names, in nginx's forms; localhost and
         # 127.0.0.1 are nginx.lan.conf's.
@@ -30909,6 +30990,9 @@ class NginxTests(unittest.TestCase):
         self.assertIn("ssl_session_tickets off;", lines)
         for text in (self.lan, self.locations):
             self.assertNotIn("strict-transport-security", "\n".join(directives(text)).lower())
+
+    def test_no_version_in_responses(self):
+        self.assertIn("server_tokens off;", directives(self.lan))
 
     def test_both_servers_share_the_locations(self):
         include = "include /etc/nginx/rag/locations.conf;"
@@ -31006,15 +31090,21 @@ if __name__ == "__main__":
 """Accounts, sessions, service principals and API keys, the endpoint/role
 matrix and the operator command (#25).
 
-Runs with the API's dependencies, in the built API image with no network
-(`17_auth.sh`):
+Runs with the API's dependencies: in the built API image with no network, as
+`17_auth.sh` does,
 
     docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
       "$(docker compose images -q api)" python scripts/tests/test_auth.py
 
+or on the host with them installed.
+
 Every test uses its own temporary store (AUTH_DIR); requests go through
-`main.app` with FastAPI's TestClient, without the lifespan, and nothing reaches
-a backend.
+`main.app` with FastAPI's TestClient, without the lifespan. Some requests pass
+the auth check and run the real handler, so the module blocks both backends
+for its whole run (setUpModule): getting the Weaviate client raises, and every
+httpx.AsyncClient request, which is how the Ollama client talks, fails before
+it opens a connection. No test reaches Weaviate or Ollama, on the host or in
+the image (#546).
 """
 import asyncio
 import hashlib
@@ -31027,12 +31117,14 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
 API_DIR = os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api")
 sys.path.insert(0, API_DIR)
 
+import httpx
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
@@ -31041,13 +31133,64 @@ from config import settings
 from main import app
 from auth import keys, passwords, policy, store
 from auth.middleware import AuthMiddleware, same_origin
-from services import audit
+from services import audit, ollama_client, weaviate_client
 
 ORIGIN = "http://testserver"
 
 
+class _NoNetwork(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request):
+        raise httpx.ConnectError("test_auth.py runs without a network", request=request)
+
+
+class _OfflineAsyncClient(httpx.AsyncClient):
+    def __init__(self, *args, **kwargs):
+        kwargs["transport"] = _NoNetwork()
+        super().__init__(*args, **kwargs)
+
+
+def _no_weaviate():
+    raise ConnectionError("test_auth.py runs without a network: there is no Weaviate")
+
+
+_OFFLINE = (patch.object(weaviate_client, "get_client", _no_weaviate),
+            patch.object(httpx, "AsyncClient", _OfflineAsyncClient))
+
+
+def setUpModule():
+    for offline in _OFFLINE:
+        offline.start()
+
+
+def tearDownModule():
+    for offline in reversed(_OFFLINE):
+        offline.stop()
+
+
 def logged(logs):
     return "\n".join(logging.Formatter().format(record) for record in logs.records)
+
+
+def failed_attempt(username, address):
+    """A failed attempt as the routes make one: counted first, then settled.
+    True when it locks the pair."""
+    if not store.reserve_attempt(username, address):
+        raise AssertionError(f"the attempt for {username!r} from {address!r} was refused")
+    return store.finish_attempt(username, address, False)
+
+
+def locked(username, address):
+    """Whether the store holds a lockout of the pair that hasn't ended."""
+    with closing(sqlite3.connect(store.db_path())) as conn:
+        row = conn.execute("SELECT until FROM login_lockouts WHERE username = ? AND address = ?",
+                           (username, address)).fetchone()
+    return row is not None and row[0] > store._now()
+
+
+def restart():
+    """As after an API restart: the new process has opened and cached nothing."""
+    store._ready.clear()
+    store._set_up.clear()
 
 
 class StoreTestCase(unittest.TestCase):
@@ -31081,6 +31224,15 @@ class StoreTestCase(unittest.TestCase):
         """Cookie and Origin headers for a new session of `username`."""
         token = store.create_session(store.get_user(username).id)
         return {"Cookie": f"{store.COOKIE}={token}", "Origin": ORIGIN}, token
+
+    def rows(self, sql):
+        with closing(sqlite3.connect(store.db_path())) as conn:
+            return conn.execute(sql).fetchall()
+
+    def set_times(self, token, created_at, last_seen):
+        with closing(sqlite3.connect(store.db_path())) as conn, conn:
+            conn.execute("UPDATE sessions SET created_at = ?, last_seen = ? WHERE token_hash = ?",
+                         (created_at, last_seen, hashlib.sha256(token.encode()).hexdigest()))
 
 
 class PasswordTests(unittest.TestCase):
@@ -31268,27 +31420,29 @@ class StoreTests(StoreTestCase):
             self.assertEqual(caught.exception.code, code)
 
     def test_throttle_locks_a_pair_and_survives_a_new_handle(self):
-        for attempt in range(4):
-            self.assertFalse(store.record_failure("alice", "10.0.0.1"))
-        self.assertTrue(store.record_failure("alice", "10.0.0.1"))
-        store._ready.clear()                            # as after an API restart
-        self.assertTrue(store.locked("alice", "10.0.0.1"))
-        self.assertFalse(store.locked("alice", "10.0.0.2"))
-        self.assertFalse(store.locked("bob", "10.0.0.1"))
+        for attempt in range(store.THROTTLE_FAILURES - 1):
+            self.assertFalse(failed_attempt("alice", "10.0.0.1"))
+        self.assertTrue(failed_attempt("alice", "10.0.0.1"))
+        restart()
+        self.assertTrue(locked("alice", "10.0.0.1"))
+        self.assertFalse(store.reserve_attempt("alice", "10.0.0.1"))
+        self.assertFalse(locked("alice", "10.0.0.2"))
+        self.assertFalse(locked("bob", "10.0.0.1"))
         with patch.object(store, "_now", return_value=store._now() + store.LOCKOUT_S + 1):
-            self.assertFalse(store.locked("alice", "10.0.0.1"))
+            self.assertFalse(locked("alice", "10.0.0.1"))
+            self.assertTrue(store.reserve_attempt("alice", "10.0.0.1"))
 
     def test_failures_outside_the_window_do_not_count(self):
         start = 5000.0
         for minute in (0, 4, 8, 12):
             with patch.object(store, "_now", return_value=start + minute * 60):
-                store.record_failure("alice", "a")
+                failed_attempt("alice", "a")
         with patch.object(store, "_now", return_value=start + 16 * 60):
-            self.assertFalse(store.record_failure("alice", "a"), "the first failure left the 15-minute window")
-        store.clear_failures("alice", "a")
-        for _ in range(4):
-            store.record_failure("alice", "a")
-        self.assertFalse(store.locked("alice", "a"))
+            self.assertFalse(failed_attempt("alice", "a"), "the first failure left the 15-minute window")
+        store.finish_attempt("alice", "a", True)        # a success clears the count
+        for _ in range(store.THROTTLE_FAILURES - 1):
+            failed_attempt("alice", "a")
+        self.assertFalse(locked("alice", "a"))
 
 
     def test_attempts_are_counted_before_they_are_checked(self):
@@ -31301,11 +31455,119 @@ class StoreTests(StoreTestCase):
         # They fail: with five counted in the window, the pair is locked.
         locks = [store.finish_attempt("alice", "a", False) for _ in range(store.THROTTLE_FAILURES)]
         self.assertTrue(any(locks))
-        self.assertTrue(store.locked("alice", "a"))
+        self.assertTrue(locked("alice", "a"))
         # A success clears the pair's count.
         store.finish_attempt("alice", "b", True)
         for _ in range(store.THROTTLE_FAILURES):
             self.assertTrue(store.reserve_attempt("alice", "b"))
+
+    def test_reserved_attempts_follow_the_window_and_the_lockout_ends(self):
+        # The path logins and password changes take (reserve_attempt and
+        # finish_attempt): failures older than 15 minutes don't count, and a
+        # lockout ends after 15 minutes.
+        start = 5000.0
+
+        def fail_at(seconds):
+            with patch.object(store, "_now", return_value=start + seconds):
+                self.assertTrue(store.reserve_attempt("alice", "a"))
+                return store.finish_attempt("alice", "a", False)
+
+        for minute in (0, 4, 8, 12):
+            self.assertFalse(fail_at(minute * 60))
+        self.assertFalse(fail_at(16 * 60), "the first failure left the 15-minute window")
+        self.assertTrue(fail_at(17 * 60), "five failures within 15 minutes lock the pair")
+        until = start + 17 * 60 + store.LOCKOUT_S
+        with patch.object(store, "_now", return_value=until - 1):
+            self.assertFalse(store.reserve_attempt("alice", "a"))
+        with patch.object(store, "_now", return_value=until + 1):
+            self.assertTrue(store.reserve_attempt("alice", "a"))
+
+    def test_the_window_and_the_lockout_at_their_exact_boundaries(self):
+        start = 5000.0
+        window = store.THROTTLE_WINDOW_S
+
+        def fail_at(address, seconds):
+            with patch.object(store, "_now", return_value=start + seconds):
+                return failed_attempt("alice", address)
+
+        for _ in range(store.THROTTLE_FAILURES - 1):
+            self.assertFalse(fail_at("a", 0))
+        self.assertFalse(fail_at("a", window), "failures exactly 15 minutes old no longer count")
+        for _ in range(store.THROTTLE_FAILURES - 1):
+            self.assertFalse(fail_at("b", 0), "fewer than five failures don't lock")
+        self.assertTrue(fail_at("b", window - 1), "failures a second short of 15 minutes old still count")
+        until = start + window - 1 + store.LOCKOUT_S
+        with patch.object(store, "_now", return_value=until - 1):
+            self.assertFalse(store.reserve_attempt("alice", "b"), "still locked a second before the end")
+        with patch.object(store, "_now", return_value=until):
+            self.assertTrue(store.reserve_attempt("alice", "b"), "the lockout ends exactly at its end")
+
+    def test_session_limits_at_their_exact_boundaries(self):
+        self.make("eng", "engineer")
+        user = store.get_user("eng")
+        start = 1000.0
+        with patch.object(store, "_now", return_value=start):
+            idle_exact, idle_past = store.create_session(user.id), store.create_session(user.id)
+        with patch.object(store, "_now", return_value=start + store.IDLE_S):
+            self.assertIsNotNone(store.authenticate(idle_exact), "exactly 12 hours idle is still valid")
+        with patch.object(store, "_now", return_value=start + store.IDLE_S + 1):
+            self.assertIsNone(store.authenticate(idle_past), "a second more ends it")
+        with patch.object(store, "_now", return_value=start):
+            age_exact, age_past = store.create_session(user.id), store.create_session(user.id)
+        at = start
+        while at + 11 * 3600 < start + store.ABSOLUTE_S:
+            at += 11 * 3600                              # used often enough never to go idle
+            with patch.object(store, "_now", return_value=at):
+                self.assertIsNotNone(store.authenticate(age_exact))
+                self.assertIsNotNone(store.authenticate(age_past))
+        with patch.object(store, "_now", return_value=start + store.ABSOLUTE_S):
+            self.assertIsNotNone(store.authenticate(age_exact), "exactly 7 days old is still valid")
+        with patch.object(store, "_now", return_value=start + store.ABSOLUTE_S + 1):
+            self.assertIsNone(store.authenticate(age_past), "a second more ends it")
+
+    def test_a_count_and_a_session_survive_a_restart(self):
+        self.make("eng", "engineer")
+        token = store.create_session(store.get_user("eng").id)
+        for _ in range(store.THROTTLE_FAILURES - 1):
+            self.assertFalse(failed_attempt("eng", "a"))
+        restart()
+        self.assertTrue(store.is_set_up())
+        self.assertEqual(store.authenticate(token).username, "eng")
+        self.assertTrue(failed_attempt("eng", "a"), "the failures before the restart still count")
+
+    def test_a_new_session_sweeps_the_ended_ones(self):
+        # Sessions abandoned without a logout are never presented again: every
+        # new session deletes those that have ended by time, anyone's (#546).
+        self.make("eng", "engineer")
+        user_id = store.get_user("eng").id
+        now = 1_000_000.0
+        with patch.object(store, "_now", return_value=now - 60):
+            tokens = {name: store.create_session(user_id) for name in
+                      ("idle_ended", "idle_exact", "age_ended", "age_exact", "fresh")}
+        times = {"idle_ended": (now - store.IDLE_S - 1, now - store.IDLE_S - 1),
+                 "idle_exact": (now - store.IDLE_S, now - store.IDLE_S),
+                 "age_ended": (now - store.ABSOLUTE_S - 1, now - 60),
+                 "age_exact": (now - store.ABSOLUTE_S, now - 60),
+                 "fresh": (now - 60, now - 60)}
+        for name, (created_at, last_seen) in times.items():
+            self.set_times(tokens[name], created_at, last_seen)
+        with patch.object(store, "_now", return_value=now):
+            tokens["new"] = store.create_session(user_id)
+        kept = {hashlib.sha256(tokens[name].encode()).hexdigest(): name for name in tokens}
+        self.assertEqual(sorted(kept[digest] for (digest,) in self.rows("SELECT token_hash FROM sessions")),
+                         ["age_exact", "fresh", "idle_exact", "new"])
+
+    def test_an_attempt_sweeps_ended_lockouts_and_old_failures(self):
+        start = 5000.0
+        with patch.object(store, "_now", return_value=start):
+            for _ in range(store.THROTTLE_FAILURES):
+                failed_attempt("alice", "a")
+            failed_attempt("bob", "b")
+        self.assertEqual(self.rows("SELECT username FROM login_lockouts"), [("alice",)])
+        with patch.object(store, "_now", return_value=start + max(store.LOCKOUT_S, store.THROTTLE_WINDOW_S)):
+            self.assertTrue(store.reserve_attempt("carol", "c"))
+        self.assertEqual(self.rows("SELECT username FROM login_lockouts"), [])
+        self.assertEqual(self.rows("SELECT username FROM login_failures"), [("carol",)])
 
 
 class PolicyTests(unittest.TestCase):
@@ -31514,7 +31776,7 @@ class MiddlewareTests(StoreTestCase):
         async def never(scope, receive, send):
             raise AssertionError("the app was called")
 
-        for path in ("/ingest/upload\n", "/collections\r", "/collections/A\x00"):
+        for path in ("/ingest/upload\n", "/collections\r", "/collections/A\x00", "/ingest/upload\x7f"):
             with self.subTest(path=path):
                 reads.clear(); sent.clear()
                 scope = {"type": "http", "method": "POST", "path": path, "headers": [(b"host", b"testserver")]}
@@ -31545,6 +31807,18 @@ class MiddlewareTests(StoreTestCase):
         response = self.client.options("/collections", headers={"Origin": "http://evil.test",
                                                                 "Access-Control-Request-Method": "DELETE"})
         self.assertFalse([k for k in response.headers if k.lower().startswith("access-control-")])
+
+    def test_a_malformed_earlier_cookie_does_not_hide_the_session(self):
+        # Cookies aren't port-scoped: another app on localhost can set one that
+        # http.cookies rejects, and the session after it was lost (#546).
+        self.make("eng", "engineer")
+        _, token = self.session("eng")
+        for before in ('other={"a":1}', "x=a b", 'a="unterminated'):
+            with self.subTest(before=before):
+                response = self.client.get("/auth/me", headers={"Cookie": f"{before}; {store.COOKIE}={token}"})
+                self.assertEqual((response.status_code, response.json()["username"]), (200, "eng"))
+        response = self.client.get("/auth/me", headers={"Cookie": "other=1"})
+        self.assertEqual((response.status_code, response.json()["error"]["code"]), (401, "AUTH_REQUIRED"))
 
 
 class RouteTests(StoreTestCase):
@@ -31691,6 +31965,34 @@ class RouteTests(StoreTestCase):
         self.assertNotIn(self.passwords["end_user"], logged(logs))
         # The same pair as the login: the login is locked too.
         self.assertEqual(self.login("user", self.passwords["end_user"]).status_code, 429)
+
+    def test_a_login_lockout_also_refuses_the_password_change(self):
+        # The other direction of the shared throttle: a pair locked by failed
+        # logins can't change the password, even with the right current one.
+        self.setup_roles()
+        headers, _ = self.session("user")
+        for _ in range(store.THROTTLE_FAILURES):
+            self.assertEqual(self.login("user", "wrong" * 3).status_code, 401)
+        refused = self.client.post("/auth/password", headers=headers,
+                                   json={"current_password": self.passwords["end_user"], "new_password": "n" * 14})
+        self.assertEqual((refused.status_code, refused.json()["error"]["code"]), (429, "LOGIN_THROTTLED"))
+        self.assertTrue(passwords.verify_password(self.passwords["end_user"], store.get_user("user").password_hash))
+
+    def test_a_right_current_password_clears_the_count(self):
+        # finish_attempt(succeeded=True) on the password route clears the pair's
+        # count like a successful login, even when the new password is refused.
+        self.setup_roles()
+        headers, _ = self.session("user")
+        password = self.passwords["end_user"]
+        for _ in range(store.THROTTLE_FAILURES - 1):
+            self.client.post("/auth/password", headers=headers,
+                             json={"current_password": "nope" * 3, "new_password": "n" * 14})
+        short = self.client.post("/auth/password", headers=headers,
+                                 json={"current_password": password, "new_password": "short"})
+        self.assertEqual(short.status_code, 422)
+        for _ in range(store.THROTTLE_FAILURES - 1):
+            self.assertEqual(self.login("user", "wrong" * 3).status_code, 401)
+        self.assertEqual(self.login("user", password).status_code, 200)
 
     def test_forced_change_allows_only_session_routes(self):
         self.make("eng", "engineer")
@@ -32549,6 +32851,16 @@ class TestingHelperTests(unittest.TestCase):
             self.assertEqual(headers["Origin"], "http://owned")
             token = headers["Cookie"].split("=", 1)[1]
             self.assertEqual(store.authenticate(token).role, "developer")
+
+
+class OfflineTests(unittest.TestCase):
+    def test_no_backend_is_reachable(self):
+        with self.assertRaises(ConnectionError):
+            weaviate_client.get_client()
+        with self.assertRaises(httpx.ConnectError):
+            asyncio.run(ollama_client.list_models())
+        health = asyncio.run(ollama_client.check_health())
+        self.assertEqual({model["status"] for model in health.values()}, {"error"})
 
 
 class ImplementationCopyTests(unittest.TestCase):
@@ -54276,7 +54588,7 @@ class EmbeddedTelemetryTests(unittest.TestCase):
         spec = (ROOT/'SPECIFICATIONS.md').read_text()
         inputs = (ROOT/'api/requirements.in').read_text().splitlines()
         lock = (ROOT/'api/requirements.txt').read_text().splitlines()
-        for dependency in ('opentelemetry-sdk==1.45.1', 'opentelemetry-exporter-otlp-proto-http==1.45.1'):
+        for dependency in ('opentelemetry-sdk==1.45.2', 'opentelemetry-exporter-otlp-proto-http==1.45.2'):
             self.assertIn(dependency, spec)
             self.assertIn(dependency, inputs)
             self.assertIn(dependency, lock)
