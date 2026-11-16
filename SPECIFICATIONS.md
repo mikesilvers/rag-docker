@@ -1536,7 +1536,7 @@ is lowercased; one that doesn't exist, or breaks the username rule, is `404 USER
 | Route | Request | Success |
 |---|---|---|
 | `GET /auth/users` | | `200 {"users": [User, ...]}`, by username |
-| `POST /auth/users` | `{"username", "role"}` | `201 {"user": User, "password"}`: an enabled account with a generated password, to be changed at first login. A username breaking the rule is `422 INVALID_USERNAME`; one that exists (ignoring case) is `409 USER_EXISTS` |
+| `POST /auth/users` | `{"username", "role"}` | `201 {"user": User, "password"}`: an enabled account with a generated password, to be changed at first login. A username breaking the rule, whatever its length, is `422 INVALID_USERNAME`; one that exists (ignoring case) is `409 USER_EXISTS` |
 | `POST /auth/users/{username}/reset-password` | | `200 {"user": User, "password"}`: a new generated password, to be changed at next login; the user's sessions end. The engineer's own account is `409 SELF_RESET_REFUSED` (use `POST /auth/password`, which needs the current password) |
 | `POST /auth/users/{username}/role` | `{"role"}` | `200 {"user": User}`; existing sessions take the role on their next request |
 | `POST /auth/users/{username}/disable` | | `200 {"user": User}`; the user's sessions end and their logins fail with `LOGIN_FAILED` |
@@ -1582,7 +1582,7 @@ routes ignore the header. Failed key requests are neither logged one by one nor 
 | Route | Request | Success |
 |---|---|---|
 | `GET /auth/service-principals` | | `200 {"principals": [Principal, ...]}`, by name |
-| `POST /auth/service-principals` | `{"name", "role"}` | `201 {"principal"}`. A name breaking the rule is `422 INVALID_USERNAME`; one a person or principal holds is `409 PRINCIPAL_EXISTS` |
+| `POST /auth/service-principals` | `{"name", "role"}` | `201 {"principal"}`. A name breaking the rule, whatever its length, is `422 INVALID_USERNAME`; one a person or principal holds is `409 PRINCIPAL_EXISTS` |
 | `POST /auth/service-principals/{name}/role` | `{"role"}` | `200 {"principal"}`; its keys take the role on their next request |
 | `POST /auth/service-principals/{name}/disable` | | `200 {"principal"}`; its keys fail until it is enabled |
 | `POST /auth/service-principals/{name}/enable` | | `200 {"principal"}` |
@@ -1629,6 +1629,7 @@ change (create, reset, role, disable, enable) naming the engineer, the change an
 password. One `WARNING` line per service principal or key change (create, role, disable, enable, key issued, key
 revoked) naming the engineer, the principal and the key id (and the role or expiry), and one per refusal
 (`INVALID_USERNAME`, `PRINCIPAL_EXISTS`, `PRINCIPAL_NOT_FOUND`, `KEY_NOT_FOUND`); never a key or its hash.
+A refused username or name longer than 256 characters is logged, and recorded as the audit target, cut to its first 256 characters.
 Successful key requests aren't logged one by one (`last_used_at` records them). The telemetry route vocabulary gains the eighteen `/auth` routes as labels.
 These lines are unchanged by the audit log (§3.1.9), which records the same events durably.
 
@@ -1971,7 +1972,7 @@ Standard error codes:
 | `LOGIN_RATE_LIMITED` | 429 | From nginx, not the API: more than 10 logins a minute (burst 5) from this client address; wait a minute (#577) |
 | `PASSWORD_INCORRECT` | 403 | The current password given to `POST /auth/password` is wrong |
 | `INVALID_PASSWORD` | 422 | The new password breaks a rule; the message names it |
-| `INVALID_USERNAME` | 422 | `POST /auth/users`: the username breaks the rule; the message states it |
+| `INVALID_USERNAME` | 422 | `POST /auth/users` or `POST /auth/service-principals`: the name breaks the rule; the message states it |
 | `USER_EXISTS` | 409 | `POST /auth/users`: an account with this username exists |
 | `USER_NOT_FOUND` | 404 | No account has the username in the path |
 | `LAST_ENGINEER` | 409 | The change would demote or disable the last enabled engineer |

@@ -25,6 +25,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -42,7 +44,7 @@ from config import settings
 from main import app
 from auth import keys, passwords, policy, store
 from auth.middleware import AuthMiddleware, same_origin
-from services import ollama_client, weaviate_client
+from services import audit, ollama_client, weaviate_client
 
 ORIGIN = "http://testserver"
 
@@ -273,6 +275,46 @@ class StoreTests(StoreTestCase):
         with self.assertRaises(store.Refused):
             store.set_enabled("eng2", False)
 
+    def test_two_last_engineer_changes_at_once_leave_one_engineer(self):
+        # #551 item 3: the last-Engineer check runs inside the write transaction
+        # (BEGIN IMMEDIATE), so two changes started together can't both pass it.
+        # The check is slowed down here, so without the lock both would see two Engineers.
+        changes = {"demote": lambda name: store.set_role(name, "developer"),
+                   "disable": lambda name: store.set_enabled(name, False)}
+        real = store._is_last_engineer
+
+        def slow(conn, row):
+            found = real(conn, row)
+            time.sleep(0.2)
+            return found
+
+        for first, second in (("demote", "demote"), ("disable", "disable"), ("demote", "disable")):
+            with self.subTest(changes=(first, second)):
+                temp = tempfile.TemporaryDirectory()
+                self.addCleanup(temp.cleanup)
+                with patch.object(settings, "auth_dir", temp.name), patch.object(store, "_is_last_engineer", slow):
+                    self.make("eng1", "engineer")
+                    self.make("eng2", "engineer")
+                    start, results = threading.Barrier(2), {}
+
+                    def run(name, change):
+                        start.wait()
+                        try:
+                            changes[change](name)
+                            results[name] = "ok"
+                        except store.Refused as exc:
+                            results[name] = exc.code
+
+                    threads = [threading.Thread(target=run, args=("eng1", first)),
+                               threading.Thread(target=run, args=("eng2", second))]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join(30)
+                    self.assertEqual(sorted(results.values()), ["LAST_ENGINEER", "ok"], results)
+                    engineers = [u.username for u in store.list_users() if u.role == "engineer" and u.enabled]
+                    self.assertEqual(len(engineers), 1, engineers)
+
     def test_refusals_carry_a_code(self):
         # The admin routes answer by these codes (PR 2 of #25).
         self.make("eng", "engineer")
@@ -453,6 +495,16 @@ class PolicyTests(unittest.TestCase):
         routes = self.app_routes()
         self.assertEqual(sorted(routes - set(policy.ACCESS)), [], "routes with no policy entry")
         self.assertEqual(sorted(set(policy.ACCESS) - routes), [], "policy entries with no route")
+
+    def test_every_api_route_is_in_the_telemetry_route_vocabulary(self):
+        # #551 item 2 (and #553 item 3): a route missing from telemetry.ROUTES is
+        # labelled "unmatched" in spans and metrics. The routes come from the app,
+        # so a new one is checked without editing this test. FastAPI's own docs
+        # routes aren't API routes.
+        from services import telemetry
+        docs = {("GET", "/docs"), ("GET", "/docs/oauth2-redirect"), ("GET", "/redoc"), ("GET", "/openapi.json")}
+        missing = sorted(f"{m} {p}" for m, p in self.app_routes() - docs if f"{m} {p}" not in telemetry.ROUTES)
+        self.assertEqual(missing, [], "routes telemetry would label 'unmatched'")
 
     def test_the_matrix_is_the_agreed_one(self):
         counts = {}
@@ -980,19 +1032,28 @@ class AdminRouteTests(StoreTestCase):
         self.assertEqual((login.status_code, login.json()["must_change_password"]), (200, True))
 
     def test_create_refusals(self):
-        for username in ("ab", "x" * 33, "has space", "semi;colon", ""):
+        for username in ("ab", "x" * 33, "has space", "semi;colon", "", "u" * 257):
             with self.subTest(username=username), self.assertLogs("auth", "WARNING") as logs:
                 response = self.admin("POST", "/auth/users", {"username": username, "role": "end_user"})
                 self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_USERNAME"))
                 self.assertIn("3-32 characters", response.json()["error"]["message"])
                 self.assertEqual(len(logs.records), 1)
+        # #551 item 4: an over-long username is refused like any other, and is
+        # logged and audited cut to its first 256 characters.
+        with patch.object(audit, "note") as note, self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "/auth/users", {"username": "u" * 5000, "role": "end_user"})
+        self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_USERNAME"))
+        self.assertEqual(note.call_args.kwargs["target"], "u" * 256)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("u" * 256, logged(logs))
+        self.assertNotIn("u" * 257, logged(logs))
+        self.assertIsNone(store.get_user("u" * 5000))
         with self.assertLogs("auth", "WARNING") as logs:
             response = self.admin("POST", "/auth/users", {"username": "DEV", "role": "end_user"})
         self.assertEqual((response.status_code, self.code(response)), (409, "USER_EXISTS"))
         self.assertIn("create of 'dev' refused", logged(logs))
         self.assertEqual(store.get_user("dev").role, "developer")
-        for body in ({"username": "newbie", "role": "admin"}, {"username": "newbie"}, {"role": "end_user"},
-                     {"username": "u" * 257, "role": "end_user"}):
+        for body in ({"username": "newbie", "role": "admin"}, {"username": "newbie"}, {"role": "end_user"}):
             with self.subTest(body=body):
                 response = self.admin("POST", "/auth/users", body)
                 self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_PARAMETER"))
@@ -1481,11 +1542,20 @@ class PrincipalRouteTests(KeyTestCase):
 
     def test_refusals(self):
         self.admin("POST", "", {"name": "svc", "role": "developer"})
-        for name in ("ab", "x" * 33, "has space", ""):
+        for name in ("ab", "x" * 33, "has space", "", "x" * 257):
             with self.subTest(name=name), self.assertLogs("auth", "WARNING") as logs:
                 response = self.admin("POST", "", {"name": name, "role": "end_user"})
                 self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_USERNAME"))
                 self.assertEqual(len(logs.records), 1)
+        # #551 item 4: an over-long name is logged and audited cut to its first 256 characters.
+        with patch.object(audit, "note") as note, self.assertLogs("auth", "WARNING") as logs:
+            response = self.admin("POST", "", {"name": "x" * 5000, "role": "end_user"})
+        self.assertEqual((response.status_code, self.code(response)), (422, "INVALID_USERNAME"))
+        self.assertEqual(note.call_args.kwargs["target"], "x" * 256)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("x" * 256, logged(logs))
+        self.assertNotIn("x" * 257, logged(logs))
+        self.assertIsNone(store.get_user("x" * 5000))
         for name in ("SVC", "dev"):
             with self.subTest(taken=name), self.assertLogs("auth", "WARNING") as logs:
                 response = self.admin("POST", "", {"name": name, "role": "end_user"})
