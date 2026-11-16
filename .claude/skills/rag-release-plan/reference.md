@@ -77,10 +77,13 @@ Use `completed` for work that is done, and `"not planned"` for a duplicate or a 
 ## Lanes and links
 
 - **Lane label:** `lane-<x>-<name>`, a letter and a short name, for example `lane-a-deps` or `lane-c-auth`. Every ticket that stays gets one.
+- **Lanes by shared files:** tickets share a lane only when they change the same files, not by theme. Tickets that share no file go in separate lanes, or are marked independent inside a lane (`·` in the Order column), so they can be worked in parallel.
 - **Blocks** when the whole ticket waits. `createJiraIssueLink` with `linkType: "Blocks"`: `inwardIssue` is the blocker and `outwardIssue` the blocked ticket ("inwardIssue blocks outwardIssue").
 - **Relates** when only part of a ticket waits, for example its UI after a toolchain upgrade. `createJiraIssueLink` with `linkType: "Relates"`, plus a comment on the waiting ticket saying which part waits, and for what.
 - **No link** for a same-file conflict that only needs a rebase: whichever PR lands second rebases. It is listed in the epic's Lanes section.
 - **Verify note:** one machine runs one verify stack at a time (`rag-verify` on port 8081, behind a lock). Lanes can be developed and reviewed in parallel, but their verify runs and `rag-pr-review` evaluations queue.
+- **Limit on open PRs:** no new fix agent starts while 2 or more non-Markdown PRs from the release wait for or are in evaluation. Markdown-only PRs (every changed file is `*.md`) don't count: they take the fast path and don't use the verify stack. A fix agent's question round doesn't count as a PR.
+- **Evaluation queue order:** the next PR to evaluate is a security fix; then a PR on the critical path or one that unblocks other tickets (for example on the longest chain, or one whose merge clears a Blocks link); then the oldest. A PR that conflicts with `develop` goes back to its fix agent, and keeps its place once updated.
 
 ## The epic's Lanes section
 
@@ -89,7 +92,7 @@ Added to the epic description below its existing text, which stays as it is:
 ```markdown
 ## Lanes (work in parallel)
 
-Each lane is a set of tickets that change the same files. Claim a lane by assigning yourself its tickets, so two agents never work in the same files. Filter one lane with `labels = lane-x-...`. Ordering dependencies are **Blocks** links on the tickets. **Relates** links mark tickets where only part waits; the comment on the ticket says which.
+Each lane is a set of tickets that change the same files. Tickets that share no file are in separate lanes, or marked independent with `·`. Claim a lane by assigning yourself its tickets, so two agents never work in the same files. Filter one lane with `labels = lane-x-...`. Ordering dependencies are **Blocks** links on the tickets. **Relates** links mark tickets where only part waits; the comment on the ticket says which.
 
 | Lane (label) | Order | Waits on other lanes |
 | --- | --- | --- |
@@ -102,6 +105,10 @@ Longest chain: RD-n → RD-m → …
 Same-file conflicts with no ordering need are not linked; whichever PR lands second rebases. They are `<file>` (RD-n, RD-m).
 
 **Verification is the bottleneck.** One machine runs one verify stack at a time (`rag-verify` on port 8081, behind a lock), so verify runs and rag-pr-review evaluations queue across lanes.
+
+**Limit on open PRs.** No new fix agent starts while 2 or more non-Markdown PRs from the release wait for or are in evaluation. Markdown-only PRs (every changed file is `*.md`) don't count, since they don't use the verify stack, and neither does a fix agent's question round.
+
+**Evaluation queue order.** Security fixes first; then PRs on the critical path or that unblock other tickets (for example on the longest chain, or whose merge clears a Blocks link); then the oldest. A PR that conflicts with `develop` goes back to its fix agent and keeps its place once updated.
 ```
 
 In the Order column, `→` means "then", `·` separates independent chains, and `+` joins items done together.
@@ -116,7 +123,7 @@ A Markdown file, `<EPIC>-release-plan.md`, in the session's scratchpad directory
 4. **Recommended moves, closes, folds and splits:** a table of item, recommendation and why. Name each overridden placement by the maintainer, with its date.
 5. **What stays:** grouped, with the count. The counts add up: children = moved + closed + folded + stay.
 6. **Dependencies:** a table of item, depends on, kind (hard, soft, or a scope note), and why, with the evidence.
-7. **Lanes:** the lane table (lane and label, order inside the lane, waits on other lanes), the start-now list, the longest chain, the rebase-only conflicts, and the verify note.
+7. **Lanes:** the lane table (lane and label, order inside the lane, waits on other lanes), grouped by the files the tickets change, with tickets that share no file in separate lanes or marked independent; the start-now list, the longest chain, the rebase-only conflicts, the verify note, the limit on open PRs and the evaluation queue order.
 8. **Decisions for the maintainer:** a numbered list, each a question that can be answered yes or no or by a choice.
 9. **Review log:** one line per review, saying what changed or "No changes".
 
