@@ -32,7 +32,7 @@ Each one points at the section of `reference.md` that holds the details.
 ### Change a ticket's status
 
 1. Use `transitionJiraIssue` with `transitionId` ("Statuses").
-2. Move it to In Progress when the fix agent takes it, to In Review when its PR opens, and to Done when the PR merges: the session that merged it does that ("Finish a ticket").
+2. Move it to In Progress when the fix agent takes it, and to In Review when the fix agent opens its PR. Move it to Done when the PR merges, as "Finish a ticket" says.
 3. When the ticket waits on the maintainer, move it to Needs Mike and add a comment saying exactly what he has to decide.
 
 ### Record a question and its answer
@@ -46,7 +46,7 @@ Change all four together: the Fix Version, the parent epic, the Jira release lab
 
 ### Finish a ticket
 
-1. Move it to Done. A ticket finished by a PR moves when the PR merges, by the session that merged it. A ticket closed without a PR (a duplicate, a won't-fix or a fold) moves when its approved close is applied (`rag-release-plan`, "Closing, folding and splitting").
+1. Move it to Done. A ticket finished by a PR moves when the PR merges. If the session merged the PR, it moves the ticket then. If the maintainer merged the PR himself (`joefeser` PRs, fork PRs, release PRs, or any he merges by hand), the session moves it once it sees the PR has landed, as for its own merges. A ticket closed without a PR (a duplicate, a won't-fix or a fold) moves when its approved close is applied (`rag-release-plan`, "Closing, folding and splitting").
 2. Check its GitHub issue's state. If it is still open, close it with `--reason completed`, or `--reason "not planned"` for a duplicate or won't-fix ("Done closes GitHub").
 
 ### Open a new GitHub issue

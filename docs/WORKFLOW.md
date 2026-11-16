@@ -101,10 +101,10 @@ Reading two rows:
 | --- | --- | --- |
 | To Do | The ticket isn't taken yet. | anyone |
 | In Progress | The fix agent takes the ticket. | anyone |
-| In Review | The ticket's PR opens. | anyone |
+| In Review | The ticket's PR opens. | the fix agent, when it opens the PR |
 | Needs Mike | The ticket waits on the maintainer. Add a comment saying exactly what he has to decide. | anyone |
 | Approved | As the maintainer likes, for example to sign off a ticket before a release. | the maintainer only; agents never use it |
-| Done | The ticket's PR merges, or its approved close without a PR is applied. It also closes the GitHub issue, if it is still open. | the session that merged the PR, or the one applying the close |
+| Done | The ticket's PR merges, or its approved close without a PR is applied. It also closes the GitHub issue, if it is still open. | the session that merged the PR; for a PR the maintainer merged himself, the session, once it sees the PR has landed; for a close without a PR, the one applying it |
 
 ### How each step is marked
 
@@ -151,7 +151,7 @@ Just before merging, every check runs again: the author, the clean evaluation on
 
 ### After the merge
 
-- **Done.** The session that merged the PR moves the ticket to Done. (`rag-jira` "Statuses", "Finish a ticket")
+- **Done.** The session that merged the PR moves the ticket to Done. When the maintainer merged the PR himself (`joefeser` PRs, fork PRs, release PRs, or any he merges by hand), the session moves it once it sees the PR has landed, as for its own merges. (`rag-jira` "Statuses", "Finish a ticket")
 - **The GitHub issue closes.** `Closes #N` closes it on the merge into `develop`. Moving the ticket to Done also closes the issue if it is still open: check its state first. (`CLAUDE.md`, `rag-jira` reference.md "Done closes GitHub")
 - **Follow-ups, any PR.** The merged PR's Medium and Low findings become a "Follow-ups from #N" issue (`CLAUDE.md`), with an RD ticket. The issue is left unlabelled for the maintainer to triage, and never gets `Triage`. (`rag-fix` SKILL.md "After the merge")
 - **Follow-ups, PRs by `joefeser`.** Only High findings go back to Joe; his PR is never held for Medium or Low findings. After it merges, the coordinator offers the maintainer a follow-up issue listing the Mediums, and the Lows worth doing, each with its `path:line`. Checks scored flaky or environmental are left out. (`rag-pr-review` reference.md "Maintainer follow-ups (PRs by `joefeser`)")

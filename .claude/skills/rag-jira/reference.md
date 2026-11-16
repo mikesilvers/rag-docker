@@ -131,10 +131,10 @@ createJiraIssue({
 | --- | --- | --- | --- |
 | To Do | `11` | The ticket isn't taken yet. | anyone |
 | In Progress | `21` | The fix agent takes the ticket. | anyone |
-| In Review | `31` | The ticket's PR opens. | anyone |
+| In Review | `31` | The ticket's PR opens. | the fix agent, when it opens the PR |
 | Needs Mike | `2` | The ticket waits on the maintainer. | anyone |
 | Approved | `3` | As the maintainer likes, for example to sign off a ticket before a release. | **Mike only.** Agents never use it. |
-| Done | `41` | The ticket's PR merges, or its approved close without a PR is applied (`rag-release-plan`). Then close the GitHub issue (below). | the session that merged the PR, or the one applying the close |
+| Done | `41` | The ticket's PR merges, or its approved close without a PR is applied (`rag-release-plan`). Then close the GitHub issue (below). | the session that merged the PR; for a PR the maintainer merged himself, the session, once it sees the PR has landed; for a close without a PR, the one applying it |
 
 `transitionJiraIssue` takes `transitionId`, a string. It doesn't take `transition: {id}`:
 
