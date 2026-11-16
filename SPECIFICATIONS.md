@@ -2811,8 +2811,9 @@ whose header fits in 2,000 characters. Retry text:
 
 ## 7. Web UI Specification
 
-**Framework:** React 18 + Vite 5  
-**Component library:** shadcn/ui + Tailwind CSS  
+**Framework:** React 18 + Vite 8  
+**Component library:** shadcn/ui + Tailwind CSS 4  
+**Browsers:** Safari 16.4, Chrome 111, Firefox 128 or newer, the floor Tailwind CSS 4 sets. The UI uses Tailwind 4's default colour palette, font stack and form-field styles (RD-157)  
 **State management:** React Context + useReducer (no external state library)  
 **Routing:** React Router v6
 

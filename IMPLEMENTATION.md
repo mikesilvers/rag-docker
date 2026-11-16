@@ -19487,6 +19487,7 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
   "name": "rag-ui",
   "version": "1.2.2",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
@@ -19501,13 +19502,13 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
     "remark-gfm": "^4.0.0"
   },
   "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.5",
     "@tailwindcss/typography": "^0.5.15",
     "@types/react": "^18.3.5",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^6.3.0",
-    "autoprefixer": "^10.6.2",
     "postcss": "^8.5.32",
-    "tailwindcss": "^3.4.11",
+    "tailwindcss": "^4.3.5",
     "typescript": "^7.0.2",
     "vite": "^8.3.8"
   },
@@ -19540,32 +19541,12 @@ export default defineConfig({
 })
 ```
 
-### ui/tailwind.config.js
-
-```javascript
-/** @type {import('tailwindcss').Config} */
-import typography from '@tailwindcss/typography'
-
-export default {
-  content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
-  theme: {
-    extend: {},
-  },
-  // `prose` is used by the Q&A answer pane and the transfer help page. Without
-  // this plugin those classes compile to nothing and Tailwind's preflight has
-  // already stripped heading and list styling, so markdown renders as one
-  // undifferentiated block.
-  plugins: [typography],
-}
-```
-
 ### ui/postcss.config.js
 
 ```javascript
 export default {
   plugins: {
-    tailwindcss: {},
-    autoprefixer: {},
+    '@tailwindcss/postcss': {},
   },
 }
 ```
@@ -19630,9 +19611,45 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 ### ui/src/index.css
 
 ```css
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+/* Scan exactly the files Tailwind 3's `content` globs named, not whatever
+   Tailwind 4's automatic detection finds in the build context. */
+@import 'tailwindcss' source(none);
+@source '../index.html';
+@source './**/*.{js,ts,jsx,tsx}';
+
+/* `prose` is used by the Q&A answer pane and the transfer help page. Without
+   this plugin those classes compile to nothing and Tailwind's preflight has
+   already stripped heading and list styling, so markdown renders as one
+   undifferentiated block. */
+@plugin '@tailwindcss/typography';
+
+/* Compatibility with Tailwind 3, from the Tailwind 4 upgrade guide. */
+
+/* Hover styles apply on every device, not only where the primary input can hover. */
+@custom-variant hover (&:hover);
+
+@layer base {
+  /* Borders default to gray-200, not currentcolor. */
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+
+  /* Placeholders are gray-400, not the text colour at half opacity. */
+  input::placeholder,
+  textarea::placeholder {
+    color: var(--color-gray-400);
+  }
+
+  /* Buttons show the pointer cursor. */
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
+}
 ```
 
 ### ui/src/App.tsx
@@ -20429,9 +20446,9 @@ const MENUS: MenuDef[] = [
 type Item = { label: string; to: string; current: boolean } | { label: string; onSelect: () => void }
 type Focus = 'first' | 'last'
 
-const TOP = 'text-sm px-2 py-1 rounded hover:text-blue-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-600'
+const TOP = 'text-sm px-2 py-1 rounded hover:text-blue-600 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-blue-600'
 const CURRENT = 'text-blue-700 font-semibold bg-blue-50'
-const ENTRY = 'block w-full text-left whitespace-nowrap px-3 py-1.5 text-sm hover:bg-gray-100 focus:bg-gray-100 focus:outline-none'
+const ENTRY = 'block w-full text-left whitespace-nowrap px-3 py-1.5 text-sm hover:bg-gray-100 focus:bg-gray-100 focus:outline-hidden'
 
 // One menu button and its menu, after the WAI-ARIA menu button pattern: Enter,
 // Space or ArrowDown opens it on the first entry, ArrowUp on the last; the
@@ -20491,7 +20508,7 @@ function NavMenu({ menuKey, label, items, current, open, focus, align, onOpen, o
   }
 
   return (
-    <div ref={wrapper} className={`relative${align === 'right' ? ' ml-auto' : ''}`}>
+    <div ref={wrapper} className={align === 'right' ? 'relative ml-auto' : 'relative'}>
       <button
         ref={button}
         type="button"
@@ -20938,7 +20955,7 @@ export default function LoginPage() {
     <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-8">
       <h1 className="text-3xl font-bold text-gray-800 mb-2">RAG Platform</h1>
       <p className="text-gray-500 mb-8">Log in to continue</p>
-      <form onSubmit={submit} className="bg-white border border-gray-200 rounded-xl p-6 shadow-sm w-full max-w-sm space-y-4">
+      <form onSubmit={submit} className="bg-white border border-gray-200 rounded-xl p-6 shadow-xs w-full max-w-sm space-y-4">
         <label className="block text-sm text-gray-700">
           Username
           <input id="login-username" autoComplete="username" value={username} onChange={e => setUsername(e.target.value)}
@@ -20970,7 +20987,7 @@ export default function SetupRequiredPage() {
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-8">
       <h1 className="text-3xl font-bold text-gray-800 mb-2">RAG Platform</h1>
-      <div className="bg-white border border-gray-200 rounded-xl p-6 shadow-sm w-full max-w-xl space-y-3">
+      <div className="bg-white border border-gray-200 rounded-xl p-6 shadow-xs w-full max-w-xl space-y-3">
         <h2 className="text-lg font-semibold text-gray-800">Not set up yet</h2>
         <p className="text-sm text-gray-600">
           No account exists. On the machine running the stack, create the first AI Engineer from the
@@ -21032,7 +21049,7 @@ export default function ChangePasswordPage({ forced = false }: { forced?: boolea
   )
 
   const form = (
-    <form onSubmit={submit} className="bg-white border border-gray-200 rounded-xl p-6 shadow-sm w-full max-w-sm space-y-4">
+    <form onSubmit={submit} className="bg-white border border-gray-200 rounded-xl p-6 shadow-xs w-full max-w-sm space-y-4">
       <h2 className="text-lg font-semibold text-gray-800">Change password</h2>
       {forced && (
         <p className="text-sm text-gray-600">
@@ -21190,7 +21207,7 @@ export default function QAPage() {
         onKeyDown={handleKeyDown}
         placeholder="Type your question… (Ctrl+Enter to submit)"
         rows={3}
-        className="w-full border rounded px-3 py-2 text-sm mb-3 resize-none focus:outline-none focus:ring-2 focus:ring-blue-300"
+        className="w-full border rounded px-3 py-2 text-sm mb-3 resize-none focus:outline-hidden focus:ring-2 focus:ring-blue-300"
       />
       <div className="flex items-center gap-4 mb-4">
         <button

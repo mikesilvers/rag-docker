@@ -41,7 +41,7 @@ export default function ChangePasswordPage({ forced = false }: { forced?: boolea
   )
 
   const form = (
-    <form onSubmit={submit} className="bg-white border border-gray-200 rounded-xl p-6 shadow-sm w-full max-w-sm space-y-4">
+    <form onSubmit={submit} className="bg-white border border-gray-200 rounded-xl p-6 shadow-xs w-full max-w-sm space-y-4">
       <h2 className="text-lg font-semibold text-gray-800">Change password</h2>
       {forced && (
         <p className="text-sm text-gray-600">

@@ -34,9 +34,9 @@ const MENUS: MenuDef[] = [
 type Item = { label: string; to: string; current: boolean } | { label: string; onSelect: () => void }
 type Focus = 'first' | 'last'
 
-const TOP = 'text-sm px-2 py-1 rounded hover:text-blue-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-600'
+const TOP = 'text-sm px-2 py-1 rounded hover:text-blue-600 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-blue-600'
 const CURRENT = 'text-blue-700 font-semibold bg-blue-50'
-const ENTRY = 'block w-full text-left whitespace-nowrap px-3 py-1.5 text-sm hover:bg-gray-100 focus:bg-gray-100 focus:outline-none'
+const ENTRY = 'block w-full text-left whitespace-nowrap px-3 py-1.5 text-sm hover:bg-gray-100 focus:bg-gray-100 focus:outline-hidden'
 
 // One menu button and its menu, after the WAI-ARIA menu button pattern: Enter,
 // Space or ArrowDown opens it on the first entry, ArrowUp on the last; the
@@ -96,7 +96,7 @@ function NavMenu({ menuKey, label, items, current, open, focus, align, onOpen, o
   }
 
   return (
-    <div ref={wrapper} className={`relative${align === 'right' ? ' ml-auto' : ''}`}>
+    <div ref={wrapper} className={align === 'right' ? 'relative ml-auto' : 'relative'}>
       <button
         ref={button}
         type="button"

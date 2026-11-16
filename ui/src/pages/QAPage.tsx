@@ -119,7 +119,7 @@ export default function QAPage() {
         onKeyDown={handleKeyDown}
         placeholder="Type your question… (Ctrl+Enter to submit)"
         rows={3}
-        className="w-full border rounded px-3 py-2 text-sm mb-3 resize-none focus:outline-none focus:ring-2 focus:ring-blue-300"
+        className="w-full border rounded px-3 py-2 text-sm mb-3 resize-none focus:outline-hidden focus:ring-2 focus:ring-blue-300"
       />
       <div className="flex items-center gap-4 mb-4">
         <button

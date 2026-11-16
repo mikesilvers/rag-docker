@@ -4,7 +4,7 @@ export default function SetupRequiredPage() {
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-8">
       <h1 className="text-3xl font-bold text-gray-800 mb-2">RAG Platform</h1>
-      <div className="bg-white border border-gray-200 rounded-xl p-6 shadow-sm w-full max-w-xl space-y-3">
+      <div className="bg-white border border-gray-200 rounded-xl p-6 shadow-xs w-full max-w-xl space-y-3">
         <h2 className="text-lg font-semibold text-gray-800">Not set up yet</h2>
         <p className="text-sm text-gray-600">
           No account exists. On the machine running the stack, create the first AI Engineer from the
