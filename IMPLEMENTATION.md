@@ -24249,9 +24249,10 @@ request comes from one address, so the harness waits for a slot instead of faili
 refuses with `429 LOGIN_RATE_LIMITED` is sent again every 6.5 s for up to 5 minutes, by
 `auth_setup.request` and `paced` (used by `auth_stack.py`'s `code`, `audit_stack.py` and
 `lan_stack.py`) and by `browser/lib.js`'s `login`; `browser/ui_criteria.js`'s §10.4 login through
-the login form is submitted once more after 6.5 s when the page shows nginx's refusal. The API's
-own `429 LOGIN_THROTTLED` and every other answer reach the check at once. Suites that log in often
-take longer for it.
+the login form is submitted once more after 6.5 s when the page shows nginx's refusal, printing a
+line when it retries. That check answers the form's first login itself with nginx's refusal, so the
+retry runs in every run (#598). The API's own `429 LOGIN_THROTTLED` and every other answer reach
+the check at once. Suites that log in often take longer for it.
 
 `require_stack` then logs `vfy-engineer` in, into the curl cookie jar
 `$RAG_AUTH_DIR/engineer.jar` (0600), exported as `RAG_AUTH_JAR`. `lib.sh` defines `curl` as a
@@ -25122,7 +25123,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `18_lan.sh` | §2.5 and §10.5 — LAN mode (#26): the real override resolved without starting it; registers `../tests/test_lan_mode.py`; with `stack.sh run --lan`, the running LAN project on loopback |
 | `lan_config.py` | host-side, standard library: `docker-compose.lan.yml` as `docker compose config` resolves it, at the default port and `RAG_LAN_PORT=8443` (#26) |
 | `lan_stack.py` | the stack checks of `18_lan.sh` in a `--lan` run, one per subcommand (#26) |
-| `../tests/test_lan_mode.py` | API image, no network: `RAG_LAN_MODE` parsing, the startup refusal (also through `import main`), the certificate step, both nginx configurations, embedded copies (#26) |
+| `../tests/test_lan_mode.py` | API image, no network: `RAG_LAN_MODE` parsing, the startup refusal (also through `import main`), the certificate step, both nginx configurations, `lan_stack.py`'s rate-limit check against faked answers (#598), embedded copies (#26) |
 | `docker-compose.lan.verify.yml` | the harness overlay of a `--lan` run: TLS on loopback at the verify port, the verify image for `tls-init`, reserved test names (#26) |
 | `16_api_paths.sh` | ingest, query, metrics and health API paths (#399), run last by suite 01: `NO_SUPPORTED_FILES`, `JOB_NOT_FOUND`, schema rules, the proxy's `/api/` timeouts, `/metrics/latency`, a default query and its metric (LLM); opt-in restart and first-start checks |
 | `../tests/test_api_paths.py` | controlled ingest error, `/query` default, §6 prompt, query metric, retrieval-config file, `/metrics/latency` and `/health` probe regressions (#399), registered by `16_api_paths.sh` |
@@ -30515,7 +30516,9 @@ Runs with the API's dependencies, in the built API image with no network
 Stores and certificate folders are temporary; nothing is started or published.
 """
 import ast
+import contextlib
 import datetime
+import importlib.util
 import io
 import json
 import os
@@ -31050,6 +31053,52 @@ class NginxTests(unittest.TestCase):
         message = "Too many login attempts. Wait a minute and try again."
         self.assertEqual(json.loads(body), {"error": {"code": "LOGIN_RATE_LIMITED", "message": message, "detail": None}})
         self.assertIn("default_type application/json;", directives(named[:named.index("\n}\n")]))
+
+
+# ── lan_stack.py's rate-limit check, against faked answers (#598) ─────────────
+
+class LanStackRateLimitTests(unittest.TestCase):
+    """On the stack the check's assertions can't be broken on their own: changing nginx's answer also stops the
+    harness's paced setup login. Here `request()` is faked, so each way the check fails is shown."""
+
+    @classmethod
+    def setUpClass(cls):
+        saved = list(sys.path)                         # lan_stack.py puts its own folder first on sys.path
+        try:
+            spec = importlib.util.spec_from_file_location("lan_stack", ROOT / "scripts" / "verify" / "lan_stack.py")
+            cls.lan_stack = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(cls.lan_stack)
+        finally:
+            sys.path[:] = saved
+
+    def run_check(self, answers):
+        """(exit status, stderr, logins sent) of `lan_stack.py rate-limit` with `answers` as the logins' answers."""
+        answers, sent = list(answers), []
+
+        def fake_request(*args, **kwargs):
+            sent.append(args)
+            status, body = answers.pop(0)
+            return status, body, []
+        err = io.StringIO()
+        with patch.object(self.lan_stack, "request", fake_request), \
+                patch.dict(os.environ, {"RAG_VERIFY_PORT": "8443"}), contextlib.redirect_stderr(err):
+            status = self.lan_stack.main(["rate-limit"])
+        return status, err.getvalue(), len(sent)
+
+    def test_a_429_with_another_code_fails(self):
+        status, err, sent = self.run_check([(429, {"error": {"code": "LOGIN_THROTTLED"}})])
+        self.assertEqual((status, sent), (1, 1))
+        self.assertIn("not nginx's", err)
+
+    def test_twelve_logins_let_through_fail(self):
+        status, err, sent = self.run_check([(401, {"error": {"code": "LOGIN_FAILED"}})] * 12)
+        self.assertEqual((status, sent), (1, 12))
+        self.assertIn("12 logins in a row were all let through", err)
+
+    def test_nginx_refusal_passes(self):
+        status, err, sent = self.run_check([(401, {"error": {"code": "LOGIN_FAILED"}})] * 2
+                                           + [(429, {"error": {"code": "LOGIN_RATE_LIMITED"}})])
+        self.assertEqual((status, err, sent), (0, "", 3))
 
 
 # ── embedded copies ──────────────────────────────────────────────────────────
@@ -41729,6 +41778,22 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
   r.section('§10.4 login and session');
   {
     const s = await session(browser, BASE, null);
+    // The retry below is forced (#598): this context's first login is answered here with nginx's own refusal
+    // (proxy/locations.conf, @login_rate_limited). It never reaches nginx, so it uses no slot; the second goes through.
+    let stubbed = 0, retried = false;
+    const stubFirstLogin = async request => {
+      try {
+        if (stubbed === 0 && request.method() === 'POST' && new URL(request.url()).pathname === '/api/auth/login') {
+          stubbed = 1;
+          await request.respond({ status: 429, contentType: 'application/json',
+            body: JSON.stringify({ error: { code: 'LOGIN_RATE_LIMITED', message: LOGIN_RATE_LIMITED, detail: null } }) });
+        } else {
+          await request.continue();
+        }
+      } catch { /* seen while interception is switched off below */ }
+    };
+    await s.page.setRequestInterception(true);
+    s.page.on('request', stubFirstLogin);
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' });
     r.check('logged out, the UI shows the login page', /Log in to continue/.test(await bodyText(s.page)) && new URL(s.page.url()).pathname === '/login');
     const { username, password } = credentialsFor('engineer');
@@ -41742,11 +41807,18 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     await submit();
     // nginx allows 10 logins a minute per address, a burst of 5 (#577), and refills a slot every 6 s:
     // a form login it refuses is submitted once more after 6.5 s, as browser/lib.js's login waits.
+    // The first answer is this check's own refusal (above), so this branch runs every time (#598).
     if (await s.page.evaluate(() => document.querySelector('p[role=alert]')?.textContent.trim()) === LOGIN_RATE_LIMITED) {
+      retried = true;
+      console.log("    the login form showed nginx's rate-limit message: submitting it once more after 6.5 s");
       await sleep(6500);
       await submit();
     }
     await s.page.waitForFunction(() => location.pathname === '/qa' && document.querySelectorAll('nav a').length > 0, { timeout: 10000 }).catch(() => {});
+    await s.page.setRequestInterception(false);
+    s.page.off('request', stubFirstLogin);
+    r.check("the form login's retry on nginx's rate-limit message ran (this check answered its first login 429)",
+      stubbed === 1 && retried, `stubbed=${stubbed} retried=${retried}`);
     const badge = await s.page.evaluate(() => document.querySelector('nav button[data-menu=account] span.bg-blue-100')?.textContent.trim());
     r.check('logging in through the form opens /qa as the account\'s role', badge === 'AI Engineer', String(badge));
     const cookies = await s.page.cookies();

@@ -961,7 +961,7 @@ class LoginCoalescingTests(AuditTestCase):
         self.now += 5
         self.failed_login("Nobody")
         self.now += 60
-        self.failed_login("Nobody")                                   # the closed window's count goes first
+        self.failed_login("Nobody")                           # the closed window's count goes first
         items = self.logins()
         self.assertEqual([r["details"].get("count") for r in items], [None, 1, None])
         self.assertEqual(len(audit._logins), 1)

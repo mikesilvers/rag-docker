@@ -1682,9 +1682,10 @@ holds its own `audit.view` or `audit.download`. A refusal by the authentication 
 is a 403 for an identified principal (`FORBIDDEN`, `KEY_NOT_ALLOWED`, `CROSS_ORIGIN_REFUSED`,
 `PASSWORD_CHANGE_REQUIRED`); `401 AUTH_REQUIRED`, `401 KEY_INVALID` and `503 SETUP_REQUIRED` write nothing. A
 failed or throttled login has actor `null`, kind `anonymous` and the typed username as `target`. Repeated ones are
-counted (#577): a failure is written at once and opens a 60-second window for its key (the typed username
-lowercased, the client address and the status, 401 or 429); further failures with that key in the window aren't
-written; when it closes, one more record with the first one's fields carries `details.count` (how many) and
+counted (#577): a failure is written at once and, once that record is written, opens a 60-second window for its
+key (the typed username lowercased, the client address and the status, 401 or 429); a failure whose record wasn't
+written opens none, so the key's next failure is written too (#598). Further failures with that key in the window
+aren't written; when it closes, one more record with the first one's fields carries `details.count` (how many) and
 `details.last_attempt` (the last one's time, as `time`). The API writes closed windows within about a second and
 open ones at shutdown; a kill loses the open counts. At most 1,000 windows are open; past that, failures are
 written one by one. A job (ingest,
@@ -4233,7 +4234,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   start-record`, `sessions`, `query`, `jobs`, `refused` and `admin` on the running stack (suite 19).*
 - [x] Logins beyond 10 a minute per address (burst 5) are refused by nginx with 429 `LOGIN_RATE_LIMITED`, and the
   refusal isn't recorded.
-  *Evidence: `auth_stack.py` login-rate-limit (suite 17); `test_lan_mode.py` `NginxTests`.*
+  *Evidence: `auth_stack.py` login-rate-limit (suite 17); `lan_stack.py rate-limit` over HTTPS (suite 18, `--lan`);
+  `browser/ui_criteria.js` "login rate limit on the login page (#577)" (suite 06); `test_lan_mode.py` `NginxTests`.*
 - [x] Repeated failed logins for one key within 60 s write one record, then one record with `details.count`. Open
   counts are written at shutdown, and at most 1,000 windows are tracked.
   *Evidence: `test_audit.py` `LoginCoalescingTests`; `audit_stack.py` coalesced-logins (suite 19).*
