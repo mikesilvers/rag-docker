@@ -14,6 +14,12 @@ command deletes an account.
 A service principal (PR 3) is a `users` row with kind 'service': it shares the
 username rule and name pool with people, has no usable password and no
 session, and authenticates only with its API keys (`api_keys`, keys.py).
+
+Two-step verification (#607, schema 3): a user's sealed TOTP secret and last
+accepted step (`mfa`), a set-up not yet confirmed (`mfa_pending`), recovery
+codes as SHA-256 (`recovery_codes`), login challenges between the password and
+the code (`mfa_challenges`, token as SHA-256) and the "require for everyone"
+switch (`settings`). The codes and the sealing are in mfa.py.
 """
 from __future__ import annotations
 
@@ -29,7 +35,7 @@ from pathlib import Path
 
 from config import settings
 
-from . import keys, passwords
+from . import keys, mfa, passwords
 from .policy import ROLES
 
 COOKIE = "rag_session"
@@ -43,7 +49,11 @@ KEY_DAYS_DEFAULT = 90            # a key's lifetime when none is given (Q23) ...
 KEY_DAYS_MAX = 365               # ... and the longest allowed
 _DAY_S = 86400
 NO_PASSWORD = "!"                # a principal's password hash: never verifies
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+MFA_PENDING_S = 10 * 60          # a started set-up must be confirmed within 10 minutes
+MFA_CHALLENGE_S = 5 * 60         # the code must follow the password within 5 minutes ...
+MFA_CHALLENGE_TRIES = 5          # ... with at most 5 codes per challenge
+MFA_COOKIE = "rag_mfa"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -86,6 +96,35 @@ CREATE TABLE IF NOT EXISTS api_keys (
     last_used REAL
 );
 CREATE INDEX IF NOT EXISTS api_keys_user ON api_keys(user_id);
+CREATE TABLE IF NOT EXISTS mfa (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id),
+    secret TEXT NOT NULL,
+    last_step INTEGER NOT NULL,
+    enrolled_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mfa_pending (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id),
+    secret TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS recovery_codes (
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    code_hash TEXT NOT NULL,
+    used_at REAL
+);
+CREATE INDEX IF NOT EXISTS recovery_codes_user ON recovery_codes(user_id);
+CREATE TABLE IF NOT EXISTS mfa_challenges (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    login_key TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS mfa_challenges_user ON mfa_challenges(user_id);
+CREATE TABLE IF NOT EXISTS settings (
+    name TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 _ready: set[str] = set()
@@ -96,7 +135,9 @@ class Refused(Exception):
     """An account change the rules don't allow; the message says why, in one line.
     `code` names the reason for the API: USER_EXISTS, USER_NOT_FOUND,
     LAST_ENGINEER, PRINCIPAL_EXISTS, PRINCIPAL_NOT_FOUND, KEY_NOT_FOUND,
-    NOT_A_USER, or REFUSED for the bootstrap rules."""
+    NOT_A_USER, REFUSED for the bootstrap rules, or one of the MFA codes
+    (MFA_ALREADY_ENROLLED, MFA_ENROLLMENT_NOT_STARTED, MFA_CODE_INCORRECT,
+    MFA_NOT_ENROLLED, MFA_REQUIRED, MFA_ENROLL_FIRST)."""
 
     def __init__(self, message: str, code: str = "REFUSED"):
         super().__init__(message)
@@ -112,6 +153,8 @@ class Principal:
     token_hash: str              # the session's; "" for a key
     kind: str = "user"           # "service" when authenticated by a key
     key_id: str | None = None
+    mfa_enrolled: bool = False
+    mfa_due: bool = False        # MFA is required for everyone and this user hasn't enrolled (#607)
 
 
 @dataclass(frozen=True)
@@ -124,6 +167,7 @@ class User:
     must_change_password: bool
     created_at: float
     kind: str = "user"
+    mfa_enrolled: bool = False
 
 
 @dataclass(frozen=True)
@@ -194,8 +238,9 @@ def _connect(write: bool = False):
 
 
 def _migrate(conn) -> None:
-    """Version 2 (PR 3): users.kind. In a write transaction, so the API and the
-    operator command can't both add the column."""
+    """Version 2 (PR 3): users.kind. Version 3 (#607) only adds tables, which
+    _SCHEMA creates. In a write transaction, so the API and the operator
+    command can't both add the column."""
     conn.execute("BEGIN IMMEDIATE")
     columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
     if "kind" not in columns:
@@ -208,7 +253,12 @@ def _user(row) -> User | None:
     if row is None:
         return None
     return User(row["id"], row["username"], row["role"], row["password_hash"],
-                bool(row["enabled"]), bool(row["must_change_password"]), row["created_at"], row["kind"])
+                bool(row["enabled"]), bool(row["must_change_password"]), row["created_at"], row["kind"],
+                bool(row["mfa_enrolled"]))
+
+
+# Every users query that builds a User selects through this, so the MFA state comes along.
+_USERS = "SELECT u.*, (m.user_id IS NOT NULL) AS mfa_enrolled FROM users u LEFT JOIN mfa m ON m.user_id = u.id"
 
 
 def _token_hash(token: str) -> str:
@@ -241,16 +291,16 @@ def has_enabled_engineer() -> bool:
 
 def get_user(username: str) -> User | None:
     with _connect() as conn:
-        return _user(conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone())
+        return _user(conn.execute(_USERS + " WHERE u.username = ?", (username,)).fetchone())
 
 
 def list_users(kind: str | None = "user") -> list[User]:
     """Human accounts by default; kind=None lists principals too (the operator's `list`)."""
     with _connect() as conn:
         if kind is None:
-            rows = conn.execute("SELECT * FROM users ORDER BY username")
+            rows = conn.execute(_USERS + " ORDER BY u.username")
         else:
-            rows = conn.execute("SELECT * FROM users WHERE kind = ? ORDER BY username", (kind,))
+            rows = conn.execute(_USERS + " WHERE u.kind = ? ORDER BY u.username", (kind,))
         return [_user(row) for row in rows]
 
 
@@ -277,7 +327,7 @@ def create_user(username: str, role: str, password: str, *, bootstrap: bool = Fa
         conn.execute("INSERT INTO users (username, role, password_hash, enabled, must_change_password, "
                      "created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?)",
                      (username, role, password_hash, int(must_change_password), now, now))
-        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        row = conn.execute(_USERS + " WHERE u.username = ?", (username,)).fetchone()
     return _user(row)
 
 
@@ -448,8 +498,10 @@ def authenticate(token: str | None) -> Principal | None:
     now = _now()
     with _connect() as conn:
         row = conn.execute(
-            "SELECT s.created_at, s.last_seen, u.id, u.username, u.role, u.enabled, u.must_change_password "
-            "FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?", (digest,)).fetchone()
+            "SELECT s.created_at, s.last_seen, u.id, u.username, u.role, u.enabled, u.must_change_password, "
+            "(m.user_id IS NOT NULL) AS mfa_enrolled FROM sessions s JOIN users u ON u.id = s.user_id "
+            "LEFT JOIN mfa m ON m.user_id = u.id WHERE s.token_hash = ?", (digest,)).fetchone()
+        required = _mfa_required(conn) if row is not None else False
     if row is None:
         return None
     if now - row["last_seen"] > IDLE_S or now - row["created_at"] > ABSOLUTE_S or not row["enabled"]:
@@ -458,7 +510,9 @@ def authenticate(token: str | None) -> Principal | None:
     if now - row["last_seen"] > _TOUCH_S:
         with _connect(write=True) as conn:
             conn.execute("UPDATE sessions SET last_seen = ? WHERE token_hash = ?", (now, digest))
-    return Principal(row["id"], row["username"], row["role"], bool(row["must_change_password"]), digest)
+    enrolled = bool(row["mfa_enrolled"])
+    return Principal(row["id"], row["username"], row["role"], bool(row["must_change_password"]), digest,
+                     mfa_enrolled=enrolled, mfa_due=required and not enrolled)
 
 
 def delete_session(token_hash: str) -> None:
@@ -515,3 +569,236 @@ def finish_attempt(username: str, address: str, succeeded: bool) -> bool:
                      (username, address, now + LOCKOUT_S))
         conn.execute("DELETE FROM login_failures WHERE username = ? AND address = ?", (username, address))
     return True
+
+
+def release_attempt(username: str, address: str) -> None:
+    """Withdraw a reserved attempt that wasn't a failure without clearing the
+    pair's count: a right password for an enrolled user (#607), whose earlier
+    failures stay counted until the second factor passes."""
+    with _connect(write=True) as conn:
+        conn.execute("DELETE FROM login_failures WHERE rowid = (SELECT MAX(rowid) FROM login_failures "
+                     "WHERE username = ? AND address = ?)", (username, address))
+
+
+# ── two-step verification (#607) ─────────────────────────────────────────────
+
+def _mfa_required(conn) -> bool:
+    return conn.execute("SELECT 1 FROM settings WHERE name = 'mfa_required' AND value = '1'").fetchone() is not None
+
+
+def mfa_required() -> bool:
+    """The "require two-step verification for everyone" switch."""
+    with _connect() as conn:
+        return _mfa_required(conn)
+
+
+def set_mfa_required(user_id: int, required: bool) -> None:
+    """Set the switch. Turning it on needs the engineer turning it on to be
+    enrolled, so nobody switches on a gate they couldn't pass themselves."""
+    with _connect(write=True) as conn:
+        if required:
+            if conn.execute("SELECT 1 FROM mfa WHERE user_id = ?", (user_id,)).fetchone() is None:
+                raise Refused("set up two-step verification for your own account first", "MFA_ENROLL_FIRST")
+            conn.execute("INSERT OR REPLACE INTO settings (name, value) VALUES ('mfa_required', '1')")
+        else:
+            conn.execute("DELETE FROM settings WHERE name = 'mfa_required'")
+
+
+def _status(conn, user_id: int) -> dict:
+    row = conn.execute("SELECT enrolled_at FROM mfa WHERE user_id = ?", (user_id,)).fetchone()
+    remaining = conn.execute("SELECT COUNT(*) FROM recovery_codes WHERE user_id = ? AND used_at IS NULL",
+                             (user_id,)).fetchone()[0]
+    return {"enrolled": row is not None, "enrolled_at": row["enrolled_at"] if row else None,
+            "required": _mfa_required(conn), "recovery_codes_remaining": remaining if row else 0}
+
+
+def mfa_status(user_id: int) -> dict:
+    """{"enrolled", "enrolled_at" (epoch or None), "required", "recovery_codes_remaining"}."""
+    with _connect() as conn:
+        return _status(conn, user_id)
+
+
+def start_enrollment(user_id: int, username: str) -> tuple[str, str]:
+    """A new pending secret (replacing an earlier one); returns it and its
+    otpauth URI. The secret is stored sealed; this answer is the only copy."""
+    secret = mfa.new_secret()
+    sealed = mfa.seal(user_id, secret)
+    with _connect(write=True) as conn:
+        if conn.execute("SELECT 1 FROM mfa WHERE user_id = ?", (user_id,)).fetchone():
+            raise Refused("two-step verification is already set up", "MFA_ALREADY_ENROLLED")
+        conn.execute("INSERT OR REPLACE INTO mfa_pending (user_id, secret, created_at) VALUES (?, ?, ?)",
+                     (user_id, sealed, _now()))
+    return secret, mfa.otpauth_uri(username, secret)
+
+
+def _new_codes(conn, user_id: int) -> list[str]:
+    codes = mfa.new_recovery_codes()
+    conn.execute("DELETE FROM recovery_codes WHERE user_id = ?", (user_id,))
+    conn.executemany("INSERT INTO recovery_codes (user_id, code_hash) VALUES (?, ?)",
+                     [(user_id, mfa.recovery_hash(code)) for code in codes])
+    return codes
+
+
+def confirm_enrollment(principal: Principal, code: str) -> list[str]:
+    """Confirm the pending set-up with a code from the app: the secret becomes
+    the user's, a recovery-code set is made, and every other session of the
+    user ends (it was opened with the password alone). Returns the codes."""
+    now = _now()
+    with _connect(write=True) as conn:
+        if conn.execute("SELECT 1 FROM mfa WHERE user_id = ?", (principal.user_id,)).fetchone():
+            raise Refused("two-step verification is already set up", "MFA_ALREADY_ENROLLED")
+        row = conn.execute("SELECT secret, created_at FROM mfa_pending WHERE user_id = ?",
+                           (principal.user_id,)).fetchone()
+        if row is None or now - row["created_at"] > MFA_PENDING_S:
+            raise Refused("no set-up is in progress; start it again", "MFA_ENROLLMENT_NOT_STARTED")
+        secret = mfa.unseal(principal.user_id, row["secret"])
+        step = mfa.matching_step(secret, code, now, -1) if secret else None
+        if step is None:
+            raise Refused("the code is incorrect", "MFA_CODE_INCORRECT")
+        conn.execute("INSERT INTO mfa (user_id, secret, last_step, enrolled_at) VALUES (?, ?, ?, ?)",
+                     (principal.user_id, row["secret"], step, now))
+        conn.execute("DELETE FROM mfa_pending WHERE user_id = ?", (principal.user_id,))
+        codes = _new_codes(conn, principal.user_id)
+        conn.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?",
+                     (principal.user_id, principal.token_hash))
+    return codes
+
+
+def _verify_factor(conn, user_id: int, code: str, allow_recovery: bool) -> str | None:
+    """Inside the caller's write transaction: "totp" or "recovery" when `code`
+    is a valid second factor of the user (and spends it), else None. A TOTP
+    code's step becomes the last accepted one; a recovery code is marked used."""
+    now = _now()
+    if mfa.is_totp(code):
+        row = conn.execute("SELECT secret, last_step FROM mfa WHERE user_id = ?", (user_id,)).fetchone()
+        secret = mfa.unseal(user_id, row["secret"]) if row else None
+        step = mfa.matching_step(secret, code, now, row["last_step"]) if secret else None
+        if step is None:
+            return None
+        conn.execute("UPDATE mfa SET last_step = ? WHERE user_id = ?", (step, user_id))
+        return "totp"
+    if not allow_recovery:
+        return None
+    digest = mfa.recovery_hash(code)
+    if digest is None:
+        return None
+    found = conn.execute("SELECT rowid FROM recovery_codes WHERE user_id = ? AND code_hash = ? AND used_at IS NULL",
+                         (user_id, digest)).fetchone()
+    if found is None:
+        return None
+    conn.execute("UPDATE recovery_codes SET used_at = ? WHERE rowid = ?", (now, found[0]))
+    return "recovery"
+
+
+def factor_method(code: str) -> str:
+    """How a typed code is checked: "totp" for 6 digits, else "recovery"."""
+    return "totp" if mfa.is_totp(code) else "recovery"
+
+
+def create_challenge(user_id: int, login_key: str) -> str:
+    """A login challenge after a right password; returns the token for the
+    `rag_mfa` cookie, of which only the SHA-256 is stored. The user's earlier
+    challenges and every expired one are deleted."""
+    token = secrets.token_urlsafe(32)
+    now = _now()
+    with _connect(write=True) as conn:
+        conn.execute("DELETE FROM mfa_challenges WHERE user_id = ? OR created_at < ?",
+                     (user_id, now - MFA_CHALLENGE_S))
+        conn.execute("INSERT INTO mfa_challenges (token_hash, user_id, login_key, created_at, attempts) "
+                     "VALUES (?, ?, ?, ?, 0)", (_token_hash(token), user_id, login_key, now))
+    return token
+
+
+def _live_challenge(conn, token: str | None):
+    if not token or len(token) > 256:
+        return None
+    row = conn.execute(
+        "SELECT c.token_hash, c.user_id, c.login_key, c.created_at, c.attempts, u.username, u.role, u.enabled, "
+        "u.kind, (m.user_id IS NOT NULL) AS enrolled FROM mfa_challenges c JOIN users u ON u.id = c.user_id "
+        "LEFT JOIN mfa m ON m.user_id = u.id WHERE c.token_hash = ?", (_token_hash(token),)).fetchone()
+    if (row is None or _now() - row["created_at"] > MFA_CHALLENGE_S or row["attempts"] >= MFA_CHALLENGE_TRIES
+            or not row["enabled"] or not row["enrolled"] or row["kind"] != "user"):
+        return None
+    return row
+
+
+def challenge(token: str | None) -> tuple[str, str] | None:
+    """(username, login_key) of a live challenge, or None when it is missing,
+    expired, used up, or its user is disabled or no longer enrolled."""
+    with _connect() as conn:
+        row = _live_challenge(conn, token)
+    return None if row is None else (row["username"], row["login_key"])
+
+
+def answer_challenge(token: str | None, code: str) -> tuple[str, User | None, str | None]:
+    """Check a second factor against a challenge, in one write transaction:
+    ("ok", user, method) deletes the challenge; ("failed", user, method) counts
+    an attempt and deletes the challenge at the fifth; ("invalid", None, None)
+    when the challenge isn't live (any more)."""
+    with _connect(write=True) as conn:
+        row = _live_challenge(conn, token)
+        if row is None:
+            return "invalid", None, None
+        method = _verify_factor(conn, row["user_id"], code, allow_recovery=True)
+        if method is None:
+            conn.execute("UPDATE mfa_challenges SET attempts = attempts + 1 WHERE token_hash = ?", (row["token_hash"],))
+            conn.execute("DELETE FROM mfa_challenges WHERE token_hash = ? AND attempts >= ?",
+                         (row["token_hash"], MFA_CHALLENGE_TRIES))
+            outcome = "failed"
+        else:
+            conn.execute("DELETE FROM mfa_challenges WHERE token_hash = ?", (row["token_hash"],))
+            outcome = "ok"
+        user = _user(conn.execute(_USERS + " WHERE u.id = ?", (row["user_id"],)).fetchone())
+    return outcome, user, method or factor_method(code)
+
+
+def regenerate_codes(principal: Principal, code: str) -> list[str] | None:
+    """A new recovery-code set, replacing the old one, for a current TOTP code
+    (a recovery code doesn't count). None when the code is wrong."""
+    with _connect(write=True) as conn:
+        if conn.execute("SELECT 1 FROM mfa WHERE user_id = ?", (principal.user_id,)).fetchone() is None:
+            raise Refused("two-step verification isn't set up", "MFA_NOT_ENROLLED")
+        if _verify_factor(conn, principal.user_id, code, allow_recovery=False) is None:
+            return None
+        return _new_codes(conn, principal.user_id)
+
+
+def disable_mfa(principal: Principal, password: str, code: str) -> bool:
+    """The user's own turn-off, only while MFA isn't required: needs the
+    current password and a TOTP or recovery code. False when either is wrong.
+    Sessions stay."""
+    with _connect() as conn:
+        if _mfa_required(conn):
+            raise Refused("two-step verification is required for everyone", "MFA_REQUIRED")
+        row = conn.execute("SELECT password_hash FROM users WHERE id = ?", (principal.user_id,)).fetchone()
+        if conn.execute("SELECT 1 FROM mfa WHERE user_id = ?", (principal.user_id,)).fetchone() is None:
+            raise Refused("two-step verification isn't set up", "MFA_NOT_ENROLLED")
+    # scrypt outside the write lock, as a login does.
+    right_password = row is not None and passwords.verify_password(password, row["password_hash"])
+    with _connect(write=True) as conn:
+        if _mfa_required(conn):
+            raise Refused("two-step verification is required for everyone", "MFA_REQUIRED")
+        if not right_password:
+            return False
+        if _verify_factor(conn, principal.user_id, code, allow_recovery=True) is None:
+            return False
+        _forget_mfa(conn, principal.user_id)
+    return True
+
+
+def _forget_mfa(conn, user_id: int) -> None:
+    for table in ("mfa", "mfa_pending", "recovery_codes", "mfa_challenges"):
+        conn.execute(f"DELETE FROM {table} WHERE user_id = ?", (user_id,))
+
+
+def reset_mfa(username: str, kind: str | None = None) -> None:
+    """An engineer's or the operator's reset: the user's secret, pending set-up,
+    recovery codes and challenges are deleted and every session of theirs ends.
+    Their next login asks for no code (and for a set-up, while MFA is required).
+    A service principal has no second factor, so it is refused."""
+    with _connect(write=True) as conn:
+        row = _existing(conn, username, kind)
+        if row["kind"] != "user":
+            raise Refused(f"{username!r} is a service principal; it has no two-step verification", "NOT_A_USER")
+        _forget_mfa(conn, row["id"])
+        conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
