@@ -9,8 +9,9 @@ standard pair and one query through the services' own code, recording the model
 Ollama reports in each /api/chat reply (the calls themselves are unchanged).
 Preparation writes its parts to a temporary folder and the pair isn't stored,
 so nothing is left behind; the build model is deleted from Ollama at the end.
-Prints one JSON line: the resolved models and, per task, the sorted set of
-models that answered (Ollama's names, `name:tag`).
+Prints one JSON line: the resolved models (as set, and as `name:tag`) and, per
+task, the sorted set of models that answered (Ollama's names, `name:tag`) and,
+when the task raised, `<task>_error`.
 """
 import asyncio
 import json
@@ -36,7 +37,10 @@ def tagged(model):
     return model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
 
 
-out = {"build_model": settings.build_model, "answer_model": settings.answer_model}
+out = {"build_model": settings.build_model, "answer_model": settings.answer_model,
+       # As Ollama names the model in a reply, so the suite compares like with like.
+       "build_tagged": tagged(settings.build_model),
+       "answer_tagged": tagged(settings.answer_model)}
 build = settings.build_model
 
 # The build model, pulled into the verify project's Ollama (removed below).

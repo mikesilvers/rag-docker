@@ -312,6 +312,31 @@ class OfflinePackageTests(Workspace):
         check = [c for c in self.calls() if c[0] == "run"][0]
         self.assertEqual(check[-len(models) - 1:], ["sh"] + models)
 
+    def test_the_model_check_finds_library_and_namespaced_models(self):
+        # The check's own script, run against a model store with one library and one
+        # namespaced model (#671): a namespaced name isn't under library/.
+        result, _out, _files = self.build({}, STUB_BUILD_LLM_MODEL="someone/assistant")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        check = [c for c in self.calls() if c[0] == "run"][0]
+        # The script as package-offline.sh writes it (the stub's log quotes newlines).
+        text = (ROOT / "package-offline.sh").read_text()
+        script = re.search(r"-c '(for m in .*?done)' sh \$MODELS", text, re.S).group(1)
+        store = self.temp / "store"
+        manifests = store / "models" / "manifests" / "registry.ollama.ai"
+        for path in ("library/llama3.1/8b", "library/nomic-embed-text/latest",
+                     "someone/assistant/latest"):
+            (manifests / path).parent.mkdir(parents=True, exist_ok=True)
+            (manifests / path).write_text("{}")
+        names = ["llama3.1:8b", "someone/assistant", "nomic-embed-text"]
+        self.assertEqual(check[-len(names):], names)
+        run = lambda *models: subprocess.run(
+            ["sh", "-c", script.replace("/models/", f"{store}/"), "sh", *models],
+            capture_output=True, text=True, timeout=60)
+        found = run(*names)
+        self.assertEqual((found.returncode, found.stdout), (0, ""), found.stderr)
+        missing = run("someone/other", "library-less:1", "llama3.1:8b")
+        self.assertEqual(missing.stdout.split(), ["someone/other", "library-less:1"])
+
     def test_unreadable_model_settings_stop_before_anything_is_saved(self):
         result, out, _files = self.build({}, STUB_BUILD_LLM_MODEL="bad name")
         self.assertEqual(result.returncode, 1)

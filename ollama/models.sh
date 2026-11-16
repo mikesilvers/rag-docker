@@ -25,6 +25,18 @@ ANSWER_MODEL="${ANSWER_LLM_MODEL:-$_llm}"
 BUILD_MODEL="${BUILD_LLM_MODEL:-$_llm}"
 EMBED_MODEL_NAME=nomic-embed-text
 
+# A model name is letters, digits and . _ : / - only, as compose-models.sh
+# requires on the host: the names are word-split below, so a space or a glob
+# character must stop here, not be split or expanded.
+for _name in "${ANSWER_MODEL}" "${BUILD_MODEL}"; do
+    case "${_name}" in
+        *[!A-Za-z0-9._:/-]*)
+            echo "models.sh: not a model name: '${_name}'" >&2
+            # Sourced, return to the caller; run, exit.
+            return 2 2>/dev/null || exit 2 ;;
+    esac
+done
+
 # `name:tag`, with `:latest` for a name without a tag (after its last `/`), so
 # `x` and `x:latest` are one model, as the API compares them.
 tagged() {

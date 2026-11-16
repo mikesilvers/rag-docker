@@ -472,6 +472,18 @@ ANSWER_MODEL="${ANSWER_LLM_MODEL:-$_llm}"
 BUILD_MODEL="${BUILD_LLM_MODEL:-$_llm}"
 EMBED_MODEL_NAME=nomic-embed-text
 
+# A model name is letters, digits and . _ : / - only, as compose-models.sh
+# requires on the host: the names are word-split below, so a space or a glob
+# character must stop here, not be split or expanded.
+for _name in "${ANSWER_MODEL}" "${BUILD_MODEL}"; do
+    case "${_name}" in
+        *[!A-Za-z0-9._:/-]*)
+            echo "models.sh: not a model name: '${_name}'" >&2
+            # Sourced, return to the caller; run, exit.
+            return 2 2>/dev/null || exit 2 ;;
+    esac
+done
+
 # `name:tag`, with `:latest` for a name without a tag (after its last `/`), so
 # `x` and `x:latest` are one model, as the API compares them.
 tagged() {
@@ -29854,9 +29866,17 @@ check_eq "with BUILD_LLM_MODEL set, the API resolves it as the build model" "$(f
 answer="$(f answer_model)"
 [ -n "$answer" ] && [ "$answer" != "None" ] && [ "$answer" != "$SMALL" ]
 check "the answer model stays as compose sets it" $? "got '$answer'"
-check_eq "preparation's LLM calls were answered by the build model only" "$(f prepare)" "['$SMALL']"
-check_eq "gold standard generation's LLM calls were answered by the build model only" "$(f goldstandard)" "['$SMALL']"
-check_eq "query's LLM calls were answered by the answer model only" "$(f query)" "['$answer']"
+# Ollama names a model `name:tag`, so compare with the tagged names. A task that
+# raised still counts the calls it made; its error is shown with the check.
+build_tagged="$(f build_tagged)"; answer_tagged="$(f answer_tagged)"
+models_check() {   # models_check <name> <task> <want>
+  local got; got="$(f "$2")"
+  [ "$got" = "['$3']" ]
+  check "$1" $? "got '$got', wanted '['$3']'; error: $(f "$2_error")"
+}
+models_check "preparation's LLM calls were answered by the build model only" prepare "$build_tagged"
+models_check "gold standard generation's LLM calls were answered by the build model only" goldstandard "$build_tagged"
+models_check "query's LLM calls were answered by the answer model only" query "$answer_tagged"
 
 drop_collection "$C"
 summary
@@ -29876,8 +29896,9 @@ standard pair and one query through the services' own code, recording the model
 Ollama reports in each /api/chat reply (the calls themselves are unchanged).
 Preparation writes its parts to a temporary folder and the pair isn't stored,
 so nothing is left behind; the build model is deleted from Ollama at the end.
-Prints one JSON line: the resolved models and, per task, the sorted set of
-models that answered (Ollama's names, `name:tag`).
+Prints one JSON line: the resolved models (as set, and as `name:tag`) and, per
+task, the sorted set of models that answered (Ollama's names, `name:tag`) and,
+when the task raised, `<task>_error`.
 """
 import asyncio
 import json
@@ -29903,7 +29924,10 @@ def tagged(model):
     return model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
 
 
-out = {"build_model": settings.build_model, "answer_model": settings.answer_model}
+out = {"build_model": settings.build_model, "answer_model": settings.answer_model,
+       # As Ollama names the model in a reply, so the suite compares like with like.
+       "build_tagged": tagged(settings.build_model),
+       "answer_tagged": tagged(settings.answer_model)}
 build = settings.build_model
 
 # The build model, pulled into the verify project's Ollama (removed below).
@@ -44647,7 +44671,8 @@ docker volume inspect "$MODELVOL" >/dev/null 2>&1 \
 # llama3.1:8b became the default holds only phi3.5). The names are the ones the
 # entrypoint resolves from the LLM settings compose gives the ollama service
 # (#671), read as the CI model cache reads them; a manifest without a tag is
-# under "latest".
+# under "latest". A library model is under library/<name>, a namespaced one
+# (`user/model`) under its own namespace.
 MODELS="$(bash ollama/compose-models.sh)" \
   || { echo "ERROR: could not read the model names (ollama/compose-models.sh)." >&2; exit 1; }
 MODELS="$(echo $MODELS)"   # one line, space-separated
@@ -44658,7 +44683,8 @@ MISSING="$(docker run --rm --network none --entrypoint sh \
   -c 'for m in "$@"; do
         n=${m%%:*}; t=latest
         case "$m" in *:*) t=${m#*:} ;; esac
-        [ -f "/models/models/manifests/registry.ollama.ai/library/$n/$t" ] || echo "$m"
+        case "$n" in */*) p=$n ;; *) p=library/$n ;; esac
+        [ -f "/models/models/manifests/registry.ollama.ai/$p/$t" ] || echo "$m"
       done' sh $MODELS)" \
   || { echo "ERROR: could not read the models in volume '$MODELVOL'." >&2; exit 1; }
 if [ -n "$MISSING" ]; then
@@ -58100,7 +58126,8 @@ docker volume inspect "$MODELVOL" >/dev/null 2>&1 \
 # llama3.1:8b became the default holds only phi3.5). The names are the ones the
 # entrypoint resolves from the LLM settings compose gives the ollama service
 # (#671), read as the CI model cache reads them; a manifest without a tag is
-# under "latest".
+# under "latest". A library model is under library/<name>, a namespaced one
+# (`user/model`) under its own namespace.
 MODELS="$(bash ollama/compose-models.sh)" \
   || { echo "ERROR: could not read the model names (ollama/compose-models.sh)." >&2; exit 1; }
 MODELS="$(echo $MODELS)"   # one line, space-separated
@@ -58111,7 +58138,8 @@ MISSING="$(docker run --rm --network none --entrypoint sh \
   -c 'for m in "$@"; do
         n=${m%%:*}; t=latest
         case "$m" in *:*) t=${m#*:} ;; esac
-        [ -f "/models/models/manifests/registry.ollama.ai/library/$n/$t" ] || echo "$m"
+        case "$n" in */*) p=$n ;; *) p=library/$n ;; esac
+        [ -f "/models/models/manifests/registry.ollama.ai/$p/$t" ] || echo "$m"
       done' sh $MODELS)" \
   || { echo "ERROR: could not read the models in volume '$MODELVOL'." >&2; exit 1; }
 if [ -n "$MISSING" ]; then

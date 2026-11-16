@@ -4348,6 +4348,40 @@ the documents and phrases read from the verify project's Weaviate (`ui_ingest_we
       *Evidence: `22_ui_ingest.sh`, one check per case and condition. Each check was shown to fail when its
       condition breaks, a job answer stubbed to fail among them, in a run of a changed copy of the suite.*
 
+### 10.10 Build and answer models (#671)
+
+The build LLM (`BUILD_LLM_MODEL`) prepares documents and writes gold standard pairs; the answer LLM
+(`ANSWER_LLM_MODEL`) answers questions; each falls back to `LLM_MODEL`, then `llama3.1:8b` (§6, §8). These
+are ticked once the tests reviewer's full `stack.sh run` on the change passes.
+
+- [ ] Each setting replaces `LLM_MODEL` for its task, an empty value counts as not set, and with neither set
+      both are `LLM_MODEL` (by default `llama3.1:8b`).
+      *Evidence: `scripts/tests/test_health.py` `ModelSettingsTests` (suite 01); `scripts/tests/test_ollama_entrypoint.py`
+      `ModelSettingsTests` for `ollama/models.sh` (run on the host by `16_api_paths.sh`, through suite 01).*
+- [ ] Preparation and gold standard generation call the build model, query the answer model: in a full run,
+      with `BUILD_LLM_MODEL=qwen2.5:0.5b` and the answer model as compose sets it, Ollama reports only
+      `qwen2.5:0.5b` answering preparation's and gold standard's calls and only the answer model answering
+      query's. Every other check runs on one model.
+      *Evidence: `scripts/verify/23_llm_split.sh` (full runs only); `test_prepare.py` (suite 21),
+      `test_goldstandard_api_paths.py` (suite 09, through 04) and `test_retrieval_controls.py` (suite 11).*
+- [ ] `/api/health` reports `llm` (the answer model), `build_llm` and `same_model`; a missing build or answer
+      model answers 503 `degraded`; `same_model` never affects the status. The Health page shows one LLM card
+      ("builds and answers") when `same_model` is true, otherwise an Answer LLM card and a Build LLM card, and
+      treats a body without `build_llm` as unreadable.
+      *Evidence: `scripts/tests/test_health.py` `TwoModelsTests` (suite 01); suite 01's real-stack check that
+      health reports `build_llm`, the same model as `llm`, with `same_model` true by default;
+      `browser/health_page.js` (suite 06).*
+- [ ] Ollama pulls each distinct model `ollama/models.sh` resolves, the answer model first, and its healthcheck
+      passes only when every one is listed by exact name; `package-offline.sh` and the CI model cache key read
+      the same names through `ollama/compose-models.sh`, so the default key is unchanged.
+      *Evidence: `test_ollama_entrypoint.py`, `test_distribution.py`, `test_ci_workflow.py` and
+      `test_collector.py` (suites 01 and 05); the stack's own start-up waits on that healthcheck.*
+- [ ] Packages record `answer_llm` and `build_llm` and keep `llm` as the answer model, at `package_format` 1;
+      `include_models` bundles the answer model, never the build model; import checks and installs only the
+      answer model (`RAG_EXPORT_SPECIFICATIONS.md` E42, E43).
+      *Evidence: `scripts/tests/test_retrieval_import.py` (suite 05) and `validate_package.py` on a real
+      export (suite 05).*
+
 ## 11. Host Requirements and Distribution
 
 ### 11.1 Host requirements

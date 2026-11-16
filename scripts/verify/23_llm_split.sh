@@ -42,9 +42,17 @@ check_eq "with BUILD_LLM_MODEL set, the API resolves it as the build model" "$(f
 answer="$(f answer_model)"
 [ -n "$answer" ] && [ "$answer" != "None" ] && [ "$answer" != "$SMALL" ]
 check "the answer model stays as compose sets it" $? "got '$answer'"
-check_eq "preparation's LLM calls were answered by the build model only" "$(f prepare)" "['$SMALL']"
-check_eq "gold standard generation's LLM calls were answered by the build model only" "$(f goldstandard)" "['$SMALL']"
-check_eq "query's LLM calls were answered by the answer model only" "$(f query)" "['$answer']"
+# Ollama names a model `name:tag`, so compare with the tagged names. A task that
+# raised still counts the calls it made; its error is shown with the check.
+build_tagged="$(f build_tagged)"; answer_tagged="$(f answer_tagged)"
+models_check() {   # models_check <name> <task> <want>
+  local got; got="$(f "$2")"
+  [ "$got" = "['$3']" ]
+  check "$1" $? "got '$got', wanted '['$3']'; error: $(f "$2_error")"
+}
+models_check "preparation's LLM calls were answered by the build model only" prepare "$build_tagged"
+models_check "gold standard generation's LLM calls were answered by the build model only" goldstandard "$build_tagged"
+models_check "query's LLM calls were answered by the answer model only" query "$answer_tagged"
 
 drop_collection "$C"
 summary
