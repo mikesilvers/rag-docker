@@ -11,7 +11,9 @@ Runs with the API's dependencies, in the built API image with no network
 Stores and certificate folders are temporary; nothing is started or published.
 """
 import ast
+import contextlib
 import datetime
+import importlib.util
 import io
 import json
 import os
@@ -546,6 +548,52 @@ class NginxTests(unittest.TestCase):
         message = "Too many login attempts. Wait a minute and try again."
         self.assertEqual(json.loads(body), {"error": {"code": "LOGIN_RATE_LIMITED", "message": message, "detail": None}})
         self.assertIn("default_type application/json;", directives(named[:named.index("\n}\n")]))
+
+
+# ── lan_stack.py's rate-limit check, against faked answers (#598) ─────────────
+
+class LanStackRateLimitTests(unittest.TestCase):
+    """On the stack the check's assertions can't be broken on their own: changing nginx's answer also stops the
+    harness's paced setup login. Here `request()` is faked, so each way the check fails is shown."""
+
+    @classmethod
+    def setUpClass(cls):
+        saved = list(sys.path)                         # lan_stack.py puts its own folder first on sys.path
+        try:
+            spec = importlib.util.spec_from_file_location("lan_stack", ROOT / "scripts" / "verify" / "lan_stack.py")
+            cls.lan_stack = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(cls.lan_stack)
+        finally:
+            sys.path[:] = saved
+
+    def run_check(self, answers):
+        """(exit status, stderr, logins sent) of `lan_stack.py rate-limit` with `answers` as the logins' answers."""
+        answers, sent = list(answers), []
+
+        def fake_request(*args, **kwargs):
+            sent.append(args)
+            status, body = answers.pop(0)
+            return status, body, []
+        err = io.StringIO()
+        with patch.object(self.lan_stack, "request", fake_request), \
+                patch.dict(os.environ, {"RAG_VERIFY_PORT": "8443"}), contextlib.redirect_stderr(err):
+            status = self.lan_stack.main(["rate-limit"])
+        return status, err.getvalue(), len(sent)
+
+    def test_a_429_with_another_code_fails(self):
+        status, err, sent = self.run_check([(429, {"error": {"code": "LOGIN_THROTTLED"}})])
+        self.assertEqual((status, sent), (1, 1))
+        self.assertIn("not nginx's", err)
+
+    def test_twelve_logins_let_through_fail(self):
+        status, err, sent = self.run_check([(401, {"error": {"code": "LOGIN_FAILED"}})] * 12)
+        self.assertEqual((status, sent), (1, 12))
+        self.assertIn("12 logins in a row were all let through", err)
+
+    def test_nginx_refusal_passes(self):
+        status, err, sent = self.run_check([(401, {"error": {"code": "LOGIN_FAILED"}})] * 2
+                                           + [(429, {"error": {"code": "LOGIN_RATE_LIMITED"}})])
+        self.assertEqual((status, err, sent), (0, "", 3))
 
 
 # ── embedded copies ──────────────────────────────────────────────────────────

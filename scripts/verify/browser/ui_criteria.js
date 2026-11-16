@@ -33,6 +33,22 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
   r.section('§10.4 login and session');
   {
     const s = await session(browser, BASE, null);
+    // The retry below is forced (#598): this context's first login is answered here with nginx's own refusal
+    // (proxy/locations.conf, @login_rate_limited). It never reaches nginx, so it uses no slot; the second goes through.
+    let stubbed = 0, retried = false;
+    const stubFirstLogin = async request => {
+      try {
+        if (stubbed === 0 && request.method() === 'POST' && new URL(request.url()).pathname === '/api/auth/login') {
+          stubbed = 1;
+          await request.respond({ status: 429, contentType: 'application/json',
+            body: JSON.stringify({ error: { code: 'LOGIN_RATE_LIMITED', message: LOGIN_RATE_LIMITED, detail: null } }) });
+        } else {
+          await request.continue();
+        }
+      } catch { /* seen while interception is switched off below */ }
+    };
+    await s.page.setRequestInterception(true);
+    s.page.on('request', stubFirstLogin);
     await s.page.goto(BASE + '/qa', { waitUntil: 'networkidle2' });
     r.check('logged out, the UI shows the login page', /Log in to continue/.test(await bodyText(s.page)) && new URL(s.page.url()).pathname === '/login');
     const { username, password } = credentialsFor('engineer');
@@ -46,11 +62,18 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     await submit();
     // nginx allows 10 logins a minute per address, a burst of 5 (#577), and refills a slot every 6 s:
     // a form login it refuses is submitted once more after 6.5 s, as browser/lib.js's login waits.
+    // The first answer is this check's own refusal (above), so this branch runs every time (#598).
     if (await s.page.evaluate(() => document.querySelector('p[role=alert]')?.textContent.trim()) === LOGIN_RATE_LIMITED) {
+      retried = true;
+      console.log("    the login form showed nginx's rate-limit message: submitting it once more after 6.5 s");
       await sleep(6500);
       await submit();
     }
     await s.page.waitForFunction(() => location.pathname === '/qa' && document.querySelectorAll('nav a').length > 0, { timeout: 10000 }).catch(() => {});
+    await s.page.setRequestInterception(false);
+    s.page.off('request', stubFirstLogin);
+    r.check("the form login's retry on nginx's rate-limit message ran (this check answered its first login 429)",
+      stubbed === 1 && retried, `stubbed=${stubbed} retried=${retried}`);
     const badge = await s.page.evaluate(() => document.querySelector('nav button[data-menu=account] span.bg-blue-100')?.textContent.trim());
     r.check('logging in through the form opens /qa as the account\'s role', badge === 'AI Engineer', String(badge));
     const cookies = await s.page.cookies();
