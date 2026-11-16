@@ -646,7 +646,7 @@ class AdminUserResult(BaseModel):
 
 
 class UserCreateRequest(BaseModel):
-    username: str = Field(max_length=256)
+    username: str   # no length cap: the route refuses any name breaking the rule as INVALID_USERNAME (#551)
     role: Literal["end_user", "developer", "engineer"]
 
 
@@ -683,7 +683,7 @@ class ServicePrincipalResult(BaseModel):
 
 
 class PrincipalCreateRequest(BaseModel):
-    name: str = Field(max_length=256)
+    name: str   # no length cap: the route refuses any name breaking the rule as INVALID_USERNAME (#551)
     role: Literal["end_user", "developer", "engineer"]
 
 
