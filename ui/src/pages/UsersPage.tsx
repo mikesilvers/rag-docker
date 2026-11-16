@@ -10,6 +10,9 @@ const ROLE_LABELS: Record<Role, string> = { end_user: 'End User', developer: 'De
 // password is changed on the Change password page, not reset here. Accounts are
 // disabled, never deleted. A generated password is shown once, from the answer
 // that carried it, and kept only in this page's memory until "Done".
+// Two-step verification (#607): each user's state, an Engineer's reset of
+// another user's set-up (which logs them out), and the switch that requires it
+// for everyone, which the API allows only once the Engineer has set it up.
 export default function UsersPage() {
   const { user: me, refresh } = useAuth()
   const [users, setUsers] = useState<AdminUser[]>([])
@@ -46,6 +49,19 @@ export default function UsersPage() {
       await load()
       return false
     } finally {
+      setBusy(false)
+    }
+  }
+
+  async function requireMfa(required: boolean) {
+    setActionError('')
+    setBusy(true)
+    try {
+      await api.setMfaRequired(required)
+    } catch (e: unknown) {
+      setActionError(e instanceof Error ? e.message : String(e))
+    } finally {
+      await refresh()
       setBusy(false)
     }
   }
@@ -92,6 +108,13 @@ export default function UsersPage() {
         </p>
       </form>
 
+      <label className="flex items-center gap-2 text-sm text-gray-700 mb-6">
+        <input id="mfa-required" type="checkbox" checked={!!me?.mfa_required} disabled={busy}
+          onChange={e => requireMfa(e.target.checked)} />
+        Require two-step verification for everyone
+        <span className="text-xs text-gray-500">(set it up for your own account first, on the Account page)</span>
+      </label>
+
       {actionError && <p role="alert" className="text-red-600 text-sm mb-4">{actionError}</p>}
 
       <table className="w-full text-sm border-collapse">
@@ -101,6 +124,7 @@ export default function UsersPage() {
             <th className="py-2 pr-4">Role</th>
             <th className="py-2 pr-4">Status</th>
             <th className="py-2 pr-4">Password</th>
+            <th className="py-2 pr-4">Two-step</th>
             <th className="py-2 pr-4">Created</th>
             <th className="py-2"></th>
           </tr>
@@ -120,6 +144,7 @@ export default function UsersPage() {
                 </td>
                 <td className="py-2 pr-4">{u.enabled ? 'Enabled' : 'Disabled'}</td>
                 <td className="py-2 pr-4">{u.must_change_password ? 'Change due' : 'Set'}</td>
+                <td className="py-2 pr-4">{u.mfa_enrolled ? 'On' : 'Off'}</td>
                 <td className="py-2 pr-4">{new Date(u.created_at).toLocaleDateString()}</td>
                 <td className="py-2 space-x-3 whitespace-nowrap">
                   {own
@@ -129,6 +154,10 @@ export default function UsersPage() {
                   <button disabled={busy}
                     onClick={() => act(u.username, () => u.enabled ? api.disableUser(u.username) : api.enableUser(u.username))}
                     className="text-blue-600 hover:underline disabled:opacity-50">{u.enabled ? 'Disable' : 'Enable'}</button>
+                  {u.mfa_enrolled && !own && (
+                    <button disabled={busy} onClick={() => act(u.username, () => api.resetUserMfa(u.username))}
+                      className="text-blue-600 hover:underline disabled:opacity-50">Reset two-step</button>
+                  )}
                 </td>
               </tr>
             )

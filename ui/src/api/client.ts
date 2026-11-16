@@ -26,10 +26,12 @@ export class ApiError extends Error {
   }
 }
 
-// The session ended (401 AUTH_REQUIRED) or a generated password must be changed
-// first (403 PASSWORD_CHANGE_REQUIRED), whichever call noticed it (#25). The
-// auth context listens and shows the login or password page.
-type AuthListener = (code: 'AUTH_REQUIRED' | 'PASSWORD_CHANGE_REQUIRED') => void
+// The session ended (401 AUTH_REQUIRED), a generated password must be changed
+// first (403 PASSWORD_CHANGE_REQUIRED), or two-step verification must be set
+// up first (403 MFA_ENROLLMENT_REQUIRED, #607), whichever call noticed it (#25).
+// The auth context listens and shows the login, password or account page.
+export type AuthProblem = 'AUTH_REQUIRED' | 'PASSWORD_CHANGE_REQUIRED' | 'MFA_ENROLLMENT_REQUIRED'
+type AuthListener = (code: AuthProblem) => void
 let authListener: AuthListener | null = null
 export function onAuthProblem(listener: AuthListener | null) { authListener = listener }
 
@@ -47,7 +49,9 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
   try { data = text ? JSON.parse(text) : null } catch { /* not JSON; handled below */ }
   if (!res.ok) {
     const code: string | null = typeof data?.error?.code === 'string' ? data.error.code : null
-    if (code === 'AUTH_REQUIRED' || code === 'PASSWORD_CHANGE_REQUIRED') authListener?.(code)
+    if (code === 'AUTH_REQUIRED' || code === 'PASSWORD_CHANGE_REQUIRED' || code === 'MFA_ENROLLMENT_REQUIRED') {
+      authListener?.(code)
+    }
     throw new ApiError(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`, res.status, code)
   }
   if (data === null && text) throw new Error('The server sent a response the UI could not read.')
@@ -90,7 +94,22 @@ export const api = {
   // sends with every same-origin request; the UI never sees or stores it.
   authStatus: () => request<{ setup_required: boolean }>('GET', '/auth/status'),
   me: () => request<AuthUser>('GET', '/auth/me'),
-  login: (username: string, password: string) => request<AuthUser>('POST', '/auth/login', { username, password }),
+  // For a user with two-step verification the password step answers
+  // {mfa_required: true} and sets a short-lived challenge cookie; loginMfa
+  // sends the code and opens the session (#607).
+  login: (username: string, password: string) =>
+    request<AuthUser | { mfa_required: true }>('POST', '/auth/login', { username, password }),
+  loginMfa: (code: string) => request<AuthUser>('POST', '/auth/login/mfa', { code }),
+  // The user's own two-step verification (#607). A secret or recovery codes are
+  // in one answer only; the Account page keeps them in memory until "Done".
+  mfaStatus: () => request<MfaStatus>('GET', '/auth/mfa'),
+  mfaEnroll: () => request<{ secret: string; otpauth_uri: string }>('POST', '/auth/mfa/enroll'),
+  mfaConfirm: (code: string) =>
+    request<{ recovery_codes: string[]; status: MfaStatus }>('POST', '/auth/mfa/enroll/confirm', { code }),
+  mfaRegenerate: (code: string) =>
+    request<{ recovery_codes: string[]; status: MfaStatus }>('POST', '/auth/mfa/recovery-codes', { code }),
+  mfaDisable: (password: string, code: string) =>
+    request<{ status: MfaStatus }>('POST', '/auth/mfa/disable', { password, code }),
   logout: () => request<{ status: string }>('POST', '/auth/logout'),
   changePassword: (current_password: string, new_password: string) =>
     request<{ status: string } & AuthUser>('POST', '/auth/password', { current_password, new_password }),
@@ -105,6 +124,9 @@ export const api = {
     request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/role`, { role }),
   disableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/disable`),
   enableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/enable`),
+  resetUserMfa: (username: string) =>
+    request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/reset-mfa`),
+  setMfaRequired: (required: boolean) => request<{ required: boolean }>('POST', '/auth/mfa/policy', { required }),
   // Service principals and their API keys (Engineers only, #25 PR 3).
   listPrincipals: () => request<{ principals: ServicePrincipal[] }>('GET', '/auth/service-principals'),
   createPrincipal: (name: string, role: Role) =>
@@ -184,8 +206,15 @@ export const api = {
 
 // Types
 export type Role = 'engineer' | 'developer' | 'end_user'
-export interface AuthUser { username: string; role: Role; must_change_password: boolean; kind?: 'user' | 'service' }
-export interface AdminUser { username: string; role: Role; enabled: boolean; must_change_password: boolean; created_at: string }
+export interface AuthUser {
+  username: string; role: Role; must_change_password: boolean; kind?: 'user' | 'service'
+  // Two-step verification (#607): enrolled, required for everyone, and a set-up due because of it.
+  mfa_enrolled?: boolean; mfa_required?: boolean; mfa_enrollment_required?: boolean
+}
+export interface AdminUser {
+  username: string; role: Role; enabled: boolean; must_change_password: boolean; created_at: string; mfa_enrolled?: boolean
+}
+export interface MfaStatus { enrolled: boolean; enrolled_at: string | null; required: boolean; recovery_codes_remaining: number }
 export interface ServiceKey {
   id: string; label: string; created_at: string; expires_at: string
   revoked_at: string | null; last_used_at: string | null; status: 'active' | 'expired' | 'revoked'
