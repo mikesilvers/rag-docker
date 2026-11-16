@@ -100,6 +100,13 @@ with tempfile.TemporaryDirectory() as td:
                 "embedding", "llm", "chunking", "fidelity", "models_bundled", "files"):
         check(f"§4.4 manifest has {key}", key in manifest)
     check("package_format is 1", manifest.get("package_format") == 1)
+    # #671: both LLMs are recorded with llm's shape; llm stays the answer model.
+    for key in ("answer_llm", "build_llm"):
+        check(f"manifest has {key} as {{'model': name}}",
+              isinstance(manifest.get(key), dict) and isinstance(manifest[key].get("model"), str)
+              and manifest[key]["model"] != "", str(manifest.get(key)))
+    check("manifest llm is the answer model", manifest.get("llm") == manifest.get("answer_llm"),
+          f"{manifest.get('llm')} vs {manifest.get('answer_llm')}")
     check("created_at is UTC ISO-8601 with Z",
           bool(re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", manifest["created_at"])),
           manifest["created_at"])

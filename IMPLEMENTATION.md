@@ -33239,7 +33239,9 @@ class OfflineTests(unittest.TestCase):
         with self.assertRaises(httpx.ConnectError):
             asyncio.run(ollama_client.list_models())
         health = asyncio.run(ollama_client.check_health())
-        self.assertEqual({model["status"] for model in health.values()}, {"error"})
+        # `same_model` is a flag beside the three models (#671).
+        self.assertEqual({model["status"] for model in health.values() if isinstance(model, dict)}, {"error"})
+        self.assertEqual(set(health), {"llm", "build_llm", "embed", "same_model"})
 
 
 class ImplementationCopyTests(unittest.TestCase):
@@ -36060,6 +36062,13 @@ with tempfile.TemporaryDirectory() as td:
                 "embedding", "llm", "chunking", "fidelity", "models_bundled", "files"):
         check(f"§4.4 manifest has {key}", key in manifest)
     check("package_format is 1", manifest.get("package_format") == 1)
+    # #671: both LLMs are recorded with llm's shape; llm stays the answer model.
+    for key in ("answer_llm", "build_llm"):
+        check(f"manifest has {key} as {{'model': name}}",
+              isinstance(manifest.get(key), dict) and isinstance(manifest[key].get("model"), str)
+              and manifest[key]["model"] != "", str(manifest.get(key)))
+    check("manifest llm is the answer model", manifest.get("llm") == manifest.get("answer_llm"),
+          f"{manifest.get('llm')} vs {manifest.get('answer_llm')}")
     check("created_at is UTC ISO-8601 with Z",
           bool(re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", manifest["created_at"])),
           manifest["created_at"])
@@ -36328,6 +36337,13 @@ ok = (s['weaviate']['status']=='ok' and s['ollama']['llm']['status']=='ok'
       and all(v['latency_ms'] >= 0 for v in (s['weaviate'], s['ollama']['llm'], s['ollama']['embed'])))
 sys.exit(0 if ok else 1)"
 check "per-service status and latency are reported" $?
+python3 -c "
+import json,sys,os; o=json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_health.json'))['services']['ollama']
+b=o.get('build_llm') or {}
+ok = (b.get('status')=='ok' and isinstance(b.get('latency_ms'), int) and b.get('model')==o['llm']['model']
+      and o.get('same_model') is True)
+sys.exit(0 if ok else 1)"
+check "health reports the build model, the same as the answer model by default, with same_model true (#671)" $?
 
 # ── memory resource reporting (Issue #98) ────────────────────────────────────
 # Advisory only (see the comment in api/routers/health.py), so it never
@@ -43352,7 +43368,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
       status,
       services: {
         weaviate: service('ok', 11),
-        ollama: { llm: service('ok', 22, 'phi3.5'), embed: service(embed, 33, 'nomic-embed-text') },
+        ollama: { llm: service('ok', 22, 'phi3.5'), build_llm: service('ok', 22, 'phi3.5'), embed: service(embed, 33, 'nomic-embed-text'), same_model: true },
       },
       resources: { memory: { status: 'ok', allocated_gb: 11.67, recommended_minimum_gb: 12.0 } },
     });
@@ -49559,11 +49575,17 @@ const { makeReporter, stubAuth } = require('./lib');
 const HEALTH = '/api/health', METRICS = '/api/metrics/latency';
 const UNREADABLE = 'Service health could not be read: The server sent a response the UI could not read.';
 const service = (status, latency_ms, model) => model ? { status, latency_ms, model } : { status, latency_ms };
-const healthBody = (embed = 'ok') => ({
-  status: embed === 'ok' ? 'ok' : 'degraded',
+const healthBody = (embed = 'ok', build = null) => ({
+  status: embed === 'ok' && (!build || build.status === 'ok') ? 'ok' : 'degraded',
   services: {
     weaviate: service('ok', 11),
-    ollama: { llm: service('ok', 22, 'phi3.5'), embed: service(embed, 33, 'nomic-embed-text') },
+    // One LLM by default; `build` gives a different build model (#671).
+    ollama: {
+      llm: service('ok', 22, 'phi3.5'),
+      build_llm: build ? service(build.status, 44, build.model) : service('ok', 22, 'phi3.5'),
+      embed: service(embed, 33, 'nomic-embed-text'),
+      same_model: !build,
+    },
   },
   resources: { memory: { status: 'ok', allocated_gb: 11.67, recommended_minimum_gb: 12.0 } },
 });
@@ -49645,6 +49667,8 @@ const cards = page => page.evaluate(() => [...document.querySelectorAll('span.ro
   colour: dot.classList.contains('bg-red-500') ? 'red' : dot.classList.contains('bg-green-500') ? 'green' : '?',
 })).map(c => `${c.label.split(' ')[0]}=${c.colour}`).join(', '));
 const ALL_GREEN = 'Weaviate=green, LLM=green, Embed=green';
+const labels = page => page.evaluate(() => [...document.querySelectorAll('span.rounded-full.w-2')]
+  .map(dot => (dot.parentElement.textContent || '').trim()));
 const EMBED_RED = 'Weaviate=green, LLM=green, Embed=red';
 const charts = n => `Latency Trends (${n} queries in ring buffer)`;
 const healthAlert = t => (t.match(/Service health could not be read:.{0,80}/) || [''])[0];
@@ -49717,6 +49741,28 @@ async function runHealthPageTests(browser, base, reporter) {
       await release(page, METRICS, 3, { body: metricsBody(5) });
       await release(page, METRICS, 2, { body: metricsBody(3) });
       await assertCharts(page, 5);
+    }],
+    // #671: one LLM card when the models are the same, an answer card and a build card otherwise.
+    ['one model shows one LLM card that builds and answers', async page => {
+      await load(page, 1, OK, { body: metricsBody(1) });
+      assert.deepEqual(await labels(page), ['Weaviate', 'LLM (phi3.5), builds and answers', 'Embed (nomic-embed-text)']);
+    }],
+    ['two models show an answer card and a build card', async page => {
+      await load(page, 1, { status: 200, body: healthBody('ok', { status: 'ok', model: 'qwen2.5:0.5b' }) }, { body: metricsBody(1) });
+      assert.deepEqual(await labels(page), ['Weaviate', 'Answer LLM (phi3.5)', 'Build LLM (qwen2.5:0.5b)', 'Embed (nomic-embed-text)']);
+      assert.equal(await cards(page), 'Weaviate=green, Answer=green, Build=green, Embed=green');
+      const t = await text(page);
+      assert.ok(t.includes('44ms') && t.includes('22ms'), t.slice(0, 300));
+    }],
+    ['a missing build model (503) shows only the build card red', async page => {
+      await load(page, 1, { status: 503, body: healthBody('ok', { status: 'error', model: 'qwen2.5:0.5b' }) }, { body: metricsBody(1) });
+      assert.equal(healthAlert(await text(page)), '');
+      assert.equal(await cards(page), 'Weaviate=green, Answer=green, Build=red, Embed=green');
+    }],
+    ['a health body without build_llm is unreadable, not a page error', async page => {
+      const body = healthBody(); delete body.services.ollama.build_llm;
+      await load(page, 1, { status: 200, body }, { body: metricsBody(1) });
+      await assertUnreadable(page, UNREADABLE);
     }],
     ['a late older metrics success after a newer failure is shown', async page => {
       await refresh(page, 2);
@@ -52171,7 +52217,7 @@ function helpCases() {
 }
 
 // -- Health: latency stat row, charts and empty state ------------------------
-const health = json(200, { status: 'ok', services: { weaviate: { status: 'ok', latency_ms: 5 }, ollama: { llm: { status: 'ok', latency_ms: 7, model: 'vfy-llm' }, embed: { status: 'ok', latency_ms: 9, model: 'vfy-embed' } } } });
+const health = json(200, { status: 'ok', services: { weaviate: { status: 'ok', latency_ms: 5 }, ollama: { llm: { status: 'ok', latency_ms: 7, model: 'vfy-llm' }, build_llm: { status: 'ok', latency_ms: 7, model: 'vfy-llm' }, embed: { status: 'ok', latency_ms: 9, model: 'vfy-embed' }, same_model: true } } });
 const record = (i, r, l) => ({ timestamp: `2026-10-21T10:0${i}:00Z`, collection: A, retrieval_mode: 'hnsw', retrieval_ms: r, llm_ms: l, total_ms: r + l });
 const metrics = (records, stats = {}) => json(200, { total_records: records.length, retrieval_latency: { p50: 10.4, p95: 20.6, p99: 30.2 }, llm_latency: { p50: 100.2, p95: 200.7, p99: 300.4 }, total_latency: { p50: 110.7, p95: 221.1, p99: 331.9 }, history: records, ...stats });
 

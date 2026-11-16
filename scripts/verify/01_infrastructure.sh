@@ -178,6 +178,13 @@ ok = (s['weaviate']['status']=='ok' and s['ollama']['llm']['status']=='ok'
       and all(v['latency_ms'] >= 0 for v in (s['weaviate'], s['ollama']['llm'], s['ollama']['embed'])))
 sys.exit(0 if ok else 1)"
 check "per-service status and latency are reported" $?
+python3 -c "
+import json,sys,os; o=json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_health.json'))['services']['ollama']
+b=o.get('build_llm') or {}
+ok = (b.get('status')=='ok' and isinstance(b.get('latency_ms'), int) and b.get('model')==o['llm']['model']
+      and o.get('same_model') is True)
+sys.exit(0 if ok else 1)"
+check "health reports the build model, the same as the answer model by default, with same_model true (#671)" $?
 
 # ── memory resource reporting (Issue #98) ────────────────────────────────────
 # Advisory only (see the comment in api/routers/health.py), so it never

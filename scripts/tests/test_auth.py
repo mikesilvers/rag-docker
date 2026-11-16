@@ -1701,7 +1701,9 @@ class OfflineTests(unittest.TestCase):
         with self.assertRaises(httpx.ConnectError):
             asyncio.run(ollama_client.list_models())
         health = asyncio.run(ollama_client.check_health())
-        self.assertEqual({model["status"] for model in health.values()}, {"error"})
+        # `same_model` is a flag beside the three models (#671).
+        self.assertEqual({model["status"] for model in health.values() if isinstance(model, dict)}, {"error"})
+        self.assertEqual(set(health), {"llm", "build_llm", "embed", "same_model"})
 
 
 class ImplementationCopyTests(unittest.TestCase):
