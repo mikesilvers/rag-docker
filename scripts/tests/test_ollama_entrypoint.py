@@ -1,5 +1,9 @@
 """ollama/entrypoint.sh skips models already present, pulls with a timeout and retries (issue #399).
 
+It pulls the models ollama/models.sh resolves from the LLM settings (#671): the answer model,
+the build model when it is a different model, and the embedding model. `models.sh present`, the
+ollama healthcheck, passes only when every one of them is listed.
+
 Feature-review item PL:G8. Runs on the host with Python's standard library and bash
 (`16_api_paths.sh`, run by `01_infrastructure.sh`):
 
@@ -17,8 +21,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 ENTRYPOINT = ROOT / "ollama" / "entrypoint.sh"
+MODELS_SH = ROOT / "ollama" / "models.sh"
 MODELS = ("llama3.1:8b", "nomic-embed-text")
 LLM = MODELS[0]
+SMALL = "qwen2.5:0.5b"
 
 # `ollama`: `serve` exits at once; `list` fails while list-fail tokens remain, then
 # prints a header and one line per pulled model; `pull <m>` fails while fail-<m>
@@ -88,10 +94,13 @@ class EntrypointTestCase(unittest.TestCase):
     def tokens(self, name, count):
         (self.state / name).write_text(str(count))
 
-    def run_entrypoint(self):
+    def run_entrypoint(self, **settings):
+        return self.run_script(ENTRYPOINT, **settings)
+
+    def run_script(self, script, *args, **settings):
         env = {"PATH": f"{self.bin}:/usr/bin:/bin", "STUB_STATE": str(self.state),
-               "HOME": str(self.state)}
-        result = subprocess.run(["bash", str(ENTRYPOINT)], env=env, capture_output=True,
+               "HOME": str(self.state), **settings}
+        result = subprocess.run(["bash", str(script), *args], env=env, capture_output=True,
                                 text=True, timeout=60)
         calls_file = self.state / "calls"
         calls = calls_file.read_text().splitlines() if calls_file.exists() else []
@@ -173,6 +182,92 @@ class EntrypointTests(EntrypointTestCase):
         self.assertIn(f"ERROR: failed to pull {LLM} after 5 attempts.", result.stderr)
         # Nothing more is pulled.
         self.assertNotIn("nomic-embed-text", "\n".join(calls))
+
+
+class ModelSettingsTests(EntrypointTestCase):
+    """The models come from LLM_MODEL, BUILD_LLM_MODEL and ANSWER_LLM_MODEL (#671)."""
+
+    def names(self, **settings):
+        result, _calls = self.run_script(MODELS_SH, **settings)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.split()
+
+    def test_no_settings_resolve_to_the_defaults(self):
+        self.assertEqual(self.names(), list(MODELS))
+        self.assertEqual(self.names(LLM_MODEL="", BUILD_LLM_MODEL="", ANSWER_LLM_MODEL=""),
+                         list(MODELS))
+
+    def test_llm_model_is_the_default_for_both(self):
+        self.assertEqual(self.names(LLM_MODEL="llama3.2"), ["llama3.2", "nomic-embed-text"])
+
+    def test_each_setting_replaces_llm_model_for_its_task(self):
+        self.assertEqual(self.names(LLM_MODEL="llama3.2", BUILD_LLM_MODEL=SMALL),
+                         ["llama3.2", SMALL, "nomic-embed-text"])
+        self.assertEqual(self.names(LLM_MODEL="llama3.2", ANSWER_LLM_MODEL=SMALL),
+                         [SMALL, "llama3.2", "nomic-embed-text"])
+        self.assertEqual(self.names(LLM_MODEL="x", BUILD_LLM_MODEL=SMALL, ANSWER_LLM_MODEL=LLM),
+                         [LLM, SMALL, "nomic-embed-text"])
+
+    def test_one_model_named_with_and_without_latest_is_pulled_once(self):
+        self.assertEqual(self.names(BUILD_LLM_MODEL="llama3.2", ANSWER_LLM_MODEL="llama3.2:latest"),
+                         ["llama3.2:latest", "nomic-embed-text"])
+        # Another tag is another model.
+        self.assertEqual(self.names(BUILD_LLM_MODEL="llama3.1"),
+                         [LLM, "llama3.1", "nomic-embed-text"])
+
+    def test_a_different_build_model_is_pulled_after_the_answer_model(self):
+        self.present("nomic-embed-text")
+        result, calls = self.run_entrypoint(BUILD_LLM_MODEL=SMALL)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.pulls(calls), [f"timeout 7200 ollama pull {LLM}",
+                                             f"timeout 7200 ollama pull {SMALL}"])
+        self.assertIn(f"ollama: {SMALL} ready.", result.stdout)
+
+    def test_the_answer_model_setting_is_pulled_instead_of_llm_model(self):
+        self.present("nomic-embed-text")
+        result, calls = self.run_entrypoint(LLM_MODEL=LLM, ANSWER_LLM_MODEL=SMALL)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # The build model is still LLM_MODEL, so both are pulled, the answer model first.
+        self.assertEqual(self.pulls(calls), [f"timeout 7200 ollama pull {SMALL}",
+                                             f"timeout 7200 ollama pull {LLM}"])
+
+    def test_present_passes_only_when_every_resolved_model_is_listed(self):
+        self.present(*MODELS)
+        result, _ = self.run_script(MODELS_SH, "present")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result, _ = self.run_script(MODELS_SH, "present", BUILD_LLM_MODEL=SMALL)
+        self.assertEqual(result.returncode, 1)
+        self.present(SMALL)
+        result, _ = self.run_script(MODELS_SH, "present", BUILD_LLM_MODEL=SMALL)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_present_uses_the_exact_name_rule(self):
+        # Another variant of the name doesn't count (#647), as for the pulls.
+        self.present("llama3.1:8b-instruct-q8_0", "nomic-embed-text")
+        result, _ = self.run_script(MODELS_SH, "present")
+        self.assertEqual(result.returncode, 1)
+
+    def test_a_name_with_a_space_or_glob_character_is_refused(self):
+        # The names are word-split, so they are checked as compose-models.sh checks them.
+        for bad in ("two words", "llama*", "x?y", "a;b"):
+            with self.subTest(name=bad):
+                result, _ = self.run_script(MODELS_SH, BUILD_LLM_MODEL=bad)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(f"models.sh: not a model name: '{bad}'", result.stderr)
+                self.assertEqual(result.stdout, "")
+        result, _ = self.run_script(MODELS_SH, ANSWER_LLM_MODEL="someone/model:v1.2_x-y")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_entrypoint_stops_on_a_bad_name_before_any_pull(self):
+        result, calls = self.run_entrypoint(ANSWER_LLM_MODEL="two words")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("models.sh: not a model name: 'two words'", result.stderr)
+        self.assertEqual(self.pulls(calls), [])
+
+    def test_an_unknown_command_is_refused(self):
+        result, _ = self.run_script(MODELS_SH, "pull")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage: bash models.sh [list|present]", result.stderr)
 
 
 if __name__ == "__main__":

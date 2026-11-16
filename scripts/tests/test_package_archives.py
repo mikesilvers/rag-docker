@@ -30,7 +30,7 @@ GIT_ISOLATION = {'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull}
 STUB_DOCKER = r'''#!/usr/bin/env bash
 echo "$*" >> "$STUB_DOCKER_LOG"
 case "$1 $2" in
-  "compose config") echo '{"name":"scratch"}' ;;
+  "compose config") echo '{"name":"scratch","services":{"ollama":{"environment":{"LLM_MODEL":"llama3.1:8b","BUILD_LLM_MODEL":"","ANSWER_LLM_MODEL":""}}}}' ;;
   "image inspect"|"volume inspect") ;;
   save*) printf 'stub image layers' ;;
   run*)
@@ -67,8 +67,10 @@ class PackageArchiveTests(unittest.TestCase):
         self.repo.mkdir()
         for name in SCRIPTS + ('.gitignore',):
             shutil.copy(ROOT / name, self.repo / name)
-        # package-offline.sh reads the model names from the entrypoint (#647).
-        write(self.repo / 'ollama' / 'entrypoint.sh', (ROOT / 'ollama' / 'entrypoint.sh').read_text())
+        # package-offline.sh reads the model names the entrypoint pulls (#647), resolved
+        # from the compose settings by these two scripts (#671).
+        for name in ('entrypoint.sh', 'models.sh', 'compose-models.sh'):
+            write(self.repo / 'ollama' / name, (ROOT / 'ollama' / name).read_text())
         write(self.repo / 'install-offline.sh', '#!/usr/bin/env bash\necho install\n', 0o755)
         write(self.repo / 'README.md', COMMITTED_README)
         write(self.repo / 'ingest-inbox' / '.gitkeep', '')

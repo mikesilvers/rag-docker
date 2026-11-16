@@ -78,13 +78,20 @@ services:
     # Windows machine in the transfer path can all drop it), which would
     # otherwise fail with "permission denied" on a fresh install.
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    # The LLMs (#671), set once; the api merges the same block. Each of
+    # BUILD_LLM_MODEL and ANSWER_LLM_MODEL falls back to LLM_MODEL when empty.
+    environment: &llm-models
+      LLM_MODEL: llama3.1:8b
+      BUILD_LLM_MODEL: ""
+      ANSWER_LLM_MODEL: ""
     volumes:
       - ollama_models:/root/.ollama
       - ./ollama/entrypoint.sh:/entrypoint.sh:ro
+      - ./ollama/models.sh:/models.sh:ro
     networks: [rag-internal]
     healthcheck:
-      # The ollama image has no curl/wget; the CLI is the only probe available.
-      test: ["CMD-SHELL", "ollama list | grep -q llama3.1:8b && ollama list | grep -q nomic-embed-text"]
+      # Healthy once `ollama list` has every model ollama/models.sh resolves (#671).
+      test: ["CMD", "bash", "/models.sh", "present"]
       interval: 20s
       timeout: 15s
       retries: 20
@@ -108,7 +115,7 @@ services:
       WEAVIATE_PORT: 8080
       OLLAMA_HOST: ollama
       OLLAMA_PORT: 11434
-      LLM_MODEL: llama3.1:8b
+      <<: *llm-models        # LLM_MODEL, BUILD_LLM_MODEL, ANSWER_LLM_MODEL (#671)
       EMBED_MODEL: nomic-embed-text
       UPLOAD_DIR: /app/uploads
       SOURCES_DIR: /app/sources
@@ -239,30 +246,33 @@ ollama serve &
 OLLAMA_PID=$!
 # Wait for server to be ready
 until ollama list > /dev/null 2>&1; do sleep 2; done   # no curl in this image
-# Pull models if not already cached in volume (a model counts as cached only when
-# a NAME in `ollama list` is exactly its name, or its name with :latest)
-ollama pull llama3.1:8b
-ollama pull nomic-embed-text
+# The models: the answer LLM, the build LLM when it is a different model, and
+# nomic-embed-text, resolved by ollama/models.sh from LLM_MODEL, BUILD_LLM_MODEL
+# and ANSWER_LLM_MODEL (#671). Each is pulled unless already cached in the volume
+# (a model counts as cached only when a NAME in `ollama list` is exactly its
+# name, or its name with :latest)
+. "$(dirname "$0")/models.sh"
+for model in $(models); do ollama pull "$model"; done   # with skip, timeout and retry in the real script
 wait $OLLAMA_PID
 ```
 
-The Ollama healthcheck is extended to verify both models are present, not merely that the server is running:
+The Ollama healthcheck is extended to verify every resolved model is present, not merely that the server is running:
 
 ```yaml
 healthcheck:
-  test: ["CMD-SHELL", "ollama list | grep -q llama3.1:8b && ollama list | grep -q nomic-embed-text"]
+  test: ["CMD", "bash", "/models.sh", "present"]
   interval: 20s
   timeout: 15s
   retries: 20
   start_period: 1800s
 ```
 
-`start_period: 1800s` gives the model pull time to complete on first run before health retries begin counting as failures: about 5.2 GB (#647), so a link down to about 23 Mbps finishes inside it, and ollama is marked unhealthy only after about 37 minutes. Docker still runs the check every 20 s during the start period and marks the container healthy at the first pass, so a start with the models present is as fast as before. `scripts/verify/stack.sh` waits up to two 900 s rounds for the stack, which together cover the start period. The API service's `depends_on: { ollama: service_healthy }` ensures no API traffic flows until both models are confirmed present.
+`start_period: 1800s` gives the model pull time to complete on first run before health retries begin counting as failures: about 5.2 GB (#647), so a link down to about 23 Mbps finishes inside it, and ollama is marked unhealthy only after about 37 minutes. Docker still runs the check every 20 s during the start period and marks the container healthy at the first pass, so a start with the models present is as fast as before. `scripts/verify/stack.sh` waits up to two 900 s rounds for the stack, which together cover the start period. The API service's `depends_on: { ollama: service_healthy }` ensures no API traffic flows until every resolved model is confirmed present.
 
 ### 2.4 Startup Sequence
 
 1. Weaviate starts with a 180-second healthcheck start period for cold Raft replay → healthcheck passes (ready endpoint returns 200)
-2. Ollama starts → pulls models (llama3.1:8b, nomic-embed-text) → healthcheck passes
+2. Ollama starts → pulls each distinct model `ollama/models.sh` resolves (the answer and build LLMs, llama3.1:8b by default, and nomic-embed-text) → healthcheck passes
 3. API starts → verifies both downstream connections → healthcheck passes
 4. UI starts (static build, no runtime deps)
 5. Nginx proxy starts
@@ -372,7 +382,9 @@ GET /health
     "weaviate": { "status": "ok", "latency_ms": 1 },
     "ollama": {
       "llm": { "status": "ok", "latency_ms": 5, "model": "llama3.1:8b" },
-      "embed": { "status": "ok", "latency_ms": 5, "model": "nomic-embed-text" }
+      "build_llm": { "status": "ok", "latency_ms": 5, "model": "llama3.1:8b" },
+      "embed": { "status": "ok", "latency_ms": 5, "model": "nomic-embed-text" },
+      "same_model": true
     }
   },
   "resources": {
@@ -386,6 +398,10 @@ GET /health
 ```
 
 **Response 503** if any downstream service is unreachable. Individual service `status` is `"ok"` or `"error"`.
+
+`llm` is the answer model (`ANSWER_LLM_MODEL`), `build_llm` the build model (`BUILD_LLM_MODEL`), each
+falling back to `LLM_MODEL` (#671); a missing one of either makes the response 503. `same_model` is true when
+they are one model (`x` and `x:latest` are); it never affects the status.
 
 **Weaviate is probed through the client, not over plain HTTP.** A bare `GET
 /v1/.well-known/ready` cannot detect a client/server version mismatch: the server
@@ -1090,10 +1106,10 @@ Ollama are available."
 not returned. Any other failure in the pipeline answers `500 INTERNAL_ERROR` (§3.2).
 
 **RAG pipeline (internal steps):**
-1. Reformat user question for retrieval using the LLM, `llama3.1:8b` by default (Section 6.1 prompt).
+1. Reformat user question for retrieval using the answer LLM (`ANSWER_LLM_MODEL`, else `LLM_MODEL`; `llama3.1:8b` by default) (Section 6.1 prompt).
 2. Embed reformulated question — **only for `hnsw` and `flat` modes**: call Ollama `/api/embeddings` directly; for `hybrid` and `semantic` modes, Weaviate handles query embedding internally via `text2vec-ollama`.
 3. Retrieve top_k chunks from Weaviate using the specified retrieval mode and its parameters.
-4. Pass original question + retrieved chunks to the LLM for synthesis (Section 6.2 or 6.3 prompt).
+4. Pass original question + retrieved chunks to the answer LLM for synthesis (Section 6.2 or 6.3 prompt).
 5. Format response according to `response_format`.
 
 ---
@@ -1381,9 +1397,9 @@ Exports are written to `{UPLOAD_DIR}/goldstandard_exports/{filename}`, a folder 
 }
 ```
 
-- `answer`: the LLM-generated answer (may have been edited by the reviewer)
+- `answer`: the answer the build LLM (`BUILD_LLM_MODEL`) generated (may have been edited by the reviewer)
 - `ground_truth`: the human-verified correct answer; initially identical to `answer` from generation, but the reviewer may have edited it separately via the PATCH endpoint before export
-- `contexts`: the source chunk(s) passed to the LLM during generation — used by RAGAS to evaluate context precision and recall
+- `contexts`: the source chunk(s) passed to the build LLM during generation — used by RAGAS to evaluate context precision and recall
 
 The file is a JSON array of these objects.
 
@@ -1790,7 +1806,7 @@ restores, whatever the package carries (`RAG_EXPORT_SPECIFICATIONS.md` §4.2).
 #### 3.1.11 Document preparation (#638)
 
 A preparation area where raw documents are made to follow the corpus rules (#615), stored on the
-instance and imported with one action. Code does the rule work exactly; the local LLM (`LLM_MODEL`) only
+instance and imported with one action. Code does the rule work exactly; the build LLM (`BUILD_LLM_MODEL`, else `LLM_MODEL`) only
 removes headers, footers, page numbers and boilerplate, and writes a title and summary, for PDF, DOCX, TXT and
 MD parts. CSV and JSON parts are labelled from their data, with no LLM call (#648). One area for the
 instance, in the `rag_preparation` volume (`PREPARATION_DIR`, `/app/preparation`); documents stay until
@@ -1867,7 +1883,7 @@ before the job, as they do at API startup after an interrupted job.
    header (the header: longer than half a part) fails the document; reading stops as soon as a row's raw text
    passes twice that, so an unclosed quote or a file with no line breaks is never held whole.
 4. *Clean* (PDF, DOCX, TXT, MD only) with §6.5: each part in windows of whole lines up to 3,000 characters
-   (a longer line is not sent); the LLM names the lines to remove and code removes them, never rewriting.
+   (a longer line is not sent); the build LLM names the lines to remove and code removes them, never rewriting.
    Each call has 120 s and is sent again once if it fails or times out; an unusable answer is asked again
    once. A window keeps its code-only text, recorded `{"window", "reason"}` on its part, when the lines named
    hold over 20 % of its characters (`removed-too-much`), include one over 200 characters
@@ -2074,7 +2090,7 @@ Long-running, so it follows the same job-and-poll shape as `/ingest/upload`.
 { "collection": "Policies", "include_models": false }
 ```
 
-`include_models: true` bundles the embedding model and the LLM into the package
+`include_models: true` bundles the embedding model and the answer LLM (never the build LLM) into the package
 (`RAG_EXPORT_SPECIFICATIONS.md` §6.3), taking it from roughly 80 KB to ~2.3 GB.
 The job reports `models_bundled` — what the package actually carries, which is
 `false` with an explanation in `warnings` if the request could not be honoured.
@@ -2684,7 +2700,7 @@ file, asking whether its name already has chunks (#22, §3.1.3), fails.
 
 ## 6. LLM Prompt Specifications
 
-All prompts use Ollama's `/api/chat` endpoint with `model: llama3.1:8b` (the `LLM_MODEL` setting; phi3.5 until 1.2.1, #647).
+All prompts use Ollama's `/api/chat` endpoint. The query prompts (6.1-6.3) send the answer model, `ANSWER_LLM_MODEL`; the gold standard and preparation prompts (6.4-6.6) send the build model, `BUILD_LLM_MODEL` (#671). Each falls back to `LLM_MODEL`, which is `llama3.1:8b` by default (phi3.5 until 1.2.1, #647).
 
 ### 6.1 Query Reformulation Prompt
 
@@ -3092,7 +3108,7 @@ A retained session can be loaded/refreshed by its session ID, including when its
 **Route:** `/health`  
 **Roles:** Engineer only
 
-- Service status cards: Weaviate, Ollama LLM, Ollama Embed. Each shows status (green/red), latency (ms). A service is red when its `status` isn't `ok`. `GET /health` answers 503 with the same per-service body when a dependency is down; the page reads that body, so the failing services show red (#375).
+- Service status cards: Weaviate, the Ollama LLMs (one "LLM, builds and answers" card when `same_model` is true, otherwise an "Answer LLM" card from `llm` and a "Build LLM" card from `build_llm`), Ollama Embed. Each shows status (green/red), latency (ms). A service is red when its `status` isn't `ok`. `GET /health` answers 503 with the same per-service body when a dependency is down; the page reads that body, so the failing services show red (#375).
 - When health can't be read (no answer from the API, a proxy error page, any other error without a health body, or a 200 without a health body (#415)), the page shows "Service health could not be read:" with the reason, as an alert, and no service cards, so an earlier green result never stays up. The next successful load clears it.
 - Latency trend charts (from the `history` field of `GET /metrics/latency`, bounded by `history_limit`, default 100): line chart of `total_ms` over time alongside `retrieval_ms` and `llm_ms`. Summary stat row shows P50/P95/P99 for each component from the `retrieval_latency`, `llm_latency` and `total_latency` objects.
 - Health and latency metrics load separately: a degraded or failed health call doesn't stop the charts from loading. A failed metrics call keeps the charts last shown.
@@ -3258,7 +3274,7 @@ nothing about jobs is kept in browser storage.
 **Route:** `/prepare`, in the Data menu after Import
 **Roles:** Engineer, Developer
 
-- What the page does (code does the rule work, the LLM only cleans and titles PDF, DOCX, TXT and MD; CSV and JSON
+- What the page does (code does the rule work, the build LLM only cleans and titles PDF, DOCX, TXT and MD; CSV and JSON
   are labelled from their data), and a note that preparation and
   ingest share the local LLM service, so either is slower while the other runs.
 - An upload zone for the §3.1.11 types, refusing a selection over 512 MB before sending; the answer's skipped
@@ -4333,6 +4349,40 @@ the documents and phrases read from the verify project's Weaviate (`ui_ingest_we
       *Evidence: `22_ui_ingest.sh`, one check per case and condition. Each check was shown to fail when its
       condition breaks, a job answer stubbed to fail among them, in a run of a changed copy of the suite.*
 
+### 10.10 Build and answer models (#671)
+
+The build LLM (`BUILD_LLM_MODEL`) prepares documents and writes gold standard pairs; the answer LLM
+(`ANSWER_LLM_MODEL`) answers questions; each falls back to `LLM_MODEL`, then `llama3.1:8b` (§6, §8). These
+are ticked once the tests reviewer's full `stack.sh run` on the change passes.
+
+- [ ] Each setting replaces `LLM_MODEL` for its task, an empty value counts as not set, and with neither set
+      both are `LLM_MODEL` (by default `llama3.1:8b`).
+      *Evidence: `scripts/tests/test_health.py` `ModelSettingsTests` (suite 01); `scripts/tests/test_ollama_entrypoint.py`
+      `ModelSettingsTests` for `ollama/models.sh` (run on the host by `16_api_paths.sh`, through suite 01).*
+- [ ] Preparation and gold standard generation call the build model, query the answer model: in a full run,
+      with `BUILD_LLM_MODEL=qwen2.5:0.5b` and the answer model as compose sets it, Ollama reports only
+      `qwen2.5:0.5b` answering preparation's and gold standard's calls and only the answer model answering
+      query's. Every other check runs on one model.
+      *Evidence: `scripts/verify/23_llm_split.sh` (full runs only); `test_prepare.py` (suite 21),
+      `test_goldstandard_api_paths.py` (suite 09, through 04) and `test_retrieval_controls.py` (suite 11).*
+- [ ] `/api/health` reports `llm` (the answer model), `build_llm` and `same_model`; a missing build or answer
+      model answers 503 `degraded`; `same_model` never affects the status. The Health page shows one LLM card
+      ("builds and answers") when `same_model` is true, otherwise an Answer LLM card and a Build LLM card, and
+      treats a body without `build_llm` as unreadable.
+      *Evidence: `scripts/tests/test_health.py` `TwoModelsTests` (suite 01); suite 01's real-stack check that
+      health reports `build_llm`, the same model as `llm`, with `same_model` true by default;
+      `browser/health_page.js` (suite 06).*
+- [ ] Ollama pulls each distinct model `ollama/models.sh` resolves, the answer model first, and its healthcheck
+      passes only when every one is listed by exact name; `package-offline.sh` and the CI model cache key read
+      the same names through `ollama/compose-models.sh`, so the default key is unchanged.
+      *Evidence: `test_ollama_entrypoint.py`, `test_distribution.py`, `test_ci_workflow.py` and
+      `test_collector.py` (suites 01 and 05); the stack's own start-up waits on that healthcheck.*
+- [ ] Packages record `answer_llm` and `build_llm` and keep `llm` as the answer model, at `package_format` 1;
+      `include_models` bundles the answer model, never the build model; import checks and installs only the
+      answer model (`RAG_EXPORT_SPECIFICATIONS.md` E42, E43).
+      *Evidence: `scripts/tests/test_retrieval_import.py` (suite 05) and `validate_package.py` on a real
+      export (suite 05).*
+
 ## 11. Host Requirements and Distribution
 
 ### 11.1 Host requirements
@@ -4385,7 +4435,7 @@ rag-docker/
 ├── install-offline.sh
 └── offline/
     ├── images.tar.gz            # docker save of all 5 images (~2.5 GB)
-    └── ollama_models.tar.gz     # llama3.1:8b + nomic-embed-text (~5.2 GB)
+    └── ollama_models.tar.gz     # the LLMs (llama3.1:8b by default) + nomic-embed-text (~5.2 GB)
 ```
 
 Before saving any image, `package-offline.sh` MUST check that the

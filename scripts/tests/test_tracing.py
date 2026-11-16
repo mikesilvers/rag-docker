@@ -444,7 +444,7 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
         async def model(*args):
             await ready.wait()
             return '{"question":"synthetic","answer":"synthetic","ground_truth":"synthetic"}'
-        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',update), patch.object(ollama,'chat',ot.traced('ollama.chat')(model)):
+        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',update), patch.object(ollama,'build_chat',ot.traced('ollama.chat')(model)):
             response=await self.client.post('/goldstandard/generate',json={'collection':'TraceGold','sample_size':1})
             self.assertEqual(response.status_code,202,response.text)
             ready.set()
@@ -454,7 +454,7 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
         pair={'pair_id':'pair','contexts':[SECRET],'source_file':SECRET,'chunk_index':0}
         async def slow(*args):
             await asyncio.sleep(10)
-        with patch.object(gs,'get_session',return_value={'pairs':[pair],'status':'completed'}), patch.object(gs,'_REGENERATION_TIMEOUT_SECONDS',.005), patch.object(ollama,'chat',ot.traced('ollama.chat')(slow)):
+        with patch.object(gs,'get_session',return_value={'pairs':[pair],'status':'completed'}), patch.object(gs,'_REGENERATION_TIMEOUT_SECONDS',.005), patch.object(ollama,'build_chat',ot.traced('ollama.chat')(slow)):
             response=await self.client.post('/goldstandard/regenerate',json={'session_id':'session','pair_id':'pair'})
         self.assertEqual(response.status_code,504,response.text)
         self.assertEqual(self.spans('rag.regenerate')[-1].attributes['error.type'],'timeout')
@@ -510,7 +510,7 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
         async def slow(*args):
             entered.set()
             await asyncio.sleep(10)
-        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',update), patch.object(ollama,'chat',ot.traced('ollama.chat')(slow)):
+        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',update), patch.object(ollama,'build_chat',ot.traced('ollama.chat')(slow)):
             response=await self.client.post('/goldstandard/generate',json={'collection':'TraceCancel','sample_size':1})
             self.assertEqual(response.status_code,202)
             await entered.wait()
@@ -522,7 +522,7 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
         # Real done callback creates the failure reporter with captured origin.
         session['status']='generating'
         async def model(*args): return '{"question":"q","answer":"a","ground_truth":"g"}'
-        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',side_effect=gs.GoldStandardError('STORE_FAILED',SECRET,500)), patch.object(gs,'_publish_generation_failure'), patch.object(ollama,'chat',ot.traced('ollama.chat')(model)):
+        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',side_effect=gs.GoldStandardError('STORE_FAILED',SECRET,500)), patch.object(gs,'_publish_generation_failure'), patch.object(ollama,'build_chat',ot.traced('ollama.chat')(model)):
             await self.client.post('/goldstandard/generate',json={'collection':'TraceFailed','sample_size':1})
             await self.until(lambda: bool(self.spans('rag.failure_report')))
         self.lineage('rag.failure_report')

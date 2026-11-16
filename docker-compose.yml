@@ -56,13 +56,26 @@ services:
     # Windows machine in the transfer path can all drop it), which would
     # otherwise fail with "permission denied" on a fresh install.
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    # The LLMs (#671), set once here; the api reads the same three through the
+    # llm-models anchor. BUILD_LLM_MODEL prepares documents and writes gold
+    # standard pairs; ANSWER_LLM_MODEL answers questions. Each falls back to
+    # LLM_MODEL when empty, and LLM_MODEL to llama3.1:8b. Ollama pulls each
+    # distinct model when it starts (ollama/models.sh). The embedding model is
+    # the api's EMBED_MODEL and stays one.
+    environment: &llm-models
+      LLM_MODEL: llama3.1:8b
+      BUILD_LLM_MODEL: ""
+      ANSWER_LLM_MODEL: ""
     volumes:
       - ollama_models:/root/.ollama
       - ./ollama/entrypoint.sh:/entrypoint.sh:ro
+      - ./ollama/models.sh:/models.sh:ro
     networks: [rag-internal]
     healthcheck:
       # The ollama image has no curl/wget; the CLI is the only probe available.
-      test: ["CMD-SHELL", "ollama list | grep -q llama3.1:8b && ollama list | grep -q nomic-embed-text"]
+      # Healthy once `ollama list` has every model ollama/models.sh resolves
+      # from the settings above, by exact name (#671).
+      test: ["CMD", "bash", "/models.sh", "present"]
       interval: 20s
       timeout: 15s
       retries: 20
@@ -90,7 +103,9 @@ services:
       WEAVIATE_PORT: 8080
       OLLAMA_HOST: ollama
       OLLAMA_PORT: 11434
-      LLM_MODEL: llama3.1:8b
+      # LLM_MODEL, BUILD_LLM_MODEL and ANSWER_LLM_MODEL, from the ollama
+      # service's environment above (#671).
+      <<: *llm-models
       EMBED_MODEL: nomic-embed-text
       UPLOAD_DIR: /app/uploads
       SOURCES_DIR: /app/sources

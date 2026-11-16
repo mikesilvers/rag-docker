@@ -302,7 +302,7 @@ class SessionImportTests(unittest.TestCase):
             async def chat(system, user):
                 return reply
             with patch.object(gs.wc, '_sample_chunks_sync', side_effect=sample), \
-                 patch.object(gs.ollama, 'chat', side_effect=chat):
+                 patch.object(gs.ollama, 'build_chat', side_effect=chat):
                 created = await gs.start_generation('Corpus', 1, None)
                 await asyncio.gather(*list(gs._tasks))
             return created['session_id']
@@ -351,7 +351,7 @@ class SessionImportTests(unittest.TestCase):
             reply = {'question': 'Q?', 'answer': 'A', 'ground_truth': 'A'}
             del reply[missing]
             with self.subTest(missing=missing), \
-                 patch.object(gs.ollama, 'chat', new=AsyncMock(return_value=json.dumps(reply))) as chat:
+                 patch.object(gs.ollama, 'build_chat', new=AsyncMock(return_value=json.dumps(reply))) as chat:
                 with self.assertRaisesRegex(ValueError, missing):
                     asyncio.run(gs._generate_pair({'content': 'Context', 'source_file': 'source.txt'}))
                 self.assertEqual(chat.await_count, 3)
@@ -380,7 +380,7 @@ class SessionImportTests(unittest.TestCase):
     def test_each_kind_of_unusable_reply_gets_its_own_reprompt(self):
         chat = AsyncMock(side_effect=['not json', '{"question": null, "answer": "A"}',
                                       '{"question": "Q?", "answer": "A"}'])
-        with patch.object(gs.ollama, 'chat', new=chat), self.assertLogs(gs.log, 'INFO') as logs:
+        with patch.object(gs.ollama, 'build_chat', new=chat), self.assertLogs(gs.log, 'INFO') as logs:
             pair = asyncio.run(gs._generate_pair({'content': 'Context', 'source_file': 'source.txt'}))
         self.assertEqual(pair['question'], 'Q?')
         self.assertEqual([call.args[0] for call in chat.await_args_list],

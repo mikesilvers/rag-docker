@@ -349,7 +349,7 @@ function helpCases() {
 }
 
 // -- Health: latency stat row, charts and empty state ------------------------
-const health = json(200, { status: 'ok', services: { weaviate: { status: 'ok', latency_ms: 5 }, ollama: { llm: { status: 'ok', latency_ms: 7, model: 'vfy-llm' }, embed: { status: 'ok', latency_ms: 9, model: 'vfy-embed' } } } });
+const health = json(200, { status: 'ok', services: { weaviate: { status: 'ok', latency_ms: 5 }, ollama: { llm: { status: 'ok', latency_ms: 7, model: 'vfy-llm' }, build_llm: { status: 'ok', latency_ms: 7, model: 'vfy-llm' }, embed: { status: 'ok', latency_ms: 9, model: 'vfy-embed' }, same_model: true } } });
 const record = (i, r, l) => ({ timestamp: `2026-10-21T10:0${i}:00Z`, collection: A, retrieval_mode: 'hnsw', retrieval_ms: r, llm_ms: l, total_ms: r + l });
 const metrics = (records, stats = {}) => json(200, { total_records: records.length, retrieval_latency: { p50: 10.4, p95: 20.6, p99: 30.2 }, llm_latency: { p50: 100.2, p95: 200.7, p99: 300.4 }, total_latency: { p50: 110.7, p95: 221.1, p99: 331.9 }, history: records, ...stats });
 

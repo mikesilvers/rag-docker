@@ -354,7 +354,7 @@ export default function TransferPage() {
           <span>
             Include the models
             <span className="block text-xs text-gray-500">
-              Bundles the embedding model and the LLM, taking the package to roughly 2.3 GB.
+              Bundles the embedding model and the answering LLM, taking the package to roughly 2.3 GB.
               Needed only when the target machine has never pulled them.
             </span>
           </span>

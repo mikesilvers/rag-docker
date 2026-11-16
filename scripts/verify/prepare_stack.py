@@ -311,7 +311,7 @@ def check_prepare(fix):
                "no header: {!r}".format(lines[:3]))
         lines = lines[4:]
     # The part's text as preparation reads the .txt: its paragraphs joined by
-    # one blank line, then cut into the windows the LLM saw.
+    # one blank line, then cut into the windows the build LLM saw.
     source = "\n\n".join(block.strip("\n") for block in PAGES.split("\n\n")
                           if block.strip()).split("\n")
     position = 0

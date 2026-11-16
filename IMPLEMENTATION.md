@@ -99,13 +99,26 @@ services:
     # Windows machine in the transfer path can all drop it), which would
     # otherwise fail with "permission denied" on a fresh install.
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    # The LLMs (#671), set once here; the api reads the same three through the
+    # llm-models anchor. BUILD_LLM_MODEL prepares documents and writes gold
+    # standard pairs; ANSWER_LLM_MODEL answers questions. Each falls back to
+    # LLM_MODEL when empty, and LLM_MODEL to llama3.1:8b. Ollama pulls each
+    # distinct model when it starts (ollama/models.sh). The embedding model is
+    # the api's EMBED_MODEL and stays one.
+    environment: &llm-models
+      LLM_MODEL: llama3.1:8b
+      BUILD_LLM_MODEL: ""
+      ANSWER_LLM_MODEL: ""
     volumes:
       - ollama_models:/root/.ollama
       - ./ollama/entrypoint.sh:/entrypoint.sh:ro
+      - ./ollama/models.sh:/models.sh:ro
     networks: [rag-internal]
     healthcheck:
       # The ollama image has no curl/wget; the CLI is the only probe available.
-      test: ["CMD-SHELL", "ollama list | grep -q llama3.1:8b && ollama list | grep -q nomic-embed-text"]
+      # Healthy once `ollama list` has every model ollama/models.sh resolves
+      # from the settings above, by exact name (#671).
+      test: ["CMD", "bash", "/models.sh", "present"]
       interval: 20s
       timeout: 15s
       retries: 20
@@ -133,7 +146,9 @@ services:
       WEAVIATE_PORT: 8080
       OLLAMA_HOST: ollama
       OLLAMA_PORT: 11434
-      LLM_MODEL: llama3.1:8b
+      # LLM_MODEL, BUILD_LLM_MODEL and ANSWER_LLM_MODEL, from the ollama
+      # service's environment above (#671).
+      <<: *llm-models
       EMBED_MODEL: nomic-embed-text
       UPLOAD_DIR: /app/uploads
       SOURCES_DIR: /app/sources
@@ -390,20 +405,9 @@ until ollama list > /dev/null 2>&1; do
   sleep 2
 done
 
-# Is the model downloaded? `ollama list` prints NAME as "<name>:<tag>", with
-# ":latest" added to a name pulled without a tag; its columns are separated by
-# tabs or spaces, so `read` splits them. The NAME must match exactly: another
-# variant of a tagged name (llama3.1:8b-instruct-q8_0 for llama3.1:8b) is a
-# different model and doesn't count (#647).
-model_present() {
-    local name rest
-    while read -r name rest; do
-        if [ "${name}" = "$1" ] || [ "${name}" = "$1:latest" ]; then
-            return 0
-        fi
-    done < <(ollama list)
-    return 1
-}
+# The model names and model_present (#671): the answer and build LLMs, resolved
+# from the settings compose passes, and the embedding model.
+. "$(dirname "$0")/models.sh"
 
 # Pull a model with retry. Ollama resumes partial downloads so retries are cheap.
 # timeout 7200 (2 hours) kills a truly hung connection while allowing slow downloads.
@@ -430,10 +434,142 @@ pull_with_retry() {
     echo "ollama: ${model} ready."
 }
 
-pull_with_retry llama3.1:8b
-pull_with_retry nomic-embed-text
+# Each distinct model, the answer model first (names hold no spaces).
+for model in $(models); do
+  pull_with_retry "${model}"
+done
 
 wait $OLLAMA_PID
+```
+
+### ollama/models.sh
+
+```bash
+#!/bin/bash
+# The Ollama models this stack needs (#671), from the three LLM settings
+# docker-compose.yml gives the ollama service (its environment):
+#
+#   the answer model  ANSWER_LLM_MODEL, else LLM_MODEL, else llama3.1:8b
+#   the build model   BUILD_LLM_MODEL,  else LLM_MODEL, else llama3.1:8b
+#   the embedding model, nomic-embed-text
+#
+# An empty setting counts as not set. The API resolves its two models the same
+# way (api/config.py). This is the one place the ollama side resolves them: the
+# entrypoint pulls these names, the healthcheck checks them, and
+# package-offline.sh and the CI model cache read them through
+# ollama/compose-models.sh.
+#
+#   bash models.sh [list]   print the names, one per line: the answer model, the
+#                           build model when it is a different model, the
+#                           embedding model
+#   bash models.sh present  exit 0 only when `ollama list` has every name
+#
+# Sourced (by entrypoint.sh), it only defines the functions. Written for bash
+# 3.2 too, which the host tests run it with.
+
+_llm="${LLM_MODEL:-llama3.1:8b}"
+ANSWER_MODEL="${ANSWER_LLM_MODEL:-$_llm}"
+BUILD_MODEL="${BUILD_LLM_MODEL:-$_llm}"
+EMBED_MODEL_NAME=nomic-embed-text
+
+# A model name is letters, digits and . _ : / - only, as compose-models.sh
+# requires on the host: the names are word-split below, so a space or a glob
+# character must stop here, not be split or expanded.
+for _name in "${ANSWER_MODEL}" "${BUILD_MODEL}"; do
+    case "${_name}" in
+        *[!A-Za-z0-9._:/-]*)
+            echo "models.sh: not a model name: '${_name}'" >&2
+            # Sourced, return to the caller; run, exit.
+            return 2 2>/dev/null || exit 2 ;;
+    esac
+done
+
+# `name:tag`, with `:latest` for a name without a tag (after its last `/`), so
+# `x` and `x:latest` are one model, as the API compares them.
+tagged() {
+    case "${1##*/}" in
+        *:*) printf '%s\n' "$1" ;;
+        *) printf '%s:latest\n' "$1" ;;
+    esac
+}
+
+models() {
+    printf '%s\n' "${ANSWER_MODEL}"
+    if [ "$(tagged "${BUILD_MODEL}")" != "$(tagged "${ANSWER_MODEL}")" ]; then
+        printf '%s\n' "${BUILD_MODEL}"
+    fi
+    printf '%s\n' "${EMBED_MODEL_NAME}"
+}
+
+# Is the model downloaded? `ollama list` prints NAME as "<name>:<tag>", with
+# ":latest" added to a name pulled without a tag; its columns are separated by
+# tabs or spaces, so `read` splits them. The NAME must match exactly: another
+# variant of a tagged name (llama3.1:8b-instruct-q8_0 for llama3.1:8b) is a
+# different model and doesn't count (#647).
+model_present() {
+    local name rest
+    while read -r name rest; do
+        if [ "${name}" = "$1" ] || [ "${name}" = "$1:latest" ]; then
+            return 0
+        fi
+    done < <(ollama list)
+    return 1
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    case "${1:-list}" in
+        list) models ;;
+        present)
+            for model in $(models); do
+                model_present "${model}" || exit 1
+            done ;;
+        *) echo "usage: bash models.sh [list|present]" >&2; exit 2 ;;
+    esac
+fi
+```
+
+### ollama/compose-models.sh
+
+```bash
+#!/usr/bin/env bash
+# The models the ollama service pulls (#671), on the host: the names
+# ollama/models.sh resolves from the LLM settings `docker compose config` gives
+# the ollama service, one per line. package-offline.sh and the CI model cache
+# read them here, so they read what the entrypoint pulls.
+#
+#   bash ollama/compose-models.sh
+#
+# Run from the folder docker compose reads its files from. Needs docker compose
+# and python3. Exits non-zero, with a message, when it can't give the names.
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+
+config="$(docker compose config --format json)" \
+  || { echo "compose-models.sh: docker compose config failed." >&2; exit 1; }
+
+# LLM_MODEL, BUILD_LLM_MODEL, ANSWER_LLM_MODEL, one per line, each after "v:" so
+# an empty one still has its line.
+settings="$(printf '%s' "$config" | python3 -c '
+import json, re, sys
+try:
+    services = json.load(sys.stdin)["services"]
+    env = services["ollama"].get("environment") or {}
+except (ValueError, KeyError, TypeError, AttributeError):
+    sys.exit("compose-models.sh: the compose config has no ollama service.")
+for key in ("LLM_MODEL", "BUILD_LLM_MODEL", "ANSWER_LLM_MODEL"):
+    value = env.get(key) or ""
+    if not re.fullmatch(r"[A-Za-z0-9._:/-]*", value):
+        sys.exit("compose-models.sh: %s is not a model name: %r" % (key, value))
+    print("v:" + value)
+')" || exit 1
+
+{ read -r llm; read -r build; read -r answer; } <<< "$settings"
+llm="${llm#v:}"; build="${build#v:}"; answer="${answer#v:}"
+names="$(env -i PATH="$PATH" LLM_MODEL="$llm" BUILD_LLM_MODEL="$build" ANSWER_LLM_MODEL="$answer" \
+  bash "$here/models.sh" list)" \
+  || { echo "compose-models.sh: ollama/models.sh failed." >&2; exit 1; }
+[ -n "$names" ] || { echo "compose-models.sh: no model names." >&2; exit 1; }
+printf '%s\n' "$names"
 ```
 
 ### proxy/nginx.conf
@@ -1016,13 +1152,23 @@ import sys
 from pydantic import ValidationError, field_validator
 from pydantic_settings import BaseSettings
 
+# The LLM when LLM_MODEL isn't set (#647).
+DEFAULT_LLM_MODEL = "llama3.1:8b"
+
 
 class Settings(BaseSettings):
     weaviate_host: str = "localhost"
     weaviate_port: int = 8080
     ollama_host: str = "localhost"
     ollama_port: int = 11434
-    llm_model: str = "llama3.1:8b"
+    # Two LLMs (#671): the build model prepares documents and writes gold
+    # standard pairs; the answer model answers questions. Each is its own
+    # setting when set and not empty, else LLM_MODEL, else DEFAULT_LLM_MODEL.
+    # Code reads only the resolved `build_model` and `answer_model` below,
+    # never these three fields directly.
+    llm_model: str = DEFAULT_LLM_MODEL
+    build_llm_model: str = ""
+    answer_llm_model: str = ""
     embed_model: str = "nomic-embed-text"
     upload_dir: str = "/app/uploads"
     # Retained original documents, content-addressed per collection. Kept in
@@ -1116,6 +1262,16 @@ class Settings(BaseSettings):
         if not 1 <= value <= 1000:
             raise ValueError("AUDIT_LOG_KEEP must be 1 to 1000")
         return value
+
+    @property
+    def build_model(self) -> str:
+        """The LLM for preparation and gold standard generation (#671)."""
+        return self.build_llm_model or self.llm_model or DEFAULT_LLM_MODEL
+
+    @property
+    def answer_model(self) -> str:
+        """The LLM that answers questions (#671)."""
+        return self.answer_llm_model or self.llm_model or DEFAULT_LLM_MODEL
 
     class Config:
         env_file = ".env"
@@ -4179,13 +4335,12 @@ async def embed(text: str) -> list[float]:
         return resp.json()["embedding"]
 
 
-@telemetry.traced("ollama.chat")
-async def chat(system: str, user: str) -> str:
+async def _chat(model: str, system: str, user: str) -> str:
     async with httpx.AsyncClient(timeout=300.0) as client:
         resp = await client.post(
             f"{_BASE}/api/chat",
             json={
-                "model": settings.llm_model,
+                "model": model,
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
@@ -4195,6 +4350,28 @@ async def chat(system: str, user: str) -> str:
         )
         resp.raise_for_status()
         return resp.json()["message"]["content"]
+
+
+@telemetry.traced("ollama.chat")
+async def chat(system: str, user: str) -> str:
+    """A call to the answer model: query's reformulation and answer (#671)."""
+    return await _chat(settings.answer_model, system, user)
+
+
+@telemetry.traced("ollama.chat")
+async def build_chat(system: str, user: str) -> str:
+    """A call to the build model: preparation and gold standard generation (#671)."""
+    return await _chat(settings.build_model, system, user)
+
+
+def _tagged(model: str) -> str:
+    """`name:tag`, with `:latest` for a name without a tag (after its last `/`)."""
+    return model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
+
+
+def same_model(a: str, b: str) -> bool:
+    """Whether two model names are one model: `x` and `x:latest` are."""
+    return _tagged(a) == _tagged(b)
 
 
 @telemetry.traced("ollama.models")
@@ -4208,6 +4385,9 @@ async def list_models() -> set[str]:
 
 @telemetry.traced("ollama.health")
 async def check_health() -> dict:
+    """`llm` is the answer model, `build_llm` the build model (#671)."""
+    answer, build = settings.answer_model, settings.build_model
+    same = same_model(answer, build)
     start = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -4215,20 +4395,24 @@ async def check_health() -> dict:
             resp.raise_for_status()
             latency_ms = int((time.monotonic() - start) * 1000)
             models = {m["name"].split(":")[0] for m in resp.json().get("models", [])}
-            llm_ok = settings.llm_model.split(":")[0] in models
-            embed_ok = settings.embed_model.split(":")[0] in models
-            if not (llm_ok and embed_ok):
+
+            def entry(model: str) -> dict:
+                ok = model.split(":")[0] in models
+                return {"status": "ok" if ok else "error", "latency_ms": latency_ms, "model": model}
+
+            result = {"llm": entry(answer), "build_llm": entry(build),
+                      "embed": entry(settings.embed_model), "same_model": same}
+            if any(result[k]["status"] != "ok" for k in ("llm", "build_llm", "embed")):
                 telemetry.outcome("error")
-            return {
-                "llm": {"status": "ok" if llm_ok else "error", "latency_ms": latency_ms, "model": settings.llm_model},
-                "embed": {"status": "ok" if embed_ok else "error", "latency_ms": latency_ms, "model": settings.embed_model},
-            }
+            return result
     except Exception as exc:
         telemetry.outcome("error", exc)
         latency_ms = int((time.monotonic() - start) * 1000)
         return {
-            "llm": {"status": "error", "latency_ms": latency_ms, "model": settings.llm_model},
+            "llm": {"status": "error", "latency_ms": latency_ms, "model": answer},
+            "build_llm": {"status": "error", "latency_ms": latency_ms, "model": build},
             "embed": {"status": "error", "latency_ms": latency_ms, "model": settings.embed_model},
+            "same_model": same,
         }
 ```
 
@@ -7472,7 +7656,7 @@ def recover() -> list[str]:
 ### api/services/preparation.py
 
 ```python
-"""Preparing one raw document (#638): code does the rule work, the LLM cleans.
+"""Preparing one raw document (#638): code does the rule work, the build LLM cleans.
 
 SPECIFICATIONS.md §3.1.11. In order, for one document:
 
@@ -7495,8 +7679,9 @@ SPECIFICATIONS.md §3.1.11. In order, for one document:
 5. **Check** each written part as ingest reads it, against the rules that don't
    depend on chunk settings.
 
-The LLM and the part writer are passed in, so tests use a stub and the job
-decides where parts go and whether there is room (a best-effort cap).
+"The LLM" here is the build model (BUILD_LLM_MODEL, else LLM_MODEL; #671): the
+job passes its chat and model list in, with the part writer, so tests use a stub
+and the job decides where parts go and whether there is room (a best-effort cap).
 """
 from __future__ import annotations
 
@@ -8221,7 +8406,7 @@ async def model_available(list_models: Callable[[], Awaitable[set[str]]]) -> boo
         models = await asyncio.wait_for(list_models(), 15)
     except Exception:                                       # noqa: BLE001
         return False
-    wanted = settings.llm_model
+    wanted = settings.build_model                          # preparation's LLM (#671)
     return wanted in models or f"{wanted}:latest" in models or (
         ":" not in wanted and any(m.split(":")[0] == wanted for m in models))
 
@@ -8681,6 +8866,11 @@ async def _work(queue: asyncio.Queue) -> None:
             _cancel_requested.discard(job_id)
 
 
+def _llm():
+    """The chat and model list preparation uses: the build model's (#671)."""
+    return ollama.build_chat, ollama.list_models
+
+
 async def _run(job_id: str) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
@@ -8722,8 +8912,9 @@ async def _run(job_id: str) -> None:
 
         try:
             raw = await asyncio.to_thread(store.raw_path, document_id)
+            chat, list_models = _llm()
             result = await preparation.prepare_document(
-                raw, name, record["raw_type"], ollama.chat, ollama.list_models,
+                raw, name, record["raw_type"], chat, list_models,
                 should_stop, write_part, progress)
             await asyncio.to_thread(store.commit, document_id, result.parts, result.fallback)
             job["documents_completed"] = job["documents_completed"] + 1
@@ -9857,7 +10048,7 @@ def _parse_gs_json(text: str) -> dict:
 
 
 async def _chat_once(system: str, user: str) -> str:
-    """One chat call, retried once if the transport fails.
+    """One call to the build model (#671), retried once if the transport fails.
 
     Ollama serialises requests per model, so generating while someone is
     querying can push a call past the client timeout. `httpx.ReadTimeout`
@@ -9865,10 +10056,10 @@ async def _chat_once(system: str, user: str) -> str:
     empty string. A transient timeout should cost a retry, not a pair.
     """
     try:
-        return await ollama.chat(system, user)
+        return await ollama.build_chat(system, user)
     except (httpx.TimeoutException, httpx.TransportError) as exc:
         log.warning("Ollama call failed (%s); retrying once", type(exc).__name__)
-        return await ollama.chat(system, user)
+        return await ollama.build_chat(system, user)
 
 
 # One initial attempt plus two reprompts. The model's failure mode is malformed
@@ -10619,7 +10810,7 @@ def render_help(embed_dimensions: int | str) -> str:
     return _render("help_transfer.md.tmpl", {
         "EMBED_MODEL": settings.embed_model,
         "EMBED_DIMENSIONS": embed_dimensions,
-        "LLM_MODEL": settings.llm_model,
+        "LLM_MODEL": settings.answer_model,
     })
 
 
@@ -10837,7 +11028,9 @@ def build(
             # models/<name>/<tag>/ folder (#487), so removing a failed copy
             # never removes another model's files.
             wanted: dict[str, str] = {}
-            for model in (settings.embed_model, settings.llm_model):
+            # Only the answer model: an imported collection is queried, never
+            # prepared, so the build model stays behind (#671).
+            for model in (settings.embed_model, settings.answer_model):
                 try:
                     key = model_bundle.model_ref(model)
                 except ValueError:
@@ -10901,7 +11094,10 @@ def build(
                 "model": settings.embed_model,
                 "dimensions": dimensions,
             },
-            "llm": {"model": settings.llm_model},
+            # `llm` is the answer model, kept for older readers (#671).
+            "llm": {"model": settings.answer_model},
+            "answer_llm": {"model": settings.answer_model},
+            "build_llm": {"model": settings.build_model},
             "chunking": chunking,
             "fidelity": fidelity,
             # What the package actually carries, not what was asked for: a
@@ -13063,6 +13259,8 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
     Absent, bundled       -> install, then verify Ollama actually reports it.
     Absent, unbundled     -> EMBEDDING_MODEL_MISSING.
     Namespaced name       -> ask Ollama; it can't be checked or installed here.
+    The LLM is this instance's answer model; the build model is neither checked
+    nor installed (#671).
     """
     notes: list[str] = []
     if not model_bundle.store_available():
@@ -13071,7 +13269,9 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
         return notes
 
     embed_model = settings.embed_model
-    llm_model = settings.llm_model
+    # Only the answer model: a query needs it; the build model is recorded in
+    # the manifest for information and never checked or installed (#671).
+    llm_model = settings.answer_model
     # `name:tag`; a folder counts only for the tag it holds (#487).
     bundled = model_bundle.bundled_models(pkg, manifest)
 
@@ -13678,7 +13878,7 @@ The manifest names every blob the model needs, so bundling resolves blobs
 weights, and on a machine with other models pulled it would be far worse.
 
 In a package each model gets its own folder, `models/<name>/<tag>/`, so two
-tags of one name (an embedding model `foo:a` and an LLM `foo:b`) never share
+tags of one name (an embedding model `foo:a` and an answer LLM `foo:b`) never share
 files. Packages built before #487 used `models/<name>/`; such a folder is used
 only for the one tag the package manifest gives that name.
 
@@ -13859,7 +14059,7 @@ def _legacy_tag(name: str, package_manifest) -> str | None:
     """The tag a pre-#487 `models/<name>/` folder holds, or None if unknown.
 
     Those packages didn't record it. The package manifest names the embedding
-    model and the LLM; when exactly one tag of `name` is among them, the folder
+    model and the (answer) LLM; when exactly one tag of `name` is among them, the folder
     holds that tag. Two tags of one name shared the folder, the last copy
     overwriting the first's manifest, so the folder can't be trusted for either.
     """
@@ -14710,7 +14910,8 @@ async def health_check():
 
     ollama_result = await ollama.check_health()
     results["ollama"] = ollama_result
-    if any(v["status"] != "ok" for v in ollama_result.values()):
+    # `same_model` is a flag, not a service: it never decides the status (#671).
+    if any(v["status"] != "ok" for v in ollama_result.values() if isinstance(v, dict)):
         overall_ok = False
 
     # Resource reporting is advisory and deliberately does NOT affect
@@ -16796,7 +16997,7 @@ fidelity for an older corpus.
 @@INCLUDE:embedding_rule@@
 
 If the target machine has no embedding model at all, export with
-`include_models: true`. That bundles `@@EMBED_MODEL@@` and `@@LLM_MODEL@@` as
+`include_models: true`. That bundles `@@EMBED_MODEL@@` and the answer model `@@LLM_MODEL@@` as
 Ollama's own manifest and blob files, taking the package from kilobytes to
 roughly 2.3 GB. On import a model already present is left alone, provided its
 files match their checksums; a missing one is installed from the package and
@@ -20077,7 +20278,8 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
 
 function isHealthResult(data: any): data is HealthResult {
   const service = (s: any) => !!s && typeof s === 'object' && typeof s.status === 'string'
-  return service(data?.services?.weaviate) && service(data?.services?.ollama?.llm) && service(data?.services?.ollama?.embed)
+  return service(data?.services?.weaviate) && service(data?.services?.ollama?.llm)
+    && service(data?.services?.ollama?.build_llm) && service(data?.services?.ollama?.embed)
 }
 
 // GET /health answers 503 with the same per-service body when a dependency is
@@ -20357,8 +20559,12 @@ export interface HealthResult {
     // `ollama_embed` keys. Reading the flat names yielded undefined and threw
     // during render, which unmounted the whole app.
     ollama: {
+      // `llm` answers questions; `build_llm` prepares documents and writes gold
+      // standard pairs; `same_model` says they are one model (#671).
       llm: { status: string; latency_ms: number; model: string }
+      build_llm: { status: string; latency_ms: number; model: string }
       embed: { status: string; latency_ms: number; model: string }
+      same_model: boolean
     }
   }
   resources?: {
@@ -21575,7 +21781,7 @@ import JobList, { newestToOpen, useJobList } from '../components/JobList'
 
 // Document preparation (#638). Raw documents are uploaded to the preparation area
 // on the instance, prepared by a background job (the code does the corpus rules'
-// work, the local LLM only removes headers, footers and boilerplate and writes a
+// work, the build LLM only removes headers, footers and boilerplate and writes a
 // title and summary for PDF, DOCX, TXT and MD; CSV and JSON parts are labelled
 // from their data, #648), reviewed here, and imported into a collection through the
 // normal ingest path. They stay on the instance until deleted.
@@ -21830,7 +22036,7 @@ export default function PreparePage() {
       <h1 className="text-2xl font-bold mb-2">Prepare Documents</h1>
       <p className="text-sm text-gray-600 mb-4">
         Raw documents are made to follow the corpus rules here: the code extracts the text, splits it to the limits,
-        normalises it and converts JSON, and the local LLM only removes page headers, footers, page numbers and
+        normalises it and converts JSON, and the build LLM only removes page headers, footers, page numbers and
         boilerplate and writes a title and summary for PDF, DOCX, TXT and MD. CSV and JSON parts are labelled from
         their data, with no LLM call. Where its cleaning would lose content, the part keeps the
         code-only text and the fallback is shown. Documents stay on this instance until you delete them.
@@ -23316,7 +23522,7 @@ export default function TransferPage() {
           <span>
             Include the models
             <span className="block text-xs text-gray-500">
-              Bundles the embedding model and the LLM, taking the package to roughly 2.3 GB.
+              Bundles the embedding model and the answering LLM, taking the package to roughly 2.3 GB.
               Needed only when the target machine has never pulled them.
             </span>
           </span>
@@ -23603,7 +23809,7 @@ export default function HealthPage() {
       </div>}
       {healthError && <p role="alert" className="text-red-700 mb-4">Service health could not be read: {healthError}</p>}
       {health && (
-        <div className="grid grid-cols-3 gap-4 mb-8">
+        <div className={`grid ${health.services.ollama.same_model ? 'grid-cols-3' : 'grid-cols-4'} gap-4 mb-8`}>
           <div className="bg-white border rounded p-4">
             <div className="flex items-center text-sm font-medium mb-1">
               <StatusBadge status={health.services.weaviate.status} />
@@ -23611,13 +23817,33 @@ export default function HealthPage() {
             </div>
             <div className="text-xs text-gray-500">{health.services.weaviate.latency_ms}ms</div>
           </div>
-          <div className="bg-white border rounded p-4">
-            <div className="flex items-center text-sm font-medium mb-1">
-              <StatusBadge status={health.services.ollama.llm.status} />
-              LLM ({health.services.ollama.llm.model})
+          {/* One LLM, or an answer model and a build model (#671). */}
+          {health.services.ollama.same_model ? (
+            <div className="bg-white border rounded p-4">
+              <div className="flex items-center text-sm font-medium mb-1">
+                <StatusBadge status={health.services.ollama.llm.status} />
+                LLM ({health.services.ollama.llm.model}), builds and answers
+              </div>
+              <div className="text-xs text-gray-500">{health.services.ollama.llm.latency_ms}ms</div>
             </div>
-            <div className="text-xs text-gray-500">{health.services.ollama.llm.latency_ms}ms</div>
-          </div>
+          ) : (
+            <>
+              <div className="bg-white border rounded p-4">
+                <div className="flex items-center text-sm font-medium mb-1">
+                  <StatusBadge status={health.services.ollama.llm.status} />
+                  Answer LLM ({health.services.ollama.llm.model})
+                </div>
+                <div className="text-xs text-gray-500">{health.services.ollama.llm.latency_ms}ms</div>
+              </div>
+              <div className="bg-white border rounded p-4">
+                <div className="flex items-center text-sm font-medium mb-1">
+                  <StatusBadge status={health.services.ollama.build_llm.status} />
+                  Build LLM ({health.services.ollama.build_llm.model})
+                </div>
+                <div className="text-xs text-gray-500">{health.services.ollama.build_llm.latency_ms}ms</div>
+              </div>
+            </>
+          )}
           <div className="bg-white border rounded p-4">
             <div className="flex items-center text-sm font-medium mb-1">
               <StatusBadge status={health.services.ollama.embed.status} />
@@ -24344,6 +24570,19 @@ and 4 min 10 s in a full run (the Prepare case about 25 s), most of it the large
 2.5 min). Splitting it through `overlap` at chunk size 50 instead embedded about 11,200 chunks and took
 26.5 min, which is why it uses `fixed` with the merge.
 
+`23_llm_split.sh` checks that each task uses its own LLM (#671): preparation and gold standard
+generation the build model, query the answer model. It runs only in a full run (`RAG_SKIP_SLOW`
+unset); every other check stays on one model. It ingests the fixtures' `policies.txt` into
+`VfyLlmSplit`, then runs `llm_split.py` in the api container with `BUILD_LLM_MODEL=qwen2.5:0.5b`
+set for that process only, the answer model left as compose sets it, so neither the API nor the
+compose settings change. `llm_split.py` pulls `qwen2.5:0.5b` into the verify project's Ollama, then
+prepares a short text (`preparation.prepare_document`, with the chat and model list
+`preparation_jobs` uses), generates one gold standard pair (`goldstandard._generate_pair`) and runs
+one query (`rag_pipeline.run_query`) on the collection, recording the model Ollama reports in each
+chat reply. The checks: preparation and gold standard were answered only by `qwen2.5:0.5b`, query
+only by the answer model. Preparation writes to a temporary folder and the pair isn't stored; the
+small model is deleted from Ollama and the collection dropped at the end.
+
 ## Entry point and verify project
 
 `stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
@@ -24520,8 +24759,9 @@ top of the main `README.md` shows its result on `develop`.
   failed.
 - **The model cache.** Even with `RAG_SKIP_SLOW=1`, ingest needs the embedding
   model, so Ollama starts with both models (about 5.2 GB). The cache key is
-  built from the models `ollama/entrypoint.sh` pulls
-  (`ollama-models-llama3.1:8b-nomic-embed-text`). On a hit, the cached models are
+  built from the models `ollama/entrypoint.sh` pulls, the names
+  `ollama/compose-models.sh` resolves from the LLM settings compose gives the
+  ollama service (#671) (`ollama-models-llama3.1:8b-nomic-embed-text` by default). On a hit, the cached models are
   copied into `rag-verify-ollama-models` before `up`, and Ollama pulls
   nothing. On a miss, Ollama pulls them; after `down`, the workflow copies the
   volume's `models/` folder out, only once every model's manifest is there,
@@ -25182,6 +25422,8 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `browser/ui_ingest.js` | the browser side of suite 22: the Import and Prepare pages driven as a user does, the observations printed as one JSON line (#641) |
 | `ui_ingest_weaviate.py` | helper for suite 22, run in the API container: the `VfyUiIngest*` collections' documents and chunk text, read only (#641) |
 | `ui_ingest_check.py` | the checks of suite 22, one per subcommand, on the host, and its cleanup (#641) |
+| `23_llm_split.sh` | the build and answer models (#671), full runs only: with `BUILD_LLM_MODEL` set to a small model, preparation and gold standard use it and query uses the answer model |
+| `llm_split.py` | helper for suite 23, run in the API container: pulls the small model, runs the three tasks through the services' code and prints the models Ollama reports answering each (#671) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
@@ -25789,7 +26031,7 @@ fi
 # question with a known answer first, unless LLM work is being skipped.
 if [ "${RAG_SKIP_SLOW:-0}" != "1" ]; then
   if ! sanity=$(cd "$REPO_ROOT" && docker compose exec -T api python - < scripts/verify/llm_sanity.py 2>&1); then
-    printf '\nThe LLM is not giving usable answers:\n  %s\n' "$sanity"
+    printf '\nThe answer LLM is not giving usable answers:\n  %s\n' "$sanity"
     printf 'Restart it and run again:  docker compose restart ollama\n'
     printf '(with the verify environment that scripts/verify/stack.sh up prints)\n\n'
     exit 2
@@ -25801,7 +26043,7 @@ printf '\nBuilding fixtures in %s\n' "$FIX"
 rm -rf "$FIX"; python3 ./fixtures.py "$FIX" >/dev/null
 export RAG_FIXTURES="$FIX"
 
-ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit 20_offline_model 21_prepare 22_ui_ingest)
+ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit 20_offline_model 21_prepare 22_ui_ingest 23_llm_split)
 if [ "$#" -gt 0 ]; then
   SUITES=()
   for want in "$@"; do
@@ -28603,7 +28845,7 @@ if __name__ == "__main__":
 # The unit checks (U1-U14) run in the API image with no network and a stub LLM.
 # The stack checks (P1-P11) run on the verify project through prepare_stack.py,
 # one check each, as the harness Developer. P9-P11 prepare three small files with
-# the local LLM, one job at a time, so they run only in a full run
+# the build LLM, one job at a time, so they run only in a full run
 # (RAG_SKIP_SLOW unset). Documents this suite uploads are vfy-prepare-*, its
 # collections VfyPrepare*; both are removed at the end.
 cd "$(dirname "$0")" && . ./lib.sh
@@ -28638,9 +28880,9 @@ check "P7 cancelling an unknown job is 404" $?
 stack audit
 check "P8 the audit log records upload, download and delete with names and no document text" $?
 
-section "Preparation with the local LLM (P9-P11)"
+section "Preparation with the build LLM (P9-P11)"
 if [ "$SKIP_SLOW" = "1" ]; then
-  skip "P9-P11 prepare, import and download with the LLM" "RAG_SKIP_SLOW=1"
+  skip "P9-P11 prepare, import and download with the build LLM" "RAG_SKIP_SLOW=1"
 else
   stack prepare
   check "P9 the .txt becomes cleaned Markdown of source lines in order with its header, every window without a fallback losing at most 20 % of its characters; the .csv and .jsonl are unchanged and labelled from their data" $?
@@ -29023,7 +29265,7 @@ def check_prepare(fix):
                "no header: {!r}".format(lines[:3]))
         lines = lines[4:]
     # The part's text as preparation reads the .txt: its paragraphs joined by
-    # one blank line, then cut into the windows the LLM saw.
+    # one blank line, then cut into the windows the build LLM saw.
     source = "\n\n".join(block.strip("\n") for block in PAGES.split("\n\n")
                           if block.strip()).split("\n")
     position = 0
@@ -29142,7 +29384,7 @@ if __name__ == "__main__":
 # A real browser (browser/ui_ingest.js), logged in as the harness Engineer, with
 # nothing stubbed, ingests on the Import page every supported type into a new
 # collection each, a ZIP of mixed types with a .jsonl.gz, and a file over the
-# part limit; prepares two files on the Prepare page with the local LLM and
+# part limit; prepares two files on the Prepare page with the build LLM and
 # imports them into a new collection (full runs only); and sends a broken PDF,
 # an unsupported type and an over-limit ZIP, each into a new collection. Then
 # ui_ingest_check.py checks each collection: the job ended with no error and the
@@ -29584,6 +29826,186 @@ try:
     print(json.dumps({"collections": out}))
 finally:
     wc.close_client()
+```
+
+### scripts/verify/23_llm_split.sh
+
+```bash
+#!/usr/bin/env bash
+# Build and answer models (#671): preparation and gold standard generation use
+# the build model, query uses the answer model.
+#
+# Slow only (it pulls a small model and makes real LLM calls), so a run with
+# RAG_SKIP_SLOW=1 skips it; every other check stays on one model. It runs
+# llm_split.py in the api container with BUILD_LLM_MODEL set to a small model
+# for that process only, leaving the answer model as compose sets it: the API
+# itself and the compose settings are not changed. Its collection is
+# VfyLlmSplit, removed at the end; it creates no preparation document and no
+# gold standard session.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
+[ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
+require_stack
+SMALL=qwen2.5:0.5b
+C="${PREFIX}LlmSplit"
+OUT="$(mktemp)"
+trap 'rm -f "$OUT" /tmp/vfy_llm_split_ingest.json' EXIT
+
+section "Build and answer models (#671)"
+
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "preparation and gold standard on the build model, query on the answer model" \
+    "set RAG_SKIP_SLOW=0 to include it"
+  summary; exit $?
+fi
+
+drop_collection "$C"; make_collection "$C"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_llm_split_ingest.json
+job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_llm_split_ingest.json'))['job_id'])" 2>/dev/null)
+check_eq "the collection for the query is ingested" "$(wait_for_job "/ingest/job/$job" 900)" "completed"
+
+(cd "$REPO_ROOT" && docker compose exec -T -e BUILD_LLM_MODEL="$SMALL" -e RAG_LLM_SPLIT_COLLECTION="$C" \
+  api python - < scripts/verify/llm_split.py) > "$OUT"
+check "llm_split.py ran to the end" $? "$(tail -c 400 "$OUT")"
+
+f() { python3 -c "import json,sys;print(json.loads(open(sys.argv[1]).read().strip().splitlines()[-1]).get(sys.argv[2]))" "$OUT" "$1" 2>/dev/null; }
+check_eq "with BUILD_LLM_MODEL set, the API resolves it as the build model" "$(f build_model)" "$SMALL"
+answer="$(f answer_model)"
+[ -n "$answer" ] && [ "$answer" != "None" ] && [ "$answer" != "$SMALL" ]
+check "the answer model stays as compose sets it" $? "got '$answer'"
+# Ollama names a model `name:tag`, so compare with the tagged names. A task that
+# raised still counts the calls it made; its error is shown with the check.
+build_tagged="$(f build_tagged)"; answer_tagged="$(f answer_tagged)"
+models_check() {   # models_check <name> <task> <want>
+  local got; got="$(f "$2")"
+  [ "$got" = "['$3']" ]
+  check "$1" $? "got '$got', wanted '['$3']'; error: $(f "$2_error")"
+}
+models_check "preparation's LLM calls were answered by the build model only" prepare "$build_tagged"
+models_check "gold standard generation's LLM calls were answered by the build model only" goldstandard "$build_tagged"
+models_check "query's LLM calls were answered by the answer model only" query "$answer_tagged"
+
+drop_collection "$C"
+summary
+```
+
+### scripts/verify/llm_split.py
+
+```python
+"""Which model answers each task (#671). Run in the api container by
+23_llm_split.sh, with BUILD_LLM_MODEL set for this process only:
+
+    docker compose exec -T -e BUILD_LLM_MODEL=qwen2.5:0.5b \
+        -e RAG_LLM_SPLIT_COLLECTION=<collection> api python - < scripts/verify/llm_split.py
+
+It pulls the build model, then runs a preparation of a short text, one gold
+standard pair and one query through the services' own code, recording the model
+Ollama reports in each /api/chat reply (the calls themselves are unchanged).
+Preparation writes its parts to a temporary folder and the pair isn't stored,
+so nothing is left behind; the build model is deleted from Ollama at the end.
+Prints one JSON line: the resolved models (as set, and as `name:tag`) and, per
+task, the sorted set of models that answered (Ollama's names, `name:tag`) and,
+when the task raised, `<task>_error`.
+"""
+import asyncio
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+import httpx
+
+from config import settings
+from services import goldstandard, preparation, preparation_jobs, rag_pipeline
+
+COLLECTION = os.environ["RAG_LLM_SPLIT_COLLECTION"]
+BASE = f"http://{settings.ollama_host}:{settings.ollama_port}"
+TEXT = ("Overtime policy\n\nDepartment managers approve overtime before it is worked. "
+        "Requests go to the manager in writing at least one day ahead.\n\n"
+        "Page 1 of 1\n\nPayroll pays approved overtime at one and a half times the "
+        "hourly rate, in the next pay period.\n")
+
+
+def tagged(model):
+    return model if ":" in model.rsplit("/", 1)[-1] else f"{model}:latest"
+
+
+out = {"build_model": settings.build_model, "answer_model": settings.answer_model,
+       # As Ollama names the model in a reply, so the suite compares like with like.
+       "build_tagged": tagged(settings.build_model),
+       "answer_tagged": tagged(settings.answer_model)}
+build = settings.build_model
+
+# The build model, pulled into the verify project's Ollama (removed below).
+httpx.post(f"{BASE}/api/pull", json={"name": build, "stream": False},
+           timeout=1800).raise_for_status()
+
+seen = []
+real_post = httpx.AsyncClient.post
+
+
+async def recording_post(self, url, *args, **kwargs):
+    response = await real_post(self, url, *args, **kwargs)
+    if str(url).endswith("/api/chat"):
+        try:
+            seen.append(response.json().get("model"))
+        except ValueError:
+            seen.append(None)
+    return response
+
+httpx.AsyncClient.post = recording_post
+
+
+def task(name, coroutine):
+    seen.clear()
+    try:
+        asyncio.run(coroutine)
+    except Exception as exc:                          # noqa: BLE001
+        out[name + "_error"] = f"{type(exc).__name__}: {exc}"
+    out[name] = sorted({tagged(m) if m else "none" for m in seen})
+
+
+async def prepare():
+    with tempfile.TemporaryDirectory() as folder:
+        raw = Path(folder) / "overtime.txt"
+        raw.write_text(TEXT)
+        parts = Path(folder) / "parts"
+        parts.mkdir()
+
+        async def write_part(index, suffix, data):
+            path = parts / f"{index + 1:03d}{suffix}"
+            path.write_bytes(data)
+            return path
+
+        chat, list_models = preparation_jobs._llm()
+        await preparation.prepare_document(raw, raw.name, ".txt", chat, list_models,
+                                           lambda: False, write_part)
+
+
+async def gold_pair():
+    await goldstandard._generate_pair({"content": TEXT})
+
+
+async def query():
+    await rag_pipeline.run_query("Who approves overtime?", COLLECTION, "hnsw", 3, 0.5,
+                                 False, "end_user")
+
+
+try:
+    task("prepare", prepare())
+    task("goldstandard", gold_pair())
+    task("query", query())
+finally:
+    httpx.AsyncClient.post = real_post
+    try:
+        httpx.request("DELETE", f"{BASE}/api/delete", json={"name": build}, timeout=60)
+    except httpx.HTTPError as exc:
+        print(f"could not delete {build}: {exc}", file=sys.stderr)
+
+print(json.dumps(out))
 ```
 
 ### scripts/verify/browser/ui_ingest.js
@@ -32920,7 +33342,9 @@ class OfflineTests(unittest.TestCase):
         with self.assertRaises(httpx.ConnectError):
             asyncio.run(ollama_client.list_models())
         health = asyncio.run(ollama_client.check_health())
-        self.assertEqual({model["status"] for model in health.values()}, {"error"})
+        # `same_model` is a flag beside the three models (#671).
+        self.assertEqual({model["status"] for model in health.values() if isinstance(model, dict)}, {"error"})
+        self.assertEqual(set(health), {"llm", "build_llm", "embed", "same_model"})
 
 
 class ImplementationCopyTests(unittest.TestCase):
@@ -33039,7 +33463,7 @@ class StubLLM:
 
     async def models(self):
         self.model_calls += 1
-        return {f"{settings.llm_model}:latest", "nomic-embed-text:latest"}
+        return {f"{settings.build_model}:latest", "nomic-embed-text:latest"}
 
 
 class AreaCase(unittest.TestCase):
@@ -33227,6 +33651,25 @@ class LlmDocumentTests(AreaCase):
         self.assertEqual(result.parts[0]["fallbacks"], [{"window": None, "reason": "llm-unavailable"}])
         self.assertEqual(llm.calls, [])
         self.assertTrue(result.fallback)
+
+    def test_the_model_check_looks_for_the_build_model(self):
+        # Preparation's LLM is the build model (#671): with only the answer model
+        # listed, the document is prepared by code alone.
+        llm = StubLLM()
+
+        async def answer_model_only():
+            return {"llama3.2:latest", "nomic-embed-text:latest"}
+        llm.models = answer_model_only
+        record = self.document("a.md", page_text())
+        with patch.object(settings, "llm_model", "llama3.2"), \
+                patch.object(settings, "build_llm_model", "qwen2.5:0.5b"):
+            result = self.prepare(record, llm)
+        self.assertEqual(result.parts[0]["fallbacks"], [{"window": None, "reason": "llm-unavailable"}])
+        self.assertEqual(llm.calls, [])
+        with patch.object(settings, "llm_model", "qwen2.5:0.5b"), \
+                patch.object(settings, "answer_llm_model", "llama3.2"):
+            self.assertTrue(asyncio.run(preparation.model_available(
+                AsyncMock(return_value={"qwen2.5:0.5b"}))))
 
     def test_over_1000_windows_is_too_large_for_the_llm_but_titled(self):
         with patch.object(preparation, "MAX_WINDOWS", 2):
@@ -33649,7 +34092,10 @@ class JobCase(AreaCase):
     def setUp(self):
         super().setUp()
         self.llm = StubLLM()
-        for name, value in (("chat", self.llm.chat), ("list_models", self.llm.models)):
+        # A job prepares with the build model (#671); the answer model is never asked.
+        never = AsyncMock(side_effect=AssertionError("the answer model was asked"))
+        for name, value in (("build_chat", self.llm.chat), ("chat", never),
+                            ("list_models", self.llm.models)):
             change = patch.object(jobs.ollama, name, value)
             change.start()
             self.addCleanup(change.stop)
@@ -34356,7 +34802,7 @@ class StreamingReviewTests(JobCase):
                 return '{"title": "Long text", "summary": "Numbered paragraphs."}'
 
             async def models(self):
-                return {f"{settings.llm_model}:latest"}
+                return {f"{settings.build_model}:latest"}
 
         def run(name, paragraphs):
             path = self.root / "uploads" / name
@@ -35562,7 +36008,7 @@ def write_ui_ingest(out: pathlib.Path, fixtures: pathlib.Path) -> None:
                   "documents": {}, "split": {"file": "vfy-ui-large.txt", "first": UI_LARGE_FIRST,
                                              "last": UI_LARGE_LAST},
                   "min_chunks": -(-len("".join(large.split())) // 6000)})
-    # Prepared with the local LLM, then imported (#638). The phrase is in three
+    # Prepared with the build LLM, then imported (#638). The phrase is in three
     # body lines, so the cleaning can't drop every one.
     notes = UI_PHRASES["vfy-ui-prep-notes.txt"]
     (out / "vfy-ui-prep-notes.txt").write_text("\n".join([
@@ -35719,6 +36165,13 @@ with tempfile.TemporaryDirectory() as td:
                 "embedding", "llm", "chunking", "fidelity", "models_bundled", "files"):
         check(f"§4.4 manifest has {key}", key in manifest)
     check("package_format is 1", manifest.get("package_format") == 1)
+    # #671: both LLMs are recorded with llm's shape; llm stays the answer model.
+    for key in ("answer_llm", "build_llm"):
+        check(f"manifest has {key} as {{'model': name}}",
+              isinstance(manifest.get(key), dict) and isinstance(manifest[key].get("model"), str)
+              and manifest[key]["model"] != "", str(manifest.get(key)))
+    check("manifest llm is the answer model", manifest.get("llm") == manifest.get("answer_llm"),
+          f"{manifest.get('llm')} vs {manifest.get('answer_llm')}")
     check("created_at is UTC ISO-8601 with Z",
           bool(re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", manifest["created_at"])),
           manifest["created_at"])
@@ -35987,6 +36440,13 @@ ok = (s['weaviate']['status']=='ok' and s['ollama']['llm']['status']=='ok'
       and all(v['latency_ms'] >= 0 for v in (s['weaviate'], s['ollama']['llm'], s['ollama']['embed'])))
 sys.exit(0 if ok else 1)"
 check "per-service status and latency are reported" $?
+python3 -c "
+import json,sys,os; o=json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_health.json'))['services']['ollama']
+b=o.get('build_llm') or {}
+ok = (b.get('status')=='ok' and isinstance(b.get('latency_ms'), int) and b.get('model')==o['llm']['model']
+      and o.get('same_model') is True)
+sys.exit(0 if ok else 1)"
+check "health reports the build model, the same as the answer model by default, with same_model true (#671)" $?
 
 # ── memory resource reporting (Issue #98) ────────────────────────────────────
 # Advisory only (see the comment in api/routers/health.py), so it never
@@ -39749,7 +40209,7 @@ drop_collection "$iname"
 # ── models on import: damaged and namespaced (E26, E27) ──────────────────────
 # Runs the importer inside the API process with its settings patched. E26 copies
 # the embedding model into a temporary store and damages the copy; the live
-# model store is only read. E27 uses the live store and a namespaced LLM name.
+# model store is only read. E27 uses the live store and a namespaced answer LLM name.
 (cd "$REPO_ROOT" && docker compose exec -T api python - "$PKG") > /tmp/vfy_models.json 2>/tmp/vfy_models.err <<'ENDPY'
 import json, shutil, sys, tempfile, uuid
 from pathlib import Path
@@ -39798,7 +40258,7 @@ with tempfile.TemporaryDirectory(prefix="vfy-model-", dir=settings.upload_dir) a
         out["e26_untouched"] = (damaged.read_bytes() == b"ordinary damaged review bytes"
                                 and mp.read_bytes() == manifest_before)
 
-# E27: a namespaced LLM that Ollama doesn't report -> import completes with a note
+# E27: a namespaced answer LLM that Ollama doesn't report -> import completes with a note
 ns = "vfy-namespace/absent-llm"
 reports = getattr(importer, "_ollama_reports", None)
 if reports:                                              # real /api/tags; tag defaults to latest
@@ -40473,7 +40933,7 @@ check_eq "the package imports under a new name" "$istat" "completed"
 check_eq "the import leaves the package's bytes, size and mtime unchanged" "$(package_state)" "$state_before"
 
 # -- E11: the import retrieves what the original does -------------------------
-# /query rewrites each question with the LLM first, so two answers can differ even for
+# /query rewrites each question with the answer LLM first, so two answers can differ even for
 # identical collections; retrieval is compared directly, for each path /query uses.
 (cd "$REPO_ROOT" && docker compose exec -T api python - "$C" "$IMP" "$QUESTION") <<'ENDPY'
 import asyncio, sys
@@ -43011,7 +43471,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
       status,
       services: {
         weaviate: service('ok', 11),
-        ollama: { llm: service('ok', 22, 'phi3.5'), embed: service(embed, 33, 'nomic-embed-text') },
+        ollama: { llm: service('ok', 22, 'phi3.5'), build_llm: service('ok', 22, 'phi3.5'), embed: service(embed, 33, 'nomic-embed-text'), same_model: true },
       },
       resources: { memory: { status: 'ok', allocated_gb: 11.67, recommended_minimum_gb: 12.0 } },
     });
@@ -43737,16 +44197,19 @@ jobs:
           # The suites run this PR's code; leave no token in its git config.
           persist-credentials: false
 
-      # The cache key is the models ollama/entrypoint.sh pulls. The copies in
+      # The cache key is the models ollama/entrypoint.sh pulls: the names
+      # ollama/compose-models.sh resolves from the LLM settings compose gives
+      # the ollama service (#671). The copies in
       # and out of the model volume run in the ollama image docker-compose.yml
       # pins, as stack.sh's own model copy does.
       - name: Read the model names
         id: models
         run: |
-          names=$(sed -n 's/^pull_with_retry \([A-Za-z0-9._:-]*\)$/\1/p' ollama/entrypoint.sh | tr '\n' ' ')
-          names=${names% }
+          names=$(bash ollama/compose-models.sh) \
+            || { echo "could not read the model names (ollama/compose-models.sh)" >&2; exit 1; }
+          names=$(echo $names)
           image=$(sed -n '/^  ollama:$/,/^  [a-z]/s/^    image: *//p' docker-compose.yml | head -1 | tr -d "\"'")
-          [ -n "$names" ] || { echo "no pull_with_retry lines in ollama/entrypoint.sh" >&2; exit 1; }
+          [ -n "$names" ] || { echo "no model names from ollama/compose-models.sh" >&2; exit 1; }
           [ -n "$image" ] || { echo "no ollama image in docker-compose.yml" >&2; exit 1; }
           echo "models: $names; image: $image"
           {
@@ -43861,15 +44324,22 @@ drifting. Standard library only; no Docker or stack needed.
 Run: python3 scripts/tests/test_ci_workflow.py
 """
 from pathlib import Path
+import os
 import re
+import subprocess
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = '.github/workflows/verify.yml'
 BADGE = ('[![Verify](https://github.com/mikesilvers/rag-docker/actions/workflows/verify.yml/badge.svg?branch=develop)]'
          '(https://github.com/mikesilvers/rag-docker/actions/workflows/verify.yml)')
-# The pattern the workflow's sed uses on ollama/entrypoint.sh, in Python.
-MODEL_LINE = re.compile(r'^pull_with_retry ([A-Za-z0-9._:-]*)$', re.M)
+# A `docker` that answers `docker compose config` with the ollama service's LLM
+# settings as docker-compose.yml sets them (#671).
+STUB_DOCKER = """#!/bin/bash
+[ "$1 $2" = "compose config" ] || { echo "stub docker: unexpected call: $*" >&2; exit 99; }
+echo '{"name": "rag-docker", "services": {"ollama": {"environment": {"LLM_MODEL": "llama3.1:8b", "BUILD_LLM_MODEL": "", "ANSWER_LLM_MODEL": ""}}}}'
+"""
 
 
 def workflow():
@@ -43974,12 +44444,25 @@ class SuiteTests(unittest.TestCase):
 
 class ModelCacheTests(unittest.TestCase):
     def test_key_is_the_models_the_entrypoint_pulls(self):
+        # The names ollama/compose-models.sh resolves from the ollama service's LLM
+        # settings, which the entrypoint pulls (#671).
         text = workflow()
         _, step = step_with(text, 'id: models')
-        self.assertIn('ollama/entrypoint.sh', step)
-        self.assertIn(r"sed -n 's/^pull_with_retry \([A-Za-z0-9._:-]*\)$/\1/p'", step)
-        self.assertIn('key=ollama-models-', step)
-        self.assertTrue(MODEL_LINE.findall((ROOT / 'ollama/entrypoint.sh').read_text()))
+        self.assertIn('names=$(bash ollama/compose-models.sh) \\\n', step)
+        self.assertIn('|| { echo "could not read the model names (ollama/compose-models.sh)" >&2; exit 1; }', step)
+        self.assertIn('echo "key=ollama-models-${names// /-}"', step)
+        self.assertIn('for model in $(models); do', (ROOT / 'ollama/entrypoint.sh').read_text())
+        with tempfile.TemporaryDirectory() as folder:
+            docker = Path(folder) / 'docker'
+            docker.write_text(STUB_DOCKER)
+            docker.chmod(0o755)
+            out = subprocess.run(['bash', str(ROOT / 'ollama/compose-models.sh')], capture_output=True,
+                                 text=True, timeout=60,
+                                 env=dict(os.environ, PATH=folder + os.pathsep + os.environ['PATH']))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        # With the default settings the key is what it was before the split.
+        self.assertEqual('ollama-models-' + '-'.join(out.stdout.split()),
+                         'ollama-models-llama3.1:8b-nomic-embed-text')
 
     def test_restored_before_start_and_saved_only_after_a_miss(self):
         text = workflow()
@@ -44211,9 +44694,9 @@ Self-contained bundle (~4.6 GB) for an air-gapped target: source plus
 #     built with `git archive`, exactly as package.sh does. Untracked and
 #     ignored files and uncommitted changes are left out (#384).
 #   * all five Docker images, pre-built (docker save)
-#   * the Ollama model weights (llama3.1:8b + nomic-embed-text), the whole
-#     model volume: a model left in it, such as phi3.5 from before 1.2.1, is
-#     carried too
+#   * the Ollama model weights (by default llama3.1:8b + nomic-embed-text; a
+#     different build or answer LLM too, #671), the whole model volume: a model
+#     left in it, such as phi3.5 from before 1.2.1, is carried too
 #
 # About 7.7 GB (2.5 GB images + 5.2 GB model weights) with both models present,
 # estimated from the parts (4.6 GB was measured when the LLM was the 2.2 GB
@@ -44264,10 +44747,14 @@ docker volume inspect "$MODELVOL" >/dev/null 2>&1 \
 
 # The volume must hold every model ollama/entrypoint.sh pulls, or the offline
 # target would try to download the missing one (#647: an install from before
-# llama3.1:8b became the default holds only phi3.5). The names are read as the
-# CI model cache reads them; a manifest without a tag is under "latest".
-MODELS="$(sed -n 's/^pull_with_retry \([A-Za-z0-9._:-]*\)$/\1/p' ollama/entrypoint.sh | tr '\n' ' ')"
-[ -n "$MODELS" ] || { echo "ERROR: no pull_with_retry lines in ollama/entrypoint.sh." >&2; exit 1; }
+# llama3.1:8b became the default holds only phi3.5). The names are the ones the
+# entrypoint resolves from the LLM settings compose gives the ollama service
+# (#671), read as the CI model cache reads them; a manifest without a tag is
+# under "latest". A library model is under library/<name>, a namespaced one
+# (`user/model`) under its own namespace.
+MODELS="$(bash ollama/compose-models.sh)" \
+  || { echo "ERROR: could not read the model names (ollama/compose-models.sh)." >&2; exit 1; }
+MODELS="$(echo $MODELS)"   # one line, space-separated
 # shellcheck disable=SC2086  # one argument per model name
 MISSING="$(docker run --rm --network none --entrypoint sh \
   -v "$MODELVOL":/models:ro \
@@ -44275,7 +44762,8 @@ MISSING="$(docker run --rm --network none --entrypoint sh \
   -c 'for m in "$@"; do
         n=${m%%:*}; t=latest
         case "$m" in *:*) t=${m#*:} ;; esac
-        [ -f "/models/models/manifests/registry.ollama.ai/library/$n/$t" ] || echo "$m"
+        case "$n" in */*) p=$n ;; *) p=library/$n ;; esac
+        [ -f "/models/models/manifests/registry.ollama.ai/$p/$t" ] || echo "$m"
       done' sh $MODELS)" \
   || { echo "ERROR: could not read the models in volume '$MODELVOL'." >&2; exit 1; }
 if [ -n "$MISSING" ]; then
@@ -44440,7 +44928,7 @@ GIT_ISOLATION = {'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull}
 STUB_DOCKER = r'''#!/usr/bin/env bash
 echo "$*" >> "$STUB_DOCKER_LOG"
 case "$1 $2" in
-  "compose config") echo '{"name":"scratch"}' ;;
+  "compose config") echo '{"name":"scratch","services":{"ollama":{"environment":{"LLM_MODEL":"llama3.1:8b","BUILD_LLM_MODEL":"","ANSWER_LLM_MODEL":""}}}}' ;;
   "image inspect"|"volume inspect") ;;
   save*) printf 'stub image layers' ;;
   run*)
@@ -44477,8 +44965,10 @@ class PackageArchiveTests(unittest.TestCase):
         self.repo.mkdir()
         for name in SCRIPTS + ('.gitignore',):
             shutil.copy(ROOT / name, self.repo / name)
-        # package-offline.sh reads the model names from the entrypoint (#647).
-        write(self.repo / 'ollama' / 'entrypoint.sh', (ROOT / 'ollama' / 'entrypoint.sh').read_text())
+        # package-offline.sh reads the model names the entrypoint pulls (#647), resolved
+        # from the compose settings by these two scripts (#671).
+        for name in ('entrypoint.sh', 'models.sh', 'compose-models.sh'):
+            write(self.repo / 'ollama' / name, (ROOT / 'ollama' / name).read_text())
         write(self.repo / 'install-offline.sh', '#!/usr/bin/env bash\necho install\n', 0o755)
         write(self.repo / 'README.md', COMMITTED_README)
         write(self.repo / 'ingest-inbox' / '.gitkeep', '')
@@ -44772,7 +45262,7 @@ asyncio.run(run())
     def test_regeneration_retains_validation_and_transport_retry_budget(self):
         valid=json.dumps({'question':'Regenerated', 'answer':'Answer', 'ground_truth':'Truth'})
         replies=[httpx.ReadTimeout(''), 'invalid', httpx.ReadTimeout(''), 'invalid', httpx.ReadTimeout(''), valid]
-        with patch.object(gs.ollama, 'chat', new=AsyncMock(side_effect=replies)) as chat:
+        with patch.object(gs.ollama, 'build_chat', new=AsyncMock(side_effect=replies)) as chat:
             result=asyncio.run(gs.regenerate_pair(self.data['session_id'], 'p_0'))
         self.assertEqual(chat.await_count, 6)
         self.assertEqual(result['question'], 'Regenerated')
@@ -48347,7 +48837,7 @@ class RetrievalImportTests(unittest.TestCase):
 
     def build_with_models(self, failing, llm_model='chat:v2', include_models=True,
                           store_available=True, broken_copy=(), fail_mid_write=(),
-                          embed_model='embed:v1'):
+                          embed_model='embed:v1', build_model=''):
         """Export with both models requested; models named in `failing` cannot bundle.
 
         Models named in `broken_copy` resolve, but their second file's copy fails.
@@ -48382,6 +48872,8 @@ class RetrievalImportTests(unittest.TestCase):
         with ExitStack() as mocks:
             mocks.enter_context(patch.object(settings, 'embed_model', embed_model))
             mocks.enter_context(patch.object(settings, 'llm_model', llm_model))
+            mocks.enter_context(patch.object(settings, 'build_llm_model', build_model))
+            mocks.enter_context(patch.object(settings, 'answer_llm_model', ''))
             mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
             mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': embed_model}))
             mocks.enter_context(patch.object(packager, '_ingest_config', return_value=None))
@@ -48492,6 +48984,17 @@ class RetrievalImportTests(unittest.TestCase):
         result, manifest = self.build_with_models(set(), llm_model='embed:v1')
         self.assertEqual(manifest['bundled_models'], ['embed:v1'])
         self.assertIs(manifest['models_bundled'], True)
+
+    def test_manifest_records_both_llms_and_keeps_llm_as_the_answer_model(self):
+        # #671: package_format stays 1.
+        result, manifest = self.build_with_models(set(), build_model='small:v1')
+        self.assertEqual(manifest['package_format'], 1)
+        self.assertEqual(manifest['llm'], {'model': 'chat:v2'})
+        self.assertEqual(manifest['answer_llm'], {'model': 'chat:v2'})
+        self.assertEqual(manifest['build_llm'], {'model': 'small:v1'})
+        # Only the embedding and answer models are bundled.
+        self.assertEqual(self.exported, ['embed:v1', 'chat:v2'])
+        self.assertEqual(manifest['bundled_models'], ['chat:v2', 'embed:v1'])
 
     def test_manifest_leaves_out_a_model_whose_file_copy_failed(self):
         result, manifest = self.build_with_models(set(), broken_copy={'chat:v2'})
@@ -48647,9 +49150,10 @@ class ModelTagFolderTests(unittest.TestCase):
         path.write_bytes(manifest)
         return manifest
 
-    def export(self, embed, llm):
+    def export(self, embed, llm, build=''):
         with ExitStack() as mocks:
-            for key, value in [('ollama_models_dir', self.store), ('embed_model', embed), ('llm_model', llm)]:
+            for key, value in [('ollama_models_dir', self.store), ('embed_model', embed), ('llm_model', llm),
+                               ('build_llm_model', build), ('answer_llm_model', '')]:
                 mocks.enter_context(patch.object(settings, key, str(value)))
             mocks.enter_context(patch.object(packager, 'read_chunks', return_value=[]))
             mocks.enter_context(patch.object(packager.wc, '_collection_config_sync', return_value={'embedding_model': embed}))
@@ -48660,9 +49164,10 @@ class ModelTagFolderTests(unittest.TestCase):
             result = packager.build('Corpus', include_models=True)
         return packager.open_package(self.exports / result['filename'], Path(tempfile.mkdtemp(dir=self.root)))
 
-    def ensure(self, pkg, manifest, embed, llm):
+    def ensure(self, pkg, manifest, embed, llm, build=''):
         with patch.object(settings, 'ollama_models_dir', str(self.target)), \
              patch.object(settings, 'embed_model', embed), patch.object(settings, 'llm_model', llm), \
+             patch.object(settings, 'build_llm_model', build), patch.object(settings, 'answer_llm_model', ''), \
              patch.object(importer, '_ollama_reports', lambda model: True):
             return importer._ensure_models(pkg, manifest)
 
@@ -48698,6 +49203,26 @@ class ModelTagFolderTests(unittest.TestCase):
             self.assertEqual((pkg / folder / 'manifest.json').read_bytes(), self.manifests[model])
         self.assertEqual(manifest['bundled_models'], ['foo:a', 'foo:b'])
         self.assertEqual(model_bundle.bundled_models(pkg, manifest), ['foo:a', 'foo:b'])
+
+    def test_a_different_build_model_is_recorded_but_never_bundled_or_installed(self):
+        # #671: the package carries the answer model only; the build model is
+        # recorded for information, and import neither checks nor installs it.
+        pkg, manifest = self.export('foo:a', 'foo:b', build='bar:x')
+        self.assertEqual(manifest['bundled_models'], ['foo:a', 'foo:b'])
+        self.assertFalse(any(k.startswith('models/bar/') for k in manifest['files']))
+        self.assertEqual(manifest['llm'], {'model': 'foo:b'})
+        self.assertEqual(manifest['answer_llm'], {'model': 'foo:b'})
+        self.assertEqual(manifest['build_llm'], {'model': 'bar:x'})
+        notes = self.ensure(pkg, manifest, 'foo:a', 'foo:b', build='bar:x')
+        self.assertEqual(self.installed('foo:b'), self.manifests['foo:b'])
+        self.assertIsNone(self.installed('bar:x'))
+        self.assertFalse(any('bar' in note for note in notes), notes)
+
+    def test_an_absent_build_model_is_not_checked_at_import(self):
+        pkg, manifest = self.export('foo:a', 'foo:b')
+        notes = self.ensure(pkg, manifest, 'foo:a', 'foo:b', build='bar:y')
+        self.assertIsNone(self.installed('bar:y'))
+        self.assertFalse(any('bar' in note for note in notes), notes)
 
     def test_a_bundled_tag_is_never_installed_under_another_tag(self):
         pkg, manifest = self.export('foo:a', 'bar:x')
@@ -49155,11 +49680,17 @@ const { makeReporter, stubAuth } = require('./lib');
 const HEALTH = '/api/health', METRICS = '/api/metrics/latency';
 const UNREADABLE = 'Service health could not be read: The server sent a response the UI could not read.';
 const service = (status, latency_ms, model) => model ? { status, latency_ms, model } : { status, latency_ms };
-const healthBody = (embed = 'ok') => ({
-  status: embed === 'ok' ? 'ok' : 'degraded',
+const healthBody = (embed = 'ok', build = null) => ({
+  status: embed === 'ok' && (!build || build.status === 'ok') ? 'ok' : 'degraded',
   services: {
     weaviate: service('ok', 11),
-    ollama: { llm: service('ok', 22, 'phi3.5'), embed: service(embed, 33, 'nomic-embed-text') },
+    // One LLM by default; `build` gives a different build model (#671).
+    ollama: {
+      llm: service('ok', 22, 'phi3.5'),
+      build_llm: build ? service(build.status, 44, build.model) : service('ok', 22, 'phi3.5'),
+      embed: service(embed, 33, 'nomic-embed-text'),
+      same_model: !build,
+    },
   },
   resources: { memory: { status: 'ok', allocated_gb: 11.67, recommended_minimum_gb: 12.0 } },
 });
@@ -49241,6 +49772,8 @@ const cards = page => page.evaluate(() => [...document.querySelectorAll('span.ro
   colour: dot.classList.contains('bg-red-500') ? 'red' : dot.classList.contains('bg-green-500') ? 'green' : '?',
 })).map(c => `${c.label.split(' ')[0]}=${c.colour}`).join(', '));
 const ALL_GREEN = 'Weaviate=green, LLM=green, Embed=green';
+const labels = page => page.evaluate(() => [...document.querySelectorAll('span.rounded-full.w-2')]
+  .map(dot => (dot.parentElement.textContent || '').trim()));
 const EMBED_RED = 'Weaviate=green, LLM=green, Embed=red';
 const charts = n => `Latency Trends (${n} queries in ring buffer)`;
 const healthAlert = t => (t.match(/Service health could not be read:.{0,80}/) || [''])[0];
@@ -49313,6 +49846,28 @@ async function runHealthPageTests(browser, base, reporter) {
       await release(page, METRICS, 3, { body: metricsBody(5) });
       await release(page, METRICS, 2, { body: metricsBody(3) });
       await assertCharts(page, 5);
+    }],
+    // #671: one LLM card when the models are the same, an answer card and a build card otherwise.
+    ['one model shows one LLM card that builds and answers', async page => {
+      await load(page, 1, OK, { body: metricsBody(1) });
+      assert.deepEqual(await labels(page), ['Weaviate', 'LLM (phi3.5), builds and answers', 'Embed (nomic-embed-text)']);
+    }],
+    ['two models show an answer card and a build card', async page => {
+      await load(page, 1, { status: 200, body: healthBody('ok', { status: 'ok', model: 'qwen2.5:0.5b' }) }, { body: metricsBody(1) });
+      assert.deepEqual(await labels(page), ['Weaviate', 'Answer LLM (phi3.5)', 'Build LLM (qwen2.5:0.5b)', 'Embed (nomic-embed-text)']);
+      assert.equal(await cards(page), 'Weaviate=green, Answer=green, Build=green, Embed=green');
+      const t = await text(page);
+      assert.ok(t.includes('44ms') && t.includes('22ms'), t.slice(0, 300));
+    }],
+    ['a missing build model (503) shows only the build card red', async page => {
+      await load(page, 1, { status: 503, body: healthBody('ok', { status: 'error', model: 'qwen2.5:0.5b' }) }, { body: metricsBody(1) });
+      assert.equal(healthAlert(await text(page)), '');
+      assert.equal(await cards(page), 'Weaviate=green, Answer=green, Build=red, Embed=green');
+    }],
+    ['a health body without build_llm is unreadable, not a page error', async page => {
+      const body = healthBody(); delete body.services.ollama.build_llm;
+      await load(page, 1, { status: 200, body }, { body: metricsBody(1) });
+      await assertUnreadable(page, UNREADABLE);
     }],
     ['a late older metrics success after a newer failure is shown', async page => {
       await refresh(page, 2);
@@ -51792,7 +52347,7 @@ function helpCases() {
 }
 
 // -- Health: latency stat row, charts and empty state ------------------------
-const health = json(200, { status: 'ok', services: { weaviate: { status: 'ok', latency_ms: 5 }, ollama: { llm: { status: 'ok', latency_ms: 7, model: 'vfy-llm' }, embed: { status: 'ok', latency_ms: 9, model: 'vfy-embed' } } } });
+const health = json(200, { status: 'ok', services: { weaviate: { status: 'ok', latency_ms: 5 }, ollama: { llm: { status: 'ok', latency_ms: 7, model: 'vfy-llm' }, build_llm: { status: 'ok', latency_ms: 7, model: 'vfy-llm' }, embed: { status: 'ok', latency_ms: 9, model: 'vfy-embed' }, same_model: true } } });
 const record = (i, r, l) => ({ timestamp: `2026-10-21T10:0${i}:00Z`, collection: A, retrieval_mode: 'hnsw', retrieval_ms: r, llm_ms: l, total_ms: r + l });
 const metrics = (records, stats = {}) => json(200, { total_records: records.length, retrieval_latency: { p50: 10.4, p95: 20.6, p99: 30.2 }, llm_latency: { p50: 100.2, p95: 200.7, p99: 300.4 }, total_latency: { p50: 110.7, p95: 221.1, p99: 331.9 }, history: records, ...stats });
 
@@ -52200,7 +52755,7 @@ if __name__ == '__main__':
 ### scripts/verify/llm_sanity.py
 
 ```python
-"""Does the LLM still give sensible answers? Run inside the api container.
+"""Does the answer LLM (#671) still give sensible answers? Run inside the api container.
 
 A degraded Ollama runner can keep listing its models (so /health stays ok)
 while every chat reply is garbage: mixed scripts, fragments of unrelated
@@ -52224,14 +52779,14 @@ MAX_CHARS = 600
 try:
     resp = httpx.post(
         f"http://{settings.ollama_host}:{settings.ollama_port}/api/chat",
-        json={"model": settings.llm_model, "stream": False,
+        json={"model": settings.answer_model, "stream": False,
               "options": {"temperature": 0, "num_predict": 80},
               "messages": [{"role": "user", "content": QUESTION}]},
         timeout=TIMEOUT_S)
     resp.raise_for_status()
     answer = resp.json()["message"]["content"].strip()
 except Exception as exc:  # unreachable, timed out, or not JSON
-    print(f"no answer from {settings.llm_model}: {type(exc).__name__}: {exc}")
+    print(f"no answer from {settings.answer_model}: {type(exc).__name__}: {exc}")
     sys.exit(2)
 
 printable = sum(1 for ch in answer if ch.isascii() and (ch.isprintable() or ch in "\n\r\t"))
@@ -52246,9 +52801,9 @@ if "manager" not in answer.lower():
     problems.append("doesn't mention managers")
 
 if problems:
-    print(f"{settings.llm_model} looks degraded ({'; '.join(problems)}): {answer[:200]!r}")
+    print(f"{settings.answer_model} looks degraded ({'; '.join(problems)}): {answer[:200]!r}")
     sys.exit(1)
-print(f"{settings.llm_model} answers sensibly: {answer[:120]!r}")
+print(f"{settings.answer_model} answers sensibly: {answer[:120]!r}")
 ```
 
 ### api/services/telemetry.py
@@ -55118,7 +55673,7 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
         async def model(*args):
             await ready.wait()
             return '{"question":"synthetic","answer":"synthetic","ground_truth":"synthetic"}'
-        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',update), patch.object(ollama,'chat',ot.traced('ollama.chat')(model)):
+        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',update), patch.object(ollama,'build_chat',ot.traced('ollama.chat')(model)):
             response=await self.client.post('/goldstandard/generate',json={'collection':'TraceGold','sample_size':1})
             self.assertEqual(response.status_code,202,response.text)
             ready.set()
@@ -55128,7 +55683,7 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
         pair={'pair_id':'pair','contexts':[SECRET],'source_file':SECRET,'chunk_index':0}
         async def slow(*args):
             await asyncio.sleep(10)
-        with patch.object(gs,'get_session',return_value={'pairs':[pair],'status':'completed'}), patch.object(gs,'_REGENERATION_TIMEOUT_SECONDS',.005), patch.object(ollama,'chat',ot.traced('ollama.chat')(slow)):
+        with patch.object(gs,'get_session',return_value={'pairs':[pair],'status':'completed'}), patch.object(gs,'_REGENERATION_TIMEOUT_SECONDS',.005), patch.object(ollama,'build_chat',ot.traced('ollama.chat')(slow)):
             response=await self.client.post('/goldstandard/regenerate',json={'session_id':'session','pair_id':'pair'})
         self.assertEqual(response.status_code,504,response.text)
         self.assertEqual(self.spans('rag.regenerate')[-1].attributes['error.type'],'timeout')
@@ -55184,7 +55739,7 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
         async def slow(*args):
             entered.set()
             await asyncio.sleep(10)
-        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',update), patch.object(ollama,'chat',ot.traced('ollama.chat')(slow)):
+        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',update), patch.object(ollama,'build_chat',ot.traced('ollama.chat')(slow)):
             response=await self.client.post('/goldstandard/generate',json={'collection':'TraceCancel','sample_size':1})
             self.assertEqual(response.status_code,202)
             await entered.wait()
@@ -55196,7 +55751,7 @@ class TracingTests(unittest.IsolatedAsyncioTestCase):
         # Real done callback creates the failure reporter with captured origin.
         session['status']='generating'
         async def model(*args): return '{"question":"q","answer":"a","ground_truth":"g"}'
-        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',side_effect=gs.GoldStandardError('STORE_FAILED',SECRET,500)), patch.object(gs,'_publish_generation_failure'), patch.object(ollama,'chat',ot.traced('ollama.chat')(model)):
+        with patch.object(wc,'collection_exists',AsyncMock(return_value=True)), patch.object(gs,'_prepare_generation_sync',return_value=(session,[{'content':SECRET}])), patch.object(gs,'_update_session_sync',side_effect=gs.GoldStandardError('STORE_FAILED',SECRET,500)), patch.object(gs,'_publish_generation_failure'), patch.object(ollama,'build_chat',ot.traced('ollama.chat')(model)):
             await self.client.post('/goldstandard/generate',json={'collection':'TraceFailed','sample_size':1})
             await self.until(lambda: bool(self.spans('rag.failure_report')))
         self.lineage('rag.failure_report')
@@ -57162,14 +57717,16 @@ class Packager(unittest.TestCase):
             with self.subTest(telemetry=telemetry), tempfile.TemporaryDirectory() as folder:
                 root=Path(folder);(root/'bin').mkdir();(root/'scripts').mkdir()
                 shutil.copy(ROOT/'package-offline.sh',root/'package-offline.sh')
-                # package-offline.sh reads the model names from the entrypoint (#647).
-                (root/'ollama').mkdir();shutil.copy(ROOT/'ollama/entrypoint.sh',root/'ollama/entrypoint.sh')
+                # package-offline.sh reads the model names the entrypoint pulls (#647),
+                # resolved from the compose settings by models.sh and compose-models.sh (#671).
+                (root/'ollama').mkdir()
+                for name in ('entrypoint.sh','models.sh','compose-models.sh'):shutil.copy(ROOT/'ollama'/name,root/'ollama'/name)
                 (root/'scripts/collector_offline.py').write_text("from pathlib import Path\nimport sys\nPath(sys.argv[2],'collector.tar').touch()\n")
                 stub=root/'bin/docker'
                 stub.write_text("""#!/usr/bin/env python3
 import sys,json,pathlib
 args=sys.argv[1:]
-if args[:2]==['compose','config']:print(json.dumps({'name':'fixture'}))
+if args[:2]==['compose','config']:print(json.dumps({'name':'fixture','services':{'ollama':{'environment':{'LLM_MODEL':'llama3.1:8b','BUILD_LLM_MODEL':'','ANSWER_LLM_MODEL':''}}}}))
 if args[:1]==['run']:
  for arg in args:
   if arg.endswith(':/out'):pathlib.Path(arg[:-5],'ollama_models.tar.gz').touch()
@@ -57617,9 +58174,9 @@ volumes:
 #     built with `git archive`, exactly as package.sh does. Untracked and
 #     ignored files and uncommitted changes are left out (#384).
 #   * all five Docker images, pre-built (docker save)
-#   * the Ollama model weights (llama3.1:8b + nomic-embed-text), the whole
-#     model volume: a model left in it, such as phi3.5 from before 1.2.1, is
-#     carried too
+#   * the Ollama model weights (by default llama3.1:8b + nomic-embed-text; a
+#     different build or answer LLM too, #671), the whole model volume: a model
+#     left in it, such as phi3.5 from before 1.2.1, is carried too
 #
 # About 7.7 GB (2.5 GB images + 5.2 GB model weights) with both models present,
 # estimated from the parts (4.6 GB was measured when the LLM was the 2.2 GB
@@ -57670,10 +58227,14 @@ docker volume inspect "$MODELVOL" >/dev/null 2>&1 \
 
 # The volume must hold every model ollama/entrypoint.sh pulls, or the offline
 # target would try to download the missing one (#647: an install from before
-# llama3.1:8b became the default holds only phi3.5). The names are read as the
-# CI model cache reads them; a manifest without a tag is under "latest".
-MODELS="$(sed -n 's/^pull_with_retry \([A-Za-z0-9._:-]*\)$/\1/p' ollama/entrypoint.sh | tr '\n' ' ')"
-[ -n "$MODELS" ] || { echo "ERROR: no pull_with_retry lines in ollama/entrypoint.sh." >&2; exit 1; }
+# llama3.1:8b became the default holds only phi3.5). The names are the ones the
+# entrypoint resolves from the LLM settings compose gives the ollama service
+# (#671), read as the CI model cache reads them; a manifest without a tag is
+# under "latest". A library model is under library/<name>, a namespaced one
+# (`user/model`) under its own namespace.
+MODELS="$(bash ollama/compose-models.sh)" \
+  || { echo "ERROR: could not read the model names (ollama/compose-models.sh)." >&2; exit 1; }
+MODELS="$(echo $MODELS)"   # one line, space-separated
 # shellcheck disable=SC2086  # one argument per model name
 MISSING="$(docker run --rm --network none --entrypoint sh \
   -v "$MODELVOL":/models:ro \
@@ -57681,7 +58242,8 @@ MISSING="$(docker run --rm --network none --entrypoint sh \
   -c 'for m in "$@"; do
         n=${m%%:*}; t=latest
         case "$m" in *:*) t=${m#*:} ;; esac
-        [ -f "/models/models/manifests/registry.ollama.ai/library/$n/$t" ] || echo "$m"
+        case "$n" in */*) p=$n ;; *) p=library/$n ;; esac
+        [ -f "/models/models/manifests/registry.ollama.ai/$p/$t" ] || echo "$m"
       done' sh $MODELS)" \
   || { echo "ERROR: could not read the models in volume '$MODELVOL'." >&2; exit 1; }
 if [ -n "$MISSING" ]; then

@@ -85,9 +85,13 @@ class ApiCase(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(patcher.stop)
 
     def use_model(self, chat):
-        patcher = patch.object(gs.ollama, "chat", chat)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # Gold standard work goes to the build model (#671); the answer model is
+        # never asked.
+        for name, value in (("build_chat", chat),
+                            ("chat", AsyncMock(side_effect=AssertionError("the answer model was asked")))):
+            patcher = patch.object(gs.ollama, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     async def settle(self):
         while gs._tasks:
@@ -226,7 +230,7 @@ class RegenerateFailureTests(ApiCase):
         before = await self.session(self.SESSION_ID)
         stored = self.saved(self.SESSION_ID).read_bytes()
         for name, chat in (("unusable replies", unusable_replies), ("transport error", transport_error)):
-            with self.subTest(failure=name), patch.object(gs.ollama, "chat", chat), \
+            with self.subTest(failure=name), patch.object(gs.ollama, "build_chat", chat), \
                  self.assertLogs(gs.log, "WARNING"):
                 response = await self.client.post("/goldstandard/regenerate",
                                                   json={"session_id": self.SESSION_ID, "pair_id": "p_398a"})

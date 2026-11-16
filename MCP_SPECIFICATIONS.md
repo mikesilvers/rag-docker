@@ -297,7 +297,7 @@ One LLM call; expect it to be slow. `readOnlyHint: false`,
 ### 4.5 Diagnostics
 
 **`rag_health`** — no input. `readOnlyHint: true`.
-Returns overall status plus Weaviate, LLM and embedding status. MUST succeed as a
+Returns overall status plus Weaviate, the answer and build LLMs (`llm`, `build_llm`, `same_model`) and embedding status. MUST succeed as a
 tool call even when the API reports `degraded` (HTTP 503) — a degraded stack is
 information, not a tool failure. Only an unreachable API is a tool error.
 

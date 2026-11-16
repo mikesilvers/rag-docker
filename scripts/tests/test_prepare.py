@@ -89,7 +89,7 @@ class StubLLM:
 
     async def models(self):
         self.model_calls += 1
-        return {f"{settings.llm_model}:latest", "nomic-embed-text:latest"}
+        return {f"{settings.build_model}:latest", "nomic-embed-text:latest"}
 
 
 class AreaCase(unittest.TestCase):
@@ -277,6 +277,25 @@ class LlmDocumentTests(AreaCase):
         self.assertEqual(result.parts[0]["fallbacks"], [{"window": None, "reason": "llm-unavailable"}])
         self.assertEqual(llm.calls, [])
         self.assertTrue(result.fallback)
+
+    def test_the_model_check_looks_for_the_build_model(self):
+        # Preparation's LLM is the build model (#671): with only the answer model
+        # listed, the document is prepared by code alone.
+        llm = StubLLM()
+
+        async def answer_model_only():
+            return {"llama3.2:latest", "nomic-embed-text:latest"}
+        llm.models = answer_model_only
+        record = self.document("a.md", page_text())
+        with patch.object(settings, "llm_model", "llama3.2"), \
+                patch.object(settings, "build_llm_model", "qwen2.5:0.5b"):
+            result = self.prepare(record, llm)
+        self.assertEqual(result.parts[0]["fallbacks"], [{"window": None, "reason": "llm-unavailable"}])
+        self.assertEqual(llm.calls, [])
+        with patch.object(settings, "llm_model", "qwen2.5:0.5b"), \
+                patch.object(settings, "answer_llm_model", "llama3.2"):
+            self.assertTrue(asyncio.run(preparation.model_available(
+                AsyncMock(return_value={"qwen2.5:0.5b"}))))
 
     def test_over_1000_windows_is_too_large_for_the_llm_but_titled(self):
         with patch.object(preparation, "MAX_WINDOWS", 2):
@@ -699,7 +718,10 @@ class JobCase(AreaCase):
     def setUp(self):
         super().setUp()
         self.llm = StubLLM()
-        for name, value in (("chat", self.llm.chat), ("list_models", self.llm.models)):
+        # A job prepares with the build model (#671); the answer model is never asked.
+        never = AsyncMock(side_effect=AssertionError("the answer model was asked"))
+        for name, value in (("build_chat", self.llm.chat), ("chat", never),
+                            ("list_models", self.llm.models)):
             change = patch.object(jobs.ollama, name, value)
             change.start()
             self.addCleanup(change.stop)
@@ -1406,7 +1428,7 @@ class StreamingReviewTests(JobCase):
                 return '{"title": "Long text", "summary": "Numbered paragraphs."}'
 
             async def models(self):
-                return {f"{settings.llm_model}:latest"}
+                return {f"{settings.build_model}:latest"}
 
         def run(name, paragraphs):
             path = self.root / "uploads" / name
