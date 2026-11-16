@@ -74,7 +74,7 @@ The lane table in RD-1's description, as it stood on 2026-11-16:
 | E `lane-e-lan-export` | RD-15 · RD-12 · RD-145 | RD-145: after RD-116 (D); its UI after B |
 | F `lane-f-query-only` | RD-139 → RD-138 | RD-138: after RD-145 (E); its UI after B |
 
-Start now: RD-175 first (two High security alerts), then RD-48, RD-108, RD-46, RD-17, RD-51 · RD-156 · RD-11 · RD-13, RD-14 · RD-15, RD-12 · RD-139.
+Start now: RD-175 first, then RD-48, RD-108, RD-46, RD-17, RD-51 · RD-156 · RD-11 · RD-13, RD-14 · RD-15, RD-12 · RD-139.
 
 Longest chain: RD-13/RD-14 → RD-116 → RD-145 → RD-138.
 

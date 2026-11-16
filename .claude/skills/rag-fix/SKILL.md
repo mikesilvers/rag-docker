@@ -23,7 +23,7 @@ After every step, save it in the work folder ("Work folder" in `reference.md`).
 
 ### 1. Start
 
-1. **Take the ticket.** Read it. Take it as assignee, unless someone else holds it: then stop and return that. How to read, assign and transition a ticket is in the `rag-jira` skill.
+1. **Take the ticket.** Read it. Take it as assignee, unless someone else holds it: then stop and return that. How to read, assign and transition a ticket is in the `rag-jira` skill. Taking it also moves it to In Progress (`rag-jira`, "Statuses").
 2. **Check its blockers.** Read its "is blocked by" links. If any blocker isn't Done, stop and return the blocker; don't start.
 3. **Check its lane.** If it has a lane label and another ticket in the same lane is In Progress under another assignee, stop and return that: a lane's tickets touch the same files, and a lane is claimed by assigning yourself its tickets. What lanes and links mean is in the `rag-release-plan` skill.
 4. **Set up or resume the work folder** `~/repo/rag-docker-work/RD-<n>/`, following that repository's README: from `_template/` for a new ticket, or through its "Resuming" steps when the folder already has a checkpoint.
@@ -58,7 +58,7 @@ Each document goes through a review loop before the next one starts, and no code
 
 ### 5. Open the PR, then stop
 
-- Open one PR against `develop`, following CONTRIBUTING.md and the PR template. Its body states the verification from step 4 and carries the line `Agent-Session: <the same session URL>`. Leave the template's `stack.sh` checkboxes unticked (maintainer decision 2), and write which verify record applies: for a Markdown-only PR (every changed file is `*.md`), the tests reviewer's fast path, with CI `verify` on the PR's head as the full-run record; otherwise the tests reviewer's full run.
+- Open one PR against `develop`, following CONTRIBUTING.md and the PR template. Its body states the verification from step 4 and carries the line `Agent-Session: <the same session URL>`. Leave the template's `stack.sh` checkboxes unticked (maintainer decision 2), and write which verify record applies: for a Markdown-only PR (every changed file is `*.md`), the tests reviewer's fast path, with CI `verify` on the PR's head as the full-run record; otherwise the tests reviewer's full run. Opening it moves the ticket to In Review (`rag-jira`, "Statuses").
 - Save the step, then return what the brief asks for.
 - **Stop here.** `rag-pr-review` and merging are separate steps, run by the coordinating session.
 
