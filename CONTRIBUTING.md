@@ -30,7 +30,13 @@ documentation improvements are all welcome.
 4. If you change dependencies, follow
    [Dependency management](README.md#dependency-management) and commit the
    regenerated lock files.
-5. Open a pull request against `develop` and fill in the template.
+5. Dependency bumps need companion edits, which Dependabot can't make: a bump
+   of `ui/package.json` also updates its embedded copy in `IMPLEMENTATION.md`
+   (`### ui/package.json`); a bump of the collector image in
+   `docker-compose.telemetry.yml` also updates `telemetry/image.json` (the image
+   and its per-architecture config IDs) and the version named in
+   `telemetry/README.md`.
+6. Open a pull request against `develop` and fill in the template.
 
 ## Pull request expectations
 

@@ -303,7 +303,8 @@ Engineer is created in the default mode before switching.
 
 **TLS server** (`proxy/nginx.lan.conf`): one server, `listen 443 ssl`, `http2 on`, TLS 1.2 and 1.3 only, Mozilla's
 intermediate cipher list for TLS 1.2, `ssl_prefer_server_ciphers off`, session tickets off, no
-`Strict-Transport-Security` header, the pair at `/etc/nginx/certs/live/{cert,key}.pem`, and the shared routes.
+`Strict-Transport-Security` header, `server_tokens off` (no nginx version in responses), the pair at
+`/etc/nginx/certs/live/{cert,key}.pem`, and the shared routes.
 
 **Certificate step** (`api/tls_cert.py`, run by `tls-init` on every start in LAN mode):
 
@@ -1522,9 +1523,9 @@ No route deletes an account: accounts are disabled, so a username is never reuse
 and the login throttle, so all survive an API restart. The cookie `rag_session` holds a random 256-bit token; the
 store keeps its SHA-256. Cookie attributes: `HttpOnly`, `SameSite=Strict`, `Path=/`, `Max-Age=604800` (it
 survives closing the browser), and `Secure` when `AUTH_COOKIE_SECURE=true`. A session ends after 12 hours without
-a request or 7 days after login, whichever is first; an ended session is deleted. Every request re-reads the
-user: a role change applies to the next request; disabling an account, resetting its password and logging out
-delete its sessions.
+a request or 7 days after login, whichever is first; an ended session is deleted when it is next presented, and
+each login also deletes every session that has ended by time. Every request re-reads the user: a role change
+applies to the next request; disabling an account, resetting its password and logging out delete its sessions.
 
 **Login throttling.** Failed logins are counted per (username as typed, lowercased; client address, `X-Real-IP`
 from nginx). Five within 15 minutes throttle the pair for 15 minutes: its logins answer `429 LOGIN_THROTTLED`
@@ -1982,7 +1983,7 @@ Standard error codes:
 | `CROSS_ORIGIN_REFUSED` | 403 | A cookie-authenticated change from another origin |
 | `PASSWORD_CHANGE_REQUIRED` | 403 | A generated password must be changed first; only `/auth/me`, `/auth/logout` and `/auth/password` answer |
 | `LOGIN_FAILED` | 401 | Login refused; the same answer for every cause |
-| `LOGIN_THROTTLED` | 429 | Five failed logins for this username and address within 15 minutes; wait 15 minutes |
+| `LOGIN_THROTTLED` | 429 | Five failed logins or wrong current passwords for this username and address within 15 minutes; wait 15 minutes |
 | `LOGIN_RATE_LIMITED` | 429 | From nginx, not the API: more than 10 logins a minute (burst 5) from this client address; wait a minute (#577) |
 | `PASSWORD_INCORRECT` | 403 | The current password given to `POST /auth/password` is wrong |
 | `INVALID_PASSWORD` | 422 | The new password breaks a rule; the message names it |
@@ -2011,8 +2012,8 @@ langchain-text-splitters>=0.3
 sentence-transformers>=3.0
 python-multipart>=0.0.9
 aiofiles>=23.0
-opentelemetry-sdk==1.45.1
-opentelemetry-exporter-otlp-proto-http==1.45.1
+opentelemetry-sdk==1.45.2
+opentelemetry-exporter-otlp-proto-http==1.45.2
 ```
 
 **Dependency pinning (normative).** The list above is *intent*, held in
@@ -2024,7 +2025,7 @@ newer Weaviate server than the one pinned here, breaking every collection call
 while the stack still reported healthy.
 
 The SDK and OTLP HTTP exporter entries in `api/requirements.in` are required
-for enabled telemetry startup; lock regeneration must retain both at 1.45.1
+for enabled telemetry startup; lock regeneration must retain both at 1.45.2
 and resolve their transitive dependencies.
 
 Regenerate the lock from the repo root using the procedure at the top of
@@ -3353,6 +3354,11 @@ LAN mode (#26, §2.5) adds one API container setting and two read by `docker-com
 | `RAG_LAN_MODE` | `false` | Exactly `true` or `false`; anything else fails API startup. `true` only through `docker-compose.lan.yml`; then the API refuses to start unless `AUTH_COOKIE_SECURE` is `true` and an enabled human AI Engineer exists |
 | `RAG_LAN_HOSTNAMES` | empty | Comma-separated DNS names and IP addresses for the self-signed certificate; required unless `proxy/certs` holds `cert.pem` and `key.pem` |
 | `RAG_LAN_PORT` | `443` | The host port of LAN mode's TLS publication, on every interface |
+
+An invalid API container setting (any setting of `api/config.py`, such as `AUTH_COOKIE_SECURE`, `RAG_LAN_MODE`,
+`AUDIT_LOG_QUESTIONS` or `MAX_ZIP_MEMBERS`) stops API startup: the API writes one line per invalid setting to standard
+error, `Settings refused: <reason>`, without the value given and with no traceback, and exits 1 (#555). Telemetry
+settings fail as described above.
 
 ---
 

@@ -1,8 +1,8 @@
-"""Host-only check that the pinned dependencies are at or above their patched versions (#522, #562, #651).
+"""Host-only check that the pinned dependencies are at or above their patched versions (#522, #562, #651, #749).
 
 Reads the Python locks, api/requirements.in, ui/package.json and
 ui/package-lock.json. The floors are the first patched versions of the
-Dependabot alerts #522, #562 and #651 closed. filelock (3.x, no patched release that
+Dependabot alerts #522, #562, #651 and #749 closed. filelock (3.x, no patched release that
 unstructured accepts) is left out on purpose; the #522 PR explains its alerts.
 postcss-selector-parser stays on 6.x (tailwindcss 3). Its nested copy under
 @tailwindcss/typography, which pins 6.0.10 exactly, is lifted by a scoped npm
@@ -20,14 +20,14 @@ ROOT = Path(__file__).resolve().parents[2]
 
 FLOORS = {
     'api/requirements.txt': {
-        'pillow': '13.0.0', 'certifi': '2026.10.19', 'pypdf': '6.21.4', 'pyasn1': '0.6.5', 'urllib3': '2.8.0',
-        'opentelemetry-api': '1.45.1', 'opentelemetry-sdk': '1.45.1', 'opentelemetry-proto': '1.45.1',
-        'opentelemetry-exporter-otlp-proto-common': '1.45.1',
-        'opentelemetry-exporter-otlp-proto-http': '1.45.1',
+        'pillow': '13.0.0', 'certifi': '2026.10.19', 'pypdf': '6.21.4', 'pyasn1': '0.6.5', 'urllib3': '2.8.0', 'soupsieve': '4.0',
+        'opentelemetry-api': '1.45.2', 'opentelemetry-sdk': '1.45.2', 'opentelemetry-proto': '1.45.2',
+        'opentelemetry-exporter-otlp-proto-common': '1.45.2',
+        'opentelemetry-exporter-otlp-proto-http': '1.45.2',
         'authlib': '1.9.1',
     },
     'mcp/requirements.txt': {
-        'certifi': '2026.10.19', 'pyjwt': '2.15.0', 'opentelemetry-api': '1.45.1',
+        'certifi': '2026.10.19', 'pyjwt': '2.15.0', 'opentelemetry-api': '1.45.2',
     },
 }
 NPM_FLOORS = {'vite': '6.4.4', 'source-map-js': '1.2.2', 'postcss-selector-parser': '6.1.5'}
@@ -72,8 +72,8 @@ class DependencyFloorTests(unittest.TestCase):
     def test_opentelemetry_family_moves_together(self):
         api, mcp, inputs = pins('api/requirements.txt'), pins('mcp/requirements.txt'), pins('api/requirements.in')
         versions = {api[name] for name in OTEL_FAMILY} | {mcp['opentelemetry-api']}
-        self.assertEqual(versions, {'1.45.1'})
-        self.assertEqual(api['opentelemetry-semantic-conventions'], '0.66b1')
+        self.assertEqual(versions, {'1.45.2'})
+        self.assertEqual(api['opentelemetry-semantic-conventions'], '0.66b2')
         for name in ('opentelemetry-sdk', 'opentelemetry-exporter-otlp-proto-http'):
             with self.subTest(package=name):
                 self.assertEqual(inputs.get(name), api[name])

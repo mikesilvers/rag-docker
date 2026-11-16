@@ -3,8 +3,8 @@
 # Run the verification suite on a disposable compose project, never on the
 # live stack (#152).
 #
-#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry | --lan] [suite ...]
-#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull] [--lan]
+#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] | --lan] [suite ...]
+#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] | --lan]
 #   bash scripts/verify/stack.sh down
 #
 # `run` brings the verify project up, runs that checkout's all.sh against it
@@ -49,6 +49,15 @@
 # exactly proxy:127.0.0.1:<verify port>->443/tcp. The suites then reach it at
 # https://localhost:<port>/api and trust the certificate it generated, copied
 # into the private folder. Without suite names, a --lan run runs 18_lan.
+#
+# --telemetry checks the collector image against this checkout's own
+# telemetry/image.json, so a PR that changes the pin is refused. To evaluate
+# one, the evaluator checks the PR's pin against the registry, copies its
+# telemetry/image.json outside the checkout and passes it with
+# --telemetry-pin FILE (#532). The guard then expects that image, which may
+# change only the tag and digest of this checkout's pin, never the
+# repository. Nothing here contacts a registry, and no file in the checkout
+# is read as a pin.
 #
 # What this does not do: the suites, and anything else the checkout runs on the
 # host, still have full access to Docker. It keeps verification away from the
@@ -104,6 +113,8 @@ PULL=""
 TELEMETRY=0
 LAN=0
 OTEL_ENABLED=true
+PIN=""
+PIN_SET=0
 ARGS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -113,6 +124,9 @@ while [ "$#" -gt 0 ]; do
     --telemetry)
       [ "$CMD" != down ] || usage
       TELEMETRY=1; shift ;;
+    --telemetry-pin)
+      { [ "$CMD" = up ] || [ "$CMD" = run ]; } && [ "$#" -ge 2 ] || usage
+      PIN="$2"; PIN_SET=1; shift 2 ;;
     --lan)
       { [ "$CMD" = up ] || [ "$CMD" = run ]; } || usage
       LAN=1; shift ;;
@@ -130,6 +144,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ "$TELEMETRY" = 0 ] || [ "$LAN" = 0 ] || fail "--lan and --telemetry can't be combined."
+[ "$PIN_SET" = 0 ] || [ "$TELEMETRY" = 1 ] || fail "--telemetry-pin requires --telemetry."
 
 PORT="${RAG_VERIFY_PORT:-8081}"
 case "$PORT" in
@@ -144,6 +159,16 @@ if [ "$CMD" != down ]; then
   { [ -d "$CHECKOUT" ] && [ -f "$CHECKOUT/docker-compose.yml" ]; } \
     || fail "--checkout must be a checkout of this project (a folder with docker-compose.yml): $CHECKOUT"
   CHECKOUT="$(cd "$CHECKOUT" && pwd -P)"
+fi
+
+# The reviewed collector pin (#532): the evaluator's file, never the checkout's.
+if [ "$PIN_SET" = 1 ]; then
+  [ -f "$PIN" ] || fail "--telemetry-pin must name an existing file: $PIN"
+  PIN="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$PIN")" \
+    || fail "could not resolve the --telemetry-pin path."
+  case "$PIN" in
+    "$CHECKOUT"/*) fail "--telemetry-pin must be outside the checkout under test: $PIN" ;;
+  esac
 fi
 
 # The private folder, checked before any Docker command; up and run create it.
@@ -202,6 +227,10 @@ export RAG_VERIFY_TELEMETRY="$TELEMETRY"
 export RAG_VERIFY_OTEL_ENABLED="$OTEL_ENABLED"
 export RAG_VERIFY_HARNESS="$HARNESS"
 export RAG_VERIFY_CHECKOUT="$CHECKOUT"
+# telemetry-mode, run by a suite under the inherited lock, keeps the run's
+# reviewed pin; up and run take it only from --telemetry-pin.
+[ "$CMD" != telemetry-mode ] || PIN="${RAG_VERIFY_TELEMETRY_PIN:-}"
+export RAG_VERIFY_TELEMETRY_PIN="$PIN"
 if [ "$TELEMETRY" = 1 ]; then
   export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.telemetry.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.telemetry.verify.yml"
   export COMPOSE_PROFILES=telemetry
@@ -335,7 +364,7 @@ do_guard() {
     rm -f "$config"
     fail "docker compose config failed for $CHECKOUT."
   fi
-  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" "$HARNESS" "$GUARD_MODE" <<'GUARDPY'
+  python3 - "$CHECKOUT" "$EXPORTS" "$PORT" "$config" "$HARNESS" "$GUARD_MODE" "$PIN" <<'GUARDPY'
 import json, os, sys
 
 checkout, exports, port, path = sys.argv[1:5]
@@ -393,8 +422,9 @@ for svc, service in services.items():
 if {'otel-collector', 'otel-capture'} & services.keys():
     import runpy
     harness = sys.argv[5] if len(sys.argv) > 5 else checkout
+    pin = sys.argv[7] if len(sys.argv) > 7 else ''
     guard = runpy.run_path(os.path.join(harness, 'scripts/verify/telemetry_guard.py'))
-    problems.extend(guard['check'](config, harness))
+    problems.extend(guard['check'](config, harness, pin or None))
 
 # (i) builds: only a context and a Dockerfile, both inside the checkout
 for svc, service in services.items():
@@ -614,7 +644,7 @@ do_up() {
     done
   fi
   if [ "$TELEMETRY" = 1 ]; then
-    for var in COMPOSE_PROFILES RAG_VERIFY_HARNESS RAG_VERIFY_CHECKOUT RAG_VERIFY_OTEL_ENABLED; do
+    for var in COMPOSE_PROFILES RAG_VERIFY_HARNESS RAG_VERIFY_CHECKOUT RAG_VERIFY_OTEL_ENABLED RAG_VERIFY_TELEMETRY_PIN; do
       printf 'export %s=%q\n' "$var" "${!var}"
     done
   fi

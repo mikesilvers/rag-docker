@@ -273,10 +273,11 @@ class Compose(unittest.TestCase):
         cls.config = json.loads(subprocess.check_output(cls.cmd, env=cls.env))
         cls.guard = re.findall(r"python3 - [^\n]*<<'GUARDPY'\n(.*?)\nGUARDPY", (ROOT/'scripts/verify/stack.sh').read_text(), re.S)[0]
 
-    def run_guard(self, config, checkout=ROOT):
+    def run_guard(self, config, checkout=ROOT, pin=''):
         with tempfile.NamedTemporaryFile(mode='w') as file:
             json.dump(config, file); file.flush()
-            return subprocess.run(['python3', '-', str(checkout), self.env['RAG_EXPORTS_DIR'], '18081', file.name, str(ROOT)],
+            return subprocess.run(['python3', '-', str(checkout), self.env['RAG_EXPORTS_DIR'], '18081', file.name, str(ROOT),
+                                   'default', pin],
                                   input=self.guard, text=True, capture_output=True)
 
     def test_optional_config_passes_full_guard(self):
@@ -313,6 +314,43 @@ class Compose(unittest.TestCase):
                 changed=copy.deepcopy(value)
                 next(v for v in changed['services'][service]['volumes'] if v['type']=='bind')['source']=str(checkout/'scripts/verify')
                 self.assertTrue(guard.check(changed,ROOT))
+
+    def test_reviewed_pin_changes_only_tag_and_digest(self):
+        # #532: a changed collector pin passes only with an evaluator-supplied
+        # reviewed pin of the harness pin's repository.
+        harness = json.loads((ROOT/'telemetry/image.json').read_text())['image']
+        repository = harness.split('@')[0].rsplit(':', 1)[0]
+        bumped = repository + ':0.999.0@sha256:' + 'b'*64
+        config = copy.deepcopy(self.config)
+        config['services']['otel-collector']['image'] = bumped
+        guard = load('guard', 'scripts/verify/telemetry_guard.py')
+        self.assertNotEqual(self.run_guard(config).returncode, 0)
+        self.assertTrue(guard.check(config, ROOT))
+        with tempfile.TemporaryDirectory() as folder:
+            def pin_file(name, value):
+                path = Path(folder)/name
+                path.write_text(json.dumps(value) if not isinstance(value, str) else value)
+                return str(path)
+            good = pin_file('good.json', {'image': bumped})
+            result = self.run_guard(config, pin=good)
+            self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+            self.assertEqual(guard.check(config, ROOT, good), [])
+            # The harness pin itself no longer matches once a reviewed pin is given.
+            self.assertTrue(guard.check(self.config, ROOT, good))
+            refused = {
+                'another repository': pin_file('other.json', {'image': 'ghcr.io/example/collector:0.999.0@sha256:'+'b'*64}),
+                'no digest': pin_file('nodigest.json', {'image': repository + ':0.999.0'}),
+                'no tag': pin_file('notag.json', {'image': repository + '@sha256:'+'b'*64}),
+                'not JSON': pin_file('broken.json', 'not json'),
+                'no image': pin_file('noimage.json', {'config_ids': {}}),
+                'missing file': str(Path(folder)/'missing.json'),
+            }
+            for case, pin in refused.items():
+                with self.subTest(case=case):
+                    self.assertNotEqual(self.run_guard(config, pin=pin).returncode, 0)
+                    self.assertTrue(guard.check(config, ROOT, pin))
+                    # A bad pin never lets the harness pin through either.
+                    self.assertTrue(guard.check(self.config, ROOT, pin))
 
     def test_unsafe_variants_still_refused(self):
         mutations = [

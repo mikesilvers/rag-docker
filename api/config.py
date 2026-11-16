@@ -1,4 +1,6 @@
-from pydantic import field_validator
+import sys
+
+from pydantic import ValidationError, field_validator
 from pydantic_settings import BaseSettings
 
 # The LLM when LLM_MODEL isn't set (#647).
@@ -126,4 +128,28 @@ class Settings(BaseSettings):
         env_file = ".env"
 
 
-settings = Settings()
+def refusal_lines(error: ValidationError) -> list[str]:
+    """One `Settings refused:` line per invalid setting (#555), without the values given."""
+    reasons: dict[str, list[str]] = {}
+    for item in error.errors(include_url=False, include_input=False):
+        name = ".".join(str(part) for part in item["loc"]).upper()
+        own = str(item["ctx"]["error"]) if item["type"] == "value_error" and "error" in item.get("ctx", {}) else ""
+        message = own or item["msg"]
+        reason = message if not name or name in message else f"{name}: {message}"
+        reasons.setdefault(name, []).append(reason)
+    return ["Settings refused: " + "; ".join(parts) for parts in reasons.values()]
+
+
+def _load() -> Settings:
+    # An invalid setting stops the API, and anything else importing this
+    # module, with one line per setting and no traceback (#555), like LAN
+    # mode's refusal: SystemExit isn't printed as a traceback.
+    try:
+        return Settings()
+    except ValidationError as error:
+        for line in refusal_lines(error):
+            print(line, file=sys.stderr, flush=True)
+        raise SystemExit(1) from None
+
+
+settings = _load()
