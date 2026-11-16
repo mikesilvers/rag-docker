@@ -11,12 +11,16 @@ that create throwaway accounts (vfy-t-<random>), service principals
 it up. No password, session token or API key is printed; keys are held in
 memory only.
 """
+import base64
 import hashlib
+import hmac
 import json
 import os
 import secrets
+import struct
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -87,10 +91,13 @@ MATRIX = (
     ("POST", "/auth/service-principals/vfy-no-such-svc/enable", None, "engineer"),
     ("POST", "/auth/service-principals/vfy-no-such-svc/keys", {}, "engineer"),
     ("POST", "/auth/service-principals/vfy-no-such-svc/keys/nosuchkey123/revoke", None, "engineer"),
+    # Two-step verification (#607): a 404 for no such account, a 422 for no value.
+    ("POST", "/auth/users/vfy-no-such-user/reset-mfa", None, "engineer"),
+    ("POST", "/auth/mfa/policy", {}, "engineer"),
 )
 # Routes an API key can't use whatever its role (S5 of PR 3): every account,
 # principal and key route, logout and the password change; and the audit log (#29).
-KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password", "/audit")
+KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password", "/audit", "/auth/mfa")
 SESSION_ROUTES = (("GET", "/auth/me", None), ("POST", "/auth/logout", None), ("POST", "/auth/password", {}))
 
 
@@ -670,6 +677,86 @@ def check_no_secrets_logged(operator_ok):
     expect(leaked == 0, "{} harness secret(s) appear in the API log".format(leaked))
     expect("Login succeeded for 'vfy-engineer'" in result.stdout + result.stderr,
            "the API log has no login line for vfy-engineer")
+
+
+def totp(secret, offset=0):
+    """RFC 6238 (SHA-1, 6 digits, 30 s), computed here from the secret the
+    set-up answered, so the API is checked against the standard, not itself."""
+    key = base64.b32decode(secret + "=" * (-len(secret) % 8))
+    digest = hmac.new(key, struct.pack(">Q", int(time.time() // 30) + offset), hashlib.sha1).digest()
+    at = digest[-1] & 0x0F
+    return str((struct.unpack(">I", digest[at:at + 4])[0] & 0x7FFFFFFF) % 1000000).zfill(6)
+
+
+def cookie_value(headers, name):
+    for cookie in headers.get_all("Set-Cookie") or []:
+        key, _, rest = cookie.partition("=")
+        if key.strip() == name:
+            return rest.split(";", 1)[0]
+    return None
+
+
+def second_factor(challenge, value):
+    """POST /auth/login/mfa with the challenge cookie; paced like a login,
+    since nginx limits it in the same zone."""
+    headers = {"Origin": auth_setup.origin(), "Cookie": "rag_mfa=" + challenge}
+    return auth_setup.paced(auth_setup.LOGIN_PATH, lambda: code(
+        "POST", "/auth/login/mfa", {"code": value}, headers=headers, paced=False))
+
+
+def password_step(username, password):
+    status, raw, headers = code("POST", "/auth/login", {"username": username, "password": password})
+    body = json.loads(raw) if status == 200 else {}
+    challenge = cookie_value(headers, "rag_mfa")
+    expect(status == 200 and body == {"mfa_required": True} and challenge
+           and cookie_value(headers, "rag_session") is None,
+           "the password step for an enrolled user answered {} {} (challenge {})".format(
+               status, body, "set" if challenge else "missing"))
+    return challenge
+
+
+def check_mfa(operator_ok):
+    """Two-step verification on the stack (#607): set-up, the two-step login,
+    no code twice, a recovery code once, and an Engineer's reset."""
+    username, password, token = throwaway("developer", operator_ok)
+    status, raw, headers = code("POST", "/auth/mfa/enroll", token=token)
+    expect(status == 200 and headers.get("Cache-Control") == "no-store", "set-up answered {} {}".format(
+        status, error_code(raw)))
+    secret = json.loads(raw)["secret"]
+    status, raw, _ = code("POST", "/auth/mfa/enroll/confirm", {"code": totp(secret, -1)}, token=token)
+    expect(status == 200, "confirming the set-up answered {} {}".format(status, error_code(raw)))
+    recovery = json.loads(raw)["recovery_codes"]
+    expect(len(recovery) == 10, "{} recovery codes".format(len(recovery)))
+
+    challenge = password_step(username, password)
+    accepted = totp(secret)
+    status, raw, headers = second_factor(challenge, accepted)
+    expect(status == 200 and cookie_value(headers, "rag_session"), "the right code answered {} {}".format(
+        status, error_code(raw)))
+    challenge = password_step(username, password)
+    status, raw, _ = second_factor(challenge, accepted)
+    expect(status == 401 and error_code(raw) == "MFA_FAILED", "a used code answered {} {}".format(
+        status, error_code(raw)))
+    status, raw, _ = second_factor(challenge, recovery[0])
+    expect(status == 200, "a recovery code answered {} {}".format(status, error_code(raw)))
+    challenge = password_step(username, password)
+    status, raw, _ = second_factor(challenge, recovery[0])
+    expect(status == 401 and error_code(raw) == "MFA_FAILED", "a used recovery code answered {} {}".format(
+        status, error_code(raw)))
+
+    admin = role_token("engineer")
+    try:
+        status, raw, _ = code("POST", "/auth/users/{}/reset-mfa".format(username), token=admin)
+        expect(status == 200 and json.loads(raw)["user"]["mfa_enrolled"] is False,
+               "the Engineer's reset answered {} {}".format(status, error_code(raw)))
+    finally:
+        request("POST", "/auth/logout", token=admin)
+    status, body, _ = request("POST", "/auth/login", {"username": username, "password": password})
+    expect(status == 200 and body.get("mfa_enrolled") is False, "after the reset the login answered {} {}".format(
+        status, body))
+    result = compose("logs", "--no-color", "api")
+    expect(all(value not in result.stdout + result.stderr for value in [secret, accepted] + recovery),
+           "a secret or code appears in the API log")
 
 
 STATE = "restart-state.json"

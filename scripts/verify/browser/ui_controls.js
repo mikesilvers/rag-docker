@@ -270,7 +270,7 @@ function navMenuCases() {
   const DATA = { key: 'data', label: 'Data', entries: ['Import', 'Prepare', 'Transfer'] };
   const TUNE = { key: 'tune', label: 'Tune', entries: ['Chunking', 'Retrieval', 'Gold Standard'] };
   const ADMIN = { key: 'admin', label: 'Admin', entries: ['Collections', 'Users', 'Service keys', 'Audit', 'Health'] };
-  const account = (username, badge) => ({ key: 'account', label: `${username} ${badge}`, entries: ['Change password', 'Log out'] });
+  const account = (username, badge) => ({ key: 'account', label: `${username} ${badge}`, entries: ['Account', 'Change password', 'Log out'] });
   const want = {
     end_user: [account('vfy-end-user', 'End User')],
     developer: [DATA, TUNE, account('vfy-developer', 'Developer')],
@@ -546,10 +546,10 @@ function usersCases() {
     { name: 'The list shows each account; the own row has no Reset password', open: open(), async run(s) {
       await waitText(s.page, 'vfy-off');
       const heads = await s.page.evaluate(() => [...document.querySelectorAll('thead th')].map(t => t.textContent.trim()));
-      assert.deepEqual(heads, ['Username', 'Role', 'Status', 'Password', 'Created', '']);
+      assert.deepEqual(heads, ['Username', 'Role', 'Status', 'Password', 'Two-step', 'Created', '']);
       const date = await s.page.evaluate(v => new Date(v).toLocaleDateString(), '2026-10-01T12:00:00Z');
       const rows = await rowTexts(s.page);
-      assert.deepEqual(rows.map(r => [r[0], r[2], r[3], r[4]]), [['vfy-developer', 'Enabled', 'Set', date], [ME + ' (you)', 'Enabled', 'Set', date], ['vfy-off', 'Disabled', 'Change due', date]]);
+      assert.deepEqual(rows.map(r => [r[0], r[2], r[3], r[4], r[5]]), [['vfy-developer', 'Enabled', 'Set', 'Off', date], [ME + ' (you)', 'Enabled', 'Set', 'Off', date], ['vfy-off', 'Disabled', 'Change due', 'Off', date]]);
       assert.deepEqual(await s.page.evaluate(() => [...document.querySelectorAll('tbody select')].map(x => x.value)), ['developer', 'engineer', 'end_user']);
       assert.deepEqual(await rowButtons(s.page, 'vfy-developer'), ['Reset password', 'Disable']);
       assert.deepEqual(await rowButtons(s.page, ME), ['Disable']);
@@ -628,6 +628,139 @@ function usersCases() {
         if (action === 'role') assert.equal((await nav(s.page)).includes('Users'), false);
       } };
     }),
+  ];
+}
+
+// Two-step verification (#607): the Account page's set-up, recovery codes and
+// turn-off, the login's code step, a forced set-up, and the Users page's
+// column, reset and switch. The API is stubbed; the real routes are checked
+// in 17_auth.sh (auth_stack.py mfa) and test_auth.py.
+function mfaCases() {
+  const SECRET = 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP';
+  const CODES = Array.from({ length: 10 }, (_, i) => `aaaa-bbbb-cccc-dd${String(i).padStart(2, '2')}`.slice(0, 19));
+  const off = { enrolled: false, enrolled_at: null, required: false, recovery_codes_remaining: 0 };
+  const on = { enrolled: true, enrolled_at: '2026-11-16T12:00:00Z', required: false, recovery_codes_remaining: 10 };
+  const me = (role, over = {}) => ({ username: 'vfy-' + role.replace('_', '-'), role, must_change_password: false, ...over });
+  const row = (username, role, over = {}) => ({ username, role, enabled: true, must_change_password: false, created_at: '2026-10-01T12:00:00Z', mfa_enrolled: false, ...over });
+  return [
+    { name: 'The account menu has Account, which opens the two-step set-up: a QR code, the key as text, and the codes once', open: { role: 'developer', path: '/qa', routes: base({
+      'GET /api/auth/mfa': json(200, off),
+      'POST /api/auth/mfa/enroll': json(200, { secret: SECRET, otpauth_uri: `otpauth://totp/RAG%20Platform:vfy-developer?secret=${SECRET}&issuer=RAG%20Platform&algorithm=SHA1&digits=6&period=30` }),
+      'POST /api/auth/mfa/enroll/confirm': json(200, { recovery_codes: CODES, status: on }),
+    }) }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      await chooseFromMenu(s.page, 'account', 'Account');
+      await waitPath(s.page, '/account');
+      await waitText(s.page, 'Two-step verification is off');
+      await press(s.page, 'Set up');
+      await waitFor(s.page, () => !!document.querySelector('[data-testid=mfa-setup] img[src^="data:image/"]'), 'the QR code drawn in the page');
+      assert.equal(await s.page.evaluate(() => document.querySelector('[data-testid=mfa-secret]').textContent.trim()), SECRET);
+      await fill(s.page, '#mfa-confirm-code', '123456');
+      await press(s.page, 'Confirm');
+      await waitFor(s.page, () => !!document.querySelector('[data-testid=recovery-codes]'), 'the recovery codes');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/mfa/enroll/confirm').map(c => c.body), [{ code: '123456' }]);
+      await waitText(s.page, CODES[9]);
+      await waitText(s.page, 'shown only once');
+      assert.deepEqual(await s.page.evaluate(() => [Object.keys(sessionStorage), Object.keys(localStorage)]), [[], []]);
+      await press(s.page, 'Done');
+      await waitText(s.page, CODES[0], true);
+      await waitText(s.page, '10 of 10 recovery codes left');
+    } },
+    { name: 'Enrolled: regenerate shows a new set once; Turn off sends the password and code', open: { role: 'developer', path: '/account', routes: base({
+      'GET /api/auth/mfa': json(200, on),
+      'POST /api/auth/mfa/recovery-codes': json(200, { recovery_codes: CODES, status: on }),
+      'POST /api/auth/mfa/disable': json(200, { status: off }),
+    }) }, async run(s) {
+      await waitText(s.page, '10 of 10 recovery codes left');
+      await press(s.page, 'Regenerate recovery codes');
+      await fill(s.page, '#mfa-regenerate-code', '654321');
+      await press(s.page, 'Get new recovery codes');
+      await waitText(s.page, CODES[3]);
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/mfa/recovery-codes').map(c => c.body), [{ code: '654321' }]);
+      await press(s.page, 'Done');
+      await press(s.page, 'Turn off');
+      await fill(s.page, '#mfa-disable-password', 'my password here');
+      await fill(s.page, '#mfa-disable-code', CODES[0]);
+      await press(s.page, 'Turn off', 'form button[type=submit]');
+      await waitText(s.page, 'Two-step verification is off');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/mfa/disable').map(c => c.body), [{ password: 'my password here', code: CODES[0] }]);
+    } },
+    { name: 'While two-step verification is required, Turn off isn\'t offered', open: { role: 'developer', path: '/account', routes: base({
+      'GET /api/auth/mfa': json(200, { ...on, required: true }),
+    }) }, async run(s) {
+      await waitText(s.page, 'Regenerate recovery codes');
+      assert.equal(await bodyHas(s.page, 'Turn off'), false);
+    } },
+    { name: 'A right password asks for a code; a wrong code shows the API\'s message; the right one opens /qa', open: { role: null, path: '/login', routes: base({
+      'POST /api/auth/login': json(200, { mfa_required: true }),
+      'POST /api/auth/login/mfa': call => call.body.code === '111111' ? json(200, me('developer', { mfa_enrolled: true })) : apiError(401, 'MFA_FAILED', 'The code is incorrect.'),
+    }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await fill(s.page, '#login-username', 'vfy-developer');
+      await fill(s.page, '#login-password', 'a password of twelve');
+      await press(s.page, 'Log in');
+      await waitFor(s.page, () => !!document.querySelector('#login-code'), 'the code step');
+      await fill(s.page, '#login-code', '000000');
+      await press(s.page, 'Verify');
+      await waitText(s.page, 'The code is incorrect.');
+      assert.equal(await s.page.evaluate(() => document.querySelector('#login-code').value), '');
+      await fill(s.page, '#login-code', '111111');
+      await press(s.page, 'Verify');
+      await waitPath(s.page, '/qa');
+      await waitText(s.page, 'Ask a Question');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/login/mfa').map(c => c.body), [{ code: '000000' }, { code: '111111' }]);
+    } },
+    { name: 'An expired challenge returns to the password step', open: { role: null, path: '/login', routes: base({
+      'POST /api/auth/login': json(200, { mfa_required: true }),
+      'POST /api/auth/login/mfa': apiError(401, 'MFA_CHALLENGE_INVALID', 'Your sign-in expired. Log in again.'),
+    }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await fill(s.page, '#login-username', 'vfy-developer');
+      await fill(s.page, '#login-password', 'a password of twelve');
+      await press(s.page, 'Log in');
+      await waitFor(s.page, () => !!document.querySelector('#login-code'), 'the code step');
+      await fill(s.page, '#login-code', '123456');
+      await press(s.page, 'Verify');
+      await waitText(s.page, 'Your sign-in expired');
+      await waitFor(s.page, () => !!document.querySelector('#login-password'), 'the password step again');
+    } },
+    { name: 'A required set-up shows only the account page, with Log out; an API answer MFA_ENROLLMENT_REQUIRED returns to it', open: { role: null, path: '/collections', routes: base({
+      'GET /api/auth/me': json(200, me('developer', { mfa_required: true, mfa_enrollment_required: true })),
+      'GET /api/auth/mfa': json(200, { ...off, required: true }),
+    }) }, async run(s) {
+      await waitPath(s.page, '/account');
+      await waitText(s.page, 'required for every account');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav').length), 0);
+      await waitText(s.page, 'Log out');
+    } },
+    { name: 'An API answer 403 MFA_ENROLLMENT_REQUIRED on any page opens the account page', open: { role: 'engineer', path: '/collections', routes: base({
+      'GET /api/collections': apiError(403, 'MFA_ENROLLMENT_REQUIRED', 'Set up two-step verification before doing anything else.'),
+      'GET /api/auth/mfa': json(200, { ...off, required: true }),
+    }) }, async run(s) {
+      await waitPath(s.page, '/account');
+      await waitText(s.page, 'required for every account');
+    } },
+    { name: 'Users page: the Two-step column, Reset two-step on enrolled rows but the own, and the switch', open: { role: 'engineer', path: '/users', routes: (() => {
+      const list = [row('vfy-developer', 'developer', { mfa_enrolled: true }), row('vfy-engineer', 'engineer', { mfa_enrolled: true }), row('vfy-off', 'end_user')];
+      return base({
+        'GET /api/auth/users': () => json(200, { users: list.map(u => ({ ...u })) }),
+        'POST /api/auth/users/vfy-developer/reset-mfa': () => { list[0].mfa_enrolled = false; return json(200, { user: list[0] }); },
+        'POST /api/auth/mfa/policy': apiError(409, 'MFA_ENROLL_FIRST', 'Set up two-step verification for your own account first, on the Account page.'),
+      });
+    })() }, async run(s) {
+      await waitText(s.page, 'vfy-off');
+      const buttons = u => s.page.evaluate(n => [...document.querySelectorAll(`tr[data-username="${n}"] button`)].map(b => b.textContent.trim()), u);
+      assert.deepEqual(await buttons('vfy-developer'), ['Reset password', 'Disable', 'Reset two-step']);
+      assert.deepEqual(await buttons('vfy-engineer'), ['Disable']);
+      assert.deepEqual(await buttons('vfy-off'), ['Reset password', 'Disable']);
+      await s.page.evaluate(() => [...document.querySelectorAll('tr[data-username="vfy-developer"] button')].find(b => b.textContent.trim() === 'Reset two-step').click());
+      await waitFor(s.page, () => document.querySelector('tr[data-username="vfy-developer"] td:nth-child(5)').textContent.trim() === 'Off', 'Off after the reset');
+      assert.equal(callsTo(s, 'POST', '/api/auth/users/vfy-developer/reset-mfa').length, 1);
+      await s.page.click('#mfa-required');
+      await waitText(s.page, 'for your own account first');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/mfa/policy').map(c => c.body), [{ required: true }]);
+      assert.equal(await s.page.evaluate(() => document.querySelector('#mfa-required').checked), false);
+    } },
   ];
 }
 
@@ -1216,6 +1349,7 @@ async function runUiControlTests(browser, baseUrl, reporter) {
   await run('Navigation, roles and redirects (#400); the API enforces the roles (#25)', navigationCases());
   await run('Login, logout, setup and password changes (#25)', authCases());
   await run('Users page: Engineers manage accounts (#25)', usersCases());
+  await run('Two-step verification: account page, login code, forced set-up, Users page (#607)', mfaCases());
   await run('Service keys page: Engineers manage service principals and keys (#25)', serviceKeysCases());
   await run('Audit page: Engineers read the audit log (#29)', auditCases());
   await run('Prepare page: list, preview, upload, jobs, deletes and import (#638)', prepareCases());

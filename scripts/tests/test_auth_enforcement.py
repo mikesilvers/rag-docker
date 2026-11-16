@@ -55,6 +55,10 @@ PROTECTED = (
     ("POST", "/auth/service-principals/nobody/role"), ("POST", "/auth/service-principals/nobody/disable"),
     ("POST", "/auth/service-principals/nobody/enable"), ("POST", "/auth/service-principals/nobody/keys"),
     ("POST", "/auth/service-principals/nobody/keys/nokey/revoke"),
+    # Two-step verification (#607): the user's own routes and the Engineer's.
+    ("GET", "/auth/mfa"), ("POST", "/auth/mfa/enroll"), ("POST", "/auth/mfa/enroll/confirm"),
+    ("POST", "/auth/mfa/recovery-codes"), ("POST", "/auth/mfa/disable"), ("POST", "/auth/mfa/policy"),
+    ("POST", "/auth/users/nobody/reset-mfa"),
 )
 
 

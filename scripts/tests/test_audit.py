@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -36,7 +37,7 @@ from pydantic import ValidationError
 import config
 from config import settings
 from main import app
-from auth import passwords, policy, store
+from auth import mfa, passwords, policy, store
 from services import audit, jobstore
 
 ORIGIN = "http://testserver"
@@ -246,6 +247,54 @@ class MiddlewareTests(AuditTestCase):
         text = self.raw()
         for secret in (password, "wrong-password-1"):
             self.assertNotIn(secret, text)
+
+    def test_second_factor_records(self):
+        # S10 of RD-117 (#607): each code attempt is its own record with the
+        # user as actor, never counted in a window, and no code is written.
+        dev = store.get_user("dev")
+        secret, _ = store.start_enrollment(dev.id, "dev")
+        token = store.create_session(dev.id)
+        codes = store.confirm_enrollment(store.authenticate(token), mfa.code_at(secret, int(time.time() // 30) - 1))
+        login = self.client.post("/auth/login", json={"username": "dev", "password": self.passwords["developer"]})
+        self.assertEqual(login.json(), {"mfa_required": True})
+        started = self.last("auth.login")
+        self.assertEqual((started["actor"], started["result"], started["details"]), ("dev", "success", {"mfa": "required"}))
+        challenge = login.cookies.get(store.MFA_COOKIE)
+        self.client.cookies.clear()
+        for _ in range(3):
+            self.client.post("/auth/login/mfa", json={"code": "zzzz-zzzz-zzzz-zzzz"},
+                             headers={"Cookie": f"{store.MFA_COOKIE}={challenge}"})
+        failed = [r for r in self.records() if r["action"] == "auth.mfa"]
+        self.assertEqual(len(failed), 3)
+        for item in failed:
+            self.assertEqual((item["actor"], item["actor_kind"], item["role"], item["result"], item["status_code"],
+                              item["details"]),
+                             ("dev", "user", "developer", "refused", 401, {"method": "recovery", "code": "MFA_FAILED"}))
+        self.client.post("/auth/login/mfa", json={"code": codes[0]}, headers={"Cookie": f"{store.MFA_COOKIE}={challenge}"})
+        ok = self.last("auth.mfa")
+        self.assertEqual((ok["actor"], ok["result"], ok["details"]), ("dev", "success", {"method": "recovery"}))
+        # No live challenge: nobody is named and nothing is written.
+        count = len(self.records())
+        self.client.post("/auth/login/mfa", json={"code": "123456"}, headers={"Cookie": f"{store.MFA_COOKIE}=nope"})
+        self.assertEqual(len(self.records()), count)
+        text = self.raw()
+        for value in [secret, challenge, "zzzz-zzzz-zzzz-zzzz"] + codes:
+            self.assertNotIn(value, text)
+
+    def test_enrollment_reset_and_switch_records(self):
+        eng = self.session("eng")
+        started = self.client.post("/auth/mfa/enroll", headers=eng).json()
+        self.client.post("/auth/mfa/enroll/confirm", headers=eng,
+                         json={"code": mfa.code_at(started["secret"], int(time.time() // 30))})
+        enrolled = self.last("auth.mfa.enroll")
+        self.assertEqual((enrolled["actor"], enrolled["result"]), ("eng", "success"))
+        self.client.post("/auth/mfa/policy", headers=eng, json={"required": True})
+        switched = self.last("admin.mfa.policy")
+        self.assertEqual((switched["actor"], switched["result"], switched["details"]), ("eng", "success", {"required": True}))
+        self.client.post("/auth/users/dev/reset-mfa", headers=eng)
+        reset = self.last("admin.user.reset-mfa")
+        self.assertEqual((reset["actor"], reset["target"], reset["result"]), ("eng", "dev", "success"))
+        self.assertNotIn(started["secret"], self.raw())
 
     def test_logout_and_password_change(self):
         headers = self.session("user")
@@ -499,6 +548,9 @@ class CommandTests(AuditTestCase):
         self.assertIn("code", self.last("operator.bootstrap")["details"])
         reset = self.run_auth("reset-password", "admin")
         self.assertEqual(self.last("operator.reset-password")["target"], "admin")
+        self.assertEqual(self.run_auth("reset-mfa", "admin").returncode, 0)          # #607
+        mfa_reset = self.last("operator.reset-mfa")
+        self.assertEqual((mfa_reset["actor"], mfa_reset["target"], mfa_reset["result"]), ("operator", "admin", "success"))
         count = len(self.records())
         self.run_auth("list")
         self.run_auth("set-role", "!!", "developer")                   # usage error
@@ -677,7 +729,10 @@ class ReviewerCoverageTests(AuditTestCase):
             "admin.principal.enable", "admin.key.issue", "admin.key.revoke", "audit.view", "audit.download",
             # Document preparation (#638).
             "prepare.upload", "prepare.start", "prepare.cancel", "prepare.import", "prepare.download",
-            "prepare.delete"})
+            "prepare.delete",
+            # Two-step verification (#607).
+            "auth.mfa", "auth.mfa.enroll", "auth.mfa.recovery-codes", "auth.mfa.disable", "admin.user.reset-mfa",
+            "admin.mfa.policy"})
         # Not recorded (D3): other GETs, job polling, gold-standard generate/edit/regenerate.
         # A preparation job's cancel is an action, not polling (#638).
         for method, path in audit.ACTIONS:
