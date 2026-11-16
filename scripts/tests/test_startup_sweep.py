@@ -6,7 +6,10 @@ Runs with the API's dependencies, inside the verify project's API container:
 
 An ingest killed mid-job left its upload staging (default `tmp` prefix) in
 UPLOAD_DIR, and a killed export its `.build-*` staging directory and
-`.<stem>.tar.gz.partial` archive in EXPORTS_DIR, for good. Disposable
+`.<stem>.tar.gz.partial` archive in EXPORTS_DIR, for good. An export now stages
+in UPLOAD_DIR as `export-*` (#549); its `.<stem>.tar.gz.partial` or, encrypted,
+`.<stem>.tar.gz.age.partial` archive is still written in EXPORTS_DIR, and
+`.build-*` left there by earlier versions is still removed. Disposable
 directories only; nothing reaches a backend. The lifespan case runs in a child
 process, so this process's module state stays untouched.
 """
@@ -66,8 +69,9 @@ class WorkdirSweepTests(SweepTestCase):
         write(self.uploads / "import-x1" / "pkg" / "manifest.json", text="{}")
         write(self.uploads / "rechunk-x2" / "doc.txt", text="text")
         write(self.uploads / "batch-verify-x3" / "rows.sqlite3", text="")
+        write(self.uploads / "export-x4" / "ragpkg-docs" / "chunks.jsonl", size=MB)
         removed = importer.sweep_stale_workdirs()
-        self.assertEqual(removed, ["batch-verify-x3 (0 MB)", "import-x1 (0 MB)",
+        self.assertEqual(removed, ["batch-verify-x3 (0 MB)", "export-x4 (1 MB)", "import-x1 (0 MB)",
                                    "ingest-abc123 (3 MB)", "rechunk-x2 (0 MB)"])
         self.assertEqual(sorted(p.name for p in self.uploads.iterdir()), [])
 
@@ -78,14 +82,16 @@ class WorkdirSweepTests(SweepTestCase):
                 write(self.uploads / "xingest-a" / "f.txt", text="x"),
                 write(self.uploads / "staged-ingest-" / "f.txt", text="x"),
                 write(self.uploads / "tmpk2j3h4" / "f.txt", text="x"),
-                write(self.uploads / "ingest-file", text="a file, not a directory")]
+                write(self.uploads / "ingest-file", text="a file, not a directory"),
+                write(self.uploads / "export-file", text="a file, not a directory")]
         (self.uploads / "ingest-link").symlink_to(self.outside / "dir")
         (self.uploads / "import-link").symlink_to(self.outside / "dir")
+        (self.uploads / "export-link").symlink_to(self.outside / "dir")
         (self.uploads / "ingest-file-link").symlink_to(self.outside / "file.bin")
         self.assertEqual(importer.sweep_stale_workdirs(), [])
         for path in keep:
             self.assertTrue(path.exists(), path)
-        for name in ("ingest-link", "import-link", "ingest-file-link"):
+        for name in ("ingest-link", "import-link", "export-link", "ingest-file-link"):
             self.assertTrue((self.uploads / name).is_symlink(), name)
         self.assert_outside_intact()
 
@@ -142,8 +148,11 @@ class ExportSweepTests(SweepTestCase):
         write(self.exports / ".build-k3j4h5" / "ragpkg-docs" / "chunks.jsonl", size=2 * MB)
         write(self.exports / ".build-k3j4h5" / "ragpkg-docs" / "models" / "blob", size=MB)
         write(self.exports / ".ragpkg-docs-20261021T120000Z-1a2b3c4d.tar.gz.partial", size=MB)
+        # An encrypted export's temporary archive (#27, #549).
+        write(self.exports / ".ragpkg-docs-20261021T120000Z-1a2b3c4d.tar.gz.age.partial", size=MB)
         removed = packager.sweep_build_leftovers()
         self.assertEqual(removed, [".build-k3j4h5 (3 MB)",
+                                   ".ragpkg-docs-20261021T120000Z-1a2b3c4d.tar.gz.age.partial (1 MB)",
                                    ".ragpkg-docs-20261021T120000Z-1a2b3c4d.tar.gz.partial (1 MB)"])
         self.assertEqual(list(self.exports.iterdir()), [])
 
@@ -159,15 +168,20 @@ class ExportSweepTests(SweepTestCase):
                 write(self.exports / ".build-file", text="a file, not a directory"),
                 write(self.exports / ".z.tar.gz.partial" / "f.txt", text="a directory, not a file"),
                 write(self.exports / "sub" / ".build-q" / "f.txt", text="not at the top"),
-                write(self.exports / "sub" / ".q.tar.gz.partial", text="not at the top")]
+                write(self.exports / "sub" / ".q.tar.gz.partial", text="not at the top"),
+                write(self.exports / "x.tar.gz.age.partial", text="not hidden"),
+                write(self.exports / ".y.tar.gz.age.partial.bak", text="other suffix"),
+                write(self.exports / ".z.tar.gz.age.partial" / "f.txt", text="a directory, not a file"),
+                write(self.exports / "sub" / ".q.tar.gz.age.partial", text="not at the top")]
         (self.exports / ".build-link").symlink_to(self.outside / "dir")
         (self.exports / ".w.tar.gz.partial").symlink_to(self.outside / "file.bin")
+        (self.exports / ".v.tar.gz.age.partial").symlink_to(self.outside / "file.bin")
         (self.exports / ".build-dangling").symlink_to(self.outside / "missing")
         self.assertEqual(packager.sweep_build_leftovers(), [])
         for path in keep:
             self.assertTrue(path.exists(), path)
         self.assertEqual(package.stat().st_size, MB)
-        for name in (".build-link", ".w.tar.gz.partial", ".build-dangling"):
+        for name in (".build-link", ".w.tar.gz.partial", ".v.tar.gz.age.partial", ".build-dangling"):
             self.assertTrue((self.exports / name).is_symlink(), name)
         self.assert_outside_intact()
 
@@ -219,6 +233,27 @@ class IngestStagingTests(SweepTestCase):
         stage = made[0]
         self.assertEqual(stage.parent, self.uploads)
         self.assertTrue(stage.name.startswith("ingest-"), stage.name)
+        self.assertEqual(importer.sweep_stale_workdirs(), [f"{stage.name} (0 MB)"])
+        self.assertFalse(stage.exists())
+
+
+class ExportStagingTests(SweepTestCase):
+    def test_export_staging_is_named_for_the_sweep(self):
+        """An export stages in UPLOAD_DIR, never in the host's EXPORTS_DIR (#549)."""
+        made = []
+        real = tempfile.mkdtemp
+
+        def mkdtemp(*args, **kwargs):
+            made.append(Path(real(*args, **kwargs)))
+            raise _Stop()
+        with patch.object(packager.tempfile, "mkdtemp", mkdtemp):
+            with self.assertRaises(_Stop):
+                packager.build("Docs")
+        self.assertEqual(len(made), 1)
+        stage = made[0]
+        self.assertEqual(stage.parent, self.uploads)
+        self.assertTrue(stage.name.startswith("export-"), stage.name)
+        self.assertEqual(list(self.exports.iterdir()), [])
         self.assertEqual(importer.sweep_stale_workdirs(), [f"{stage.name} (0 MB)"])
         self.assertFalse(stage.exists())
 

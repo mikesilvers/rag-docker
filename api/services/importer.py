@@ -181,12 +181,14 @@ def _mark_finished(collection: str) -> None:
     collection_recovery._sync_dir(_markers_dir())
 
 
-# Extraction workspaces created by an import or a re-chunk, and an ingest's
-# upload staging (#377). Each removes its own directory in a `finally`, which a
-# hard kill skips -- twelve of these were found holding 152 MB after the kill
-# tests, a with-models package would leave 2.3 GB behind each time, and an
-# ingest up to 512 MB of upload plus 2 GiB of extracted ZIP members.
-_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-", "ingest-", "prepare-")
+# Extraction workspaces created by an import or a re-chunk, an ingest's upload
+# staging (#377), and an export's staging (#549). Each removes its own directory
+# in a `finally`, which a hard kill skips -- twelve of these were found holding
+# 152 MB after the kill tests, a with-models package would leave 2.3 GB behind
+# each time, and an ingest up to 512 MB of upload plus 2 GiB of extracted ZIP
+# members.
+_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-", "ingest-", "prepare-",
+                     "export-")
 # Document preparation also writes two temporary files there (#640): the ZIP of
 # a multi-part prepared download (prepare-*.zip) and a decompressed .json.gz
 # (prepare-*.json). They are removed as regular files, besides as directories.

@@ -329,19 +329,23 @@ the same passphrase.
   payload in 64 KiB plaintext chunks with ChaCha20-Poly1305, all as the age
   specification defines. The tar.gz writer streams through the encryptor into the
   temporary file: no unencrypted archive is written, and only one chunk is held in
-  memory. The package's files are still staged unencrypted in
-  `./exports/.build-*` while the export runs (§6.1), removed when it ends or by
-  the next start-up's sweep; moving that staging out of the bind mount is a
-  follow-up.
+  memory. The package's files are staged unencrypted in `{UPLOAD_DIR}/export-*`,
+  inside the API container's volume and never in the `./exports` bind mount,
+  while the export runs (§6.1), for every export, encrypted or not (#549); the
+  folder is removed when the export ends or by the next start-up's sweep, which
+  also removes `.build-*` staging left in `./exports` by earlier versions.
 - **Decryption** accepts only a header that parses under the age grammar and
   holds one stanza, of type `scrypt`, with a canonical 16-byte salt, a work
-  factor, and a 32-byte body. A work factor that is not one or two decimal digits
-  without a sign or leading zero is refused `DECRYPT_FAILED` (`reason`
-  `work_factor`) before it is converted, so no field length can cause an
-  unhandled error; a work factor
+  factor, and a 32-byte body. A work factor that is not a decimal without a sign
+  or leading zero (for example `0x12`, `018`, `+18` or `0`) makes the header
+  malformed and is refused `PACKAGE_UNREADABLE` (maintainer decision of
+  2026-11-16 on #549, under #27's decision 7). A work factor
   above 20 (about 1 GiB of scrypt memory; a maintainer decision on #27, below
-  age's own limit of 22, about 4 GiB) is refused `DECRYPT_FAILED` without
-  deriving anything, and at most one scrypt derivation runs at a time in the API.
+  age's own limit of 22, about 4 GiB), a decimal of more than two digits
+  included, is refused `DECRYPT_FAILED` (`reason` `work_factor`) without
+  deriving anything; a field longer than two digits is never converted, so no
+  field length can cause an unhandled error. At most one scrypt derivation runs
+  at a time in the API.
   The header MAC is checked before any plaintext is released, and every payload
   chunk is authenticated before it is; a file that ends inside the payload nonce,
   a truncated payload, a missing or
@@ -1089,7 +1093,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E35 | Digest-valid malformed ingest settings (invalid JSON, a non-object, a wrong type or an invalid value) are refused `PACKAGE_CORRUPT`, naming `ingest_config.json`, before live mutation in all conflict modes, leaving the existing collection's settings unchanged; valid settings, including ones with missing or unknown fields, numeric strings and a `chunk_size`/`min_chunk_size` from before the chunk bounds, import and `GET /ingest/config/{collection}` returns them for the import target (#510), by `test_retrieval_import.py` |
 | E36 | An export holds its collection's writer guard for its whole run: a re-ingest that tries to commit mid-export waits, and the package holds the old chunks with the old source bytes, every non-null `source_sha256` naming a blob in it; gold-standard generation is refused `COLLECTION_BUSY` and guarded writers wait meanwhile; an export started while another writer holds the guard reads `queued`; the guard is released when the export completes, fails or is cancelled (#509); a cancelled export ends `failed` with an `error` saying so, and the cancellation still propagates (#521), by `test_export_snapshot.py` |
 | E37 | An export with a `passphrase` writes `<stem>.tar.gz.age`, an age v1 scrypt file at work factor 18 whose decryption satisfies §4.1 to §4.5 and that the listing shows `encrypted: true` with null metadata; the export and import jobs report `encrypted` and hold no passphrase (#27), by `test_export_encryption.py` and suite 05 |
-| E38 | Importing an encrypted package with a wrong passphrase fails `DECRYPT_FAILED` (`reason` `passphrase`), and a damaged or truncated file fails `DECRYPT_FAILED` or `PACKAGE_UNREADABLE` and a scrypt work factor above 20 (21 included) or not one or two decimal digits (thousands of digits included) fails `DECRYPT_FAILED` before any key derivation; a file cut inside the payload nonce fails `DECRYPT_FAILED`, with no collection, marker, setting, session or package file changed and no work directory left; the right passphrase imports it with every chunk (#27), by `test_export_encryption.py` and suite 05 |
+| E38 | Importing an encrypted package with a wrong passphrase fails `DECRYPT_FAILED` (`reason` `passphrase`), and a damaged or truncated file fails `DECRYPT_FAILED` or `PACKAGE_UNREADABLE` and a scrypt work factor above 20 (21, and decimals of thousands of digits, included) fails `DECRYPT_FAILED` before any key derivation, and one that is not a decimal without a sign or leading zero (`0x12`, `018`, `+18`, `0`) fails `PACKAGE_UNREADABLE` (#549); a file cut inside the payload nonce fails `DECRYPT_FAILED`, with no collection, marker, setting, session or package file changed and no work directory left; the right passphrase imports it with every chunk (#27), by `test_export_encryption.py` and suite 05 |
 | E39 | `POST /import` refuses an encrypted package without a passphrase `400 PASSPHRASE_REQUIRED` and a passphrase for any other package `400 PASSPHRASE_NOT_EXPECTED`, before any job; `POST /export` refuses a passphrase outside 12 to 1024 characters, and both refuse one with no UTF-8 form (a lone surrogate), `422 INVALID_PARAMETER` without echoing it; one bad encrypted file never fails `GET /packages` (#27) |
 | E40 | The age implementation passes every applicable C2SP CCTV age testkit vector, and its output decrypts with an independent decryption written from the age specification (#27), by `test_export_encryption.py` |
 | E41 | A package of more than `max_package_members` entries, directories included, fails `PACKAGE_TOO_MANY_MEMBERS`, folders implied by member paths counting once each (a directory member's own folder as its entry; a name with a `..` component is refused `PACKAGE_UNREADABLE` before its folders are counted), and one whose members add up to more than `max_package_expanded_bytes` fails `PACKAGE_TOO_LARGE`, each with its message and `detail`, for `.tar.gz` and `.tar.gz.age` packages alike; a package exactly at a cap imports; a member with a negative size is refused `PACKAGE_UNREADABLE` before its size is counted, and a sparse file (old GNU type `S`, PAX sparse 0.0, 0.1 or 1.0) is refused `PACKAGE_UNREADABLE`; a `.tar.gz` refusal extracts nothing and reads no header after the refusing member, a `.tar.gz.age` refusal leaves at most the cap's bytes, and the job creates no collection and leaves no work directory (#317), by `test_package_limits.py` with caps of 1 MiB and 20 entries set through the environment |

@@ -14,6 +14,8 @@ const PACKAGE = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz';
 const collectionsBody = { collections: [A, B].map(name => ({ name, object_count: 3, index_type: 'hnsw', distance_metric: 'cosine', created_at: null })) };
 // An encrypted package lists no metadata (#27).
 const SEALED = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz.age';
+// An encrypted package whose header can't be read: listed readable: false (#27).
+const BROKEN = 'ragpkg-vfytransfera-20261021-0000-ffff0000.tar.gz.age';
 const packagesBody = { packages: [
   { filename: PACKAGE, size_bytes: 2048, collection: A, chunk_count: 3, fidelity: 'with-sources', created_at: null, readable: true, encrypted: false },
   { filename: SEALED, size_bytes: 2100, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: true, encrypted: true },
@@ -255,6 +257,32 @@ async function runTransferPageTests(browser, base, reporter) {
     await release(page, HALVES.export.poll, exportJob('completed', { chunks_written: 3, filename: 'ragpkg-vfy.tar.gz.age', size_bytes: 4096, fidelity: 'with-sources', models_bundled: false, retrieve_script: true, encrypted: true }));
     await waitText(page, 'with-sources, encrypted');
   }]);
+  cases.push(['export encryption: the bounds count characters, 1025 holds Export, and a refused start keeps the fields (#27)', async page => {
+    assert.equal(await checkEncrypt(page), true, 'no "Encrypt with a passphrase" checkbox');
+    await page.waitForFunction(() => document.querySelectorAll('input[type=password]').length === 2);
+    const lock = '\u{1F512}';   // one character, two UTF-16 units
+    await typePassword(page, 0, lock.repeat(11));
+    await typePassword(page, 1, lock.repeat(11));
+    await waitText(page, 'The passphrase needs at least 12 characters.');
+    assert.equal((await button(page, 'export')).disabled, true, 'Export enabled with 11 characters (22 UTF-16 units)');
+    await typePassword(page, 0, lock.repeat(12));
+    await typePassword(page, 1, lock.repeat(12));
+    await waitText(page, 'The passphrase needs at least 12 characters.', true);
+    await expectButton(page, 'export', false);
+    await typePassword(page, 0, 'a'.repeat(1025));
+    await typePassword(page, 1, 'a'.repeat(1025));
+    await waitText(page, 'The passphrase can have at most 1024 characters.');
+    assert.equal((await button(page, 'export')).disabled, true, 'Export enabled with 1025 characters');
+    await typePassword(page, 0, 'a'.repeat(1024));
+    await typePassword(page, 1, 'a'.repeat(1024));
+    await waitText(page, 'The passphrase can have at most 1024 characters.', true);
+    await expectButton(page, 'export', false);
+    assert.equal(await click(page, 'Export'), true, 'no Export button');
+    await release(page, '/api/export', apiError(409, 'EXPORT_IN_PROGRESS', 'An export of this collection is already running.'), 'POST');
+    await waitText(page, 'An export of this collection is already running.');
+    assert.deepEqual(await passwords(page), ['a'.repeat(1024), 'a'.repeat(1024)], 'the fields were cleared after a refused start');
+    await expectButton(page, 'export', false);
+  }]);
   cases.push(['export encryption: an unchecked box sends no passphrase (#27)', async page => {
     await start(page, 'export');
     assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false });
@@ -282,6 +310,14 @@ async function runTransferPageTests(browser, base, reporter) {
     await pending(page, '/api/import', 'POST');
     assert.deepEqual(await sentBody(page, '/api/import'), { filename: PACKAGE, on_conflict: 'abort' });
   }]);
+  cases.push(['import encryption: an encrypted package that can\'t be read is labelled "encrypted, unreadable" (#27)', async page => {
+    const broken = { filename: BROKEN, size_bytes: 512, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: false, encrypted: true };
+    await release(page, '/api/packages', json(200, { packages: [...packagesBody.packages, broken] }));
+    await page.waitForFunction(n => [...document.querySelectorAll('option')].some(o => o.value === n), { timeout: 5000 }, BROKEN)
+      .catch(() => { throw new Error('the unreadable encrypted package is not listed'); });
+    const label = await page.evaluate(n => [...document.querySelectorAll('option')].find(o => o.value === n).textContent, BROKEN);
+    assert.equal(label, BROKEN + ' — encrypted, unreadable');
+  }, { hold: ['GET /api/packages'] }]);
 
   for (const [name, test, opts] of cases) {
     let s;

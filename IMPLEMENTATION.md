@@ -10399,6 +10399,8 @@ def exports_dir() -> Path:
 # which a hard kill skips: each killed export left them in ./exports for good,
 # hidden and root-owned, about 2.3 GB with models. Matched by exact name pattern
 # and by kind, never by age; anything else in the folder is left alone.
+# Staging is now `{UPLOAD_DIR}/export-*`, swept with the other work directories
+# there (#549); `.build-*` is staging left here by earlier versions.
 _BUILD_DIR = ".build-*"
 # An encrypted export is written as `.<stem>.tar.gz.age.partial` (#27).
 _PARTIAL_ARCHIVES = (".*.tar.gz.partial", ".*.tar.gz.age.partial")
@@ -10744,8 +10746,13 @@ def build(
     out_dir = exports_dir()
     warnings: list[str] = []
 
-    # Staged inside exports_dir so the final rename is on the same filesystem.
-    stage = Path(tempfile.mkdtemp(dir=out_dir, prefix=".build-"))
+    # Staged in UPLOAD_DIR, a volume only the container sees (#549): the package's
+    # unencrypted files, originals included and for an encrypted export too,
+    # never sit in the host's ./exports. Only the archive goes there, written as
+    # `.<filename>.partial` and renamed in place.
+    upload = Path(settings.upload_dir)
+    upload.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(dir=upload, prefix="export-"))
     tmp_archive: Path | None = None
     try:
         b = _Builder(stage)
@@ -11431,10 +11438,11 @@ _SCRYPT_LABEL = b"age-encryption.org/v1/scrypt"
 HEADER_MAX = 64 * 1024
 
 _B64 = re.compile(rb"^[A-Za-z0-9+/]*$")
-# One or two digits, no sign or leading zero: every accepted value (1 to 20) fits,
-# and a longer field is refused before int(), which raises on a very long one
-# (Python's int string-length limit), so no field can reach an unhandled error.
-_WORK_FACTOR_TEXT = re.compile(r"^[1-9][0-9]?$")
+# A plain decimal, no sign or leading zero; anything else is a malformed header
+# (#549). Every accepted value (1 to 20) has one or two digits, so a longer one
+# is refused as above the limit before int(), which raises on a very long one
+# (Python's int string-length limit): no field can reach an unhandled error.
+_WORK_FACTOR_TEXT = re.compile(r"[1-9][0-9]*")
 # One scrypt derivation at a time in this process: a hostile file at the work
 # factor limit needs about 1 GiB, and concurrent imports must not multiply that.
 _scrypt_lock = threading.Lock()
@@ -11443,10 +11451,12 @@ _scrypt_lock = threading.Lock()
 class AgeError(Exception):
     """A file that can't be decrypted. `kind` says why, without any secret:
 
-    header      not a valid age header (or not an age file at all)
+    header      not a valid age header (or not an age file at all), a scrypt
+                work factor that is not a decimal without a sign or leading
+                zero included (#549)
     recipient   a valid age header, but not for a passphrase
-    work_factor the scrypt work factor is above MAX_WORK_FACTOR, or is not one or
-                two decimal digits without a sign or leading zero
+    work_factor the scrypt work factor is above MAX_WORK_FACTOR, a decimal of
+                more than two digits included
     nonce       the file ends inside the 16-byte payload nonce
     passphrase  the passphrase does not unwrap the file key
     hmac        the header MAC does not match: the header was changed
@@ -11562,8 +11572,9 @@ def scrypt_stanza(header: Header) -> tuple[bytes, int, bytes]:
 
     A passphrase file has exactly one stanza, of type `scrypt`; age refuses a
     scrypt stanza next to any other, since anyone holding the other key could
-    otherwise change the file without the passphrase. The work factor is
-    returned unchecked against MAX_WORK_FACTOR; `unwrap_file_key` checks it.
+    otherwise change the file without the passphrase. A work factor of one or
+    two digits is returned unchecked against MAX_WORK_FACTOR; `unwrap_file_key`
+    checks it. A longer decimal is refused here, before int().
     """
     types = [s.args[0] for s in header.stanzas]
     if "scrypt" in types and len(types) > 1:
@@ -11576,12 +11587,16 @@ def scrypt_stanza(header: Header) -> tuple[bytes, int, bytes]:
     salt = _b64decode(stanza.args[1].encode("ascii"))
     if len(salt) != 16:
         raise AgeError("header", "malformed scrypt salt")
-    if not _WORK_FACTOR_TEXT.match(stanza.args[2]):
-        raise AgeError("work_factor", "the scrypt work factor is not one or two decimal "
-                       "digits without a leading zero")
+    field = stanza.args[2]
+    if not _WORK_FACTOR_TEXT.fullmatch(field):
+        raise AgeError("header", "malformed scrypt work factor: not a decimal number "
+                       "without a sign or leading zero")
+    if len(field) > 2:
+        raise AgeError("work_factor", "the scrypt work factor is above the limit of "
+                       f"{MAX_WORK_FACTOR}")
     if len(stanza.body) != _FILE_KEY + _TAG:
         raise AgeError("header", "malformed scrypt stanza body")
-    return salt, int(stanza.args[2]), stanza.body
+    return salt, int(field), stanza.body
 
 
 def _scrypt(passphrase: bytes, salt: bytes, work_factor: int) -> bytes:
@@ -12812,12 +12827,14 @@ def _mark_finished(collection: str) -> None:
     collection_recovery._sync_dir(_markers_dir())
 
 
-# Extraction workspaces created by an import or a re-chunk, and an ingest's
-# upload staging (#377). Each removes its own directory in a `finally`, which a
-# hard kill skips -- twelve of these were found holding 152 MB after the kill
-# tests, a with-models package would leave 2.3 GB behind each time, and an
-# ingest up to 512 MB of upload plus 2 GiB of extracted ZIP members.
-_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-", "ingest-", "prepare-")
+# Extraction workspaces created by an import or a re-chunk, an ingest's upload
+# staging (#377), and an export's staging (#549). Each removes its own directory
+# in a `finally`, which a hard kill skips -- twelve of these were found holding
+# 152 MB after the kill tests, a with-models package would leave 2.3 GB behind
+# each time, and an ingest up to 512 MB of upload plus 2 GiB of extracted ZIP
+# members.
+_WORKDIR_PREFIXES = ("import-", "rechunk-", "batch-verify-", "ingest-", "prepare-",
+                     "export-")
 # Document preparation also writes two temporary files there (#640): the ZIP of
 # a multi-part prepared download (prepare-*.zip) and a decompressed .json.gz
 # (prepare-*.json). They are removed as regular files, besides as directories.
@@ -24902,9 +24919,11 @@ operation runs reliably long enough to interrupt, so `test_jobstore.py` covers i
 
 `scripts/tests/test_startup_sweep.py` (#377) checks the startup sweeps of what a killed job
 leaves behind, in disposable folders. In `UPLOAD_DIR`, ingest staging is created as
-`ingest-*` and removed with the `import-*`, `rechunk-*`, `batch-verify-*` and `prepare-*` work
-directories, and document preparation's `prepare-*.zip` and `prepare-*.json` temporary files (#640);
-in `EXPORTS_DIR`, `.build-*` directories and `.*.tar.gz.partial` files are removed. Only those
+`ingest-*` and export staging as `export-*` (#549), and both are removed with the `import-*`,
+`rechunk-*`, `batch-verify-*` and `prepare-*` work directories, and document preparation's
+`prepare-*.zip` and `prepare-*.json` temporary files (#640); in `EXPORTS_DIR`, `.build-*`
+directories (export staging from earlier versions) and `.*.tar.gz.partial` and
+`.*.tar.gz.age.partial` files are removed. Only those
 names, and only a real directory or regular file as the name says: completed packages,
 `ingest_configs/`, look-alike names, a file where a directory is expected and the reverse, and
 anything in a sub-folder are kept. A symlink is never followed, at the top or inside a
@@ -24914,7 +24933,7 @@ child process removes both kinds and logs them by name and size. A second one, w
 sweep fails, logs the error and still starts, with the ingest staging removed (#423).
 `02_ingest.sh` runs it in the API container. With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` checks
 that its two killed ingests' `ingest-*` staging existed before its restart and is gone after it
-(#423), and `05_transfer.sh` checks after its export restart that the interrupted export's build
+(#423), and `05_transfer.sh` checks after its export restart that the interrupted export's staging
 directory and temporary archive are gone, without removing anything itself, and that the
 completed package from the top of the suite is still there.
 
@@ -39987,7 +40006,7 @@ ENDPY
   ) >/tmp/vfy_xrestart_prepare.log 2>&1
   check "a 30,000-chunk collection is built for the interrupted export" $? \
     "$(grep -E 'Error' /tmp/vfy_xrestart_prepare.log | tail -1)"
-  builds_before=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
+  builds_before=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/uploads/export-* 2>/dev/null' | sort)
   api_post "/export" "{\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_xrestart_start.json
   xjob=$(jfield "['job_id']" < /tmp/vfy_xrestart_start.json)
   state=""
@@ -40003,9 +40022,10 @@ print(d['status'] + ('-writing' if d['chunks_written'] > 0 else ''))" 2>/dev/nul
     check "an export is running with chunks written before the restart" 1 "last status '$state'; nothing restarted"
   else
     sleep 2
-    # The build directory this export is writing; the restart kills it there.
-    builds_during=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
-    killed=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_during") | grep '^/app/exports/\.build-' || true)
+    # The staging directory this export is writing, in UPLOAD_DIR since #549;
+    # the restart kills it there.
+    builds_during=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/uploads/export-* 2>/dev/null' | sort)
+    killed=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_during") | grep '^/app/uploads/export-' || true)
     _rag_require_lock_owner
     (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
     for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
@@ -40028,16 +40048,16 @@ ENDPY
     check "an interrupted export reads back 200 'failed' with INTERRUPTED and its progress" $? \
       "$(head -c 300 /tmp/vfy_xrestart_after.json)"
     # The killed build's leftovers (root, mode 0700) are the startup sweep's to
-    # remove (#377): its build directory and any temporary archive must be gone,
+    # remove (#377): its staging directory and any temporary archive must be gone,
     # and the completed package from the top of this suite still there.
-    check "the interrupted export had a build directory for the restart to sweep" \
-      "$([ -n "$killed" ] && echo 0 || echo 1)" "no new /app/exports/.build-* while the export ran"
+    check "the interrupted export had a staging directory for the restart to sweep" \
+      "$([ -n "$killed" ] && echo 0 || echo 1)" "no new /app/uploads/export-* while the export ran"
     stem=$(printf '%s' "$XR" | tr '[:upper:]' '[:lower:]')
     left=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c '
       for p in "$@" /app/exports/.ragpkg-'"$stem"'-*.tar.gz.partial; do
         if [ -e "$p" ] || [ -L "$p" ]; then echo "$p"; fi
       done; echo checked' sh $killed)
-    check "the restart removes the interrupted export's build directory and temporary archive" \
+    check "the restart removes the interrupted export's staging directory and temporary archive" \
       "$([ "$left" = checked ] && echo 0 || echo 1)" "still there: $left"
     check "the restart sweep keeps completed packages" "$([ -f "$EXPORTS/$PKG" ] && echo 0 || echo 1)" \
       "$EXPORTS/$PKG is gone"
@@ -40446,12 +40466,29 @@ ENDPY
     check "E8/E9: retrieve.py ($name) answers with $want citation(s)" $? \
       "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
   done
-  python3 ./auth_setup.py password end_user \
-    | python3 -I -S "$RTMP/retrieve.py" --username vfy-end-user --password-stdin --api-url "$API" \
-        --collection "$IMP" "$QUESTION" > /tmp/vfy_p_r.out 2> /tmp/vfy_p_r.err
-  rc=$?
-  [ "$rc" = 0 ] && [ -n "$(tr -d '[:space:]' < /tmp/vfy_p_r.out)" ]
-  check "E11: retrieve.py answers from the imported collection" $? "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
+  # Retrieval, not the generated text, is what shows retrieve.py works against
+  # the import: generation varies (an empty answer) and can time out under CPU
+  # load (a 504), so the check wants citations and allows 3 attempts (#549).
+  e11=1
+  for attempt in 1 2 3; do
+    python3 ./auth_setup.py password end_user \
+      | python3 -I -S "$RTMP/retrieve.py" --username vfy-end-user --password-stdin --api-url "$API" \
+          --json --citations --collection "$IMP" "$QUESTION" > /tmp/vfy_p_r.json 2> /tmp/vfy_p_r.err
+    rc=$?
+    python3 - <<'ENDPY'
+import json, sys
+try:
+    d = json.load(open("/tmp/vfy_p_r.json"))
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if isinstance(d, dict) and d.get("citations") else 1)
+ENDPY
+    cited=$?
+    if [ "$rc" = 0 ] && [ "$cited" = 0 ]; then e11=0; break; fi
+    [ "$attempt" -lt 3 ] && sleep 10
+  done
+  check "E11: retrieve.py retrieves from the imported collection (citations, up to 3 attempts)" "$e11" \
+    "after $attempt attempt(s): exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
 fi
 rm -rf "$RTMP"
 
@@ -49218,6 +49255,8 @@ const PACKAGE = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz';
 const collectionsBody = { collections: [A, B].map(name => ({ name, object_count: 3, index_type: 'hnsw', distance_metric: 'cosine', created_at: null })) };
 // An encrypted package lists no metadata (#27).
 const SEALED = 'ragpkg-vfytransfera-20261021-0000-abcd1234.tar.gz.age';
+// An encrypted package whose header can't be read: listed readable: false (#27).
+const BROKEN = 'ragpkg-vfytransfera-20261021-0000-ffff0000.tar.gz.age';
 const packagesBody = { packages: [
   { filename: PACKAGE, size_bytes: 2048, collection: A, chunk_count: 3, fidelity: 'with-sources', created_at: null, readable: true, encrypted: false },
   { filename: SEALED, size_bytes: 2100, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: true, encrypted: true },
@@ -49459,6 +49498,32 @@ async function runTransferPageTests(browser, base, reporter) {
     await release(page, HALVES.export.poll, exportJob('completed', { chunks_written: 3, filename: 'ragpkg-vfy.tar.gz.age', size_bytes: 4096, fidelity: 'with-sources', models_bundled: false, retrieve_script: true, encrypted: true }));
     await waitText(page, 'with-sources, encrypted');
   }]);
+  cases.push(['export encryption: the bounds count characters, 1025 holds Export, and a refused start keeps the fields (#27)', async page => {
+    assert.equal(await checkEncrypt(page), true, 'no "Encrypt with a passphrase" checkbox');
+    await page.waitForFunction(() => document.querySelectorAll('input[type=password]').length === 2);
+    const lock = '\u{1F512}';   // one character, two UTF-16 units
+    await typePassword(page, 0, lock.repeat(11));
+    await typePassword(page, 1, lock.repeat(11));
+    await waitText(page, 'The passphrase needs at least 12 characters.');
+    assert.equal((await button(page, 'export')).disabled, true, 'Export enabled with 11 characters (22 UTF-16 units)');
+    await typePassword(page, 0, lock.repeat(12));
+    await typePassword(page, 1, lock.repeat(12));
+    await waitText(page, 'The passphrase needs at least 12 characters.', true);
+    await expectButton(page, 'export', false);
+    await typePassword(page, 0, 'a'.repeat(1025));
+    await typePassword(page, 1, 'a'.repeat(1025));
+    await waitText(page, 'The passphrase can have at most 1024 characters.');
+    assert.equal((await button(page, 'export')).disabled, true, 'Export enabled with 1025 characters');
+    await typePassword(page, 0, 'a'.repeat(1024));
+    await typePassword(page, 1, 'a'.repeat(1024));
+    await waitText(page, 'The passphrase can have at most 1024 characters.', true);
+    await expectButton(page, 'export', false);
+    assert.equal(await click(page, 'Export'), true, 'no Export button');
+    await release(page, '/api/export', apiError(409, 'EXPORT_IN_PROGRESS', 'An export of this collection is already running.'), 'POST');
+    await waitText(page, 'An export of this collection is already running.');
+    assert.deepEqual(await passwords(page), ['a'.repeat(1024), 'a'.repeat(1024)], 'the fields were cleared after a refused start');
+    await expectButton(page, 'export', false);
+  }]);
   cases.push(['export encryption: an unchecked box sends no passphrase (#27)', async page => {
     await start(page, 'export');
     assert.deepEqual(await sentBody(page, '/api/export'), { collection: A, include_models: false });
@@ -49486,6 +49551,14 @@ async function runTransferPageTests(browser, base, reporter) {
     await pending(page, '/api/import', 'POST');
     assert.deepEqual(await sentBody(page, '/api/import'), { filename: PACKAGE, on_conflict: 'abort' });
   }]);
+  cases.push(['import encryption: an encrypted package that can\'t be read is labelled "encrypted, unreadable" (#27)', async page => {
+    const broken = { filename: BROKEN, size_bytes: 512, collection: null, chunk_count: null, fidelity: null, created_at: null, readable: false, encrypted: true };
+    await release(page, '/api/packages', json(200, { packages: [...packagesBody.packages, broken] }));
+    await page.waitForFunction(n => [...document.querySelectorAll('option')].some(o => o.value === n), { timeout: 5000 }, BROKEN)
+      .catch(() => { throw new Error('the unreadable encrypted package is not listed'); });
+    const label = await page.evaluate(n => [...document.querySelectorAll('option')].find(o => o.value === n).textContent, BROKEN);
+    assert.equal(label, BROKEN + ' — encrypted, unreadable');
+  }, { hold: ['GET /api/packages'] }]);
 
   for (const [name, test, opts] of cases) {
     let s;

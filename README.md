@@ -1074,11 +1074,10 @@ curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localho
 The package is then written as `ragpkg-...tar.gz.age`: an
 [age](https://age-encryption.org) file encrypted with that passphrase (scrypt).
 The archive is encrypted as it is written, so it is never held in memory and no
-unencrypted archive is written. While the export runs, though, the package's
-files are staged unencrypted in a hidden `./exports/.build-*` folder, which is
-removed when the export ends (or at the next start-up if the API was killed).
-Since `./exports/` is a host folder, anyone who can read it during an export can
-read those files; moving the staging out of it is a follow-up.
+unencrypted archive is written. While the export runs, the package's files are
+staged unencrypted only inside the container, in a work folder on the API's
+upload volume, never in `./exports/`; that folder is removed when the export
+ends (or at the next start-up if the API was killed).
 Import needs the same passphrase, and `age -d` opens the file as well. Import
 accepts a scrypt work factor of at most 20 (about 1 GiB of memory to derive the
 key) and refuses a higher one as `DECRYPT_FAILED` before deriving anything; age's

@@ -56,10 +56,11 @@ _SCRYPT_LABEL = b"age-encryption.org/v1/scrypt"
 HEADER_MAX = 64 * 1024
 
 _B64 = re.compile(rb"^[A-Za-z0-9+/]*$")
-# One or two digits, no sign or leading zero: every accepted value (1 to 20) fits,
-# and a longer field is refused before int(), which raises on a very long one
-# (Python's int string-length limit), so no field can reach an unhandled error.
-_WORK_FACTOR_TEXT = re.compile(r"^[1-9][0-9]?$")
+# A plain decimal, no sign or leading zero; anything else is a malformed header
+# (#549). Every accepted value (1 to 20) has one or two digits, so a longer one
+# is refused as above the limit before int(), which raises on a very long one
+# (Python's int string-length limit): no field can reach an unhandled error.
+_WORK_FACTOR_TEXT = re.compile(r"[1-9][0-9]*")
 # One scrypt derivation at a time in this process: a hostile file at the work
 # factor limit needs about 1 GiB, and concurrent imports must not multiply that.
 _scrypt_lock = threading.Lock()
@@ -68,10 +69,12 @@ _scrypt_lock = threading.Lock()
 class AgeError(Exception):
     """A file that can't be decrypted. `kind` says why, without any secret:
 
-    header      not a valid age header (or not an age file at all)
+    header      not a valid age header (or not an age file at all), a scrypt
+                work factor that is not a decimal without a sign or leading
+                zero included (#549)
     recipient   a valid age header, but not for a passphrase
-    work_factor the scrypt work factor is above MAX_WORK_FACTOR, or is not one or
-                two decimal digits without a sign or leading zero
+    work_factor the scrypt work factor is above MAX_WORK_FACTOR, a decimal of
+                more than two digits included
     nonce       the file ends inside the 16-byte payload nonce
     passphrase  the passphrase does not unwrap the file key
     hmac        the header MAC does not match: the header was changed
@@ -187,8 +190,9 @@ def scrypt_stanza(header: Header) -> tuple[bytes, int, bytes]:
 
     A passphrase file has exactly one stanza, of type `scrypt`; age refuses a
     scrypt stanza next to any other, since anyone holding the other key could
-    otherwise change the file without the passphrase. The work factor is
-    returned unchecked against MAX_WORK_FACTOR; `unwrap_file_key` checks it.
+    otherwise change the file without the passphrase. A work factor of one or
+    two digits is returned unchecked against MAX_WORK_FACTOR; `unwrap_file_key`
+    checks it. A longer decimal is refused here, before int().
     """
     types = [s.args[0] for s in header.stanzas]
     if "scrypt" in types and len(types) > 1:
@@ -201,12 +205,16 @@ def scrypt_stanza(header: Header) -> tuple[bytes, int, bytes]:
     salt = _b64decode(stanza.args[1].encode("ascii"))
     if len(salt) != 16:
         raise AgeError("header", "malformed scrypt salt")
-    if not _WORK_FACTOR_TEXT.match(stanza.args[2]):
-        raise AgeError("work_factor", "the scrypt work factor is not one or two decimal "
-                       "digits without a leading zero")
+    field = stanza.args[2]
+    if not _WORK_FACTOR_TEXT.fullmatch(field):
+        raise AgeError("header", "malformed scrypt work factor: not a decimal number "
+                       "without a sign or leading zero")
+    if len(field) > 2:
+        raise AgeError("work_factor", "the scrypt work factor is above the limit of "
+                       f"{MAX_WORK_FACTOR}")
     if len(stanza.body) != _FILE_KEY + _TAG:
         raise AgeError("header", "malformed scrypt stanza body")
-    return salt, int(stanza.args[2]), stanza.body
+    return salt, int(field), stanza.body
 
 
 def _scrypt(passphrase: bytes, salt: bytes, work_factor: int) -> bytes:

@@ -58,6 +58,8 @@ def exports_dir() -> Path:
 # which a hard kill skips: each killed export left them in ./exports for good,
 # hidden and root-owned, about 2.3 GB with models. Matched by exact name pattern
 # and by kind, never by age; anything else in the folder is left alone.
+# Staging is now `{UPLOAD_DIR}/export-*`, swept with the other work directories
+# there (#549); `.build-*` is staging left here by earlier versions.
 _BUILD_DIR = ".build-*"
 # An encrypted export is written as `.<stem>.tar.gz.age.partial` (#27).
 _PARTIAL_ARCHIVES = (".*.tar.gz.partial", ".*.tar.gz.age.partial")
@@ -403,8 +405,13 @@ def build(
     out_dir = exports_dir()
     warnings: list[str] = []
 
-    # Staged inside exports_dir so the final rename is on the same filesystem.
-    stage = Path(tempfile.mkdtemp(dir=out_dir, prefix=".build-"))
+    # Staged in UPLOAD_DIR, a volume only the container sees (#549): the package's
+    # unencrypted files, originals included and for an encrypted export too,
+    # never sit in the host's ./exports. Only the archive goes there, written as
+    # `.<filename>.partial` and renamed in place.
+    upload = Path(settings.upload_dir)
+    upload.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(dir=upload, prefix="export-"))
     tmp_archive: Path | None = None
     try:
         b = _Builder(stage)
