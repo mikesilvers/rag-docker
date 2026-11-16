@@ -29,11 +29,10 @@ app; test_auth.py fails when any route lacks an entry.
 from __future__ import annotations
 
 import asyncio
-from http.cookies import CookieError, SimpleCookie
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
-from starlette.requests import Request
+from starlette.requests import Request, cookie_parser
 
 from utils import api_error
 
@@ -63,13 +62,10 @@ def session_token(scope) -> str | None:
     raw = _header(scope, b"cookie")
     if not raw:
         return None
-    cookies = SimpleCookie()
-    try:
-        cookies.load(raw)
-    except CookieError:
-        return None
-    morsel = cookies.get(store.COOKIE)
-    return morsel.value if morsel else None
+    # starlette's parser, as Request.cookies uses: a malformed earlier cookie
+    # (another app on localhost) doesn't hide the session, as it did with
+    # http.cookies.SimpleCookie (#546).
+    return cookie_parser(raw).get(store.COOKIE) or None
 
 
 def same_origin(scope) -> bool:

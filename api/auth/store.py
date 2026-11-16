@@ -428,10 +428,13 @@ def authenticate_key(key: str | None) -> Principal | None:
 # ── sessions ─────────────────────────────────────────────────────────────────
 
 def create_session(user_id: int) -> str:
-    """A new session; returns the token for the cookie. Only its SHA-256 is stored."""
+    """A new session; returns the token for the cookie. Only its SHA-256 is stored.
+    Every session that has ended by time, anyone's, is deleted in the same
+    transaction, so sessions abandoned without a logout don't pile up (#546)."""
     token = secrets.token_urlsafe(32)
     now = _now()
     with _connect(write=True) as conn:
+        conn.execute("DELETE FROM sessions WHERE last_seen < ? OR created_at < ?", (now - IDLE_S, now - ABSOLUTE_S))
         conn.execute("INSERT INTO sessions (token_hash, user_id, created_at, last_seen) VALUES (?, ?, ?, ?)",
                      (_token_hash(token), user_id, now, now))
     return token
@@ -475,31 +478,6 @@ def change_password(principal: Principal, password: str) -> None:
 
 # ── login throttle ───────────────────────────────────────────────────────────
 
-def locked(username: str, address: str) -> bool:
-    with _connect() as conn:
-        row = conn.execute("SELECT until FROM login_lockouts WHERE username = ? AND address = ?",
-                           (username, address)).fetchone()
-    return row is not None and row["until"] > _now()
-
-
-def record_failure(username: str, address: str) -> bool:
-    """Count a failed login; True when it locks the pair."""
-    now = _now()
-    with _connect(write=True) as conn:
-        conn.execute("DELETE FROM login_failures WHERE at <= ?", (now - THROTTLE_WINDOW_S,))
-        conn.execute("DELETE FROM login_lockouts WHERE until <= ?", (now,))
-        conn.execute("INSERT INTO login_failures (username, address, at) VALUES (?, ?, ?)",
-                     (username, address, now))
-        count = conn.execute("SELECT COUNT(*) FROM login_failures WHERE username = ? AND address = ?",
-                             (username, address)).fetchone()[0]
-        if count < THROTTLE_FAILURES:
-            return False
-        conn.execute("INSERT OR REPLACE INTO login_lockouts (username, address, until) VALUES (?, ?, ?)",
-                     (username, address, now + LOCKOUT_S))
-        conn.execute("DELETE FROM login_failures WHERE username = ? AND address = ?", (username, address))
-    return True
-
-
 def reserve_attempt(username: str, address: str) -> bool:
     """Count an attempt before its password is checked; False when the pair is
     locked or already has its 5 counted attempts in the window (some of them
@@ -537,8 +515,3 @@ def finish_attempt(username: str, address: str, succeeded: bool) -> bool:
                      (username, address, now + LOCKOUT_S))
         conn.execute("DELETE FROM login_failures WHERE username = ? AND address = ?", (username, address))
     return True
-
-
-def clear_failures(username: str, address: str) -> None:
-    with _connect(write=True) as conn:
-        conn.execute("DELETE FROM login_failures WHERE username = ? AND address = ?", (username, address))

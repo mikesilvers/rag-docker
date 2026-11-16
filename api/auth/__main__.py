@@ -14,8 +14,10 @@ shown nowhere else, and the user must change it at their first login. Each
 action writes one line to standard error. Exit status: 0 done, 1 refused,
 2 usage error.
 
-The last enabled engineer can't be disabled or demoted. A lockout is recovered
-with create-user, enable or reset-password.
+The last enabled engineer can't be disabled or demoted. An account a user is
+locked out of (lost password, disabled) is recovered with create-user, enable
+or reset-password; these don't lift a login throttle, which ends by itself
+after 15 minutes.
 
 Service principals (API keys, PR 3) are created and given keys by Engineers in
 the app; this command issues no key. `list` shows principals too, marked
