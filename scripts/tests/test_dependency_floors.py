@@ -4,9 +4,9 @@ Reads the Python locks, api/requirements.in, ui/package.json and
 ui/package-lock.json. The floors are the first patched versions of the
 Dependabot alerts #522, #562, #651 and #749 closed. filelock (3.x, no patched release that
 unstructured accepts) is left out on purpose; the #522 PR explains its alerts.
-postcss-selector-parser stays on 6.x (tailwindcss 3). Its nested copy under
-@tailwindcss/typography, which pins 6.0.10 exactly, is lifted by a scoped npm
-override in ui/package.json (#562).
+postcss-selector-parser stays on 6.x: @tailwindcss/typography, its only user
+since Tailwind 4 (RD-157), pins 6.0.10 exactly, and a scoped npm override in
+ui/package.json lifts it to the patched 6.1.5 (#562).
 
 Standard library only; no Docker or stack needed.
 Run: python3 scripts/tests/test_dependency_floors.py
@@ -90,7 +90,8 @@ class DependencyFloorTests(unittest.TestCase):
                                             '{} resolves {}, below {}'.format(key, version, floor))
 
     def test_ui_postcss_selector_parser_stays_on_6x(self):
-        # tailwindcss 3 needs 6.x (Decision on #522); 6.1.5 is the patched 6.x release (#562).
+        # @tailwindcss/typography, its only user since Tailwind 4 (RD-157), pins 6.0.10
+        # exactly; the scoped override lifts it to 6.1.5, the patched 6.x release (#562).
         packages = json.loads((ROOT / 'ui/package-lock.json').read_text())['packages']
         entries = {key: value['version'] for key, value in packages.items()
                    if key.endswith('node_modules/postcss-selector-parser')}

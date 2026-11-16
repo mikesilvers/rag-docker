@@ -1,3 +1,39 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+/* Scan exactly the files Tailwind 3's `content` globs named, not whatever
+   Tailwind 4's automatic detection finds in the build context. */
+@import 'tailwindcss' source(none);
+@source '../index.html';
+@source './**/*.{js,ts,jsx,tsx}';
+
+/* `prose` is used by the Q&A answer pane and the transfer help page. Without
+   this plugin those classes compile to nothing and Tailwind's preflight has
+   already stripped heading and list styling, so markdown renders as one
+   undifferentiated block. */
+@plugin '@tailwindcss/typography';
+
+/* Compatibility with Tailwind 3, from the Tailwind 4 upgrade guide. */
+
+/* Hover styles apply on every device, not only where the primary input can hover. */
+@custom-variant hover (&:hover);
+
+@layer base {
+  /* Borders default to gray-200, not currentcolor. */
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+
+  /* Placeholders are gray-400, not the text colour at half opacity. */
+  input::placeholder,
+  textarea::placeholder {
+    color: var(--color-gray-400);
+  }
+
+  /* Buttons show the pointer cursor. */
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
+}

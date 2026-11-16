@@ -309,7 +309,7 @@ The architecture is designed to minimize extraction friction:
 | Document parsing | Unstructured | 0.14+ |
 | Text splitting | LangChain text splitters | 0.3+ |
 | Vector client | weaviate-client | v4 |
-| Web UI | React + Vite | React 18, Vite 5 |
+| Web UI | React + Vite | React 18, Vite 8 |
 | UI component library | shadcn/ui + Tailwind CSS | Latest |
 | Reverse proxy | Nginx | Alpine |
 
