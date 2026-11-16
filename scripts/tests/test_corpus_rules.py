@@ -241,12 +241,13 @@ class CorpusRulesTests(unittest.TestCase):
             with self.subTest(setting=name):
                 self.assertEqual(compose.get(name), zip_default(name))
         # The upload limit (/api/) is the UI's. The login location has its own
-        # 16k limit (#663, also asserted in test_lan_mode.py); no other
-        # location sets one.
+        # 16k limit (#663, also asserted in test_lan_mode.py), and so does the
+        # login's code step (#607); no other location sets one.
         limits = proxy_body_limits()
-        self.assertEqual(set(limits), {'/api/', '= /api/auth/login'}, limits)
+        self.assertEqual(set(limits), {'/api/', '= /api/auth/login', '= /api/auth/login/mfa'}, limits)
         self.assertEqual(proxy_upload_mb(), client_upload_mb(), limits)
         self.assertEqual(limits['= /api/auth/login'], '16k', limits)
+        self.assertEqual(limits['= /api/auth/login/mfa'], '16k', limits)
 
 
 def language_count(text, size, overlap):

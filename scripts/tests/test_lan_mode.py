@@ -495,8 +495,9 @@ class NginxTests(unittest.TestCase):
         lines = directives(self.locations)
         self.assertEqual([l for l in lines if l.startswith("location")],
                          ["location = /api/goldstandard/regenerate {", "location = /api/auth/login {",
-                          "location @login_rate_limited {", "location /api/ {", "location / {"])
-        self.assertEqual(lines.count("proxy_set_header Host $http_host;"), 3)
+                          "location = /api/auth/login/mfa {", "location @login_rate_limited {", "location /api/ {",
+                          "location / {"])
+        self.assertEqual(lines.count("proxy_set_header Host $http_host;"), 4)
 
     def test_only_listed_hosts_are_served(self):
         # #664: a map of the accepted hosts, and a server-level 421 for any other.
@@ -531,6 +532,15 @@ class NginxTests(unittest.TestCase):
                      "error_page 429 = @login_rate_limited;", "proxy_pass http://api/auth/login;",
                      "proxy_set_header X-Real-IP $remote_addr;", "client_max_body_size 16k;"):
             self.assertIn(line, lines)
+        # #607: the login's code step shares the zone, the refusal and the body limit.
+        code = self.locations[self.locations.index("location = /api/auth/login/mfa {"):]
+        code = directives(code[:code.index("\n}\n")])
+        for line in ("limit_req zone=login burst=5 nodelay;", "limit_req_status 429;",
+                     "error_page 429 = @login_rate_limited;", "proxy_pass http://api/auth/login/mfa;",
+                     "proxy_set_header Host $http_host;", "proxy_set_header X-Real-IP $remote_addr;",
+                     "client_max_body_size 16k;"):
+            self.assertIn(line, code)
+        self.assertEqual([l for l in code if l.startswith("proxy_request_buffering")], [])
         # #663: login reads a body before authentication, so it has a small,
         # buffered body limit, not /api/'s 512m streamed uploads.
         self.assertEqual([l for l in lines if l.startswith("proxy_request_buffering")], [])
