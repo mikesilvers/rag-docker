@@ -11,20 +11,9 @@ until ollama list > /dev/null 2>&1; do
   sleep 2
 done
 
-# Is the model downloaded? `ollama list` prints NAME as "<name>:<tag>", with
-# ":latest" added to a name pulled without a tag; its columns are separated by
-# tabs or spaces, so `read` splits them. The NAME must match exactly: another
-# variant of a tagged name (llama3.1:8b-instruct-q8_0 for llama3.1:8b) is a
-# different model and doesn't count (#647).
-model_present() {
-    local name rest
-    while read -r name rest; do
-        if [ "${name}" = "$1" ] || [ "${name}" = "$1:latest" ]; then
-            return 0
-        fi
-    done < <(ollama list)
-    return 1
-}
+# The model names and model_present (#671): the answer and build LLMs, resolved
+# from the settings compose passes, and the embedding model.
+. "$(dirname "$0")/models.sh"
 
 # Pull a model with retry. Ollama resumes partial downloads so retries are cheap.
 # timeout 7200 (2 hours) kills a truly hung connection while allowing slow downloads.
@@ -51,7 +40,9 @@ pull_with_retry() {
     echo "ollama: ${model} ready."
 }
 
-pull_with_retry llama3.1:8b
-pull_with_retry nomic-embed-text
+# Each distinct model, the answer model first (names hold no spaces).
+for model in $(models); do
+  pull_with_retry "${model}"
+done
 
 wait $OLLAMA_PID

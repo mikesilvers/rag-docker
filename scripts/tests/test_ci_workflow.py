@@ -10,15 +10,22 @@ drifting. Standard library only; no Docker or stack needed.
 Run: python3 scripts/tests/test_ci_workflow.py
 """
 from pathlib import Path
+import os
 import re
+import subprocess
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = '.github/workflows/verify.yml'
 BADGE = ('[![Verify](https://github.com/mikesilvers/rag-docker/actions/workflows/verify.yml/badge.svg?branch=develop)]'
          '(https://github.com/mikesilvers/rag-docker/actions/workflows/verify.yml)')
-# The pattern the workflow's sed uses on ollama/entrypoint.sh, in Python.
-MODEL_LINE = re.compile(r'^pull_with_retry ([A-Za-z0-9._:-]*)$', re.M)
+# A `docker` that answers `docker compose config` with the ollama service's LLM
+# settings as docker-compose.yml sets them (#671).
+STUB_DOCKER = """#!/bin/bash
+[ "$1 $2" = "compose config" ] || { echo "stub docker: unexpected call: $*" >&2; exit 99; }
+echo '{"name": "rag-docker", "services": {"ollama": {"environment": {"LLM_MODEL": "llama3.1:8b", "BUILD_LLM_MODEL": "", "ANSWER_LLM_MODEL": ""}}}}'
+"""
 
 
 def workflow():
@@ -123,12 +130,25 @@ class SuiteTests(unittest.TestCase):
 
 class ModelCacheTests(unittest.TestCase):
     def test_key_is_the_models_the_entrypoint_pulls(self):
+        # The names ollama/compose-models.sh resolves from the ollama service's LLM
+        # settings, which the entrypoint pulls (#671).
         text = workflow()
         _, step = step_with(text, 'id: models')
-        self.assertIn('ollama/entrypoint.sh', step)
-        self.assertIn(r"sed -n 's/^pull_with_retry \([A-Za-z0-9._:-]*\)$/\1/p'", step)
-        self.assertIn('key=ollama-models-', step)
-        self.assertTrue(MODEL_LINE.findall((ROOT / 'ollama/entrypoint.sh').read_text()))
+        self.assertIn('names=$(bash ollama/compose-models.sh) \\\n', step)
+        self.assertIn('|| { echo "could not read the model names (ollama/compose-models.sh)" >&2; exit 1; }', step)
+        self.assertIn('echo "key=ollama-models-${names// /-}"', step)
+        self.assertIn('for model in $(models); do', (ROOT / 'ollama/entrypoint.sh').read_text())
+        with tempfile.TemporaryDirectory() as folder:
+            docker = Path(folder) / 'docker'
+            docker.write_text(STUB_DOCKER)
+            docker.chmod(0o755)
+            out = subprocess.run(['bash', str(ROOT / 'ollama/compose-models.sh')], capture_output=True,
+                                 text=True, timeout=60,
+                                 env=dict(os.environ, PATH=folder + os.pathsep + os.environ['PATH']))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        # With the default settings the key is what it was before the split.
+        self.assertEqual('ollama-models-' + '-'.join(out.stdout.split()),
+                         'ollama-models-llama3.1:8b-nomic-embed-text')
 
     def test_restored_before_start_and_saved_only_after_a_miss(self):
         text = workflow()

@@ -31,16 +31,19 @@ jobs:
           # The suites run this PR's code; leave no token in its git config.
           persist-credentials: false
 
-      # The cache key is the models ollama/entrypoint.sh pulls. The copies in
+      # The cache key is the models ollama/entrypoint.sh pulls: the names
+      # ollama/compose-models.sh resolves from the LLM settings compose gives
+      # the ollama service (#671). The copies in
       # and out of the model volume run in the ollama image docker-compose.yml
       # pins, as stack.sh's own model copy does.
       - name: Read the model names
         id: models
         run: |
-          names=$(sed -n 's/^pull_with_retry \([A-Za-z0-9._:-]*\)$/\1/p' ollama/entrypoint.sh | tr '\n' ' ')
-          names=${names% }
+          names=$(bash ollama/compose-models.sh) \
+            || { echo "could not read the model names (ollama/compose-models.sh)" >&2; exit 1; }
+          names=$(echo $names)
           image=$(sed -n '/^  ollama:$/,/^  [a-z]/s/^    image: *//p' docker-compose.yml | head -1 | tr -d "\"'")
-          [ -n "$names" ] || { echo "no pull_with_retry lines in ollama/entrypoint.sh" >&2; exit 1; }
+          [ -n "$names" ] || { echo "no model names from ollama/compose-models.sh" >&2; exit 1; }
           [ -n "$image" ] || { echo "no ollama image in docker-compose.yml" >&2; exit 1; }
           echo "models: $names; image: $image"
           {

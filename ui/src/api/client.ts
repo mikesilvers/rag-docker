@@ -56,7 +56,8 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
 
 function isHealthResult(data: any): data is HealthResult {
   const service = (s: any) => !!s && typeof s === 'object' && typeof s.status === 'string'
-  return service(data?.services?.weaviate) && service(data?.services?.ollama?.llm) && service(data?.services?.ollama?.embed)
+  return service(data?.services?.weaviate) && service(data?.services?.ollama?.llm)
+    && service(data?.services?.ollama?.build_llm) && service(data?.services?.ollama?.embed)
 }
 
 // GET /health answers 503 with the same per-service body when a dependency is
@@ -336,8 +337,12 @@ export interface HealthResult {
     // `ollama_embed` keys. Reading the flat names yielded undefined and threw
     // during render, which unmounted the whole app.
     ollama: {
+      // `llm` answers questions; `build_llm` prepares documents and writes gold
+      // standard pairs; `same_model` says they are one model (#671).
       llm: { status: string; latency_ms: number; model: string }
+      build_llm: { status: string; latency_ms: number; model: string }
       embed: { status: string; latency_ms: number; model: string }
+      same_model: boolean
     }
   }
   resources?: {

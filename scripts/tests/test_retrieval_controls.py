@@ -90,6 +90,16 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(chat.await_args_list[-1].args[0],rag.SYNTHESIS_ENGINEER_SYSTEM)
                 self.assertEqual(response['chunks_retrieved'],1)
 
+    async def test_query_asks_only_the_answer_model(self):
+        # #671: both of a query's LLM calls go to the answer model.
+        with patch.object(rag.ollama,'chat',new=AsyncMock(side_effect=['Reformulated','Answer'])) as chat, \
+             patch.object(rag.ollama,'build_chat',new=AsyncMock(side_effect=AssertionError('the build model was asked'))) as build, \
+             patch.object(rag.ollama,'embed',new=AsyncMock(return_value=[0.1,0.2])), \
+             patch.object(wc,'near_vector_query',new=AsyncMock(return_value=[])):
+            await rag.run_query('Inert','Synthetic','hnsw',3,0.5,False,'end_user')
+        self.assertEqual(chat.await_count,2)
+        build.assert_not_awaited()
+
     async def test_hybrid_alpha_top_k_and_semantic_method_forward_to_backend(self):
         with patch.object(rag.ollama,'chat',new=AsyncMock(return_value='Synthetic')), \
              patch.object(wc,'hybrid_query',new=AsyncMock(return_value=[])) as hybrid, \

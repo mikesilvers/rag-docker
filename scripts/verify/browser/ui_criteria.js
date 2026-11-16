@@ -1176,7 +1176,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
       status,
       services: {
         weaviate: service('ok', 11),
-        ollama: { llm: service('ok', 22, 'phi3.5'), embed: service(embed, 33, 'nomic-embed-text') },
+        ollama: { llm: service('ok', 22, 'phi3.5'), build_llm: service('ok', 22, 'phi3.5'), embed: service(embed, 33, 'nomic-embed-text'), same_model: true },
       },
       resources: { memory: { status: 'ok', allocated_gb: 11.67, recommended_minimum_gb: 12.0 } },
     });

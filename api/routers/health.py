@@ -36,7 +36,8 @@ async def health_check():
 
     ollama_result = await ollama.check_health()
     results["ollama"] = ollama_result
-    if any(v["status"] != "ok" for v in ollama_result.values()):
+    # `same_model` is a flag, not a service: it never decides the status (#671).
+    if any(v["status"] != "ok" for v in ollama_result.values() if isinstance(v, dict)):
         overall_ok = False
 
     # Resource reporting is advisory and deliberately does NOT affect

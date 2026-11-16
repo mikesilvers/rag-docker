@@ -69,7 +69,7 @@ export default function HealthPage() {
       </div>}
       {healthError && <p role="alert" className="text-red-700 mb-4">Service health could not be read: {healthError}</p>}
       {health && (
-        <div className="grid grid-cols-3 gap-4 mb-8">
+        <div className={`grid ${health.services.ollama.same_model ? 'grid-cols-3' : 'grid-cols-4'} gap-4 mb-8`}>
           <div className="bg-white border rounded p-4">
             <div className="flex items-center text-sm font-medium mb-1">
               <StatusBadge status={health.services.weaviate.status} />
@@ -77,13 +77,33 @@ export default function HealthPage() {
             </div>
             <div className="text-xs text-gray-500">{health.services.weaviate.latency_ms}ms</div>
           </div>
-          <div className="bg-white border rounded p-4">
-            <div className="flex items-center text-sm font-medium mb-1">
-              <StatusBadge status={health.services.ollama.llm.status} />
-              LLM ({health.services.ollama.llm.model})
+          {/* One LLM, or an answer model and a build model (#671). */}
+          {health.services.ollama.same_model ? (
+            <div className="bg-white border rounded p-4">
+              <div className="flex items-center text-sm font-medium mb-1">
+                <StatusBadge status={health.services.ollama.llm.status} />
+                LLM ({health.services.ollama.llm.model}), builds and answers
+              </div>
+              <div className="text-xs text-gray-500">{health.services.ollama.llm.latency_ms}ms</div>
             </div>
-            <div className="text-xs text-gray-500">{health.services.ollama.llm.latency_ms}ms</div>
-          </div>
+          ) : (
+            <>
+              <div className="bg-white border rounded p-4">
+                <div className="flex items-center text-sm font-medium mb-1">
+                  <StatusBadge status={health.services.ollama.llm.status} />
+                  Answer LLM ({health.services.ollama.llm.model})
+                </div>
+                <div className="text-xs text-gray-500">{health.services.ollama.llm.latency_ms}ms</div>
+              </div>
+              <div className="bg-white border rounded p-4">
+                <div className="flex items-center text-sm font-medium mb-1">
+                  <StatusBadge status={health.services.ollama.build_llm.status} />
+                  Build LLM ({health.services.ollama.build_llm.model})
+                </div>
+                <div className="text-xs text-gray-500">{health.services.ollama.build_llm.latency_ms}ms</div>
+              </div>
+            </>
+          )}
           <div className="bg-white border rounded p-4">
             <div className="flex items-center text-sm font-medium mb-1">
               <StatusBadge status={health.services.ollama.embed.status} />

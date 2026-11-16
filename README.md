@@ -9,7 +9,7 @@ A self-contained, Dockerized Retrieval-Augmented Generation (RAG) platform. Uplo
 | Component | Technology | Purpose |
 |---|---|---|
 | Vector store | Weaviate 1.40.2 | Stores and retrieves document chunks |
-| LLM + embeddings | Ollama 0.3.14 | Runs llama3.1:8b (chat) and nomic-embed-text (embeddings) locally |
+| LLM + embeddings | Ollama 0.3.14 | Runs llama3.1:8b (by default both the build LLM, which prepares documents and writes gold standard pairs, and the answer LLM, which answers questions) and nomic-embed-text (embeddings) locally |
 | API | FastAPI + Python 3.11 | RAG pipeline, ingest, gold standard generation |
 | UI | React 18 + Vite + Tailwind | Web interface with login and three roles |
 | Proxy | nginx 1.29 | Routes traffic; listens on port 80 in-container, published on host port 8080 |
@@ -504,7 +504,7 @@ Navigate to **Data → Import**, drop in your files (PDF, DOCX, TXT, MD, CSV, JS
 
 You don't have to stay on the page while a job runs. The Import, Gold Standard and Transfer pages each show a **Running and recent jobs** list, read from the server whenever the page opens, so coming back to it (after visiting another page, reloading, in another tab or after logging in again) shows the running job's progress, or its result once it has finished. The newest job opens by itself; click another row to switch. The list holds your own jobs that are running or finished in the last 24 hours (at most 20 finished ones); an AI Engineer sees everyone's, with who started each.
 
-**Documents that break the corpus rules?** **Data → Prepare** makes raw documents follow them on this instance, without downloading and uploading them again. Upload the raw files (the same types and ZIP limits as Import), then **Prepare**: the code extracts the text, splits it into parts within the rules' limits, normalises the encoding and converts JSON to JSON Lines; the local LLM only removes page headers, footers, page numbers and boilerplate from PDF, DOCX, TXT and Markdown, and writes a title and short summary for each of their parts. It never rewrites text: where its cleaning would remove too much, or a long line, that part of the document keeps the code-only text, and the page shows the fallback and why. CSV, JSON and JSON Lines are prepared by code only, with no LLM call: each part's title is the file name and part number, and its summary gives the record count, the field names and the first and last records' keys. Review each document's parts in **Preview**, then **Import selected** or **Import all prepared** into a collection, with the usual chunk settings; this starts an ordinary ingest job. One import can hold at most 512 MB of prepared parts, the same as one upload; import a larger set in smaller selections. Raw and prepared documents stay until you delete them, and each can be downloaded. Preparation uses the same local LLM as Q&A and ingest's embeddings, so on a CPU-only machine a long document takes a while, and either is slower while the other runs.
+**Documents that break the corpus rules?** **Data → Prepare** makes raw documents follow them on this instance, without downloading and uploading them again. Upload the raw files (the same types and ZIP limits as Import), then **Prepare**: the code extracts the text, splits it into parts within the rules' limits, normalises the encoding and converts JSON to JSON Lines; the build LLM (`BUILD_LLM_MODEL`) only removes page headers, footers, page numbers and boilerplate from PDF, DOCX, TXT and Markdown, and writes a title and short summary for each of their parts. It never rewrites text: where its cleaning would remove too much, or a long line, that part of the document keeps the code-only text, and the page shows the fallback and why. CSV, JSON and JSON Lines are prepared by code only, with no LLM call: each part's title is the file name and part number, and its summary gives the record count, the field names and the first and last records' keys. Review each document's parts in **Preview**, then **Import selected** or **Import all prepared** into a collection, with the usual chunk settings; this starts an ordinary ingest job. One import can hold at most 512 MB of prepared parts, the same as one upload; import a larger set in smaller selections. Raw and prepared documents stay until you delete them, and each can be downloaded. Preparation uses the build LLM, which by default is the same model Q&A answers with, on the same Ollama service as ingest's embeddings, so on a CPU-only machine a long document takes a while, and either is slower while the other runs.
 
 Uploading a file again under the same name replaces its earlier chunks (even if the content is unchanged); files inside a ZIP are named by their path in the archive, so `a/report.pdf` and `b/report.pdf` stay separate documents. macOS metadata in a ZIP (the `__MACOSX/` folder and `._*` files the Finder adds) is not ingested; the job lists it under skipped files.
 
@@ -536,11 +536,11 @@ Navigate to **Q&A**, select a collection, type your question, and press **Ask** 
 
 ### 5. Generate gold standard data
 
-Navigate to **Tune → Gold Standard**, choose a collection and sample size, and click **Generate Pairs**. The platform samples chunks and uses the LLM to generate question/answer pairs. The page shows how the generation ended, including pairs that failed and why. Review each pair (approve, edit, reject, or regenerate), then export to a RAGAS-compatible JSON file.
+Navigate to **Tune → Gold Standard**, choose a collection and sample size, and click **Generate Pairs**. The platform samples chunks and uses the build LLM (`BUILD_LLM_MODEL`) to generate question/answer pairs. The page shows how the generation ended, including pairs that failed and why. Review each pair (approve, edit, reject, or regenerate), then export to a RAGAS-compatible JSON file.
 
 ## Health check
 
-Navigate to **Admin → Health** (AI Engineer role) to see live status and latency for Weaviate, the LLM, and the embedding model. Latency charts populate after the first few Q&A queries.
+Navigate to **Admin → Health** (AI Engineer role) to see live status and latency for Weaviate, the answer LLM and the build LLM (one card when they are the same model), and the embedding model. Latency charts populate after the first few Q&A queries.
 
 You can also hit the API directly:
 
@@ -914,7 +914,9 @@ All API settings are environment variables in `docker-compose.yml`:
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_MODEL` | `llama3.1:8b` | Ollama model name for chat |
+| `LLM_MODEL` | `llama3.1:8b` | Ollama model name for the LLM: the default for both `BUILD_LLM_MODEL` and `ANSWER_LLM_MODEL` |
+| `BUILD_LLM_MODEL` | empty | The LLM that prepares documents and writes gold standard pairs. Empty means `LLM_MODEL` |
+| `ANSWER_LLM_MODEL` | empty | The LLM that answers questions. Empty means `LLM_MODEL`. Export with `include_models` bundles this one, never the build model |
 | `EMBED_MODEL` | `nomic-embed-text` | Ollama model name for embeddings |
 | `WEAVIATE_HOST` | `weaviate` | Weaviate hostname (internal) |
 | `OLLAMA_HOST` | `ollama` | Ollama hostname (internal) |
@@ -944,7 +946,7 @@ LAN mode reads two more settings from your shell or a `.env` file next to `docke
 | `RAG_LAN_HOSTNAMES` | empty | The names and IP addresses clients use to reach this machine, comma-separated. The self-signed certificate names them plus `localhost`. Required unless `proxy/certs/` holds your own `cert.pem` and `key.pem` |
 | `RAG_LAN_PORT` | `443` | The host port LAN mode publishes HTTPS on, on every interface |
 
-To swap the LLM (e.g. to `llama3.2`), update `LLM_MODEL` in `docker-compose.yml` and add the model name to `ollama/entrypoint.sh`.
+To swap the LLM (e.g. to `llama3.2`), set `LLM_MODEL`, or `BUILD_LLM_MODEL` or `ANSWER_LLM_MODEL` for one task only, in the ollama service's `environment` in `docker-compose.yml`, then `docker compose up -d`. That is the one place they are set: the api reads the same three through the `llm-models` anchor, and Ollama pulls each distinct model when it starts.
 
 **Upload size limit.** One upload (all files in it together, or one ZIP) can be at most **512 MB**. The proxy enforces it with `client_max_body_size` in `proxy/locations.conf`. To change it, edit that value and `MAX_UPLOAD_MB` in `ui/src/api/client.ts` (the Import page uses it to warn before sending), then rebuild the UI and recreate the proxy:
 
@@ -1144,7 +1146,8 @@ curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localho
 ```
 
 That takes the package from roughly 80 KB to ~5.2 GB, because it carries the
-embedding model and the LLM as Ollama's own manifest and blob files. On import,
+embedding model and the answer LLM as Ollama's own manifest and blob files (never
+the build LLM). On import,
 a model already present is left alone, provided its files match their checksums;
 a missing one is installed from the package and verified before the collection
 is built. If the embedding model is present but damaged, the import fails

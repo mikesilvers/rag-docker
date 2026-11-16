@@ -258,6 +258,8 @@ and on import.
   },
   "embedding": {"model": "nomic-embed-text", "dimensions": 768},
   "llm": {"model": "llama3.1:8b"},
+  "answer_llm": {"model": "llama3.1:8b"},
+  "build_llm": {"model": "llama3.1:8b"},
   "chunking": {"strategy": "overlap", "chunk_size": 1000, "chunk_overlap": 200},
   "fidelity": "with-sources",
   "models_bundled": false,
@@ -268,6 +270,12 @@ and on import.
 
 `collection.name` is authoritative. `embedding` is the field import checks
 hardest (§6.2).
+
+`answer_llm` and `build_llm` are the exporting instance's answer and build
+LLMs (#671); `llm` is the answer model, kept for older readers. Import reads
+none of them: it checks this instance's answer model, and the build model is
+for information only. `include_models` bundles the answer model, never the
+build model.
 
 `bundled_models` lists each model the package carries whole, as `name:tag`
 (a name with no tag is `name:latest`), sorted; it is `[]` when none is, and
@@ -645,7 +653,8 @@ model, or a re-export from one (#390).
 ### 6.3 Bundled models
 
 `include_models` defaults to `false`. When `true`, `models/` contains the
-**embedding model and the LLM named in the manifest**, as the Ollama manifest and
+**embedding model and the answer LLM named in the manifest** (`llm` and
+`answer_llm`; the build LLM is never bundled, #671), as the Ollama manifest and
 blob files required to serve them, in a folder per name and tag,
 `models/<name>/<tag>/` (a name with no tag has tag `latest`):
 
@@ -675,14 +684,14 @@ A model is bundled whole or not at all. If any of its files can't be copied,
 the files of that model already copied are removed from the package and from
 `files`, and a warning names the model (#449). Import takes a model with a
 `models/<name>/<tag>/manifest.json` as bundled, so a partly copied model must
-never be left behind. A model used for both embedding and the LLM is copied
+never be left behind. A model used for both embedding and the answer LLM is copied
 once; the two are compared by name and tag, so `x` and `x:latest` are one
 model (#494).
 
-Two tags of one name (an embedding model `foo:a` and an LLM `foo:b`) are both
+Two tags of one name (an embedding model `foo:a` and an answer LLM `foo:b`) are both
 bundled, each in its own folder (#487). Import uses a folder only for the name
 and tag it holds: a package that bundles `bar:x` doesn't bundle `bar:y`, so an
-instance whose LLM is `bar:y` gets the "absent, not bundled" outcome below,
+instance whose answer LLM is `bar:y` gets the "absent, not bundled" outcome below,
 never `bar:x`'s files under the name `bar:y`.
 
 Packages built before #487 put a model in `models/<name>/`, without the tag.
@@ -703,10 +712,13 @@ Where the volume is not mounted, export records a warning and bundles nothing,
 and import reports that models were not checked rather than assuming.
 
 The embedding model is the one that matters: vectors are meaningless without the
-model that produced them. The LLM is included for completeness so a package can
-stand alone, and is the larger share of the ~2.5 GB.
+model that produced them. The answer LLM is included for completeness so a
+package can stand alone to answer questions, and is the larger share of the
+package's size; the build LLM, which only prepares documents and writes gold
+standard pairs, is not (#671).
 
-On import:
+On import, "the LLM" below is this instance's answer LLM (`ANSWER_LLM_MODEL`,
+else `LLM_MODEL`); the build LLM is neither checked nor installed (#671):
 
 | Target state | Behaviour |
 |---|---|
@@ -1078,7 +1090,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E24 | Export, edit original, rename-import twice: all three session identities retain independent review/export state and reported import provenance |
 | E25 | With the embedding endpoint unavailable, reindex changes the physical index while preserving exact UUIDs/properties/vectors; completed jobs leave retained evaluation sessions unchanged; same-process ingestion is serialized, incompatible vectorizers are refused, and uncertain cutover retains durable recovery |
 | E26 | Importing when the installed embedding model's files don't match their checksums fails `MODEL_INTEGRITY_FAILED`, leaves the model's files untouched and says to restore or re-pull it |
-| E27 | With a namespaced `LLM_MODEL` (`user/model`), an import of a package without bundled models succeeds and notes the model |
+| E27 | With a namespaced answer LLM (`LLM_MODEL` with `ANSWER_LLM_MODEL` unset, `user/model`), an import of a package without bundled models succeeds and notes the model |
 | E28 | Digest-valid malformed retrieval settings are refused before live mutation in all conflict modes; valid historical settings round-trip, a legacy out-of-range integer `ef` imports as `null` with a note, and generated script defaults/metadata remain encoded typed literals. On export, a saved legacy out-of-range integer `ef` is written to the package as `null` with a warning and the saved settings are left alone; other invalid saved settings fail the export before any chunk is read, with an error naming the failing fields and the Retrieval page, and no package is published |
 | E29 | An imported source index with a non-digest identity or linked/mismatched blob fails `PACKAGE_CORRUPT` before live mutation; export and re-chunking refuse unsafe retained-source paths; import and replace-mode recovery ignore unindexed source blobs; invalid-index tune options return `SOURCE_INDEX_INVALID`, and an invalid-index re-chunk or re-embed with chunking parameters is refused with HTTP 409 `SOURCE_INDEX_INVALID` before any job is created (#389), while record-only tuning still works; missing-blob exports pass import preflight, with `null` for the chunks of the missing blob; a chunk whose non-null `source_sha256` isn't in the package's source index fails `PACKAGE_CORRUPT` naming `chunks.jsonl`, before live mutation (#509) |
 | E30 | Export refuses `EMBEDDING_MISMATCH` before streaming/bundling when the stored collection model is unknown, named-vector, or differs from the configured model; vectors are never relabeled from current environment settings |
@@ -1093,6 +1105,8 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E39 | `POST /import` refuses an encrypted package without a passphrase `400 PASSPHRASE_REQUIRED` and a passphrase for any other package `400 PASSPHRASE_NOT_EXPECTED`, before any job; `POST /export` refuses a passphrase outside 12 to 1024 characters, and both refuse one with no UTF-8 form (a lone surrogate), `422 INVALID_PARAMETER` without echoing it; one bad encrypted file never fails `GET /packages` (#27) |
 | E40 | The age implementation passes every applicable C2SP CCTV age testkit vector, and its output decrypts with an independent decryption written from the age specification (#27), by `test_export_encryption.py` |
 | E41 | A package of more than `max_package_members` entries, directories included, fails `PACKAGE_TOO_MANY_MEMBERS`, folders implied by member paths counting once each (a directory member's own folder as its entry; a name with a `..` component is refused `PACKAGE_UNREADABLE` before its folders are counted), and one whose members add up to more than `max_package_expanded_bytes` fails `PACKAGE_TOO_LARGE`, each with its message and `detail`, for `.tar.gz` and `.tar.gz.age` packages alike; a package exactly at a cap imports; a member with a negative size is refused `PACKAGE_UNREADABLE` before its size is counted, and a sparse file (old GNU type `S`, PAX sparse 0.0, 0.1 or 1.0) is refused `PACKAGE_UNREADABLE`; a `.tar.gz` refusal extracts nothing and reads no header after the refusing member, a `.tar.gz.age` refusal leaves at most the cap's bytes, and the job creates no collection and leaves no work directory (#317), by `test_package_limits.py` with caps of 1 MiB and 20 entries set through the environment |
+| E42 | A package's `manifest.json` records `answer_llm` and `build_llm` as `{"model": <name>}`, with `llm` the same as `answer_llm`, at `package_format` 1; with a build model that differs from the answer model, `include_models: true` bundles the embedding and answer models only (#671), by `test_retrieval_import.py` and `validate_package.py` on a real export |
+| E43 | Import checks and installs only this instance's answer model: a build model that differs, absent or not, is neither checked, installed nor noted (#671), by `test_retrieval_import.py` |
 
 ---
 

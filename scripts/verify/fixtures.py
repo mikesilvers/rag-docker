@@ -343,7 +343,7 @@ def write_ui_ingest(out: pathlib.Path, fixtures: pathlib.Path) -> None:
                   "documents": {}, "split": {"file": "vfy-ui-large.txt", "first": UI_LARGE_FIRST,
                                              "last": UI_LARGE_LAST},
                   "min_chunks": -(-len("".join(large.split())) // 6000)})
-    # Prepared with the local LLM, then imported (#638). The phrase is in three
+    # Prepared with the build LLM, then imported (#638). The phrase is in three
     # body lines, so the cleaning can't drop every one.
     notes = UI_PHRASES["vfy-ui-prep-notes.txt"]
     (out / "vfy-ui-prep-notes.txt").write_text("\n".join([

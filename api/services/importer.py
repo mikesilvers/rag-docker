@@ -432,6 +432,8 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
     Absent, bundled       -> install, then verify Ollama actually reports it.
     Absent, unbundled     -> EMBEDDING_MODEL_MISSING.
     Namespaced name       -> ask Ollama; it can't be checked or installed here.
+    The LLM is this instance's answer model; the build model is neither checked
+    nor installed (#671).
     """
     notes: list[str] = []
     if not model_bundle.store_available():
@@ -440,7 +442,9 @@ def _ensure_models(pkg: Path, manifest: dict) -> list[str]:
         return notes
 
     embed_model = settings.embed_model
-    llm_model = settings.llm_model
+    # Only the answer model: a query needs it; the build model is recorded in
+    # the manifest for information and never checked or installed (#671).
+    llm_model = settings.answer_model
     # `name:tag`; a folder counts only for the tag it holds (#487).
     bundled = model_bundle.bundled_models(pkg, manifest)
 
