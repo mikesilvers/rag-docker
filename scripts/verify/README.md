@@ -706,9 +706,11 @@ operation runs reliably long enough to interrupt, so `test_jobstore.py` covers i
 
 `scripts/tests/test_startup_sweep.py` (#377) checks the startup sweeps of what a killed job
 leaves behind, in disposable folders. In `UPLOAD_DIR`, ingest staging is created as
-`ingest-*` and removed with the `import-*`, `rechunk-*`, `batch-verify-*` and `prepare-*` work
-directories, and document preparation's `prepare-*.zip` and `prepare-*.json` temporary files (#640);
-in `EXPORTS_DIR`, `.build-*` directories and `.*.tar.gz.partial` files are removed. Only those
+`ingest-*` and export staging as `export-*` (#549), and both are removed with the `import-*`,
+`rechunk-*`, `batch-verify-*` and `prepare-*` work directories, and document preparation's
+`prepare-*.zip` and `prepare-*.json` temporary files (#640); in `EXPORTS_DIR`, `.build-*`
+directories (export staging from earlier versions) and `.*.tar.gz.partial` and
+`.*.tar.gz.age.partial` files are removed. Only those
 names, and only a real directory or regular file as the name says: completed packages,
 `ingest_configs/`, look-alike names, a file where a directory is expected and the reverse, and
 anything in a sub-folder are kept. A symlink is never followed, at the top or inside a
@@ -718,7 +720,7 @@ child process removes both kinds and logs them by name and size. A second one, w
 sweep fails, logs the error and still starts, with the ingest staging removed (#423).
 `02_ingest.sh` runs it in the API container. With `RAG_ALLOW_RESTART=1`, `02_ingest.sh` checks
 that its two killed ingests' `ingest-*` staging existed before its restart and is gone after it
-(#423), and `05_transfer.sh` checks after its export restart that the interrupted export's build
+(#423), and `05_transfer.sh` checks after its export restart that the interrupted export's staging
 directory and temporary archive are gone, without removing anything itself, and that the
 completed package from the top of the suite is still there.
 

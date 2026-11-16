@@ -1240,7 +1240,7 @@ ENDPY
   ) >/tmp/vfy_xrestart_prepare.log 2>&1
   check "a 30,000-chunk collection is built for the interrupted export" $? \
     "$(grep -E 'Error' /tmp/vfy_xrestart_prepare.log | tail -1)"
-  builds_before=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
+  builds_before=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/uploads/export-* 2>/dev/null' | sort)
   api_post "/export" "{\"collection\":\"$XR\",\"include_models\":false}" > /tmp/vfy_xrestart_start.json
   xjob=$(jfield "['job_id']" < /tmp/vfy_xrestart_start.json)
   state=""
@@ -1256,9 +1256,10 @@ print(d['status'] + ('-writing' if d['chunks_written'] > 0 else ''))" 2>/dev/nul
     check "an export is running with chunks written before the restart" 1 "last status '$state'; nothing restarted"
   else
     sleep 2
-    # The build directory this export is writing; the restart kills it there.
-    builds_during=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/exports/.build-* 2>/dev/null' | sort)
-    killed=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_during") | grep '^/app/exports/\.build-' || true)
+    # The staging directory this export is writing, in UPLOAD_DIR since #549;
+    # the restart kills it there.
+    builds_during=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c 'ls -d /app/uploads/export-* 2>/dev/null' | sort)
+    killed=$(comm -13 <(printf '%s\n' "$builds_before") <(printf '%s\n' "$builds_during") | grep '^/app/uploads/export-' || true)
     _rag_require_lock_owner
     (cd "$REPO_ROOT" && docker compose restart --timeout 0 api) >/dev/null 2>&1
     for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
@@ -1281,16 +1282,16 @@ ENDPY
     check "an interrupted export reads back 200 'failed' with INTERRUPTED and its progress" $? \
       "$(head -c 300 /tmp/vfy_xrestart_after.json)"
     # The killed build's leftovers (root, mode 0700) are the startup sweep's to
-    # remove (#377): its build directory and any temporary archive must be gone,
+    # remove (#377): its staging directory and any temporary archive must be gone,
     # and the completed package from the top of this suite still there.
-    check "the interrupted export had a build directory for the restart to sweep" \
-      "$([ -n "$killed" ] && echo 0 || echo 1)" "no new /app/exports/.build-* while the export ran"
+    check "the interrupted export had a staging directory for the restart to sweep" \
+      "$([ -n "$killed" ] && echo 0 || echo 1)" "no new /app/uploads/export-* while the export ran"
     stem=$(printf '%s' "$XR" | tr '[:upper:]' '[:lower:]')
     left=$(cd "$REPO_ROOT" && docker compose exec -T api sh -c '
       for p in "$@" /app/exports/.ragpkg-'"$stem"'-*.tar.gz.partial; do
         if [ -e "$p" ] || [ -L "$p" ]; then echo "$p"; fi
       done; echo checked' sh $killed)
-    check "the restart removes the interrupted export's build directory and temporary archive" \
+    check "the restart removes the interrupted export's staging directory and temporary archive" \
       "$([ "$left" = checked ] && echo 0 || echo 1)" "still there: $left"
     check "the restart sweep keeps completed packages" "$([ -f "$EXPORTS/$PKG" ] && echo 0 || echo 1)" \
       "$EXPORTS/$PKG is gone"

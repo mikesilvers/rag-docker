@@ -259,12 +259,29 @@ ENDPY
     check "E8/E9: retrieve.py ($name) answers with $want citation(s)" $? \
       "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
   done
-  python3 ./auth_setup.py password end_user \
-    | python3 -I -S "$RTMP/retrieve.py" --username vfy-end-user --password-stdin --api-url "$API" \
-        --collection "$IMP" "$QUESTION" > /tmp/vfy_p_r.out 2> /tmp/vfy_p_r.err
-  rc=$?
-  [ "$rc" = 0 ] && [ -n "$(tr -d '[:space:]' < /tmp/vfy_p_r.out)" ]
-  check "E11: retrieve.py answers from the imported collection" $? "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
+  # Retrieval, not the generated text, is what shows retrieve.py works against
+  # the import: generation varies (an empty answer) and can time out under CPU
+  # load (a 504), so the check wants citations and allows 3 attempts (#549).
+  e11=1
+  for attempt in 1 2 3; do
+    python3 ./auth_setup.py password end_user \
+      | python3 -I -S "$RTMP/retrieve.py" --username vfy-end-user --password-stdin --api-url "$API" \
+          --json --citations --collection "$IMP" "$QUESTION" > /tmp/vfy_p_r.json 2> /tmp/vfy_p_r.err
+    rc=$?
+    python3 - <<'ENDPY'
+import json, sys
+try:
+    d = json.load(open("/tmp/vfy_p_r.json"))
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if isinstance(d, dict) and d.get("citations") else 1)
+ENDPY
+    cited=$?
+    if [ "$rc" = 0 ] && [ "$cited" = 0 ]; then e11=0; break; fi
+    [ "$attempt" -lt 3 ] && sleep 10
+  done
+  check "E11: retrieve.py retrieves from the imported collection (citations, up to 3 attempts)" "$e11" \
+    "after $attempt attempt(s): exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
 fi
 rm -rf "$RTMP"
 

@@ -283,16 +283,20 @@ class RoundTrip(unittest.TestCase):
 
     def test_a_malformed_or_overlong_work_factor_is_refused_before_int(self):
         """A field of thousands of digits once made int() raise ValueError, which
-        broke the listing and turned an import into IMPORT_FAILED (#27 review)."""
+        broke the listing and turned an import into IMPORT_FAILED (#27 review).
+        A field that is not a decimal without a sign or leading zero is a malformed
+        header; a longer decimal is above the limit (#549)."""
         blob = encrypt(b"data")
         line = blob.split(b"\n")[1]
-        for factor in (b"9" * 5000, b"100", b"018", b"+18", b"0x12", b"1e1", b"0"):
+        for factor, kind in ((b"9" * 5000, "work_factor"), (b"100", "work_factor"),
+                             (b"018", "header"), (b"+18", "header"), (b"0x12", "header"),
+                             (b"1e1", "header"), (b"0", "header")):
             hostile = blob.replace(line, line.rsplit(b" ", 1)[0] + b" " + factor, 1)
             with self.subTest(factor=factor[:12]), \
                  patch.object(age_stream, "_scrypt", side_effect=AssertionError("scrypt ran")), \
                  self.assertRaises(age_stream.AgeError) as caught:
                 decrypt(hostile)
-            self.assertEqual(caught.exception.kind, "work_factor")
+            self.assertEqual(caught.exception.kind, kind)
             self.assertFalse(age_stream.check_header(io.BytesIO(hostile)))
 
     def test_check_header_never_raises(self):
@@ -524,6 +528,19 @@ class OpenEncrypted(Fixture):
         archive.write_bytes(good.replace(line, line.rsplit(b" ", 1)[0] + b" 21", 1))
         with patch.object(age_stream, "_scrypt", side_effect=AssertionError("scrypt ran")):
             self.assertEqual(self.refused(archive, "DECRYPT_FAILED").detail, {"reason": "work_factor"})
+
+    def test_a_malformed_work_factor_is_package_unreadable(self):
+        """Not a decimal without a sign or leading zero: a malformed age header,
+        PACKAGE_UNREADABLE as #27 decision 7 says, not DECRYPT_FAILED (#549)."""
+        good = self.sealed().read_bytes()
+        line = good.split(b"\n")[1]
+        for factor in (b"0x12", b"018", b"+18", b"0"):
+            archive = self.exports / "ragpkg-wf-bad.tar.gz.age"
+            archive.write_bytes(good.replace(line, line.rsplit(b" ", 1)[0] + b" " + factor, 1))
+            with self.subTest(factor=factor), \
+                 patch.object(age_stream, "_scrypt", side_effect=AssertionError("scrypt ran")):
+                detail = self.refused(archive, "PACKAGE_UNREADABLE").detail
+                self.assertIn("work factor", detail["reason"])
 
     def test_an_overlong_work_factor_is_decrypt_failed_not_import_failed(self):
         good = self.sealed().read_bytes()
