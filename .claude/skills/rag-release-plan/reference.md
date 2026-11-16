@@ -82,7 +82,7 @@ Use `completed` for work that is done, and `"not planned"` for a duplicate or a 
 - **Relates** when only part of a ticket waits, for example its UI after a toolchain upgrade. `createJiraIssueLink` with `linkType: "Relates"`, plus a comment on the waiting ticket saying which part waits, and for what.
 - **No link** for a same-file conflict that only needs a rebase: whichever PR lands second rebases. It is listed in the epic's Lanes section.
 - **Verify note:** one machine runs one verify stack at a time (`rag-verify` on port 8081, behind a lock). Lanes can be developed and reviewed in parallel, but their verify runs and `rag-pr-review` evaluations queue.
-- **Limit on open PRs:** no new fix agent starts while more than 2 PRs from the release are open and waiting for, or in, evaluation. Markdown-only PRs (every changed file is `*.md`) don't count: they take the fast path and don't use the verify stack. A fix agent's question round doesn't count as a PR.
+- **Limit on open PRs:** no new fix agent starts while 2 or more non-Markdown PRs from the release wait for or are in evaluation. Markdown-only PRs (every changed file is `*.md`) don't count: they take the fast path and don't use the verify stack. A fix agent's question round doesn't count as a PR.
 - **Evaluation queue order:** the next PR to evaluate is a security fix; then a PR on the critical path or one that unblocks other tickets (for example on the longest chain, or one whose merge clears a Blocks link); then the oldest. A PR that conflicts with `develop` goes back to its fix agent, and keeps its place once updated.
 
 ## The epic's Lanes section
@@ -106,7 +106,7 @@ Same-file conflicts with no ordering need are not linked; whichever PR lands sec
 
 **Verification is the bottleneck.** One machine runs one verify stack at a time (`rag-verify` on port 8081, behind a lock), so verify runs and rag-pr-review evaluations queue across lanes.
 
-**Limit on open PRs.** No new fix agent starts while more than 2 PRs from the release are open and waiting for, or in, evaluation. Markdown-only PRs (every changed file is `*.md`) don't count, since they don't use the verify stack, and neither does a fix agent's question round.
+**Limit on open PRs.** No new fix agent starts while 2 or more non-Markdown PRs from the release wait for or are in evaluation. Markdown-only PRs (every changed file is `*.md`) don't count, since they don't use the verify stack, and neither does a fix agent's question round.
 
 **Evaluation queue order.** Security fixes first; then PRs on the critical path or that unblock other tickets (for example on the longest chain, or whose merge clears a Blocks link); then the oldest. A PR that conflicts with `develop` goes back to its fix agent and keeps its place once updated.
 ```

@@ -175,7 +175,7 @@ Re-read the epic's children with JQL. Check the counts, the lane labels, the Fix
 
 These rules are for the session that runs the release: it starts the fix agents and picks the next PR to evaluate. You don't start fix agents or evaluate PRs. You write the rules into the report (step 8) and the epic's Lanes section (step 15).
 
-- **Limit on open PRs.** No new fix agent starts while more than 2 PRs from the release are open and waiting for, or in, evaluation. Markdown-only PRs (every changed file is `*.md`) don't count: they take the fast path and don't use the verify stack. A fix agent's question round doesn't count as a PR.
+- **Limit on open PRs.** No new fix agent starts while 2 or more non-Markdown PRs from the release wait for or are in evaluation. Markdown-only PRs (every changed file is `*.md`) don't count: they take the fast path and don't use the verify stack. A fix agent's question round doesn't count as a PR.
 - **Evaluation queue order.** The next PR to evaluate is:
   1. a security fix;
   2. then a PR on the critical path or one that unblocks other tickets, for example on the longest chain, or one whose merge clears a Blocks link;
@@ -213,7 +213,7 @@ Use this when the maintainer says the release has shipped, or asks to mark its v
 | Applying a change the report didn't propose | Stop and ask. Phase 2 applies only the approved decisions. |
 | Linking a rebase-only conflict | No link. List it in the epic's Lanes section. |
 | Grouping lanes by theme | Group tickets by the files they change. Tickets that share no file go in separate lanes, or are marked independent. |
-| Starting a fix agent while more than 2 non-Markdown PRs wait for, or are in, evaluation | Wait until no more than 2 are open. Markdown-only PRs and question rounds don't count. |
+| Starting a fix agent while 2 or more non-Markdown PRs wait for or are in evaluation | Wait until fewer than 2 are open. Markdown-only PRs and question rounds don't count. |
 | Evaluating PRs out of queue order, or sending a conflicting PR to the back | Security fixes first, then the critical path or unblockers, then the oldest. A conflicting PR keeps its place once updated. |
 | Moving a ticket's epic without its Fix Version and labels | Change all four together: Fix Version, parent epic, Jira release label, GitHub `release:` label. |
 | Marking a version released without the go-ahead | Only on the maintainer's own yes in this session. |

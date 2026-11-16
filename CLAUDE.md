@@ -27,6 +27,8 @@ Code from forks is built or run only after a clean security review and the maint
 
 Before a release's work starts, run the project's `rag-release-plan` skill on its Jira epic (`/rag-release-plan <epic key>`). Its first phase is read-only and ends with a review report that the maintainer approves. Nothing in Jira or GitHub changes before that approval. The procedure lives in `.claude/skills/rag-release-plan/`.
 
+During a release, no new fix agent starts while 2 or more non-Markdown PRs from the release wait for or are in evaluation, and the evaluation queue runs security fixes first, then the critical path or unblockers, then the oldest (details in `rag-release-plan`).
+
 ## Developing a fix
 
 Every fix starts in a fresh agent run with the `rag-fix` skill (`rag-fix RD-<n>`), which holds the procedure. Its always-on rules:
