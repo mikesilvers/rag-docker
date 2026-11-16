@@ -10,6 +10,9 @@ The refusals, in the order they apply:
   401 AUTH_REQUIRED           no valid session cookie
   403 CROSS_ORIGIN_REFUSED    a cookie-authenticated POST/PUT/PATCH/DELETE from another origin
   403 PASSWORD_CHANGE_REQUIRED the user must change a generated password first
+  403 MFA_ENROLLMENT_REQUIRED two-step verification is required for everyone and
+                              the user hasn't set it up (#607); only the session
+                              routes and their own MFA routes answer
   403 FORBIDDEN               the user's role is too low
 
 A request with an `Authorization` header is a service key request (PR 3): the
@@ -145,7 +148,10 @@ class AuthMiddleware:
         if principal.must_change_password and access != policy.SESSION:
             return api_error(403, "PASSWORD_CHANGE_REQUIRED",
                              "Change your password before doing anything else."), principal
-        if access != policy.SESSION and policy.rank(principal.role) < policy.rank(access):
+        if principal.mfa_due and access not in (policy.SESSION, policy.MFA):
+            return api_error(403, "MFA_ENROLLMENT_REQUIRED",
+                             "Set up two-step verification before doing anything else."), principal
+        if access not in (policy.SESSION, policy.MFA) and policy.rank(principal.role) < policy.rank(access):
             return api_error(403, "FORBIDDEN", "Your role can't do this.",
                              detail={"required_role": access}), principal
         return None, principal
@@ -157,7 +163,7 @@ class AuthMiddleware:
             return api_error(401, "KEY_INVALID", "The API key is invalid, expired or revoked."), None
         if template in policy.HUMAN_ONLY:
             return api_error(403, "KEY_NOT_ALLOWED", "API keys can't be used for this."), principal
-        if access != policy.SESSION and policy.rank(principal.role) < policy.rank(access):
+        if access not in (policy.SESSION, policy.MFA) and policy.rank(principal.role) < policy.rank(access):
             return api_error(403, "FORBIDDEN", "Your role can't do this.",
                              detail={"required_role": access}), principal
         return None, principal
