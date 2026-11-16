@@ -50,6 +50,12 @@ The maintainer merges pull requests. How the maintainer's own agents may merge a
 PR after the maintainer's go-ahead is in [CLAUDE.md](CLAUDE.md#merging-into-develop).
 Workflows on pull requests from forks run after the maintainer approves them.
 
+## How releases are worked
+
+[docs/WORKFLOW.md](docs/WORKFLOW.md) describes how the maintainer's release work
+runs: intake into Jira, release planning and lanes, how each step is marked, and
+evaluation and merge. It names the file that holds each rule.
+
 ## License
 
 By contributing, you agree that your contributions are licensed under the
