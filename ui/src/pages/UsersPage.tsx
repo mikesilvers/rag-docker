@@ -4,6 +4,17 @@ import { useAuth } from '../context/AuthContext'
 
 const ROLES: Role[] = ['end_user', 'developer', 'engineer']
 const ROLE_LABELS: Record<Role, string> = { end_user: 'End User', developer: 'Developer', engineer: 'AI Engineer' }
+// Reset password, Disable and a role change ask first, on every row; Enable
+// doesn't (#551). The own row says what the change does to the Engineer.
+const ASK = {
+  role: (name: string, own: boolean, next: Role) => own
+    ? `Change your own role to ${ROLE_LABELS[next]}? You will lose access to the Users page.`
+    : `Change the role of ${name} to ${ROLE_LABELS[next]}?`,
+  disable: (name: string, own: boolean) => own
+    ? "Disable your own account? You will be logged out and can't log in again until another AI Engineer enables you."
+    : `Disable ${name}? Their sessions end and they can't log in until enabled.`,
+  reset: (name: string) => `Reset the password of ${name}? Their sessions end and they must change the new password at their next login.`,
+}
 
 // Account administration for Engineers (#25). The API decides what is allowed:
 // the last enabled Engineer can't be demoted or disabled, and an Engineer's own
@@ -137,7 +148,7 @@ export default function UsersPage() {
                 <td className="py-2 pr-4 font-medium">{u.username}{own && <span className="text-gray-500 font-normal"> (you)</span>}</td>
                 <td className="py-2 pr-4">
                   <select aria-label={`Role of ${u.username}`} value={u.role} disabled={busy}
-                    onChange={e => { const next = e.target.value as Role; act(u.username, () => api.setUserRole(u.username, next)) }}
+                    onChange={e => { const next = e.target.value as Role; if (window.confirm(ASK.role(u.username, own, next))) act(u.username, () => api.setUserRole(u.username, next)) }}
                     className="border border-gray-300 rounded px-2 py-1 text-sm">
                     {ROLES.map(r => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
                   </select>
@@ -149,10 +160,10 @@ export default function UsersPage() {
                 <td className="py-2 space-x-3 whitespace-nowrap">
                   {own
                     ? <span className="text-xs text-gray-500">Use Change password for your own</span>
-                    : <button disabled={busy} onClick={() => act(u.username, () => api.resetUserPassword(u.username))}
+                    : <button disabled={busy} onClick={() => { if (window.confirm(ASK.reset(u.username))) act(u.username, () => api.resetUserPassword(u.username)) }}
                         className="text-blue-600 hover:underline disabled:opacity-50">Reset password</button>}
                   <button disabled={busy}
-                    onClick={() => act(u.username, () => u.enabled ? api.disableUser(u.username) : api.enableUser(u.username))}
+                    onClick={() => { if (!u.enabled || window.confirm(ASK.disable(u.username, own))) act(u.username, () => u.enabled ? api.disableUser(u.username) : api.enableUser(u.username)) }}
                     className="text-blue-600 hover:underline disabled:opacity-50">{u.enabled ? 'Disable' : 'Enable'}</button>
                   {u.mfa_enrolled && !own && (
                     <button disabled={busy} onClick={() => act(u.username, () => api.resetUserMfa(u.username))}
