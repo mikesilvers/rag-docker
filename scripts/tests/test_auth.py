@@ -514,10 +514,12 @@ class PolicyTests(unittest.TestCase):
         counts = {}
         for access in policy.ACCESS.values():
             counts[access] = counts.get(access, 0) + 1
-        self.assertEqual(counts, {"public": 4, "session": 3, "mfa": 5, "end_user": 3, "developer": 36, "engineer": 28})
+        self.assertEqual(counts, {"public": 4, "session": 3, "mfa": 5, "end_user": 3, "developer": 36, "engineer": 30})
         self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
         self.assertEqual(policy.ACCESS[("GET", "/health/details")], "developer")   # #750
         self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
+        self.assertEqual(policy.ACCESS[("GET", "/collections/{name}/access")], "engineer")   # #606
+        self.assertEqual(policy.ACCESS[("PUT", "/collections/{name}/access")], "engineer")
         self.assertEqual(policy.ACCESS[("POST", "/collections")], "developer")
         self.assertEqual(policy.ACCESS[("GET", "/tune/{collection}")], "developer")
         self.assertEqual(policy.ACCESS[("GET", "/tune/job/{job_id}")], "engineer")
@@ -554,10 +556,12 @@ class PolicyTests(unittest.TestCase):
 
     def test_keys_cannot_reach_administration_or_the_session_routes(self):
         # S5 of PR 3: every account, principal and key route, logout and the
-        # password change, and the audit log (#29); GET /auth/me stays open to a key.
+        # password change, the audit log (#29) and per-collection access (#606);
+        # GET /auth/me stays open to a key.
         admin = {path for _, path in policy.ACCESS
                  if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa"))}
-        self.assertEqual(policy.HUMAN_ONLY, admin | {"/auth/logout", "/auth/password", "/audit", "/audit.csv"})
+        self.assertEqual(policy.HUMAN_ONLY, admin | {"/auth/logout", "/auth/password", "/audit", "/audit.csv",
+                                                     "/collections/{name}/access"})
         self.assertNotIn("/auth/me", policy.HUMAN_ONLY)
 
     def test_each_template_resolves_to_itself(self):
@@ -2003,7 +2007,7 @@ class MfaStoreTests(MfaTestCase):
             self.assertFalse(store.get_user("old").mfa_enrolled)
             self.assertFalse(store.mfa_required())
             version = sqlite3.connect(Path(temp.name, "auth.db")).execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 3)
+            self.assertEqual(version, store.SCHEMA_VERSION)   # 3, and 4 since #606
 
     def test_no_secret_or_code_is_stored_in_plain_form(self):
         secret, codes = self.enroll("dev")
