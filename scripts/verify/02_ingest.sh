@@ -382,6 +382,10 @@ import json; d=json.load(open('/tmp/vfy_job.json')); print(d['status'], d['chunk
   drop_collection "$SC"
 done
 
+# A scanned (image-only) PDF is read by OCR with the locked Pillow (#522, #524).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_scanned_pdf_ocr.py)
+check "a scanned, image-only PDF is read by OCR with the locked Pillow (#524)" $?
+
 # ── min_chunk_size merging ───────────────────────────────────────────────────
 drop_collection "$C"; make_collection "$C"
 ingest "$C" fixed 60 100 "$FIX/tiny.txt"

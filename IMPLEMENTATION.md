@@ -26695,6 +26695,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_embed_batching.py` | controlled embedding writes (#613): a write that leaves vectors to Weaviate's `text2vec-ollama` uses `fixed_size(10, 1)` batches and one with every vector `dynamic()`; only objects whose embed request timed out in Weaviate are sent again, at most twice, with the write counts and rollback unchanged, and no other failure is retried. Registered by ingest in the API image with the repository mounted, after which ingest writes 45 vectorless chunks to a scratch `<prefix>EmbedBatch` collection on the real Weaviate and Ollama and checks they are all stored, through `fixed_size(10, 1)` and never `dynamic()`; the collection is removed afterwards |
 | `../tests/test_corpus_rules.py` | controlled: the corpus preparation rules the Import page offers (`ui/public/corpus-preparation-rules.md`) state every ingest limit as the chunker, the ingest pipeline, the settings defaults, the chunk-setting bounds, `docker-compose.yml` and the proxy define it, and no other number (#615), registered by ingest in the API image with the repository mounted |
 | `../tests/test_corpus_rules_estimates.py` | controlled: the chunk counts the corpus preparation rules give hold for the real chunker for every strategy, on files built at the rules' targets, which are never refused for the text or chunk limits (#615), registered by ingest in the API image with the repository mounted |
+| `../tests/test_scanned_pdf_ocr.py` | an image-only (scanned) PDF is read by OCR through the ingest pipeline's own parser, and the installed Pillow is the version `api/requirements.txt` pins (#522, #524); run in the built API image with no network, registered by suite 02 |
 | `../tests/test_model_bundle.py` | controlled bundled-model install safety, E21 and E22 with a temporary store, registered by transfer in the API image with the repository mounted (#386) |
 | `../tests/test_settings_validation.py` | controlled settings refusals before work, registered by settings in the API image with the repository mounted (#386) |
 | `../tests/test_retrieval_controls.py` | controlled collection list rows and retrieval-mode dispatch, registered by retrieval (suite 11) in the API image with the repository mounted (#386) |
@@ -39707,6 +39708,10 @@ import json; d=json.load(open('/tmp/vfy_job.json')); print(d['status'], d['chunk
   check "strategy '$strategy' produces chunks from a PDF" $? "status=$status chunks=$chunks"
   drop_collection "$SC"
 done
+
+# A scanned (image-only) PDF is read by OCR with the locked Pillow (#522, #524).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_scanned_pdf_ocr.py)
+check "a scanned, image-only PDF is read by OCR with the locked Pillow (#524)" $?
 
 # ── min_chunk_size merging ───────────────────────────────────────────────────
 drop_collection "$C"; make_collection "$C"
