@@ -35278,6 +35278,18 @@ class MfaLoginTests(MfaTestCase):
         self.assertEqual(self.rows("SELECT COUNT(*) FROM mfa_challenges"), [(0,)])
         self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
 
+    def test_an_mfa_reset_ends_a_challenge(self):
+        # Decision 2 (#607): a reset ends the user's pending challenges, so a
+        # login started before it can't be finished with the next enrollment's code.
+        self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM mfa_challenges"), [(1,)])
+        store.reset_mfa("dev", "user")
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM mfa_challenges"), [(0,)])
+        secret, _ = self.enroll("dev")
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+
     def test_non_ascii_digits_are_a_plain_wrong_code(self):
         # #607 review: other scripts' digits are refused as any wrong code, not a 500.
         secret, _ = self.enroll("dev")
