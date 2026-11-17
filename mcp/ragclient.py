@@ -69,8 +69,8 @@ async def request(
     """Call the RAG API.
 
     allow_status lists status codes to return normally instead of raising. It
-    exists for /health, which answers 503 with a full, useful body: turning that
-    into an error string would discard the per-service detail the caller needs.
+    exists for /health, which answers 503 {"status": "degraded"} when a
+    dependency is down: that is information for the caller, not an error.
     """
     url = f"{config.RAG_API_BASE_URL}{path}"
     log.debug("%s %s", method, url)
@@ -83,7 +83,8 @@ async def request(
         raise RagApiError(
             f"The RAG API did not respond within {config.HTTP_TIMEOUT:.0f}s. "
             "LLM generation is CPU-bound and slow when Docker is short on memory; "
-            "check 'resources.memory' from the rag_health tool."
+            "check 'resources.memory' at the API's /health/details (a Developer "
+            "or AI Engineer login)."
         ) from exc
     except httpx.HTTPError as exc:
         raise _unreachable(exc) from exc

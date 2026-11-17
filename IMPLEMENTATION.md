@@ -31,8 +31,8 @@ immediate because the images are built and the models are cached in the
 
 **Docker must be allocated 12 GB of memory and 2 GB of swap** (Settings →
 Resources); on a 16 GB Mac that is the practical ceiling, leaving macOS about 4 GB. phi3.5 is ~6 GB resident; below that it is evicted and reloaded between
-calls and queries time out. `curl http://localhost:8080/api/health` reports the
-allocated figure against the recommendation.
+calls and queries time out. `curl -b ~/.rag-session http://localhost:8080/api/health/details`
+(a Developer or AI Engineer login) reports the allocated figure against the recommendation.
 
 ---
 
@@ -166,7 +166,7 @@ services:
       # when it is imported and on every partition call, so ingest never
       # dials out (issue #695). Also set as ENV in api/Dockerfile.
       DO_NOT_TRACK: "1"
-      # Shown by /health and compared against the memory Docker actually
+      # Shown by /health/details and compared against the memory Docker actually
       # provides. Raise this if you allocate more to Docker Desktop.
       RECOMMENDED_MEMORY_GB: 12
       # The most one upload's ZIPs may expand to in all, gzipped members'
@@ -1198,7 +1198,7 @@ class Settings(BaseSettings):
     # Ollama's model store, mounted from the same volume the ollama service
     # uses. Only touched when a package bundles models.
     ollama_models_dir: str = "/ollama"
-    # Reported by /health and compared against the memory Docker actually
+    # Reported by /health/details and compared against the memory Docker actually
     # provides. Raise it in docker-compose.yml; no rebuild required.
     recommended_memory_gb: float = 12.0
     # The most an upload's ZIPs may expand to, in bytes, summed over every ZIP
@@ -14938,9 +14938,15 @@ from services import weaviate_client as wc
 
 router = APIRouter()
 
+# Two routes, one check (#750). GET /health needs no login: the compose
+# healthcheck, stack.sh, CI and the verify wait loops read its status code, so it
+# answers only {"status"}, and on a LAN nobody without an account learns the
+# models, timings or the host's memory. GET /health/details gives Developers and
+# AI Engineers the full report, with the same 200/503 rule.
 
-@router.get("/health")
-async def health_check():
+
+async def _report() -> tuple[bool, dict]:
+    """Whether every dependency is ok, and the full report."""
     results = {}
     overall_ok = True
 
@@ -14972,15 +14978,24 @@ async def health_check():
     # take the whole stack down over a tuning warning.
     resources = {"memory": system_info.memory_info(settings.recommended_memory_gb)}
 
-    status_code = 200 if overall_ok else 503
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "status": "ok" if overall_ok else "degraded",
-            "services": results,
-            "resources": resources,
-        },
-    )
+    return overall_ok, {
+        "status": "ok" if overall_ok else "degraded",
+        "services": results,
+        "resources": resources,
+    }
+
+
+@router.get("/health")
+async def health_check():
+    overall_ok, _ = await _report()
+    return JSONResponse(status_code=200 if overall_ok else 503,
+                        content={"status": "ok" if overall_ok else "degraded"})
+
+
+@router.get("/health/details")
+async def health_details():
+    overall_ok, report = await _report()
+    return JSONResponse(status_code=200 if overall_ok else 503, content=report)
 ```
 
 ### api/routers/help.py
@@ -17516,7 +17531,8 @@ MFA = "mfa"
 END_USER, DEVELOPER, ENGINEER = ROLES
 
 ACCESS: dict[tuple[str, str], str] = {
-    # Liveness for the container healthcheck, stack.sh and CI, unchanged (Q8).
+    # Liveness for the container healthcheck, stack.sh and CI (Q8): only
+    # {"status"} since #750; the full report is GET /health/details.
     ("GET", "/health"): PUBLIC,
     ("GET", "/auth/status"): PUBLIC,
     ("POST", "/auth/login"): PUBLIC,
@@ -17559,6 +17575,8 @@ ACCESS: dict[tuple[str, str], str] = {
     ("GET", "/packages"): DEVELOPER,
     ("GET", "/help/transfer"): DEVELOPER,
     ("GET", "/tune/{collection}"): DEVELOPER,          # read by the Transfer page (Q3)
+    # The full health report (#750): services, models and memory, keys too.
+    ("GET", "/health/details"): DEVELOPER,
     # Document preparation (#638): the ingest permissions (C3).
     ("POST", "/prepare/upload"): DEVELOPER,
     ("GET", "/prepare/documents"): DEVELOPER,
@@ -21174,7 +21192,7 @@ function isHealthResult(data: any): data is HealthResult {
     && service(data?.services?.ollama?.build_llm) && service(data?.services?.ollama?.embed)
 }
 
-// GET /health answers 503 with the same per-service body when a dependency is
+// GET /health/details answers 503 with the same per-service body when a dependency is
 // down. request() throws on any non-2xx, so the Health page never saw which
 // service failed and could not show it red (#375). This call accepts a 200 or
 // a 503 that carries that body; every other error is thrown as request() would,
@@ -21182,7 +21200,7 @@ function isHealthResult(data: any): data is HealthResult {
 async function getHealthResult(): Promise<HealthResult> {
   let res: Response
   try {
-    res = await fetch(`${BASE}/health`)
+    res = await fetch(`${BASE}/health/details`)
   } catch {
     // fetch rejects only when no answer arrived; its own text ("Failed to fetch") says nothing.
     throw new Error('The API could not be reached. Check that the stack is running.')
@@ -26609,7 +26627,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `01_infrastructure.sh` | §10.5 — ports, health, config lifecycle, startup sweeps; the proxy answers `Host` localhost and 127.0.0.1 and refuses another with 421 (#664) |
 | `../tests/test_error_envelope.py` | controlled JSON error envelope and dependency-failure 503 regressions through the app (#373), registered by suite 01 |
 | `../tests/test_package_archives.py` | host-side: `package.sh` and `package-offline.sh` in a scratch git repository with `docker` stubbed hold exactly the tracked files of `HEAD`, and refuse outside a git top level (#384), run in a checkout reached through a symlink, and ignore the user's system and global git config (#447); embedded copies; registered by suite 01 |
-| `../tests/test_health.py` | controlled `/health` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415), registered by suite 01 |
+| `../tests/test_health.py` | controlled `/health/details` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415); the public `/health`'s status-only body and who may read the details (#750), registered by suite 01 |
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
 | `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health` reports, so the status flips to `below_recommended` on any host (#536) |
 | `../tests/test_memory_override.py` | host-side, standard library: the derived override makes `system_info.memory_info` report `below_recommended` with a note for allocations below and above the 12.35 GB a fixed 13 GB could flip, and no override without a usable allocation (#536); embedded copies; registered by suite 01 |
@@ -27017,15 +27035,17 @@ ingests under a lowercase-first name, reads the tuning options and exports under
 name, re-chunks under the lowercase name and, unless `RAG_SKIP_SLOW=1`, checks a query's
 metrics under both spellings.
 
-Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health`
+Suite 01 also runs `scripts/tests/test_health.py` the same way (#375). It sends `GET /health/details`
 through the app with Ollama's `/api/tags` answered by an httpx mock transport and the Weaviate
 client check mocked, and checks the 503 `degraded` body: the LLM or embedding model missing
 from Ollama's list (that service `error`, the rest `ok`), Ollama unreachable (both models
 `error`), Weaviate not ready or unreachable (Weaviate `error`), Weaviate and Ollama down
 together (all three `error`), each with its latency, model names and `resources`; and 200
 `ok` when everything is up, also with memory below the recommendation or unreadable
-(`resources.memory.status` `below_recommended` or `unknown`; memory is advisory, #415). `browser/ui_criteria.js` (suite 06)
-stubs `/api/health` and checks that the Health page shows a degraded 503 body with the failing
+(`resources.memory.status` `below_recommended` or `unknown`; memory is advisory, #415). Without a
+session, `GET /health` answers only `{"status"}` by the same rule, and `/health/details` is 401;
+an End User gets 403 and a Developer the full body (#750). `browser/ui_criteria.js` (suite 06)
+stubs `/api/health/details` and checks that the Health page shows a degraded 503 body with the failing
 service red and the others green, that a proxy 502, a refused connection and a 503 without a
 health body each show "Service health could not be read:" with the reason and remove the
 earlier cards, that the next good load clears it, and that the latency metrics load on every
@@ -28883,6 +28903,7 @@ MATRIX = (
     ("GET", "/packages", None, "developer"),
     ("GET", "/help/transfer", None, "developer"),
     ("GET", "/tune/" + X, None, "developer"),
+    ("GET", "/health/details", None, "developer"),       # the full health report (#750)
     ("DELETE", "/collections/" + X + "?confirm=true", None, "engineer"),
     ("POST", "/tune/rechunk", {}, "engineer"),
     ("POST", "/tune/reembed", {}, "engineer"),
@@ -33599,8 +33620,9 @@ class PolicyTests(unittest.TestCase):
         counts = {}
         for access in policy.ACCESS.values():
             counts[access] = counts.get(access, 0) + 1
-        self.assertEqual(counts, {"public": 4, "session": 3, "mfa": 5, "end_user": 3, "developer": 35, "engineer": 28})
+        self.assertEqual(counts, {"public": 4, "session": 3, "mfa": 5, "end_user": 3, "developer": 36, "engineer": 28})
         self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
+        self.assertEqual(policy.ACCESS[("GET", "/health/details")], "developer")   # #750
         self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
         self.assertEqual(policy.ACCESS[("POST", "/collections")], "developer")
         self.assertEqual(policy.ACCESS[("GET", "/tune/{collection}")], "developer")
@@ -37293,7 +37315,7 @@ PROTECTED = (
     ("GET", "/packages"), ("GET", "/help/transfer"),
     ("POST", "/tune/rechunk"), ("POST", "/tune/reembed"), ("POST", "/tune/reindex"),
     ("GET", "/tune/job/nope"), ("GET", f"/tune/{X}"),
-    ("GET", "/metrics/latency"),
+    ("GET", "/metrics/latency"), ("GET", "/health/details"),
     ("GET", "/docs"), ("GET", "/docs/oauth2-redirect"), ("GET", "/redoc"), ("GET", "/openapi.json"),
     ("GET", "/auth/users"), ("POST", "/auth/users"), ("POST", "/auth/users/nobody/reset-password"),
     ("POST", "/auth/users/nobody/role"), ("POST", "/auth/users/nobody/disable"),
@@ -38543,10 +38565,11 @@ check_eq "  ... with its Allow header, POST" \
   "$(printf '%s\n' "$wrong_method" | awk 'tolower($1)=="allow:" {print $2}')" "POST"
 check_eq "  ... in the envelope, code METHOD_NOT_ALLOWED" \
   "$(printf '%s\n' "$wrong_method" | sed '1,/^$/d' | jfield "['error']['code']")" "METHOD_NOT_ALLOWED"
-# /health's 503 body for a missing model or an unreachable dependency, which the
-# Health page reads to show the failing services (#375).
+# /health/details' 503 body for a missing model or an unreachable dependency, which
+# the Health page reads to show the failing services (#375), and the public
+# /health's status-only body (#750).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_health.py)
-check "/health answers 503 with the per-service body when a dependency is down (#375)" $?
+check "/health/details answers 503 with the per-service body when a dependency is down (#375); /health only the status (#750)" $?
 # The collection registry is written atomically and kept when it can't be read (#388).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_registry.py)
 check "the collection registry is written atomically and kept when unreadable (#388)" $?
@@ -38651,7 +38674,7 @@ unhealthy=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Status}}') | gre
 check_eq "no service reports unhealthy" "$unhealthy" "0"
 
 # ── health endpoint reports each dependency ──────────────────────────────────
-api_get "/health" > "$RAG_INFRA_TMP/vfy_health.json"
+api_get "/health/details" > "$RAG_INFRA_TMP/vfy_health.json"
 check_eq "health status is ok" "$(jfield "['status']" < "$RAG_INFRA_TMP/vfy_health.json")" "ok"
 python3 -c "
 import json,sys,os; d=json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_health.json'))
@@ -38908,13 +38931,13 @@ summary
 ```python
 """The memory recommendation suite 01 raises past the allocation (#536).
 
-Suite 01 checks that /health's memory report flips to below_recommended, with a
+Suite 01 checks that /health/details' memory report flips to below_recommended, with a
 note, once the recommendation exceeds what Docker is allocated. It raises the
-recommendation in-process, and the value must come from the allocation /health
-reports: a fixed 13 GB stayed 'ok' on any host giving Docker 12.35 GB or more.
+recommendation in-process, and the value must come from the allocation
+/health/details reports: a fixed 13 GB stayed 'ok' on any host giving Docker 12.35 GB or more.
 Standard library only.
 
-Run: python3 scripts/verify/memory_override.py <saved /health JSON>
+Run: python3 scripts/verify/memory_override.py <saved /health/details JSON>
 Prints the override in whole GB, or nothing (exit 1) without a usable allocation.
 """
 import json
@@ -38923,7 +38946,7 @@ import sys
 
 # api/services/system_info.py reports 'ok' while allocated >= recommended * 0.95.
 TOLERANCE = 0.95
-# /health rounds allocated_gb to 2 decimals, so the real figure can be this much higher.
+# /health/details rounds allocated_gb to 2 decimals, so the real figure can be this much higher.
 ROUNDING = 0.005
 
 
@@ -38941,7 +38964,7 @@ def main(argv):
         with open(argv[1]) as fh:
             allocated = json.load(fh)['resources']['memory']['allocated_gb']
     except (IndexError, OSError, ValueError, KeyError, TypeError) as exc:
-        print('memory_override: no allocation in the /health report: {!r}'.format(exc), file=sys.stderr)
+        print('memory_override: no allocation in the /health/details report: {!r}'.format(exc), file=sys.stderr)
         return 1
     override = override_gb(allocated)
     if override is None:
@@ -45749,7 +45772,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     await s.page.setRequestInterception(true);
     s.page.on('request', request => {
       const path = new URL(request.url()).pathname;
-      if (path === '/api/health') {
+      if (path === '/api/health/details') {
         if (mode === 'refused') return request.abort('connectionrefused');
         if (mode === 'proxy502') return request.respond({ status: 502, contentType: 'text/html', body: proxyPage('502 Bad Gateway') });
         if (mode === 'html503') return request.respond({ status: 503, contentType: 'text/html', body: proxyPage('503 Service Temporarily Unavailable') });
@@ -51939,7 +51962,7 @@ if (require.main === module) (async () => {
 const assert = require('node:assert/strict');
 const { makeReporter, stubAuth } = require('./lib');
 
-const HEALTH = '/api/health', METRICS = '/api/metrics/latency';
+const HEALTH = '/api/health/details', METRICS = '/api/metrics/latency';
 const UNREADABLE = 'Service health could not be read: The server sent a response the UI could not read.';
 const service = (status, latency_ms, model) => model ? { status, latency_ms, model } : { status, latency_ms };
 const healthBody = (embed = 'ok', build = null) => ({
@@ -54798,7 +54821,7 @@ const record = (i, r, l) => ({ timestamp: `2026-10-21T10:0${i}:00Z`, collection:
 const metrics = (records, stats = {}) => json(200, { total_records: records.length, retrieval_latency: { p50: 10.4, p95: 20.6, p99: 30.2 }, llm_latency: { p50: 100.2, p95: 200.7, p99: 300.4 }, total_latency: { p50: 110.7, p95: 221.1, p99: 331.9 }, history: records, ...stats });
 
 function healthCases() {
-  const open = m => ({ role: 'engineer', path: '/health', routes: common({ 'GET /api/health': health, 'GET /api/metrics/latency': m, 'GET /api/goldstandard/diagnostics': json(200, { issues: [] }) }) });
+  const open = m => ({ role: 'engineer', path: '/health', routes: common({ 'GET /api/health/details': health, 'GET /api/metrics/latency': m, 'GET /api/goldstandard/diagnostics': json(200, { issues: [] }) }) });
   return [
     { name: 'Health shows the latency trend heading, a P50/P95/P99 row per stage in whole ms, and a chart with its three series', open: open(metrics([record(1, 10, 100), record(2, 12, 110), record(3, 14, 120)])), async run(s) {
       await waitText(s.page, 'Latency Trends (3 queries in ring buffer)');
@@ -55428,7 +55451,7 @@ ENUMS = {
 SPAN_NAMES = frozenset("rag." + v for v in ENUMS["rag.operation"])
 
 # Explicit code-owned vocabulary. Raw URL/path values never enter this schema.
-ROUTES = frozenset(('DELETE /collections/{name}', 'DELETE /prepare/documents/{document_id}', 'DELETE /prepare/documents/{document_id}/prepared', 'GET /audit', 'GET /audit.csv', 'GET /auth/me', 'GET /auth/mfa', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /export/job/{job_id}', 'GET /export/jobs', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /goldstandard/sessions', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /import/jobs', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /ingest/jobs', 'GET /metrics/latency', 'GET /packages', 'GET /prepare/documents', 'GET /prepare/documents/{document_id}', 'GET /prepare/documents/{document_id}/prepared', 'GET /prepare/documents/{document_id}/raw', 'GET /prepare/job/{job_id}', 'GET /prepare/jobs', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/login/mfa', 'POST /auth/logout', 'POST /auth/mfa/disable', 'POST /auth/mfa/enroll', 'POST /auth/mfa/enroll/confirm', 'POST /auth/mfa/policy', 'POST /auth/mfa/recovery-codes', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-mfa', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /prepare/import', 'POST /prepare/job/{job_id}/cancel', 'POST /prepare/jobs', 'POST /prepare/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
+ROUTES = frozenset(('DELETE /collections/{name}', 'DELETE /prepare/documents/{document_id}', 'DELETE /prepare/documents/{document_id}/prepared', 'GET /audit', 'GET /audit.csv', 'GET /auth/me', 'GET /auth/mfa', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /export/job/{job_id}', 'GET /export/jobs', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /goldstandard/sessions', 'GET /health', 'GET /health/details', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /import/jobs', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /ingest/jobs', 'GET /metrics/latency', 'GET /packages', 'GET /prepare/documents', 'GET /prepare/documents/{document_id}', 'GET /prepare/documents/{document_id}/prepared', 'GET /prepare/documents/{document_id}/raw', 'GET /prepare/job/{job_id}', 'GET /prepare/jobs', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/login/mfa', 'POST /auth/logout', 'POST /auth/mfa/disable', 'POST /auth/mfa/enroll', 'POST /auth/mfa/enroll/confirm', 'POST /auth/mfa/policy', 'POST /auth/mfa/recovery-codes', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-mfa', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /prepare/import', 'POST /prepare/job/{job_id}/cancel', 'POST /prepare/jobs', 'POST /prepare/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
 ENUMS.update({"http.route": ROUTES | {"unmatched"},
               "rag.tuning_operation": frozenset(("rechunk", "reembed", "reindex")),
               "http.status_class": frozenset(("1xx", "2xx", "3xx", "4xx", "5xx"))})

@@ -17,7 +17,7 @@ A self-contained, Dockerized Retrieval-Augmented Generation (RAG) platform. Uplo
 ## Prerequisites
 
 - **Docker Desktop with Engine 28.0.0 or newer** (or Docker Engine 28.0.0+ with Compose v2) — [install](https://docs.docker.com/get-docker/)
-- **12 GB RAM and 2 GB swap allocated to Docker** (Docker Desktop → Settings → Resources → Memory and Swap). llama3.1:8b alone is ~6 GB resident; at 10 GB, full verification runs still hit Ollama timeouts under memory pressure, and below that the model is repeatedly evicted and reloaded and queries time out. Swap turns a short spike into a slowdown instead of a failure. Leave macOS at least 4 GB: on a 16 GB Mac, 12 GB is the practical ceiling. `/health` reports what Docker actually has against this recommendation
+- **12 GB RAM and 2 GB swap allocated to Docker** (Docker Desktop → Settings → Resources → Memory and Swap). llama3.1:8b alone is ~6 GB resident; at 10 GB, full verification runs still hit Ollama timeouts under memory pressure, and below that the model is repeatedly evicted and reloaded and queries time out. Swap turns a short spike into a slowdown instead of a failure. Leave macOS at least 4 GB: on a 16 GB Mac, 12 GB is the practical ceiling. `/health/details` reports what Docker actually has against this recommendation
 - **20 GB disk minimum allocated to Docker, 32 GB recommended** — see [Storage requirements](#storage-requirements) below. Check your current limit before building — a small virtual disk (8 GB or so) cannot hold this stack, and the build fails partway through with a confusing error.
 - Port **8080** free on the host — `docker-compose.yml` publishes the proxy as `127.0.0.1:8080:80`, bound to host loopback on supported engines
 
@@ -121,7 +121,7 @@ Endpoint by endpoint (paths under `/api`):
 | nothing | `GET /health`, `GET /auth/status`, `POST /auth/login`, `POST /auth/login/mfa` |
 | any logged-in user | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password`; their own two-step verification (`GET /auth/mfa`, `POST /auth/mfa/enroll`, `/enroll/confirm`, `/recovery-codes`, `/disable`) |
 | End User | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
-| Developer | creating a collection; ingest (upload, job status, settings); document preparation (`POST /prepare/upload`; `GET /prepare/documents`; `GET` and `DELETE /prepare/documents/{document_id}`; `GET /prepare/documents/{document_id}/raw`; `GET` and `DELETE /prepare/documents/{document_id}/prepared`; `POST` and `GET /prepare/jobs`; `GET /prepare/job/{job_id}`; `POST /prepare/job/{job_id}/cancel`; `POST /prepare/import`); saving retrieval settings; gold standard (generate, sessions, pairs, regenerate, save, download); export, import, their job status, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
+| Developer | creating a collection; ingest (upload, job status, settings); document preparation (`POST /prepare/upload`; `GET /prepare/documents`; `GET` and `DELETE /prepare/documents/{document_id}`; `GET /prepare/documents/{document_id}/raw`; `GET` and `DELETE /prepare/documents/{document_id}/prepared`; `POST` and `GET /prepare/jobs`; `GET /prepare/job/{job_id}`; `POST /prepare/job/{job_id}/cancel`; `POST /prepare/import`); saving retrieval settings; gold standard (generate, sessions, pairs, regenerate, save, download); export, import, their job status, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}`; the full health report, `GET /health/details` |
 | AI Engineer | `DELETE /collections/{name}`; `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/job/{id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; the API docs (`/docs`, `/redoc`, `/openapi.json`); account management (`GET` and `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `/role`, `/disable`, `/enable`, `/reset-mfa`; `POST /auth/mfa/policy`); service keys (`GET` and `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `/disable`, `/enable`, `/keys`, `/keys/{key_id}/revoke`); the audit log (`GET /audit`, `GET /audit.csv`), in a browser session only |
 
 Without a session the API answers `401 AUTH_REQUIRED`; with a role that is too
@@ -353,7 +353,8 @@ curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localho
 ```
 
 The curl examples below assume you are logged in this way. `GET /health` needs
-no session.
+no session and answers only `{"status": "ok"}` or `{"status": "degraded"}`;
+the full report, `GET /health/details`, needs a Developer or AI Engineer.
 
 ### Upgrading from the role picker
 
@@ -572,10 +573,13 @@ Navigate to **Tune → Gold Standard**, choose a collection and sample size, and
 
 Navigate to **Admin → Health** (AI Engineer role) to see live status and latency for Weaviate, the answer LLM and the build LLM (one card when they are the same model), and the embedding model. Latency charts populate after the first few Q&A queries.
 
-You can also hit the API directly:
+You can also hit the API directly. `/api/health` needs no login and answers only
+`ok` or `degraded`; the full report (each service, the models and Docker's memory)
+needs a Developer or AI Engineer login:
 
 ```bash
 curl http://localhost:8080/api/health
+curl -b ~/.rag-session http://localhost:8080/api/health/details
 ```
 
 The response includes a `resources` block reporting the memory Docker actually
@@ -951,7 +955,7 @@ All API settings are environment variables in `docker-compose.yml`:
 | `WEAVIATE_HOST` | `weaviate` | Weaviate hostname (internal) |
 | `OLLAMA_HOST` | `ollama` | Ollama hostname (internal) |
 | `UPLOAD_DIR` | `/app/uploads` | Container path for uploads and session data |
-| `RECOMMENDED_MEMORY_GB` | `12` | Memory recommendation reported by `/health`. Raise it if you allocate more to Docker; no rebuild needed |
+| `RECOMMENDED_MEMORY_GB` | `12` | Memory recommendation reported by `/health/details`. Raise it if you allocate more to Docker; no rebuild needed |
 | `MAX_ZIP_EXPANDED_BYTES` | `2147483648` (2 GiB) | The most one upload's ZIPs may expand to in all, gzipped members' output included. Over it the upload is refused with `ARCHIVE_TOO_LARGE` |
 | `MAX_ZIP_MEMBERS` | `5000` | The most entries one ZIP may hold, folders included. Over it the upload is refused with `ARCHIVE_TOO_MANY_MEMBERS` |
 | `MAX_ZIP_MEMBER_RATIO` | `200` | The most a ZIP member of 1 MiB or more may expand relative to its compressed size. Over it the upload is refused with `ARCHIVE_RATIO_TOO_HIGH` |
@@ -1506,7 +1510,7 @@ docker compose exec <service> sh -c 'command -v curl wget'
 Check what Docker actually has, and what is loaded:
 
 ```bash
-curl -s http://localhost:8080/api/health      # resources.memory
+curl -s -b ~/.rag-session http://localhost:8080/api/health/details   # resources.memory (Developer or AI Engineer login)
 docker compose exec ollama ollama ps          # "Stopping..." means thrashing
 ```
 

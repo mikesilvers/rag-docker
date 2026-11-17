@@ -1215,7 +1215,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     await s.page.setRequestInterception(true);
     s.page.on('request', request => {
       const path = new URL(request.url()).pathname;
-      if (path === '/api/health') {
+      if (path === '/api/health/details') {
         if (mode === 'refused') return request.abort('connectionrefused');
         if (mode === 'proxy502') return request.respond({ status: 502, contentType: 'text/html', body: proxyPage('502 Bad Gateway') });
         if (mode === 'html503') return request.respond({ status: 503, contentType: 'text/html', body: proxyPage('503 Service Temporarily Unavailable') });

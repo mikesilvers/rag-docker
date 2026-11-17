@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     # Ollama's model store, mounted from the same volume the ollama service
     # uses. Only touched when a package bundles models.
     ollama_models_dir: str = "/ollama"
-    # Reported by /health and compared against the memory Docker actually
+    # Reported by /health/details and compared against the memory Docker actually
     # provides. Raise it in docker-compose.yml; no rebuild required.
     recommended_memory_gb: float = 12.0
     # The most an upload's ZIPs may expand to, in bytes, summed over every ZIP

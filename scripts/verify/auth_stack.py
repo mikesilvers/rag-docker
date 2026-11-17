@@ -61,6 +61,7 @@ MATRIX = (
     ("GET", "/packages", None, "developer"),
     ("GET", "/help/transfer", None, "developer"),
     ("GET", "/tune/" + X, None, "developer"),
+    ("GET", "/health/details", None, "developer"),       # the full health report (#750)
     ("DELETE", "/collections/" + X + "?confirm=true", None, "engineer"),
     ("POST", "/tune/rechunk", {}, "engineer"),
     ("POST", "/tune/reembed", {}, "engineer"),

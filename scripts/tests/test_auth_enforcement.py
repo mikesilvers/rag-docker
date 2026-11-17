@@ -46,7 +46,7 @@ PROTECTED = (
     ("GET", "/packages"), ("GET", "/help/transfer"),
     ("POST", "/tune/rechunk"), ("POST", "/tune/reembed"), ("POST", "/tune/reindex"),
     ("GET", "/tune/job/nope"), ("GET", f"/tune/{X}"),
-    ("GET", "/metrics/latency"),
+    ("GET", "/metrics/latency"), ("GET", "/health/details"),
     ("GET", "/docs"), ("GET", "/docs/oauth2-redirect"), ("GET", "/redoc"), ("GET", "/openapi.json"),
     ("GET", "/auth/users"), ("POST", "/auth/users"), ("POST", "/auth/users/nobody/reset-password"),
     ("POST", "/auth/users/nobody/role"), ("POST", "/auth/users/nobody/disable"),

@@ -73,6 +73,6 @@ These notes are specific to the maintainer's machine.
   ```
 
 - **Docker CLI.** `docker` is at `/Applications/Docker.app/Contents/Resources/bin`, which isn't on the default `PATH`: prepend it.
-- **Docker memory.** Docker Desktop has 12 GB. When `04`'s LLM checks fail, check `resources.memory` in `/api/health` first: below about 12 GB the model is evicted and generation fails for environmental reasons.
+- **Docker memory.** Docker Desktop has 12 GB. When `04`'s LLM checks fail, check `resources.memory` in the verify project's `/api/health/details` first, with the verify suites' engineer cookie jar (`curl -s -b "${TMPDIR:-/tmp}/rag-verify-auth-$(id -u)/engineer.jar" http://localhost:8081/api/health/details`), or `docker info --format '{{.MemTotal}}'`: below about 12 GB the model is evicted and generation fails for environmental reasons.
 - **External drive.** `/Volumes/Docker-Images` must be mounted. Keep the `rag-docker_ollama_models` volume: verify copies its models from it.
 - **The verify lock.** One verify run at a time on the machine (`/tmp/rag-verify.lock`). A second run exits 3 while another holds the lock; wait for that run to end.

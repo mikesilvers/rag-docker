@@ -64,7 +64,7 @@ function isHealthResult(data: any): data is HealthResult {
     && service(data?.services?.ollama?.build_llm) && service(data?.services?.ollama?.embed)
 }
 
-// GET /health answers 503 with the same per-service body when a dependency is
+// GET /health/details answers 503 with the same per-service body when a dependency is
 // down. request() throws on any non-2xx, so the Health page never saw which
 // service failed and could not show it red (#375). This call accepts a 200 or
 // a 503 that carries that body; every other error is thrown as request() would,
@@ -72,7 +72,7 @@ function isHealthResult(data: any): data is HealthResult {
 async function getHealthResult(): Promise<HealthResult> {
   let res: Response
   try {
-    res = await fetch(`${BASE}/health`)
+    res = await fetch(`${BASE}/health/details`)
   } catch {
     // fetch rejects only when no answer arrived; its own text ("Failed to fetch") says nothing.
     throw new Error('The API could not be reached. Check that the stack is running.')

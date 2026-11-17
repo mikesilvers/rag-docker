@@ -43,8 +43,8 @@ body:
   - type: textarea
     id: health
     attributes:
-      label: Output of /api/health
-      description: "Output of `curl -s http://localhost:8080/api/health`, if the stack is up."
+      label: Output of /api/health/details
+      description: "If the stack is up: open http://localhost:8080/api/health/details in a browser where a Developer or AI Engineer is logged in, and paste the page. Without such a login, paste the output of `curl -s http://localhost:8080/api/health` instead."
       render: json
   - type: textarea
     id: logs
