@@ -18,7 +18,8 @@ MFA = "mfa"
 END_USER, DEVELOPER, ENGINEER = ROLES
 
 ACCESS: dict[tuple[str, str], str] = {
-    # Liveness for the container healthcheck, stack.sh and CI, unchanged (Q8).
+    # Liveness for the container healthcheck, stack.sh and CI (Q8): only
+    # {"status"} since #750; the full report is GET /health/details.
     ("GET", "/health"): PUBLIC,
     ("GET", "/auth/status"): PUBLIC,
     ("POST", "/auth/login"): PUBLIC,
@@ -61,6 +62,8 @@ ACCESS: dict[tuple[str, str], str] = {
     ("GET", "/packages"): DEVELOPER,
     ("GET", "/help/transfer"): DEVELOPER,
     ("GET", "/tune/{collection}"): DEVELOPER,          # read by the Transfer page (Q3)
+    # The full health report (#750): services, models and memory, keys too.
+    ("GET", "/health/details"): DEVELOPER,
     # Document preparation (#638): the ingest permissions (C3).
     ("POST", "/prepare/upload"): DEVELOPER,
     ("GET", "/prepare/documents"): DEVELOPER,

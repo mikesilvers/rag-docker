@@ -60,10 +60,11 @@ check_eq "  ... with its Allow header, POST" \
   "$(printf '%s\n' "$wrong_method" | awk 'tolower($1)=="allow:" {print $2}')" "POST"
 check_eq "  ... in the envelope, code METHOD_NOT_ALLOWED" \
   "$(printf '%s\n' "$wrong_method" | sed '1,/^$/d' | jfield "['error']['code']")" "METHOD_NOT_ALLOWED"
-# /health's 503 body for a missing model or an unreachable dependency, which the
-# Health page reads to show the failing services (#375).
+# /health/details' 503 body for a missing model or an unreachable dependency, which
+# the Health page reads to show the failing services (#375), and the public
+# /health's status-only body (#750).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_health.py)
-check "/health answers 503 with the per-service body when a dependency is down (#375)" $?
+check "/health/details answers 503 with the per-service body when a dependency is down (#375); /health only the status (#750)" $?
 # The collection registry is written atomically and kept when it can't be read (#388).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_registry.py)
 check "the collection registry is written atomically and kept when unreadable (#388)" $?
@@ -168,7 +169,7 @@ unhealthy=$( (cd "$REPO_ROOT" && docker compose ps --format '{{.Status}}') | gre
 check_eq "no service reports unhealthy" "$unhealthy" "0"
 
 # ── health endpoint reports each dependency ──────────────────────────────────
-api_get "/health" > "$RAG_INFRA_TMP/vfy_health.json"
+api_get "/health/details" > "$RAG_INFRA_TMP/vfy_health.json"
 check_eq "health status is ok" "$(jfield "['status']" < "$RAG_INFRA_TMP/vfy_health.json")" "ok"
 python3 -c "
 import json,sys,os; d=json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_health.json'))

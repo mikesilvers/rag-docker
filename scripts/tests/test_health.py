@@ -1,9 +1,12 @@
-"""GET /health answers 503 with the per-service body when a dependency is down (issue #375).
+"""GET /health/details answers 503 with the per-service body when a dependency is down (issue #375).
 
-The Health page reads that body to show the failing services in red, so the body is
+Since #750 the full body is at `GET /health/details`, for Developers and AI Engineers, and
+the public `GET /health` answers only `{"status": "ok" | "degraded"}` with the same 200/503
+rule; both, and who may read the details, are checked here too. The Health page reads the
+details body to show the failing services in red, so the body is
 checked here: a model missing from Ollama, Ollama unreachable, Weaviate unreachable,
 and Weaviate and Ollama down together. Memory below the recommendation, or unreadable,
-is advisory: still 200 `ok` (#415). `/health` itself is unchanged by #375 and #415;
+is advisory: still 200 `ok` (#415). The body is unchanged by #375, #415 and #750;
 this pins what the page relies on. `llm` is the answer model and `build_llm` the build
 model, with `same_model` saying whether they are one (#671); a missing build model is 503
 too, and the two settings resolve from LLM_MODEL as config.py says.
@@ -51,8 +54,10 @@ class HealthTestCase(unittest.TestCase):
         self.client = TestClient(app, headers=auth_testing.headers(), raise_server_exceptions=False)
         self.addCleanup(self.client.close)
 
-    def get_health(self, *, models=None, ollama_down=False, weaviate=True, memory_gb=UNSET):
-        """GET /health with Ollama listing `models` (or refusing connections),
+    def get_health(self, *, models=None, ollama_down=False, weaviate=True, memory_gb=UNSET,
+                   path="/health/details", client=None):
+        """GET `path` (by default /health/details, as the engineer) with Ollama listing
+        `models` (or refusing connections),
         Weaviate's client check returning, or raising, `weaviate`, and, when given,
         `memory_gb` as the Docker VM's memory (None: unreadable)."""
         if models is None:
@@ -75,7 +80,7 @@ class HealthTestCase(unittest.TestCase):
                   if memory_gb is not UNSET else contextlib.nullcontext())
         with patch.object(httpx, "AsyncClient", client_factory), \
                 patch.object(wc, "check_health", check), memory:
-            return self.client.get("/health")
+            return (client or self.client).get(path)
 
     def assert_body(self, response, status_code, overall, weaviate, llm, embed, build=None,
                     same_model=True):
@@ -247,6 +252,56 @@ class HealthMemoryTests(HealthTestCase):
         memory = body["resources"]["memory"]
         self.assertEqual(memory["status"], "unknown")
         self.assertIsNone(memory["allocated_gb"])
+
+
+class PublicHealthTests(HealthTestCase):
+    """The public GET /health answers only the overall status, with the same rule (#750)."""
+
+    def setUp(self):
+        super().setUp()
+        self.anonymous = TestClient(app, raise_server_exceptions=False)   # no session
+        self.addCleanup(self.anonymous.close)
+
+    def get_public(self, **kw):
+        return self.get_health(path="/health", client=self.anonymous, **kw)
+
+    def assert_only_status(self, response, status_code, overall):
+        self.assertEqual(response.status_code, status_code, response.text)
+        self.assertEqual(response.json(), {"status": overall})
+
+    def test_all_services_ok_is_200_with_only_the_status(self):
+        self.assert_only_status(self.get_public(), 200, "ok")
+
+    def test_a_dependency_down_is_503_with_only_the_status(self):
+        for case in ({"ollama_down": True}, {"weaviate": False}, {"models": [settings.embed_model]}):
+            with self.subTest(case=case):
+                self.assert_only_status(self.get_public(**case), 503, "degraded")
+
+    def test_low_memory_stays_200_with_only_the_status(self):
+        self.assert_only_status(self.get_public(memory_gb=1.0), 200, "ok")
+
+
+class DetailsAccessTests(HealthTestCase):
+    """GET /health/details is for Developers and AI Engineers, sessions and keys (#750)."""
+
+    def client_for(self, role=None):
+        headers = auth_testing.headers(role) if role else {}
+        client = TestClient(app, headers=headers, raise_server_exceptions=False)
+        self.addCleanup(client.close)
+        return client
+
+    def test_without_a_session_it_is_401(self):
+        response = self.get_health(client=self.client_for())
+        self.assertEqual((response.status_code, response.json()["error"]["code"]), (401, "AUTH_REQUIRED"))
+
+    def test_an_end_user_is_refused(self):
+        response = self.get_health(client=self.client_for("end_user"))
+        self.assertEqual((response.status_code, response.json()["error"]["code"]), (403, "FORBIDDEN"))
+
+    def test_a_developer_gets_the_full_body(self):
+        self.assert_body(self.get_health(client=self.client_for("developer")), 200, "ok", "ok", "ok", "ok")
+        response = self.get_health(client=self.client_for("developer"), ollama_down=True)
+        self.assert_body(response, 503, "degraded", "ok", "error", "error")
 
 
 if __name__ == "__main__":

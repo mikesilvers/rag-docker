@@ -3,7 +3,7 @@
 const assert = require('node:assert/strict');
 const { makeReporter, stubAuth } = require('./lib');
 
-const HEALTH = '/api/health', METRICS = '/api/metrics/latency';
+const HEALTH = '/api/health/details', METRICS = '/api/metrics/latency';
 const UNREADABLE = 'Service health could not be read: The server sent a response the UI could not read.';
 const service = (status, latency_ms, model) => model ? { status, latency_ms, model } : { status, latency_ms };
 const healthBody = (embed = 'ok', build = null) => ({

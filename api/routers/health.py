@@ -12,9 +12,15 @@ from services import weaviate_client as wc
 
 router = APIRouter()
 
+# Two routes, one check (#750). GET /health needs no login: the compose
+# healthcheck, stack.sh, CI and the verify wait loops read its status code, so it
+# answers only {"status"}, and on a LAN nobody without an account learns the
+# models, timings or the host's memory. GET /health/details gives Developers and
+# AI Engineers the full report, with the same 200/503 rule.
 
-@router.get("/health")
-async def health_check():
+
+async def _report() -> tuple[bool, dict]:
+    """Whether every dependency is ok, and the full report."""
     results = {}
     overall_ok = True
 
@@ -46,12 +52,21 @@ async def health_check():
     # take the whole stack down over a tuning warning.
     resources = {"memory": system_info.memory_info(settings.recommended_memory_gb)}
 
-    status_code = 200 if overall_ok else 503
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "status": "ok" if overall_ok else "degraded",
-            "services": results,
-            "resources": resources,
-        },
-    )
+    return overall_ok, {
+        "status": "ok" if overall_ok else "degraded",
+        "services": results,
+        "resources": resources,
+    }
+
+
+@router.get("/health")
+async def health_check():
+    overall_ok, _ = await _report()
+    return JSONResponse(status_code=200 if overall_ok else 503,
+                        content={"status": "ok" if overall_ok else "degraded"})
+
+
+@router.get("/health/details")
+async def health_details():
+    overall_ok, report = await _report()
+    return JSONResponse(status_code=200 if overall_ok else 503, content=report)

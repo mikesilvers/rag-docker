@@ -335,9 +335,10 @@ Argument validation raised inside a tool body must also use `ToolError`, not
 `ValueError`.
 
 `rag_health` is the one endpoint that must not raise on a 4xx/5xx: the API
-answers `503` with a full body naming the failing component. `ragclient.request`
-takes an `allow_status` tuple so that status returns normally and the structured
-body reaches the caller intact.
+answers `503` with `{"status": "degraded"}` when a dependency is down (since
+#750 the per-service body is at `/health/details`, behind a login).
+`ragclient.request` takes an `allow_status` tuple so that status returns
+normally and the body reaches the caller intact.
 
 ### 6.5 Bounded polling (spec §4.3)
 

@@ -354,7 +354,7 @@ const record = (i, r, l) => ({ timestamp: `2026-10-21T10:0${i}:00Z`, collection:
 const metrics = (records, stats = {}) => json(200, { total_records: records.length, retrieval_latency: { p50: 10.4, p95: 20.6, p99: 30.2 }, llm_latency: { p50: 100.2, p95: 200.7, p99: 300.4 }, total_latency: { p50: 110.7, p95: 221.1, p99: 331.9 }, history: records, ...stats });
 
 function healthCases() {
-  const open = m => ({ role: 'engineer', path: '/health', routes: common({ 'GET /api/health': health, 'GET /api/metrics/latency': m, 'GET /api/goldstandard/diagnostics': json(200, { issues: [] }) }) });
+  const open = m => ({ role: 'engineer', path: '/health', routes: common({ 'GET /api/health/details': health, 'GET /api/metrics/latency': m, 'GET /api/goldstandard/diagnostics': json(200, { issues: [] }) }) });
   return [
     { name: 'Health shows the latency trend heading, a P50/P95/P99 row per stage in whole ms, and a chart with its three series', open: open(metrics([record(1, 10, 100), record(2, 12, 110), record(3, 14, 120)])), async run(s) {
       await waitText(s.page, 'Latency Trends (3 queries in ring buffer)');
