@@ -111,9 +111,11 @@ request but `/health` and the login (#25).
   only route that reads a request body before authentication, so the proxy
   accepts a body of at most 16k there; nginx refuses a larger one with `413`
   before the API reads it.
-- **Not covered yet.** The MCP server's use of keys is #39. `GET /health` is
-  open, for container healthchecks, and reports service status and host
-  resources.
+- **Health (#750).** `GET /health` stays open, for container healthchecks,
+  and answers only `ok` or `degraded`. Which service is down, the model
+  names, latencies and the host's memory are at `GET /health/details`, for
+  Developers and AI Engineers (a session or a key).
+- **Not covered yet.** The MCP server's use of keys is #39.
 
 Exposing the workbench to an untrusted network is outside the supported
 configuration, but reports of issues that make that riskier than expected are
