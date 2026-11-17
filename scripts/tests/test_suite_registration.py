@@ -29,6 +29,7 @@ REGISTERED = (
     ('scripts/tests/test_prepare.py', '21_prepare.sh', True),
     ('scripts/tests/test_offline_ingest.py', '20_offline_model.sh', True),
     ('scripts/verify/ui_ingest_weaviate.py', '22_ui_ingest.sh', False),
+    ('scripts/tests/test_installed_authlib.py', '01_infrastructure.sh', True),
 )
 
 
