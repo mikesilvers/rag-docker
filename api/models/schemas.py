@@ -617,6 +617,19 @@ class PasswordChangeRequest(BaseModel):
     new_password: str = Field(max_length=1024)
 
 
+class MfaCodeRequest(BaseModel):
+    code: str = Field(max_length=64)   # a 6-digit TOTP code or a recovery code (#607)
+
+
+class MfaDisableRequest(BaseModel):
+    password: str = Field(max_length=1024)
+    code: str = Field(max_length=64)
+
+
+class MfaPolicyRequest(BaseModel):
+    required: bool
+
+
 class AuthStatus(BaseModel):
     setup_required: bool
 
@@ -626,6 +639,10 @@ class AuthUser(BaseModel):
     role: Literal["end_user", "developer", "engineer"]
     must_change_password: bool
     kind: Optional[Literal["user", "service"]] = None   # GET /auth/me: a session's user or a key's principal
+    # Two-step verification (#607): enrolled, the switch, and a set-up due because of it.
+    mfa_enrolled: Optional[bool] = None
+    mfa_required: Optional[bool] = None
+    mfa_enrollment_required: Optional[bool] = None
 
 
 class AdminUser(BaseModel):
@@ -634,6 +651,7 @@ class AdminUser(BaseModel):
     enabled: bool
     must_change_password: bool
     created_at: str
+    mfa_enrolled: bool = False
 
 
 class AdminUserList(BaseModel):

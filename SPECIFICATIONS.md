@@ -1484,17 +1484,18 @@ objects as the aggregate stat row.
 
 #### 3.1.8 Authentication and the endpoint/role matrix (#25)
 
-Every route needs an account, except `GET /health` (unchanged, for container healthchecks), `GET /auth/status`
-and `POST /auth/login`. Roles are ordered `end_user` < `developer` < `engineer`; a role may do everything a lower
+Every route needs an account, except `GET /health` (unchanged, for container healthchecks), `GET /auth/status`,
+`POST /auth/login` and `POST /auth/login/mfa` (the code step of a login with two-step verification, #607). Roles are ordered `end_user` < `developer` < `engineer`; a role may do everything a lower
 one may. The role of a request is the one stored for its user at that moment, never anything the client sends.
 
 | Needs | Routes |
 |---|---|
-| nothing | `GET /health`, `GET /auth/status`, `POST /auth/login` |
+| nothing | `GET /health`, `GET /auth/status`, `POST /auth/login`, `POST /auth/login/mfa` |
 | any session (also one with a password change due) | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password` |
+| any session, after a due password change (also one with a two-step set-up due) | `GET /auth/mfa`, `POST /auth/mfa/enroll`, `POST /auth/mfa/enroll/confirm`, `POST /auth/mfa/recovery-codes`, `POST /auth/mfa/disable` |
 | `end_user` | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
 | `developer` | `POST /collections`; `POST /ingest/upload`, `GET /ingest/job/{job_id}`, `GET /ingest/jobs`, `GET /ingest/config/{collection}`, `POST /ingest/config`; `POST /retrieval/config`; `POST /goldstandard/generate`, `GET /goldstandard/session/{session_id}`, `GET /goldstandard/sessions`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST /goldstandard/save`, `GET /goldstandard/download/{filename}`; `POST /export`, `GET /export/job/{job_id}`, `GET /export/jobs`, `POST /import`, `GET /import/job/{job_id}`, `GET /import/jobs`, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}`; document preparation (§3.1.11): `POST /prepare/upload`, `GET /prepare/documents`, `GET /prepare/documents/{document_id}`, `GET /prepare/documents/{document_id}/raw`, `GET /prepare/documents/{document_id}/prepared`, `DELETE /prepare/documents/{document_id}`, `DELETE /prepare/documents/{document_id}/prepared`, `POST /prepare/jobs`, `GET /prepare/jobs`, `GET /prepare/job/{job_id}`, `POST /prepare/job/{job_id}/cancel`, `POST /prepare/import` |
-| `engineer` | `DELETE /collections/{name}`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json`; account administration: `GET /auth/users`, `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `POST /auth/users/{username}/role`, `POST /auth/users/{username}/disable`, `POST /auth/users/{username}/enable`; service principals and keys: `GET /auth/service-principals`, `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `POST /auth/service-principals/{name}/disable`, `POST /auth/service-principals/{name}/enable`, `POST /auth/service-principals/{name}/keys`, `POST /auth/service-principals/{name}/keys/{key_id}/revoke`; the audit log (§3.1.9): `GET /audit`, `GET /audit.csv` |
+| `engineer` | `DELETE /collections/{name}`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json`; account administration: `GET /auth/users`, `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `POST /auth/users/{username}/role`, `POST /auth/users/{username}/disable`, `POST /auth/users/{username}/enable`, `POST /auth/users/{username}/reset-mfa`, `POST /auth/mfa/policy`; service principals and keys: `GET /auth/service-principals`, `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `POST /auth/service-principals/{name}/disable`, `POST /auth/service-principals/{name}/enable`, `POST /auth/service-principals/{name}/keys`, `POST /auth/service-principals/{name}/keys/{key_id}/revoke`; the audit log (§3.1.9): `GET /audit`, `GET /audit.csv` |
 
 The matrix is one table in `api/auth/policy.py`. A route without an entry is refused for everyone (`403
 FORBIDDEN`), and a registered check fails when a route lacks an entry or an entry names no route. Jobs and
@@ -1508,7 +1509,8 @@ is never received.
 AUTH_REQUIRED` (no valid session); `403 CROSS_ORIGIN_REFUSED` (a cookie-authenticated `POST`, `PUT`, `PATCH` or
 `DELETE` whose `Origin` names another host or port than its `Host`, or that has no `Origin` and no `Sec-Fetch-Site:
 same-origin`); `403 PASSWORD_CHANGE_REQUIRED` (a generated password is due for change; only the session routes
-answer); `403 FORBIDDEN` (the role is too low; `detail: {"required_role": ...}`). The API has no CORS middleware
+answer); `403 MFA_ENROLLMENT_REQUIRED` (two-step verification is required for everyone and the user hasn't set it
+up; only the session routes and the user's own `/auth/mfa` routes answer); `403 FORBIDDEN` (the role is too low; `detail: {"required_role": ...}`). The API has no CORS middleware
 and sends no `Access-Control-*` headers. A request with an `Authorization` header is a service key request and
 has its own refusals (**Service keys**, below).
 
@@ -1539,13 +1541,13 @@ to 10 a minute per client address with a burst of 5 (`429 LOGIN_RATE_LIMITED`, �
 | Route | Request | Success |
 |---|---|---|
 | `GET /auth/status` | | `200 {"setup_required": bool}` |
-| `POST /auth/login` | `{"username", "password"}` | `200 {"username", "role", "must_change_password"}` and the cookie. Every failure (unknown user, wrong password, disabled account, malformed username) is the same `401 LOGIN_FAILED` "The username or password is incorrect.", checked against a hash either way so the time doesn't differ |
-| `GET /auth/me` | | `200 {"username", "role", "must_change_password", "kind"}`; `kind` is `user` for a session and `service` for an API key (whose `must_change_password` is `false`) |
+| `POST /auth/login` | `{"username", "password"}` | `200 {"username", "role", "must_change_password", "mfa_enrolled", "mfa_required", "mfa_enrollment_required"}` and the cookie; for a user with two-step verification, `200 {"mfa_required": true}` and the challenge cookie instead (**Two-step verification**, below). Every failure (unknown user, wrong password, disabled account, malformed username) is the same `401 LOGIN_FAILED` "The username or password is incorrect.", checked against a hash either way so the time doesn't differ |
+| `GET /auth/me` | | `200 {"username", "role", "must_change_password", "kind", "mfa_enrolled", "mfa_required", "mfa_enrollment_required"}`; `kind` is `user` for a session and `service` for an API key (whose `must_change_password` and MFA fields are `false`); `mfa_required` is the switch, `mfa_enrollment_required` that it is on and the user isn't enrolled |
 | `POST /auth/logout` | | `200 {"status": "logged_out"}`; the session is deleted and the cookie expired |
 | `POST /auth/password` | `{"current_password", "new_password"}` | `200 {"status": "changed", "username", "role", "must_change_password": false}`; the user's other sessions end, this one stays. A wrong current password is `403 PASSWORD_INCORRECT`; a new one breaking the rules, or equal to the current one (so a generated password can't be kept), is `422 INVALID_PASSWORD` naming the rule |
 
 **Account administration** (engineers only). `User` is `{"username", "role", "enabled", "must_change_password",
-"created_at"}` (`created_at` in ISO 8601 UTC); it never holds a password, hash or session. A `{username}` in a path
+"created_at", "mfa_enrolled"}` (`created_at` in ISO 8601 UTC); it never holds a password, hash or session. A `{username}` in a path
 is lowercased; one that doesn't exist, or breaks the username rule, is `404 USER_NOT_FOUND`. A role other than
 `end_user`, `developer` or `engineer`, or a missing field, is `422 INVALID_PARAMETER`.
 
@@ -1557,6 +1559,8 @@ is lowercased; one that doesn't exist, or breaks the username rule, is `404 USER
 | `POST /auth/users/{username}/role` | `{"role"}` | `200 {"user": User}`; existing sessions take the role on their next request |
 | `POST /auth/users/{username}/disable` | | `200 {"user": User}`; the user's sessions end and their logins fail with `LOGIN_FAILED` |
 | `POST /auth/users/{username}/enable` | | `200 {"user": User}`; the user can log in again with their current password |
+| `POST /auth/users/{username}/reset-mfa` | | `200 {"user": User}`: the user's two-step secret, recovery codes and challenges are deleted and all their sessions end (also when they weren't enrolled). The engineer's own account is `409 SELF_MFA_RESET_REFUSED` (another engineer, or the operator's `reset-mfa`) |
+| `POST /auth/mfa/policy` | `{"required": bool}` | `200 {"required"}`: requires two-step verification for everyone, or stops requiring it. Turning it on while the engineer isn't enrolled is `409 MFA_ENROLL_FIRST`; setting the current value changes nothing |
 
 A generated password (as the operator command's) is in its `201` or `200` answer only, sent with
 `Cache-Control: no-store`, and nowhere else. Demoting or disabling the last enabled engineer is `409
@@ -1613,6 +1617,44 @@ enabled. The account routes stay for people: `GET /auth/users` lists no principa
 `/auth/users/{username}/...` path is `404 USER_NOT_FOUND`, and `POST /auth/users` with a principal's name is
 `409 USER_EXISTS`.
 
+**Two-step verification** (#607). TOTP with an authenticator app; no SMS and no external service, so it works
+offline. Service keys are unchanged: they have no second factor and get `403 KEY_NOT_ALLOWED` on every `/auth/mfa`
+route and on `reset-mfa`.
+
+- *Codes.* RFC 6238 with HMAC-SHA1, 6 digits, a 30-second step and a 160-bit random secret. A code counts for the
+  step before, the current one or the one after, and only for a step later than the last one the user's account
+  accepted, so no code works twice. A *recovery code* is 80 random bits shown as `xxxx-xxxx-xxxx-xxxx` (case,
+  spaces and `-` ignored); a user has 10, each works once in place of a code at login or for turning off, and they
+  are stored only as SHA-256.
+- *At rest.* `auth.db` (schema 3: tables `mfa`, `mfa_pending`, `recovery_codes`, `mfa_challenges`, `settings`;
+  an existing store gains them on first open with nobody enrolled and the switch off) holds each TOTP secret sealed
+  with AES-256-GCM, the user id as associated data, under a 32-byte key in `AUTH_DIR/mfa.key` (mode 0600, created
+  on first need). A copied `auth.db` alone reveals no secret. A secret that can't be unsealed (the key file lost or
+  replaced) never verifies: its user logs in with a recovery code, or is reset.
+- *Login.* For an enrolled user a right password opens no session: `POST /auth/login` answers `200
+  {"mfa_required": true}` and sets `rag_mfa` (a random 256-bit token, stored as SHA-256; HttpOnly,
+  SameSite=Strict, Path=/, Max-Age=300, Secure as `rag_session`), and the pair's earlier login failures stay
+  counted. `POST /auth/login/mfa {"code"}` (a TOTP code or a recovery code, at most 64 characters) then needs a
+  challenge under 5 minutes old with fewer than 5 codes tried, else `401 MFA_CHALLENGE_INVALID` "Your sign-in
+  expired. Log in again." (also once the user is disabled or reset). Each code counts against the login throttle of
+  the username and address before it is checked (`429 LOGIN_THROTTLED`). A wrong code is `401 MFA_FAILED` "The code
+  is incorrect.", for both kinds; a right one deletes the challenge, expires `rag_mfa` and answers as a login
+  without two-step verification, session cookie included. nginx limits `/api/auth/login/mfa` in the login's zone,
+  with its 16k body limit.
+- *The user's own routes.*
+
+| Route | Request | Success |
+|---|---|---|
+| `GET /auth/mfa` | | `200 {"enrolled", "enrolled_at", "required", "recovery_codes_remaining"}` |
+| `POST /auth/mfa/enroll` | | `200 {"secret", "otpauth_uri"}`, `Cache-Control: no-store`: a pending secret for 10 minutes, replacing an earlier one. Enrolled: `409 MFA_ALREADY_ENROLLED` |
+| `POST /auth/mfa/enroll/confirm` | `{"code"}` | `200 {"recovery_codes", "status"}`, `Cache-Control: no-store`: the secret becomes the user's, 10 recovery codes are made, and the user's other sessions end. No set-up in progress (or older than 10 minutes): `409 MFA_ENROLLMENT_NOT_STARTED`; a wrong code `422 MFA_CODE_INCORRECT` (the set-up stays) |
+| `POST /auth/mfa/recovery-codes` | `{"code"}` | `200 {"recovery_codes", "status"}`, `Cache-Control: no-store`: a new set replacing the old one, for a current TOTP code. A wrong code is `403 MFA_CODE_INCORRECT` and counts against the throttle; not enrolled `409 MFA_NOT_ENROLLED` |
+| `POST /auth/mfa/disable` | `{"password", "code"}` | `200 {"status"}`: the secret and recovery codes are deleted; sessions stay. Needs the current password and a TOTP or recovery code (either wrong: `403 MFA_DISABLE_INCORRECT`, counted against the throttle). While two-step verification is required: `409 MFA_REQUIRED`; not enrolled `409 MFA_NOT_ENROLLED` |
+
+- *Required for everyone.* While an engineer has it on (`POST /auth/mfa/policy`, only in the app), a session of a
+  user who isn't enrolled, existing sessions included, reaches only the session routes and the user's own
+  `/auth/mfa` routes; everything else is `403 MFA_ENROLLMENT_REQUIRED`. A due password change comes first.
+
 **Operator command**, inside the api container: `docker compose exec api python -m auth <subcommand>`.
 
 | Subcommand | Effect |
@@ -1622,6 +1664,7 @@ enabled. The account routes stay for people: `GET /auth/users` lists no principa
 | `reset-password USERNAME` | New generated password; the user's sessions end |
 | `set-role USERNAME ROLE` | Applies to existing sessions on their next request |
 | `disable USERNAME` / `enable USERNAME` | Disabling ends the user's sessions |
+| `reset-mfa USERNAME` | Removes the user's two-step verification (secret, recovery codes) and ends their sessions; the last-resort recovery, also for an engineer's own account. Refused (exit 1) for a service principal or an unknown name |
 | `list` | Username, role, enabled, password change due (`service account` for a service principal), created; never a password, hash or key |
 
 `bootstrap`, `create-user` and `reset-password` print a generated password (24 characters, 144 random bits)
@@ -1639,14 +1682,15 @@ is a single-file bind mount, and a proxy still running the old copy sends `Host`
 cookie-authenticated change fails the origin check with `403 CROSS_ORIGIN_REFUSED`.
 
 **Logging.** One `WARNING` line per login attempt (success, failure, throttled) on logger `auth`, with the
-username and client address; never a password, token or cookie. One `WARNING` line per account administration
+username and client address; never a password, token or cookie. Likewise one per second-factor attempt (accepted,
+failed, throttled) and per two-step set-up, regeneration, turn-off, reset and switch change, never a secret or code. One `WARNING` line per account administration
 change (create, reset, role, disable, enable) naming the engineer, the change and the account, and one per refusal
 (`INVALID_USERNAME`, `USER_EXISTS`, `USER_NOT_FOUND`, `LAST_ENGINEER`, `SELF_RESET_REFUSED`) saying why; never a
 password. One `WARNING` line per service principal or key change (create, role, disable, enable, key issued, key
 revoked) naming the engineer, the principal and the key id (and the role or expiry), and one per refusal
 (`INVALID_USERNAME`, `PRINCIPAL_EXISTS`, `PRINCIPAL_NOT_FOUND`, `KEY_NOT_FOUND`); never a key or its hash.
 A refused username or name longer than 256 characters is logged, and recorded as the audit target, cut to its first 256 characters.
-Successful key requests aren't logged one by one (`last_used_at` records them). The telemetry route vocabulary gains the eighteen `/auth` routes as labels.
+Successful key requests aren't logged one by one (`last_used_at` records them). The telemetry route vocabulary gains the `/auth` routes as labels (eighteen, and eight more with two-step verification, #607).
 These lines are unchanged by the audit log (§3.1.9), which records the same events durably.
 
 #### 3.1.9 Audit log (#29)
@@ -1683,10 +1727,14 @@ built yet; it is to include this folder.
 **Actions.** `auth.login` (success, failure, throttled), `auth.logout`, `auth.password`; `query`;
 `collection.create`, `collection.delete`; `ingest`, `ingest.config`; `retrieval.config`; `export`, `import`;
 `tune.rechunk`, `tune.reembed`, `tune.reindex`; `goldstandard.save`, `goldstandard.download`; `admin.user.create`,
-`admin.user.reset-password`, `admin.user.set-role`, `admin.user.disable`, `admin.user.enable`;
+`admin.user.reset-password`, `admin.user.set-role`, `admin.user.disable`, `admin.user.enable`,
+`admin.user.reset-mfa`, `admin.mfa.policy` (`details.required`); two-step verification (#607): `auth.mfa` (each
+code attempt that reaches a live challenge, never counted in a window: actor the user, `details.method` `totp` or
+`recovery`; a request with no live challenge writes nothing; the password step before it is `auth.login` with
+`details.mfa` `required`), `auth.mfa.enroll`, `auth.mfa.recovery-codes`, `auth.mfa.disable`;
 `admin.principal.create`, `admin.principal.set-role`, `admin.principal.disable`, `admin.principal.enable`,
 `admin.key.issue`, `admin.key.revoke`; `audit.view`, `audit.download`; `operator.bootstrap`, `operator.create-user`,
-`operator.reset-password`, `operator.set-role`, `operator.disable`, `operator.enable` (`python -m auth`; not `list`,
+`operator.reset-password`, `operator.set-role`, `operator.disable`, `operator.enable`, `operator.reset-mfa` (`python -m auth`; not `list`,
 not usage errors); `system.start` (each API start, after the job records are loaded, with `question_text_logged`,
 `max_bytes` and `keep`); document preparation (§3.1.11): `prepare.upload` (names, count, bytes), `prepare.start`
 (the ids or `all`; the job's `accepted` and end records), `prepare.cancel`, `prepare.import` (collection and part
@@ -2845,12 +2893,13 @@ them in browser storage; the session is the HttpOnly cookie. On load it asks `GE
 | State | Shown |
 |---|---|
 | Setup required | "Not set up yet" with the command `docker compose exec api python -m auth bootstrap <username>`, and nothing else |
-| No valid session | The login page at `/login` (any other path redirects there): username, password, "Log in". A failure shows the API's message (the generic `LOGIN_FAILED`, or "wait" when throttled) and clears the password. Success opens `/qa` |
+| No valid session | The login page at `/login` (any other path redirects there): username, password, "Log in". A failure shows the API's message (the generic `LOGIN_FAILED`, or "wait" when throttled) and clears the password. Success opens `/qa`. For a user with two-step verification (#607) the page then asks for "Authentication code" (from the app, or a recovery code) with "Verify" and "Back"; a wrong code shows the API's message and clears the field, `MFA_CHALLENGE_INVALID` returns to the password step, and success opens `/qa` |
 | Password change due | Only the password page at `/account/password`: current password, new password, the new one again, "Change password" and "Log out". A mismatch is caught before sending; the API's rule message is shown; success opens `/qa` |
-| Logged in | The pages of the user's role (§7.2) and `/account/password`, where a change says the other sessions were logged out |
+| Two-step set-up due (#607) | After a due password change: only the account page at `/account` (§7.17), with "Log out"; once set up and the recovery codes put away, `/qa` |
+| Logged in | The pages of the user's role (§7.2), `/account` (§7.17) and `/account/password`, where a change says the other sessions were logged out |
 
-Any API answer `401 AUTH_REQUIRED` returns the UI to the login page, and `403 PASSWORD_CHANGE_REQUIRED` to the
-password page.
+Any API answer `401 AUTH_REQUIRED` returns the UI to the login page, `403 PASSWORD_CHANGE_REQUIRED` to the
+password page, and `403 MFA_ENROLLMENT_REQUIRED` to the account page.
 
 | Role | Label |
 |---|---|
@@ -2884,11 +2933,12 @@ Developer also Data and Tune, an Engineer also Admin.
 | Admin | Service keys | ✓ | — | — |
 | Admin | Audit | ✓ | — | — |
 | Admin | Health | ✓ | — | — |
-| Account (labelled with the username and role badge) | Change password | ✓ | ✓ | ✓ |
+| Account (labelled with the username and role badge) | Account | ✓ | ✓ | ✓ |
+| Account | Change password | ✓ | ✓ | ✓ |
 | Account | Log out | ✓ | ✓ | ✓ |
 
 - **Current page.** The current page's entry has `aria-current="page"` and is highlighted, and so is
-  the button of the menu that holds it (`/account/password` highlights the account menu). A page with
+  the button of the menu that holds it (`/account` and `/account/password` highlight the account menu). A page with
   no entry, such as `/help/transfer`, highlights nothing.
 - **Menus.** Each menu follows the WAI-ARIA menu button pattern: a button with `aria-haspopup="menu"`,
   `aria-expanded` and, while open, `aria-controls` naming a `role="menu"` element labelled by the
@@ -3201,11 +3251,15 @@ page renders as one undifferentiated block.
 **Roles:** Engineer only (others are sent to `/qa`)
 
 - A table of every account from `GET /auth/users`: username (the engineer's own marked "(you)"), a role selector,
-  Enabled or Disabled, the password state ("Change due" or "Set"), and the creation date. If the list can't be
+  Enabled or Disabled, the password state ("Change due" or "Set"), two-step verification ("On" or "Off", #607),
+  and the creation date. If the list can't be
   loaded the page says "Could not load the users:" with the reason, as an alert.
 - A form with username, role (End User by default) and "Create user". The username rule is shown under it.
 - Each row: changing the role selector sends the role change; "Disable" or "Enable"; and "Reset password", except
-  on the engineer's own row, which says to use Change password instead.
+  on the engineer's own row, which says to use Change password instead; and "Reset two-step" on a row whose user
+  has two-step verification on, except the engineer's own (#607).
+- A checkbox "Require two-step verification for everyone" (#607), checked from `GET /auth/me`'s `mfa_required`; a
+  refusal (`MFA_ENROLL_FIRST`) shows the API's message as an alert.
 - After a create or a reset, a panel shows the username and the generated password, says it is shown only once and
   must be changed at first login, and has "Done", which removes it. The password is kept only in the page's memory.
 - A refused change shows the API's message as an alert and reloads the list. After a change to the engineer's own
@@ -3297,6 +3351,24 @@ nothing about jobs is kept in browser storage.
 - A refusal shows the API's message as an alert.
 
 The Import page shows a link "Prepare documents first" to `/prepare` beside the corpus rules link.
+
+### 7.17 Account Page (#607)
+
+**Route:** `/account`  
+**Roles:** All (also the only page while a two-step set-up is due, §7.1)
+
+- The heading "Account", the username and a link to Change password (`/account/password`); the account menu's
+  "Account" entry opens it.
+- A "Two-step verification" section from `GET /auth/mfa`:
+  - Off: a short explanation and "Set up" (while required for everyone: that it is required). "Set up" shows a QR
+    code of the `otpauth://` URI, drawn in the browser by the pinned npm package `qrcode-generator`, the secret as
+    text for manual entry, a code field, "Confirm" and "Cancel".
+  - After "Confirm": the 10 recovery codes, said to be shown only once, and "Done", which removes them.
+  - On: since when, how many of the 10 recovery codes are left, "Regenerate recovery codes" (a current code; the
+    new set is shown once in the same way) and, only while it isn't required, "Turn off" (password and a code from
+    the app or a recovery code).
+- An error shows the API's message as an alert. The secret and the codes are kept only in the page's memory, never
+  in browser storage.
 
 ## 8. Configuration Defaults and Constraints
 
@@ -4236,6 +4308,41 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   message.
   *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request
   interception; `ui_criteria.js` checks the real engineer's nav includes Service keys.*
+
+Two-step verification (#607). These are ticked once the tests reviewer's full `stack.sh run` on the change passes.
+
+- [ ] Codes are RFC 6238 (SHA-1, 6 digits, 30 s, a 160-bit secret), accepted one step either side and never twice;
+  a recovery code is 80 bits, works once and is stored only as SHA-256; a TOTP secret is stored only sealed with
+  AES-256-GCM under `AUTH_DIR/mfa.key` (0600), and one sealed for another user or under another or a lost key never
+  verifies; an existing store gains the schema 3 tables with nobody enrolled.
+  *Evidence: `scripts/tests/test_auth.py` `MfaUnitTests` (the RFC 6238 Appendix B vectors) and `MfaStoreTests`
+  (suite 17).*
+- [ ] A right password for an enrolled user opens no session and sets the 5-minute `rag_mfa` challenge; the code
+  step accepts a TOTP or recovery code, counts each against the login throttle (a right password doesn't clear
+  earlier failures), allows 5 codes per challenge, refuses an expired, used-up or reset user's challenge with `401
+  MFA_CHALLENGE_INVALID`, a wrong code with the same `401 MFA_FAILED` for both kinds, and opens a session for a
+  right one; nginx limits the code step in the login's zone.
+  *Evidence: `test_auth.py` `MfaLoginTests` (suite 17); `auth_stack.py mfa` on the running stack: set-up, password
+  then code, a used code and a used recovery code refused, and no secret or code in the API log (suite 17).*
+- [ ] Set-up shows the secret once (`no-store`), needs a code from the app, makes 10 recovery codes shown once and
+  ends the user's other sessions; regeneration needs a current TOTP code; a user turns it off with their password
+  and a code only while it isn't required; an engineer resets another user's set-up, ending their sessions, but not
+  their own; the operator command's `reset-mfa` does it for anyone; with the switch on (only for an enrolled
+  engineer), an unenrolled user's sessions reach only the session and `/auth/mfa` routes (`403
+  MFA_ENROLLMENT_REQUIRED`), after a due password change; API keys can't use any of it and aren't gated.
+  *Evidence: `test_auth.py` `MfaStoreTests`, `MfaRouteTests`, `CommandTests.test_reset_mfa` and the policy checks;
+  `test_auth_enforcement.py` with the seven new protected routes; `auth_stack.py matrix` and `key-matrix` with the
+  engineer routes and `auth_stack.py mfa` with an Engineer's reset (suite 17).*
+- [ ] Every enrollment, regeneration, turn-off, reset (engineer and operator) and switch change is an audit record,
+  and each second-factor attempt on a live challenge is its own record with the user as actor and the method, never
+  a code or secret.
+  *Evidence: `scripts/tests/test_audit.py` `MiddlewareTests.test_second_factor_records`,
+  `test_enrollment_reset_and_switch_records` and `CommandTests` (suite 19).*
+- [ ] The UI: the login's code step; the Account page (account menu "Account") with the QR code drawn in the
+  browser, the secret as text, the recovery codes shown once, regeneration and turn-off; the forced set-up page; the
+  Users page's Two-step column, "Reset two-step" and the switch.
+  *Evidence: `scripts/verify/browser/ui_controls.js` "Two-step verification" cases (suite 06), with every API call
+  answered by request interception.*
 
 ### 10.7 Audit log (#29)
 

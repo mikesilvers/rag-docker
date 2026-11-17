@@ -11,6 +11,9 @@ import re
 ROLES = ("end_user", "developer", "engineer")   # lowest to highest
 PUBLIC = "public"     # no session needed
 SESSION = "session"   # any logged-in user, even one who must change their password
+# Any logged-in user's own two-step verification (#607): after a due password
+# change, and still open while a required set-up is due (the way out of it).
+MFA = "mfa"
 
 END_USER, DEVELOPER, ENGINEER = ROLES
 
@@ -22,6 +25,14 @@ ACCESS: dict[tuple[str, str], str] = {
     ("GET", "/auth/me"): SESSION,
     ("POST", "/auth/logout"): SESSION,
     ("POST", "/auth/password"): SESSION,
+    # Two-step verification (#607): the code after the password, and the
+    # user's own set-up, recovery codes and turn-off.
+    ("POST", "/auth/login/mfa"): PUBLIC,
+    ("GET", "/auth/mfa"): MFA,
+    ("POST", "/auth/mfa/enroll"): MFA,
+    ("POST", "/auth/mfa/enroll/confirm"): MFA,
+    ("POST", "/auth/mfa/recovery-codes"): MFA,
+    ("POST", "/auth/mfa/disable"): MFA,
     # What the Q&A page needs (Q4).
     ("GET", "/collections"): END_USER,
     ("POST", "/query"): END_USER,
@@ -78,6 +89,8 @@ ACCESS: dict[tuple[str, str], str] = {
     ("POST", "/auth/users/{username}/role"): ENGINEER,
     ("POST", "/auth/users/{username}/disable"): ENGINEER,
     ("POST", "/auth/users/{username}/enable"): ENGINEER,
+    ("POST", "/auth/users/{username}/reset-mfa"): ENGINEER,
+    ("POST", "/auth/mfa/policy"): ENGINEER,               # require two-step verification for everyone
     # Service principals and their keys (PR 3 of #25). Nothing deletes a principal.
     ("GET", "/auth/service-principals"): ENGINEER,
     ("POST", "/auth/service-principals"): ENGINEER,
@@ -101,9 +114,10 @@ ACCESS: dict[tuple[str, str], str] = {
 # account, principal and key administration, so a leaked key can't mint further
 # keys or accounts that outlive its revocation, and the session's own routes.
 # GET /auth/me answers for a key. The audit log too (#29): a leaked key can't
-# read who did what, or question text when that is recorded.
+# read who did what, or question text when that is recorded. And two-step
+# verification (#607): service keys are unchanged and have no second factor.
 HUMAN_ONLY = frozenset(path for _, path in ACCESS
-                       if path.startswith(("/auth/users", "/auth/service-principals"))) | {
+                       if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa"))) | {
     "/auth/logout", "/auth/password", "/audit", "/audit.csv"}
 
 

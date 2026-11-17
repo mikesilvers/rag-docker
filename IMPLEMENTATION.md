@@ -665,6 +665,23 @@ location = /api/auth/login {
     proxy_connect_timeout 10s;
 }
 
+# The second step of a login with two-step verification (#607): the code. It
+# shares the login's zone, so a client's passwords and codes together stay
+# within 10 a minute and a burst of 5, and gets the same 16k body limit (a
+# code is at most 64 characters).
+location = /api/auth/login/mfa {
+    limit_req zone=login burst=5 nodelay;
+    limit_req_status 429;
+    error_page 429 = @login_rate_limited;
+    client_max_body_size 16k;
+    proxy_pass http://api/auth/login/mfa;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 300s;
+    proxy_connect_timeout 10s;
+}
+
 location @login_rate_limited {
     default_type application/json;
     return 429 '{"error":{"code":"LOGIN_RATE_LIMITED","message":"Too many login attempts. Wait a minute and try again.","detail":null}}';
@@ -2291,6 +2308,19 @@ class PasswordChangeRequest(BaseModel):
     new_password: str = Field(max_length=1024)
 
 
+class MfaCodeRequest(BaseModel):
+    code: str = Field(max_length=64)   # a 6-digit TOTP code or a recovery code (#607)
+
+
+class MfaDisableRequest(BaseModel):
+    password: str = Field(max_length=1024)
+    code: str = Field(max_length=64)
+
+
+class MfaPolicyRequest(BaseModel):
+    required: bool
+
+
 class AuthStatus(BaseModel):
     setup_required: bool
 
@@ -2300,6 +2330,10 @@ class AuthUser(BaseModel):
     role: Literal["end_user", "developer", "engineer"]
     must_change_password: bool
     kind: Optional[Literal["user", "service"]] = None   # GET /auth/me: a session's user or a key's principal
+    # Two-step verification (#607): enrolled, the switch, and a set-up due because of it.
+    mfa_enrolled: Optional[bool] = None
+    mfa_required: Optional[bool] = None
+    mfa_enrollment_required: Optional[bool] = None
 
 
 class AdminUser(BaseModel):
@@ -2308,6 +2342,7 @@ class AdminUser(BaseModel):
     enabled: bool
     must_change_password: bool
     created_at: str
+    mfa_enrolled: bool = False
 
 
 class AdminUserList(BaseModel):
@@ -17263,6 +17298,201 @@ def bearer(value: str | None) -> str | None:
     return key
 ```
 
+### api/auth/mfa.py
+
+```python
+"""Two-step verification (MFA, #607): TOTP codes, recovery codes and the
+encryption of TOTP secrets at rest. Pure functions; the store (store.py) keeps
+the rows and decides when a code counts.
+
+- TOTP is RFC 6238 with HMAC-SHA1, 6 digits and a 30-second step, what every
+  common authenticator app supports, over a 160-bit random secret. A code is
+  accepted for the step before, the current one and the one after (clock drift)
+  and only for a step later than the last one accepted, so no code works twice.
+- Recovery codes are 80 random bits each, shown as `xxxx-xxxx-xxxx-xxxx` and
+  stored only as the SHA-256 of their normalized form: with that much entropy
+  and the login throttle, a slow hash would add nothing.
+- A TOTP secret has to be read back, so it can't be hashed. It is sealed with
+  AES-256-GCM under a key kept in its own file, `AUTH_DIR/mfa.key` (0600),
+  with the user id as associated data: a copied `auth.db` alone (a bug report,
+  a partial backup) reveals no secret, and a sealed secret can't be moved to
+  another user. A secret that can't be unsealed (the key file lost or
+  replaced) never verifies; its user signs in with a recovery code or is reset.
+
+Nothing here logs a secret, code or key.
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import os
+import re
+import secrets
+import struct
+from pathlib import Path
+from urllib.parse import quote
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from config import settings
+
+STEP_S = 30           # the TOTP time step
+DIGITS = 6
+WINDOW = 1            # steps accepted either side of the current one
+SECRET_BYTES = 20     # 160 bits, RFC 4226's recommended length
+RECOVERY_COUNT = 10
+RECOVERY_BYTES = 10   # 80 bits: 16 base32 characters
+ISSUER = "RAG Platform"
+KEY_FILE = "mfa.key"
+_NONCE = 12
+# ASCII digits only: \d also matches other scripts' digits, which
+# hmac.compare_digest refuses with a TypeError (a 500 and no audit record).
+_TOTP = re.compile(r"[0-9]{6}")
+_RECOVERY = re.compile(r"[a-z2-7]{16}")
+
+
+def _b32(raw: bytes) -> str:
+    return base64.b32encode(raw).decode("ascii").rstrip("=")
+
+
+def _unb32(text: str) -> bytes:
+    text = text.upper()
+    return base64.b32decode(text + "=" * (-len(text) % 8))
+
+
+# ── TOTP ─────────────────────────────────────────────────────────────────────
+
+def new_secret() -> str:
+    """A new TOTP secret as unpadded base32, as authenticator apps take it."""
+    return _b32(secrets.token_bytes(SECRET_BYTES))
+
+
+def code_at(secret: str, step: int) -> str:
+    """The RFC 4226 HOTP value of `step` (RFC 6238's time counter)."""
+    digest = hmac.new(_unb32(secret), struct.pack(">Q", step), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+    return str(value % 10 ** DIGITS).zfill(DIGITS)
+
+
+def clean(code: str) -> str:
+    return "".join(code.split())
+
+
+def is_totp(code: str) -> bool:
+    return bool(_TOTP.fullmatch(clean(code)))
+
+
+def matching_step(secret: str, code: str, now: float, last_step: int) -> int | None:
+    """The step in now's window, later than `last_step`, whose code is `code`;
+    None when there is none. Every candidate is compared in constant time."""
+    code = clean(code)
+    if not _TOTP.fullmatch(code):
+        return None
+    current = int(now // STEP_S)
+    found = None
+    for step in range(current - WINDOW, current + WINDOW + 1):
+        if hmac.compare_digest(code_at(secret, step), code) and step > last_step and found is None:
+            found = step
+    return found
+
+
+def otpauth_uri(username: str, secret: str) -> str:
+    """The `otpauth://` URI an authenticator app reads from the QR code."""
+    label = quote(f"{ISSUER}:{username}", safe=":")
+    return (f"otpauth://totp/{label}?secret={secret}&issuer={quote(ISSUER)}"
+            f"&algorithm=SHA1&digits={DIGITS}&period={STEP_S}")
+
+
+# ── recovery codes ───────────────────────────────────────────────────────────
+
+def normalize_recovery(code: str) -> str:
+    return "".join(code.split()).replace("-", "").lower()
+
+
+def new_recovery_codes() -> list[str]:
+    codes = []
+    for _ in range(RECOVERY_COUNT):
+        raw = _b32(secrets.token_bytes(RECOVERY_BYTES)).lower()
+        codes.append("-".join(raw[i:i + 4] for i in range(0, 16, 4)))
+    return codes
+
+
+def recovery_hash(code: str) -> str | None:
+    """The stored form of a recovery code, or None when it can't be one."""
+    normal = normalize_recovery(code)
+    if not _RECOVERY.fullmatch(normal):
+        return None
+    return hashlib.sha256(normal.encode("ascii")).hexdigest()
+
+
+# ── secrets at rest ──────────────────────────────────────────────────────────
+
+def key_path() -> Path:
+    return Path(settings.auth_dir) / KEY_FILE
+
+
+def _key(create: bool) -> bytes | None:
+    """The sealing key; created on first need. None when it doesn't exist and
+    `create` is false, or the file isn't a 32-byte key.
+
+    The key is written whole to a private temporary file (0600, fsync'd) and
+    then hard-linked to `mfa.key`, which fails if the name exists: so
+    `mfa.key` never exists without its 32 bytes (no reader sees it empty, and
+    a crash can't leave it empty), and when the API and the operator command
+    race, one key wins and both use it."""
+    path = key_path()
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        if not create:
+            return None
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        key = secrets.token_bytes(32)
+        temp = path.with_name(f".{KEY_FILE}.{os.getpid()}.{secrets.token_hex(4)}")
+        fd = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as out:
+                out.write(key)
+                out.flush()
+                os.fsync(out.fileno())
+            try:
+                os.link(temp, path)
+            except FileExistsError:
+                raw = path.read_bytes()    # another process created it first
+            else:
+                return key
+        finally:
+            temp.unlink(missing_ok=True)
+    return raw if len(raw) == 32 else None
+
+
+def _aad(user_id: int) -> bytes:
+    return b"rag-mfa:%d" % user_id
+
+
+def seal(user_id: int, secret: str) -> str:
+    key = _key(create=True)
+    if key is None:
+        raise RuntimeError(f"{key_path()} is not a 32-byte key")
+    nonce = secrets.token_bytes(_NONCE)
+    sealed = AESGCM(key).encrypt(nonce, secret.encode("ascii"), _aad(user_id))
+    return base64.b64encode(nonce + sealed).decode("ascii")
+
+
+def unseal(user_id: int, sealed: str) -> str | None:
+    """The secret, or None when it can't be read (no key, another key, tampered)."""
+    key = _key(create=False)
+    if key is None:
+        return None
+    try:
+        raw = base64.b64decode(sealed, validate=True)
+        return AESGCM(key).decrypt(raw[:_NONCE], raw[_NONCE:], _aad(user_id)).decode("ascii")
+    except Exception:                                  # noqa: BLE001 - any failure means "can't verify"
+        return None
+```
+
 ### api/auth/policy.py
 
 ```python
@@ -17279,6 +17509,9 @@ import re
 ROLES = ("end_user", "developer", "engineer")   # lowest to highest
 PUBLIC = "public"     # no session needed
 SESSION = "session"   # any logged-in user, even one who must change their password
+# Any logged-in user's own two-step verification (#607): after a due password
+# change, and still open while a required set-up is due (the way out of it).
+MFA = "mfa"
 
 END_USER, DEVELOPER, ENGINEER = ROLES
 
@@ -17290,6 +17523,14 @@ ACCESS: dict[tuple[str, str], str] = {
     ("GET", "/auth/me"): SESSION,
     ("POST", "/auth/logout"): SESSION,
     ("POST", "/auth/password"): SESSION,
+    # Two-step verification (#607): the code after the password, and the
+    # user's own set-up, recovery codes and turn-off.
+    ("POST", "/auth/login/mfa"): PUBLIC,
+    ("GET", "/auth/mfa"): MFA,
+    ("POST", "/auth/mfa/enroll"): MFA,
+    ("POST", "/auth/mfa/enroll/confirm"): MFA,
+    ("POST", "/auth/mfa/recovery-codes"): MFA,
+    ("POST", "/auth/mfa/disable"): MFA,
     # What the Q&A page needs (Q4).
     ("GET", "/collections"): END_USER,
     ("POST", "/query"): END_USER,
@@ -17346,6 +17587,8 @@ ACCESS: dict[tuple[str, str], str] = {
     ("POST", "/auth/users/{username}/role"): ENGINEER,
     ("POST", "/auth/users/{username}/disable"): ENGINEER,
     ("POST", "/auth/users/{username}/enable"): ENGINEER,
+    ("POST", "/auth/users/{username}/reset-mfa"): ENGINEER,
+    ("POST", "/auth/mfa/policy"): ENGINEER,               # require two-step verification for everyone
     # Service principals and their keys (PR 3 of #25). Nothing deletes a principal.
     ("GET", "/auth/service-principals"): ENGINEER,
     ("POST", "/auth/service-principals"): ENGINEER,
@@ -17369,9 +17612,10 @@ ACCESS: dict[tuple[str, str], str] = {
 # account, principal and key administration, so a leaked key can't mint further
 # keys or accounts that outlive its revocation, and the session's own routes.
 # GET /auth/me answers for a key. The audit log too (#29): a leaked key can't
-# read who did what, or question text when that is recorded.
+# read who did what, or question text when that is recorded. And two-step
+# verification (#607): service keys are unchanged and have no second factor.
 HUMAN_ONLY = frozenset(path for _, path in ACCESS
-                       if path.startswith(("/auth/users", "/auth/service-principals"))) | {
+                       if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa"))) | {
     "/auth/logout", "/auth/password", "/audit", "/audit.csv"}
 
 
@@ -17425,6 +17669,12 @@ command deletes an account.
 A service principal (PR 3) is a `users` row with kind 'service': it shares the
 username rule and name pool with people, has no usable password and no
 session, and authenticates only with its API keys (`api_keys`, keys.py).
+
+Two-step verification (#607, schema 3): a user's sealed TOTP secret and last
+accepted step (`mfa`), a set-up not yet confirmed (`mfa_pending`), recovery
+codes as SHA-256 (`recovery_codes`), login challenges between the password and
+the code (`mfa_challenges`, token as SHA-256) and the "require for everyone"
+switch (`settings`). The codes and the sealing are in mfa.py.
 """
 from __future__ import annotations
 
@@ -17440,7 +17690,7 @@ from pathlib import Path
 
 from config import settings
 
-from . import keys, passwords
+from . import keys, mfa, passwords
 from .policy import ROLES
 
 COOKIE = "rag_session"
@@ -17454,7 +17704,11 @@ KEY_DAYS_DEFAULT = 90            # a key's lifetime when none is given (Q23) ...
 KEY_DAYS_MAX = 365               # ... and the longest allowed
 _DAY_S = 86400
 NO_PASSWORD = "!"                # a principal's password hash: never verifies
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+MFA_PENDING_S = 10 * 60          # a started set-up must be confirmed within 10 minutes
+MFA_CHALLENGE_S = 5 * 60         # the code must follow the password within 5 minutes ...
+MFA_CHALLENGE_TRIES = 5          # ... with at most 5 codes per challenge
+MFA_COOKIE = "rag_mfa"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -17497,6 +17751,35 @@ CREATE TABLE IF NOT EXISTS api_keys (
     last_used REAL
 );
 CREATE INDEX IF NOT EXISTS api_keys_user ON api_keys(user_id);
+CREATE TABLE IF NOT EXISTS mfa (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id),
+    secret TEXT NOT NULL,
+    last_step INTEGER NOT NULL,
+    enrolled_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mfa_pending (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id),
+    secret TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS recovery_codes (
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    code_hash TEXT NOT NULL,
+    used_at REAL
+);
+CREATE INDEX IF NOT EXISTS recovery_codes_user ON recovery_codes(user_id);
+CREATE TABLE IF NOT EXISTS mfa_challenges (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    login_key TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS mfa_challenges_user ON mfa_challenges(user_id);
+CREATE TABLE IF NOT EXISTS settings (
+    name TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 _ready: set[str] = set()
@@ -17507,7 +17790,9 @@ class Refused(Exception):
     """An account change the rules don't allow; the message says why, in one line.
     `code` names the reason for the API: USER_EXISTS, USER_NOT_FOUND,
     LAST_ENGINEER, PRINCIPAL_EXISTS, PRINCIPAL_NOT_FOUND, KEY_NOT_FOUND,
-    NOT_A_USER, or REFUSED for the bootstrap rules."""
+    NOT_A_USER, REFUSED for the bootstrap rules, or one of the MFA codes
+    (MFA_ALREADY_ENROLLED, MFA_ENROLLMENT_NOT_STARTED, MFA_CODE_INCORRECT,
+    MFA_NOT_ENROLLED, MFA_REQUIRED, MFA_ENROLL_FIRST)."""
 
     def __init__(self, message: str, code: str = "REFUSED"):
         super().__init__(message)
@@ -17523,6 +17808,8 @@ class Principal:
     token_hash: str              # the session's; "" for a key
     kind: str = "user"           # "service" when authenticated by a key
     key_id: str | None = None
+    mfa_enrolled: bool = False
+    mfa_due: bool = False        # MFA is required for everyone and this user hasn't enrolled (#607)
 
 
 @dataclass(frozen=True)
@@ -17535,6 +17822,7 @@ class User:
     must_change_password: bool
     created_at: float
     kind: str = "user"
+    mfa_enrolled: bool = False
 
 
 @dataclass(frozen=True)
@@ -17605,8 +17893,9 @@ def _connect(write: bool = False):
 
 
 def _migrate(conn) -> None:
-    """Version 2 (PR 3): users.kind. In a write transaction, so the API and the
-    operator command can't both add the column."""
+    """Version 2 (PR 3): users.kind. Version 3 (#607) only adds tables, which
+    _SCHEMA creates. In a write transaction, so the API and the operator
+    command can't both add the column."""
     conn.execute("BEGIN IMMEDIATE")
     columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
     if "kind" not in columns:
@@ -17619,7 +17908,12 @@ def _user(row) -> User | None:
     if row is None:
         return None
     return User(row["id"], row["username"], row["role"], row["password_hash"],
-                bool(row["enabled"]), bool(row["must_change_password"]), row["created_at"], row["kind"])
+                bool(row["enabled"]), bool(row["must_change_password"]), row["created_at"], row["kind"],
+                bool(row["mfa_enrolled"]))
+
+
+# Every users query that builds a User selects through this, so the MFA state comes along.
+_USERS = "SELECT u.*, (m.user_id IS NOT NULL) AS mfa_enrolled FROM users u LEFT JOIN mfa m ON m.user_id = u.id"
 
 
 def _token_hash(token: str) -> str:
@@ -17652,16 +17946,16 @@ def has_enabled_engineer() -> bool:
 
 def get_user(username: str) -> User | None:
     with _connect() as conn:
-        return _user(conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone())
+        return _user(conn.execute(_USERS + " WHERE u.username = ?", (username,)).fetchone())
 
 
 def list_users(kind: str | None = "user") -> list[User]:
     """Human accounts by default; kind=None lists principals too (the operator's `list`)."""
     with _connect() as conn:
         if kind is None:
-            rows = conn.execute("SELECT * FROM users ORDER BY username")
+            rows = conn.execute(_USERS + " ORDER BY u.username")
         else:
-            rows = conn.execute("SELECT * FROM users WHERE kind = ? ORDER BY username", (kind,))
+            rows = conn.execute(_USERS + " WHERE u.kind = ? ORDER BY u.username", (kind,))
         return [_user(row) for row in rows]
 
 
@@ -17688,7 +17982,7 @@ def create_user(username: str, role: str, password: str, *, bootstrap: bool = Fa
         conn.execute("INSERT INTO users (username, role, password_hash, enabled, must_change_password, "
                      "created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?)",
                      (username, role, password_hash, int(must_change_password), now, now))
-        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        row = conn.execute(_USERS + " WHERE u.username = ?", (username,)).fetchone()
     return _user(row)
 
 
@@ -17722,6 +18016,8 @@ def reset_password(username: str, password: str, kind: str | None = None) -> Non
         conn.execute("UPDATE users SET password_hash = ?, must_change_password = 1, updated_at = ? "
                      "WHERE id = ?", (password_hash, _now(), row["id"]))
         conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+        # A login half-way through, started with the old password, ends too (#607).
+        conn.execute("DELETE FROM mfa_challenges WHERE user_id = ?", (row["id"],))
 
 
 def set_role(username: str, role: str, kind: str | None = None) -> None:
@@ -17747,6 +18043,8 @@ def set_enabled(username: str, enabled: bool, kind: str | None = None) -> None:
                      (int(enabled), _now(), row["id"]))
         if not enabled:
             conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+            # Pending login challenges end too, so enabling again doesn't revive one (#607).
+            conn.execute("DELETE FROM mfa_challenges WHERE user_id = ?", (row["id"],))
 
 
 # ── service principals and their keys (PR 3) ─────────────────────────────────
@@ -17859,8 +18157,10 @@ def authenticate(token: str | None) -> Principal | None:
     now = _now()
     with _connect() as conn:
         row = conn.execute(
-            "SELECT s.created_at, s.last_seen, u.id, u.username, u.role, u.enabled, u.must_change_password "
-            "FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?", (digest,)).fetchone()
+            "SELECT s.created_at, s.last_seen, u.id, u.username, u.role, u.enabled, u.must_change_password, "
+            "(m.user_id IS NOT NULL) AS mfa_enrolled FROM sessions s JOIN users u ON u.id = s.user_id "
+            "LEFT JOIN mfa m ON m.user_id = u.id WHERE s.token_hash = ?", (digest,)).fetchone()
+        required = _mfa_required(conn) if row is not None else False
     if row is None:
         return None
     if now - row["last_seen"] > IDLE_S or now - row["created_at"] > ABSOLUTE_S or not row["enabled"]:
@@ -17869,7 +18169,9 @@ def authenticate(token: str | None) -> Principal | None:
     if now - row["last_seen"] > _TOUCH_S:
         with _connect(write=True) as conn:
             conn.execute("UPDATE sessions SET last_seen = ? WHERE token_hash = ?", (now, digest))
-    return Principal(row["id"], row["username"], row["role"], bool(row["must_change_password"]), digest)
+    enrolled = bool(row["mfa_enrolled"])
+    return Principal(row["id"], row["username"], row["role"], bool(row["must_change_password"]), digest,
+                     mfa_enrolled=enrolled, mfa_due=required and not enrolled)
 
 
 def delete_session(token_hash: str) -> None:
@@ -17885,6 +18187,8 @@ def change_password(principal: Principal, password: str) -> None:
                      "WHERE id = ?", (password_hash, _now(), principal.user_id))
         conn.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?",
                      (principal.user_id, principal.token_hash))
+        # A login half-way through, started with the old password, ends too (#607).
+        conn.execute("DELETE FROM mfa_challenges WHERE user_id = ?", (principal.user_id,))
 
 
 # ── login throttle ───────────────────────────────────────────────────────────
@@ -17926,6 +18230,239 @@ def finish_attempt(username: str, address: str, succeeded: bool) -> bool:
                      (username, address, now + LOCKOUT_S))
         conn.execute("DELETE FROM login_failures WHERE username = ? AND address = ?", (username, address))
     return True
+
+
+def release_attempt(username: str, address: str) -> None:
+    """Withdraw a reserved attempt that wasn't a failure without clearing the
+    pair's count: a right password for an enrolled user (#607), whose earlier
+    failures stay counted until the second factor passes."""
+    with _connect(write=True) as conn:
+        conn.execute("DELETE FROM login_failures WHERE rowid = (SELECT MAX(rowid) FROM login_failures "
+                     "WHERE username = ? AND address = ?)", (username, address))
+
+
+# ── two-step verification (#607) ─────────────────────────────────────────────
+
+def _mfa_required(conn) -> bool:
+    return conn.execute("SELECT 1 FROM settings WHERE name = 'mfa_required' AND value = '1'").fetchone() is not None
+
+
+def mfa_required() -> bool:
+    """The "require two-step verification for everyone" switch."""
+    with _connect() as conn:
+        return _mfa_required(conn)
+
+
+def set_mfa_required(user_id: int, required: bool) -> None:
+    """Set the switch. Turning it on needs the engineer turning it on to be
+    enrolled, so nobody switches on a gate they couldn't pass themselves."""
+    with _connect(write=True) as conn:
+        if required:
+            if conn.execute("SELECT 1 FROM mfa WHERE user_id = ?", (user_id,)).fetchone() is None:
+                raise Refused("set up two-step verification for your own account first", "MFA_ENROLL_FIRST")
+            conn.execute("INSERT OR REPLACE INTO settings (name, value) VALUES ('mfa_required', '1')")
+        else:
+            conn.execute("DELETE FROM settings WHERE name = 'mfa_required'")
+
+
+def _status(conn, user_id: int) -> dict:
+    row = conn.execute("SELECT enrolled_at FROM mfa WHERE user_id = ?", (user_id,)).fetchone()
+    remaining = conn.execute("SELECT COUNT(*) FROM recovery_codes WHERE user_id = ? AND used_at IS NULL",
+                             (user_id,)).fetchone()[0]
+    return {"enrolled": row is not None, "enrolled_at": row["enrolled_at"] if row else None,
+            "required": _mfa_required(conn), "recovery_codes_remaining": remaining if row else 0}
+
+
+def mfa_status(user_id: int) -> dict:
+    """{"enrolled", "enrolled_at" (epoch or None), "required", "recovery_codes_remaining"}."""
+    with _connect() as conn:
+        return _status(conn, user_id)
+
+
+def start_enrollment(user_id: int, username: str) -> tuple[str, str]:
+    """A new pending secret (replacing an earlier one); returns it and its
+    otpauth URI. The secret is stored sealed; this answer is the only copy."""
+    secret = mfa.new_secret()
+    sealed = mfa.seal(user_id, secret)
+    with _connect(write=True) as conn:
+        if conn.execute("SELECT 1 FROM mfa WHERE user_id = ?", (user_id,)).fetchone():
+            raise Refused("two-step verification is already set up", "MFA_ALREADY_ENROLLED")
+        conn.execute("INSERT OR REPLACE INTO mfa_pending (user_id, secret, created_at) VALUES (?, ?, ?)",
+                     (user_id, sealed, _now()))
+    return secret, mfa.otpauth_uri(username, secret)
+
+
+def _new_codes(conn, user_id: int) -> list[str]:
+    codes = mfa.new_recovery_codes()
+    conn.execute("DELETE FROM recovery_codes WHERE user_id = ?", (user_id,))
+    conn.executemany("INSERT INTO recovery_codes (user_id, code_hash) VALUES (?, ?)",
+                     [(user_id, mfa.recovery_hash(code)) for code in codes])
+    return codes
+
+
+def confirm_enrollment(principal: Principal, code: str) -> list[str]:
+    """Confirm the pending set-up with a code from the app: the secret becomes
+    the user's, a recovery-code set is made, and every other session of the
+    user ends (it was opened with the password alone). Returns the codes."""
+    now = _now()
+    with _connect(write=True) as conn:
+        if conn.execute("SELECT 1 FROM mfa WHERE user_id = ?", (principal.user_id,)).fetchone():
+            raise Refused("two-step verification is already set up", "MFA_ALREADY_ENROLLED")
+        row = conn.execute("SELECT secret, created_at FROM mfa_pending WHERE user_id = ?",
+                           (principal.user_id,)).fetchone()
+        if row is None or now - row["created_at"] > MFA_PENDING_S:
+            raise Refused("no set-up is in progress; start it again", "MFA_ENROLLMENT_NOT_STARTED")
+        secret = mfa.unseal(principal.user_id, row["secret"])
+        step = mfa.matching_step(secret, code, now, -1) if secret else None
+        if step is None:
+            raise Refused("the code is incorrect", "MFA_CODE_INCORRECT")
+        conn.execute("INSERT INTO mfa (user_id, secret, last_step, enrolled_at) VALUES (?, ?, ?, ?)",
+                     (principal.user_id, row["secret"], step, now))
+        conn.execute("DELETE FROM mfa_pending WHERE user_id = ?", (principal.user_id,))
+        codes = _new_codes(conn, principal.user_id)
+        conn.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?",
+                     (principal.user_id, principal.token_hash))
+    return codes
+
+
+def _verify_factor(conn, user_id: int, code: str, allow_recovery: bool) -> str | None:
+    """Inside the caller's write transaction: "totp" or "recovery" when `code`
+    is a valid second factor of the user (and spends it), else None. A TOTP
+    code's step becomes the last accepted one; a recovery code is marked used."""
+    now = _now()
+    if mfa.is_totp(code):
+        row = conn.execute("SELECT secret, last_step FROM mfa WHERE user_id = ?", (user_id,)).fetchone()
+        secret = mfa.unseal(user_id, row["secret"]) if row else None
+        step = mfa.matching_step(secret, code, now, row["last_step"]) if secret else None
+        if step is None:
+            return None
+        conn.execute("UPDATE mfa SET last_step = ? WHERE user_id = ?", (step, user_id))
+        return "totp"
+    if not allow_recovery:
+        return None
+    digest = mfa.recovery_hash(code)
+    if digest is None:
+        return None
+    found = conn.execute("SELECT rowid FROM recovery_codes WHERE user_id = ? AND code_hash = ? AND used_at IS NULL",
+                         (user_id, digest)).fetchone()
+    if found is None:
+        return None
+    conn.execute("UPDATE recovery_codes SET used_at = ? WHERE rowid = ?", (now, found[0]))
+    return "recovery"
+
+
+def factor_method(code: str) -> str:
+    """How a typed code is checked: "totp" for 6 digits, else "recovery"."""
+    return "totp" if mfa.is_totp(code) else "recovery"
+
+
+def create_challenge(user_id: int, login_key: str) -> str:
+    """A login challenge after a right password; returns the token for the
+    `rag_mfa` cookie, of which only the SHA-256 is stored. The user's earlier
+    challenges and every expired one are deleted."""
+    token = secrets.token_urlsafe(32)
+    now = _now()
+    with _connect(write=True) as conn:
+        conn.execute("DELETE FROM mfa_challenges WHERE user_id = ? OR created_at < ?",
+                     (user_id, now - MFA_CHALLENGE_S))
+        conn.execute("INSERT INTO mfa_challenges (token_hash, user_id, login_key, created_at, attempts) "
+                     "VALUES (?, ?, ?, ?, 0)", (_token_hash(token), user_id, login_key, now))
+    return token
+
+
+def _live_challenge(conn, token: str | None):
+    if not token or len(token) > 256:
+        return None
+    row = conn.execute(
+        "SELECT c.token_hash, c.user_id, c.login_key, c.created_at, c.attempts, u.username, u.role, u.enabled, "
+        "u.kind, (m.user_id IS NOT NULL) AS enrolled FROM mfa_challenges c JOIN users u ON u.id = c.user_id "
+        "LEFT JOIN mfa m ON m.user_id = u.id WHERE c.token_hash = ?", (_token_hash(token),)).fetchone()
+    if (row is None or _now() - row["created_at"] > MFA_CHALLENGE_S or row["attempts"] >= MFA_CHALLENGE_TRIES
+            or not row["enabled"] or not row["enrolled"] or row["kind"] != "user"):
+        return None
+    return row
+
+
+def challenge(token: str | None) -> tuple[str, str] | None:
+    """(username, login_key) of a live challenge, or None when it is missing,
+    expired, used up, or its user is disabled or no longer enrolled."""
+    with _connect() as conn:
+        row = _live_challenge(conn, token)
+    return None if row is None else (row["username"], row["login_key"])
+
+
+def answer_challenge(token: str | None, code: str) -> tuple[str, User | None, str | None]:
+    """Check a second factor against a challenge, in one write transaction:
+    ("ok", user, method) deletes the challenge; ("failed", user, method) counts
+    an attempt and deletes the challenge at the fifth; ("invalid", None, None)
+    when the challenge isn't live (any more)."""
+    with _connect(write=True) as conn:
+        row = _live_challenge(conn, token)
+        if row is None:
+            return "invalid", None, None
+        method = _verify_factor(conn, row["user_id"], code, allow_recovery=True)
+        if method is None:
+            conn.execute("UPDATE mfa_challenges SET attempts = attempts + 1 WHERE token_hash = ?", (row["token_hash"],))
+            conn.execute("DELETE FROM mfa_challenges WHERE token_hash = ? AND attempts >= ?",
+                         (row["token_hash"], MFA_CHALLENGE_TRIES))
+            outcome = "failed"
+        else:
+            conn.execute("DELETE FROM mfa_challenges WHERE token_hash = ?", (row["token_hash"],))
+            outcome = "ok"
+        user = _user(conn.execute(_USERS + " WHERE u.id = ?", (row["user_id"],)).fetchone())
+    return outcome, user, method or factor_method(code)
+
+
+def regenerate_codes(principal: Principal, code: str) -> list[str] | None:
+    """A new recovery-code set, replacing the old one, for a current TOTP code
+    (a recovery code doesn't count). None when the code is wrong."""
+    with _connect(write=True) as conn:
+        if conn.execute("SELECT 1 FROM mfa WHERE user_id = ?", (principal.user_id,)).fetchone() is None:
+            raise Refused("two-step verification isn't set up", "MFA_NOT_ENROLLED")
+        if _verify_factor(conn, principal.user_id, code, allow_recovery=False) is None:
+            return None
+        return _new_codes(conn, principal.user_id)
+
+
+def disable_mfa(principal: Principal, password: str, code: str) -> bool:
+    """The user's own turn-off, only while MFA isn't required: needs the
+    current password and a TOTP or recovery code. False when either is wrong.
+    Sessions stay."""
+    with _connect() as conn:
+        if _mfa_required(conn):
+            raise Refused("two-step verification is required for everyone", "MFA_REQUIRED")
+        row = conn.execute("SELECT password_hash FROM users WHERE id = ?", (principal.user_id,)).fetchone()
+        if conn.execute("SELECT 1 FROM mfa WHERE user_id = ?", (principal.user_id,)).fetchone() is None:
+            raise Refused("two-step verification isn't set up", "MFA_NOT_ENROLLED")
+    # scrypt outside the write lock, as a login does.
+    right_password = row is not None and passwords.verify_password(password, row["password_hash"])
+    with _connect(write=True) as conn:
+        if _mfa_required(conn):
+            raise Refused("two-step verification is required for everyone", "MFA_REQUIRED")
+        if not right_password:
+            return False
+        if _verify_factor(conn, principal.user_id, code, allow_recovery=True) is None:
+            return False
+        _forget_mfa(conn, principal.user_id)
+    return True
+
+
+def _forget_mfa(conn, user_id: int) -> None:
+    for table in ("mfa", "mfa_pending", "recovery_codes", "mfa_challenges"):
+        conn.execute(f"DELETE FROM {table} WHERE user_id = ?", (user_id,))
+
+
+def reset_mfa(username: str, kind: str | None = None) -> None:
+    """An engineer's or the operator's reset: the user's secret, pending set-up,
+    recovery codes and challenges are deleted and every session of theirs ends.
+    Their next login asks for no code (and for a set-up, while MFA is required).
+    A service principal has no second factor, so it is refused."""
+    with _connect(write=True) as conn:
+        row = _existing(conn, username, kind)
+        if row["kind"] != "user":
+            raise Refused(f"{username!r} is a service principal; it has no two-step verification", "NOT_A_USER")
+        _forget_mfa(conn, row["id"])
+        conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
 ```
 
 ### api/auth/middleware.py
@@ -17943,6 +18480,9 @@ The refusals, in the order they apply:
   401 AUTH_REQUIRED           no valid session cookie
   403 CROSS_ORIGIN_REFUSED    a cookie-authenticated POST/PUT/PATCH/DELETE from another origin
   403 PASSWORD_CHANGE_REQUIRED the user must change a generated password first
+  403 MFA_ENROLLMENT_REQUIRED two-step verification is required for everyone and
+                              the user hasn't set it up (#607); only the session
+                              routes and their own MFA routes answer
   403 FORBIDDEN               the user's role is too low
 
 A request with an `Authorization` header is a service key request (PR 3): the
@@ -18078,7 +18618,10 @@ class AuthMiddleware:
         if principal.must_change_password and access != policy.SESSION:
             return api_error(403, "PASSWORD_CHANGE_REQUIRED",
                              "Change your password before doing anything else."), principal
-        if access != policy.SESSION and policy.rank(principal.role) < policy.rank(access):
+        if principal.mfa_due and access not in (policy.SESSION, policy.MFA):
+            return api_error(403, "MFA_ENROLLMENT_REQUIRED",
+                             "Set up two-step verification before doing anything else."), principal
+        if access not in (policy.SESSION, policy.MFA) and policy.rank(principal.role) < policy.rank(access):
             return api_error(403, "FORBIDDEN", "Your role can't do this.",
                              detail={"required_role": access}), principal
         return None, principal
@@ -18090,7 +18633,7 @@ class AuthMiddleware:
             return api_error(401, "KEY_INVALID", "The API key is invalid, expired or revoked."), None
         if template in policy.HUMAN_ONLY:
             return api_error(403, "KEY_NOT_ALLOWED", "API keys can't be used for this."), principal
-        if access != policy.SESSION and policy.rank(principal.role) < policy.rank(access):
+        if access not in (policy.SESSION, policy.MFA) and policy.rank(principal.role) < policy.rank(access):
             return api_error(403, "FORBIDDEN", "Your role can't do this.",
                              detail={"required_role": access}), principal
         return None, principal
@@ -18127,6 +18670,7 @@ def require_listed(request: Request) -> None:
     docker compose exec api python -m auth set-role USERNAME ROLE
     docker compose exec api python -m auth disable USERNAME
     docker compose exec api python -m auth enable USERNAME
+    docker compose exec api python -m auth reset-mfa USERNAME
     docker compose exec api python -m auth list
 
 ROLE is end_user, developer or engineer. bootstrap, create-user and
@@ -18139,6 +18683,11 @@ The last enabled engineer can't be disabled or demoted. An account a user is
 locked out of (lost password, disabled) is recovered with create-user, enable
 or reset-password; these don't lift a login throttle, which ends by itself
 after 15 minutes.
+
+reset-mfa (#607) is the last-resort recovery of two-step verification: it
+deletes the user's secret and recovery codes and ends their sessions, so their
+next login asks for no code (and, while MFA is required for everyone, for a new
+set-up). It works for an engineer's own account too, which the app refuses.
 
 Service principals (API keys, PR 3) are created and given keys by Engineers in
 the app; this command issues no key. `list` shows principals too, marked
@@ -18204,6 +18753,8 @@ def main(argv=None) -> int:
     p.add_argument("username")
     p = commands.add_parser("enable", help="enable a disabled account")
     p.add_argument("username")
+    p = commands.add_parser("reset-mfa", help="remove a user's two-step verification and end their sessions")
+    p.add_argument("username")
     commands.add_parser("list", help="list the accounts")
     args = parser.parse_args(argv)
 
@@ -18225,6 +18776,9 @@ def main(argv=None) -> int:
         elif args.command == "set-role":
             store.set_role(username, role)
             _say(f"set-role: {username!r} is now {role}")
+        elif args.command == "reset-mfa":
+            store.reset_mfa(username)
+            _say(f"reset-mfa: two-step verification of {username!r} removed; their sessions ended")
         elif args.command in ("disable", "enable"):
             store.set_enabled(username, args.command == "enable")
             ended = ""
@@ -18336,6 +18890,13 @@ Each of these requests that logs in, changes something or is refused is also an
 audit record (#29), written by services/audit.py's middleware with what the
 handlers note here (a typed username, a new role, a key's id; never a password
 or a key). The WARNING log lines are unchanged.
+
+Two-step verification (#607): for an enrolled user a right password starts a
+challenge (the `rag_mfa` cookie) instead of a session, and POST
+/auth/login/mfa with a TOTP or recovery code completes the login. The user's
+own set-up, recovery codes and turn-off are under /auth/mfa; engineers reset a
+user's enrollment and switch "required for everyone". Codes and secrets are in
+their one answer only (no-store) and never logged or audited.
 """
 from __future__ import annotations
 
@@ -18350,8 +18911,9 @@ from auth import passwords, store
 from config import settings
 from services import audit
 from models.schemas import (AdminUserList, AdminUserResult, AuthStatus, AuthUser, KeyIssueRequest, LoginRequest,
-                            PasswordChangeRequest, PrincipalCreateRequest, RoleChangeRequest,
-                            ServicePrincipalList, ServicePrincipalResult, UserCreateRequest)
+                            MfaCodeRequest, MfaDisableRequest, MfaPolicyRequest, PasswordChangeRequest,
+                            PrincipalCreateRequest, RoleChangeRequest, ServicePrincipalList, ServicePrincipalResult,
+                            UserCreateRequest)
 from utils import api_error
 
 router = APIRouter(prefix="/auth")
@@ -18360,6 +18922,8 @@ router = APIRouter(prefix="/auth")
 _log = logging.getLogger("auth")
 
 LOGIN_FAILED = "The username or password is incorrect."
+MFA_FAILED = "The code is incorrect."
+MFA_CHALLENGE_INVALID = "Your sign-in expired. Log in again."
 
 
 def _address(request: Request) -> str:
@@ -18372,9 +18936,34 @@ def _user_body(username: str, role: str, must_change_password: bool) -> dict:
     return {"username": username, "role": role, "must_change_password": must_change_password}
 
 
+def _mfa_body(enrolled: bool, required: bool) -> dict:
+    """The MFA fields of a user's answers (#607); never a secret or code."""
+    return {"mfa_enrolled": enrolled, "mfa_required": required,
+            "mfa_enrollment_required": required and not enrolled}
+
+
 def _cookie(response: JSONResponse, token: str) -> None:
     response.set_cookie(store.COOKIE, token, max_age=store.ABSOLUTE_S, path="/", httponly=True,
                         samesite="strict", secure=settings.auth_cookie_secure)
+
+
+def _challenge_cookie(response: JSONResponse, token: str | None) -> None:
+    """Set the login challenge's cookie, or expire it with None."""
+    if token is None:
+        response.delete_cookie(store.MFA_COOKIE, path="/", httponly=True, samesite="strict",
+                               secure=settings.auth_cookie_secure)
+    else:
+        response.set_cookie(store.MFA_COOKIE, token, max_age=store.MFA_CHALLENGE_S, path="/", httponly=True,
+                            samesite="strict", secure=settings.auth_cookie_secure)
+
+
+def _session_answer(user: store.User, token: str) -> JSONResponse:
+    """A login's answer: the user, their MFA state and the session cookie."""
+    required = store.mfa_required()
+    response = JSONResponse({**_user_body(user.username, user.role, user.must_change_password),
+                             **_mfa_body(user.mfa_enrolled, required)})
+    _cookie(response, token)
+    return response
 
 
 @router.get("/status", response_model=AuthStatus)
@@ -18383,7 +18972,9 @@ async def auth_status():
 
 
 def _login(typed: str, password: str, address: str):
-    """('throttled' | 'failed' | 'ok', user, token). Blocking: scrypt and SQLite."""
+    """('throttled' | 'failed' | 'ok' | 'mfa', user, token). Blocking: scrypt and SQLite.
+    'mfa': the password was right for an enrolled user; the token is a
+    challenge's, not a session's (#607)."""
     key = typed.lower()
     # The attempt is counted before the password is checked, in the same
     # transaction as the lockout check, so parallel requests can't all slip in.
@@ -18397,6 +18988,11 @@ def _login(typed: str, password: str, address: str):
     person = user if user and user.kind == "user" else None
     matched = passwords.verify_password(password, person.password_hash if person else passwords.dummy_hash())
     ok = bool(matched and person and person.enabled)
+    if ok and user.mfa_enrolled:
+        # Not a failure, but the pair's earlier failures stay counted until the
+        # second factor passes (#607).
+        store.release_attempt(key, address)
+        return "mfa", user, store.create_challenge(user.id, key)
     store.finish_attempt(key, address, ok)
     if not ok:
         return "failed", None, None
@@ -18413,7 +19009,7 @@ async def login(body: LoginRequest, request: Request):
     outcome, user, token = await asyncio.to_thread(_login, body.username, body.password, address)
     # The audit record (#29): a success names the account, a failure the
     # username as typed; never the password.
-    if outcome == "ok":
+    if outcome in ("ok", "mfa"):
         audit.identify(user.username, user.role)
     else:
         audit.note(target=body.username)
@@ -18423,9 +19019,61 @@ async def login(body: LoginRequest, request: Request):
     if outcome == "failed":
         _log.warning("Login failed for %r from %s", body.username, address)
         return api_error(401, "LOGIN_FAILED", LOGIN_FAILED)
+    if outcome == "mfa":
+        audit.note(mfa="required")
+        _log.warning("Login for %r (%s) from %s: password accepted, code required", user.username, user.role, address)
+        response = JSONResponse({"mfa_required": True})
+        _challenge_cookie(response, token)
+        return response
     _log.warning("Login succeeded for %r (%s) from %s", user.username, user.role, address)
-    response = JSONResponse(_user_body(user.username, user.role, user.must_change_password))
-    _cookie(response, token)
+    return await asyncio.to_thread(_session_answer, user, token)
+
+
+def _second_factor(token: str | None, code: str, address: str):
+    """('invalid' | 'throttled' | 'failed' | 'ok', user, method, session token).
+    The attempt counts against the login throttle of the challenge's username
+    and this address before the code is checked, as a password is."""
+    found = store.challenge(token)
+    if found is None:
+        return "invalid", None, None, None
+    username, key = found
+    if not store.reserve_attempt(key, address):
+        return "throttled", store.get_user(username), store.factor_method(code), None
+    outcome, user, method = store.answer_challenge(token, code)
+    store.finish_attempt(key, address, outcome == "ok")
+    if outcome == "invalid":
+        return "invalid", None, None, None
+    if outcome == "failed":
+        return "failed", user, method, None
+    return "ok", user, method, store.create_session(user.id)
+
+
+@router.post("/login/mfa", response_model=AuthUser, response_model_exclude_none=True)
+async def login_mfa(body: MfaCodeRequest, request: Request):
+    if not await asyncio.to_thread(store.is_set_up):
+        return api_error(503, "SETUP_REQUIRED",
+                         "No account exists yet. An operator must create the first Engineer with "
+                         "`docker compose exec api python -m auth bootstrap <username>`.")
+    address = _address(request)
+    token = request.cookies.get(store.MFA_COOKIE)
+    outcome, user, method, session = await asyncio.to_thread(_second_factor, token, body.code, address)
+    # Every attempt that reaches a live challenge is its own audit record, with
+    # its user as the actor (#607); the code never is.
+    if user is not None:
+        audit.identify(user.username, user.role)
+        audit.note(method=method)
+    if outcome == "invalid":
+        return api_error(401, "MFA_CHALLENGE_INVALID", MFA_CHALLENGE_INVALID)
+    if outcome == "throttled":
+        _log.warning("Second factor refused for %r from %s: too many failed attempts", user.username if user else None,
+                     address)
+        return api_error(429, "LOGIN_THROTTLED", "Too many failed attempts. Wait 15 minutes and try again.")
+    if outcome == "failed":
+        _log.warning("Second factor failed for %r from %s (%s)", user.username, address, method)
+        return api_error(401, "MFA_FAILED", MFA_FAILED)
+    _log.warning("Login succeeded for %r (%s) from %s with a %s code", user.username, user.role, address, method)
+    response = await asyncio.to_thread(_session_answer, user, session)
+    _challenge_cookie(response, None)
     return response
 
 
@@ -18444,8 +19092,9 @@ async def logout(request: Request):
 async def me(request: Request):
     # A session's user (kind "user") or an API key's service principal ("service").
     principal = request.state.auth
+    required = principal.kind == "user" and await asyncio.to_thread(store.mfa_required)
     return {**_user_body(principal.username, principal.role, principal.must_change_password),
-            "kind": principal.kind}
+            "kind": principal.kind, **_mfa_body(principal.mfa_enrolled, required)}
 
 
 def _change(principal, current: str, new: str, address: str):
@@ -18489,14 +19138,15 @@ async def change_password(body: PasswordChangeRequest, request: Request):
 # Each change and each refusal is one WARNING line naming the Engineer, the
 # action and the account (Q30); a generated password is in its answer only.
 
-_REFUSED_STATUS = {"USER_NOT_FOUND": 404, "USER_EXISTS": 409, "LAST_ENGINEER": 409}
+_REFUSED_STATUS = {"USER_NOT_FOUND": 404, "USER_EXISTS": 409, "LAST_ENGINEER": 409, "MFA_ENROLL_FIRST": 409}
 _NO_STORE = {"Cache-Control": "no-store"}
 
 
 def _admin_user(user: store.User) -> dict:
     return {"username": user.username, "role": user.role, "enabled": user.enabled,
             "must_change_password": user.must_change_password,
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(user.created_at))}
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(user.created_at)),
+            "mfa_enrolled": user.mfa_enrolled}
 
 
 def _target(username: str) -> str | None:
@@ -18624,6 +19274,160 @@ async def disable_user(username: str, request: Request):
 @router.post("/users/{username}/enable", response_model=AdminUserResult, response_model_exclude_none=True)
 async def enable_user(username: str, request: Request):
     return await _set_enabled(username, request, True)
+
+
+@router.post("/users/{username}/reset-mfa", response_model=AdminUserResult, response_model_exclude_none=True)
+async def reset_user_mfa(username: str, request: Request):
+    """Reset a user's two-step verification (#607): their secret and recovery
+    codes are deleted and every session of theirs ends."""
+    actor = request.state.auth.username
+    target = _target(username)
+    if target is None:
+        return _not_found(actor, "reset-mfa", username)
+    if target == actor:
+        _log.warning("Admin %r: reset-mfa of their own account refused", actor)
+        return api_error(409, "SELF_MFA_RESET_REFUSED",
+                         "You can't reset your own two-step verification here. Another engineer can, or the "
+                         "operator command `python -m auth reset-mfa`.")
+    try:
+        user = await asyncio.to_thread(_apply, store.reset_mfa, target, "user")
+    except store.Refused as exc:
+        return _refused(actor, "reset-mfa", target, exc)
+    _log.warning("Admin %r reset the two-step verification of %r; their sessions ended", actor, target)
+    return {"user": _admin_user(user)}
+
+
+@router.post("/mfa/policy")
+async def set_mfa_policy(body: MfaPolicyRequest, request: Request):
+    """Require two-step verification for everyone, or stop requiring it (#607)."""
+    principal = request.state.auth
+    audit.note(required=body.required)
+    try:
+        await asyncio.to_thread(store.set_mfa_required, principal.user_id, body.required)
+    except store.Refused as exc:
+        return _refusal(principal.username, "require-mfa", principal.username, exc.code,
+                        "Set up two-step verification for your own account first, on the Account page.")
+    _log.warning("Admin %r %s two-step verification for everyone", principal.username,
+                 "required" if body.required else "stopped requiring")
+    return {"required": body.required}
+
+
+# ── the user's own two-step verification (#607) ──────────────────────────────
+
+def _iso_or_none(at: float | None) -> str | None:
+    return None if at is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+
+
+def _status_body(user_id: int) -> dict:
+    status = store.mfa_status(user_id)
+    return {**status, "enrolled_at": _iso_or_none(status["enrolled_at"])}
+
+
+_MFA_STATUS = {"MFA_ALREADY_ENROLLED": 409, "MFA_ENROLLMENT_NOT_STARTED": 409, "MFA_CODE_INCORRECT": 422,
+               "MFA_NOT_ENROLLED": 409, "MFA_REQUIRED": 409}
+
+
+def _mfa_refused(principal, action: str, exc: store.Refused):
+    message = str(exc)
+    _log.warning("Two-step verification %s for %r refused: %s", action, principal.username, message)
+    return api_error(_MFA_STATUS.get(exc.code, 409), exc.code, message[:1].upper() + message[1:] + ".")
+
+
+@router.get("/mfa")
+async def mfa_status(request: Request):
+    return await asyncio.to_thread(_status_body, request.state.auth.user_id)
+
+
+@router.post("/mfa/enroll")
+async def mfa_enroll(request: Request):
+    principal = request.state.auth
+    try:
+        secret, uri = await asyncio.to_thread(store.start_enrollment, principal.user_id, principal.username)
+    except store.Refused as exc:
+        return _mfa_refused(principal, "set-up", exc)
+    return JSONResponse({"secret": secret, "otpauth_uri": uri}, headers=_NO_STORE)
+
+
+def _confirm(principal, code: str):
+    codes = store.confirm_enrollment(principal, code)
+    return codes, _status_body(principal.user_id)
+
+
+@router.post("/mfa/enroll/confirm")
+async def mfa_enroll_confirm(body: MfaCodeRequest, request: Request):
+    principal = request.state.auth
+    try:
+        codes, status = await asyncio.to_thread(_confirm, principal, body.code)
+    except store.Refused as exc:
+        return _mfa_refused(principal, "confirmation", exc)
+    _log.warning("Two-step verification set up by %r; their other sessions ended", principal.username)
+    return JSONResponse({"recovery_codes": codes, "status": status}, headers=_NO_STORE)
+
+
+def _regenerate(principal, code: str, address: str):
+    # A wrong code counts against the login throttle, like a wrong current
+    # password: an open session can't be used to guess codes.
+    if not store.reserve_attempt(principal.username, address):
+        return "throttled", None
+    try:
+        codes = store.regenerate_codes(principal, code)
+    except store.Refused:
+        store.release_attempt(principal.username, address)   # refused by rule, not a guess
+        raise
+    store.finish_attempt(principal.username, address, codes is not None)
+    if codes is None:
+        return "incorrect", None
+    return "ok", (codes, _status_body(principal.user_id))
+
+
+@router.post("/mfa/recovery-codes")
+async def mfa_recovery_codes(body: MfaCodeRequest, request: Request):
+    principal = request.state.auth
+    address = _address(request)
+    try:
+        outcome, result = await asyncio.to_thread(_regenerate, principal, body.code, address)
+    except store.Refused as exc:
+        return _mfa_refused(principal, "recovery-code regeneration", exc)
+    if outcome == "throttled":
+        _log.warning("Recovery codes refused for %r from %s: too many failed attempts", principal.username, address)
+        return api_error(429, "LOGIN_THROTTLED", "Too many failed attempts. Wait 15 minutes and try again.")
+    if outcome == "incorrect":
+        _log.warning("Recovery codes refused for %r from %s: wrong code", principal.username, address)
+        return api_error(403, "MFA_CODE_INCORRECT", MFA_FAILED)
+    codes, status = result
+    _log.warning("Recovery codes regenerated by %r", principal.username)
+    return JSONResponse({"recovery_codes": codes, "status": status}, headers=_NO_STORE)
+
+
+def _disable(principal, password: str, code: str, address: str):
+    if not store.reserve_attempt(principal.username, address):
+        return "throttled"
+    try:
+        ok = store.disable_mfa(principal, password, code)
+    except store.Refused:
+        store.release_attempt(principal.username, address)   # refused by rule, not a guess
+        raise
+    store.finish_attempt(principal.username, address, ok)
+    return "ok" if ok else "incorrect"
+
+
+@router.post("/mfa/disable")
+async def mfa_disable(body: MfaDisableRequest, request: Request):
+    principal = request.state.auth
+    address = _address(request)
+    audit.note(method=store.factor_method(body.code))
+    try:
+        outcome = await asyncio.to_thread(_disable, principal, body.password, body.code, address)
+    except store.Refused as exc:
+        return _mfa_refused(principal, "turn-off", exc)
+    if outcome == "throttled":
+        _log.warning("Two-step turn-off refused for %r from %s: too many failed attempts", principal.username, address)
+        return api_error(429, "LOGIN_THROTTLED", "Too many failed attempts. Wait 15 minutes and try again.")
+    if outcome == "incorrect":
+        _log.warning("Two-step turn-off refused for %r from %s: wrong password or code", principal.username, address)
+        return api_error(403, "MFA_DISABLE_INCORRECT", "The password or code is incorrect.")
+    _log.warning("Two-step verification turned off by %r", principal.username)
+    return {"status": await asyncio.to_thread(_status_body, principal.user_id)}
 
 
 # ── service principals and their API keys (Engineers only; PR 3) ─────────────
@@ -18816,6 +19620,13 @@ and `details.last_attempt` (the last one's time). The API's background task
 writes closed windows and its shutdown writes open ones; a kill loses the
 open counts. At most LOGIN_WINDOWS_MAX windows are open; past that, failures
 are written one by one. nginx also limits logins per address (locations.conf).
+
+**A second factor is never counted, always written (#607).** POST
+/auth/login/mfa is public like the login; its handler names the challenge's
+user, so each attempt, accepted or failed, is its own record with that user as
+the actor and `details.method` (`totp` or `recovery`). A request with no live
+challenge names nobody and writes nothing. The login throttle and nginx's
+per-address limit bound how many can be written.
 """
 from __future__ import annotations
 
@@ -18844,6 +19655,10 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("POST", "/auth/login"): "auth.login",
     ("POST", "/auth/logout"): "auth.logout",
     ("POST", "/auth/password"): "auth.password",
+    ("POST", "/auth/login/mfa"): "auth.mfa",
+    ("POST", "/auth/mfa/enroll/confirm"): "auth.mfa.enroll",
+    ("POST", "/auth/mfa/recovery-codes"): "auth.mfa.recovery-codes",
+    ("POST", "/auth/mfa/disable"): "auth.mfa.disable",
     ("POST", "/query"): "query",
     ("POST", "/collections"): "collection.create",
     ("DELETE", "/collections/{name}"): "collection.delete",
@@ -18870,6 +19685,8 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("POST", "/auth/users/{username}/role"): "admin.user.set-role",
     ("POST", "/auth/users/{username}/disable"): "admin.user.disable",
     ("POST", "/auth/users/{username}/enable"): "admin.user.enable",
+    ("POST", "/auth/users/{username}/reset-mfa"): "admin.user.reset-mfa",
+    ("POST", "/auth/mfa/policy"): "admin.mfa.policy",
     ("POST", "/auth/service-principals"): "admin.principal.create",
     ("POST", "/auth/service-principals/{name}/role"): "admin.principal.set-role",
     ("POST", "/auth/service-principals/{name}/disable"): "admin.principal.disable",
@@ -18879,7 +19696,7 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("GET", "/audit"): "audit.view",
     ("GET", "/audit.csv"): "audit.download",
 }
-OPERATOR_ACTIONS = ("bootstrap", "create-user", "reset-password", "set-role", "disable", "enable")
+OPERATOR_ACTIONS = ("bootstrap", "create-user", "reset-password", "set-role", "disable", "enable", "reset-mfa")
 # Every action name, for the API's filter and the UI's list.
 ALL_ACTIONS = tuple(sorted(set(ACTIONS.values()) | {"operator." + a for a in OPERATOR_ACTIONS}
                           | {"system.start"}))
@@ -19372,7 +20189,7 @@ class AuditMiddleware:
             # nothing (D4). Only a login, which is public, is recorded without
             # a principal: a success names its account, a failure the username
             # as typed.
-            if ctx["action"] != "auth.login" or (ctx["actor"] is None and ctx["target"] is None):
+            if ctx["action"] not in ("auth.login", "auth.mfa") or (ctx["actor"] is None and ctx["target"] is None):
                 return
         status = seen["status"] or 500
         if ctx["job_recorded"] and status == 202:
@@ -19725,6 +20542,7 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
     "preview": "vite preview"
   },
   "dependencies": {
+    "qrcode-generator": "2.0.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^9.0.1",
@@ -19913,6 +20731,7 @@ import NavBar from './components/NavBar'
 import LoginPage from './pages/LoginPage'
 import SetupRequiredPage from './pages/SetupRequiredPage'
 import ChangePasswordPage from './pages/ChangePasswordPage'
+import AccountPage from './pages/AccountPage'
 import QAPage from './pages/QAPage'
 import ImportPage from './pages/ImportPage'
 import PreparePage from './pages/PreparePage'
@@ -19928,7 +20747,7 @@ import TransferPage from './pages/TransferPage'
 import HelpTransferPage from './pages/HelpTransferPage'
 
 // What the API says decides what is shown (#25): set up, logged in, a password
-// change due, and the role. Hiding a page is a convenience; the API refuses
+// change due, a two-step verification set-up due (#607), and the role. Hiding a page is a convenience; the API refuses
 // what the role can't do whatever the UI shows.
 export default function AppRouter() {
   const { state } = useAuth()
@@ -19956,6 +20775,16 @@ export default function AppRouter() {
       </Routes>
     )
   }
+  // Two-step verification is required for everyone and this user hasn't set
+  // it up: only the account page, until they do (#607).
+  if (state.user.mfa_enrollment_required) {
+    return (
+      <Routes>
+        <Route path="/account" element={<AccountPage forced />} />
+        <Route path="*" element={<Navigate to="/account" replace />} />
+      </Routes>
+    )
+  }
   const role = state.user.role
 
   return (
@@ -19966,6 +20795,7 @@ export default function AppRouter() {
           <Route path="/" element={<Navigate to="/qa" replace />} />
           <Route path="/login" element={<Navigate to="/qa" replace />} />
           <Route path="/qa" element={<QAPage />} />
+          <Route path="/account" element={<AccountPage />} />
           <Route path="/account/password" element={<ChangePasswordPage />} />
           {role !== 'end_user' && (
             <>
@@ -20013,7 +20843,9 @@ type AuthState =
 interface AuthValue {
   state: AuthState
   user: AuthUser | null
-  login: (username: string, password: string) => Promise<void>
+  // Resolves to true when the password was right and a code is needed (#607).
+  login: (username: string, password: string) => Promise<boolean>
+  verifyCode: (code: string) => Promise<void>
   logout: () => Promise<void>
   changePassword: (current: string, next: string) => Promise<void>
   refresh: () => Promise<void>
@@ -20048,14 +20880,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     onAuthProblem(code => {
       if (code === 'AUTH_REQUIRED') setState({ phase: 'logged_out' })
+      else if (code === 'MFA_ENROLLMENT_REQUIRED') {
+        setState(s => s.phase === 'logged_in' ? { phase: 'logged_in', user: { ...s.user, mfa_enrollment_required: true } } : s)
+      }
       else setState(s => s.phase === 'logged_in' ? { phase: 'logged_in', user: { ...s.user, must_change_password: true } } : s)
     })
     return () => onAuthProblem(null)
   }, [])
 
   const login = useCallback(async (username: string, password: string) => {
-    const user = await api.login(username, password)
-    setState({ phase: 'logged_in', user })
+    const result = await api.login(username, password)
+    // A login that opened a session names the user; it also carries the switch
+    // as `mfa_required` (true while MFA is required for everyone), so that field
+    // alone doesn't mean a code is due. Only the challenge answer,
+    // {mfa_required: true} with no user, asks for one (#607).
+    if (!('username' in result)) {
+      if (result.mfa_required === true) return true
+      throw new Error('The server sent a response the UI could not read.')
+    }
+    setState({ phase: 'logged_in', user: result })
+    return false
+  }, [])
+
+  const verifyCode = useCallback(async (code: string) => {
+    setState({ phase: 'logged_in', user: await api.loginMfa(code) })
   }, [])
 
   const logout = useCallback(async () => {
@@ -20064,12 +20912,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const changePassword = useCallback(async (current: string, next: string) => {
     const result = await api.changePassword(current, next)
-    setState({ phase: 'logged_in', user: { username: result.username, role: result.role, must_change_password: false } })
+    setState(s => ({ phase: 'logged_in', user: {
+      ...(s.phase === 'logged_in' ? s.user : {}), username: result.username, role: result.role, must_change_password: false,
+    } }))
   }, [])
 
   const user = state.phase === 'logged_in' ? state.user : null
   return (
-    <AuthContext.Provider value={{ state, user, login, logout, changePassword, refresh }}>
+    <AuthContext.Provider value={{ state, user, login, verifyCode, logout, changePassword, refresh }}>
       {children}
     </AuthContext.Provider>
   )
@@ -20286,10 +21136,12 @@ export class ApiError extends Error {
   }
 }
 
-// The session ended (401 AUTH_REQUIRED) or a generated password must be changed
-// first (403 PASSWORD_CHANGE_REQUIRED), whichever call noticed it (#25). The
-// auth context listens and shows the login or password page.
-type AuthListener = (code: 'AUTH_REQUIRED' | 'PASSWORD_CHANGE_REQUIRED') => void
+// The session ended (401 AUTH_REQUIRED), a generated password must be changed
+// first (403 PASSWORD_CHANGE_REQUIRED), or two-step verification must be set
+// up first (403 MFA_ENROLLMENT_REQUIRED, #607), whichever call noticed it (#25).
+// The auth context listens and shows the login, password or account page.
+export type AuthProblem = 'AUTH_REQUIRED' | 'PASSWORD_CHANGE_REQUIRED' | 'MFA_ENROLLMENT_REQUIRED'
+type AuthListener = (code: AuthProblem) => void
 let authListener: AuthListener | null = null
 export function onAuthProblem(listener: AuthListener | null) { authListener = listener }
 
@@ -20307,7 +21159,9 @@ async function request<T>(method: string, path: string, body?: unknown, isFormDa
   try { data = text ? JSON.parse(text) : null } catch { /* not JSON; handled below */ }
   if (!res.ok) {
     const code: string | null = typeof data?.error?.code === 'string' ? data.error.code : null
-    if (code === 'AUTH_REQUIRED' || code === 'PASSWORD_CHANGE_REQUIRED') authListener?.(code)
+    if (code === 'AUTH_REQUIRED' || code === 'PASSWORD_CHANGE_REQUIRED' || code === 'MFA_ENROLLMENT_REQUIRED') {
+      authListener?.(code)
+    }
     throw new ApiError(data?.error?.message ?? PROXY_ERRORS[res.status] ?? `HTTP ${res.status}`, res.status, code)
   }
   if (data === null && text) throw new Error('The server sent a response the UI could not read.')
@@ -20350,7 +21204,22 @@ export const api = {
   // sends with every same-origin request; the UI never sees or stores it.
   authStatus: () => request<{ setup_required: boolean }>('GET', '/auth/status'),
   me: () => request<AuthUser>('GET', '/auth/me'),
-  login: (username: string, password: string) => request<AuthUser>('POST', '/auth/login', { username, password }),
+  // For a user with two-step verification the password step answers
+  // {mfa_required: true} and sets a short-lived challenge cookie; loginMfa
+  // sends the code and opens the session (#607).
+  login: (username: string, password: string) =>
+    request<AuthUser | { mfa_required: true }>('POST', '/auth/login', { username, password }),
+  loginMfa: (code: string) => request<AuthUser>('POST', '/auth/login/mfa', { code }),
+  // The user's own two-step verification (#607). A secret or recovery codes are
+  // in one answer only; the Account page keeps them in memory until "Done".
+  mfaStatus: () => request<MfaStatus>('GET', '/auth/mfa'),
+  mfaEnroll: () => request<{ secret: string; otpauth_uri: string }>('POST', '/auth/mfa/enroll'),
+  mfaConfirm: (code: string) =>
+    request<{ recovery_codes: string[]; status: MfaStatus }>('POST', '/auth/mfa/enroll/confirm', { code }),
+  mfaRegenerate: (code: string) =>
+    request<{ recovery_codes: string[]; status: MfaStatus }>('POST', '/auth/mfa/recovery-codes', { code }),
+  mfaDisable: (password: string, code: string) =>
+    request<{ status: MfaStatus }>('POST', '/auth/mfa/disable', { password, code }),
   logout: () => request<{ status: string }>('POST', '/auth/logout'),
   changePassword: (current_password: string, new_password: string) =>
     request<{ status: string } & AuthUser>('POST', '/auth/password', { current_password, new_password }),
@@ -20365,6 +21234,9 @@ export const api = {
     request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/role`, { role }),
   disableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/disable`),
   enableUser: (username: string) => request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/enable`),
+  resetUserMfa: (username: string) =>
+    request<{ user: AdminUser }>('POST', `/auth/users/${encodeURIComponent(username)}/reset-mfa`),
+  setMfaRequired: (required: boolean) => request<{ required: boolean }>('POST', '/auth/mfa/policy', { required }),
   // Service principals and their API keys (Engineers only, #25 PR 3).
   listPrincipals: () => request<{ principals: ServicePrincipal[] }>('GET', '/auth/service-principals'),
   createPrincipal: (name: string, role: Role) =>
@@ -20444,8 +21316,15 @@ export const api = {
 
 // Types
 export type Role = 'engineer' | 'developer' | 'end_user'
-export interface AuthUser { username: string; role: Role; must_change_password: boolean; kind?: 'user' | 'service' }
-export interface AdminUser { username: string; role: Role; enabled: boolean; must_change_password: boolean; created_at: string }
+export interface AuthUser {
+  username: string; role: Role; must_change_password: boolean; kind?: 'user' | 'service'
+  // Two-step verification (#607): enrolled, required for everyone, and a set-up due because of it.
+  mfa_enrolled?: boolean; mfa_required?: boolean; mfa_enrollment_required?: boolean
+}
+export interface AdminUser {
+  username: string; role: Role; enabled: boolean; must_change_password: boolean; created_at: string; mfa_enrolled?: boolean
+}
+export interface MfaStatus { enrolled: boolean; enrolled_at: string | null; required: boolean; recovery_codes_remaining: number }
 export interface ServiceKey {
   id: string; label: string; created_at: string; expires_at: string
   revoked_at: string | null; last_used_at: string | null; status: 'active' | 'expired' | 'revoked'
@@ -20828,7 +21707,7 @@ export default function NavBar() {
   const menus = MENUS
     .map(m => ({ ...m, entries: m.entries.filter(e => role !== null && e.roles.includes(role)) }))
     .filter(m => m.entries.length > 0)
-  const accountCurrent = pathname === '/account/password'
+  const accountCurrent = pathname === '/account' || pathname === '/account/password'
 
   return (
     <nav className="bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-4">
@@ -20859,7 +21738,9 @@ export default function NavBar() {
         align="right"
         current={accountCurrent}
         items={[
-          { label: 'Change password', to: '/account/password', current: accountCurrent },
+          // The account page holds two-step verification (#607).
+          { label: 'Account', to: '/account', current: pathname === '/account' },
+          { label: 'Change password', to: '/account/password', current: pathname === '/account/password' },
           { label: 'Log out', onSelect: logOut },
         ]}
       />
@@ -21160,14 +22041,19 @@ export default function LatencyCharts({ data }: { data: MetricsResult }) {
 ```typescript
 import { FormEvent, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { ApiError } from '../api/client'
 import { useAuth } from '../context/AuthContext'
 
 // Replaces the role picker (#25): the role now comes with the account.
+// With two-step verification (#607) a right password asks for a code from the
+// authenticator app, or a recovery code, before the session opens.
 export default function LoginPage() {
-  const { login } = useAuth()
+  const { login, verifyCode } = useAuth()
   const navigate = useNavigate()
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [code, setCode] = useState('')
+  const [step, setStep] = useState<'password' | 'code'>('password')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -21176,7 +22062,11 @@ export default function LoginPage() {
     setBusy(true)
     setError('')
     try {
-      await login(username, password)
+      if (await login(username, password)) {
+        setPassword('')
+        setStep('code')
+        return
+      }
       navigate('/qa', { replace: true })
     } catch (err) {
       // The server's own message: generic for a failed login, "wait" when throttled.
@@ -21187,28 +22077,70 @@ export default function LoginPage() {
     }
   }
 
+  async function submitCode(e: FormEvent) {
+    e.preventDefault()
+    setBusy(true)
+    setError('')
+    try {
+      await verifyCode(code)
+      navigate('/qa', { replace: true })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      setCode('')
+      // The challenge ended (expired or used up): start again with the password.
+      if (err instanceof ApiError && err.code === 'MFA_CHALLENGE_INVALID') setStep('password')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function back() {
+    setStep('password')
+    setCode('')
+    setError('')
+  }
+
+  const input = 'mt-1 w-full border border-gray-300 rounded px-3 py-2 text-sm'
+  const button = 'w-full bg-blue-600 text-white rounded px-4 py-2 text-sm font-medium disabled:opacity-50'
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-8">
       <h1 className="text-3xl font-bold text-gray-800 mb-2">RAG Platform</h1>
       <p className="text-gray-500 mb-8">Log in to continue</p>
-      <form onSubmit={submit} className="bg-white border border-gray-200 rounded-xl p-6 shadow-xs w-full max-w-sm space-y-4">
-        <label className="block text-sm text-gray-700">
-          Username
-          <input id="login-username" autoComplete="username" value={username} onChange={e => setUsername(e.target.value)}
-            className="mt-1 w-full border border-gray-300 rounded px-3 py-2 text-sm" required />
-        </label>
-        <label className="block text-sm text-gray-700">
-          Password
-          <input id="login-password" type="password" autoComplete="current-password" value={password}
-            onChange={e => setPassword(e.target.value)}
-            className="mt-1 w-full border border-gray-300 rounded px-3 py-2 text-sm" required />
-        </label>
-        {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
-        <button type="submit" disabled={busy || !username || !password}
-          className="w-full bg-blue-600 text-white rounded px-4 py-2 text-sm font-medium disabled:opacity-50">
-          {busy ? 'Logging in…' : 'Log in'}
-        </button>
-      </form>
+      {step === 'password' ? (
+        <form onSubmit={submit} className="bg-white border border-gray-200 rounded-xl p-6 shadow-xs w-full max-w-sm space-y-4">
+          <label className="block text-sm text-gray-700">
+            Username
+            <input id="login-username" autoComplete="username" value={username} onChange={e => setUsername(e.target.value)}
+              className={input} required />
+          </label>
+          <label className="block text-sm text-gray-700">
+            Password
+            <input id="login-password" type="password" autoComplete="current-password" value={password}
+              onChange={e => setPassword(e.target.value)}
+              className={input} required />
+          </label>
+          {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
+          <button type="submit" disabled={busy || !username || !password} className={button}>
+            {busy ? 'Logging in…' : 'Log in'}
+          </button>
+        </form>
+      ) : (
+        <form onSubmit={submitCode} className="bg-white border border-gray-200 rounded-xl p-6 shadow-xs w-full max-w-sm space-y-4">
+          <p className="text-sm text-gray-600">
+            Enter the 6-digit code from your authenticator app, or one of your recovery codes.
+          </p>
+          <label className="block text-sm text-gray-700">
+            Authentication code
+            <input id="login-code" autoComplete="one-time-code" inputMode="text" value={code} maxLength={64}
+              onChange={e => setCode(e.target.value)} className={input} required autoFocus />
+          </label>
+          {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
+          <button type="submit" disabled={busy || !code} className={button}>
+            {busy ? 'Verifying…' : 'Verify'}
+          </button>
+          <button type="button" onClick={back} className="w-full text-sm text-gray-500 hover:text-blue-600">Back</button>
+        </form>
+      )}
     </div>
   )
 }
@@ -23920,6 +24852,9 @@ const ROLE_LABELS: Record<Role, string> = { end_user: 'End User', developer: 'De
 // password is changed on the Change password page, not reset here. Accounts are
 // disabled, never deleted. A generated password is shown once, from the answer
 // that carried it, and kept only in this page's memory until "Done".
+// Two-step verification (#607): each user's state, an Engineer's reset of
+// another user's set-up (which logs them out), and the switch that requires it
+// for everyone, which the API allows only once the Engineer has set it up.
 export default function UsersPage() {
   const { user: me, refresh } = useAuth()
   const [users, setUsers] = useState<AdminUser[]>([])
@@ -23956,6 +24891,19 @@ export default function UsersPage() {
       await load()
       return false
     } finally {
+      setBusy(false)
+    }
+  }
+
+  async function requireMfa(required: boolean) {
+    setActionError('')
+    setBusy(true)
+    try {
+      await api.setMfaRequired(required)
+    } catch (e: unknown) {
+      setActionError(e instanceof Error ? e.message : String(e))
+    } finally {
+      await refresh()
       setBusy(false)
     }
   }
@@ -24002,6 +24950,13 @@ export default function UsersPage() {
         </p>
       </form>
 
+      <label className="flex items-center gap-2 text-sm text-gray-700 mb-6">
+        <input id="mfa-required" type="checkbox" checked={!!me?.mfa_required} disabled={busy}
+          onChange={e => requireMfa(e.target.checked)} />
+        Require two-step verification for everyone
+        <span className="text-xs text-gray-500">(set it up for your own account first, on the Account page)</span>
+      </label>
+
       {actionError && <p role="alert" className="text-red-600 text-sm mb-4">{actionError}</p>}
 
       <table className="w-full text-sm border-collapse">
@@ -24011,6 +24966,7 @@ export default function UsersPage() {
             <th className="py-2 pr-4">Role</th>
             <th className="py-2 pr-4">Status</th>
             <th className="py-2 pr-4">Password</th>
+            <th className="py-2 pr-4">Two-step</th>
             <th className="py-2 pr-4">Created</th>
             <th className="py-2"></th>
           </tr>
@@ -24030,6 +24986,7 @@ export default function UsersPage() {
                 </td>
                 <td className="py-2 pr-4">{u.enabled ? 'Enabled' : 'Disabled'}</td>
                 <td className="py-2 pr-4">{u.must_change_password ? 'Change due' : 'Set'}</td>
+                <td className="py-2 pr-4">{u.mfa_enrolled ? 'On' : 'Off'}</td>
                 <td className="py-2 pr-4">{new Date(u.created_at).toLocaleDateString()}</td>
                 <td className="py-2 space-x-3 whitespace-nowrap">
                   {own
@@ -24039,12 +24996,265 @@ export default function UsersPage() {
                   <button disabled={busy}
                     onClick={() => act(u.username, () => u.enabled ? api.disableUser(u.username) : api.enableUser(u.username))}
                     className="text-blue-600 hover:underline disabled:opacity-50">{u.enabled ? 'Disable' : 'Enable'}</button>
+                  {u.mfa_enrolled && !own && (
+                    <button disabled={busy} onClick={() => act(u.username, () => api.resetUserMfa(u.username))}
+                      className="text-blue-600 hover:underline disabled:opacity-50">Reset two-step</button>
+                  )}
                 </td>
               </tr>
             )
           })}
         </tbody>
       </table>
+    </div>
+  )
+}
+```
+
+### ui/src/pages/AccountPage.tsx
+
+```typescript
+import { FormEvent, ReactNode, useEffect, useState } from 'react'
+import { Link, useNavigate } from 'react-router-dom'
+import qrcode from 'qrcode-generator'
+import { api, MfaStatus } from '../api/client'
+import { useAuth } from '../context/AuthContext'
+
+// The user's own account (#607): two-step verification with an authenticator
+// app (TOTP), and a link to Change password. Everything sensitive (the secret
+// while setting up, recovery codes) comes in one answer and is kept only in
+// this page's memory until "Done". The QR code is drawn here in the browser,
+// so the secret never leaves the machine for an image service; the secret is
+// also shown as text for apps that take it typed. When two-step verification
+// is required for everyone and this user hasn't set it up, this is the only
+// page the UI shows (`forced`), with a way to log out.
+
+function qrDataUrl(text: string): string {
+  const qr = qrcode(0, 'M')
+  qr.addData(text)
+  qr.make()
+  return qr.createDataURL(4, 4)
+}
+
+function Codes({ codes, onDone }: { codes: string[]; onDone: () => void }) {
+  return (
+    <div data-testid="recovery-codes" className="border border-amber-300 bg-amber-50 rounded p-4 text-sm space-y-3">
+      <p>
+        Your recovery codes. Each works once, in place of a code from the app, if you lose your phone. They are
+        shown only once: save them somewhere safe now.
+      </p>
+      <ul className="grid grid-cols-2 gap-2 font-mono">
+        {codes.map(c => <li key={c} className="bg-white border border-gray-200 rounded px-2 py-1 select-all">{c}</li>)}
+      </ul>
+      <button onClick={onDone} className="bg-blue-600 text-white px-3 py-1 rounded text-sm hover:bg-blue-700">Done</button>
+    </div>
+  )
+}
+
+export default function AccountPage({ forced = false }: { forced?: boolean }) {
+  const { user, logout, refresh } = useAuth()
+  const navigate = useNavigate()
+  const [status, setStatus] = useState<MfaStatus | null>(null)
+  const [loadError, setLoadError] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [setup, setSetup] = useState<{ secret: string; uri: string } | null>(null)
+  const [codes, setCodes] = useState<string[] | null>(null)
+  const [code, setCode] = useState('')
+  const [password, setPassword] = useState('')
+  const [form, setForm] = useState<'none' | 'regenerate' | 'disable'>('none')
+
+  async function load() {
+    try {
+      setStatus(await api.mfaStatus())
+      setLoadError('')
+    } catch (e: unknown) {
+      setLoadError(`Could not load your two-step verification: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  useEffect(() => { load() }, [])
+
+  async function run(action: () => Promise<void>) {
+    setError('')
+    setBusy(true)
+    try {
+      await action()
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const start = () => run(async () => {
+    const started = await api.mfaEnroll()
+    setSetup({ secret: started.secret, uri: started.otpauth_uri })
+    setCode('')
+  })
+
+  const confirm = (e: FormEvent) => {
+    e.preventDefault()
+    run(async () => {
+      try {
+        const result = await api.mfaConfirm(code)
+        setSetup(null)
+        setStatus(result.status)
+        setCodes(result.recovery_codes)
+      } finally {
+        setCode('')
+      }
+    })
+  }
+
+  const regenerate = (e: FormEvent) => {
+    e.preventDefault()
+    run(async () => {
+      try {
+        const result = await api.mfaRegenerate(code)
+        setStatus(result.status)
+        setCodes(result.recovery_codes)
+        setForm('none')
+      } finally {
+        setCode('')
+      }
+    })
+  }
+
+  const disable = (e: FormEvent) => {
+    e.preventDefault()
+    run(async () => {
+      try {
+        const result = await api.mfaDisable(password, code)
+        setStatus(result.status)
+        setForm('none')
+        await refresh()
+      } finally {
+        setCode('')
+        setPassword('')
+      }
+    })
+  }
+
+  // After the codes of a new set-up are put away, the API's view of the user
+  // (enrolled; no set-up due any more) is read again; a forced set-up then
+  // opens Q&A, as a forced password change does.
+  const done = async () => {
+    setCodes(null)
+    await refresh()
+    if (forced) navigate('/qa', { replace: true })
+  }
+
+  const input = 'mt-1 block w-full border border-gray-300 rounded px-3 py-2 text-sm'
+  const primary = 'bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-50'
+  const codeField = (id: string, label: string) => (
+    <label className="block text-sm text-gray-700">
+      {label}
+      <input id={id} autoComplete="one-time-code" value={code} maxLength={64} onChange={e => setCode(e.target.value)}
+        className={input} required />
+    </label>
+  )
+
+  let body: ReactNode
+  if (codes) {
+    body = <Codes codes={codes} onDone={done} />
+  } else if (!status) {
+    body = loadError ? null : <p className="text-sm text-gray-500">Loading…</p>
+  } else if (!status.enrolled) {
+    body = setup ? (
+      <form onSubmit={confirm} className="space-y-4" data-testid="mfa-setup">
+        <p className="text-sm text-gray-700">
+          Scan this code with an authenticator app (for example Microsoft Authenticator, Google Authenticator or
+          1Password), then enter the 6-digit code it shows.
+        </p>
+        <img src={qrDataUrl(setup.uri)} alt="QR code for your authenticator app" className="border border-gray-200 rounded" />
+        <p className="text-sm text-gray-700">
+          Or enter this key in the app by hand:{' '}
+          <code data-testid="mfa-secret" className="bg-white border border-gray-200 rounded px-2 py-1 select-all break-all">{setup.secret}</code>
+        </p>
+        {codeField('mfa-confirm-code', 'Code from the app')}
+        <div className="flex gap-3">
+          <button type="submit" disabled={busy || !code} className={primary}>Confirm</button>
+          <button type="button" onClick={() => setSetup(null)} className="text-sm text-gray-500 hover:text-blue-600">Cancel</button>
+        </div>
+      </form>
+    ) : (
+      <div className="space-y-3">
+        <p className="text-sm text-gray-700">
+          {forced
+            ? 'Two-step verification is required for every account. Set it up to continue.'
+            : 'Two-step verification is off. When it is on, logging in also needs a code from an authenticator app on your phone.'}
+        </p>
+        <button onClick={start} disabled={busy} className={primary}>Set up</button>
+      </div>
+    )
+  } else {
+    body = (
+      <div className="space-y-4">
+        <p className="text-sm text-gray-700" data-testid="mfa-on">
+          Two-step verification is on{status.enrolled_at ? ` since ${new Date(status.enrolled_at).toLocaleDateString()}` : ''}.
+          {' '}{status.recovery_codes_remaining} of 10 recovery codes left.
+        </p>
+        {form === 'regenerate' && (
+          <form onSubmit={regenerate} className="space-y-3">
+            <p className="text-sm text-gray-600">New codes replace all your old ones.</p>
+            {codeField('mfa-regenerate-code', 'Code from the app')}
+            <button type="submit" disabled={busy || !code} className={primary}>Get new recovery codes</button>
+          </form>
+        )}
+        {form === 'disable' && (
+          <form onSubmit={disable} className="space-y-3">
+            <label className="block text-sm text-gray-700">
+              Password
+              <input id="mfa-disable-password" type="password" autoComplete="current-password" value={password}
+                onChange={e => setPassword(e.target.value)} className={input} required />
+            </label>
+            {codeField('mfa-disable-code', 'Code from the app, or a recovery code')}
+            <button type="submit" disabled={busy || !code || !password} className={primary}>Turn off</button>
+          </form>
+        )}
+        {form === 'none' && (
+          <div className="flex gap-4">
+            <button onClick={() => { setForm('regenerate'); setCode(''); setError('') }}
+              className="text-sm text-blue-600 hover:underline">Regenerate recovery codes</button>
+            {!status.required && (
+              <button onClick={() => { setForm('disable'); setCode(''); setPassword(''); setError('') }}
+                className="text-sm text-blue-600 hover:underline">Turn off</button>
+            )}
+          </div>
+        )}
+        {form !== 'none' && (
+          <button onClick={() => { setForm('none'); setError('') }} className="text-sm text-gray-500 hover:text-blue-600">Cancel</button>
+        )}
+      </div>
+    )
+  }
+
+  const section = (
+    <div className="bg-white border border-gray-200 rounded-xl p-6 shadow-xs w-full max-w-lg space-y-4">
+      <h2 className="text-lg font-semibold text-gray-800">Two-step verification</h2>
+      {loadError && <p role="alert" className="text-sm text-red-600">{loadError}</p>}
+      {body}
+      {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
+    </div>
+  )
+
+  if (forced) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-8 gap-4">
+        <h1 className="text-3xl font-bold text-gray-800 mb-2">RAG Platform</h1>
+        {section}
+        <button type="button" onClick={() => logout()} className="text-sm text-gray-500 hover:text-blue-600">Log out</button>
+      </div>
+    )
+  }
+  return (
+    <div className="flex flex-col items-center gap-6">
+      <h1 className="text-2xl font-bold self-start">Account</h1>
+      <p className="text-sm text-gray-600 self-start">
+        {user?.username}. <Link to="/account/password" className="text-blue-600 hover:underline">Change password</Link>
+      </p>
+      {section}
     </div>
   )
 }
@@ -24248,14 +25458,15 @@ import { api, AuditFilters, AuditPage as AuditPageData, AuditRecord, auditCsvUrl
 
 // The names the API records (api/services/audit.py ALL_ACTIONS), for the filter.
 const ACTIONS = [
-  'admin.key.issue', 'admin.key.revoke', 'admin.principal.create', 'admin.principal.disable',
+  'admin.key.issue', 'admin.key.revoke', 'admin.mfa.policy', 'admin.principal.create', 'admin.principal.disable',
   'admin.principal.enable', 'admin.principal.set-role', 'admin.user.create', 'admin.user.disable',
-  'admin.user.enable', 'admin.user.reset-password', 'admin.user.set-role', 'audit.download', 'audit.view',
-  'auth.login', 'auth.logout', 'auth.password', 'collection.create', 'collection.delete', 'export',
+  'admin.user.enable', 'admin.user.reset-mfa', 'admin.user.reset-password', 'admin.user.set-role', 'audit.download',
+  'audit.view', 'auth.login', 'auth.logout', 'auth.mfa', 'auth.mfa.disable', 'auth.mfa.enroll',
+  'auth.mfa.recovery-codes', 'auth.password', 'collection.create', 'collection.delete', 'export',
   'goldstandard.download', 'goldstandard.save', 'import', 'ingest', 'ingest.config', 'operator.bootstrap',
-  'operator.create-user', 'operator.disable', 'operator.enable', 'operator.reset-password', 'operator.set-role',
-  'prepare.cancel', 'prepare.delete', 'prepare.download', 'prepare.import', 'prepare.start', 'prepare.upload',
-  'query', 'retrieval.config', 'system.start', 'tune.rechunk', 'tune.reembed', 'tune.reindex',
+  'operator.create-user', 'operator.disable', 'operator.enable', 'operator.reset-mfa', 'operator.reset-password',
+  'operator.set-role', 'prepare.cancel', 'prepare.delete', 'prepare.download', 'prepare.import', 'prepare.start',
+  'prepare.upload', 'query', 'retrieval.config', 'system.start', 'tune.rechunk', 'tune.reembed', 'tune.reindex',
 ]
 const RESULTS = ['success', 'refused', 'error', 'accepted', 'succeeded', 'failed', 'interrupted']
 const EMPTY: AuditFilters = { from: '', to: '', actor: '', action: '', collection: '', result: '' }
@@ -25402,7 +26613,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
 | `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health` reports, so the status flips to `below_recommended` on any host (#536) |
 | `../tests/test_memory_override.py` | host-side, standard library: the derived override makes `system_info.memory_info` report `below_recommended` with a note for allocations below and above the 12.35 GB a fixed 13 GB could flip, and no override without a usable allocation (#536); embedded copies; registered by suite 01 |
-| `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command, account administration, service API keys; registers `../tests/test_auth.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
+| `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command, account administration, service API keys, two-step verification (#607); registers `../tests/test_auth.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
 | `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
 | `auth_stack.py` | the stack checks of `17_auth.sh`, one per subcommand (#25) |
 | `auth_headers.py` | the suite's session as `Cookie` and `Origin` headers, for the host-side Python helpers (#25) |
@@ -27546,6 +28757,14 @@ section "Account administration by Engineers (PR 2)"
 stack admin-accounts
 check "an Engineer creates, resets, re-roles, disables and enables an account through the API; own reset refused; no password logged" $?
 
+section "Two-step verification (#607)"
+stack mfa
+check "set-up, password then code, no code twice, a recovery code once, an Engineer's reset; nothing secret logged" $?
+stack mfa-required
+check "the switch needs an enrolled Engineer and gates an unenrolled session to its own routes; reset-mfa ends the sessions; audit records hold no code" $?
+stack mfa-rate-limit
+check "nginx gives POST /auth/login/mfa the login's 16k body limit and its rate zone (429 LOGIN_RATE_LIMITED)" $?
+
 section "Service principals and API keys (PR 3, H3)"
 stack key-matrix end_user
 check "End User key, no Origin: 403 above its role and on account/key administration, logout and password change" $?
@@ -27614,12 +28833,16 @@ that create throwaway accounts (vfy-t-<random>), service principals
 it up. No password, session token or API key is printed; keys are held in
 memory only.
 """
+import base64
 import hashlib
+import hmac
 import json
 import os
 import secrets
+import struct
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -27690,10 +28913,13 @@ MATRIX = (
     ("POST", "/auth/service-principals/vfy-no-such-svc/enable", None, "engineer"),
     ("POST", "/auth/service-principals/vfy-no-such-svc/keys", {}, "engineer"),
     ("POST", "/auth/service-principals/vfy-no-such-svc/keys/nosuchkey123/revoke", None, "engineer"),
+    # Two-step verification (#607): a 404 for no such account, a 422 for no value.
+    ("POST", "/auth/users/vfy-no-such-user/reset-mfa", None, "engineer"),
+    ("POST", "/auth/mfa/policy", {}, "engineer"),
 )
 # Routes an API key can't use whatever its role (S5 of PR 3): every account,
 # principal and key route, logout and the password change; and the audit log (#29).
-KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password", "/audit")
+KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password", "/audit", "/auth/mfa")
 SESSION_ROUTES = (("GET", "/auth/me", None), ("POST", "/auth/logout", None), ("POST", "/auth/password", {}))
 
 
@@ -27974,7 +29200,8 @@ def check_login_logout(operator_ok):
     status, raw, _ = code("GET", "/auth/me", token=token)
     body = json.loads(raw)
     expect(status == 200 and body == {"username": "vfy-developer", "role": "developer", "must_change_password": False,
-                                      "kind": "user"},
+                                      "kind": "user", "mfa_enrolled": False, "mfa_required": False,
+                                      "mfa_enrollment_required": False},
            "GET /auth/me answered {} {}".format(status, body))
     status, _, _ = code("POST", "/auth/logout", token=token)
     expect(status == 200, "logout answered {}".format(status))
@@ -28273,6 +29500,197 @@ def check_no_secrets_logged(operator_ok):
     expect(leaked == 0, "{} harness secret(s) appear in the API log".format(leaked))
     expect("Login succeeded for 'vfy-engineer'" in result.stdout + result.stderr,
            "the API log has no login line for vfy-engineer")
+
+
+def totp(secret, offset=0):
+    """RFC 6238 (SHA-1, 6 digits, 30 s), computed here from the secret the
+    set-up answered, so the API is checked against the standard, not itself."""
+    key = base64.b32decode(secret + "=" * (-len(secret) % 8))
+    digest = hmac.new(key, struct.pack(">Q", int(time.time() // 30) + offset), hashlib.sha1).digest()
+    at = digest[-1] & 0x0F
+    return str((struct.unpack(">I", digest[at:at + 4])[0] & 0x7FFFFFFF) % 1000000).zfill(6)
+
+
+def cookie_value(headers, name):
+    for cookie in headers.get_all("Set-Cookie") or []:
+        key, _, rest = cookie.partition("=")
+        if key.strip() == name:
+            return rest.split(";", 1)[0]
+    return None
+
+
+def second_factor(challenge, value):
+    """POST /auth/login/mfa with the challenge cookie; paced like a login,
+    since nginx limits it in the same zone."""
+    headers = {"Origin": auth_setup.origin(), "Cookie": "rag_mfa=" + challenge}
+    return auth_setup.paced(auth_setup.LOGIN_PATH, lambda: code(
+        "POST", "/auth/login/mfa", {"code": value}, headers=headers, paced=False))
+
+
+def password_step(username, password):
+    status, raw, headers = code("POST", "/auth/login", {"username": username, "password": password})
+    body = json.loads(raw) if status == 200 else {}
+    challenge = cookie_value(headers, "rag_mfa")
+    expect(status == 200 and body == {"mfa_required": True} and challenge
+           and cookie_value(headers, "rag_session") is None,
+           "the password step for an enrolled user answered {} {} (challenge {})".format(
+               status, body, "set" if challenge else "missing"))
+    return challenge
+
+
+def check_mfa(operator_ok):
+    """Two-step verification on the stack (#607): set-up, the two-step login,
+    no code twice, a recovery code once, and an Engineer's reset."""
+    username, password, token = throwaway("developer", operator_ok)
+    status, raw, headers = code("POST", "/auth/mfa/enroll", token=token)
+    expect(status == 200 and headers.get("Cache-Control") == "no-store", "set-up answered {} {}".format(
+        status, error_code(raw)))
+    secret = json.loads(raw)["secret"]
+    status, raw, _ = code("POST", "/auth/mfa/enroll/confirm", {"code": totp(secret, -1)}, token=token)
+    expect(status == 200, "confirming the set-up answered {} {}".format(status, error_code(raw)))
+    recovery = json.loads(raw)["recovery_codes"]
+    expect(len(recovery) == 10, "{} recovery codes".format(len(recovery)))
+
+    challenge = password_step(username, password)
+    accepted = totp(secret)
+    status, raw, headers = second_factor(challenge, accepted)
+    expect(status == 200 and cookie_value(headers, "rag_session"), "the right code answered {} {}".format(
+        status, error_code(raw)))
+    challenge = password_step(username, password)
+    status, raw, _ = second_factor(challenge, accepted)
+    expect(status == 401 and error_code(raw) == "MFA_FAILED", "a used code answered {} {}".format(
+        status, error_code(raw)))
+    status, raw, _ = second_factor(challenge, recovery[0])
+    expect(status == 200, "a recovery code answered {} {}".format(status, error_code(raw)))
+    challenge = password_step(username, password)
+    status, raw, _ = second_factor(challenge, recovery[0])
+    expect(status == 401 and error_code(raw) == "MFA_FAILED", "a used recovery code answered {} {}".format(
+        status, error_code(raw)))
+
+    admin = role_token("engineer")
+    try:
+        status, raw, _ = code("POST", "/auth/users/{}/reset-mfa".format(username), token=admin)
+        expect(status == 200 and json.loads(raw)["user"]["mfa_enrolled"] is False,
+               "the Engineer's reset answered {} {}".format(status, error_code(raw)))
+    finally:
+        request("POST", "/auth/logout", token=admin)
+    status, body, _ = request("POST", "/auth/login", {"username": username, "password": password})
+    expect(status == 200 and body.get("mfa_enrolled") is False, "after the reset the login answered {} {}".format(
+        status, body))
+    result = compose("logs", "--no-color", "api")
+    expect(all(value not in result.stdout + result.stderr for value in [secret, accepted] + recovery),
+           "a secret or code appears in the API log")
+
+
+def enroll(token):
+    """Set up two-step verification for the session `token` through the API; returns the secret."""
+    status, raw, _ = code("POST", "/auth/mfa/enroll", token=token)
+    expect(status == 200, "set-up answered {} {}".format(status, error_code(raw)))
+    secret = json.loads(raw)["secret"]
+    status, raw, _ = code("POST", "/auth/mfa/enroll/confirm", {"code": totp(secret, -1)}, token=token)
+    expect(status == 200, "confirming the set-up answered {} {}".format(status, error_code(raw)))
+    return secret
+
+
+def check_mfa_rate_limit(operator_ok):
+    """#607: nginx gives POST /auth/login/mfa the login's 16k body limit and its
+    rate zone, so codes and passwords from one address share 10 a minute."""
+    big = {"code": "x" * 17000}
+    status, raw, headers = code("POST", "/auth/login/mfa", big, paced=False)
+    expect(status == 413 and error_code(raw) is None
+           and not headers.get("Content-Type", "").startswith("application/json"),
+           "a {}-byte code body answered {} {} (not nginx's 413)".format(len(json.dumps(big)), status,
+                                                                        error_code(raw)))
+    refusal = None
+    for _ in range(12):
+        status, raw, _ = code("POST", "/auth/login/mfa", {"code": "123456"}, paced=False)
+        if status == 429:
+            refusal = raw
+            break
+        expect(status == 401 and error_code(raw) == "MFA_CHALLENGE_INVALID",
+               "a code with no challenge answered {} {}".format(status, error_code(raw)))
+    expect(refusal is not None, "12 codes in a row were all let through")
+    expect(json.loads(refusal) == {"error": {"code": "LOGIN_RATE_LIMITED", "detail": None,
+                                             "message": "Too many login attempts. Wait a minute and try again."}},
+           "the refusal is {}".format(refusal[:200]))
+    status, raw, _ = code("POST", "/auth/login", {"username": "vfy-rate-" + secrets.token_hex(3),
+                                                  "password": "x" * 12}, paced=False)
+    expect(status == 429 and error_code(raw) == "LOGIN_RATE_LIMITED",
+           "right after the codes were limited, a login answered {} {}: not the same zone".format(
+               status, error_code(raw)))
+
+
+def _set_required(token, required):
+    return code("POST", "/auth/mfa/policy", {"required": required}, token=token)
+
+
+def check_mfa_required(operator_ok):
+    """#607 on the stack: the switch needs an enrolled Engineer; while it is on,
+    an unenrolled session reaches only its session and MFA routes; the operator's
+    reset-mfa ends the sessions and the next login asks for no code; the policy,
+    reset and code attempts are audit records without a code."""
+    eng_name, eng_password, eng = throwaway("engineer", operator_ok)
+    dev_name, _, dev = throwaway("developer", operator_ok)
+    status, raw, _ = _set_required(eng, True)
+    expect(status == 409 and error_code(raw) == "MFA_ENROLL_FIRST",
+           "an unenrolled Engineer turning the switch on answered {} {}".format(status, error_code(raw)))
+    secret = enroll(eng)
+    switched = False
+    try:
+        status, raw, _ = _set_required(eng, True)
+        switched = status == 200
+        expect(switched, "an enrolled Engineer turning the switch on answered {} {}".format(status, error_code(raw)))
+        status, raw, _ = code("GET", "/collections", token=dev)
+        expect(status == 403 and error_code(raw) == "MFA_ENROLLMENT_REQUIRED",
+               "while required, an unenrolled session's GET /collections answered {} {}".format(
+                   status, error_code(raw)))
+        status, body, _ = request("GET", "/auth/me", token=dev)
+        expect(status == 200 and body.get("mfa_enrollment_required") is True,
+               "while required, /auth/me answered {} {}".format(status, body))
+        status, raw, _ = code("GET", "/auth/mfa", token=dev)
+        expect(status == 200 and json.loads(raw).get("required") is True,
+               "while required, GET /auth/mfa answered {} {}".format(status, error_code(raw)))
+        status, raw, _ = code("GET", "/collections", token=eng)
+        expect(status == 200, "while required, the enrolled Engineer's GET /collections answered {}".format(status))
+    finally:
+        if switched:
+            status, raw, _ = _set_required(eng, False)
+            expect(status == 200, "turning the switch off answered {} {}".format(status, error_code(raw)))
+    status, raw, _ = code("GET", "/collections", token=dev)
+    expect(status == 200, "after the switch went off, GET /collections answered {} {}".format(status, error_code(raw)))
+
+    challenge = password_step(eng_name, eng_password)
+    status, _, _ = second_factor(challenge, "abcd-efgh-ijkl-mnop")
+    expect(status == 401, "a wrong recovery code answered {}".format(status))
+    rc, _ = auth_setup.operator("reset-mfa", eng_name)
+    expect(rc == 0, "reset-mfa exited {}".format(rc))
+    status, _, _ = code("GET", "/auth/me", token=eng)
+    expect(status == 401, "after reset-mfa the Engineer's session answered {}".format(status))
+    status, body, eng = request("POST", "/auth/login", {"username": eng_name, "password": eng_password})
+    expect(status == 200 and eng and body.get("mfa_enrolled") is False,
+           "after reset-mfa the login answered {} {}".format(status, body))
+    request("POST", "/auth/logout", token=eng)
+    request("POST", "/auth/logout", token=dev)
+
+    admin = role_token("engineer")
+    try:
+        def records(action):
+            status, raw, _ = code("GET", "/audit?action={}&limit=1000".format(action), token=admin)
+            expect(status == 200, "GET /audit?action={} answered {}".format(action, status))
+            return json.loads(raw)["records"]
+        policy = [r for r in records("admin.mfa.policy") if r["actor"] == eng_name]
+        expect(sorted(r["details"].get("required") for r in policy if r["result"] == "success") == [False, True],
+               "the switch's audit records are {}".format(policy))
+        expect(any(r["actor"] == eng_name for r in records("auth.mfa.enroll")), "no auth.mfa.enroll record")
+        failed = [r for r in records("auth.mfa") if r["actor"] == eng_name]
+        expect(len(failed) == 1 and failed[0]["details"].get("method") == "recovery"
+               and failed[0]["result"] != "success",
+               "the failed code's audit records are {}".format(failed))
+        expect(any(r["target"] == eng_name for r in records("operator.reset-mfa")), "no operator.reset-mfa record")
+        expect("abcd" not in json.dumps(failed) and secret not in json.dumps(records("auth.mfa.enroll")),
+               "an audit record holds a code or secret")
+    finally:
+        request("POST", "/auth/logout", token=admin)
 
 
 STATE = "restart-state.json"
@@ -31531,8 +32949,9 @@ class NginxTests(unittest.TestCase):
         lines = directives(self.locations)
         self.assertEqual([l for l in lines if l.startswith("location")],
                          ["location = /api/goldstandard/regenerate {", "location = /api/auth/login {",
-                          "location @login_rate_limited {", "location /api/ {", "location / {"])
-        self.assertEqual(lines.count("proxy_set_header Host $http_host;"), 3)
+                          "location = /api/auth/login/mfa {", "location @login_rate_limited {", "location /api/ {",
+                          "location / {"])
+        self.assertEqual(lines.count("proxy_set_header Host $http_host;"), 4)
 
     def test_only_listed_hosts_are_served(self):
         # #664: a map of the accepted hosts, and a server-level 421 for any other.
@@ -31567,6 +32986,15 @@ class NginxTests(unittest.TestCase):
                      "error_page 429 = @login_rate_limited;", "proxy_pass http://api/auth/login;",
                      "proxy_set_header X-Real-IP $remote_addr;", "client_max_body_size 16k;"):
             self.assertIn(line, lines)
+        # #607: the login's code step shares the zone, the refusal and the body limit.
+        code = self.locations[self.locations.index("location = /api/auth/login/mfa {"):]
+        code = directives(code[:code.index("\n}\n")])
+        for line in ("limit_req zone=login burst=5 nodelay;", "limit_req_status 429;",
+                     "error_page 429 = @login_rate_limited;", "proxy_pass http://api/auth/login/mfa;",
+                     "proxy_set_header Host $http_host;", "proxy_set_header X-Real-IP $remote_addr;",
+                     "client_max_body_size 16k;"):
+            self.assertIn(line, code)
+        self.assertEqual([l for l in code if l.startswith("proxy_request_buffering")], [])
         # #663: login reads a body before authentication, so it has a small,
         # buffered body limit, not /api/'s 512m streamed uploads.
         self.assertEqual([l for l in lines if l.startswith("proxy_request_buffering")], [])
@@ -31703,7 +33131,7 @@ from pydantic import ValidationError
 import config
 from config import settings
 from main import app
-from auth import keys, passwords, policy, store
+from auth import keys, mfa, passwords, policy, store
 from auth.middleware import AuthMiddleware, same_origin
 from services import audit, ollama_client, weaviate_client
 
@@ -32171,7 +33599,7 @@ class PolicyTests(unittest.TestCase):
         counts = {}
         for access in policy.ACCESS.values():
             counts[access] = counts.get(access, 0) + 1
-        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 35, "engineer": 26})
+        self.assertEqual(counts, {"public": 4, "session": 3, "mfa": 5, "end_user": 3, "developer": 35, "engineer": 28})
         self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
         self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
         self.assertEqual(policy.ACCESS[("POST", "/collections")], "developer")
@@ -32187,7 +33615,8 @@ class PolicyTests(unittest.TestCase):
                                       ("POST", "/auth/users/{username}/reset-password"),
                                       ("POST", "/auth/users/{username}/role"),
                                       ("POST", "/auth/users/{username}/disable"),
-                                      ("POST", "/auth/users/{username}/enable")})
+                                      ("POST", "/auth/users/{username}/enable"),
+                                      ("POST", "/auth/users/{username}/reset-mfa")})
         self.assertEqual(set(admin.values()), {"engineer"})
         self.assertFalse([key for key in policy.ACCESS if key[0] == "DELETE" and key[1].startswith("/auth")])
         # Service principals and keys (PR 3): the Engineer's, and nothing deletes a principal.
@@ -32199,11 +33628,19 @@ class PolicyTests(unittest.TestCase):
             ("POST", "/auth/service-principals/{name}/enable"), ("POST", "/auth/service-principals/{name}/keys"),
             ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke")})
         self.assertEqual(set(principals.values()), {"engineer"})
+        # Two-step verification (#607): the code step is public like the login;
+        # the user's own routes are any session's; the switch is the Engineer's.
+        own = {key: access for key, access in policy.ACCESS.items() if key[1].startswith("/auth/mfa")}
+        self.assertEqual(own, {("GET", "/auth/mfa"): "mfa", ("POST", "/auth/mfa/enroll"): "mfa",
+                               ("POST", "/auth/mfa/enroll/confirm"): "mfa", ("POST", "/auth/mfa/recovery-codes"): "mfa",
+                               ("POST", "/auth/mfa/disable"): "mfa", ("POST", "/auth/mfa/policy"): "engineer"})
+        self.assertEqual(policy.ACCESS[("POST", "/auth/login/mfa")], "public")
 
     def test_keys_cannot_reach_administration_or_the_session_routes(self):
         # S5 of PR 3: every account, principal and key route, logout and the
         # password change, and the audit log (#29); GET /auth/me stays open to a key.
-        admin = {path for _, path in policy.ACCESS if path.startswith(("/auth/users", "/auth/service-principals"))}
+        admin = {path for _, path in policy.ACCESS
+                 if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa"))}
         self.assertEqual(policy.HUMAN_ONLY, admin | {"/auth/logout", "/auth/password", "/audit", "/audit.csv"})
         self.assertNotIn("/auth/me", policy.HUMAN_ONLY)
 
@@ -32407,7 +33844,9 @@ class RouteTests(StoreTestCase):
         with self.assertLogs("auth", "WARNING") as logs:
             response = self.login("ENG", password)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"username": "eng", "role": "engineer", "must_change_password": True})
+        self.assertEqual(response.json(), {"username": "eng", "role": "engineer", "must_change_password": True,
+                                           "mfa_enrolled": False, "mfa_required": False,
+                                           "mfa_enrollment_required": False})
         cookie = response.headers["set-cookie"]
         attributes = [a.strip().lower() for a in cookie.split(";")[1:]]
         for want in ("httponly", "samesite=strict", "path=/", f"max-age={store.ABSOLUTE_S}"):
@@ -32673,7 +34112,8 @@ class AdminRouteTests(StoreTestCase):
         self.assertEqual(response.status_code, 200)
         users = response.json()["users"]
         self.assertEqual([u["username"] for u in users], ["dev", "eng", "user"])
-        self.assertEqual(set(users[0]), {"username", "role", "enabled", "must_change_password", "created_at"})
+        self.assertEqual(set(users[0]), {"username", "role", "enabled", "must_change_password", "created_at",
+                                         "mfa_enrolled"})
         self.assertEqual((users[0]["role"], users[0]["enabled"], users[0]["must_change_password"]),
                          ("developer", True, False))
         self.assertRegex(users[0]["created_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
@@ -32882,7 +34322,7 @@ class KeyStoreTests(KeyTestCase):
         with patch.object(settings, "auth_dir", temp.name):
             self.assertEqual(store.get_user("old").kind, "user")
             version = sqlite3.connect(Path(temp.name, "auth.db")).execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 2)
+            self.assertEqual(version, store.SCHEMA_VERSION)
             store.create_principal("svc", "developer")
             self.assertEqual([p.name for p in store.list_principals()], ["svc"])
 
@@ -33063,7 +34503,8 @@ class KeyMiddlewareTests(KeyTestCase):
         _, key = self.principal("svc", "end_user")
         response = self.client.get("/auth/me", headers=self.bearer(key))
         self.assertEqual(response.json(), {"username": "svc", "role": "end_user", "must_change_password": False,
-                                           "kind": "service"})
+                                           "kind": "service", "mfa_enrolled": False, "mfa_required": False,
+                                           "mfa_enrollment_required": False})
         headers, _ = self.session("dev")
         self.assertEqual(self.client.get("/auth/me", headers=headers).json()["kind"], "user")
 
@@ -33437,6 +34878,28 @@ class CommandTests(unittest.TestCase):
                     if secret:
                         self.assertNotIn(secret, result.stderr)
 
+    def test_reset_mfa(self):
+        # S6.2 of RD-117 (#607): the last-resort recovery, for an engineer too.
+        self.run_auth("bootstrap", "admin")
+        with patch.object(settings, "auth_dir", self.dir):
+            store._ready.discard(str(store.db_path()))
+            admin = store.get_user("admin")
+            secret, _ = store.start_enrollment(admin.id, "admin")
+            token = store.create_session(admin.id)
+            store.confirm_enrollment(store.authenticate(token), mfa.code_at(secret, int(time.time() // 30)))
+            store.create_principal("svc", "developer")
+        result = self.run_auth("reset-mfa", "Admin")
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual(result.stderr.strip().splitlines(), [
+            "auth: reset-mfa: two-step verification of 'admin' removed; their sessions ended"])
+        self.assertFalse(self.users()["admin"].mfa_enrolled)
+        with patch.object(settings, "auth_dir", self.dir):
+            self.assertIsNone(store.authenticate(token))
+        for args in (("reset-mfa", "nobody"), ("reset-mfa", "svc")):
+            with self.subTest(args=args):
+                refused = self.run_auth(*args)
+                self.assertEqual(refused.returncode, 1, refused.stderr)
+
 
 class TestingHelperTests(unittest.TestCase):
     def test_headers_are_a_real_session(self):
@@ -33463,6 +34926,644 @@ class OfflineTests(unittest.TestCase):
         self.assertEqual(set(health), {"llm", "build_llm", "embed", "same_model"})
 
 
+class MfaUnitTests(unittest.TestCase):
+    """TOTP, recovery codes and sealing (#607): S1.2, S2, S3 of RD-117's specifications."""
+
+    # RFC 6238 Appendix B, SHA-1: the ASCII secret "12345678901234567890", the
+    # last 6 of the 8 digits given there.
+    RFC = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+    VECTORS = ((59, "287082"), (1111111109, "081804"), (1111111111, "050471"), (1234567890, "005924"),
+               (2000000000, "279037"), (20000000000, "353130"))
+
+    def test_rfc_6238_vectors(self):
+        for at, code in self.VECTORS:
+            with self.subTest(at=at):
+                self.assertEqual(mfa.code_at(self.RFC, at // 30), code)
+
+    def test_window_and_replay(self):
+        now = 1_000_000_000.0
+        step = int(now // 30)
+        for offset in (-1, 0, 1):
+            with self.subTest(offset=offset):
+                code = mfa.code_at(self.RFC, step + offset)
+                self.assertEqual(mfa.matching_step(self.RFC, code, now, -1), step + offset)
+                # A step at or before the last accepted one never counts again.
+                self.assertIsNone(mfa.matching_step(self.RFC, code, now, step + offset))
+        for offset in (-2, 2):
+            with self.subTest(outside=offset):
+                self.assertIsNone(mfa.matching_step(self.RFC, mfa.code_at(self.RFC, step + offset), now, -1))
+        self.assertEqual(mfa.matching_step(self.RFC, " " + mfa.code_at(self.RFC, step)[:3] + " "
+                                           + mfa.code_at(self.RFC, step)[3:], now, -1), step)
+        for bad in ("", "12345", "1234567", "abcdef", "\u0661\u0662\u0663\u0664\u0665\u0666",
+                    "\uff11\uff12\uff13\uff14\uff15\uff16"):
+            self.assertIsNone(mfa.matching_step(self.RFC, bad, now, -1))
+            self.assertFalse(mfa.is_totp(bad))
+
+    def test_new_secret_is_160_bits_of_base32(self):
+        secret = mfa.new_secret()
+        self.assertRegex(secret, r"^[A-Z2-7]{32}$")
+        self.assertNotEqual(secret, mfa.new_secret())
+
+    def test_recovery_codes(self):
+        codes = mfa.new_recovery_codes()
+        self.assertEqual(len(codes), 10)
+        self.assertEqual(len(set(codes)), 10)
+        for code in codes:
+            self.assertRegex(code, r"^[a-z2-7]{4}-[a-z2-7]{4}-[a-z2-7]{4}-[a-z2-7]{4}$")
+        code = codes[0]
+        self.assertEqual(mfa.recovery_hash(code), mfa.recovery_hash(code.upper().replace("-", " ")))
+        self.assertEqual(mfa.recovery_hash(code), hashlib.sha256(code.replace("-", "").encode()).hexdigest())
+        for bad in ("", "123456", code + "a", "0000-0000-0000-0000"):
+            self.assertIsNone(mfa.recovery_hash(bad))
+
+    def test_otpauth_uri(self):
+        self.assertEqual(mfa.otpauth_uri("eng", "ABC"),
+                         "otpauth://totp/RAG%20Platform:eng?secret=ABC&issuer=RAG%20Platform"
+                         "&algorithm=SHA1&digits=6&period=30")
+
+    def test_sealing(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with patch.object(settings, "auth_dir", temp.name):
+            sealed = mfa.seal(7, "SECRET")
+            key = Path(temp.name, mfa.KEY_FILE)
+            self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(len(key.read_bytes()), 32)
+            self.assertNotIn("SECRET", sealed)
+            self.assertEqual(mfa.unseal(7, sealed), "SECRET")
+            self.assertIsNone(mfa.unseal(8, sealed), "another user's id is other associated data")
+            self.assertIsNone(mfa.unseal(7, sealed[:-4] + "AAAA"))
+            self.assertNotEqual(mfa.seal(7, "SECRET"), sealed, "a fresh nonce every time")
+            self.assertEqual([p.name for p in Path(temp.name).iterdir()], [mfa.KEY_FILE], "no temporary file is left")
+            key.write_bytes(os.urandom(32))
+            self.assertIsNone(mfa.unseal(7, sealed), "another key never verifies")
+            key.unlink()
+            self.assertIsNone(mfa.unseal(7, sealed), "a lost key never verifies")
+
+
+class MfaKeyFileTests(unittest.TestCase):
+    """The key file is never seen without its key (#607 review)."""
+
+    def test_a_racing_creator_uses_the_key_that_won(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with patch.object(settings, "auth_dir", temp.name):
+            key = Path(temp.name, mfa.KEY_FILE)
+            winner = os.urandom(32)
+            real_link = os.link
+
+            def link_after_the_other(src, dst):
+                key.write_bytes(winner)          # the other process linked its key first
+                return real_link(src, dst)
+            with patch.object(mfa.os, "link", link_after_the_other):
+                sealed = mfa.seal(3, "SECRET")
+            self.assertEqual(key.read_bytes(), winner)
+            self.assertEqual(mfa.unseal(3, sealed), "SECRET", "sealed under the winning key")
+            self.assertEqual([p.name for p in Path(temp.name).iterdir()], [mfa.KEY_FILE])
+
+    def test_a_failed_write_leaves_no_key_file(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with patch.object(settings, "auth_dir", temp.name), \
+                patch.object(mfa.os, "fsync", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                mfa.seal(3, "SECRET")
+            self.assertEqual(list(Path(temp.name).iterdir()), [], "neither an empty mfa.key nor a temporary file")
+
+
+class MfaTestCase(StoreTestCase):
+    """Helpers: enroll a user through the store, and the current code of a secret."""
+
+    def setUp(self):
+        super().setUp()
+        self.setup_roles()
+
+    def principal(self, username):
+        headers, token = self.session(username)
+        return store.authenticate(token), headers
+
+    def enroll(self, username):
+        """Enroll `username`; returns its secret and recovery codes."""
+        user = store.get_user(username)
+        secret, _ = store.start_enrollment(user.id, username)
+        principal, _ = self.principal(username)
+        codes = store.confirm_enrollment(principal, self.code(secret, -1))
+        return secret, codes
+
+    @staticmethod
+    def code(secret, offset=0):
+        return mfa.code_at(secret, int(time.time() // 30) + offset)
+
+    def challenge(self, username):
+        response = self.login(username, self.passwords[{"eng": "engineer", "dev": "developer",
+                                                        "user": "end_user"}[username]])
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"mfa_required": True})
+        self.assertNotIn(store.COOKIE + "=", response.headers.get("set-cookie", "").split(";")[0])
+        return response.cookies.get(store.MFA_COOKIE)
+
+    def second(self, token, code):
+        return self.client.post("/auth/login/mfa", json={"code": code},
+                                headers={"Cookie": f"{store.MFA_COOKIE}={token}"} if token else {})
+
+    def err(self, response):
+        return response.status_code, response.json()["error"]["code"]
+
+
+class MfaStoreTests(MfaTestCase):
+    def test_a_version_2_store_gains_the_mfa_tables(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        conn = sqlite3.connect(Path(temp.name, "auth.db"))
+        conn.executescript("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, "
+                           "role TEXT NOT NULL, password_hash TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, "
+                           "must_change_password INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL, "
+                           "updated_at REAL NOT NULL, kind TEXT NOT NULL DEFAULT 'user');"
+                           "INSERT INTO users VALUES (1, 'old', 'engineer', 'x', 1, 0, 1.0, 1.0, 'user');"
+                           "PRAGMA user_version = 2;")
+        conn.commit()
+        conn.close()
+        with patch.object(settings, "auth_dir", temp.name):
+            self.assertFalse(store.get_user("old").mfa_enrolled)
+            self.assertFalse(store.mfa_required())
+            version = sqlite3.connect(Path(temp.name, "auth.db")).execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(version, 3)
+
+    def test_no_secret_or_code_is_stored_in_plain_form(self):
+        secret, codes = self.enroll("dev")
+        raw = Path(self.dir, "auth.db").read_bytes() + b"".join(
+            p.read_bytes() for p in Path(self.dir).glob("auth.db-*"))
+        self.assertNotIn(secret.encode(), raw)
+        for code in codes:
+            self.assertNotIn(code.encode(), raw)
+            self.assertNotIn(code.replace("-", "").encode(), raw)
+        hashes = {row[0] for row in self.rows("SELECT code_hash FROM recovery_codes")}
+        self.assertEqual(hashes, {mfa.recovery_hash(c) for c in codes})
+        self.assertEqual(Path(self.dir, mfa.KEY_FILE).stat().st_mode & 0o777, 0o600)
+
+    def test_enrollment_ends_the_other_sessions(self):
+        _, other = self.session("dev")
+        user = store.get_user("dev")
+        secret, uri = store.start_enrollment(user.id, "dev")
+        self.assertIn(f"secret={secret}", uri)
+        principal, _ = self.principal("dev")
+        with self.assertRaises(store.Refused) as wrong:
+            store.confirm_enrollment(principal, "000000" if self.code(secret) != "000000" else "111111")
+        self.assertEqual(wrong.exception.code, "MFA_CODE_INCORRECT")
+        codes = store.confirm_enrollment(principal, self.code(secret))
+        self.assertEqual(len(codes), 10)
+        self.assertIsNone(store.authenticate(other))
+        rows = self.rows(f"SELECT token_hash FROM sessions WHERE user_id = {principal.user_id}")
+        self.assertEqual([r[0] for r in rows], [principal.token_hash], "only this session stays")
+        with self.assertRaises(store.Refused) as again:
+            store.start_enrollment(user.id, "dev")
+        self.assertEqual(again.exception.code, "MFA_ALREADY_ENROLLED")
+
+    def test_a_pending_set_up_expires(self):
+        user = store.get_user("dev")
+        secret, _ = store.start_enrollment(user.id, "dev")
+        with closing(sqlite3.connect(store.db_path())) as conn, conn:
+            conn.execute("UPDATE mfa_pending SET created_at = created_at - ?", (store.MFA_PENDING_S + 1,))
+        principal, _ = self.principal("dev")
+        with self.assertRaises(store.Refused) as refused:
+            store.confirm_enrollment(principal, self.code(secret))
+        self.assertEqual(refused.exception.code, "MFA_ENROLLMENT_NOT_STARTED")
+
+    def test_regenerate_needs_a_current_totp_code(self):
+        secret, codes = self.enroll("dev")
+        principal, _ = self.principal("dev")
+        self.assertIsNone(store.regenerate_codes(principal, codes[0]), "a recovery code doesn't count here")
+        fresh = store.regenerate_codes(principal, self.code(secret, 1))
+        self.assertEqual(len(fresh), 10)
+        self.assertTrue(set(fresh).isdisjoint(codes))
+        self.assertEqual(store.mfa_status(principal.user_id)["recovery_codes_remaining"], 10)
+
+    def test_disable_rules(self):
+        secret, codes = self.enroll("dev")
+        principal, _ = self.principal("dev")
+        password = self.passwords["developer"]
+        self.assertFalse(store.disable_mfa(principal, "wrong password!", self.code(secret, 1)))
+        self.assertFalse(store.disable_mfa(principal, password, "000000-not"))
+        eng, _ = self.principal("eng")
+        self.enroll("eng")
+        store.set_mfa_required(eng.user_id, True)
+        with self.assertRaises(store.Refused) as required:
+            store.disable_mfa(principal, password, codes[0])
+        self.assertEqual(required.exception.code, "MFA_REQUIRED")
+        store.set_mfa_required(eng.user_id, False)
+        self.assertTrue(store.disable_mfa(principal, password, codes[0]))
+        self.assertFalse(store.get_user("dev").mfa_enrolled)
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM recovery_codes WHERE user_id = %d" % principal.user_id),
+                         [(0,)])
+        with self.assertRaises(store.Refused) as not_enrolled:
+            store.disable_mfa(principal, password, codes[1])
+        self.assertEqual(not_enrolled.exception.code, "MFA_NOT_ENROLLED")
+
+    def test_the_switch_needs_an_enrolled_engineer(self):
+        eng = store.get_user("eng")
+        with self.assertRaises(store.Refused) as refused:
+            store.set_mfa_required(eng.id, True)
+        self.assertEqual(refused.exception.code, "MFA_ENROLL_FIRST")
+        self.enroll("eng")
+        store.set_mfa_required(eng.id, True)
+        store.set_mfa_required(eng.id, True)
+        self.assertTrue(store.mfa_required())
+        store.set_mfa_required(eng.id, False)
+        self.assertFalse(store.mfa_required())
+
+    def test_reset(self):
+        self.enroll("dev")
+        _, token = self.session("dev")
+        store.reset_mfa("dev", "user")
+        self.assertFalse(store.get_user("dev").mfa_enrolled)
+        self.assertIsNone(store.authenticate(token))
+        for table in ("mfa", "mfa_pending", "recovery_codes", "mfa_challenges"):
+            self.assertEqual(self.rows(f"SELECT COUNT(*) FROM {table}"), [(0,)])
+        store.create_principal("svc", "developer")
+        with self.assertRaises(store.Refused) as principal:
+            store.reset_mfa("svc", "user")
+        self.assertEqual(principal.exception.code, "USER_NOT_FOUND")
+        with self.assertRaises(store.Refused) as operator:
+            store.reset_mfa("svc")
+        self.assertEqual(operator.exception.code, "NOT_A_USER")
+
+
+class MfaLoginTests(MfaTestCase):
+    def test_a_user_without_mfa_logs_in_as_before(self):
+        response = self.login("dev", self.passwords["developer"])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["mfa_enrolled"], False)
+        self.assertIn(store.COOKIE, response.cookies)
+
+    def test_password_then_code(self):
+        secret, _ = self.enroll("dev")
+        sessions = "SELECT COUNT(*) FROM sessions WHERE user_id = (SELECT id FROM users WHERE username = 'dev')"
+        before = self.rows(sessions)
+        with self.assertLogs("auth", "WARNING") as logs:
+            token = self.challenge("dev")
+        self.assertIn("code required", logged(logs))
+        self.assertTrue(token)
+        self.assertEqual(self.rows(sessions), before, "a right password alone opens no session")
+        cookie = [c for c in self.client.cookies.jar if c.name == store.MFA_COOKIE]
+        self.client.cookies.clear()
+        code = self.code(secret, 1)
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.second(token, code)
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual((body["username"], body["mfa_enrolled"]), ("dev", True))
+        self.assertIn(store.COOKIE, response.cookies)
+        self.assertNotIn(code, logged(logs))
+        self.assertTrue(cookie)
+        # The challenge is spent, and the same code never works again.
+        self.client.cookies.clear()
+        self.assertEqual(self.err(self.second(token, code)), (401, "MFA_CHALLENGE_INVALID"))
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        self.assertEqual(self.err(self.second(token, code)), (401, "MFA_FAILED"))
+
+    def test_challenge_cookie_attributes(self):
+        self.enroll("dev")
+        response = self.login("dev", self.passwords["developer"])
+        attributes = [a.strip().lower() for a in response.headers["set-cookie"].split(";")[1:]]
+        for want in ("httponly", "samesite=strict", "path=/", f"max-age={store.MFA_CHALLENGE_S}"):
+            self.assertIn(want, attributes)
+
+    def test_wrong_codes_count_against_the_throttle(self):
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        wrong = "000000" if self.code(secret) != "000000" else "111111"
+        for _ in range(4):
+            self.assertEqual(self.err(self.second(token, wrong)), (401, "MFA_FAILED"))
+        # A right password doesn't clear the count (S4.2): a new challenge, one more wrong code locks.
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        self.assertEqual(self.err(self.second(token, wrong)), (401, "MFA_FAILED"))
+        self.assertTrue(locked("dev", "testclient"))
+        self.assertEqual(self.err(self.second(token, self.code(secret))), (429, "LOGIN_THROTTLED"))
+        self.assertEqual(self.login("dev", self.passwords["developer"]).status_code, 429)
+
+    def test_a_challenge_allows_five_codes(self):
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        for _ in range(5):
+            with closing(sqlite3.connect(store.db_path())) as conn, conn:
+                conn.execute("DELETE FROM login_failures")       # isolate the challenge's own limit
+            self.assertEqual(self.second(token, "999999-x").status_code, 401)
+        self.assertEqual(self.err(self.second(token, self.code(secret))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_a_challenge_expires(self):
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        with closing(sqlite3.connect(store.db_path())) as conn, conn:
+            conn.execute("UPDATE mfa_challenges SET created_at = created_at - ?", (store.MFA_CHALLENGE_S + 1,))
+        self.assertEqual(self.err(self.second(token, self.code(secret))), (401, "MFA_CHALLENGE_INVALID"))
+        self.assertEqual(self.err(self.second(None, self.code(secret))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_a_recovery_code_works_once(self):
+        _, codes = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        self.assertEqual(self.second(token, codes[3].upper()).status_code, 200)
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        self.assertEqual(self.err(self.second(token, codes[3])), (401, "MFA_FAILED"))
+        headers, _ = self.session("dev")
+        status = self.client.get("/auth/mfa", headers=headers).json()
+        self.assertEqual(status["recovery_codes_remaining"], 9)
+
+    def test_a_lost_key_leaves_the_recovery_codes(self):
+        secret, codes = self.enroll("dev")
+        Path(self.dir, mfa.KEY_FILE).unlink()
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_FAILED"))
+        self.assertEqual(self.second(token, codes[0]).status_code, 200)
+
+    def test_a_reset_or_disable_ends_a_challenge(self):
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        store.set_enabled("dev", False)
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+        # Enabling again doesn't revive it: disabling deleted it (#607 review).
+        store.set_enabled("dev", True)
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM mfa_challenges"), [(0,)])
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_a_password_change_or_reset_ends_a_challenge(self):
+        # #607 review: a login started with the old password can't be finished.
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        store.reset_password("dev", passwords.generate_password())
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+        store.reset_password("dev", self.passwords["developer"])   # back to a known password
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        principal, _ = self.principal("dev")
+        store.change_password(principal, passwords.generate_password())
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM mfa_challenges"), [(0,)])
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_an_mfa_reset_ends_a_challenge(self):
+        # Decision 2 (#607): a reset ends the user's pending challenges, so a
+        # login started before it can't be finished with the next enrollment's code.
+        self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM mfa_challenges"), [(1,)])
+        store.reset_mfa("dev", "user")
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM mfa_challenges"), [(0,)])
+        secret, _ = self.enroll("dev")
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_non_ascii_digits_are_a_plain_wrong_code(self):
+        # #607 review: other scripts' digits are refused as any wrong code, not a 500.
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        arabic = "\u0661\u0662\u0663\u0664\u0665\u0666"
+        self.assertEqual(self.err(self.second(token, arabic)), (401, "MFA_FAILED"))
+        headers, _ = self.session("dev")
+        self.assertEqual(self.err(self.client.post("/auth/mfa/recovery-codes", json={"code": arabic},
+                                                   headers=headers)), (403, "MFA_CODE_INCORRECT"))
+        self.assertEqual(self.second(token, self.code(secret, 1)).status_code, 200)
+
+
+class MfaConcurrencyTests(MfaTestCase):
+    """Reviewer's checks (#607): a code is spent once and a challenge's limits
+    hold when requests arrive together. Each check is slowed down inside the
+    write transaction, so without BEGIN IMMEDIATE the parallel requests would
+    all see the same unspent state."""
+
+    @staticmethod
+    def slowed(name="matching_step"):
+        real = getattr(mfa, name)
+
+        def slow(*args, **kwargs):
+            found = real(*args, **kwargs)
+            time.sleep(0.2)
+            return found
+        return patch.object(mfa, name, slow)
+
+    WRONG = "abcd-efgh-ijkl-mnop"           # a well-formed recovery code nobody holds
+
+    @staticmethod
+    def together(calls):
+        start, results = threading.Barrier(len(calls)), [None] * len(calls)
+
+        def run(i, call):
+            start.wait()
+            try:
+                results[i] = call()
+            except Exception as exc:          # recorded, so the assertion names it
+                results[i] = exc
+        threads = [threading.Thread(target=run, args=(i, c)) for i, c in enumerate(calls)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        return results
+
+    def test_one_totp_code_is_spent_once_across_parallel_uses(self):
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        principal, _ = self.principal("dev")
+        code = self.code(secret, 1)
+        with self.slowed():
+            results = self.together([
+                lambda: store.answer_challenge(token, code)[0] == "ok",
+                lambda: store.regenerate_codes(principal, code) is not None,
+                lambda: store.disable_mfa(principal, self.passwords["developer"], code),
+            ])
+        self.assertEqual(sorted(map(repr, results)), ["False", "False", "True"], results)
+
+    def test_one_recovery_code_is_spent_once_in_parallel(self):
+        _, codes = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        principal, _ = self.principal("dev")
+        with self.slowed("recovery_hash"):
+            results = self.together([
+                lambda: store.answer_challenge(token, codes[0])[0] == "ok",
+                lambda: store.disable_mfa(principal, self.passwords["developer"], codes[0]),
+            ])
+        self.assertEqual(sorted(map(repr, results)), ["False", "True"], results)
+
+    def test_parallel_wrong_codes_use_at_most_five_of_a_challenge(self):
+        from routers import auth as auth_router
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        # A different address per request, so the (username, address) throttle
+        # never applies and only the challenge's own limit of 5 can.
+        with self.slowed("recovery_hash"):
+            results = self.together([lambda n=n: auth_router._second_factor(token, self.WRONG, f"10.0.0.{n}")[0]
+                                     for n in range(8)])
+        self.assertEqual(results.count("failed"), store.MFA_CHALLENGE_TRIES, results)
+        self.assertEqual(results.count("invalid"), 8 - store.MFA_CHALLENGE_TRIES, results)
+        self.assertEqual(self.err(self.second(token, self.code(secret))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_parallel_wrong_codes_from_one_address_lock_the_pair(self):
+        from routers import auth as auth_router
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        with self.slowed("recovery_hash"):
+            results = self.together([lambda: auth_router._second_factor(token, self.WRONG, "10.0.0.9")[0]
+                                     for _ in range(8)])
+        self.assertLessEqual(results.count("failed"), store.THROTTLE_FAILURES, results)
+        self.assertNotIn("ok", results)
+        self.assertTrue(locked("dev", "10.0.0.9"))
+
+
+class MfaDecisionDetailTests(MfaTestCase):
+    """Reviewer's checks of two details the maintainer accepted on #607 (2026-11-16)."""
+
+    def test_code_fields_accept_at_most_64_characters(self):
+        headers, _ = self.session("dev")
+        for path, body in (("/auth/login/mfa", {}), ("/auth/mfa/enroll/confirm", {}),
+                           ("/auth/mfa/recovery-codes", {}), ("/auth/mfa/disable", {"password": "x"})):
+            with self.subTest(path=path):
+                long = self.client.post(path, json={**body, "code": "1" * 65}, headers=headers)
+                self.assertEqual(long.status_code, 422, long.text)
+                self.assertEqual(long.json()["error"]["code"], "INVALID_PARAMETER", long.text)
+                at_limit = self.client.post(path, json={**body, "code": "1" * 64}, headers=headers)
+                self.assertNotEqual(at_limit.json().get("error", {}).get("code"), "INVALID_PARAMETER", at_limit.text)
+
+    def test_wrong_codes_at_set_up_confirm_do_not_count_toward_the_lockout(self):
+        headers, _ = self.session("dev")
+        secret = self.client.post("/auth/mfa/enroll", headers=headers).json()["secret"]
+        for _ in range(store.THROTTLE_FAILURES + 2):
+            self.assertEqual(self.err(self.client.post("/auth/mfa/enroll/confirm", json={"code": "abc"},
+                                                       headers=headers)), (422, "MFA_CODE_INCORRECT"))
+        self.assertFalse(locked("dev", "testclient"))
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM login_failures")[0][0], 0)
+        done = self.client.post("/auth/mfa/enroll/confirm", json={"code": self.code(secret)}, headers=headers)
+        self.assertEqual(done.status_code, 200, done.text)
+
+
+class MfaRouteTests(MfaTestCase):
+    def test_enroll_and_confirm(self):
+        headers, _ = self.session("dev")
+        other, _ = self.session("dev")
+        self.assertEqual(self.client.get("/auth/mfa", headers=headers).json(),
+                         {"enrolled": False, "enrolled_at": None, "required": False, "recovery_codes_remaining": 0})
+        started = self.client.post("/auth/mfa/enroll", headers=headers)
+        self.assertEqual(started.status_code, 200, started.text)
+        self.assertEqual(started.headers["cache-control"], "no-store")
+        secret = started.json()["secret"]
+        self.assertTrue(started.json()["otpauth_uri"].startswith("otpauth://totp/RAG%20Platform:dev?secret="))
+        wrong = self.client.post("/auth/mfa/enroll/confirm", json={"code": "12"}, headers=headers)
+        self.assertEqual(self.err(wrong), (422, "MFA_CODE_INCORRECT"))
+        with self.assertLogs("auth", "WARNING") as logs:
+            done = self.client.post("/auth/mfa/enroll/confirm", json={"code": self.code(secret)}, headers=headers)
+        self.assertEqual(done.status_code, 200, done.text)
+        self.assertEqual(done.headers["cache-control"], "no-store")
+        self.assertEqual(len(done.json()["recovery_codes"]), 10)
+        self.assertTrue(done.json()["status"]["enrolled"])
+        self.assertRegex(done.json()["status"]["enrolled_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertNotIn(secret, logged(logs))
+        self.assertEqual(self.client.get("/auth/me", headers=other).status_code, 401, "other sessions end")
+        self.assertTrue(self.client.get("/auth/me", headers=headers).json()["mfa_enrolled"])
+        self.assertEqual(self.err(self.client.post("/auth/mfa/enroll", headers=headers)),
+                         (409, "MFA_ALREADY_ENROLLED"))
+
+    def test_regenerate_route(self):
+        secret, _ = self.enroll("dev")
+        headers, _ = self.session("dev")
+        wrong = self.client.post("/auth/mfa/recovery-codes", json={"code": "abcdef"}, headers=headers)
+        self.assertEqual(self.err(wrong), (403, "MFA_CODE_INCORRECT"))
+        done = self.client.post("/auth/mfa/recovery-codes", json={"code": self.code(secret, 1)}, headers=headers)
+        self.assertEqual(done.status_code, 200, done.text)
+        self.assertEqual(done.headers["cache-control"], "no-store")
+        self.assertEqual(len(done.json()["recovery_codes"]), 10)
+        user_headers, _ = self.session("user")
+        self.assertEqual(self.err(self.client.post("/auth/mfa/recovery-codes", json={"code": "123456"},
+                                                   headers=user_headers)), (409, "MFA_NOT_ENROLLED"))
+
+    def test_disable_route(self):
+        secret, codes = self.enroll("dev")
+        headers, _ = self.session("dev")
+        wrong = self.client.post("/auth/mfa/disable", json={"password": "nope nope nope", "code": codes[0]},
+                                 headers=headers)
+        self.assertEqual(self.err(wrong), (403, "MFA_DISABLE_INCORRECT"))
+        done = self.client.post("/auth/mfa/disable", json={"password": self.passwords["developer"],
+                                                           "code": codes[0]}, headers=headers)
+        self.assertEqual(done.status_code, 200, done.text)
+        self.assertFalse(done.json()["status"]["enrolled"])
+        self.assertEqual(self.client.get("/auth/me", headers=headers).status_code, 200, "sessions stay")
+
+    def test_engineer_reset(self):
+        self.enroll("dev")
+        dev, _ = self.session("dev")
+        eng, _ = self.session("eng")
+        response = self.client.post("/auth/users/dev/reset-mfa", headers=eng)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["user"]["mfa_enrolled"])
+        self.assertEqual(self.client.get("/auth/me", headers=dev).status_code, 401)
+        self.assertEqual(self.err(self.client.post("/auth/users/eng/reset-mfa", headers=eng)),
+                         (409, "SELF_MFA_RESET_REFUSED"))
+        self.assertEqual(self.err(self.client.post("/auth/users/nobody/reset-mfa", headers=eng)),
+                         (404, "USER_NOT_FOUND"))
+        dev, _ = self.session("dev")
+        self.assertEqual(self.err(self.client.post("/auth/users/user/reset-mfa", headers=dev)), (403, "FORBIDDEN"))
+        users = self.client.get("/auth/users", headers=eng).json()["users"]
+        self.assertEqual({u["username"]: u["mfa_enrolled"] for u in users}, {"dev": False, "eng": False, "user": False})
+
+    def test_the_switch_and_the_enrollment_gate(self):
+        eng, _ = self.session("eng")
+        refused = self.client.post("/auth/mfa/policy", json={"required": True}, headers=eng)
+        self.assertEqual(self.err(refused), (409, "MFA_ENROLL_FIRST"))
+        self.enroll("eng")
+        eng, _ = self.session("eng")
+        dev, _ = self.session("dev")       # an existing session of a user who isn't enrolled
+        self.assertEqual(self.client.post("/auth/mfa/policy", json={"required": True}, headers=eng).json(),
+                         {"required": True})
+        self.assertEqual(self.err(self.client.get("/packages", headers=dev)), (403, "MFA_ENROLLMENT_REQUIRED"))
+        me = self.client.get("/auth/me", headers=dev).json()
+        self.assertEqual((me["mfa_required"], me["mfa_enrollment_required"]), (True, True))
+        self.assertEqual(self.client.get("/auth/mfa", headers=dev).status_code, 200)
+        self.assertEqual(self.err(self.client.post("/auth/mfa/disable", json={"password": "x", "code": "1"},
+                                                   headers=dev)), (409, "MFA_REQUIRED"))
+        self.assertEqual(self.client.get("/collections", headers=eng).status_code != 403, True,
+                         "an enrolled engineer isn't gated")
+        secret = self.client.post("/auth/mfa/enroll", headers=dev).json()["secret"]
+        self.client.post("/auth/mfa/enroll/confirm", json={"code": self.code(secret)}, headers=dev)
+        self.assertNotEqual(self.client.get("/packages", headers=dev).status_code, 403)
+        self.assertFalse(self.client.get("/auth/me", headers=dev).json()["mfa_enrollment_required"])
+
+    def test_a_due_password_change_comes_first(self):
+        eng, _ = self.session("eng")
+        self.enroll("eng")
+        store.set_mfa_required(store.get_user("eng").id, True)
+        self.make("fresh", "developer", must_change=True)
+        fresh, _ = self.session("fresh")
+        self.assertEqual(self.err(self.client.post("/auth/mfa/enroll", headers=fresh)),
+                         (403, "PASSWORD_CHANGE_REQUIRED"))
+        self.assertEqual(self.err(self.client.get("/packages", headers=fresh)), (403, "PASSWORD_CHANGE_REQUIRED"))
+
+    def test_keys_cannot_use_the_mfa_routes(self):
+        store.create_principal("svc", "engineer")
+        _, key = store.issue_key("svc")
+        for method, path in (("GET", "/auth/mfa"), ("POST", "/auth/mfa/enroll"), ("POST", "/auth/mfa/policy"),
+                             ("POST", "/auth/users/dev/reset-mfa")):
+            with self.subTest(route=f"{method} {path}"):
+                response = self.client.request(method, path, json={"required": True},
+                                               headers={"Authorization": f"Bearer {key}"})
+                self.assertEqual(self.err(response), (403, "KEY_NOT_ALLOWED"))
+        eng = store.get_user("eng")
+        self.enroll("eng")
+        store.set_mfa_required(eng.id, True)
+        self.assertNotEqual(self.client.get("/packages", headers={"Authorization": f"Bearer {key}"}).status_code,
+                            403, "a key isn't gated by the switch")
+
+
 class ImplementationCopyTests(unittest.TestCase):
     def test_embedded_copies_match(self):
         root = Path(API_DIR).parent
@@ -33472,7 +35573,7 @@ class ImplementationCopyTests(unittest.TestCase):
                      "api/routers/auth.py", "api/main.py", "ui/src/pages/UsersPage.tsx",
                      "api/auth/keys.py", "ui/src/pages/ServiceKeysPage.tsx", "api/config.py", "proxy/nginx.conf",
                      "scripts/verify/17_auth.sh", "scripts/verify/auth_setup.py", "scripts/verify/auth_stack.py",
-                     "scripts/verify/auth_headers.py"):
+                     "scripts/verify/auth_headers.py", "api/auth/mfa.py", "ui/src/pages/AccountPage.tsx"):
             with self.subTest(name=name):
                 header = "### " + name + "\n\n```"
                 start = document.index("\n", document.index(header) + len(header)) + 1
@@ -35201,6 +37302,10 @@ PROTECTED = (
     ("POST", "/auth/service-principals/nobody/role"), ("POST", "/auth/service-principals/nobody/disable"),
     ("POST", "/auth/service-principals/nobody/enable"), ("POST", "/auth/service-principals/nobody/keys"),
     ("POST", "/auth/service-principals/nobody/keys/nokey/revoke"),
+    # Two-step verification (#607): the user's own routes and the Engineer's.
+    ("GET", "/auth/mfa"), ("POST", "/auth/mfa/enroll"), ("POST", "/auth/mfa/enroll/confirm"),
+    ("POST", "/auth/mfa/recovery-codes"), ("POST", "/auth/mfa/disable"), ("POST", "/auth/mfa/policy"),
+    ("POST", "/auth/users/nobody/reset-mfa"),
 )
 
 
@@ -51221,7 +53326,7 @@ function navMenuCases() {
   const DATA = { key: 'data', label: 'Data', entries: ['Import', 'Prepare', 'Transfer'] };
   const TUNE = { key: 'tune', label: 'Tune', entries: ['Chunking', 'Retrieval', 'Gold Standard'] };
   const ADMIN = { key: 'admin', label: 'Admin', entries: ['Collections', 'Users', 'Service keys', 'Audit', 'Health'] };
-  const account = (username, badge) => ({ key: 'account', label: `${username} ${badge}`, entries: ['Change password', 'Log out'] });
+  const account = (username, badge) => ({ key: 'account', label: `${username} ${badge}`, entries: ['Account', 'Change password', 'Log out'] });
   const want = {
     end_user: [account('vfy-end-user', 'End User')],
     developer: [DATA, TUNE, account('vfy-developer', 'Developer')],
@@ -51497,10 +53602,10 @@ function usersCases() {
     { name: 'The list shows each account; the own row has no Reset password', open: open(), async run(s) {
       await waitText(s.page, 'vfy-off');
       const heads = await s.page.evaluate(() => [...document.querySelectorAll('thead th')].map(t => t.textContent.trim()));
-      assert.deepEqual(heads, ['Username', 'Role', 'Status', 'Password', 'Created', '']);
+      assert.deepEqual(heads, ['Username', 'Role', 'Status', 'Password', 'Two-step', 'Created', '']);
       const date = await s.page.evaluate(v => new Date(v).toLocaleDateString(), '2026-10-01T12:00:00Z');
       const rows = await rowTexts(s.page);
-      assert.deepEqual(rows.map(r => [r[0], r[2], r[3], r[4]]), [['vfy-developer', 'Enabled', 'Set', date], [ME + ' (you)', 'Enabled', 'Set', date], ['vfy-off', 'Disabled', 'Change due', date]]);
+      assert.deepEqual(rows.map(r => [r[0], r[2], r[3], r[4], r[5]]), [['vfy-developer', 'Enabled', 'Set', 'Off', date], [ME + ' (you)', 'Enabled', 'Set', 'Off', date], ['vfy-off', 'Disabled', 'Change due', 'Off', date]]);
       assert.deepEqual(await s.page.evaluate(() => [...document.querySelectorAll('tbody select')].map(x => x.value)), ['developer', 'engineer', 'end_user']);
       assert.deepEqual(await rowButtons(s.page, 'vfy-developer'), ['Reset password', 'Disable']);
       assert.deepEqual(await rowButtons(s.page, ME), ['Disable']);
@@ -51579,6 +53684,153 @@ function usersCases() {
         if (action === 'role') assert.equal((await nav(s.page)).includes('Users'), false);
       } };
     }),
+  ];
+}
+
+// Two-step verification (#607): the Account page's set-up, recovery codes and
+// turn-off, the login's code step, a forced set-up, and the Users page's
+// column, reset and switch. The API is stubbed; the real routes are checked
+// in 17_auth.sh (auth_stack.py mfa) and test_auth.py.
+function mfaCases() {
+  const SECRET = 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP';
+  const CODES = Array.from({ length: 10 }, (_, i) => `aaaa-bbbb-cccc-dd${String(i).padStart(2, '2')}`.slice(0, 19));
+  const off = { enrolled: false, enrolled_at: null, required: false, recovery_codes_remaining: 0 };
+  const on = { enrolled: true, enrolled_at: '2026-11-16T12:00:00Z', required: false, recovery_codes_remaining: 10 };
+  const me = (role, over = {}) => ({ username: 'vfy-' + role.replace('_', '-'), role, must_change_password: false, ...over });
+  const row = (username, role, over = {}) => ({ username, role, enabled: true, must_change_password: false, created_at: '2026-10-01T12:00:00Z', mfa_enrolled: false, ...over });
+  return [
+    { name: 'The account menu has Account, which opens the two-step set-up: a QR code, the key as text, and the codes once', open: { role: 'developer', path: '/qa', routes: base({
+      'GET /api/auth/mfa': json(200, off),
+      'POST /api/auth/mfa/enroll': json(200, { secret: SECRET, otpauth_uri: `otpauth://totp/RAG%20Platform:vfy-developer?secret=${SECRET}&issuer=RAG%20Platform&algorithm=SHA1&digits=6&period=30` }),
+      'POST /api/auth/mfa/enroll/confirm': json(200, { recovery_codes: CODES, status: on }),
+    }) }, async run(s) {
+      await waitText(s.page, 'Ask a Question');
+      await chooseFromMenu(s.page, 'account', 'Account');
+      await waitPath(s.page, '/account');
+      await waitText(s.page, 'Two-step verification is off');
+      await press(s.page, 'Set up');
+      await waitFor(s.page, () => !!document.querySelector('[data-testid=mfa-setup] img[src^="data:image/"]'), 'the QR code drawn in the page');
+      assert.equal(await s.page.evaluate(() => document.querySelector('[data-testid=mfa-secret]').textContent.trim()), SECRET);
+      await fill(s.page, '#mfa-confirm-code', '123456');
+      await press(s.page, 'Confirm');
+      await waitFor(s.page, () => !!document.querySelector('[data-testid=recovery-codes]'), 'the recovery codes');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/mfa/enroll/confirm').map(c => c.body), [{ code: '123456' }]);
+      await waitText(s.page, CODES[9]);
+      await waitText(s.page, 'shown only once');
+      assert.deepEqual(await s.page.evaluate(() => [Object.keys(sessionStorage), Object.keys(localStorage)]), [[], []]);
+      await press(s.page, 'Done');
+      await waitText(s.page, CODES[0], true);
+      await waitText(s.page, '10 of 10 recovery codes left');
+    } },
+    { name: 'Enrolled: regenerate shows a new set once; Turn off sends the password and code', open: { role: 'developer', path: '/account', routes: base({
+      'GET /api/auth/mfa': json(200, on),
+      'POST /api/auth/mfa/recovery-codes': json(200, { recovery_codes: CODES, status: on }),
+      'POST /api/auth/mfa/disable': json(200, { status: off }),
+    }) }, async run(s) {
+      await waitText(s.page, '10 of 10 recovery codes left');
+      await press(s.page, 'Regenerate recovery codes');
+      await fill(s.page, '#mfa-regenerate-code', '654321');
+      await press(s.page, 'Get new recovery codes');
+      await waitText(s.page, CODES[3]);
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/mfa/recovery-codes').map(c => c.body), [{ code: '654321' }]);
+      await press(s.page, 'Done');
+      await press(s.page, 'Turn off');
+      await fill(s.page, '#mfa-disable-password', 'my password here');
+      await fill(s.page, '#mfa-disable-code', CODES[0]);
+      await press(s.page, 'Turn off', 'form button[type=submit]');
+      await waitText(s.page, 'Two-step verification is off');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/mfa/disable').map(c => c.body), [{ password: 'my password here', code: CODES[0] }]);
+    } },
+    { name: 'While two-step verification is required, Turn off isn\'t offered', open: { role: 'developer', path: '/account', routes: base({
+      'GET /api/auth/mfa': json(200, { ...on, required: true }),
+    }) }, async run(s) {
+      await waitText(s.page, 'Regenerate recovery codes');
+      assert.equal(await bodyHas(s.page, 'Turn off'), false);
+    } },
+    { name: 'A right password asks for a code; a wrong code shows the API\'s message; the right one opens /qa', open: { role: null, path: '/login', routes: base({
+      'POST /api/auth/login': json(200, { mfa_required: true }),
+      'POST /api/auth/login/mfa': call => call.body.code === '111111' ? json(200, me('developer', { mfa_enrolled: true })) : apiError(401, 'MFA_FAILED', 'The code is incorrect.'),
+    }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await fill(s.page, '#login-username', 'vfy-developer');
+      await fill(s.page, '#login-password', 'a password of twelve');
+      await press(s.page, 'Log in');
+      await waitFor(s.page, () => !!document.querySelector('#login-code'), 'the code step');
+      await fill(s.page, '#login-code', '000000');
+      await press(s.page, 'Verify');
+      await waitText(s.page, 'The code is incorrect.');
+      assert.equal(await s.page.evaluate(() => document.querySelector('#login-code').value), '');
+      await fill(s.page, '#login-code', '111111');
+      await press(s.page, 'Verify');
+      await waitPath(s.page, '/qa');
+      await waitText(s.page, 'Ask a Question');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/login/mfa').map(c => c.body), [{ code: '000000' }, { code: '111111' }]);
+    } },
+    // A login that opens a session carries the switch as mfa_required (#607 review):
+    // false, or true while required for everyone, it opens /qa, never the code step.
+    ...[false, true].map(required => ({ name: `A login answered with a user and mfa_required ${required} opens /qa without a code step`, open: { role: null, path: '/login', routes: base({
+      'POST /api/auth/login': json(200, me('developer', { mfa_enrolled: required, mfa_required: required, mfa_enrollment_required: false })),
+    }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await fill(s.page, '#login-username', 'vfy-developer');
+      await fill(s.page, '#login-password', 'a password of twelve');
+      await press(s.page, 'Log in');
+      await waitPath(s.page, '/qa');
+      await waitText(s.page, 'Ask a Question');
+      assert.equal(await s.page.evaluate(() => !!document.querySelector('#login-code')), false);
+      assert.equal(callsTo(s, 'POST', '/api/auth/login/mfa').length, 0);
+    } })),
+    { name: 'An expired challenge returns to the password step', open: { role: null, path: '/login', routes: base({
+      'POST /api/auth/login': json(200, { mfa_required: true }),
+      'POST /api/auth/login/mfa': apiError(401, 'MFA_CHALLENGE_INVALID', 'Your sign-in expired. Log in again.'),
+    }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await fill(s.page, '#login-username', 'vfy-developer');
+      await fill(s.page, '#login-password', 'a password of twelve');
+      await press(s.page, 'Log in');
+      await waitFor(s.page, () => !!document.querySelector('#login-code'), 'the code step');
+      await fill(s.page, '#login-code', '123456');
+      await press(s.page, 'Verify');
+      await waitText(s.page, 'Your sign-in expired');
+      await waitFor(s.page, () => !!document.querySelector('#login-password'), 'the password step again');
+    } },
+    { name: 'A required set-up shows only the account page, with Log out; an API answer MFA_ENROLLMENT_REQUIRED returns to it', open: { role: null, path: '/collections', routes: base({
+      'GET /api/auth/me': json(200, me('developer', { mfa_required: true, mfa_enrollment_required: true })),
+      'GET /api/auth/mfa': json(200, { ...off, required: true }),
+    }) }, async run(s) {
+      await waitPath(s.page, '/account');
+      await waitText(s.page, 'required for every account');
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('nav').length), 0);
+      await waitText(s.page, 'Log out');
+    } },
+    { name: 'An API answer 403 MFA_ENROLLMENT_REQUIRED on any page opens the account page', open: { role: 'engineer', path: '/collections', routes: base({
+      'GET /api/collections': apiError(403, 'MFA_ENROLLMENT_REQUIRED', 'Set up two-step verification before doing anything else.'),
+      'GET /api/auth/mfa': json(200, { ...off, required: true }),
+    }) }, async run(s) {
+      await waitPath(s.page, '/account');
+      await waitText(s.page, 'required for every account');
+    } },
+    { name: 'Users page: the Two-step column, Reset two-step on enrolled rows but the own, and the switch', open: { role: 'engineer', path: '/users', routes: (() => {
+      const list = [row('vfy-developer', 'developer', { mfa_enrolled: true }), row('vfy-engineer', 'engineer', { mfa_enrolled: true }), row('vfy-off', 'end_user')];
+      return base({
+        'GET /api/auth/users': () => json(200, { users: list.map(u => ({ ...u })) }),
+        'POST /api/auth/users/vfy-developer/reset-mfa': () => { list[0].mfa_enrolled = false; return json(200, { user: list[0] }); },
+        'POST /api/auth/mfa/policy': apiError(409, 'MFA_ENROLL_FIRST', 'Set up two-step verification for your own account first, on the Account page.'),
+      });
+    })() }, async run(s) {
+      await waitText(s.page, 'vfy-off');
+      const buttons = u => s.page.evaluate(n => [...document.querySelectorAll(`tr[data-username="${n}"] button`)].map(b => b.textContent.trim()), u);
+      assert.deepEqual(await buttons('vfy-developer'), ['Reset password', 'Disable', 'Reset two-step']);
+      assert.deepEqual(await buttons('vfy-engineer'), ['Disable']);
+      assert.deepEqual(await buttons('vfy-off'), ['Reset password', 'Disable']);
+      await s.page.evaluate(() => [...document.querySelectorAll('tr[data-username="vfy-developer"] button')].find(b => b.textContent.trim() === 'Reset two-step').click());
+      await waitFor(s.page, () => document.querySelector('tr[data-username="vfy-developer"] td:nth-child(5)').textContent.trim() === 'Off', 'Off after the reset');
+      assert.equal(callsTo(s, 'POST', '/api/auth/users/vfy-developer/reset-mfa').length, 1);
+      await s.page.click('#mfa-required');
+      await waitText(s.page, 'for your own account first');
+      assert.deepEqual(callsTo(s, 'POST', '/api/auth/mfa/policy').map(c => c.body), [{ required: true }]);
+      assert.equal(await s.page.evaluate(() => document.querySelector('#mfa-required').checked), false);
+    } },
   ];
 }
 
@@ -52167,6 +54419,7 @@ async function runUiControlTests(browser, baseUrl, reporter) {
   await run('Navigation, roles and redirects (#400); the API enforces the roles (#25)', navigationCases());
   await run('Login, logout, setup and password changes (#25)', authCases());
   await run('Users page: Engineers manage accounts (#25)', usersCases());
+  await run('Two-step verification: account page, login code, forced set-up, Users page (#607)', mfaCases());
   await run('Service keys page: Engineers manage service principals and keys (#25)', serviceKeysCases());
   await run('Audit page: Engineers read the audit log (#29)', auditCases());
   await run('Prepare page: list, preview, upload, jobs, deletes and import (#638)', prepareCases());
@@ -53175,7 +55428,7 @@ ENUMS = {
 SPAN_NAMES = frozenset("rag." + v for v in ENUMS["rag.operation"])
 
 # Explicit code-owned vocabulary. Raw URL/path values never enter this schema.
-ROUTES = frozenset(('DELETE /collections/{name}', 'DELETE /prepare/documents/{document_id}', 'DELETE /prepare/documents/{document_id}/prepared', 'GET /audit', 'GET /audit.csv', 'GET /auth/me', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /export/job/{job_id}', 'GET /export/jobs', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /goldstandard/sessions', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /import/jobs', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /ingest/jobs', 'GET /metrics/latency', 'GET /packages', 'GET /prepare/documents', 'GET /prepare/documents/{document_id}', 'GET /prepare/documents/{document_id}/prepared', 'GET /prepare/documents/{document_id}/raw', 'GET /prepare/job/{job_id}', 'GET /prepare/jobs', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/logout', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /prepare/import', 'POST /prepare/job/{job_id}/cancel', 'POST /prepare/jobs', 'POST /prepare/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
+ROUTES = frozenset(('DELETE /collections/{name}', 'DELETE /prepare/documents/{document_id}', 'DELETE /prepare/documents/{document_id}/prepared', 'GET /audit', 'GET /audit.csv', 'GET /auth/me', 'GET /auth/mfa', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /export/job/{job_id}', 'GET /export/jobs', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /goldstandard/sessions', 'GET /health', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /import/jobs', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /ingest/jobs', 'GET /metrics/latency', 'GET /packages', 'GET /prepare/documents', 'GET /prepare/documents/{document_id}', 'GET /prepare/documents/{document_id}/prepared', 'GET /prepare/documents/{document_id}/raw', 'GET /prepare/job/{job_id}', 'GET /prepare/jobs', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/login/mfa', 'POST /auth/logout', 'POST /auth/mfa/disable', 'POST /auth/mfa/enroll', 'POST /auth/mfa/enroll/confirm', 'POST /auth/mfa/policy', 'POST /auth/mfa/recovery-codes', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-mfa', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /prepare/import', 'POST /prepare/job/{job_id}/cancel', 'POST /prepare/jobs', 'POST /prepare/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
 ENUMS.update({"http.route": ROUTES | {"unmatched"},
               "rag.tuning_operation": frozenset(("rechunk", "reembed", "reindex")),
               "http.status_class": frozenset(("1xx", "2xx", "3xx", "4xx", "5xx"))})

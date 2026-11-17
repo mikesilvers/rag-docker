@@ -180,7 +180,7 @@ export default function NavBar() {
   const menus = MENUS
     .map(m => ({ ...m, entries: m.entries.filter(e => role !== null && e.roles.includes(role)) }))
     .filter(m => m.entries.length > 0)
-  const accountCurrent = pathname === '/account/password'
+  const accountCurrent = pathname === '/account' || pathname === '/account/password'
 
   return (
     <nav className="bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-4">
@@ -211,7 +211,9 @@ export default function NavBar() {
         align="right"
         current={accountCurrent}
         items={[
-          { label: 'Change password', to: '/account/password', current: accountCurrent },
+          // The account page holds two-step verification (#607).
+          { label: 'Account', to: '/account', current: pathname === '/account' },
+          { label: 'Change password', to: '/account/password', current: pathname === '/account/password' },
           { label: 'Log out', onSelect: logOut },
         ]}
       />

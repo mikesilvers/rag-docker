@@ -38,6 +38,13 @@ and `details.last_attempt` (the last one's time). The API's background task
 writes closed windows and its shutdown writes open ones; a kill loses the
 open counts. At most LOGIN_WINDOWS_MAX windows are open; past that, failures
 are written one by one. nginx also limits logins per address (locations.conf).
+
+**A second factor is never counted, always written (#607).** POST
+/auth/login/mfa is public like the login; its handler names the challenge's
+user, so each attempt, accepted or failed, is its own record with that user as
+the actor and `details.method` (`totp` or `recovery`). A request with no live
+challenge names nobody and writes nothing. The login throttle and nginx's
+per-address limit bound how many can be written.
 """
 from __future__ import annotations
 
@@ -66,6 +73,10 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("POST", "/auth/login"): "auth.login",
     ("POST", "/auth/logout"): "auth.logout",
     ("POST", "/auth/password"): "auth.password",
+    ("POST", "/auth/login/mfa"): "auth.mfa",
+    ("POST", "/auth/mfa/enroll/confirm"): "auth.mfa.enroll",
+    ("POST", "/auth/mfa/recovery-codes"): "auth.mfa.recovery-codes",
+    ("POST", "/auth/mfa/disable"): "auth.mfa.disable",
     ("POST", "/query"): "query",
     ("POST", "/collections"): "collection.create",
     ("DELETE", "/collections/{name}"): "collection.delete",
@@ -92,6 +103,8 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("POST", "/auth/users/{username}/role"): "admin.user.set-role",
     ("POST", "/auth/users/{username}/disable"): "admin.user.disable",
     ("POST", "/auth/users/{username}/enable"): "admin.user.enable",
+    ("POST", "/auth/users/{username}/reset-mfa"): "admin.user.reset-mfa",
+    ("POST", "/auth/mfa/policy"): "admin.mfa.policy",
     ("POST", "/auth/service-principals"): "admin.principal.create",
     ("POST", "/auth/service-principals/{name}/role"): "admin.principal.set-role",
     ("POST", "/auth/service-principals/{name}/disable"): "admin.principal.disable",
@@ -101,7 +114,7 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("GET", "/audit"): "audit.view",
     ("GET", "/audit.csv"): "audit.download",
 }
-OPERATOR_ACTIONS = ("bootstrap", "create-user", "reset-password", "set-role", "disable", "enable")
+OPERATOR_ACTIONS = ("bootstrap", "create-user", "reset-password", "set-role", "disable", "enable", "reset-mfa")
 # Every action name, for the API's filter and the UI's list.
 ALL_ACTIONS = tuple(sorted(set(ACTIONS.values()) | {"operator." + a for a in OPERATOR_ACTIONS}
                           | {"system.start"}))
@@ -594,7 +607,7 @@ class AuditMiddleware:
             # nothing (D4). Only a login, which is public, is recorded without
             # a principal: a success names its account, a failure the username
             # as typed.
-            if ctx["action"] != "auth.login" or (ctx["actor"] is None and ctx["target"] is None):
+            if ctx["action"] not in ("auth.login", "auth.mfa") or (ctx["actor"] is None and ctx["target"] is None):
                 return
         status = seen["status"] or 500
         if ctx["job_recorded"] and status == 202:
