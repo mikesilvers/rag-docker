@@ -361,6 +361,8 @@ def reset_password(username: str, password: str, kind: str | None = None) -> Non
         conn.execute("UPDATE users SET password_hash = ?, must_change_password = 1, updated_at = ? "
                      "WHERE id = ?", (password_hash, _now(), row["id"]))
         conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+        # A login half-way through, started with the old password, ends too (#607).
+        conn.execute("DELETE FROM mfa_challenges WHERE user_id = ?", (row["id"],))
 
 
 def set_role(username: str, role: str, kind: str | None = None) -> None:
@@ -386,6 +388,8 @@ def set_enabled(username: str, enabled: bool, kind: str | None = None) -> None:
                      (int(enabled), _now(), row["id"]))
         if not enabled:
             conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+            # Pending login challenges end too, so enabling again doesn't revive one (#607).
+            conn.execute("DELETE FROM mfa_challenges WHERE user_id = ?", (row["id"],))
 
 
 # ── service principals and their keys (PR 3) ─────────────────────────────────
@@ -528,6 +532,8 @@ def change_password(principal: Principal, password: str) -> None:
                      "WHERE id = ?", (password_hash, _now(), principal.user_id))
         conn.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?",
                      (principal.user_id, principal.token_hash))
+        # A login half-way through, started with the old password, ends too (#607).
+        conn.execute("DELETE FROM mfa_challenges WHERE user_id = ?", (principal.user_id,))
 
 
 # ── login throttle ───────────────────────────────────────────────────────────

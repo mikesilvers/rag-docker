@@ -1839,8 +1839,10 @@ class MfaUnitTests(unittest.TestCase):
                 self.assertIsNone(mfa.matching_step(self.RFC, mfa.code_at(self.RFC, step + offset), now, -1))
         self.assertEqual(mfa.matching_step(self.RFC, " " + mfa.code_at(self.RFC, step)[:3] + " "
                                            + mfa.code_at(self.RFC, step)[3:], now, -1), step)
-        for bad in ("", "12345", "1234567", "abcdef"):
+        for bad in ("", "12345", "1234567", "abcdef", "\u0661\u0662\u0663\u0664\u0665\u0666",
+                    "\uff11\uff12\uff13\uff14\uff15\uff16"):
             self.assertIsNone(mfa.matching_step(self.RFC, bad, now, -1))
+            self.assertFalse(mfa.is_totp(bad))
 
     def test_new_secret_is_160_bits_of_base32(self):
         secret = mfa.new_secret()
@@ -1877,10 +1879,41 @@ class MfaUnitTests(unittest.TestCase):
             self.assertIsNone(mfa.unseal(8, sealed), "another user's id is other associated data")
             self.assertIsNone(mfa.unseal(7, sealed[:-4] + "AAAA"))
             self.assertNotEqual(mfa.seal(7, "SECRET"), sealed, "a fresh nonce every time")
+            self.assertEqual([p.name for p in Path(temp.name).iterdir()], [mfa.KEY_FILE], "no temporary file is left")
             key.write_bytes(os.urandom(32))
             self.assertIsNone(mfa.unseal(7, sealed), "another key never verifies")
             key.unlink()
             self.assertIsNone(mfa.unseal(7, sealed), "a lost key never verifies")
+
+
+class MfaKeyFileTests(unittest.TestCase):
+    """The key file is never seen without its key (#607 review)."""
+
+    def test_a_racing_creator_uses_the_key_that_won(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with patch.object(settings, "auth_dir", temp.name):
+            key = Path(temp.name, mfa.KEY_FILE)
+            winner = os.urandom(32)
+            real_link = os.link
+
+            def link_after_the_other(src, dst):
+                key.write_bytes(winner)          # the other process linked its key first
+                return real_link(src, dst)
+            with patch.object(mfa.os, "link", link_after_the_other):
+                sealed = mfa.seal(3, "SECRET")
+            self.assertEqual(key.read_bytes(), winner)
+            self.assertEqual(mfa.unseal(3, sealed), "SECRET", "sealed under the winning key")
+            self.assertEqual([p.name for p in Path(temp.name).iterdir()], [mfa.KEY_FILE])
+
+    def test_a_failed_write_leaves_no_key_file(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with patch.object(settings, "auth_dir", temp.name), \
+                patch.object(mfa.os, "fsync", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                mfa.seal(3, "SECRET")
+            self.assertEqual(list(Path(temp.name).iterdir()), [], "neither an empty mfa.key nor a temporary file")
 
 
 class MfaTestCase(StoreTestCase):
@@ -2141,6 +2174,151 @@ class MfaLoginTests(MfaTestCase):
         self.client.cookies.clear()
         store.set_enabled("dev", False)
         self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+        # Enabling again doesn't revive it: disabling deleted it (#607 review).
+        store.set_enabled("dev", True)
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM mfa_challenges"), [(0,)])
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_a_password_change_or_reset_ends_a_challenge(self):
+        # #607 review: a login started with the old password can't be finished.
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        store.reset_password("dev", passwords.generate_password())
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+        store.reset_password("dev", self.passwords["developer"])   # back to a known password
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        principal, _ = self.principal("dev")
+        store.change_password(principal, passwords.generate_password())
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM mfa_challenges"), [(0,)])
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_non_ascii_digits_are_a_plain_wrong_code(self):
+        # #607 review: other scripts' digits are refused as any wrong code, not a 500.
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        arabic = "\u0661\u0662\u0663\u0664\u0665\u0666"
+        self.assertEqual(self.err(self.second(token, arabic)), (401, "MFA_FAILED"))
+        headers, _ = self.session("dev")
+        self.assertEqual(self.err(self.client.post("/auth/mfa/recovery-codes", json={"code": arabic},
+                                                   headers=headers)), (403, "MFA_CODE_INCORRECT"))
+        self.assertEqual(self.second(token, self.code(secret, 1)).status_code, 200)
+
+
+class MfaConcurrencyTests(MfaTestCase):
+    """Reviewer's checks (#607): a code is spent once and a challenge's limits
+    hold when requests arrive together. Each check is slowed down inside the
+    write transaction, so without BEGIN IMMEDIATE the parallel requests would
+    all see the same unspent state."""
+
+    @staticmethod
+    def slowed(name="matching_step"):
+        real = getattr(mfa, name)
+
+        def slow(*args, **kwargs):
+            found = real(*args, **kwargs)
+            time.sleep(0.2)
+            return found
+        return patch.object(mfa, name, slow)
+
+    WRONG = "abcd-efgh-ijkl-mnop"           # a well-formed recovery code nobody holds
+
+    @staticmethod
+    def together(calls):
+        start, results = threading.Barrier(len(calls)), [None] * len(calls)
+
+        def run(i, call):
+            start.wait()
+            try:
+                results[i] = call()
+            except Exception as exc:          # recorded, so the assertion names it
+                results[i] = exc
+        threads = [threading.Thread(target=run, args=(i, c)) for i, c in enumerate(calls)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        return results
+
+    def test_one_totp_code_is_spent_once_across_parallel_uses(self):
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        principal, _ = self.principal("dev")
+        code = self.code(secret, 1)
+        with self.slowed():
+            results = self.together([
+                lambda: store.answer_challenge(token, code)[0] == "ok",
+                lambda: store.regenerate_codes(principal, code) is not None,
+                lambda: store.disable_mfa(principal, self.passwords["developer"], code),
+            ])
+        self.assertEqual(sorted(map(repr, results)), ["False", "False", "True"], results)
+
+    def test_one_recovery_code_is_spent_once_in_parallel(self):
+        _, codes = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        principal, _ = self.principal("dev")
+        with self.slowed("recovery_hash"):
+            results = self.together([
+                lambda: store.answer_challenge(token, codes[0])[0] == "ok",
+                lambda: store.disable_mfa(principal, self.passwords["developer"], codes[0]),
+            ])
+        self.assertEqual(sorted(map(repr, results)), ["False", "True"], results)
+
+    def test_parallel_wrong_codes_use_at_most_five_of_a_challenge(self):
+        from routers import auth as auth_router
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        # A different address per request, so the (username, address) throttle
+        # never applies and only the challenge's own limit of 5 can.
+        with self.slowed("recovery_hash"):
+            results = self.together([lambda n=n: auth_router._second_factor(token, self.WRONG, f"10.0.0.{n}")[0]
+                                     for n in range(8)])
+        self.assertEqual(results.count("failed"), store.MFA_CHALLENGE_TRIES, results)
+        self.assertEqual(results.count("invalid"), 8 - store.MFA_CHALLENGE_TRIES, results)
+        self.assertEqual(self.err(self.second(token, self.code(secret))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_parallel_wrong_codes_from_one_address_lock_the_pair(self):
+        from routers import auth as auth_router
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        with self.slowed("recovery_hash"):
+            results = self.together([lambda: auth_router._second_factor(token, self.WRONG, "10.0.0.9")[0]
+                                     for _ in range(8)])
+        self.assertLessEqual(results.count("failed"), store.THROTTLE_FAILURES, results)
+        self.assertNotIn("ok", results)
+        self.assertTrue(locked("dev", "10.0.0.9"))
+
+
+class MfaDecisionDetailTests(MfaTestCase):
+    """Reviewer's checks of two details the maintainer accepted on #607 (2026-11-16)."""
+
+    def test_code_fields_accept_at_most_64_characters(self):
+        headers, _ = self.session("dev")
+        for path, body in (("/auth/login/mfa", {}), ("/auth/mfa/enroll/confirm", {}),
+                           ("/auth/mfa/recovery-codes", {}), ("/auth/mfa/disable", {"password": "x"})):
+            with self.subTest(path=path):
+                long = self.client.post(path, json={**body, "code": "1" * 65}, headers=headers)
+                self.assertEqual(long.status_code, 422, long.text)
+                self.assertEqual(long.json()["error"]["code"], "INVALID_PARAMETER", long.text)
+                at_limit = self.client.post(path, json={**body, "code": "1" * 64}, headers=headers)
+                self.assertNotEqual(at_limit.json().get("error", {}).get("code"), "INVALID_PARAMETER", at_limit.text)
+
+    def test_wrong_codes_at_set_up_confirm_do_not_count_toward_the_lockout(self):
+        headers, _ = self.session("dev")
+        secret = self.client.post("/auth/mfa/enroll", headers=headers).json()["secret"]
+        for _ in range(store.THROTTLE_FAILURES + 2):
+            self.assertEqual(self.err(self.client.post("/auth/mfa/enroll/confirm", json={"code": "abc"},
+                                                       headers=headers)), (422, "MFA_CODE_INCORRECT"))
+        self.assertFalse(locked("dev", "testclient"))
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM login_failures")[0][0], 0)
+        done = self.client.post("/auth/mfa/enroll/confirm", json={"code": self.code(secret)}, headers=headers)
+        self.assertEqual(done.status_code, 200, done.text)
 
 
 class MfaRouteTests(MfaTestCase):

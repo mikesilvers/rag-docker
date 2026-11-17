@@ -60,7 +60,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const login = useCallback(async (username: string, password: string) => {
     const result = await api.login(username, password)
-    if ('mfa_required' in result) return true
+    // A login that opened a session names the user; it also carries the switch
+    // as `mfa_required` (true while MFA is required for everyone), so that field
+    // alone doesn't mean a code is due. Only the challenge answer,
+    // {mfa_required: true} with no user, asks for one (#607).
+    if (!('username' in result)) {
+      if (result.mfa_required === true) return true
+      throw new Error('The server sent a response the UI could not read.')
+    }
     setState({ phase: 'logged_in', user: result })
     return false
   }, [])

@@ -43,7 +43,9 @@ RECOVERY_BYTES = 10   # 80 bits: 16 base32 characters
 ISSUER = "RAG Platform"
 KEY_FILE = "mfa.key"
 _NONCE = 12
-_TOTP = re.compile(r"\d{6}")
+# ASCII digits only: \d also matches other scripts' digits, which
+# hmac.compare_digest refuses with a TypeError (a 500 and no audit record).
+_TOTP = re.compile(r"[0-9]{6}")
 _RECOVERY = re.compile(r"[a-z2-7]{16}")
 
 
@@ -129,9 +131,14 @@ def key_path() -> Path:
 
 
 def _key(create: bool) -> bytes | None:
-    """The sealing key; created on first need (0600, exclusive create, so the
-    API and the operator command can't both write one). None when it doesn't
-    exist and `create` is false, or the file isn't a 32-byte key."""
+    """The sealing key; created on first need. None when it doesn't exist and
+    `create` is false, or the file isn't a 32-byte key.
+
+    The key is written whole to a private temporary file (0600, fsync'd) and
+    then hard-linked to `mfa.key`, which fails if the name exists: so
+    `mfa.key` never exists without its 32 bytes (no reader sees it empty, and
+    a crash can't leave it empty), and when the API and the operator command
+    race, one key wins and both use it."""
     path = key_path()
     try:
         raw = path.read_bytes()
@@ -140,16 +147,21 @@ def _key(create: bool) -> bytes | None:
             return None
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         key = secrets.token_bytes(32)
+        temp = path.with_name(f".{KEY_FILE}.{os.getpid()}.{secrets.token_hex(4)}")
+        fd = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            raw = path.read_bytes()        # another process created it first
-        else:
             with os.fdopen(fd, "wb") as out:
                 out.write(key)
                 out.flush()
                 os.fsync(out.fileno())
-            return key
+            try:
+                os.link(temp, path)
+            except FileExistsError:
+                raw = path.read_bytes()    # another process created it first
+            else:
+                return key
+        finally:
+            temp.unlink(missing_ok=True)
     return raw if len(raw) == 32 else None
 
 

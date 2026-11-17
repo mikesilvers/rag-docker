@@ -17346,7 +17346,9 @@ RECOVERY_BYTES = 10   # 80 bits: 16 base32 characters
 ISSUER = "RAG Platform"
 KEY_FILE = "mfa.key"
 _NONCE = 12
-_TOTP = re.compile(r"\d{6}")
+# ASCII digits only: \d also matches other scripts' digits, which
+# hmac.compare_digest refuses with a TypeError (a 500 and no audit record).
+_TOTP = re.compile(r"[0-9]{6}")
 _RECOVERY = re.compile(r"[a-z2-7]{16}")
 
 
@@ -17432,9 +17434,14 @@ def key_path() -> Path:
 
 
 def _key(create: bool) -> bytes | None:
-    """The sealing key; created on first need (0600, exclusive create, so the
-    API and the operator command can't both write one). None when it doesn't
-    exist and `create` is false, or the file isn't a 32-byte key."""
+    """The sealing key; created on first need. None when it doesn't exist and
+    `create` is false, or the file isn't a 32-byte key.
+
+    The key is written whole to a private temporary file (0600, fsync'd) and
+    then hard-linked to `mfa.key`, which fails if the name exists: so
+    `mfa.key` never exists without its 32 bytes (no reader sees it empty, and
+    a crash can't leave it empty), and when the API and the operator command
+    race, one key wins and both use it."""
     path = key_path()
     try:
         raw = path.read_bytes()
@@ -17443,16 +17450,21 @@ def _key(create: bool) -> bytes | None:
             return None
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         key = secrets.token_bytes(32)
+        temp = path.with_name(f".{KEY_FILE}.{os.getpid()}.{secrets.token_hex(4)}")
+        fd = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            raw = path.read_bytes()        # another process created it first
-        else:
             with os.fdopen(fd, "wb") as out:
                 out.write(key)
                 out.flush()
                 os.fsync(out.fileno())
-            return key
+            try:
+                os.link(temp, path)
+            except FileExistsError:
+                raw = path.read_bytes()    # another process created it first
+            else:
+                return key
+        finally:
+            temp.unlink(missing_ok=True)
     return raw if len(raw) == 32 else None
 
 
@@ -18004,6 +18016,8 @@ def reset_password(username: str, password: str, kind: str | None = None) -> Non
         conn.execute("UPDATE users SET password_hash = ?, must_change_password = 1, updated_at = ? "
                      "WHERE id = ?", (password_hash, _now(), row["id"]))
         conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+        # A login half-way through, started with the old password, ends too (#607).
+        conn.execute("DELETE FROM mfa_challenges WHERE user_id = ?", (row["id"],))
 
 
 def set_role(username: str, role: str, kind: str | None = None) -> None:
@@ -18029,6 +18043,8 @@ def set_enabled(username: str, enabled: bool, kind: str | None = None) -> None:
                      (int(enabled), _now(), row["id"]))
         if not enabled:
             conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+            # Pending login challenges end too, so enabling again doesn't revive one (#607).
+            conn.execute("DELETE FROM mfa_challenges WHERE user_id = ?", (row["id"],))
 
 
 # ── service principals and their keys (PR 3) ─────────────────────────────────
@@ -18171,6 +18187,8 @@ def change_password(principal: Principal, password: str) -> None:
                      "WHERE id = ?", (password_hash, _now(), principal.user_id))
         conn.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?",
                      (principal.user_id, principal.token_hash))
+        # A login half-way through, started with the old password, ends too (#607).
+        conn.execute("DELETE FROM mfa_challenges WHERE user_id = ?", (principal.user_id,))
 
 
 # ── login throttle ───────────────────────────────────────────────────────────
@@ -20868,7 +20886,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const login = useCallback(async (username: string, password: string) => {
     const result = await api.login(username, password)
-    if ('mfa_required' in result) return true
+    // A login that opened a session names the user; it also carries the switch
+    // as `mfa_required` (true while MFA is required for everyone), so that field
+    // alone doesn't mean a code is due. Only the challenge answer,
+    // {mfa_required: true} with no user, asks for one (#607).
+    if (!('username' in result)) {
+      if (result.mfa_required === true) return true
+      throw new Error('The server sent a response the UI could not read.')
+    }
     setState({ phase: 'logged_in', user: result })
     return false
   }, [])
@@ -28731,6 +28756,10 @@ check "an Engineer creates, resets, re-roles, disables and enables an account th
 section "Two-step verification (#607)"
 stack mfa
 check "set-up, password then code, no code twice, a recovery code once, an Engineer's reset; nothing secret logged" $?
+stack mfa-required
+check "the switch needs an enrolled Engineer and gates an unenrolled session to its own routes; reset-mfa ends the sessions; audit records hold no code" $?
+stack mfa-rate-limit
+check "nginx gives POST /auth/login/mfa the login's 16k body limit and its rate zone (429 LOGIN_RATE_LIMITED)" $?
 
 section "Service principals and API keys (PR 3, H3)"
 stack key-matrix end_user
@@ -29167,7 +29196,8 @@ def check_login_logout(operator_ok):
     status, raw, _ = code("GET", "/auth/me", token=token)
     body = json.loads(raw)
     expect(status == 200 and body == {"username": "vfy-developer", "role": "developer", "must_change_password": False,
-                                      "kind": "user"},
+                                      "kind": "user", "mfa_enrolled": False, "mfa_required": False,
+                                      "mfa_enrollment_required": False},
            "GET /auth/me answered {} {}".format(status, body))
     status, _, _ = code("POST", "/auth/logout", token=token)
     expect(status == 200, "logout answered {}".format(status))
@@ -29546,6 +29576,117 @@ def check_mfa(operator_ok):
     result = compose("logs", "--no-color", "api")
     expect(all(value not in result.stdout + result.stderr for value in [secret, accepted] + recovery),
            "a secret or code appears in the API log")
+
+
+def enroll(token):
+    """Set up two-step verification for the session `token` through the API; returns the secret."""
+    status, raw, _ = code("POST", "/auth/mfa/enroll", token=token)
+    expect(status == 200, "set-up answered {} {}".format(status, error_code(raw)))
+    secret = json.loads(raw)["secret"]
+    status, raw, _ = code("POST", "/auth/mfa/enroll/confirm", {"code": totp(secret, -1)}, token=token)
+    expect(status == 200, "confirming the set-up answered {} {}".format(status, error_code(raw)))
+    return secret
+
+
+def check_mfa_rate_limit(operator_ok):
+    """#607: nginx gives POST /auth/login/mfa the login's 16k body limit and its
+    rate zone, so codes and passwords from one address share 10 a minute."""
+    big = {"code": "x" * 17000}
+    status, raw, headers = code("POST", "/auth/login/mfa", big, paced=False)
+    expect(status == 413 and error_code(raw) is None
+           and not headers.get("Content-Type", "").startswith("application/json"),
+           "a {}-byte code body answered {} {} (not nginx's 413)".format(len(json.dumps(big)), status,
+                                                                        error_code(raw)))
+    refusal = None
+    for _ in range(12):
+        status, raw, _ = code("POST", "/auth/login/mfa", {"code": "123456"}, paced=False)
+        if status == 429:
+            refusal = raw
+            break
+        expect(status == 401 and error_code(raw) == "MFA_CHALLENGE_INVALID",
+               "a code with no challenge answered {} {}".format(status, error_code(raw)))
+    expect(refusal is not None, "12 codes in a row were all let through")
+    expect(json.loads(refusal) == {"error": {"code": "LOGIN_RATE_LIMITED", "detail": None,
+                                             "message": "Too many login attempts. Wait a minute and try again."}},
+           "the refusal is {}".format(refusal[:200]))
+    status, raw, _ = code("POST", "/auth/login", {"username": "vfy-rate-" + secrets.token_hex(3),
+                                                  "password": "x" * 12}, paced=False)
+    expect(status == 429 and error_code(raw) == "LOGIN_RATE_LIMITED",
+           "right after the codes were limited, a login answered {} {}: not the same zone".format(
+               status, error_code(raw)))
+
+
+def _set_required(token, required):
+    return code("POST", "/auth/mfa/policy", {"required": required}, token=token)
+
+
+def check_mfa_required(operator_ok):
+    """#607 on the stack: the switch needs an enrolled Engineer; while it is on,
+    an unenrolled session reaches only its session and MFA routes; the operator's
+    reset-mfa ends the sessions and the next login asks for no code; the policy,
+    reset and code attempts are audit records without a code."""
+    eng_name, eng_password, eng = throwaway("engineer", operator_ok)
+    dev_name, _, dev = throwaway("developer", operator_ok)
+    status, raw, _ = _set_required(eng, True)
+    expect(status == 409 and error_code(raw) == "MFA_ENROLL_FIRST",
+           "an unenrolled Engineer turning the switch on answered {} {}".format(status, error_code(raw)))
+    secret = enroll(eng)
+    switched = False
+    try:
+        status, raw, _ = _set_required(eng, True)
+        switched = status == 200
+        expect(switched, "an enrolled Engineer turning the switch on answered {} {}".format(status, error_code(raw)))
+        status, raw, _ = code("GET", "/collections", token=dev)
+        expect(status == 403 and error_code(raw) == "MFA_ENROLLMENT_REQUIRED",
+               "while required, an unenrolled session's GET /collections answered {} {}".format(
+                   status, error_code(raw)))
+        status, body, _ = request("GET", "/auth/me", token=dev)
+        expect(status == 200 and body.get("mfa_enrollment_required") is True,
+               "while required, /auth/me answered {} {}".format(status, body))
+        status, raw, _ = code("GET", "/auth/mfa", token=dev)
+        expect(status == 200 and json.loads(raw).get("required") is True,
+               "while required, GET /auth/mfa answered {} {}".format(status, error_code(raw)))
+        status, raw, _ = code("GET", "/collections", token=eng)
+        expect(status == 200, "while required, the enrolled Engineer's GET /collections answered {}".format(status))
+    finally:
+        if switched:
+            status, raw, _ = _set_required(eng, False)
+            expect(status == 200, "turning the switch off answered {} {}".format(status, error_code(raw)))
+    status, raw, _ = code("GET", "/collections", token=dev)
+    expect(status == 200, "after the switch went off, GET /collections answered {} {}".format(status, error_code(raw)))
+
+    challenge = password_step(eng_name, eng_password)
+    status, _, _ = second_factor(challenge, "abcd-efgh-ijkl-mnop")
+    expect(status == 401, "a wrong recovery code answered {}".format(status))
+    rc, _ = auth_setup.operator("reset-mfa", eng_name)
+    expect(rc == 0, "reset-mfa exited {}".format(rc))
+    status, _, _ = code("GET", "/auth/me", token=eng)
+    expect(status == 401, "after reset-mfa the Engineer's session answered {}".format(status))
+    status, body, eng = request("POST", "/auth/login", {"username": eng_name, "password": eng_password})
+    expect(status == 200 and eng and body.get("mfa_enrolled") is False,
+           "after reset-mfa the login answered {} {}".format(status, body))
+    request("POST", "/auth/logout", token=eng)
+    request("POST", "/auth/logout", token=dev)
+
+    admin = role_token("engineer")
+    try:
+        def records(action):
+            status, raw, _ = code("GET", "/audit?action={}&limit=1000".format(action), token=admin)
+            expect(status == 200, "GET /audit?action={} answered {}".format(action, status))
+            return json.loads(raw)["records"]
+        policy = [r for r in records("admin.mfa.policy") if r["actor"] == eng_name]
+        expect(sorted(r["details"].get("required") for r in policy if r["result"] == "success") == [False, True],
+               "the switch's audit records are {}".format(policy))
+        expect(any(r["actor"] == eng_name for r in records("auth.mfa.enroll")), "no auth.mfa.enroll record")
+        failed = [r for r in records("auth.mfa") if r["actor"] == eng_name]
+        expect(len(failed) == 1 and failed[0]["details"].get("method") == "recovery"
+               and failed[0]["result"] != "success",
+               "the failed code's audit records are {}".format(failed))
+        expect(any(r["target"] == eng_name for r in records("operator.reset-mfa")), "no operator.reset-mfa record")
+        expect("abcd" not in json.dumps(failed) and secret not in json.dumps(records("auth.mfa.enroll")),
+               "an audit record holds a code or secret")
+    finally:
+        request("POST", "/auth/logout", token=admin)
 
 
 STATE = "restart-state.json"
@@ -34782,8 +34923,10 @@ class MfaUnitTests(unittest.TestCase):
                 self.assertIsNone(mfa.matching_step(self.RFC, mfa.code_at(self.RFC, step + offset), now, -1))
         self.assertEqual(mfa.matching_step(self.RFC, " " + mfa.code_at(self.RFC, step)[:3] + " "
                                            + mfa.code_at(self.RFC, step)[3:], now, -1), step)
-        for bad in ("", "12345", "1234567", "abcdef"):
+        for bad in ("", "12345", "1234567", "abcdef", "\u0661\u0662\u0663\u0664\u0665\u0666",
+                    "\uff11\uff12\uff13\uff14\uff15\uff16"):
             self.assertIsNone(mfa.matching_step(self.RFC, bad, now, -1))
+            self.assertFalse(mfa.is_totp(bad))
 
     def test_new_secret_is_160_bits_of_base32(self):
         secret = mfa.new_secret()
@@ -34820,10 +34963,41 @@ class MfaUnitTests(unittest.TestCase):
             self.assertIsNone(mfa.unseal(8, sealed), "another user's id is other associated data")
             self.assertIsNone(mfa.unseal(7, sealed[:-4] + "AAAA"))
             self.assertNotEqual(mfa.seal(7, "SECRET"), sealed, "a fresh nonce every time")
+            self.assertEqual([p.name for p in Path(temp.name).iterdir()], [mfa.KEY_FILE], "no temporary file is left")
             key.write_bytes(os.urandom(32))
             self.assertIsNone(mfa.unseal(7, sealed), "another key never verifies")
             key.unlink()
             self.assertIsNone(mfa.unseal(7, sealed), "a lost key never verifies")
+
+
+class MfaKeyFileTests(unittest.TestCase):
+    """The key file is never seen without its key (#607 review)."""
+
+    def test_a_racing_creator_uses_the_key_that_won(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with patch.object(settings, "auth_dir", temp.name):
+            key = Path(temp.name, mfa.KEY_FILE)
+            winner = os.urandom(32)
+            real_link = os.link
+
+            def link_after_the_other(src, dst):
+                key.write_bytes(winner)          # the other process linked its key first
+                return real_link(src, dst)
+            with patch.object(mfa.os, "link", link_after_the_other):
+                sealed = mfa.seal(3, "SECRET")
+            self.assertEqual(key.read_bytes(), winner)
+            self.assertEqual(mfa.unseal(3, sealed), "SECRET", "sealed under the winning key")
+            self.assertEqual([p.name for p in Path(temp.name).iterdir()], [mfa.KEY_FILE])
+
+    def test_a_failed_write_leaves_no_key_file(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with patch.object(settings, "auth_dir", temp.name), \
+                patch.object(mfa.os, "fsync", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                mfa.seal(3, "SECRET")
+            self.assertEqual(list(Path(temp.name).iterdir()), [], "neither an empty mfa.key nor a temporary file")
 
 
 class MfaTestCase(StoreTestCase):
@@ -35084,6 +35258,151 @@ class MfaLoginTests(MfaTestCase):
         self.client.cookies.clear()
         store.set_enabled("dev", False)
         self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+        # Enabling again doesn't revive it: disabling deleted it (#607 review).
+        store.set_enabled("dev", True)
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM mfa_challenges"), [(0,)])
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_a_password_change_or_reset_ends_a_challenge(self):
+        # #607 review: a login started with the old password can't be finished.
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        store.reset_password("dev", passwords.generate_password())
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+        store.reset_password("dev", self.passwords["developer"])   # back to a known password
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        principal, _ = self.principal("dev")
+        store.change_password(principal, passwords.generate_password())
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM mfa_challenges"), [(0,)])
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_non_ascii_digits_are_a_plain_wrong_code(self):
+        # #607 review: other scripts' digits are refused as any wrong code, not a 500.
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        arabic = "\u0661\u0662\u0663\u0664\u0665\u0666"
+        self.assertEqual(self.err(self.second(token, arabic)), (401, "MFA_FAILED"))
+        headers, _ = self.session("dev")
+        self.assertEqual(self.err(self.client.post("/auth/mfa/recovery-codes", json={"code": arabic},
+                                                   headers=headers)), (403, "MFA_CODE_INCORRECT"))
+        self.assertEqual(self.second(token, self.code(secret, 1)).status_code, 200)
+
+
+class MfaConcurrencyTests(MfaTestCase):
+    """Reviewer's checks (#607): a code is spent once and a challenge's limits
+    hold when requests arrive together. Each check is slowed down inside the
+    write transaction, so without BEGIN IMMEDIATE the parallel requests would
+    all see the same unspent state."""
+
+    @staticmethod
+    def slowed(name="matching_step"):
+        real = getattr(mfa, name)
+
+        def slow(*args, **kwargs):
+            found = real(*args, **kwargs)
+            time.sleep(0.2)
+            return found
+        return patch.object(mfa, name, slow)
+
+    WRONG = "abcd-efgh-ijkl-mnop"           # a well-formed recovery code nobody holds
+
+    @staticmethod
+    def together(calls):
+        start, results = threading.Barrier(len(calls)), [None] * len(calls)
+
+        def run(i, call):
+            start.wait()
+            try:
+                results[i] = call()
+            except Exception as exc:          # recorded, so the assertion names it
+                results[i] = exc
+        threads = [threading.Thread(target=run, args=(i, c)) for i, c in enumerate(calls)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        return results
+
+    def test_one_totp_code_is_spent_once_across_parallel_uses(self):
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        principal, _ = self.principal("dev")
+        code = self.code(secret, 1)
+        with self.slowed():
+            results = self.together([
+                lambda: store.answer_challenge(token, code)[0] == "ok",
+                lambda: store.regenerate_codes(principal, code) is not None,
+                lambda: store.disable_mfa(principal, self.passwords["developer"], code),
+            ])
+        self.assertEqual(sorted(map(repr, results)), ["False", "False", "True"], results)
+
+    def test_one_recovery_code_is_spent_once_in_parallel(self):
+        _, codes = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        principal, _ = self.principal("dev")
+        with self.slowed("recovery_hash"):
+            results = self.together([
+                lambda: store.answer_challenge(token, codes[0])[0] == "ok",
+                lambda: store.disable_mfa(principal, self.passwords["developer"], codes[0]),
+            ])
+        self.assertEqual(sorted(map(repr, results)), ["False", "True"], results)
+
+    def test_parallel_wrong_codes_use_at_most_five_of_a_challenge(self):
+        from routers import auth as auth_router
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        # A different address per request, so the (username, address) throttle
+        # never applies and only the challenge's own limit of 5 can.
+        with self.slowed("recovery_hash"):
+            results = self.together([lambda n=n: auth_router._second_factor(token, self.WRONG, f"10.0.0.{n}")[0]
+                                     for n in range(8)])
+        self.assertEqual(results.count("failed"), store.MFA_CHALLENGE_TRIES, results)
+        self.assertEqual(results.count("invalid"), 8 - store.MFA_CHALLENGE_TRIES, results)
+        self.assertEqual(self.err(self.second(token, self.code(secret))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_parallel_wrong_codes_from_one_address_lock_the_pair(self):
+        from routers import auth as auth_router
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        with self.slowed("recovery_hash"):
+            results = self.together([lambda: auth_router._second_factor(token, self.WRONG, "10.0.0.9")[0]
+                                     for _ in range(8)])
+        self.assertLessEqual(results.count("failed"), store.THROTTLE_FAILURES, results)
+        self.assertNotIn("ok", results)
+        self.assertTrue(locked("dev", "10.0.0.9"))
+
+
+class MfaDecisionDetailTests(MfaTestCase):
+    """Reviewer's checks of two details the maintainer accepted on #607 (2026-11-16)."""
+
+    def test_code_fields_accept_at_most_64_characters(self):
+        headers, _ = self.session("dev")
+        for path, body in (("/auth/login/mfa", {}), ("/auth/mfa/enroll/confirm", {}),
+                           ("/auth/mfa/recovery-codes", {}), ("/auth/mfa/disable", {"password": "x"})):
+            with self.subTest(path=path):
+                long = self.client.post(path, json={**body, "code": "1" * 65}, headers=headers)
+                self.assertEqual(long.status_code, 422, long.text)
+                self.assertEqual(long.json()["error"]["code"], "INVALID_PARAMETER", long.text)
+                at_limit = self.client.post(path, json={**body, "code": "1" * 64}, headers=headers)
+                self.assertNotEqual(at_limit.json().get("error", {}).get("code"), "INVALID_PARAMETER", at_limit.text)
+
+    def test_wrong_codes_at_set_up_confirm_do_not_count_toward_the_lockout(self):
+        headers, _ = self.session("dev")
+        secret = self.client.post("/auth/mfa/enroll", headers=headers).json()["secret"]
+        for _ in range(store.THROTTLE_FAILURES + 2):
+            self.assertEqual(self.err(self.client.post("/auth/mfa/enroll/confirm", json={"code": "abc"},
+                                                       headers=headers)), (422, "MFA_CODE_INCORRECT"))
+        self.assertFalse(locked("dev", "testclient"))
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM login_failures")[0][0], 0)
+        done = self.client.post("/auth/mfa/enroll/confirm", json={"code": self.code(secret)}, headers=headers)
+        self.assertEqual(done.status_code, 200, done.text)
 
 
 class MfaRouteTests(MfaTestCase):
@@ -53404,6 +53723,20 @@ function mfaCases() {
       await waitText(s.page, 'Ask a Question');
       assert.deepEqual(callsTo(s, 'POST', '/api/auth/login/mfa').map(c => c.body), [{ code: '000000' }, { code: '111111' }]);
     } },
+    // A login that opens a session carries the switch as mfa_required (#607 review):
+    // false, or true while required for everyone, it opens /qa, never the code step.
+    ...[false, true].map(required => ({ name: `A login answered with a user and mfa_required ${required} opens /qa without a code step`, open: { role: null, path: '/login', routes: base({
+      'POST /api/auth/login': json(200, me('developer', { mfa_enrolled: required, mfa_required: required, mfa_enrollment_required: false })),
+    }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await fill(s.page, '#login-username', 'vfy-developer');
+      await fill(s.page, '#login-password', 'a password of twelve');
+      await press(s.page, 'Log in');
+      await waitPath(s.page, '/qa');
+      await waitText(s.page, 'Ask a Question');
+      assert.equal(await s.page.evaluate(() => !!document.querySelector('#login-code')), false);
+      assert.equal(callsTo(s, 'POST', '/api/auth/login/mfa').length, 0);
+    } })),
     { name: 'An expired challenge returns to the password step', open: { role: null, path: '/login', routes: base({
       'POST /api/auth/login': json(200, { mfa_required: true }),
       'POST /api/auth/login/mfa': apiError(401, 'MFA_CHALLENGE_INVALID', 'Your sign-in expired. Log in again.'),

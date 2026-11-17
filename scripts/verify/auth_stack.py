@@ -378,7 +378,8 @@ def check_login_logout(operator_ok):
     status, raw, _ = code("GET", "/auth/me", token=token)
     body = json.loads(raw)
     expect(status == 200 and body == {"username": "vfy-developer", "role": "developer", "must_change_password": False,
-                                      "kind": "user"},
+                                      "kind": "user", "mfa_enrolled": False, "mfa_required": False,
+                                      "mfa_enrollment_required": False},
            "GET /auth/me answered {} {}".format(status, body))
     status, _, _ = code("POST", "/auth/logout", token=token)
     expect(status == 200, "logout answered {}".format(status))
@@ -757,6 +758,117 @@ def check_mfa(operator_ok):
     result = compose("logs", "--no-color", "api")
     expect(all(value not in result.stdout + result.stderr for value in [secret, accepted] + recovery),
            "a secret or code appears in the API log")
+
+
+def enroll(token):
+    """Set up two-step verification for the session `token` through the API; returns the secret."""
+    status, raw, _ = code("POST", "/auth/mfa/enroll", token=token)
+    expect(status == 200, "set-up answered {} {}".format(status, error_code(raw)))
+    secret = json.loads(raw)["secret"]
+    status, raw, _ = code("POST", "/auth/mfa/enroll/confirm", {"code": totp(secret, -1)}, token=token)
+    expect(status == 200, "confirming the set-up answered {} {}".format(status, error_code(raw)))
+    return secret
+
+
+def check_mfa_rate_limit(operator_ok):
+    """#607: nginx gives POST /auth/login/mfa the login's 16k body limit and its
+    rate zone, so codes and passwords from one address share 10 a minute."""
+    big = {"code": "x" * 17000}
+    status, raw, headers = code("POST", "/auth/login/mfa", big, paced=False)
+    expect(status == 413 and error_code(raw) is None
+           and not headers.get("Content-Type", "").startswith("application/json"),
+           "a {}-byte code body answered {} {} (not nginx's 413)".format(len(json.dumps(big)), status,
+                                                                        error_code(raw)))
+    refusal = None
+    for _ in range(12):
+        status, raw, _ = code("POST", "/auth/login/mfa", {"code": "123456"}, paced=False)
+        if status == 429:
+            refusal = raw
+            break
+        expect(status == 401 and error_code(raw) == "MFA_CHALLENGE_INVALID",
+               "a code with no challenge answered {} {}".format(status, error_code(raw)))
+    expect(refusal is not None, "12 codes in a row were all let through")
+    expect(json.loads(refusal) == {"error": {"code": "LOGIN_RATE_LIMITED", "detail": None,
+                                             "message": "Too many login attempts. Wait a minute and try again."}},
+           "the refusal is {}".format(refusal[:200]))
+    status, raw, _ = code("POST", "/auth/login", {"username": "vfy-rate-" + secrets.token_hex(3),
+                                                  "password": "x" * 12}, paced=False)
+    expect(status == 429 and error_code(raw) == "LOGIN_RATE_LIMITED",
+           "right after the codes were limited, a login answered {} {}: not the same zone".format(
+               status, error_code(raw)))
+
+
+def _set_required(token, required):
+    return code("POST", "/auth/mfa/policy", {"required": required}, token=token)
+
+
+def check_mfa_required(operator_ok):
+    """#607 on the stack: the switch needs an enrolled Engineer; while it is on,
+    an unenrolled session reaches only its session and MFA routes; the operator's
+    reset-mfa ends the sessions and the next login asks for no code; the policy,
+    reset and code attempts are audit records without a code."""
+    eng_name, eng_password, eng = throwaway("engineer", operator_ok)
+    dev_name, _, dev = throwaway("developer", operator_ok)
+    status, raw, _ = _set_required(eng, True)
+    expect(status == 409 and error_code(raw) == "MFA_ENROLL_FIRST",
+           "an unenrolled Engineer turning the switch on answered {} {}".format(status, error_code(raw)))
+    secret = enroll(eng)
+    switched = False
+    try:
+        status, raw, _ = _set_required(eng, True)
+        switched = status == 200
+        expect(switched, "an enrolled Engineer turning the switch on answered {} {}".format(status, error_code(raw)))
+        status, raw, _ = code("GET", "/collections", token=dev)
+        expect(status == 403 and error_code(raw) == "MFA_ENROLLMENT_REQUIRED",
+               "while required, an unenrolled session's GET /collections answered {} {}".format(
+                   status, error_code(raw)))
+        status, body, _ = request("GET", "/auth/me", token=dev)
+        expect(status == 200 and body.get("mfa_enrollment_required") is True,
+               "while required, /auth/me answered {} {}".format(status, body))
+        status, raw, _ = code("GET", "/auth/mfa", token=dev)
+        expect(status == 200 and json.loads(raw).get("required") is True,
+               "while required, GET /auth/mfa answered {} {}".format(status, error_code(raw)))
+        status, raw, _ = code("GET", "/collections", token=eng)
+        expect(status == 200, "while required, the enrolled Engineer's GET /collections answered {}".format(status))
+    finally:
+        if switched:
+            status, raw, _ = _set_required(eng, False)
+            expect(status == 200, "turning the switch off answered {} {}".format(status, error_code(raw)))
+    status, raw, _ = code("GET", "/collections", token=dev)
+    expect(status == 200, "after the switch went off, GET /collections answered {} {}".format(status, error_code(raw)))
+
+    challenge = password_step(eng_name, eng_password)
+    status, _, _ = second_factor(challenge, "abcd-efgh-ijkl-mnop")
+    expect(status == 401, "a wrong recovery code answered {}".format(status))
+    rc, _ = auth_setup.operator("reset-mfa", eng_name)
+    expect(rc == 0, "reset-mfa exited {}".format(rc))
+    status, _, _ = code("GET", "/auth/me", token=eng)
+    expect(status == 401, "after reset-mfa the Engineer's session answered {}".format(status))
+    status, body, eng = request("POST", "/auth/login", {"username": eng_name, "password": eng_password})
+    expect(status == 200 and eng and body.get("mfa_enrolled") is False,
+           "after reset-mfa the login answered {} {}".format(status, body))
+    request("POST", "/auth/logout", token=eng)
+    request("POST", "/auth/logout", token=dev)
+
+    admin = role_token("engineer")
+    try:
+        def records(action):
+            status, raw, _ = code("GET", "/audit?action={}&limit=1000".format(action), token=admin)
+            expect(status == 200, "GET /audit?action={} answered {}".format(action, status))
+            return json.loads(raw)["records"]
+        policy = [r for r in records("admin.mfa.policy") if r["actor"] == eng_name]
+        expect(sorted(r["details"].get("required") for r in policy if r["result"] == "success") == [False, True],
+               "the switch's audit records are {}".format(policy))
+        expect(any(r["actor"] == eng_name for r in records("auth.mfa.enroll")), "no auth.mfa.enroll record")
+        failed = [r for r in records("auth.mfa") if r["actor"] == eng_name]
+        expect(len(failed) == 1 and failed[0]["details"].get("method") == "recovery"
+               and failed[0]["result"] != "success",
+               "the failed code's audit records are {}".format(failed))
+        expect(any(r["target"] == eng_name for r in records("operator.reset-mfa")), "no operator.reset-mfa record")
+        expect("abcd" not in json.dumps(failed) and secret not in json.dumps(records("auth.mfa.enroll")),
+               "an audit record holds a code or secret")
+    finally:
+        request("POST", "/auth/logout", token=admin)
 
 
 STATE = "restart-state.json"

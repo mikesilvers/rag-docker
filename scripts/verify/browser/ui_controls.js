@@ -710,6 +710,20 @@ function mfaCases() {
       await waitText(s.page, 'Ask a Question');
       assert.deepEqual(callsTo(s, 'POST', '/api/auth/login/mfa').map(c => c.body), [{ code: '000000' }, { code: '111111' }]);
     } },
+    // A login that opens a session carries the switch as mfa_required (#607 review):
+    // false, or true while required for everyone, it opens /qa, never the code step.
+    ...[false, true].map(required => ({ name: `A login answered with a user and mfa_required ${required} opens /qa without a code step`, open: { role: null, path: '/login', routes: base({
+      'POST /api/auth/login': json(200, me('developer', { mfa_enrolled: required, mfa_required: required, mfa_enrollment_required: false })),
+    }) }, async run(s) {
+      await waitText(s.page, 'Log in to continue');
+      await fill(s.page, '#login-username', 'vfy-developer');
+      await fill(s.page, '#login-password', 'a password of twelve');
+      await press(s.page, 'Log in');
+      await waitPath(s.page, '/qa');
+      await waitText(s.page, 'Ask a Question');
+      assert.equal(await s.page.evaluate(() => !!document.querySelector('#login-code')), false);
+      assert.equal(callsTo(s, 'POST', '/api/auth/login/mfa').length, 0);
+    } })),
     { name: 'An expired challenge returns to the password step', open: { role: null, path: '/login', routes: base({
       'POST /api/auth/login': json(200, { mfa_required: true }),
       'POST /api/auth/login/mfa': apiError(401, 'MFA_CHALLENGE_INVALID', 'Your sign-in expired. Log in again.'),

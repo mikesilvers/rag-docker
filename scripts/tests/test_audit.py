@@ -261,9 +261,12 @@ class MiddlewareTests(AuditTestCase):
         self.assertEqual((started["actor"], started["result"], started["details"]), ("dev", "success", {"mfa": "required"}))
         challenge = login.cookies.get(store.MFA_COOKIE)
         self.client.cookies.clear()
-        for _ in range(3):
+        for _ in range(2):
             self.client.post("/auth/login/mfa", json={"code": "zzzz-zzzz-zzzz-zzzz"},
                              headers={"Cookie": f"{store.MFA_COOKIE}={challenge}"})
+        # Non-ASCII digits are a wrong code like any other, with its record (#607 review).
+        self.client.post("/auth/login/mfa", json={"code": "\u0661\u0662\u0663\u0664\u0665\u0666"},
+                         headers={"Cookie": f"{store.MFA_COOKIE}={challenge}"})
         failed = [r for r in self.records() if r["action"] == "auth.mfa"]
         self.assertEqual(len(failed), 3)
         for item in failed:
