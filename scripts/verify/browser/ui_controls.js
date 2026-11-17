@@ -523,7 +523,12 @@ function usersCases() {
     onDialog: async d => { dialog.seen.push(d.message()); if (dialog.answer(d.message())) await d.accept(); else await d.dismiss(); } });
   const othersAccepted = { answer: m => !m.includes('your own'), seen: [] }, allCancelled = { answer: () => false, seen: [] };
   const rowTexts = page => page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => [...r.querySelectorAll('td')].map(c => c.textContent.trim())));
+  // The row controls are disabled while a change is in flight, and a click on a
+  // disabled button does nothing. The one-time password shows before the list
+  // has reloaded and the controls are enabled again, so wait for that first.
+  const settled = page => waitFor(page, () => ![...document.querySelectorAll('tbody button, tbody select')].some(e => e.disabled), 'the row controls to be enabled');
   const rowPress = async (page, username, label) => {
+    await settled(page);
     const done = await page.evaluate((u, t) => {
       const b = [...document.querySelectorAll(`tr[data-username="${u}"] button`)].find(x => x.textContent.trim() === t);
       if (!b) return false; b.click(); return true;
@@ -616,9 +621,10 @@ function usersCases() {
       await waitText(s.page, 'ResetOnce-0987654321ab');
       await rowPress(s.page, 'vfy-off', 'Enable');
       await status('vfy-off', 'Enabled');
+      await settled(s.page);
       await fill(s.page, `select[aria-label="Role of ${ME}"]`, 'developer');
       await rowPress(s.page, ME, 'Disable');
-      await new Promise(r => setTimeout(r, 300));
+      await settled(s.page);
       assert.deepEqual(othersAccepted.seen, [
         'Change the role of vfy-developer to End User?',
         "Disable vfy-developer? Their sessions end and they can't log in until enabled.",
@@ -635,6 +641,8 @@ function usersCases() {
       await fill(s.page, 'select[aria-label="Role of vfy-developer"]', 'end_user');
       await rowPress(s.page, 'vfy-developer', 'Disable');
       await rowPress(s.page, 'vfy-developer', 'Reset password');
+      // A dismissed confirmation is answered inside the click, so nothing can be
+      // in flight; the pause only gives a wrongly sent request time to be seen.
       await new Promise(r => setTimeout(r, 300));
       assert.equal(allCancelled.seen.length, 3);
       assert.equal(s.calls.filter(c => c.method === 'POST' && c.path.startsWith('/api/auth/users/')).length, 0);
