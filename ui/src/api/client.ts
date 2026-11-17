@@ -200,6 +200,9 @@ export const api = {
   listExportJobs: () => request<{ jobs: ExportJobEntry[] }>('GET', '/export/jobs'),
   listImportJobs: () => request<{ jobs: ImportJobEntry[] }>('GET', '/import/jobs'),
   getPackages: () => request<{ packages: PackageSummary[] }>('GET', '/packages'),
+  // A plain link, sent with the session cookie. A full download deletes a
+  // package this instance exported (#677).
+  packageDownloadUrl: (filename: string) => `${BASE}/packages/${encodeURIComponent(filename)}`,
   getTuneOptions: (collection: string) => request<TuneOptions>('GET', `/tune/${collection}`),
   getTransferHelp: () => request<{ topic: string; markdown: string }>('GET', '/help/transfer'),
 
@@ -309,6 +312,9 @@ export interface ExportJob {
   fidelity: string | null; models_bundled: boolean | null; retrieve_script: boolean | null
   warnings: string[]; error: string | null; error_code: string | null; error_detail: Record<string, unknown> | null
   encrypted?: boolean
+  // When the package is deleted if nobody downloads it (UTC, #677); null once
+  // it has been downloaded or swept.
+  expires_at?: string | null
 }
 // passphrase: required for a .tar.gz.age package and refused for any other (#27).
 export interface ImportBody { filename: string; on_conflict: string; passphrase?: string }
@@ -358,6 +364,9 @@ export interface PackageSummary {
   filename: string; size_bytes: number; collection: string | null
   chunk_count: number | null; fidelity: string | null; created_at: string | null; readable: boolean
   encrypted?: boolean
+  // When a package this instance exported is deleted if nobody downloads it
+  // (UTC, #677); null for one copied in to be imported.
+  expires_at?: string | null
 }
 export interface TuneOptions {
   collection: string; fidelity: string; source_document_count: number

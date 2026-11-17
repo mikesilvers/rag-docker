@@ -26,6 +26,11 @@ function sizeLabel(bytes: number | null): string {
   return `${bytes} B`
 }
 
+// A package's expiry (#677) in the viewer's local time.
+function expiresLabel(iso: string): string {
+  return new Date(iso).toLocaleString()
+}
+
 const CONFLICT = [
   { id: 'abort', label: 'Abort', description: 'Fail if a collection of that name already exists. Nothing is changed.' },
   { id: 'rename', label: 'Rename', description: 'Import alongside the existing one, under a new name the API reports back.' },
@@ -309,6 +314,8 @@ export default function TransferPage() {
       </div>
       <p className="text-sm text-gray-500 mb-6">
         Packages are written to and read from <code>./exports</code> in the project directory.
+        A package exported here is deleted from there once it has been fully downloaded, or when it
+        expires if nobody downloads it. Packages copied in to be imported are left alone.
       </p>
 
       <JobList rows={jobRows} showOwner={role === 'engineer'}
@@ -410,6 +417,17 @@ export default function TransferPage() {
                 </span>
               </p>
             )}
+            {exportJob.status === 'completed' && exportJob.filename && (
+              <p className="mt-2 flex items-center gap-3">
+                <a href={api.packageDownloadUrl(exportJob.filename)} download
+                   className="bg-blue-600 text-white px-3 py-1 rounded text-xs hover:bg-blue-700">
+                  Download
+                </a>
+                {exportJob.expires_at && (
+                  <span className="text-gray-500 text-xs">Expires {expiresLabel(exportJob.expires_at)}</span>
+                )}
+              </p>
+            )}
             {exportJob.status === 'failed' && (
               <p className="text-red-600">
                 {exportJob.error_code && <code className="text-xs mr-2">{exportJob.error_code}</code>}
@@ -429,7 +447,13 @@ export default function TransferPage() {
 
         <div className="flex items-center justify-between mb-1">
           <label className="block text-sm font-medium">Package in ./exports</label>
-          <button onClick={loadPackages} className="text-xs text-blue-600 hover:underline">Refresh</button>
+          <span className="flex items-center gap-3">
+            {filename
+              ? <a href={api.packageDownloadUrl(filename)} download
+                   className="text-xs text-blue-600 hover:underline">Download</a>
+              : <button disabled className="text-xs text-gray-400">Download</button>}
+            <button onClick={loadPackages} className="text-xs text-blue-600 hover:underline">Refresh</button>
+          </span>
         </div>
         <select
           value={filename}
@@ -445,6 +469,7 @@ export default function TransferPage() {
                 : p.readable
                 ? ` — ${p.collection}, ${p.chunk_count} chunks, ${p.fidelity}, ${sizeLabel(p.size_bytes)}`
                 : ' — unreadable'}
+              {p.expires_at ? `, expires ${expiresLabel(p.expires_at)}` : ''}
             </option>
           ))}
         </select>
