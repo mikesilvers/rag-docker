@@ -10,6 +10,8 @@ import logging
 
 from fastapi import APIRouter, Request
 
+from auth import access
+
 from models.schemas import (
     ExportJobEntry,
     ExportJobList,
@@ -37,6 +39,9 @@ _log = logging.getLogger(__name__)
 async def start_export(body: ExportRequest, request: Request = None):
     # The audit record's parameters (#29): whether it is encrypted, never the passphrase.
     audit.note(collection=body.collection, include_models=body.include_models, encrypted=body.passphrase is not None)
+    # A collection the caller may not use answers as one that doesn't exist (#606).
+    if not await access.check(request, body.collection):
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
     try:
         exists = await wc.collection_exists(body.collection)
     except Exception:                                 # noqa: BLE001
@@ -80,9 +85,10 @@ async def list_export_jobs(request: Request):
 
 
 @router.get("/export/job/{job_id}", response_model=ExportJobStatusResponse)
-async def export_job_status(job_id: str):
+async def export_job_status(job_id: str, request: Request = None):
     job = exporter.get_job(job_id)
-    if job is None:
+    # A job on a collection the caller may not use answers as a missing one (#606).
+    if job is None or (job.get("collection") and not await access.check(request, job["collection"], "JOB_NOT_FOUND")):
         return api_error(404, "JOB_NOT_FOUND", f"Job '{job_id}' not found.")
     return ExportJobStatusResponse(**job)
 
@@ -118,9 +124,10 @@ async def list_import_jobs(request: Request):
 
 
 @router.get("/import/job/{job_id}", response_model=ImportJobStatusResponse)
-async def import_job_status(job_id: str):
+async def import_job_status(job_id: str, request: Request = None):
     job = importer.get_job(job_id)
-    if job is None:
+    # An import job names its collection once its package is read (#606).
+    if job is None or (job.get("collection") and not await access.check(request, job["collection"], "JOB_NOT_FOUND")):
         return api_error(404, "JOB_NOT_FOUND", f"Job '{job_id}' not found.")
     return ImportJobStatusResponse(**job)
 
@@ -161,8 +168,36 @@ def _list_packages_sync() -> list[dict]:
     return out
 
 
+async def _hidden(principal, packages: list[dict]) -> set[str]:
+    """The packages a caller may not see (#606): unencrypted ones whose
+    collection exists here and is restricted to others. Weaviate failing to
+    answer counts as existing, so the listing fails closed."""
+    visible = await asyncio.to_thread(access.visible_filter, principal)
+    hidden = set()
+
+    async def exists(name):
+        try:
+            return await wc.collection_exists(name)
+        except Exception:                             # noqa: BLE001
+            _log.exception("Could not check whether %r exists for the package listing", name)
+            return True
+    for p in packages:
+        name = p.get("collection")
+        if p.get("encrypted") or not p.get("readable") or not isinstance(name, str) or not name:
+            continue
+        # A package of a discarded staging or recovery copy follows its target.
+        source = access.canonical(name)
+        if access.target_of(source) != source and not await exists(source):
+            source = access.target_of(source)
+        if not visible(source) and await exists(source):
+            hidden.add(p["filename"])
+    return hidden
+
+
 @router.get("/packages", response_model=PackageListResponse)
-async def list_packages():
+async def list_packages(request: Request = None):
     """Packages sitting in ./exports — both exported here and dropped in to import."""
     packages = await asyncio.to_thread(_list_packages_sync)
+    hidden = await _hidden(access.principal_of(request), packages)
+    packages = [p for p in packages if p["filename"] not in hidden]
     return PackageListResponse(packages=[PackageSummary(**p) for p in packages])

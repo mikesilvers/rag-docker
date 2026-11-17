@@ -1159,6 +1159,29 @@ def collection_check_unavailable(name: str, outcome: str) -> JSONResponse:
                      f"Cannot check whether '{name}' exists: Weaviate could not be read. "
                      f"{outcome}; try again when Weaviate is available.",
                      detail={"collection": name})
+
+
+def collection_not_found(name: str) -> JSONResponse:
+    """A collection that doesn't exist, or one the caller may not use (#606)."""
+    return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{name}' not found.")
+
+
+async def usable_collection(request, name: str, outcome: str) -> JSONResponse | None:
+    """For the settings routes (#606): None when the caller may use the
+    collection and it exists; otherwise the answer to send, the same 404 for a
+    refused collection as for a missing one, or the 503 when Weaviate can't say."""
+    import logging
+    from auth import access
+    from services import weaviate_client as wc
+    if not await access.check(request, name):
+        return collection_not_found(name)
+    try:
+        exists = await wc.collection_exists(name)
+    except Exception:                                 # noqa: BLE001
+        # Weaviate couldn't be asked; the cause is logged, not sent (#366).
+        logging.getLogger(__name__).exception("Could not check whether %r exists for its settings", name)
+        return collection_check_unavailable(name, outcome)
+    return None if exists else collection_not_found(name)
 ```
 
 ### api/config.py
@@ -1691,7 +1714,7 @@ if __name__ == "__main__":
 ```python
 from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
-from pydantic import AfterValidator, BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator, SecretStr, StrictInt
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, BeforeValidator, ValidationError, field_validator, model_validator, SecretStr, StrictInt
 
 from services.collection_writes import canonical
 
@@ -1774,6 +1797,28 @@ class CollectionInfo(BaseModel):
 
 class CollectionsResponse(BaseModel):
     collections: list[CollectionInfo]
+
+
+class CollectionAccessRequest(BaseModel):
+    """PUT /collections/{name}/access (#606): the whole state at once. Open
+    takes no names; restricted grants exactly the people and service
+    principals named (none: Engineers only)."""
+    model_config = ConfigDict(extra="forbid")
+    restricted: bool
+    users: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
+    service_principals: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
+
+    @model_validator(mode="after")
+    def _names_only_when_restricted(self):
+        if not self.restricted and (self.users or self.service_principals):
+            raise ValueError("an open collection takes no users or service principals")
+        return self
+
+
+class CollectionAccessResponse(BaseModel):
+    restricted: bool
+    users: list[str]
+    service_principals: list[str]
 
 
 # ── Ingest ────────────────────────────────────────────────────────────────────
@@ -3375,6 +3420,7 @@ import shutil
 import uuid
 from pathlib import Path
 
+from auth import store as auth_store
 from config import settings
 from services import sources
 
@@ -3424,6 +3470,10 @@ def begin(target: str, operation: str, client) -> dict:
     record = dict(version=1, operation_id=token, operation=operation,
                   target=target, staging=staging, state="scratch")
     _write(record)  # Ownership is persisted before collection creation.
+    # The copy will hold the target's data, so it gets the target's access as
+    # it is now, under its own name, before it exists (#606). Later changes to
+    # the target (a delete, a re-create, new grants) never change it.
+    auth_store.copy_collection_access(target, staging)
     return record
 
 
@@ -3565,6 +3615,7 @@ def discard(record: dict, client) -> None:
     name = record["staging"]
     if telemetry.call("weaviate.exists", client.collections.exists, name):
         telemetry.call("weaviate.delete", client.collections.delete, name)
+    auth_store.drop_collection_access(name)          # the copy's own access state (#606)
     sources.delete(name)
     if sources.collection_dir(name).exists():
         raise OSError(f"Could not remove recovery sources for {name}")
@@ -8801,18 +8852,26 @@ async def upload(files: list[Any], owner: dict | None) -> tuple[list[dict], list
 
 # ── selection ────────────────────────────────────────────────────────────────
 
-def _resolve(document_ids: list[str] | None, all_of: set[str]) -> list[dict]:
+def _resolve(document_ids: list[str] | None, all_of: set[str], usable=None) -> list[dict]:
     """The records selected: the ids in the order given, or every document whose
-    status is in `all_of`, oldest first."""
+    status is in `all_of`, oldest first. `usable` (a predicate on a record, #606)
+    hides documents the caller may not use: such an id is answered as unknown,
+    and `all` leaves them out."""
+    usable = usable or (lambda record: True)
     if document_ids is None:
-        records = [r for r in store.list_documents() if r.get("status") in all_of]
+        records = [r for r in store.list_documents() if r.get("status") in all_of and usable(r)]
         records.sort(key=lambda r: r.get("created_at") or "")
     else:
         records, missing = [], []
         for document_id in dict.fromkeys(document_ids):
             try:
-                records.append(store.get(document_id))
+                record = store.get(document_id)
             except store.DocumentNotFound:
+                missing.append(document_id)
+                continue
+            if usable(record):
+                records.append(record)
+            else:
                 missing.append(document_id)
         if missing:
             raise store.DocumentNotFound(
@@ -8825,14 +8884,14 @@ def _resolve(document_ids: list[str] | None, all_of: set[str]) -> list[dict]:
 
 # ── jobs ─────────────────────────────────────────────────────────────────────
 
-async def start(document_ids: list[str] | None, owner: dict | None) -> dict:
+async def start(document_ids: list[str] | None, owner: dict | None, usable=None) -> dict:
     """Queue a preparation job for the selected documents (or every document that
     isn't being prepared, with document_ids None)."""
     await asyncio.to_thread(store.check_not_full)
     job_id = uuid.uuid4().hex[:8]
 
     def admit() -> list[dict]:
-        records = _resolve(document_ids, {"raw", "prepared", "failed"})
+        records = _resolve(document_ids, {"raw", "prepared", "failed"}, usable)
         busy = [r["name"] for r in records
                 if r.get("status") in ("queued", "preparing") or store.is_busy(r["id"])]
         if busy:
@@ -9009,11 +9068,11 @@ class _Part:
         self.size = None
 
 
-async def import_documents(body: Any) -> dict:
+async def import_documents(body: Any, usable=None) -> dict:
     """Start one ingest job with every part of the selected prepared documents."""
 
     def select() -> tuple[list[dict], list[str]]:
-        records = _resolve(body.document_ids, {"prepared"})
+        records = _resolve(body.document_ids, {"prepared"}, usable)
         busy = [r["name"] for r in records
                 if r.get("status") in ("queued", "preparing") or store.is_busy(r["id"])]
         if busy:
@@ -10505,6 +10564,46 @@ def _save_export_sync(out_path: Path, ragas: list[dict]) -> None:
     _replace_durably(out_path, json.dumps(ragas, indent=2))
 
 
+# Which collection each saved export came from (#606), so a download can be
+# checked against that collection's access. Kept beside the exports folder,
+# never in it, so it is never served; the exports stay plain RAGAS lists. A file
+# with no entry (saved before #606, or put there by hand) is served to Engineers
+# only. An unreadable index is treated as empty, which only narrows downloads.
+EXPORT_INDEX_NAME = "goldstandard_export_collections.json"
+_export_index_lock = threading.Lock()
+
+
+def _export_index_path() -> Path:
+    return Path(settings.upload_dir).resolve() / EXPORT_INDEX_NAME
+
+
+def _read_export_index() -> dict:
+    try:
+        data = json.loads(_export_index_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        log.exception("The gold-standard export index can't be read; its files are served to Engineers only")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _record_export_collection(filename: str, collection: str | None) -> None:
+    with _export_index_lock:
+        index = _read_export_index()
+        if collection:
+            index[filename] = collection
+        else:
+            index.pop(filename, None)
+        _replace_durably(_export_index_path(), json.dumps(index, indent=2, sort_keys=True))
+
+
+def export_collection(filename: str) -> str | None:
+    """The collection a saved export came from, or None when it isn't known."""
+    value = _read_export_index().get(filename)
+    return value if isinstance(value, str) and value else None
+
+
 async def save_session(session_id: str, filename: str | None, allow_historical: bool = False) -> dict | None:
     session = _sessions.get(session_id)
     if session is None:
@@ -10550,6 +10649,9 @@ async def save_session(session_id: str, filename: str | None, allow_historical: 
         }
         for p in approved
     ]
+    # The collection is recorded before the file is written (#606): a failure
+    # or a race in between narrows who may download it, never widens it.
+    await asyncio.to_thread(_record_export_collection, filename, session.get("collection"))
     await asyncio.to_thread(_save_export_sync, out_path, ragas)
 
     return {
@@ -12912,6 +13014,8 @@ import uuid
 from pathlib import Path
 from contextlib import nullcontext
 
+from auth import access
+from auth import store as auth_store
 from config import settings
 from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import age_stream
@@ -13696,6 +13800,44 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
         raise
 
 
+def _exists(name: str) -> bool:
+    """Whether a collection exists; Weaviate failing to answer counts as
+    existing, so the access checks below fail closed."""
+    try:
+        return wc._collection_exists_sync(name)
+    except Exception:                                 # noqa: BLE001
+        _log.exception("Could not check whether %r exists for an import's access check", name)
+        return True
+
+
+def _source(original: str) -> str:
+    """Whose access a package of `original` follows (#606): the collection
+    itself, or for a staging or recovery copy that no longer exists here, its
+    target (auth.access.package_source)."""
+    return access.package_source(original, _exists)
+
+
+def _refused(owner, source: str) -> bool:
+    """True when the package's collection (`_source`) exists here, is
+    restricted, and the job's owner may not use it (#606)."""
+    if owner is None or not auth_store.collection_access(source).restricted:
+        return False
+    return _exists(source) and not auth_store.owner_has_access(owner, source)
+
+
+def _start_access(owner, source: str, target: str):
+    """A collection this import creates (#606): when the package's collection
+    (`_source`) exists here, the new one gets its state; otherwise it starts
+    restricted to the job's owner. Written before any data; returns (the state
+    replaced, the state written) for auth_store.put_back. A job with no owner
+    (a direct call in tests) records nothing and returns None."""
+    if owner is None:
+        return None
+    if source != target and _exists(source):
+        return auth_store.copy_collection_access(source, target)
+    return auth_store.restrict_to(target, auth_store.user_id_for(owner))
+
+
 @telemetry.traced("rag.import")
 def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = None) -> None:
     job = _jobs[job_id]
@@ -13708,6 +13850,8 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
     # set is not by itself evidence that anything survived to recover.
     staged = False
     ownership: dict | None = None
+    new_access = None    # (collection, state replaced, state written) when this job set one (#606)
+    built = False        # this job's build of the target finished
 
     def progress(n: int) -> None:
         job["chunks_written"] = n
@@ -13726,6 +13870,13 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
         _check_embedding(manifest)                                  # check 4
 
         original = manifest["collection"]["name"]
+        # A package of a collection its owner may not use is refused as if it
+        # weren't there, before the job names the collection anywhere (#606).
+        source = _source(original) if isinstance(original, str) and original else None
+        if source and _refused(job.get("owner"), source):
+            job["access_refused"] = True
+            raise PackageError("PACKAGE_UNREADABLE",
+                               f"No package named '{archive.name}' in the exports directory.")
         id8 = packager.sha256_file(pkg / "manifest.json")[:8]
         job["collection"] = original
         job["fidelity"] = manifest.get("fidelity")
@@ -13775,6 +13926,14 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
                 raise PackageError("COLLECTION_DELETING", collection_writes.deleting_message(target),
                                    {"collection": target}) from None
 
+            # A collection this import creates gets its access state before any
+            # data is written; a replace keeps the target's (#606).
+            if not exists or on_conflict != "replace":
+                states = _start_access(job.get("owner"), source or target, target)
+                if states is not None:
+                    before, written = states
+                    new_access = (target, written, before)       # put_back's (collection, expected, previous)
+
             if exists and on_conflict == "replace":
                 # Prove the package inserts cleanly before destroying anything.
                 ownership = collection_recovery.begin(target, "import", wc.get_client())
@@ -13801,6 +13960,7 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
             instance = _mark_started(target, expected, job_id, lambda: _package_records(pkg, manifest))
             marked = target
             written = _build(target, pkg, manifest, progress, instance)
+            built = True
             _mark_finished(target)
             marked = None
             job.setdefault("restored_sessions", [])
@@ -13849,6 +14009,16 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
                 _mark_finished(marked)
             except Exception:
                 _log.exception("Could not finish import marker for %r; startup will retry", marked)
+        if new_access and not built and job.get("status") == "failed":
+            # This job made no collection (its build removes what it started),
+            # so the state it wrote goes back to what it replaced, unless a
+            # create of the same name wrote its own since (#606). A collection
+            # it did build keeps its state.
+            try:
+                auth_store.put_back(*new_access)
+            except Exception:                         # noqa: BLE001
+                _log.exception("Could not put back the access state of %r after a failed import",
+                               new_access[0])
         if ownership and ownership["state"] == "scratch":
             try:
                 collection_recovery.discard(ownership, wc.get_client())
@@ -15066,11 +15236,14 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from auth import access, store
 from config import settings
 from models.schemas import (
+    CollectionAccessRequest,
+    CollectionAccessResponse,
     CollectionInfo,
     CollectionName,
     CollectionsResponse,
@@ -15168,7 +15341,7 @@ def remove_interrupted_saves() -> None:
 
 
 @router.get("", response_model=CollectionsResponse)
-async def list_collections():
+async def list_collections(request: Request = None):
     try:
         raw = await wc.get_collections()
     except Exception:                                 # noqa: BLE001
@@ -15184,6 +15357,8 @@ async def list_collections():
         _log.warning("The collection registry can't be read, so created_at is null "
                      "for every collection: %s", exc)
         registry = {}
+    # Only the collections the caller may use (#606); Engineers see all.
+    visible = await asyncio.to_thread(access.visible_filter, access.principal_of(request))
     items = [
         CollectionInfo(
             name=c["name"],
@@ -15194,12 +15369,13 @@ async def list_collections():
             hnsw_config=c.get("hnsw_config"),
         )
         for c in raw
+        if visible(c["name"])
     ]
     return CollectionsResponse(collections=items)
 
 
 @router.post("", status_code=201)
-async def create_collection(body: CreateCollectionRequest):
+async def create_collection(body: CreateCollectionRequest, request: Request = None):
     audit.note(collection=body.name)              # the audit record's collection (#29)
     try:
         exists = await wc.collection_exists(body.name)
@@ -15209,6 +15385,18 @@ async def create_collection(body: CreateCollectionRequest):
         return collection_check_unavailable(body.name, "No collection was created")
     if exists:
         return api_error(409, "COLLECTION_EXISTS", f"Collection '{body.name}' already exists.")
+
+    # A new collection starts restricted to the account that created it (#606),
+    # written before it exists, so it is never open: if this write fails nothing
+    # is created, and if the create fails the state goes back (put_back).
+    principal = access.principal_of(request)
+    states = None
+    if principal is not None:
+        try:
+            states = await asyncio.to_thread(store.restrict_to, body.name, principal.user_id)
+        except Exception:                             # noqa: BLE001
+            _log.exception("Could not restrict new collection %r; it was not created", body.name)
+            return api_error(500, "CREATE_FAILED", "Failed to create collection.")
 
     try:
         await wc.create_collection(
@@ -15220,6 +15408,11 @@ async def create_collection(body: CreateCollectionRequest):
     except Exception:                                 # noqa: BLE001
         # The cause is logged, not sent (#373).
         _log.exception("Could not create collection %r", body.name)
+        if states is not None:
+            try:
+                await asyncio.to_thread(store.put_back, body.name, states[1], states[0])
+            except Exception:                         # noqa: BLE001
+                _log.exception("Could not put back the access state of %r after a failed create", body.name)
         return api_error(500, "CREATE_FAILED", "Failed to create collection.")
 
     async with _registry_lock:
@@ -15298,7 +15491,65 @@ async def delete_collection(name: CollectionName, confirm: str | None = None):
                 registry.pop(spelling, None)
             await asyncio.to_thread(_save_registry, registry)
 
+    # A later collection of the same name starts afresh (#606).
+    await asyncio.to_thread(store.drop_collection_access, name)
     return {"name": name, "objects_deleted": count}
+
+
+# ── per-collection access (#606) ─────────────────────────────────────────────
+
+def _access_body(state: store.CollectionAccess) -> CollectionAccessResponse:
+    return CollectionAccessResponse(restricted=state.restricted, users=list(state.users),
+                                    service_principals=list(state.service_principals))
+
+
+async def _missing(name: str, outcome: str):
+    """The 503 or 404 when the collection can't be confirmed, else None."""
+    try:
+        exists = await wc.collection_exists(name)
+    except Exception:                                 # noqa: BLE001
+        _log.exception("Could not check whether %r exists for its access settings", name)
+        return collection_check_unavailable(name, outcome)
+    if not exists:
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{name}' not found.")
+    return None
+
+
+@router.get("/{name}/access", response_model=CollectionAccessResponse)
+async def get_collection_access(name: CollectionName):
+    """Open, or restricted and to whom (Engineers, in a browser session)."""
+    missing = await _missing(name, "Nothing was read")
+    if missing is not None:
+        return missing
+    return _access_body(await asyncio.to_thread(store.collection_access, name))
+
+
+def _names(before: tuple, after: tuple) -> tuple[list, list]:
+    return sorted(set(after) - set(before)), sorted(set(before) - set(after))
+
+
+@router.put("/{name}/access", response_model=CollectionAccessResponse)
+async def set_collection_access(name: CollectionName, body: CollectionAccessRequest, request: Request = None):
+    """Set who may use the collection, the whole state at once (#606)."""
+    audit.note(collection=name)
+    missing = await _missing(name, "Nothing was changed")
+    if missing is not None:
+        return missing
+    try:
+        before, after = await asyncio.to_thread(store.set_collection_access, name, body.restricted,
+                                                body.users, body.service_principals)
+    except store.Refused as exc:
+        return api_error(422, "INVALID_PARAMETER", str(exc))
+    added_users, removed_users = _names(before.users, after.users)
+    added_svc, removed_svc = _names(before.service_principals, after.service_principals)
+    audit.note(restricted_before=before.restricted, restricted_after=after.restricted,
+               added={"users": added_users, "service_principals": added_svc},
+               removed={"users": removed_users, "service_principals": removed_svc})
+    actor = getattr(access.principal_of(request), "username", "?")
+    _log.warning("Admin %r set the access of collection %r: %s, %d people and %d service principals granted",
+                 actor, name, "restricted" if after.restricted else "open", len(after.users),
+                 len(after.service_principals))
+    return _access_body(after)
 ```
 
 ### api/routers/ingest.py
@@ -15317,7 +15568,9 @@ from services import audit, ingest_config, job_lists
 from services import ingest_pipeline
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError, canonical
-from utils import api_error, collection_check_unavailable, collection_deleting_error
+from auth import access
+from utils import (api_error, collection_check_unavailable, collection_deleting_error, collection_not_found,
+                   usable_collection)
 
 router = APIRouter(prefix="/ingest")
 _log = logging.getLogger(__name__)
@@ -15350,7 +15603,7 @@ async def ingest_upload(
     try:
         return await _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
                                     similarity_threshold, min_chunk_size, files,
-                                    job_lists.job_owner(request))
+                                    job_lists.job_owner(request), request)
     except Exception:
         # Anything not handled below used to reach the client as a plain-text
         # 500, which the Import page could only show as "HTTP 500" (#290).
@@ -15363,7 +15616,7 @@ async def ingest_upload(
 
 
 async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
-                         similarity_threshold, min_chunk_size, files, owner=None):
+                         similarity_threshold, min_chunk_size, files, owner=None, request=None):
     try:
         config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
                               chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
@@ -15371,6 +15624,9 @@ async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
     except ValidationError as exc:
         return api_error(422, "INVALID_SETTINGS", "Invalid chunking settings.",
                          detail={"errors": exc.errors(include_context=False, include_input=False)})
+    # A collection the caller may not use answers as one that doesn't exist (#606).
+    if not await access.check(request, collection):
+        return collection_not_found(collection)
     try:
         exists = await wc.collection_exists(collection)
     except Exception:                                 # noqa: BLE001
@@ -15418,22 +15674,30 @@ async def list_jobs(request: Request):
 
 
 @router.get("/job/{job_id}", response_model=JobStatusResponse)
-async def job_status(job_id: str):
+async def job_status(job_id: str, request: Request = None):
     job = ingest_pipeline.get_job(job_id)
-    if job is None:
+    # A job on a collection the caller may not use answers as a missing one (#606).
+    if job is None or (job.get("collection") and not await access.check(request, job["collection"], "JOB_NOT_FOUND")):
         return api_error(404, "JOB_NOT_FOUND", f"Job '{job_id}' not found.")
     return JobStatusResponse(**job)
 
 
 @router.get("/config/{collection}", response_model=IngestConfigResponse)
-async def get_ingest_config(collection: CollectionName):
+async def get_ingest_config(collection: CollectionName, request: Request = None):
+    # A missing collection, or one the caller may not use, is a 404 (#606).
+    refusal = await usable_collection(request, collection, "No settings were read")
+    if refusal is not None:
+        return refusal
     cfg, is_default = await asyncio.to_thread(ingest_config.resolve, collection)
     return IngestConfigResponse(is_default=is_default, **cfg)
 
 
 @router.post("/config", response_model=IngestConfigResponse, status_code=201)
-async def save_ingest_config(body: SaveIngestConfigBody):
+async def save_ingest_config(body: SaveIngestConfigBody, request: Request = None):
     audit.note(collection=body.collection)        # the audit record's collection (#29)
+    refusal = await usable_collection(request, body.collection, "No settings were saved")
+    if refusal is not None:
+        return refusal
     cfg = body.model_dump()
     await asyncio.to_thread(ingest_config.save, cfg)
     return IngestConfigResponse(is_default=False, **cfg)
@@ -15465,6 +15729,7 @@ from fastapi import APIRouter, File, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
+from auth import access
 from config import settings
 from models.schemas import PrepareImportRequest, PrepareJobEntry, PrepareJobList, PrepareStartRequest
 from services import audit, ingest_pipeline, job_lists
@@ -15481,6 +15746,126 @@ _BLOCK = 1024 * 1024
 
 def _error(exc: store.AreaError):
     return api_error(exc.status, exc.code, exc.message, detail=exc.detail)
+
+
+# ── per-collection access (#606) ─────────────────────────────────────────────
+# A document whose imports are all into collections the caller may not use is
+# hidden from them and refused as an unknown document (Q18, Q19). One with at
+# least one import into a collection they may use stays visible, with the other
+# import records left out. Preparation job records leave hidden documents out
+# (Q20). Engineers see everything. A document with no imports is shared as before.
+
+def _import_names(record: dict) -> list[str]:
+    return [item["collection"] for item in record.get("imports") or []
+            if isinstance(item, dict) and isinstance(item.get("collection"), str) and item["collection"]]
+
+
+def _visible_of(request):
+    """The caller's visible-collection predicate; None for an Engineer or a
+    direct call, who see everything. Reads the store: call it in a thread."""
+    principal = access.principal_of(request)
+    if principal is None or principal.role == "engineer":
+        return None
+    return access.visible_filter(principal)
+
+
+def _blocker(request):
+    """A function giving, for a document record, a collection among its imports
+    the caller may not use when every import is into such a collection (the
+    document is hidden), else None. None for an Engineer or a direct call.
+    Reads the store: call it in a thread."""
+    visible = _visible_of(request)
+    if visible is None:
+        return None
+
+    def blocked(record: dict):
+        names = _import_names(record)
+        if names and not any(visible(name) for name in names):
+            return names[0]
+        return None
+    return blocked
+
+
+def _shown(record: dict, visible) -> dict:
+    """A visible document as the caller sees it: without the import records
+    for collections they may not use."""
+    if visible is None or not record.get("imports"):
+        return record
+    kept = [item for item in record["imports"]
+            if not (isinstance(item, dict) and isinstance(item.get("collection"), str)
+                    and item["collection"] and not visible(item["collection"]))]
+    return {**record, "imports": kept}
+
+
+def _job_view(job: dict, blocked) -> dict:
+    """A preparation job record without the documents hidden from the caller
+    (Q20): their ids and names, `current` when it is one of them, and the
+    errors that name them. The counters stay; they name no document. A
+    document that can't be read (deleted since) isn't hidden."""
+    if blocked is None:
+        return job
+    ids = list(job.get("document_ids") or [])
+    names = list(job.get("names") or [])
+    hidden = set()
+    for document_id in ids:
+        try:
+            record = store.get(document_id)
+        except store.AreaError:
+            continue
+        if blocked(record) is not None:
+            hidden.add(document_id)
+    if not hidden:
+        return job
+    hidden_names = {names[i] for i, document_id in enumerate(ids) if document_id in hidden and i < len(names)}
+    view = dict(job)
+    view["document_ids"] = [d for d in ids if d not in hidden]
+    view["names"] = [n for i, n in enumerate(names) if not (i < len(ids) and ids[i] in hidden)]
+    current = job.get("current")
+    if isinstance(current, dict) and current.get("document_id") in hidden:
+        view["current"] = None
+    prefixes = tuple(f"{key}:" for key in hidden | hidden_names)
+    view["errors"] = [e for e in job.get("errors") or [] if not (isinstance(e, str) and e.startswith(prefixes))]
+    return view
+
+
+async def _hidden(request, document_id: str):
+    """The 404 for a document the caller may not use, audited; None otherwise
+    (also for an unknown or unreadable id, which the route answers itself)."""
+    blocked = await asyncio.to_thread(_blocker, request)
+    if blocked is None:
+        return None
+    try:
+        record = await asyncio.to_thread(store.get, document_id)
+    except store.AreaError:
+        return None
+    collection = blocked(record)
+    if collection is None:
+        return None
+    await asyncio.to_thread(audit.access_refused, request, collection, "DOCUMENT_NOT_FOUND")
+    return api_error(404, "DOCUMENT_NOT_FOUND", f"Document '{document_id}' not found.")
+
+
+async def _usable(request):
+    """The predicate preparation_jobs uses to select documents (None: all)."""
+    blocked = await asyncio.to_thread(_blocker, request)
+    return None if blocked is None else (lambda record: blocked(record) is None)
+
+
+async def _audit_refused_ids(request, document_ids) -> None:
+    """Audit each explicitly selected document the caller may not use (#606)."""
+    if not document_ids:
+        return
+    blocked = await asyncio.to_thread(_blocker, request)
+    if blocked is None:
+        return
+    for document_id in dict.fromkeys(document_ids):
+        try:
+            record = await asyncio.to_thread(store.get, document_id)
+        except store.AreaError:
+            continue
+        collection = blocked(record)
+        if collection is not None:
+            await asyncio.to_thread(audit.access_refused, request, collection, "DOCUMENT_NOT_FOUND")
 
 
 # ── upload ───────────────────────────────────────────────────────────────────
@@ -15509,19 +15894,26 @@ async def upload(files: list[UploadFile] = File(...), request: Request = None):
 # ── reading ──────────────────────────────────────────────────────────────────
 
 @router.get("/documents")
-async def list_documents():
+async def list_documents(request: Request = None):
     records = await asyncio.to_thread(store.list_documents)
+    blocked = await asyncio.to_thread(_blocker, request)
+    if blocked is not None:
+        visible = await asyncio.to_thread(_visible_of, request)
+        records = [_shown(r, visible) for r in records if blocked(r) is None]
     used = await asyncio.to_thread(store.usage)
     return {"documents": [store.list_entry(r) for r in records],
             "used_bytes": used, "limit_bytes": store.limit()}
 
 
 @router.get("/documents/{document_id}")
-async def get_document(document_id: str):
+async def get_document(document_id: str, request: Request = None):
+    if (hidden := await _hidden(request, document_id)) is not None:
+        return hidden
     try:
-        return await asyncio.to_thread(store.preview, document_id)
+        record = await asyncio.to_thread(store.preview, document_id)
     except store.AreaError as exc:
         return _error(exc)
+    return _shown(record, await asyncio.to_thread(_visible_of, request))
 
 
 # ── downloads ────────────────────────────────────────────────────────────────
@@ -15550,7 +15942,9 @@ def _media_type(name: str) -> str:
 
 
 @router.get("/documents/{document_id}/raw")
-async def download_raw(document_id: str):
+async def download_raw(document_id: str, request: Request = None):
+    if (hidden := await _hidden(request, document_id)) is not None:
+        return hidden
     try:
         record, handle = await asyncio.to_thread(store.open_raw, document_id)
     except store.AreaError as exc:
@@ -15586,7 +15980,9 @@ def _build_zip(handles: list[tuple[str, Any]]) -> Path:
 
 
 @router.get("/documents/{document_id}/prepared")
-async def download_prepared(document_id: str):
+async def download_prepared(document_id: str, request: Request = None):
+    if (hidden := await _hidden(request, document_id)) is not None:
+        return hidden
     try:
         record, handles = await asyncio.to_thread(store.open_parts, document_id)
     except store.AreaError as exc:
@@ -15614,7 +16010,9 @@ async def download_prepared(document_id: str):
 # ── deletes ──────────────────────────────────────────────────────────────────
 
 @router.delete("/documents/{document_id}", status_code=204)
-async def delete_document(document_id: str):
+async def delete_document(document_id: str, request: Request = None):
+    if (hidden := await _hidden(request, document_id)) is not None:
+        return hidden
     try:
         record = await asyncio.to_thread(store.delete, document_id)
     except store.AreaError as exc:
@@ -15624,7 +16022,9 @@ async def delete_document(document_id: str):
 
 
 @router.delete("/documents/{document_id}/prepared", status_code=204)
-async def delete_prepared(document_id: str):
+async def delete_prepared(document_id: str, request: Request = None):
+    if (hidden := await _hidden(request, document_id)) is not None:
+        return hidden
     try:
         record = await asyncio.to_thread(store.delete_prepared, document_id)
     except store.AreaError as exc:
@@ -15642,8 +16042,10 @@ async def start_job(body: PrepareStartRequest, request: Request = None):
     else:
         audit.note(document_ids=body.document_ids)
     try:
-        answer = await jobs.start(body.document_ids, job_lists.job_owner(request))
+        answer = await jobs.start(body.document_ids, job_lists.job_owner(request), await _usable(request))
     except store.AreaError as exc:
+        if isinstance(exc, store.DocumentNotFound):
+            await _audit_refused_ids(request, body.document_ids)
         return _error(exc)
     return JSONResponse(status_code=202, content=answer)
 
@@ -15654,16 +16056,21 @@ async def list_jobs(request: Request):
 
     def build():
         items = job_lists.job_items(jobs.job_records())
+        blocked = _blocker(request)
+        if blocked is not None:
+            items = [(_job_view(record, blocked), running, finish) for record, running, finish in items]
         return job_lists.entries(PrepareJobEntry, items, principal)
     return PrepareJobList(jobs=await asyncio.to_thread(build))
 
 
 @router.get("/job/{job_id}")
-async def job_status(job_id: str):
+async def job_status(job_id: str, request: Request = None):
     job = jobs.get_job(job_id)
     if job is None:
         return api_error(404, "JOB_NOT_FOUND", f"Job '{job_id}' not found.")
-    return {key: value for key, value in dict(job).items() if not key.startswith("_")}
+    blocked = await asyncio.to_thread(_blocker, request)
+    view = await asyncio.to_thread(_job_view, dict(job), blocked)
+    return {key: value for key, value in view.items() if not key.startswith("_")}
 
 
 @router.post("/job/{job_id}/cancel", status_code=202)
@@ -15683,10 +16090,15 @@ async def import_documents(body: PrepareImportRequest, request: Request = None):
     collection = body.collection
     audit.note(collection=collection)
     try:
-        selected = await jobs.import_documents(body)
+        selected = await jobs.import_documents(body, await _usable(request))
     except store.AreaError as exc:
+        if isinstance(exc, store.DocumentNotFound):
+            await _audit_refused_ids(request, body.document_ids)
         return _error(exc)
     audit.note(names=selected["names"])
+    # A collection the caller may not use answers as one that doesn't exist (#606).
+    if not await access.check(request, collection):
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
     try:
         exists = await jobs.collection_exists(collection)
     except Exception:                                       # noqa: BLE001
@@ -15715,8 +16127,10 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+
+from auth import access
 
 from models.schemas import QueryRequest, QueryResponse
 from config import settings
@@ -15746,12 +16160,15 @@ def _unavailable(collection: str, exc: rag_pipeline.ServiceUnavailable) -> JSONR
 
 
 @router.post("", response_model=QueryResponse)
-async def run_query(body: QueryRequest):
+async def run_query(body: QueryRequest, request: Request = None):
     # The audit record's parameters (#29); the question only when the operator
     # turned AUDIT_LOG_QUESTIONS on, and never the answer.
     audit.note(collection=body.collection, retrieval_mode=body.retrieval_mode, top_k=body.top_k,
                alpha=body.alpha, response_format=body.response_format, include_citations=body.include_citations,
                **({"question": body.question} if settings.audit_log_questions else {}))
+    # A collection the caller may not use answers as one that doesn't exist (#606).
+    if not await access.check(request, body.collection):
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
     try:
         exists = await wc.collection_exists(body.collection)
     except Exception:                                 # noqa: BLE001
@@ -15798,23 +16215,31 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from models.schemas import CollectionName, RetrievalConfigResponse, SaveRetrievalConfigBody
 from services import audit, retrieval_config
+from utils import usable_collection
 
 router = APIRouter(prefix="/retrieval")
 
 
 @router.get("/config/{collection}", response_model=RetrievalConfigResponse)
-async def get_retrieval_config(collection: CollectionName):
+async def get_retrieval_config(collection: CollectionName, request: Request = None):
+    # A missing collection, or one the caller may not use, is a 404 (#606).
+    refusal = await usable_collection(request, collection, "No settings were read")
+    if refusal is not None:
+        return refusal
     cfg, is_default = await asyncio.to_thread(retrieval_config.resolve, collection)
     return RetrievalConfigResponse(is_default=is_default, **cfg)
 
 
 @router.post("/config", response_model=RetrievalConfigResponse, status_code=201)
-async def save_retrieval_config(body: SaveRetrievalConfigBody):
+async def save_retrieval_config(body: SaveRetrievalConfigBody, request: Request = None):
     audit.note(collection=body.collection)        # the audit record's collection (#29)
+    refusal = await usable_collection(request, body.collection, "No settings were saved")
+    if refusal is not None:
+        return refusal
     cfg = body.model_dump()
     await asyncio.to_thread(retrieval_config.save, cfg)
     return RetrievalConfigResponse(is_default=False, **cfg)
@@ -15834,6 +16259,8 @@ import asyncio
 import logging
 
 from fastapi import APIRouter, Request
+
+from auth import access
 
 from models.schemas import (
     ExportJobEntry,
@@ -15862,6 +16289,9 @@ _log = logging.getLogger(__name__)
 async def start_export(body: ExportRequest, request: Request = None):
     # The audit record's parameters (#29): whether it is encrypted, never the passphrase.
     audit.note(collection=body.collection, include_models=body.include_models, encrypted=body.passphrase is not None)
+    # A collection the caller may not use answers as one that doesn't exist (#606).
+    if not await access.check(request, body.collection):
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
     try:
         exists = await wc.collection_exists(body.collection)
     except Exception:                                 # noqa: BLE001
@@ -15905,9 +16335,10 @@ async def list_export_jobs(request: Request):
 
 
 @router.get("/export/job/{job_id}", response_model=ExportJobStatusResponse)
-async def export_job_status(job_id: str):
+async def export_job_status(job_id: str, request: Request = None):
     job = exporter.get_job(job_id)
-    if job is None:
+    # A job on a collection the caller may not use answers as a missing one (#606).
+    if job is None or (job.get("collection") and not await access.check(request, job["collection"], "JOB_NOT_FOUND")):
         return api_error(404, "JOB_NOT_FOUND", f"Job '{job_id}' not found.")
     return ExportJobStatusResponse(**job)
 
@@ -15943,9 +16374,10 @@ async def list_import_jobs(request: Request):
 
 
 @router.get("/import/job/{job_id}", response_model=ImportJobStatusResponse)
-async def import_job_status(job_id: str):
+async def import_job_status(job_id: str, request: Request = None):
     job = importer.get_job(job_id)
-    if job is None:
+    # An import job names its collection once its package is read (#606).
+    if job is None or (job.get("collection") and not await access.check(request, job["collection"], "JOB_NOT_FOUND")):
         return api_error(404, "JOB_NOT_FOUND", f"Job '{job_id}' not found.")
     return ImportJobStatusResponse(**job)
 
@@ -15986,10 +16418,38 @@ def _list_packages_sync() -> list[dict]:
     return out
 
 
+async def _hidden(principal, packages: list[dict]) -> set[str]:
+    """The packages a caller may not see (#606): unencrypted ones whose
+    collection exists here and is restricted to others. Weaviate failing to
+    answer counts as existing, so the listing fails closed."""
+    visible = await asyncio.to_thread(access.visible_filter, principal)
+    hidden = set()
+
+    async def exists(name):
+        try:
+            return await wc.collection_exists(name)
+        except Exception:                             # noqa: BLE001
+            _log.exception("Could not check whether %r exists for the package listing", name)
+            return True
+    for p in packages:
+        name = p.get("collection")
+        if p.get("encrypted") or not p.get("readable") or not isinstance(name, str) or not name:
+            continue
+        # A package of a discarded staging or recovery copy follows its target.
+        source = access.canonical(name)
+        if access.target_of(source) != source and not await exists(source):
+            source = access.target_of(source)
+        if not visible(source) and await exists(source):
+            hidden.add(p["filename"])
+    return hidden
+
+
 @router.get("/packages", response_model=PackageListResponse)
-async def list_packages():
+async def list_packages(request: Request = None):
     """Packages sitting in ./exports — both exported here and dropped in to import."""
     packages = await asyncio.to_thread(_list_packages_sync)
+    hidden = await _hidden(access.principal_of(request), packages)
+    packages = [p for p in packages if p["filename"] not in hidden]
     return PackageListResponse(packages=[PackageSummary(**p) for p in packages])
 ```
 
@@ -16006,7 +16466,9 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
+
+from auth import access
 
 from models.schemas import (
     CollectionName,
@@ -16105,8 +16567,11 @@ def _options_unavailable(collection: str):
 
 
 @router.get("/{collection}", response_model=TuneOptionsResponse)
-async def tune_options(collection: CollectionName):
+async def tune_options(collection: CollectionName, request: Request = None):
     """What this collection can be tuned with, given its fidelity."""
+    # A collection the caller may not use answers as one that doesn't exist (#606).
+    if not await access.check(request, collection):
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
     try:
         exists = await wc.collection_exists(collection)
     except Exception:                                 # noqa: BLE001
@@ -16163,6 +16628,8 @@ import logging
 from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse
 
+from auth import access
+
 from models.schemas import (
     GenerateRequest,
     GenerateResponse,
@@ -16187,6 +16654,9 @@ _log = logging.getLogger(__name__)
 
 @router.post("/generate", response_model=GenerateResponse, status_code=202)
 async def generate(body: GenerateRequest, request: Request = None):
+    # A collection the caller may not use answers as one that doesn't exist (#606).
+    if not await access.check(request, body.collection):
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
     try:
         exists = await wc.collection_exists(body.collection)
     except Exception:                                 # noqa: BLE001
@@ -16219,10 +16689,19 @@ async def list_generations(request: Request):
     return GenerationList(sessions=await asyncio.to_thread(build))
 
 
-@router.get("/session/{session_id}", response_model=SessionResponse)
-async def get_session(session_id: str):
+async def _refused(request, session_id: str):
+    """The 404 for a session on a collection the caller may not use (#606), the
+    one a missing session gets; None when there is no such session or it may be used."""
     session = gs.get_session(session_id)
-    if session is None:
+    if session is None or await access.check(request, session.get("collection") or "", "SESSION_NOT_FOUND"):
+        return None
+    return api_error(404, "SESSION_NOT_FOUND", f"Session '{session_id}' not found.")
+
+
+@router.get("/session/{session_id}", response_model=SessionResponse)
+async def get_session(session_id: str, request: Request = None):
+    session = gs.get_session(session_id)
+    if session is None or not await access.check(request, session.get("collection") or "", "SESSION_NOT_FOUND"):
         return api_error(404, "SESSION_NOT_FOUND", f"Session '{session_id}' not found.")
     pairs = []
     for p in session.get("pairs", []):
@@ -16246,7 +16725,10 @@ async def get_session(session_id: str):
 
 
 @router.patch("/session/{session_id}/pair/{pair_id}", response_model=GoldPair)
-async def patch_pair(session_id: str, pair_id: str, body: PatchPairRequest):
+async def patch_pair(session_id: str, pair_id: str, body: PatchPairRequest, request: Request = None):
+    refused = await _refused(request, session_id)
+    if refused is not None:
+        return refused
     updates = body.model_dump(exclude_none=True)
     try:
         pair = await gs.update_pair(session_id, pair_id, updates)
@@ -16258,7 +16740,10 @@ async def patch_pair(session_id: str, pair_id: str, body: PatchPairRequest):
 
 
 @router.post("/regenerate", response_model=GoldPair)
-async def regenerate(body: RegenerateRequest):
+async def regenerate(body: RegenerateRequest, request: Request = None):
+    refused = await _refused(request, body.session_id)
+    if refused is not None:
+        return refused
     try:
         pair = await gs.regenerate_pair(body.session_id, body.pair_id)
     except gs.GoldStandardError as exc:
@@ -16269,8 +16754,11 @@ async def regenerate(body: RegenerateRequest):
 
 
 @router.post("/save", response_model=SaveResponse)
-async def save(body: SaveRequest):
+async def save(body: SaveRequest, request: Request = None):
     audit.note(session_id=body.session_id, file=body.filename)   # the audit record's parameters (#29)
+    refused = await _refused(request, body.session_id)
+    if refused is not None:
+        return refused
     try:
         result = await gs.save_session(body.session_id, body.filename, body.allow_historical)
     except gs.GoldStandardError as exc:
@@ -16282,7 +16770,7 @@ async def save(body: SaveRequest):
 
 
 @router.get("/download/{filename}")
-async def download(filename: str):
+async def download(filename: str, request: Request = None):
     # Only files in the exports folder are served, never other upload state (#370).
     try:
         target = gs.export_path(filename)
@@ -16292,6 +16780,16 @@ async def download(filename: str):
     if gs.export_entry_is_other(target):
         return api_error(400, "INVALID_PATH", f"'{filename}' is not an export file.")
     if not target.is_file():
+        return api_error(404, "FILE_NOT_FOUND", f"File '{filename}' not found.")
+    # Only to a caller who may use the collection it came from (#606); a file
+    # whose collection isn't recorded only to an Engineer.
+    collection = await asyncio.to_thread(gs.export_collection, filename)
+    principal = access.principal_of(request)
+    if collection is None:
+        if principal is not None and principal.role != "engineer":
+            await asyncio.to_thread(audit.access_refused, request, None, "FILE_NOT_FOUND")
+            return api_error(404, "FILE_NOT_FOUND", f"File '{filename}' not found.")
+    elif not await access.check(request, collection, "FILE_NOT_FOUND"):
         return api_error(404, "FILE_NOT_FOUND", f"File '{filename}' not found.")
     return FileResponse(
         path=str(target),
@@ -17132,6 +17630,7 @@ alone.
   their API keys, sessions and the login throttle.
 - `keys`: the service API key format (`Authorization: Bearer rag_<id>_<secret>`).
 - `policy`: which role each route needs.
+- `access`: per-collection access (#606): who may use a restricted collection.
 - `middleware`: enforces the policy on every request, before the route sees its body.
 - `__main__`: the operator command, `python -m auth`, which creates the first
   Engineer and recovers lockouts; Engineers manage accounts in the app too
@@ -17592,6 +18091,9 @@ ACCESS: dict[tuple[str, str], str] = {
     ("POST", "/prepare/import"): DEVELOPER,
     # Collections management, tuning, the Health page's data (Q3, Q5, Q6).
     ("DELETE", "/collections/{name}"): ENGINEER,
+    # Who may use a collection (#606): Engineers, in a browser session only.
+    ("GET", "/collections/{name}/access"): ENGINEER,
+    ("PUT", "/collections/{name}/access"): ENGINEER,
     ("POST", "/tune/rechunk"): ENGINEER,
     ("POST", "/tune/reembed"): ENGINEER,
     ("POST", "/tune/reindex"): ENGINEER,
@@ -17632,9 +18134,11 @@ ACCESS: dict[tuple[str, str], str] = {
 # GET /auth/me answers for a key. The audit log too (#29): a leaked key can't
 # read who did what, or question text when that is recorded. And two-step
 # verification (#607): service keys are unchanged and have no second factor.
+# And per-collection access (#606), so a leaked key can't open a collection to
+# another principal.
 HUMAN_ONLY = frozenset(path for _, path in ACCESS
                        if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa"))) | {
-    "/auth/logout", "/auth/password", "/audit", "/audit.csv"}
+    "/auth/logout", "/auth/password", "/audit", "/audit.csv", "/collections/{name}/access"}
 
 
 def required(method: str, path: str) -> str | None:
@@ -17693,6 +18197,12 @@ accepted step (`mfa`), a set-up not yet confirmed (`mfa_pending`), recovery
 codes as SHA-256 (`recovery_codes`), login challenges between the password and
 the code (`mfa_challenges`, token as SHA-256) and the "require for everyone"
 switch (`settings`). The codes and the sealing are in mfa.py.
+
+Per-collection access (#606, schema 4): a collection named in
+`restricted_collections` is restricted, and only the accounts in its
+`collection_grants` (people or service principals) and Engineers may use it;
+any other collection is open to every account its role allows. Names are the
+canonical (stored) collection names. The rule itself is in access.py.
 """
 from __future__ import annotations
 
@@ -17722,7 +18232,7 @@ KEY_DAYS_DEFAULT = 90            # a key's lifetime when none is given (Q23) ...
 KEY_DAYS_MAX = 365               # ... and the longest allowed
 _DAY_S = 86400
 NO_PASSWORD = "!"                # a principal's password hash: never verifies
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MFA_PENDING_S = 10 * 60          # a started set-up must be confirmed within 10 minutes
 MFA_CHALLENGE_S = 5 * 60         # the code must follow the password within 5 minutes ...
 MFA_CHALLENGE_TRIES = 5          # ... with at most 5 codes per challenge
@@ -17798,6 +18308,16 @@ CREATE TABLE IF NOT EXISTS settings (
     name TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS restricted_collections (
+    collection TEXT PRIMARY KEY,
+    restricted_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS collection_grants (
+    collection TEXT NOT NULL,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    granted_at REAL NOT NULL,
+    PRIMARY KEY (collection, user_id)
+);
 """
 
 _ready: set[str] = set()
@@ -17810,7 +18330,8 @@ class Refused(Exception):
     LAST_ENGINEER, PRINCIPAL_EXISTS, PRINCIPAL_NOT_FOUND, KEY_NOT_FOUND,
     NOT_A_USER, REFUSED for the bootstrap rules, or one of the MFA codes
     (MFA_ALREADY_ENROLLED, MFA_ENROLLMENT_NOT_STARTED, MFA_CODE_INCORRECT,
-    MFA_NOT_ENROLLED, MFA_REQUIRED, MFA_ENROLL_FIRST)."""
+    MFA_NOT_ENROLLED, MFA_REQUIRED, MFA_ENROLL_FIRST), or UNKNOWN_ACCOUNT for a
+    collection grant naming no such account (#606)."""
 
     def __init__(self, message: str, code: str = "REFUSED"):
         super().__init__(message)
@@ -17911,8 +18432,9 @@ def _connect(write: bool = False):
 
 
 def _migrate(conn) -> None:
-    """Version 2 (PR 3): users.kind. Version 3 (#607) only adds tables, which
-    _SCHEMA creates. In a write transaction, so the API and the operator
+    """Version 2 (PR 3): users.kind. Versions 3 (#607) and 4 (#606) only add
+    tables, which _SCHEMA creates; version 4 leaves every existing collection
+    open, since none is named in restricted_collections. In a write transaction, so the API and the operator
     command can't both add the column."""
     conn.execute("BEGIN IMMEDIATE")
     columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
@@ -18481,6 +19003,192 @@ def reset_mfa(username: str, kind: str | None = None) -> None:
             raise Refused(f"{username!r} is a service principal; it has no two-step verification", "NOT_A_USER")
         _forget_mfa(conn, row["id"])
         conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+
+
+# ── per-collection access (#606) ─────────────────────────────────────────────
+
+def _canonical(collection: str) -> str:
+    # collection_writes.canonical, inlined so auth imports nothing from services.
+    return collection[:1].upper() + collection[1:]
+
+
+@dataclass(frozen=True)
+class CollectionAccess:
+    restricted: bool
+    users: tuple[str, ...] = ()
+    service_principals: tuple[str, ...] = ()
+
+
+def _access(conn, collection: str) -> CollectionAccess:
+    if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (collection,)).fetchone() is None:
+        return CollectionAccess(False)
+    rows = conn.execute("SELECT u.username, u.kind FROM collection_grants g JOIN users u ON u.id = g.user_id "
+                        "WHERE g.collection = ? ORDER BY u.username", (collection,)).fetchall()
+    return CollectionAccess(True, tuple(r["username"] for r in rows if r["kind"] == "user"),
+                            tuple(r["username"] for r in rows if r["kind"] == "service"))
+
+
+def collection_access(collection: str) -> CollectionAccess:
+    """Whether the collection is restricted, and who is granted it (names sorted)."""
+    with _connect() as conn:
+        return _access(conn, _canonical(collection))
+
+
+def restricted_collections() -> dict[str, frozenset[int]]:
+    """Every restricted collection and the ids of the accounts granted it."""
+    with _connect() as conn:
+        found = {row["collection"]: set() for row in conn.execute("SELECT collection FROM restricted_collections")}
+        for row in conn.execute("SELECT collection, user_id FROM collection_grants"):
+            if row["collection"] in found:
+                found[row["collection"]].add(row["user_id"])
+    return {name: frozenset(ids) for name, ids in found.items()}
+
+
+def has_access(user_id: int, role: str, collection: str) -> bool:
+    """An Engineer reaches every collection; anyone else an open one, or a
+    restricted one they are granted. Read on every call, so a change applies to
+    the next request."""
+    if role == "engineer":
+        return True
+    collection = _canonical(collection)
+    with _connect() as conn:
+        if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (collection,)).fetchone() is None:
+            return True
+        return conn.execute("SELECT 1 FROM collection_grants WHERE collection = ? AND user_id = ?",
+                            (collection, user_id)).fetchone() is not None
+
+
+def _owner_row(conn, owner):
+    """The account a job record's owner ({"name", "kind"}) names, or None."""
+    if not isinstance(owner, dict):
+        return None
+    kind = "service" if owner.get("kind") == "service" else "user"
+    return conn.execute("SELECT * FROM users WHERE username = ? AND kind = ?", (owner.get("name"), kind)).fetchone()
+
+
+def owner_has_access(owner, collection: str) -> bool:
+    """has_access for a job's owner as the account is now. A job with no owner
+    (a direct call in tests) isn't checked; an owner that names no account has
+    no access."""
+    if owner is None:
+        return True
+    with _connect() as conn:
+        row = _owner_row(conn, owner)
+    return row is not None and has_access(row["id"], row["role"], collection)
+
+
+def user_id_for(owner) -> int | None:
+    """The id of the account a job's owner names, or None."""
+    with _connect() as conn:
+        row = _owner_row(conn, owner)
+    return row["id"] if row is not None else None
+
+
+def _grant_ids(conn, names, kind: str) -> list[int]:
+    ids = []
+    for name in names:
+        row = conn.execute("SELECT id FROM users WHERE username = ? AND kind = ?",
+                           (str(name).strip().lower(), kind)).fetchone()
+        if row is None:
+            what = "person" if kind == "user" else "service principal"
+            raise Refused(f"no {what} is named {name!r}", "UNKNOWN_ACCOUNT")
+        ids.append(row["id"])
+    return ids
+
+
+def _restrict(conn, collection: str, user_ids) -> None:
+    now = _now()
+    conn.execute("INSERT OR IGNORE INTO restricted_collections (collection, restricted_at) VALUES (?, ?)",
+                 (collection, now))
+    conn.execute("DELETE FROM collection_grants WHERE collection = ?", (collection,))
+    conn.executemany("INSERT INTO collection_grants (collection, user_id, granted_at) VALUES (?, ?, ?)",
+                     [(collection, user_id, now) for user_id in dict.fromkeys(user_ids)])
+
+
+def _open(conn, collection: str) -> None:
+    conn.execute("DELETE FROM collection_grants WHERE collection = ?", (collection,))
+    conn.execute("DELETE FROM restricted_collections WHERE collection = ?", (collection,))
+
+
+def set_collection_access(collection: str, restricted: bool, users=(), service_principals=()):
+    """An Engineer's change (PUT /collections/{name}/access): the whole state
+    at once. Returns (before, after). An unknown name refuses the whole change
+    (UNKNOWN_ACCOUNT); disabled accounts may be granted."""
+    collection = _canonical(collection)
+    with _connect(write=True) as conn:
+        before = _access(conn, collection)
+        if restricted:
+            ids = _grant_ids(conn, users, "user") + _grant_ids(conn, service_principals, "service")
+            _restrict(conn, collection, ids)
+        else:
+            _open(conn, collection)
+        return before, _access(conn, collection)
+
+
+def restrict_to(collection: str, user_id: int | None) -> tuple[CollectionAccess, CollectionAccess]:
+    """A new collection: restricted, granted only to its creator (none when
+    None). Returns (the state it replaced, the state written), for put_back."""
+    collection = _canonical(collection)
+    with _connect(write=True) as conn:
+        before = _access(conn, collection)
+        _restrict(conn, collection, [] if user_id is None else [user_id])
+        return before, _access(conn, collection)
+
+
+def _no_store() -> bool:
+    """True when no account store exists yet: then nothing can be restricted,
+    so copying or dropping a collection's state has nothing to do, and the
+    store isn't created just for that (a rebuild or import run outside the API,
+    as in-process tests do)."""
+    return str(db_path()) not in _ready and not db_path().exists()
+
+
+def copy_collection_access(source: str, target: str) -> tuple[CollectionAccess, CollectionAccess]:
+    """The target takes the source's state: open stays open, restricted copies
+    its grants. Returns (the target's state it replaced, the state written)."""
+    source, target = _canonical(source), _canonical(target)
+    if _no_store():
+        return CollectionAccess(False), CollectionAccess(False)
+    with _connect(write=True) as conn:
+        before = _access(conn, target)
+        if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (source,)).fetchone() is None:
+            _open(conn, target)
+        else:
+            ids = [row["user_id"] for row in
+                   conn.execute("SELECT user_id FROM collection_grants WHERE collection = ?", (source,))]
+            _restrict(conn, target, ids)
+        return before, _access(conn, target)
+
+
+def put_back(collection: str, expected: CollectionAccess, previous: CollectionAccess) -> bool:
+    """After a create that failed: the collection's state goes back to
+    `previous`, but only while it is still `expected`, the state the failed
+    create wrote. A concurrent create or import that wrote its own state since
+    keeps it, so a failure never takes another's grants nor opens a collection.
+    One transaction. True when it put the state back."""
+    collection = _canonical(collection)
+    with _connect(write=True) as conn:
+        if _access(conn, collection) != expected:
+            return False
+        if not previous.restricted:
+            _open(conn, collection)
+            return True
+        ids = []
+        for names, kind in ((previous.users, "user"), (previous.service_principals, "service")):
+            for name in names:
+                row = conn.execute("SELECT id FROM users WHERE username = ? AND kind = ?", (name, kind)).fetchone()
+                if row is not None:
+                    ids.append(row["id"])
+        _restrict(conn, collection, ids)
+        return True
+
+
+def drop_collection_access(collection: str) -> None:
+    """A deleted collection's restriction and grants, so a later one of the same name starts afresh."""
+    if _no_store():
+        return
+    with _connect(write=True) as conn:
+        _open(conn, _canonical(collection))
 ```
 
 ### api/auth/middleware.py
@@ -18890,6 +19598,97 @@ def headers(role: str = "engineer", base_url: str = "http://testserver") -> dict
         _accounts[role] = user
     token = store.create_session(user.id)
     return {"Cookie": f"{store.COOKIE}={token}", "Origin": base_url.rstrip("/")}
+```
+
+### api/auth/access.py
+
+```python
+"""Per-collection access (#606): who may use which collection.
+
+A collection is open, or restricted to the accounts granted it (people or
+service principals; a key acts as its principal). Engineers reach every
+collection. The state is in the store (store.py, schema 4); this module holds
+the rule and the check the routes call.
+
+A refused caller gets the answer the route gives a collection, session, job or
+file that doesn't exist, so a restricted collection's name isn't confirmed. The
+refusal is audited (services/audit.py, `access_refused`).
+
+A staging or recovery collection of a rebuild or import
+(`<target>__tuning_<token>`, `<target>__importing_<token>`) holds its target's
+data, so it is given its target's access when it is made
+(collection_recovery.begin) and keeps that state under its own name, whatever
+later happens to the target. Every name is looked up as itself. `target_of`
+maps a copy's name to its target only for a package of a copy that no longer
+exists (services/importer.py, routers/transfer.py).
+"""
+from __future__ import annotations
+
+import asyncio
+import re
+
+from . import store
+
+_STAGING = re.compile(r"(.+)__(?:tuning|importing)_[0-9a-f]{32}")
+
+
+def canonical(name: str) -> str:
+    return name[:1].upper() + name[1:]
+
+
+def target_of(name: str) -> str:
+    """The target of a staging or recovery copy's name; any other name, canonical."""
+    name = canonical(name)
+    found = _STAGING.fullmatch(name)
+    return found.group(1) if found else name
+
+
+def package_source(name: str, exists) -> str:
+    """Whose access a package of collection `name` follows (#606): the name
+    itself, unless it is a staging or recovery copy's that no longer exists here
+    (`exists(name)` is False), whose target's it is then, so a package of a
+    discarded copy isn't open to everyone."""
+    name = canonical(name)
+    target = target_of(name)
+    if target != name and not exists(name):
+        return target
+    return name
+
+
+def allowed(principal, name: str) -> bool:
+    """True when the principal may use the collection. No principal means a
+    handler called directly (tests), which is not checked, as job owners aren't."""
+    if principal is None:
+        return True
+    return store.has_access(principal.user_id, principal.role, canonical(name))
+
+
+def principal_of(request):
+    return getattr(getattr(request, "state", None), "auth", None) if request is not None else None
+
+
+async def check(request, name: str, code: str = "COLLECTION_NOT_FOUND") -> bool:
+    """Whether the request's caller may use the collection. A refusal is
+    audited here, with `code`, the not-found code the caller then answers with."""
+    if await asyncio.to_thread(allowed, principal_of(request), name):
+        return True
+    from services import audit
+    await asyncio.to_thread(audit.access_refused, request, canonical(name), code)
+    return False
+
+
+def visible_filter(principal):
+    """A predicate for listings: True for a collection name the principal may
+    see. One read of the store for the whole listing."""
+    if principal is None or principal.role == "engineer":
+        return lambda name: True
+    restricted = store.restricted_collections()
+    me = principal.user_id
+
+    def visible(name: str) -> bool:
+        grants = restricted.get(canonical(name))
+        return grants is None or me in grants
+    return visible
 ```
 
 ### api/routers/auth.py
@@ -19680,6 +20479,7 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("POST", "/query"): "query",
     ("POST", "/collections"): "collection.create",
     ("DELETE", "/collections/{name}"): "collection.delete",
+    ("PUT", "/collections/{name}/access"): "collection.access",       # #606
     ("POST", "/ingest/upload"): "ingest",
     ("POST", "/ingest/config"): "ingest.config",
     ("POST", "/retrieval/config"): "retrieval.config",
@@ -19714,10 +20514,13 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("GET", "/audit"): "audit.view",
     ("GET", "/audit.csv"): "audit.download",
 }
+# A refused use of a restricted collection on a route that has no action of its
+# own (#606); on an audited route the refusal is that route's record.
+ACCESS_REFUSED = "collection.access.refused"
 OPERATOR_ACTIONS = ("bootstrap", "create-user", "reset-password", "set-role", "disable", "enable", "reset-mfa")
 # Every action name, for the API's filter and the UI's list.
 ALL_ACTIONS = tuple(sorted(set(ACTIONS.values()) | {"operator." + a for a in OPERATOR_ACTIONS}
-                          | {"system.start"}))
+                          | {"system.start", ACCESS_REFUSED}))
 RESULTS = ("success", "refused", "error", "accepted", "succeeded", "failed", "interrupted")
 # A job's final status and the result its end record carries.
 JOB_RESULT = {"completed": "succeeded", "failed": "failed", "partial": "failed", "cancelled": "failed"}
@@ -19758,6 +20561,33 @@ def note(collection: str | None = None, target: str | None = None, **details) ->
     if target is not None:
         ctx["target"] = target
     ctx["details"].update(details)
+
+
+def access_refused(request, collection: str, code: str = "COLLECTION_NOT_FOUND") -> None:
+    """A caller refused a restricted collection (#606). Inside an audited
+    request its own record names the collection and the reason (the middleware
+    adds the error code sent); otherwise one record of its own, with `code`, the
+    not-found code the route answers with. Never raises."""
+    ctx = _current.get()
+    if ctx is not None:
+        ctx["collection"] = collection
+        ctx["details"]["reason"] = "collection_access"
+        return
+    try:
+        scope = getattr(request, "scope", None) or {}
+        principal = (scope.get("state") or {}).get("auth")
+        route = getattr(scope.get("route"), "path", None)
+        client = scope.get("client")
+        record(ACCESS_REFUSED, result="refused", status_code=404, collection=collection,
+               actor=getattr(principal, "username", None),
+               actor_kind=("service" if getattr(principal, "kind", None) == "service" else "user")
+               if principal is not None else "anonymous",
+               role=getattr(principal, "role", None), key_id=getattr(principal, "key_id", None),
+               client_ip=_header(scope, b"x-real-ip") or (client[0] if client else None),
+               details={"route": f"{scope.get('method', '')} {route}" if route else scope.get("path"),
+                        "reason": "collection_access", "code": code})
+    except Exception:                                 # noqa: BLE001 - never breaks the answer
+        _log.exception("Could not record a collection access refusal")
 
 
 def add_details(values: dict) -> None:
@@ -19985,7 +20815,11 @@ def job_ended(job: dict, interrupted: bool) -> None:
         details.update(package=job.get("filename"), fidelity=job.get("fidelity"))
     elif snapshot.get("action") == "import":
         collection = job.get("collection") or collection
-    record(snapshot.get("action", "unknown"), result="interrupted" if interrupted else JOB_RESULT.get(status, "failed"),
+    result = "interrupted" if interrupted else JOB_RESULT.get(status, "failed")
+    if job.get("access_refused"):
+        # An import of a package from a collection its owner can't use (#606).
+        result, details["reason"] = "refused", "collection_access"
+    record(snapshot.get("action", "unknown"), result=result,
            job_id=job.get("job_id") or getattr(job, "_id", None), collection=collection, target=snapshot.get("target"),
            details=details, **{k: snapshot.get(k) for k in ("actor", "actor_kind", "role", "key_id", "client_ip")})
 
@@ -21277,6 +22111,10 @@ export const api = {
   // Answers with the name as stored, first letter capitalised (#372).
   createCollection: (body: CreateCollectionBody) => request<{ name: string; status: string }>('POST', '/collections', body),
   deleteCollection: (name: string) => request('DELETE', `/collections/${name}?confirm=true`),
+  // Who may use a collection (#606), for Engineers: open, or restricted to the named accounts.
+  getCollectionAccess: (name: string) => request<CollectionAccess>('GET', `/collections/${encodeURIComponent(name)}/access`),
+  setCollectionAccess: (name: string, body: CollectionAccess) =>
+    request<CollectionAccess>('PUT', `/collections/${encodeURIComponent(name)}/access`, body),
 
   // Ingest — form field is "strategy"; job status URL is /ingest/job/{id}; config POST is /ingest/config
   uploadFiles: (form: FormData) => request<{ job_id: string; status: string; files_queued: number; collection: string }>('POST', '/ingest/upload', form, true),
@@ -21352,6 +22190,7 @@ export interface CollectionInfo {
   name: string; object_count: number; index_type: string; distance_metric: string; created_at: string | null
   hnsw_config?: { ef: number; efConstruction: number; maxConnections: number } | null
 }
+export interface CollectionAccess { restricted: boolean; users: string[]; service_principals: string[] }
 export interface CreateCollectionBody {
   name: string; index_type: string; distance_metric: string; hnsw_config: { efConstruction: number; maxConnections: number; ef: number }
 }
@@ -23979,8 +24818,15 @@ export default function GoldStandardPage() {
 ### ui/src/pages/CollectionsPage.tsx
 
 ```typescript
-import { useState, useEffect } from 'react'
-import { api, CollectionInfo } from '../api/client'
+import { useState, useEffect, useRef } from 'react'
+import { api, AdminUser, CollectionAccess, CollectionInfo, ServicePrincipal } from '../api/client'
+
+// Who may use each collection (#606): "Open", "Restricted (n)" with n grants,
+// or a dash when the state couldn't be read.
+function accessLabel(a: CollectionAccess | null | undefined): string {
+  if (!a) return '—'
+  return a.restricted ? `Restricted (${a.users.length + a.service_principals.length})` : 'Open'
+}
 
 export default function CollectionsPage() {
   const [collections, setCollections] = useState<CollectionInfo[]>([])
@@ -24000,12 +24846,67 @@ export default function CollectionsPage() {
   // Shown inside the delete dialog: the page-level error sits behind its
   // overlay, so a refused delete (409 while a job runs, #40) looked like nothing.
   const [deleteError, setDeleteError] = useState('')
+  // Per-collection access (#606): each row's state, and the Access dialog.
+  const [access, setAccess] = useState<Record<string, CollectionAccess | null>>({})
+  const [accessTarget, setAccessTarget] = useState('')
+  const [draft, setDraft] = useState<CollectionAccess>({ restricted: false, users: [], service_principals: [] })
+  const [people, setPeople] = useState<AdminUser[]>([])
+  const [principals, setPrincipals] = useState<ServicePrincipal[]>([])
+  const [accessError, setAccessError] = useState('')
+  // The dialog's own read of the state: until it succeeds the choice is
+  // unknown and Save stays disabled; once the Engineer changes something, a
+  // late answer doesn't overwrite the change.
+  const [accessLoaded, setAccessLoaded] = useState(false)
+  const touched = useRef(false)
 
   async function load() {
     api.getCollections().then(r => {
       setCollections(r.collections)
       setListError('')
+      for (const c of r.collections) {
+        api.getCollectionAccess(c.name)
+          .then(a => setAccess(prev => ({ ...prev, [c.name]: a })))
+          .catch(() => setAccess(prev => ({ ...prev, [c.name]: null })))
+      }
     }).catch((e: unknown) => setListError(`Could not load the collections: ${e instanceof Error ? e.message : String(e)}`))
+  }
+
+  function openAccess(name: string) {
+    setAccessError('')
+    setAccessTarget(name)
+    setAccessLoaded(false)
+    touched.current = false
+    setDraft({ restricted: false, users: [], service_principals: [] })
+    api.getCollectionAccess(name).then(a => {
+      if (!touched.current) setDraft({ ...a })
+      setAccessLoaded(true)
+    }).catch((e: unknown) => setAccessError(`Could not read who may use this collection: ${e instanceof Error ? e.message : String(e)}`))
+    api.listUsers().then(r => setPeople(r.users))
+      .catch((e: unknown) => setAccessError(`Could not load the people: ${e instanceof Error ? e.message : String(e)}`))
+    api.listPrincipals().then(r => setPrincipals(r.principals))
+      .catch((e: unknown) => setAccessError(`Could not load the service principals: ${e instanceof Error ? e.message : String(e)}`))
+  }
+
+  function closeAccess() {
+    setAccessTarget('')
+    setAccessError('')
+  }
+
+  function toggle(list: 'users' | 'service_principals', name: string) {
+    touched.current = true
+    setDraft(d => ({ ...d, [list]: d[list].includes(name) ? d[list].filter(n => n !== name) : [...d[list], name] }))
+  }
+
+  async function saveAccess() {
+    if (!accessLoaded) return
+    const body = draft.restricted ? draft : { restricted: false, users: [], service_principals: [] }
+    try {
+      const saved = await api.setCollectionAccess(accessTarget, body)
+      setAccess(prev => ({ ...prev, [accessTarget]: saved }))
+      closeAccess()
+    } catch (e: unknown) {
+      setAccessError(e instanceof Error ? e.message : String(e))
+    }
   }
 
   useEffect(() => { load() }, [])
@@ -24066,6 +24967,7 @@ export default function CollectionsPage() {
             <th className="py-2">Index</th>
             <th className="py-2">Distance</th>
             <th className="py-2">Created</th>
+            <th className="py-2">Access</th>
             <th />
           </tr>
         </thead>
@@ -24077,7 +24979,9 @@ export default function CollectionsPage() {
               <td className="py-2">{c.index_type}</td>
               <td className="py-2">{c.distance_metric}</td>
               <td className="py-2 text-gray-500">{c.created_at ? new Date(c.created_at).toLocaleDateString() : '—'}</td>
-              <td className="py-2">
+              <td className="py-2">{accessLabel(access[c.name])}</td>
+              <td className="py-2 space-x-3">
+                <button onClick={() => openAccess(c.name)} className="text-blue-500 hover:text-blue-700 text-xs">Access</button>
                 <button onClick={() => { setDeleteError(''); setDeleteTarget(c.name) }} className="text-red-400 hover:text-red-600 text-xs">Delete</button>
               </td>
             </tr>
@@ -24127,6 +25031,50 @@ export default function CollectionsPage() {
             <div className="flex justify-end gap-2">
               <button onClick={closeCreate} className="text-sm text-gray-500">Cancel</button>
               <button onClick={create} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">Create</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {accessTarget && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div role="dialog" aria-label={`Access to ${accessTarget}`} className="bg-white rounded-xl p-6 w-96 shadow-xl max-h-[80vh] overflow-y-auto">
+            <h2 className="font-semibold mb-3">Access to {accessTarget}</h2>
+            <label className="flex items-center gap-2 text-sm mb-1">
+              <input type="radio" name="access-mode" checked={accessLoaded && !draft.restricted} disabled={!accessLoaded} onChange={() => { touched.current = true; setDraft(d => ({ ...d, restricted: false })) }} />
+              Open: everyone whose role allows it
+            </label>
+            <label className="flex items-center gap-2 text-sm mb-3">
+              <input type="radio" name="access-mode" checked={accessLoaded && draft.restricted} disabled={!accessLoaded} onChange={() => { touched.current = true; setDraft(d => ({ ...d, restricted: true })) }} />
+              Restricted: only the accounts ticked below (and AI Engineers)
+            </label>
+            {accessLoaded && draft.restricted && (
+              <div className="space-y-3 mb-4">
+                <fieldset>
+                  <legend className="text-xs text-gray-500 mb-1">People</legend>
+                  {people.map(u => (
+                    <label key={u.username} className="flex items-center gap-2 text-sm">
+                      <input type="checkbox" checked={draft.users.includes(u.username)} onChange={() => toggle('users', u.username)} />
+                      {u.username}{u.enabled ? '' : ' (disabled)'}
+                    </label>
+                  ))}
+                </fieldset>
+                <fieldset>
+                  <legend className="text-xs text-gray-500 mb-1">Service principals</legend>
+                  {principals.length === 0 && <p className="text-xs text-gray-400">None</p>}
+                  {principals.map(p => (
+                    <label key={p.name} className="flex items-center gap-2 text-sm">
+                      <input type="checkbox" checked={draft.service_principals.includes(p.name)} onChange={() => toggle('service_principals', p.name)} />
+                      {p.name}{p.enabled ? '' : ' (disabled)'}
+                    </label>
+                  ))}
+                </fieldset>
+              </div>
+            )}
+            {accessError && <p role="alert" className="text-red-600 text-sm mb-4">{accessError}</p>}
+            <div className="flex justify-end gap-2">
+              <button onClick={closeAccess} className="text-sm text-gray-500">Cancel</button>
+              <button onClick={saveAccess} disabled={!accessLoaded} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-40">Save</button>
             </div>
           </div>
         </div>
@@ -25491,7 +26439,8 @@ const ACTIONS = [
   'admin.principal.enable', 'admin.principal.set-role', 'admin.user.create', 'admin.user.disable',
   'admin.user.enable', 'admin.user.reset-mfa', 'admin.user.reset-password', 'admin.user.set-role', 'audit.download',
   'audit.view', 'auth.login', 'auth.logout', 'auth.mfa', 'auth.mfa.disable', 'auth.mfa.enroll',
-  'auth.mfa.recovery-codes', 'auth.password', 'collection.create', 'collection.delete', 'export',
+  'auth.mfa.recovery-codes', 'auth.password', 'collection.access', 'collection.access.refused', 'collection.create',
+  'collection.delete', 'export',
   'goldstandard.download', 'goldstandard.save', 'import', 'ingest', 'ingest.config', 'operator.bootstrap',
   'operator.create-user', 'operator.disable', 'operator.enable', 'operator.reset-mfa', 'operator.reset-password',
   'operator.set-role', 'prepare.cancel', 'prepare.delete', 'prepare.download', 'prepare.import', 'prepare.start',
@@ -26643,7 +27592,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
 | `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health` reports, so the status flips to `below_recommended` on any host (#536) |
 | `../tests/test_memory_override.py` | host-side, standard library: the derived override makes `system_info.memory_info` report `below_recommended` with a note for allocations below and above the 12.35 GB a fixed 13 GB could flip, and no override without a usable allocation (#536); embedded copies; registered by suite 01 |
-| `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command, account administration, service API keys, two-step verification (#607); registers `../tests/test_auth.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
+| `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command, account administration, service API keys, two-step verification (#607), per-collection access (#606); registers `../tests/test_auth.py`, `../tests/test_collection_access.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
 | `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
 | `auth_stack.py` | the stack checks of `17_auth.sh`, one per subcommand (#25) |
 | `auth_headers.py` | the suite's session as `Cookie` and `Origin` headers, for the host-side Python helpers (#25) |
@@ -28230,6 +29179,12 @@ make_collection() {
 
 drop_collection() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -X DELETE "$API/collections/$1?confirm=true"; }
 
+# open_collection <name>: a new collection is restricted to the account that
+# created it, here the harness Engineer (#606); this opens it to every account
+# its role allows, for a suite that then uses it as another role.
+open_collection() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -X PUT "$API/collections/$1/access" \
+  -H 'Content-Type: application/json' -d '{"restricted":false}'; }
+
 # Remove every collection and package this run created.
 cleanup_prefixed() {
   local names
@@ -28753,6 +29708,8 @@ stack() { _rag_require_lock_owner; python3 ./auth_stack.py "$@" $operator; }
 section "Auth units: passwords, store, policy, middleware, routes, operator command"
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_auth.py)
 check "test_auth.py registered regression checks" $?
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_access.py)
+check "test_collection_access.py: per-collection access (#606) in the store, the routes and the audit log" $?
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_auth_enforcement.py)
 check "test_auth_enforcement.py: every protected route refuses a request without a session" $?
 python3 "$REPO_ROOT/scripts/tests/test_verify_auth.py"
@@ -28807,6 +29764,10 @@ stack key-matrix engineer
 check "Engineer key, no Origin: no 401 or 403 on data routes; 403 KEY_NOT_ALLOWED on account/key administration" $?
 stack service-keys
 check "keys: no principal login, rotation, role change, disable, revoke and expiry; bad keys 401; no key in listings or the log" $?
+
+section "Per-collection access (#606)"
+stack collection-access
+check "a new collection is restricted to its creator: hidden from and refused to others until granted; a key can't change access; audited" $?
 
 section "Request protection and login throttling (H4)"
 stack control-path
@@ -28918,6 +29879,9 @@ MATRIX = (
     ("GET", "/tune/" + X, None, "developer"),
     ("GET", "/health/details", None, "developer"),       # the full health report (#750)
     ("DELETE", "/collections/" + X + "?confirm=true", None, "engineer"),
+    # Per-collection access (#606): a 404 for no such collection, a 422 for no value.
+    ("GET", "/collections/" + X + "/access", None, "engineer"),
+    ("PUT", "/collections/" + X + "/access", {}, "engineer"),
     ("POST", "/tune/rechunk", {}, "engineer"),
     ("POST", "/tune/reembed", {}, "engineer"),
     ("POST", "/tune/reindex", {}, "engineer"),
@@ -28954,6 +29918,8 @@ MATRIX = (
 # Routes an API key can't use whatever its role (S5 of PR 3): every account,
 # principal and key route, logout and the password change; and the audit log (#29).
 KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password", "/audit", "/auth/mfa")
+# And per-collection access (#606), by its path's end.
+KEY_REFUSED_SUFFIX = "/access"
 SESSION_ROUTES = (("GET", "/auth/me", None), ("POST", "/auth/logout", None), ("POST", "/auth/password", {}))
 
 
@@ -29084,7 +30050,7 @@ def check_key_matrix(role, operator_ok):
     try:
         for method, path, body, need in MATRIX:
             status, raw, _ = code(method, path, body, headers=bearer(key))
-            if path.startswith(KEY_REFUSED):
+            if path.startswith(KEY_REFUSED) or path.endswith(KEY_REFUSED_SUFFIX):
                 ok = status == 403 and error_code(raw) == "KEY_NOT_ALLOWED"
             elif ROLES.index(role) < ROLES.index(need):
                 ok = status == 403 and error_code(raw) == "FORBIDDEN"
@@ -29749,6 +30715,85 @@ def check_restart_verify(operator_ok):
     expect(status == 200, "a session did not survive the API restart ({})".format(status))
     status, _, _ = code("POST", "/auth/login", {"username": state["locked"], "password": "x" * 12})
     expect(status == 429, "a lockout did not survive the API restart ({})".format(status))
+
+
+def check_collection_access(operator_ok):
+    """Per-collection access (#606) on the stack: a collection the harness
+    Engineer creates is restricted to it; a throwaway End User and Developer
+    and a Developer key can't see or use it until granted, and the access routes
+    refuse a key. Changes and refusals are in the audit log."""
+    expect(operator_ok, "creates accounts, a service principal and a collection, so it runs only on the verify project")
+    admin = role_token("engineer")
+    name = "VfyAccess" + secrets.token_hex(4)
+    users, principal = [], None
+    try:
+        status, raw, _ = code("POST", "/collections", {"name": name}, token=admin)
+        expect(status == 201, "creating {} answered {} {}".format(name, status, error_code(raw)))
+        user, _, user_token = throwaway("end_user", operator_ok)
+        users.append(user)
+        dev, _, dev_token = throwaway("developer", operator_ok)
+        users.append(dev)
+        principal, _, key = new_principal(admin, "developer")
+        callers = {"End User": {"token": user_token}, "Developer": {"token": dev_token},
+                   "key": {"headers": bearer(key)}}
+
+        def listed(who):
+            status, raw, _ = code("GET", "/collections", **callers[who])
+            expect(status == 200, "{}: GET /collections answered {}".format(who, status))
+            return name in [c["name"] for c in json.loads(raw)["collections"]]
+
+        def answer(who, method, path, body=None):
+            status, raw, _ = code(method, path, body, **callers[who])
+            return status, error_code(raw)
+
+        missing = (404, "COLLECTION_NOT_FOUND")
+        for who in callers:
+            expect(not listed(who), "{} sees the new collection, restricted to its creator".format(who))
+            got = answer(who, "POST", "/query", {"question": "Is it there?", "collection": name})
+            expect(got == missing, "{}: the query answered {}".format(who, got))
+        for who in ("Developer", "key"):
+            got = answer(who, "POST", "/export", {"collection": name})
+            expect(got == missing, "{}: the export answered {}".format(who, got))
+        got = answer("key", "GET", "/retrieval/config/" + name)
+        expect(got == missing, "key: the retrieval settings answered {}".format(got))
+        expect(answer("End User", "GET", "/retrieval/config/VfyAccessNoSuch")[0] == 404,
+               "a missing collection's settings must be a 404 as well")
+
+        status, raw, _ = code("PUT", "/collections/{}/access".format(name),
+                              {"restricted": True, "users": [dev], "service_principals": [principal]}, token=admin)
+        expect(status == 200 and json.loads(raw) == {"restricted": True, "users": [dev], "service_principals": [principal]},
+               "granting answered {} {}".format(status, raw[:200]))
+        for who in ("Developer", "key"):
+            expect(listed(who), "{} doesn't see the collection once granted".format(who))
+            got = answer(who, "GET", "/ingest/config/" + name)
+            expect(got[0] == 200, "{}: the granted collection's settings answered {}".format(who, got))
+        expect(not listed("End User"), "the End User sees a collection not granted to it")
+        got = answer("key", "PUT", "/collections/{}/access".format(name), {"restricted": False})
+        expect(got == (403, "KEY_NOT_ALLOWED"), "a key changing access answered {}".format(got))
+        got = answer("key", "GET", "/collections/{}/access".format(name))
+        expect(got == (403, "KEY_NOT_ALLOWED"), "a key reading access answered {}".format(got))
+
+        def audited(action, **match):
+            query = "/audit?action={}&collection={}&limit=100".format(action, name)
+            status, raw, _ = code("GET", query, token=admin)
+            expect(status == 200, "GET /audit answered {}".format(status))
+            return [r for r in json.loads(raw)["records"] if all(r.get(k) == v for k, v in match.items())]
+        # The newest record is the key's refused change below; this is the Engineer's grant.
+        change = audited("collection.access", result="success")
+        expect(change and change[0]["details"].get("added") == {"users": [dev], "service_principals": [principal]},
+               "the change's audit record is {}".format(change[:1]))
+        refused = audited("query", actor=user)
+        expect(refused and refused[0]["result"] == "refused" and refused[0]["details"].get("reason") == "collection_access",
+               "the refused query's audit record is {}".format(refused[:1]))
+        expect(audited("collection.access.refused", actor=principal),
+               "no collection.access.refused record for the key's settings read")
+    finally:
+        code("DELETE", "/collections/{}?confirm=true".format(name), token=admin)
+        for username in users:
+            code("POST", "/auth/users/{}/disable".format(username), token=admin)
+        if principal:
+            code("POST", "/auth/service-principals/{}/disable".format(principal), token=admin)
+        request("POST", "/auth/logout", token=admin)
 
 
 CHECKS = {name[len("check_"):].replace("_", "-"): fn for name, fn in globals().items() if name.startswith("check_")}
@@ -31892,6 +32937,10 @@ def main(argv):
         status, raw, _ = code("POST", "/collections", {"name": name}, token=dev)
         expect(status == 201, "creating {} answered {} {}".format(name, status, error_code(raw)))
         name = json.loads(raw)["name"]
+        # The new collection is the Developer's alone (#606); the key's principal is granted it too.
+        status, raw, _ = code("PUT", "/collections/{}/access".format(name),
+                              {"restricted": True, "users": [DEVELOPER], "service_principals": [principal]}, token=admin)
+        expect(status == 200, "granting {} answered {} {}".format(name, status, error_code(raw)))
 
         status, mine = upload(name, "vfy-jobs-dev.txt", b"A note the Developer imports.\n" * 20, token=dev)
         expect(status == 202, "the Developer's upload answered {} {}".format(status, mine))
@@ -33636,10 +34685,12 @@ class PolicyTests(unittest.TestCase):
         counts = {}
         for access in policy.ACCESS.values():
             counts[access] = counts.get(access, 0) + 1
-        self.assertEqual(counts, {"public": 4, "session": 3, "mfa": 5, "end_user": 3, "developer": 36, "engineer": 28})
+        self.assertEqual(counts, {"public": 4, "session": 3, "mfa": 5, "end_user": 3, "developer": 36, "engineer": 30})
         self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
         self.assertEqual(policy.ACCESS[("GET", "/health/details")], "developer")   # #750
         self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
+        self.assertEqual(policy.ACCESS[("GET", "/collections/{name}/access")], "engineer")   # #606
+        self.assertEqual(policy.ACCESS[("PUT", "/collections/{name}/access")], "engineer")
         self.assertEqual(policy.ACCESS[("POST", "/collections")], "developer")
         self.assertEqual(policy.ACCESS[("GET", "/tune/{collection}")], "developer")
         self.assertEqual(policy.ACCESS[("GET", "/tune/job/{job_id}")], "engineer")
@@ -33676,10 +34727,12 @@ class PolicyTests(unittest.TestCase):
 
     def test_keys_cannot_reach_administration_or_the_session_routes(self):
         # S5 of PR 3: every account, principal and key route, logout and the
-        # password change, and the audit log (#29); GET /auth/me stays open to a key.
+        # password change, the audit log (#29) and per-collection access (#606);
+        # GET /auth/me stays open to a key.
         admin = {path for _, path in policy.ACCESS
                  if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa"))}
-        self.assertEqual(policy.HUMAN_ONLY, admin | {"/auth/logout", "/auth/password", "/audit", "/audit.csv"})
+        self.assertEqual(policy.HUMAN_ONLY, admin | {"/auth/logout", "/auth/password", "/audit", "/audit.csv",
+                                                     "/collections/{name}/access"})
         self.assertNotIn("/auth/me", policy.HUMAN_ONLY)
 
     def test_each_template_resolves_to_itself(self):
@@ -35125,7 +36178,7 @@ class MfaStoreTests(MfaTestCase):
             self.assertFalse(store.get_user("old").mfa_enrolled)
             self.assertFalse(store.mfa_required())
             version = sqlite3.connect(Path(temp.name, "auth.db")).execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 3)
+            self.assertEqual(version, store.SCHEMA_VERSION)   # 3, and 4 since #606
 
     def test_no_secret_or_code_is_stored_in_plain_form(self):
         secret, codes = self.enroll("dev")
@@ -35611,7 +36664,8 @@ class ImplementationCopyTests(unittest.TestCase):
                      "api/routers/auth.py", "api/main.py", "ui/src/pages/UsersPage.tsx",
                      "api/auth/keys.py", "ui/src/pages/ServiceKeysPage.tsx", "api/config.py", "proxy/nginx.conf",
                      "scripts/verify/17_auth.sh", "scripts/verify/auth_setup.py", "scripts/verify/auth_stack.py",
-                     "scripts/verify/auth_headers.py", "api/auth/mfa.py", "ui/src/pages/AccountPage.tsx"):
+                     "scripts/verify/auth_headers.py", "api/auth/mfa.py", "ui/src/pages/AccountPage.tsx",
+                     "api/auth/access.py", "scripts/tests/test_collection_access.py"):
             with self.subTest(name=name):
                 header = "### " + name + "\n\n```"
                 start = document.index("\n", document.index(header) + len(header)) + 1
@@ -37274,6 +38328,750 @@ class CsvReviewTests(JobCase):
         self.assertEqual(job["status"], "partial", job)
         self.assertEqual(store.get(good["id"])["status"], "prepared")
         self.assertEqual(store.get(bad["id"])["status"], "failed")
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+### scripts/tests/test_collection_access.py
+
+```python
+"""Per-collection access (#606): who may use a restricted collection.
+
+A collection is open, or restricted to the people and service principals
+granted it; Engineers reach every collection. A caller without access gets the
+answer the route gives something that doesn't exist, and the refusal is
+audited. SPECIFICATIONS.md §3.1.8 "Per-collection access".
+
+Runs with the API's dependencies, in the built API image with no network
+(`17_auth.sh`):
+
+    docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
+      "$(docker compose images -q api)" python scripts/tests/test_collection_access.py
+
+or on the host with them installed. Every test has its own account store,
+upload folder and audit folder. Requests go through `main.app` with FastAPI's
+TestClient, without the lifespan, with real sessions and keys. Weaviate is a
+fake set of collection names; nothing reaches a backend. On the code before
+#606 the listing, query and creation cases fail.
+"""
+import asyncio
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+API_DIR = os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api")
+sys.path.insert(0, API_DIR)
+
+from fastapi.testclient import TestClient
+
+from config import settings
+from main import app
+from auth import passwords, store
+from services import audit, exporter, goldstandard, importer, ingest_pipeline, rag_pipeline
+from services import weaviate_client as wc
+
+ORIGIN = "http://testserver"
+SECRET, OPEN = "Secret", "Open1"
+STAGING = SECRET + "__tuning_" + "0" * 32
+
+
+def _no_weaviate():
+    raise ConnectionError("test_collection_access.py runs without a network: there is no Weaviate")
+
+
+class AccessTestCase(unittest.TestCase):
+    """A fresh store, upload and audit folder; people of each role, a
+    Developer service principal with a key; Weaviate holding OPEN, SECRET and
+    a staging copy of SECRET; SECRET restricted to `dev` and the principal, and
+    the copy given SECRET's access when it was made."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        for name, value in (("audit_dir", str(self.root / "audit")), ("auth_dir", str(self.root / "auth")),
+                            ("upload_dir", str(self.root / "uploads")), ("exports_dir", str(self.root / "exports"))):
+            target = patch.object(settings, name, value)
+            target.start()
+            self.addCleanup(target.stop)
+        (self.root / "uploads").mkdir()
+        self.collections = {OPEN, SECRET, STAGING}
+
+        async def exists(name):
+            return name[:1].upper() + name[1:] in self.collections
+
+        async def listing():
+            return [{"name": n, "object_count": 1, "index_type": "hnsw", "distance_metric": "cosine"}
+                    for n in sorted(self.collections)]
+
+        for target in (patch.object(wc, "get_client", _no_weaviate), patch.object(wc, "collection_exists", exists),
+                       patch.object(wc, "_collection_exists_sync", lambda n: n[:1].upper() + n[1:] in self.collections),
+                       patch.object(wc, "get_collections", listing)):
+            target.start()
+            self.addCleanup(target.stop)
+        for username, role in (("eng", "engineer"), ("dev", "developer"), ("dev2", "developer"),
+                               ("user", "end_user")):
+            store.create_user(username, role, passwords.generate_password(), bootstrap=not store.is_set_up(),
+                              must_change_password=False)
+        store.create_principal("svc", "developer")
+        store.create_principal("svc2", "developer")
+        self.key = store.issue_key("svc")[1]
+        self.key2 = store.issue_key("svc2")[1]
+        self.client = TestClient(app, raise_server_exceptions=False)
+        self.addCleanup(self.client.close)
+        status = self.put(SECRET, {"restricted": True, "users": ["dev"], "service_principals": ["svc"]}).status_code
+        self.assertEqual(status, 200)
+        # The staging copy got SECRET's access when it was made (collection_recovery.begin).
+        store.copy_collection_access(SECRET, STAGING)
+
+    def as_(self, who):
+        if who in ("svc", "svc2"):
+            return {"Authorization": "Bearer " + (self.key if who == "svc" else self.key2)}
+        token = store.create_session(store.get_user(who).id)
+        return {"Cookie": f"{store.COOKIE}={token}", "Origin": ORIGIN}
+
+    def put(self, name, body, who="eng"):
+        return self.client.put(f"/collections/{name}/access", json=body, headers=self.as_(who))
+
+    def names(self, who):
+        answer = self.client.get("/collections", headers=self.as_(who))
+        self.assertEqual(answer.status_code, 200, answer.text)
+        return [c["name"] for c in answer.json()["collections"]]
+
+    def records(self, action=None):
+        return [r for r in reversed(list(audit.newest_first())) if action is None or r["action"] == action]
+
+    def refused(self, answer, code="COLLECTION_NOT_FOUND"):
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, code), answer.text)
+
+
+class StoreTests(AccessTestCase):
+    def test_a_version_3_store_gains_the_tables_and_every_collection_stays_open(self):
+        path = store.db_path()
+        conn = sqlite3.connect(path)
+        conn.executescript("DROP TABLE collection_grants; DROP TABLE restricted_collections; PRAGMA user_version = 3;")
+        conn.close()
+        store._ready.clear()
+        self.assertTrue(store.has_access(store.get_user("user").id, "end_user", SECRET))
+        version = sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0]
+        self.assertEqual(version, 4)
+        self.assertEqual(store.get_user("dev").role, "developer")       # rows kept
+
+    def test_the_rule(self):
+        dev, user = store.get_user("dev"), store.get_user("user")
+        self.assertTrue(store.has_access(dev.id, "developer", SECRET))
+        self.assertTrue(store.has_access(dev.id, "developer", "secret"))          # canonical name
+        self.assertFalse(store.has_access(user.id, "end_user", SECRET))
+        self.assertTrue(store.has_access(user.id, "engineer", SECRET))            # Engineers reach everything
+        self.assertTrue(store.has_access(user.id, "end_user", OPEN))
+
+    def test_grants_survive_disable_and_a_demoted_engineer_is_bound(self):
+        store.set_enabled("dev", False)
+        store.set_enabled("dev", True)
+        self.assertEqual(store.collection_access(SECRET).users, ("dev",))
+        eng = store.get_user("eng")
+        self.assertTrue(store.has_access(eng.id, "engineer", SECRET))
+        self.assertFalse(store.has_access(eng.id, "developer", SECRET))           # once demoted
+
+    def test_no_store_means_nothing_to_copy_or_drop(self):
+        empty = self.root / "empty-auth"
+        with patch.object(settings, "auth_dir", str(empty)):
+            self.assertEqual(store.copy_collection_access(SECRET, STAGING),
+                             (store.CollectionAccess(False), store.CollectionAccess(False)))
+            store.drop_collection_access(SECRET)
+            self.assertFalse((empty / "auth.db").exists())
+
+    def test_copy_and_drop(self):
+        store.copy_collection_access(SECRET, "Copy")
+        self.assertEqual(store.collection_access("Copy"), store.collection_access(SECRET))
+        store.copy_collection_access(OPEN, "Copy")
+        self.assertFalse(store.collection_access("Copy").restricted)
+        store.drop_collection_access(SECRET)
+        self.assertFalse(store.collection_access(SECRET).restricted)
+
+
+class ListingTests(AccessTestCase):
+    def test_the_list_holds_only_usable_collections(self):
+        self.assertEqual(self.names("user"), [OPEN])
+        self.assertEqual(self.names("dev2"), [OPEN])
+        self.assertEqual(self.names("dev"), [OPEN, SECRET, STAGING])              # a staging copy has its target's access
+        self.assertEqual(self.names("svc"), [OPEN, SECRET, STAGING])
+        self.assertEqual(self.names("svc2"), [OPEN])
+        self.assertEqual(self.names("eng"), [OPEN, SECRET, STAGING])
+        self.assertFalse(self.records("collection.access.refused"))               # a filtered list is no refusal
+
+    def test_a_change_applies_to_the_next_request(self):
+        self.assertEqual(self.put(SECRET, {"restricted": False}).status_code, 200)
+        # The copy keeps the access it was made with (CopyTests).
+        self.assertEqual(self.names("user"), [OPEN, SECRET])
+
+
+class CreateDeleteTests(AccessTestCase):
+    def test_a_new_collection_is_restricted_to_its_creator(self):
+        async def create(**kwargs):
+            self.collections.add(kwargs["name"])
+        with patch.object(wc, "create_collection", create):
+            answer = self.client.post("/collections", json={"name": "fresh"}, headers=self.as_("dev2"))
+        self.assertEqual(answer.status_code, 201, answer.text)
+        self.assertEqual(self.names("dev2"), ["Fresh", OPEN])
+        self.assertNotIn("Fresh", self.names("user"))
+        self.assertNotIn("Fresh", self.names("dev"))
+        self.assertEqual(store.collection_access("Fresh"), store.CollectionAccess(True, ("dev2",), ()))
+
+    def test_a_key_creates_for_its_principal(self):
+        async def create(**kwargs):
+            self.collections.add(kwargs["name"])
+        with patch.object(wc, "create_collection", create):
+            answer = self.client.post("/collections", json={"name": "Keyed"}, headers=self.as_("svc2"))
+        self.assertEqual(answer.status_code, 201, answer.text)
+        self.assertEqual(store.collection_access("Keyed").service_principals, ("svc2",))
+
+    def test_a_delete_drops_the_restriction(self):
+        async def delete(name):
+            self.collections.discard(name)
+            return 1
+        with patch.object(wc, "delete_collection_when_idle", delete):
+            answer = self.client.delete(f"/collections/{SECRET}?confirm=true", headers=self.as_("eng"))
+        self.assertEqual(answer.status_code, 200, answer.text)
+        self.assertFalse(store.collection_access(SECRET).restricted)
+
+
+class AccessRouteTests(AccessTestCase):
+    def test_engineers_in_a_session_only(self):
+        self.assertEqual(self.client.get(f"/collections/{SECRET}/access", headers=self.as_("dev")).status_code, 403)
+        store.create_principal("boss", "engineer")
+        key = store.issue_key("boss")[1]
+        answer = self.client.get(f"/collections/{SECRET}/access", headers={"Authorization": "Bearer " + key})
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (403, "KEY_NOT_ALLOWED"))
+
+    def test_read_and_set(self):
+        answer = self.client.get(f"/collections/{SECRET.lower()}/access", headers=self.as_("eng"))
+        self.assertEqual(answer.json(), {"restricted": True, "users": ["dev"], "service_principals": ["svc"]})
+        self.assertEqual(self.client.get(f"/collections/{OPEN}/access", headers=self.as_("eng")).json(),
+                         {"restricted": False, "users": [], "service_principals": []})
+        self.refused(self.client.get("/collections/Nowhere/access", headers=self.as_("eng")))
+        answer = self.put(SECRET, {"restricted": True, "users": ["DEV2", "user"], "service_principals": []})
+        self.assertEqual(answer.json(), {"restricted": True, "users": ["dev2", "user"], "service_principals": []})
+        item = self.records("collection.access")[-1]
+        self.assertEqual((item["actor"], item["collection"], item["result"]), ("eng", SECRET, "success"))
+        self.assertEqual(item["details"]["added"], {"users": ["dev2", "user"], "service_principals": []})
+        self.assertEqual(item["details"]["removed"], {"users": ["dev"], "service_principals": ["svc"]})
+        self.assertEqual((item["details"]["restricted_before"], item["details"]["restricted_after"]), (True, True))
+
+    def test_refused_changes_change_nothing(self):
+        for body in ({"restricted": False, "users": ["dev"]}, {"restricted": True, "users": ["nobody"]},
+                     {"restricted": True, "users": ["svc"]}, {"restricted": True, "service_principals": ["dev"]},
+                     {"restricted": True, "extra": 1}, {}):
+            with self.subTest(body=body):
+                answer = self.put(SECRET, body)
+                self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (422, "INVALID_PARAMETER"))
+        self.assertEqual(store.collection_access(SECRET), store.CollectionAccess(True, ("dev",), ("svc",)))
+        self.refused(self.put("Nowhere", {"restricted": False}))
+
+    def test_an_empty_grant_set_leaves_engineers_only(self):
+        self.put(SECRET, {"restricted": True})
+        self.assertEqual(self.names("dev"), [OPEN, STAGING])               # the copy keeps its own grants
+        self.assertEqual(self.names("eng"), [OPEN, SECRET, STAGING])
+
+
+class RefusalTests(AccessTestCase):
+    """Every route that names a collection refuses one the caller may not use
+    as it answers one that doesn't exist, and the refusal is audited."""
+
+    def unavailable(self, *args, **kwargs):
+        raise rag_pipeline.ServiceUnavailable("Ollama")
+
+    def test_query(self):
+        body = {"question": "What?", "collection": SECRET}
+        with patch.object(rag_pipeline, "run_query", self.unavailable):
+            self.refused(self.client.post("/query", json=body, headers=self.as_("user")))
+            self.assertEqual(self.client.post("/query", json=body, headers=self.as_("dev")).status_code, 503)
+            self.assertEqual(self.client.post("/query", json=body, headers=self.as_("svc")).status_code, 503)
+            self.refused(self.client.post("/query", json=body, headers=self.as_("svc2")))
+            self.refused(self.client.post("/query", json={**body, "collection": STAGING}, headers=self.as_("user")))
+        item = [r for r in self.records("query") if r["actor"] == "user"][0]
+        self.assertEqual((item["result"], item["status_code"], item["collection"]), ("refused", 404, SECRET))
+        self.assertEqual(item["details"]["reason"], "collection_access")
+        self.assertEqual(item["details"]["code"], "COLLECTION_NOT_FOUND")
+
+    def test_settings_routes(self):
+        for path in (f"/retrieval/config/{SECRET}", f"/ingest/config/{SECRET}"):
+            with self.subTest(path=path):
+                who = "user" if path.startswith("/retrieval") else "dev2"
+                self.refused(self.client.get(path, headers=self.as_(who)))
+                self.assertEqual(self.client.get(path, headers=self.as_("dev")).status_code, 200)
+                item = self.records("collection.access.refused")[-1]
+                self.assertEqual((item["actor"], item["collection"], item["status_code"], item["result"]),
+                                 (who, SECRET, 404, "refused"))
+                self.assertEqual(item["details"]["route"], "GET " + path.replace(SECRET, "{collection}"))
+        saves = (("/retrieval/config", {"collection": SECRET, "top_k": 4}),
+                 ("/ingest/config", {"collection": SECRET, "chunking_strategy": "fixed", "chunk_size": 300,
+                                     "chunk_overlap": 0, "min_chunk_size": 50}))
+        for path, body in saves:
+            with self.subTest(path=path):
+                self.refused(self.client.post(path, json=body, headers=self.as_("dev2")))
+                self.assertEqual(self.client.post(path, json=body, headers=self.as_("dev")).status_code, 201)
+
+    def test_settings_routes_answer_404_for_a_missing_collection(self):
+        self.refused(self.client.get("/retrieval/config/Nowhere", headers=self.as_("eng")))
+        self.refused(self.client.get("/ingest/config/Nowhere", headers=self.as_("eng")))
+        self.refused(self.client.post("/retrieval/config", json={"collection": "Nowhere", "top_k": 4},
+                                      headers=self.as_("eng")))
+        self.refused(self.client.post("/ingest/config", json={"collection": "Nowhere", "chunking_strategy": "fixed",
+                                                              "chunk_size": 300, "chunk_overlap": 0,
+                                                              "min_chunk_size": 50}, headers=self.as_("eng")))
+        self.assertFalse((self.root / "uploads" / "retrieval_configs").exists()
+                         and any((self.root / "uploads" / "retrieval_configs").iterdir()))
+
+    def test_developer_routes(self):
+        dev2 = self.as_("dev2")
+        self.refused(self.client.post("/export", json={"collection": SECRET}, headers=dev2))
+        self.refused(self.client.post("/goldstandard/generate", json={"collection": SECRET}, headers=dev2))
+        self.refused(self.client.get(f"/tune/{SECRET}", headers=dev2))
+        files = {"files": ("a.txt", b"text", "text/plain")}
+        self.refused(self.client.post("/ingest/upload", data={"collection": SECRET}, files=files, headers=dev2))
+        from services import preparation_jobs
+
+        async def selected(body, usable=None):
+            return {"records": [], "names": ["a.md"]}
+        with patch.object(preparation_jobs, "import_documents", selected):
+            self.refused(self.client.post("/prepare/import", json={"collection": SECRET, "all": True}, headers=dev2))
+
+    def test_job_status_by_id(self):
+        common = {"job_id": "j1", "status": "running", "collection": SECRET}
+        jobs = {
+            "/ingest/job/j1": (ingest_pipeline, {**common, "files_total": 1, "files_completed": 0, "files_failed": 0,
+                                                 "chunks_stored": 0, "errors": []}),
+            "/export/job/j1": (exporter, {**common, "chunks_written": 0, "filename": None, "size_bytes": None,
+                                          "source_document_count": None, "fidelity": None, "models_bundled": None,
+                                          "retrieve_script": None, "warnings": [], "error": None}),
+            "/import/job/j1": (importer, {**common, "filename": "p.tar.gz", "on_conflict": "rename",
+                                          "original_collection": None, "chunks_written": 0, "fidelity": None,
+                                          "renamed": False, "notes": [], "error": None, "error_code": None,
+                                          "error_detail": None}),
+        }
+        for path, (module, job) in jobs.items():
+            with self.subTest(path=path), patch.object(module, "get_job", lambda job_id, job=job: dict(job)):
+                self.refused(self.client.get(path, headers=self.as_("dev2")), "JOB_NOT_FOUND")
+                self.assertEqual(self.client.get(path, headers=self.as_("dev")).status_code, 200)
+        # An import whose package isn't read yet names no collection.
+        unread = {**jobs["/import/job/j1"][1], "collection": None}
+        with patch.object(importer, "get_job", lambda job_id: dict(unread)):
+            self.assertEqual(self.client.get("/import/job/j1", headers=self.as_("dev2")).status_code, 200)
+
+    def test_gold_standard_sessions(self):
+        session = {"session_id": "gs_1", "collection": SECRET, "status": "completed", "pairs": [],
+                   "pairs_total": 0, "pairs_completed": 0}
+        with patch.object(goldstandard, "get_session", lambda session_id: dict(session)):
+            for method, path, body in (("GET", "/goldstandard/session/gs_1", None),
+                                       ("PATCH", "/goldstandard/session/gs_1/pair/p1", {"status": "approved"}),
+                                       ("POST", "/goldstandard/regenerate", {"session_id": "gs_1", "pair_id": "p1"}),
+                                       ("POST", "/goldstandard/save", {"session_id": "gs_1"})):
+                with self.subTest(path=path):
+                    self.refused(self.client.request(method, path, json=body, headers=self.as_("dev2")),
+                                 "SESSION_NOT_FOUND")
+            self.assertEqual(self.client.get("/goldstandard/session/gs_1", headers=self.as_("dev")).status_code, 200)
+
+    def test_gold_standard_download(self):
+        folder = self.root / "uploads" / goldstandard.EXPORT_DIRNAME
+        folder.mkdir()
+        for name in ("known.json", "unknown.json"):
+            (folder / name).write_text("[]")
+        goldstandard._record_export_collection("known.json", SECRET)
+        self.refused(self.client.get("/goldstandard/download/known.json", headers=self.as_("dev2")), "FILE_NOT_FOUND")
+        self.assertEqual(self.client.get("/goldstandard/download/known.json", headers=self.as_("dev")).status_code, 200)
+        self.refused(self.client.get("/goldstandard/download/unknown.json", headers=self.as_("dev")), "FILE_NOT_FOUND")
+        self.assertEqual(self.client.get("/goldstandard/download/unknown.json", headers=self.as_("eng")).status_code, 200)
+        self.assertEqual(goldstandard.export_collection("known.json"), SECRET)
+
+
+class PackageTests(AccessTestCase):
+    PACKAGES = [
+        {"filename": "ragpkg-secret.tar.gz", "size_bytes": 1, "collection": SECRET, "chunk_count": 1,
+         "fidelity": "chunks-only", "created_at": None, "readable": True},
+        {"filename": "ragpkg-open.tar.gz", "size_bytes": 1, "collection": OPEN, "chunk_count": 1,
+         "fidelity": "chunks-only", "created_at": None, "readable": True},
+        {"filename": "ragpkg-gone.tar.gz", "size_bytes": 1, "collection": "Gone", "chunk_count": 1,
+         "fidelity": "chunks-only", "created_at": None, "readable": True},
+        {"filename": "ragpkg-x.tar.gz.age", "size_bytes": 1, "collection": None, "chunk_count": None,
+         "fidelity": None, "created_at": None, "readable": True, "encrypted": True},
+    ]
+
+    def listed(self, who):
+        from routers import transfer
+        with patch.object(transfer, "_list_packages_sync", lambda: [dict(p) for p in self.PACKAGES]):
+            return [p["filename"] for p in self.client.get("/packages", headers=self.as_(who)).json()["packages"]]
+
+    def test_the_listing_hides_restricted_packages(self):
+        store.restrict_to("Gone", None)       # restricted, but no such collection here: listed
+        everything = [p["filename"] for p in self.PACKAGES]
+        self.assertEqual(self.listed("dev"), everything)
+        self.assertEqual(self.listed("eng"), everything)
+        self.assertEqual(self.listed("dev2"), [n for n in everything if n != "ragpkg-secret.tar.gz"])
+
+    def test_the_import_job_refuses_and_names_no_collection(self):
+        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, SECRET))
+        self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, SECRET))
+        self.assertFalse(importer._refused({"name": "svc", "kind": "service"}, SECRET))
+        self.assertTrue(importer._refused({"name": "svc", "kind": "user"}, SECRET))    # kind must match
+        self.assertFalse(importer._refused({"name": "dev2", "kind": "user"}, OPEN))
+        self.assertFalse(importer._refused(None, SECRET))
+        store.restrict_to("Gone", None)
+        self.assertFalse(importer._refused({"name": "dev2", "kind": "user"}, "Gone"))   # not here
+
+        manifest = {"collection": {"name": SECRET}}
+        job_id = "imp1"
+        record = {"job_id": job_id, "status": "queued", "filename": "ragpkg-secret.tar.gz", "collection": None,
+                  "owner": {"name": "dev2", "kind": "user"}, "notes": [], "restored_sessions": []}
+        with patch.object(importer, "_jobs", {job_id: record}), \
+                patch.object(importer.packager, "open_package", lambda *a: (self.root, manifest)), \
+                patch.object(importer.packager, "verify_digests", lambda *a: None), \
+                patch.object(importer, "_validate_package_sources", lambda *a: None), \
+                patch.object(importer, "_check_embedding", lambda *a: None):
+            importer._run(job_id, "ragpkg-secret.tar.gz", "rename")
+        self.assertEqual((record["status"], record["error_code"]), ("failed", "PACKAGE_UNREADABLE"))
+        self.assertEqual(record["error"], "No package named 'ragpkg-secret.tar.gz' in the exports directory.")
+        self.assertIsNone(record["collection"])
+        self.assertTrue(record["access_refused"])
+
+    def test_an_import_job_refusal_is_audited_as_refused(self):
+        audit.job_ended({"job_id": "imp1", "status": "failed", "access_refused": True,
+                         "_audit": {"action": "import", "actor": "dev2", "actor_kind": "user", "role": "developer",
+                                    "details": {}}}, False)
+        item = self.records("import")[-1]
+        self.assertEqual((item["result"], item["details"]["reason"]), ("refused", "collection_access"))
+
+    def test_a_new_collection_from_an_import(self):
+        importer._start_access({"name": "dev2", "kind": "user"}, "Brandnew", "Brandnew")
+        self.assertEqual(store.collection_access("Brandnew"), store.CollectionAccess(True, ("dev2",), ()))
+        importer._start_access({"name": "dev", "kind": "user"}, SECRET, "Secret_ab12cd34")
+        self.assertEqual(store.collection_access("Secret_ab12cd34"), store.collection_access(SECRET))
+        importer._start_access({"name": "dev", "kind": "user"}, OPEN, "Open1_ab12cd34")
+        self.assertFalse(store.collection_access("Open1_ab12cd34").restricted)
+        importer._start_access(None, "Untracked", "Untracked")
+        self.assertFalse(store.collection_access("Untracked").restricted)
+
+    def run_import(self, name, on_conflict, owner, **patches):
+        """importer._run on a package of collection `name`, with the package
+        checks and the build stubbed out; returns the job record."""
+        manifest = {"collection": {"name": name, "chunk_count": 1}}
+        record = {"job_id": "imp2", "status": "queued", "filename": "ragpkg-x.tar.gz", "collection": None,
+                  "owner": owner, "notes": [], "restored_sessions": []}
+        stubs = {"_validate_package_sources": lambda *a: None, "_check_embedding": lambda *a: None,
+                 "_read_goldstandard_sessions": lambda *a: [], "_read_retrieval_config": lambda *a: None,
+                 "_read_ingest_config": lambda *a: None, "_ensure_models": lambda *a: [],
+                 "_claim_target": lambda job_id, target, instead_of=None: target,
+                 "_mark_started": lambda target, *a: target, "_mark_finished": lambda *a: None, **patches}
+        targets = [patch.object(importer, "_jobs", {"imp2": record}),
+                   patch.object(importer.packager, "open_package", lambda *a: (self.root, manifest)),
+                   patch.object(importer.packager, "verify_digests", lambda *a: None),
+                   patch.object(importer.packager, "sha256_file", lambda *a: "ab12cd34" * 8)]
+        targets += [patch.object(importer, k, v) for k, v in stubs.items()]
+        for target in targets:
+            target.start()
+        try:
+            importer._run("imp2", "ragpkg-x.tar.gz", on_conflict)
+        finally:
+            for target in reversed(targets):
+                target.stop()
+        return record
+
+    def test_a_failed_import_of_a_new_name_leaves_no_access_state(self):
+        seen = []
+
+        def build(target, *a):
+            seen.append(store.collection_access(target))      # restricted before any data is written
+            raise importer.PackageError("IMPORT_FAILED", "the build failed")
+        record = self.run_import("Brandnew", "rename", {"name": "dev2", "kind": "user"}, _build=build)
+        self.assertEqual(record["status"], "failed", record)
+        self.assertEqual(seen, [store.CollectionAccess(True, ("dev2",), ())])
+        self.assertFalse(store.collection_access("Brandnew").restricted)
+
+    def test_a_replace_keeps_the_target_access(self):
+        def begin(*a):
+            raise importer.PackageError("IMPORT_FAILED", "stopped before the replace")
+        before = store.collection_access(SECRET)
+        with patch.object(importer.collection_recovery, "begin", begin), \
+                patch.object(wc, "get_client", lambda: None):
+            record = self.run_import(SECRET, "replace", {"name": "dev", "kind": "user"})
+        self.assertEqual((record["status"], record["error"]), ("failed", "stopped before the replace"), record)
+        self.assertEqual(store.collection_access(SECRET), before)
+
+
+
+class CopyTests(AccessTestCase):
+    """A staging or recovery copy keeps the access it was made with (#606)."""
+
+    def test_begin_snapshots_and_discard_drops(self):
+        from services import collection_recovery
+
+        class Client:
+            class collections:
+                @staticmethod
+                def exists(name):
+                    return False
+
+                @staticmethod
+                def delete(name):
+                    pass
+        record = collection_recovery.begin(SECRET, "import", Client)
+        copy = record["staging"]
+        self.assertEqual(store.collection_access(copy), store.collection_access(SECRET))
+        record = collection_recovery.begin(OPEN, "tune", Client)
+        self.assertFalse(store.collection_access(record["staging"]).restricted)
+        collection_recovery.discard(collection_recovery.begin(SECRET, "tune", Client), Client)
+        collection_recovery.discard({**collection_recovery.begin(SECRET, "import", Client)}, Client)
+        last = collection_recovery.begin(SECRET, "import", Client)
+        collection_recovery.discard(last, Client)
+        self.assertFalse(store.collection_access(last["staging"]).restricted)
+        self.assertTrue(store.collection_access(copy).restricted)          # a copy not discarded keeps it
+
+    def test_deleting_or_recreating_the_target_leaves_the_copy_as_it_was(self):
+        async def delete(name):
+            self.collections.discard(name)
+            return 1
+
+        async def create(**kwargs):
+            self.collections.add(kwargs["name"])
+        with patch.object(wc, "delete_collection_when_idle", delete):
+            self.assertEqual(self.client.delete(f"/collections/{SECRET}?confirm=true",
+                                                headers=self.as_("eng")).status_code, 200)
+        self.assertNotIn(STAGING, self.names("user"))                     # not opened by the delete
+        with patch.object(wc, "create_collection", create):
+            self.assertEqual(self.client.post("/collections", json={"name": SECRET},
+                                              headers=self.as_("dev2")).status_code, 201)
+        self.assertEqual(self.names("dev2"), [OPEN, SECRET])               # the new SECRET, not the old copy
+        self.assertIn(STAGING, self.names("dev"))
+        body = {"question": "What?", "collection": STAGING}
+        self.refused(self.client.post("/query", json=body, headers=self.as_("dev2")))
+
+
+class CreateFailureTests(AccessTestCase):
+    def test_a_failed_restriction_creates_nothing(self):
+        created = []
+
+        async def create(**kwargs):
+            created.append(kwargs["name"])
+
+        def broken(*args):
+            raise sqlite3.OperationalError("database is locked")
+        with patch.object(wc, "create_collection", create), patch.object(store, "restrict_to", broken):
+            answer = self.client.post("/collections", json={"name": "Fresh"}, headers=self.as_("dev2"))
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (500, "CREATE_FAILED"))
+        self.assertEqual(created, [])
+
+    def test_a_failed_create_puts_the_state_back(self):
+        seen = []
+
+        async def create(**kwargs):
+            seen.append(store.collection_access(kwargs["name"]))          # restricted before it exists
+            raise RuntimeError("weaviate refused")
+        with patch.object(wc, "create_collection", create):
+            answer = self.client.post("/collections", json={"name": "Fresh"}, headers=self.as_("dev2"))
+        self.assertEqual(answer.status_code, 500)
+        self.assertEqual(seen, [store.CollectionAccess(True, ("dev2",), ())])
+        self.assertFalse(store.collection_access("Fresh").restricted)
+
+    def test_put_back_only_restores_its_own_state(self):
+        before, mine = store.restrict_to("Race", store.get_user("dev2").id)
+        theirs = store.restrict_to("Race", store.get_user("dev").id)[1]     # another create wrote since
+        self.assertFalse(store.put_back("Race", mine, before))
+        self.assertEqual(store.collection_access("Race"), theirs)
+        self.assertTrue(store.put_back("Race", theirs, mine))
+        self.assertEqual(store.collection_access("Race"), mine)
+        self.assertTrue(store.put_back("Race", mine, before))
+        self.assertFalse(store.collection_access("Race").restricted)
+
+    def test_a_failed_import_after_a_concurrent_create_keeps_the_creator(self):
+        # The import wrote its state, then a create of the same name wrote its
+        # own and made the collection; the import's build fails.
+        before, mine = importer._start_access({"name": "dev2", "kind": "user"}, "Race", "Race")
+        theirs = store.restrict_to("Race", store.get_user("dev").id)[1]
+        self.collections.add("Race")
+        store.put_back("Race", mine, before)
+        self.assertEqual(store.collection_access("Race"), theirs)
+
+
+class PackageSourceTests(AccessTestCase):
+    def test_a_package_of_a_discarded_copy_follows_its_target(self):
+        gone = SECRET + "__importing_" + "1" * 32
+        self.assertEqual(importer._source(gone), SECRET)                   # the copy no longer exists
+        self.assertEqual(importer._source(STAGING), STAGING)               # an existing copy is itself
+        self.assertEqual(importer._source(OPEN), OPEN)
+        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, importer._source(gone)))
+        before, after = importer._start_access({"name": "dev", "kind": "user"}, importer._source(gone),
+                                               gone + "_ab12cd34")
+        self.assertEqual(after, store.collection_access(SECRET))
+        from routers import transfer
+        listed = [{"filename": "ragpkg-gone-copy.tar.gz", "size_bytes": 1, "collection": gone, "chunk_count": 1,
+                   "fidelity": "chunks-only", "created_at": None, "readable": True}]
+        with patch.object(transfer, "_list_packages_sync", lambda: [dict(p) for p in listed]):
+            self.assertEqual(self.client.get("/packages", headers=self.as_("dev2")).json()["packages"], [])
+            self.assertEqual(len(self.client.get("/packages", headers=self.as_("dev")).json()["packages"]), 1)
+
+    def test_an_encrypted_package_is_refused_once_decrypted(self):
+        import io
+        import tarfile
+        from services import age_stream, packager
+        manifest = json.dumps({"package_format": 1, "collection": {"name": SECRET, "chunk_count": 0}}).encode()
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w:gz") as tar:
+            info = tarfile.TarInfo("package/manifest.json")
+            info.size = len(manifest)
+            tar.addfile(info, io.BytesIO(manifest))
+        exports = Path(settings.exports_dir)
+        exports.mkdir(parents=True, exist_ok=True)
+        name = "ragpkg-secret.tar.gz.age"
+        with (exports / name).open("wb") as out:
+            enc = age_stream.Encryptor(out, "a test passphrase", 1)
+            enc.write(raw.getvalue())
+            enc.close()
+        record = {"job_id": "enc1", "status": "queued", "filename": name, "collection": None,
+                  "owner": {"name": "dev2", "kind": "user"}, "notes": [], "restored_sessions": []}
+        reached = []
+        with patch.object(importer, "_jobs", {"enc1": record}), \
+                patch.object(packager, "verify_digests", lambda *a: reached.append("digests")), \
+                patch.object(importer, "_validate_package_sources", lambda *a: None), \
+                patch.object(importer, "_check_embedding", lambda *a: None):
+            importer._run("enc1", name, "rename", "a test passphrase")
+        self.assertEqual(reached, ["digests"])                              # decrypted and opened for real
+        self.assertEqual((record["status"], record["error_code"]), ("failed", "PACKAGE_UNREADABLE"))
+        self.assertEqual(record["error"], f"No package named '{name}' in the exports directory.")
+        self.assertIsNone(record["collection"])
+        self.assertTrue(record["access_refused"])
+
+
+class GoldIndexOrderTests(AccessTestCase):
+    def test_the_collection_is_recorded_before_the_file(self):
+        order = []
+        session = {"session_id": "gs_9", "collection": SECRET, "status": "completed", "pairs": [],
+                   "pairs_total": 0, "pairs_completed": 0}
+        with patch.dict(goldstandard._sessions, {"gs_9": session}), \
+                patch.object(goldstandard, "_record_export_collection", lambda *a: order.append("index")), \
+                patch.object(goldstandard, "_save_export_sync", lambda *a: order.append("file")):
+            asyncio.run(goldstandard.save_session("gs_9", "gold.json", True))
+        self.assertEqual(order, ["index", "file"])
+
+
+class PrepareAreaTests(AccessTestCase):
+    """Documents imported only into collections the caller can't use are hidden
+    (#606, Q18, Q19); job records leave them out (Q20)."""
+
+    def setUp(self):
+        super().setUp()
+        from services import preparation_store as prep
+        target = patch.object(settings, "preparation_dir", str(self.root / "preparation"))
+        target.start()
+        self.addCleanup(target.stop)
+        source = self.root / "note.txt"
+        source.write_text("A note.\n")
+        self.secret_doc = prep.create("secret-note.txt", source, None)["id"]
+        self.open_doc = prep.create("open-note.txt", source, None)["id"]
+        self.plain_doc = prep.create("plain-note.txt", source, None)["id"]
+        self.mixed_doc = prep.create("mixed-note.txt", source, None)["id"]
+        prep.add_import([self.secret_doc], SECRET, "job1")
+        prep.add_import([self.open_doc], OPEN, "job2")
+        prep.add_import([self.mixed_doc], SECRET, "job3")
+        prep.add_import([self.mixed_doc], OPEN, "job4")
+
+    def listed(self, who):
+        answer = self.client.get("/prepare/documents", headers=self.as_(who))
+        self.assertEqual(answer.status_code, 200, answer.text)
+        return {d["id"] for d in answer.json()["documents"]}
+
+    def test_the_list_hides_documents_of_restricted_collections(self):
+        everything = {self.secret_doc, self.open_doc, self.plain_doc, self.mixed_doc}
+        self.assertEqual(self.listed("dev2"), everything - {self.secret_doc})
+        self.assertEqual(self.listed("dev"), everything)
+        self.assertEqual(self.listed("svc2"), everything - {self.secret_doc})
+        self.assertEqual(self.listed("eng"), everything)
+        self.assertFalse(self.records("collection.access.refused"))
+
+    def test_the_document_routes_refuse_a_hidden_document(self):
+        doc = self.secret_doc
+        for method, path in (("GET", f"/prepare/documents/{doc}"), ("GET", f"/prepare/documents/{doc}/raw"),
+                             ("GET", f"/prepare/documents/{doc}/prepared"),
+                             ("DELETE", f"/prepare/documents/{doc}/prepared"), ("DELETE", f"/prepare/documents/{doc}")):
+            with self.subTest(method=method, path=path):
+                answer = self.client.request(method, path, headers=self.as_("dev2"))
+                self.assertEqual((answer.status_code, answer.json()["error"]["code"],
+                                  answer.json()["error"]["message"]),
+                                 (404, "DOCUMENT_NOT_FOUND", f"Document '{doc}' not found."))
+        self.assertEqual(self.client.get(f"/prepare/documents/{doc}", headers=self.as_("dev")).status_code, 200)
+        self.assertEqual(self.client.get(f"/prepare/documents/{doc}/raw", headers=self.as_("eng")).status_code, 200)
+        item = self.records("collection.access.refused")[-1]
+        self.assertEqual((item["actor"], item["collection"], item["details"]["code"]),
+                         ("dev2", SECRET, "DOCUMENT_NOT_FOUND"))
+        download = [r for r in self.records("prepare.download") if r["actor"] == "dev2"][0]
+        self.assertEqual((download["result"], download["details"]["reason"]), ("refused", "collection_access"))
+
+    def test_a_selection_treats_a_hidden_document_as_unknown(self):
+        for path, body in (("/prepare/jobs", {"document_ids": [self.secret_doc]}),
+                           ("/prepare/import", {"collection": OPEN, "document_ids": [self.secret_doc]})):
+            with self.subTest(path=path):
+                answer = self.client.post(path, json=body, headers=self.as_("dev2"))
+                self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "DOCUMENT_NOT_FOUND"))
+                self.assertEqual(answer.json()["error"]["detail"], {"documents": [self.secret_doc]})
+        from services import preparation_jobs
+        from routers import prepare
+        usable = lambda record: prepare._blocker(None) is None  # noqa: E731 - no request: everything
+        self.assertEqual(len(preparation_jobs._resolve(None, {"raw"}, usable)), 4)
+        dev2 = type("P", (), {"user_id": store.get_user("dev2").id, "role": "developer"})()
+        visible = __import__("auth.access", fromlist=["x"]).visible_filter(dev2)
+        blocked = prepare._blocker(type("R", (), {"state": type("S", (), {"auth": dev2})()})())
+        shown = lambda record: blocked(record) is None  # noqa: E731
+        self.assertEqual({r["id"] for r in preparation_jobs._resolve(None, {"raw"}, shown)},
+                         {self.open_doc, self.plain_doc, self.mixed_doc})
+        self.assertTrue(visible(OPEN))
+
+    def test_a_document_with_one_usable_import_stays_visible_without_the_other_records(self):
+        # Q19: mixed imports keep the document visible; the SECRET record is left out.
+        doc = self.mixed_doc
+        listed = {d["id"]: d for d in self.client.get("/prepare/documents", headers=self.as_("dev2")).json()["documents"]}
+        self.assertEqual([i["collection"] for i in listed[doc]["imports"]], [OPEN])
+        detail = self.client.get(f"/prepare/documents/{doc}", headers=self.as_("dev2"))
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual([i["collection"] for i in detail.json()["imports"]], [OPEN])
+        self.assertEqual(self.client.get(f"/prepare/documents/{doc}/raw", headers=self.as_("dev2")).status_code, 200)
+        for who in ("dev", "eng"):
+            seen = self.client.get(f"/prepare/documents/{doc}", headers=self.as_(who)).json()
+            self.assertEqual([i["collection"] for i in seen["imports"]], [SECRET, OPEN])
+        self.assertFalse(self.records("collection.access.refused"))
+
+    def test_job_records_leave_hidden_documents_out(self):
+        # Q20: a job naming the hidden document and two visible ones.
+        from services import preparation_jobs
+        job = {"job_id": "pj1", "status": "running", "documents_total": 3, "documents_completed": 1,
+               "documents_failed": 1, "document_ids": [self.secret_doc, self.mixed_doc, self.plain_doc],
+               "names": ["secret-note.txt", "mixed-note.txt", "plain-note.txt"],
+               "current": {"document_id": self.secret_doc, "name": "secret-note.txt"},
+               "errors": ["secret-note.txt: the model failed", f"{self.secret_doc}: unreadable",
+                          "plain-note.txt: the model failed"],
+               "owner": {"name": "dev2", "kind": "user"}, "created_at": "2026-11-17T10:00:00+00:00"}
+        with patch.object(preparation_jobs, "get_job", lambda job_id: dict(job)), \
+                patch.object(preparation_jobs, "job_records", lambda: [("pj1", dict(job), None)]):
+            seen = self.client.get("/prepare/job/pj1", headers=self.as_("dev2")).json()
+            self.assertEqual(seen["document_ids"], [self.mixed_doc, self.plain_doc])
+            self.assertEqual(seen["names"], ["mixed-note.txt", "plain-note.txt"])
+            self.assertIsNone(seen["current"])
+            self.assertEqual(seen["errors"], ["plain-note.txt: the model failed"])
+            self.assertEqual(seen["documents_total"], 3)
+            listed = self.client.get("/prepare/jobs", headers=self.as_("dev2")).json()["jobs"]
+            self.assertEqual([(j["document_ids"], j["names"]) for j in listed],
+                             [([self.mixed_doc, self.plain_doc], ["mixed-note.txt", "plain-note.txt"])])
+            full = self.client.get("/prepare/job/pj1", headers=self.as_("eng")).json()
+            self.assertEqual((full["document_ids"], full["current"], full["errors"]),
+                             (job["document_ids"], job["current"], job["errors"]))
+            mine = self.client.get("/prepare/job/pj1", headers=self.as_("dev")).json()
+            self.assertEqual(mine["document_ids"], job["document_ids"])
+        self.assertFalse(self.records("collection.access.refused"))
 
 
 if __name__ == "__main__":
@@ -43104,6 +44902,9 @@ run_import() {   # run_import <file> <on_conflict>; leaves the job in /tmp/vfy_p
 }
 
 drop_collection "$C"; make_collection "$C"
+# The End User's retrieve.py queries it and its import below (#606); the import
+# under a new name copies its access.
+open_collection "$C"
 curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
   -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_p_ing.json
 check_eq "the suite's collection is ingested" \
@@ -43839,6 +45640,9 @@ fi
 # A collection must exist for the delete-confirmation check to have a target.
 C="${PREFIX}Ui"
 drop_collection "$C"; make_collection "$C"
+# The browser cases use it as the Developer; a new collection is restricted to
+# its creator, the harness Engineer (#606).
+open_collection "$C"
 
 # The test accounts' credentials go in on standard input (#25), never on a
 # command line or in the environment; browser/lib.js reads them once.
@@ -49748,7 +51552,7 @@ class DeletedRecoveryTests(unittest.TestCase):
         from services import collection_recovery as recovery,weaviate_client as wc,goldstandard as gs,ingest_config,retrieval_config
         self.recovery,self.wc=recovery,wc
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup);self.root=Path(temp.name);stack=ExitStack();self.addCleanup(stack.close)
-        for change in [patch.object(settings,'upload_dir',temp.name),patch.object(settings,'sources_dir',str(self.root/'sources')),patch.object(gs,'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None)]:stack.enter_context(change)
+        for change in [patch.object(settings,'upload_dir',temp.name),patch.object(settings,'auth_dir',str(self.root/'auth')),patch.object(settings,'sources_dir',str(self.root/'sources')),patch.object(gs,'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None)]:stack.enter_context(change)
         self.backend={'OwnedRecovery'}
         class Collections:
             def exists(inner,name):return writes.canonical(name) in self.backend
@@ -51616,8 +53420,14 @@ class IngestImportTests(unittest.TestCase):
 
     def served(self, collection):
         from routers import ingest as ingest_router
+        from services import weaviate_client
         import asyncio
-        return asyncio.run(ingest_router.get_ingest_config(collection)).model_dump()
+
+        # The route answers 404 for a collection that doesn't exist (#606); these exist.
+        async def exists(name):
+            return True
+        with patch.object(weaviate_client, 'collection_exists', exists):
+            return asyncio.run(ingest_router.get_ingest_config(collection)).model_dump()
 
     def assert_refused_before_mutation(self):
         saved = ingest_config._path('Corpus')
@@ -53124,8 +54934,11 @@ const CITATIONS = [
   { source_file: 'beta.txt', chunk_index: 0, score: null, excerpt: 'Second excerpt.' },
 ];
 // Answers for the pages a case may pass through; a case adds or overrides routes.
+const OPEN = { restricted: false, users: [], service_principals: [] };
 const base = (extra = {}) => ({
   'GET /api/collections': json(200, { collections: COLS }),
+  // Each collection's access on the Collections page (#606): open unless a case says otherwise.
+  'GET /api/collections/*': json(200, OPEN),
   'GET /api/retrieval/config/*': call => json(200, retrievalConfig(call.path.split('/').pop())),
   'GET /api/packages': json(200, { packages: [] }),
   'GET /api/tune/*': call => json(200, { collection: call.path.split('/').pop(), fidelity: 'with-sources', source_document_count: 2, can_rechunk: true, can_reembed: true, can_reindex: true, note: '' }),
@@ -53169,12 +54982,61 @@ function collectionsCases() {
     { name: 'Collections table shows its columns, each collection and a dash for a null created date', open: open(), async run(s) {
       await waitText(s.page, A);
       const heads = await s.page.evaluate(() => [...document.querySelectorAll('thead th')].map(t => t.textContent.trim()));
-      assert.deepEqual(heads, ['Name', 'Objects', 'Index', 'Distance', 'Created', '']);
+      assert.deepEqual(heads, ['Name', 'Objects', 'Index', 'Distance', 'Created', 'Access', '']);
       const rows = await s.page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => [...r.querySelectorAll('td')].map(c => c.textContent.trim())));
       const date = await s.page.evaluate(v => new Date(v).toLocaleDateString(), COLS[0].created_at);
       assert.deepEqual(rows[0].slice(0, 5), [A, '12', 'hnsw', 'cosine', date]);
       assert.notEqual(date, DASH);
       assert.deepEqual(rows[1].slice(0, 5), [B, '0', 'flat', 'dot', DASH]);
+      await waitFor(s.page, () => [...document.querySelectorAll('tbody tr')].every(r => r.cells[5].textContent.trim() !== '\u2014'), 'the access column');
+      const access = await s.page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => r.cells[5].textContent.trim()));
+      assert.deepEqual(access, ['Open', 'Open']);
+    } },
+    { name: 'Access (#606): a restricted collection shows its grant count; the dialog restricts to the ticked accounts and PUTs them; a refused save stays open with the message', open: (() => {
+      let saves = 0;
+      return open({
+        ['GET /api/collections/' + A + '/access']: json(200, { restricted: true, users: ['vfy-developer'], service_principals: [] }),
+        'GET /api/auth/users': json(200, { users: [{ username: 'vfy-developer', role: 'developer', enabled: true, must_change_password: false, created_at: '2026-01-02T12:00:00Z' }, { username: 'vfy-off', role: 'end_user', enabled: false, must_change_password: false, created_at: '2026-01-02T12:00:00Z' }] }),
+        'GET /api/auth/service-principals': json(200, { principals: [{ name: 'vfy-svc', role: 'end_user', enabled: true, created_at: '2026-01-02T12:00:00Z', keys: [] }] }),
+        'PUT /api/collections/*': call => (++saves === 1 ? apiError(422, 'INVALID_PARAMETER', 'no person is named \'x\'') : json(200, call.body)),
+      });
+    })(), async run(s) {
+      await waitText(s.page, 'Restricted (1)');
+      const accessButtons = () => s.page.$$('tbody button');
+      await (await accessButtons())[2].click();   // row B: Access, Delete; row A first
+      await waitText(s.page, 'Access to ' + B);
+      await waitText(s.page, 'Open: everyone whose role allows it');
+      await waitFor(s.page, () => [...document.querySelectorAll('.fixed button')].some(b => b.textContent.trim() === 'Save' && !b.disabled), 'Save to be enabled once the state is read');
+      await s.page.click('input[type=radio]:not(:checked)');
+      await waitText(s.page, 'vfy-off (disabled)');
+      await waitText(s.page, 'vfy-svc');
+      const boxes = await s.page.$$('input[type=checkbox]');
+      await boxes[0].click();   // vfy-developer
+      await boxes[2].click();   // vfy-svc
+      await press(s.page, 'Save');
+      await waitText(s.page, "no person is named 'x'");
+      assert.equal(await modalOpen(s.page), true);
+      await press(s.page, 'Save');
+      await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+      const puts = callsTo(s, 'PUT', '/api/collections/' + B + '/access');
+      assert.equal(puts.length, 2);
+      assert.deepEqual(puts[1].body, { restricted: true, users: ['vfy-developer'], service_principals: ['vfy-svc'] });
+      await waitText(s.page, 'Restricted (2)');
+    } },
+    { name: 'Access (#606): when the dialog cannot read the state, the choice stays unknown and Save is disabled', open: open({
+      ['GET /api/collections/' + B + '/access']: apiError(500, 'INTERNAL_ERROR', 'Synthetic read failure.'),
+      'GET /api/auth/users': json(200, { users: [] }),
+      'GET /api/auth/service-principals': json(200, { principals: [] }),
+    }), async run(s) {
+      await waitText(s.page, A);
+      await (await s.page.$$('tbody button'))[2].click();
+      await waitText(s.page, 'Synthetic read failure.');
+      const state = await s.page.evaluate(() => ({
+        save: [...document.querySelectorAll('.fixed button')].find(b => b.textContent.trim() === 'Save').disabled,
+        checked: [...document.querySelectorAll('.fixed input[type=radio]')].filter(r => r.checked).length,
+      }));
+      assert.deepEqual(state, { save: true, checked: 0 });
+      assert.equal(callsTo(s, 'PUT', '/api/collections/' + B + '/access').length, 0);
     } },
     { name: 'New Collection modal starts with HNSW, Cosine and the three HNSW sliders at their defaults and bounds', open: open(), async run(s) {
       await waitText(s.page, A);
@@ -55523,7 +57385,7 @@ ENUMS = {
 SPAN_NAMES = frozenset("rag." + v for v in ENUMS["rag.operation"])
 
 # Explicit code-owned vocabulary. Raw URL/path values never enter this schema.
-ROUTES = frozenset(('DELETE /collections/{name}', 'DELETE /prepare/documents/{document_id}', 'DELETE /prepare/documents/{document_id}/prepared', 'GET /audit', 'GET /audit.csv', 'GET /auth/me', 'GET /auth/mfa', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /export/job/{job_id}', 'GET /export/jobs', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /goldstandard/sessions', 'GET /health', 'GET /health/details', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /import/jobs', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /ingest/jobs', 'GET /metrics/latency', 'GET /packages', 'GET /prepare/documents', 'GET /prepare/documents/{document_id}', 'GET /prepare/documents/{document_id}/prepared', 'GET /prepare/documents/{document_id}/raw', 'GET /prepare/job/{job_id}', 'GET /prepare/jobs', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/login/mfa', 'POST /auth/logout', 'POST /auth/mfa/disable', 'POST /auth/mfa/enroll', 'POST /auth/mfa/enroll/confirm', 'POST /auth/mfa/policy', 'POST /auth/mfa/recovery-codes', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-mfa', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /prepare/import', 'POST /prepare/job/{job_id}/cancel', 'POST /prepare/jobs', 'POST /prepare/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex'))
+ROUTES = frozenset(('DELETE /collections/{name}', 'DELETE /prepare/documents/{document_id}', 'DELETE /prepare/documents/{document_id}/prepared', 'GET /audit', 'GET /audit.csv', 'GET /auth/me', 'GET /auth/mfa', 'GET /auth/service-principals', 'GET /auth/status', 'GET /auth/users', 'GET /collections', 'GET /collections/{name}/access', 'GET /export/job/{job_id}', 'GET /export/jobs', 'GET /goldstandard/diagnostics', 'GET /goldstandard/download/{filename}', 'GET /goldstandard/session/{session_id}', 'GET /goldstandard/sessions', 'GET /health', 'GET /health/details', 'GET /help/transfer', 'GET /import/job/{job_id}', 'GET /import/jobs', 'GET /ingest/config/{collection}', 'GET /ingest/job/{job_id}', 'GET /ingest/jobs', 'GET /metrics/latency', 'GET /packages', 'GET /prepare/documents', 'GET /prepare/documents/{document_id}', 'GET /prepare/documents/{document_id}/prepared', 'GET /prepare/documents/{document_id}/raw', 'GET /prepare/job/{job_id}', 'GET /prepare/jobs', 'GET /retrieval/config/{collection}', 'GET /tune/job/{job_id}', 'GET /tune/{collection}', 'PATCH /goldstandard/session/{session_id}/pair/{pair_id}', 'POST /auth/login', 'POST /auth/login/mfa', 'POST /auth/logout', 'POST /auth/mfa/disable', 'POST /auth/mfa/enroll', 'POST /auth/mfa/enroll/confirm', 'POST /auth/mfa/policy', 'POST /auth/mfa/recovery-codes', 'POST /auth/password', 'POST /auth/service-principals', 'POST /auth/service-principals/{name}/disable', 'POST /auth/service-principals/{name}/enable', 'POST /auth/service-principals/{name}/keys', 'POST /auth/service-principals/{name}/keys/{key_id}/revoke', 'POST /auth/service-principals/{name}/role', 'POST /auth/users', 'POST /auth/users/{username}/disable', 'POST /auth/users/{username}/enable', 'POST /auth/users/{username}/reset-mfa', 'POST /auth/users/{username}/reset-password', 'POST /auth/users/{username}/role', 'POST /collections', 'POST /export', 'POST /goldstandard/generate', 'POST /goldstandard/regenerate', 'POST /goldstandard/save', 'POST /import', 'POST /ingest/config', 'POST /ingest/upload', 'POST /prepare/import', 'POST /prepare/job/{job_id}/cancel', 'POST /prepare/jobs', 'POST /prepare/upload', 'POST /query', 'POST /retrieval/config', 'POST /tune/rechunk', 'POST /tune/reembed', 'POST /tune/reindex', 'PUT /collections/{name}/access'))
 ENUMS.update({"http.route": ROUTES | {"unmatched"},
               "rag.tuning_operation": frozenset(("rechunk", "reembed", "reindex")),
               "http.status_class": frozenset(("1xx", "2xx", "3xx", "4xx", "5xx"))})

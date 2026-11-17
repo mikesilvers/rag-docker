@@ -735,7 +735,9 @@ class ReviewerCoverageTests(AuditTestCase):
             "prepare.delete",
             # Two-step verification (#607).
             "auth.mfa", "auth.mfa.enroll", "auth.mfa.recovery-codes", "auth.mfa.disable", "admin.user.reset-mfa",
-            "admin.mfa.policy"})
+            "admin.mfa.policy",
+            # Per-collection access (#606); its refusals elsewhere are written directly.
+            "collection.access"})
         # Not recorded (D3): other GETs, job polling, gold-standard generate/edit/regenerate.
         # A preparation job's cancel is an action, not polling (#638).
         for method, path in audit.ACTIONS:
@@ -748,8 +750,10 @@ class ReviewerCoverageTests(AuditTestCase):
                 "/goldstandard/save", "/goldstandard/download/{filename}"), path)
 
     def test_successful_config_saves_and_password_change(self):
+        # The settings routes answer 404 for a collection that doesn't exist (#606).
         with patch("services.ingest_config.save", lambda cfg: cfg), \
-                patch("services.retrieval_config.save", lambda cfg: cfg):
+                patch("services.retrieval_config.save", lambda cfg: cfg), \
+                patch("services.weaviate_client.collection_exists", AsyncMock(return_value=True)):
             self.assertEqual(self.client.post("/ingest/config", headers=self.session("dev"),
                                               json={"collection": "Docs"}).status_code, 201)
             self.assertEqual(self.client.post("/retrieval/config", headers=self.session("dev"),

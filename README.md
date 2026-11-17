@@ -112,7 +112,7 @@ can't use.
 |---|---|
 | **End User** | Q&A only |
 | **Developer** | Q&A, Import, Prepare, Chunking, Retrieval, Gold Standard, Transfer |
-| **AI Engineer** | All of the above + Collections management (deleting collections) + Health dashboard + tuning + Users (account management) + Service keys (API keys for programs) + Audit (the audit log) |
+| **AI Engineer** | All of the above + Collections management (deleting collections, and who may use each one) + Health dashboard + tuning + Users (account management) + Service keys (API keys for programs) + Audit (the audit log) |
 
 Endpoint by endpoint (paths under `/api`):
 
@@ -122,12 +122,27 @@ Endpoint by endpoint (paths under `/api`):
 | any logged-in user | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password`; their own two-step verification (`GET /auth/mfa`, `POST /auth/mfa/enroll`, `/enroll/confirm`, `/recovery-codes`, `/disable`) |
 | End User | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
 | Developer | creating a collection; ingest (upload, job status, settings); document preparation (`POST /prepare/upload`; `GET /prepare/documents`; `GET` and `DELETE /prepare/documents/{document_id}`; `GET /prepare/documents/{document_id}/raw`; `GET` and `DELETE /prepare/documents/{document_id}/prepared`; `POST` and `GET /prepare/jobs`; `GET /prepare/job/{job_id}`; `POST /prepare/job/{job_id}/cancel`; `POST /prepare/import`); saving retrieval settings; gold standard (generate, sessions, pairs, regenerate, save, download); export, import, their job status, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}`; the full health report, `GET /health/details` |
-| AI Engineer | `DELETE /collections/{name}`; `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/job/{id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; the API docs (`/docs`, `/redoc`, `/openapi.json`); account management (`GET` and `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `/role`, `/disable`, `/enable`, `/reset-mfa`; `POST /auth/mfa/policy`); service keys (`GET` and `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `/disable`, `/enable`, `/keys`, `/keys/{key_id}/revoke`); the audit log (`GET /audit`, `GET /audit.csv`), in a browser session only |
+| AI Engineer | `DELETE /collections/{name}`; `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/job/{id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; the API docs (`/docs`, `/redoc`, `/openapi.json`); account management (`GET` and `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `/role`, `/disable`, `/enable`, `/reset-mfa`; `POST /auth/mfa/policy`); service keys (`GET` and `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `/disable`, `/enable`, `/keys`, `/keys/{key_id}/revoke`); the audit log (`GET /audit`, `GET /audit.csv`), in a browser session only; who may use a collection (`GET` and `PUT /collections/{name}/access`), in a browser session only |
 
 Without a session the API answers `401 AUTH_REQUIRED`; with a role that is too
 low, `403 FORBIDDEN`. Programs use service API keys instead of a session
 ([Service keys](#service-keys)). Jobs and gold-standard sessions belong to no particular
-user: anyone with the role may poll or open them.
+user: anyone with the role may poll or open them, if they may use the collection.
+
+**Who may use each collection** (#606). On top of the role, each collection is
+*open* (every account whose role allows it) or *restricted* to the people and
+service principals an AI Engineer grants it; AI Engineers reach every
+collection. A **new collection starts restricted to whoever made it**: one
+created on the Collections page or with **+ New** on the Import page, or by an
+import under a new name (an import next to an existing collection copies that
+collection's access). End Users and other Developers don't see it until an AI
+Engineer opens it or grants them access with the **Access** button on the
+Collections page. Collections that existed before the upgrade stay open. To
+anyone else a restricted collection looks like one that doesn't exist (`404`),
+everywhere it can be named: Q&A, settings, ingest, gold standard, export, job
+status, packages, and the Prepare area's documents imported only into collections
+the caller can't use (and their place in preparation jobs). Every
+change and refusal is in the audit log.
 
 ### Managing accounts
 
@@ -526,6 +541,8 @@ volume is kept, unused until you switch again.
 ### 1. Create a collection
 
 **AI Engineers** can manage collections, including deleting them, from the dedicated **Collections** page. **Developers** can create a collection inline from the Import page using the **+ New** button next to the collection selector.
+
+A new collection is restricted to the account that created it (#606). For End Users or other Developers to see it, an AI Engineer opens it, or grants it to them, with **Access** on the Collections page ([Who may use each collection](#accounts-and-roles)).
 
 A collection is a named vector index that holds chunks from one or more documents. Choose HNSW (approximate, fast) or Flat (exact, slower at scale).
 

@@ -63,6 +63,9 @@ MATRIX = (
     ("GET", "/tune/" + X, None, "developer"),
     ("GET", "/health/details", None, "developer"),       # the full health report (#750)
     ("DELETE", "/collections/" + X + "?confirm=true", None, "engineer"),
+    # Per-collection access (#606): a 404 for no such collection, a 422 for no value.
+    ("GET", "/collections/" + X + "/access", None, "engineer"),
+    ("PUT", "/collections/" + X + "/access", {}, "engineer"),
     ("POST", "/tune/rechunk", {}, "engineer"),
     ("POST", "/tune/reembed", {}, "engineer"),
     ("POST", "/tune/reindex", {}, "engineer"),
@@ -99,6 +102,8 @@ MATRIX = (
 # Routes an API key can't use whatever its role (S5 of PR 3): every account,
 # principal and key route, logout and the password change; and the audit log (#29).
 KEY_REFUSED = ("/auth/users", "/auth/service-principals", "/auth/logout", "/auth/password", "/audit", "/auth/mfa")
+# And per-collection access (#606), by its path's end.
+KEY_REFUSED_SUFFIX = "/access"
 SESSION_ROUTES = (("GET", "/auth/me", None), ("POST", "/auth/logout", None), ("POST", "/auth/password", {}))
 
 
@@ -229,7 +234,7 @@ def check_key_matrix(role, operator_ok):
     try:
         for method, path, body, need in MATRIX:
             status, raw, _ = code(method, path, body, headers=bearer(key))
-            if path.startswith(KEY_REFUSED):
+            if path.startswith(KEY_REFUSED) or path.endswith(KEY_REFUSED_SUFFIX):
                 ok = status == 403 and error_code(raw) == "KEY_NOT_ALLOWED"
             elif ROLES.index(role) < ROLES.index(need):
                 ok = status == 403 and error_code(raw) == "FORBIDDEN"
@@ -894,6 +899,85 @@ def check_restart_verify(operator_ok):
     expect(status == 200, "a session did not survive the API restart ({})".format(status))
     status, _, _ = code("POST", "/auth/login", {"username": state["locked"], "password": "x" * 12})
     expect(status == 429, "a lockout did not survive the API restart ({})".format(status))
+
+
+def check_collection_access(operator_ok):
+    """Per-collection access (#606) on the stack: a collection the harness
+    Engineer creates is restricted to it; a throwaway End User and Developer
+    and a Developer key can't see or use it until granted, and the access routes
+    refuse a key. Changes and refusals are in the audit log."""
+    expect(operator_ok, "creates accounts, a service principal and a collection, so it runs only on the verify project")
+    admin = role_token("engineer")
+    name = "VfyAccess" + secrets.token_hex(4)
+    users, principal = [], None
+    try:
+        status, raw, _ = code("POST", "/collections", {"name": name}, token=admin)
+        expect(status == 201, "creating {} answered {} {}".format(name, status, error_code(raw)))
+        user, _, user_token = throwaway("end_user", operator_ok)
+        users.append(user)
+        dev, _, dev_token = throwaway("developer", operator_ok)
+        users.append(dev)
+        principal, _, key = new_principal(admin, "developer")
+        callers = {"End User": {"token": user_token}, "Developer": {"token": dev_token},
+                   "key": {"headers": bearer(key)}}
+
+        def listed(who):
+            status, raw, _ = code("GET", "/collections", **callers[who])
+            expect(status == 200, "{}: GET /collections answered {}".format(who, status))
+            return name in [c["name"] for c in json.loads(raw)["collections"]]
+
+        def answer(who, method, path, body=None):
+            status, raw, _ = code(method, path, body, **callers[who])
+            return status, error_code(raw)
+
+        missing = (404, "COLLECTION_NOT_FOUND")
+        for who in callers:
+            expect(not listed(who), "{} sees the new collection, restricted to its creator".format(who))
+            got = answer(who, "POST", "/query", {"question": "Is it there?", "collection": name})
+            expect(got == missing, "{}: the query answered {}".format(who, got))
+        for who in ("Developer", "key"):
+            got = answer(who, "POST", "/export", {"collection": name})
+            expect(got == missing, "{}: the export answered {}".format(who, got))
+        got = answer("key", "GET", "/retrieval/config/" + name)
+        expect(got == missing, "key: the retrieval settings answered {}".format(got))
+        expect(answer("End User", "GET", "/retrieval/config/VfyAccessNoSuch")[0] == 404,
+               "a missing collection's settings must be a 404 as well")
+
+        status, raw, _ = code("PUT", "/collections/{}/access".format(name),
+                              {"restricted": True, "users": [dev], "service_principals": [principal]}, token=admin)
+        expect(status == 200 and json.loads(raw) == {"restricted": True, "users": [dev], "service_principals": [principal]},
+               "granting answered {} {}".format(status, raw[:200]))
+        for who in ("Developer", "key"):
+            expect(listed(who), "{} doesn't see the collection once granted".format(who))
+            got = answer(who, "GET", "/ingest/config/" + name)
+            expect(got[0] == 200, "{}: the granted collection's settings answered {}".format(who, got))
+        expect(not listed("End User"), "the End User sees a collection not granted to it")
+        got = answer("key", "PUT", "/collections/{}/access".format(name), {"restricted": False})
+        expect(got == (403, "KEY_NOT_ALLOWED"), "a key changing access answered {}".format(got))
+        got = answer("key", "GET", "/collections/{}/access".format(name))
+        expect(got == (403, "KEY_NOT_ALLOWED"), "a key reading access answered {}".format(got))
+
+        def audited(action, **match):
+            query = "/audit?action={}&collection={}&limit=100".format(action, name)
+            status, raw, _ = code("GET", query, token=admin)
+            expect(status == 200, "GET /audit answered {}".format(status))
+            return [r for r in json.loads(raw)["records"] if all(r.get(k) == v for k, v in match.items())]
+        # The newest record is the key's refused change below; this is the Engineer's grant.
+        change = audited("collection.access", result="success")
+        expect(change and change[0]["details"].get("added") == {"users": [dev], "service_principals": [principal]},
+               "the change's audit record is {}".format(change[:1]))
+        refused = audited("query", actor=user)
+        expect(refused and refused[0]["result"] == "refused" and refused[0]["details"].get("reason") == "collection_access",
+               "the refused query's audit record is {}".format(refused[:1]))
+        expect(audited("collection.access.refused", actor=principal),
+               "no collection.access.refused record for the key's settings read")
+    finally:
+        code("DELETE", "/collections/{}?confirm=true".format(name), token=admin)
+        for username in users:
+            code("POST", "/auth/users/{}/disable".format(username), token=admin)
+        if principal:
+            code("POST", "/auth/service-principals/{}/disable".format(principal), token=admin)
+        request("POST", "/auth/logout", token=admin)
 
 
 CHECKS = {name[len("check_"):].replace("_", "-"): fn for name, fn in globals().items() if name.startswith("check_")}

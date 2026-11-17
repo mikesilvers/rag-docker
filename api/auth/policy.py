@@ -79,6 +79,9 @@ ACCESS: dict[tuple[str, str], str] = {
     ("POST", "/prepare/import"): DEVELOPER,
     # Collections management, tuning, the Health page's data (Q3, Q5, Q6).
     ("DELETE", "/collections/{name}"): ENGINEER,
+    # Who may use a collection (#606): Engineers, in a browser session only.
+    ("GET", "/collections/{name}/access"): ENGINEER,
+    ("PUT", "/collections/{name}/access"): ENGINEER,
     ("POST", "/tune/rechunk"): ENGINEER,
     ("POST", "/tune/reembed"): ENGINEER,
     ("POST", "/tune/reindex"): ENGINEER,
@@ -119,9 +122,11 @@ ACCESS: dict[tuple[str, str], str] = {
 # GET /auth/me answers for a key. The audit log too (#29): a leaked key can't
 # read who did what, or question text when that is recorded. And two-step
 # verification (#607): service keys are unchanged and have no second factor.
+# And per-collection access (#606), so a leaked key can't open a collection to
+# another principal.
 HUMAN_ONLY = frozenset(path for _, path in ACCESS
                        if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa"))) | {
-    "/auth/logout", "/auth/password", "/audit", "/audit.csv"}
+    "/auth/logout", "/auth/password", "/audit", "/audit.csv", "/collections/{name}/access"}
 
 
 def required(method: str, path: str) -> str | None:

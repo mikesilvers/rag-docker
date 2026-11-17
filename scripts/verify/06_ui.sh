@@ -23,6 +23,9 @@ fi
 # A collection must exist for the delete-confirmation check to have a target.
 C="${PREFIX}Ui"
 drop_collection "$C"; make_collection "$C"
+# The browser cases use it as the Developer; a new collection is restricted to
+# its creator, the harness Engineer (#606).
+open_collection "$C"
 
 # The test accounts' credentials go in on standard input (#25), never on a
 # command line or in the environment; browser/lib.js reads them once.

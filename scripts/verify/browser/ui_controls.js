@@ -22,8 +22,11 @@ const CITATIONS = [
   { source_file: 'beta.txt', chunk_index: 0, score: null, excerpt: 'Second excerpt.' },
 ];
 // Answers for the pages a case may pass through; a case adds or overrides routes.
+const OPEN = { restricted: false, users: [], service_principals: [] };
 const base = (extra = {}) => ({
   'GET /api/collections': json(200, { collections: COLS }),
+  // Each collection's access on the Collections page (#606): open unless a case says otherwise.
+  'GET /api/collections/*': json(200, OPEN),
   'GET /api/retrieval/config/*': call => json(200, retrievalConfig(call.path.split('/').pop())),
   'GET /api/packages': json(200, { packages: [] }),
   'GET /api/tune/*': call => json(200, { collection: call.path.split('/').pop(), fidelity: 'with-sources', source_document_count: 2, can_rechunk: true, can_reembed: true, can_reindex: true, note: '' }),
@@ -67,12 +70,61 @@ function collectionsCases() {
     { name: 'Collections table shows its columns, each collection and a dash for a null created date', open: open(), async run(s) {
       await waitText(s.page, A);
       const heads = await s.page.evaluate(() => [...document.querySelectorAll('thead th')].map(t => t.textContent.trim()));
-      assert.deepEqual(heads, ['Name', 'Objects', 'Index', 'Distance', 'Created', '']);
+      assert.deepEqual(heads, ['Name', 'Objects', 'Index', 'Distance', 'Created', 'Access', '']);
       const rows = await s.page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => [...r.querySelectorAll('td')].map(c => c.textContent.trim())));
       const date = await s.page.evaluate(v => new Date(v).toLocaleDateString(), COLS[0].created_at);
       assert.deepEqual(rows[0].slice(0, 5), [A, '12', 'hnsw', 'cosine', date]);
       assert.notEqual(date, DASH);
       assert.deepEqual(rows[1].slice(0, 5), [B, '0', 'flat', 'dot', DASH]);
+      await waitFor(s.page, () => [...document.querySelectorAll('tbody tr')].every(r => r.cells[5].textContent.trim() !== '\u2014'), 'the access column');
+      const access = await s.page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => r.cells[5].textContent.trim()));
+      assert.deepEqual(access, ['Open', 'Open']);
+    } },
+    { name: 'Access (#606): a restricted collection shows its grant count; the dialog restricts to the ticked accounts and PUTs them; a refused save stays open with the message', open: (() => {
+      let saves = 0;
+      return open({
+        ['GET /api/collections/' + A + '/access']: json(200, { restricted: true, users: ['vfy-developer'], service_principals: [] }),
+        'GET /api/auth/users': json(200, { users: [{ username: 'vfy-developer', role: 'developer', enabled: true, must_change_password: false, created_at: '2026-01-02T12:00:00Z' }, { username: 'vfy-off', role: 'end_user', enabled: false, must_change_password: false, created_at: '2026-01-02T12:00:00Z' }] }),
+        'GET /api/auth/service-principals': json(200, { principals: [{ name: 'vfy-svc', role: 'end_user', enabled: true, created_at: '2026-01-02T12:00:00Z', keys: [] }] }),
+        'PUT /api/collections/*': call => (++saves === 1 ? apiError(422, 'INVALID_PARAMETER', 'no person is named \'x\'') : json(200, call.body)),
+      });
+    })(), async run(s) {
+      await waitText(s.page, 'Restricted (1)');
+      const accessButtons = () => s.page.$$('tbody button');
+      await (await accessButtons())[2].click();   // row B: Access, Delete; row A first
+      await waitText(s.page, 'Access to ' + B);
+      await waitText(s.page, 'Open: everyone whose role allows it');
+      await waitFor(s.page, () => [...document.querySelectorAll('.fixed button')].some(b => b.textContent.trim() === 'Save' && !b.disabled), 'Save to be enabled once the state is read');
+      await s.page.click('input[type=radio]:not(:checked)');
+      await waitText(s.page, 'vfy-off (disabled)');
+      await waitText(s.page, 'vfy-svc');
+      const boxes = await s.page.$$('input[type=checkbox]');
+      await boxes[0].click();   // vfy-developer
+      await boxes[2].click();   // vfy-svc
+      await press(s.page, 'Save');
+      await waitText(s.page, "no person is named 'x'");
+      assert.equal(await modalOpen(s.page), true);
+      await press(s.page, 'Save');
+      await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+      const puts = callsTo(s, 'PUT', '/api/collections/' + B + '/access');
+      assert.equal(puts.length, 2);
+      assert.deepEqual(puts[1].body, { restricted: true, users: ['vfy-developer'], service_principals: ['vfy-svc'] });
+      await waitText(s.page, 'Restricted (2)');
+    } },
+    { name: 'Access (#606): when the dialog cannot read the state, the choice stays unknown and Save is disabled', open: open({
+      ['GET /api/collections/' + B + '/access']: apiError(500, 'INTERNAL_ERROR', 'Synthetic read failure.'),
+      'GET /api/auth/users': json(200, { users: [] }),
+      'GET /api/auth/service-principals': json(200, { principals: [] }),
+    }), async run(s) {
+      await waitText(s.page, A);
+      await (await s.page.$$('tbody button'))[2].click();
+      await waitText(s.page, 'Synthetic read failure.');
+      const state = await s.page.evaluate(() => ({
+        save: [...document.querySelectorAll('.fixed button')].find(b => b.textContent.trim() === 'Save').disabled,
+        checked: [...document.querySelectorAll('.fixed input[type=radio]')].filter(r => r.checked).length,
+      }));
+      assert.deepEqual(state, { save: true, checked: 0 });
+      assert.equal(callsTo(s, 'PUT', '/api/collections/' + B + '/access').length, 0);
     } },
     { name: 'New Collection modal starts with HNSW, Cosine and the three HNSW sliders at their defaults and bounds', open: open(), async run(s) {
       await waitText(s.page, A);

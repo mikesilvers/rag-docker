@@ -446,7 +446,9 @@ unhealthy and take the whole stack down over a tuning warning.
 GET /collections
 ```
 
-Returns all Weaviate collections with stats. `created_at` is tracked by the API service (written to `{UPLOAD_DIR}/collection_registry.json` on each `POST /collections` call) since Weaviate does not expose a native collection creation timestamp.
+Returns the Weaviate collections the caller may use, with stats: Engineers see all; anyone else sees the open collections and the restricted ones granted to them (per-collection access, §3.1.8, #606). `created_at` is tracked by the API service (written to `{UPLOAD_DIR}/collection_registry.json` on each `POST /collections` call) since Weaviate does not expose a native collection creation timestamp.
+
+A collection created with `POST /collections` starts restricted to the account that created it (the person, or a key's service principal); `DELETE /collections/{name}` also deletes its restriction and grants. `GET /collections/{name}/access` and `PUT /collections/{name}/access` read and set who may use it (§3.1.8).
 
 **Response 200:**
 ```json
@@ -956,7 +958,7 @@ shorten repeated headers or keys, or split the file` (§5.1.1).
 GET /ingest/config/{collection}
 ```
 
-Returns the saved default chunking configuration for a collection. If no configuration has been saved yet, returns the system defaults.
+Returns the saved default chunking configuration for a collection. If no configuration has been saved yet, returns the system defaults. A collection that doesn't exist, or one the caller may not use (§3.1.8, #606), is `404 COLLECTION_NOT_FOUND`; before #606 a missing collection got the defaults. `503 SERVICE_UNAVAILABLE` when Weaviate can't say whether it exists.
 
 **Response 200:**
 ```json
@@ -979,7 +981,7 @@ Returns the saved default chunking configuration for a collection. If no configu
 POST /ingest/config
 ```
 
-Saves (upserts) a default chunking configuration for a collection. Creates the config entry on first call; overwrites on subsequent calls. Used by the Chunking Config page. Does not re-process existing documents.
+Saves (upserts) a default chunking configuration for a collection. Creates the config entry on first call; overwrites on subsequent calls. Used by the Chunking Config page. Does not re-process existing documents. A collection that doesn't exist, or one the caller may not use, is `404 COLLECTION_NOT_FOUND` and nothing is saved (#606; before it, settings were saved for any name).
 
 **Request body:** same schema as the GET response above, including `collection` (which selects the target) but excluding `is_default` (server-computed).
 
@@ -1130,7 +1132,9 @@ GET /retrieval/config/{collection}
 
 Returns the saved retrieval configuration for a collection. If nothing has been
 saved, returns the system defaults rather than a 404, so a caller never has to
-special-case a new collection.
+special-case a new collection. A collection that doesn't exist, or one the caller
+may not use (§3.1.8, #606), is `404 COLLECTION_NOT_FOUND` (before #606 a missing
+collection got the defaults); `503 SERVICE_UNAVAILABLE` when Weaviate can't say.
 
 **Response 200:**
 ```json
@@ -1188,7 +1192,9 @@ carries the settings it was tuned with.
 
 Config is persisted to `{UPLOAD_DIR}/retrieval_configs/{collection}.json`, written
 atomically with the same unique-temporary-file and serialized-publication contract
-as ingest settings above. Deleting a collection deletes its retrieval config.
+as ingest settings above. Deleting a collection deletes its retrieval config. Saving
+for a collection that doesn't exist, or one the caller may not use, is
+`404 COLLECTION_NOT_FOUND` and saves nothing (#606).
 
 ---
 
@@ -1505,7 +1511,7 @@ one may. The role of a request is the one stored for its user at that moment, ne
 | any session, after a due password change (also one with a two-step set-up due) | `GET /auth/mfa`, `POST /auth/mfa/enroll`, `POST /auth/mfa/enroll/confirm`, `POST /auth/mfa/recovery-codes`, `POST /auth/mfa/disable` |
 | `end_user` | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
 | `developer` | `GET /health/details`; `POST /collections`; `POST /ingest/upload`, `GET /ingest/job/{job_id}`, `GET /ingest/jobs`, `GET /ingest/config/{collection}`, `POST /ingest/config`; `POST /retrieval/config`; `POST /goldstandard/generate`, `GET /goldstandard/session/{session_id}`, `GET /goldstandard/sessions`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST /goldstandard/save`, `GET /goldstandard/download/{filename}`; `POST /export`, `GET /export/job/{job_id}`, `GET /export/jobs`, `POST /import`, `GET /import/job/{job_id}`, `GET /import/jobs`, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}`; document preparation (§3.1.11): `POST /prepare/upload`, `GET /prepare/documents`, `GET /prepare/documents/{document_id}`, `GET /prepare/documents/{document_id}/raw`, `GET /prepare/documents/{document_id}/prepared`, `DELETE /prepare/documents/{document_id}`, `DELETE /prepare/documents/{document_id}/prepared`, `POST /prepare/jobs`, `GET /prepare/jobs`, `GET /prepare/job/{job_id}`, `POST /prepare/job/{job_id}/cancel`, `POST /prepare/import` |
-| `engineer` | `DELETE /collections/{name}`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json`; account administration: `GET /auth/users`, `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `POST /auth/users/{username}/role`, `POST /auth/users/{username}/disable`, `POST /auth/users/{username}/enable`, `POST /auth/users/{username}/reset-mfa`, `POST /auth/mfa/policy`; service principals and keys: `GET /auth/service-principals`, `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `POST /auth/service-principals/{name}/disable`, `POST /auth/service-principals/{name}/enable`, `POST /auth/service-principals/{name}/keys`, `POST /auth/service-principals/{name}/keys/{key_id}/revoke`; the audit log (§3.1.9): `GET /audit`, `GET /audit.csv` |
+| `engineer` | `DELETE /collections/{name}`; per-collection access (#606, browser sessions only): `GET /collections/{name}/access`, `PUT /collections/{name}/access`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json`; account administration: `GET /auth/users`, `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `POST /auth/users/{username}/role`, `POST /auth/users/{username}/disable`, `POST /auth/users/{username}/enable`, `POST /auth/users/{username}/reset-mfa`, `POST /auth/mfa/policy`; service principals and keys: `GET /auth/service-principals`, `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `POST /auth/service-principals/{name}/disable`, `POST /auth/service-principals/{name}/enable`, `POST /auth/service-principals/{name}/keys`, `POST /auth/service-principals/{name}/keys/{key_id}/revoke`; the audit log (§3.1.9): `GET /audit`, `GET /audit.csv` |
 
 The matrix is one table in `api/auth/policy.py`. A route without an entry is refused for everyone (`403
 FORBIDDEN`), and a registered check fails when a route lacks an entry or an entry names no route. Jobs and
@@ -1627,6 +1633,69 @@ enabled. The account routes stay for people: `GET /auth/users` lists no principa
 `/auth/users/{username}/...` path is `404 USER_NOT_FOUND`, and `POST /auth/users` with a principal's name is
 `409 USER_EXISTS`.
 
+**Per-collection access** (#606). A collection is *open* or *restricted*. A restricted collection may be used
+only by Engineers and the accounts granted it: people and service principals (a key acts as its principal, so all
+of a principal's keys share its grants). Grants are per account; there are no groups. A granted account does on the
+collection everything its role allows; an ungranted one can do nothing with it. Engineers reach every collection.
+The state is in `auth.db` (schema version 4, tables `restricted_collections` and `collection_grants`, keyed by the
+stored collection name): a store from before #606 gains the empty tables on first open, so every existing
+collection stays open. A staging or recovery collection of a rebuild or import (`<target>__tuning_<token>`,
+`<target>__importing_<token>`) gets its target's access when its ownership is recorded, before it is created, under
+its own name, and keeps it whatever later happens to the target (a delete, a re-create, new grants); discarding or
+deleting the copy drops it. The rule is read on every request, so a change applies to
+each session's and key's next request; no session ends and a running job finishes. Grants stay when an account is
+disabled or its role changes; an Engineer demoted to a lower role is then bound by them.
+
+- **New collections.** `POST /collections` restricts the new collection to the creating account, Engineers
+  included. The restriction is written before the collection is created: if that write fails nothing is created
+  (`500 CREATE_FAILED`); if the create fails, the state it replaced is put back, but only while the state is still
+  the one it wrote, so a create and an import of the same new name at once never leave it open or give one the
+  other's grants. An import does the same with the state it writes. An import that creates a collection under a new name (`rename`) copies its source collection's state
+  (open stays open; restricted copies the grants); one that creates its package's own name, which doesn't exist
+  here, restricts it to the job's owner. An import `replace` and tuning keep the target's state.
+  `DELETE /collections/{name}` deletes the state, so a later collection of the same name starts afresh.
+- **Refusal.** A caller without access gets the answer given for something that doesn't exist, so the name isn't
+  confirmed: `404 COLLECTION_NOT_FOUND` on `POST /query`, `GET`/`POST /retrieval/config`, `GET`/`POST
+  /ingest/config`, `POST /ingest/upload`, `POST /prepare/import`, `POST /goldstandard/generate`, `POST /export` and
+  `GET /tune/{collection}`; `404 SESSION_NOT_FOUND` on the gold-standard session routes (`GET
+  /goldstandard/session/{session_id}`, `PATCH .../pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST
+  /goldstandard/save`) for a session of such a collection; `404 JOB_NOT_FOUND` on `GET /ingest/job/{job_id}`, `GET
+  /export/job/{job_id}` and `GET /import/job/{job_id}` for a job naming one (an import job names its collection
+  once its package is read). The check runs before Weaviate is asked. `GET /collections` lists only usable
+  collections. Accepted: a Developer can still learn that a name exists where names must be unique, since
+  `POST /collections` with it answers `409 COLLECTION_EXISTS` and an import with `on_conflict: abort` fails on it;
+  the content stays closed.
+- **Gold-standard files.** `POST /goldstandard/save` records which collection each file came from in
+  `{UPLOAD_DIR}/goldstandard_export_collections.json`, outside the served folder, before it writes the file. `GET
+  /goldstandard/download/{filename}` checks it (`404 FILE_NOT_FOUND` without access); a file with no recorded
+  collection (saved before #606, or placed by hand) is served to Engineers only.
+- **Packages.** A package's collection is the name in its manifest; for a staging or recovery copy that no longer
+  exists here, its target. `GET /packages` hides an unencrypted package whose collection exists here and is
+  restricted, from a caller without access to it (Weaviate not answering counts as existing). An import job refuses a package of such
+  a collection, for encrypted packages too once decrypted, before anything is created or replaced: the job fails
+  with the answer a missing package gives (`PACKAGE_UNREADABLE`, "No package named '<file>' in the exports
+  directory.") and names no collection.
+- **The Prepare area** (§3.1.11). A prepared document whose imports are all into collections the caller may not
+  use is hidden from them: left out of `GET /prepare/documents`, `404 DOCUMENT_NOT_FOUND` on its detail, raw and
+  prepared downloads and deletes, and an unknown id to `POST /prepare/jobs` and `POST /prepare/import` (`all: true`
+  doesn't select it). A document with at least one import into a collection the caller may use stays visible
+  everywhere, with its import records for the other collections left out. Preparation job records (`GET
+  /prepare/job/{job_id}`, `GET /prepare/jobs`) leave hidden documents out of `document_ids`, `names`, `current`
+  and `errors`; their counters stay. Engineers see every document and record; a document with no imports is
+  shared as before.
+- **Audit** (§3.1.9). A refusal on an audited route is that route's record, result `refused`, with
+  `details.reason: "collection_access"`; on another route, a `collection.access.refused` record (status 404,
+  `details.route`, `details.code`). A refused import's end record has result `refused` and the reason. A filtered
+  listing writes nothing. The MCP server (parked) needs no change: it reaches data only through these routes.
+
+| Route | Request | Success |
+|---|---|---|
+| `GET /collections/{name}/access` | | `200 {"restricted", "users", "service_principals"}`, names sorted. No such collection: `404 COLLECTION_NOT_FOUND`; Weaviate unavailable: `503 SERVICE_UNAVAILABLE` |
+| `PUT /collections/{name}/access` | `{"restricted", "users": [...], "service_principals": [...]}` (lists default `[]`, no other field) | The whole state at once, in one transaction; answers as the GET. `restricted: false` opens it and deletes its grants (names with it are `422 INVALID_PARAMETER`); `restricted: true` grants exactly the people in `users` and the principals in `service_principals` (lowercased; disabled accounts allowed; none means Engineers only). An unknown name, or one of the other kind, is `422 INVALID_PARAMETER` and changes nothing. One `collection.access` audit record with `restricted_before`, `restricted_after`, `added` and `removed`, and one API log line |
+
+Both are Engineers' routes for a browser session only: a key gets `403 KEY_NOT_ALLOWED`, so a leaked key can't open a
+collection to another principal. The Collections page (§7.8) manages them.
+
 **Two-step verification** (#607). TOTP with an authenticator app; no SMS and no external service, so it works
 offline. Service keys are unchanged: they have no second factor and get `403 KEY_NOT_ALLOWED` on every `/auth/mfa`
 route and on `reset-mfa`.
@@ -1735,7 +1804,9 @@ built yet; it is to include this folder.
 | `details` | The action's other parameters (below); `code`: the error envelope's code on a non-2xx answer |
 
 **Actions.** `auth.login` (success, failure, throttled), `auth.logout`, `auth.password`; `query`;
-`collection.create`, `collection.delete`; `ingest`, `ingest.config`; `retrieval.config`; `export`, `import`;
+`collection.create`, `collection.delete`; per-collection access (#606): `collection.access` (`restricted_before`,
+`restricted_after`, `added`, `removed`), `collection.access.refused` (a refused collection on a route with no action
+of its own); `ingest`, `ingest.config`; `retrieval.config`; `export`, `import`;
 `tune.rechunk`, `tune.reembed`, `tune.reindex`; `goldstandard.save`, `goldstandard.download`; `admin.user.create`,
 `admin.user.reset-password`, `admin.user.set-role`, `admin.user.disable`, `admin.user.enable`,
 `admin.user.reset-mfa`, `admin.mfa.policy` (`details.required`); two-step verification (#607): `auth.mfa` (each
@@ -1870,7 +1941,10 @@ removes headers, footers, page numbers and boilerplate, and writes a title and s
 MD parts. CSV and JSON parts are labelled from their data, with no LLM call (#648). One area for the
 instance, in the `rag_preparation` volume (`PREPARATION_DIR`, `/app/preparation`); documents stay until
 deleted. Every route is `developer` (§3.1.8); documents are shared, each showing its owner, and any caller
-with access may delete any document.
+with access may delete any document, except that a document whose imports are all into collections the caller may
+not use is hidden from them and refused as an unknown document (`404 DOCUMENT_NOT_FOUND`), audited; a document with
+at least one import into a collection they may use stays visible without the other import records; job records
+leave hidden documents out; Engineers see everything (per-collection access, §3.1.8, #606).
 
 **Storage limit.** `MAX_PREPARATION_BYTES` (default 21474836480, 20 GiB; at least 1048576 or the API
 refuses to start): the most the area's files may hold, raw and prepared together. A best-effort cap
@@ -3165,6 +3239,7 @@ A retained session can be loaded/refreshed by its session ID, including when its
 - "New Collection" button → modal with fields: name, index type, distance metric, HNSW params.
 - A refused create (for example `409 COLLECTION_EXISTS`, a 422 or a 503) keeps the modal open and shows the API's message inside it, as an alert. The message clears on Cancel, when the modal is opened again, or when a create succeeds (#379).
 - Delete button per row → confirmation modal with collection name typed to confirm. Calls `DELETE /collections/{name}?confirm=true`.
+- Access (#606): the dialog reads the state when it opens; until that read succeeds the choice is unknown and Save is disabled, and a read answering after the Engineer changed something doesn't overwrite the change. An "Access" column shows "Open", "Restricted (n)" (n grants) or "—" when `GET /collections/{name}/access` failed for that row. An "Access" button per row opens a dialog: Open or Restricted, and when restricted the people (`GET /auth/users`) and service principals (`GET /auth/service-principals`) as checkboxes, disabled ones marked. Save calls `PUT /collections/{name}/access`; a refused save keeps the dialog open with the API's message as an alert.
 - A refused delete keeps the modal open and shows the API's message inside it, as an alert: for `409 COLLECTION_BUSY`, for example, "An ingest job is running for this collection (…)". The collection stays listed; the message clears on Cancel, when the modal is opened again, or when a delete succeeds.
 
 ### 7.9 Health Dashboard Page
@@ -4369,6 +4444,22 @@ Two-step verification (#607). These are ticked once the tests reviewer's full `s
   Users page's Two-step column, "Reset two-step" and the switch.
   *Evidence: `scripts/verify/browser/ui_controls.js` "Two-step verification" cases (suite 06), with every API call
   answered by request interception.*
+
+- [x] Per-collection access (#606): a restricted collection is hidden from `GET /collections` and refused, as if
+  missing, on every route that names it (query, settings, ingest, prepare import, gold standard, export, tune
+  options, job and session lookups, gold-standard downloads) to accounts and keys not granted it, and usable by
+  granted ones and Engineers; a new collection is restricted to its creator; a delete drops the state; existing
+  collections stay open after the upgrade; the settings routes answer `404` for a missing collection; packages of
+  restricted collections are hidden and their import fails as a missing package (encrypted ones once decrypted, and
+  a package of a discarded staging copy as its target's); an imported copy takes its source's access; a staging or
+  recovery copy keeps the access it was made with when its target is deleted or re-created; creation is fail-closed
+  and a failed create or import puts back only its own state; documents in the Prepare area imported only into
+  collections the caller can't use are hidden and refused, a document with a usable import stays visible without
+  the other import records, and job records leave hidden documents out; only Engineers' sessions read or change access; every
+  change and refusal is audited.
+  *Evidence: `scripts/tests/test_collection_access.py` (suite 17), which fails on the code before #606;
+  `auth_stack.py collection-access` and the matrix rows (suite 17); the Collections page's Access case in
+  `scripts/verify/browser/ui_controls.js` (suite 06).*
 
 ### 10.7 Audit log (#29)
 

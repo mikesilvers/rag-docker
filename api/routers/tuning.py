@@ -8,7 +8,9 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
+
+from auth import access
 
 from models.schemas import (
     CollectionName,
@@ -107,8 +109,11 @@ def _options_unavailable(collection: str):
 
 
 @router.get("/{collection}", response_model=TuneOptionsResponse)
-async def tune_options(collection: CollectionName):
+async def tune_options(collection: CollectionName, request: Request = None):
     """What this collection can be tuned with, given its fidelity."""
+    # A collection the caller may not use answers as one that doesn't exist (#606).
+    if not await access.check(request, collection):
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
     try:
         exists = await wc.collection_exists(collection)
     except Exception:                                 # noqa: BLE001
