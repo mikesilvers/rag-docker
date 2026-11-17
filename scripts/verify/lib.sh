@@ -162,6 +162,12 @@ make_collection() {
 
 drop_collection() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -X DELETE "$API/collections/$1?confirm=true"; }
 
+# open_collection <name>: a new collection is restricted to the account that
+# created it, here the harness Engineer (#606); this opens it to every account
+# its role allows, for a suite that then uses it as another role.
+open_collection() { _rag_require_lock_owner; curl -s -o /dev/null -m 120 -X PUT "$API/collections/$1/access" \
+  -H 'Content-Type: application/json' -d '{"restricted":false}'; }
+
 # Remove every collection and package this run created.
 cleanup_prefixed() {
   local names

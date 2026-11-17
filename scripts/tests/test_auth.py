@@ -2493,7 +2493,8 @@ class ImplementationCopyTests(unittest.TestCase):
                      "api/routers/auth.py", "api/main.py", "ui/src/pages/UsersPage.tsx",
                      "api/auth/keys.py", "ui/src/pages/ServiceKeysPage.tsx", "api/config.py", "proxy/nginx.conf",
                      "scripts/verify/17_auth.sh", "scripts/verify/auth_setup.py", "scripts/verify/auth_stack.py",
-                     "scripts/verify/auth_headers.py", "api/auth/mfa.py", "ui/src/pages/AccountPage.tsx"):
+                     "scripts/verify/auth_headers.py", "api/auth/mfa.py", "ui/src/pages/AccountPage.tsx",
+                     "api/auth/access.py", "scripts/tests/test_collection_access.py"):
             with self.subTest(name=name):
                 header = "### " + name + "\n\n```"
                 start = document.index("\n", document.index(header) + len(header)) + 1

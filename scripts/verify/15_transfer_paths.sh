@@ -50,6 +50,9 @@ run_import() {   # run_import <file> <on_conflict>; leaves the job in /tmp/vfy_p
 }
 
 drop_collection "$C"; make_collection "$C"
+# The End User's retrieve.py queries it and its import below (#606); the import
+# under a new name copies its access.
+open_collection "$C"
 curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
   -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_p_ing.json
 check_eq "the suite's collection is ingested" \
