@@ -121,7 +121,7 @@ Endpoint by endpoint (paths under `/api`):
 | nothing | `GET /health`, `GET /auth/status`, `POST /auth/login`, `POST /auth/login/mfa` |
 | any logged-in user | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password`; their own two-step verification (`GET /auth/mfa`, `POST /auth/mfa/enroll`, `/enroll/confirm`, `/recovery-codes`, `/disable`) |
 | End User | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
-| Developer | creating a collection; ingest (upload, job status, settings); document preparation (`POST /prepare/upload`; `GET /prepare/documents`; `GET` and `DELETE /prepare/documents/{document_id}`; `GET /prepare/documents/{document_id}/raw`; `GET` and `DELETE /prepare/documents/{document_id}/prepared`; `POST` and `GET /prepare/jobs`; `GET /prepare/job/{job_id}`; `POST /prepare/job/{job_id}/cancel`; `POST /prepare/import`); saving retrieval settings; gold standard (generate, sessions, pairs, regenerate, save, download); export, import, their job status, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}`; the full health report, `GET /health/details` |
+| Developer | creating a collection; ingest (upload, job status, settings); document preparation (`POST /prepare/upload`; `GET /prepare/documents`; `GET` and `DELETE /prepare/documents/{document_id}`; `GET /prepare/documents/{document_id}/raw`; `GET` and `DELETE /prepare/documents/{document_id}/prepared`; `POST` and `GET /prepare/jobs`; `GET /prepare/job/{job_id}`; `POST /prepare/job/{job_id}/cancel`; `POST /prepare/import`); saving retrieval settings; gold standard (generate, sessions, pairs, regenerate, save, download); export, import, their job status, `GET /packages`, downloading a package (`GET /packages/{filename}`), `GET /help/transfer`; `GET /tune/{collection}`; the full health report, `GET /health/details` |
 | AI Engineer | `DELETE /collections/{name}`; `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/job/{id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; the API docs (`/docs`, `/redoc`, `/openapi.json`); account management (`GET` and `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `/role`, `/disable`, `/enable`, `/reset-mfa`; `POST /auth/mfa/policy`); service keys (`GET` and `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `/disable`, `/enable`, `/keys`, `/keys/{key_id}/revoke`); the audit log (`GET /audit`, `GET /audit.csv`), in a browser session only; who may use a collection (`GET` and `PUT /collections/{name}/access`), in a browser session only |
 
 Without a session the API answers `401 AUTH_REQUIRED`; with a role that is too
@@ -295,7 +295,10 @@ then one more with their count), logouts and
 password changes; queries; creating and deleting collections; saving ingest
 and retrieval settings; ingest, export, import and tuning jobs, once when
 started and once when they end (succeeded, failed or interrupted by a
-restart); saving and downloading gold-standard files; every change and
+restart); saving and downloading gold-standard files; downloading an export
+package (`package.download`, saying whether the download completed) and each
+deletion of one, after its download or when it expired (`package.delete`,
+with the reason; an expiry's actor is `system`); every change and
 refusal on the Users and Service keys pages; every `python -m auth` action
 but `list` (actor `operator`); reads of the audit log; and each API start.
 Each record names the actor (a username, a service principal with the key id,
@@ -981,6 +984,7 @@ All API settings are environment variables in `docker-compose.yml`:
 | `AUTH_COOKIE_SECURE` | `false` | Marks the session cookie `Secure`. Exactly `true` or `false`; anything else stops the API. Leave it `false` for the loopback HTTP profile, where a Secure cookie would never be sent back. `docker-compose.lan.yml` sets it `true` for LAN mode's TLS (#26) |
 | `RAG_LAN_MODE` | `false` | LAN mode (#26), set `true` only by `docker-compose.lan.yml`. Exactly `true` or `false`; anything else stops the API. When `true` the API refuses to start unless `AUTH_COOKIE_SECURE` is `true` and an enabled AI Engineer exists. See [Sharing with your office](#sharing-with-your-office) |
 | `AUTH_DIR` | `/app/auth_data` | Container path of the accounts store, the `auth_data` volume |
+| `EXPORT_RETENTION_HOURS` | `24` | How long a package this instance exported stays in `./exports/` when nobody downloads it, counted from the export's finish; whole hours, 1-720, anything else stops the API. A full download deletes it at once. Packages copied in to be imported are never expired. See [Downloading a package](#downloading-a-package-and-when-packages-are-deleted) |
 | `AUDIT_LOG_QUESTIONS` | `false` | Whether the [audit log](#audit-log) records a query's question text. Exactly `true` or `false`; anything else stops the API |
 | `AUDIT_LOG_MAX_BYTES` | `10485760` (10 MiB) | The size at which `audit.jsonl` is rotated; at least 4096 |
 | `AUDIT_LOG_KEEP` | `10` | How many rotated audit files are kept (1-1000); the oldest beyond them is deleted |
@@ -1113,6 +1117,48 @@ Three things worth knowing before you move one:
 are never included when you package the project with `package.sh` or
 `package-offline.sh` — the directory ships, the corpus does not.
 
+### Downloading a package, and when packages are deleted
+
+A package left in `./exports/` is a whole collection at rest, so a package this
+instance exported doesn't stay there (#677):
+
+```bash
+# download it (Developer or AI Engineer); -OJ keeps the package's own name
+curl -b ~/.rag-session -OJ http://localhost:8080/api/packages/<filename>
+```
+
+On the Transfer page, **Download** is next to a finished export and next to the
+package list.
+
+- **A full download deletes it.** Once the last byte has gone out to your
+  connection, the package is deleted from `./exports/`. An interrupted download
+  keeps it, so you can try again; there is no resuming part-way.
+- **Otherwise it expires.** A package nobody downloads is deleted
+  `EXPORT_RETENTION_HOURS` after its export finished (`docker-compose.yml`, 1 to
+  720 hours, default 24; expiry can't be turned off). The sweep runs when the API
+  starts and then every 15 minutes. `GET /packages` and the export's job status
+  give the time as `expires_at` (UTC); the Transfer page shows it in your local
+  time.
+- **Copying it straight from the host folder** (for example to load it into a
+  query-only instance on another machine) is fine, but the server can't see that
+  copy: the package is still deleted after `EXPORT_RETENTION_HOURS`, so copy it
+  before then.
+- **Busy packages wait.** While a package is being imported or downloaded,
+  another download of it answers `409 PACKAGE_BUSY`, and the sweep leaves it
+  until its next run.
+- **Only packages exported here.** When an export finishes, its package's name
+  and finish time are recorded in the `ingest_uploads` volume. A package you
+  copy into `./exports/` to import is never recorded: it can be downloaded, but
+  neither a download nor the sweep deletes it. Packages already in `./exports/`
+  before this version aren't recorded either; delete them by hand once you no
+  longer need them.
+- Each download is audited as `package.download` and each deletion as
+  `package.delete`, with the reason (`downloaded` or `expired`).
+- The download follows the listing's access rule: a package of a restricted
+  collection you can't use answers `404 PACKAGE_NOT_FOUND`, as a missing one
+  does. Encrypted packages name no collection, so any Developer can download
+  one, and so delete it if it was exported here; its content stays encrypted.
+
 ### Encrypting a package
 
 Add a `passphrase` (12 to 1024 characters) to the export, or tick **Encrypt with a
@@ -1139,7 +1185,9 @@ passphrase is never stored, logged or returned, and it can't be recovered: send 
 by a different channel than the file. Once a package is decrypted or imported, its
 contents are plaintext again on that machine.
 
-To import one, drop the package into `./exports/` on the target machine and:
+To import one, drop the package into `./exports/` on the target machine (a
+package copied in like this is never expired, and a download doesn't delete it)
+and:
 
 ```bash
 curl -b ~/.rag-session -H 'Origin: http://localhost:8080' -X POST http://localhost:8080/api/import \
