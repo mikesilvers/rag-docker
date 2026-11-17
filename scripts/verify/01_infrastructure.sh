@@ -68,6 +68,9 @@ check "/health/details answers 503 with the per-service body when a dependency i
 # The collection registry is written atomically and kept when it can't be read (#388).
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_collection_registry.py)
 check "the collection registry is written atomically and kept when unreadable (#388)" $?
+# The Authlib installed in the built API image is the one api/requirements.txt pins (#565).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_installed_authlib.py)
+check "the Authlib installed in the API image is the version api/requirements.txt pins (#565)" $?
 
 RAG_INFRA_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rag-infra.XXXXXX") || exit 2
 export RAG_INFRA_TMP
