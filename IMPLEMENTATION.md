@@ -166,7 +166,7 @@ services:
       # when it is imported and on every partition call, so ingest never
       # dials out (issue #695). Also set as ENV in api/Dockerfile.
       DO_NOT_TRACK: "1"
-      # Shown by /health and compared against the memory Docker actually
+      # Shown by /health/details and compared against the memory Docker actually
       # provides. Raise this if you allocate more to Docker Desktop.
       RECOMMENDED_MEMORY_GB: 12
       # The most one upload's ZIPs may expand to in all, gzipped members'
@@ -1198,7 +1198,7 @@ class Settings(BaseSettings):
     # Ollama's model store, mounted from the same volume the ollama service
     # uses. Only touched when a package bundles models.
     ollama_models_dir: str = "/ollama"
-    # Reported by /health and compared against the memory Docker actually
+    # Reported by /health/details and compared against the memory Docker actually
     # provides. Raise it in docker-compose.yml; no rebuild required.
     recommended_memory_gb: float = 12.0
     # The most an upload's ZIPs may expand to, in bytes, summed over every ZIP
@@ -38931,13 +38931,13 @@ summary
 ```python
 """The memory recommendation suite 01 raises past the allocation (#536).
 
-Suite 01 checks that /health's memory report flips to below_recommended, with a
+Suite 01 checks that /health/details' memory report flips to below_recommended, with a
 note, once the recommendation exceeds what Docker is allocated. It raises the
-recommendation in-process, and the value must come from the allocation /health
-reports: a fixed 13 GB stayed 'ok' on any host giving Docker 12.35 GB or more.
+recommendation in-process, and the value must come from the allocation
+/health/details reports: a fixed 13 GB stayed 'ok' on any host giving Docker 12.35 GB or more.
 Standard library only.
 
-Run: python3 scripts/verify/memory_override.py <saved /health JSON>
+Run: python3 scripts/verify/memory_override.py <saved /health/details JSON>
 Prints the override in whole GB, or nothing (exit 1) without a usable allocation.
 """
 import json
@@ -38946,7 +38946,7 @@ import sys
 
 # api/services/system_info.py reports 'ok' while allocated >= recommended * 0.95.
 TOLERANCE = 0.95
-# /health rounds allocated_gb to 2 decimals, so the real figure can be this much higher.
+# /health/details rounds allocated_gb to 2 decimals, so the real figure can be this much higher.
 ROUNDING = 0.005
 
 
@@ -38964,7 +38964,7 @@ def main(argv):
         with open(argv[1]) as fh:
             allocated = json.load(fh)['resources']['memory']['allocated_gb']
     except (IndexError, OSError, ValueError, KeyError, TypeError) as exc:
-        print('memory_override: no allocation in the /health report: {!r}'.format(exc), file=sys.stderr)
+        print('memory_override: no allocation in the /health/details report: {!r}'.format(exc), file=sys.stderr)
         return 1
     override = override_gb(allocated)
     if override is None:
