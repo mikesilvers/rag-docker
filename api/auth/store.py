@@ -20,6 +20,12 @@ accepted step (`mfa`), a set-up not yet confirmed (`mfa_pending`), recovery
 codes as SHA-256 (`recovery_codes`), login challenges between the password and
 the code (`mfa_challenges`, token as SHA-256) and the "require for everyone"
 switch (`settings`). The codes and the sealing are in mfa.py.
+
+Per-collection access (#606, schema 4): a collection named in
+`restricted_collections` is restricted, and only the accounts in its
+`collection_grants` (people or service principals) and Engineers may use it;
+any other collection is open to every account its role allows. Names are the
+canonical (stored) collection names. The rule itself is in access.py.
 """
 from __future__ import annotations
 
@@ -49,7 +55,7 @@ KEY_DAYS_DEFAULT = 90            # a key's lifetime when none is given (Q23) ...
 KEY_DAYS_MAX = 365               # ... and the longest allowed
 _DAY_S = 86400
 NO_PASSWORD = "!"                # a principal's password hash: never verifies
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MFA_PENDING_S = 10 * 60          # a started set-up must be confirmed within 10 minutes
 MFA_CHALLENGE_S = 5 * 60         # the code must follow the password within 5 minutes ...
 MFA_CHALLENGE_TRIES = 5          # ... with at most 5 codes per challenge
@@ -125,6 +131,16 @@ CREATE TABLE IF NOT EXISTS settings (
     name TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS restricted_collections (
+    collection TEXT PRIMARY KEY,
+    restricted_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS collection_grants (
+    collection TEXT NOT NULL,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    granted_at REAL NOT NULL,
+    PRIMARY KEY (collection, user_id)
+);
 """
 
 _ready: set[str] = set()
@@ -137,7 +153,8 @@ class Refused(Exception):
     LAST_ENGINEER, PRINCIPAL_EXISTS, PRINCIPAL_NOT_FOUND, KEY_NOT_FOUND,
     NOT_A_USER, REFUSED for the bootstrap rules, or one of the MFA codes
     (MFA_ALREADY_ENROLLED, MFA_ENROLLMENT_NOT_STARTED, MFA_CODE_INCORRECT,
-    MFA_NOT_ENROLLED, MFA_REQUIRED, MFA_ENROLL_FIRST)."""
+    MFA_NOT_ENROLLED, MFA_REQUIRED, MFA_ENROLL_FIRST), or UNKNOWN_ACCOUNT for a
+    collection grant naming no such account (#606)."""
 
     def __init__(self, message: str, code: str = "REFUSED"):
         super().__init__(message)
@@ -238,8 +255,9 @@ def _connect(write: bool = False):
 
 
 def _migrate(conn) -> None:
-    """Version 2 (PR 3): users.kind. Version 3 (#607) only adds tables, which
-    _SCHEMA creates. In a write transaction, so the API and the operator
+    """Version 2 (PR 3): users.kind. Versions 3 (#607) and 4 (#606) only add
+    tables, which _SCHEMA creates; version 4 leaves every existing collection
+    open, since none is named in restricted_collections. In a write transaction, so the API and the operator
     command can't both add the column."""
     conn.execute("BEGIN IMMEDIATE")
     columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
@@ -808,3 +826,147 @@ def reset_mfa(username: str, kind: str | None = None) -> None:
             raise Refused(f"{username!r} is a service principal; it has no two-step verification", "NOT_A_USER")
         _forget_mfa(conn, row["id"])
         conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+
+
+# ── per-collection access (#606) ─────────────────────────────────────────────
+
+def _canonical(collection: str) -> str:
+    # collection_writes.canonical, inlined so auth imports nothing from services.
+    return collection[:1].upper() + collection[1:]
+
+
+@dataclass(frozen=True)
+class CollectionAccess:
+    restricted: bool
+    users: tuple[str, ...] = ()
+    service_principals: tuple[str, ...] = ()
+
+
+def _access(conn, collection: str) -> CollectionAccess:
+    if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (collection,)).fetchone() is None:
+        return CollectionAccess(False)
+    rows = conn.execute("SELECT u.username, u.kind FROM collection_grants g JOIN users u ON u.id = g.user_id "
+                        "WHERE g.collection = ? ORDER BY u.username", (collection,)).fetchall()
+    return CollectionAccess(True, tuple(r["username"] for r in rows if r["kind"] == "user"),
+                            tuple(r["username"] for r in rows if r["kind"] == "service"))
+
+
+def collection_access(collection: str) -> CollectionAccess:
+    """Whether the collection is restricted, and who is granted it (names sorted)."""
+    with _connect() as conn:
+        return _access(conn, _canonical(collection))
+
+
+def restricted_collections() -> dict[str, frozenset[int]]:
+    """Every restricted collection and the ids of the accounts granted it."""
+    with _connect() as conn:
+        found = {row["collection"]: set() for row in conn.execute("SELECT collection FROM restricted_collections")}
+        for row in conn.execute("SELECT collection, user_id FROM collection_grants"):
+            if row["collection"] in found:
+                found[row["collection"]].add(row["user_id"])
+    return {name: frozenset(ids) for name, ids in found.items()}
+
+
+def has_access(user_id: int, role: str, collection: str) -> bool:
+    """An Engineer reaches every collection; anyone else an open one, or a
+    restricted one they are granted. Read on every call, so a change applies to
+    the next request."""
+    if role == "engineer":
+        return True
+    collection = _canonical(collection)
+    with _connect() as conn:
+        if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (collection,)).fetchone() is None:
+            return True
+        return conn.execute("SELECT 1 FROM collection_grants WHERE collection = ? AND user_id = ?",
+                            (collection, user_id)).fetchone() is not None
+
+
+def _owner_row(conn, owner):
+    """The account a job record's owner ({"name", "kind"}) names, or None."""
+    if not isinstance(owner, dict):
+        return None
+    kind = "service" if owner.get("kind") == "service" else "user"
+    return conn.execute("SELECT * FROM users WHERE username = ? AND kind = ?", (owner.get("name"), kind)).fetchone()
+
+
+def owner_has_access(owner, collection: str) -> bool:
+    """has_access for a job's owner as the account is now. A job with no owner
+    (a direct call in tests) isn't checked; an owner that names no account has
+    no access."""
+    if owner is None:
+        return True
+    with _connect() as conn:
+        row = _owner_row(conn, owner)
+    return row is not None and has_access(row["id"], row["role"], collection)
+
+
+def user_id_for(owner) -> int | None:
+    """The id of the account a job's owner names, or None."""
+    with _connect() as conn:
+        row = _owner_row(conn, owner)
+    return row["id"] if row is not None else None
+
+
+def _grant_ids(conn, names, kind: str) -> list[int]:
+    ids = []
+    for name in names:
+        row = conn.execute("SELECT id FROM users WHERE username = ? AND kind = ?",
+                           (str(name).strip().lower(), kind)).fetchone()
+        if row is None:
+            what = "person" if kind == "user" else "service principal"
+            raise Refused(f"no {what} is named {name!r}", "UNKNOWN_ACCOUNT")
+        ids.append(row["id"])
+    return ids
+
+
+def _restrict(conn, collection: str, user_ids) -> None:
+    now = _now()
+    conn.execute("INSERT OR IGNORE INTO restricted_collections (collection, restricted_at) VALUES (?, ?)",
+                 (collection, now))
+    conn.execute("DELETE FROM collection_grants WHERE collection = ?", (collection,))
+    conn.executemany("INSERT INTO collection_grants (collection, user_id, granted_at) VALUES (?, ?, ?)",
+                     [(collection, user_id, now) for user_id in dict.fromkeys(user_ids)])
+
+
+def _open(conn, collection: str) -> None:
+    conn.execute("DELETE FROM collection_grants WHERE collection = ?", (collection,))
+    conn.execute("DELETE FROM restricted_collections WHERE collection = ?", (collection,))
+
+
+def set_collection_access(collection: str, restricted: bool, users=(), service_principals=()):
+    """An Engineer's change (PUT /collections/{name}/access): the whole state
+    at once. Returns (before, after). An unknown name refuses the whole change
+    (UNKNOWN_ACCOUNT); disabled accounts may be granted."""
+    collection = _canonical(collection)
+    with _connect(write=True) as conn:
+        before = _access(conn, collection)
+        if restricted:
+            ids = _grant_ids(conn, users, "user") + _grant_ids(conn, service_principals, "service")
+            _restrict(conn, collection, ids)
+        else:
+            _open(conn, collection)
+        return before, _access(conn, collection)
+
+
+def restrict_to(collection: str, user_id: int | None) -> None:
+    """A new collection: restricted, granted only to its creator (none when None)."""
+    with _connect(write=True) as conn:
+        _restrict(conn, _canonical(collection), [] if user_id is None else [user_id])
+
+
+def copy_collection_access(source: str, target: str) -> None:
+    """The target takes the source's state: open stays open, restricted copies its grants."""
+    source, target = _canonical(source), _canonical(target)
+    with _connect(write=True) as conn:
+        if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (source,)).fetchone() is None:
+            _open(conn, target)
+            return
+        ids = [row["user_id"] for row in
+               conn.execute("SELECT user_id FROM collection_grants WHERE collection = ?", (source,))]
+        _restrict(conn, target, ids)
+
+
+def drop_collection_access(collection: str) -> None:
+    """A deleted collection's restriction and grants, so a later one of the same name starts afresh."""
+    with _connect(write=True) as conn:
+        _open(conn, _canonical(collection))

@@ -5,6 +5,7 @@
   their API keys, sessions and the login throttle.
 - `keys`: the service API key format (`Authorization: Bearer rag_<id>_<secret>`).
 - `policy`: which role each route needs.
+- `access`: per-collection access (#606): who may use a restricted collection.
 - `middleware`: enforces the policy on every request, before the route sees its body.
 - `__main__`: the operator command, `python -m auth`, which creates the first
   Engineer and recovers lockouts; Engineers manage accounts in the app too

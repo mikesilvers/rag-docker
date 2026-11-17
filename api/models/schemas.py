@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Any, Optional, Annotated, Literal
-from pydantic import AfterValidator, BaseModel, Field, BeforeValidator, ValidationError, field_validator, model_validator, SecretStr, StrictInt
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, BeforeValidator, ValidationError, field_validator, model_validator, SecretStr, StrictInt
 
 from services.collection_writes import canonical
 
@@ -83,6 +83,28 @@ class CollectionInfo(BaseModel):
 
 class CollectionsResponse(BaseModel):
     collections: list[CollectionInfo]
+
+
+class CollectionAccessRequest(BaseModel):
+    """PUT /collections/{name}/access (#606): the whole state at once. Open
+    takes no names; restricted grants exactly the people and service
+    principals named (none: Engineers only)."""
+    model_config = ConfigDict(extra="forbid")
+    restricted: bool
+    users: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
+    service_principals: list[Annotated[str, Field(max_length=64)]] = Field(default_factory=list, max_length=1000)
+
+    @model_validator(mode="after")
+    def _names_only_when_restricted(self):
+        if not self.restricted and (self.users or self.service_principals):
+            raise ValueError("an open collection takes no users or service principals")
+        return self
+
+
+class CollectionAccessResponse(BaseModel):
+    restricted: bool
+    users: list[str]
+    service_principals: list[str]
 
 
 # ── Ingest ────────────────────────────────────────────────────────────────────

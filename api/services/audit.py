@@ -80,6 +80,7 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("POST", "/query"): "query",
     ("POST", "/collections"): "collection.create",
     ("DELETE", "/collections/{name}"): "collection.delete",
+    ("PUT", "/collections/{name}/access"): "collection.access",       # #606
     ("POST", "/ingest/upload"): "ingest",
     ("POST", "/ingest/config"): "ingest.config",
     ("POST", "/retrieval/config"): "retrieval.config",
@@ -114,10 +115,13 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("GET", "/audit"): "audit.view",
     ("GET", "/audit.csv"): "audit.download",
 }
+# A refused use of a restricted collection on a route that has no action of its
+# own (#606); on an audited route the refusal is that route's record.
+ACCESS_REFUSED = "collection.access.refused"
 OPERATOR_ACTIONS = ("bootstrap", "create-user", "reset-password", "set-role", "disable", "enable", "reset-mfa")
 # Every action name, for the API's filter and the UI's list.
 ALL_ACTIONS = tuple(sorted(set(ACTIONS.values()) | {"operator." + a for a in OPERATOR_ACTIONS}
-                          | {"system.start"}))
+                          | {"system.start", ACCESS_REFUSED}))
 RESULTS = ("success", "refused", "error", "accepted", "succeeded", "failed", "interrupted")
 # A job's final status and the result its end record carries.
 JOB_RESULT = {"completed": "succeeded", "failed": "failed", "partial": "failed", "cancelled": "failed"}
@@ -158,6 +162,33 @@ def note(collection: str | None = None, target: str | None = None, **details) ->
     if target is not None:
         ctx["target"] = target
     ctx["details"].update(details)
+
+
+def access_refused(request, collection: str, code: str = "COLLECTION_NOT_FOUND") -> None:
+    """A caller refused a restricted collection (#606). Inside an audited
+    request its own record names the collection and the reason (the middleware
+    adds the error code sent); otherwise one record of its own, with `code`, the
+    not-found code the route answers with. Never raises."""
+    ctx = _current.get()
+    if ctx is not None:
+        ctx["collection"] = collection
+        ctx["details"]["reason"] = "collection_access"
+        return
+    try:
+        scope = getattr(request, "scope", None) or {}
+        principal = (scope.get("state") or {}).get("auth")
+        route = getattr(scope.get("route"), "path", None)
+        client = scope.get("client")
+        record(ACCESS_REFUSED, result="refused", status_code=404, collection=collection,
+               actor=getattr(principal, "username", None),
+               actor_kind=("service" if getattr(principal, "kind", None) == "service" else "user")
+               if principal is not None else "anonymous",
+               role=getattr(principal, "role", None), key_id=getattr(principal, "key_id", None),
+               client_ip=_header(scope, b"x-real-ip") or (client[0] if client else None),
+               details={"route": f"{scope.get('method', '')} {route}" if route else scope.get("path"),
+                        "reason": "collection_access", "code": code})
+    except Exception:                                 # noqa: BLE001 - never breaks the answer
+        _log.exception("Could not record a collection access refusal")
 
 
 def add_details(values: dict) -> None:
@@ -385,7 +416,11 @@ def job_ended(job: dict, interrupted: bool) -> None:
         details.update(package=job.get("filename"), fidelity=job.get("fidelity"))
     elif snapshot.get("action") == "import":
         collection = job.get("collection") or collection
-    record(snapshot.get("action", "unknown"), result="interrupted" if interrupted else JOB_RESULT.get(status, "failed"),
+    result = "interrupted" if interrupted else JOB_RESULT.get(status, "failed")
+    if job.get("access_refused"):
+        # An import of a package from a collection its owner can't use (#606).
+        result, details["reason"] = "refused", "collection_access"
+    record(snapshot.get("action", "unknown"), result=result,
            job_id=job.get("job_id") or getattr(job, "_id", None), collection=collection, target=snapshot.get("target"),
            details=details, **{k: snapshot.get(k) for k in ("actor", "actor_kind", "role", "key_id", "client_ip")})
 
