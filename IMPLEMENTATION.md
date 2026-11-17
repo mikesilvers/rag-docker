@@ -18227,8 +18227,12 @@ def main(argv=None) -> int:
             _say(f"set-role: {username!r} is now {role}")
         elif args.command in ("disable", "enable"):
             store.set_enabled(username, args.command == "enable")
-            _say(f"{args.command}: {username!r} {args.command}d"
-                 + ("; their sessions ended" if args.command == "disable" else ""))
+            ended = ""
+            if args.command == "disable":
+                # A service principal has no sessions: disabling it stops its keys (#553).
+                service = store.get_user(username).kind == "service"
+                ended = "; its keys stop working" if service else "; their sessions ended"
+            _say(f"{args.command}: {username!r} {args.command}d{ended}")
         else:
             for user in store.list_users(kind=None):
                 created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(user.created_at))
@@ -31674,6 +31678,7 @@ it opens a connection. No test reaches Weaviate or Ollama, on the host or in
 the image (#546).
 """
 import asyncio
+import calendar
 import hashlib
 import logging
 import os
@@ -32265,6 +32270,14 @@ class MiddlewareTests(StoreTestCase):
         self.assertEqual(self.client.get("/auth/status").json(), {"setup_required": True})
         self.make("eng", "engineer")
         self.assertEqual(self.client.get("/auth/status").json(), {"setup_required": False})
+
+    def test_a_key_request_before_bootstrap_is_setup_required(self):
+        # PR 3: the setup check comes before the key check, as for a session.
+        _, key = keys.generate()
+        for value in ("Bearer " + key, "Bearer nonsense"):
+            with self.subTest(value=value):
+                response = self.client.get("/collections", headers={"Authorization": value})
+                self.assertEqual((response.status_code, response.json()["error"]["code"]), (503, "SETUP_REQUIRED"))
 
     def test_role_matrix_through_the_app(self):
         self.setup_roles()
@@ -33240,6 +33253,19 @@ class PrincipalRouteTests(KeyTestCase):
         self.assertEqual(store.get_principal("svc").keys, ())
         self.assertIsNone(store.get_user("newsvc"))
 
+    def test_issue_accepts_the_bounds(self):
+        # S7/S8 of PR 3: a label of up to 64 characters, a lifetime of 1 to 365 whole days.
+        self.admin("POST", "", {"name": "svc", "role": "developer"})
+        for body, days in (({"days": 1}, 1), ({"days": 365}, 365), ({"label": "l" * 64}, 90)):
+            with self.subTest(body=body):
+                response = self.admin("POST", "/svc/keys", body)
+                self.assertEqual(response.status_code, 201, response.text)
+                key = response.json()["key"]
+                seconds = (calendar.timegm(time.strptime(key["expires_at"], "%Y-%m-%dT%H:%M:%SZ"))
+                           - calendar.timegm(time.strptime(key["created_at"], "%Y-%m-%dT%H:%M:%SZ")))
+                self.assertIn(seconds - days * 86400, (-1, 0, 1))
+                self.assertEqual(key["label"], body.get("label", ""))
+
     def test_role_disable_enable(self):
         self.admin("POST", "", {"name": "svc", "role": "developer"})
         secret = self.admin("POST", "/svc/keys", {}).json()["secret"]
@@ -33351,7 +33377,9 @@ class CommandTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1, args)
             self.assertIn("last enabled engineer", result.stderr)
         self.run_auth("create-user", "eng2", "engineer")
-        self.assertEqual(self.run_auth("disable", "admin").returncode, 0)
+        disabled = self.run_auth("disable", "admin")
+        self.assertEqual(disabled.returncode, 0)
+        self.assertTrue(disabled.stderr.strip().endswith("; their sessions ended"), disabled.stderr)
         self.assertFalse(self.users()["admin"].enabled)
         self.assertEqual(self.run_auth("enable", "admin").returncode, 0)
         self.assertEqual(self.run_auth("set-role", "eng2", "end_user").returncode, 0)
@@ -33382,7 +33410,10 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(len(reset.stderr.strip().splitlines()), 1)
         self.assertEqual(self.run_auth("create-user", "svc", "end_user").returncode, 1)
         self.assertEqual(self.run_auth("set-role", "svc", "end_user").returncode, 0)
-        self.assertEqual(self.run_auth("disable", "svc").returncode, 0)
+        disabled = self.run_auth("disable", "svc")
+        self.assertEqual(disabled.returncode, 0)
+        self.assertTrue(disabled.stderr.strip().endswith("; its keys stop working"), disabled.stderr)
+        self.assertNotIn("sessions", disabled.stderr)
         with patch.object(settings, "auth_dir", self.dir):
             self.assertIsNone(store.authenticate_key(key))
             self.assertEqual(store.get_user("svc").role, "end_user")

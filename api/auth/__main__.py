@@ -106,8 +106,12 @@ def main(argv=None) -> int:
             _say(f"set-role: {username!r} is now {role}")
         elif args.command in ("disable", "enable"):
             store.set_enabled(username, args.command == "enable")
-            _say(f"{args.command}: {username!r} {args.command}d"
-                 + ("; their sessions ended" if args.command == "disable" else ""))
+            ended = ""
+            if args.command == "disable":
+                # A service principal has no sessions: disabling it stops its keys (#553).
+                service = store.get_user(username).kind == "service"
+                ended = "; its keys stop working" if service else "; their sessions ended"
+            _say(f"{args.command}: {username!r} {args.command}d{ended}")
         else:
             for user in store.list_users(kind=None):
                 created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(user.created_at))
