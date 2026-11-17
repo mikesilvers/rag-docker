@@ -244,6 +244,13 @@ DEFAULTS = {"collection": "Coll", "retrieval_mode": "hnsw", "top_k": 5, "alpha":
 
 
 class RetrievalConfigFileTests(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        # The settings routes answer 404 for a collection that doesn't exist (#606).
+        patcher = patch.object(wc, "collection_exists", AsyncMock(return_value=True))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def saved_file(self):
         return retrieval_config._dir() / "Coll.json"
 

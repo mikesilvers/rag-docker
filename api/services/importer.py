@@ -820,7 +820,6 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
         raise
 
 
-@telemetry.traced("rag.import")
 def _refused(owner, source: str) -> bool:
     """True when the package's collection exists here, is restricted, and the
     job's owner may not use it (#606). Weaviate failing to answer counts as
@@ -848,6 +847,7 @@ def _start_access(owner, source: str, target: str) -> None:
         auth_store.restrict_to(target, auth_store.user_id_for(owner))
 
 
+@telemetry.traced("rag.import")
 def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = None) -> None:
     job = _jobs[job_id]
     job["status"] = "running"

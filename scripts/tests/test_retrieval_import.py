@@ -759,8 +759,14 @@ class IngestImportTests(unittest.TestCase):
 
     def served(self, collection):
         from routers import ingest as ingest_router
+        from services import weaviate_client
         import asyncio
-        return asyncio.run(ingest_router.get_ingest_config(collection)).model_dump()
+
+        # The route answers 404 for a collection that doesn't exist (#606); these exist.
+        async def exists(name):
+            return True
+        with patch.object(weaviate_client, 'collection_exists', exists):
+            return asyncio.run(ingest_router.get_ingest_config(collection)).model_dump()
 
     def assert_refused_before_mutation(self):
         saved = ingest_config._path('Corpus')

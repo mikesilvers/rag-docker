@@ -13783,7 +13783,6 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
         raise
 
 
-@telemetry.traced("rag.import")
 def _refused(owner, source: str) -> bool:
     """True when the package's collection exists here, is restricted, and the
     job's owner may not use it (#606). Weaviate failing to answer counts as
@@ -13811,6 +13810,7 @@ def _start_access(owner, source: str, target: str) -> None:
         auth_store.restrict_to(target, auth_store.user_id_for(owner))
 
 
+@telemetry.traced("rag.import")
 def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = None) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
@@ -26169,7 +26169,8 @@ const ACTIONS = [
   'admin.principal.enable', 'admin.principal.set-role', 'admin.user.create', 'admin.user.disable',
   'admin.user.enable', 'admin.user.reset-mfa', 'admin.user.reset-password', 'admin.user.set-role', 'audit.download',
   'audit.view', 'auth.login', 'auth.logout', 'auth.mfa', 'auth.mfa.disable', 'auth.mfa.enroll',
-  'auth.mfa.recovery-codes', 'auth.password', 'collection.create', 'collection.delete', 'export',
+  'auth.mfa.recovery-codes', 'auth.password', 'collection.access', 'collection.access.refused', 'collection.create',
+  'collection.delete', 'export',
   'goldstandard.download', 'goldstandard.save', 'import', 'ingest', 'ingest.config', 'operator.bootstrap',
   'operator.create-user', 'operator.disable', 'operator.enable', 'operator.reset-mfa', 'operator.reset-password',
   'operator.set-role', 'prepare.cancel', 'prepare.delete', 'prepare.download', 'prepare.import', 'prepare.start',
@@ -50941,7 +50942,7 @@ class DeletedRecoveryTests(unittest.TestCase):
         from services import collection_recovery as recovery,weaviate_client as wc,goldstandard as gs,ingest_config,retrieval_config
         self.recovery,self.wc=recovery,wc
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup);self.root=Path(temp.name);stack=ExitStack();self.addCleanup(stack.close)
-        for change in [patch.object(settings,'upload_dir',temp.name),patch.object(settings,'sources_dir',str(self.root/'sources')),patch.object(gs,'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None)]:stack.enter_context(change)
+        for change in [patch.object(settings,'upload_dir',temp.name),patch.object(settings,'auth_dir',str(self.root/'auth')),patch.object(settings,'sources_dir',str(self.root/'sources')),patch.object(gs,'_sessions',{}),patch.object(ingest_config,'_DIR',None),patch.object(retrieval_config,'_DIR',None)]:stack.enter_context(change)
         self.backend={'OwnedRecovery'}
         class Collections:
             def exists(inner,name):return writes.canonical(name) in self.backend
@@ -52809,8 +52810,14 @@ class IngestImportTests(unittest.TestCase):
 
     def served(self, collection):
         from routers import ingest as ingest_router
+        from services import weaviate_client
         import asyncio
-        return asyncio.run(ingest_router.get_ingest_config(collection)).model_dump()
+
+        # The route answers 404 for a collection that doesn't exist (#606); these exist.
+        async def exists(name):
+            return True
+        with patch.object(weaviate_client, 'collection_exists', exists):
+            return asyncio.run(ingest_router.get_ingest_config(collection)).model_dump()
 
     def assert_refused_before_mutation(self):
         saved = ingest_config._path('Corpus')
