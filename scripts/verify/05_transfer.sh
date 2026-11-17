@@ -44,6 +44,9 @@ check "the package listing reads only up to each manifest (#383)" $?
 # import, listing and refusals, with no backend.
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_export_encryption.py)
 check "export encryption: age format, encrypted export and import, refusals (#27)" $?
+# Downloading a package deletes it; undownloaded exports expire (#677).
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_package_download.py)
+check "package download and expiry: delete after a full download, busy, access, sweep (#677)" $?
 
 python3 "$REPO_ROOT/scripts/tests/test_batch_implementation.py"
 check "test_batch_implementation.py registered regression checks" $?
@@ -1420,6 +1423,68 @@ else
     < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_cleanup.log 2>&1
   check "recovery acceptance fixtures are removed" $?
 fi
+
+# ── downloading a package, and expiry (#677) ─────────────────────────────────
+# A full download through the proxy deletes a package exported here; an
+# interrupted one keeps it; a recorded package past EXPORT_RETENTION_HOURS (the
+# default, 24) is swept while one copied in is kept; an End User is refused.
+# Fixtures come from package_retention_stack.py inside the API container.
+retention() { (cd "$REPO_ROOT" && docker compose exec -T api python - "$@" < scripts/verify/package_retention_stack.py); }
+audit_has() {   # audit_has <action> <file> <python condition on r>: exit 0 when a record matches
+  api_get "/audit?action=$1&limit=1000" | python3 -c "
+import json, sys
+r = [r for r in json.load(sys.stdin)['records'] if r['details'].get('file') == sys.argv[1]]
+sys.exit(0 if r and eval(sys.argv[2], {'r': r[0]}) else 1)" "$2" "$3"
+}
+
+api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_dl_exp.json
+djob=$(python3 -c "import json;print(json.load(open('/tmp/vfy_dl_exp.json'))['job_id'])")
+check_eq "#677: an export to download completes" "$(wait_for_job "/export/job/$djob" 1800)" "completed"
+DPKG=$(api_get "/export/job/$djob" | jfield "['filename']")
+read -r dsize dexp <<<"$(api_get "/packages" | python3 -c "
+import json, sys
+p = next(p for p in json.load(sys.stdin)['packages'] if p['filename'] == sys.argv[1])
+print(p['size_bytes'], p['expires_at'])" "$DPKG")"
+[ -n "$dexp" ] && [ "$dexp" != "None" ]
+check "#677: GET /packages says when the new export expires ($dexp)" $?
+dcode=$(curl -s -o /tmp/vfy_dl.bin -m 600 -w '%{http_code}' "$API/packages/$DPKG")
+check_eq "#677: GET /packages/{filename} downloads the package" "$dcode" "200"
+check_eq "#677: ... every byte of it" "$(wc -c < /tmp/vfy_dl.bin | tr -d ' ')" "$dsize"
+[ ! -e "$EXPORTS/$DPKG" ] && ! api_get "/packages" | grep -q "\"$DPKG\""
+check "#677: a full download deletes the package from ./exports and the listing" $?
+audit_has package.download "$DPKG" "r['details'].get('complete') is True and r['result'] == 'success'"
+check "#677: the download is audited as package.download, complete" $?
+audit_has package.delete "$DPKG" "r['details'].get('reason') == 'downloaded' and r['actor_kind'] == 'user'"
+check "#677: the deletion is audited as package.delete, reason downloaded, by the user" $?
+rm -f /tmp/vfy_dl.bin
+
+IPKG="ragpkg-vfy677-int-$$.tar.gz"
+retention junk "$IPKG" 64 0 >/dev/null
+command curl -s -o /dev/null -b "$RAG_AUTH_JAR" --limit-rate 1M --max-time 2 "$API/packages/$IPKG"
+sleep 3
+retention exists "$IPKG"
+check "#677: an interrupted download keeps the package" $?
+audit_has package.download "$IPKG" "r['details'].get('complete') is False"
+check "#677: ... and its package.download record says it was incomplete" $?
+retention remove "$IPKG"
+
+OPKG="ragpkg-vfy677-old-$$.tar.gz"; NPKG="ragpkg-vfy677-dropin-$$.tar.gz"
+retention junk "$OPKG" 1 25 >/dev/null
+retention junk "$NPKG" 1 none >/dev/null
+retention sweep > /tmp/vfy_sweep.txt
+! retention exists "$OPKG" && grep -qx "$OPKG" /tmp/vfy_sweep.txt
+check "#677: the sweep deletes a package recorded more than EXPORT_RETENTION_HOURS ago" $? "$(cat /tmp/vfy_sweep.txt)"
+retention exists "$NPKG"
+check "#677: ... and keeps a package copied in, which isn't recorded" $?
+audit_has package.delete "$OPKG" "r['details'].get('reason') == 'expired' and r['actor'] == 'system'"
+check "#677: the expiry is audited as package.delete, reason expired, by the system" $?
+
+EUJAR=$(auth_jar end_user) || EUJAR=""
+check_eq "#677: an End User is refused GET /packages/{filename}" \
+  "$(command curl -s -o /dev/null -m 60 -b "$EUJAR" -w '%{http_code}' "$API/packages/$NPKG")" "403"
+retention exists "$NPKG"
+check "#677: ... and the package stays" $?
+retention remove "$NPKG"
 
 rm -f "$EXPORTS/$PKG"
 drop_collection "$C"
