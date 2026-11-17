@@ -32172,11 +32172,14 @@ class PolicyTests(unittest.TestCase):
         # #551 item 2 (and #553 item 3): a route missing from telemetry.ROUTES is
         # labelled "unmatched" in spans and metrics. The routes come from the app,
         # so a new one is checked without editing this test. FastAPI's own docs
-        # routes aren't API routes.
+        # routes aren't API routes. An entry left in ROUTES after its route is
+        # removed or renamed fails too (PR #755's review).
         from services import telemetry
         docs = {("GET", "/docs"), ("GET", "/docs/oauth2-redirect"), ("GET", "/redoc"), ("GET", "/openapi.json")}
         missing = sorted(f"{m} {p}" for m, p in self.app_routes() - docs if f"{m} {p}" not in telemetry.ROUTES)
         self.assertEqual(missing, [], "routes telemetry would label 'unmatched'")
+        stale = sorted(telemetry.ROUTES - {f"{m} {p}" for m, p in self.app_routes()})
+        self.assertEqual(stale, [], "telemetry routes with no app route")
 
     def test_the_matrix_is_the_agreed_one(self):
         counts = {}
