@@ -1675,10 +1675,14 @@ disabled or its role changes; an Engineer demoted to a lower role is then bound 
   a collection, for encrypted packages too once decrypted, before anything is created or replaced: the job fails
   with the answer a missing package gives (`PACKAGE_UNREADABLE`, "No package named '<file>' in the exports
   directory.") and names no collection.
-- **The Prepare area** (§3.1.11). A prepared document with an import record for a collection the caller may not
+- **The Prepare area** (§3.1.11). A prepared document whose imports are all into collections the caller may not
   use is hidden from them: left out of `GET /prepare/documents`, `404 DOCUMENT_NOT_FOUND` on its detail, raw and
   prepared downloads and deletes, and an unknown id to `POST /prepare/jobs` and `POST /prepare/import` (`all: true`
-  doesn't select it). Engineers see every document; a document with no imports is shared as before.
+  doesn't select it). A document with at least one import into a collection the caller may use stays visible
+  everywhere, with its import records for the other collections left out. Preparation job records (`GET
+  /prepare/job/{job_id}`, `GET /prepare/jobs`) leave hidden documents out of `document_ids`, `names`, `current`
+  and `errors`; their counters stay. Engineers see every document and record; a document with no imports is
+  shared as before.
 - **Audit** (§3.1.9). A refusal on an audited route is that route's record, result `refused`, with
   `details.reason: "collection_access"`; on another route, a `collection.access.refused` record (status 404,
   `details.route`, `details.code`). A refused import's end record has result `refused` and the reason. A filtered
@@ -1937,9 +1941,10 @@ removes headers, footers, page numbers and boilerplate, and writes a title and s
 MD parts. CSV and JSON parts are labelled from their data, with no LLM call (#648). One area for the
 instance, in the `rag_preparation` volume (`PREPARATION_DIR`, `/app/preparation`); documents stay until
 deleted. Every route is `developer` (§3.1.8); documents are shared, each showing its owner, and any caller
-with access may delete any document, except that a document imported into a collection the caller may not use is
-hidden from them and refused as an unknown document (`404 DOCUMENT_NOT_FOUND`), audited; Engineers see every
-document (per-collection access, §3.1.8, #606).
+with access may delete any document, except that a document whose imports are all into collections the caller may
+not use is hidden from them and refused as an unknown document (`404 DOCUMENT_NOT_FOUND`), audited; a document with
+at least one import into a collection they may use stays visible without the other import records; job records
+leave hidden documents out; Engineers see everything (per-collection access, §3.1.8, #606).
 
 **Storage limit.** `MAX_PREPARATION_BYTES` (default 21474836480, 20 GiB; at least 1048576 or the API
 refuses to start): the most the area's files may hold, raw and prepared together. A best-effort cap
@@ -4448,8 +4453,9 @@ Two-step verification (#607). These are ticked once the tests reviewer's full `s
   restricted collections are hidden and their import fails as a missing package (encrypted ones once decrypted, and
   a package of a discarded staging copy as its target's); an imported copy takes its source's access; a staging or
   recovery copy keeps the access it was made with when its target is deleted or re-created; creation is fail-closed
-  and a failed create or import puts back only its own state; documents in the Prepare area imported into a
-  collection the caller can't use are hidden and refused; only Engineers' sessions read or change access; every
+  and a failed create or import puts back only its own state; documents in the Prepare area imported only into
+  collections the caller can't use are hidden and refused, a document with a usable import stays visible without
+  the other import records, and job records leave hidden documents out; only Engineers' sessions read or change access; every
   change and refusal is audited.
   *Evidence: `scripts/tests/test_collection_access.py` (suite 17), which fails on the code before #606;
   `auth_stack.py collection-access` and the matrix rows (suite 17); the Collections page's Access case in

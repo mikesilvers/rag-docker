@@ -41,27 +41,83 @@ def _error(exc: store.AreaError):
 
 
 # ── per-collection access (#606) ─────────────────────────────────────────────
-# A document imported into a collection the caller may not use is hidden from
-# them, with its import records, and refused as an unknown document; Engineers
-# see every document. A document with no imports is shared as before.
+# A document whose imports are all into collections the caller may not use is
+# hidden from them and refused as an unknown document (Q18, Q19). One with at
+# least one import into a collection they may use stays visible, with the other
+# import records left out. Preparation job records leave hidden documents out
+# (Q20). Engineers see everything. A document with no imports is shared as before.
 
-def _blocker(request):
-    """A function giving, for a document record, the first collection among its
-    imports the caller may not use (None when it may be shown). None for an
-    Engineer or a direct call, who see everything. Reads the store: call it in
-    a thread."""
+def _import_names(record: dict) -> list[str]:
+    return [item["collection"] for item in record.get("imports") or []
+            if isinstance(item, dict) and isinstance(item.get("collection"), str) and item["collection"]]
+
+
+def _visible_of(request):
+    """The caller's visible-collection predicate; None for an Engineer or a
+    direct call, who see everything. Reads the store: call it in a thread."""
     principal = access.principal_of(request)
     if principal is None or principal.role == "engineer":
         return None
-    visible = access.visible_filter(principal)
+    return access.visible_filter(principal)
+
+
+def _blocker(request):
+    """A function giving, for a document record, a collection among its imports
+    the caller may not use when every import is into such a collection (the
+    document is hidden), else None. None for an Engineer or a direct call.
+    Reads the store: call it in a thread."""
+    visible = _visible_of(request)
+    if visible is None:
+        return None
 
     def blocked(record: dict):
-        for item in record.get("imports") or []:
-            name = item.get("collection") if isinstance(item, dict) else None
-            if isinstance(name, str) and name and not visible(name):
-                return name
+        names = _import_names(record)
+        if names and not any(visible(name) for name in names):
+            return names[0]
         return None
     return blocked
+
+
+def _shown(record: dict, visible) -> dict:
+    """A visible document as the caller sees it: without the import records
+    for collections they may not use."""
+    if visible is None or not record.get("imports"):
+        return record
+    kept = [item for item in record["imports"]
+            if not (isinstance(item, dict) and isinstance(item.get("collection"), str)
+                    and item["collection"] and not visible(item["collection"]))]
+    return {**record, "imports": kept}
+
+
+def _job_view(job: dict, blocked) -> dict:
+    """A preparation job record without the documents hidden from the caller
+    (Q20): their ids and names, `current` when it is one of them, and the
+    errors that name them. The counters stay; they name no document. A
+    document that can't be read (deleted since) isn't hidden."""
+    if blocked is None:
+        return job
+    ids = list(job.get("document_ids") or [])
+    names = list(job.get("names") or [])
+    hidden = set()
+    for document_id in ids:
+        try:
+            record = store.get(document_id)
+        except store.AreaError:
+            continue
+        if blocked(record) is not None:
+            hidden.add(document_id)
+    if not hidden:
+        return job
+    hidden_names = {names[i] for i, document_id in enumerate(ids) if document_id in hidden and i < len(names)}
+    view = dict(job)
+    view["document_ids"] = [d for d in ids if d not in hidden]
+    view["names"] = [n for i, n in enumerate(names) if not (i < len(ids) and ids[i] in hidden)]
+    current = job.get("current")
+    if isinstance(current, dict) and current.get("document_id") in hidden:
+        view["current"] = None
+    prefixes = tuple(f"{key}:" for key in hidden | hidden_names)
+    view["errors"] = [e for e in job.get("errors") or [] if not (isinstance(e, str) and e.startswith(prefixes))]
+    return view
 
 
 async def _hidden(request, document_id: str):
@@ -134,7 +190,8 @@ async def list_documents(request: Request = None):
     records = await asyncio.to_thread(store.list_documents)
     blocked = await asyncio.to_thread(_blocker, request)
     if blocked is not None:
-        records = [r for r in records if blocked(r) is None]
+        visible = await asyncio.to_thread(_visible_of, request)
+        records = [_shown(r, visible) for r in records if blocked(r) is None]
     used = await asyncio.to_thread(store.usage)
     return {"documents": [store.list_entry(r) for r in records],
             "used_bytes": used, "limit_bytes": store.limit()}
@@ -145,9 +202,10 @@ async def get_document(document_id: str, request: Request = None):
     if (hidden := await _hidden(request, document_id)) is not None:
         return hidden
     try:
-        return await asyncio.to_thread(store.preview, document_id)
+        record = await asyncio.to_thread(store.preview, document_id)
     except store.AreaError as exc:
         return _error(exc)
+    return _shown(record, await asyncio.to_thread(_visible_of, request))
 
 
 # ── downloads ────────────────────────────────────────────────────────────────
@@ -290,16 +348,21 @@ async def list_jobs(request: Request):
 
     def build():
         items = job_lists.job_items(jobs.job_records())
+        blocked = _blocker(request)
+        if blocked is not None:
+            items = [(_job_view(record, blocked), running, finish) for record, running, finish in items]
         return job_lists.entries(PrepareJobEntry, items, principal)
     return PrepareJobList(jobs=await asyncio.to_thread(build))
 
 
 @router.get("/job/{job_id}")
-async def job_status(job_id: str):
+async def job_status(job_id: str, request: Request = None):
     job = jobs.get_job(job_id)
     if job is None:
         return api_error(404, "JOB_NOT_FOUND", f"Job '{job_id}' not found.")
-    return {key: value for key, value in dict(job).items() if not key.startswith("_")}
+    blocked = await asyncio.to_thread(_blocker, request)
+    view = await asyncio.to_thread(_job_view, dict(job), blocked)
+    return {key: value for key, value in view.items() if not key.startswith("_")}
 
 
 @router.post("/job/{job_id}/cancel", status_code=202)

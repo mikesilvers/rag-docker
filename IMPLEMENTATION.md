@@ -15749,27 +15749,83 @@ def _error(exc: store.AreaError):
 
 
 # ── per-collection access (#606) ─────────────────────────────────────────────
-# A document imported into a collection the caller may not use is hidden from
-# them, with its import records, and refused as an unknown document; Engineers
-# see every document. A document with no imports is shared as before.
+# A document whose imports are all into collections the caller may not use is
+# hidden from them and refused as an unknown document (Q18, Q19). One with at
+# least one import into a collection they may use stays visible, with the other
+# import records left out. Preparation job records leave hidden documents out
+# (Q20). Engineers see everything. A document with no imports is shared as before.
 
-def _blocker(request):
-    """A function giving, for a document record, the first collection among its
-    imports the caller may not use (None when it may be shown). None for an
-    Engineer or a direct call, who see everything. Reads the store: call it in
-    a thread."""
+def _import_names(record: dict) -> list[str]:
+    return [item["collection"] for item in record.get("imports") or []
+            if isinstance(item, dict) and isinstance(item.get("collection"), str) and item["collection"]]
+
+
+def _visible_of(request):
+    """The caller's visible-collection predicate; None for an Engineer or a
+    direct call, who see everything. Reads the store: call it in a thread."""
     principal = access.principal_of(request)
     if principal is None or principal.role == "engineer":
         return None
-    visible = access.visible_filter(principal)
+    return access.visible_filter(principal)
+
+
+def _blocker(request):
+    """A function giving, for a document record, a collection among its imports
+    the caller may not use when every import is into such a collection (the
+    document is hidden), else None. None for an Engineer or a direct call.
+    Reads the store: call it in a thread."""
+    visible = _visible_of(request)
+    if visible is None:
+        return None
 
     def blocked(record: dict):
-        for item in record.get("imports") or []:
-            name = item.get("collection") if isinstance(item, dict) else None
-            if isinstance(name, str) and name and not visible(name):
-                return name
+        names = _import_names(record)
+        if names and not any(visible(name) for name in names):
+            return names[0]
         return None
     return blocked
+
+
+def _shown(record: dict, visible) -> dict:
+    """A visible document as the caller sees it: without the import records
+    for collections they may not use."""
+    if visible is None or not record.get("imports"):
+        return record
+    kept = [item for item in record["imports"]
+            if not (isinstance(item, dict) and isinstance(item.get("collection"), str)
+                    and item["collection"] and not visible(item["collection"]))]
+    return {**record, "imports": kept}
+
+
+def _job_view(job: dict, blocked) -> dict:
+    """A preparation job record without the documents hidden from the caller
+    (Q20): their ids and names, `current` when it is one of them, and the
+    errors that name them. The counters stay; they name no document. A
+    document that can't be read (deleted since) isn't hidden."""
+    if blocked is None:
+        return job
+    ids = list(job.get("document_ids") or [])
+    names = list(job.get("names") or [])
+    hidden = set()
+    for document_id in ids:
+        try:
+            record = store.get(document_id)
+        except store.AreaError:
+            continue
+        if blocked(record) is not None:
+            hidden.add(document_id)
+    if not hidden:
+        return job
+    hidden_names = {names[i] for i, document_id in enumerate(ids) if document_id in hidden and i < len(names)}
+    view = dict(job)
+    view["document_ids"] = [d for d in ids if d not in hidden]
+    view["names"] = [n for i, n in enumerate(names) if not (i < len(ids) and ids[i] in hidden)]
+    current = job.get("current")
+    if isinstance(current, dict) and current.get("document_id") in hidden:
+        view["current"] = None
+    prefixes = tuple(f"{key}:" for key in hidden | hidden_names)
+    view["errors"] = [e for e in job.get("errors") or [] if not (isinstance(e, str) and e.startswith(prefixes))]
+    return view
 
 
 async def _hidden(request, document_id: str):
@@ -15842,7 +15898,8 @@ async def list_documents(request: Request = None):
     records = await asyncio.to_thread(store.list_documents)
     blocked = await asyncio.to_thread(_blocker, request)
     if blocked is not None:
-        records = [r for r in records if blocked(r) is None]
+        visible = await asyncio.to_thread(_visible_of, request)
+        records = [_shown(r, visible) for r in records if blocked(r) is None]
     used = await asyncio.to_thread(store.usage)
     return {"documents": [store.list_entry(r) for r in records],
             "used_bytes": used, "limit_bytes": store.limit()}
@@ -15853,9 +15910,10 @@ async def get_document(document_id: str, request: Request = None):
     if (hidden := await _hidden(request, document_id)) is not None:
         return hidden
     try:
-        return await asyncio.to_thread(store.preview, document_id)
+        record = await asyncio.to_thread(store.preview, document_id)
     except store.AreaError as exc:
         return _error(exc)
+    return _shown(record, await asyncio.to_thread(_visible_of, request))
 
 
 # ── downloads ────────────────────────────────────────────────────────────────
@@ -15998,16 +16056,21 @@ async def list_jobs(request: Request):
 
     def build():
         items = job_lists.job_items(jobs.job_records())
+        blocked = _blocker(request)
+        if blocked is not None:
+            items = [(_job_view(record, blocked), running, finish) for record, running, finish in items]
         return job_lists.entries(PrepareJobEntry, items, principal)
     return PrepareJobList(jobs=await asyncio.to_thread(build))
 
 
 @router.get("/job/{job_id}")
-async def job_status(job_id: str):
+async def job_status(job_id: str, request: Request = None):
     job = jobs.get_job(job_id)
     if job is None:
         return api_error(404, "JOB_NOT_FOUND", f"Job '{job_id}' not found.")
-    return {key: value for key, value in dict(job).items() if not key.startswith("_")}
+    blocked = await asyncio.to_thread(_blocker, request)
+    view = await asyncio.to_thread(_job_view, dict(job), blocked)
+    return {key: value for key, value in view.items() if not key.startswith("_")}
 
 
 @router.post("/job/{job_id}/cancel", status_code=202)
@@ -38897,7 +38960,8 @@ class GoldIndexOrderTests(AccessTestCase):
 
 
 class PrepareAreaTests(AccessTestCase):
-    """Documents imported into a collection the caller can't use are hidden (#606, Q18)."""
+    """Documents imported only into collections the caller can't use are hidden
+    (#606, Q18, Q19); job records leave them out (Q20)."""
 
     def setUp(self):
         super().setUp()
@@ -38910,8 +38974,11 @@ class PrepareAreaTests(AccessTestCase):
         self.secret_doc = prep.create("secret-note.txt", source, None)["id"]
         self.open_doc = prep.create("open-note.txt", source, None)["id"]
         self.plain_doc = prep.create("plain-note.txt", source, None)["id"]
+        self.mixed_doc = prep.create("mixed-note.txt", source, None)["id"]
         prep.add_import([self.secret_doc], SECRET, "job1")
         prep.add_import([self.open_doc], OPEN, "job2")
+        prep.add_import([self.mixed_doc], SECRET, "job3")
+        prep.add_import([self.mixed_doc], OPEN, "job4")
 
     def listed(self, who):
         answer = self.client.get("/prepare/documents", headers=self.as_(who))
@@ -38919,7 +38986,7 @@ class PrepareAreaTests(AccessTestCase):
         return {d["id"] for d in answer.json()["documents"]}
 
     def test_the_list_hides_documents_of_restricted_collections(self):
-        everything = {self.secret_doc, self.open_doc, self.plain_doc}
+        everything = {self.secret_doc, self.open_doc, self.plain_doc, self.mixed_doc}
         self.assertEqual(self.listed("dev2"), everything - {self.secret_doc})
         self.assertEqual(self.listed("dev"), everything)
         self.assertEqual(self.listed("svc2"), everything - {self.secret_doc})
@@ -38954,12 +39021,56 @@ class PrepareAreaTests(AccessTestCase):
         from services import preparation_jobs
         from routers import prepare
         usable = lambda record: prepare._blocker(None) is None  # noqa: E731 - no request: everything
-        self.assertEqual(len(preparation_jobs._resolve(None, {"raw"}, usable)), 3)
+        self.assertEqual(len(preparation_jobs._resolve(None, {"raw"}, usable)), 4)
         dev2 = type("P", (), {"user_id": store.get_user("dev2").id, "role": "developer"})()
         visible = __import__("auth.access", fromlist=["x"]).visible_filter(dev2)
-        hidden = lambda record: all(visible(i["collection"]) for i in record.get("imports") or [])  # noqa: E731
-        self.assertEqual({r["id"] for r in preparation_jobs._resolve(None, {"raw"}, hidden)},
-                         {self.open_doc, self.plain_doc})
+        blocked = prepare._blocker(type("R", (), {"state": type("S", (), {"auth": dev2})()})())
+        shown = lambda record: blocked(record) is None  # noqa: E731
+        self.assertEqual({r["id"] for r in preparation_jobs._resolve(None, {"raw"}, shown)},
+                         {self.open_doc, self.plain_doc, self.mixed_doc})
+        self.assertTrue(visible(OPEN))
+
+    def test_a_document_with_one_usable_import_stays_visible_without_the_other_records(self):
+        # Q19: mixed imports keep the document visible; the SECRET record is left out.
+        doc = self.mixed_doc
+        listed = {d["id"]: d for d in self.client.get("/prepare/documents", headers=self.as_("dev2")).json()["documents"]}
+        self.assertEqual([i["collection"] for i in listed[doc]["imports"]], [OPEN])
+        detail = self.client.get(f"/prepare/documents/{doc}", headers=self.as_("dev2"))
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual([i["collection"] for i in detail.json()["imports"]], [OPEN])
+        self.assertEqual(self.client.get(f"/prepare/documents/{doc}/raw", headers=self.as_("dev2")).status_code, 200)
+        for who in ("dev", "eng"):
+            seen = self.client.get(f"/prepare/documents/{doc}", headers=self.as_(who)).json()
+            self.assertEqual([i["collection"] for i in seen["imports"]], [SECRET, OPEN])
+        self.assertFalse(self.records("collection.access.refused"))
+
+    def test_job_records_leave_hidden_documents_out(self):
+        # Q20: a job naming the hidden document and two visible ones.
+        from services import preparation_jobs
+        job = {"job_id": "pj1", "status": "running", "documents_total": 3, "documents_completed": 1,
+               "documents_failed": 1, "document_ids": [self.secret_doc, self.mixed_doc, self.plain_doc],
+               "names": ["secret-note.txt", "mixed-note.txt", "plain-note.txt"],
+               "current": {"document_id": self.secret_doc, "name": "secret-note.txt"},
+               "errors": ["secret-note.txt: the model failed", f"{self.secret_doc}: unreadable",
+                          "plain-note.txt: the model failed"],
+               "owner": {"name": "dev2", "kind": "user"}, "created_at": "2026-11-17T10:00:00+00:00"}
+        with patch.object(preparation_jobs, "get_job", lambda job_id: dict(job)), \
+                patch.object(preparation_jobs, "job_records", lambda: [("pj1", dict(job), None)]):
+            seen = self.client.get("/prepare/job/pj1", headers=self.as_("dev2")).json()
+            self.assertEqual(seen["document_ids"], [self.mixed_doc, self.plain_doc])
+            self.assertEqual(seen["names"], ["mixed-note.txt", "plain-note.txt"])
+            self.assertIsNone(seen["current"])
+            self.assertEqual(seen["errors"], ["plain-note.txt: the model failed"])
+            self.assertEqual(seen["documents_total"], 3)
+            listed = self.client.get("/prepare/jobs", headers=self.as_("dev2")).json()["jobs"]
+            self.assertEqual([(j["document_ids"], j["names"]) for j in listed],
+                             [([self.mixed_doc, self.plain_doc], ["mixed-note.txt", "plain-note.txt"])])
+            full = self.client.get("/prepare/job/pj1", headers=self.as_("eng")).json()
+            self.assertEqual((full["document_ids"], full["current"], full["errors"]),
+                             (job["document_ids"], job["current"], job["errors"]))
+            mine = self.client.get("/prepare/job/pj1", headers=self.as_("dev")).json()
+            self.assertEqual(mine["document_ids"], job["document_ids"])
+        self.assertFalse(self.records("collection.access.refused"))
 
 
 if __name__ == "__main__":

@@ -140,7 +140,8 @@ Engineer opens it or grants them access with the **Access** button on the
 Collections page. Collections that existed before the upgrade stay open. To
 anyone else a restricted collection looks like one that doesn't exist (`404`),
 everywhere it can be named: Q&A, settings, ingest, gold standard, export, job
-status, packages, and the Prepare area's documents imported into it. Every
+status, packages, and the Prepare area's documents imported only into collections
+the caller can't use (and their place in preparation jobs). Every
 change and refusal is in the audit log.
 
 ### Managing accounts

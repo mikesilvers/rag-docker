@@ -622,7 +622,8 @@ class GoldIndexOrderTests(AccessTestCase):
 
 
 class PrepareAreaTests(AccessTestCase):
-    """Documents imported into a collection the caller can't use are hidden (#606, Q18)."""
+    """Documents imported only into collections the caller can't use are hidden
+    (#606, Q18, Q19); job records leave them out (Q20)."""
 
     def setUp(self):
         super().setUp()
@@ -635,8 +636,11 @@ class PrepareAreaTests(AccessTestCase):
         self.secret_doc = prep.create("secret-note.txt", source, None)["id"]
         self.open_doc = prep.create("open-note.txt", source, None)["id"]
         self.plain_doc = prep.create("plain-note.txt", source, None)["id"]
+        self.mixed_doc = prep.create("mixed-note.txt", source, None)["id"]
         prep.add_import([self.secret_doc], SECRET, "job1")
         prep.add_import([self.open_doc], OPEN, "job2")
+        prep.add_import([self.mixed_doc], SECRET, "job3")
+        prep.add_import([self.mixed_doc], OPEN, "job4")
 
     def listed(self, who):
         answer = self.client.get("/prepare/documents", headers=self.as_(who))
@@ -644,7 +648,7 @@ class PrepareAreaTests(AccessTestCase):
         return {d["id"] for d in answer.json()["documents"]}
 
     def test_the_list_hides_documents_of_restricted_collections(self):
-        everything = {self.secret_doc, self.open_doc, self.plain_doc}
+        everything = {self.secret_doc, self.open_doc, self.plain_doc, self.mixed_doc}
         self.assertEqual(self.listed("dev2"), everything - {self.secret_doc})
         self.assertEqual(self.listed("dev"), everything)
         self.assertEqual(self.listed("svc2"), everything - {self.secret_doc})
@@ -679,12 +683,56 @@ class PrepareAreaTests(AccessTestCase):
         from services import preparation_jobs
         from routers import prepare
         usable = lambda record: prepare._blocker(None) is None  # noqa: E731 - no request: everything
-        self.assertEqual(len(preparation_jobs._resolve(None, {"raw"}, usable)), 3)
+        self.assertEqual(len(preparation_jobs._resolve(None, {"raw"}, usable)), 4)
         dev2 = type("P", (), {"user_id": store.get_user("dev2").id, "role": "developer"})()
         visible = __import__("auth.access", fromlist=["x"]).visible_filter(dev2)
-        hidden = lambda record: all(visible(i["collection"]) for i in record.get("imports") or [])  # noqa: E731
-        self.assertEqual({r["id"] for r in preparation_jobs._resolve(None, {"raw"}, hidden)},
-                         {self.open_doc, self.plain_doc})
+        blocked = prepare._blocker(type("R", (), {"state": type("S", (), {"auth": dev2})()})())
+        shown = lambda record: blocked(record) is None  # noqa: E731
+        self.assertEqual({r["id"] for r in preparation_jobs._resolve(None, {"raw"}, shown)},
+                         {self.open_doc, self.plain_doc, self.mixed_doc})
+        self.assertTrue(visible(OPEN))
+
+    def test_a_document_with_one_usable_import_stays_visible_without_the_other_records(self):
+        # Q19: mixed imports keep the document visible; the SECRET record is left out.
+        doc = self.mixed_doc
+        listed = {d["id"]: d for d in self.client.get("/prepare/documents", headers=self.as_("dev2")).json()["documents"]}
+        self.assertEqual([i["collection"] for i in listed[doc]["imports"]], [OPEN])
+        detail = self.client.get(f"/prepare/documents/{doc}", headers=self.as_("dev2"))
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual([i["collection"] for i in detail.json()["imports"]], [OPEN])
+        self.assertEqual(self.client.get(f"/prepare/documents/{doc}/raw", headers=self.as_("dev2")).status_code, 200)
+        for who in ("dev", "eng"):
+            seen = self.client.get(f"/prepare/documents/{doc}", headers=self.as_(who)).json()
+            self.assertEqual([i["collection"] for i in seen["imports"]], [SECRET, OPEN])
+        self.assertFalse(self.records("collection.access.refused"))
+
+    def test_job_records_leave_hidden_documents_out(self):
+        # Q20: a job naming the hidden document and two visible ones.
+        from services import preparation_jobs
+        job = {"job_id": "pj1", "status": "running", "documents_total": 3, "documents_completed": 1,
+               "documents_failed": 1, "document_ids": [self.secret_doc, self.mixed_doc, self.plain_doc],
+               "names": ["secret-note.txt", "mixed-note.txt", "plain-note.txt"],
+               "current": {"document_id": self.secret_doc, "name": "secret-note.txt"},
+               "errors": ["secret-note.txt: the model failed", f"{self.secret_doc}: unreadable",
+                          "plain-note.txt: the model failed"],
+               "owner": {"name": "dev2", "kind": "user"}, "created_at": "2026-11-17T10:00:00+00:00"}
+        with patch.object(preparation_jobs, "get_job", lambda job_id: dict(job)), \
+                patch.object(preparation_jobs, "job_records", lambda: [("pj1", dict(job), None)]):
+            seen = self.client.get("/prepare/job/pj1", headers=self.as_("dev2")).json()
+            self.assertEqual(seen["document_ids"], [self.mixed_doc, self.plain_doc])
+            self.assertEqual(seen["names"], ["mixed-note.txt", "plain-note.txt"])
+            self.assertIsNone(seen["current"])
+            self.assertEqual(seen["errors"], ["plain-note.txt: the model failed"])
+            self.assertEqual(seen["documents_total"], 3)
+            listed = self.client.get("/prepare/jobs", headers=self.as_("dev2")).json()["jobs"]
+            self.assertEqual([(j["document_ids"], j["names"]) for j in listed],
+                             [([self.mixed_doc, self.plain_doc], ["mixed-note.txt", "plain-note.txt"])])
+            full = self.client.get("/prepare/job/pj1", headers=self.as_("eng")).json()
+            self.assertEqual((full["document_ids"], full["current"], full["errors"]),
+                             (job["document_ids"], job["current"], job["errors"]))
+            mine = self.client.get("/prepare/job/pj1", headers=self.as_("dev")).json()
+            self.assertEqual(mine["document_ids"], job["document_ids"])
+        self.assertFalse(self.records("collection.access.refused"))
 
 
 if __name__ == "__main__":
