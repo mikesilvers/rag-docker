@@ -43,7 +43,7 @@ from pydantic import ValidationError
 import config
 from config import settings
 from main import app
-from auth import keys, passwords, policy, store
+from auth import keys, mfa, passwords, policy, store
 from auth.middleware import AuthMiddleware, same_origin
 from services import audit, ollama_client, weaviate_client
 
@@ -514,7 +514,7 @@ class PolicyTests(unittest.TestCase):
         counts = {}
         for access in policy.ACCESS.values():
             counts[access] = counts.get(access, 0) + 1
-        self.assertEqual(counts, {"public": 3, "session": 3, "end_user": 3, "developer": 35, "engineer": 26})
+        self.assertEqual(counts, {"public": 4, "session": 3, "mfa": 5, "end_user": 3, "developer": 35, "engineer": 28})
         self.assertEqual(policy.ACCESS[("GET", "/health")], "public")
         self.assertEqual(policy.ACCESS[("DELETE", "/collections/{name}")], "engineer")
         self.assertEqual(policy.ACCESS[("POST", "/collections")], "developer")
@@ -530,7 +530,8 @@ class PolicyTests(unittest.TestCase):
                                       ("POST", "/auth/users/{username}/reset-password"),
                                       ("POST", "/auth/users/{username}/role"),
                                       ("POST", "/auth/users/{username}/disable"),
-                                      ("POST", "/auth/users/{username}/enable")})
+                                      ("POST", "/auth/users/{username}/enable"),
+                                      ("POST", "/auth/users/{username}/reset-mfa")})
         self.assertEqual(set(admin.values()), {"engineer"})
         self.assertFalse([key for key in policy.ACCESS if key[0] == "DELETE" and key[1].startswith("/auth")])
         # Service principals and keys (PR 3): the Engineer's, and nothing deletes a principal.
@@ -542,11 +543,19 @@ class PolicyTests(unittest.TestCase):
             ("POST", "/auth/service-principals/{name}/enable"), ("POST", "/auth/service-principals/{name}/keys"),
             ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke")})
         self.assertEqual(set(principals.values()), {"engineer"})
+        # Two-step verification (#607): the code step is public like the login;
+        # the user's own routes are any session's; the switch is the Engineer's.
+        own = {key: access for key, access in policy.ACCESS.items() if key[1].startswith("/auth/mfa")}
+        self.assertEqual(own, {("GET", "/auth/mfa"): "mfa", ("POST", "/auth/mfa/enroll"): "mfa",
+                               ("POST", "/auth/mfa/enroll/confirm"): "mfa", ("POST", "/auth/mfa/recovery-codes"): "mfa",
+                               ("POST", "/auth/mfa/disable"): "mfa", ("POST", "/auth/mfa/policy"): "engineer"})
+        self.assertEqual(policy.ACCESS[("POST", "/auth/login/mfa")], "public")
 
     def test_keys_cannot_reach_administration_or_the_session_routes(self):
         # S5 of PR 3: every account, principal and key route, logout and the
         # password change, and the audit log (#29); GET /auth/me stays open to a key.
-        admin = {path for _, path in policy.ACCESS if path.startswith(("/auth/users", "/auth/service-principals"))}
+        admin = {path for _, path in policy.ACCESS
+                 if path.startswith(("/auth/users", "/auth/service-principals", "/auth/mfa"))}
         self.assertEqual(policy.HUMAN_ONLY, admin | {"/auth/logout", "/auth/password", "/audit", "/audit.csv"})
         self.assertNotIn("/auth/me", policy.HUMAN_ONLY)
 
@@ -750,7 +759,9 @@ class RouteTests(StoreTestCase):
         with self.assertLogs("auth", "WARNING") as logs:
             response = self.login("ENG", password)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"username": "eng", "role": "engineer", "must_change_password": True})
+        self.assertEqual(response.json(), {"username": "eng", "role": "engineer", "must_change_password": True,
+                                           "mfa_enrolled": False, "mfa_required": False,
+                                           "mfa_enrollment_required": False})
         cookie = response.headers["set-cookie"]
         attributes = [a.strip().lower() for a in cookie.split(";")[1:]]
         for want in ("httponly", "samesite=strict", "path=/", f"max-age={store.ABSOLUTE_S}"):
@@ -1016,7 +1027,8 @@ class AdminRouteTests(StoreTestCase):
         self.assertEqual(response.status_code, 200)
         users = response.json()["users"]
         self.assertEqual([u["username"] for u in users], ["dev", "eng", "user"])
-        self.assertEqual(set(users[0]), {"username", "role", "enabled", "must_change_password", "created_at"})
+        self.assertEqual(set(users[0]), {"username", "role", "enabled", "must_change_password", "created_at",
+                                         "mfa_enrolled"})
         self.assertEqual((users[0]["role"], users[0]["enabled"], users[0]["must_change_password"]),
                          ("developer", True, False))
         self.assertRegex(users[0]["created_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
@@ -1225,7 +1237,7 @@ class KeyStoreTests(KeyTestCase):
         with patch.object(settings, "auth_dir", temp.name):
             self.assertEqual(store.get_user("old").kind, "user")
             version = sqlite3.connect(Path(temp.name, "auth.db")).execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 2)
+            self.assertEqual(version, store.SCHEMA_VERSION)
             store.create_principal("svc", "developer")
             self.assertEqual([p.name for p in store.list_principals()], ["svc"])
 
@@ -1406,7 +1418,8 @@ class KeyMiddlewareTests(KeyTestCase):
         _, key = self.principal("svc", "end_user")
         response = self.client.get("/auth/me", headers=self.bearer(key))
         self.assertEqual(response.json(), {"username": "svc", "role": "end_user", "must_change_password": False,
-                                           "kind": "service"})
+                                           "kind": "service", "mfa_enrolled": False, "mfa_required": False,
+                                           "mfa_enrollment_required": False})
         headers, _ = self.session("dev")
         self.assertEqual(self.client.get("/auth/me", headers=headers).json()["kind"], "user")
 
@@ -1780,6 +1793,28 @@ class CommandTests(unittest.TestCase):
                     if secret:
                         self.assertNotIn(secret, result.stderr)
 
+    def test_reset_mfa(self):
+        # S6.2 of RD-117 (#607): the last-resort recovery, for an engineer too.
+        self.run_auth("bootstrap", "admin")
+        with patch.object(settings, "auth_dir", self.dir):
+            store._ready.discard(str(store.db_path()))
+            admin = store.get_user("admin")
+            secret, _ = store.start_enrollment(admin.id, "admin")
+            token = store.create_session(admin.id)
+            store.confirm_enrollment(store.authenticate(token), mfa.code_at(secret, int(time.time() // 30)))
+            store.create_principal("svc", "developer")
+        result = self.run_auth("reset-mfa", "Admin")
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual(result.stderr.strip().splitlines(), [
+            "auth: reset-mfa: two-step verification of 'admin' removed; their sessions ended"])
+        self.assertFalse(self.users()["admin"].mfa_enrolled)
+        with patch.object(settings, "auth_dir", self.dir):
+            self.assertIsNone(store.authenticate(token))
+        for args in (("reset-mfa", "nobody"), ("reset-mfa", "svc")):
+            with self.subTest(args=args):
+                refused = self.run_auth(*args)
+                self.assertEqual(refused.returncode, 1, refused.stderr)
+
 
 class TestingHelperTests(unittest.TestCase):
     def test_headers_are_a_real_session(self):
@@ -1806,6 +1841,644 @@ class OfflineTests(unittest.TestCase):
         self.assertEqual(set(health), {"llm", "build_llm", "embed", "same_model"})
 
 
+class MfaUnitTests(unittest.TestCase):
+    """TOTP, recovery codes and sealing (#607): S1.2, S2, S3 of RD-117's specifications."""
+
+    # RFC 6238 Appendix B, SHA-1: the ASCII secret "12345678901234567890", the
+    # last 6 of the 8 digits given there.
+    RFC = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+    VECTORS = ((59, "287082"), (1111111109, "081804"), (1111111111, "050471"), (1234567890, "005924"),
+               (2000000000, "279037"), (20000000000, "353130"))
+
+    def test_rfc_6238_vectors(self):
+        for at, code in self.VECTORS:
+            with self.subTest(at=at):
+                self.assertEqual(mfa.code_at(self.RFC, at // 30), code)
+
+    def test_window_and_replay(self):
+        now = 1_000_000_000.0
+        step = int(now // 30)
+        for offset in (-1, 0, 1):
+            with self.subTest(offset=offset):
+                code = mfa.code_at(self.RFC, step + offset)
+                self.assertEqual(mfa.matching_step(self.RFC, code, now, -1), step + offset)
+                # A step at or before the last accepted one never counts again.
+                self.assertIsNone(mfa.matching_step(self.RFC, code, now, step + offset))
+        for offset in (-2, 2):
+            with self.subTest(outside=offset):
+                self.assertIsNone(mfa.matching_step(self.RFC, mfa.code_at(self.RFC, step + offset), now, -1))
+        self.assertEqual(mfa.matching_step(self.RFC, " " + mfa.code_at(self.RFC, step)[:3] + " "
+                                           + mfa.code_at(self.RFC, step)[3:], now, -1), step)
+        for bad in ("", "12345", "1234567", "abcdef", "\u0661\u0662\u0663\u0664\u0665\u0666",
+                    "\uff11\uff12\uff13\uff14\uff15\uff16"):
+            self.assertIsNone(mfa.matching_step(self.RFC, bad, now, -1))
+            self.assertFalse(mfa.is_totp(bad))
+
+    def test_new_secret_is_160_bits_of_base32(self):
+        secret = mfa.new_secret()
+        self.assertRegex(secret, r"^[A-Z2-7]{32}$")
+        self.assertNotEqual(secret, mfa.new_secret())
+
+    def test_recovery_codes(self):
+        codes = mfa.new_recovery_codes()
+        self.assertEqual(len(codes), 10)
+        self.assertEqual(len(set(codes)), 10)
+        for code in codes:
+            self.assertRegex(code, r"^[a-z2-7]{4}-[a-z2-7]{4}-[a-z2-7]{4}-[a-z2-7]{4}$")
+        code = codes[0]
+        self.assertEqual(mfa.recovery_hash(code), mfa.recovery_hash(code.upper().replace("-", " ")))
+        self.assertEqual(mfa.recovery_hash(code), hashlib.sha256(code.replace("-", "").encode()).hexdigest())
+        for bad in ("", "123456", code + "a", "0000-0000-0000-0000"):
+            self.assertIsNone(mfa.recovery_hash(bad))
+
+    def test_otpauth_uri(self):
+        self.assertEqual(mfa.otpauth_uri("eng", "ABC"),
+                         "otpauth://totp/RAG%20Platform:eng?secret=ABC&issuer=RAG%20Platform"
+                         "&algorithm=SHA1&digits=6&period=30")
+
+    def test_sealing(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with patch.object(settings, "auth_dir", temp.name):
+            sealed = mfa.seal(7, "SECRET")
+            key = Path(temp.name, mfa.KEY_FILE)
+            self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(len(key.read_bytes()), 32)
+            self.assertNotIn("SECRET", sealed)
+            self.assertEqual(mfa.unseal(7, sealed), "SECRET")
+            self.assertIsNone(mfa.unseal(8, sealed), "another user's id is other associated data")
+            self.assertIsNone(mfa.unseal(7, sealed[:-4] + "AAAA"))
+            self.assertNotEqual(mfa.seal(7, "SECRET"), sealed, "a fresh nonce every time")
+            self.assertEqual([p.name for p in Path(temp.name).iterdir()], [mfa.KEY_FILE], "no temporary file is left")
+            key.write_bytes(os.urandom(32))
+            self.assertIsNone(mfa.unseal(7, sealed), "another key never verifies")
+            key.unlink()
+            self.assertIsNone(mfa.unseal(7, sealed), "a lost key never verifies")
+
+
+class MfaKeyFileTests(unittest.TestCase):
+    """The key file is never seen without its key (#607 review)."""
+
+    def test_a_racing_creator_uses_the_key_that_won(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with patch.object(settings, "auth_dir", temp.name):
+            key = Path(temp.name, mfa.KEY_FILE)
+            winner = os.urandom(32)
+            real_link = os.link
+
+            def link_after_the_other(src, dst):
+                key.write_bytes(winner)          # the other process linked its key first
+                return real_link(src, dst)
+            with patch.object(mfa.os, "link", link_after_the_other):
+                sealed = mfa.seal(3, "SECRET")
+            self.assertEqual(key.read_bytes(), winner)
+            self.assertEqual(mfa.unseal(3, sealed), "SECRET", "sealed under the winning key")
+            self.assertEqual([p.name for p in Path(temp.name).iterdir()], [mfa.KEY_FILE])
+
+    def test_a_failed_write_leaves_no_key_file(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with patch.object(settings, "auth_dir", temp.name), \
+                patch.object(mfa.os, "fsync", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                mfa.seal(3, "SECRET")
+            self.assertEqual(list(Path(temp.name).iterdir()), [], "neither an empty mfa.key nor a temporary file")
+
+
+class MfaTestCase(StoreTestCase):
+    """Helpers: enroll a user through the store, and the current code of a secret."""
+
+    def setUp(self):
+        super().setUp()
+        self.setup_roles()
+
+    def principal(self, username):
+        headers, token = self.session(username)
+        return store.authenticate(token), headers
+
+    def enroll(self, username):
+        """Enroll `username`; returns its secret and recovery codes."""
+        user = store.get_user(username)
+        secret, _ = store.start_enrollment(user.id, username)
+        principal, _ = self.principal(username)
+        codes = store.confirm_enrollment(principal, self.code(secret, -1))
+        return secret, codes
+
+    @staticmethod
+    def code(secret, offset=0):
+        return mfa.code_at(secret, int(time.time() // 30) + offset)
+
+    def challenge(self, username):
+        response = self.login(username, self.passwords[{"eng": "engineer", "dev": "developer",
+                                                        "user": "end_user"}[username]])
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"mfa_required": True})
+        self.assertNotIn(store.COOKIE + "=", response.headers.get("set-cookie", "").split(";")[0])
+        return response.cookies.get(store.MFA_COOKIE)
+
+    def second(self, token, code):
+        return self.client.post("/auth/login/mfa", json={"code": code},
+                                headers={"Cookie": f"{store.MFA_COOKIE}={token}"} if token else {})
+
+    def err(self, response):
+        return response.status_code, response.json()["error"]["code"]
+
+
+class MfaStoreTests(MfaTestCase):
+    def test_a_version_2_store_gains_the_mfa_tables(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        conn = sqlite3.connect(Path(temp.name, "auth.db"))
+        conn.executescript("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, "
+                           "role TEXT NOT NULL, password_hash TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, "
+                           "must_change_password INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL, "
+                           "updated_at REAL NOT NULL, kind TEXT NOT NULL DEFAULT 'user');"
+                           "INSERT INTO users VALUES (1, 'old', 'engineer', 'x', 1, 0, 1.0, 1.0, 'user');"
+                           "PRAGMA user_version = 2;")
+        conn.commit()
+        conn.close()
+        with patch.object(settings, "auth_dir", temp.name):
+            self.assertFalse(store.get_user("old").mfa_enrolled)
+            self.assertFalse(store.mfa_required())
+            version = sqlite3.connect(Path(temp.name, "auth.db")).execute("PRAGMA user_version").fetchone()[0]
+            self.assertEqual(version, 3)
+
+    def test_no_secret_or_code_is_stored_in_plain_form(self):
+        secret, codes = self.enroll("dev")
+        raw = Path(self.dir, "auth.db").read_bytes() + b"".join(
+            p.read_bytes() for p in Path(self.dir).glob("auth.db-*"))
+        self.assertNotIn(secret.encode(), raw)
+        for code in codes:
+            self.assertNotIn(code.encode(), raw)
+            self.assertNotIn(code.replace("-", "").encode(), raw)
+        hashes = {row[0] for row in self.rows("SELECT code_hash FROM recovery_codes")}
+        self.assertEqual(hashes, {mfa.recovery_hash(c) for c in codes})
+        self.assertEqual(Path(self.dir, mfa.KEY_FILE).stat().st_mode & 0o777, 0o600)
+
+    def test_enrollment_ends_the_other_sessions(self):
+        _, other = self.session("dev")
+        user = store.get_user("dev")
+        secret, uri = store.start_enrollment(user.id, "dev")
+        self.assertIn(f"secret={secret}", uri)
+        principal, _ = self.principal("dev")
+        with self.assertRaises(store.Refused) as wrong:
+            store.confirm_enrollment(principal, "000000" if self.code(secret) != "000000" else "111111")
+        self.assertEqual(wrong.exception.code, "MFA_CODE_INCORRECT")
+        codes = store.confirm_enrollment(principal, self.code(secret))
+        self.assertEqual(len(codes), 10)
+        self.assertIsNone(store.authenticate(other))
+        rows = self.rows(f"SELECT token_hash FROM sessions WHERE user_id = {principal.user_id}")
+        self.assertEqual([r[0] for r in rows], [principal.token_hash], "only this session stays")
+        with self.assertRaises(store.Refused) as again:
+            store.start_enrollment(user.id, "dev")
+        self.assertEqual(again.exception.code, "MFA_ALREADY_ENROLLED")
+
+    def test_a_pending_set_up_expires(self):
+        user = store.get_user("dev")
+        secret, _ = store.start_enrollment(user.id, "dev")
+        with closing(sqlite3.connect(store.db_path())) as conn, conn:
+            conn.execute("UPDATE mfa_pending SET created_at = created_at - ?", (store.MFA_PENDING_S + 1,))
+        principal, _ = self.principal("dev")
+        with self.assertRaises(store.Refused) as refused:
+            store.confirm_enrollment(principal, self.code(secret))
+        self.assertEqual(refused.exception.code, "MFA_ENROLLMENT_NOT_STARTED")
+
+    def test_regenerate_needs_a_current_totp_code(self):
+        secret, codes = self.enroll("dev")
+        principal, _ = self.principal("dev")
+        self.assertIsNone(store.regenerate_codes(principal, codes[0]), "a recovery code doesn't count here")
+        fresh = store.regenerate_codes(principal, self.code(secret, 1))
+        self.assertEqual(len(fresh), 10)
+        self.assertTrue(set(fresh).isdisjoint(codes))
+        self.assertEqual(store.mfa_status(principal.user_id)["recovery_codes_remaining"], 10)
+
+    def test_disable_rules(self):
+        secret, codes = self.enroll("dev")
+        principal, _ = self.principal("dev")
+        password = self.passwords["developer"]
+        self.assertFalse(store.disable_mfa(principal, "wrong password!", self.code(secret, 1)))
+        self.assertFalse(store.disable_mfa(principal, password, "000000-not"))
+        eng, _ = self.principal("eng")
+        self.enroll("eng")
+        store.set_mfa_required(eng.user_id, True)
+        with self.assertRaises(store.Refused) as required:
+            store.disable_mfa(principal, password, codes[0])
+        self.assertEqual(required.exception.code, "MFA_REQUIRED")
+        store.set_mfa_required(eng.user_id, False)
+        self.assertTrue(store.disable_mfa(principal, password, codes[0]))
+        self.assertFalse(store.get_user("dev").mfa_enrolled)
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM recovery_codes WHERE user_id = %d" % principal.user_id),
+                         [(0,)])
+        with self.assertRaises(store.Refused) as not_enrolled:
+            store.disable_mfa(principal, password, codes[1])
+        self.assertEqual(not_enrolled.exception.code, "MFA_NOT_ENROLLED")
+
+    def test_the_switch_needs_an_enrolled_engineer(self):
+        eng = store.get_user("eng")
+        with self.assertRaises(store.Refused) as refused:
+            store.set_mfa_required(eng.id, True)
+        self.assertEqual(refused.exception.code, "MFA_ENROLL_FIRST")
+        self.enroll("eng")
+        store.set_mfa_required(eng.id, True)
+        store.set_mfa_required(eng.id, True)
+        self.assertTrue(store.mfa_required())
+        store.set_mfa_required(eng.id, False)
+        self.assertFalse(store.mfa_required())
+
+    def test_reset(self):
+        self.enroll("dev")
+        _, token = self.session("dev")
+        store.reset_mfa("dev", "user")
+        self.assertFalse(store.get_user("dev").mfa_enrolled)
+        self.assertIsNone(store.authenticate(token))
+        for table in ("mfa", "mfa_pending", "recovery_codes", "mfa_challenges"):
+            self.assertEqual(self.rows(f"SELECT COUNT(*) FROM {table}"), [(0,)])
+        store.create_principal("svc", "developer")
+        with self.assertRaises(store.Refused) as principal:
+            store.reset_mfa("svc", "user")
+        self.assertEqual(principal.exception.code, "USER_NOT_FOUND")
+        with self.assertRaises(store.Refused) as operator:
+            store.reset_mfa("svc")
+        self.assertEqual(operator.exception.code, "NOT_A_USER")
+
+
+class MfaLoginTests(MfaTestCase):
+    def test_a_user_without_mfa_logs_in_as_before(self):
+        response = self.login("dev", self.passwords["developer"])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["mfa_enrolled"], False)
+        self.assertIn(store.COOKIE, response.cookies)
+
+    def test_password_then_code(self):
+        secret, _ = self.enroll("dev")
+        sessions = "SELECT COUNT(*) FROM sessions WHERE user_id = (SELECT id FROM users WHERE username = 'dev')"
+        before = self.rows(sessions)
+        with self.assertLogs("auth", "WARNING") as logs:
+            token = self.challenge("dev")
+        self.assertIn("code required", logged(logs))
+        self.assertTrue(token)
+        self.assertEqual(self.rows(sessions), before, "a right password alone opens no session")
+        cookie = [c for c in self.client.cookies.jar if c.name == store.MFA_COOKIE]
+        self.client.cookies.clear()
+        code = self.code(secret, 1)
+        with self.assertLogs("auth", "WARNING") as logs:
+            response = self.second(token, code)
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual((body["username"], body["mfa_enrolled"]), ("dev", True))
+        self.assertIn(store.COOKIE, response.cookies)
+        self.assertNotIn(code, logged(logs))
+        self.assertTrue(cookie)
+        # The challenge is spent, and the same code never works again.
+        self.client.cookies.clear()
+        self.assertEqual(self.err(self.second(token, code)), (401, "MFA_CHALLENGE_INVALID"))
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        self.assertEqual(self.err(self.second(token, code)), (401, "MFA_FAILED"))
+
+    def test_challenge_cookie_attributes(self):
+        self.enroll("dev")
+        response = self.login("dev", self.passwords["developer"])
+        attributes = [a.strip().lower() for a in response.headers["set-cookie"].split(";")[1:]]
+        for want in ("httponly", "samesite=strict", "path=/", f"max-age={store.MFA_CHALLENGE_S}"):
+            self.assertIn(want, attributes)
+
+    def test_wrong_codes_count_against_the_throttle(self):
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        wrong = "000000" if self.code(secret) != "000000" else "111111"
+        for _ in range(4):
+            self.assertEqual(self.err(self.second(token, wrong)), (401, "MFA_FAILED"))
+        # A right password doesn't clear the count (S4.2): a new challenge, one more wrong code locks.
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        self.assertEqual(self.err(self.second(token, wrong)), (401, "MFA_FAILED"))
+        self.assertTrue(locked("dev", "testclient"))
+        self.assertEqual(self.err(self.second(token, self.code(secret))), (429, "LOGIN_THROTTLED"))
+        self.assertEqual(self.login("dev", self.passwords["developer"]).status_code, 429)
+
+    def test_a_challenge_allows_five_codes(self):
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        for _ in range(5):
+            with closing(sqlite3.connect(store.db_path())) as conn, conn:
+                conn.execute("DELETE FROM login_failures")       # isolate the challenge's own limit
+            self.assertEqual(self.second(token, "999999-x").status_code, 401)
+        self.assertEqual(self.err(self.second(token, self.code(secret))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_a_challenge_expires(self):
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        with closing(sqlite3.connect(store.db_path())) as conn, conn:
+            conn.execute("UPDATE mfa_challenges SET created_at = created_at - ?", (store.MFA_CHALLENGE_S + 1,))
+        self.assertEqual(self.err(self.second(token, self.code(secret))), (401, "MFA_CHALLENGE_INVALID"))
+        self.assertEqual(self.err(self.second(None, self.code(secret))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_a_recovery_code_works_once(self):
+        _, codes = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        self.assertEqual(self.second(token, codes[3].upper()).status_code, 200)
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        self.assertEqual(self.err(self.second(token, codes[3])), (401, "MFA_FAILED"))
+        headers, _ = self.session("dev")
+        status = self.client.get("/auth/mfa", headers=headers).json()
+        self.assertEqual(status["recovery_codes_remaining"], 9)
+
+    def test_a_lost_key_leaves_the_recovery_codes(self):
+        secret, codes = self.enroll("dev")
+        Path(self.dir, mfa.KEY_FILE).unlink()
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_FAILED"))
+        self.assertEqual(self.second(token, codes[0]).status_code, 200)
+
+    def test_a_reset_or_disable_ends_a_challenge(self):
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        store.set_enabled("dev", False)
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+        # Enabling again doesn't revive it: disabling deleted it (#607 review).
+        store.set_enabled("dev", True)
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM mfa_challenges"), [(0,)])
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_a_password_change_or_reset_ends_a_challenge(self):
+        # #607 review: a login started with the old password can't be finished.
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        store.reset_password("dev", passwords.generate_password())
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+        store.reset_password("dev", self.passwords["developer"])   # back to a known password
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        principal, _ = self.principal("dev")
+        store.change_password(principal, passwords.generate_password())
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM mfa_challenges"), [(0,)])
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_an_mfa_reset_ends_a_challenge(self):
+        # Decision 2 (#607): a reset ends the user's pending challenges, so a
+        # login started before it can't be finished with the next enrollment's code.
+        self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM mfa_challenges"), [(1,)])
+        store.reset_mfa("dev", "user")
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM mfa_challenges"), [(0,)])
+        secret, _ = self.enroll("dev")
+        self.assertEqual(self.err(self.second(token, self.code(secret, 1))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_non_ascii_digits_are_a_plain_wrong_code(self):
+        # #607 review: other scripts' digits are refused as any wrong code, not a 500.
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        arabic = "\u0661\u0662\u0663\u0664\u0665\u0666"
+        self.assertEqual(self.err(self.second(token, arabic)), (401, "MFA_FAILED"))
+        headers, _ = self.session("dev")
+        self.assertEqual(self.err(self.client.post("/auth/mfa/recovery-codes", json={"code": arabic},
+                                                   headers=headers)), (403, "MFA_CODE_INCORRECT"))
+        self.assertEqual(self.second(token, self.code(secret, 1)).status_code, 200)
+
+
+class MfaConcurrencyTests(MfaTestCase):
+    """Reviewer's checks (#607): a code is spent once and a challenge's limits
+    hold when requests arrive together. Each check is slowed down inside the
+    write transaction, so without BEGIN IMMEDIATE the parallel requests would
+    all see the same unspent state."""
+
+    @staticmethod
+    def slowed(name="matching_step"):
+        real = getattr(mfa, name)
+
+        def slow(*args, **kwargs):
+            found = real(*args, **kwargs)
+            time.sleep(0.2)
+            return found
+        return patch.object(mfa, name, slow)
+
+    WRONG = "abcd-efgh-ijkl-mnop"           # a well-formed recovery code nobody holds
+
+    @staticmethod
+    def together(calls):
+        start, results = threading.Barrier(len(calls)), [None] * len(calls)
+
+        def run(i, call):
+            start.wait()
+            try:
+                results[i] = call()
+            except Exception as exc:          # recorded, so the assertion names it
+                results[i] = exc
+        threads = [threading.Thread(target=run, args=(i, c)) for i, c in enumerate(calls)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        return results
+
+    def test_one_totp_code_is_spent_once_across_parallel_uses(self):
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        principal, _ = self.principal("dev")
+        code = self.code(secret, 1)
+        with self.slowed():
+            results = self.together([
+                lambda: store.answer_challenge(token, code)[0] == "ok",
+                lambda: store.regenerate_codes(principal, code) is not None,
+                lambda: store.disable_mfa(principal, self.passwords["developer"], code),
+            ])
+        self.assertEqual(sorted(map(repr, results)), ["False", "False", "True"], results)
+
+    def test_one_recovery_code_is_spent_once_in_parallel(self):
+        _, codes = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        principal, _ = self.principal("dev")
+        with self.slowed("recovery_hash"):
+            results = self.together([
+                lambda: store.answer_challenge(token, codes[0])[0] == "ok",
+                lambda: store.disable_mfa(principal, self.passwords["developer"], codes[0]),
+            ])
+        self.assertEqual(sorted(map(repr, results)), ["False", "True"], results)
+
+    def test_parallel_wrong_codes_use_at_most_five_of_a_challenge(self):
+        from routers import auth as auth_router
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        # A different address per request, so the (username, address) throttle
+        # never applies and only the challenge's own limit of 5 can.
+        with self.slowed("recovery_hash"):
+            results = self.together([lambda n=n: auth_router._second_factor(token, self.WRONG, f"10.0.0.{n}")[0]
+                                     for n in range(8)])
+        self.assertEqual(results.count("failed"), store.MFA_CHALLENGE_TRIES, results)
+        self.assertEqual(results.count("invalid"), 8 - store.MFA_CHALLENGE_TRIES, results)
+        self.assertEqual(self.err(self.second(token, self.code(secret))), (401, "MFA_CHALLENGE_INVALID"))
+
+    def test_parallel_wrong_codes_from_one_address_lock_the_pair(self):
+        from routers import auth as auth_router
+        secret, _ = self.enroll("dev")
+        token = self.challenge("dev")
+        self.client.cookies.clear()
+        with self.slowed("recovery_hash"):
+            results = self.together([lambda: auth_router._second_factor(token, self.WRONG, "10.0.0.9")[0]
+                                     for _ in range(8)])
+        self.assertLessEqual(results.count("failed"), store.THROTTLE_FAILURES, results)
+        self.assertNotIn("ok", results)
+        self.assertTrue(locked("dev", "10.0.0.9"))
+
+
+class MfaDecisionDetailTests(MfaTestCase):
+    """Reviewer's checks of two details the maintainer accepted on #607 (2026-11-16)."""
+
+    def test_code_fields_accept_at_most_64_characters(self):
+        headers, _ = self.session("dev")
+        for path, body in (("/auth/login/mfa", {}), ("/auth/mfa/enroll/confirm", {}),
+                           ("/auth/mfa/recovery-codes", {}), ("/auth/mfa/disable", {"password": "x"})):
+            with self.subTest(path=path):
+                long = self.client.post(path, json={**body, "code": "1" * 65}, headers=headers)
+                self.assertEqual(long.status_code, 422, long.text)
+                self.assertEqual(long.json()["error"]["code"], "INVALID_PARAMETER", long.text)
+                at_limit = self.client.post(path, json={**body, "code": "1" * 64}, headers=headers)
+                self.assertNotEqual(at_limit.json().get("error", {}).get("code"), "INVALID_PARAMETER", at_limit.text)
+
+    def test_wrong_codes_at_set_up_confirm_do_not_count_toward_the_lockout(self):
+        headers, _ = self.session("dev")
+        secret = self.client.post("/auth/mfa/enroll", headers=headers).json()["secret"]
+        for _ in range(store.THROTTLE_FAILURES + 2):
+            self.assertEqual(self.err(self.client.post("/auth/mfa/enroll/confirm", json={"code": "abc"},
+                                                       headers=headers)), (422, "MFA_CODE_INCORRECT"))
+        self.assertFalse(locked("dev", "testclient"))
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM login_failures")[0][0], 0)
+        done = self.client.post("/auth/mfa/enroll/confirm", json={"code": self.code(secret)}, headers=headers)
+        self.assertEqual(done.status_code, 200, done.text)
+
+
+class MfaRouteTests(MfaTestCase):
+    def test_enroll_and_confirm(self):
+        headers, _ = self.session("dev")
+        other, _ = self.session("dev")
+        self.assertEqual(self.client.get("/auth/mfa", headers=headers).json(),
+                         {"enrolled": False, "enrolled_at": None, "required": False, "recovery_codes_remaining": 0})
+        started = self.client.post("/auth/mfa/enroll", headers=headers)
+        self.assertEqual(started.status_code, 200, started.text)
+        self.assertEqual(started.headers["cache-control"], "no-store")
+        secret = started.json()["secret"]
+        self.assertTrue(started.json()["otpauth_uri"].startswith("otpauth://totp/RAG%20Platform:dev?secret="))
+        wrong = self.client.post("/auth/mfa/enroll/confirm", json={"code": "12"}, headers=headers)
+        self.assertEqual(self.err(wrong), (422, "MFA_CODE_INCORRECT"))
+        with self.assertLogs("auth", "WARNING") as logs:
+            done = self.client.post("/auth/mfa/enroll/confirm", json={"code": self.code(secret)}, headers=headers)
+        self.assertEqual(done.status_code, 200, done.text)
+        self.assertEqual(done.headers["cache-control"], "no-store")
+        self.assertEqual(len(done.json()["recovery_codes"]), 10)
+        self.assertTrue(done.json()["status"]["enrolled"])
+        self.assertRegex(done.json()["status"]["enrolled_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertNotIn(secret, logged(logs))
+        self.assertEqual(self.client.get("/auth/me", headers=other).status_code, 401, "other sessions end")
+        self.assertTrue(self.client.get("/auth/me", headers=headers).json()["mfa_enrolled"])
+        self.assertEqual(self.err(self.client.post("/auth/mfa/enroll", headers=headers)),
+                         (409, "MFA_ALREADY_ENROLLED"))
+
+    def test_regenerate_route(self):
+        secret, _ = self.enroll("dev")
+        headers, _ = self.session("dev")
+        wrong = self.client.post("/auth/mfa/recovery-codes", json={"code": "abcdef"}, headers=headers)
+        self.assertEqual(self.err(wrong), (403, "MFA_CODE_INCORRECT"))
+        done = self.client.post("/auth/mfa/recovery-codes", json={"code": self.code(secret, 1)}, headers=headers)
+        self.assertEqual(done.status_code, 200, done.text)
+        self.assertEqual(done.headers["cache-control"], "no-store")
+        self.assertEqual(len(done.json()["recovery_codes"]), 10)
+        user_headers, _ = self.session("user")
+        self.assertEqual(self.err(self.client.post("/auth/mfa/recovery-codes", json={"code": "123456"},
+                                                   headers=user_headers)), (409, "MFA_NOT_ENROLLED"))
+
+    def test_disable_route(self):
+        secret, codes = self.enroll("dev")
+        headers, _ = self.session("dev")
+        wrong = self.client.post("/auth/mfa/disable", json={"password": "nope nope nope", "code": codes[0]},
+                                 headers=headers)
+        self.assertEqual(self.err(wrong), (403, "MFA_DISABLE_INCORRECT"))
+        done = self.client.post("/auth/mfa/disable", json={"password": self.passwords["developer"],
+                                                           "code": codes[0]}, headers=headers)
+        self.assertEqual(done.status_code, 200, done.text)
+        self.assertFalse(done.json()["status"]["enrolled"])
+        self.assertEqual(self.client.get("/auth/me", headers=headers).status_code, 200, "sessions stay")
+
+    def test_engineer_reset(self):
+        self.enroll("dev")
+        dev, _ = self.session("dev")
+        eng, _ = self.session("eng")
+        response = self.client.post("/auth/users/dev/reset-mfa", headers=eng)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["user"]["mfa_enrolled"])
+        self.assertEqual(self.client.get("/auth/me", headers=dev).status_code, 401)
+        self.assertEqual(self.err(self.client.post("/auth/users/eng/reset-mfa", headers=eng)),
+                         (409, "SELF_MFA_RESET_REFUSED"))
+        self.assertEqual(self.err(self.client.post("/auth/users/nobody/reset-mfa", headers=eng)),
+                         (404, "USER_NOT_FOUND"))
+        dev, _ = self.session("dev")
+        self.assertEqual(self.err(self.client.post("/auth/users/user/reset-mfa", headers=dev)), (403, "FORBIDDEN"))
+        users = self.client.get("/auth/users", headers=eng).json()["users"]
+        self.assertEqual({u["username"]: u["mfa_enrolled"] for u in users}, {"dev": False, "eng": False, "user": False})
+
+    def test_the_switch_and_the_enrollment_gate(self):
+        eng, _ = self.session("eng")
+        refused = self.client.post("/auth/mfa/policy", json={"required": True}, headers=eng)
+        self.assertEqual(self.err(refused), (409, "MFA_ENROLL_FIRST"))
+        self.enroll("eng")
+        eng, _ = self.session("eng")
+        dev, _ = self.session("dev")       # an existing session of a user who isn't enrolled
+        self.assertEqual(self.client.post("/auth/mfa/policy", json={"required": True}, headers=eng).json(),
+                         {"required": True})
+        self.assertEqual(self.err(self.client.get("/packages", headers=dev)), (403, "MFA_ENROLLMENT_REQUIRED"))
+        me = self.client.get("/auth/me", headers=dev).json()
+        self.assertEqual((me["mfa_required"], me["mfa_enrollment_required"]), (True, True))
+        self.assertEqual(self.client.get("/auth/mfa", headers=dev).status_code, 200)
+        self.assertEqual(self.err(self.client.post("/auth/mfa/disable", json={"password": "x", "code": "1"},
+                                                   headers=dev)), (409, "MFA_REQUIRED"))
+        self.assertEqual(self.client.get("/collections", headers=eng).status_code != 403, True,
+                         "an enrolled engineer isn't gated")
+        secret = self.client.post("/auth/mfa/enroll", headers=dev).json()["secret"]
+        self.client.post("/auth/mfa/enroll/confirm", json={"code": self.code(secret)}, headers=dev)
+        self.assertNotEqual(self.client.get("/packages", headers=dev).status_code, 403)
+        self.assertFalse(self.client.get("/auth/me", headers=dev).json()["mfa_enrollment_required"])
+
+    def test_a_due_password_change_comes_first(self):
+        eng, _ = self.session("eng")
+        self.enroll("eng")
+        store.set_mfa_required(store.get_user("eng").id, True)
+        self.make("fresh", "developer", must_change=True)
+        fresh, _ = self.session("fresh")
+        self.assertEqual(self.err(self.client.post("/auth/mfa/enroll", headers=fresh)),
+                         (403, "PASSWORD_CHANGE_REQUIRED"))
+        self.assertEqual(self.err(self.client.get("/packages", headers=fresh)), (403, "PASSWORD_CHANGE_REQUIRED"))
+
+    def test_keys_cannot_use_the_mfa_routes(self):
+        store.create_principal("svc", "engineer")
+        _, key = store.issue_key("svc")
+        for method, path in (("GET", "/auth/mfa"), ("POST", "/auth/mfa/enroll"), ("POST", "/auth/mfa/policy"),
+                             ("POST", "/auth/users/dev/reset-mfa")):
+            with self.subTest(route=f"{method} {path}"):
+                response = self.client.request(method, path, json={"required": True},
+                                               headers={"Authorization": f"Bearer {key}"})
+                self.assertEqual(self.err(response), (403, "KEY_NOT_ALLOWED"))
+        eng = store.get_user("eng")
+        self.enroll("eng")
+        store.set_mfa_required(eng.id, True)
+        self.assertNotEqual(self.client.get("/packages", headers={"Authorization": f"Bearer {key}"}).status_code,
+                            403, "a key isn't gated by the switch")
+
+
 class ImplementationCopyTests(unittest.TestCase):
     def test_embedded_copies_match(self):
         root = Path(API_DIR).parent
@@ -1815,7 +2488,7 @@ class ImplementationCopyTests(unittest.TestCase):
                      "api/routers/auth.py", "api/main.py", "ui/src/pages/UsersPage.tsx",
                      "api/auth/keys.py", "ui/src/pages/ServiceKeysPage.tsx", "api/config.py", "proxy/nginx.conf",
                      "scripts/verify/17_auth.sh", "scripts/verify/auth_setup.py", "scripts/verify/auth_stack.py",
-                     "scripts/verify/auth_headers.py"):
+                     "scripts/verify/auth_headers.py", "api/auth/mfa.py", "ui/src/pages/AccountPage.tsx"):
             with self.subTest(name=name):
                 header = "### " + name + "\n\n```"
                 start = document.index("\n", document.index(header) + len(header)) + 1

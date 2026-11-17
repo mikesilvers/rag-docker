@@ -118,11 +118,11 @@ Endpoint by endpoint (paths under `/api`):
 
 | Needs | Endpoints |
 |---|---|
-| nothing | `GET /health`, `GET /auth/status`, `POST /auth/login` |
-| any logged-in user | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password` |
+| nothing | `GET /health`, `GET /auth/status`, `POST /auth/login`, `POST /auth/login/mfa` |
+| any logged-in user | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password`; their own two-step verification (`GET /auth/mfa`, `POST /auth/mfa/enroll`, `/enroll/confirm`, `/recovery-codes`, `/disable`) |
 | End User | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
 | Developer | creating a collection; ingest (upload, job status, settings); document preparation (`POST /prepare/upload`; `GET /prepare/documents`; `GET` and `DELETE /prepare/documents/{document_id}`; `GET /prepare/documents/{document_id}/raw`; `GET` and `DELETE /prepare/documents/{document_id}/prepared`; `POST` and `GET /prepare/jobs`; `GET /prepare/job/{job_id}`; `POST /prepare/job/{job_id}/cancel`; `POST /prepare/import`); saving retrieval settings; gold standard (generate, sessions, pairs, regenerate, save, download); export, import, their job status, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}` |
-| AI Engineer | `DELETE /collections/{name}`; `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/job/{id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; the API docs (`/docs`, `/redoc`, `/openapi.json`); account management (`GET` and `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `/role`, `/disable`, `/enable`); service keys (`GET` and `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `/disable`, `/enable`, `/keys`, `/keys/{key_id}/revoke`); the audit log (`GET /audit`, `GET /audit.csv`), in a browser session only |
+| AI Engineer | `DELETE /collections/{name}`; `POST /tune/rechunk`, `/tune/reembed`, `/tune/reindex` and `GET /tune/job/{id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; the API docs (`/docs`, `/redoc`, `/openapi.json`); account management (`GET` and `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `/role`, `/disable`, `/enable`, `/reset-mfa`; `POST /auth/mfa/policy`); service keys (`GET` and `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `/disable`, `/enable`, `/keys`, `/keys/{key_id}/revoke`); the audit log (`GET /audit`, `GET /audit.csv`), in a browser session only |
 
 Without a session the API answers `401 AUTH_REQUIRED`; with a role that is too
 low, `403 FORBIDDEN`. Programs use service API keys instead of a session
@@ -145,6 +145,7 @@ docker compose exec api python -m auth reset-password <username>
 docker compose exec api python -m auth set-role <username> <role>
 docker compose exec api python -m auth disable <username>
 docker compose exec api python -m auth enable <username>
+docker compose exec api python -m auth reset-mfa <username>         # remove two-step verification (#607)
 docker compose exec api python -m auth list
 ```
 
@@ -170,6 +171,35 @@ person. The last enabled AI Engineer can't be demoted or disabled here either.
 Each change made on the Users page is one line in `docker compose logs api`,
 naming the AI Engineer, the change and the account, never a password, and one
 [audit log](#audit-log) record.
+
+### Two-step verification
+
+Each user can turn on two-step verification (#607) on the **Account** page
+(the account menu, top right): scan the QR code with an authenticator app
+(Microsoft Authenticator, Google Authenticator, 1Password and the like), or
+type the key it shows, and enter the 6-digit code. Logging in then takes the
+password and a code from the app. It uses the TOTP standard and needs no SMS,
+email or outside service, so it works offline. Setting it up logs out the
+user's other sessions.
+
+Setting it up also shows 10 recovery codes, once: each works once in place of
+a code, for a lost phone. A user can get a new set (with a code from the app)
+and, while it isn't required, turn two-step verification off (with their
+password and a code).
+
+An AI Engineer can require it for everyone on the **Users** page, once they have
+set it up themselves: until a user sets it up, they can only reach the Account
+page. On the Users page an AI Engineer also sees who has it on and can reset
+another user's set-up ("Reset two-step"), which logs them out; the user can
+then log in with their password and set it up again. An AI Engineer who has
+lost both their phone and their recovery codes is recovered by another AI
+Engineer, or with `python -m auth reset-mfa <username>`. Service keys are
+unchanged: programs have no second factor.
+
+The codes' secrets are stored encrypted in `auth.db` with a key in the
+`auth_data` volume (`mfa.key`); recovery codes are stored only as hashes.
+Back up `auth_data` as a whole: without `mfa.key`, codes from the apps stop
+working and users need a recovery code or a reset.
 
 ### Sessions
 
@@ -968,7 +998,7 @@ Six named Docker volumes persist data across restarts:
 | `ingest_uploads` | Ingest configs, gold standard sessions, exported gold-standard JSON files (`goldstandard_exports/`), metrics ring buffer (`metrics.jsonl`, bounded to 1,000 lines), the audit log (`audit/`, #29) |
 | `rag_sources` | Original uploaded documents, content-addressed per collection. Grows with your corpus |
 | `rag_preparation` | The preparation area (#638): raw documents uploaded on **Data → Prepare** and their prepared parts, until deleted. At most `MAX_PREPARATION_BYTES`. Not part of collection export packages |
-| `auth_data` | Accounts, password hashes, sessions and the login throttle (`auth.db`, SQLite, #25) |
+| `auth_data` | Accounts, password hashes, sessions and the login throttle (`auth.db`, SQLite, #25); two-step verification (#607): sealed TOTP secrets, recovery-code hashes and the switch in `auth.db`, and the sealing key `mfa.key` |
 
 Run `docker compose down -v` to delete all volumes and start fresh. Updating keeps every volume; see [Don't run these](#dont-run-these) for the commands that delete them.
 

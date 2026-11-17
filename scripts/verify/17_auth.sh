@@ -56,6 +56,14 @@ section "Account administration by Engineers (PR 2)"
 stack admin-accounts
 check "an Engineer creates, resets, re-roles, disables and enables an account through the API; own reset refused; no password logged" $?
 
+section "Two-step verification (#607)"
+stack mfa
+check "set-up, password then code, no code twice, a recovery code once, an Engineer's reset; nothing secret logged" $?
+stack mfa-required
+check "the switch needs an enrolled Engineer and gates an unenrolled session to its own routes; reset-mfa ends the sessions; audit records hold no code" $?
+stack mfa-rate-limit
+check "nginx gives POST /auth/login/mfa the login's 16k body limit and its rate zone (429 LOGIN_RATE_LIMITED)" $?
+
 section "Service principals and API keys (PR 3, H3)"
 stack key-matrix end_user
 check "End User key, no Origin: 403 above its role and on account/key administration, logout and password change" $?
