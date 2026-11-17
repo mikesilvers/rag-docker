@@ -3210,6 +3210,12 @@ page renders as one undifferentiated block.
   must be changed at first login, and has "Done", which removes it. The password is kept only in the page's memory.
 - A refused change shows the API's message as an alert and reloads the list. After a change to the engineer's own
   account the UI re-reads `GET /auth/me`: a demoted engineer leaves the page, a disabled one is logged out.
+- "Reset password", "Disable" and a role change ask first, in the browser's confirmation dialog (#551); "Enable"
+  doesn't. Cancelling sends nothing, and a cancelled role selector shows the current role again. On the engineer's
+  own row: "Change your own role to <Role>? You will lose access to the Users page." and "Disable your own account?
+  You will be logged out and can't log in again until another AI Engineer enables you." On other rows: "Change the
+  role of <name> to <Role>?", "Disable <name>? Their sessions end and they can't log in until enabled." and "Reset
+  the password of <name>? Their sessions end and they must change the new password at their next login."
 
 ### 7.13 Service Keys Page (#25)
 
@@ -4215,9 +4221,14 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   account and the API log searched for the generated passwords (suite 17). These checks fail on the code before
   PR 2 of #25, which has no such routes.*
 - [x] The Users page: an engineer-only entry in the nav's Admin menu and route; the account list; create and reset show the generated
-  password once until "Done"; no reset on the own row; role change, disable and enable; a refusal's message.
+  password once until "Done"; no reset on the own row; role change, disable and enable; reset, disable and a role
+  change ask first (the own row says what it does to the engineer), a cancel sends nothing, and enable doesn't ask;
+  a refusal's message; after a change to their own account a demoted engineer leaves the page and a disabled one is
+  logged out.
   *Evidence: `scripts/verify/browser/ui_controls.js` (suite 06), with every API call answered by request
-  interception; `ui_criteria.js` checks the real engineer's nav includes Users.*
+  interception, including the cases of an engineer who demotes or disables themselves and the two confirmation
+  cases (the wording of each, enable not asking, a cancel sending nothing); `ui_criteria.js` checks the real
+  engineer's nav includes Users.*
 - [x] Service keys: only engineers' sessions reach the principal and key routes; a key is issued only to a service
   principal, shown once (`Cache-Control: no-store`) and stored only as its SHA-256; a principal can't log in; a key
   works only as `Authorization: Bearer`, with its principal's current role and no `Origin`, and never on account,

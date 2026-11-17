@@ -516,7 +516,12 @@ function usersCases() {
       ...extra,
     });
   };
-  const open = (extra = {}) => ({ role: 'engineer', path: '/users', routes: usersApi(extra) });
+  // Reset password, Disable and a role change ask first (#551): `dialog.answer`
+  // says whether a confirmation is accepted (yes by default), `dialog.seen` keeps
+  // what was asked.
+  const open = (extra = {}, dialog = { answer: () => true, seen: [] }) => ({ role: 'engineer', path: '/users', routes: usersApi(extra),
+    onDialog: async d => { dialog.seen.push(d.message()); if (dialog.answer(d.message())) await d.accept(); else await d.dismiss(); } });
+  const othersAccepted = { answer: m => !m.includes('your own'), seen: [] }, allCancelled = { answer: () => false, seen: [] };
   const rowTexts = page => page.evaluate(() => [...document.querySelectorAll('tbody tr')].map(r => [...r.querySelectorAll('td')].map(c => c.textContent.trim())));
   const rowPress = async (page, username, label) => {
     const done = await page.evaluate((u, t) => {
@@ -599,6 +604,42 @@ function usersCases() {
       await waitFor(s.page, () => document.querySelector('[role=alert]') !== null, 'the alert');
       assert.ok(callsTo(s, 'GET', '/api/auth/users').length > before, 'the list was reloaded');
       assert.equal(await s.page.evaluate(() => document.querySelector('tr[data-username="vfy-engineer"] td:nth-child(3)').textContent.trim()), 'Enabled');
+    } },
+    { name: 'Reset password, Disable and a role change ask first, worded for the account; Enable asks nothing', open: open({}, othersAccepted), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      const status = (u, want) => waitFor(s.page, (n, w) => document.querySelector(`tr[data-username="${n}"] td:nth-child(3)`).textContent.trim() === w, `${u} ${want}`, u, want);
+      await fill(s.page, 'select[aria-label="Role of vfy-developer"]', 'end_user');
+      await waitFor(s.page, () => document.querySelector('select[aria-label="Role of vfy-developer"]').value === 'end_user', 'the new role');
+      await rowPress(s.page, 'vfy-developer', 'Disable');
+      await status('vfy-developer', 'Disabled');
+      await rowPress(s.page, 'vfy-off', 'Reset password');
+      await waitText(s.page, 'ResetOnce-0987654321ab');
+      await rowPress(s.page, 'vfy-off', 'Enable');
+      await status('vfy-off', 'Enabled');
+      await fill(s.page, `select[aria-label="Role of ${ME}"]`, 'developer');
+      await rowPress(s.page, ME, 'Disable');
+      await new Promise(r => setTimeout(r, 300));
+      assert.deepEqual(othersAccepted.seen, [
+        'Change the role of vfy-developer to End User?',
+        "Disable vfy-developer? Their sessions end and they can't log in until enabled.",
+        'Reset the password of vfy-off? Their sessions end and they must change the new password at their next login.',
+        'Change your own role to Developer? You will lose access to the Users page.',
+        "Disable your own account? You will be logged out and can't log in again until another AI Engineer enables you.",
+      ]);
+      for (const action of ['vfy-developer/role', 'vfy-developer/disable', 'vfy-off/reset-password', 'vfy-off/enable']) assert.equal(callsTo(s, 'POST', `/api/auth/users/${action}`).length, 1, action);
+      assert.equal(s.calls.filter(c => c.method === 'POST' && c.path.startsWith(`/api/auth/users/${ME}/`)).length, 0);
+      assert.equal(await s.page.evaluate(n => document.querySelector(`select[aria-label="Role of ${n}"]`).value, ME), 'engineer');
+    } },
+    { name: 'A cancelled role change, Disable or Reset password sends nothing', open: open({}, allCancelled), async run(s) {
+      await waitText(s.page, 'vfy-off');
+      await fill(s.page, 'select[aria-label="Role of vfy-developer"]', 'end_user');
+      await rowPress(s.page, 'vfy-developer', 'Disable');
+      await rowPress(s.page, 'vfy-developer', 'Reset password');
+      await new Promise(r => setTimeout(r, 300));
+      assert.equal(allCancelled.seen.length, 3);
+      assert.equal(s.calls.filter(c => c.method === 'POST' && c.path.startsWith('/api/auth/users/')).length, 0);
+      assert.equal(await s.page.evaluate(() => document.querySelector('select[aria-label="Role of vfy-developer"]').value), 'developer');
+      assert.equal(await s.page.evaluate(() => document.querySelector('tr[data-username="vfy-developer"] td:nth-child(3)').textContent.trim()), 'Enabled');
     } },
     { name: 'A list that cannot be loaded says so', open: open({ 'GET /api/auth/users': apiError(500, 'INTERNAL_ERROR', 'Synthetic failure.') }), async run(s) {
       await waitText(s.page, 'Could not load the users: Synthetic failure.');
