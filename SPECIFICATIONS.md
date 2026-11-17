@@ -4215,8 +4215,11 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   login; a reset does the same, ends the user's sessions, and is refused for the engineer's own account; a role
   change applies to an existing session's next request; disabling ends the user's sessions and refuses their login,
   and enabling restores it; the last enabled engineer can't be demoted or disabled, also by themselves; no route
-  deletes an account; each change and refusal is one API log line with no password.
-  *Evidence: `test_auth.py` `AdminRouteTests` and the policy checks (suite 17); `auth_stack.py matrix` with the six
+  deletes an account; each change and refusal is one API log line with no password. A username breaking the rule is
+  `422 INVALID_USERNAME` whatever its length, its refusal logged and audited cut to 256 characters.
+  *Evidence: `test_auth.py` `AdminRouteTests`, `StoreTests.test_two_last_engineer_changes_at_once_leave_one_engineer`
+  (two last-engineer changes at the same time leave one engineer) and the policy checks (suite 17); `auth_stack.py
+  matrix` with the six
   routes for every role and `auth_stack.py admin-accounts` on the running stack, with a throwaway `vfy-t-*`
   account and the API log searched for the generated passwords (suite 17). These checks fail on the code before
   PR 2 of #25, which has no such routes.*
@@ -4237,6 +4240,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   principal get `401 KEY_INVALID`; a key in a URL is no credential; expiry is 1-365 days, 90 by default; principals
   share the name pool and don't count for the last-engineer rule; the operator command lists principals, refuses
   their password reset and issues no key; each change and refusal is one API log line, and no key reaches the log.
+  A principal name follows the username rule: one breaking it is `422 INVALID_USERNAME` whatever its length, its
+  refusal logged and audited cut to 256 characters.
   *Evidence: `test_auth.py` `KeyFormatTests`, `KeyStoreTests`, `KeyMiddlewareTests`, `PrincipalRouteTests`, the
   `CommandTests` principal case and the policy checks (suite 17); `test_auth_enforcement.py` with the seven routes;
   `auth_stack.py matrix` with the seven routes for every role, `auth_stack.py key-matrix` with a key of each role,
