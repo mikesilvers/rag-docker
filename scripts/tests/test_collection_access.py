@@ -141,6 +141,14 @@ class StoreTests(AccessTestCase):
         self.assertTrue(store.has_access(eng.id, "engineer", SECRET))
         self.assertFalse(store.has_access(eng.id, "developer", SECRET))           # once demoted
 
+    def test_no_store_means_nothing_to_copy_or_drop(self):
+        empty = self.root / "empty-auth"
+        with patch.object(settings, "auth_dir", str(empty)):
+            self.assertEqual(store.copy_collection_access(SECRET, STAGING),
+                             (store.CollectionAccess(False), store.CollectionAccess(False)))
+            store.drop_collection_access(SECRET)
+            self.assertFalse((empty / "auth.db").exists())
+
     def test_copy_and_drop(self):
         store.copy_collection_access(SECRET, "Copy")
         self.assertEqual(store.collection_access("Copy"), store.collection_access(SECRET))

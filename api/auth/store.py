@@ -958,10 +958,20 @@ def restrict_to(collection: str, user_id: int | None) -> tuple[CollectionAccess,
         return before, _access(conn, collection)
 
 
+def _no_store() -> bool:
+    """True when no account store exists yet: then nothing can be restricted,
+    so copying or dropping a collection's state has nothing to do, and the
+    store isn't created just for that (a rebuild or import run outside the API,
+    as in-process tests do)."""
+    return str(db_path()) not in _ready and not db_path().exists()
+
+
 def copy_collection_access(source: str, target: str) -> tuple[CollectionAccess, CollectionAccess]:
     """The target takes the source's state: open stays open, restricted copies
     its grants. Returns (the target's state it replaced, the state written)."""
     source, target = _canonical(source), _canonical(target)
+    if _no_store():
+        return CollectionAccess(False), CollectionAccess(False)
     with _connect(write=True) as conn:
         before = _access(conn, target)
         if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (source,)).fetchone() is None:
@@ -998,5 +1008,7 @@ def put_back(collection: str, expected: CollectionAccess, previous: CollectionAc
 
 def drop_collection_access(collection: str) -> None:
     """A deleted collection's restriction and grants, so a later one of the same name starts afresh."""
+    if _no_store():
+        return
     with _connect(write=True) as conn:
         _open(conn, _canonical(collection))
