@@ -312,7 +312,10 @@ class _PackageStream(Response):
                 await self.background()
 
 
-@router.api_route("/packages/{filename}", methods=["GET", "HEAD"])
+# HEAD is its own route, out of the API schema, so the schema and the policy
+# list the download once (GET); policy.required answers HEAD as GET.
+@router.head("/packages/{filename}", include_in_schema=False)
+@router.get("/packages/{filename}")
 async def download_package(filename: str, request: Request = None):
     """One package from ./exports, streamed (#677). A full download deletes a
     package this instance exported; any other package is served and kept."""

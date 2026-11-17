@@ -755,6 +755,8 @@ class TelemetryTests(unittest.TestCase):
                                     # Document preparation (#638): its jobs, then its area's recovery.
                                     preparation_jobs=SimpleNamespace(_jobs=SimpleNamespace(load=lambda:(order.append('prepare') or [])),
                                                                      recover=lambda:(order.append('recover') or [])),
+                                    # The export package sweep (#677), a task cancelled at shutdown.
+                                    package_retention=SimpleNamespace(sweeper=lambda:asyncio.sleep(3600)),
                                     audit=SimpleNamespace(record=lambda *args,**kwargs:order.append('audit'),
                                                           login_flusher=lambda:asyncio.sleep(3600),
                                                           flush_logins=lambda:order.append('flush')))

@@ -1397,33 +1397,6 @@ fi
 [ -n "$sppkg" ] && rm -f "$EXPORTS/$sppkg"
 drop_collection "$SC"
 
-# ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
-RP="${PREFIX}BatchRecovery"
-# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
-if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
-if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
-  skip "batch recovery across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
-elif [ -n "$restart_refusal" ]; then
-  check "batch recovery across an API restart" 1 "$restart_refusal"
-elif ! [[ "$RP" =~ ^Vfy[A-Za-z0-9_]+$ ]]; then
-  # batch_recovery.py refuses any other prefix, as a guard on its destructive phases.
-  skip "batch recovery across an API restart" "batch_recovery.py accepts only Vfy… prefixes; RAG_TEST_PREFIX='$PREFIX' gives '$RP'"
-else
-  (cd "$REPO_ROOT" && docker compose exec -T api python - prepare --prefix "$RP" \
-    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_prepare.log 2>&1
-  check "batch faults fail truthfully and retain verified recovery" $? \
-    "$(grep -E 'Error|AssertionError' /tmp/vfy_recovery_prepare.log | tail -1)"
-  (cd "$REPO_ROOT" && docker compose restart api) >/dev/null 2>&1
-  for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
-  (cd "$REPO_ROOT" && docker compose exec -T api python - check --prefix "$RP" \
-    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_check.log 2>&1
-  check "recovery survives restart; owned scratch swept, unowned names kept" $? \
-    "$(grep -E 'Error|AssertionError' /tmp/vfy_recovery_check.log | tail -1)"
-  (cd "$REPO_ROOT" && docker compose exec -T api python - cleanup --prefix "$RP" \
-    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_cleanup.log 2>&1
-  check "recovery acceptance fixtures are removed" $?
-fi
-
 # ── downloading a package, and expiry (#677) ─────────────────────────────────
 # A full download through the proxy deletes a package exported here; an
 # interrupted one keeps it; a recorded package past EXPORT_RETENTION_HOURS (the
@@ -1485,6 +1458,33 @@ check_eq "#677: an End User is refused GET /packages/{filename}" \
 retention exists "$NPKG"
 check "#677: ... and the package stays" $?
 retention remove "$NPKG"
+
+# ── verified recovery across an API restart (#43, #44; opt-in: restarts the API) ──
+RP="${PREFIX}BatchRecovery"
+# Never the live rag-docker project, whatever RAG_VERIFY_LIVE says (#152).
+if [ "${RAG_ALLOW_RESTART:-0}" = "1" ]; then restart_refusal=$(restart_refusal_reason); fi
+if [ "${RAG_ALLOW_RESTART:-0}" != "1" ]; then
+  skip "batch recovery across an API restart" "set RAG_ALLOW_RESTART=1 to include it"
+elif [ -n "$restart_refusal" ]; then
+  check "batch recovery across an API restart" 1 "$restart_refusal"
+elif ! [[ "$RP" =~ ^Vfy[A-Za-z0-9_]+$ ]]; then
+  # batch_recovery.py refuses any other prefix, as a guard on its destructive phases.
+  skip "batch recovery across an API restart" "batch_recovery.py accepts only Vfy… prefixes; RAG_TEST_PREFIX='$PREFIX' gives '$RP'"
+else
+  (cd "$REPO_ROOT" && docker compose exec -T api python - prepare --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_prepare.log 2>&1
+  check "batch faults fail truthfully and retain verified recovery" $? \
+    "$(grep -E 'Error|AssertionError' /tmp/vfy_recovery_prepare.log | tail -1)"
+  (cd "$REPO_ROOT" && docker compose restart api) >/dev/null 2>&1
+  for _ in $(seq 1 90); do [ "$(api_code "$API/health")" = "200" ] && break; sleep 2; done
+  (cd "$REPO_ROOT" && docker compose exec -T api python - check --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_check.log 2>&1
+  check "recovery survives restart; owned scratch swept, unowned names kept" $? \
+    "$(grep -E 'Error|AssertionError' /tmp/vfy_recovery_check.log | tail -1)"
+  (cd "$REPO_ROOT" && docker compose exec -T api python - cleanup --prefix "$RP" \
+    < scripts/verify/batch_recovery.py) > /tmp/vfy_recovery_cleanup.log 2>&1
+  check "recovery acceptance fixtures are removed" $?
+fi
 
 rm -f "$EXPORTS/$PKG"
 drop_collection "$C"
