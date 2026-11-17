@@ -265,6 +265,9 @@ class ExportJobStatusResponse(BaseModel):
 
     error_code: Optional[str] = None
     error_detail: Optional[dict] = None
+    # When the package expires (UTC, #677): set for a completed export whose
+    # package is still recorded, null once it is downloaded or swept.
+    expires_at: Optional[str] = None
 
 class ImportRequest(BaseModel):
     filename: str
@@ -335,6 +338,9 @@ class PackageSummary(BaseModel):
     # can't be read without the passphrase. `readable` then says whether its
     # age header is valid.
     encrypted: bool = False
+    # When a package this instance exported is deleted if nobody downloads it
+    # (UTC, #677); null for one copied in to be imported or from before #677.
+    expires_at: Optional[str] = None
 
 
 class PackageListResponse(BaseModel):

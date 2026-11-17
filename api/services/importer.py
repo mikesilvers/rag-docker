@@ -305,6 +305,13 @@ def _package_key(filename: str) -> str:
     return Path(filename).name
 
 
+def package_busy(filename: str) -> bool:
+    """Whether an import of this package is running (#677: a download is
+    refused, and the expiry sweep waits, meanwhile)."""
+    with _lock:
+        return _package_key(filename) in _active
+
+
 def _claim_target(job_id: str, target: str, instead_of: str | None = None) -> str:
     """Claim `target` for this import, or refuse while another import holds it.
 

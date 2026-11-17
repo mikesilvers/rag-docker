@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     # Written export packages. A host bind mount, not a named volume: the
     # whole point is that the user can pick the file up and carry it away.
     exports_dir: str = "/app/exports"
+    # How long a package this instance exported stays in exports_dir when nobody
+    # downloads it (#677), in whole hours, 1 to 720. Counted from the export's
+    # finish; the sweep (services/package_retention.py) deletes it after that.
+    # Packages copied in to be imported are never expired.
+    export_retention_hours: int = 24
     # Ollama's model store, mounted from the same volume the ollama service
     # uses. Only touched when a package bundles models.
     ollama_models_dir: str = "/ollama"
@@ -105,6 +110,14 @@ class Settings(BaseSettings):
     def _preparation_cap(cls, value):
         if value < 1024 * 1024:
             raise ValueError("MAX_PREPARATION_BYTES must be at least 1048576")
+        return value
+
+    @field_validator("export_retention_hours")
+    @classmethod
+    def _retention_hours(cls, value):
+        # No value turns expiry off (#677): a package must not stay for good.
+        if not 1 <= value <= 720:
+            raise ValueError("EXPORT_RETENTION_HOURS must be 1 to 720")
         return value
 
     @field_validator("audit_log_keep")

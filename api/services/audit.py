@@ -13,7 +13,8 @@ know with `note()` (a collection named in a body, file names, a typed
 username). A refusal by the auth middleware is recorded only when it is a 403
 for an identified principal; 401s and 503s write nothing. Jobs get one record
 when they are stored (`job_started`, called by the job store) and one when they
-end (`job_ended`). The operator command and the API's start write their own.
+end (`job_ended`). The operator command and the API's start write their own,
+and so does the deletion of an export package (`package_deleted`, #677).
 
 **What never does.** No password, session token, API key, passphrase, answer
 or document text reaches a record: handlers note named parameters only, and a
@@ -91,6 +92,7 @@ ACTIONS: dict[tuple[str, str], str] = {
     ("POST", "/tune/reindex"): "tune.reindex",
     ("POST", "/goldstandard/save"): "goldstandard.save",
     ("GET", "/goldstandard/download/{filename}"): "goldstandard.download",
+    ("GET", "/packages/{filename}"): "package.download",                # #677
     ("POST", "/prepare/upload"): "prepare.upload",
     ("POST", "/prepare/jobs"): "prepare.start",
     ("POST", "/prepare/job/{job_id}/cancel"): "prepare.cancel",
@@ -118,10 +120,12 @@ ACTIONS: dict[tuple[str, str], str] = {
 # A refused use of a restricted collection on a route that has no action of its
 # own (#606); on an audited route the refusal is that route's record.
 ACCESS_REFUSED = "collection.access.refused"
+# An export package deleted after its download or when it expired (#677).
+PACKAGE_DELETE = "package.delete"
 OPERATOR_ACTIONS = ("bootstrap", "create-user", "reset-password", "set-role", "disable", "enable", "reset-mfa")
 # Every action name, for the API's filter and the UI's list.
 ALL_ACTIONS = tuple(sorted(set(ACTIONS.values()) | {"operator." + a for a in OPERATOR_ACTIONS}
-                          | {"system.start", ACCESS_REFUSED}))
+                          | {"system.start", ACCESS_REFUSED, PACKAGE_DELETE}))
 RESULTS = ("success", "refused", "error", "accepted", "succeeded", "failed", "interrupted")
 # A job's final status and the result its end record carries.
 JOB_RESULT = {"completed": "succeeded", "failed": "failed", "partial": "failed", "cancelled": "failed"}
@@ -176,19 +180,35 @@ def access_refused(request, collection: str, code: str = "COLLECTION_NOT_FOUND")
         return
     try:
         scope = getattr(request, "scope", None) or {}
-        principal = (scope.get("state") or {}).get("auth")
         route = getattr(scope.get("route"), "path", None)
-        client = scope.get("client")
         record(ACCESS_REFUSED, result="refused", status_code=404, collection=collection,
-               actor=getattr(principal, "username", None),
-               actor_kind=("service" if getattr(principal, "kind", None) == "service" else "user")
-               if principal is not None else "anonymous",
-               role=getattr(principal, "role", None), key_id=getattr(principal, "key_id", None),
-               client_ip=_header(scope, b"x-real-ip") or (client[0] if client else None),
+               **_scope_actor(scope),
                details={"route": f"{scope.get('method', '')} {route}" if route else scope.get("path"),
                         "reason": "collection_access", "code": code})
     except Exception:                                 # noqa: BLE001 - never breaks the answer
         _log.exception("Could not record a collection access refusal")
+
+
+def _scope_actor(scope) -> dict:
+    """The actor fields of a request's scope: its principal and client address."""
+    principal = (scope.get("state") or {}).get("auth")
+    client = scope.get("client")
+    return {"actor": getattr(principal, "username", None),
+            "actor_kind": ("service" if getattr(principal, "kind", None) == "service" else "user")
+            if principal is not None else "anonymous",
+            "role": getattr(principal, "role", None), "key_id": getattr(principal, "key_id", None),
+            "client_ip": _header(scope, b"x-real-ip") or (client[0] if client else None)}
+
+
+def package_deleted(filename: str, reason: str, scope=None) -> None:
+    """One `package.delete` record (#677): `reason` is `downloaded`, with the
+    downloading request's scope for its actor, or `expired`, by the system.
+    Never raises."""
+    try:
+        actor = _scope_actor(scope) if scope is not None else {"actor": "system", "actor_kind": "system"}
+        record(PACKAGE_DELETE, result="success", details={"file": filename, "reason": reason}, **actor)
+    except Exception:                                 # noqa: BLE001 - never breaks the deletion
+        _log.exception("Could not record the deletion of package %s", filename)
 
 
 def add_details(values: dict) -> None:
