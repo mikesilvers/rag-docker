@@ -50,7 +50,8 @@ def _no_weaviate():
 class AccessTestCase(unittest.TestCase):
     """A fresh store, upload and audit folder; people of each role, a
     Developer service principal with a key; Weaviate holding OPEN, SECRET and
-    a staging copy of SECRET; SECRET restricted to `dev` and the principal."""
+    a staging copy of SECRET; SECRET restricted to `dev` and the principal, and
+    the copy given SECRET's access when it was made."""
 
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -88,6 +89,8 @@ class AccessTestCase(unittest.TestCase):
         self.addCleanup(self.client.close)
         status = self.put(SECRET, {"restricted": True, "users": ["dev"], "service_principals": ["svc"]}).status_code
         self.assertEqual(status, 200)
+        # The staging copy got SECRET's access when it was made (collection_recovery.begin).
+        store.copy_collection_access(SECRET, STAGING)
 
     def as_(self, who):
         if who in ("svc", "svc2"):
@@ -159,7 +162,8 @@ class ListingTests(AccessTestCase):
 
     def test_a_change_applies_to_the_next_request(self):
         self.assertEqual(self.put(SECRET, {"restricted": False}).status_code, 200)
-        self.assertEqual(self.names("user"), [OPEN, SECRET, STAGING])
+        # The copy keeps the access it was made with (CopyTests).
+        self.assertEqual(self.names("user"), [OPEN, SECRET])
 
 
 class CreateDeleteTests(AccessTestCase):
@@ -226,7 +230,7 @@ class AccessRouteTests(AccessTestCase):
 
     def test_an_empty_grant_set_leaves_engineers_only(self):
         self.put(SECRET, {"restricted": True})
-        self.assertEqual(self.names("dev"), [OPEN])
+        self.assertEqual(self.names("dev"), [OPEN, STAGING])               # the copy keeps its own grants
         self.assertEqual(self.names("eng"), [OPEN, SECRET, STAGING])
 
 
@@ -288,7 +292,7 @@ class RefusalTests(AccessTestCase):
         self.refused(self.client.post("/ingest/upload", data={"collection": SECRET}, files=files, headers=dev2))
         from services import preparation_jobs
 
-        async def selected(body):
+        async def selected(body, usable=None):
             return {"records": [], "names": ["a.md"]}
         with patch.object(preparation_jobs, "import_documents", selected):
             self.refused(self.client.post("/prepare/import", json={"collection": SECRET, "all": True}, headers=dev2))
@@ -406,6 +410,273 @@ class PackageTests(AccessTestCase):
         self.assertFalse(store.collection_access("Open1_ab12cd34").restricted)
         importer._start_access(None, "Untracked", "Untracked")
         self.assertFalse(store.collection_access("Untracked").restricted)
+
+    def run_import(self, name, on_conflict, owner, **patches):
+        """importer._run on a package of collection `name`, with the package
+        checks and the build stubbed out; returns the job record."""
+        manifest = {"collection": {"name": name, "chunk_count": 1}}
+        record = {"job_id": "imp2", "status": "queued", "filename": "ragpkg-x.tar.gz", "collection": None,
+                  "owner": owner, "notes": [], "restored_sessions": []}
+        stubs = {"_validate_package_sources": lambda *a: None, "_check_embedding": lambda *a: None,
+                 "_read_goldstandard_sessions": lambda *a: [], "_read_retrieval_config": lambda *a: None,
+                 "_read_ingest_config": lambda *a: None, "_ensure_models": lambda *a: [],
+                 "_claim_target": lambda job_id, target, instead_of=None: target,
+                 "_mark_started": lambda target, *a: target, "_mark_finished": lambda *a: None, **patches}
+        targets = [patch.object(importer, "_jobs", {"imp2": record}),
+                   patch.object(importer.packager, "open_package", lambda *a: (self.root, manifest)),
+                   patch.object(importer.packager, "verify_digests", lambda *a: None),
+                   patch.object(importer.packager, "sha256_file", lambda *a: "ab12cd34" * 8)]
+        targets += [patch.object(importer, k, v) for k, v in stubs.items()]
+        for target in targets:
+            target.start()
+        try:
+            importer._run("imp2", "ragpkg-x.tar.gz", on_conflict)
+        finally:
+            for target in reversed(targets):
+                target.stop()
+        return record
+
+    def test_a_failed_import_of_a_new_name_leaves_no_access_state(self):
+        seen = []
+
+        def build(target, *a):
+            seen.append(store.collection_access(target))      # restricted before any data is written
+            raise importer.PackageError("IMPORT_FAILED", "the build failed")
+        record = self.run_import("Brandnew", "rename", {"name": "dev2", "kind": "user"}, _build=build)
+        self.assertEqual(record["status"], "failed", record)
+        self.assertEqual(seen, [store.CollectionAccess(True, ("dev2",), ())])
+        self.assertFalse(store.collection_access("Brandnew").restricted)
+
+    def test_a_replace_keeps_the_target_access(self):
+        def begin(*a):
+            raise importer.PackageError("IMPORT_FAILED", "stopped before the replace")
+        before = store.collection_access(SECRET)
+        with patch.object(importer.collection_recovery, "begin", begin), \
+                patch.object(wc, "get_client", lambda: None):
+            record = self.run_import(SECRET, "replace", {"name": "dev", "kind": "user"})
+        self.assertEqual((record["status"], record["error"]), ("failed", "stopped before the replace"), record)
+        self.assertEqual(store.collection_access(SECRET), before)
+
+
+
+class CopyTests(AccessTestCase):
+    """A staging or recovery copy keeps the access it was made with (#606)."""
+
+    def test_begin_snapshots_and_discard_drops(self):
+        from services import collection_recovery
+
+        class Client:
+            class collections:
+                @staticmethod
+                def exists(name):
+                    return False
+
+                @staticmethod
+                def delete(name):
+                    pass
+        record = collection_recovery.begin(SECRET, "import", Client)
+        copy = record["staging"]
+        self.assertEqual(store.collection_access(copy), store.collection_access(SECRET))
+        record = collection_recovery.begin(OPEN, "tune", Client)
+        self.assertFalse(store.collection_access(record["staging"]).restricted)
+        collection_recovery.discard(collection_recovery.begin(SECRET, "tune", Client), Client)
+        collection_recovery.discard({**collection_recovery.begin(SECRET, "import", Client)}, Client)
+        last = collection_recovery.begin(SECRET, "import", Client)
+        collection_recovery.discard(last, Client)
+        self.assertFalse(store.collection_access(last["staging"]).restricted)
+        self.assertTrue(store.collection_access(copy).restricted)          # a copy not discarded keeps it
+
+    def test_deleting_or_recreating_the_target_leaves_the_copy_as_it_was(self):
+        async def delete(name):
+            self.collections.discard(name)
+            return 1
+
+        async def create(**kwargs):
+            self.collections.add(kwargs["name"])
+        with patch.object(wc, "delete_collection_when_idle", delete):
+            self.assertEqual(self.client.delete(f"/collections/{SECRET}?confirm=true",
+                                                headers=self.as_("eng")).status_code, 200)
+        self.assertNotIn(STAGING, self.names("user"))                     # not opened by the delete
+        with patch.object(wc, "create_collection", create):
+            self.assertEqual(self.client.post("/collections", json={"name": SECRET},
+                                              headers=self.as_("dev2")).status_code, 201)
+        self.assertEqual(self.names("dev2"), [OPEN, SECRET])               # the new SECRET, not the old copy
+        self.assertIn(STAGING, self.names("dev"))
+        body = {"question": "What?", "collection": STAGING}
+        self.refused(self.client.post("/query", json=body, headers=self.as_("dev2")))
+
+
+class CreateFailureTests(AccessTestCase):
+    def test_a_failed_restriction_creates_nothing(self):
+        created = []
+
+        async def create(**kwargs):
+            created.append(kwargs["name"])
+
+        def broken(*args):
+            raise sqlite3.OperationalError("database is locked")
+        with patch.object(wc, "create_collection", create), patch.object(store, "restrict_to", broken):
+            answer = self.client.post("/collections", json={"name": "Fresh"}, headers=self.as_("dev2"))
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (500, "CREATE_FAILED"))
+        self.assertEqual(created, [])
+
+    def test_a_failed_create_puts_the_state_back(self):
+        seen = []
+
+        async def create(**kwargs):
+            seen.append(store.collection_access(kwargs["name"]))          # restricted before it exists
+            raise RuntimeError("weaviate refused")
+        with patch.object(wc, "create_collection", create):
+            answer = self.client.post("/collections", json={"name": "Fresh"}, headers=self.as_("dev2"))
+        self.assertEqual(answer.status_code, 500)
+        self.assertEqual(seen, [store.CollectionAccess(True, ("dev2",), ())])
+        self.assertFalse(store.collection_access("Fresh").restricted)
+
+    def test_put_back_only_restores_its_own_state(self):
+        before, mine = store.restrict_to("Race", store.get_user("dev2").id)
+        theirs = store.restrict_to("Race", store.get_user("dev").id)[1]     # another create wrote since
+        self.assertFalse(store.put_back("Race", mine, before))
+        self.assertEqual(store.collection_access("Race"), theirs)
+        self.assertTrue(store.put_back("Race", theirs, mine))
+        self.assertEqual(store.collection_access("Race"), mine)
+        self.assertTrue(store.put_back("Race", mine, before))
+        self.assertFalse(store.collection_access("Race").restricted)
+
+    def test_a_failed_import_after_a_concurrent_create_keeps_the_creator(self):
+        # The import wrote its state, then a create of the same name wrote its
+        # own and made the collection; the import's build fails.
+        before, mine = importer._start_access({"name": "dev2", "kind": "user"}, "Race", "Race")
+        theirs = store.restrict_to("Race", store.get_user("dev").id)[1]
+        self.collections.add("Race")
+        store.put_back("Race", mine, before)
+        self.assertEqual(store.collection_access("Race"), theirs)
+
+
+class PackageSourceTests(AccessTestCase):
+    def test_a_package_of_a_discarded_copy_follows_its_target(self):
+        gone = SECRET + "__importing_" + "1" * 32
+        self.assertEqual(importer._source(gone), SECRET)                   # the copy no longer exists
+        self.assertEqual(importer._source(STAGING), STAGING)               # an existing copy is itself
+        self.assertEqual(importer._source(OPEN), OPEN)
+        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, importer._source(gone)))
+        before, after = importer._start_access({"name": "dev", "kind": "user"}, importer._source(gone),
+                                               gone + "_ab12cd34")
+        self.assertEqual(after, store.collection_access(SECRET))
+        from routers import transfer
+        listed = [{"filename": "ragpkg-gone-copy.tar.gz", "size_bytes": 1, "collection": gone, "chunk_count": 1,
+                   "fidelity": "chunks-only", "created_at": None, "readable": True}]
+        with patch.object(transfer, "_list_packages_sync", lambda: [dict(p) for p in listed]):
+            self.assertEqual(self.client.get("/packages", headers=self.as_("dev2")).json()["packages"], [])
+            self.assertEqual(len(self.client.get("/packages", headers=self.as_("dev")).json()["packages"]), 1)
+
+    def test_an_encrypted_package_is_refused_once_decrypted(self):
+        import io
+        import tarfile
+        from services import age_stream, packager
+        manifest = json.dumps({"package_format": 1, "collection": {"name": SECRET, "chunk_count": 0}}).encode()
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w:gz") as tar:
+            info = tarfile.TarInfo("package/manifest.json")
+            info.size = len(manifest)
+            tar.addfile(info, io.BytesIO(manifest))
+        exports = Path(settings.exports_dir)
+        exports.mkdir(parents=True, exist_ok=True)
+        name = "ragpkg-secret.tar.gz.age"
+        with (exports / name).open("wb") as out:
+            enc = age_stream.Encryptor(out, "a test passphrase", 1)
+            enc.write(raw.getvalue())
+            enc.close()
+        record = {"job_id": "enc1", "status": "queued", "filename": name, "collection": None,
+                  "owner": {"name": "dev2", "kind": "user"}, "notes": [], "restored_sessions": []}
+        reached = []
+        with patch.object(importer, "_jobs", {"enc1": record}), \
+                patch.object(packager, "verify_digests", lambda *a: reached.append("digests")), \
+                patch.object(importer, "_validate_package_sources", lambda *a: None), \
+                patch.object(importer, "_check_embedding", lambda *a: None):
+            importer._run("enc1", name, "rename", "a test passphrase")
+        self.assertEqual(reached, ["digests"])                              # decrypted and opened for real
+        self.assertEqual((record["status"], record["error_code"]), ("failed", "PACKAGE_UNREADABLE"))
+        self.assertEqual(record["error"], f"No package named '{name}' in the exports directory.")
+        self.assertIsNone(record["collection"])
+        self.assertTrue(record["access_refused"])
+
+
+class GoldIndexOrderTests(AccessTestCase):
+    def test_the_collection_is_recorded_before_the_file(self):
+        order = []
+        session = {"session_id": "gs_9", "collection": SECRET, "status": "completed", "pairs": [],
+                   "pairs_total": 0, "pairs_completed": 0}
+        with patch.dict(goldstandard._sessions, {"gs_9": session}), \
+                patch.object(goldstandard, "_record_export_collection", lambda *a: order.append("index")), \
+                patch.object(goldstandard, "_save_export_sync", lambda *a: order.append("file")):
+            asyncio.run(goldstandard.save_session("gs_9", "gold.json", True))
+        self.assertEqual(order, ["index", "file"])
+
+
+class PrepareAreaTests(AccessTestCase):
+    """Documents imported into a collection the caller can't use are hidden (#606, Q18)."""
+
+    def setUp(self):
+        super().setUp()
+        from services import preparation_store as prep
+        target = patch.object(settings, "preparation_dir", str(self.root / "preparation"))
+        target.start()
+        self.addCleanup(target.stop)
+        source = self.root / "note.txt"
+        source.write_text("A note.\n")
+        self.secret_doc = prep.create("secret-note.txt", source, None)["id"]
+        self.open_doc = prep.create("open-note.txt", source, None)["id"]
+        self.plain_doc = prep.create("plain-note.txt", source, None)["id"]
+        prep.add_import([self.secret_doc], SECRET, "job1")
+        prep.add_import([self.open_doc], OPEN, "job2")
+
+    def listed(self, who):
+        answer = self.client.get("/prepare/documents", headers=self.as_(who))
+        self.assertEqual(answer.status_code, 200, answer.text)
+        return {d["id"] for d in answer.json()["documents"]}
+
+    def test_the_list_hides_documents_of_restricted_collections(self):
+        everything = {self.secret_doc, self.open_doc, self.plain_doc}
+        self.assertEqual(self.listed("dev2"), everything - {self.secret_doc})
+        self.assertEqual(self.listed("dev"), everything)
+        self.assertEqual(self.listed("svc2"), everything - {self.secret_doc})
+        self.assertEqual(self.listed("eng"), everything)
+        self.assertFalse(self.records("collection.access.refused"))
+
+    def test_the_document_routes_refuse_a_hidden_document(self):
+        doc = self.secret_doc
+        for method, path in (("GET", f"/prepare/documents/{doc}"), ("GET", f"/prepare/documents/{doc}/raw"),
+                             ("GET", f"/prepare/documents/{doc}/prepared"),
+                             ("DELETE", f"/prepare/documents/{doc}/prepared"), ("DELETE", f"/prepare/documents/{doc}")):
+            with self.subTest(method=method, path=path):
+                answer = self.client.request(method, path, headers=self.as_("dev2"))
+                self.assertEqual((answer.status_code, answer.json()["error"]["code"],
+                                  answer.json()["error"]["message"]),
+                                 (404, "DOCUMENT_NOT_FOUND", f"Document '{doc}' not found."))
+        self.assertEqual(self.client.get(f"/prepare/documents/{doc}", headers=self.as_("dev")).status_code, 200)
+        self.assertEqual(self.client.get(f"/prepare/documents/{doc}/raw", headers=self.as_("eng")).status_code, 200)
+        item = self.records("collection.access.refused")[-1]
+        self.assertEqual((item["actor"], item["collection"], item["details"]["code"]),
+                         ("dev2", SECRET, "DOCUMENT_NOT_FOUND"))
+        download = [r for r in self.records("prepare.download") if r["actor"] == "dev2"][0]
+        self.assertEqual((download["result"], download["details"]["reason"]), ("refused", "collection_access"))
+
+    def test_a_selection_treats_a_hidden_document_as_unknown(self):
+        for path, body in (("/prepare/jobs", {"document_ids": [self.secret_doc]}),
+                           ("/prepare/import", {"collection": OPEN, "document_ids": [self.secret_doc]})):
+            with self.subTest(path=path):
+                answer = self.client.post(path, json=body, headers=self.as_("dev2"))
+                self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "DOCUMENT_NOT_FOUND"))
+                self.assertEqual(answer.json()["error"]["detail"], {"documents": [self.secret_doc]})
+        from services import preparation_jobs
+        from routers import prepare
+        usable = lambda record: prepare._blocker(None) is None  # noqa: E731 - no request: everything
+        self.assertEqual(len(preparation_jobs._resolve(None, {"raw"}, usable)), 3)
+        dev2 = type("P", (), {"user_id": store.get_user("dev2").id, "role": "developer"})()
+        visible = __import__("auth.access", fromlist=["x"]).visible_filter(dev2)
+        hidden = lambda record: all(visible(i["collection"]) for i in record.get("imports") or [])  # noqa: E731
+        self.assertEqual({r["id"] for r in preparation_jobs._resolve(None, {"raw"}, hidden)},
+                         {self.open_doc, self.plain_doc})
 
 
 if __name__ == "__main__":

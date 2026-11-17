@@ -35,6 +35,7 @@ import uuid
 from pathlib import Path
 from contextlib import nullcontext
 
+from auth import access
 from auth import store as auth_store
 from config import settings
 from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
@@ -820,31 +821,42 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
         raise
 
 
+def _exists(name: str) -> bool:
+    """Whether a collection exists; Weaviate failing to answer counts as
+    existing, so the access checks below fail closed."""
+    try:
+        return wc._collection_exists_sync(name)
+    except Exception:                                 # noqa: BLE001
+        _log.exception("Could not check whether %r exists for an import's access check", name)
+        return True
+
+
+def _source(original: str) -> str:
+    """Whose access a package of `original` follows (#606): the collection
+    itself, or for a staging or recovery copy that no longer exists here, its
+    target (auth.access.package_source)."""
+    return access.package_source(original, _exists)
+
+
 def _refused(owner, source: str) -> bool:
-    """True when the package's collection exists here, is restricted, and the
-    job's owner may not use it (#606). Weaviate failing to answer counts as
-    existing, so the check fails closed."""
+    """True when the package's collection (`_source`) exists here, is
+    restricted, and the job's owner may not use it (#606)."""
     if owner is None or not auth_store.collection_access(source).restricted:
         return False
-    try:
-        exists = wc._collection_exists_sync(source)
-    except Exception:                                 # noqa: BLE001
-        _log.exception("Could not check whether %r exists for an import's access check", source)
-        exists = True
-    return exists and not auth_store.owner_has_access(owner, source)
+    return _exists(source) and not auth_store.owner_has_access(owner, source)
 
 
-def _start_access(owner, source: str, target: str) -> None:
-    """A collection this import creates (#606): a rename copies the source's
-    access (the source exists here, or there would be nothing to rename
-    around); a new name starts restricted to the job's owner. A job with no
-    owner (a direct call in tests) records nothing."""
+def _start_access(owner, source: str, target: str):
+    """A collection this import creates (#606): when the package's collection
+    (`_source`) exists here, the new one gets its state; otherwise it starts
+    restricted to the job's owner. Written before any data; returns (the state
+    replaced, the state written) for auth_store.put_back. A job with no owner
+    (a direct call in tests) records nothing and returns None."""
     if owner is None:
-        return
-    if target != source:
-        auth_store.copy_collection_access(source, target)
-    else:
-        auth_store.restrict_to(target, auth_store.user_id_for(owner))
+        return None
+    if source != target and _exists(source):
+        return auth_store.copy_collection_access(source, target)
+    return auth_store.restrict_to(target, auth_store.user_id_for(owner))
 
 
 @telemetry.traced("rag.import")
@@ -859,7 +871,8 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
     # set is not by itself evidence that anything survived to recover.
     staged = False
     ownership: dict | None = None
-    new_access: str | None = None    # a collection this job gave its access state to (#606)
+    new_access = None    # (collection, state replaced, state written) when this job set one (#606)
+    built = False        # this job's build of the target finished
 
     def progress(n: int) -> None:
         job["chunks_written"] = n
@@ -880,7 +893,8 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
         original = manifest["collection"]["name"]
         # A package of a collection its owner may not use is refused as if it
         # weren't there, before the job names the collection anywhere (#606).
-        if isinstance(original, str) and original and _refused(job.get("owner"), canonical(original)):
+        source = _source(original) if isinstance(original, str) and original else None
+        if source and _refused(job.get("owner"), source):
             job["access_refused"] = True
             raise PackageError("PACKAGE_UNREADABLE",
                                f"No package named '{archive.name}' in the exports directory.")
@@ -936,8 +950,10 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
             # A collection this import creates gets its access state before any
             # data is written; a replace keeps the target's (#606).
             if not exists or on_conflict != "replace":
-                _start_access(job.get("owner"), canonical(original), target)
-                new_access = target
+                states = _start_access(job.get("owner"), source or target, target)
+                if states is not None:
+                    before, written = states
+                    new_access = (target, written, before)       # put_back's (collection, expected, previous)
 
             if exists and on_conflict == "replace":
                 # Prove the package inserts cleanly before destroying anything.
@@ -965,6 +981,7 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
             instance = _mark_started(target, expected, job_id, lambda: _package_records(pkg, manifest))
             marked = target
             written = _build(target, pkg, manifest, progress, instance)
+            built = True
             _mark_finished(target)
             marked = None
             job.setdefault("restored_sessions", [])
@@ -1013,13 +1030,16 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
                 _mark_finished(marked)
             except Exception:
                 _log.exception("Could not finish import marker for %r; startup will retry", marked)
-        if new_access and job.get("status") == "failed":
-            # The collection wasn't made; its access state goes too (#606).
+        if new_access and not built and job.get("status") == "failed":
+            # This job made no collection (its build removes what it started),
+            # so the state it wrote goes back to what it replaced, unless a
+            # create of the same name wrote its own since (#606). A collection
+            # it did build keeps its state.
             try:
-                if not wc._collection_exists_sync(new_access):
-                    auth_store.drop_collection_access(new_access)
+                auth_store.put_back(*new_access)
             except Exception:                         # noqa: BLE001
-                _log.exception("Could not clear the access state of %r after a failed import", new_access)
+                _log.exception("Could not put back the access state of %r after a failed import",
+                               new_access[0])
         if ownership and ownership["state"] == "scratch":
             try:
                 collection_recovery.discard(ownership, wc.get_client())

@@ -174,16 +174,22 @@ async def _hidden(principal, packages: list[dict]) -> set[str]:
     answer counts as existing, so the listing fails closed."""
     visible = await asyncio.to_thread(access.visible_filter, principal)
     hidden = set()
-    for p in packages:
-        name = p.get("collection")
-        if p.get("encrypted") or not p.get("readable") or not isinstance(name, str) or not name or visible(name):
-            continue
+
+    async def exists(name):
         try:
-            exists = await wc.collection_exists(access.target_of(name))
+            return await wc.collection_exists(name)
         except Exception:                             # noqa: BLE001
             _log.exception("Could not check whether %r exists for the package listing", name)
-            exists = True
-        if exists:
+            return True
+    for p in packages:
+        name = p.get("collection")
+        if p.get("encrypted") or not p.get("readable") or not isinstance(name, str) or not name:
+            continue
+        # A package of a discarded staging or recovery copy follows its target.
+        source = access.canonical(name)
+        if access.target_of(source) != source and not await exists(source):
+            source = access.target_of(source)
+        if not visible(source) and await exists(source):
             hidden.add(p["filename"])
     return hidden
 

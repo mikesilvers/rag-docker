@@ -1640,12 +1640,17 @@ collection everything its role allows; an ungranted one can do nothing with it. 
 The state is in `auth.db` (schema version 4, tables `restricted_collections` and `collection_grants`, keyed by the
 stored collection name): a store from before #606 gains the empty tables on first open, so every existing
 collection stays open. A staging or recovery collection of a rebuild or import (`<target>__tuning_<token>`,
-`<target>__importing_<token>`) has its target's access. The rule is read on every request, so a change applies to
+`<target>__importing_<token>`) gets its target's access when its ownership is recorded, before it is created, under
+its own name, and keeps it whatever later happens to the target (a delete, a re-create, new grants); discarding or
+deleting the copy drops it. The rule is read on every request, so a change applies to
 each session's and key's next request; no session ends and a running job finishes. Grants stay when an account is
 disabled or its role changes; an Engineer demoted to a lower role is then bound by them.
 
 - **New collections.** `POST /collections` restricts the new collection to the creating account, Engineers
-  included. An import that creates a collection under a new name (`rename`) copies its source collection's state
+  included. The restriction is written before the collection is created: if that write fails nothing is created
+  (`500 CREATE_FAILED`); if the create fails, the state it replaced is put back, but only while the state is still
+  the one it wrote, so a create and an import of the same new name at once never leave it open or give one the
+  other's grants. An import does the same with the state it writes. An import that creates a collection under a new name (`rename`) copies its source collection's state
   (open stays open; restricted copies the grants); one that creates its package's own name, which doesn't exist
   here, restricts it to the job's owner. An import `replace` and tuning keep the target's state.
   `DELETE /collections/{name}` deletes the state, so a later collection of the same name starts afresh.
@@ -1661,14 +1666,19 @@ disabled or its role changes; an Engineer demoted to a lower role is then bound 
   `POST /collections` with it answers `409 COLLECTION_EXISTS` and an import with `on_conflict: abort` fails on it;
   the content stays closed.
 - **Gold-standard files.** `POST /goldstandard/save` records which collection each file came from in
-  `{UPLOAD_DIR}/goldstandard_export_collections.json`, outside the served folder. `GET
+  `{UPLOAD_DIR}/goldstandard_export_collections.json`, outside the served folder, before it writes the file. `GET
   /goldstandard/download/{filename}` checks it (`404 FILE_NOT_FOUND` without access); a file with no recorded
   collection (saved before #606, or placed by hand) is served to Engineers only.
-- **Packages.** `GET /packages` hides an unencrypted package whose collection exists here and is restricted, from a
-  caller without access to it (Weaviate not answering counts as existing). An import job refuses a package of such
+- **Packages.** A package's collection is the name in its manifest; for a staging or recovery copy that no longer
+  exists here, its target. `GET /packages` hides an unencrypted package whose collection exists here and is
+  restricted, from a caller without access to it (Weaviate not answering counts as existing). An import job refuses a package of such
   a collection, for encrypted packages too once decrypted, before anything is created or replaced: the job fails
   with the answer a missing package gives (`PACKAGE_UNREADABLE`, "No package named '<file>' in the exports
   directory.") and names no collection.
+- **The Prepare area** (§3.1.11). A prepared document with an import record for a collection the caller may not
+  use is hidden from them: left out of `GET /prepare/documents`, `404 DOCUMENT_NOT_FOUND` on its detail, raw and
+  prepared downloads and deletes, and an unknown id to `POST /prepare/jobs` and `POST /prepare/import` (`all: true`
+  doesn't select it). Engineers see every document; a document with no imports is shared as before.
 - **Audit** (§3.1.9). A refusal on an audited route is that route's record, result `refused`, with
   `details.reason: "collection_access"`; on another route, a `collection.access.refused` record (status 404,
   `details.route`, `details.code`). A refused import's end record has result `refused` and the reason. A filtered
@@ -1927,7 +1937,9 @@ removes headers, footers, page numbers and boilerplate, and writes a title and s
 MD parts. CSV and JSON parts are labelled from their data, with no LLM call (#648). One area for the
 instance, in the `rag_preparation` volume (`PREPARATION_DIR`, `/app/preparation`); documents stay until
 deleted. Every route is `developer` (§3.1.8); documents are shared, each showing its owner, and any caller
-with access may delete any document.
+with access may delete any document, except that a document imported into a collection the caller may not use is
+hidden from them and refused as an unknown document (`404 DOCUMENT_NOT_FOUND`), audited; Engineers see every
+document (per-collection access, §3.1.8, #606).
 
 **Storage limit.** `MAX_PREPARATION_BYTES` (default 21474836480, 20 GiB; at least 1048576 or the API
 refuses to start): the most the area's files may hold, raw and prepared together. A best-effort cap
@@ -3222,7 +3234,7 @@ A retained session can be loaded/refreshed by its session ID, including when its
 - "New Collection" button → modal with fields: name, index type, distance metric, HNSW params.
 - A refused create (for example `409 COLLECTION_EXISTS`, a 422 or a 503) keeps the modal open and shows the API's message inside it, as an alert. The message clears on Cancel, when the modal is opened again, or when a create succeeds (#379).
 - Delete button per row → confirmation modal with collection name typed to confirm. Calls `DELETE /collections/{name}?confirm=true`.
-- Access (#606): an "Access" column shows "Open", "Restricted (n)" (n grants) or "—" when `GET /collections/{name}/access` failed for that row. An "Access" button per row opens a dialog: Open or Restricted, and when restricted the people (`GET /auth/users`) and service principals (`GET /auth/service-principals`) as checkboxes, disabled ones marked. Save calls `PUT /collections/{name}/access`; a refused save keeps the dialog open with the API's message as an alert.
+- Access (#606): the dialog reads the state when it opens; until that read succeeds the choice is unknown and Save is disabled, and a read answering after the Engineer changed something doesn't overwrite the change. An "Access" column shows "Open", "Restricted (n)" (n grants) or "—" when `GET /collections/{name}/access` failed for that row. An "Access" button per row opens a dialog: Open or Restricted, and when restricted the people (`GET /auth/users`) and service principals (`GET /auth/service-principals`) as checkboxes, disabled ones marked. Save calls `PUT /collections/{name}/access`; a refused save keeps the dialog open with the API's message as an alert.
 - A refused delete keeps the modal open and shows the API's message inside it, as an alert: for `409 COLLECTION_BUSY`, for example, "An ingest job is running for this collection (…)". The collection stays listed; the message clears on Cancel, when the modal is opened again, or when a delete succeeds.
 
 ### 7.9 Health Dashboard Page
@@ -4433,8 +4445,12 @@ Two-step verification (#607). These are ticked once the tests reviewer's full `s
   options, job and session lookups, gold-standard downloads) to accounts and keys not granted it, and usable by
   granted ones and Engineers; a new collection is restricted to its creator; a delete drops the state; existing
   collections stay open after the upgrade; the settings routes answer `404` for a missing collection; packages of
-  restricted collections are hidden and their import fails as a missing package; an imported copy takes its
-  source's access; only Engineers' sessions read or change access; every change and refusal is audited.
+  restricted collections are hidden and their import fails as a missing package (encrypted ones once decrypted, and
+  a package of a discarded staging copy as its target's); an imported copy takes its source's access; a staging or
+  recovery copy keeps the access it was made with when its target is deleted or re-created; creation is fail-closed
+  and a failed create or import puts back only its own state; documents in the Prepare area imported into a
+  collection the caller can't use are hidden and refused; only Engineers' sessions read or change access; every
+  change and refusal is audited.
   *Evidence: `scripts/tests/test_collection_access.py` (suite 17), which fails on the code before #606;
   `auth_stack.py collection-access` and the matrix rows (suite 17); the Collections page's Access case in
   `scripts/verify/browser/ui_controls.js` (suite 06).*

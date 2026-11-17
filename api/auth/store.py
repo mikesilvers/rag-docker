@@ -948,22 +948,52 @@ def set_collection_access(collection: str, restricted: bool, users=(), service_p
         return before, _access(conn, collection)
 
 
-def restrict_to(collection: str, user_id: int | None) -> None:
-    """A new collection: restricted, granted only to its creator (none when None)."""
+def restrict_to(collection: str, user_id: int | None) -> tuple[CollectionAccess, CollectionAccess]:
+    """A new collection: restricted, granted only to its creator (none when
+    None). Returns (the state it replaced, the state written), for put_back."""
+    collection = _canonical(collection)
     with _connect(write=True) as conn:
-        _restrict(conn, _canonical(collection), [] if user_id is None else [user_id])
+        before = _access(conn, collection)
+        _restrict(conn, collection, [] if user_id is None else [user_id])
+        return before, _access(conn, collection)
 
 
-def copy_collection_access(source: str, target: str) -> None:
-    """The target takes the source's state: open stays open, restricted copies its grants."""
+def copy_collection_access(source: str, target: str) -> tuple[CollectionAccess, CollectionAccess]:
+    """The target takes the source's state: open stays open, restricted copies
+    its grants. Returns (the target's state it replaced, the state written)."""
     source, target = _canonical(source), _canonical(target)
     with _connect(write=True) as conn:
+        before = _access(conn, target)
         if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (source,)).fetchone() is None:
             _open(conn, target)
-            return
-        ids = [row["user_id"] for row in
-               conn.execute("SELECT user_id FROM collection_grants WHERE collection = ?", (source,))]
-        _restrict(conn, target, ids)
+        else:
+            ids = [row["user_id"] for row in
+                   conn.execute("SELECT user_id FROM collection_grants WHERE collection = ?", (source,))]
+            _restrict(conn, target, ids)
+        return before, _access(conn, target)
+
+
+def put_back(collection: str, expected: CollectionAccess, previous: CollectionAccess) -> bool:
+    """After a create that failed: the collection's state goes back to
+    `previous`, but only while it is still `expected`, the state the failed
+    create wrote. A concurrent create or import that wrote its own state since
+    keeps it, so a failure never takes another's grants nor opens a collection.
+    One transaction. True when it put the state back."""
+    collection = _canonical(collection)
+    with _connect(write=True) as conn:
+        if _access(conn, collection) != expected:
+            return False
+        if not previous.restricted:
+            _open(conn, collection)
+            return True
+        ids = []
+        for names, kind in ((previous.users, "user"), (previous.service_principals, "service")):
+            for name in names:
+                row = conn.execute("SELECT id FROM users WHERE username = ? AND kind = ?", (name, kind)).fetchone()
+                if row is not None:
+                    ids.append(row["id"])
+        _restrict(conn, collection, ids)
+        return True
 
 
 def drop_collection_access(collection: str) -> None:

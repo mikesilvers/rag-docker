@@ -40,6 +40,70 @@ def _error(exc: store.AreaError):
     return api_error(exc.status, exc.code, exc.message, detail=exc.detail)
 
 
+# ── per-collection access (#606) ─────────────────────────────────────────────
+# A document imported into a collection the caller may not use is hidden from
+# them, with its import records, and refused as an unknown document; Engineers
+# see every document. A document with no imports is shared as before.
+
+def _blocker(request):
+    """A function giving, for a document record, the first collection among its
+    imports the caller may not use (None when it may be shown). None for an
+    Engineer or a direct call, who see everything. Reads the store: call it in
+    a thread."""
+    principal = access.principal_of(request)
+    if principal is None or principal.role == "engineer":
+        return None
+    visible = access.visible_filter(principal)
+
+    def blocked(record: dict):
+        for item in record.get("imports") or []:
+            name = item.get("collection") if isinstance(item, dict) else None
+            if isinstance(name, str) and name and not visible(name):
+                return name
+        return None
+    return blocked
+
+
+async def _hidden(request, document_id: str):
+    """The 404 for a document the caller may not use, audited; None otherwise
+    (also for an unknown or unreadable id, which the route answers itself)."""
+    blocked = await asyncio.to_thread(_blocker, request)
+    if blocked is None:
+        return None
+    try:
+        record = await asyncio.to_thread(store.get, document_id)
+    except store.AreaError:
+        return None
+    collection = blocked(record)
+    if collection is None:
+        return None
+    await asyncio.to_thread(audit.access_refused, request, collection, "DOCUMENT_NOT_FOUND")
+    return api_error(404, "DOCUMENT_NOT_FOUND", f"Document '{document_id}' not found.")
+
+
+async def _usable(request):
+    """The predicate preparation_jobs uses to select documents (None: all)."""
+    blocked = await asyncio.to_thread(_blocker, request)
+    return None if blocked is None else (lambda record: blocked(record) is None)
+
+
+async def _audit_refused_ids(request, document_ids) -> None:
+    """Audit each explicitly selected document the caller may not use (#606)."""
+    if not document_ids:
+        return
+    blocked = await asyncio.to_thread(_blocker, request)
+    if blocked is None:
+        return
+    for document_id in dict.fromkeys(document_ids):
+        try:
+            record = await asyncio.to_thread(store.get, document_id)
+        except store.AreaError:
+            continue
+        collection = blocked(record)
+        if collection is not None:
+            await asyncio.to_thread(audit.access_refused, request, collection, "DOCUMENT_NOT_FOUND")
+
+
 # ── upload ───────────────────────────────────────────────────────────────────
 
 @router.post("/upload", status_code=201)
@@ -66,15 +130,20 @@ async def upload(files: list[UploadFile] = File(...), request: Request = None):
 # ── reading ──────────────────────────────────────────────────────────────────
 
 @router.get("/documents")
-async def list_documents():
+async def list_documents(request: Request = None):
     records = await asyncio.to_thread(store.list_documents)
+    blocked = await asyncio.to_thread(_blocker, request)
+    if blocked is not None:
+        records = [r for r in records if blocked(r) is None]
     used = await asyncio.to_thread(store.usage)
     return {"documents": [store.list_entry(r) for r in records],
             "used_bytes": used, "limit_bytes": store.limit()}
 
 
 @router.get("/documents/{document_id}")
-async def get_document(document_id: str):
+async def get_document(document_id: str, request: Request = None):
+    if (hidden := await _hidden(request, document_id)) is not None:
+        return hidden
     try:
         return await asyncio.to_thread(store.preview, document_id)
     except store.AreaError as exc:
@@ -107,7 +176,9 @@ def _media_type(name: str) -> str:
 
 
 @router.get("/documents/{document_id}/raw")
-async def download_raw(document_id: str):
+async def download_raw(document_id: str, request: Request = None):
+    if (hidden := await _hidden(request, document_id)) is not None:
+        return hidden
     try:
         record, handle = await asyncio.to_thread(store.open_raw, document_id)
     except store.AreaError as exc:
@@ -143,7 +214,9 @@ def _build_zip(handles: list[tuple[str, Any]]) -> Path:
 
 
 @router.get("/documents/{document_id}/prepared")
-async def download_prepared(document_id: str):
+async def download_prepared(document_id: str, request: Request = None):
+    if (hidden := await _hidden(request, document_id)) is not None:
+        return hidden
     try:
         record, handles = await asyncio.to_thread(store.open_parts, document_id)
     except store.AreaError as exc:
@@ -171,7 +244,9 @@ async def download_prepared(document_id: str):
 # ── deletes ──────────────────────────────────────────────────────────────────
 
 @router.delete("/documents/{document_id}", status_code=204)
-async def delete_document(document_id: str):
+async def delete_document(document_id: str, request: Request = None):
+    if (hidden := await _hidden(request, document_id)) is not None:
+        return hidden
     try:
         record = await asyncio.to_thread(store.delete, document_id)
     except store.AreaError as exc:
@@ -181,7 +256,9 @@ async def delete_document(document_id: str):
 
 
 @router.delete("/documents/{document_id}/prepared", status_code=204)
-async def delete_prepared(document_id: str):
+async def delete_prepared(document_id: str, request: Request = None):
+    if (hidden := await _hidden(request, document_id)) is not None:
+        return hidden
     try:
         record = await asyncio.to_thread(store.delete_prepared, document_id)
     except store.AreaError as exc:
@@ -199,8 +276,10 @@ async def start_job(body: PrepareStartRequest, request: Request = None):
     else:
         audit.note(document_ids=body.document_ids)
     try:
-        answer = await jobs.start(body.document_ids, job_lists.job_owner(request))
+        answer = await jobs.start(body.document_ids, job_lists.job_owner(request), await _usable(request))
     except store.AreaError as exc:
+        if isinstance(exc, store.DocumentNotFound):
+            await _audit_refused_ids(request, body.document_ids)
         return _error(exc)
     return JSONResponse(status_code=202, content=answer)
 
@@ -240,8 +319,10 @@ async def import_documents(body: PrepareImportRequest, request: Request = None):
     collection = body.collection
     audit.note(collection=collection)
     try:
-        selected = await jobs.import_documents(body)
+        selected = await jobs.import_documents(body, await _usable(request))
     except store.AreaError as exc:
+        if isinstance(exc, store.DocumentNotFound):
+            await _audit_refused_ids(request, body.document_ids)
         return _error(exc)
     audit.note(names=selected["names"])
     # A collection the caller may not use answers as one that doesn't exist (#606).

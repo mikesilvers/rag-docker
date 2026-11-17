@@ -157,6 +157,18 @@ async def create_collection(body: CreateCollectionRequest, request: Request = No
     if exists:
         return api_error(409, "COLLECTION_EXISTS", f"Collection '{body.name}' already exists.")
 
+    # A new collection starts restricted to the account that created it (#606),
+    # written before it exists, so it is never open: if this write fails nothing
+    # is created, and if the create fails the state goes back (put_back).
+    principal = access.principal_of(request)
+    states = None
+    if principal is not None:
+        try:
+            states = await asyncio.to_thread(store.restrict_to, body.name, principal.user_id)
+        except Exception:                             # noqa: BLE001
+            _log.exception("Could not restrict new collection %r; it was not created", body.name)
+            return api_error(500, "CREATE_FAILED", "Failed to create collection.")
+
     try:
         await wc.create_collection(
             name=body.name,
@@ -167,12 +179,12 @@ async def create_collection(body: CreateCollectionRequest, request: Request = No
     except Exception:                                 # noqa: BLE001
         # The cause is logged, not sent (#373).
         _log.exception("Could not create collection %r", body.name)
+        if states is not None:
+            try:
+                await asyncio.to_thread(store.put_back, body.name, states[1], states[0])
+            except Exception:                         # noqa: BLE001
+                _log.exception("Could not put back the access state of %r after a failed create", body.name)
         return api_error(500, "CREATE_FAILED", "Failed to create collection.")
-
-    # A new collection starts restricted to the account that created it (#606).
-    principal = access.principal_of(request)
-    if principal is not None:
-        await asyncio.to_thread(store.restrict_to, body.name, principal.user_id)
 
     async with _registry_lock:
         try:

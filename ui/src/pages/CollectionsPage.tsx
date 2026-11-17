@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { api, AdminUser, CollectionAccess, CollectionInfo, ServicePrincipal } from '../api/client'
 
 // Who may use each collection (#606): "Open", "Restricted (n)" with n grants,
@@ -33,6 +33,11 @@ export default function CollectionsPage() {
   const [people, setPeople] = useState<AdminUser[]>([])
   const [principals, setPrincipals] = useState<ServicePrincipal[]>([])
   const [accessError, setAccessError] = useState('')
+  // The dialog's own read of the state: until it succeeds the choice is
+  // unknown and Save stays disabled; once the Engineer changes something, a
+  // late answer doesn't overwrite the change.
+  const [accessLoaded, setAccessLoaded] = useState(false)
+  const touched = useRef(false)
 
   async function load() {
     api.getCollections().then(r => {
@@ -49,10 +54,13 @@ export default function CollectionsPage() {
   function openAccess(name: string) {
     setAccessError('')
     setAccessTarget(name)
-    const current = access[name]
-    setDraft(current ? { ...current } : { restricted: false, users: [], service_principals: [] })
-    api.getCollectionAccess(name).then(a => setDraft({ ...a }))
-      .catch((e: unknown) => setAccessError(e instanceof Error ? e.message : String(e)))
+    setAccessLoaded(false)
+    touched.current = false
+    setDraft({ restricted: false, users: [], service_principals: [] })
+    api.getCollectionAccess(name).then(a => {
+      if (!touched.current) setDraft({ ...a })
+      setAccessLoaded(true)
+    }).catch((e: unknown) => setAccessError(`Could not read who may use this collection: ${e instanceof Error ? e.message : String(e)}`))
     api.listUsers().then(r => setPeople(r.users))
       .catch((e: unknown) => setAccessError(`Could not load the people: ${e instanceof Error ? e.message : String(e)}`))
     api.listPrincipals().then(r => setPrincipals(r.principals))
@@ -65,10 +73,12 @@ export default function CollectionsPage() {
   }
 
   function toggle(list: 'users' | 'service_principals', name: string) {
+    touched.current = true
     setDraft(d => ({ ...d, [list]: d[list].includes(name) ? d[list].filter(n => n !== name) : [...d[list], name] }))
   }
 
   async function saveAccess() {
+    if (!accessLoaded) return
     const body = draft.restricted ? draft : { restricted: false, users: [], service_principals: [] }
     try {
       const saved = await api.setCollectionAccess(accessTarget, body)
@@ -211,14 +221,14 @@ export default function CollectionsPage() {
           <div role="dialog" aria-label={`Access to ${accessTarget}`} className="bg-white rounded-xl p-6 w-96 shadow-xl max-h-[80vh] overflow-y-auto">
             <h2 className="font-semibold mb-3">Access to {accessTarget}</h2>
             <label className="flex items-center gap-2 text-sm mb-1">
-              <input type="radio" name="access-mode" checked={!draft.restricted} onChange={() => setDraft(d => ({ ...d, restricted: false }))} />
+              <input type="radio" name="access-mode" checked={accessLoaded && !draft.restricted} disabled={!accessLoaded} onChange={() => { touched.current = true; setDraft(d => ({ ...d, restricted: false })) }} />
               Open: everyone whose role allows it
             </label>
             <label className="flex items-center gap-2 text-sm mb-3">
-              <input type="radio" name="access-mode" checked={draft.restricted} onChange={() => setDraft(d => ({ ...d, restricted: true }))} />
+              <input type="radio" name="access-mode" checked={accessLoaded && draft.restricted} disabled={!accessLoaded} onChange={() => { touched.current = true; setDraft(d => ({ ...d, restricted: true })) }} />
               Restricted: only the accounts ticked below (and AI Engineers)
             </label>
-            {draft.restricted && (
+            {accessLoaded && draft.restricted && (
               <div className="space-y-3 mb-4">
                 <fieldset>
                   <legend className="text-xs text-gray-500 mb-1">People</legend>
@@ -244,7 +254,7 @@ export default function CollectionsPage() {
             {accessError && <p role="alert" className="text-red-600 text-sm mb-4">{accessError}</p>}
             <div className="flex justify-end gap-2">
               <button onClick={closeAccess} className="text-sm text-gray-500">Cancel</button>
-              <button onClick={saveAccess} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">Save</button>
+              <button onClick={saveAccess} disabled={!accessLoaded} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700 disabled:opacity-40">Save</button>
             </div>
           </div>
         </div>

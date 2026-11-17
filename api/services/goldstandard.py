@@ -1316,8 +1316,10 @@ async def save_session(session_id: str, filename: str | None, allow_historical: 
         }
         for p in approved
     ]
-    await asyncio.to_thread(_save_export_sync, out_path, ragas)
+    # The collection is recorded before the file is written (#606): a failure
+    # or a race in between narrows who may download it, never widens it.
     await asyncio.to_thread(_record_export_collection, filename, session.get("collection"))
+    await asyncio.to_thread(_save_export_sync, out_path, ragas)
 
     return {
         "filename": filename,

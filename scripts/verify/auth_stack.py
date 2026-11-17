@@ -962,7 +962,8 @@ def check_collection_access(operator_ok):
             status, raw, _ = code("GET", query, token=admin)
             expect(status == 200, "GET /audit answered {}".format(status))
             return [r for r in json.loads(raw)["records"] if all(r.get(k) == v for k, v in match.items())]
-        change = audited("collection.access")
+        # The newest record is the key's refused change below; this is the Engineer's grant.
+        change = audited("collection.access", result="success")
         expect(change and change[0]["details"].get("added") == {"users": [dev], "service_principals": [principal]},
                "the change's audit record is {}".format(change[:1]))
         refused = audited("query", actor=user)

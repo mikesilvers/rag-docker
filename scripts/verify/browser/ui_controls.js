@@ -94,6 +94,7 @@ function collectionsCases() {
       await (await accessButtons())[2].click();   // row B: Access, Delete; row A first
       await waitText(s.page, 'Access to ' + B);
       await waitText(s.page, 'Open: everyone whose role allows it');
+      await waitFor(s.page, () => [...document.querySelectorAll('.fixed button')].some(b => b.textContent.trim() === 'Save' && !b.disabled), 'Save to be enabled once the state is read');
       await s.page.click('input[type=radio]:not(:checked)');
       await waitText(s.page, 'vfy-off (disabled)');
       await waitText(s.page, 'vfy-svc');
@@ -109,6 +110,21 @@ function collectionsCases() {
       assert.equal(puts.length, 2);
       assert.deepEqual(puts[1].body, { restricted: true, users: ['vfy-developer'], service_principals: ['vfy-svc'] });
       await waitText(s.page, 'Restricted (2)');
+    } },
+    { name: 'Access (#606): when the dialog cannot read the state, the choice stays unknown and Save is disabled', open: open({
+      ['GET /api/collections/' + B + '/access']: apiError(500, 'INTERNAL_ERROR', 'Synthetic read failure.'),
+      'GET /api/auth/users': json(200, { users: [] }),
+      'GET /api/auth/service-principals': json(200, { principals: [] }),
+    }), async run(s) {
+      await waitText(s.page, A);
+      await (await s.page.$$('tbody button'))[2].click();
+      await waitText(s.page, 'Synthetic read failure.');
+      const state = await s.page.evaluate(() => ({
+        save: [...document.querySelectorAll('.fixed button')].find(b => b.textContent.trim() === 'Save').disabled,
+        checked: [...document.querySelectorAll('.fixed input[type=radio]')].filter(r => r.checked).length,
+      }));
+      assert.deepEqual(state, { save: true, checked: 0 });
+      assert.equal(callsTo(s, 'PUT', '/api/collections/' + B + '/access').length, 0);
     } },
     { name: 'New Collection modal starts with HNSW, Cosine and the three HNSW sliders at their defaults and bounds', open: open(), async run(s) {
       await waitText(s.page, A);

@@ -11,7 +11,11 @@ refusal is audited (services/audit.py, `access_refused`).
 
 A staging or recovery collection of a rebuild or import
 (`<target>__tuning_<token>`, `<target>__importing_<token>`) holds its target's
-data, so it has its target's access.
+data, so it is given its target's access when it is made
+(collection_recovery.begin) and keeps that state under its own name, whatever
+later happens to the target. Every name is looked up as itself. `target_of`
+maps a copy's name to its target only for a package of a copy that no longer
+exists (services/importer.py, routers/transfer.py).
 """
 from __future__ import annotations
 
@@ -23,11 +27,27 @@ from . import store
 _STAGING = re.compile(r"(.+)__(?:tuning|importing)_[0-9a-f]{32}")
 
 
+def canonical(name: str) -> str:
+    return name[:1].upper() + name[1:]
+
+
 def target_of(name: str) -> str:
-    """The canonical collection whose access `name` has."""
-    name = name[:1].upper() + name[1:]
+    """The target of a staging or recovery copy's name; any other name, canonical."""
+    name = canonical(name)
     found = _STAGING.fullmatch(name)
     return found.group(1) if found else name
+
+
+def package_source(name: str, exists) -> str:
+    """Whose access a package of collection `name` follows (#606): the name
+    itself, unless it is a staging or recovery copy's that no longer exists here
+    (`exists(name)` is False), whose target's it is then, so a package of a
+    discarded copy isn't open to everyone."""
+    name = canonical(name)
+    target = target_of(name)
+    if target != name and not exists(name):
+        return target
+    return name
 
 
 def allowed(principal, name: str) -> bool:
@@ -35,7 +55,7 @@ def allowed(principal, name: str) -> bool:
     handler called directly (tests), which is not checked, as job owners aren't."""
     if principal is None:
         return True
-    return store.has_access(principal.user_id, principal.role, target_of(name))
+    return store.has_access(principal.user_id, principal.role, canonical(name))
 
 
 def principal_of(request):
@@ -48,7 +68,7 @@ async def check(request, name: str, code: str = "COLLECTION_NOT_FOUND") -> bool:
     if await asyncio.to_thread(allowed, principal_of(request), name):
         return True
     from services import audit
-    await asyncio.to_thread(audit.access_refused, request, target_of(name), code)
+    await asyncio.to_thread(audit.access_refused, request, canonical(name), code)
     return False
 
 
@@ -61,6 +81,6 @@ def visible_filter(principal):
     me = principal.user_id
 
     def visible(name: str) -> bool:
-        grants = restricted.get(target_of(name))
+        grants = restricted.get(canonical(name))
         return grants is None or me in grants
     return visible
