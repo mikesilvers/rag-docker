@@ -11,7 +11,9 @@ from services import audit, ingest_config, job_lists
 from services import ingest_pipeline
 from services import weaviate_client as wc
 from services.collection_writes import CollectionDeletingError, canonical
-from utils import api_error, collection_check_unavailable, collection_deleting_error
+from auth import access
+from utils import (api_error, collection_check_unavailable, collection_deleting_error, collection_not_found,
+                   usable_collection)
 
 router = APIRouter(prefix="/ingest")
 _log = logging.getLogger(__name__)
@@ -44,7 +46,7 @@ async def ingest_upload(
     try:
         return await _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
                                     similarity_threshold, min_chunk_size, files,
-                                    job_lists.job_owner(request))
+                                    job_lists.job_owner(request), request)
     except Exception:
         # Anything not handled below used to reach the client as a plain-text
         # 500, which the Import page could only show as "HTTP 500" (#290).
@@ -57,7 +59,7 @@ async def ingest_upload(
 
 
 async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
-                         similarity_threshold, min_chunk_size, files, owner=None):
+                         similarity_threshold, min_chunk_size, files, owner=None, request=None):
     try:
         config = IngestConfig(chunking_strategy=strategy, chunk_size=chunk_size,
                               chunk_overlap=chunk_overlap, similarity_threshold=similarity_threshold,
@@ -65,6 +67,9 @@ async def _ingest_upload(collection, strategy, chunk_size, chunk_overlap,
     except ValidationError as exc:
         return api_error(422, "INVALID_SETTINGS", "Invalid chunking settings.",
                          detail={"errors": exc.errors(include_context=False, include_input=False)})
+    # A collection the caller may not use answers as one that doesn't exist (#606).
+    if not await access.check(request, collection):
+        return collection_not_found(collection)
     try:
         exists = await wc.collection_exists(collection)
     except Exception:                                 # noqa: BLE001
@@ -112,22 +117,30 @@ async def list_jobs(request: Request):
 
 
 @router.get("/job/{job_id}", response_model=JobStatusResponse)
-async def job_status(job_id: str):
+async def job_status(job_id: str, request: Request = None):
     job = ingest_pipeline.get_job(job_id)
-    if job is None:
+    # A job on a collection the caller may not use answers as a missing one (#606).
+    if job is None or (job.get("collection") and not await access.check(request, job["collection"], "JOB_NOT_FOUND")):
         return api_error(404, "JOB_NOT_FOUND", f"Job '{job_id}' not found.")
     return JobStatusResponse(**job)
 
 
 @router.get("/config/{collection}", response_model=IngestConfigResponse)
-async def get_ingest_config(collection: CollectionName):
+async def get_ingest_config(collection: CollectionName, request: Request = None):
+    # A missing collection, or one the caller may not use, is a 404 (#606).
+    refusal = await usable_collection(request, collection, "No settings were read")
+    if refusal is not None:
+        return refusal
     cfg, is_default = await asyncio.to_thread(ingest_config.resolve, collection)
     return IngestConfigResponse(is_default=is_default, **cfg)
 
 
 @router.post("/config", response_model=IngestConfigResponse, status_code=201)
-async def save_ingest_config(body: SaveIngestConfigBody):
+async def save_ingest_config(body: SaveIngestConfigBody, request: Request = None):
     audit.note(collection=body.collection)        # the audit record's collection (#29)
+    refusal = await usable_collection(request, body.collection, "No settings were saved")
+    if refusal is not None:
+        return refusal
     cfg = body.model_dump()
     await asyncio.to_thread(ingest_config.save, cfg)
     return IngestConfigResponse(is_default=False, **cfg)

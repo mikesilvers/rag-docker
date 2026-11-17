@@ -35,6 +35,7 @@ import uuid
 from pathlib import Path
 from contextlib import nullcontext
 
+from auth import store as auth_store
 from config import settings
 from models.schemas import SEARCH_EF_MAX, SEARCH_EF_MIN
 from services import age_stream
@@ -820,6 +821,33 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
 
 
 @telemetry.traced("rag.import")
+def _refused(owner, source: str) -> bool:
+    """True when the package's collection exists here, is restricted, and the
+    job's owner may not use it (#606). Weaviate failing to answer counts as
+    existing, so the check fails closed."""
+    if owner is None or not auth_store.collection_access(source).restricted:
+        return False
+    try:
+        exists = wc._collection_exists_sync(source)
+    except Exception:                                 # noqa: BLE001
+        _log.exception("Could not check whether %r exists for an import's access check", source)
+        exists = True
+    return exists and not auth_store.owner_has_access(owner, source)
+
+
+def _start_access(owner, source: str, target: str) -> None:
+    """A collection this import creates (#606): a rename copies the source's
+    access (the source exists here, or there would be nothing to rename
+    around); a new name starts restricted to the job's owner. A job with no
+    owner (a direct call in tests) records nothing."""
+    if owner is None:
+        return
+    if target != source:
+        auth_store.copy_collection_access(source, target)
+    else:
+        auth_store.restrict_to(target, auth_store.user_id_for(owner))
+
+
 def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = None) -> None:
     job = _jobs[job_id]
     job["status"] = "running"
@@ -831,6 +859,7 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
     # set is not by itself evidence that anything survived to recover.
     staged = False
     ownership: dict | None = None
+    new_access: str | None = None    # a collection this job gave its access state to (#606)
 
     def progress(n: int) -> None:
         job["chunks_written"] = n
@@ -849,6 +878,12 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
         _check_embedding(manifest)                                  # check 4
 
         original = manifest["collection"]["name"]
+        # A package of a collection its owner may not use is refused as if it
+        # weren't there, before the job names the collection anywhere (#606).
+        if isinstance(original, str) and original and _refused(job.get("owner"), canonical(original)):
+            job["access_refused"] = True
+            raise PackageError("PACKAGE_UNREADABLE",
+                               f"No package named '{archive.name}' in the exports directory.")
         id8 = packager.sha256_file(pkg / "manifest.json")[:8]
         job["collection"] = original
         job["fidelity"] = manifest.get("fidelity")
@@ -897,6 +932,12 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
             except collection_writes.CollectionDeletingError:
                 raise PackageError("COLLECTION_DELETING", collection_writes.deleting_message(target),
                                    {"collection": target}) from None
+
+            # A collection this import creates gets its access state before any
+            # data is written; a replace keeps the target's (#606).
+            if not exists or on_conflict != "replace":
+                _start_access(job.get("owner"), canonical(original), target)
+                new_access = target
 
             if exists and on_conflict == "replace":
                 # Prove the package inserts cleanly before destroying anything.
@@ -972,6 +1013,13 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
                 _mark_finished(marked)
             except Exception:
                 _log.exception("Could not finish import marker for %r; startup will retry", marked)
+        if new_access and job.get("status") == "failed":
+            # The collection wasn't made; its access state goes too (#606).
+            try:
+                if not wc._collection_exists_sync(new_access):
+                    auth_store.drop_collection_access(new_access)
+            except Exception:                         # noqa: BLE001
+                _log.exception("Could not clear the access state of %r after a failed import", new_access)
         if ownership and ownership["state"] == "scratch":
             try:
                 collection_recovery.discard(ownership, wc.get_client())

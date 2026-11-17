@@ -1231,6 +1231,46 @@ def _save_export_sync(out_path: Path, ragas: list[dict]) -> None:
     _replace_durably(out_path, json.dumps(ragas, indent=2))
 
 
+# Which collection each saved export came from (#606), so a download can be
+# checked against that collection's access. Kept beside the exports folder,
+# never in it, so it is never served; the exports stay plain RAGAS lists. A file
+# with no entry (saved before #606, or put there by hand) is served to Engineers
+# only. An unreadable index is treated as empty, which only narrows downloads.
+EXPORT_INDEX_NAME = "goldstandard_export_collections.json"
+_export_index_lock = threading.Lock()
+
+
+def _export_index_path() -> Path:
+    return Path(settings.upload_dir).resolve() / EXPORT_INDEX_NAME
+
+
+def _read_export_index() -> dict:
+    try:
+        data = json.loads(_export_index_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        log.exception("The gold-standard export index can't be read; its files are served to Engineers only")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _record_export_collection(filename: str, collection: str | None) -> None:
+    with _export_index_lock:
+        index = _read_export_index()
+        if collection:
+            index[filename] = collection
+        else:
+            index.pop(filename, None)
+        _replace_durably(_export_index_path(), json.dumps(index, indent=2, sort_keys=True))
+
+
+def export_collection(filename: str) -> str | None:
+    """The collection a saved export came from, or None when it isn't known."""
+    value = _read_export_index().get(filename)
+    return value if isinstance(value, str) and value else None
+
+
 async def save_session(session_id: str, filename: str | None, allow_historical: bool = False) -> dict | None:
     session = _sessions.get(session_id)
     if session is None:
@@ -1277,6 +1317,7 @@ async def save_session(session_id: str, filename: str | None, allow_historical: 
         for p in approved
     ]
     await asyncio.to_thread(_save_export_sync, out_path, ragas)
+    await asyncio.to_thread(_record_export_collection, filename, session.get("collection"))
 
     return {
         "filename": filename,

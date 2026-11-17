@@ -21,6 +21,7 @@ from fastapi import APIRouter, File, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
+from auth import access
 from config import settings
 from models.schemas import PrepareImportRequest, PrepareJobEntry, PrepareJobList, PrepareStartRequest
 from services import audit, ingest_pipeline, job_lists
@@ -243,6 +244,9 @@ async def import_documents(body: PrepareImportRequest, request: Request = None):
     except store.AreaError as exc:
         return _error(exc)
     audit.note(names=selected["names"])
+    # A collection the caller may not use answers as one that doesn't exist (#606).
+    if not await access.check(request, collection):
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{collection}' not found.")
     try:
         exists = await jobs.collection_exists(collection)
     except Exception:                                       # noqa: BLE001

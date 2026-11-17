@@ -7,11 +7,14 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from auth import access, store
 from config import settings
 from models.schemas import (
+    CollectionAccessRequest,
+    CollectionAccessResponse,
     CollectionInfo,
     CollectionName,
     CollectionsResponse,
@@ -109,7 +112,7 @@ def remove_interrupted_saves() -> None:
 
 
 @router.get("", response_model=CollectionsResponse)
-async def list_collections():
+async def list_collections(request: Request = None):
     try:
         raw = await wc.get_collections()
     except Exception:                                 # noqa: BLE001
@@ -125,6 +128,8 @@ async def list_collections():
         _log.warning("The collection registry can't be read, so created_at is null "
                      "for every collection: %s", exc)
         registry = {}
+    # Only the collections the caller may use (#606); Engineers see all.
+    visible = await asyncio.to_thread(access.visible_filter, access.principal_of(request))
     items = [
         CollectionInfo(
             name=c["name"],
@@ -135,12 +140,13 @@ async def list_collections():
             hnsw_config=c.get("hnsw_config"),
         )
         for c in raw
+        if visible(c["name"])
     ]
     return CollectionsResponse(collections=items)
 
 
 @router.post("", status_code=201)
-async def create_collection(body: CreateCollectionRequest):
+async def create_collection(body: CreateCollectionRequest, request: Request = None):
     audit.note(collection=body.name)              # the audit record's collection (#29)
     try:
         exists = await wc.collection_exists(body.name)
@@ -162,6 +168,11 @@ async def create_collection(body: CreateCollectionRequest):
         # The cause is logged, not sent (#373).
         _log.exception("Could not create collection %r", body.name)
         return api_error(500, "CREATE_FAILED", "Failed to create collection.")
+
+    # A new collection starts restricted to the account that created it (#606).
+    principal = access.principal_of(request)
+    if principal is not None:
+        await asyncio.to_thread(store.restrict_to, body.name, principal.user_id)
 
     async with _registry_lock:
         try:
@@ -239,4 +250,62 @@ async def delete_collection(name: CollectionName, confirm: str | None = None):
                 registry.pop(spelling, None)
             await asyncio.to_thread(_save_registry, registry)
 
+    # A later collection of the same name starts afresh (#606).
+    await asyncio.to_thread(store.drop_collection_access, name)
     return {"name": name, "objects_deleted": count}
+
+
+# ── per-collection access (#606) ─────────────────────────────────────────────
+
+def _access_body(state: store.CollectionAccess) -> CollectionAccessResponse:
+    return CollectionAccessResponse(restricted=state.restricted, users=list(state.users),
+                                    service_principals=list(state.service_principals))
+
+
+async def _missing(name: str, outcome: str):
+    """The 503 or 404 when the collection can't be confirmed, else None."""
+    try:
+        exists = await wc.collection_exists(name)
+    except Exception:                                 # noqa: BLE001
+        _log.exception("Could not check whether %r exists for its access settings", name)
+        return collection_check_unavailable(name, outcome)
+    if not exists:
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{name}' not found.")
+    return None
+
+
+@router.get("/{name}/access", response_model=CollectionAccessResponse)
+async def get_collection_access(name: CollectionName):
+    """Open, or restricted and to whom (Engineers, in a browser session)."""
+    missing = await _missing(name, "Nothing was read")
+    if missing is not None:
+        return missing
+    return _access_body(await asyncio.to_thread(store.collection_access, name))
+
+
+def _names(before: tuple, after: tuple) -> tuple[list, list]:
+    return sorted(set(after) - set(before)), sorted(set(before) - set(after))
+
+
+@router.put("/{name}/access", response_model=CollectionAccessResponse)
+async def set_collection_access(name: CollectionName, body: CollectionAccessRequest, request: Request = None):
+    """Set who may use the collection, the whole state at once (#606)."""
+    audit.note(collection=name)
+    missing = await _missing(name, "Nothing was changed")
+    if missing is not None:
+        return missing
+    try:
+        before, after = await asyncio.to_thread(store.set_collection_access, name, body.restricted,
+                                                body.users, body.service_principals)
+    except store.Refused as exc:
+        return api_error(422, "INVALID_PARAMETER", str(exc))
+    added_users, removed_users = _names(before.users, after.users)
+    added_svc, removed_svc = _names(before.service_principals, after.service_principals)
+    audit.note(restricted_before=before.restricted, restricted_after=after.restricted,
+               added={"users": added_users, "service_principals": added_svc},
+               removed={"users": removed_users, "service_principals": removed_svc})
+    actor = getattr(access.principal_of(request), "username", "?")
+    _log.warning("Admin %r set the access of collection %r: %s, %d people and %d service principals granted",
+                 actor, name, "restricted" if after.restricted else "open", len(after.users),
+                 len(after.service_principals))
+    return _access_body(after)

@@ -5,6 +5,8 @@ import logging
 from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse
 
+from auth import access
+
 from models.schemas import (
     GenerateRequest,
     GenerateResponse,
@@ -29,6 +31,9 @@ _log = logging.getLogger(__name__)
 
 @router.post("/generate", response_model=GenerateResponse, status_code=202)
 async def generate(body: GenerateRequest, request: Request = None):
+    # A collection the caller may not use answers as one that doesn't exist (#606).
+    if not await access.check(request, body.collection):
+        return api_error(404, "COLLECTION_NOT_FOUND", f"Collection '{body.collection}' not found.")
     try:
         exists = await wc.collection_exists(body.collection)
     except Exception:                                 # noqa: BLE001
@@ -61,10 +66,19 @@ async def list_generations(request: Request):
     return GenerationList(sessions=await asyncio.to_thread(build))
 
 
-@router.get("/session/{session_id}", response_model=SessionResponse)
-async def get_session(session_id: str):
+async def _refused(request, session_id: str):
+    """The 404 for a session on a collection the caller may not use (#606), the
+    one a missing session gets; None when there is no such session or it may be used."""
     session = gs.get_session(session_id)
-    if session is None:
+    if session is None or await access.check(request, session.get("collection") or "", "SESSION_NOT_FOUND"):
+        return None
+    return api_error(404, "SESSION_NOT_FOUND", f"Session '{session_id}' not found.")
+
+
+@router.get("/session/{session_id}", response_model=SessionResponse)
+async def get_session(session_id: str, request: Request = None):
+    session = gs.get_session(session_id)
+    if session is None or not await access.check(request, session.get("collection") or "", "SESSION_NOT_FOUND"):
         return api_error(404, "SESSION_NOT_FOUND", f"Session '{session_id}' not found.")
     pairs = []
     for p in session.get("pairs", []):
@@ -88,7 +102,10 @@ async def get_session(session_id: str):
 
 
 @router.patch("/session/{session_id}/pair/{pair_id}", response_model=GoldPair)
-async def patch_pair(session_id: str, pair_id: str, body: PatchPairRequest):
+async def patch_pair(session_id: str, pair_id: str, body: PatchPairRequest, request: Request = None):
+    refused = await _refused(request, session_id)
+    if refused is not None:
+        return refused
     updates = body.model_dump(exclude_none=True)
     try:
         pair = await gs.update_pair(session_id, pair_id, updates)
@@ -100,7 +117,10 @@ async def patch_pair(session_id: str, pair_id: str, body: PatchPairRequest):
 
 
 @router.post("/regenerate", response_model=GoldPair)
-async def regenerate(body: RegenerateRequest):
+async def regenerate(body: RegenerateRequest, request: Request = None):
+    refused = await _refused(request, body.session_id)
+    if refused is not None:
+        return refused
     try:
         pair = await gs.regenerate_pair(body.session_id, body.pair_id)
     except gs.GoldStandardError as exc:
@@ -111,8 +131,11 @@ async def regenerate(body: RegenerateRequest):
 
 
 @router.post("/save", response_model=SaveResponse)
-async def save(body: SaveRequest):
+async def save(body: SaveRequest, request: Request = None):
     audit.note(session_id=body.session_id, file=body.filename)   # the audit record's parameters (#29)
+    refused = await _refused(request, body.session_id)
+    if refused is not None:
+        return refused
     try:
         result = await gs.save_session(body.session_id, body.filename, body.allow_historical)
     except gs.GoldStandardError as exc:
@@ -124,7 +147,7 @@ async def save(body: SaveRequest):
 
 
 @router.get("/download/{filename}")
-async def download(filename: str):
+async def download(filename: str, request: Request = None):
     # Only files in the exports folder are served, never other upload state (#370).
     try:
         target = gs.export_path(filename)
@@ -134,6 +157,16 @@ async def download(filename: str):
     if gs.export_entry_is_other(target):
         return api_error(400, "INVALID_PATH", f"'{filename}' is not an export file.")
     if not target.is_file():
+        return api_error(404, "FILE_NOT_FOUND", f"File '{filename}' not found.")
+    # Only to a caller who may use the collection it came from (#606); a file
+    # whose collection isn't recorded only to an Engineer.
+    collection = await asyncio.to_thread(gs.export_collection, filename)
+    principal = access.principal_of(request)
+    if collection is None:
+        if principal is not None and principal.role != "engineer":
+            await asyncio.to_thread(audit.access_refused, request, None, "FILE_NOT_FOUND")
+            return api_error(404, "FILE_NOT_FOUND", f"File '{filename}' not found.")
+    elif not await access.check(request, collection, "FILE_NOT_FOUND"):
         return api_error(404, "FILE_NOT_FOUND", f"File '{filename}' not found.")
     return FileResponse(
         path=str(target),
