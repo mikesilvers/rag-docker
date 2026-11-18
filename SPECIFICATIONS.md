@@ -24,6 +24,11 @@ services:
   weaviate:
     # 1.27.0 is the minimum supported by weaviate-client 4.23.1 (pinned in
     # api/requirements.txt); 1.25.x fails at connect with WeaviateStartUpError.
+    # Use the plain X.Y.Z tag: it is the multi-arch image. The suffixed tags,
+    # such as 1.40.2-9858973.arm64, carry one platform only (#527, #530), so
+    # Dependabot ignores Weaviate (.github/dependabot.yml) and it is upgraded
+    # by hand. Pinned by tag, not digest, like ollama and nginx: digest pinning
+    # would be a project-wide change (decided on #544).
     image: semitechnologies/weaviate:1.40.2
     environment:
       QUERY_DEFAULTS_LIMIT: 25
