@@ -178,21 +178,38 @@ def _list_packages_sync() -> list[dict]:
             for p in sorted([*root.glob("ragpkg-*.tar.gz"), *root.glob("ragpkg-*" + age_stream.ENCRYPTED_SUFFIX)])]
 
 
-async def _hidden(principal, packages: list[dict]) -> set[str]:
-    """The packages a caller may not see (#606): unencrypted ones whose
-    collection exists here and is restricted to others. Whose access a package
-    follows is the import's own rule (importer.package_source), so the
-    listing and POST /import agree (#788). Weaviate failing to answer counts as
-    existing (importer.exists_fail_closed), so the listing fails closed."""
+async def _hidden(principal, packages: list[dict]) -> dict[str, str | None]:
+    """The packages a caller may not see (#606), each with the collection its
+    refusal names: those whose collection exists here and is restricted to
+    others. An unencrypted package's collection is its manifest's; an encrypted
+    package exported here follows the collection recorded at its export (#794),
+    and one recorded without a collection (before #794) is seen by Engineers
+    only. An encrypted package copied in names no collection and is not hidden.
+    Whose access a package follows is the import's own rule
+    (importer.package_source), so the listing and POST /import agree (#788).
+    Weaviate failing to answer counts as existing
+    (importer.exists_fail_closed), so the listing fails closed."""
     visible = await asyncio.to_thread(access.visible_filter, principal)
-    hidden = set()
+    recorded = None
+    hidden: dict[str, str | None] = {}
     for p in packages:
-        name = p.get("collection")
-        if p.get("encrypted") or not p.get("readable") or not isinstance(name, str) or not name:
-            continue
+        if p.get("encrypted"):
+            if recorded is None:
+                recorded = await asyncio.to_thread(package_retention.recorded_collections)
+            if p["filename"] not in recorded:
+                continue
+            name = recorded[p["filename"]]
+            if name is None:
+                if principal is not None and principal.role != "engineer":
+                    hidden[p["filename"]] = None
+                continue
+        else:
+            name = p.get("collection")
+            if not p.get("readable") or not isinstance(name, str) or not name:
+                continue
         source = await asyncio.to_thread(importer.package_source, name)
         if not visible(source) and await asyncio.to_thread(importer.exists_fail_closed, source):
-            hidden.add(p["filename"])
+            hidden[p["filename"]] = name
     return hidden
 
 
@@ -245,7 +262,10 @@ class _PackageStream(Response):
         listener = None
         try:
             if not self.head:
-                claimed = await asyncio.to_thread(package_retention.claim, self.filename)
+                # A cancellation while the claim runs still releases it (#794).
+                claimed = await package_retention.run_claim(
+                    lambda: package_retention.claim(self.filename),
+                    lambda took: took and package_retention.release(self.filename))
                 if not claimed:
                     return await self._refuse(send, _package_busy(self.filename))
             try:
@@ -293,7 +313,8 @@ class _PackageStream(Response):
                 listener.cancel()
             if fd is not None:
                 os.close(fd)
-            audit.note(completed=completed)
+            if not self.head:
+                audit.note(completed=completed)
             try:
                 if completed and not self.head:
                     await asyncio.to_thread(package_retention.after_download, self.filename, scope)
@@ -310,8 +331,13 @@ class _PackageStream(Response):
 @router.get("/packages/{filename}")
 async def download_package(filename: str, request: Request = None):
     """One package from ./exports, streamed (#677). A full download deletes a
-    package this instance exported; any other package is served and kept."""
-    audit.note(completed=False)
+    package this instance exported; any other package is served and kept. A
+    HEAD is audited with `head: true` and no `completed` (#794)."""
+    head = request is not None and request.method == "HEAD"
+    if head:
+        audit.note(head=True)
+    else:
+        audit.note(completed=False)
     if not package_retention.valid_name(filename):
         return _package_not_found(filename)
     path = packager.exports_dir() / filename
@@ -324,11 +350,12 @@ async def download_package(filename: str, request: Request = None):
     # The listing's access rule (#606): a package hidden from the caller there
     # answers as one that doesn't exist, and the refusal is audited.
     summary = await asyncio.to_thread(_summary, path)
-    if filename in await _hidden(access.principal_of(request), [summary]):
-        await asyncio.to_thread(audit.access_refused, request, access.canonical(summary["collection"]),
-                                "PACKAGE_NOT_FOUND")
+    refused = await _hidden(access.principal_of(request), [summary])
+    if filename in refused:
+        collection = refused[filename]
+        await asyncio.to_thread(audit.access_refused, request,
+                                access.canonical(collection) if collection else None, "PACKAGE_NOT_FOUND")
         return _package_not_found(filename)
     if await asyncio.to_thread(package_retention.busy, filename):
         return _package_busy(filename)
-    head = request is not None and request.method == "HEAD"
     return _PackageStream(path, filename, head=head)

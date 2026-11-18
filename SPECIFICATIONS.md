@@ -1524,7 +1524,8 @@ is never received.
 **Refusals**, the first that applies answering: `503 SETUP_REQUIRED` (no account exists yet); `401
 AUTH_REQUIRED` (no valid session); `403 CROSS_ORIGIN_REFUSED` (a cookie-authenticated `POST`, `PUT`, `PATCH` or
 `DELETE` whose `Origin` names another host or port than its `Host`, or that has no `Origin` and no `Sec-Fetch-Site:
-same-origin`); `403 PASSWORD_CHANGE_REQUIRED` (a generated password is due for change; only the session routes
+same-origin`; also a cookie-authenticated `GET` of a route that changes state, `GET /packages/{filename}` (#794),
+whose `Sec-Fetch-Site` is present and neither `same-origin` nor `none`); `403 PASSWORD_CHANGE_REQUIRED` (a generated password is due for change; only the session routes
 answer); `403 MFA_ENROLLMENT_REQUIRED` (two-step verification is required for everyone and the user hasn't set it
 up; only the session routes and the user's own `/auth/mfa` routes answer); `403 FORBIDDEN` (the role is too low; `detail: {"required_role": ...}`). The API has no CORS middleware
 and sends no `Access-Control-*` headers. A request with an `Authorization` header is a service key request and
@@ -1682,8 +1683,10 @@ disabled or its role changes; an Engineer demoted to a lower role is then bound 
   /goldstandard/download/{filename}` checks it (`404 FILE_NOT_FOUND` without access); a file with no recorded
   collection (saved before #606, or placed by hand) is served to Engineers only.
 - **Packages.** A package's collection is the name in its manifest; for a staging or recovery copy that no longer
-  exists here, the nearest collection in its chain that exists here, or the original when none does (#792).
-  `GET /packages` hides an unencrypted package whose collection exists here and is
+  exists here, the nearest collection in its chain that exists here, or the original when none does (#792). An
+  encrypted package's manifest can't be read, so one exported here has the collection recorded at its export (#794);
+  one recorded without a collection (before #794) is listed and served to Engineers only, and one copied in names no
+  collection. `GET /packages` hides a package whose collection exists here and is
   restricted, from a caller without access to it (Weaviate not answering counts as existing); for an existing copy,
   access means access to every collection in its chain. The listing and the import job use the same rule. An import job refuses a package of such
   a collection, for encrypted packages too once decrypted, before anything is created or replaced: the job fails
@@ -1821,7 +1824,8 @@ built yet; it is to include this folder.
 `collection.create`, `collection.delete`; per-collection access (#606): `collection.access` (`restricted_before`,
 `restricted_after`, `added`, `removed`), `collection.access.refused` (a refused collection on a route with no action
 of its own); `ingest`, `ingest.config`; `retrieval.config`; `export`, `import`; export packages (#677):
-`package.download` (each `GET /packages/{filename}`, `details.file` and `details.completed`) and `package.delete`
+`package.download` (each `GET` or `HEAD` of `/packages/{filename}`, `details.file`; `details.completed` for a `GET`,
+`details.head: true` for a `HEAD`) and `package.delete`
 (each deletion of a package, `details.file` and `details.reason` `downloaded`, with the downloading caller as actor,
 or `expired`, actor `system`; written directly, not by a request);
 `tune.rechunk`, `tune.reembed`, `tune.reindex`; `goldstandard.save`, `goldstandard.download`; `admin.user.create`,
@@ -2133,7 +2137,7 @@ Standard error codes:
 | `SETUP_REQUIRED` | 503 | No account exists yet; run `python -m auth bootstrap` (§3.1.8) |
 | `AUTH_REQUIRED` | 401 | No valid session: none, unknown, ended or of a disabled user |
 | `FORBIDDEN` | 403 | The user's role is too low (`detail.required_role`), or the route has no policy entry |
-| `CROSS_ORIGIN_REFUSED` | 403 | A cookie-authenticated change from another origin |
+| `CROSS_ORIGIN_REFUSED` | 403 | A cookie-authenticated change from another origin, or a download of a package (`GET /packages/{filename}`) whose `Sec-Fetch-Site` is present and neither `same-origin` nor `none` (#794) |
 | `PASSWORD_CHANGE_REQUIRED` | 403 | A generated password must be changed first; only `/auth/me`, `/auth/logout` and `/auth/password` answer |
 | `LOGIN_FAILED` | 401 | Login refused; the same answer for every cause |
 | `LOGIN_THROTTLED` | 429 | Five failed logins or wrong current passwords for this username and address within 15 minutes; wait 15 minutes |
@@ -2637,15 +2641,23 @@ Downloads one package from `./exports` (#677), for the Developer role and above
   or `-`, ending in `.tar.gz` or `.tar.gz.age`, naming a regular file in the
   exports folder (never a link). Anything else answers `404 PACKAGE_NOT_FOUND`.
 - **Access.** The listing's rule (§3.1.8): a package `GET /packages` hides from
-  the caller answers `404 PACKAGE_NOT_FOUND` too, and the refusal is audited.
-  Encrypted and unreadable packages name no collection, so any Developer may
-  download them.
+  the caller answers `404 PACKAGE_NOT_FOUND` too, and the refusal is audited
+  (`details.reason` `collection_access`, with the package's collection). An
+  encrypted package exported here follows the collection recorded at its export,
+  and one recorded without a collection is served to Engineers only (#794); an
+  encrypted package copied in and an unreadable package name no collection, so
+  any Developer may download them.
+- **Origin.** A cookie-authenticated `GET` whose `Sec-Fetch-Site` is present and
+  neither `same-origin` nor `none` is refused `403 CROSS_ORIGIN_REFUSED` (#794),
+  as it may delete the package. `HEAD`, service keys and requests without
+  `Sec-Fetch-Site` aren't checked.
 - **Busy.** While an import of the same file runs, or another download of it is
   in progress: `409 PACKAGE_BUSY`.
 - **Response 200.** The file, streamed: `Content-Type: application/octet-stream`,
   `Content-Length`, `Content-Disposition: attachment`, `Cache-Control: no-store`
   and `X-Accel-Buffering: no` (nginx passes it on as the client takes it). No
-  `Range` support. `HEAD` answers the headers only and deletes nothing.
+  `Range` support. `HEAD` answers the headers only and deletes nothing; its
+  `package.download` record has `details.head: true` and no `completed`.
 - **Deletion after the download.** A download is complete when every byte has
   been handed to the connection and no disconnect was seen before the last
   message. After a complete download of a package this instance exported, the
@@ -2654,9 +2666,13 @@ Downloads one package from `./exports` (#677), for the Developer role and above
   that started during the download. The server can't know that the client kept
   every byte, so the user compares the file's size with `size_bytes`.
 
-**The record and the expiry.** When an export finishes, its package's name and
-finish time are recorded in `<UPLOAD_DIR>/exported_packages.json` (never in
-`./exports`); only recorded packages are deleted after a download or expired. A
+**The record and the expiry.** When an export finishes, its package's name,
+finish time and collection are recorded in `<UPLOAD_DIR>/exported_packages.json`
+(never in `./exports`), as `{"packages": {"<file>": {"finished_at": "<UTC>",
+"collection": "<name>"}}}`; an entry written before #794 is a bare finish time and
+is read with no collection. A recorded name outside the download's filename rule
+is ignored and logged. Only recorded packages are deleted after a download or
+expired. A
 recorded package expires `EXPORT_RETENTION_HOURS` after its export finished (whole
 hours, 1-720, default 24; any other value stops the API; expiry can't be turned
 off). A sweep runs at start-up, after the job records are loaded, and then every

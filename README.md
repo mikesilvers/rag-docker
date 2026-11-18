@@ -300,7 +300,8 @@ password changes; queries; creating and deleting collections; saving ingest
 and retrieval settings; ingest, export, import and tuning jobs, once when
 started and once when they end (succeeded, failed or interrupted by a
 restart); saving and downloading gold-standard files; downloading an export
-package (`package.download`, with `completed` true or false) and each
+package (`package.download`, with `completed` true or false; a header check,
+`HEAD`, has `head: true` instead) and each
 deletion of one, after its download or when it expired (`package.delete`,
 with the reason; an expiry's actor is `system`); every change and
 refusal on the Users and Service keys pages; every `python -m auth` action
@@ -1159,12 +1160,21 @@ package list.
   neither a download nor the sweep deletes it. Packages already in `./exports/`
   before this version aren't recorded either; delete them by hand once you no
   longer need them.
-- Each download is audited as `package.download` and each deletion as
-  `package.delete`, with the reason (`downloaded` or `expired`).
+- Each download is audited as `package.download` (a `HEAD` with `head: true`)
+  and each deletion as `package.delete`, with the reason (`downloaded` or
+  `expired`).
 - The download follows the listing's access rule: a package of a restricted
-  collection you can't use answers `404 PACKAGE_NOT_FOUND`, as a missing one
-  does. Encrypted packages name no collection, so any Developer can download
-  one, and so delete it if it was exported here; its content stays encrypted.
+  collection you can't use is left out of the listing and answers
+  `404 PACKAGE_NOT_FOUND`, as a missing one does. An encrypted package names no
+  collection itself, so one exported here follows the collection recorded when
+  it was exported (#794); one recorded before this version, with no collection,
+  is listed and served to AI Engineers only. An encrypted package copied in to
+  be imported can be downloaded by any Developer; its content stays encrypted.
+- Because a download can delete the package, a download sent with the session
+  cookie from another origin of the same site (another port on the same host)
+  is refused `403 CROSS_ORIGIN_REFUSED`: the browser says so in
+  `Sec-Fetch-Site`. The Transfer page's **Download**, a URL typed into the
+  address bar, `curl` and service keys are not affected.
 
 ### Encrypting a package
 
