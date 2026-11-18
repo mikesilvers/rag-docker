@@ -97,6 +97,8 @@ class DownloadTestCase(unittest.TestCase):
         self.client = TestClient(app, raise_server_exceptions=False)
         self.addCleanup(self.client.close)
         self.addCleanup(package_retention._downloading.clear)
+        package_retention._reported.clear()
+        self.addCleanup(package_retention._reported.clear)
         self.addCleanup(importer._active.clear)
 
     def as_(self, who="dev"):
@@ -259,6 +261,29 @@ class RecordTests(DownloadTestCase):
         self.assertTrue(outside.exists())
         self.assertFalse(old.exists())
         self.assertNotIn("../outside.tar.gz", package_retention.expiries())
+
+    def test_a_recorded_name_outside_the_rule_is_logged_once_and_the_record_left_as_it_is(self):
+        # #798 item 4: a tampered name is logged once per process, and reads write nothing.
+        self.write("ragpkg-old.tar.gz", recorded_hours_ago=1)
+        record = self.root / "uploads" / "exported_packages.json"
+        data = json.loads(record.read_text())
+        data["packages"]["../outside.tar.gz"] = "2026-01-01T00:00:00Z"
+        record.write_text(json.dumps(data))
+        before = record.read_bytes()
+        with self.assertLogs("services.package_retention", "WARNING") as logs:
+            self.assertEqual(list(package_retention.expiries()), ["ragpkg-old.tar.gz"])
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("'../outside.tar.gz'", logs.output[0])
+        with self.assertNoLogs("services.package_retention", "WARNING"):
+            package_retention.expiries()
+            self.assertEqual(package_retention.recorded_collections(), {"ragpkg-old.tar.gz": None})
+        self.assertEqual(record.read_bytes(), before, "a read doesn't rewrite the record")
+        data["packages"]["ragpkg-x/../y.tar.gz"] = "2026-01-01T00:00:00Z"
+        record.write_text(json.dumps(data))
+        with self.assertLogs("services.package_retention", "WARNING") as logs:
+            package_retention.expiries()
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("'ragpkg-x/../y.tar.gz'", logs.output[0])
 
     def test_an_export_whose_record_fails_still_completes_and_says_so(self):
         def broken(*_):
