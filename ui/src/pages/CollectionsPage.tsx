@@ -37,7 +37,10 @@ export default function CollectionsPage() {
   // unknown and Save stays disabled; once the Engineer changes something, a
   // late answer doesn't overwrite the change. Each opening is numbered, and
   // an answer to an earlier opening (another collection's, or one closed
-  // since) is ignored, so it can't become this dialog's draft (#788).
+  // since) is ignored, so it can't become this dialog's draft (#788). The
+  // opening's lists of people and service principals are numbered the same
+  // way, so an earlier opening's late answer or error never reaches this one
+  // (#792).
   const [accessLoaded, setAccessLoaded] = useState(false)
   const touched = useRef(false)
   const accessRead = useRef(0)
@@ -69,10 +72,20 @@ export default function CollectionsPage() {
       if (ticket !== accessRead.current) return
       setAccessError(`Could not read who may use this collection: ${e instanceof Error ? e.message : String(e)}`)
     })
-    api.listUsers().then(r => setPeople(r.users))
-      .catch((e: unknown) => setAccessError(`Could not load the people: ${e instanceof Error ? e.message : String(e)}`))
-    api.listPrincipals().then(r => setPrincipals(r.principals))
-      .catch((e: unknown) => setAccessError(`Could not load the service principals: ${e instanceof Error ? e.message : String(e)}`))
+    api.listUsers().then(r => {
+      if (ticket !== accessRead.current) return
+      setPeople(r.users)
+    }).catch((e: unknown) => {
+      if (ticket !== accessRead.current) return
+      setAccessError(`Could not load the people: ${e instanceof Error ? e.message : String(e)}`)
+    })
+    api.listPrincipals().then(r => {
+      if (ticket !== accessRead.current) return
+      setPrincipals(r.principals)
+    }).catch((e: unknown) => {
+      if (ticket !== accessRead.current) return
+      setAccessError(`Could not load the service principals: ${e instanceof Error ? e.message : String(e)}`)
+    })
   }
 
   function closeAccess() {

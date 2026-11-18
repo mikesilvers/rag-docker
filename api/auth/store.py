@@ -35,6 +35,7 @@ import os
 import secrets
 import sqlite3
 import time
+from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -975,20 +976,19 @@ def _grant_set(conn, collection: str):
 
 
 def copy_collection_access(source: str, target: str,
-                           narrowed_by: str | None = None) -> tuple[CollectionAccess, CollectionAccess]:
+                           narrowed_by: Iterable[str] = ()) -> tuple[CollectionAccess, CollectionAccess]:
     """The target takes the source's state: open stays open, restricted copies
-    its grants. With `narrowed_by` (the target of a staging or recovery copy
-    `source`, #788), it takes the narrower of the two: restricted when either
-    is, to the accounts granted every restricted one. Returns (the target's
-    state it replaced, the state written)."""
+    its grants. With `narrowed_by` (the collections a staging or recovery copy
+    was made from, its chain after itself, #788, #792), it takes the narrowest
+    of them all: restricted when any is, to the accounts granted every
+    restricted one. Returns (the target's state it replaced, the state
+    written)."""
     source, target = _canonical(source), _canonical(target)
     if _no_store():
         return CollectionAccess(False), CollectionAccess(False)
     with _connect(write=True) as conn:
         before = _access(conn, target)
-        sets = [_grant_set(conn, source)]
-        if narrowed_by is not None:
-            sets.append(_grant_set(conn, _canonical(narrowed_by)))
+        sets = [_grant_set(conn, source)] + [_grant_set(conn, _canonical(n)) for n in narrowed_by]
         restricted = [ids for ids in sets if ids is not None]
         if not restricted:
             _open(conn, target)

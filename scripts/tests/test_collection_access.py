@@ -34,13 +34,14 @@ from fastapi.testclient import TestClient
 
 from config import settings
 from main import app
-from auth import passwords, store
+from auth import access, passwords, store
 from services import audit, exporter, goldstandard, importer, ingest_pipeline, rag_pipeline
 from services import weaviate_client as wc
 
 ORIGIN = "http://testserver"
 SECRET, OPEN = "Secret", "Open1"
 STAGING = SECRET + "__tuning_" + "0" * 32
+NESTED = STAGING + "__tuning_" + "2" * 32         # a rebuild of the kept copy (#792)
 
 
 def _no_weaviate():
@@ -473,6 +474,23 @@ class PackageTests(AccessTestCase):
         self.assertEqual(record["status"], "failed", record)
         self.assertEqual(store.collection_access("Applied"), store.CollectionAccess(True, ("dev2",), ()))
 
+    def test_a_failed_build_with_no_answer_on_existence_keeps_its_access(self):
+        # Weaviate can't say whether the partial collection is gone: fail closed (#788).
+        built = []
+
+        def build(target, *a):
+            built.append(target)
+            raise RuntimeError("timed out")
+
+        def unknown(name):
+            if built:
+                raise ConnectionError("no answer")
+            return name[:1].upper() + name[1:] in self.collections
+        with patch.object(wc, "_collection_exists_sync", unknown):
+            record = self.run_import("Unanswered", "rename", {"name": "dev2", "kind": "user"}, _build=build)
+        self.assertEqual((record["status"], built), ("failed", ["Unanswered"]), record)
+        self.assertEqual(store.collection_access("Unanswered"), store.CollectionAccess(True, ("dev2",), ()))
+
     def test_a_replace_keeps_the_target_access(self):
         def begin(*a):
             raise importer.PackageError("IMPORT_FAILED", "stopped before the replace")
@@ -564,6 +582,109 @@ class CopyTests(AccessTestCase):
         self.assertEqual(self.put(SECRET, {"restricted": False}).status_code, 200)
         self.assertNotIn(STAGING, self.names("user"))
         self.assertIn(STAGING, self.names("dev"))
+
+
+class NestedCopyTests(AccessTestCase):
+    """A kept copy can be rebuilt, so a copy's target can be a copy too. The
+    copy of the copy follows every collection in its chain (#792)."""
+
+    def setUp(self):
+        super().setUp()
+        self.collections.add(NESTED)
+        store.copy_collection_access(STAGING, NESTED)    # the copy's own state, as begin gave it before #792
+
+    def open_copies(self):
+        for name in (STAGING, NESTED):
+            self.assertEqual(self.put(name, {"restricted": False}).status_code, 200)
+
+    def test_the_chain_reaches_the_original(self):
+        self.assertEqual(access.chain(NESTED), (NESTED, STAGING, SECRET))
+        self.assertEqual(access.scope(NESTED), (NESTED, STAGING, SECRET))
+        self.assertEqual(access.scope(STAGING), (STAGING, SECRET))
+        self.assertEqual(access.scope(OPEN), (OPEN,))
+        self.assertEqual(access.chain(NESTED.lower()), (NESTED, STAGING, SECRET))
+
+    def test_narrowing_the_original_reaches_a_copy_of_a_copy(self):
+        self.open_copies()
+        body = {"question": "What?", "collection": NESTED}
+        self.assertNotIn(NESTED, self.names("dev2"))
+        self.refused(self.client.post("/query", json=body, headers=self.as_("dev2")))
+        self.assertIn(NESTED, self.names("svc"))
+        self.assertEqual(self.put(SECRET, {"restricted": True, "users": ["dev"]}).status_code, 200)
+        self.assertNotIn(NESTED, self.names("svc"))
+        self.refused(self.client.post("/query", json=body, headers=self.as_("svc")))
+        self.assertIn(NESTED, self.names("dev"))
+        self.assertIn(NESTED, self.names("eng"))
+
+    def test_a_copy_of_a_copy_with_no_state_follows_the_original(self):
+        # Copies kept from before #606 have no state of their own.
+        store.drop_collection_access(STAGING)
+        store.drop_collection_access(NESTED)
+        for who, sees in (("dev", True), ("svc", True), ("eng", True), ("user", False), ("dev2", False)):
+            with self.subTest(who=who):
+                self.assertEqual(NESTED in self.names(who), sees)
+
+    def test_package_checks_of_an_existing_copy_of_a_copy(self):
+        self.open_copies()
+        self.assertEqual(importer._source(NESTED), NESTED)
+        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, NESTED))
+        self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, NESTED))
+        self.assertEqual(self.packages_seen(NESTED), {"dev2": 0, "dev": 1})
+
+    def packages_seen(self, collection):
+        from routers import transfer
+        listed = [{"filename": "ragpkg-nested.tar.gz", "size_bytes": 1, "collection": collection, "chunk_count": 1,
+                   "fidelity": "chunks-only", "created_at": None, "readable": True}]
+        with patch.object(transfer, "_list_packages_sync", lambda: [dict(p) for p in listed]):
+            return {who: len(self.client.get("/packages", headers=self.as_(who)).json()["packages"])
+                    for who in ("dev2", "dev")}
+
+    def test_a_package_of_a_discarded_copy_of_a_copy_follows_the_nearest_existing(self):
+        gone_copy = STAGING + "__importing_" + "3" * 32          # STAGING is still here
+        gone_both = SECRET + "__tuning_" + "4" * 32 + "__tuning_" + "5" * 32
+        self.assertEqual(importer._source(gone_copy), STAGING)
+        self.assertEqual(importer._source(gone_both), SECRET)
+        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, importer._source(gone_both)))
+        self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, importer._source(gone_both)))
+        self.assertEqual(self.packages_seen(gone_both), {"dev2": 0, "dev": 1})
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, importer._source(gone_both),
+                                            "Fromgone")
+        self.assertEqual(written, store.collection_access(SECRET))
+
+        def unanswered(name):
+            if name == gone_copy:
+                raise ConnectionError("no answer")
+            return name[:1].upper() + name[1:] in self.collections
+        with patch.object(wc, "_collection_exists_sync", unanswered):
+            self.assertEqual(importer._source(gone_copy), gone_copy)      # no answer counts as existing
+
+    def test_begin_on_a_copy_takes_the_narrowest_state_of_its_chain(self):
+        from services import collection_recovery
+
+        class Client:
+            class collections:
+                @staticmethod
+                def exists(name):
+                    return False
+        self.assertEqual(self.put(STAGING, {"restricted": False}).status_code, 200)
+        record = collection_recovery.begin(STAGING, "tune", Client)
+        self.assertEqual(store.collection_access(record["staging"]), store.CollectionAccess(True, ("dev",), ("svc",)))
+        self.assertEqual(self.put(STAGING, {"restricted": True, "users": ["dev"]}).status_code, 200)
+        record = collection_recovery.begin(STAGING, "tune", Client)
+        self.assertEqual(store.collection_access(record["staging"]), store.CollectionAccess(True, ("dev",), ()))
+        for name in (SECRET, STAGING):
+            self.assertEqual(self.put(name, {"restricted": False}).status_code, 200)
+        record = collection_recovery.begin(STAGING, "tune", Client)
+        self.assertFalse(store.collection_access(record["staging"]).restricted)
+
+    def test_an_import_from_a_copy_of_a_copy_takes_the_narrowest_state(self):
+        self.open_copies()
+        self.assertEqual(self.put(SECRET, {"restricted": True, "users": ["dev"]}).status_code, 200)
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, NESTED, "Fromnested")
+        self.assertEqual(written, store.CollectionAccess(True, ("dev",), ()))
+        self.assertEqual(self.put(SECRET, {"restricted": False}).status_code, 200)
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, NESTED, "Fromnested2")
+        self.assertEqual(written, store.CollectionAccess(False))
 
 
 class CreateFailureTests(AccessTestCase):

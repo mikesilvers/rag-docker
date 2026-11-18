@@ -857,16 +857,17 @@ def _exists(name: str) -> bool:
 
 def _source(original: str) -> str:
     """Whose access a package of `original` follows (#606): the collection
-    itself, or for a staging or recovery copy that no longer exists here, its
-    target (auth.access.package_source)."""
+    itself, or for a staging or recovery copy that no longer exists here, the
+    nearest collection it was made from that exists here, or the original
+    (auth.access.package_source, #792)."""
     return access.package_source(original, _exists)
 
 
 def _refused(owner, source: str) -> bool:
     """True when the package's collection (`_source`) exists here, is
     restricted, and the job's owner may not use it (#606). For an existing
-    staging or recovery copy that means the copy or its target (access.scope,
-    #788)."""
+    staging or recovery copy that means the copy or any collection it was made
+    from (access.scope, #788, #792)."""
     names = access.scope(source)
     if owner is None or not any(auth_store.collection_access(n).restricted for n in names):
         return False
@@ -876,16 +877,16 @@ def _refused(owner, source: str) -> bool:
 def _start_access(owner, source: str, target: str):
     """A collection this import creates (#606): when the package's collection
     (`_source`) exists here, the new one gets its state, and for a staging or
-    recovery copy the narrower of the copy's and its target's (#788), so an
-    import can't open what the copy's target restricts; otherwise it starts
+    recovery copy the narrowest of the copy's and every collection's it was
+    made from (#788, #792), so an import can't open what any of them restricts;
+    otherwise it starts
     restricted to the job's owner. Written before any data; returns (the state
     replaced, the state written) for auth_store.put_back. A job with no owner
     (a direct call in tests) records nothing and returns None."""
     if owner is None:
         return None
     if source != target and _exists(source):
-        scope = access.scope(source)
-        return auth_store.copy_collection_access(source, target, scope[1] if len(scope) > 1 else None)
+        return auth_store.copy_collection_access(source, target, access.scope(source)[1:])
     return auth_store.restrict_to(target, auth_store.user_id_for(owner))
 
 
