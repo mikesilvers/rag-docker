@@ -910,6 +910,47 @@ class StackDockerCallTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(ups, [])
 
+    def test_telemetry_mode_refuses_a_bad_inherited_pin(self):
+        # #764: the inherited pin gets the checks --telemetry-pin gets: a missing
+        # file and a file inside the checkout are refused before any Docker call.
+        for inherited in ('/nonexistent/pin.json', str(ROOT / 'telemetry/image.json')):
+            with self.subTest(inherited=inherited):
+                box = Sandbox(self)
+                lock = Path(box.env['RAG_VERIFY_LOCK'])
+                lock.mkdir()
+                (lock / 'pid').write_text(f'{os.getpid()}\n')
+                result = box.run(['bash', str(STACK), 'telemetry-mode', '--telemetry'],
+                                 RAG_VERIFY_LOCK_HELD='1', RAG_VERIFY_TELEMETRY_PIN=inherited)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn('RAG_VERIFY_TELEMETRY_PIN', result.stderr)
+                self.assertEqual([c for c in box.calls() if c[0] == 'docker'], [])
+
+    def test_pin_in_the_checkout_by_another_spelling_is_refused(self):
+        # #764: a different letter case on a case-insensitive volume (APFS), and a
+        # hard link outside the checkout, are the checkout's file all the same.
+        real = ROOT / 'telemetry/image.json'
+        variant = str(real).upper()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        hard = Path(folder.name) / 'hard.json'
+        spellings = {}
+        if variant != str(real) and Path(variant).exists() and os.path.samefile(variant, real):
+            spellings['letter case'] = variant
+        try:
+            os.link(real, hard)
+            spellings['hard link'] = str(hard)
+        except OSError:
+            pass
+        if not spellings:
+            self.skipTest('the volume is case-sensitive and no hard link can be made')
+        for name, pin in spellings.items():
+            with self.subTest(spelling=name):
+                box = Sandbox(self)
+                result = box.run(['bash', str(STACK), 'run', '--telemetry', '--telemetry-pin', pin])
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn('must be outside the checkout', result.stderr)
+                self.assertEqual([c for c in box.calls() if c[0] == 'docker'], [])
+
     def test_up_lan_bootstraps_then_switches_to_lan_mode(self):
         # #26: default up, the first Engineer, the LAN guard, the LAN up without a
         # build, then the certificate copied for the suites, in that order.
