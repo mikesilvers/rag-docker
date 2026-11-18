@@ -704,6 +704,8 @@ class StackArgumentTests(unittest.TestCase):
         self.addCleanup(folder.cleanup)
         pin = str(Path(folder.name) / 'pin.json')
         Path(pin).write_text('{}')
+        link = str(Path(folder.name) / 'link.json')
+        os.symlink(ROOT / 'telemetry/image.json', link)
         cases = [
             (['up'], {'RAG_VERIFY_PORT': '8080'}),
             (['up'], {'RAG_VERIFY_PORT': 'abc'}),
@@ -725,6 +727,9 @@ class StackArgumentTests(unittest.TestCase):
             (['run', '--lan', '--telemetry-pin', pin], {}),
             (['run', '--telemetry', '--telemetry-pin', str(ROOT / 'telemetry/image.json')], {}),
             (['up', '--telemetry', '--telemetry-pin', str(ROOT / 'telemetry')], {}),
+            # Written by the testing reviewer: a symlink outside the checkout that
+            # resolves into it is refused too.
+            (['run', '--telemetry', '--telemetry-pin', link], {}),
             (['telemetry-mode', '--telemetry', '--telemetry-pin', pin], {'RAG_VERIFY_LOCK_HELD': '1'}),
             # Query-only mode (#670): its own option, never with --lan or --telemetry; its
             # switch only under an inherited lock of a --query-only run, with a package name.
@@ -832,6 +837,78 @@ class StackDockerCallTests(unittest.TestCase):
                 lines = [line for line in result.stdout.splitlines()
                          if line.startswith('export RAG_VERIFY_TELEMETRY_PIN=')]
                 self.assertEqual(lines, ['export RAG_VERIFY_TELEMETRY_PIN=' + (shlex.quote(expected) if expected else "''")])
+
+    def telemetry_config(self, box, image=None):
+        """The resolved telemetry configuration for ROOT, as stack.sh's guard
+        reads it, with the collector image changed when one is given (#532,
+        written by the testing reviewer). Needs the real Docker CLI."""
+        docker = shutil.which('docker')
+        if not docker:
+            self.skipTest('the Docker CLI is not on PATH')
+        env = {**os.environ, 'RAG_VERIFY_PORT': '8081', 'RAG_EXPORTS_DIR': str(box.exports),
+               'COMPOSE_PROFILES': 'telemetry', 'RAG_VERIFY_HARNESS': str(ROOT), 'RAG_VERIFY_CHECKOUT': str(ROOT)}
+        config = json.loads(subprocess.check_output(
+            [docker, 'compose', '-p', 'rag-verify', '-f', str(ROOT / 'docker-compose.yml'),
+             '-f', str(ROOT / 'docker-compose.telemetry.yml'), '-f', str(ROOT / 'docker-compose.verify.yml'),
+             '-f', str(ROOT / 'docker-compose.telemetry.verify.yml'), 'config', '--format', 'json'], env=env))
+        if image:
+            config['services']['otel-collector']['image'] = image
+        (box.root / 'config.json').write_text(json.dumps(config))
+
+    def bumped_pin(self):
+        harness = json.loads((ROOT / 'telemetry/image.json').read_text())['image']
+        image = harness.split('@')[0].rsplit(':', 1)[0] + ':0.999.0@sha256:' + 'c' * 64
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        pin = Path(folder.name) / 'pin.json'
+        pin.write_text(json.dumps({'image': image}))
+        return image, str(pin)
+
+    def test_telemetry_pin_reaches_the_guard_end_to_end(self):
+        # #532 (testing reviewer): stack.sh itself hands --telemetry-pin to the
+        # guard. A bumped collector is refused before any build without the
+        # option, and accepted with a reviewed pin naming it.
+        image, pin = self.bumped_pin()
+        for argv, accepted in (([], False), (['--telemetry-pin', pin], True)):
+            with self.subTest(argv=argv):
+                box = Sandbox(self)
+                self.telemetry_config(box, image)
+                result = box.run(['bash', str(STACK), 'up', '--telemetry', *argv],
+                                 STUB_UP_OK='1', STUB_CURL_CODE='200')
+                compose = [c[1:] for c in box.calls() if c[0] == 'docker' and c[1:2] == ['compose']]
+                built = any('build' in c or 'up' in c for c in compose)
+                if accepted:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertTrue(built, 'the accepted configuration was never built')
+                else:
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn('otel-collector: unexpected telemetry image/build', result.stdout + result.stderr)
+                    self.assertFalse(built, 'a refused configuration was built or started')
+
+    def test_telemetry_mode_checks_against_the_inherited_pin(self):
+        # #532 (testing reviewer): suite 15's nested telemetry-mode call takes
+        # the run's reviewed pin from RAG_VERIFY_TELEMETRY_PIN. With it, the
+        # bumped collector passes and the API is recreated; without it, the
+        # guard refuses and nothing is started.
+        image, pin = self.bumped_pin()
+        for inherited, accepted in ((None, False), (pin, True)):
+            with self.subTest(inherited=inherited):
+                box = Sandbox(self)
+                self.telemetry_config(box, image)
+                # The lock a run holds, owned by this process, an ancestor of stack.sh.
+                lock = Path(box.env['RAG_VERIFY_LOCK'])
+                lock.mkdir()
+                (lock / 'pid').write_text(f'{os.getpid()}\n')
+                result = box.run(['bash', str(STACK), 'telemetry-mode', '--telemetry'],
+                                 RAG_VERIFY_LOCK_HELD='1', RAG_VERIFY_TELEMETRY_PIN=inherited,
+                                 STUB_UP_OK='1', STUB_CURL_CODE='200')
+                ups = [c for c in box.calls() if c[0] == 'docker' and 'up' in c]
+                if accepted:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(len(ups), 1, box.calls())
+                else:
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(ups, [])
 
     def test_up_lan_bootstraps_then_switches_to_lan_mode(self):
         # #26: default up, the first Engineer, the LAN guard, the LAN up without a
