@@ -12,14 +12,18 @@ refusal is audited (services/audit.py, `access_refused`).
 A staging or recovery collection of a rebuild or import
 (`<target>__tuning_<token>`, `<target>__importing_<token>`) holds its target's
 data, so it is given its target's access when it is made
-(collection_recovery.begin) and keeps that state under its own name. While its
-target has a state too, a caller other than an Engineer may use the copy only
-when they may use both (`scope`, #788): restricting the target later reaches
-its existing copies, including ones kept from before #606 with no state of
-their own. A deleted target's state is dropped with it, so the copy is then
-governed by its own state alone; a re-created target's new state narrows it
-again. `target_of` also maps a package of a copy that no longer exists to its
-target (services/importer.py, routers/transfer.py).
+(collection_recovery.begin) and keeps that state under its own name. A kept
+copy can itself be rebuilt, so a copy's target may be a copy too: its `chain`
+is the copy, its target, that one's target and so on, down to the original
+collection. A new copy takes the narrowest state across its target's chain
+(#792). While any collection in the chain has a state too, a caller other than
+an Engineer may use the copy only when they may use every one (`scope`, #788,
+#792): restricting the original later reaches its existing copies and their
+copies, including ones kept from before #606 with no state of their own. A
+deleted collection's state is dropped with it, so it then narrows nothing; a
+re-created one's new state narrows its copies again. A package of a copy that
+no longer exists follows the nearest collection in its chain that exists here,
+or the original (`package_source`; services/importer.py, routers/transfer.py).
 """
 from __future__ import annotations
 
@@ -42,24 +46,36 @@ def target_of(name: str) -> str:
     return found.group(1) if found else name
 
 
+def chain(name: str) -> tuple[str, ...]:
+    """Collection `name` (canonical), then each collection it was copied from:
+    its target while it is a staging or recovery copy's name, that one's
+    target, and so on, ending at the original (#792). An ordinary name is its
+    own chain. Each step is strictly shorter, so the walk ends."""
+    names = [canonical(name)]
+    while (target := target_of(names[-1])) != names[-1]:
+        names.append(target)
+    return tuple(names)
+
+
 def package_source(name: str, exists) -> str:
     """Whose access a package of collection `name` follows (#606): the name
     itself, unless it is a staging or recovery copy's that no longer exists here
-    (`exists(name)` is False), whose target's it is then, so a package of a
-    discarded copy isn't open to everyone."""
-    name = canonical(name)
-    target = target_of(name)
-    if target != name and not exists(name):
-        return target
-    return name
+    (`exists(name)` is False); then the nearest collection in its `chain` that
+    exists here, or the original when none does (#792), so a package of a
+    discarded copy isn't open to everyone. `exists` is asked in chain order and
+    an ordinary name is never asked about."""
+    names = chain(name)
+    for i, n in enumerate(names):
+        if i == len(names) - 1 or exists(n):
+            return n
+    return names[-1]
 
 
 def scope(name: str) -> tuple[str, ...]:
-    """The names whose state decides who may use collection `name`: the name
-    itself, and for a staging or recovery copy also its target (#788)."""
-    name = canonical(name)
-    target = target_of(name)
-    return (name,) if target == name else (name, target)
+    """The names whose state decides who may use collection `name`: its whole
+    `chain`, the name itself and, for a staging or recovery copy, every
+    collection it was made from (#788, #792)."""
+    return chain(name)
 
 
 def allowed(principal, name: str) -> bool:

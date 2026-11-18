@@ -3444,6 +3444,7 @@ import shutil
 import uuid
 from pathlib import Path
 
+from auth import access
 from auth import store as auth_store
 from config import settings
 from services import sources
@@ -3495,10 +3496,12 @@ def begin(target: str, operation: str, client) -> dict:
                   target=target, staging=staging, state="scratch")
     _write(record)  # Ownership is persisted before collection creation.
     # The copy will hold the target's data, so it gets the target's access as
-    # it is now, under its own name, before it exists (#606). Later changes to
-    # the target never change this state, but while the target has a state a
-    # caller other than an Engineer needs both (access.scope, #788).
-    auth_store.copy_collection_access(target, staging)
+    # it is now, under its own name, before it exists (#606). A target that is
+    # itself a kept copy narrows it by every collection that one was made from:
+    # the narrowest state across the target's chain (#792). Later changes to
+    # them never change this state, but while any of them has a state a caller
+    # other than an Engineer needs every one (access.scope, #788, #792).
+    auth_store.copy_collection_access(target, staging, access.scope(target)[1:])
     return record
 
 
@@ -14180,16 +14183,17 @@ def _exists(name: str) -> bool:
 
 def _source(original: str) -> str:
     """Whose access a package of `original` follows (#606): the collection
-    itself, or for a staging or recovery copy that no longer exists here, its
-    target (auth.access.package_source)."""
+    itself, or for a staging or recovery copy that no longer exists here, the
+    nearest collection it was made from that exists here, or the original
+    (auth.access.package_source, #792)."""
     return access.package_source(original, _exists)
 
 
 def _refused(owner, source: str) -> bool:
     """True when the package's collection (`_source`) exists here, is
     restricted, and the job's owner may not use it (#606). For an existing
-    staging or recovery copy that means the copy or its target (access.scope,
-    #788)."""
+    staging or recovery copy that means the copy or any collection it was made
+    from (access.scope, #788, #792)."""
     names = access.scope(source)
     if owner is None or not any(auth_store.collection_access(n).restricted for n in names):
         return False
@@ -14199,16 +14203,16 @@ def _refused(owner, source: str) -> bool:
 def _start_access(owner, source: str, target: str):
     """A collection this import creates (#606): when the package's collection
     (`_source`) exists here, the new one gets its state, and for a staging or
-    recovery copy the narrower of the copy's and its target's (#788), so an
-    import can't open what the copy's target restricts; otherwise it starts
+    recovery copy the narrowest of the copy's and every collection's it was
+    made from (#788, #792), so an import can't open what any of them restricts;
+    otherwise it starts
     restricted to the job's owner. Written before any data; returns (the state
     replaced, the state written) for auth_store.put_back. A job with no owner
     (a direct call in tests) records nothing and returns None."""
     if owner is None:
         return None
     if source != target and _exists(source):
-        scope = access.scope(source)
-        return auth_store.copy_collection_access(source, target, scope[1] if len(scope) > 1 else None)
+        return auth_store.copy_collection_access(source, target, access.scope(source)[1:])
     return auth_store.restrict_to(target, auth_store.user_id_for(owner))
 
 
@@ -18734,6 +18738,7 @@ import os
 import secrets
 import sqlite3
 import time
+from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -19674,20 +19679,19 @@ def _grant_set(conn, collection: str):
 
 
 def copy_collection_access(source: str, target: str,
-                           narrowed_by: str | None = None) -> tuple[CollectionAccess, CollectionAccess]:
+                           narrowed_by: Iterable[str] = ()) -> tuple[CollectionAccess, CollectionAccess]:
     """The target takes the source's state: open stays open, restricted copies
-    its grants. With `narrowed_by` (the target of a staging or recovery copy
-    `source`, #788), it takes the narrower of the two: restricted when either
-    is, to the accounts granted every restricted one. Returns (the target's
-    state it replaced, the state written)."""
+    its grants. With `narrowed_by` (the collections a staging or recovery copy
+    was made from, its chain after itself, #788, #792), it takes the narrowest
+    of them all: restricted when any is, to the accounts granted every
+    restricted one. Returns (the target's state it replaced, the state
+    written)."""
     source, target = _canonical(source), _canonical(target)
     if _no_store():
         return CollectionAccess(False), CollectionAccess(False)
     with _connect(write=True) as conn:
         before = _access(conn, target)
-        sets = [_grant_set(conn, source)]
-        if narrowed_by is not None:
-            sets.append(_grant_set(conn, _canonical(narrowed_by)))
+        sets = [_grant_set(conn, source)] + [_grant_set(conn, _canonical(n)) for n in narrowed_by]
         restricted = [ids for ids in sets if ids is not None]
         if not restricted:
             _open(conn, target)
@@ -20153,14 +20157,18 @@ refusal is audited (services/audit.py, `access_refused`).
 A staging or recovery collection of a rebuild or import
 (`<target>__tuning_<token>`, `<target>__importing_<token>`) holds its target's
 data, so it is given its target's access when it is made
-(collection_recovery.begin) and keeps that state under its own name. While its
-target has a state too, a caller other than an Engineer may use the copy only
-when they may use both (`scope`, #788): restricting the target later reaches
-its existing copies, including ones kept from before #606 with no state of
-their own. A deleted target's state is dropped with it, so the copy is then
-governed by its own state alone; a re-created target's new state narrows it
-again. `target_of` also maps a package of a copy that no longer exists to its
-target (services/importer.py, routers/transfer.py).
+(collection_recovery.begin) and keeps that state under its own name. A kept
+copy can itself be rebuilt, so a copy's target may be a copy too: its `chain`
+is the copy, its target, that one's target and so on, down to the original
+collection. A new copy takes the narrowest state across its target's chain
+(#792). While any collection in the chain has a state too, a caller other than
+an Engineer may use the copy only when they may use every one (`scope`, #788,
+#792): restricting the original later reaches its existing copies and their
+copies, including ones kept from before #606 with no state of their own. A
+deleted collection's state is dropped with it, so it then narrows nothing; a
+re-created one's new state narrows its copies again. A package of a copy that
+no longer exists follows the nearest collection in its chain that exists here,
+or the original (`package_source`; services/importer.py, routers/transfer.py).
 """
 from __future__ import annotations
 
@@ -20183,24 +20191,36 @@ def target_of(name: str) -> str:
     return found.group(1) if found else name
 
 
+def chain(name: str) -> tuple[str, ...]:
+    """Collection `name` (canonical), then each collection it was copied from:
+    its target while it is a staging or recovery copy's name, that one's
+    target, and so on, ending at the original (#792). An ordinary name is its
+    own chain. Each step is strictly shorter, so the walk ends."""
+    names = [canonical(name)]
+    while (target := target_of(names[-1])) != names[-1]:
+        names.append(target)
+    return tuple(names)
+
+
 def package_source(name: str, exists) -> str:
     """Whose access a package of collection `name` follows (#606): the name
     itself, unless it is a staging or recovery copy's that no longer exists here
-    (`exists(name)` is False), whose target's it is then, so a package of a
-    discarded copy isn't open to everyone."""
-    name = canonical(name)
-    target = target_of(name)
-    if target != name and not exists(name):
-        return target
-    return name
+    (`exists(name)` is False); then the nearest collection in its `chain` that
+    exists here, or the original when none does (#792), so a package of a
+    discarded copy isn't open to everyone. `exists` is asked in chain order and
+    an ordinary name is never asked about."""
+    names = chain(name)
+    for i, n in enumerate(names):
+        if i == len(names) - 1 or exists(n):
+            return n
+    return names[-1]
 
 
 def scope(name: str) -> tuple[str, ...]:
-    """The names whose state decides who may use collection `name`: the name
-    itself, and for a staging or recovery copy also its target (#788)."""
-    name = canonical(name)
-    target = target_of(name)
-    return (name,) if target == name else (name, target)
+    """The names whose state decides who may use collection `name`: its whole
+    `chain`, the name itself and, for a staging or recovery copy, every
+    collection it was made from (#788, #792)."""
+    return chain(name)
 
 
 def allowed(principal, name: str) -> bool:
@@ -25445,7 +25465,10 @@ export default function CollectionsPage() {
   // unknown and Save stays disabled; once the Engineer changes something, a
   // late answer doesn't overwrite the change. Each opening is numbered, and
   // an answer to an earlier opening (another collection's, or one closed
-  // since) is ignored, so it can't become this dialog's draft (#788).
+  // since) is ignored, so it can't become this dialog's draft (#788). The
+  // opening's lists of people and service principals are numbered the same
+  // way, so an earlier opening's late answer or error never reaches this one
+  // (#792).
   const [accessLoaded, setAccessLoaded] = useState(false)
   const touched = useRef(false)
   const accessRead = useRef(0)
@@ -25477,10 +25500,20 @@ export default function CollectionsPage() {
       if (ticket !== accessRead.current) return
       setAccessError(`Could not read who may use this collection: ${e instanceof Error ? e.message : String(e)}`)
     })
-    api.listUsers().then(r => setPeople(r.users))
-      .catch((e: unknown) => setAccessError(`Could not load the people: ${e instanceof Error ? e.message : String(e)}`))
-    api.listPrincipals().then(r => setPrincipals(r.principals))
-      .catch((e: unknown) => setAccessError(`Could not load the service principals: ${e instanceof Error ? e.message : String(e)}`))
+    api.listUsers().then(r => {
+      if (ticket !== accessRead.current) return
+      setPeople(r.users)
+    }).catch((e: unknown) => {
+      if (ticket !== accessRead.current) return
+      setAccessError(`Could not load the people: ${e instanceof Error ? e.message : String(e)}`)
+    })
+    api.listPrincipals().then(r => {
+      if (ticket !== accessRead.current) return
+      setPrincipals(r.principals)
+    }).catch((e: unknown) => {
+      if (ticket !== accessRead.current) return
+      setAccessError(`Could not load the service principals: ${e instanceof Error ? e.message : String(e)}`)
+    })
   }
 
   function closeAccess() {
@@ -31513,11 +31546,6 @@ def check_collection_access(operator_ok):
         expect(status == 202, "starting the preparation answered {} {}".format(status, error_code(raw)))
         job = wait_job(dev_token, "/prepare/job/" + json.loads(raw)["job_id"])
         expect(job["status"] == "completed", "the preparation ended {}: {}".format(job["status"], job.get("errors")))
-        status, raw, _ = code("POST", "/prepare/import", {"collection": name, "document_ids": [document],
-                                                          "chunk_size": 500, "chunk_overlap": 50}, token=dev_token)
-        expect(status == 202, "the import into {} answered {} {}".format(name, status, error_code(raw)))
-        job = wait_job(dev_token, "/ingest/job/" + json.loads(raw)["job_id"])
-        expect(job["status"] == "completed", "the import ended {}: {}".format(job["status"], job.get("errors")))
         other, _, other_token = throwaway("developer", operator_ok)
         users.append(other)
 
@@ -31525,6 +31553,13 @@ def check_collection_access(operator_ok):
             status, raw, _ = code("GET", "/prepare/documents", token=token)
             expect(status == 200, "GET /prepare/documents answered {}".format(status))
             return document in [d["id"] for d in json.loads(raw)["documents"]]
+        # A document with no imports is shared, so the hiding below comes from the import (#792).
+        expect(prepared(other_token), "a second Developer doesn't see a prepared document with no imports")
+        status, raw, _ = code("POST", "/prepare/import", {"collection": name, "document_ids": [document],
+                                                          "chunk_size": 500, "chunk_overlap": 50}, token=dev_token)
+        expect(status == 202, "the import into {} answered {} {}".format(name, status, error_code(raw)))
+        job = wait_job(dev_token, "/ingest/job/" + json.loads(raw)["job_id"])
+        expect(job["status"] == "completed", "the import ended {}: {}".format(job["status"], job.get("errors")))
         expect(prepared(dev_token), "the granted Developer doesn't see the document it imported")
         expect(not prepared(other_token), "a Developer without access sees a document imported only into {}".format(name))
         status, raw, _ = code("GET", "/prepare/documents/" + document, token=other_token)
@@ -39137,13 +39172,14 @@ from fastapi.testclient import TestClient
 
 from config import settings
 from main import app
-from auth import passwords, store
+from auth import access, passwords, store
 from services import audit, exporter, goldstandard, importer, ingest_pipeline, rag_pipeline
 from services import weaviate_client as wc
 
 ORIGIN = "http://testserver"
 SECRET, OPEN = "Secret", "Open1"
 STAGING = SECRET + "__tuning_" + "0" * 32
+NESTED = STAGING + "__tuning_" + "2" * 32         # a rebuild of the kept copy (#792)
 
 
 def _no_weaviate():
@@ -39576,6 +39612,23 @@ class PackageTests(AccessTestCase):
         self.assertEqual(record["status"], "failed", record)
         self.assertEqual(store.collection_access("Applied"), store.CollectionAccess(True, ("dev2",), ()))
 
+    def test_a_failed_build_with_no_answer_on_existence_keeps_its_access(self):
+        # Weaviate can't say whether the partial collection is gone: fail closed (#788).
+        built = []
+
+        def build(target, *a):
+            built.append(target)
+            raise RuntimeError("timed out")
+
+        def unknown(name):
+            if built:
+                raise ConnectionError("no answer")
+            return name[:1].upper() + name[1:] in self.collections
+        with patch.object(wc, "_collection_exists_sync", unknown):
+            record = self.run_import("Unanswered", "rename", {"name": "dev2", "kind": "user"}, _build=build)
+        self.assertEqual((record["status"], built), ("failed", ["Unanswered"]), record)
+        self.assertEqual(store.collection_access("Unanswered"), store.CollectionAccess(True, ("dev2",), ()))
+
     def test_a_replace_keeps_the_target_access(self):
         def begin(*a):
             raise importer.PackageError("IMPORT_FAILED", "stopped before the replace")
@@ -39667,6 +39720,109 @@ class CopyTests(AccessTestCase):
         self.assertEqual(self.put(SECRET, {"restricted": False}).status_code, 200)
         self.assertNotIn(STAGING, self.names("user"))
         self.assertIn(STAGING, self.names("dev"))
+
+
+class NestedCopyTests(AccessTestCase):
+    """A kept copy can be rebuilt, so a copy's target can be a copy too. The
+    copy of the copy follows every collection in its chain (#792)."""
+
+    def setUp(self):
+        super().setUp()
+        self.collections.add(NESTED)
+        store.copy_collection_access(STAGING, NESTED)    # the copy's own state, as begin gave it before #792
+
+    def open_copies(self):
+        for name in (STAGING, NESTED):
+            self.assertEqual(self.put(name, {"restricted": False}).status_code, 200)
+
+    def test_the_chain_reaches_the_original(self):
+        self.assertEqual(access.chain(NESTED), (NESTED, STAGING, SECRET))
+        self.assertEqual(access.scope(NESTED), (NESTED, STAGING, SECRET))
+        self.assertEqual(access.scope(STAGING), (STAGING, SECRET))
+        self.assertEqual(access.scope(OPEN), (OPEN,))
+        self.assertEqual(access.chain(NESTED.lower()), (NESTED, STAGING, SECRET))
+
+    def test_narrowing_the_original_reaches_a_copy_of_a_copy(self):
+        self.open_copies()
+        body = {"question": "What?", "collection": NESTED}
+        self.assertNotIn(NESTED, self.names("dev2"))
+        self.refused(self.client.post("/query", json=body, headers=self.as_("dev2")))
+        self.assertIn(NESTED, self.names("svc"))
+        self.assertEqual(self.put(SECRET, {"restricted": True, "users": ["dev"]}).status_code, 200)
+        self.assertNotIn(NESTED, self.names("svc"))
+        self.refused(self.client.post("/query", json=body, headers=self.as_("svc")))
+        self.assertIn(NESTED, self.names("dev"))
+        self.assertIn(NESTED, self.names("eng"))
+
+    def test_a_copy_of_a_copy_with_no_state_follows_the_original(self):
+        # Copies kept from before #606 have no state of their own.
+        store.drop_collection_access(STAGING)
+        store.drop_collection_access(NESTED)
+        for who, sees in (("dev", True), ("svc", True), ("eng", True), ("user", False), ("dev2", False)):
+            with self.subTest(who=who):
+                self.assertEqual(NESTED in self.names(who), sees)
+
+    def test_package_checks_of_an_existing_copy_of_a_copy(self):
+        self.open_copies()
+        self.assertEqual(importer._source(NESTED), NESTED)
+        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, NESTED))
+        self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, NESTED))
+        self.assertEqual(self.packages_seen(NESTED), {"dev2": 0, "dev": 1})
+
+    def packages_seen(self, collection):
+        from routers import transfer
+        listed = [{"filename": "ragpkg-nested.tar.gz", "size_bytes": 1, "collection": collection, "chunk_count": 1,
+                   "fidelity": "chunks-only", "created_at": None, "readable": True}]
+        with patch.object(transfer, "_list_packages_sync", lambda: [dict(p) for p in listed]):
+            return {who: len(self.client.get("/packages", headers=self.as_(who)).json()["packages"])
+                    for who in ("dev2", "dev")}
+
+    def test_a_package_of_a_discarded_copy_of_a_copy_follows_the_nearest_existing(self):
+        gone_copy = STAGING + "__importing_" + "3" * 32          # STAGING is still here
+        gone_both = SECRET + "__tuning_" + "4" * 32 + "__tuning_" + "5" * 32
+        self.assertEqual(importer._source(gone_copy), STAGING)
+        self.assertEqual(importer._source(gone_both), SECRET)
+        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, importer._source(gone_both)))
+        self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, importer._source(gone_both)))
+        self.assertEqual(self.packages_seen(gone_both), {"dev2": 0, "dev": 1})
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, importer._source(gone_both),
+                                            "Fromgone")
+        self.assertEqual(written, store.collection_access(SECRET))
+
+        def unanswered(name):
+            if name == gone_copy:
+                raise ConnectionError("no answer")
+            return name[:1].upper() + name[1:] in self.collections
+        with patch.object(wc, "_collection_exists_sync", unanswered):
+            self.assertEqual(importer._source(gone_copy), gone_copy)      # no answer counts as existing
+
+    def test_begin_on_a_copy_takes_the_narrowest_state_of_its_chain(self):
+        from services import collection_recovery
+
+        class Client:
+            class collections:
+                @staticmethod
+                def exists(name):
+                    return False
+        self.assertEqual(self.put(STAGING, {"restricted": False}).status_code, 200)
+        record = collection_recovery.begin(STAGING, "tune", Client)
+        self.assertEqual(store.collection_access(record["staging"]), store.CollectionAccess(True, ("dev",), ("svc",)))
+        self.assertEqual(self.put(STAGING, {"restricted": True, "users": ["dev"]}).status_code, 200)
+        record = collection_recovery.begin(STAGING, "tune", Client)
+        self.assertEqual(store.collection_access(record["staging"]), store.CollectionAccess(True, ("dev",), ()))
+        for name in (SECRET, STAGING):
+            self.assertEqual(self.put(name, {"restricted": False}).status_code, 200)
+        record = collection_recovery.begin(STAGING, "tune", Client)
+        self.assertFalse(store.collection_access(record["staging"]).restricted)
+
+    def test_an_import_from_a_copy_of_a_copy_takes_the_narrowest_state(self):
+        self.open_copies()
+        self.assertEqual(self.put(SECRET, {"restricted": True, "users": ["dev"]}).status_code, 200)
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, NESTED, "Fromnested")
+        self.assertEqual(written, store.CollectionAccess(True, ("dev",), ()))
+        self.assertEqual(self.put(SECRET, {"restricted": False}).status_code, 200)
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, NESTED, "Fromnested2")
+        self.assertEqual(written, store.CollectionAccess(False))
 
 
 class CreateFailureTests(AccessTestCase):
@@ -56669,6 +56825,37 @@ function collectionsCases() {
         assert.equal(puts.length, 1);
         assert.equal(puts[0].path, '/api/collections/' + B + '/access');
         assert.deepEqual(puts[0].body, { restricted: true, users: ['vfy-developer'], service_principals: [] });
+      } };
+    })(),
+    (() => {
+      // As above, but the dialog's held read of A later fails: its error must
+      // not reach B's dialog (#792).
+      const late = hold();
+      let readsOfA = 0;
+      return { name: 'Access (#792): a failed read for an earlier opening does not show its error in another collection\'s dialog', open: open({
+        ['GET /api/collections/' + A + '/access']: () => (++readsOfA === 1 ? json(200, OPEN) : late),
+        ['GET /api/collections/' + B + '/access']: json(200, { restricted: true, users: ['vfy-developer'], service_principals: [] }),
+        'GET /api/auth/users': json(200, { users: [] }),
+        'GET /api/auth/service-principals': json(200, { principals: [] }),
+        'PUT /api/collections/*': call => json(200, call.body),
+      }), async run(s) {
+        await waitText(s.page, A);
+        await waitFor(s.page, () => [...document.querySelectorAll('tbody tr')].every(r => r.cells[5].textContent.trim() !== '\u2014'), 'the access column');
+        await (await s.page.$$('tbody button'))[0].click();   // row A: Access
+        await waitText(s.page, 'Access to ' + A);
+        await press(s.page, 'Cancel');
+        await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+        await (await s.page.$$('tbody button'))[2].click();   // row B: Access
+        await waitText(s.page, 'Access to ' + B);
+        await waitFor(s.page, () => [...document.querySelectorAll('.fixed button')].some(b => b.textContent.trim() === 'Save' && !b.disabled), 'Save to be enabled once B is read');
+        late.release(apiError(500, 'INTERNAL_ERROR', 'Synthetic late failure.'));
+        await new Promise(r => setTimeout(r, 300));
+        const state = await s.page.evaluate(() => ({
+          error: document.body.textContent.includes('Synthetic late failure.'),
+          save: [...document.querySelectorAll('.fixed button')].find(b => b.textContent.trim() === 'Save').disabled,
+        }));
+        assert.deepEqual(state, { error: false, save: false });
+        assert.equal(s.calls.filter(call => call.method === 'PUT').length, 0);
       } };
     })(),
     { name: 'New Collection modal starts with HNSW, Cosine and the three HNSW sliders at their defaults and bounds', open: open(), async run(s) {
