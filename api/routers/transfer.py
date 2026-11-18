@@ -185,9 +185,10 @@ async def _hidden(principal, packages: list[dict]) -> dict[str, str | None]:
     package exported here follows the collection recorded at its export (#794),
     and one recorded without a collection (before #794) is seen by Engineers
     only. An encrypted package copied in names no collection and is not hidden.
-    Whose access a package follows is the import's own rule (importer._source),
-    so the listing and POST /import agree (#788). Weaviate failing to answer
-    counts as existing (importer._exists), so the listing fails closed."""
+    Whose access a package follows is the import's own rule
+    (importer.package_source), so the listing and POST /import agree (#788).
+    Weaviate failing to answer counts as existing
+    (importer.exists_fail_closed), so the listing fails closed."""
     visible = await asyncio.to_thread(access.visible_filter, principal)
     recorded = None
     hidden: dict[str, str | None] = {}
@@ -206,8 +207,8 @@ async def _hidden(principal, packages: list[dict]) -> dict[str, str | None]:
             name = p.get("collection")
             if not p.get("readable") or not isinstance(name, str) or not name:
                 continue
-        source = await asyncio.to_thread(importer._source, name)
-        if not visible(source) and await asyncio.to_thread(importer._exists, source):
+        source = await asyncio.to_thread(importer.package_source, name)
+        if not visible(source) and await asyncio.to_thread(importer.exists_fail_closed, source):
             hidden[p["filename"]] = name
     return hidden
 

@@ -458,7 +458,7 @@ class AccessTests(Folders):
                           must_change_password=False)
 
     def test_an_operator_load_restricts_a_new_collection_with_no_grants(self):
-        with patch.object(importer, "_exists", return_value=False):
+        with patch.object(importer, "exists_fail_closed", return_value=False):
             states = importer._start_access(None, "Policies", "Policies", operator=True)
         self.assertIsNotNone(states)
         self.assertEqual(store.collection_access("Policies"), store.CollectionAccess(True, (), ()))
@@ -469,13 +469,13 @@ class AccessTests(Folders):
 
     def test_a_rename_takes_the_existing_collections_state(self):
         store.set_collection_access("Policies", False)
-        with patch.object(importer, "_exists", return_value=True):
+        with patch.object(importer, "exists_fail_closed", return_value=True):
             importer._start_access(None, "Policies", "Policies_ab12cd34", operator=True)
         self.assertEqual(store.collection_access("Policies_ab12cd34"), store.CollectionAccess(False))
 
     def test_the_operator_is_never_refused_for_access(self):
         store.restrict_to("Policies", None)
-        with patch.object(importer, "_exists", return_value=True):
+        with patch.object(importer, "exists_fail_closed", return_value=True):
             self.assertFalse(importer._refused(None, "Policies"))
 
 

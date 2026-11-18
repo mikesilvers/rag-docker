@@ -14490,7 +14490,7 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
         raise
 
 
-def _exists(name: str) -> bool:
+def exists_fail_closed(name: str) -> bool:
     """Whether a collection exists; Weaviate failing to answer counts as
     existing, so the access checks below fail closed."""
     try:
@@ -14500,40 +14500,39 @@ def _exists(name: str) -> bool:
         return True
 
 
-def _source(original: str) -> str:
+def package_source(original: str) -> str:
     """Whose access a package of `original` follows (#606): the collection
     itself, or for a staging or recovery copy that no longer exists here, the
     nearest collection it was made from that exists here, or the original
     (auth.access.package_source, #792)."""
-    return access.package_source(original, _exists)
+    return access.package_source(original, exists_fail_closed)
 
 
 def _refused(owner, source: str) -> bool:
-    """True when the package's collection (`_source`) exists here, is
+    """True when the package's collection (`package_source`) exists here, is
     restricted, and the job's owner may not use it (#606). For an existing
     staging or recovery copy that means the copy or any collection it was made
     from (access.scope, #788, #792)."""
     names = access.scope(source)
     if owner is None or not any(auth_store.collection_access(n).restricted for n in names):
         return False
-    return _exists(source) and not all(auth_store.owner_has_access(owner, n) for n in names)
+    return exists_fail_closed(source) and not all(auth_store.owner_has_access(owner, n) for n in names)
 
 
 def _start_access(owner, source: str, target: str, operator: bool = False):
     """A collection this import creates (#606): when the package's collection
-    (`_source`) exists here, the new one gets its state, and for a staging or
-    recovery copy the narrowest of the copy's and every collection's it was
-    made from (#788, #792), so an import can't open what any of them restricts;
-    otherwise it starts
-    restricted to the job's owner. Written before any data; returns (the state
-    replaced, the state written) for auth_store.put_back. A job with no owner
-    (a direct call in tests) records nothing and returns None. A load by the
-    operator (`python -m loader`, #670) has no owner either, but its new
-    collection starts restricted with no grants: Engineers only, until one
-    opens or grants it."""
+    (`package_source`) exists here, the new one gets its state, and for a
+    staging or recovery copy the narrowest of the copy's and every
+    collection's it was made from (#788, #792), so an import can't open what
+    any of them restricts; otherwise it starts restricted to the job's owner.
+    Written before any data; returns (the state replaced, the state written)
+    for auth_store.put_back. A job with no owner (a direct call in tests)
+    records nothing and returns None. A load by the operator (`python -m
+    loader`, #670) has no owner either, but its new collection starts
+    restricted with no grants: Engineers only, until one opens or grants it."""
     if owner is None and not operator:
         return None
-    if source != target and _exists(source):
+    if source != target and exists_fail_closed(source):
         return auth_store.copy_collection_access(source, target, access.scope(source)[1:])
     return auth_store.restrict_to(target, auth_store.user_id_for(owner) if owner is not None else None)
 
@@ -14572,7 +14571,7 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
         original = manifest["collection"]["name"]
         # A package of a collection its owner may not use is refused as if it
         # weren't there, before the job names the collection anywhere (#606).
-        source = _source(original) if isinstance(original, str) and original else None
+        source = package_source(original) if isinstance(original, str) and original else None
         if source and _refused(job.get("owner"), source):
             job["access_refused"] = True
             raise PackageError("PACKAGE_UNREADABLE",
@@ -14718,7 +14717,7 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
             # an error, leaves a partial collection, which keeps the
             # restriction (#788). A collection it did build keeps its state.
             if ((job.get("error_detail") or {}).get("cleanup_pending")
-                    or _exists(new_access[0])):
+                    or exists_fail_closed(new_access[0])):
                 _log.warning("Import into %r failed but the collection may still exist; "
                              "its access state stays", new_access[0])
             else:
@@ -17153,9 +17152,10 @@ async def _hidden(principal, packages: list[dict]) -> dict[str, str | None]:
     package exported here follows the collection recorded at its export (#794),
     and one recorded without a collection (before #794) is seen by Engineers
     only. An encrypted package copied in names no collection and is not hidden.
-    Whose access a package follows is the import's own rule (importer._source),
-    so the listing and POST /import agree (#788). Weaviate failing to answer
-    counts as existing (importer._exists), so the listing fails closed."""
+    Whose access a package follows is the import's own rule
+    (importer.package_source), so the listing and POST /import agree (#788).
+    Weaviate failing to answer counts as existing
+    (importer.exists_fail_closed), so the listing fails closed."""
     visible = await asyncio.to_thread(access.visible_filter, principal)
     recorded = None
     hidden: dict[str, str | None] = {}
@@ -17174,8 +17174,8 @@ async def _hidden(principal, packages: list[dict]) -> dict[str, str | None]:
             name = p.get("collection")
             if not p.get("readable") or not isinstance(name, str) or not name:
                 continue
-        source = await asyncio.to_thread(importer._source, name)
-        if not visible(source) and await asyncio.to_thread(importer._exists, source):
+        source = await asyncio.to_thread(importer.package_source, name)
+        if not visible(source) and await asyncio.to_thread(importer.exists_fail_closed, source):
             hidden[p["filename"]] = name
     return hidden
 
@@ -36262,7 +36262,7 @@ class AccessTests(Folders):
                           must_change_password=False)
 
     def test_an_operator_load_restricts_a_new_collection_with_no_grants(self):
-        with patch.object(importer, "_exists", return_value=False):
+        with patch.object(importer, "exists_fail_closed", return_value=False):
             states = importer._start_access(None, "Policies", "Policies", operator=True)
         self.assertIsNotNone(states)
         self.assertEqual(store.collection_access("Policies"), store.CollectionAccess(True, (), ()))
@@ -36273,13 +36273,13 @@ class AccessTests(Folders):
 
     def test_a_rename_takes_the_existing_collections_state(self):
         store.set_collection_access("Policies", False)
-        with patch.object(importer, "_exists", return_value=True):
+        with patch.object(importer, "exists_fail_closed", return_value=True):
             importer._start_access(None, "Policies", "Policies_ab12cd34", operator=True)
         self.assertEqual(store.collection_access("Policies_ab12cd34"), store.CollectionAccess(False))
 
     def test_the_operator_is_never_refused_for_access(self):
         store.restrict_to("Policies", None)
-        with patch.object(importer, "_exists", return_value=True):
+        with patch.object(importer, "exists_fail_closed", return_value=True):
             self.assertFalse(importer._refused(None, "Policies"))
 
 
@@ -41092,7 +41092,7 @@ class NestedCopyTests(AccessTestCase):
 
     def test_package_checks_of_an_existing_copy_of_a_copy(self):
         self.open_copies()
-        self.assertEqual(importer._source(NESTED), NESTED)
+        self.assertEqual(importer.package_source(NESTED), NESTED)
         self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, NESTED))
         self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, NESTED))
         self.assertEqual(self.packages_seen(NESTED), {"dev2": 0, "dev": 1})
@@ -41108,12 +41108,12 @@ class NestedCopyTests(AccessTestCase):
     def test_a_package_of_a_discarded_copy_of_a_copy_follows_the_nearest_existing(self):
         gone_copy = STAGING + "__importing_" + "3" * 32          # STAGING is still here
         gone_both = SECRET + "__tuning_" + "4" * 32 + "__tuning_" + "5" * 32
-        self.assertEqual(importer._source(gone_copy), STAGING)
-        self.assertEqual(importer._source(gone_both), SECRET)
-        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, importer._source(gone_both)))
-        self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, importer._source(gone_both)))
+        self.assertEqual(importer.package_source(gone_copy), STAGING)
+        self.assertEqual(importer.package_source(gone_both), SECRET)
+        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, importer.package_source(gone_both)))
+        self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, importer.package_source(gone_both)))
         self.assertEqual(self.packages_seen(gone_both), {"dev2": 0, "dev": 1})
-        _, written = importer._start_access({"name": "dev", "kind": "user"}, importer._source(gone_both),
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, importer.package_source(gone_both),
                                             "Fromgone")
         self.assertEqual(written, store.collection_access(SECRET))
 
@@ -41122,7 +41122,21 @@ class NestedCopyTests(AccessTestCase):
                 raise ConnectionError("no answer")
             return name[:1].upper() + name[1:] in self.collections
         with patch.object(wc, "_collection_exists_sync", unanswered):
-            self.assertEqual(importer._source(gone_copy), gone_copy)      # no answer counts as existing
+            self.assertEqual(importer.package_source(gone_copy), gone_copy)      # no answer counts as existing
+
+    def test_package_source_asks_in_chain_order_and_never_about_the_original(self):
+        asked = []
+
+        def none_exist(name):
+            asked.append(name)
+            return False
+        self.assertEqual(access.package_source(OPEN, none_exist), OPEN)
+        self.assertEqual(asked, [])
+        self.assertEqual(access.package_source(NESTED, none_exist), SECRET)
+        self.assertEqual(asked, [NESTED, STAGING])
+        asked.clear()
+        self.assertEqual(access.package_source(NESTED, lambda n: asked.append(n) or n == STAGING), STAGING)
+        self.assertEqual(asked, [NESTED, STAGING])
 
     def test_begin_on_a_copy_takes_the_narrowest_state_of_its_chain(self):
         from services import collection_recovery
@@ -41230,7 +41244,7 @@ class PackageSourceTests(AccessTestCase):
         # The copy's own state is open; SECRET still restricts it (#788).
         self.assertEqual(self.put(STAGING, {"restricted": False}).status_code, 200)
         dev2 = {"name": "dev2", "kind": "user"}
-        self.assertEqual(importer._source(STAGING), STAGING)
+        self.assertEqual(importer.package_source(STAGING), STAGING)
         self.assertTrue(importer._refused(dev2, STAGING))
         self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, STAGING))
         from routers import transfer
@@ -41254,11 +41268,11 @@ class PackageSourceTests(AccessTestCase):
 
     def test_a_package_of_a_discarded_copy_follows_its_target(self):
         gone = SECRET + "__importing_" + "1" * 32
-        self.assertEqual(importer._source(gone), SECRET)                   # the copy no longer exists
-        self.assertEqual(importer._source(STAGING), STAGING)               # an existing copy is itself
-        self.assertEqual(importer._source(OPEN), OPEN)
-        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, importer._source(gone)))
-        before, after = importer._start_access({"name": "dev", "kind": "user"}, importer._source(gone),
+        self.assertEqual(importer.package_source(gone), SECRET)                   # the copy no longer exists
+        self.assertEqual(importer.package_source(STAGING), STAGING)               # an existing copy is itself
+        self.assertEqual(importer.package_source(OPEN), OPEN)
+        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, importer.package_source(gone)))
+        before, after = importer._start_access({"name": "dev", "kind": "user"}, importer.package_source(gone),
                                                gone + "_ab12cd34")
         self.assertEqual(after, store.collection_access(SECRET))
         from routers import transfer
@@ -58431,6 +58445,40 @@ function collectionsCases() {
         }));
         assert.deepEqual(state, { error: false, save: false });
         assert.equal(s.calls.filter(call => call.method === 'PUT').length, 0);
+      } };
+    })(),
+    (() => {
+      // A's opening's lists of people and service principals are held until B's
+      // dialog has its own: the late people list and the late principals error
+      // must not reach B's dialog (#792).
+      const lateUsers = hold(), latePrincipals = hold();
+      let usersReads = 0, principalsReads = 0;
+      const user = name => ({ username: name, role: 'developer', enabled: true, must_change_password: false, created_at: '2026-01-02T12:00:00Z' });
+      return { name: 'Access (#792): an earlier opening\'s late lists of people and service principals do not reach another collection\'s dialog', open: open({
+        ['GET /api/collections/' + B + '/access']: json(200, { restricted: true, users: ['vfy-developer'], service_principals: [] }),
+        'GET /api/auth/users': () => (++usersReads === 1 ? lateUsers : json(200, { users: [user('vfy-developer')] })),
+        'GET /api/auth/service-principals': () => (++principalsReads === 1 ? latePrincipals : json(200, { principals: [] })),
+        'PUT /api/collections/*': call => json(200, call.body),
+      }), async run(s) {
+        await waitText(s.page, A);
+        await (await s.page.$$('tbody button'))[0].click();   // row A: Access
+        await waitText(s.page, 'Access to ' + A);
+        await press(s.page, 'Cancel');
+        await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+        await (await s.page.$$('tbody button'))[2].click();   // row B: Access
+        await waitText(s.page, 'Access to ' + B);
+        await waitText(s.page, 'vfy-developer');
+        lateUsers.release(json(200, { users: [user('vfy-stale')] }));
+        latePrincipals.release(apiError(500, 'INTERNAL_ERROR', 'Synthetic late principals failure.'));
+        await new Promise(r => setTimeout(r, 300));
+        const state = await s.page.evaluate(() => ({
+          error: document.body.textContent.includes('Synthetic late principals failure.'),
+          people: [...document.querySelectorAll('.fixed fieldset')][0].textContent.trim(),
+          save: [...document.querySelectorAll('.fixed button')].find(b => b.textContent.trim() === 'Save').disabled,
+        }));
+        assert.deepEqual(state, { error: false, people: 'Peoplevfy-developer', save: false });
+        assert.equal(usersReads, 2);
+        assert.equal(principalsReads, 2);
       } };
     })(),
     { name: 'New Collection modal starts with HNSW, Cosine and the three HNSW sliders at their defaults and bounds', open: open(), async run(s) {

@@ -626,7 +626,7 @@ class NestedCopyTests(AccessTestCase):
 
     def test_package_checks_of_an_existing_copy_of_a_copy(self):
         self.open_copies()
-        self.assertEqual(importer._source(NESTED), NESTED)
+        self.assertEqual(importer.package_source(NESTED), NESTED)
         self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, NESTED))
         self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, NESTED))
         self.assertEqual(self.packages_seen(NESTED), {"dev2": 0, "dev": 1})
@@ -642,12 +642,12 @@ class NestedCopyTests(AccessTestCase):
     def test_a_package_of_a_discarded_copy_of_a_copy_follows_the_nearest_existing(self):
         gone_copy = STAGING + "__importing_" + "3" * 32          # STAGING is still here
         gone_both = SECRET + "__tuning_" + "4" * 32 + "__tuning_" + "5" * 32
-        self.assertEqual(importer._source(gone_copy), STAGING)
-        self.assertEqual(importer._source(gone_both), SECRET)
-        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, importer._source(gone_both)))
-        self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, importer._source(gone_both)))
+        self.assertEqual(importer.package_source(gone_copy), STAGING)
+        self.assertEqual(importer.package_source(gone_both), SECRET)
+        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, importer.package_source(gone_both)))
+        self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, importer.package_source(gone_both)))
         self.assertEqual(self.packages_seen(gone_both), {"dev2": 0, "dev": 1})
-        _, written = importer._start_access({"name": "dev", "kind": "user"}, importer._source(gone_both),
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, importer.package_source(gone_both),
                                             "Fromgone")
         self.assertEqual(written, store.collection_access(SECRET))
 
@@ -656,7 +656,21 @@ class NestedCopyTests(AccessTestCase):
                 raise ConnectionError("no answer")
             return name[:1].upper() + name[1:] in self.collections
         with patch.object(wc, "_collection_exists_sync", unanswered):
-            self.assertEqual(importer._source(gone_copy), gone_copy)      # no answer counts as existing
+            self.assertEqual(importer.package_source(gone_copy), gone_copy)      # no answer counts as existing
+
+    def test_package_source_asks_in_chain_order_and_never_about_the_original(self):
+        asked = []
+
+        def none_exist(name):
+            asked.append(name)
+            return False
+        self.assertEqual(access.package_source(OPEN, none_exist), OPEN)
+        self.assertEqual(asked, [])
+        self.assertEqual(access.package_source(NESTED, none_exist), SECRET)
+        self.assertEqual(asked, [NESTED, STAGING])
+        asked.clear()
+        self.assertEqual(access.package_source(NESTED, lambda n: asked.append(n) or n == STAGING), STAGING)
+        self.assertEqual(asked, [NESTED, STAGING])
 
     def test_begin_on_a_copy_takes_the_narrowest_state_of_its_chain(self):
         from services import collection_recovery
@@ -764,7 +778,7 @@ class PackageSourceTests(AccessTestCase):
         # The copy's own state is open; SECRET still restricts it (#788).
         self.assertEqual(self.put(STAGING, {"restricted": False}).status_code, 200)
         dev2 = {"name": "dev2", "kind": "user"}
-        self.assertEqual(importer._source(STAGING), STAGING)
+        self.assertEqual(importer.package_source(STAGING), STAGING)
         self.assertTrue(importer._refused(dev2, STAGING))
         self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, STAGING))
         from routers import transfer
@@ -788,11 +802,11 @@ class PackageSourceTests(AccessTestCase):
 
     def test_a_package_of_a_discarded_copy_follows_its_target(self):
         gone = SECRET + "__importing_" + "1" * 32
-        self.assertEqual(importer._source(gone), SECRET)                   # the copy no longer exists
-        self.assertEqual(importer._source(STAGING), STAGING)               # an existing copy is itself
-        self.assertEqual(importer._source(OPEN), OPEN)
-        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, importer._source(gone)))
-        before, after = importer._start_access({"name": "dev", "kind": "user"}, importer._source(gone),
+        self.assertEqual(importer.package_source(gone), SECRET)                   # the copy no longer exists
+        self.assertEqual(importer.package_source(STAGING), STAGING)               # an existing copy is itself
+        self.assertEqual(importer.package_source(OPEN), OPEN)
+        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, importer.package_source(gone)))
+        before, after = importer._start_access({"name": "dev", "kind": "user"}, importer.package_source(gone),
                                                gone + "_ab12cd34")
         self.assertEqual(after, store.collection_access(SECRET))
         from routers import transfer

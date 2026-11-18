@@ -130,7 +130,7 @@ createJiraIssue({
 | Status | Transition id | When it's used | Who |
 | --- | --- | --- | --- |
 | To Do | `11` | The ticket isn't taken yet. | anyone |
-| In Progress | `21` | The fix agent takes the ticket. | anyone |
+| In Progress | `21` | The fix agent takes the ticket. It stays In Progress while its branch is prepared and waits for an open-PR slot (`rag-release-plan`, "Running the release"). | anyone |
 | In Review | `31` | The ticket's PR opens. | the fix agent, when it opens the PR |
 | Needs Mike | `2` | The ticket waits on the maintainer. | anyone |
 | Approved | `3` | As the maintainer likes, for example to sign off a ticket before a release. | **Mike only.** Agents never use it. |

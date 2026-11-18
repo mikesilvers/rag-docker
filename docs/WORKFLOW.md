@@ -23,11 +23,15 @@ flowchart TD
     C --> D[Fix agent takes the ticket<br/>In Progress]
     D --> E[Three dev-docs, then code]
     E --> F[PR opens<br/>In Review]
+    E -. open-PR limit reached .-> P[Branch prepared, no PR<br/>In Progress]
+    P -. slot frees: merge develop .-> F
     F --> G[rag-pr-review evaluation]
+    G -. ready reviewer patch .-> R[Fix agent applies it<br/>new head]
+    R -. patch-only re-evaluation .-> G
     G --> H{READY TO MERGE?}
     H -- yes --> I[Merge into develop]
     I --> J[Done, GitHub issue closed]
-    J --> K["Follow-ups from #N issue<br/>for Medium and Low findings"]
+    J --> K["Follow-ups from #N issue<br/>for Medium and Low findings<br/>with no ready patch"]
     D -. question .-> M[Needs Mike]
     M -. answer relayed .-> D
 ```
@@ -87,8 +91,9 @@ Reading two rows:
 
 - **One agent per lane.** A lane is claimed by assigning yourself its tickets, so two agents never work in the same files. (`rag-release-plan` reference.md "The epic's Lanes section") A fix agent stops if another ticket in its lane is In Progress under another assignee. (`rag-fix` SKILL.md step 1)
 - **One verify stack.** One machine runs one verify stack at a time (`rag-verify` on port 8081, behind a lock). Lanes can be developed and reviewed in parallel, but their verify runs and `rag-pr-review` evaluations queue. `rag-pr-review` processes PRs one at a time through its build check. (`rag-release-plan` reference.md "Lanes and links", `rag-pr-review` SKILL.md "Procedure")
-- **Limit on open PRs.** No new fix agent starts while 2 or more non-Markdown PRs from the release wait for or are in evaluation. Markdown-only PRs don't count, since they don't use the verify stack, and neither does a fix agent's question round. (`CLAUDE.md` "Planning a release", `rag-release-plan` "Running the release")
-- **Evaluation queue order.** The next PR to evaluate is a security fix; then a PR on the critical path or one that unblocks other tickets (for example on the longest chain, or one whose merge clears a Blocks link); then the oldest. A PR that conflicts with `develop` goes back to its fix agent, and keeps its place once updated. (`CLAUDE.md` "Planning a release", `rag-release-plan` "Running the release")
+- **Limit on open PRs.** No non-Markdown PR from the release opens while 2 or more non-Markdown PRs from the release wait for or are in evaluation. Markdown-only PRs don't count, since they don't use the verify stack, and neither does a fix agent's question round. (`CLAUDE.md` "Planning a release", `rag-release-plan` "Running the release")
+- **Prepared branches.** While the limit is reached, a fix agent may still start: it writes the dev-docs, the code and the host tests, pushes its branch and stops without opening the PR. At most 2 prepared branches from the release exist at a time. The ticket stays In Progress, with the checkpoint comment `Prepared: <branch> @ <sha>, waiting for an open-PR slot`. When a slot frees, the agent merges the current `develop` (no rebase, no force-push), re-runs its host tests and opens the PR. (`CLAUDE.md` "Planning a release", `rag-release-plan` "Running the release", `rag-fix` SKILL.md step 5)
+- **Evaluation queue order.** The next PR to evaluate is a security fix; then a PR on the critical path or one that unblocks other tickets (for example on the longest chain, or one whose merge clears a Blocks link); then the oldest. A PR that conflicts with `develop` goes back to its fix agent, and keeps its place once updated. The same order picks the next ticket to prepare and the next prepared branch to open; a prepared branch's age counts from the time it was pushed ready. (`CLAUDE.md` "Planning a release", `rag-release-plan` "Running the release")
 - **The Markdown-only fast path.** When every file a PR changes is `*.md` (skills under `.claude/` included), the tests reviewer runs no `stack.sh`. It runs the host tests that read the changed files, and CI `verify` on the PR's head is the full-run record. Such a PR doesn't wait for CI `verify` to merge: CI still runs, and its result is reported. (`CLAUDE.md` "Verification" and "Merging into `develop`", `rag-pr-review-tests` "The fast path")
 
 ## 5. A ticket's life
@@ -100,7 +105,7 @@ Reading two rows:
 | Status | When it's used | Who |
 | --- | --- | --- |
 | To Do | The ticket isn't taken yet. | anyone |
-| In Progress | The fix agent takes the ticket. | anyone |
+| In Progress | The fix agent takes the ticket. It stays In Progress while its branch is prepared and waits for an open-PR slot. | anyone |
 | In Review | The ticket's PR opens. | the fix agent, when it opens the PR |
 | Needs Mike | The ticket waits on the maintainer. Add a comment saying exactly what he has to decide. | anyone |
 | Approved | As the maintainer likes, for example to sign off a ticket before a release. | the maintainer only; agents never use it |
@@ -142,6 +147,8 @@ Every PR is evaluated with `rag-pr-review`, never any other way. (`CLAUDE.md` "R
 - **Labels.** After the recap is posted, and only if the PR's head hasn't moved, each check that concluded gets `Passed: <check>` or `FAILED: <check>` (Coding, Security, Tests, Build). A check that didn't run or didn't conclude gets no label. (`rag-pr-review` reference.md "Labels")
 - **The recap.** One review, `event: COMMENT`, on the head commit, holds every check's findings and the verdict. It is the only notification the PR's author gets. (`rag-pr-review` reference.md "The recap review")
 - **READY TO MERGE** only when Coding, Security, Tests and Build all passed and no High is open. A High finding must be fixed before merging; Medium and Low findings don't block it. (`rag-pr-review` reference.md "Severities", SKILL.md step 10)
+- **Reviewer patches before merge.** On a PR by `mikesilvers` that isn't from a fork, a ready patch from the tests reviewer (every test in it ran and passed) goes into the PR before it merges, READY or NOT READY, whatever the finding's severity. The coordinating session sends it to the PR's fix agent, which applies it and pushes; the maintainer isn't asked anything extra. (`CLAUDE.md`, `rag-pr-review` reference.md "Reviewer patches before merge", `rag-fix` "Applying a reviewer patch")
+- **Patch-only re-evaluation.** A new head that adds only that patch, with `develop` unchanged, gets a lighter evaluation: coding and security review the patch, Tests runs only the suites the patch touches (the previous full run plus these are the verify record), and Build runs only if the patch changes `api/`, `ui/`, `proxy/`, `ollama/` or a compose file. Earlier findings the patch doesn't address carry over. (`CLAUDE.md` "Verification", `rag-pr-review` reference.md "Patch-only re-evaluation", `rag-pr-review-tests` "The patch-only path")
 
 ### Who may merge
 
@@ -153,8 +160,8 @@ Just before merging, every check runs again: the author, the clean evaluation on
 
 - **Done.** The session that merged the PR moves the ticket to Done. When the maintainer merged the PR himself (`joefeser` PRs, fork PRs, release PRs, or any he merges by hand), the session moves it once it sees the PR has landed, as for its own merges. (`rag-jira` "Statuses", "Finish a ticket")
 - **The GitHub issue closes.** `Closes #N` closes it on the merge into `develop`. Moving the ticket to Done also closes the issue if it is still open: check its state first. (`CLAUDE.md`, `rag-jira` reference.md "Done closes GitHub")
-- **Follow-ups, any PR.** The merged PR's Medium and Low findings become a "Follow-ups from #N" issue (`CLAUDE.md`), with an RD ticket. The issue is left unlabelled for the maintainer to triage, and never gets `Triage`. (`rag-fix` SKILL.md "After the merge")
-- **Follow-ups, PRs by `joefeser`.** Only High findings go back to Joe; his PR is never held for Medium or Low findings. After it merges, the coordinator offers the maintainer a follow-up issue listing the Mediums, and the Lows worth doing, each with its `path:line`. Checks scored flaky or environmental are left out. (`rag-pr-review` reference.md "Maintainer follow-ups (PRs by `joefeser`)")
+- **Follow-ups, any PR.** The merged PR's Medium and Low findings with no ready reviewer patch become a "Follow-ups from #N" issue (`CLAUDE.md`), with an RD ticket. The issue is left unlabelled for the maintainer to triage, and never gets `Triage`. (`rag-fix` SKILL.md "After the merge")
+- **Follow-ups, PRs by `joefeser`.** Only High findings go back to Joe; his PR is never held for Medium or Low findings. After it merges, the coordinator offers the maintainer a follow-up issue listing the Mediums, and the Lows worth doing, each with its `path:line`. Checks scored flaky or environmental are left out. Reviewer patches before merge don't apply to his PRs. (`rag-pr-review` reference.md "Maintainer follow-ups (PRs by `joefeser`)")
 
 ## 7. Joe's side
 
