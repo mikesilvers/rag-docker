@@ -161,7 +161,7 @@ See "Lanes and links" in `reference.md` for the link calls.
 
 ### 15. Update the epic description
 
-Keep the existing text, the theme included, and add the "Lanes" section of `reference.md`: the lane table, the start-now list, the longest chain, the rebase-only conflicts, the verify note, the limit on open PRs and the evaluation queue order.
+Keep the existing text, the theme included, and add the "Lanes" section of `reference.md`: the lane table, the start-now list, the longest chain, the rebase-only conflicts, the verify note, the limit on open PRs with prepared branches, and the evaluation queue order.
 
 ### 16. Attach the report
 

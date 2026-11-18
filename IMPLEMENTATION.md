@@ -13098,6 +13098,9 @@ _downloading: set[str] = set()
 _settling: set = set()
 # An unreadable record that couldn't be moved aside: writes refuse meanwhile.
 _stuck = False
+# Recorded names outside the download rule already logged by this process
+# (#798): each is logged once, not on every read. Changed under `_lock` only.
+_reported: set[str] = set()
 
 
 def lock():
@@ -13150,8 +13153,9 @@ def _entry(value) -> dict | None:
 def _read() -> dict[str, dict]:
     """Recorded filename -> `{"finished_at", "collection"}`. Missing is empty; an
     unreadable record is moved aside (`_set_aside`) and taken as empty. A name
-    outside the download rule is left out and logged (#794): nothing deletes,
-    expires or serves it as recorded."""
+    outside the download rule is left out and logged (#794), once per process
+    (#798): nothing deletes, expires or serves it as recorded, and reads never
+    rewrite the record, so the next export or deletion writes it out."""
     path = _path()
     with _lock:
         try:
@@ -13167,8 +13171,10 @@ def _read() -> dict[str, dict]:
             _set_aside(path)
             return {}
         for name in [k for k in entries if not valid_name(k)]:
-            _log.warning("The record of exported packages names %r, which isn't a package name; "
-                         "it is ignored", name)
+            if name not in _reported:
+                _reported.add(name)
+                _log.warning("The record of exported packages names %r, which isn't a package name; "
+                             "it is ignored", name)
             del entries[name]
         return entries
 
@@ -31141,6 +31147,26 @@ def check_origin(operator_ok):
                 name, status, error_code(raw)))
     status, _, _ = code("GET", "/collections", token=token, headers={"Origin": "http://evil.example"})
     expect(status == 200, "a cross-origin GET answered {} (reads aren't origin-checked)".format(status))
+    # #794: the deleting GET /packages/{filename} refuses a cookie request whose
+    # Sec-Fetch-Site is present and not same-origin or none, through nginx. The
+    # package doesn't exist, so an allowed request is a 404 and deletes nothing.
+    package = "/packages/ragpkg-vfy-no-such.tar.gz"
+    for method, site, want in (("GET", "cross-site", 403), ("GET", "same-site", 403),
+                               ("GET", "same-origin", 404), ("GET", "none", 404), ("GET", None, 404),
+                               ("HEAD", "cross-site", 404)):
+        headers = {"Origin": auth_setup.origin()}
+        if site is not None:
+            headers["Sec-Fetch-Site"] = site
+        status, raw, _ = code(method, package, token=token, headers=headers)
+        if want == 403:
+            expect(status == 403 and error_code(raw) == "CROSS_ORIGIN_REFUSED",
+                   "{} {} with Sec-Fetch-Site {}: answered {} {}".format(method, package, site, status,
+                                                                         error_code(raw)))
+        else:
+            expect(status == 404, "{} {} with Sec-Fetch-Site {}: answered {}, wanted the 404 of an "
+                   "allowed request".format(method, package, site, status))
+    status, _, _ = code("GET", "/packages", token=token, headers={"Sec-Fetch-Site": "cross-site"})
+    expect(status == 200, "the package listing with Sec-Fetch-Site cross-site answered {}".format(status))
     request("POST", "/auth/logout", token=token)
 
 
@@ -39918,6 +39944,20 @@ class NestedCopyTests(AccessTestCase):
         with patch.object(wc, "_collection_exists_sync", unanswered):
             self.assertEqual(importer.package_source(gone_copy), gone_copy)      # no answer counts as existing
 
+    def test_package_source_asks_in_chain_order_and_never_about_the_original(self):
+        asked = []
+
+        def none_exist(name):
+            asked.append(name)
+            return False
+        self.assertEqual(access.package_source(OPEN, none_exist), OPEN)
+        self.assertEqual(asked, [])
+        self.assertEqual(access.package_source(NESTED, none_exist), SECRET)
+        self.assertEqual(asked, [NESTED, STAGING])
+        asked.clear()
+        self.assertEqual(access.package_source(NESTED, lambda n: asked.append(n) or n == STAGING), STAGING)
+        self.assertEqual(asked, [NESTED, STAGING])
+
     def test_begin_on_a_copy_takes_the_narrowest_state_of_its_chain(self):
         from services import collection_recovery
 
@@ -40338,6 +40378,8 @@ class DownloadTestCase(unittest.TestCase):
         self.client = TestClient(app, raise_server_exceptions=False)
         self.addCleanup(self.client.close)
         self.addCleanup(package_retention._downloading.clear)
+        package_retention._reported.clear()
+        self.addCleanup(package_retention._reported.clear)
         self.addCleanup(importer._active.clear)
 
     def as_(self, who="dev"):
@@ -40476,6 +40518,15 @@ class RecordTests(DownloadTestCase):
             self.assertEqual(package_retention.expiries(), {})
         self.assertFalse(record.exists())
 
+    def test_an_entry_whose_collection_isnt_a_string_moves_the_record_aside(self):
+        # Reviewer (#794): `_entry` accepts a string or null collection only.
+        record = self.root / "uploads" / "exported_packages.json"
+        record.write_text(json.dumps({"packages": {"ragpkg-a.tar.gz": {
+            "finished_at": "2026-11-17T12:00:00Z", "collection": 7}}}))
+        with self.assertLogs("services.package_retention", "ERROR"):
+            self.assertEqual(package_retention.recorded_collections(), {})
+        self.assertFalse(record.exists())
+
     def test_a_recorded_name_outside_the_rule_is_ignored_and_never_deleted(self):
         # #794 item 4: a tampered record can't name a file outside the exports folder.
         outside = self.root / "outside.tar.gz"
@@ -40491,6 +40542,29 @@ class RecordTests(DownloadTestCase):
         self.assertTrue(outside.exists())
         self.assertFalse(old.exists())
         self.assertNotIn("../outside.tar.gz", package_retention.expiries())
+
+    def test_a_recorded_name_outside_the_rule_is_logged_once_and_the_record_left_as_it_is(self):
+        # #798 item 4: a tampered name is logged once per process, and reads write nothing.
+        self.write("ragpkg-old.tar.gz", recorded_hours_ago=1)
+        record = self.root / "uploads" / "exported_packages.json"
+        data = json.loads(record.read_text())
+        data["packages"]["../outside.tar.gz"] = "2026-01-01T00:00:00Z"
+        record.write_text(json.dumps(data))
+        before = record.read_bytes()
+        with self.assertLogs("services.package_retention", "WARNING") as logs:
+            self.assertEqual(list(package_retention.expiries()), ["ragpkg-old.tar.gz"])
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("'../outside.tar.gz'", logs.output[0])
+        with self.assertNoLogs("services.package_retention", "WARNING"):
+            package_retention.expiries()
+            self.assertEqual(package_retention.recorded_collections(), {"ragpkg-old.tar.gz": None})
+        self.assertEqual(record.read_bytes(), before, "a read doesn't rewrite the record")
+        data["packages"]["ragpkg-x/../y.tar.gz"] = "2026-01-01T00:00:00Z"
+        record.write_text(json.dumps(data))
+        with self.assertLogs("services.package_retention", "WARNING") as logs:
+            package_retention.expiries()
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("'ragpkg-x/../y.tar.gz'", logs.output[0])
 
     def test_an_export_whose_record_fails_still_completes_and_says_so(self):
         def broken(*_):
@@ -40748,6 +40822,35 @@ class EncryptedAccessTests(DownloadTestCase):
         self.assertEqual(self.get(path.name, who="dev2").status_code, 200)
         self.assertTrue(path.exists(), "a package not exported here is kept")
 
+    def test_a_restricted_collection_that_no_longer_exists_here_hides_nothing(self):
+        # Reviewer (#794): the import's own rule (importer.package_source, exists_fail_closed); a
+        # restricted collection deleted here no longer guards its encrypted package.
+        path = self.write_encrypted("ragpkg-gone.tar.gz.age")
+        with patch.object(wc, "_collection_exists_sync", lambda name: False):
+            self.assertIn(path.name, self.listed("dev2"))
+            self.assertEqual(self.get(path.name, who="dev2").status_code, 200)
+
+    def test_weaviate_failing_hides_a_restricted_collections_encrypted_package(self):
+        # Reviewer (#794): Weaviate failing to answer counts as existing, so the
+        # encrypted path fails closed like the unencrypted one.
+        path = self.write_encrypted("ragpkg-down.tar.gz.age")
+
+        def down(name):
+            raise RuntimeError("weaviate is down")
+        with patch.object(wc, "_collection_exists_sync", down), \
+                self.assertLogs("services.importer", "ERROR"):
+            self.assertNotIn(path.name, self.listed("dev2"))
+            answer = self.get(path.name, who="dev2")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertTrue(path.exists())
+
+    def test_an_end_user_never_reaches_an_encrypted_package(self):
+        # Reviewer (#794): the route is Developer and above, whatever is recorded.
+        path = self.write_encrypted("ragpkg-before.tar.gz.age", collection=None)
+        answer = self.get(path.name, who="user")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (403, "FORBIDDEN"))
+        self.assertTrue(path.exists())
+
 
 class DeletionRecordTests(DownloadTestCase):
     def test_a_deletion_is_audited_and_the_sweep_goes_on_when_the_record_cant_be_rewritten(self):
@@ -40800,6 +40903,16 @@ class SameOriginTests(DownloadTestCase):
         key = store.issue_key("svc")[1]
         self.assertEqual(self.fetch("cross-site", headers={"Authorization": "Bearer " + key}).status_code, 200)
         self.assertFalse(path.exists())
+
+    def test_the_listing_and_a_refused_package_are_not_origin_checked_by_sec_fetch_site(self):
+        # Reviewer (#794): only the deleting GET is checked; the listing changes nothing.
+        self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+        headers = dict(self.as_("dev"), **{"Sec-Fetch-Site": "cross-site"})
+        answer = self.client.get("/packages", headers=headers)
+        self.assertEqual(answer.status_code, 200, answer.text)
+        # The refusal comes before the route: a name that doesn't exist is refused too.
+        answer = self.client.get("/packages/ragpkg-none.tar.gz", headers=headers)
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (403, "CROSS_ORIGIN_REFUSED"))
 
 
 class HeadRecordTests(DownloadTestCase):
@@ -57225,6 +57338,40 @@ function collectionsCases() {
         }));
         assert.deepEqual(state, { error: false, save: false });
         assert.equal(s.calls.filter(call => call.method === 'PUT').length, 0);
+      } };
+    })(),
+    (() => {
+      // A's opening's lists of people and service principals are held until B's
+      // dialog has its own: the late people list and the late principals error
+      // must not reach B's dialog (#792).
+      const lateUsers = hold(), latePrincipals = hold();
+      let usersReads = 0, principalsReads = 0;
+      const user = name => ({ username: name, role: 'developer', enabled: true, must_change_password: false, created_at: '2026-01-02T12:00:00Z' });
+      return { name: 'Access (#792): an earlier opening\'s late lists of people and service principals do not reach another collection\'s dialog', open: open({
+        ['GET /api/collections/' + B + '/access']: json(200, { restricted: true, users: ['vfy-developer'], service_principals: [] }),
+        'GET /api/auth/users': () => (++usersReads === 1 ? lateUsers : json(200, { users: [user('vfy-developer')] })),
+        'GET /api/auth/service-principals': () => (++principalsReads === 1 ? latePrincipals : json(200, { principals: [] })),
+        'PUT /api/collections/*': call => json(200, call.body),
+      }), async run(s) {
+        await waitText(s.page, A);
+        await (await s.page.$$('tbody button'))[0].click();   // row A: Access
+        await waitText(s.page, 'Access to ' + A);
+        await press(s.page, 'Cancel');
+        await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+        await (await s.page.$$('tbody button'))[2].click();   // row B: Access
+        await waitText(s.page, 'Access to ' + B);
+        await waitText(s.page, 'vfy-developer');
+        lateUsers.release(json(200, { users: [user('vfy-stale')] }));
+        latePrincipals.release(apiError(500, 'INTERNAL_ERROR', 'Synthetic late principals failure.'));
+        await new Promise(r => setTimeout(r, 300));
+        const state = await s.page.evaluate(() => ({
+          error: document.body.textContent.includes('Synthetic late principals failure.'),
+          people: [...document.querySelectorAll('.fixed fieldset')][0].textContent.trim(),
+          save: [...document.querySelectorAll('.fixed button')].find(b => b.textContent.trim() === 'Save').disabled,
+        }));
+        assert.deepEqual(state, { error: false, people: 'Peoplevfy-developer', save: false });
+        assert.equal(usersReads, 2);
+        assert.equal(principalsReads, 2);
       } };
     })(),
     { name: 'New Collection modal starts with HNSW, Cosine and the three HNSW sliders at their defaults and bounds', open: open(), async run(s) {
