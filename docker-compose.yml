@@ -149,6 +149,10 @@ services:
       # docker-compose.lan.yml serves TLS and sets it true (#26). Exactly true
       # or false.
       AUTH_COOKIE_SECURE: "false"
+      # Query-only mode (#670): an instance that serves questions on collections
+      # loaded with `python -m loader` and can't change them. Exactly true or
+      # false; the overlay docker-compose.query-only.yml sets it true.
+      RAG_QUERY_ONLY: "false"
       # The audit log (#29), in the ingest_uploads volume under audit/ and read
       # on the AI Engineer's Audit page. Whether a query's question text is
       # recorded: exactly true or false, off by default. audit.jsonl is rotated

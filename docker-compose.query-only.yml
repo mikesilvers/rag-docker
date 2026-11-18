@@ -1,0 +1,27 @@
+# Query-only mode (#670): an instance that serves questions on collections
+# built elsewhere and can't change them. Opt-in, and only together with the
+# base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.query-only.yml up -d
+#
+# and, to share it with your office in LAN mode (#26), with LAN mode's file too:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.lan.yml -f docker-compose.query-only.yml up -d
+#
+# What this changes: the API runs with RAG_QUERY_ONLY=true. It then refuses
+# every route that creates, changes or deletes a collection or its data with
+# 403 QUERY_ONLY (ingest, preparation, chunking and retrieval settings, gold
+# standard, tuning, collection create and delete, package import), and the UI
+# hides their pages. Questions, accounts, keys, collection access, the audit
+# log and export keep working. No model setting changes.
+#
+# Collections are built and exported on a full instance, the package is copied
+# into ./exports here, and an operator loads it on this host:
+#
+#   docker compose exec api python -m loader <package> [--on-conflict abort|rename|replace]
+#
+# See README "Query-only mode".
+services:
+  api:
+    environment:
+      RAG_QUERY_ONLY: "true"
