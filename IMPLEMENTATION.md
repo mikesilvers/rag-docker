@@ -31135,6 +31135,26 @@ def check_origin(operator_ok):
                 name, status, error_code(raw)))
     status, _, _ = code("GET", "/collections", token=token, headers={"Origin": "http://evil.example"})
     expect(status == 200, "a cross-origin GET answered {} (reads aren't origin-checked)".format(status))
+    # #794: the deleting GET /packages/{filename} refuses a cookie request whose
+    # Sec-Fetch-Site is present and not same-origin or none, through nginx. The
+    # package doesn't exist, so an allowed request is a 404 and deletes nothing.
+    package = "/packages/ragpkg-vfy-no-such.tar.gz"
+    for method, site, want in (("GET", "cross-site", 403), ("GET", "same-site", 403),
+                               ("GET", "same-origin", 404), ("GET", "none", 404), ("GET", None, 404),
+                               ("HEAD", "cross-site", 404)):
+        headers = {"Origin": auth_setup.origin()}
+        if site is not None:
+            headers["Sec-Fetch-Site"] = site
+        status, raw, _ = code(method, package, token=token, headers=headers)
+        if want == 403:
+            expect(status == 403 and error_code(raw) == "CROSS_ORIGIN_REFUSED",
+                   "{} {} with Sec-Fetch-Site {}: answered {} {}".format(method, package, site, status,
+                                                                         error_code(raw)))
+        else:
+            expect(status == 404, "{} {} with Sec-Fetch-Site {}: answered {}, wanted the 404 of an "
+                   "allowed request".format(method, package, site, status))
+    status, _, _ = code("GET", "/packages", token=token, headers={"Sec-Fetch-Site": "cross-site"})
+    expect(status == 200, "the package listing with Sec-Fetch-Site cross-site answered {}".format(status))
     request("POST", "/auth/logout", token=token)
 
 
@@ -40470,6 +40490,15 @@ class RecordTests(DownloadTestCase):
             self.assertEqual(package_retention.expiries(), {})
         self.assertFalse(record.exists())
 
+    def test_an_entry_whose_collection_isnt_a_string_moves_the_record_aside(self):
+        # Reviewer (#794): `_entry` accepts a string or null collection only.
+        record = self.root / "uploads" / "exported_packages.json"
+        record.write_text(json.dumps({"packages": {"ragpkg-a.tar.gz": {
+            "finished_at": "2026-11-17T12:00:00Z", "collection": 7}}}))
+        with self.assertLogs("services.package_retention", "ERROR"):
+            self.assertEqual(package_retention.recorded_collections(), {})
+        self.assertFalse(record.exists())
+
     def test_a_recorded_name_outside_the_rule_is_ignored_and_never_deleted(self):
         # #794 item 4: a tampered record can't name a file outside the exports folder.
         outside = self.root / "outside.tar.gz"
@@ -40742,6 +40771,35 @@ class EncryptedAccessTests(DownloadTestCase):
         self.assertEqual(self.get(path.name, who="dev2").status_code, 200)
         self.assertTrue(path.exists(), "a package not exported here is kept")
 
+    def test_a_restricted_collection_that_no_longer_exists_here_hides_nothing(self):
+        # Reviewer (#794): the import's own rule (importer._source, _exists); a
+        # restricted collection deleted here no longer guards its encrypted package.
+        path = self.write_encrypted("ragpkg-gone.tar.gz.age")
+        with patch.object(wc, "_collection_exists_sync", lambda name: False):
+            self.assertIn(path.name, self.listed("dev2"))
+            self.assertEqual(self.get(path.name, who="dev2").status_code, 200)
+
+    def test_weaviate_failing_hides_a_restricted_collections_encrypted_package(self):
+        # Reviewer (#794): Weaviate failing to answer counts as existing, so the
+        # encrypted path fails closed like the unencrypted one.
+        path = self.write_encrypted("ragpkg-down.tar.gz.age")
+
+        def down(name):
+            raise RuntimeError("weaviate is down")
+        with patch.object(wc, "_collection_exists_sync", down), \
+                self.assertLogs("services.importer", "ERROR"):
+            self.assertNotIn(path.name, self.listed("dev2"))
+            answer = self.get(path.name, who="dev2")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertTrue(path.exists())
+
+    def test_an_end_user_never_reaches_an_encrypted_package(self):
+        # Reviewer (#794): the route is Developer and above, whatever is recorded.
+        path = self.write_encrypted("ragpkg-before.tar.gz.age", collection=None)
+        answer = self.get(path.name, who="user")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (403, "FORBIDDEN"))
+        self.assertTrue(path.exists())
+
 
 class DeletionRecordTests(DownloadTestCase):
     def test_a_deletion_is_audited_and_the_sweep_goes_on_when_the_record_cant_be_rewritten(self):
@@ -40794,6 +40852,16 @@ class SameOriginTests(DownloadTestCase):
         key = store.issue_key("svc")[1]
         self.assertEqual(self.fetch("cross-site", headers={"Authorization": "Bearer " + key}).status_code, 200)
         self.assertFalse(path.exists())
+
+    def test_the_listing_and_a_refused_package_are_not_origin_checked_by_sec_fetch_site(self):
+        # Reviewer (#794): only the deleting GET is checked; the listing changes nothing.
+        self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+        headers = dict(self.as_("dev"), **{"Sec-Fetch-Site": "cross-site"})
+        answer = self.client.get("/packages", headers=headers)
+        self.assertEqual(answer.status_code, 200, answer.text)
+        # The refusal comes before the route: a name that doesn't exist is refused too.
+        answer = self.client.get("/packages/ragpkg-none.tar.gz", headers=headers)
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (403, "CROSS_ORIGIN_REFUSED"))
 
 
 class HeadRecordTests(DownloadTestCase):
