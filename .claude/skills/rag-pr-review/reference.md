@@ -289,8 +289,9 @@ A test the tests reviewer already wrote and ran goes into the PR before it merge
 
 When a covered PR's new head adds only the previous evaluation's ready patch, the evaluation is lighter: the full suite already ran on that code.
 
-**Detection,** before step 6 of SKILL.md. All three must hold, or the evaluation is a full one, as usual:
+**Detection,** at the start of step 6 of SKILL.md. All four must hold, or the evaluation is a full one, as usual:
 
+0. The PR is by `mikesilvers` and isn't from a fork (`gh pr view <N> --json author,isCrossRepository`, as check 0 of "Merging into `develop`" in `CLAUDE.md`).
 1. The previous evaluation of this PR, whose recap the authenticated account wrote ("Finding an existing recap"), has a "Reviewer patch" line, and its bundle still holds the patch file.
 2. `develop` is still at that evaluation's develop SHA (`git rev-parse origin/develop` after `git fetch origin develop`).
 3. The new head's tree is the previous head's tree with the patch applied:
@@ -307,7 +308,7 @@ When a covered PR's new head adds only the previous evaluation's ready patch, th
 
 - **Coding and security** review only the patch's hunks. Every finding of the previous evaluation that the patch doesn't address carries over unchanged, with its severity, into the new recap. A carried-over High keeps the PR NOT READY.
 - **Tests** takes the patch-only path (`rag-pr-review-tests`, "The patch-only path"): the host tests and the suites the patch touches, no full run. The previous full run plus these runs are the verify record.
-- **Build** runs only if the patch changes a file under `api/` or `ui/` (the build contexts). Otherwise the previous evaluation's build result carries over: set `rag-pr-review/build` to its previous state with the description `carried over from <previous-sha7> (patch-only)`, and the recap says so.
+- **Build** runs only if the patch changes a file under `api/`, `ui/`, `proxy/` or `ollama/`, or a compose file (`docker-compose*.yml`), because the build check also validates the compose configuration and that every service comes up healthy. Otherwise the previous evaluation's build result carries over: set `rag-pr-review/build` to its previous state with the description `carried over from <previous-sha7> (patch-only)`, and the recap says so.
 
 The recap opens with the "Patch-only re-evaluation" line. Statuses, labels, the one-evaluation-per-commit lock and the merge checks in `CLAUDE.md` are unchanged.
 
