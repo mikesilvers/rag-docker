@@ -134,7 +134,7 @@ Use the Agent tool with `subagent_type: general-purpose` and the chosen `model`.
 
 Do this yourself, after **all** specialists have returned. It proves the evaluated commit builds from clean and the whole stack comes up. It runs on the verify project, never on the live `rag-docker` stack.
 
-On a patch-only re-evaluation, it runs only if the patch changes a file under `api/`, `ui/`, `proxy/` or `ollama/`, or a compose file (`docker-compose*.yml`). Otherwise the previous build result carries over, as "Patch-only re-evaluation" in `reference.md` says, and nothing is built.
+On a patch-only re-evaluation, it runs only if the patch changes a file under `api/`, `ui/`, `proxy/` or `ollama/`, a compose file (`docker-compose*.yml`), or the root `.env` file. Otherwise the previous build result carries over, as "Patch-only re-evaluation" in `reference.md` says, and nothing is built.
 
 It runs code, so the same rule as testing applies: for a cross-repository PR, only after security has no High findings and the user has said yes. If it can't run, record `Build: not run (<reason>)`.
 
