@@ -5134,7 +5134,9 @@ trace continuity. Full default and enabled runs and their actual limitations are
 required; a resolved Compose file alone is not runtime acceptance.
 
 Collector verification binds exact harness-owned assets across alternate checkouts
-and pins verification protocol/version/export budgets. Disabled-mode observation
+and pins verification protocol/version/export budgets. An evaluator-supplied
+`--telemetry-pin` (same repository, tag and digest only, outside the checkout) may
+set the expected Collector image. Disabled-mode observation
 requires termination of previous producer, Collector queues and capture handlers.
 Malformed decoded evidence is incomplete acceptance; malformed archive metadata
 and incomplete TAR framing are rejected before offline reconstruction.
