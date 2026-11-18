@@ -37228,6 +37228,15 @@ class MiddlewareTests(StoreTestCase):
         response = self.client.get("/auth/me", headers={"Cookie": "other=1"})
         self.assertEqual((response.status_code, response.json()["error"]["code"]), (401, "AUTH_REQUIRED"))
 
+    def test_an_empty_or_unreadable_session_cookie_is_no_session(self):
+        # The parser's edge cases end as "no session" (401), never as an error
+        # or as someone's session (#546).
+        self.make("eng", "engineer")
+        for header in (f"{store.COOKIE}=", f"{store.COOKIE}", ";;;", f'{store.COOKIE}=""', "=x; ==="):
+            with self.subTest(header=header):
+                response = self.client.get("/auth/me", headers={"Cookie": header})
+                self.assertEqual((response.status_code, response.json()["error"]["code"]), (401, "AUTH_REQUIRED"))
+
 
 class RouteTests(StoreTestCase):
     def test_login_success_cookie_and_me(self):
@@ -37404,6 +37413,22 @@ class RouteTests(StoreTestCase):
         for _ in range(store.THROTTLE_FAILURES - 1):
             self.assertEqual(self.login("user", "wrong" * 3).status_code, 401)
         self.assertEqual(self.login("user", password).status_code, 200)
+
+    def test_a_login_sweeps_other_users_ended_sessions(self):
+        # The sweep runs on the login route and is not limited to the user
+        # logging in: another user's abandoned session goes, a live one stays (#546).
+        self.setup_roles()
+        _, ended = self.session("dev")
+        _, live = self.session("user")
+        now = store._now()
+        self.set_times(ended, now - store.ABSOLUTE_S - 60, now - store.IDLE_S - 60)
+        self.assertEqual(len(self.rows("SELECT token_hash FROM sessions")), 2)
+        self.assertEqual(self.login("eng", self.passwords["engineer"]).status_code, 200)
+        digests = {digest for (digest,) in self.rows("SELECT token_hash FROM sessions")}
+        self.assertNotIn(hashlib.sha256(ended.encode()).hexdigest(), digests, "the ended session was swept")
+        self.assertIn(hashlib.sha256(live.encode()).hexdigest(), digests, "the live session was kept")
+        self.assertEqual(len(digests), 2, "the live session and the new login")
+        self.assertEqual(store.authenticate(live).username, "user")
 
     def test_forced_change_allows_only_session_routes(self):
         self.make("eng", "engineer")
