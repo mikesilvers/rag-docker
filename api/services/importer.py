@@ -827,7 +827,7 @@ def _exists(name: str) -> bool:
     try:
         return wc._collection_exists_sync(name)
     except Exception:                                 # noqa: BLE001
-        _log.exception("Could not check whether %r exists for an import's access check", name)
+        _log.exception("Could not check whether %r exists for a package's access check", name)
         return True
 
 
