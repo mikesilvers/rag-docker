@@ -48,8 +48,11 @@ services:
     # Use the plain X.Y.Z tag: it is the multi-arch image. The suffixed tags,
     # such as 1.40.2-9858973.arm64, carry one platform only (#527, #530), so
     # Dependabot ignores Weaviate (.github/dependabot.yml) and it is upgraded
-    # by hand. Pinned by tag, not digest, like ollama and nginx: digest pinning
-    # would be a project-wide change (decided on #544).
+    # by hand. The main stack's images are pinned by tag, not digest (decided
+    # on #544): weaviate and ollama to exact versions, nginx to the 1.29-alpine
+    # tag, which moves with patch and Alpine rebuilds and which Dependabot
+    # updates. The opt-in telemetry collector (docker-compose.telemetry.yml) is
+    # the exception: it is pinned by digest.
     image: semitechnologies/weaviate:1.40.2
     environment:
       QUERY_DEFAULTS_LIMIT: 25
