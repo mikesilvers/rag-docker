@@ -45,7 +45,8 @@ MANIFEST = {
 READ_BOUND = 1024 * 1024
 # The manifest size bound, SPECIFICATIONS.md `GET /packages`.
 MANIFEST_LIMIT = 16 * 1024 * 1024
-NULLS = {"collection": None, "chunk_count": None, "fidelity": None, "created_at": None}
+# expires_at is null for a package this instance didn't export (#677).
+NULLS = {"collection": None, "chunk_count": None, "fidelity": None, "created_at": None, "expires_at": None}
 
 
 def write_archive(path, members):

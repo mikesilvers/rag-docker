@@ -319,6 +319,59 @@ async function runTransferPageTests(browser, base, reporter) {
     assert.equal(label, BROKEN + ' — encrypted, unreadable');
   }, { hold: ['GET /api/packages'] }]);
 
+  // Downloading a package and its expiry (#677, RD-145 Q4).
+  const EXPIRES = '2026-11-18T12:00:00Z';
+  const downloadLinks = page => page.evaluate(() => [...document.querySelectorAll('a')]
+    .filter(a => a.textContent.trim() === 'Download').map(a => ({ href: a.getAttribute('href'), download: a.hasAttribute('download') })));
+  const localTime = (page, iso) => page.evaluate(i => new Date(i).toLocaleString(), iso);
+  cases.push(['export: a finished export shows a Download link to its package and "Expires <local time>" (#677)', async page => {
+    await startAndPoll(page, 'export');
+    const done = JSON.parse(HALVES.export.done.body);
+    await release(page, HALVES.export.poll, json(200, { ...done, expires_at: EXPIRES }));
+    await waitText(page, 'Done.');
+    await waitText(page, 'Expires ' + await localTime(page, EXPIRES));
+    const links = await downloadLinks(page);
+    assert.ok(links.some(l => l.href === '/api/packages/ragpkg-vfy.tar.gz' && l.download), JSON.stringify(links));
+  }]);
+  cases.push(['export: a finished export with no expiry still offers Download and shows no "Expires" (#677)', async page => {
+    await startAndPoll(page, 'export');
+    await release(page, HALVES.export.poll, HALVES.export.done);
+    await waitText(page, 'Done.');
+    const links = await downloadLinks(page);
+    assert.ok(links.some(l => l.href === '/api/packages/ragpkg-vfy.tar.gz'), JSON.stringify(links));
+    assert.ok(!(await text(page)).includes('Expires '), 'an "Expires" label for a package with no expiry');
+  }]);
+  cases.push(['import: the package list says when a package exported here expires, and Download follows the selected package (#677)', async page => {
+    await release(page, '/api/packages', json(200, { packages: [{ ...packagesBody.packages[0], expires_at: EXPIRES }, packagesBody.packages[1]] }));
+    await page.waitForFunction(n => [...document.querySelectorAll('option')].some(o => o.value === n), { timeout: 5000 }, PACKAGE);
+    const labels = await page.evaluate(() => Object.fromEntries([...document.querySelectorAll('option')].map(o => [o.value, o.textContent])));
+    assert.ok(labels[PACKAGE].endsWith(', expires ' + await localTime(page, EXPIRES)), labels[PACKAGE]);
+    assert.ok(!labels[SEALED].includes('expires'), labels[SEALED]);
+    const disabled = await page.evaluate(() => [...document.querySelectorAll('button')].some(b => b.textContent.trim() === 'Download' && b.disabled));
+    assert.equal(disabled, true, 'no disabled Download while no package is selected');
+    assert.deepEqual(await downloadLinks(page), [], 'a Download link with no package selected');
+    await selectPackage(page, PACKAGE);
+    await page.waitForFunction(() => [...document.querySelectorAll('a')].some(a => a.textContent.trim() === 'Download'), { timeout: 5000 });
+    assert.deepEqual(await downloadLinks(page), [{ href: '/api/packages/' + encodeURIComponent(PACKAGE), download: true }]);
+    await selectPackage(page, SEALED);
+    await page.waitForFunction(h => [...document.querySelectorAll('a')].some(a => a.getAttribute('href') === h), { timeout: 5000 }, '/api/packages/' + encodeURIComponent(SEALED))
+      .catch(async () => { throw new Error('Download did not follow the selection: ' + JSON.stringify(await downloadLinks(page))); });
+  }, { hold: ['GET /api/packages'] }]);
+  cases.push(['export: after Download, the page sees the package go and stops offering it (#677)', async page => {
+    await startAndPoll(page, 'export');
+    const done = JSON.parse(HALVES.export.done.body);
+    await release(page, HALVES.export.poll, json(200, { ...done, expires_at: EXPIRES }));
+    await waitText(page, 'Done.');
+    // The click must not navigate; React's onClick still runs.
+    await page.evaluate(() => document.addEventListener('click', e => e.preventDefault(), true));
+    await page.evaluate(() => [...document.querySelectorAll('a')].find(a => a.textContent.trim() === 'Download'
+      && a.getAttribute('href') === '/api/packages/ragpkg-vfy.tar.gz').click());
+    // The fixed package list doesn't name ragpkg-vfy.tar.gz: the first re-read (3 s) finds it gone.
+    await waitText(page, 'Downloaded and deleted from ./exports.');
+    assert.deepEqual((await downloadLinks(page)).filter(l => l.href === '/api/packages/ragpkg-vfy.tar.gz'), []);
+    assert.ok(!(await text(page)).includes('Expires '), 'still shows when the deleted package expires');
+  }]);
+
   for (const [name, test, opts] of cases) {
     let s;
     try { s = await fixture(browser, base, opts); await test(s.page); assert.deepEqual(s.errors, []); reporter.check(name, true); }

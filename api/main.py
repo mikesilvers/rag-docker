@@ -22,6 +22,7 @@ async def lifespan(app: FastAPI):
     runtime = bootstrap()
     app.state.telemetry = runtime
     flusher = None
+    sweeper = None
     try:
         import logging
         from services import goldstandard, metrics
@@ -92,6 +93,10 @@ async def lifespan(app: FastAPI):
                             "earlier state: %s", len(restored), ", ".join(restored))
         except Exception:                                 # noqa: BLE001
             log.exception("Could not recover the preparation area")
+        # Export packages nobody downloaded are deleted after EXPORT_RETENTION_HOURS
+        # (#677): a sweep now, after the job records are loaded, then every 15 minutes.
+        from services import package_retention
+        sweeper = asyncio.create_task(package_retention.sweeper())
         # One audit record per start, saying whether question text is recorded,
         # so a reader can tell why some query records carry it (#29).
         from config import settings
@@ -107,6 +112,8 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         try:
+            if sweeper is not None:
+                sweeper.cancel()
             if flusher is not None:
                 flusher.cancel()
                 from services import audit

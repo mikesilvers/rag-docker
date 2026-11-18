@@ -363,7 +363,7 @@ Run `python3 scripts/tests/test_session_implementation.py` from the repository r
 
 Suite 05 also runs `scripts/tests/test_batch_implementation.py` on the host (Python and bash).
 
-`05_transfer.sh` registers the nine controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py`, `test_package_listing.py` and `test_export_encryption.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work.
+`05_transfer.sh` registers the ten controlled regressions (`test_session_import.py`, `test_source_index_boundary.py`, `test_export_snapshot.py`, `test_retrieval_import.py`, `test_import_embedding.py`, `test_import_guard.py`, `test_batch_recovery.py`, `test_package_listing.py`, `test_export_encryption.py` and `test_package_download.py`) and the source-contract check, so `all.sh` runs them. Its E23 live checks use digest-valid synthetic packages to verify malformed metadata is refused before replacement and valid metadata is restored on rename. The retained-source boundary group checks import refusal before backend/model work, valid digest identity, and export refusal of unsafe paths and links. It also checks (#509) that export writes a `null` `source_sha256` for a chunk whose retained blob is missing on disk, and that import check 3a refuses a chunk whose non-null `source_sha256` isn't a digest of the package's source index (with or without `sources/`) as `PACKAGE_CORRUPT`, `detail` `{"file": "chunks.jsonl", "line": n}`, before the embedding check and any backend work.
 
 `scripts/tests/test_export_snapshot.py` (#509, API container) drives `exporter._run` with the real `packager.build` and retained-source store and a mocked Weaviate backend whose iterator reads the stored chunks one at a time. A re-ingest that tries to commit new chunks and a new `doc.txt` source after the first chunk is streamed waits for the export: the package holds the old chunk text and the old source bytes and index, every chunk's `source_sha256` names a blob in `sources/`, and the re-ingest lands after the build. During an export, gold-standard generation preparation answers `COLLECTION_BUSY` (409) and a guarded chunk insert waits; an export started while another writer holds the guard reads `queued` until it is released; and the guard is free again after an export that succeeds, is refused (`PackageError`), fails or is cancelled. An export whose build is cancelled, or ended by another non-`Exception`, reads `failed` with an `error` naming the exception and saying it was cancelled, and the exception still propagates (#521). Orderings use events and the guard's waiter count. On the code before #509 the re-ingest, generation, insert, queued and guard-held checks fail; on the code before #521 the cancelled-status checks fail.
 
@@ -947,7 +947,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_goldstandard_review.py` | controlled PATCH/regenerate 404 codes for unknown sessions and pairs, and the empty-edit refusal (#381), registered by `04_goldstandard.sh` outside the slow gate |
 | `../tests/test_goldstandard_exports.py` | controlled gold-standard export folder, name rule, overwrite and refusal regressions (#370), exports-folder refusal and replace-not-follow write (#402), registered by `10_validity.sh` |
 | `../tests/test_session_validity.py` | controlled retained-session validity, historical export guard, durable pre-replacement stale markers, their rollback on abort and the real tuning abort branch (#93, #275), registered by `10_validity.sh` |
-| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E40, encrypted packages (#27); destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372) |
+| `05_transfer.sh` | export/import/tuning — E5–E20, E23 and E26–E40, encrypted packages (#27); destructive replace fidelity, live metadata and model checks, controlled regressions and source drift; a lowercase-first collection name end to end (#372); downloading a package and expiry (#677) |
 | `../tests/test_ingest_errors.py` | controlled upload-unpacking error and `.json.gz` member regressions, registered by ingest |
 | `../tests/test_zip_expansion.py` | controlled ZIP expansion-cap (1 MiB cap from env) and off-event-loop regressions, registered by ingest |
 | `../tests/test_zip_limits.py` | controlled ZIP member-count (cap of 20 from env), ratio, escaping-member and `detail` bound regressions (#28), registered by ingest |
@@ -966,6 +966,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_batch_recovery.py` | controlled writer, import and tuning recovery regressions, registered by transfer |
 | `../tests/test_batch_recovery_fixture.py` | controlled check that the import package `batch_recovery.py`'s `write_import_package` writes passes the importer's real digest and source checks; run in the API image with no network and the repository mounted read-only, registered by transfer |
 | `../tests/test_package_listing.py` | controlled package-listing regressions (#383): the listing reads each archive only up to its manifest, new archives put the manifest first, an oversized manifest and other unreadable files are listed `readable: false`, and so is a manifest with a wrongly typed listed value (#451); run in the API image with no network, registered by transfer |
+| `../tests/test_package_download.py` | controlled package download and expiry regressions (#677): the record of exported packages, `expires_at`, `GET /packages/{filename}` (deletion after a complete download only, HEAD, names, roles, access, busy), an interrupted download, the sweep and the audit records; registered by suite 05 |
 | `../tests/test_session_implementation.py` | exact embedded source checks, registered by transfer |
 | `../tests/test_batch_implementation.py` | host-side: exact embedded source checks for `api/main.py`, the Weaviate client, the batch-write, recovery, import and tuning services and their verify scripts, and the restart-recovery block of `05_transfer.sh` with stubbed commands (refused-prefix skip, `RAG_ALLOW_RESTART`, the #152 refusal), registered by transfer |
 | `../tests/test_chunk_limits.py` / `../tests/test_insert_chunks.py` | controlled chunker per-file limits, chunk ceiling and semantic floor (#111) / insert batching and the "index not ready" retry, registered by ingest in the API image with the repository mounted (#386) |
@@ -1201,11 +1202,42 @@ secrecy rules above. Suite 05 then exports the transfer collection encrypted, va
 with `validate_package.py` in the API container (`RAG_PACKAGE_PASSPHRASE`), and checks a wrong
 passphrase, both refusals and a round trip on the live verify stack.
 
+## Downloading a package and expiry (#677)
+
+`scripts/tests/test_package_download.py`, run by `05_transfer.sh` in the API image with no
+network (or on the host with the API's dependencies), checks:
+
+- `EXPORT_RETENTION_HOURS` (1-720);
+- the record of exported packages (`<UPLOAD_DIR>/exported_packages.json`) and `expires_at` in
+  `GET /packages` and the export job status;
+- `GET /packages/{filename}`:
+  - the bytes and headers;
+  - the deletion of a recorded package after a complete download only;
+  - HEAD;
+  - bad names, folders and links answering `404 PACKAGE_NOT_FOUND`;
+  - an End User refused;
+  - the #606 access rule and its audit record;
+  - `409 PACKAGE_BUSY` during an import or another download;
+- a client that goes away keeping the package (the response driven directly);
+- the sweep (expired, fresh, busy, gone, a link);
+- the `package.download` and `package.delete` records.
+
+Suite 05's live checks run through the proxy on the verify stack, with fixtures from
+`package_retention_stack.py` in the API container:
+
+- a new export's listing entry has `expires_at`;
+- a full download returns every byte, removes the package from `./exports` and the listing, and
+  is audited as `package.download` (`completed: true`) and `package.delete` (`downloaded`, by the user);
+- a 64 MiB recorded package read at 1 MB/s for 2 seconds is kept, its record `completed: false`;
+- one sweep deletes a package recorded 25 hours ago (`package.delete`, `expired`, `system`) and
+  keeps an unrecorded one;
+- an End User is refused `403`.
+
 ## Transfer page polling and failure checks
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
 Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
-20 ms (#382). Seventeen cases: for each half, a failed poll (a proxy 502) is shown and retried
+20 ms (#382). Twenty-three cases: for each half, a failed poll (a proxy 502) is shown and retried
 with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
 show the last error and enable the button again, and a new start clears the message; a poll in
 flight when the page is left schedules no further poll. An export start answered after the page
@@ -1216,7 +1248,15 @@ is shown without the empty-folder hint until a good Refresh. Three cases cover e
 an export passphrase holds Export until it has 12 characters and matches its confirmation, is
 sent only when the box is checked, and both fields clear once the export starts; an encrypted
 package is labelled, asks for its passphrase, sends it and clears it, and a plain package sends
-none. Like `query_config.js`, it can run
+none. Four cases cover downloading a package (#677):
+- a finished export offers a Download link to its package with "Expires" in local time, and none
+  when it has no expiry;
+- the package list says when a package exported here expires, and its Download link follows the
+  selected package;
+- after a Download click the page re-reads the list, and once the package is gone it shows
+  "Downloaded and deleted from ./exports." instead of the link.
+
+Like `query_config.js`, it can run
 on its own against a UI with no backend (`RAG_UI_BASE`, `RAG_CHROMIUM_PATH`):
 
 ```bash

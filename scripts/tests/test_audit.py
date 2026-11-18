@@ -733,6 +733,8 @@ class ReviewerCoverageTests(AuditTestCase):
             # Document preparation (#638).
             "prepare.upload", "prepare.start", "prepare.cancel", "prepare.import", "prepare.download",
             "prepare.delete",
+            # Downloading an export package (#677).
+            "package.download",
             # Two-step verification (#607).
             "auth.mfa", "auth.mfa.enroll", "auth.mfa.recovery-codes", "auth.mfa.disable", "admin.user.reset-mfa",
             "admin.mfa.policy",
@@ -743,7 +745,8 @@ class ReviewerCoverageTests(AuditTestCase):
         for method, path in audit.ACTIONS:
             self.assertFalse(method == "GET" and path not in (
                 "/goldstandard/download/{filename}", "/audit", "/audit.csv",
-                "/prepare/documents/{document_id}/raw", "/prepare/documents/{document_id}/prepared"), path)
+                "/prepare/documents/{document_id}/raw", "/prepare/documents/{document_id}/prepared",
+                "/packages/{filename}"), path)
             if path != "/prepare/job/{job_id}/cancel":
                 self.assertNotIn("/job/", path)
             self.assertFalse(path.startswith("/goldstandard/") and path not in (

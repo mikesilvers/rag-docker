@@ -110,6 +110,11 @@ services:
       UPLOAD_DIR: /app/uploads
       SOURCES_DIR: /app/sources
       EXPORTS_DIR: /app/exports
+      # A package exported here and never downloaded is deleted from ./exports
+      # this many hours after its export finished (#677), 1 to 720; a full
+      # download through the API deletes it at once. Packages copied into
+      # ./exports to be imported are never deleted.
+      EXPORT_RETENTION_HOURS: "24"
       OLLAMA_MODELS_DIR: /ollama
       # The sentence-transformers model is pre-cached in the api image at
       # build time (api/Dockerfile). Without these flags the Hugging Face

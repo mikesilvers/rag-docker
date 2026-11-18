@@ -1510,7 +1510,7 @@ one may. The role of a request is the one stored for its user at that moment, ne
 | any session (also one with a password change due) | `GET /auth/me`, `POST /auth/logout`, `POST /auth/password` |
 | any session, after a due password change (also one with a two-step set-up due) | `GET /auth/mfa`, `POST /auth/mfa/enroll`, `POST /auth/mfa/enroll/confirm`, `POST /auth/mfa/recovery-codes`, `POST /auth/mfa/disable` |
 | `end_user` | `GET /collections`, `POST /query`, `GET /retrieval/config/{collection}` |
-| `developer` | `GET /health/details`; `POST /collections`; `POST /ingest/upload`, `GET /ingest/job/{job_id}`, `GET /ingest/jobs`, `GET /ingest/config/{collection}`, `POST /ingest/config`; `POST /retrieval/config`; `POST /goldstandard/generate`, `GET /goldstandard/session/{session_id}`, `GET /goldstandard/sessions`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST /goldstandard/save`, `GET /goldstandard/download/{filename}`; `POST /export`, `GET /export/job/{job_id}`, `GET /export/jobs`, `POST /import`, `GET /import/job/{job_id}`, `GET /import/jobs`, `GET /packages`, `GET /help/transfer`; `GET /tune/{collection}`; document preparation (§3.1.11): `POST /prepare/upload`, `GET /prepare/documents`, `GET /prepare/documents/{document_id}`, `GET /prepare/documents/{document_id}/raw`, `GET /prepare/documents/{document_id}/prepared`, `DELETE /prepare/documents/{document_id}`, `DELETE /prepare/documents/{document_id}/prepared`, `POST /prepare/jobs`, `GET /prepare/jobs`, `GET /prepare/job/{job_id}`, `POST /prepare/job/{job_id}/cancel`, `POST /prepare/import` |
+| `developer` | `GET /health/details`; `POST /collections`; `POST /ingest/upload`, `GET /ingest/job/{job_id}`, `GET /ingest/jobs`, `GET /ingest/config/{collection}`, `POST /ingest/config`; `POST /retrieval/config`; `POST /goldstandard/generate`, `GET /goldstandard/session/{session_id}`, `GET /goldstandard/sessions`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/regenerate`, `POST /goldstandard/save`, `GET /goldstandard/download/{filename}`; `POST /export`, `GET /export/job/{job_id}`, `GET /export/jobs`, `POST /import`, `GET /import/job/{job_id}`, `GET /import/jobs`, `GET /packages`, `GET /packages/{filename}` (#677), `GET /help/transfer`; `GET /tune/{collection}`; document preparation (§3.1.11): `POST /prepare/upload`, `GET /prepare/documents`, `GET /prepare/documents/{document_id}`, `GET /prepare/documents/{document_id}/raw`, `GET /prepare/documents/{document_id}/prepared`, `DELETE /prepare/documents/{document_id}`, `DELETE /prepare/documents/{document_id}/prepared`, `POST /prepare/jobs`, `GET /prepare/jobs`, `GET /prepare/job/{job_id}`, `POST /prepare/job/{job_id}/cancel`, `POST /prepare/import` |
 | `engineer` | `DELETE /collections/{name}`; per-collection access (#606, browser sessions only): `GET /collections/{name}/access`, `PUT /collections/{name}/access`; `POST /tune/rechunk`, `POST /tune/reembed`, `POST /tune/reindex`, `GET /tune/job/{job_id}`; `GET /metrics/latency`; `GET /goldstandard/diagnostics`; FastAPI's `GET /docs`, `GET /docs/oauth2-redirect`, `GET /redoc`, `GET /openapi.json`; account administration: `GET /auth/users`, `POST /auth/users`, `POST /auth/users/{username}/reset-password`, `POST /auth/users/{username}/role`, `POST /auth/users/{username}/disable`, `POST /auth/users/{username}/enable`, `POST /auth/users/{username}/reset-mfa`, `POST /auth/mfa/policy`; service principals and keys: `GET /auth/service-principals`, `POST /auth/service-principals`, `POST /auth/service-principals/{name}/role`, `POST /auth/service-principals/{name}/disable`, `POST /auth/service-principals/{name}/enable`, `POST /auth/service-principals/{name}/keys`, `POST /auth/service-principals/{name}/keys/{key_id}/revoke`; the audit log (§3.1.9): `GET /audit`, `GET /audit.csv` |
 
 The matrix is one table in `api/auth/policy.py`. A route without an entry is refused for everyone (`403
@@ -1816,7 +1816,10 @@ built yet; it is to include this folder.
 **Actions.** `auth.login` (success, failure, throttled), `auth.logout`, `auth.password`; `query`;
 `collection.create`, `collection.delete`; per-collection access (#606): `collection.access` (`restricted_before`,
 `restricted_after`, `added`, `removed`), `collection.access.refused` (a refused collection on a route with no action
-of its own); `ingest`, `ingest.config`; `retrieval.config`; `export`, `import`;
+of its own); `ingest`, `ingest.config`; `retrieval.config`; `export`, `import`; export packages (#677):
+`package.download` (each `GET /packages/{filename}`, `details.file` and `details.completed`) and `package.delete`
+(each deletion of a package, `details.file` and `details.reason` `downloaded`, with the downloading caller as actor,
+or `expired`, actor `system`; written directly, not by a request);
 `tune.rechunk`, `tune.reembed`, `tune.reindex`; `goldstandard.save`, `goldstandard.download`; `admin.user.create`,
 `admin.user.reset-password`, `admin.user.set-role`, `admin.user.disable`, `admin.user.enable`,
 `admin.user.reset-mfa`, `admin.mfa.policy` (`details.required`); two-step verification (#607): `auth.mfa` (each
@@ -2117,6 +2120,8 @@ Standard error codes:
 | `CONFIRMATION_REQUIRED` | 400 | Destructive operation called without `?confirm=true` |
 | `INVALID_PATH` | 400 | Gold-standard export name breaks the name rule (1-128 ASCII letters, digits, `_`, `-`, `.` or spaces, ending in `.json`), or the name in the exports folder is not a regular file |
 | `FILE_NOT_FOUND` | 404 | Requested download file does not exist |
+| `PACKAGE_NOT_FOUND` | 404 | `GET /packages/{filename}`: no such package in `./exports`, a name outside the rule, or one the caller may not see (#677) |
+| `PACKAGE_BUSY` | 409 | `GET /packages/{filename}`: an import of the package runs or another download of it is in progress (#677) |
 | `EXPORTS_FOLDER_INVALID` | 409 | Gold-standard save or download refused: `goldstandard_exports` in `UPLOAD_DIR` is a file or a symbolic link, not a directory; move or rename it |
 | `PAIR_NOT_FOUND` | 404 | pair_id not found within the given session |
 | `SESSION_BUSY` | 409 | Operation not allowed while session is still generating |
@@ -2571,11 +2576,17 @@ dropped in to be imported.
       "fidelity": "with-sources",
       "created_at": "2026-09-18T15:31:27Z",
       "readable": true,
-      "encrypted": false
+      "encrypted": false,
+      "expires_at": "2026-09-19T15:31:40Z"
     }
   ]
 }
 ```
+
+`expires_at` (UTC, #677) is when a package this instance exported is deleted if
+nobody downloads it, and `null` for any other package (one copied in to be
+imported, or one exported before #677). `GET /export/job/{job_id}` carries the same
+field for a `completed` job while its package is still recorded.
 
 Encrypted packages (`ragpkg-*.tar.gz.age`, #27) are listed too, with
 `encrypted: true` and `collection`, `chunk_count`, `fidelity` and `created_at`
@@ -2607,6 +2618,49 @@ other packages (#451).
 
 The package format itself — filename convention, layout, manifest and
 `chunks.jsonl` — is specified in `RAG_EXPORT_SPECIFICATIONS.md` §4.
+
+---
+
+```
+GET /packages/{filename}
+HEAD /packages/{filename}
+```
+
+Downloads one package from `./exports` (#677), for the Developer role and above
+(people and service keys).
+
+- **Which file.** `filename` is `ragpkg-` followed by letters, digits, `.`, `_`
+  or `-`, ending in `.tar.gz` or `.tar.gz.age`, naming a regular file in the
+  exports folder (never a link). Anything else answers `404 PACKAGE_NOT_FOUND`.
+- **Access.** The listing's rule (§3.1.8): a package `GET /packages` hides from
+  the caller answers `404 PACKAGE_NOT_FOUND` too, and the refusal is audited.
+  Encrypted and unreadable packages name no collection, so any Developer may
+  download them.
+- **Busy.** While an import of the same file runs, or another download of it is
+  in progress: `409 PACKAGE_BUSY`.
+- **Response 200.** The file, streamed: `Content-Type: application/octet-stream`,
+  `Content-Length`, `Content-Disposition: attachment`, `Cache-Control: no-store`
+  and `X-Accel-Buffering: no` (nginx passes it on as the client takes it). No
+  `Range` support. `HEAD` answers the headers only and deletes nothing.
+- **Deletion after the download.** A download is complete when every byte has
+  been handed to the connection and no disconnect was seen before the last
+  message. After a complete download of a package this instance exported, the
+  package is deleted from `./exports`. A package not exported here is served and
+  kept, an interrupted download keeps the package, and so does an import of it
+  that started during the download. The server can't know that the client kept
+  every byte, so the user compares the file's size with `size_bytes`.
+
+**The record and the expiry.** When an export finishes, its package's name and
+finish time are recorded in `<UPLOAD_DIR>/exported_packages.json` (never in
+`./exports`); only recorded packages are deleted after a download or expired. A
+recorded package expires `EXPORT_RETENTION_HOURS` after its export finished (whole
+hours, 1-720, default 24; any other value stops the API; expiry can't be turned
+off). A sweep runs at start-up, after the job records are loaded, and then every
+15 minutes: it deletes expired recorded packages, skips busy ones until its next
+run, and drops the entry of one whose file is gone. A record that can't be read is
+moved aside to `exported_packages.json.corrupt-<time>` and logged, never
+overwritten; the packages it named no longer expire. Every deletion writes a
+`package.delete` audit record.
 
 ---
 
@@ -4334,6 +4388,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *Evidence: `scripts/tests/test_export_encryption.py` in the built API image with `--network none` (suite 05): the age module passes every applicable C2SP CCTV age vector (vendored in `scripts/tests/fixtures/age-testkit`) and an independent decryption written from the age specification, and runs an encrypted export and two imports through the router with tracing on to check no span or telemetry log record holds the passphrase; suite 05 exports the transfer collection encrypted, checks the file header and work factor, validates the decrypted package with `validate_package.py` and checks the listing entry; `browser/transfer_page.js` (suite 06) checks the passphrase rules, what the page sends and that it clears the fields.*
 - [x] Import of a `.tar.gz.age` package decrypts it as a stream while unpacking it, checking each member before extraction and authenticating the file to its end; a wrong passphrase, a damaged or truncated file or a scrypt work factor above 20 (refused before any key derivation) fails the job `DECRYPT_FAILED` (with `error_detail.reason`) and a file without a valid age passphrase header `PACKAGE_UNREADABLE`, before any collection, marker, setting or session is touched and with the package file unchanged; an encrypted package without a passphrase is refused 400 `PASSPHRASE_REQUIRED` and a passphrase for any other package 400 `PASSPHRASE_NOT_EXPECTED`, before any job (#27).
       *Evidence: `scripts/tests/test_export_encryption.py` (suite 05) through `packager.open_package`, `importer._run` and the API; suite 05 imports the encrypted export with a wrong passphrase against the existing collection (`replace`) and checks the collections, their counts, the package file and the import work directories are unchanged, checks both 400 refusals, then imports it with the right passphrase (`rename`) with every chunk.*
+- [x] A package this instance exported doesn't stay in `./exports` (#677): `GET /packages/{filename}` (Developer and above, the listing's access rule) streams it and deletes it after a complete download, while an interrupted download, `HEAD` and a package not exported here keep it; `409 PACKAGE_BUSY` while an import of it runs or another download is in progress; a sweep at start-up and every 15 minutes deletes recorded packages older than `EXPORT_RETENTION_HOURS` (1-720, default 24) and skips busy ones; `GET /packages` and the export job status carry `expires_at`; downloads and deletions are audited as `package.download` and `package.delete`; an unreadable record is moved aside, never overwritten.
+      *Evidence: `scripts/tests/test_package_download.py` (suite 05): the route's bytes, headers and refusals, deletion only of a recorded package, an interrupted download driven directly, the record, the sweep and its 15-minute interval, a real API start-up sweeping an expired package, an invalid setting stopping the API, the import claim under the shared lock, and the audit records; suite 05's live checks through the proxy (a full download deletes, an interrupted one keeps, the sweep deletes a recorded package and keeps one copied in, an End User is refused); `browser/transfer_page.js` (suite 06): the Download links, "Expires" in local time and the page catching up after a download.*
 - [x] `GET /ingest/config` returns `is_default: true` for a collection with no saved config; `is_default: false` after saving one.
 - [x] `GET /retrieval/config/{collection}` answers 200 with the defaults and `is_default: true`, and logs a warning naming the collection, when the saved file can't be read, isn't JSON, holds JSON that isn't an object, has a field the response can't carry (a wrong type, a fractional or nested `top_k`, a `NaN` or infinite `alpha`) or holds the response-only key `is_default`; missing fields are filled from the defaults, and coercible and out-of-range values are still served as saved (#439, #477).
       *Evidence: `RetrievalConfigFileTests` in `scripts/tests/test_api_paths.py`, in the built API image with `--network none` (suite 01, through `16_api_paths.sh`), sends each saved file through the app; its non-object, wrong-type and fractional or nested checks fail on the code before #439, and its non-finite `alpha` and `is_default` checks fail on the code before #477.*

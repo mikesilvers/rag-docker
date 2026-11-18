@@ -60,6 +60,8 @@ ACCESS: dict[tuple[str, str], str] = {
     ("GET", "/import/job/{job_id}"): DEVELOPER,
     ("GET", "/import/jobs"): DEVELOPER,                 # the caller's jobs only (#617)
     ("GET", "/packages"): DEVELOPER,
+    # Downloading a package; a full download of one exported here deletes it (#677).
+    ("GET", "/packages/{filename}"): DEVELOPER,
     ("GET", "/help/transfer"): DEVELOPER,
     ("GET", "/tune/{collection}"): DEVELOPER,          # read by the Transfer page (Q3)
     # The full health report (#750): services, models and memory, keys too.
