@@ -765,6 +765,7 @@ class RouteTests(StoreTestCase):
             response = self.login("ENG", password)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"username": "eng", "role": "engineer", "must_change_password": True,
+                                           "query_only": False,      # #670
                                            "mfa_enrolled": False, "mfa_required": False,
                                            "mfa_enrollment_required": False})
         cookie = response.headers["set-cookie"]
@@ -1424,7 +1425,7 @@ class KeyMiddlewareTests(KeyTestCase):
         response = self.client.get("/auth/me", headers=self.bearer(key))
         self.assertEqual(response.json(), {"username": "svc", "role": "end_user", "must_change_password": False,
                                            "kind": "service", "mfa_enrolled": False, "mfa_required": False,
-                                           "mfa_enrollment_required": False})
+                                           "mfa_enrollment_required": False, "query_only": False})
         headers, _ = self.session("dev")
         self.assertEqual(self.client.get("/auth/me", headers=headers).json()["kind"], "user")
 

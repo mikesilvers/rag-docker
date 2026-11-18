@@ -351,6 +351,82 @@ which the login page shows; the API never sees the attempt, so it writes no audi
 pass through. Where every client shares one address (Docker Desktop, LAN mode included; above), the limit is
 shared by all of them.
 
+### 2.6 Query-only Mode (#670)
+
+A query-only instance answers questions on collections built and exported elsewhere and can't change them. It is
+opt-in: only `docker compose -f docker-compose.yml -f docker-compose.query-only.yml ...` turns it on, alone or with
+LAN mode's file (`-f docker-compose.yml -f docker-compose.lan.yml -f docker-compose.query-only.yml`); without the
+override the stack is exactly as in §2.1. It may run on another machine; nothing connects it to the build instance,
+and packages move by file copy.
+
+**File:** `docker-compose.query-only.yml`. Over the base file it sets only `RAG_QUERY_ONLY: "true"` on the api (the
+base file sets `"false"`). It changes no other service, setting, port, volume or model.
+
+**The setting** (`api/config.py`): `RAG_QUERY_ONLY`, exactly `true` or `false`, default `false`; anything else stops
+the API at start-up with `Settings refused: RAG_QUERY_ONLY must be exactly true or false` (#555). No route or page
+changes it.
+
+**Refused routes** (`api/auth/policy.py` `QUERY_ONLY_REFUSED`). With the mode on, the authentication middleware
+answers `403 QUERY_ONLY` "This instance is query-only: its collections can't be created, changed or deleted here.
+Collections are loaded on the host with `python -m loader`." to: `POST /collections`, `DELETE /collections/{name}`,
+`POST /ingest/upload`, `POST /ingest/config`, `POST /retrieval/config`, `POST /goldstandard/generate`, `POST
+/goldstandard/regenerate`, `PATCH /goldstandard/session/{session_id}/pair/{pair_id}`, `POST /goldstandard/save`,
+`POST /import`, `POST /prepare/upload`, `DELETE /prepare/documents/{document_id}`, `DELETE
+/prepare/documents/{document_id}/prepared`, `POST /prepare/jobs`, `POST /prepare/job/{job_id}/cancel`, `POST
+/prepare/import`, `POST /tune/rechunk`, `POST /tune/reembed` and `POST /tune/reindex`. The check comes after every
+other refusal of a session or a key (§3.1.8), so a caller refused today is refused the same way, and before the route
+reads the body. The refusal carries its principal, so it is audited as the route's action, result `refused`.
+
+**Kept** (`QUERY_ONLY_KEPT`): every other route that changes state, that is the `/auth` routes, `POST /query`,
+`POST /export`, `GET /packages/{filename}` (and its delete of a package exported here, #677) and `PUT
+/collections/{name}/access`, plus every read. A host test fails when a state-changing route is in neither set.
+
+**The flag.** Every `AuthUser` answer (`POST /auth/login`, `POST /auth/login/mfa`, `GET /auth/me`, `POST
+/auth/password`) carries `query_only`. `GET /auth/status` and `GET /health` don't. The UI (§7.2) hides the Import,
+Prepare, Chunking, Retrieval and Gold Standard pages from the menus and the router, shows a "Query-only" tag, keeps
+the Transfer page's export and package list (with Download) under "Packages in ./exports" without its import
+controls, and keeps the Collections page's list and Access without "+ New Collection" and Delete.
+
+**The loader** (`api/loader.py`), the operator's way to load a package:
+`docker compose exec api python -m loader PACKAGE [--on-conflict abort|rename|replace]`.
+
+- `PACKAGE` is a file name in `./exports` (`/app/exports`), `ragpkg-*.tar.gz` or `ragpkg-*.tar.gz.age`; anything else,
+  a `/` included, is a usage error. `--on-conflict` defaults to `abort` and means what it means for `POST /import`.
+- Refusals, before the package is read: `NOT_QUERY_ONLY` (the instance isn't query-only), `LOAD_IN_PROGRESS` (another
+  load holds `loader.lock` in `UPLOAD_DIR`, a non-blocking exclusive `flock` held for the whole load),
+  `PACKAGE_NOT_FOUND` (not a regular file in `./exports`), `PASSPHRASE_REQUIRED` (an encrypted package and an empty
+  passphrase).
+- It runs the import code of `POST /import` (`services/importer.py`) in its own process, so every check of §6.2 and
+  §6.3 of `RAG_EXPORT_SPECIFICATIONS.md` applies, the embedding model and dimensions included (#390), bundled models
+  are installed and the sidecars restored. Its job record stays in its own memory; the API's job lists don't show it.
+  Under the lock and before the load it runs the import's sweep of an interrupted import, as the API does at start-up.
+- An encrypted package's passphrase is read from the terminal without echo, or as the first line of standard input
+  when that isn't a terminal; never an argument, never printed or recorded.
+- Every collection it creates starts restricted with no grants (Engineers only, until one opens or grants it): a
+  `rename`, or a package of a staging or recovery copy whose base exists here, too. It never copies another
+  collection's state (maintainer, 2026-11-18). `replace` keeps the target's state; a failed load puts back the state
+  it wrote. It is never refused a package for collection access.
+- While any load runs, whatever its mode, a question or export of its collection can meet it half-built or fail: the
+  API's in-process guards don't see the loader's process.
+- Ctrl-C: a SIGINT handler writes the `operator.load` record with result `interrupted` (`details.code`
+  `INTERRUPTED`), restores SIG_DFL and sends SIGINT again, so the process ends as a kill would and the import's
+  `finally` never retires the marker of a half-built collection. The next load's sweep removes a half-built
+  collection a marker owns; the work folder (`import-*` in `UPLOAD_DIR`) and a `replace`'s scratch staging collection
+  stay until the API's next start. A `replace` builds the package into a recovery collection before it deletes the
+  old collection, so one stopped after that delete leaves the target missing or partial, with the package's data (not
+  the old collection's) in the retained recovery collection; loading the package again with `--on-conflict replace`
+  restores the target. A Ctrl-C after the run's own record is written writes no second record; the handler's kill is
+  in a `finally`, and its line is written with `os.write`.
+- Output: one `loader: ` line per step on standard error (the package and mode, `chunks written: N` at most every 5
+  seconds while it changes, then the collection, chunks, fidelity and notes, or `load refused: CODE: message` / `load
+  failed: CODE: message`). Exit 0 loaded, 1 refused or failed, 2 usage error.
+- Audit: each run past the arguments writes `operator.load` (§3.1.9), actor `operator`, `target` the package,
+  `collection` the collection loaded into (or the package's, when a failure knows it), result `success`, `refused`
+  (a refusal before the load), `failed` (the import job failed) or `interrupted` (Ctrl-C), `details` `on_conflict`,
+  `encrypted`, and `chunks` or `code`.
+
+**Verify.** `scripts/verify/stack.sh run --query-only` (§10.11).
+
 ---
 
 ## 3. API Service Specification
@@ -1535,7 +1611,8 @@ AUTH_REQUIRED` (no valid session); `403 CROSS_ORIGIN_REFUSED` (a cookie-authenti
 same-origin`; also a cookie-authenticated `GET` of a route that changes state, `GET /packages/{filename}` (#794),
 whose `Sec-Fetch-Site` is present and neither `same-origin` nor `none`); `403 PASSWORD_CHANGE_REQUIRED` (a generated password is due for change; only the session routes
 answer); `403 MFA_ENROLLMENT_REQUIRED` (two-step verification is required for everyone and the user hasn't set it
-up; only the session routes and the user's own `/auth/mfa` routes answer); `403 FORBIDDEN` (the role is too low; `detail: {"required_role": ...}`). The API has no CORS middleware
+up; only the session routes and the user's own `/auth/mfa` routes answer); `403 FORBIDDEN` (the role is too low; `detail: {"required_role": ...}`); `403 QUERY_ONLY` (query-only mode, §2.6,
+and a route that changes a collection or its data). The API has no CORS middleware
 and sends no `Access-Control-*` headers. A request with an `Authorization` header is a service key request and
 has its own refusals (**Service keys**, below).
 
@@ -1566,10 +1643,10 @@ to 10 a minute per client address with a burst of 5 (`429 LOGIN_RATE_LIMITED`, �
 | Route | Request | Success |
 |---|---|---|
 | `GET /auth/status` | | `200 {"setup_required": bool}` |
-| `POST /auth/login` | `{"username", "password"}` | `200 {"username", "role", "must_change_password", "mfa_enrolled", "mfa_required", "mfa_enrollment_required"}` and the cookie; for a user with two-step verification, `200 {"mfa_required": true}` and the challenge cookie instead (**Two-step verification**, below). Every failure (unknown user, wrong password, disabled account, malformed username) is the same `401 LOGIN_FAILED` "The username or password is incorrect.", checked against a hash either way so the time doesn't differ |
-| `GET /auth/me` | | `200 {"username", "role", "must_change_password", "kind", "mfa_enrolled", "mfa_required", "mfa_enrollment_required"}`; `kind` is `user` for a session and `service` for an API key (whose `must_change_password` and MFA fields are `false`); `mfa_required` is the switch, `mfa_enrollment_required` that it is on and the user isn't enrolled |
+| `POST /auth/login` | `{"username", "password"}` | `200 {"username", "role", "must_change_password", "query_only", "mfa_enrolled", "mfa_required", "mfa_enrollment_required"}` (`query_only`: §2.6, in every user answer) and the cookie; for a user with two-step verification, `200 {"mfa_required": true}` and the challenge cookie instead (**Two-step verification**, below). Every failure (unknown user, wrong password, disabled account, malformed username) is the same `401 LOGIN_FAILED` "The username or password is incorrect.", checked against a hash either way so the time doesn't differ |
+| `GET /auth/me` | | `200 {"username", "role", "must_change_password", "query_only", "kind", "mfa_enrolled", "mfa_required", "mfa_enrollment_required"}`; `kind` is `user` for a session and `service` for an API key (whose `must_change_password` and MFA fields are `false`); `mfa_required` is the switch, `mfa_enrollment_required` that it is on and the user isn't enrolled |
 | `POST /auth/logout` | | `200 {"status": "logged_out"}`; the session is deleted and the cookie expired |
-| `POST /auth/password` | `{"current_password", "new_password"}` | `200 {"status": "changed", "username", "role", "must_change_password": false}`; the user's other sessions end, this one stays. A wrong current password is `403 PASSWORD_INCORRECT`; a new one breaking the rules, or equal to the current one (so a generated password can't be kept), is `422 INVALID_PASSWORD` naming the rule |
+| `POST /auth/password` | `{"current_password", "new_password"}` | `200 {"status": "changed", "username", "role", "must_change_password": false, "query_only"}`; the user's other sessions end, this one stays. A wrong current password is `403 PASSWORD_INCORRECT`; a new one breaking the rules, or equal to the current one (so a generated password can't be kept), is `422 INVALID_PASSWORD` naming the rule |
 
 **Account administration** (engineers only). `User` is `{"username", "role", "enabled", "must_change_password",
 "created_at", "mfa_enrolled"}` (`created_at` in ISO 8601 UTC); it never holds a password, hash or session. A `{username}` in a path
@@ -1616,7 +1693,7 @@ unrevoked, unexpired ones. Refusals, first that applies: `503 SETUP_REQUIRED`; `
 invalid, expired or revoked." for every reason; `403 KEY_NOT_ALLOWED` on every `/auth/users...` and
 `/auth/service-principals...` route, `POST /auth/logout`, `POST /auth/password`, `GET /audit` and `GET
 /audit.csv`, whatever the role; `403
-FORBIDDEN` when the role is too low. A key request has no origin check and no password-change check. Public
+FORBIDDEN` when the role is too low; `403 QUERY_ONLY` in query-only mode (§2.6). A key request has no origin check and no password-change check. Public
 routes ignore the header. Failed key requests are neither logged one by one nor throttled.
 
 **Service principal and key administration** (engineers' sessions only). `Principal` is `{"name", "role",
@@ -1847,7 +1924,7 @@ code attempt that reaches a live challenge, never counted in a window: actor the
 `admin.principal.create`, `admin.principal.set-role`, `admin.principal.disable`, `admin.principal.enable`,
 `admin.key.issue`, `admin.key.revoke`; `audit.view`, `audit.download`; `operator.bootstrap`, `operator.create-user`,
 `operator.reset-password`, `operator.set-role`, `operator.disable`, `operator.enable`, `operator.reset-mfa` (`python -m auth`; not `list`,
-not usage errors); `system.start` (each API start, after the job records are loaded, with `question_text_logged`,
+not usage errors); `operator.load` (`python -m loader`, §2.6; not usage errors); `system.start` (each API start, after the job records are loaded, with `question_text_logged`,
 `max_bytes` and `keep`); document preparation (§3.1.11): `prepare.upload` (names, count, bytes), `prepare.start`
 (the ids or `all`; the job's `accepted` and end records), `prepare.cancel`, `prepare.import` (collection and part
 names; the ingest job's records), `prepare.download` and `prepare.delete` (two routes each, `target` the
@@ -1856,7 +1933,7 @@ polling, no gold-standard generate, edit or regenerate.
 
 **When.** A request to an audited route writes one record once its answer has been sent, so a page or CSV never
 holds its own `audit.view` or `audit.download`. A refusal by the authentication middleware is recorded only when it
-is a 403 for an identified principal (`FORBIDDEN`, `KEY_NOT_ALLOWED`, `CROSS_ORIGIN_REFUSED`,
+is a 403 for an identified principal (`FORBIDDEN`, `KEY_NOT_ALLOWED`, `CROSS_ORIGIN_REFUSED`, `QUERY_ONLY`,
 `PASSWORD_CHANGE_REQUIRED`); `401 AUTH_REQUIRED`, `401 KEY_INVALID` and `503 SETUP_REQUIRED` write nothing. A
 failed or throttled login has actor `null`, kind `anonymous` and the typed username as `target`. Repeated ones are
 counted (#577): a failure is written at once and, once that record is written, opens a 60-second window for its
@@ -2149,6 +2226,7 @@ Standard error codes:
 | `FORBIDDEN` | 403 | The user's role is too low (`detail.required_role`), or the route has no policy entry |
 | `CROSS_ORIGIN_REFUSED` | 403 | A cookie-authenticated change from another origin, or a download of a package (`GET /packages/{filename}`) whose `Sec-Fetch-Site` is present and neither `same-origin` nor `none` (#794) |
 | `PASSWORD_CHANGE_REQUIRED` | 403 | A generated password must be changed first; only `/auth/me`, `/auth/logout` and `/auth/password` answer |
+| `QUERY_ONLY` | 403 | Query-only mode (`RAG_QUERY_ONLY=true`, §2.6): the route creates, changes or deletes a collection or its data; collections are loaded with `python -m loader` |
 | `LOGIN_FAILED` | 401 | Login refused; the same answer for every cause |
 | `LOGIN_THROTTLED` | 429 | Five failed logins or wrong current passwords for this username and address within 15 minutes; wait 15 minutes |
 | `LOGIN_RATE_LIMITED` | 429 | From nginx, not the API: more than 10 logins a minute (burst 5) from this client address; wait a minute (#577) |
@@ -3115,6 +3193,9 @@ Developer also Data and Tune, an Engineer also Admin.
 | Account | Change password | ✓ | ✓ | ✓ |
 | Account | Log out | ✓ | ✓ | ✓ |
 
+- **Query-only mode** (#670, §2.6). When the user answer's `query_only` is true, Import, Prepare, Chunking,
+  Retrieval and Gold Standard are hidden for every role (so Tune isn't shown) and not routed, and a "Query-only" tag
+  follows "RAG Platform".
 - **Current page.** The current page's entry has `aria-current="page"` and is highlighted, and so is
   the button of the menu that holds it (`/account` and `/account/password` highlight the account menu). A page with
   no entry, such as `/help/transfer`, highlights nothing.
@@ -3616,6 +3697,12 @@ LAN mode (#26, §2.5) adds one API container setting and two read by `docker-com
 | `RAG_LAN_MODE` | `false` | Exactly `true` or `false`; anything else fails API startup. `true` only through `docker-compose.lan.yml`; then the API refuses to start unless `AUTH_COOKIE_SECURE` is `true` and an enabled human AI Engineer exists |
 | `RAG_LAN_HOSTNAMES` | empty | Comma-separated DNS names and IP addresses for the self-signed certificate; required unless `proxy/certs` holds `cert.pem` and `key.pem` |
 | `RAG_LAN_PORT` | `443` | The host port of LAN mode's TLS publication, on every interface |
+
+Query-only mode (#670, §2.6) adds one API container setting:
+
+| Setting | Default | Accepted values |
+|---|---|---|
+| `RAG_QUERY_ONLY` | `false` | Exactly `true` or `false`; anything else fails API startup. `true` through `docker-compose.query-only.yml`; then the routes of §2.6 answer `403 QUERY_ONLY` and `python -m loader` loads packages |
 
 An invalid API container setting (any setting of `api/config.py`, such as `AUTH_COOKIE_SECURE`, `RAG_LAN_MODE`,
 `AUDIT_LOG_QUESTIONS` or `MAX_ZIP_MEMBERS`) stops API startup: the API writes one line per invalid setting to standard
@@ -4718,6 +4805,38 @@ are ticked once the tests reviewer's full `stack.sh run` on the change passes.
       answer model (`RAG_EXPORT_SPECIFICATIONS.md` E42, E43).
       *Evidence: `scripts/tests/test_retrieval_import.py` (suite 05) and `validate_package.py` on a real
       export (suite 05).*
+
+### 10.11 Query-only mode (#670)
+
+A query-only instance answers questions on loaded collections and can't change them (§2.6). These are ticked once
+the tests reviewer's full `stack.sh run` and `stack.sh run --query-only` on the change pass.
+
+- [ ] `docker-compose.query-only.yml` changes only the api's `RAG_QUERY_ONLY`, from `"false"` to `"true"`;
+      `RAG_QUERY_ONLY` accepts exactly `true` or `false`, and the API image refuses another value at start-up with one
+      line and no traceback.
+      *Evidence: `query_only_config.py`, `test_query_only.py` `SettingTests` and the start-up refusal (suite 24, every
+      run).*
+- [ ] With the mode on, each of the 19 routes of §2.6 answers `403 QUERY_ONLY`, to a session and to a key, after
+      every other refusal (`401`, `CROSS_ORIGIN_REFUSED`, `FORBIDDEN`, `KEY_INVALID` unchanged) and without reading the
+      body; every other state-changing route is kept, and a new one fails the test until it is classified; the
+      refusal is audited with its principal; every user answer carries `query_only`.
+      *Evidence: `test_query_only.py` `PolicyTests` and `AppTests` (suite 24, in the API image); in a `stack.sh run
+      --query-only`, suite 24 sends each route to the query-only instance.*
+- [ ] `python -m loader` loads a package from `./exports` on a query-only instance only, one at a time, with the
+      import's checks (another embedding model is refused `EMBEDDING_MISMATCH` and creates nothing), exits 0, 1 or 2,
+      reads an encrypted package's passphrase from the terminal or standard input only, and writes one `operator.load`
+      record per run past its arguments (`success`, `refused`, `failed` or `interrupted`); every collection it
+      creates, a rename included, is restricted with no grants.
+      *Evidence: `test_query_only.py` `LoaderTests` and `AccessTests`; in every run suite 24 checks the refusal on a
+      full instance; in a `stack.sh run --query-only` it loads the package, checks the refused load, `COLLECTION_EXISTS`
+      on a second load, and that the End User sees the collection only after the Engineer opens it.*
+- [ ] Two instances, as two machines: a collection built and exported on the default instance, its package copied
+      into the empty exports folder of a query-only instance with its own volumes, loaded there and asked a question by
+      an End User, with an answer and citations; export and the package list keep working there.
+      *Evidence: suite 24 in a `stack.sh run --query-only` (the question outside `RAG_SKIP_SLOW=1`).*
+- [ ] The UI hides Import, Prepare, Chunking, Retrieval and Gold Standard and the Transfer page's import controls
+      and the Collections page's create and delete in query-only mode, and is unchanged otherwise.
+      *Evidence: the UI build (`tsc && vite build`) and review; `GET /auth/me`'s `query_only` in suite 24.*
 
 ## 11. Host Requirements and Distribution
 

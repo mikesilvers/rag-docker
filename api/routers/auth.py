@@ -54,7 +54,9 @@ def _address(request: Request) -> str:
 
 
 def _user_body(username: str, role: str, must_change_password: bool) -> dict:
-    return {"username": username, "role": role, "must_change_password": must_change_password}
+    # query_only (#670) in every user answer, so the UI knows it from the login on.
+    return {"username": username, "role": role, "must_change_password": must_change_password,
+            "query_only": settings.rag_query_only}
 
 
 def _mfa_body(enrolled: bool, required: bool) -> dict:

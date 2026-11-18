@@ -66,6 +66,11 @@ class Settings(BaseSettings):
     # refuses to start unless the cookie is Secure and an enabled Engineer
     # exists (lan_mode.py).
     rag_lan_mode: bool = False
+    # Query-only mode (#670), set only by docker-compose.query-only.yml. When
+    # true the API refuses every route that creates, changes or deletes a
+    # collection or its data (auth/policy.py QUERY_ONLY_REFUSED) with
+    # 403 QUERY_ONLY; collections are loaded on the host with `python -m loader`.
+    rag_query_only: bool = False
     # The audit log (#29): append-only JSON Lines in the ingest_uploads volume,
     # rotated by size (services/audit.py). The folder is its own setting so
     # tests that point upload_dir elsewhere don't find an audit/ folder there.
@@ -86,7 +91,7 @@ class Settings(BaseSettings):
     # briefly (maintainer's decision, #638).
     max_preparation_bytes: int = 20 * 1024 * 1024 * 1024
 
-    @field_validator("auth_cookie_secure", "rag_lan_mode", "audit_log_questions", mode="before")
+    @field_validator("auth_cookie_secure", "rag_lan_mode", "rag_query_only", "audit_log_questions", mode="before")
     @classmethod
     def _exact_boolean(cls, value, info):
         # pydantic would read "1", "yes" or "on" as true. A typo in a security

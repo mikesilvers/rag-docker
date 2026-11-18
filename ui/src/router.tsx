@@ -59,6 +59,9 @@ export default function AppRouter() {
     )
   }
   const role = state.user.role
+  // Query-only mode (#670): the pages that change data aren't routed; the API
+  // refuses their writes whatever the UI shows.
+  const queryOnly = state.user.query_only === true
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -72,11 +75,15 @@ export default function AppRouter() {
           <Route path="/account/password" element={<ChangePasswordPage />} />
           {role !== 'end_user' && (
             <>
-              <Route path="/import" element={<ImportPage />} />
-              <Route path="/prepare" element={<PreparePage />} />
-              <Route path="/chunking" element={<ChunkingPage />} />
-              <Route path="/retrieval" element={<RetrievalPage />} />
-              <Route path="/goldstandard" element={<GoldStandardPage />} />
+              {!queryOnly && (
+                <>
+                  <Route path="/import" element={<ImportPage />} />
+                  <Route path="/prepare" element={<PreparePage />} />
+                  <Route path="/chunking" element={<ChunkingPage />} />
+                  <Route path="/retrieval" element={<RetrievalPage />} />
+                  <Route path="/goldstandard" element={<GoldStandardPage />} />
+                </>
+              )}
               <Route path="/transfer" element={<TransferPage />} />
               <Route path="/help/transfer" element={<HelpTransferPage />} />
             </>

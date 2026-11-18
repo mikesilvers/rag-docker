@@ -422,7 +422,7 @@ def check_login_logout(operator_ok):
     body = json.loads(raw)
     expect(status == 200 and body == {"username": "vfy-developer", "role": "developer", "must_change_password": False,
                                       "kind": "user", "mfa_enrolled": False, "mfa_required": False,
-                                      "mfa_enrollment_required": False},
+                                      "mfa_enrollment_required": False, "query_only": False},
            "GET /auth/me answered {} {}".format(status, body))
     status, _, _ = code("POST", "/auth/logout", token=token)
     expect(status == 200, "logout answered {}".format(status))

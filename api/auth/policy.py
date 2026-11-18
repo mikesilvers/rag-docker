@@ -138,6 +138,40 @@ HUMAN_ONLY = frozenset(path for _, path in ACCESS
 STATE_CHANGING_GET = frozenset({"/packages/{filename}"})
 
 
+# Query-only mode (#670, RAG_QUERY_ONLY): the routes that create, change or
+# delete a collection or its data. With the mode on, the auth middleware
+# refuses each of them with 403 QUERY_ONLY, after every other check.
+QUERY_ONLY_REFUSED = frozenset({
+    ("POST", "/collections"),
+    ("DELETE", "/collections/{name}"),
+    ("POST", "/ingest/upload"),
+    ("POST", "/ingest/config"),
+    ("POST", "/retrieval/config"),
+    ("POST", "/goldstandard/generate"),
+    ("POST", "/goldstandard/regenerate"),
+    ("PATCH", "/goldstandard/session/{session_id}/pair/{pair_id}"),
+    ("POST", "/goldstandard/save"),
+    ("POST", "/import"),          # packages are loaded on the host (python -m loader)
+    ("POST", "/prepare/upload"),
+    ("DELETE", "/prepare/documents/{document_id}"),
+    ("DELETE", "/prepare/documents/{document_id}/prepared"),
+    ("POST", "/prepare/jobs"),
+    ("POST", "/prepare/job/{job_id}/cancel"),
+    ("POST", "/prepare/import"),
+    ("POST", "/tune/rechunk"),
+    ("POST", "/tune/reembed"),
+    ("POST", "/tune/reindex"),
+})
+# Every other route that changes state keeps working in query-only mode: the
+# /auth routes, a query, export and the package download (#677), and collection
+# access (#606), since the query-only machine has its own accounts. A new
+# data-changing route lands here until it is classified; test_query_only.py
+# pins this set, so it fails until someone decides.
+QUERY_ONLY_KEPT = frozenset(key for key in ACCESS
+                            if (key[0] != "GET" or key[1] in STATE_CHANGING_GET)
+                            and key not in QUERY_ONLY_REFUSED)
+
+
 def required(method: str, path: str) -> str | None:
     """The access a route needs, or None when it has no entry (refused)."""
     return ACCESS.get(("GET" if method == "HEAD" else method, path))

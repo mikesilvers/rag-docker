@@ -13,7 +13,8 @@ know with `note()` (a collection named in a body, file names, a typed
 username). A refusal by the auth middleware is recorded only when it is a 403
 for an identified principal; 401s and 503s write nothing. Jobs get one record
 when they are stored (`job_started`, called by the job store) and one when they
-end (`job_ended`). The operator command and the API's start write their own,
+end (`job_ended`). The operator commands (`python -m auth`, `python -m loader`,
+#670) and the API's start write their own,
 and so does the deletion of an export package (`package_deleted`, #677).
 
 **What never does.** No password, session token, API key, passphrase, answer
@@ -122,7 +123,9 @@ ACTIONS: dict[tuple[str, str], str] = {
 ACCESS_REFUSED = "collection.access.refused"
 # An export package deleted after its download or when it expired (#677).
 PACKAGE_DELETE = "package.delete"
-OPERATOR_ACTIONS = ("bootstrap", "create-user", "reset-password", "set-role", "disable", "enable", "reset-mfa")
+# The operator commands: python -m auth's (#25), and python -m loader's load (#670).
+OPERATOR_ACTIONS = ("bootstrap", "create-user", "reset-password", "set-role", "disable", "enable", "reset-mfa",
+                    "load")
 # Every action name, for the API's filter and the UI's list.
 ALL_ACTIONS = tuple(sorted(set(ACTIONS.values()) | {"operator." + a for a in OPERATOR_ACTIONS}
                           | {"system.start", ACCESS_REFUSED, PACKAGE_DELETE}))
