@@ -157,6 +157,37 @@ function collectionsCases() {
         assert.deepEqual(puts[0].body, { restricted: true, users: ['vfy-developer'], service_principals: [] });
       } };
     })(),
+    (() => {
+      // As above, but the dialog's held read of A later fails: its error must
+      // not reach B's dialog (#792).
+      const late = hold();
+      let readsOfA = 0;
+      return { name: 'Access (#792): a failed read for an earlier opening does not show its error in another collection\'s dialog', open: open({
+        ['GET /api/collections/' + A + '/access']: () => (++readsOfA === 1 ? json(200, OPEN) : late),
+        ['GET /api/collections/' + B + '/access']: json(200, { restricted: true, users: ['vfy-developer'], service_principals: [] }),
+        'GET /api/auth/users': json(200, { users: [] }),
+        'GET /api/auth/service-principals': json(200, { principals: [] }),
+        'PUT /api/collections/*': call => json(200, call.body),
+      }), async run(s) {
+        await waitText(s.page, A);
+        await waitFor(s.page, () => [...document.querySelectorAll('tbody tr')].every(r => r.cells[5].textContent.trim() !== '\u2014'), 'the access column');
+        await (await s.page.$$('tbody button'))[0].click();   // row A: Access
+        await waitText(s.page, 'Access to ' + A);
+        await press(s.page, 'Cancel');
+        await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+        await (await s.page.$$('tbody button'))[2].click();   // row B: Access
+        await waitText(s.page, 'Access to ' + B);
+        await waitFor(s.page, () => [...document.querySelectorAll('.fixed button')].some(b => b.textContent.trim() === 'Save' && !b.disabled), 'Save to be enabled once B is read');
+        late.release(apiError(500, 'INTERNAL_ERROR', 'Synthetic late failure.'));
+        await new Promise(r => setTimeout(r, 300));
+        const state = await s.page.evaluate(() => ({
+          error: document.body.textContent.includes('Synthetic late failure.'),
+          save: [...document.querySelectorAll('.fixed button')].find(b => b.textContent.trim() === 'Save').disabled,
+        }));
+        assert.deepEqual(state, { error: false, save: false });
+        assert.equal(s.calls.filter(call => call.method === 'PUT').length, 0);
+      } };
+    })(),
     { name: 'New Collection modal starts with HNSW, Cosine and the three HNSW sliders at their defaults and bounds', open: open(), async run(s) {
       await waitText(s.page, A);
       await press(s.page, '+ New Collection');

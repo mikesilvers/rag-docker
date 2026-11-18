@@ -24923,7 +24923,10 @@ export default function CollectionsPage() {
   // unknown and Save stays disabled; once the Engineer changes something, a
   // late answer doesn't overwrite the change. Each opening is numbered, and
   // an answer to an earlier opening (another collection's, or one closed
-  // since) is ignored, so it can't become this dialog's draft (#788).
+  // since) is ignored, so it can't become this dialog's draft (#788). The
+  // opening's lists of people and service principals are numbered the same
+  // way, so an earlier opening's late answer or error never reaches this one
+  // (#792).
   const [accessLoaded, setAccessLoaded] = useState(false)
   const touched = useRef(false)
   const accessRead = useRef(0)
@@ -24955,10 +24958,20 @@ export default function CollectionsPage() {
       if (ticket !== accessRead.current) return
       setAccessError(`Could not read who may use this collection: ${e instanceof Error ? e.message : String(e)}`)
     })
-    api.listUsers().then(r => setPeople(r.users))
-      .catch((e: unknown) => setAccessError(`Could not load the people: ${e instanceof Error ? e.message : String(e)}`))
-    api.listPrincipals().then(r => setPrincipals(r.principals))
-      .catch((e: unknown) => setAccessError(`Could not load the service principals: ${e instanceof Error ? e.message : String(e)}`))
+    api.listUsers().then(r => {
+      if (ticket !== accessRead.current) return
+      setPeople(r.users)
+    }).catch((e: unknown) => {
+      if (ticket !== accessRead.current) return
+      setAccessError(`Could not load the people: ${e instanceof Error ? e.message : String(e)}`)
+    })
+    api.listPrincipals().then(r => {
+      if (ticket !== accessRead.current) return
+      setPrincipals(r.principals)
+    }).catch((e: unknown) => {
+      if (ticket !== accessRead.current) return
+      setAccessError(`Could not load the service principals: ${e instanceof Error ? e.message : String(e)}`)
+    })
   }
 
   function closeAccess() {
@@ -55449,6 +55462,37 @@ function collectionsCases() {
         assert.equal(puts.length, 1);
         assert.equal(puts[0].path, '/api/collections/' + B + '/access');
         assert.deepEqual(puts[0].body, { restricted: true, users: ['vfy-developer'], service_principals: [] });
+      } };
+    })(),
+    (() => {
+      // As above, but the dialog's held read of A later fails: its error must
+      // not reach B's dialog (#792).
+      const late = hold();
+      let readsOfA = 0;
+      return { name: 'Access (#792): a failed read for an earlier opening does not show its error in another collection\'s dialog', open: open({
+        ['GET /api/collections/' + A + '/access']: () => (++readsOfA === 1 ? json(200, OPEN) : late),
+        ['GET /api/collections/' + B + '/access']: json(200, { restricted: true, users: ['vfy-developer'], service_principals: [] }),
+        'GET /api/auth/users': json(200, { users: [] }),
+        'GET /api/auth/service-principals': json(200, { principals: [] }),
+        'PUT /api/collections/*': call => json(200, call.body),
+      }), async run(s) {
+        await waitText(s.page, A);
+        await waitFor(s.page, () => [...document.querySelectorAll('tbody tr')].every(r => r.cells[5].textContent.trim() !== '\u2014'), 'the access column');
+        await (await s.page.$$('tbody button'))[0].click();   // row A: Access
+        await waitText(s.page, 'Access to ' + A);
+        await press(s.page, 'Cancel');
+        await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+        await (await s.page.$$('tbody button'))[2].click();   // row B: Access
+        await waitText(s.page, 'Access to ' + B);
+        await waitFor(s.page, () => [...document.querySelectorAll('.fixed button')].some(b => b.textContent.trim() === 'Save' && !b.disabled), 'Save to be enabled once B is read');
+        late.release(apiError(500, 'INTERNAL_ERROR', 'Synthetic late failure.'));
+        await new Promise(r => setTimeout(r, 300));
+        const state = await s.page.evaluate(() => ({
+          error: document.body.textContent.includes('Synthetic late failure.'),
+          save: [...document.querySelectorAll('.fixed button')].find(b => b.textContent.trim() === 'Save').disabled,
+        }));
+        assert.deepEqual(state, { error: false, save: false });
+        assert.equal(s.calls.filter(call => call.method === 'PUT').length, 0);
       } };
     })(),
     { name: 'New Collection modal starts with HNSW, Cosine and the three HNSW sliders at their defaults and bounds', open: open(), async run(s) {
