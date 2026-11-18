@@ -16,6 +16,8 @@ The refusals, in the order they apply:
                               the user hasn't set it up (#607); only the session
                               routes and their own MFA routes answer
   403 FORBIDDEN               the user's role is too low
+  403 QUERY_ONLY              query-only mode (#670) and a route that changes a
+                              collection or its data (policy.QUERY_ONLY_REFUSED)
 
 A request with an `Authorization` header is a service key request (PR 3): the
 header alone decides and any cookie is ignored, with no fallback to it.
@@ -23,6 +25,7 @@ header alone decides and any cookie is ignored, with no fallback to it.
   401 KEY_INVALID             not one `Bearer <key>` header with a valid key (one answer for every reason)
   403 KEY_NOT_ALLOWED         a route keys can't use (policy.HUMAN_ONLY)
   403 FORBIDDEN               the principal's role is too low
+  403 QUERY_ONLY              as above
 It has no origin check (it carries no cookie, Q26) and no password change.
 
 Each 403 comes back with the principal it refused, which the audit log
@@ -39,6 +42,7 @@ from urllib.parse import urlsplit
 
 from starlette.requests import Request, cookie_parser
 
+from config import settings
 from utils import api_error
 
 from . import keys, policy, store
@@ -140,7 +144,7 @@ class AuthMiddleware:
                              "`docker compose exec api python -m auth bootstrap <username>`."), None
         authorization = _headers(scope, b"authorization")
         if authorization:
-            return await self._check_key(access, template, authorization)
+            return await self._check_key(scope, access, template, authorization)
         principal = await asyncio.to_thread(store.authenticate, session_token(scope))
         if principal is None:
             return api_error(401, "AUTH_REQUIRED", "Log in to use this."), None
@@ -160,9 +164,9 @@ class AuthMiddleware:
         if access not in (policy.SESSION, policy.MFA) and policy.rank(principal.role) < policy.rank(access):
             return api_error(403, "FORBIDDEN", "Your role can't do this.",
                              detail={"required_role": access}), principal
-        return None, principal
+        return _query_only(scope, template), principal
 
-    async def _check_key(self, access, template, authorization):
+    async def _check_key(self, scope, access, template, authorization):
         key = keys.bearer(authorization[0]) if len(authorization) == 1 else None
         principal = await asyncio.to_thread(store.authenticate_key, key) if key else None
         if principal is None:
@@ -172,7 +176,20 @@ class AuthMiddleware:
         if access not in (policy.SESSION, policy.MFA) and policy.rank(principal.role) < policy.rank(access):
             return api_error(403, "FORBIDDEN", "Your role can't do this.",
                              detail={"required_role": access}), principal
-        return None, principal
+        return _query_only(scope, template), principal
+
+
+QUERY_ONLY_MESSAGE = ("This instance is query-only: its collections can't be created, changed or deleted "
+                      "here. Collections are loaded on the host with `python -m loader`.")
+
+
+def _query_only(scope, template):
+    """The 403 QUERY_ONLY refusal (#670), or None. Checked last, so a caller
+    refused for any other reason is refused as before; read on each request."""
+    method = "GET" if scope["method"] == "HEAD" else scope["method"]
+    if settings.rag_query_only and (method, template) in policy.QUERY_ONLY_REFUSED:
+        return api_error(403, "QUERY_ONLY", QUERY_ONLY_MESSAGE)
+    return None
 
 
 class Unlisted(Exception):

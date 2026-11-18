@@ -1554,6 +1554,75 @@ function prepareCases() {
   ];
 }
 
+// Query-only mode (#670): GET /api/auth/me says query_only, and the UI shows
+// the "Query-only" tag, hides the pages that change data from the nav and the
+// router, keeps Transfer's export and package list without its import
+// controls, and drops "+ New Collection" and Delete from the Collections page.
+// The API refuses those writes whatever the UI shows (24_query_only.sh).
+function queryOnlyCases() {
+  const me = (role, queryOnly) => json(200, { username: 'vfy-' + role.replace('_', '-'), role, must_change_password: false, query_only: queryOnly });
+  const qo = (role, path, routes = {}) => ({ role, path, routes: base({ 'GET /api/auth/me': me(role, true), ...routes }) });
+  const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
+  const tag = page => page.evaluate(() => document.querySelector('[data-testid=nav-query-only]')?.textContent.trim() ?? null);
+  const ready = page => waitFor(page, () => document.querySelectorAll('nav button[data-menu]').length > 0, 'the nav');
+  const WRITE_PAGES = ['/import', '/prepare', '/chunking', '/retrieval', '/goldstandard'];
+  return [
+    { name: 'Query-only Engineer: the nav shows the Query-only tag and Q&A, Transfer and the Admin pages, without Import, Prepare, Chunking, Retrieval or Gold Standard', open: qo('engineer', '/qa'), async run(s) {
+      await ready(s.page);
+      assert.equal(await tag(s.page), 'Query-only');
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Transfer', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
+    } },
+    { name: 'Query-only Developer: the nav shows the tag, Q&A and Transfer, and no Tune menu', open: qo('developer', '/qa'), async run(s) {
+      await ready(s.page);
+      assert.equal(await tag(s.page), 'Query-only');
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Transfer']);
+      assert.equal(await s.page.evaluate(() => !!document.querySelector('nav button[data-menu="tune"]')), false);
+    } },
+    { name: 'Query-only: opening Import, Prepare, Chunking, Retrieval or Gold Standard directly is sent to Q&A, while Transfer and Collections still open', open: qo('engineer', '/qa'), async run(s) {
+      for (const p of WRITE_PAGES) {
+        await goto(s.page, p);
+        await waitText(s.page, 'Ask a Question');
+        await waitPath(s.page, '/qa');
+      }
+      await goto(s.page, '/transfer');
+      await waitText(s.page, 'Export a collection');
+      await waitPath(s.page, '/transfer');
+      await goto(s.page, '/collections');
+      await waitText(s.page, A);
+      await waitPath(s.page, '/collections');
+    } },
+    { name: 'Query-only Collections page: the list and Access stay, "+ New Collection" and Delete are gone', open: qo('engineer', '/collections'), async run(s) {
+      await waitText(s.page, A);
+      const buttons = await s.page.evaluate(() => [...document.querySelectorAll('main button')].map(b => b.textContent.trim()));
+      assert.equal(buttons.includes('+ New Collection'), false);
+      assert.equal(buttons.includes('Delete'), false);
+      assert.equal(buttons.filter(b => b === 'Access').length, COLS.length);
+    } },
+    { name: 'Query-only Transfer page: export, the package list, Download and Refresh stay; the import controls are gone and the loader is named', open: qo('developer', '/transfer', {
+        'GET /api/packages': json(200, { packages: [{ filename: 'ragpkg-vfyqo.tar.gz', readable: true, encrypted: false, collection: A, chunk_count: 3, fidelity: 'with-sources', size_bytes: 2048 }] }) }), async run(s) {
+      await waitText(s.page, 'Export a collection');
+      await waitText(s.page, 'Packages in ./exports');
+      await waitText(s.page, 'python -m loader');
+      await waitFor(s.page, () => document.querySelectorAll('select')[1]?.options.length > 1, 'the packages');
+      await fillNth(s.page, 'select', 1, 'ragpkg-vfyqo.tar.gz');
+      await waitFor(s.page, () => [...document.querySelectorAll('a')].some(a => a.textContent.trim() === 'Download'), 'the Download link');
+      const buttons = await s.page.evaluate(() => [...document.querySelectorAll('main button')].map(b => b.textContent.trim()));
+      assert.equal(buttons.includes('Refresh'), true);
+      assert.equal(buttons.includes('Import'), false);
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('input[name=conflict]').length), 0);
+      assert.equal(await s.page.evaluate(() => document.body.innerText.includes('Import a package')), false);
+      assert.equal(callsTo(s, 'POST', '/api/import').length, 0);
+    } },
+    { name: 'query_only false: no Query-only tag, the full Engineer nav, and "+ New Collection" on the Collections page', open: { role: 'engineer', path: '/collections', routes: base({ 'GET /api/auth/me': me('engineer', false) }) }, async run(s) {
+      await waitText(s.page, A);
+      await ready(s.page);
+      assert.equal(await tag(s.page), null);
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Prepare', 'Transfer', 'Chunking', 'Retrieval', 'Gold Standard', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
+      assert.equal(await s.page.evaluate(() => [...document.querySelectorAll('main button')].some(b => b.textContent.trim() === '+ New Collection')), true);
+    } },
+  ];
+}
+
 async function runUiControlTests(browser, baseUrl, reporter) {
   S.BASE = baseUrl;
   const run = (section, cases) => S.runCases(browser, baseUrl, reporter, section, cases);
@@ -1569,6 +1638,7 @@ async function runUiControlTests(browser, baseUrl, reporter) {
   await run('Q&A input, citations toggle, answer display and End User view (#400)', qaCases());
   await run('Retrieval page status text, alpha slider and save (#400)', retrievalCases());
   await run('Client handling of the proxy error pages (#400)', proxyCases());
+  await run('Query-only mode: the tag, the hidden pages and controls (#670)', queryOnlyCases());
 }
 
 module.exports = { runUiControlTests };
