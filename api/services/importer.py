@@ -845,7 +845,7 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
         raise
 
 
-def _exists(name: str) -> bool:
+def exists_fail_closed(name: str) -> bool:
     """Whether a collection exists; Weaviate failing to answer counts as
     existing, so the access checks below fail closed."""
     try:
@@ -855,37 +855,37 @@ def _exists(name: str) -> bool:
         return True
 
 
-def _source(original: str) -> str:
+def package_source(original: str) -> str:
     """Whose access a package of `original` follows (#606): the collection
     itself, or for a staging or recovery copy that no longer exists here, the
     nearest collection it was made from that exists here, or the original
     (auth.access.package_source, #792)."""
-    return access.package_source(original, _exists)
+    return access.package_source(original, exists_fail_closed)
 
 
 def _refused(owner, source: str) -> bool:
-    """True when the package's collection (`_source`) exists here, is
+    """True when the package's collection (`package_source`) exists here, is
     restricted, and the job's owner may not use it (#606). For an existing
     staging or recovery copy that means the copy or any collection it was made
     from (access.scope, #788, #792)."""
     names = access.scope(source)
     if owner is None or not any(auth_store.collection_access(n).restricted for n in names):
         return False
-    return _exists(source) and not all(auth_store.owner_has_access(owner, n) for n in names)
+    return exists_fail_closed(source) and not all(auth_store.owner_has_access(owner, n) for n in names)
 
 
 def _start_access(owner, source: str, target: str):
     """A collection this import creates (#606): when the package's collection
-    (`_source`) exists here, the new one gets its state, and for a staging or
-    recovery copy the narrowest of the copy's and every collection's it was
-    made from (#788, #792), so an import can't open what any of them restricts;
-    otherwise it starts
-    restricted to the job's owner. Written before any data; returns (the state
-    replaced, the state written) for auth_store.put_back. A job with no owner
-    (a direct call in tests) records nothing and returns None."""
+    (`package_source`) exists here, the new one gets its state, and for a
+    staging or recovery copy the narrowest of the copy's and every
+    collection's it was made from (#788, #792), so an import can't open what
+    any of them restricts; otherwise it starts restricted to the job's owner.
+    Written before any data; returns (the state replaced, the state written)
+    for auth_store.put_back. A job with no owner (a direct call in tests)
+    records nothing and returns None."""
     if owner is None:
         return None
-    if source != target and _exists(source):
+    if source != target and exists_fail_closed(source):
         return auth_store.copy_collection_access(source, target, access.scope(source)[1:])
     return auth_store.restrict_to(target, auth_store.user_id_for(owner))
 
@@ -924,7 +924,7 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
         original = manifest["collection"]["name"]
         # A package of a collection its owner may not use is refused as if it
         # weren't there, before the job names the collection anywhere (#606).
-        source = _source(original) if isinstance(original, str) and original else None
+        source = package_source(original) if isinstance(original, str) and original else None
         if source and _refused(job.get("owner"), source):
             job["access_refused"] = True
             raise PackageError("PACKAGE_UNREADABLE",
@@ -1069,7 +1069,7 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
             # an error, leaves a partial collection, which keeps the
             # restriction (#788). A collection it did build keeps its state.
             if ((job.get("error_detail") or {}).get("cleanup_pending")
-                    or _exists(new_access[0])):
+                    or exists_fail_closed(new_access[0])):
                 _log.warning("Import into %r failed but the collection may still exist; "
                              "its access state stays", new_access[0])
             else:
