@@ -137,7 +137,10 @@ created on the Collections page or with **+ New** on the Import page, or by an
 import under a new name (an import next to an existing collection copies that
 collection's access). End Users and other Developers don't see it until an AI
 Engineer opens it or grants them access with the **Access** button on the
-Collections page. Collections that existed before the upgrade stay open. To
+Collections page. Collections that existed before the upgrade stay open. A
+recovery or staging copy of a collection (`<name>__importing_…`,
+`<name>__tuning_…`) is usable only by those who may use both the copy and the
+collection, so restricting a collection also covers its copies. To
 anyone else a restricted collection looks like one that doesn't exist (`404`),
 everywhere it can be named: Q&A, settings, ingest, gold standard, export, job
 status, packages, and the Prepare area's documents imported only into collections
