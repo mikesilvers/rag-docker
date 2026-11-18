@@ -181,17 +181,17 @@ def _list_packages_sync() -> list[dict]:
 async def _hidden(principal, packages: list[dict]) -> set[str]:
     """The packages a caller may not see (#606): unencrypted ones whose
     collection exists here and is restricted to others. Whose access a package
-    follows is the import's own rule (importer._source), so the listing and
-    POST /import agree (#788). Weaviate failing to answer counts as existing
-    (importer._exists), so the listing fails closed."""
+    follows is the import's own rule (importer.package_source), so the
+    listing and POST /import agree (#788). Weaviate failing to answer counts as
+    existing (importer.exists_fail_closed), so the listing fails closed."""
     visible = await asyncio.to_thread(access.visible_filter, principal)
     hidden = set()
     for p in packages:
         name = p.get("collection")
         if p.get("encrypted") or not p.get("readable") or not isinstance(name, str) or not name:
             continue
-        source = await asyncio.to_thread(importer._source, name)
-        if not visible(source) and await asyncio.to_thread(importer._exists, source):
+        source = await asyncio.to_thread(importer.package_source, name)
+        if not visible(source) and await asyncio.to_thread(importer.exists_fail_closed, source):
             hidden.add(p["filename"])
     return hidden
 
