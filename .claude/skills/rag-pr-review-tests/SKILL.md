@@ -39,6 +39,7 @@ The three dots give the PR's own changes since its merge base, and `--no-renames
 
 - **Fast path:** `git diff` succeeded, listed at least one path, and every listed path ends in `.md`, wherever it is, Claude skills under `.claude/` included. Follow "The fast path" below.
 - **Full path:** anything else: the listing failed or was empty, the count failed, or a changed file is code, a script, a test, a Dockerfile, a compose file, a workflow, config, a lock file, or any other non-`.md` file. Follow the steps below as they stand.
+- **Patch-only path:** the coordinator's dispatch says the evaluation is a patch-only re-evaluation: the head is the previous reviewed head plus exactly a ready reviewer patch, with `develop` unchanged ("Patch-only re-evaluation" in `reference.md`; the coordinator decides it). Follow "The patch-only path" below instead of the full path. When the command above prints `fast path`, the fast path still applies.
 
 A Markdown file that the stack builds, starts or serves (for example `api/templates/partials/*.md` or `ui/public/corpus-preparation-rules.md`) doesn't change the path: the PR stays on the fast path.
 
@@ -49,6 +50,15 @@ A Markdown file that the stack builds, starts or serves (for example `api/templa
 - **The stack-read check.** Check whether anything the stack builds, starts or serves reads a changed file. In `merged/`, search for each changed path and file name in the compose files (`docker-compose*.yml`, mounts included), each service's `Dockerfile` and `.dockerignore`, and the code of the build contexts (the `build:` keys). A changed file inside a build context that its Dockerfile copies (`COPY . .` in `api/` and `ui/`) is in the image. Name each changed file the stack builds, starts or serves in your recap section. It doesn't end the fast path.
 - **Tests you write that need the stack** aren't run locally. Put them in your patch as usual, and give their considerations the Result `➖ fast path: needs the stack`. CI `verify` runs them once the PR's author adds them. Any other test you write runs as usual.
 - **The full-run record** is CI `verify` on the PR's head (which skips the slow LLM checks). A Markdown-only PR doesn't wait for it to merge: CI still runs and its result is reported. The coordinator's build-and-run check still runs.
+
+## The patch-only path (a head that only added your earlier patch)
+
+The previous evaluation already ran the full suite on this PR, and the new head adds only the tests reviewer's ready patch from it. So:
+
+- **No full run.** Run the host tests the patch touches, found as on the fast path, and only the `stack.sh` suites the patch touches: `bash <main>/scripts/verify/stack.sh run --checkout <bundle>/merged <suites>`, with "Machine setup" from `reference.md` and "Waiting for long runs" below, as for any run.
+- **A suite is touched** when the patch changes its suite file, or a script or helper the suite runs (the list in "Flaky failures" step 1, and `scripts/verify/README.md`). A patch that changes a file every check depends on (the same step's list: the compose files, any `Dockerfile`, dependency files, API startup and settings, and the shared verify files) touches every suite: run the full suite.
+- **The verify record** is the previous evaluation's full run (link its recap) plus these runs.
+- Score any failure as "Flaky failures" says. Map the patch's considerations to tests as in steps 1–2; earlier considerations the patch doesn't touch keep their results from the previous recap.
 
 ## Steps
 
@@ -74,7 +84,7 @@ A Markdown file that the stack builds, starts or serves (for example `api/templa
 
 ## Waiting for long runs
 
-This applies only on the full path. A full `all.sh` takes 10–25 minutes, longer than one tool call may run. **Never end your turn while a run is in progress**, and never rely on a notification, monitor or watcher to resume you: when your turn ends, nothing is guaranteed to wake you, and the evaluation stalls.
+This applies on the full path and the patch-only path. A full `all.sh` takes 10–25 minutes, longer than one tool call may run. **Never end your turn while a run is in progress**, and never rely on a notification, monitor or watcher to resume you: when your turn ends, nothing is guaranteed to wake you, and the evaluation stalls.
 
 1. Start the run in the background, with its output going to a file in the bundle and its process id saved next to it:
 
@@ -136,6 +146,14 @@ Don't push to the PR branch or create branches. Put the tests in your recap sect
 </details>
 ````
 
+Also save the same diff as `<bundle>/tests-patch.diff`, and record it in `findings-tests.json` with the fields `patch`, `patch_ready` and `patch_findings` (see "Findings file" in `reference.md`):
+
+- `patch_ready` is `true` only when every test in the patch ran and passed in this evaluation. A test with the Result `➖ fast path: needs the stack`, or any test that didn't run or failed, makes it `false`.
+- `patch_findings` lists the findings the patch addresses, by their first line or consideration number.
+- Say in your recap section whether the patch is ready, and why not when it isn't.
+
+A ready patch goes into the PR before it merges, instead of becoming a follow-up ("Reviewer patches before merge" in `reference.md`).
+
 ## Your extra recap section
 
 On the full path:
@@ -175,6 +193,15 @@ Fast path: every file the PR changes is Markdown (<the changed files>), so no lo
 | Suites (`all.sh`) | not run locally: fast path; CI verify is the record |
 ```
 
-On the full path, the Verify record block is the PR's verify record (the maintainer's decision of 2026-11-14). On the fast path, the full-run record is CI `verify` on the PR's head, which skips the slow LLM checks (the maintainer's decisions of 2026-11-15).
+On the patch-only path:
+
+```markdown
+### Verify record
+Patch-only re-evaluation: the head adds only the reviewer's patch from the evaluation of `<previous-sha7>` (<link to its recap>). Full run: that evaluation's, on `<previous-evaluated-sha7>`: <passed | failed: <suites>>. Run now on the evaluated commit `<evaluated-sha7>`: host tests <each and its result | none>; suites <the suites the patch touches and their results>, `stack.sh exit=<code>`.
+```
+
+Then the Test coverage and Runs tables, as on the full path.
+
+On the full path, the Verify record block is the PR's verify record (the maintainer's decision of 2026-11-14). On the fast path, the full-run record is CI `verify` on the PR's head, which skips the slow LLM checks (the maintainer's decisions of 2026-11-15). On the patch-only path, the previous evaluation's full run plus the runs of this one are the record (the maintainer's decision of 2026-11-18, #799).
 
 Write `findings-tests.json` per `reference.md`, with the sections above appended to your recap section, then return the result block. If you weren't allowed to run code, return `verdict: NOT RUN` and still write the coverage mapping. Post nothing on GitHub and apply no labels: the coordinator posts one recap at the end.
