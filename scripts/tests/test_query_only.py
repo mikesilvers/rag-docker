@@ -456,15 +456,52 @@ class LoaderTests(Folders):
         loader._state.clear()
         loader._state["job"] = {"collection": "Policies"}
         loader.signal.signal.reset_mock()
-        err = io.StringIO()
-        with patch.object(loader.os, "kill") as kill, contextlib.redirect_stderr(err):
+        real_write = os.write
+        with patch.object(loader.os, "kill") as kill, \
+                patch.object(loader.os, "write", side_effect=lambda fd, data: len(data) if fd == 2
+                             else real_write(fd, data)) as write:
             handler(loader.signal.SIGINT, None)
         loader.signal.signal.assert_called_once_with(loader.signal.SIGINT, loader.signal.SIG_DFL)
         kill.assert_called_once_with(os.getpid(), loader.signal.SIGINT)
-        self.assertIn("load interrupted: INTERRUPTED", err.getvalue())
+        # Straight to fd 2, not through sys.stderr (a reentrant print could raise).
+        self.assertEqual(write.call_args_list[0][0], (2, b"loader: load interrupted: INTERRUPTED\n"))
         record = self.records("operator.load")[-1]
         self.assertEqual((record["result"], record["collection"], record["target"], record["details"]["code"]),
                          ("interrupted", "Policies", name, "INTERRUPTED"))
+
+    def test_the_kill_happens_even_when_the_record_fails(self):
+        handler = loader._interrupted("ragpkg-x.tar.gz", "abort", False)
+        loader._state.clear()
+        with patch.object(loader.os, "kill") as kill, patch.object(loader.os, "write"), \
+                patch.object(loader, "_audit", side_effect=RuntimeError("reentrant call")):
+            with self.assertRaises(RuntimeError):
+                handler(loader.signal.SIGINT, None)
+        kill.assert_called_once_with(os.getpid(), loader.signal.SIGINT)
+        with patch.object(loader.os, "kill") as kill, \
+                patch.object(loader.os, "write", side_effect=OSError("closed")):
+            with self.assertRaises(OSError):
+                handler(loader.signal.SIGINT, None)
+        kill.assert_called_once_with(os.getpid(), loader.signal.SIGINT)
+        loader._state.clear()
+
+    def test_after_the_runs_own_record_ctrl_c_writes_none(self):
+        # The run marks itself done before its final record, whatever the result.
+        name = self.package()
+        for run, argv in ((self.fake_run(collection="P", original_collection="P"), [name]),
+                          (self.fake_run(status="failed", error_code="IMPORT_FAILED"), [name]),
+                          (self.fake_run(), ["ragpkg-absent.tar.gz"])):
+            with self.subTest(argv=argv, run=run), run:
+                self.main(argv)
+                self.assertIs(loader._state.get("done"), True)
+                handler = loader.signal.signal.call_args_list[0][0][1]
+                before = len(self.records())
+                with patch.object(loader.os, "kill") as kill, patch.object(loader.os, "write") as write:
+                    handler(loader.signal.SIGINT, None)
+                kill.assert_called_once()
+                write.assert_not_called()
+                self.assertEqual(len(self.records()), before)
+                loader.signal.signal.reset_mock()
+        loader._state.clear()
 
     def test_ctrl_c_while_a_record_is_written_writes_no_second_one(self):
         handler = loader._interrupted("ragpkg-x.tar.gz", "abort", False)

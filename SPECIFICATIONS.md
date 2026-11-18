@@ -404,8 +404,11 @@ controls, and keeps the Collections page's list and Access without "+ New Collec
   `INTERRUPTED`), restores SIG_DFL and sends SIGINT again, so the process ends as a kill would and the import's
   `finally` never retires the marker of a half-built collection. The next load's sweep removes a half-built
   collection a marker owns; the work folder (`import-*` in `UPLOAD_DIR`) and a `replace`'s scratch staging collection
-  stay until the API's next start. A `replace` stopped after deleting the old collection leaves the old data in the
-  retained recovery collection.
+  stay until the API's next start. A `replace` builds the package into a recovery collection before it deletes the
+  old collection, so one stopped after that delete leaves the target missing or partial, with the package's data (not
+  the old collection's) in the retained recovery collection; loading the package again with `--on-conflict replace`
+  restores the target. A Ctrl-C after the run's own record is written writes no second record; the handler's kill is
+  in a `finally`, and its line is written with `os.write`.
 - Output: one `loader: ` line per step on standard error (the package and mode, `chunks written: N` at most every 5
   seconds while it changes, then the collection, chunks, fidelity and notes, or `load refused: CODE: message` / `load
   failed: CODE: message`). Exit 0 loaded, 1 refused or failed, 2 usage error.

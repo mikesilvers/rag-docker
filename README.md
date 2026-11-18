@@ -628,11 +628,13 @@ audit log, health, and export with the package list and download.
    the next load, which removes it first. The load's work folder (`import-*`
    in the upload volume, several GB for a package with models) and, for a
    `replace`, its scratch staging collection stay until the API restarts:
-   run `docker compose restart api` to remove them. A `replace` stopped after
-   it had deleted the old collection leaves the old data in the recovery
-   collection the import keeps (`<Name>__importing_<token>`, listed on the
-   Collections page): load the package again with `--on-conflict replace`, or
-   export the recovery collection and load that package.
+   run `docker compose restart api` to remove them. A `replace` builds the
+   package into a recovery collection (`<Name>__importing_<token>`) before it
+   deletes the old collection, so one stopped after that delete leaves
+   `<Name>` missing or partial: the old data is gone, and the recovery
+   collection holds the package's data, not the old collection's. To put
+   `<Name>` back, load the package again with `--on-conflict replace`. The
+   recovery collection stays (a query-only instance can't delete it).
 5. **Open it** to the people who should use it. Every collection the loader
    creates, a `rename` included, starts restricted with no grants, so only AI
    Engineers can use it until one opens it or grants it to accounts and keys

@@ -41,9 +41,10 @@ kill would. What it leaves: a collection it was building, which the next load
 removes (it runs the import's clean-up of an interrupted import first); the
 load's work folder (import-* in UPLOAD_DIR) and a replace's scratch staging
 collection, which stay until the API's next start (docker compose restart api).
-A replace stopped after the old collection was deleted keeps the old data in
-the recovery collection the import made; load the package again with
---on-conflict replace, or restore from that collection.
+A replace builds the package into a recovery collection before it deletes the
+old collection, so one stopped after that delete leaves the collection missing
+or partial (the recovery collection holds the package's data, not the old
+data): load the package again with --on-conflict replace to put it back.
 """
 from __future__ import annotations
 
@@ -72,8 +73,9 @@ def _say(line: str) -> None:
 
 
 # The run's state, for the Ctrl-C handler: the job once the load has started,
-# and whether a record is being written (the handler then writes none: the
-# audit log's locks are held, and that record is the run's own).
+# whether a record is being written (the handler then writes none: the audit
+# log's locks are held, and that record is the run's own), and whether the
+# run's final record has been started (`done`: a later Ctrl-C writes none).
 _state: dict = {}
 
 
@@ -100,13 +102,18 @@ def _interrupted(package: str, on_conflict: str, encrypted: bool):
     signal as a kill would, so the import's `finally` never retires the marker
     of a half-built collection."""
     def handler(signum, frame):
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
-        if not _state.get("auditing"):
-            job = _state.get("job") or {}
-            _say("load interrupted: INTERRUPTED")
-            _audit(package, on_conflict, encrypted, job.get("collection"), result="interrupted",
-                   code="INTERRUPTED")
-        os.kill(os.getpid(), signal.SIGINT)
+        # The kill is in `finally`: nothing raised here may reach the import's
+        # own clean-up. The line goes straight to fd 2, since print could be
+        # interrupted in the middle of the main thread's own write to stderr.
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            if not (_state.get("auditing") or _state.get("done")):
+                os.write(2, b"loader: load interrupted: INTERRUPTED\n")
+                job = _state.get("job") or {}
+                _audit(package, on_conflict, encrypted, job.get("collection"), result="interrupted",
+                       code="INTERRUPTED")
+        finally:
+            os.kill(os.getpid(), signal.SIGINT)
     return handler
 
 
@@ -211,6 +218,7 @@ def main(argv=None) -> int:
             _say(f"removed a collection an interrupted load left half-built: {removed}")
         job = _load(package, on_conflict, passphrase)
     except _Refused as refused:
+        _state["done"] = True
         _say(f"load refused: {refused.code}: {refused}")
         _audit(package, on_conflict, encrypted, None, result="refused", code=refused.code)
         return 1
@@ -218,6 +226,8 @@ def main(argv=None) -> int:
         if lock is not None:
             lock.close()
 
+    # The run's own record follows: from here a Ctrl-C writes no other.
+    _state["done"] = True
     if job.get("status") == "completed":
         renamed = f" (renamed from {job['original_collection']})" if job.get("renamed") else ""
         _say(f"loaded into collection {job['collection']}{renamed}: {job['chunks_written']} chunks, "

@@ -1503,9 +1503,10 @@ kill would. What it leaves: a collection it was building, which the next load
 removes (it runs the import's clean-up of an interrupted import first); the
 load's work folder (import-* in UPLOAD_DIR) and a replace's scratch staging
 collection, which stay until the API's next start (docker compose restart api).
-A replace stopped after the old collection was deleted keeps the old data in
-the recovery collection the import made; load the package again with
---on-conflict replace, or restore from that collection.
+A replace builds the package into a recovery collection before it deletes the
+old collection, so one stopped after that delete leaves the collection missing
+or partial (the recovery collection holds the package's data, not the old
+data): load the package again with --on-conflict replace to put it back.
 """
 from __future__ import annotations
 
@@ -1534,8 +1535,9 @@ def _say(line: str) -> None:
 
 
 # The run's state, for the Ctrl-C handler: the job once the load has started,
-# and whether a record is being written (the handler then writes none: the
-# audit log's locks are held, and that record is the run's own).
+# whether a record is being written (the handler then writes none: the audit
+# log's locks are held, and that record is the run's own), and whether the
+# run's final record has been started (`done`: a later Ctrl-C writes none).
 _state: dict = {}
 
 
@@ -1562,13 +1564,18 @@ def _interrupted(package: str, on_conflict: str, encrypted: bool):
     signal as a kill would, so the import's `finally` never retires the marker
     of a half-built collection."""
     def handler(signum, frame):
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
-        if not _state.get("auditing"):
-            job = _state.get("job") or {}
-            _say("load interrupted: INTERRUPTED")
-            _audit(package, on_conflict, encrypted, job.get("collection"), result="interrupted",
-                   code="INTERRUPTED")
-        os.kill(os.getpid(), signal.SIGINT)
+        # The kill is in `finally`: nothing raised here may reach the import's
+        # own clean-up. The line goes straight to fd 2, since print could be
+        # interrupted in the middle of the main thread's own write to stderr.
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            if not (_state.get("auditing") or _state.get("done")):
+                os.write(2, b"loader: load interrupted: INTERRUPTED\n")
+                job = _state.get("job") or {}
+                _audit(package, on_conflict, encrypted, job.get("collection"), result="interrupted",
+                       code="INTERRUPTED")
+        finally:
+            os.kill(os.getpid(), signal.SIGINT)
     return handler
 
 
@@ -1673,6 +1680,7 @@ def main(argv=None) -> int:
             _say(f"removed a collection an interrupted load left half-built: {removed}")
         job = _load(package, on_conflict, passphrase)
     except _Refused as refused:
+        _state["done"] = True
         _say(f"load refused: {refused.code}: {refused}")
         _audit(package, on_conflict, encrypted, None, result="refused", code=refused.code)
         return 1
@@ -1680,6 +1688,8 @@ def main(argv=None) -> int:
         if lock is not None:
             lock.close()
 
+    # The run's own record follows: from here a Ctrl-C writes no other.
+    _state["done"] = True
     if job.get("status") == "completed":
         renamed = f" (renamed from {job['original_collection']})" if job.get("renamed") else ""
         _say(f"loaded into collection {job['collection']}{renamed}: {job['chunks_written']} chunks, "
@@ -36305,15 +36315,52 @@ class LoaderTests(Folders):
         loader._state.clear()
         loader._state["job"] = {"collection": "Policies"}
         loader.signal.signal.reset_mock()
-        err = io.StringIO()
-        with patch.object(loader.os, "kill") as kill, contextlib.redirect_stderr(err):
+        real_write = os.write
+        with patch.object(loader.os, "kill") as kill, \
+                patch.object(loader.os, "write", side_effect=lambda fd, data: len(data) if fd == 2
+                             else real_write(fd, data)) as write:
             handler(loader.signal.SIGINT, None)
         loader.signal.signal.assert_called_once_with(loader.signal.SIGINT, loader.signal.SIG_DFL)
         kill.assert_called_once_with(os.getpid(), loader.signal.SIGINT)
-        self.assertIn("load interrupted: INTERRUPTED", err.getvalue())
+        # Straight to fd 2, not through sys.stderr (a reentrant print could raise).
+        self.assertEqual(write.call_args_list[0][0], (2, b"loader: load interrupted: INTERRUPTED\n"))
         record = self.records("operator.load")[-1]
         self.assertEqual((record["result"], record["collection"], record["target"], record["details"]["code"]),
                          ("interrupted", "Policies", name, "INTERRUPTED"))
+
+    def test_the_kill_happens_even_when_the_record_fails(self):
+        handler = loader._interrupted("ragpkg-x.tar.gz", "abort", False)
+        loader._state.clear()
+        with patch.object(loader.os, "kill") as kill, patch.object(loader.os, "write"), \
+                patch.object(loader, "_audit", side_effect=RuntimeError("reentrant call")):
+            with self.assertRaises(RuntimeError):
+                handler(loader.signal.SIGINT, None)
+        kill.assert_called_once_with(os.getpid(), loader.signal.SIGINT)
+        with patch.object(loader.os, "kill") as kill, \
+                patch.object(loader.os, "write", side_effect=OSError("closed")):
+            with self.assertRaises(OSError):
+                handler(loader.signal.SIGINT, None)
+        kill.assert_called_once_with(os.getpid(), loader.signal.SIGINT)
+        loader._state.clear()
+
+    def test_after_the_runs_own_record_ctrl_c_writes_none(self):
+        # The run marks itself done before its final record, whatever the result.
+        name = self.package()
+        for run, argv in ((self.fake_run(collection="P", original_collection="P"), [name]),
+                          (self.fake_run(status="failed", error_code="IMPORT_FAILED"), [name]),
+                          (self.fake_run(), ["ragpkg-absent.tar.gz"])):
+            with self.subTest(argv=argv, run=run), run:
+                self.main(argv)
+                self.assertIs(loader._state.get("done"), True)
+                handler = loader.signal.signal.call_args_list[0][0][1]
+                before = len(self.records())
+                with patch.object(loader.os, "kill") as kill, patch.object(loader.os, "write") as write:
+                    handler(loader.signal.SIGINT, None)
+                kill.assert_called_once()
+                write.assert_not_called()
+                self.assertEqual(len(self.records()), before)
+                loader.signal.signal.reset_mock()
+        loader._state.clear()
 
     def test_ctrl_c_while_a_record_is_written_writes_no_second_one(self):
         handler = loader._interrupted("ragpkg-x.tar.gz", "abort", False)
