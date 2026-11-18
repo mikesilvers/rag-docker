@@ -726,6 +726,19 @@ class StackArgumentTests(unittest.TestCase):
             (['run', '--telemetry', '--telemetry-pin', str(ROOT / 'telemetry/image.json')], {}),
             (['up', '--telemetry', '--telemetry-pin', str(ROOT / 'telemetry')], {}),
             (['telemetry-mode', '--telemetry', '--telemetry-pin', pin], {'RAG_VERIFY_LOCK_HELD': '1'}),
+            # Query-only mode (#670): its own option, never with --lan or --telemetry; its
+            # switch only under an inherited lock of a --query-only run, with a package name.
+            (['down', '--query-only'], {}),
+            (['run', '--query-only', '--lan'], {}),
+            (['up', '--telemetry', '--query-only'], {}),
+            (['run', '--package', 'ragpkg-a.tar.gz'], {}),
+            (['query-only-mode', '--package', 'ragpkg-a.tar.gz'], {}),
+            (['query-only-mode', '--package', 'ragpkg-a.tar.gz'], {'RAG_VERIFY_LOCK_HELD': '1'}),
+            (['query-only-mode', '--package', '../ragpkg-a.tar.gz'],
+             {'RAG_VERIFY_LOCK_HELD': '1', 'RAG_VERIFY_QUERY_ONLY': '1'}),
+            (['query-only-mode', '--package', 'notes.txt'],
+             {'RAG_VERIFY_LOCK_HELD': '1', 'RAG_VERIFY_QUERY_ONLY': '1'}),
+            (['query-only-mode'], {'RAG_VERIFY_LOCK_HELD': '1', 'RAG_VERIFY_QUERY_ONLY': '1'}),
             (['bogus'], {}),
             ([], {}),
         ]
@@ -851,6 +864,65 @@ class StackDockerCallTests(unittest.TestCase):
         curls = [c for c in box.calls() if c[0] == 'curl']
         self.assertIn('https://localhost:8081/api/health', curls[-1])
         self.assert_no_live_object(box.calls())
+
+    def test_up_query_only_exports_the_mode(self):
+        # #670: up and run take --query-only; the suites read RAG_VERIFY_QUERY_ONLY.
+        for argv, expected in ((['--query-only'], '1'), ([], '0')):
+            with self.subTest(argv=argv):
+                box = Sandbox(self)
+                (box.root / 'config.json').write_text(json.dumps(passing_config(ROOT, box.exports)))
+                result = box.run(['bash', str(STACK), 'up', *argv], STUB_UP_OK='1', STUB_CURL_CODE='200')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('export RAG_VERIFY_QUERY_ONLY=' + expected, result.stdout)
+                compose = [c[1:] for c in box.calls() if c[0] == 'docker' and c[1:2] == ['compose']]
+                self.assertEqual(len([c for c in compose if 'up' in c]), 1, 'up --query-only starts the default once')
+
+    def test_query_only_mode_restarts_the_project_with_only_the_package(self):
+        # #670: under the inherited lock of a --query-only run, the default instance's
+        # containers, network and volumes go (not its images or the model copy), the
+        # package comes back alone in an empty exports folder, and the project starts
+        # again from the query-only configuration after the guard, without a build.
+        box = Sandbox(self)
+        (box.root / 'config.json').write_text(json.dumps(passing_config(ROOT, box.exports)))
+        lock = box.root / 'verify.lock'
+        lock.mkdir()
+        (lock / 'pid').write_text(str(os.getpid()))
+        box.exports.mkdir()
+        package = 'ragpkg-vfyqueryonly-1.tar.gz'
+        (box.exports / package).write_bytes(b'package bytes')
+        (box.exports / 'ragpkg-other.tar.gz').write_bytes(b'left on the build instance')
+        result = box.run(['bash', str(STACK), 'query-only-mode', '--package', package, '--checkout', str(ROOT)],
+                         RAG_VERIFY_LOCK_HELD='1', RAG_VERIFY_QUERY_ONLY='1', STUB_UP_OK='1',
+                         STUB_CURL_CODE='200')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        docker = [c[1:] for c in box.calls() if c[0] == 'docker']
+        compose = [c for c in docker if c[:1] == ['compose']]
+        for call in compose:
+            self.assertEqual(call[1:3], ['-p', 'rag-verify'], call)
+        self.assertEqual([c[3:] for c in compose], [
+            ['down', '-v', '--remove-orphans'],
+            ['config', '--format', 'json'],
+            ['up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '900'],
+        ])
+        self.assertFalse(any(c[:2] in (['image', 'rm'], ['volume', 'rm']) for c in docker))
+        self.assertEqual(sorted(p.name for p in box.exports.iterdir()), [package])
+        self.assertEqual((box.exports / package).read_bytes(), b'package bytes')
+        self.assertFalse((box.private / 'query-only-carry').exists())
+        curls = [c for c in box.calls() if c[0] == 'curl']
+        self.assertIn('http://localhost:8081/api/health', curls[-1])
+        self.assert_no_live_object(box.calls())
+
+    def test_query_only_mode_refuses_a_missing_package_before_docker(self):
+        box = Sandbox(self)
+        (box.root / 'config.json').write_text(json.dumps(passing_config(ROOT, box.exports)))
+        lock = box.root / 'verify.lock'
+        lock.mkdir()
+        (lock / 'pid').write_text(str(os.getpid()))
+        box.exports.mkdir()
+        result = box.run(['bash', str(STACK), 'query-only-mode', '--package', 'ragpkg-absent.tar.gz'],
+                         RAG_VERIFY_LOCK_HELD='1', RAG_VERIFY_QUERY_ONLY='1', STUB_UP_OK='1')
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual([c for c in box.calls() if c[0] == 'docker'], [])
 
     def test_up_lan_stops_when_the_lan_guard_refuses(self):
         box = Sandbox(self)

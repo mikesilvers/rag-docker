@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import {
   api, CollectionInfo, ExportJob, ExportJobEntry, ImportJob, ImportJobEntry, PackageSummary, TuneOptions,
 } from '../api/client'
-import { useRole } from '../context/AuthContext'
+import { useAuth, useRole } from '../context/AuthContext'
 import JobList, { JobRow, newestToOpen, useJobList } from '../components/JobList'
 
 // A transfer job is running until it completes or fails (#617).
@@ -59,6 +59,8 @@ function message(e: unknown): string {
 
 export default function TransferPage() {
   const { role } = useRole()
+  // Query-only mode (#670): no import here; packages are loaded on the host.
+  const queryOnly = useAuth().user?.query_only === true
   // Running and recent exports and imports, in one list (#617). Each panel
   // opens its own newest job on the first answer, unless it already has one.
   const exportJobs = useJobList<ExportJobEntry>(loadExportJobs, transferRunning)
@@ -477,7 +479,13 @@ export default function TransferPage() {
 
       {/* ── Import ─────────────────────────────────────────────────────── */}
       <section className="bg-white border rounded p-4">
-        <h2 className="font-medium mb-3">Import a package</h2>
+        <h2 className="font-medium mb-3">{queryOnly ? 'Packages in ./exports' : 'Import a package'}</h2>
+        {queryOnly && (
+          <p className="text-xs text-gray-500 mb-3">
+            This instance is query-only. An operator loads a package on the host
+            with <code>python -m loader</code> (README, "Query-only mode").
+          </p>
+        )}
 
         <div className="flex items-center justify-between mb-1">
           <label className="block text-sm font-medium">Package in ./exports</label>
@@ -514,6 +522,7 @@ export default function TransferPage() {
           </p>
         )}
 
+        {!queryOnly && (<>
         {selectedEncrypted && (
           <div className="mb-3">
             <label className="block text-sm font-medium mb-1">Passphrase</label>
@@ -575,6 +584,7 @@ export default function TransferPage() {
             ))}
           </div>
         )}
+        </>)}
       </section>
     </div>
   )

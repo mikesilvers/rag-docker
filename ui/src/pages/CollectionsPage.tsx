@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { api, AdminUser, CollectionAccess, CollectionInfo, ServicePrincipal } from '../api/client'
+import { useAuth } from '../context/AuthContext'
 
 // Who may use each collection (#606): "Open", "Restricted (n)" with n grants,
 // or a dash when the state couldn't be read.
@@ -9,6 +10,8 @@ function accessLabel(a: CollectionAccess | null | undefined): string {
 }
 
 export default function CollectionsPage() {
+  // Query-only mode (#670): no create or delete; the list and access stay.
+  const queryOnly = useAuth().user?.query_only === true
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   // A refused create is shown inside the New Collection modal, and a failed
   // list on the page; both were hidden or swallowed before (#379).
@@ -158,7 +161,9 @@ export default function CollectionsPage() {
     <div className="max-w-4xl mx-auto">
       <div className="flex justify-between items-center mb-6">
         <h1 className="text-2xl font-bold">Collections</h1>
-        <button onClick={openCreate} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">+ New Collection</button>
+        {!queryOnly && (
+          <button onClick={openCreate} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">+ New Collection</button>
+        )}
       </div>
       {listError && <p role="alert" className="text-red-600 text-sm mb-4">{listError}</p>}
       <table className="w-full text-sm border-collapse">
@@ -184,7 +189,9 @@ export default function CollectionsPage() {
               <td className="py-2">{accessLabel(access[c.name])}</td>
               <td className="py-2 space-x-3">
                 <button onClick={() => openAccess(c.name)} className="text-blue-500 hover:text-blue-700 text-xs">Access</button>
-                <button onClick={() => { setDeleteError(''); setDeleteTarget(c.name) }} className="text-red-400 hover:text-red-600 text-xs">Delete</button>
+                {!queryOnly && (
+                  <button onClick={() => { setDeleteError(''); setDeleteTarget(c.name) }} className="text-red-400 hover:text-red-600 text-xs">Delete</button>
+                )}
               </td>
             </tr>
           ))}

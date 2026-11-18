@@ -5,22 +5,23 @@ import type { Role } from '../api/client'
 
 // The pages grouped into menus (#616). Each role sees the pages it had before;
 // a menu with none of them isn't shown. Hiding a page is a convenience: the
-// router and the API refuse what the role can't do (#25).
-interface PageEntry { label: string; to: string; roles: Role[] }
+// router and the API refuse what the role can't do (#25). A page that changes
+// data (`writes`) is hidden in query-only mode, where the API refuses it (#670).
+interface PageEntry { label: string; to: string; roles: Role[]; writes?: true }
 interface MenuDef { key: string; label: string; entries: PageEntry[] }
 
 const STAFF: Role[] = ['engineer', 'developer']
 const ENGINEER: Role[] = ['engineer']
 const MENUS: MenuDef[] = [
   { key: 'data', label: 'Data', entries: [
-    { label: 'Import', to: '/import', roles: STAFF },
-    { label: 'Prepare', to: '/prepare', roles: STAFF },
+    { label: 'Import', to: '/import', roles: STAFF, writes: true },
+    { label: 'Prepare', to: '/prepare', roles: STAFF, writes: true },
     { label: 'Transfer', to: '/transfer', roles: STAFF },
   ] },
   { key: 'tune', label: 'Tune', entries: [
-    { label: 'Chunking', to: '/chunking', roles: STAFF },
-    { label: 'Retrieval', to: '/retrieval', roles: STAFF },
-    { label: 'Gold Standard', to: '/goldstandard', roles: STAFF },
+    { label: 'Chunking', to: '/chunking', roles: STAFF, writes: true },
+    { label: 'Retrieval', to: '/retrieval', roles: STAFF, writes: true },
+    { label: 'Gold Standard', to: '/goldstandard', roles: STAFF, writes: true },
   ] },
   { key: 'admin', label: 'Admin', entries: [
     { label: 'Collections', to: '/collections', roles: ENGINEER },
@@ -157,6 +158,7 @@ export default function NavBar() {
   const navigate = useNavigate()
   const { pathname } = useLocation()
   const role = user?.role ?? null
+  const queryOnly = user?.query_only === true
   const [open, setOpen] = useState<{ key: string; focus: Focus } | null>(null)
 
   // A change of page closes any open menu.
@@ -178,13 +180,19 @@ export default function NavBar() {
   })
 
   const menus = MENUS
-    .map(m => ({ ...m, entries: m.entries.filter(e => role !== null && e.roles.includes(role)) }))
+    .map(m => ({ ...m, entries: m.entries.filter(e => role !== null && e.roles.includes(role)
+      && !(queryOnly && e.writes)) }))
     .filter(m => m.entries.length > 0)
   const accountCurrent = pathname === '/account' || pathname === '/account/password'
 
   return (
     <nav className="bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-4">
       <span className="font-bold text-blue-700 text-lg mr-2">RAG Platform</span>
+      {queryOnly && (
+        <span data-testid="nav-query-only"
+              title="This instance is query-only: it answers questions on its collections and can't change them."
+              className="text-xs bg-amber-100 text-amber-800 px-2 py-1 rounded">Query-only</span>
+      )}
       <Link
         to="/qa"
         aria-current={pathname === '/qa' ? 'page' : undefined}

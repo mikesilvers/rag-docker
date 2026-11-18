@@ -200,6 +200,10 @@ services:
       # docker-compose.lan.yml serves TLS and sets it true (#26). Exactly true
       # or false.
       AUTH_COOKIE_SECURE: "false"
+      # Query-only mode (#670): an instance that serves questions on collections
+      # loaded with `python -m loader` and can't change them. Exactly true or
+      # false; the overlay docker-compose.query-only.yml sets it true.
+      RAG_QUERY_ONLY: "false"
       # The audit log (#29), in the ingest_uploads volume under audit/ and read
       # on the AI Engineer's Audit page. Whether a query's question text is
       # recorded: exactly true or false, off by default. audit.jsonl is rotated
@@ -378,6 +382,38 @@ services:
 volumes:
   # The active certificate and key, written by tls-init, read by the proxy.
   lan_certs:
+```
+
+### docker-compose.query-only.yml
+
+```yaml
+# Query-only mode (#670): an instance that serves questions on collections
+# built elsewhere and can't change them. Opt-in, and only together with the
+# base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.query-only.yml up -d
+#
+# and, to share it with your office in LAN mode (#26), with LAN mode's file too:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.lan.yml -f docker-compose.query-only.yml up -d
+#
+# What this changes: the API runs with RAG_QUERY_ONLY=true. It then refuses
+# every route that creates, changes or deletes a collection or its data with
+# 403 QUERY_ONLY (ingest, preparation, chunking and retrieval settings, gold
+# standard, tuning, collection create and delete, package import), and the UI
+# hides their pages. Questions, accounts, keys, collection access, the audit
+# log and export keep working. No model setting changes.
+#
+# Collections are built and exported on a full instance, the package is copied
+# into ./exports here, and an operator loads it on this host:
+#
+#   docker compose exec api python -m loader <package> [--on-conflict abort|rename|replace]
+#
+# See README "Query-only mode".
+services:
+  api:
+    environment:
+      RAG_QUERY_ONLY: "true"
 ```
 
 ### docker-compose.lan.verify.yml
@@ -1268,6 +1304,11 @@ class Settings(BaseSettings):
     # refuses to start unless the cookie is Secure and an enabled Engineer
     # exists (lan_mode.py).
     rag_lan_mode: bool = False
+    # Query-only mode (#670), set only by docker-compose.query-only.yml. When
+    # true the API refuses every route that creates, changes or deletes a
+    # collection or its data (auth/policy.py QUERY_ONLY_REFUSED) with
+    # 403 QUERY_ONLY; collections are loaded on the host with `python -m loader`.
+    rag_query_only: bool = False
     # The audit log (#29): append-only JSON Lines in the ingest_uploads volume,
     # rotated by size (services/audit.py). The folder is its own setting so
     # tests that point upload_dir elsewhere don't find an audit/ folder there.
@@ -1288,7 +1329,7 @@ class Settings(BaseSettings):
     # briefly (maintainer's decision, #638).
     max_preparation_bytes: int = 20 * 1024 * 1024 * 1024
 
-    @field_validator("auth_cookie_secure", "rag_lan_mode", "audit_log_questions", mode="before")
+    @field_validator("auth_cookie_secure", "rag_lan_mode", "rag_query_only", "audit_log_questions", mode="before")
     @classmethod
     def _exact_boolean(cls, value, info):
         # pydantic would read "1", "yes" or "on" as true. A typo in a security
@@ -1422,6 +1463,257 @@ def enforce() -> None:
         # One line, and SystemExit, which Python doesn't print as a traceback.
         print(reason, file=sys.stderr, flush=True)
         raise SystemExit(1)
+```
+
+### api/loader.py
+
+```python
+"""The operator command that loads an export package into a query-only instance (#670).
+
+    docker compose exec api python -m loader PACKAGE [--on-conflict abort|rename|replace]
+
+PACKAGE is the name of a package file in ./exports (the api container's
+/app/exports): ragpkg-*.tar.gz, or ragpkg-*.tar.gz.age when it is encrypted.
+Copy the package there first (scp, a shared folder, a USB drive). The load runs
+the import code of POST /import (services/importer.py) in this process, so
+every check of an import applies: the archive, its digests, its sources, and
+the embedding model and dimensions (#390), which must be this instance's. A
+package that carries models installs them, and the collection's retrieval and
+ingest settings and gold standard sessions come with it.
+
+--on-conflict says what to do when the collection already exists: abort (the
+default) refuses, rename loads it under a new name, replace loads it over the
+existing one. While any load runs, a question or export of its collection can
+meet it half-built or fail.
+
+It runs only on a query-only instance (RAG_QUERY_ONLY=true), where the API
+itself changes no collection; a full instance imports on the Transfer page. One
+load runs at a time. Every collection it creates, a rename included, starts
+restricted with no grants, so only AI Engineers can use it until one opens it
+or grants it on the Collections page; it never copies another collection's
+access. Only a replace keeps the collection's access.
+
+The passphrase of an encrypted package is asked for without echo when standard
+input is a terminal, and otherwise read as the first line of standard input
+(`docker compose exec -T api python -m loader NAME < file`). It is never an
+argument, never printed and never recorded.
+
+Each step is one line on standard error, prefixed "loader: ". Exit status: 0
+loaded, 1 refused or failed, 2 usage error. Every run past the arguments writes
+one audit record (#29), `operator.load`, with actor `operator` and result
+`success`, `refused` (before the load), `failed` (the load failed) or
+`interrupted` (Ctrl-C): the package, the collection, the conflict mode, whether
+it is encrypted, and the chunks loaded or the code. A record that can't be
+written is one more line.
+
+Ctrl-C writes the `interrupted` record and then stops the load at once, as a
+kill would. What it leaves: a collection it was building, which the next load
+removes (it runs the import's clean-up of an interrupted import first); the
+load's work folder (import-* in UPLOAD_DIR) and a replace's scratch staging
+collection, which stay until the API's next start (docker compose restart api).
+A replace builds the package into a recovery collection before it deletes the
+old collection, so one stopped after that delete leaves the collection missing
+or partial (the recovery collection holds the package's data, not the old
+data): load the package again with --on-conflict replace to put it back.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import getpass
+import os
+import signal
+import stat
+import sys
+import threading
+import uuid
+from pathlib import Path
+
+PROGRESS_SECONDS = 5
+
+
+class _Refused(Exception):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def _say(line: str) -> None:
+    print("loader: " + line, file=sys.stderr, flush=True)
+
+
+# The run's state, for the Ctrl-C handler: the job once the load has started,
+# whether a record is being written (the handler then writes none: the audit
+# log's locks are held, and that record is the run's own), and whether the
+# run's final record has been started (`done`: a later Ctrl-C writes none).
+_state: dict = {}
+
+
+def _audit(package: str, on_conflict: str, encrypted: bool, collection: str | None,
+           result: str = "success", code: str | None = None, chunks: int | None = None) -> None:
+    from services import audit
+    details: dict = {"on_conflict": on_conflict, "encrypted": encrypted}
+    if chunks is not None:
+        details["chunks"] = chunks
+    if code:
+        details["code"] = code
+    _state["auditing"] = True
+    try:
+        written = audit.record("operator.load", result=result, actor="operator", actor_kind="operator",
+                               target=package, collection=collection, details=details)
+    finally:
+        _state["auditing"] = False
+    if not written:
+        _say("the audit record could not be written")
+
+
+def _interrupted(package: str, on_conflict: str, encrypted: bool):
+    """The SIGINT handler: record the load as interrupted, then die of the
+    signal as a kill would, so the import's `finally` never retires the marker
+    of a half-built collection."""
+    def handler(signum, frame):
+        # The kill is in `finally`: nothing raised here may reach the import's
+        # own clean-up. The line goes straight to fd 2, since print could be
+        # interrupted in the middle of the main thread's own write to stderr.
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            if not (_state.get("auditing") or _state.get("done")):
+                os.write(2, b"loader: load interrupted: INTERRUPTED\n")
+                job = _state.get("job") or {}
+                _audit(package, on_conflict, encrypted, job.get("collection"), result="interrupted",
+                       code="INTERRUPTED")
+        finally:
+            os.kill(os.getpid(), signal.SIGINT)
+    return handler
+
+
+def _passphrase() -> str:
+    if sys.stdin.isatty():
+        return getpass.getpass("Passphrase: ")
+    return sys.stdin.readline().rstrip("\r\n")
+
+
+def _lock(upload_dir: str):
+    """The one-load-at-a-time lock, held until the returned file is closed."""
+    Path(upload_dir).mkdir(parents=True, exist_ok=True)
+    handle = open(os.path.join(upload_dir, "loader.lock"), "a")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise _Refused("LOAD_IN_PROGRESS", "another load is running on this instance; "
+                                           "try again when it has finished") from None
+    return handle
+
+
+def _progress(job: dict, done: threading.Event) -> None:
+    shown = 0
+    while not done.wait(PROGRESS_SECONDS):
+        count = job.get("chunks_written") or 0
+        if count != shown:
+            shown = count
+            _say(f"chunks written: {count}")
+
+
+def _load(package: str, on_conflict: str, passphrase: str | None) -> dict:
+    """Run the import code on the package and return its finished job record."""
+    from services import importer
+    job_id = "load-" + uuid.uuid4().hex[:8]
+    # The job record lives in this process only: the import's job store is
+    # unbound here (jobstore.py), so nothing is added to the API's job lists.
+    importer._jobs[job_id] = {
+        "job_id": job_id, "status": "queued", "filename": package, "on_conflict": on_conflict,
+        "collection": None, "original_collection": None, "chunks_written": 0, "fidelity": None,
+        "renamed": False, "notes": [], "restored_sessions": [], "error": None, "error_code": None,
+        "error_detail": None, "encrypted": passphrase is not None,
+        "owner": None, "operator": True,        # access: restricted, no grants (#670)
+    }
+    job = importer._jobs[job_id]
+    _state["job"] = job
+    done = threading.Event()
+    ticker = threading.Thread(target=_progress, args=(job, done), daemon=True)
+    ticker.start()
+    try:
+        importer._run(job_id, package, on_conflict, passphrase)
+    finally:
+        done.set()
+    return job
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m loader",
+        description="Load an export package from ./exports into this query-only instance.")
+    parser.add_argument("package", help="the package's file name in ./exports")
+    parser.add_argument("--on-conflict", choices=("abort", "rename", "replace"), default="abort",
+                        help="when the collection already exists (default: abort)")
+    args = parser.parse_args(argv)
+
+    from services import age_stream, package_retention
+    if "/" in args.package or not package_retention.valid_name(args.package):
+        parser.error(f"not a package name: {args.package!r} (ragpkg-*.tar.gz or ragpkg-*.tar.gz.age, "
+                     "a file in ./exports)")
+
+    from config import settings
+    from services import importer, packager
+    package, on_conflict = args.package, args.on_conflict
+    encrypted = age_stream.is_encrypted_name(package)
+    # Ctrl-C is recorded, then acts as a kill: Python's KeyboardInterrupt would
+    # run the import's clean-up, which retires the marker of a half-built
+    # collection that the next load must remove.
+    _state.clear()
+    signal.signal(signal.SIGINT, _interrupted(package, on_conflict, encrypted))
+    _say(f"loading {package} (on conflict: {on_conflict})")
+    lock = None
+    try:
+        if not settings.rag_query_only:
+            raise _Refused("NOT_QUERY_ONLY", "this instance isn't query-only (RAG_QUERY_ONLY is false); "
+                                             "import the package on the Transfer page instead")
+        lock = _lock(settings.upload_dir)
+        path = packager.exports_dir() / package
+        try:
+            regular = stat.S_ISREG(os.lstat(path).st_mode)
+        except OSError:
+            regular = False
+        if not regular:
+            raise _Refused("PACKAGE_NOT_FOUND", f"no package named '{package}' in ./exports; copy it there first")
+        passphrase = None
+        if encrypted:
+            passphrase = _passphrase()
+            if not passphrase:
+                raise _Refused("PASSPHRASE_REQUIRED", f"'{package}' is encrypted; give its passphrase")
+        # What an earlier load left when it was killed: the same clean-up the
+        # API runs at its start. Under the lock, and nothing else imports here.
+        for removed in importer.sweep_interrupted_imports():
+            _say(f"removed a collection an interrupted load left half-built: {removed}")
+        job = _load(package, on_conflict, passphrase)
+    except _Refused as refused:
+        _state["done"] = True
+        _say(f"load refused: {refused.code}: {refused}")
+        _audit(package, on_conflict, encrypted, None, result="refused", code=refused.code)
+        return 1
+    finally:
+        if lock is not None:
+            lock.close()
+
+    # The run's own record follows: from here a Ctrl-C writes no other.
+    _state["done"] = True
+    if job.get("status") == "completed":
+        renamed = f" (renamed from {job['original_collection']})" if job.get("renamed") else ""
+        _say(f"loaded into collection {job['collection']}{renamed}: {job['chunks_written']} chunks, "
+             f"{job.get('fidelity')}")
+        for note in job.get("notes") or []:
+            _say("note: " + str(note))
+        _audit(package, on_conflict, encrypted, job["collection"], chunks=job["chunks_written"])
+        return 0
+    code = job.get("error_code") or "IMPORT_FAILED"
+    _say(f"load failed: {code}: {job.get('error')}")
+    _audit(package, on_conflict, encrypted, job.get("collection"), result="failed", code=code)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 ```
 
 ### api/tls_cert.py
@@ -2411,6 +2703,8 @@ class AuthUser(BaseModel):
     mfa_enrolled: Optional[bool] = None
     mfa_required: Optional[bool] = None
     mfa_enrollment_required: Optional[bool] = None
+    # Query-only mode (#670): the UI hides the pages that change data.
+    query_only: Optional[bool] = None
 
 
 class AdminUser(BaseModel):
@@ -14287,7 +14581,7 @@ def _refused(owner, source: str) -> bool:
     return exists_fail_closed(source) and not all(auth_store.owner_has_access(owner, n) for n in names)
 
 
-def _start_access(owner, source: str, target: str):
+def _start_access(owner, source: str, target: str, operator: bool = False):
     """A collection this import creates (#606): when the package's collection
     (`package_source`) exists here, the new one gets its state, and for a
     staging or recovery copy the narrowest of the copy's and every
@@ -14295,7 +14589,13 @@ def _start_access(owner, source: str, target: str):
     any of them restricts; otherwise it starts restricted to the job's owner.
     Written before any data; returns (the state replaced, the state written)
     for auth_store.put_back. A job with no owner (a direct call in tests)
-    records nothing and returns None."""
+    records nothing and returns None. A load by the operator (`python -m
+    loader`, #670) has no owner either: every collection it creates starts
+    restricted with no grants (Engineers only, until one opens or grants it),
+    and never copies an existing collection's state, a rename or a staging
+    copy's package included (maintainer, 2026-11-18)."""
+    if operator:
+        return auth_store.restrict_to(target, None)
     if owner is None:
         return None
     if source != target and exists_fail_closed(source):
@@ -14394,7 +14694,8 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
             # A collection this import creates gets its access state before any
             # data is written; a replace keeps the target's (#606).
             if not exists or on_conflict != "replace":
-                states = _start_access(job.get("owner"), source or target, target)
+                states = _start_access(job.get("owner"), source or target, target,
+                                       operator=job.get("operator") is True)
                 if states is not None:
                     before, written = states
                     new_access = (target, written, before)       # put_back's (collection, expected, previous)
@@ -18790,6 +19091,40 @@ HUMAN_ONLY = frozenset(path for _, path in ACCESS
 STATE_CHANGING_GET = frozenset({"/packages/{filename}"})
 
 
+# Query-only mode (#670, RAG_QUERY_ONLY): the routes that create, change or
+# delete a collection or its data. With the mode on, the auth middleware
+# refuses each of them with 403 QUERY_ONLY, after every other check.
+QUERY_ONLY_REFUSED = frozenset({
+    ("POST", "/collections"),
+    ("DELETE", "/collections/{name}"),
+    ("POST", "/ingest/upload"),
+    ("POST", "/ingest/config"),
+    ("POST", "/retrieval/config"),
+    ("POST", "/goldstandard/generate"),
+    ("POST", "/goldstandard/regenerate"),
+    ("PATCH", "/goldstandard/session/{session_id}/pair/{pair_id}"),
+    ("POST", "/goldstandard/save"),
+    ("POST", "/import"),          # packages are loaded on the host (python -m loader)
+    ("POST", "/prepare/upload"),
+    ("DELETE", "/prepare/documents/{document_id}"),
+    ("DELETE", "/prepare/documents/{document_id}/prepared"),
+    ("POST", "/prepare/jobs"),
+    ("POST", "/prepare/job/{job_id}/cancel"),
+    ("POST", "/prepare/import"),
+    ("POST", "/tune/rechunk"),
+    ("POST", "/tune/reembed"),
+    ("POST", "/tune/reindex"),
+})
+# Every other route that changes state keeps working in query-only mode: the
+# /auth routes, a query, export and the package download (#677), and collection
+# access (#606), since the query-only machine has its own accounts. A new
+# data-changing route lands here until it is classified; test_query_only.py
+# pins this set, so it fails until someone decides.
+QUERY_ONLY_KEPT = frozenset(key for key in ACCESS
+                            if (key[0] != "GET" or key[1] in STATE_CHANGING_GET)
+                            and key not in QUERY_ONLY_REFUSED)
+
+
 def required(method: str, path: str) -> str | None:
     """The access a route needs, or None when it has no entry (refused)."""
     return ACCESS.get(("GET" if method == "HEAD" else method, path))
@@ -19875,6 +20210,8 @@ The refusals, in the order they apply:
                               the user hasn't set it up (#607); only the session
                               routes and their own MFA routes answer
   403 FORBIDDEN               the user's role is too low
+  403 QUERY_ONLY              query-only mode (#670) and a route that changes a
+                              collection or its data (policy.QUERY_ONLY_REFUSED)
 
 A request with an `Authorization` header is a service key request (PR 3): the
 header alone decides and any cookie is ignored, with no fallback to it.
@@ -19882,6 +20219,7 @@ header alone decides and any cookie is ignored, with no fallback to it.
   401 KEY_INVALID             not one `Bearer <key>` header with a valid key (one answer for every reason)
   403 KEY_NOT_ALLOWED         a route keys can't use (policy.HUMAN_ONLY)
   403 FORBIDDEN               the principal's role is too low
+  403 QUERY_ONLY              as above
 It has no origin check (it carries no cookie, Q26) and no password change.
 
 Each 403 comes back with the principal it refused, which the audit log
@@ -19898,6 +20236,7 @@ from urllib.parse import urlsplit
 
 from starlette.requests import Request, cookie_parser
 
+from config import settings
 from utils import api_error
 
 from . import keys, policy, store
@@ -19999,7 +20338,7 @@ class AuthMiddleware:
                              "`docker compose exec api python -m auth bootstrap <username>`."), None
         authorization = _headers(scope, b"authorization")
         if authorization:
-            return await self._check_key(access, template, authorization)
+            return await self._check_key(scope, access, template, authorization)
         principal = await asyncio.to_thread(store.authenticate, session_token(scope))
         if principal is None:
             return api_error(401, "AUTH_REQUIRED", "Log in to use this."), None
@@ -20019,9 +20358,9 @@ class AuthMiddleware:
         if access not in (policy.SESSION, policy.MFA) and policy.rank(principal.role) < policy.rank(access):
             return api_error(403, "FORBIDDEN", "Your role can't do this.",
                              detail={"required_role": access}), principal
-        return None, principal
+        return _query_only(scope, template), principal
 
-    async def _check_key(self, access, template, authorization):
+    async def _check_key(self, scope, access, template, authorization):
         key = keys.bearer(authorization[0]) if len(authorization) == 1 else None
         principal = await asyncio.to_thread(store.authenticate_key, key) if key else None
         if principal is None:
@@ -20031,7 +20370,20 @@ class AuthMiddleware:
         if access not in (policy.SESSION, policy.MFA) and policy.rank(principal.role) < policy.rank(access):
             return api_error(403, "FORBIDDEN", "Your role can't do this.",
                              detail={"required_role": access}), principal
-        return None, principal
+        return _query_only(scope, template), principal
+
+
+QUERY_ONLY_MESSAGE = ("This instance is query-only: its collections can't be created, changed or deleted "
+                      "here. Collections are loaded on the host with `python -m loader`.")
+
+
+def _query_only(scope, template):
+    """The 403 QUERY_ONLY refusal (#670), or None. Checked last, so a caller
+    refused for any other reason is refused as before; read on each request."""
+    method = "GET" if scope["method"] == "HEAD" else scope["method"]
+    if settings.rag_query_only and (method, template) in policy.QUERY_ONLY_REFUSED:
+        return api_error(403, "QUERY_ONLY", QUERY_ONLY_MESSAGE)
+    return None
 
 
 class Unlisted(Exception):
@@ -20451,7 +20803,9 @@ def _address(request: Request) -> str:
 
 
 def _user_body(username: str, role: str, must_change_password: bool) -> dict:
-    return {"username": username, "role": role, "must_change_password": must_change_password}
+    # query_only (#670) in every user answer, so the UI knows it from the login on.
+    return {"username": username, "role": role, "must_change_password": must_change_password,
+            "query_only": settings.rag_query_only}
 
 
 def _mfa_body(enrolled: bool, required: bool) -> dict:
@@ -21113,7 +21467,8 @@ know with `note()` (a collection named in a body, file names, a typed
 username). A refusal by the auth middleware is recorded only when it is a 403
 for an identified principal; 401s and 503s write nothing. Jobs get one record
 when they are stored (`job_started`, called by the job store) and one when they
-end (`job_ended`). The operator command and the API's start write their own,
+end (`job_ended`). The operator commands (`python -m auth`, `python -m loader`,
+#670) and the API's start write their own,
 and so does the deletion of an export package (`package_deleted`, #677).
 
 **What never does.** No password, session token, API key, passphrase, answer
@@ -21222,7 +21577,9 @@ ACTIONS: dict[tuple[str, str], str] = {
 ACCESS_REFUSED = "collection.access.refused"
 # An export package deleted after its download or when it expired (#677).
 PACKAGE_DELETE = "package.delete"
-OPERATOR_ACTIONS = ("bootstrap", "create-user", "reset-password", "set-role", "disable", "enable", "reset-mfa")
+# The operator commands: python -m auth's (#25), and python -m loader's load (#670).
+OPERATOR_ACTIONS = ("bootstrap", "create-user", "reset-password", "set-role", "disable", "enable", "reset-mfa",
+                    "load")
 # Every action name, for the API's filter and the UI's list.
 ALL_ACTIONS = tuple(sorted(set(ACTIONS.values()) | {"operator." + a for a in OPERATOR_ACTIONS}
                           | {"system.start", ACCESS_REFUSED, PACKAGE_DELETE}))
@@ -22366,6 +22723,9 @@ export default function AppRouter() {
     )
   }
   const role = state.user.role
+  // Query-only mode (#670): the pages that change data aren't routed; the API
+  // refuses their writes whatever the UI shows.
+  const queryOnly = state.user.query_only === true
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -22379,11 +22739,15 @@ export default function AppRouter() {
           <Route path="/account/password" element={<ChangePasswordPage />} />
           {role !== 'end_user' && (
             <>
-              <Route path="/import" element={<ImportPage />} />
-              <Route path="/prepare" element={<PreparePage />} />
-              <Route path="/chunking" element={<ChunkingPage />} />
-              <Route path="/retrieval" element={<RetrievalPage />} />
-              <Route path="/goldstandard" element={<GoldStandardPage />} />
+              {!queryOnly && (
+                <>
+                  <Route path="/import" element={<ImportPage />} />
+                  <Route path="/prepare" element={<PreparePage />} />
+                  <Route path="/chunking" element={<ChunkingPage />} />
+                  <Route path="/retrieval" element={<RetrievalPage />} />
+                  <Route path="/goldstandard" element={<GoldStandardPage />} />
+                </>
+              )}
               <Route path="/transfer" element={<TransferPage />} />
               <Route path="/help/transfer" element={<HelpTransferPage />} />
             </>
@@ -22907,6 +23271,8 @@ export interface AuthUser {
   username: string; role: Role; must_change_password: boolean; kind?: 'user' | 'service'
   // Two-step verification (#607): enrolled, required for everyone, and a set-up due because of it.
   mfa_enrolled?: boolean; mfa_required?: boolean; mfa_enrollment_required?: boolean
+  // Query-only mode (#670): the pages that change data are hidden.
+  query_only?: boolean
 }
 export interface AdminUser {
   username: string; role: Role; enabled: boolean; must_change_password: boolean; created_at: string; mfa_enrolled?: boolean
@@ -23126,22 +23492,23 @@ import type { Role } from '../api/client'
 
 // The pages grouped into menus (#616). Each role sees the pages it had before;
 // a menu with none of them isn't shown. Hiding a page is a convenience: the
-// router and the API refuse what the role can't do (#25).
-interface PageEntry { label: string; to: string; roles: Role[] }
+// router and the API refuse what the role can't do (#25). A page that changes
+// data (`writes`) is hidden in query-only mode, where the API refuses it (#670).
+interface PageEntry { label: string; to: string; roles: Role[]; writes?: true }
 interface MenuDef { key: string; label: string; entries: PageEntry[] }
 
 const STAFF: Role[] = ['engineer', 'developer']
 const ENGINEER: Role[] = ['engineer']
 const MENUS: MenuDef[] = [
   { key: 'data', label: 'Data', entries: [
-    { label: 'Import', to: '/import', roles: STAFF },
-    { label: 'Prepare', to: '/prepare', roles: STAFF },
+    { label: 'Import', to: '/import', roles: STAFF, writes: true },
+    { label: 'Prepare', to: '/prepare', roles: STAFF, writes: true },
     { label: 'Transfer', to: '/transfer', roles: STAFF },
   ] },
   { key: 'tune', label: 'Tune', entries: [
-    { label: 'Chunking', to: '/chunking', roles: STAFF },
-    { label: 'Retrieval', to: '/retrieval', roles: STAFF },
-    { label: 'Gold Standard', to: '/goldstandard', roles: STAFF },
+    { label: 'Chunking', to: '/chunking', roles: STAFF, writes: true },
+    { label: 'Retrieval', to: '/retrieval', roles: STAFF, writes: true },
+    { label: 'Gold Standard', to: '/goldstandard', roles: STAFF, writes: true },
   ] },
   { key: 'admin', label: 'Admin', entries: [
     { label: 'Collections', to: '/collections', roles: ENGINEER },
@@ -23278,6 +23645,7 @@ export default function NavBar() {
   const navigate = useNavigate()
   const { pathname } = useLocation()
   const role = user?.role ?? null
+  const queryOnly = user?.query_only === true
   const [open, setOpen] = useState<{ key: string; focus: Focus } | null>(null)
 
   // A change of page closes any open menu.
@@ -23299,13 +23667,19 @@ export default function NavBar() {
   })
 
   const menus = MENUS
-    .map(m => ({ ...m, entries: m.entries.filter(e => role !== null && e.roles.includes(role)) }))
+    .map(m => ({ ...m, entries: m.entries.filter(e => role !== null && e.roles.includes(role)
+      && !(queryOnly && e.writes)) }))
     .filter(m => m.entries.length > 0)
   const accountCurrent = pathname === '/account' || pathname === '/account/password'
 
   return (
     <nav className="bg-white border-b border-gray-200 px-4 py-3 flex items-center gap-4">
       <span className="font-bold text-blue-700 text-lg mr-2">RAG Platform</span>
+      {queryOnly && (
+        <span data-testid="nav-query-only"
+              title="This instance is query-only: it answers questions on its collections and can't change them."
+              className="text-xs bg-amber-100 text-amber-800 px-2 py-1 rounded">Query-only</span>
+      )}
       <Link
         to="/qa"
         aria-current={pathname === '/qa' ? 'page' : undefined}
@@ -25557,6 +25931,7 @@ export default function GoldStandardPage() {
 ```typescript
 import { useState, useEffect, useRef } from 'react'
 import { api, AdminUser, CollectionAccess, CollectionInfo, ServicePrincipal } from '../api/client'
+import { useAuth } from '../context/AuthContext'
 
 // Who may use each collection (#606): "Open", "Restricted (n)" with n grants,
 // or a dash when the state couldn't be read.
@@ -25566,6 +25941,8 @@ function accessLabel(a: CollectionAccess | null | undefined): string {
 }
 
 export default function CollectionsPage() {
+  // Query-only mode (#670): no create or delete; the list and access stay.
+  const queryOnly = useAuth().user?.query_only === true
   const [collections, setCollections] = useState<CollectionInfo[]>([])
   // A refused create is shown inside the New Collection modal, and a failed
   // list on the page; both were hidden or swallowed before (#379).
@@ -25715,7 +26092,9 @@ export default function CollectionsPage() {
     <div className="max-w-4xl mx-auto">
       <div className="flex justify-between items-center mb-6">
         <h1 className="text-2xl font-bold">Collections</h1>
-        <button onClick={openCreate} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">+ New Collection</button>
+        {!queryOnly && (
+          <button onClick={openCreate} className="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700">+ New Collection</button>
+        )}
       </div>
       {listError && <p role="alert" className="text-red-600 text-sm mb-4">{listError}</p>}
       <table className="w-full text-sm border-collapse">
@@ -25741,7 +26120,9 @@ export default function CollectionsPage() {
               <td className="py-2">{accessLabel(access[c.name])}</td>
               <td className="py-2 space-x-3">
                 <button onClick={() => openAccess(c.name)} className="text-blue-500 hover:text-blue-700 text-xs">Access</button>
-                <button onClick={() => { setDeleteError(''); setDeleteTarget(c.name) }} className="text-red-400 hover:text-red-600 text-xs">Delete</button>
+                {!queryOnly && (
+                  <button onClick={() => { setDeleteError(''); setDeleteTarget(c.name) }} className="text-red-400 hover:text-red-600 text-xs">Delete</button>
+                )}
               </td>
             </tr>
           ))}
@@ -25866,7 +26247,7 @@ import { Link } from 'react-router-dom'
 import {
   api, CollectionInfo, ExportJob, ExportJobEntry, ImportJob, ImportJobEntry, PackageSummary, TuneOptions,
 } from '../api/client'
-import { useRole } from '../context/AuthContext'
+import { useAuth, useRole } from '../context/AuthContext'
 import JobList, { JobRow, newestToOpen, useJobList } from '../components/JobList'
 
 // A transfer job is running until it completes or fails (#617).
@@ -25922,6 +26303,8 @@ function message(e: unknown): string {
 
 export default function TransferPage() {
   const { role } = useRole()
+  // Query-only mode (#670): no import here; packages are loaded on the host.
+  const queryOnly = useAuth().user?.query_only === true
   // Running and recent exports and imports, in one list (#617). Each panel
   // opens its own newest job on the first answer, unless it already has one.
   const exportJobs = useJobList<ExportJobEntry>(loadExportJobs, transferRunning)
@@ -26340,7 +26723,13 @@ export default function TransferPage() {
 
       {/* ── Import ─────────────────────────────────────────────────────── */}
       <section className="bg-white border rounded p-4">
-        <h2 className="font-medium mb-3">Import a package</h2>
+        <h2 className="font-medium mb-3">{queryOnly ? 'Packages in ./exports' : 'Import a package'}</h2>
+        {queryOnly && (
+          <p className="text-xs text-gray-500 mb-3">
+            This instance is query-only. An operator loads a package on the host
+            with <code>python -m loader</code> (README, "Query-only mode").
+          </p>
+        )}
 
         <div className="flex items-center justify-between mb-1">
           <label className="block text-sm font-medium">Package in ./exports</label>
@@ -26377,6 +26766,7 @@ export default function TransferPage() {
           </p>
         )}
 
+        {!queryOnly && (<>
         {selectedEncrypted && (
           <div className="mb-3">
             <label className="block text-sm font-medium mb-1">Passphrase</label>
@@ -26438,6 +26828,7 @@ export default function TransferPage() {
             ))}
           </div>
         )}
+        </>)}
       </section>
     </div>
   )
@@ -27260,7 +27651,7 @@ const ACTIONS = [
   'auth.mfa.recovery-codes', 'auth.password', 'collection.access', 'collection.access.refused', 'collection.create',
   'collection.delete', 'export',
   'goldstandard.download', 'goldstandard.save', 'import', 'ingest', 'ingest.config', 'operator.bootstrap',
-  'operator.create-user', 'operator.disable', 'operator.enable', 'operator.reset-mfa', 'operator.reset-password',
+  'operator.create-user', 'operator.disable', 'operator.enable', 'operator.load', 'operator.reset-mfa', 'operator.reset-password',
   'operator.set-role', 'package.delete', 'package.download', 'prepare.cancel', 'prepare.delete', 'prepare.download', 'prepare.import', 'prepare.start',
   'prepare.upload', 'query', 'retrieval.config', 'system.start', 'tune.rechunk', 'tune.reembed', 'tune.reindex',
 ]
@@ -27499,6 +27890,7 @@ bash scripts/verify/stack.sh run                    # everything, ~20 min plus s
 RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run    # skip LLM work, ~8 min, start-up included
 bash scripts/verify/stack.sh run 02 04              # only the named suites
 bash scripts/verify/stack.sh run --lan              # LAN mode, TLS on loopback only (#26)
+bash scripts/verify/stack.sh run --query-only       # query-only mode on a second instance (#670)
 ```
 
 Exits non-zero if any check fails.
@@ -27629,6 +28021,24 @@ chat reply. The checks: preparation and gold standard were answered only by `qwe
 only by the answer model. Preparation writes to a temporary folder and the pair isn't stored; the
 small model is deleted from Ollama and the collection dropped at the end.
 
+`24_query_only.sh` checks query-only mode (#670, SPECIFICATIONS.md §2.6 and §10.11). In every run:
+`query_only_config.py` resolves `docker-compose.yml` with and without `docker-compose.query-only.yml` through
+`docker compose config` (nothing started) and checks that only the api's `RAG_QUERY_ONLY` changes, from `"false"` to
+`"true"`; `../tests/test_query_only.py` runs in the API image with no network (the setting, the classification of
+every state-changing route, the `403 QUERY_ONLY` refusals and their order, the user answers' `query_only`, the
+loader and the access of a collection it creates); a one-off api container refuses `RAG_QUERY_ONLY=yes` with one
+line; and on the default instance `python -m loader` refuses with `NOT_QUERY_ONLY` (exit 1, an `operator.load`
+record) and a path is a usage error (exit 2). The rest needs `stack.sh run --query-only`, which runs this suite
+alone: it ingests the fixtures' `policies.txt` into `VfyQueryOnly` and exports it, then `stack.sh query-only-mode`
+starts the project again in query-only mode with empty volumes and only that package in its exports folder (the
+second machine). There, after the test accounts are made again, it checks `GET /auth/me`'s `query_only`, a load
+with `EMBED_MODEL` set to another model for that process (refused `EMBEDDING_MISMATCH`, no collection), the load
+(exit 0, the exported chunk count, an `operator.load` record), a second load (`COLLECTION_EXISTS`), that the End
+User doesn't see the loaded collection until the Engineer opens it (`PUT .../access`, kept), each of the 19 refused
+routes (`403 QUERY_ONLY`), a Developer's delete (`FORBIDDEN`) and no session (`401`), outside `RAG_SKIP_SLOW=1` an
+End User's question with an answer and citations, and an export and the package list. The project is removed when
+the run ends. Two stacks never run at once, so Docker's memory holds one answer model.
+
 ## Entry point and verify project
 
 `stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
@@ -27639,9 +28049,10 @@ against" below).
 
 | Command | What it does |
 |---|---|
-| `stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] \| --lan] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
-| `stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] \| --lan]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT`, `RAG_VERIFY_OTEL_ENABLED` and `RAG_VERIFY_TELEMETRY_PIN`. `--telemetry-pin FILE` supplies a reviewed collector pin (see "Evaluating a collector pin change"). |
+| `stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
+| `stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT`, `RAG_VERIFY_OTEL_ENABLED` and `RAG_VERIFY_TELEMETRY_PIN`. `--telemetry-pin FILE` supplies a reviewed collector pin (see "Evaluating a collector pin change"). |
 | `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
+| `stack.sh query-only-mode --package NAME [--checkout DIR]` | Only for `24_query_only.sh`, under the inherited lock of a `run --query-only` (#670): keeps package NAME aside, removes the project's containers, network and volumes (not its images or the model copy), puts the package back alone in an empty exports folder, and starts the project again from the checkout's `docker-compose.query-only.yml`, after the configuration check and without a build, as a second instance on another machine would be. |
 
 `--checkout` is the checkout to build and test; the default is the one holding
 `stack.sh`. The overlay `docker-compose.verify.yml` and `stack.sh` itself always
@@ -28475,6 +28886,9 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `ui_ingest_check.py` | the checks of suite 22, one per subcommand, on the host, and its cleanup (#641) |
 | `23_llm_split.sh` | the build and answer models (#671), full runs only: with `BUILD_LLM_MODEL` set to a small model, preparation and gold standard use it and query uses the answer model |
 | `llm_split.py` | helper for suite 23, run in the API container: pulls the small model, runs the three tasks through the services' code and prints the models Ollama reports answering each (#671) |
+| `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance |
+| `query_only_config.py` | host-side, standard library: `docker-compose.yml` with and without `docker-compose.query-only.yml` as `docker compose config` resolves them; only the api's `RAG_QUERY_ONLY` may differ (#670) |
+| `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, the loader (usage, refusals, lock, passphrase, results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
@@ -28808,7 +29222,9 @@ nothing reaches the backend or a model. 67 cases:
   (Ctrl+Enter, plain Enter, Ask disabled while empty or loading), the citations toggle, markdown,
   the latency and error lines and the End User view with `response_format`; the Retrieval page's
   saved and default texts, alpha slider and Save while loading; and the client's handling of
-  nginx's HTML 413, 502, 504 and 500 pages, a non-JSON 200 and a JSON message.
+  nginx's HTML 413, 502, 504 and 500 pages, a non-JSON 200 and a JSON message; and query-only
+  mode (#670): the "Query-only" tag, the nav and router without the pages that change data, the
+  Collections page without create and Delete, and the Transfer page without its import controls.
 - `ui_pages.js`: Gold Standard generate (selector, sample size, progress, confirm) and review
   (summary bar, approve, reject, regenerate, edit, failed action, export enabled); the Transfer
   export controls (collection selector, fidelity line, include-models payload, progress and
@@ -29136,7 +29552,7 @@ printf '\nBuilding fixtures in %s\n' "$FIX"
 rm -rf "$FIX"; python3 ./fixtures.py "$FIX" >/dev/null
 export RAG_FIXTURES="$FIX"
 
-ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit 20_offline_model 21_prepare 22_ui_ingest 23_llm_split)
+ALL=(01_infrastructure 02_ingest 03_query 04_goldstandard 05_transfer 06_ui 07_settings 15_telemetry 17_auth 18_lan 19_audit 20_offline_model 21_prepare 22_ui_ingest 23_llm_split 24_query_only)
 if [ "$#" -gt 0 ]; then
   SUITES=()
   for want in "$@"; do
@@ -29185,8 +29601,8 @@ exit "$overall"
 # Run the verification suite on a disposable compose project, never on the
 # live stack (#152).
 #
-#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] | --lan] [suite ...]
-#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] | --lan]
+#   bash scripts/verify/stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] | --lan | --query-only] [suite ...]
+#   bash scripts/verify/stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] | --lan | --query-only]
 #   bash scripts/verify/stack.sh down
 #
 # `run` brings the verify project up, runs that checkout's all.sh against it
@@ -29231,6 +29647,16 @@ exit "$overall"
 # exactly proxy:127.0.0.1:<verify port>->443/tcp. The suites then reach it at
 # https://localhost:<port>/api and trust the certificate it generated, copied
 # into the private folder. Without suite names, a --lan run runs 18_lan.
+#
+# --query-only (#670) runs the verify project in its default configuration,
+# where 24_query_only builds and exports a collection; that suite then calls
+# `stack.sh query-only-mode --package NAME` under the inherited lock, which
+# carries the package out of the exports folder, removes the project's
+# containers, network and volumes (its images and the model copy stay), puts
+# the package back alone in an empty exports folder and starts the project
+# again in query-only mode (the checkout's docker-compose.query-only.yml): a
+# second instance with its own empty volumes, as on another machine, never two
+# at once. Without suite names, a --query-only run runs 24_query_only.
 #
 # --telemetry checks the collector image against this checkout's own
 # telemetry/image.json, so a PR that changes the pin is refused. To evaluate
@@ -29286,14 +29712,20 @@ private_problem() {
 # ── arguments, checked before any Docker command ─────────────────────────────
 [ "$#" -ge 1 ] || usage
 CMD="$1"; shift
-case "$CMD" in up|down|run|telemetry-mode) ;; *) usage ;; esac
+case "$CMD" in up|down|run|telemetry-mode|query-only-mode) ;; *) usage ;; esac
 if [ "$CMD" = telemetry-mode ]; then
   [ "${RAG_VERIFY_LOCK_HELD:-}" = 1 ] || fail "telemetry-mode requires an inherited verification lock"
+fi
+if [ "$CMD" = query-only-mode ]; then
+  [ "${RAG_VERIFY_LOCK_HELD:-}" = 1 ] || fail "query-only-mode requires an inherited verification lock"
+  [ "${RAG_VERIFY_QUERY_ONLY:-}" = 1 ] || fail "query-only-mode runs only in a stack.sh run --query-only"
 fi
 CHECKOUT="$HARNESS"
 PULL=""
 TELEMETRY=0
 LAN=0
+QUERY_ONLY=0
+QO_PACKAGE=""
 OTEL_ENABLED=true
 PIN=""
 PIN_SET=0
@@ -29312,6 +29744,12 @@ while [ "$#" -gt 0 ]; do
     --lan)
       { [ "$CMD" = up ] || [ "$CMD" = run ]; } || usage
       LAN=1; shift ;;
+    --query-only)
+      { [ "$CMD" = up ] || [ "$CMD" = run ]; } || usage
+      QUERY_ONLY=1; shift ;;
+    --package)
+      [ "$CMD" = query-only-mode ] && [ "$#" -ge 2 ] || usage
+      QO_PACKAGE="$2"; shift 2 ;;
     --disabled)
       [ "$CMD" = telemetry-mode ] || usage
       OTEL_ENABLED=false; shift ;;
@@ -29326,6 +29764,13 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ "$TELEMETRY" = 0 ] || [ "$LAN" = 0 ] || fail "--lan and --telemetry can't be combined."
+[ "$QUERY_ONLY" = 0 ] || { [ "$TELEMETRY" = 0 ] && [ "$LAN" = 0 ]; } \
+  || fail "--query-only can't be combined with --lan or --telemetry."
+if [ "$CMD" = query-only-mode ]; then
+  # A package name as the loader takes it (#670): no path, no other file.
+  printf '%s' "$QO_PACKAGE" | grep -Eqx 'ragpkg-[A-Za-z0-9._-]+\.tar\.gz(\.age)?' \
+    || fail "query-only-mode needs --package with a package name (ragpkg-*.tar.gz), not '$QO_PACKAGE'."
+fi
 [ "$PIN_SET" = 0 ] || [ "$TELEMETRY" = 1 ] || fail "--telemetry-pin requires --telemetry."
 
 PORT="${RAG_VERIFY_PORT:-8081}"
@@ -29420,6 +29865,12 @@ fi
 # LAN mode's configuration, switched to once the default one is up and set up.
 LAN_COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.lan.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.lan.verify.yml"
 export RAG_VERIFY_LAN="$LAN"
+# Query-only mode's configuration (#670), switched to by query-only-mode.
+QUERY_ONLY_COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.query-only.yml:$HARNESS/docker-compose.verify.yml"
+[ "$CMD" != query-only-mode ] || QUERY_ONLY="${RAG_VERIFY_QUERY_ONLY:-0}"
+export RAG_VERIFY_QUERY_ONLY="$QUERY_ONLY"
+# Where query-only-mode keeps the package while the exports folder is replaced.
+QO_CARRY="$PRIVATE/query-only-carry"
 export RAG_VERIFY_PORT="$PORT"
 export RAG_API="http://localhost:$PORT/api"
 export RAG_EXPECTED_PROXY_PORT="$PORT"
@@ -29459,6 +29910,11 @@ do_down() {
   fi
   [ ! -d "$EXPORTS" ] || rm -rf "$EXPORTS"
   rm -f "$LAN_CERT"
+  if [ -L "$QO_CARRY" ]; then
+    printf 'stack.sh: %s is a symlink; not removing it.\n' "$QO_CARRY" >&2
+    return 2
+  fi
+  [ ! -d "$QO_CARRY" ] || rm -rf "$QO_CARRY"
   left="$(docker ps -aq --filter "$filter")$(docker network ls -q --filter "$filter")$(docker volume ls -q --filter "$filter" | grep -vx "$MODELS")$(labelled_images)"
   if [ -e "$EXPORTS" ] || [ -L "$EXPORTS" ]; then
     left="$left $EXPORTS"
@@ -29783,6 +30239,49 @@ lan_switch() {
   [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 over TLS within 60 seconds (last: $code)."
 }
 
+# ── query-only mode (#670) ───────────────────────────────────────────────────
+# Called by 24_query_only under the inherited lock, once it has exported a
+# package from the default configuration: the same project comes up again in
+# query-only mode with its own empty volumes and only that package in its
+# exports folder, as another machine would have it. Images are kept (no build),
+# and so is the model copy, an external volume `down -v` doesn't remove.
+query_only_switch() {
+  local i code=000 service state health
+  [ -f "$EXPORTS/$QO_PACKAGE" ] && [ ! -L "$EXPORTS/$QO_PACKAGE" ] \
+    || fail "query-only-mode: no package $QO_PACKAGE in $EXPORTS."
+  { [ ! -e "$QO_CARRY" ] && [ ! -L "$QO_CARRY" ]; } || rm -rf "$QO_CARRY" \
+    || fail "query-only-mode: could not clear $QO_CARRY."
+  mkdir -m 700 "$QO_CARRY" && cp -p "$EXPORTS/$QO_PACKAGE" "$QO_CARRY/" \
+    || fail "query-only-mode: could not copy the package out of the exports folder."
+  printf 'removing the default instance (its containers, network and volumes)...\n'
+  docker compose -p "$PROJECT" down -v --remove-orphans >/dev/null 2>&1 \
+    || fail "query-only-mode: could not remove the default instance."
+  { [ ! -L "$EXPORTS" ] && rm -rf "$EXPORTS" && mkdir -p "$EXPORTS" \
+      && cp -p "$QO_CARRY/$QO_PACKAGE" "$EXPORTS/" && rm -rf "$QO_CARRY"; } \
+    || fail "query-only-mode: could not put the package back alone in $EXPORTS."
+  export COMPOSE_FILE="$QUERY_ONLY_COMPOSE_FILE"
+  do_guard
+  printf 'starting the query-only instance...\n'
+  if ! docker compose -p "$PROJECT" up -d --no-build --pull never --wait --wait-timeout 900; then
+    docker compose -p "$PROJECT" ps -a --format '{{.Service}} {{.State}} {{.Health}}' \
+      | while read -r service state health; do
+          case "$state/${health:-}" in
+            running/healthy|running/) ;;
+            *) printf '\n── %s (%s %s) ──\n' "$service" "$state" "${health:-}"
+               docker compose -p "$PROJECT" logs --tail 50 "$service" ;;
+          esac
+        done
+    fail "the verify project did not come up in query-only mode."
+  fi
+  for i in $(seq 1 60); do
+    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$RAG_API/health" 2>/dev/null)
+    [ "$code" = 200 ] && break
+    sleep 1
+  done
+  [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 within 60 seconds in query-only mode (last: $code)."
+  printf 'the verify project is up in query-only mode with %s\n' "$QO_PACKAGE"
+}
+
 # ── up ───────────────────────────────────────────────────────────────────────
 do_up() {
   local i code=000 service state health
@@ -29817,7 +30316,7 @@ do_up() {
   [ "$code" = 200 ] || fail "$RAG_API/health did not return 200 within 60 seconds (last: $code)."
   [ "$LAN" = 0 ] || lan_switch
   printf '\nThe verify project is up at %s. To point commands at it:\n\n' "${RAG_API%/api}"
-  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT RAG_VERIFY_TELEMETRY RAG_VERIFY_LAN; do
+  for var in COMPOSE_PROJECT_NAME COMPOSE_FILE RAG_API RAG_EXPECTED_PROXY_PORT RAG_EXPORTS_DIR RAG_VERIFY_PORT RAG_VERIFY_TELEMETRY RAG_VERIFY_LAN RAG_VERIFY_QUERY_ONLY; do
     printf 'export %s=%q\n' "$var" "${!var}"
   done
   if [ "$LAN" = 1 ]; then
@@ -29839,6 +30338,9 @@ case "$CMD" in
     [ "$TELEMETRY" = 1 ] || fail "telemetry-mode requires --telemetry"
     do_guard
     docker compose -p "$PROJECT" up -d --no-deps --no-build --pull never --wait --wait-timeout 120 api || fail "API telemetry reconfiguration failed" ;;
+  query-only-mode)
+    # Called only by 24_query_only under the inherited lock of a --query-only run.
+    query_only_switch ;;
   down)
     do_down || exit 2 ;;
   up)
@@ -29849,6 +30351,8 @@ case "$CMD" in
     rc=0
     # A LAN run checks LAN mode; other suites assume the default configuration.
     [ "$LAN" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(18_lan)
+    # A query-only run checks query-only mode (#670).
+    [ "$QUERY_ONLY" = 0 ] || [ "${#ARGS[@]}" -gt 0 ] || ARGS=(24_query_only)
     # In the background with job control on, all.sh leads a process group of
     # its own (pgid $!), which stop_suite ends; and `wait`, unlike a foreground
     # command, returns as soon as INT or TERM arrives, so the traps act at once.
@@ -31097,7 +31601,7 @@ def check_login_logout(operator_ok):
     body = json.loads(raw)
     expect(status == 200 and body == {"username": "vfy-developer", "role": "developer", "must_change_password": False,
                                       "kind": "user", "mfa_enrolled": False, "mfa_required": False,
-                                      "mfa_enrollment_required": False},
+                                      "mfa_enrollment_required": False, "query_only": False},
            "GET /auth/me answered {} {}".format(status, body))
     status, _, _ = code("POST", "/auth/logout", token=token)
     expect(status == 200, "logout answered {}".format(status))
@@ -34482,6 +34986,276 @@ if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
 ```
 
+### scripts/verify/24_query_only.sh
+
+```bash
+#!/usr/bin/env bash
+# Query-only mode (#670): SPECIFICATIONS.md §2.6 and §10.11.
+#
+# Every run checks the real docker-compose.query-only.yml as `docker compose
+# config` resolves it (nothing is started), runs test_query_only.py in the API
+# image with no network, checks that the API image refuses a non-boolean
+# RAG_QUERY_ONLY at start-up, and that the loader refuses on the running
+# default instance. The two-instance checks need `stack.sh run --query-only`:
+# a collection is built and exported on the default instance, then
+# `stack.sh query-only-mode` starts the same project again in query-only mode
+# with empty volumes and only that package in its exports folder, as another
+# machine would have it, and the package is loaded and queried there. Anywhere
+# else they are skipped. Nothing here needs cleaning up afterwards: a
+# --query-only run ends with stack.sh removing the project.
+cd "$(dirname "$0")" && . ./lib.sh
+REPO_ROOT="$(cd ../.. && pwd)"
+FIX="${RAG_FIXTURES:-/tmp/rag-verify-fixtures}"
+[ -d "$FIX" ] || python3 ./fixtures.py "$FIX" >/dev/null
+require_stack
+C="${PREFIX}QueryOnly"
+OUT="$(mktemp)"
+trap 'rm -f "$OUT" /tmp/vfy_qo.json' EXIT
+
+# loader [docker compose exec options...] -- [loader arguments...]: runs the
+# loader in the api container, its lines in $OUT, and returns its exit status.
+loader() {
+  local opts=()
+  while [ "$#" -gt 0 ] && [ "$1" != -- ]; do opts+=("$1"); shift; done
+  shift
+  _rag_require_lock_owner
+  (cd "$REPO_ROOT" && docker compose exec -T ${opts[@]+"${opts[@]}"} api python -m loader "$@") \
+    </dev/null >"$OUT" 2>&1
+}
+
+# The newest operator.load record's result and code, as "result code".
+last_load() {
+  api_get "/audit?action=operator.load&limit=1" | python3 -c "
+import json, sys
+r = json.load(sys.stdin)['records'][0]
+print(r['result'], (r.get('details') or {}).get('code') or '-', r.get('target'))" 2>/dev/null
+}
+
+section "Query-only overlay, resolved without starting it"
+python3 ./query_only_config.py "$REPO_ROOT"
+check "docker-compose.query-only.yml changes only the api's RAG_QUERY_ONLY, from false to true" $?
+
+section "Query-only units: setting, policy, refusal, flag, loader"
+(cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \
+  "$(docker compose images -q api)" python scripts/tests/test_query_only.py)
+check "test_query_only.py registered regression checks" $?
+
+section "Query-only refusal in the built API image"
+_rag_require_lock_owner
+(cd "$REPO_ROOT" && docker compose run --rm --no-deps -T -e RAG_QUERY_ONLY=yes api </dev/null 2>&1) > "$OUT"
+hits=$(grep -c "Settings refused: RAG_QUERY_ONLY must be exactly true or false" "$OUT")
+! grep -q '^Traceback' "$OUT" && [ "$hits" = 1 ]
+check "the API image refuses RAG_QUERY_ONLY=yes at start-up with one line and no traceback" $? "$(tail -3 "$OUT")"
+
+section "The loader on a full instance"
+loader -- ragpkg-vfy-not-there.tar.gz
+rc=$?
+[ "$rc" = 1 ] && grep -q "NOT_QUERY_ONLY" "$OUT"
+check "the loader refuses on an instance that isn't query-only (exit 1, NOT_QUERY_ONLY)" $? "exit $rc: $(tail -2 "$OUT")"
+check_eq "the refusal is an operator.load audit record" "$(last_load)" "refused NOT_QUERY_ONLY ragpkg-vfy-not-there.tar.gz"
+loader -- ../etc/passwd
+check_eq "a path instead of a package name is a usage error (exit 2)" "$?" "2"
+
+if [ "${RAG_VERIFY_QUERY_ONLY:-0}" != 1 ]; then
+  skip "query-only mode on a second instance: build, export, load, refusals, Q&A" "run stack.sh run --query-only"
+  summary
+  exit $?
+fi
+
+# ── the build instance ───────────────────────────────────────────────────────
+section "Build and export on the default instance"
+drop_collection "$C"; make_collection "$C"
+curl -s -m 600 -X POST "$API/ingest/upload" -F "collection=$C" -F "strategy=fixed" \
+  -F "chunk_size=150" -F "min_chunk_size=40" -F "files=@$FIX/policies.txt" > /tmp/vfy_qo.json
+job=$(python3 -c "import json;print(json.load(open('/tmp/vfy_qo.json'))['job_id'])" 2>/dev/null)
+check_eq "the collection is ingested" "$(wait_for_job "/ingest/job/$job" 900)" "completed"
+api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_qo.json
+ejob=$(jfield "['job_id']" < /tmp/vfy_qo.json)
+check_eq "the collection is exported" "$(wait_for_job "/export/job/$ejob" 1800)" "completed"
+pkg=$(api_get "/export/job/$ejob" | jfield "['filename']")
+chunks=$(api_get "/packages" | python3 -c "
+import json, sys
+print([p['chunk_count'] for p in json.load(sys.stdin)['packages'] if p['filename'] == sys.argv[1]][0])" "$pkg" 2>/dev/null)
+[ -n "$pkg" ] && [ -f "${RAG_EXPORTS_DIR:?}/$pkg" ] && [ -n "$chunks" ]
+check "the package is in the exports folder, with its chunk count" $? "package '$pkg', chunks '$chunks'"
+if [ "$FAIL" -gt 0 ]; then
+  summary
+  exit $?
+fi
+
+# ── the query-only instance ──────────────────────────────────────────────────
+section "Switch to a query-only instance with its own volumes"
+_rag_require_lock_owner
+bash "$RAG_VERIFY_HARNESS/scripts/verify/stack.sh" query-only-mode --package "$pkg" \
+  --checkout "$RAG_VERIFY_CHECKOUT"
+check "stack.sh query-only-mode started the project again in query-only mode with only the package" $?
+if [ "$FAIL" -gt 0 ]; then
+  summary
+  exit $?
+fi
+# The same project, now with the overlay: docker compose here resolves it so.
+export COMPOSE_FILE="$RAG_VERIFY_CHECKOUT/docker-compose.yml:$RAG_VERIFY_CHECKOUT/docker-compose.query-only.yml:$RAG_VERIFY_HARNESS/docker-compose.verify.yml"
+# A new, empty account store: the test accounts are made again.
+auth_ensure
+names=$(ls "${RAG_EXPORTS_DIR:?}")
+check_eq "the exports folder holds only the copied package" "$names" "$pkg"
+code=$(api_get "/collections" | python3 -c "import json,sys; print(len(json.load(sys.stdin)['collections']))" 2>/dev/null)
+check_eq "the query-only instance starts with no collection" "$code" "0"
+check_eq "GET /auth/me says query_only" "$(api_get /auth/me | jfield "['query_only']")" "True"
+
+section "Load the package"
+loader -e EMBED_MODEL=vfy-other-embed -- "$pkg"
+rc=$?
+[ "$rc" = 1 ] && grep -q "EMBEDDING_MISMATCH" "$OUT"
+check "a package from another embedding model is refused (exit 1, EMBEDDING_MISMATCH)" $? "exit $rc: $(tail -2 "$OUT")"
+exists=$(api_get "/collections" | python3 -c "import json,sys; print(any(c['name']=='$C' for c in json.load(sys.stdin)['collections']))" 2>/dev/null)
+check_eq "the refused load created no collection" "$exists" "False"
+loader -- "$pkg"
+rc=$?
+check_eq "the loader loads the package (exit 0)" "$rc" "0"
+grep -q "loaded into collection $C: $chunks chunks" "$OUT"
+check "the loader reports the collection and its $chunks chunks" $? "$(tail -3 "$OUT")"
+count=$(api_get "/collections" | python3 -c "
+import json, sys
+print([c['object_count'] for c in json.load(sys.stdin)['collections'] if c['name'] == sys.argv[1]][0])" "$C" 2>/dev/null)
+check_eq "the loaded collection holds the exported chunks" "$count" "$chunks"
+check_eq "the load is an operator.load audit record" "$(last_load)" "success - $pkg"
+loader -- "$pkg"
+rc=$?
+[ "$rc" = 1 ] && grep -q "COLLECTION_EXISTS" "$OUT"
+check "loading it again with the default abort is refused (exit 1, COLLECTION_EXISTS)" $? "exit $rc: $(tail -2 "$OUT")"
+
+section "Who sees the loaded collection"
+user=$(auth_jar end_user) || user=""
+seen() { command curl -s -m 60 -b "$1" "$API/collections" | python3 -c "import json,sys; print(any(c['name']=='$C' for c in json.load(sys.stdin)['collections']))" 2>/dev/null; }
+check_eq "the End User doesn't see it: a loaded collection starts restricted with no grants" "$(seen "$user")" "False"
+check_eq "the Engineer sees it" "$(seen "$RAG_AUTH_JAR")" "True"
+
+section "Refused and kept routes"
+refused() {   # refused <method> <path>: the Engineer's answer, as "status code"
+  curl -s -m 60 -o /tmp/vfy_qo.json -w '%{http_code}' -X "$1" "$API$2" -H 'Content-Type: application/json' -d '{}' \
+    >/tmp/vfy_qo.code
+  printf '%s %s' "$(cat /tmp/vfy_qo.code)" "$(jfield "['error']['code']" < /tmp/vfy_qo.json)"
+}
+bad=""
+for route in "POST /collections" "DELETE /collections/$C" "POST /ingest/upload" "POST /ingest/config" \
+             "POST /retrieval/config" "POST /goldstandard/generate" "POST /goldstandard/regenerate" \
+             "PATCH /goldstandard/session/vfy-s/pair/vfy-p" "POST /goldstandard/save" "POST /import" \
+             "POST /prepare/upload" "DELETE /prepare/documents/vfy-d" "DELETE /prepare/documents/vfy-d/prepared" \
+             "POST /prepare/jobs" "POST /prepare/job/vfy-j/cancel" "POST /prepare/import" \
+             "POST /tune/rechunk" "POST /tune/reembed" "POST /tune/reindex"; do
+  got=$(refused ${route% *} "${route#* }")
+  [ "$got" = "403 QUERY_ONLY" ] || bad="$bad; $route: $got"
+done
+[ -z "$bad" ]
+check "each of the 19 data-changing routes answers the Engineer 403 QUERY_ONLY" $? "${bad#; }"
+dev=$(auth_jar developer) || dev=""
+got=$(command curl -s -m 60 -b "$dev" -H "Origin: $RAG_AUTH_ORIGIN" -X DELETE "$API/collections/$C?confirm=true" | jfield "['error']['code']")
+check_eq "a Developer deleting a collection is still refused FORBIDDEN" "$got" "FORBIDDEN"
+check_eq "no session is still 401" "$(command curl -s -o /dev/null -m 60 -w '%{http_code}' -X POST "$API/import" -H 'Content-Type: application/json' -d '{}')" "401"
+check_eq "the Engineer opens the loaded collection (PUT access is kept)" \
+  "$(curl -s -o /dev/null -m 60 -w '%{http_code}' -X PUT "$API/collections/$C/access" -H 'Content-Type: application/json' -d '{"restricted":false}')" "200"
+check_eq "the End User then sees it" "$(seen "$user")" "True"
+
+if [ "$SKIP_SLOW" = "1" ]; then
+  skip "an End User's question on the loaded collection" "set RAG_SKIP_SLOW=0 to include it"
+else
+  command curl -s -m 600 -b "$user" -H "Origin: $RAG_AUTH_ORIGIN" -X POST "$API/query" -H 'Content-Type: application/json' \
+    -d "{\"question\":\"who approves overtime?\",\"collection\":\"$C\",\"top_k\":3,\"include_citations\":true}" > /tmp/vfy_qo.json
+  python3 -c "
+import json, sys
+r = json.load(open('/tmp/vfy_qo.json'))
+sys.exit(0 if r.get('answer', '').strip() and r.get('citations') else 1)"
+  check "an End User asks a question on the loaded collection and gets an answer with citations" $? "$(head -c 300 /tmp/vfy_qo.json)"
+fi
+
+api_post "/export" "{\"collection\":\"$C\",\"include_models\":false}" > /tmp/vfy_qo.json
+ejob=$(jfield "['job_id']" < /tmp/vfy_qo.json)
+check_eq "export keeps working in query-only mode" "$(wait_for_job "/export/job/$ejob" 1800)" "completed"
+check_eq "the package list keeps working" "$(api_code "$API/packages")" "200"
+
+summary
+```
+
+### scripts/verify/query_only_config.py
+
+```python
+"""The real query-only overlay, resolved without starting it (#670). Host-side, standard library, Python 3.9+.
+
+    python3 query_only_config.py CHECKOUT
+
+Resolves CHECKOUT's docker-compose.yml alone and with docker-compose.query-only.yml
+through `docker compose config` (which creates no container, volume or network),
+under a project name that is neither rag-docker nor rag-verify, with no .env file
+and none of the caller's COMPOSE_* or RAG_* variables, and checks that the overlay
+changes exactly one thing: the API's RAG_QUERY_ONLY, from "false" to "true". No
+other service, setting, port, volume or model changes. Prints each problem;
+exits 0 or 1.
+"""
+import json
+import os
+import subprocess
+import sys
+
+PROJECT = "rag-query-only-config"
+
+
+def resolve(checkout, overlay):
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("COMPOSE_", "RAG_"))}
+    files = ["-f", os.path.join(checkout, "docker-compose.yml")]
+    if overlay:
+        files += ["-f", os.path.join(checkout, "docker-compose.query-only.yml")]
+    result = subprocess.run(
+        ["docker", "compose", "--env-file", os.devnull, "-p", PROJECT, *files, "config", "--format", "json"],
+        cwd=checkout, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError("docker compose config failed: " + result.stderr.strip())
+    return json.loads(result.stdout)
+
+
+def problems(base, query_only):
+    found = []
+    base_env = ((base.get("services") or {}).get("api") or {}).get("environment") or {}
+    qo_env = ((query_only.get("services") or {}).get("api") or {}).get("environment") or {}
+    if base_env.get("RAG_QUERY_ONLY") != "false":
+        found.append("the base file's api must set RAG_QUERY_ONLY to \"false\", not {!r}".format(
+            base_env.get("RAG_QUERY_ONLY")))
+    if qo_env.get("RAG_QUERY_ONLY") != "true":
+        found.append("with the overlay the api's RAG_QUERY_ONLY must be \"true\", not {!r}".format(
+            qo_env.get("RAG_QUERY_ONLY")))
+    # Everything else is the same: put the one setting back and compare.
+    changed = json.loads(json.dumps(query_only))
+    api_env = ((changed.get("services") or {}).get("api") or {}).get("environment")
+    if isinstance(api_env, dict) and "RAG_QUERY_ONLY" in base_env:
+        api_env["RAG_QUERY_ONLY"] = base_env["RAG_QUERY_ONLY"]
+    if changed != base:
+        keys = sorted(set(base.get("services") or {}) | set(changed.get("services") or {}))
+        differ = [k for k in keys if (base.get("services") or {}).get(k) != (changed.get("services") or {}).get(k)]
+        found.append("the overlay changes more than the api's RAG_QUERY_ONLY (services differing: {})".format(
+            ", ".join(differ) or "none; a top-level key differs"))
+    return found
+
+
+def main(argv):
+    if len(argv) != 2:
+        print(__doc__.strip().splitlines()[2].strip(), file=sys.stderr)
+        return 2
+    checkout = os.path.realpath(argv[1])
+    try:
+        found = problems(resolve(checkout, False), resolve(checkout, True))
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+        print("    " + str(exc), file=sys.stderr)
+        return 1
+    for problem in found:
+        print("    " + problem, file=sys.stderr)
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+```
+
 ### scripts/tests/test_lan_mode.py
 
 ````python
@@ -35116,9 +35890,585 @@ if __name__ == "__main__":
     unittest.main(verbosity=2)
 ````
 
-### scripts/tests/test_auth.py
+### scripts/tests/test_query_only.py
 
 ```python
+"""Query-only mode (#670): the setting, the refused routes, the flag in the
+user answers, the loader and the access of a collection it creates.
+
+Runs with the API's dependencies: in the built API image with no network, as
+`24_query_only.sh` does,
+
+    docker run --rm --network none -v "$PWD:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api \\
+      "$(docker compose images -q api)" python scripts/tests/test_query_only.py
+
+or on the host with them installed. Every test uses its own temporary account
+store, audit folder, upload folder and exports folder; requests go through
+`main.app` with FastAPI's TestClient, without the lifespan. Weaviate and Ollama
+are blocked for the whole run, as in test_auth.py, and the loader's import run
+is replaced where it would need them.
+"""
+import asyncio
+import contextlib
+import fcntl
+import io
+import json
+import os
+import re
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+API_DIR = os.environ.get("RAG_TEST_API_DIR") or str(Path(__file__).resolve().parents[2] / "api")
+sys.path.insert(0, API_DIR)
+ROOT = Path(API_DIR).parent
+
+import httpx
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
+
+import config
+import loader
+from config import settings
+from main import app
+from auth import keys, passwords, policy, store
+from auth.middleware import AuthMiddleware
+from services import importer, ollama_client, weaviate_client
+
+ORIGIN = "http://testserver"
+
+# The 19 routes refused in query-only mode (#670, decision Q2), written out
+# here rather than read from the policy, so a change to either is a decision.
+REFUSED = {
+    ("POST", "/collections"), ("DELETE", "/collections/{name}"),
+    ("POST", "/ingest/upload"), ("POST", "/ingest/config"), ("POST", "/retrieval/config"),
+    ("POST", "/goldstandard/generate"), ("POST", "/goldstandard/regenerate"),
+    ("PATCH", "/goldstandard/session/{session_id}/pair/{pair_id}"), ("POST", "/goldstandard/save"),
+    ("POST", "/import"),
+    ("POST", "/prepare/upload"), ("DELETE", "/prepare/documents/{document_id}"),
+    ("DELETE", "/prepare/documents/{document_id}/prepared"), ("POST", "/prepare/jobs"),
+    ("POST", "/prepare/job/{job_id}/cancel"), ("POST", "/prepare/import"),
+    ("POST", "/tune/rechunk"), ("POST", "/tune/reembed"), ("POST", "/tune/reindex"),
+}
+# Every other state-changing route keeps working: a new one fails this test
+# until it is put in one list or the other.
+KEPT = {
+    ("POST", "/auth/login"), ("POST", "/auth/logout"), ("POST", "/auth/password"),
+    ("POST", "/auth/login/mfa"), ("POST", "/auth/mfa/enroll"), ("POST", "/auth/mfa/enroll/confirm"),
+    ("POST", "/auth/mfa/recovery-codes"), ("POST", "/auth/mfa/disable"), ("POST", "/auth/mfa/policy"),
+    ("POST", "/auth/users"), ("POST", "/auth/users/{username}/reset-password"),
+    ("POST", "/auth/users/{username}/role"), ("POST", "/auth/users/{username}/disable"),
+    ("POST", "/auth/users/{username}/enable"), ("POST", "/auth/users/{username}/reset-mfa"),
+    ("POST", "/auth/service-principals"), ("POST", "/auth/service-principals/{name}/role"),
+    ("POST", "/auth/service-principals/{name}/disable"), ("POST", "/auth/service-principals/{name}/enable"),
+    ("POST", "/auth/service-principals/{name}/keys"),
+    ("POST", "/auth/service-principals/{name}/keys/{key_id}/revoke"),
+    ("POST", "/query"), ("POST", "/export"), ("GET", "/packages/{filename}"),
+    ("PUT", "/collections/{name}/access"),
+}
+
+
+class _NoNetwork(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request):
+        raise httpx.ConnectError("test_query_only.py runs without a network", request=request)
+
+
+class _OfflineAsyncClient(httpx.AsyncClient):
+    def __init__(self, *args, **kwargs):
+        kwargs["transport"] = _NoNetwork()
+        super().__init__(*args, **kwargs)
+
+
+def _no_weaviate():
+    raise ConnectionError("test_query_only.py runs without a network: there is no Weaviate")
+
+
+_OFFLINE = (patch.object(weaviate_client, "get_client", _no_weaviate),
+            patch.object(httpx, "AsyncClient", _OfflineAsyncClient))
+
+
+def setUpModule():
+    for offline in _OFFLINE:
+        offline.start()
+
+
+def tearDownModule():
+    for offline in reversed(_OFFLINE):
+        offline.stop()
+
+
+def concrete(template):
+    return re.sub(r"\{[a-z_]+\}", "x", template)
+
+
+class Folders(unittest.TestCase):
+    """Temporary account store, audit, upload and exports folders, and the mode."""
+
+    QUERY_ONLY = True
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        for name in ("auth", "audit", "uploads", "exports"):
+            (self.root / name).mkdir()
+        for name, value in (("auth_dir", str(self.root / "auth")), ("audit_dir", str(self.root / "audit")),
+                            ("upload_dir", str(self.root / "uploads")),
+                            ("exports_dir", str(self.root / "exports")),
+                            ("rag_query_only", self.QUERY_ONLY)):
+            target = patch.object(settings, name, value)
+            target.start()
+            self.addCleanup(target.stop)
+
+    def records(self, action=None):
+        path = self.root / "audit" / "audit.jsonl"
+        if not path.exists():
+            return []
+        found = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        return [r for r in found if action is None or r["action"] == action]
+
+
+# ── S1: the setting ──────────────────────────────────────────────────────────
+
+class SettingTests(unittest.TestCase):
+    def test_exactly_true_or_false(self):
+        for value, expected in (("true", True), ("false", False)):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {"RAG_QUERY_ONLY": value}):
+                    self.assertIs(config.Settings().rag_query_only, expected)
+        self.assertIs(config.Settings.model_fields["rag_query_only"].default, False)
+        for value in ("yes", "1", "TRUE", "on", ""):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {"RAG_QUERY_ONLY": value}):
+                    with self.assertRaises(ValidationError) as caught:
+                        config.Settings()
+                self.assertEqual(config.refusal_lines(caught.exception),
+                                 ["Settings refused: RAG_QUERY_ONLY must be exactly true or false"])
+
+    def test_the_overlay_sets_only_the_api_switch(self):
+        text = (ROOT / "docker-compose.query-only.yml").read_text()
+        body = [line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+        self.assertEqual(body, ["services:", "  api:", "    environment:", '      RAG_QUERY_ONLY: "true"'])
+        base = (ROOT / "docker-compose.yml").read_text()
+        self.assertEqual(base.count('RAG_QUERY_ONLY: "false"'), 1)
+
+    def test_config_check_compares_the_whole_configuration(self):
+        sys.path.insert(0, str(ROOT / "scripts" / "verify"))
+        try:
+            import query_only_config
+        finally:
+            sys.path.pop(0)
+        base = {"services": {"api": {"environment": {"RAG_QUERY_ONLY": "false", "A": "1"}}, "ui": {}}}
+        good = {"services": {"api": {"environment": {"RAG_QUERY_ONLY": "true", "A": "1"}}, "ui": {}}}
+        self.assertEqual(query_only_config.problems(base, good), [])
+        worse = json.loads(json.dumps(good))
+        worse["services"]["ui"] = {"ports": ["0.0.0.0:1:1"]}
+        self.assertEqual(len(query_only_config.problems(base, worse)), 1)
+        self.assertEqual(len(query_only_config.problems(base, base)), 1)
+
+
+# ── S2: the policy ───────────────────────────────────────────────────────────
+
+class PolicyTests(unittest.TestCase):
+    def test_the_refused_routes_are_the_decided_ones(self):
+        self.assertEqual(set(policy.QUERY_ONLY_REFUSED), REFUSED)
+
+    def test_every_state_changing_route_is_classified_once(self):
+        changing = {key for key in policy.ACCESS
+                    if key[0] != "GET" or key[1] in policy.STATE_CHANGING_GET}
+        self.assertEqual(set(policy.QUERY_ONLY_KEPT), KEPT,
+                         "a state-changing route is not classified for query-only mode (#670)")
+        self.assertEqual(REFUSED | KEPT, changing)
+        self.assertEqual(REFUSED & KEPT, set())
+        self.assertTrue(REFUSED <= set(policy.ACCESS))
+
+
+# ── S2, S3: through the app ──────────────────────────────────────────────────
+
+class AppTests(Folders):
+    def setUp(self):
+        super().setUp()
+        self.client = TestClient(app, raise_server_exceptions=False)
+        self.addCleanup(self.client.close)
+        self.passwords = {}
+        for name, role in (("eng", "engineer"), ("dev", "developer"), ("user", "end_user")):
+            self.passwords[name] = passwords.generate_password()
+            store.create_user(name, role, self.passwords[name], bootstrap=not store.is_set_up(),
+                              must_change_password=False)
+
+    def session(self, username):
+        token = store.create_session(store.get_user(username).id)
+        return {"Cookie": f"{store.COOKIE}={token}", "Origin": ORIGIN}
+
+    def code(self, response):
+        try:
+            return response.json()["error"]["code"]
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    def test_each_refused_route_answers_query_only(self):
+        for method, template in sorted(REFUSED):
+            with self.subTest(route=(method, template)):
+                response = self.client.request(method, concrete(template), json={},
+                                               headers=self.session("eng"))
+                self.assertEqual((response.status_code, self.code(response)), (403, "QUERY_ONLY"))
+                self.assertIn("query-only", response.json()["error"]["message"])
+
+    def test_other_refusals_come_first(self):
+        # No session: 401. A Developer on an Engineer's route: FORBIDDEN. Cross-origin first too.
+        response = self.client.post("/import", json={})
+        self.assertEqual((response.status_code, self.code(response)), (401, "AUTH_REQUIRED"))
+        response = self.client.delete("/collections/x", headers=self.session("dev"))
+        self.assertEqual((response.status_code, self.code(response)), (403, "FORBIDDEN"))
+        response = self.client.post("/import", json={}, headers={**self.session("user")})
+        self.assertEqual(self.code(response), "FORBIDDEN")
+        headers = {**self.session("eng"), "Origin": "http://elsewhere.example"}
+        response = self.client.post("/import", json={}, headers=headers)
+        self.assertEqual(self.code(response), "CROSS_ORIGIN_REFUSED")
+
+    def test_a_key_is_refused_too(self):
+        store.create_principal("svc", "engineer")
+        _, key = store.issue_key("svc", 30, "")
+        response = self.client.post("/tune/reindex", json={}, headers={"Authorization": f"Bearer {key}"})
+        self.assertEqual((response.status_code, self.code(response)), (403, "QUERY_ONLY"))
+        response = self.client.post("/import", json={}, headers={"Authorization": "Bearer nonsense"})
+        self.assertEqual(self.code(response), "KEY_INVALID")
+
+    def test_kept_routes_are_not_refused(self):
+        for method, template in sorted(KEPT):
+            with self.subTest(route=(method, template)):
+                response = self.client.request(method, concrete(template), json={},
+                                               headers=self.session("eng"))
+                self.assertNotEqual(self.code(response), "QUERY_ONLY")
+        self.assertEqual(self.client.get("/collections", headers=self.session("user")).status_code != 403, True)
+
+    def test_off_nothing_is_refused_for_the_mode(self):
+        with patch.object(settings, "rag_query_only", False):
+            for method, template in sorted(REFUSED):
+                with self.subTest(route=(method, template)):
+                    response = self.client.request(method, concrete(template), json={},
+                                                   headers=self.session("eng"))
+                    self.assertNotEqual(self.code(response), "QUERY_ONLY")
+
+    def test_the_refusal_is_audited_with_its_principal(self):
+        self.client.post("/import", json={"filename": "ragpkg-x.tar.gz"}, headers=self.session("eng"))
+        found = self.records("import")
+        self.assertEqual(len(found), 1, found)
+        self.assertEqual((found[0]["actor"], found[0]["result"], found[0]["status_code"]),
+                         ("eng", "refused", 403))
+        self.assertIn("QUERY_ONLY", json.dumps(found[0]))
+
+    def test_the_body_of_a_refused_request_is_never_read(self):
+        token = store.create_session(store.get_user("eng").id)
+        scope = {"type": "http", "method": "POST", "path": "/ingest/upload", "query_string": b"",
+                 "headers": [(b"cookie", f"{store.COOKIE}={token}".encode()), (b"origin", ORIGIN.encode()),
+                             (b"host", b"testserver")]}
+        sent = []
+
+        async def inner(scope, receive, send):
+            raise AssertionError("the route ran")
+
+        async def receive():
+            raise AssertionError("the body was read")
+
+        async def send(message):
+            sent.append(message)
+
+        asyncio.run(AuthMiddleware(inner)(scope, receive, send))
+        self.assertEqual(sent[0]["status"], 403)
+        self.assertIn(b"QUERY_ONLY", sent[1]["body"])
+
+    def test_user_answers_carry_the_mode(self):
+        response = self.client.post("/auth/login", json={"username": "user", "password": self.passwords["user"]},
+                                    headers={"Origin": ORIGIN})
+        self.assertIs(response.json()["query_only"], True)
+        self.assertIs(self.client.get("/auth/me", headers=self.session("user")).json()["query_only"], True)
+        with patch.object(settings, "rag_query_only", False):
+            self.assertIs(self.client.get("/auth/me", headers=self.session("user")).json()["query_only"], False)
+        self.assertNotIn("query_only", self.client.get("/auth/status").json())
+
+
+# ── S4: the loader ───────────────────────────────────────────────────────────
+
+class LoaderTests(Folders):
+    def setUp(self):
+        super().setUp()
+        self.sigint = patch.object(loader.signal, "signal")   # never change the test runner's SIGINT
+        self.sigint.start()
+        self.addCleanup(self.sigint.stop)
+        self.sweep = patch.object(importer, "sweep_interrupted_imports", return_value=[])
+        self.swept = self.sweep.start()
+        self.addCleanup(self.sweep.stop)
+        self.calls = []
+
+    def package(self, name="ragpkg-vfy-1.tar.gz"):
+        (self.root / "exports" / name).write_bytes(b"not read: the import run is replaced")
+        return name
+
+    def fake_run(self, status="completed", **fields):
+        def run(job_id, filename, on_conflict, passphrase=None):
+            job = importer._jobs[job_id]
+            self.calls.append({"job": dict(job), "filename": filename, "on_conflict": on_conflict,
+                               "passphrase": passphrase, "lock_held": self.lock_is_held()})
+            job.update({"status": status, **fields})
+        return patch.object(importer, "_run", run)
+
+    def lock_is_held(self):
+        with open(self.root / "uploads" / "loader.lock", "a") as other:
+            try:
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(other, fcntl.LOCK_UN)
+            return False
+
+    def main(self, argv, stdin=""):
+        err = io.StringIO()
+        with patch.object(sys, "stdin", io.StringIO(stdin)), contextlib.redirect_stderr(err):
+            try:
+                code = loader.main(argv)
+            except SystemExit as exc:
+                code = exc.code
+        return code, err.getvalue()
+
+    def test_usage_errors_exit_2_and_record_nothing(self):
+        for argv in ([], ["../etc/passwd"], ["notes.txt"], ["exports/ragpkg-a.tar.gz"],
+                     ["ragpkg-a.tar.gz", "--on-conflict", "merge"], ["ragpkg-a.tar.gz", "--passphrase", "x"]):
+            with self.subTest(argv=argv):
+                code, _ = self.main(argv)
+                self.assertEqual(code, 2)
+        self.assertEqual(self.records(), [])
+
+    def test_refused_on_a_full_instance(self):
+        name = self.package()
+        with patch.object(settings, "rag_query_only", False), self.fake_run():
+            code, err = self.main([name])
+        self.assertEqual(code, 1)
+        self.assertIn("load refused: NOT_QUERY_ONLY", err)
+        self.assertEqual(self.calls, [])
+        record = self.records("operator.load")[-1]
+        self.assertEqual((record["actor"], record["actor_kind"], record["result"], record["target"]),
+                         ("operator", "operator", "refused", name))
+        self.assertEqual(record["details"], {"on_conflict": "abort", "encrypted": False, "code": "NOT_QUERY_ONLY"})
+
+    def test_one_load_at_a_time(self):
+        name = self.package()
+        with open(self.root / "uploads" / "loader.lock", "a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            with self.fake_run():
+                code, err = self.main([name])
+        self.assertEqual(code, 1)
+        self.assertIn("LOAD_IN_PROGRESS", err)
+        self.assertEqual(self.calls, [])
+
+    def test_a_missing_package(self):
+        with self.fake_run():
+            code, err = self.main(["ragpkg-absent.tar.gz"])
+        self.assertEqual(code, 1)
+        self.assertIn("PACKAGE_NOT_FOUND", err)
+        (self.root / "exports" / "ragpkg-dir.tar.gz").mkdir()
+        os.symlink(self.root / "elsewhere", self.root / "exports" / "ragpkg-link.tar.gz")
+        for name in ("ragpkg-dir.tar.gz", "ragpkg-link.tar.gz"):
+            with self.subTest(name=name), self.fake_run():
+                code, err = self.main([name])
+                self.assertEqual((code, "PACKAGE_NOT_FOUND" in err), (1, True))
+        self.assertEqual(self.calls, [])
+
+    def test_a_load_runs_the_import_code_under_the_lock(self):
+        name = self.package()
+        with self.fake_run(collection="Policies", original_collection="Policies", chunks_written=12,
+                           fidelity="with-sources", notes=["a note"]):
+            code, err = self.main([name, "--on-conflict", "replace"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.calls), 1)
+        call = self.calls[0]
+        self.assertEqual((call["filename"], call["on_conflict"], call["passphrase"], call["lock_held"]),
+                         (name, "replace", None, True))
+        self.assertIs(call["job"]["operator"], True)
+        self.assertIsNone(call["job"]["owner"])
+        self.swept.assert_called_once()
+        self.assertIn("loaded into collection Policies: 12 chunks, with-sources", err)
+        self.assertIn("note: a note", err)
+        self.assertFalse(self.lock_is_held())
+        record = self.records("operator.load")[-1]
+        self.assertEqual((record["result"], record["collection"], record["target"]), ("success", "Policies", name))
+        self.assertEqual(record["details"], {"on_conflict": "replace", "encrypted": False, "chunks": 12})
+
+    def test_a_failed_load(self):
+        name = self.package()
+        with self.fake_run(status="failed", error_code="EMBEDDING_MISMATCH", error="another model",
+                           collection=None):
+            code, err = self.main([name])
+        self.assertEqual(code, 1)
+        self.assertIn("load failed: EMBEDDING_MISMATCH: another model", err)
+        record = self.records("operator.load")[-1]
+        # A load that ran and failed is `failed`, not `refused` (maintainer, 2026-11-18).
+        self.assertEqual((record["result"], record["details"]["code"]), ("failed", "EMBEDDING_MISMATCH"))
+
+    def test_an_encrypted_package_reads_its_passphrase_from_stdin(self):
+        name = self.package("ragpkg-vfy-2.tar.gz.age")
+        secret = "correct horse battery staple"
+        with self.fake_run(collection="P", original_collection="P", chunks_written=1):
+            code, err = self.main([name], stdin=secret + "\n")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.calls[0]["passphrase"], secret)
+        self.assertNotIn(secret, err)
+        self.assertNotIn(secret, (self.root / "audit" / "audit.jsonl").read_text())
+        self.assertIs(self.records("operator.load")[-1]["details"]["encrypted"], True)
+        with self.fake_run():
+            code, err = self.main([name], stdin="\n")
+        self.assertEqual(code, 1)
+        self.assertIn("PASSPHRASE_REQUIRED", err)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_progress_lines(self):
+        name = self.package()
+
+        def run(job_id, filename, on_conflict, passphrase=None):
+            job = importer._jobs[job_id]
+            job["chunks_written"] = 7
+            import time
+            time.sleep(0.3)
+            job.update({"status": "completed", "collection": "P", "original_collection": "P"})
+
+        with patch.object(loader, "PROGRESS_SECONDS", 0.1), patch.object(importer, "_run", run):
+            code, err = self.main([name])
+        self.assertEqual(code, 0)
+        self.assertIn("loader: chunks written: 7", err)
+
+    def test_ctrl_c_is_recorded_then_acts_as_a_kill(self):
+        # The handler is installed once the arguments are read; on SIGINT it
+        # records the load as interrupted (with the job's collection), restores
+        # SIG_DFL and sends SIGINT again, so the import's `finally` never runs.
+        name = self.package()
+        with self.fake_run(collection="P", original_collection="P"):
+            self.main([name])
+        signum, handler = loader.signal.signal.call_args_list[0][0]
+        self.assertEqual(signum, loader.signal.SIGINT)
+        self.assertTrue(callable(handler))
+        loader._state.clear()
+        loader._state["job"] = {"collection": "Policies"}
+        loader.signal.signal.reset_mock()
+        real_write = os.write
+        with patch.object(loader.os, "kill") as kill, \
+                patch.object(loader.os, "write", side_effect=lambda fd, data: len(data) if fd == 2
+                             else real_write(fd, data)) as write:
+            handler(loader.signal.SIGINT, None)
+        loader.signal.signal.assert_called_once_with(loader.signal.SIGINT, loader.signal.SIG_DFL)
+        kill.assert_called_once_with(os.getpid(), loader.signal.SIGINT)
+        # Straight to fd 2, not through sys.stderr (a reentrant print could raise).
+        self.assertEqual(write.call_args_list[0][0], (2, b"loader: load interrupted: INTERRUPTED\n"))
+        record = self.records("operator.load")[-1]
+        self.assertEqual((record["result"], record["collection"], record["target"], record["details"]["code"]),
+                         ("interrupted", "Policies", name, "INTERRUPTED"))
+
+    def test_the_kill_happens_even_when_the_record_fails(self):
+        handler = loader._interrupted("ragpkg-x.tar.gz", "abort", False)
+        loader._state.clear()
+        with patch.object(loader.os, "kill") as kill, patch.object(loader.os, "write"), \
+                patch.object(loader, "_audit", side_effect=RuntimeError("reentrant call")):
+            with self.assertRaises(RuntimeError):
+                handler(loader.signal.SIGINT, None)
+        kill.assert_called_once_with(os.getpid(), loader.signal.SIGINT)
+        with patch.object(loader.os, "kill") as kill, \
+                patch.object(loader.os, "write", side_effect=OSError("closed")):
+            with self.assertRaises(OSError):
+                handler(loader.signal.SIGINT, None)
+        kill.assert_called_once_with(os.getpid(), loader.signal.SIGINT)
+        loader._state.clear()
+
+    def test_after_the_runs_own_record_ctrl_c_writes_none(self):
+        # The run marks itself done before its final record, whatever the result.
+        name = self.package()
+        for run, argv in ((self.fake_run(collection="P", original_collection="P"), [name]),
+                          (self.fake_run(status="failed", error_code="IMPORT_FAILED"), [name]),
+                          (self.fake_run(), ["ragpkg-absent.tar.gz"])):
+            with self.subTest(argv=argv, run=run), run:
+                self.main(argv)
+                self.assertIs(loader._state.get("done"), True)
+                handler = loader.signal.signal.call_args_list[0][0][1]
+                before = len(self.records())
+                with patch.object(loader.os, "kill") as kill, patch.object(loader.os, "write") as write:
+                    handler(loader.signal.SIGINT, None)
+                kill.assert_called_once()
+                write.assert_not_called()
+                self.assertEqual(len(self.records()), before)
+                loader.signal.signal.reset_mock()
+        loader._state.clear()
+
+    def test_ctrl_c_while_a_record_is_written_writes_no_second_one(self):
+        handler = loader._interrupted("ragpkg-x.tar.gz", "abort", False)
+        loader._state.clear()
+        loader._state["auditing"] = True
+        before = len(self.records())
+        with patch.object(loader.os, "kill") as kill:
+            handler(loader.signal.SIGINT, None)
+        kill.assert_called_once()
+        self.assertEqual(len(self.records()), before)
+        loader._state.clear()
+
+
+# ── S5: access to a collection the loader creates ────────────────────────────
+
+class AccessTests(Folders):
+    def setUp(self):
+        super().setUp()
+        store.create_user("eng", "engineer", passwords.generate_password(), bootstrap=True,
+                          must_change_password=False)
+
+    def test_an_operator_load_restricts_a_new_collection_with_no_grants(self):
+        with patch.object(importer, "exists_fail_closed", return_value=False):
+            states = importer._start_access(None, "Policies", "Policies", operator=True)
+        self.assertIsNotNone(states)
+        self.assertEqual(store.collection_access("Policies"), store.CollectionAccess(True, (), ()))
+
+    def test_without_an_owner_or_the_operator_nothing_is_recorded(self):
+        self.assertIsNone(importer._start_access(None, "Policies", "Policies"))
+        self.assertEqual(store.collection_access("Policies"), store.CollectionAccess(False))
+
+    def test_a_rename_starts_engineers_only_too(self):
+        # Maintainer, 2026-11-18 (#808): the loader never copies an existing
+        # collection's access, even an open one; only replace keeps access.
+        store.set_collection_access("Policies", False)
+        with patch.object(importer, "exists_fail_closed", return_value=True):
+            importer._start_access(None, "Policies", "Policies_ab12cd34", operator=True)
+        self.assertEqual(store.collection_access("Policies_ab12cd34"), store.CollectionAccess(True, (), ()))
+        self.assertEqual(store.collection_access("Policies"), store.CollectionAccess(False))
+
+    def test_a_staging_copys_package_starts_engineers_only(self):
+        store.set_collection_access("Policies", False)
+        staging = "Policies__importing_" + "0" * 32
+        with patch.object(importer, "exists_fail_closed", return_value=True):
+            importer._start_access(None, "Policies", staging, operator=True)
+        self.assertEqual(store.collection_access(staging), store.CollectionAccess(True, (), ()))
+
+    def test_an_owners_import_still_copies_the_source_state(self):
+        # The API's import is unchanged (#606): a rename copies the source's state.
+        store.set_collection_access("Policies", False)
+        with patch.object(importer, "exists_fail_closed", return_value=True):
+            importer._start_access({"name": "eng", "kind": "user"}, "Policies", "Policies_ab12cd34")
+        self.assertEqual(store.collection_access("Policies_ab12cd34"), store.CollectionAccess(False))
+
+    def test_the_operator_is_never_refused_for_access(self):
+        store.restrict_to("Policies", None)
+        with patch.object(importer, "exists_fail_closed", return_value=True):
+            self.assertFalse(importer._refused(None, "Policies"))
+
+
+class ImplementationNotes(unittest.TestCase):
+    def test_the_loader_docstring_is_its_usage(self):
+        self.assertIn("python -m loader PACKAGE [--on-conflict abort|rename|replace]", loader.__doc__)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+```
+
+### scripts/tests/test_auth.py
+
+````python
 """Accounts, sessions, service principals and API keys, the endpoint/role
 matrix and the operator command (#25).
 
@@ -35886,6 +37236,7 @@ class RouteTests(StoreTestCase):
             response = self.login("ENG", password)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"username": "eng", "role": "engineer", "must_change_password": True,
+                                           "query_only": False,      # #670
                                            "mfa_enrolled": False, "mfa_required": False,
                                            "mfa_enrollment_required": False})
         cookie = response.headers["set-cookie"]
@@ -36545,7 +37896,7 @@ class KeyMiddlewareTests(KeyTestCase):
         response = self.client.get("/auth/me", headers=self.bearer(key))
         self.assertEqual(response.json(), {"username": "svc", "role": "end_user", "must_change_password": False,
                                            "kind": "service", "mfa_enrolled": False, "mfa_required": False,
-                                           "mfa_enrollment_required": False})
+                                           "mfa_enrollment_required": False, "query_only": False})
         headers, _ = self.session("dev")
         self.assertEqual(self.client.get("/auth/me", headers=headers).json()["kind"], "user")
 
@@ -37626,7 +38977,7 @@ class ImplementationCopyTests(unittest.TestCase):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.CRITICAL)
     unittest.main(verbosity=2)
-```
+````
 
 ### scripts/tests/test_prepare.py
 
@@ -58707,6 +60058,75 @@ function prepareCases() {
   ];
 }
 
+// Query-only mode (#670): GET /api/auth/me says query_only, and the UI shows
+// the "Query-only" tag, hides the pages that change data from the nav and the
+// router, keeps Transfer's export and package list without its import
+// controls, and drops "+ New Collection" and Delete from the Collections page.
+// The API refuses those writes whatever the UI shows (24_query_only.sh).
+function queryOnlyCases() {
+  const me = (role, queryOnly) => json(200, { username: 'vfy-' + role.replace('_', '-'), role, must_change_password: false, query_only: queryOnly });
+  const qo = (role, path, routes = {}) => ({ role, path, routes: base({ 'GET /api/auth/me': me(role, true), ...routes }) });
+  const goto = async (page, p) => { await page.goto(S.BASE + p, { waitUntil: 'domcontentloaded' }); };
+  const tag = page => page.evaluate(() => document.querySelector('[data-testid=nav-query-only]')?.textContent.trim() ?? null);
+  const ready = page => waitFor(page, () => document.querySelectorAll('nav button[data-menu]').length > 0, 'the nav');
+  const WRITE_PAGES = ['/import', '/prepare', '/chunking', '/retrieval', '/goldstandard'];
+  return [
+    { name: 'Query-only Engineer: the nav shows the Query-only tag and Q&A, Transfer and the Admin pages, without Import, Prepare, Chunking, Retrieval or Gold Standard', open: qo('engineer', '/qa'), async run(s) {
+      await ready(s.page);
+      assert.equal(await tag(s.page), 'Query-only');
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Transfer', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
+    } },
+    { name: 'Query-only Developer: the nav shows the tag, Q&A and Transfer, and no Tune menu', open: qo('developer', '/qa'), async run(s) {
+      await ready(s.page);
+      assert.equal(await tag(s.page), 'Query-only');
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Transfer']);
+      assert.equal(await s.page.evaluate(() => !!document.querySelector('nav button[data-menu="tune"]')), false);
+    } },
+    { name: 'Query-only: opening Import, Prepare, Chunking, Retrieval or Gold Standard directly is sent to Q&A, while Transfer and Collections still open', open: qo('engineer', '/qa'), async run(s) {
+      for (const p of WRITE_PAGES) {
+        await goto(s.page, p);
+        await waitText(s.page, 'Ask a Question');
+        await waitPath(s.page, '/qa');
+      }
+      await goto(s.page, '/transfer');
+      await waitText(s.page, 'Export a collection');
+      await waitPath(s.page, '/transfer');
+      await goto(s.page, '/collections');
+      await waitText(s.page, A);
+      await waitPath(s.page, '/collections');
+    } },
+    { name: 'Query-only Collections page: the list and Access stay, "+ New Collection" and Delete are gone', open: qo('engineer', '/collections'), async run(s) {
+      await waitText(s.page, A);
+      const buttons = await s.page.evaluate(() => [...document.querySelectorAll('main button')].map(b => b.textContent.trim()));
+      assert.equal(buttons.includes('+ New Collection'), false);
+      assert.equal(buttons.includes('Delete'), false);
+      assert.equal(buttons.filter(b => b === 'Access').length, COLS.length);
+    } },
+    { name: 'Query-only Transfer page: export, the package list, Download and Refresh stay; the import controls are gone and the loader is named', open: qo('developer', '/transfer', {
+        'GET /api/packages': json(200, { packages: [{ filename: 'ragpkg-vfyqo.tar.gz', readable: true, encrypted: false, collection: A, chunk_count: 3, fidelity: 'with-sources', size_bytes: 2048 }] }) }), async run(s) {
+      await waitText(s.page, 'Export a collection');
+      await waitText(s.page, 'Packages in ./exports');
+      await waitText(s.page, 'python -m loader');
+      await waitFor(s.page, () => document.querySelectorAll('select')[1]?.options.length > 1, 'the packages');
+      await fillNth(s.page, 'select', 1, 'ragpkg-vfyqo.tar.gz');
+      await waitFor(s.page, () => [...document.querySelectorAll('a')].some(a => a.textContent.trim() === 'Download'), 'the Download link');
+      const buttons = await s.page.evaluate(() => [...document.querySelectorAll('main button')].map(b => b.textContent.trim()));
+      assert.equal(buttons.includes('Refresh'), true);
+      assert.equal(buttons.includes('Import'), false);
+      assert.equal(await s.page.evaluate(() => document.querySelectorAll('input[name=conflict]').length), 0);
+      assert.equal(await s.page.evaluate(() => document.body.innerText.includes('Import a package')), false);
+      assert.equal(callsTo(s, 'POST', '/api/import').length, 0);
+    } },
+    { name: 'query_only false: no Query-only tag, the full Engineer nav, and "+ New Collection" on the Collections page', open: { role: 'engineer', path: '/collections', routes: base({ 'GET /api/auth/me': me('engineer', false) }) }, async run(s) {
+      await waitText(s.page, A);
+      await ready(s.page);
+      assert.equal(await tag(s.page), null);
+      assert.deepEqual(await nav(s.page), ['Q&A', 'Import', 'Prepare', 'Transfer', 'Chunking', 'Retrieval', 'Gold Standard', 'Collections', 'Users', 'Service keys', 'Audit', 'Health']);
+      assert.equal(await s.page.evaluate(() => [...document.querySelectorAll('main button')].some(b => b.textContent.trim() === '+ New Collection')), true);
+    } },
+  ];
+}
+
 async function runUiControlTests(browser, baseUrl, reporter) {
   S.BASE = baseUrl;
   const run = (section, cases) => S.runCases(browser, baseUrl, reporter, section, cases);
@@ -58722,6 +60142,7 @@ async function runUiControlTests(browser, baseUrl, reporter) {
   await run('Q&A input, citations toggle, answer display and End User view (#400)', qaCases());
   await run('Retrieval page status text, alpha slider and save (#400)', retrievalCases());
   await run('Client handling of the proxy error pages (#400)', proxyCases());
+  await run('Query-only mode: the tag, the hidden pages and controls (#670)', queryOnlyCases());
 }
 
 module.exports = { runUiControlTests };

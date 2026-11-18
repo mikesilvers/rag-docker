@@ -671,6 +671,8 @@ class AuthUser(BaseModel):
     mfa_enrolled: Optional[bool] = None
     mfa_required: Optional[bool] = None
     mfa_enrollment_required: Optional[bool] = None
+    # Query-only mode (#670): the UI hides the pages that change data.
+    query_only: Optional[bool] = None
 
 
 class AdminUser(BaseModel):

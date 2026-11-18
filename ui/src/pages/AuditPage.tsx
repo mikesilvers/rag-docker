@@ -10,7 +10,7 @@ const ACTIONS = [
   'auth.mfa.recovery-codes', 'auth.password', 'collection.access', 'collection.access.refused', 'collection.create',
   'collection.delete', 'export',
   'goldstandard.download', 'goldstandard.save', 'import', 'ingest', 'ingest.config', 'operator.bootstrap',
-  'operator.create-user', 'operator.disable', 'operator.enable', 'operator.reset-mfa', 'operator.reset-password',
+  'operator.create-user', 'operator.disable', 'operator.enable', 'operator.load', 'operator.reset-mfa', 'operator.reset-password',
   'operator.set-role', 'package.delete', 'package.download', 'prepare.cancel', 'prepare.delete', 'prepare.download', 'prepare.import', 'prepare.start',
   'prepare.upload', 'query', 'retrieval.config', 'system.start', 'tune.rechunk', 'tune.reembed', 'tune.reindex',
 ]
