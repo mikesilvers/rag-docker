@@ -102,6 +102,11 @@ export default function TransferPage() {
   const importTimer = useRef<number | null>(null)
   const exportPoll = useRef(0)
   const importPoll = useRef(0)
+  // Downloads being watched (#677): a full download deletes a package exported
+  // here, so the list is re-read until it is gone. `gone` holds the packages
+  // seen to go, so the finished export stops offering its Download.
+  const downloadWatches = useRef(new Map<string, number>())
+  const [gone, setGone] = useState<Set<string>>(new Set())
 
   const loadPackages = useCallback(() => {
     api.getPackages().then(r => {
@@ -123,8 +128,33 @@ export default function TransferPage() {
       importPoll.current += 1
       if (exportTimer.current) window.clearTimeout(exportTimer.current)
       if (importTimer.current) window.clearTimeout(importTimer.current)
+      downloadWatches.current.forEach(id => window.clearInterval(id))
+      downloadWatches.current.clear()
     }
   }, [loadPackages])
+
+  // After a Download click: re-read the package list every 3 s, for at most 10
+  // minutes, until the package isn't listed any more. A package not exported
+  // here stays listed, and its watch just ends at the limit (#677).
+  const watchDownload = useCallback((name: string) => {
+    const watches = downloadWatches.current
+    if (watches.has(name)) return
+    const started = Date.now()
+    const stop = () => { window.clearInterval(watches.get(name)); watches.delete(name) }
+    watches.set(name, window.setInterval(() => {
+      if (!alive.current || Date.now() - started > 10 * 60 * 1000) { stop(); return }
+      api.getPackages().then(r => {
+        if (!alive.current) return
+        setPackages(r.packages)
+        setPackagesError('')
+        if (!r.packages.some(p => p.filename === name)) {
+          stop()
+          setGone(g => new Set(g).add(name))
+          setFilename(f => (f === name ? '' : f))
+        }
+      }, () => {})
+    }, 3000))
+  }, [])
 
   // Fidelity is shown before the export runs, so the choice is informed rather
   // than discovered afterwards in the manifest. A lookup that fails says so
@@ -417,9 +447,13 @@ export default function TransferPage() {
                 </span>
               </p>
             )}
-            {exportJob.status === 'completed' && exportJob.filename && (
+            {exportJob.status === 'completed' && exportJob.filename && gone.has(exportJob.filename) && (
+              <p className="mt-2 text-gray-500 text-xs">Downloaded and deleted from ./exports.</p>
+            )}
+            {exportJob.status === 'completed' && exportJob.filename && !gone.has(exportJob.filename) && (
               <p className="mt-2 flex items-center gap-3">
                 <a href={api.packageDownloadUrl(exportJob.filename)} download
+                   onClick={() => watchDownload(exportJob.filename as string)}
                    className="bg-blue-600 text-white px-3 py-1 rounded text-xs hover:bg-blue-700">
                   Download
                 </a>
@@ -449,7 +483,7 @@ export default function TransferPage() {
           <label className="block text-sm font-medium">Package in ./exports</label>
           <span className="flex items-center gap-3">
             {filename
-              ? <a href={api.packageDownloadUrl(filename)} download
+              ? <a href={api.packageDownloadUrl(filename)} download onClick={() => watchDownload(filename)}
                    className="text-xs text-blue-600 hover:underline">Download</a>
               : <button disabled className="text-xs text-gray-400">Download</button>}
             <button onClick={loadPackages} className="text-xs text-blue-600 hover:underline">Refresh</button>

@@ -248,7 +248,7 @@ class _PackageStream(Response):
         await send({"type": "http.response.body", "body": response.body, "more_body": False})
 
     async def __call__(self, scope, receive, send) -> None:
-        complete = claimed = False
+        completed = claimed = False
         fd = None
         listener = None
         try:
@@ -292,7 +292,7 @@ class _PackageStream(Response):
                 sent += len(chunk)
             await asyncio.sleep(0)                    # let the listener see a disconnect
             if sent == size and not gone.is_set():
-                complete = True
+                completed = True
                 await send({"type": "http.response.body", "body": b"", "more_body": False})
             # Otherwise no final message: uvicorn drops a lost connection and
             # closes one that is still open, so the client sees it cut short.
@@ -301,9 +301,9 @@ class _PackageStream(Response):
                 listener.cancel()
             if fd is not None:
                 os.close(fd)
-            audit.note(complete=complete)
+            audit.note(completed=completed)
             try:
-                if complete and not self.head:
+                if completed and not self.head:
                     await asyncio.to_thread(package_retention.after_download, self.filename, scope)
             finally:
                 if claimed:
@@ -319,7 +319,7 @@ class _PackageStream(Response):
 async def download_package(filename: str, request: Request = None):
     """One package from ./exports, streamed (#677). A full download deletes a
     package this instance exported; any other package is served and kept."""
-    audit.note(complete=False)
+    audit.note(completed=False)
     if not package_retention.valid_name(filename):
         return _package_not_found(filename)
     path = packager.exports_dir() / filename

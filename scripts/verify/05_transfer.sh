@@ -1425,8 +1425,8 @@ check_eq "#677: GET /packages/{filename} downloads the package" "$dcode" "200"
 check_eq "#677: ... every byte of it" "$(wc -c < /tmp/vfy_dl.bin | tr -d ' ')" "$dsize"
 [ ! -e "$EXPORTS/$DPKG" ] && ! api_get "/packages" | grep -q "\"$DPKG\""
 check "#677: a full download deletes the package from ./exports and the listing" $?
-audit_has package.download "$DPKG" "r['details'].get('complete') is True and r['result'] == 'success'"
-check "#677: the download is audited as package.download, complete" $?
+audit_has package.download "$DPKG" "r['details'].get('completed') is True and r['result'] == 'success'"
+check "#677: the download is audited as package.download, completed" $?
 audit_has package.delete "$DPKG" "r['details'].get('reason') == 'downloaded' and r['actor_kind'] == 'user'"
 check "#677: the deletion is audited as package.delete, reason downloaded, by the user" $?
 rm -f /tmp/vfy_dl.bin
@@ -1437,7 +1437,7 @@ command curl -s -o /dev/null -b "$RAG_AUTH_JAR" --limit-rate 1M --max-time 2 "$A
 sleep 3
 retention exists "$IPKG"
 check "#677: an interrupted download keeps the package" $?
-audit_has package.download "$IPKG" "r['details'].get('complete') is False"
+audit_has package.download "$IPKG" "r['details'].get('completed') is False"
 check "#677: ... and its package.download record says it was incomplete" $?
 retention remove "$IPKG"
 

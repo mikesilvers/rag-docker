@@ -305,6 +305,18 @@ def _package_key(filename: str) -> str:
     return Path(filename).name
 
 
+def _claim_package(key: str, filename: str) -> None:
+    """Claim the package for this import, or refuse while another import has it.
+    Taken under package_retention's lock as well (that lock, then _lock), so an
+    expiry sweep or a post-download deletion never removes a package between its
+    busy check and the unlink while an import starts (#677)."""
+    from services import package_retention
+    with package_retention.lock(), _lock:
+        if key in _active:
+            raise ImportInProgressError(filename)
+        _active.add(key)
+
+
 def package_busy(filename: str) -> bool:
     """Whether an import of this package is running (#677: a download is
     refused, and the expiry sweep waits, meanwhile)."""
@@ -1077,10 +1089,8 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
                               f"'{key}' is not encrypted, so it takes no passphrase. "
                               "Anyone with the file can read it.")
     job_id = str(uuid.uuid4())[:8]
-    with _lock:
-        if key in _active:
-            raise ImportInProgressError(filename)
-        _active.add(key)
+    # Off the event loop: the claim waits while a sweep holds the retention lock (#677).
+    await asyncio.to_thread(_claim_package, key, filename)
 
     # The first write is durable, so it runs off the event loop (#309). A start
     # cancelled meanwhile releases its guard; the store removes the record.

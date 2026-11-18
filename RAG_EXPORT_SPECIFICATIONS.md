@@ -285,7 +285,10 @@ The package listing (`GET /packages`) shows `collection.name` and
 `collection.chunk_count`, `fidelity` and `created_at`, with the types above:
 `collection` an object, `chunk_count` an integer, the other three strings. A
 value that is absent or `null` is listed as `null`; any other type is not
-coerced, and the package is listed `readable: false` (#451).
+coerced, and the package is listed `readable: false` (#451). Each entry also
+carries `expires_at`, set only for a package this instance exported, and
+`GET /packages/{filename}` downloads a package and deletes one exported here once
+the download is complete (#677; `SPECIFICATIONS.md`, `GET /packages/{filename}`).
 
 `files` covers every file except `manifest.json`, `README.md` and `retrieve.py`.
 

@@ -144,10 +144,36 @@ class RecordTests(DownloadTestCase):
         self.assertTrue((self.root / "uploads" / "exported_packages.json").is_file())
         self.assertFalse(list(self.exports.iterdir()), "the record is never written in ./exports")
 
-    def test_an_unreadable_record_is_taken_as_empty(self):
-        (self.root / "uploads" / "exported_packages.json").write_text("{not json")
-        with self.assertLogs("services.package_retention", "ERROR"):
+    def test_an_unreadable_record_is_moved_aside_never_overwritten(self):
+        record = self.root / "uploads" / "exported_packages.json"
+        record.write_text("{not json")
+        with self.assertLogs("services.package_retention", "ERROR") as logs:
             self.assertEqual(package_retention.expiries(), {})
+        aside = [p for p in record.parent.iterdir() if p.name.startswith("exported_packages.json.corrupt-")]
+        self.assertEqual(len(aside), 1)
+        self.assertEqual(aside[0].read_text(), "{not json")
+        self.assertIn(aside[0].name, "\n".join(logs.output))
+        self.assertFalse(record.exists())
+        package_retention.record_export("ragpkg-new.tar.gz", NOW)      # a new record starts
+        self.assertTrue(package_retention.recorded("ragpkg-new.tar.gz"))
+        self.assertEqual(aside[0].read_text(), "{not json")
+
+    def test_a_record_that_cant_be_moved_aside_is_not_overwritten(self):
+        record = self.root / "uploads" / "exported_packages.json"
+        record.write_text('{"packages": "wrong shape"}')
+        self.addCleanup(setattr, package_retention, "_stuck", False)
+        real_replace = os.replace
+
+        def replace(src, dst):
+            if Path(src) == record:                   # the record can't be moved aside
+                raise OSError("read-only")
+            return real_replace(src, dst)
+        with patch.object(package_retention.os, "replace", replace), \
+                self.assertLogs("services.package_retention", "ERROR"):
+            self.assertEqual(package_retention.expiries(), {})
+            with self.assertRaises(RuntimeError):
+                package_retention.record_export("ragpkg-new.tar.gz", NOW)
+        self.assertEqual(record.read_text(), '{"packages": "wrong shape"}')
 
     def run_export(self, record=None):
         result = {"filename": "ragpkg-open1-x.tar.gz", "size_bytes": 1, "chunk_count": 1,
@@ -212,7 +238,7 @@ class DownloadTests(DownloadTestCase):
         self.assertFalse(package_retention._downloading)
         download = self.records("package.download")[-1]
         self.assertEqual((download["actor"], download["result"], download["details"]["file"],
-                          download["details"]["complete"]), ("dev", "success", "ragpkg-mine.tar.gz", True))
+                          download["details"]["completed"]), ("dev", "success", "ragpkg-mine.tar.gz", True))
         deleted = self.records("package.delete")[-1]
         self.assertEqual((deleted["actor"], deleted["actor_kind"], deleted["result"], deleted["details"]),
                          ("dev", "user", "success", {"file": "ragpkg-mine.tar.gz", "reason": "downloaded"}))
@@ -223,7 +249,7 @@ class DownloadTests(DownloadTestCase):
         self.assertEqual((answer.status_code, answer.content), (200, path.read_bytes()))
         self.assertTrue(path.exists())
         self.assertEqual(self.records("package.delete"), [])
-        self.assertTrue(self.records("package.download")[-1]["details"]["complete"])
+        self.assertTrue(self.records("package.download")[-1]["details"]["completed"])
 
     def test_head_answers_the_headers_and_keeps_the_package(self):
         path = self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
@@ -299,6 +325,34 @@ class DownloadTests(DownloadTestCase):
         self.assertTrue(package_retention.recorded("ragpkg-mine.tar.gz"))
 
 
+class ImportClaimTests(DownloadTestCase):
+    def test_an_import_claim_waits_while_a_sweep_holds_the_lock(self):
+        # #677: the sweep checks busy and deletes under package_retention's lock;
+        # an import claims its package under the same lock, so it can't slip between.
+        import threading
+        holding, release = threading.Event(), threading.Event()
+
+        def sweep_like():
+            with package_retention.lock():
+                holding.set()
+                release.wait(5)
+        worker = threading.Thread(target=sweep_like)
+        worker.start()
+        holding.wait(5)
+        claimed = threading.Event()
+        claimer = threading.Thread(target=lambda: (importer._claim_package("ragpkg-x.tar.gz", "ragpkg-x.tar.gz"),
+                                                   claimed.set()))
+        claimer.start()
+        self.assertFalse(claimed.wait(0.3), "the import claimed its package while the lock was held")
+        release.set()
+        self.assertTrue(claimed.wait(5))
+        worker.join(5)
+        claimer.join(5)
+        self.assertTrue(importer.package_busy("ragpkg-x.tar.gz"))
+        with self.assertRaises(importer.ImportInProgressError):
+            importer._claim_package("ragpkg-x.tar.gz", "ragpkg-x.tar.gz")
+
+
 class InterruptedDownloadTests(DownloadTestCase):
     def drive(self, path, disconnect_after):
         """Run the response with a client that goes away after `disconnect_after` body messages."""
@@ -335,7 +389,7 @@ class InterruptedDownloadTests(DownloadTestCase):
             self.drive(path, disconnect_after=1)
         finally:
             audit._current.reset(token)
-        self.assertIs(ctx["details"]["complete"], False)
+        self.assertIs(ctx["details"]["completed"], False)
 
 
 class SweepTests(DownloadTestCase):
@@ -387,6 +441,80 @@ class SweepTests(DownloadTestCase):
         self.assertEqual(package_retention.sweep(), [])
         with patch.object(settings, "export_retention_hours", 2):
             self.assertEqual(package_retention.sweep(), ["ragpkg-mine.tar.gz"])
+
+
+class SweeperTests(DownloadTestCase):
+    """Q3 (RD-145): the sweep runs at start-up and then every 15 minutes, fixed in code."""
+
+    def test_the_sweeper_sweeps_at_once_then_every_15_minutes_and_survives_a_failure(self):
+        self.assertEqual(package_retention.SWEEP_INTERVAL_S, 15 * 60)
+        calls, sleeps = [], []
+
+        def sweep():
+            calls.append(len(sleeps))
+            if len(calls) == 2:
+                raise RuntimeError("synthetic sweep failure")
+            return []
+
+        async def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 3:
+                raise asyncio.CancelledError
+
+        with patch.object(package_retention, "sweep", sweep), \
+                patch.object(package_retention.asyncio, "sleep", sleep), \
+                self.assertLogs("services.package_retention", "ERROR"):
+            with self.assertRaises(asyncio.CancelledError):
+                asyncio.run(package_retention.sweeper())
+        # The first sweep comes before any wait; a failed sweep doesn't stop the next one.
+        self.assertEqual(calls, [0, 1, 2])
+        self.assertEqual(sleeps, [900, 900, 900])
+
+    def test_the_api_start_sweeps_an_expired_package_and_keeps_others(self):
+        # The real lifespan, in another process (as test_audit's lifespan test).
+        old = self.write("ragpkg-old.tar.gz", recorded_hours_ago=25)
+        fresh = self.write("ragpkg-fresh.tar.gz", recorded_hours_ago=1)
+        dropped = self.write("ragpkg-dropped-in.tar.gz")
+        os.utime(dropped, (0, 0))
+        script = """
+import asyncio, sys
+from unittest.mock import AsyncMock, patch
+sys.path.insert(0, sys.argv[1])
+from main import app, lifespan
+from services import importer, packager, weaviate_client as wc
+async def run():
+    with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), \\
+         patch.object(importer, 'sweep_interrupted_imports', return_value=[]), \\
+         patch.object(importer, 'sweep_stale_workdirs', return_value=[]), \\
+         patch.object(packager, 'sweep_build_leftovers', return_value=[]), \\
+         patch.object(wc, 'close_client'):
+        async with lifespan(app):
+            await asyncio.sleep(2)
+asyncio.run(run())
+"""
+        import subprocess
+        env = {**os.environ, "AUDIT_DIR": str(self.root / "audit"), "AUTH_DIR": str(self.root / "auth"),
+               "UPLOAD_DIR": str(self.root / "uploads"), "EXPORTS_DIR": str(self.exports),
+               "EXPORT_RETENTION_HOURS": "24"}
+        result = subprocess.run([sys.executable, "-c", script, API_DIR], capture_output=True, text=True,
+                                timeout=120, cwd=API_DIR, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertFalse(old.exists(), "the start-up sweep did not delete the expired package")
+        self.assertTrue(fresh.exists())
+        self.assertTrue(dropped.exists())
+        deleted = [r for r in self.records("package.delete") if r["details"].get("file") == "ragpkg-old.tar.gz"]
+        self.assertEqual([(r["actor"], r["details"]["reason"]) for r in deleted], [("system", "expired")])
+
+    def test_an_invalid_retention_stops_the_api_at_start_up(self):
+        import subprocess
+        for bad in ("0", "721", "off"):
+            env = {**os.environ, "EXPORT_RETENTION_HOURS": bad, "AUDIT_DIR": str(self.root / "audit"),
+                   "AUTH_DIR": str(self.root / "auth"), "UPLOAD_DIR": str(self.root / "uploads"),
+                   "EXPORTS_DIR": str(self.exports)}
+            result = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import main",
+                                     API_DIR], capture_output=True, text=True, timeout=120, cwd=API_DIR, env=env)
+            self.assertNotEqual(result.returncode, 0, f"the API imported with EXPORT_RETENTION_HOURS={bad}")
+            self.assertIn("EXPORT_RETENTION_HOURS", result.stderr, result.stderr[-1000:])
 
 
 class AuditActionTests(unittest.TestCase):

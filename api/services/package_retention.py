@@ -27,8 +27,14 @@ yet; #676's key file will be one) and its record entry, and writes one
 delete a package, so a later "keep" flag changes only that function.
 
 **The record.** Replaced whole (a temporary file renamed into place) under a
-lock. One that can't be read is logged and taken as empty: nothing recorded is
-then deleted until a new record is written.
+lock. One that can't be read is never overwritten: it is moved aside to
+`exported_packages.json.corrupt-<time>` and logged, the packages it named are
+no longer expired (delete them by hand), and a new record starts. If it can't be
+moved, writes refuse until it is dealt with.
+
+**Imports.** An import claims its package (importer.start_import_job) under
+this module's lock too, so a sweep or a post-download deletion can't remove a
+package between its busy check and the unlink while an import starts.
 """
 from __future__ import annotations
 
@@ -56,6 +62,13 @@ _TIME = "%Y-%m-%dT%H:%M:%SZ"
 
 _lock = threading.RLock()
 _downloading: set[str] = set()
+# An unreadable record that couldn't be moved aside: writes refuse meanwhile.
+_stuck = False
+
+
+def lock():
+    """The lock an import's claim, the download slot and every deletion share."""
+    return _lock
 
 
 def valid_name(name) -> bool:
@@ -72,28 +85,46 @@ def _path() -> Path:
 
 # ── the record ───────────────────────────────────────────────────────────────
 
-def _read() -> dict[str, str]:
-    """Recorded filename -> finish time. Missing is empty; unreadable is logged
-    and taken as empty."""
-    path = _path()
+def _set_aside(path: Path) -> None:
+    """Move an unreadable record aside so nothing overwrites it, and say so."""
+    global _stuck
+    aside = path.with_name(path.name + ".corrupt-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {}
-    except (OSError, ValueError):
-        _log.error("Could not read %s; no exported package is expired or deleted after a "
-                   "download until it is written again", path)
-        return {}
-    packages = data.get("packages") if isinstance(data, dict) else None
-    if not isinstance(packages, dict) or not all(
-            isinstance(k, str) and isinstance(v, str) for k, v in packages.items()):
-        _log.error("%s is not a record of exported packages; it is taken as empty", path)
-        return {}
-    return dict(packages)
+        os.replace(path, aside)
+    except OSError:
+        _stuck = True
+        _log.exception("Could not read %s, nor move it aside; it is left as it is, packages are "
+                       "not recorded until it is removed, and the ones it named don't expire", path)
+        return
+    _stuck = False
+    _log.error("Could not read %s; it was moved to %s and a new record starts. The packages it "
+               "named won't expire: delete them from ./exports by hand", path, aside)
+
+
+def _read() -> dict[str, str]:
+    """Recorded filename -> finish time. Missing is empty; an unreadable record
+    is moved aside (`_set_aside`) and taken as empty."""
+    path = _path()
+    with _lock:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            _set_aside(path)
+            return {}
+        packages = data.get("packages") if isinstance(data, dict) else None
+        if not isinstance(packages, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in packages.items()):
+            _set_aside(path)
+            return {}
+        return dict(packages)
 
 
 def _write(entries: dict[str, str]) -> None:
     path = _path()
+    if _stuck and os.path.lexists(path):
+        raise RuntimeError(f"{path} is unreadable and couldn't be moved aside; it isn't overwritten")
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix="." + RECORD_NAME + ".")
     try:

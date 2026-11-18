@@ -1227,8 +1227,8 @@ Suite 05's live checks run through the proxy on the verify stack, with fixtures 
 
 - a new export's listing entry has `expires_at`;
 - a full download returns every byte, removes the package from `./exports` and the listing, and
-  is audited as `package.download` (complete) and `package.delete` (`downloaded`, by the user);
-- a 64 MiB recorded package read at 1 MB/s for 2 seconds is kept, its record `complete: false`;
+  is audited as `package.download` (`completed: true`) and `package.delete` (`downloaded`, by the user);
+- a 64 MiB recorded package read at 1 MB/s for 2 seconds is kept, its record `completed: false`;
 - one sweep deletes a package recorded 25 hours ago (`package.delete`, `expired`, `system`) and
   keeps an unrecorded one;
 - an End User is refused `403`.
@@ -1237,7 +1237,7 @@ Suite 05's live checks run through the proxy on the verify stack, with fixtures 
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
 Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
-20 ms (#382). Seventeen cases: for each half, a failed poll (a proxy 502) is shown and retried
+20 ms (#382). Twenty-three cases: for each half, a failed poll (a proxy 502) is shown and retried
 with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
 show the last error and enable the button again, and a new start clears the message; a poll in
 flight when the page is left schedules no further poll. An export start answered after the page
@@ -1248,7 +1248,15 @@ is shown without the empty-folder hint until a good Refresh. Three cases cover e
 an export passphrase holds Export until it has 12 characters and matches its confirmation, is
 sent only when the box is checked, and both fields clear once the export starts; an encrypted
 package is labelled, asks for its passphrase, sends it and clears it, and a plain package sends
-none. Like `query_config.js`, it can run
+none. Four cases cover downloading a package (#677):
+- a finished export offers a Download link to its package with "Expires" in local time, and none
+  when it has no expiry;
+- the package list says when a package exported here expires, and its Download link follows the
+  selected package;
+- after a Download click the page re-reads the list, and once the package is gone it shows
+  "Downloaded and deleted from ./exports." instead of the link.
+
+Like `query_config.js`, it can run
 on its own against a UI with no backend (`RAG_UI_BASE`, `RAG_CHROMIUM_PATH`):
 
 ```bash

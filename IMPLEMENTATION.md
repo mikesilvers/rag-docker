@@ -13041,8 +13041,14 @@ yet; #676's key file will be one) and its record entry, and writes one
 delete a package, so a later "keep" flag changes only that function.
 
 **The record.** Replaced whole (a temporary file renamed into place) under a
-lock. One that can't be read is logged and taken as empty: nothing recorded is
-then deleted until a new record is written.
+lock. One that can't be read is never overwritten: it is moved aside to
+`exported_packages.json.corrupt-<time>` and logged, the packages it named are
+no longer expired (delete them by hand), and a new record starts. If it can't be
+moved, writes refuse until it is dealt with.
+
+**Imports.** An import claims its package (importer.start_import_job) under
+this module's lock too, so a sweep or a post-download deletion can't remove a
+package between its busy check and the unlink while an import starts.
 """
 from __future__ import annotations
 
@@ -13070,6 +13076,13 @@ _TIME = "%Y-%m-%dT%H:%M:%SZ"
 
 _lock = threading.RLock()
 _downloading: set[str] = set()
+# An unreadable record that couldn't be moved aside: writes refuse meanwhile.
+_stuck = False
+
+
+def lock():
+    """The lock an import's claim, the download slot and every deletion share."""
+    return _lock
 
 
 def valid_name(name) -> bool:
@@ -13086,28 +13099,46 @@ def _path() -> Path:
 
 # ── the record ───────────────────────────────────────────────────────────────
 
-def _read() -> dict[str, str]:
-    """Recorded filename -> finish time. Missing is empty; unreadable is logged
-    and taken as empty."""
-    path = _path()
+def _set_aside(path: Path) -> None:
+    """Move an unreadable record aside so nothing overwrites it, and say so."""
+    global _stuck
+    aside = path.with_name(path.name + ".corrupt-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {}
-    except (OSError, ValueError):
-        _log.error("Could not read %s; no exported package is expired or deleted after a "
-                   "download until it is written again", path)
-        return {}
-    packages = data.get("packages") if isinstance(data, dict) else None
-    if not isinstance(packages, dict) or not all(
-            isinstance(k, str) and isinstance(v, str) for k, v in packages.items()):
-        _log.error("%s is not a record of exported packages; it is taken as empty", path)
-        return {}
-    return dict(packages)
+        os.replace(path, aside)
+    except OSError:
+        _stuck = True
+        _log.exception("Could not read %s, nor move it aside; it is left as it is, packages are "
+                       "not recorded until it is removed, and the ones it named don't expire", path)
+        return
+    _stuck = False
+    _log.error("Could not read %s; it was moved to %s and a new record starts. The packages it "
+               "named won't expire: delete them from ./exports by hand", path, aside)
+
+
+def _read() -> dict[str, str]:
+    """Recorded filename -> finish time. Missing is empty; an unreadable record
+    is moved aside (`_set_aside`) and taken as empty."""
+    path = _path()
+    with _lock:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            _set_aside(path)
+            return {}
+        packages = data.get("packages") if isinstance(data, dict) else None
+        if not isinstance(packages, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in packages.items()):
+            _set_aside(path)
+            return {}
+        return dict(packages)
 
 
 def _write(entries: dict[str, str]) -> None:
     path = _path()
+    if _stuck and os.path.lexists(path):
+        raise RuntimeError(f"{path} is unreadable and couldn't be moved aside; it isn't overwritten")
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix="." + RECORD_NAME + ".")
     try:
@@ -13599,6 +13630,18 @@ def canonical(name: str) -> str:
 def _package_key(filename: str) -> str:
     """The package the worker opens, so every spelling of one file is one key."""
     return Path(filename).name
+
+
+def _claim_package(key: str, filename: str) -> None:
+    """Claim the package for this import, or refuse while another import has it.
+    Taken under package_retention's lock as well (that lock, then _lock), so an
+    expiry sweep or a post-download deletion never removes a package between its
+    busy check and the unlink while an import starts (#677)."""
+    from services import package_retention
+    with package_retention.lock(), _lock:
+        if key in _active:
+            raise ImportInProgressError(filename)
+        _active.add(key)
 
 
 def package_busy(filename: str) -> bool:
@@ -14373,10 +14416,8 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
                               f"'{key}' is not encrypted, so it takes no passphrase. "
                               "Anyone with the file can read it.")
     job_id = str(uuid.uuid4())[:8]
-    with _lock:
-        if key in _active:
-            raise ImportInProgressError(filename)
-        _active.add(key)
+    # Off the event loop: the claim waits while a sweep holds the retention lock (#677).
+    await asyncio.to_thread(_claim_package, key, filename)
 
     # The first write is durable, so it runs off the event loop (#309). A start
     # cancelled meanwhile releases its guard; the store removes the record.
@@ -16822,7 +16863,7 @@ class _PackageStream(Response):
         await send({"type": "http.response.body", "body": response.body, "more_body": False})
 
     async def __call__(self, scope, receive, send) -> None:
-        complete = claimed = False
+        completed = claimed = False
         fd = None
         listener = None
         try:
@@ -16866,7 +16907,7 @@ class _PackageStream(Response):
                 sent += len(chunk)
             await asyncio.sleep(0)                    # let the listener see a disconnect
             if sent == size and not gone.is_set():
-                complete = True
+                completed = True
                 await send({"type": "http.response.body", "body": b"", "more_body": False})
             # Otherwise no final message: uvicorn drops a lost connection and
             # closes one that is still open, so the client sees it cut short.
@@ -16875,9 +16916,9 @@ class _PackageStream(Response):
                 listener.cancel()
             if fd is not None:
                 os.close(fd)
-            audit.note(complete=complete)
+            audit.note(completed=completed)
             try:
-                if complete and not self.head:
+                if completed and not self.head:
                     await asyncio.to_thread(package_retention.after_download, self.filename, scope)
             finally:
                 if claimed:
@@ -16893,7 +16934,7 @@ class _PackageStream(Response):
 async def download_package(filename: str, request: Request = None):
     """One package from ./exports, streamed (#677). A full download deletes a
     package this instance exported; any other package is served and kept."""
-    audit.note(complete=False)
+    audit.note(completed=False)
     if not package_retention.valid_name(filename):
         return _package_not_found(filename)
     path = packager.exports_dir() / filename
@@ -25707,6 +25748,11 @@ export default function TransferPage() {
   const importTimer = useRef<number | null>(null)
   const exportPoll = useRef(0)
   const importPoll = useRef(0)
+  // Downloads being watched (#677): a full download deletes a package exported
+  // here, so the list is re-read until it is gone. `gone` holds the packages
+  // seen to go, so the finished export stops offering its Download.
+  const downloadWatches = useRef(new Map<string, number>())
+  const [gone, setGone] = useState<Set<string>>(new Set())
 
   const loadPackages = useCallback(() => {
     api.getPackages().then(r => {
@@ -25728,8 +25774,33 @@ export default function TransferPage() {
       importPoll.current += 1
       if (exportTimer.current) window.clearTimeout(exportTimer.current)
       if (importTimer.current) window.clearTimeout(importTimer.current)
+      downloadWatches.current.forEach(id => window.clearInterval(id))
+      downloadWatches.current.clear()
     }
   }, [loadPackages])
+
+  // After a Download click: re-read the package list every 3 s, for at most 10
+  // minutes, until the package isn't listed any more. A package not exported
+  // here stays listed, and its watch just ends at the limit (#677).
+  const watchDownload = useCallback((name: string) => {
+    const watches = downloadWatches.current
+    if (watches.has(name)) return
+    const started = Date.now()
+    const stop = () => { window.clearInterval(watches.get(name)); watches.delete(name) }
+    watches.set(name, window.setInterval(() => {
+      if (!alive.current || Date.now() - started > 10 * 60 * 1000) { stop(); return }
+      api.getPackages().then(r => {
+        if (!alive.current) return
+        setPackages(r.packages)
+        setPackagesError('')
+        if (!r.packages.some(p => p.filename === name)) {
+          stop()
+          setGone(g => new Set(g).add(name))
+          setFilename(f => (f === name ? '' : f))
+        }
+      }, () => {})
+    }, 3000))
+  }, [])
 
   // Fidelity is shown before the export runs, so the choice is informed rather
   // than discovered afterwards in the manifest. A lookup that fails says so
@@ -26022,9 +26093,13 @@ export default function TransferPage() {
                 </span>
               </p>
             )}
-            {exportJob.status === 'completed' && exportJob.filename && (
+            {exportJob.status === 'completed' && exportJob.filename && gone.has(exportJob.filename) && (
+              <p className="mt-2 text-gray-500 text-xs">Downloaded and deleted from ./exports.</p>
+            )}
+            {exportJob.status === 'completed' && exportJob.filename && !gone.has(exportJob.filename) && (
               <p className="mt-2 flex items-center gap-3">
                 <a href={api.packageDownloadUrl(exportJob.filename)} download
+                   onClick={() => watchDownload(exportJob.filename as string)}
                    className="bg-blue-600 text-white px-3 py-1 rounded text-xs hover:bg-blue-700">
                   Download
                 </a>
@@ -26054,7 +26129,7 @@ export default function TransferPage() {
           <label className="block text-sm font-medium">Package in ./exports</label>
           <span className="flex items-center gap-3">
             {filename
-              ? <a href={api.packageDownloadUrl(filename)} download
+              ? <a href={api.packageDownloadUrl(filename)} download onClick={() => watchDownload(filename)}
                    className="text-xs text-blue-600 hover:underline">Download</a>
               : <button disabled className="text-xs text-gray-400">Download</button>}
             <button onClick={loadPackages} className="text-xs text-blue-600 hover:underline">Refresh</button>
@@ -28425,8 +28500,8 @@ Suite 05's live checks run through the proxy on the verify stack, with fixtures 
 
 - a new export's listing entry has `expires_at`;
 - a full download returns every byte, removes the package from `./exports` and the listing, and
-  is audited as `package.download` (complete) and `package.delete` (`downloaded`, by the user);
-- a 64 MiB recorded package read at 1 MB/s for 2 seconds is kept, its record `complete: false`;
+  is audited as `package.download` (`completed: true`) and `package.delete` (`downloaded`, by the user);
+- a 64 MiB recorded package read at 1 MB/s for 2 seconds is kept, its record `completed: false`;
 - one sweep deletes a package recorded 25 hours ago (`package.delete`, `expired`, `system`) and
   keeps an unrecorded one;
 - an End User is refused `403`.
@@ -28435,7 +28510,7 @@ Suite 05's live checks run through the proxy on the verify stack, with fixtures 
 
 `browser/transfer_page.js`, registered in `06_ui.sh` through `ui_criteria.js`, renders the
 Transfer page with every API call stubbed in the browser and the page's 2 s poll delay cut to
-20 ms (#382). Seventeen cases: for each half, a failed poll (a proxy 502) is shown and retried
+20 ms (#382). Twenty-three cases: for each half, a failed poll (a proxy 502) is shown and retried
 with the button still busy and cleared by the next good poll; 30 failures in a row stop polling,
 show the last error and enable the button again, and a new start clears the message; a poll in
 flight when the page is left schedules no further poll. An export start answered after the page
@@ -28446,7 +28521,15 @@ is shown without the empty-folder hint until a good Refresh. Three cases cover e
 an export passphrase holds Export until it has 12 characters and matches its confirmation, is
 sent only when the box is checked, and both fields clear once the export starts; an encrypted
 package is labelled, asks for its passphrase, sends it and clears it, and a plain package sends
-none. Like `query_config.js`, it can run
+none. Four cases cover downloading a package (#677):
+- a finished export offers a Download link to its package with "Expires" in local time, and none
+  when it has no expiry;
+- the package list says when a package exported here expires, and its Download link follows the
+  selected package;
+- after a Download click the page re-reads the list, and once the package is gone it shows
+  "Downloaded and deleted from ./exports." instead of the link.
+
+Like `query_config.js`, it can run
 on its own against a UI with no backend (`RAG_UI_BASE`, `RAG_CHROMIUM_PATH`):
 
 ```bash
@@ -39786,10 +39869,36 @@ class RecordTests(DownloadTestCase):
         self.assertTrue((self.root / "uploads" / "exported_packages.json").is_file())
         self.assertFalse(list(self.exports.iterdir()), "the record is never written in ./exports")
 
-    def test_an_unreadable_record_is_taken_as_empty(self):
-        (self.root / "uploads" / "exported_packages.json").write_text("{not json")
-        with self.assertLogs("services.package_retention", "ERROR"):
+    def test_an_unreadable_record_is_moved_aside_never_overwritten(self):
+        record = self.root / "uploads" / "exported_packages.json"
+        record.write_text("{not json")
+        with self.assertLogs("services.package_retention", "ERROR") as logs:
             self.assertEqual(package_retention.expiries(), {})
+        aside = [p for p in record.parent.iterdir() if p.name.startswith("exported_packages.json.corrupt-")]
+        self.assertEqual(len(aside), 1)
+        self.assertEqual(aside[0].read_text(), "{not json")
+        self.assertIn(aside[0].name, "\n".join(logs.output))
+        self.assertFalse(record.exists())
+        package_retention.record_export("ragpkg-new.tar.gz", NOW)      # a new record starts
+        self.assertTrue(package_retention.recorded("ragpkg-new.tar.gz"))
+        self.assertEqual(aside[0].read_text(), "{not json")
+
+    def test_a_record_that_cant_be_moved_aside_is_not_overwritten(self):
+        record = self.root / "uploads" / "exported_packages.json"
+        record.write_text('{"packages": "wrong shape"}')
+        self.addCleanup(setattr, package_retention, "_stuck", False)
+        real_replace = os.replace
+
+        def replace(src, dst):
+            if Path(src) == record:                   # the record can't be moved aside
+                raise OSError("read-only")
+            return real_replace(src, dst)
+        with patch.object(package_retention.os, "replace", replace), \
+                self.assertLogs("services.package_retention", "ERROR"):
+            self.assertEqual(package_retention.expiries(), {})
+            with self.assertRaises(RuntimeError):
+                package_retention.record_export("ragpkg-new.tar.gz", NOW)
+        self.assertEqual(record.read_text(), '{"packages": "wrong shape"}')
 
     def run_export(self, record=None):
         result = {"filename": "ragpkg-open1-x.tar.gz", "size_bytes": 1, "chunk_count": 1,
@@ -39854,7 +39963,7 @@ class DownloadTests(DownloadTestCase):
         self.assertFalse(package_retention._downloading)
         download = self.records("package.download")[-1]
         self.assertEqual((download["actor"], download["result"], download["details"]["file"],
-                          download["details"]["complete"]), ("dev", "success", "ragpkg-mine.tar.gz", True))
+                          download["details"]["completed"]), ("dev", "success", "ragpkg-mine.tar.gz", True))
         deleted = self.records("package.delete")[-1]
         self.assertEqual((deleted["actor"], deleted["actor_kind"], deleted["result"], deleted["details"]),
                          ("dev", "user", "success", {"file": "ragpkg-mine.tar.gz", "reason": "downloaded"}))
@@ -39865,7 +39974,7 @@ class DownloadTests(DownloadTestCase):
         self.assertEqual((answer.status_code, answer.content), (200, path.read_bytes()))
         self.assertTrue(path.exists())
         self.assertEqual(self.records("package.delete"), [])
-        self.assertTrue(self.records("package.download")[-1]["details"]["complete"])
+        self.assertTrue(self.records("package.download")[-1]["details"]["completed"])
 
     def test_head_answers_the_headers_and_keeps_the_package(self):
         path = self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
@@ -39941,6 +40050,34 @@ class DownloadTests(DownloadTestCase):
         self.assertTrue(package_retention.recorded("ragpkg-mine.tar.gz"))
 
 
+class ImportClaimTests(DownloadTestCase):
+    def test_an_import_claim_waits_while_a_sweep_holds_the_lock(self):
+        # #677: the sweep checks busy and deletes under package_retention's lock;
+        # an import claims its package under the same lock, so it can't slip between.
+        import threading
+        holding, release = threading.Event(), threading.Event()
+
+        def sweep_like():
+            with package_retention.lock():
+                holding.set()
+                release.wait(5)
+        worker = threading.Thread(target=sweep_like)
+        worker.start()
+        holding.wait(5)
+        claimed = threading.Event()
+        claimer = threading.Thread(target=lambda: (importer._claim_package("ragpkg-x.tar.gz", "ragpkg-x.tar.gz"),
+                                                   claimed.set()))
+        claimer.start()
+        self.assertFalse(claimed.wait(0.3), "the import claimed its package while the lock was held")
+        release.set()
+        self.assertTrue(claimed.wait(5))
+        worker.join(5)
+        claimer.join(5)
+        self.assertTrue(importer.package_busy("ragpkg-x.tar.gz"))
+        with self.assertRaises(importer.ImportInProgressError):
+            importer._claim_package("ragpkg-x.tar.gz", "ragpkg-x.tar.gz")
+
+
 class InterruptedDownloadTests(DownloadTestCase):
     def drive(self, path, disconnect_after):
         """Run the response with a client that goes away after `disconnect_after` body messages."""
@@ -39977,7 +40114,7 @@ class InterruptedDownloadTests(DownloadTestCase):
             self.drive(path, disconnect_after=1)
         finally:
             audit._current.reset(token)
-        self.assertIs(ctx["details"]["complete"], False)
+        self.assertIs(ctx["details"]["completed"], False)
 
 
 class SweepTests(DownloadTestCase):
@@ -40029,6 +40166,80 @@ class SweepTests(DownloadTestCase):
         self.assertEqual(package_retention.sweep(), [])
         with patch.object(settings, "export_retention_hours", 2):
             self.assertEqual(package_retention.sweep(), ["ragpkg-mine.tar.gz"])
+
+
+class SweeperTests(DownloadTestCase):
+    """Q3 (RD-145): the sweep runs at start-up and then every 15 minutes, fixed in code."""
+
+    def test_the_sweeper_sweeps_at_once_then_every_15_minutes_and_survives_a_failure(self):
+        self.assertEqual(package_retention.SWEEP_INTERVAL_S, 15 * 60)
+        calls, sleeps = [], []
+
+        def sweep():
+            calls.append(len(sleeps))
+            if len(calls) == 2:
+                raise RuntimeError("synthetic sweep failure")
+            return []
+
+        async def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 3:
+                raise asyncio.CancelledError
+
+        with patch.object(package_retention, "sweep", sweep), \
+                patch.object(package_retention.asyncio, "sleep", sleep), \
+                self.assertLogs("services.package_retention", "ERROR"):
+            with self.assertRaises(asyncio.CancelledError):
+                asyncio.run(package_retention.sweeper())
+        # The first sweep comes before any wait; a failed sweep doesn't stop the next one.
+        self.assertEqual(calls, [0, 1, 2])
+        self.assertEqual(sleeps, [900, 900, 900])
+
+    def test_the_api_start_sweeps_an_expired_package_and_keeps_others(self):
+        # The real lifespan, in another process (as test_audit's lifespan test).
+        old = self.write("ragpkg-old.tar.gz", recorded_hours_ago=25)
+        fresh = self.write("ragpkg-fresh.tar.gz", recorded_hours_ago=1)
+        dropped = self.write("ragpkg-dropped-in.tar.gz")
+        os.utime(dropped, (0, 0))
+        script = """
+import asyncio, sys
+from unittest.mock import AsyncMock, patch
+sys.path.insert(0, sys.argv[1])
+from main import app, lifespan
+from services import importer, packager, weaviate_client as wc
+async def run():
+    with patch.object(wc, 'sweep_staging', new=AsyncMock(return_value=[])), \\
+         patch.object(importer, 'sweep_interrupted_imports', return_value=[]), \\
+         patch.object(importer, 'sweep_stale_workdirs', return_value=[]), \\
+         patch.object(packager, 'sweep_build_leftovers', return_value=[]), \\
+         patch.object(wc, 'close_client'):
+        async with lifespan(app):
+            await asyncio.sleep(2)
+asyncio.run(run())
+"""
+        import subprocess
+        env = {**os.environ, "AUDIT_DIR": str(self.root / "audit"), "AUTH_DIR": str(self.root / "auth"),
+               "UPLOAD_DIR": str(self.root / "uploads"), "EXPORTS_DIR": str(self.exports),
+               "EXPORT_RETENTION_HOURS": "24"}
+        result = subprocess.run([sys.executable, "-c", script, API_DIR], capture_output=True, text=True,
+                                timeout=120, cwd=API_DIR, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertFalse(old.exists(), "the start-up sweep did not delete the expired package")
+        self.assertTrue(fresh.exists())
+        self.assertTrue(dropped.exists())
+        deleted = [r for r in self.records("package.delete") if r["details"].get("file") == "ragpkg-old.tar.gz"]
+        self.assertEqual([(r["actor"], r["details"]["reason"]) for r in deleted], [("system", "expired")])
+
+    def test_an_invalid_retention_stops_the_api_at_start_up(self):
+        import subprocess
+        for bad in ("0", "721", "off"):
+            env = {**os.environ, "EXPORT_RETENTION_HOURS": bad, "AUDIT_DIR": str(self.root / "audit"),
+                   "AUTH_DIR": str(self.root / "auth"), "UPLOAD_DIR": str(self.root / "uploads"),
+                   "EXPORTS_DIR": str(self.exports)}
+            result = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import main",
+                                     API_DIR], capture_output=True, text=True, timeout=120, cwd=API_DIR, env=env)
+            self.assertNotEqual(result.returncode, 0, f"the API imported with EXPORT_RETENTION_HOURS={bad}")
+            self.assertIn("EXPORT_RETENTION_HOURS", result.stderr, result.stderr[-1000:])
 
 
 class AuditActionTests(unittest.TestCase):
@@ -45802,8 +46013,8 @@ check_eq "#677: GET /packages/{filename} downloads the package" "$dcode" "200"
 check_eq "#677: ... every byte of it" "$(wc -c < /tmp/vfy_dl.bin | tr -d ' ')" "$dsize"
 [ ! -e "$EXPORTS/$DPKG" ] && ! api_get "/packages" | grep -q "\"$DPKG\""
 check "#677: a full download deletes the package from ./exports and the listing" $?
-audit_has package.download "$DPKG" "r['details'].get('complete') is True and r['result'] == 'success'"
-check "#677: the download is audited as package.download, complete" $?
+audit_has package.download "$DPKG" "r['details'].get('completed') is True and r['result'] == 'success'"
+check "#677: the download is audited as package.download, completed" $?
 audit_has package.delete "$DPKG" "r['details'].get('reason') == 'downloaded' and r['actor_kind'] == 'user'"
 check "#677: the deletion is audited as package.delete, reason downloaded, by the user" $?
 rm -f /tmp/vfy_dl.bin
@@ -45814,7 +46025,7 @@ command curl -s -o /dev/null -b "$RAG_AUTH_JAR" --limit-rate 1M --max-time 2 "$A
 sleep 3
 retention exists "$IPKG"
 check "#677: an interrupted download keeps the package" $?
-audit_has package.download "$IPKG" "r['details'].get('complete') is False"
+audit_has package.download "$IPKG" "r['details'].get('completed') is False"
 check "#677: ... and its package.download record says it was incomplete" $?
 retention remove "$IPKG"
 
@@ -55434,6 +55645,59 @@ async function runTransferPageTests(browser, base, reporter) {
     const label = await page.evaluate(n => [...document.querySelectorAll('option')].find(o => o.value === n).textContent, BROKEN);
     assert.equal(label, BROKEN + ' — encrypted, unreadable');
   }, { hold: ['GET /api/packages'] }]);
+
+  // Downloading a package and its expiry (#677, RD-145 Q4).
+  const EXPIRES = '2026-11-18T12:00:00Z';
+  const downloadLinks = page => page.evaluate(() => [...document.querySelectorAll('a')]
+    .filter(a => a.textContent.trim() === 'Download').map(a => ({ href: a.getAttribute('href'), download: a.hasAttribute('download') })));
+  const localTime = (page, iso) => page.evaluate(i => new Date(i).toLocaleString(), iso);
+  cases.push(['export: a finished export shows a Download link to its package and "Expires <local time>" (#677)', async page => {
+    await startAndPoll(page, 'export');
+    const done = JSON.parse(HALVES.export.done.body);
+    await release(page, HALVES.export.poll, json(200, { ...done, expires_at: EXPIRES }));
+    await waitText(page, 'Done.');
+    await waitText(page, 'Expires ' + await localTime(page, EXPIRES));
+    const links = await downloadLinks(page);
+    assert.ok(links.some(l => l.href === '/api/packages/ragpkg-vfy.tar.gz' && l.download), JSON.stringify(links));
+  }]);
+  cases.push(['export: a finished export with no expiry still offers Download and shows no "Expires" (#677)', async page => {
+    await startAndPoll(page, 'export');
+    await release(page, HALVES.export.poll, HALVES.export.done);
+    await waitText(page, 'Done.');
+    const links = await downloadLinks(page);
+    assert.ok(links.some(l => l.href === '/api/packages/ragpkg-vfy.tar.gz'), JSON.stringify(links));
+    assert.ok(!(await text(page)).includes('Expires '), 'an "Expires" label for a package with no expiry');
+  }]);
+  cases.push(['import: the package list says when a package exported here expires, and Download follows the selected package (#677)', async page => {
+    await release(page, '/api/packages', json(200, { packages: [{ ...packagesBody.packages[0], expires_at: EXPIRES }, packagesBody.packages[1]] }));
+    await page.waitForFunction(n => [...document.querySelectorAll('option')].some(o => o.value === n), { timeout: 5000 }, PACKAGE);
+    const labels = await page.evaluate(() => Object.fromEntries([...document.querySelectorAll('option')].map(o => [o.value, o.textContent])));
+    assert.ok(labels[PACKAGE].endsWith(', expires ' + await localTime(page, EXPIRES)), labels[PACKAGE]);
+    assert.ok(!labels[SEALED].includes('expires'), labels[SEALED]);
+    const disabled = await page.evaluate(() => [...document.querySelectorAll('button')].some(b => b.textContent.trim() === 'Download' && b.disabled));
+    assert.equal(disabled, true, 'no disabled Download while no package is selected');
+    assert.deepEqual(await downloadLinks(page), [], 'a Download link with no package selected');
+    await selectPackage(page, PACKAGE);
+    await page.waitForFunction(() => [...document.querySelectorAll('a')].some(a => a.textContent.trim() === 'Download'), { timeout: 5000 });
+    assert.deepEqual(await downloadLinks(page), [{ href: '/api/packages/' + encodeURIComponent(PACKAGE), download: true }]);
+    await selectPackage(page, SEALED);
+    await page.waitForFunction(h => [...document.querySelectorAll('a')].some(a => a.getAttribute('href') === h), { timeout: 5000 }, '/api/packages/' + encodeURIComponent(SEALED))
+      .catch(async () => { throw new Error('Download did not follow the selection: ' + JSON.stringify(await downloadLinks(page))); });
+  }, { hold: ['GET /api/packages'] }]);
+  cases.push(['export: after Download, the page sees the package go and stops offering it (#677)', async page => {
+    await startAndPoll(page, 'export');
+    const done = JSON.parse(HALVES.export.done.body);
+    await release(page, HALVES.export.poll, json(200, { ...done, expires_at: EXPIRES }));
+    await waitText(page, 'Done.');
+    // The click must not navigate; React's onClick still runs.
+    await page.evaluate(() => document.addEventListener('click', e => e.preventDefault(), true));
+    await page.evaluate(() => [...document.querySelectorAll('a')].find(a => a.textContent.trim() === 'Download'
+      && a.getAttribute('href') === '/api/packages/ragpkg-vfy.tar.gz').click());
+    // The fixed package list doesn't name ragpkg-vfy.tar.gz: the first re-read (3 s) finds it gone.
+    await waitText(page, 'Downloaded and deleted from ./exports.');
+    assert.deepEqual((await downloadLinks(page)).filter(l => l.href === '/api/packages/ragpkg-vfy.tar.gz'), []);
+    assert.ok(!(await text(page)).includes('Expires '), 'still shows when the deleted package expires');
+  }]);
 
   for (const [name, test, opts] of cases) {
     let s;

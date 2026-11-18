@@ -296,7 +296,7 @@ password changes; queries; creating and deleting collections; saving ingest
 and retrieval settings; ingest, export, import and tuning jobs, once when
 started and once when they end (succeeded, failed or interrupted by a
 restart); saving and downloading gold-standard files; downloading an export
-package (`package.download`, saying whether the download completed) and each
+package (`package.download`, with `completed` true or false) and each
 deletion of one, after its download or when it expired (`package.delete`,
 with the reason; an expiry's actor is `system`); every change and
 refusal on the Users and Service keys pages; every `python -m auth` action
@@ -1133,6 +1133,9 @@ package list.
 - **A full download deletes it.** Once the last byte has gone out to your
   connection, the package is deleted from `./exports/`. An interrupted download
   keeps it, so you can try again; there is no resuming part-way.
+  The server can't tell whether your end kept every byte, so check the file's
+  size against `size_bytes` in `GET /packages` (or the Transfer page) and export
+  again if it is short.
 - **Otherwise it expires.** A package nobody downloads is deleted
   `EXPORT_RETENTION_HOURS` after its export finished (`docker-compose.yml`, 1 to
   720 hours, default 24; expiry can't be turned off). The sweep runs when the API
