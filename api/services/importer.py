@@ -1037,15 +1037,22 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
             except Exception:
                 _log.exception("Could not finish import marker for %r; startup will retry", marked)
         if new_access and not built and job.get("status") == "failed":
-            # This job made no collection (its build removes what it started),
-            # so the state it wrote goes back to what it replaced, unless a
-            # create of the same name wrote its own since (#606). A collection
-            # it did build keeps its state.
-            try:
-                auth_store.put_back(*new_access)
-            except Exception:                         # noqa: BLE001
-                _log.exception("Could not put back the access state of %r after a failed import",
-                               new_access[0])
+            # The state this job wrote goes back to what it replaced, unless a
+            # create of the same name wrote its own since (#606), but only once
+            # the collection is known to be gone: a build whose cleanup failed
+            # (cleanup_pending), or a create Weaviate applied but answered with
+            # an error, leaves a partial collection, which keeps the
+            # restriction (#788). A collection it did build keeps its state.
+            if ((job.get("error_detail") or {}).get("cleanup_pending")
+                    or _exists(new_access[0])):
+                _log.warning("Import into %r failed but the collection may still exist; "
+                             "its access state stays", new_access[0])
+            else:
+                try:
+                    auth_store.put_back(*new_access)
+                except Exception:                         # noqa: BLE001
+                    _log.exception("Could not put back the access state of %r after a failed import",
+                                   new_access[0])
         if ownership and ownership["state"] == "scratch":
             try:
                 collection_recovery.discard(ownership, wc.get_client())

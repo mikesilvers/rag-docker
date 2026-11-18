@@ -159,7 +159,9 @@ async def create_collection(body: CreateCollectionRequest, request: Request = No
 
     # A new collection starts restricted to the account that created it (#606),
     # written before it exists, so it is never open: if this write fails nothing
-    # is created, and if the create fails the state goes back (put_back).
+    # is created, and if the create fails the state goes back (put_back), but
+    # only when the collection is known not to exist: a create Weaviate applied
+    # but answered with an error keeps the restriction (#788).
     principal = access.principal_of(request)
     states = None
     if principal is not None:
@@ -181,9 +183,17 @@ async def create_collection(body: CreateCollectionRequest, request: Request = No
         _log.exception("Could not create collection %r", body.name)
         if states is not None:
             try:
-                await asyncio.to_thread(store.put_back, body.name, states[1], states[0])
+                gone = not await wc.collection_exists(body.name)
             except Exception:                         # noqa: BLE001
-                _log.exception("Could not put back the access state of %r after a failed create", body.name)
+                _log.exception("Could not check whether %r exists after a failed create", body.name)
+                gone = False
+            if not gone:
+                _log.warning("Collection %r may exist after a failed create; its restriction stays", body.name)
+            else:
+                try:
+                    await asyncio.to_thread(store.put_back, body.name, states[1], states[0])
+                except Exception:                         # noqa: BLE001
+                    _log.exception("Could not put back the access state of %r after a failed create", body.name)
         return api_error(500, "CREATE_FAILED", "Failed to create collection.")
 
     async with _registry_lock:
