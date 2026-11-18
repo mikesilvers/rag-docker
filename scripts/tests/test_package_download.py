@@ -199,6 +199,58 @@ class RecordTests(DownloadTestCase):
         self.assertEqual(answer.status_code, 200, answer.text)
         self.assertEqual(answer.json()["expires_at"], package_retention.expires_at("ragpkg-open1-x.tar.gz"))
 
+    def test_the_export_status_drops_expires_at_once_the_package_is_downloaded(self):
+        # SPECIFICATIONS.md GET /packages: the job status carries expires_at only
+        # while its package is still recorded (#677).
+        self.run_export()
+        (self.exports / "ragpkg-open1-x.tar.gz").write_bytes(package_bytes("Open1"))
+        self.assertIsNotNone(self.client.get("/export/job/j677", headers=self.as_("eng")).json()["expires_at"])
+        self.assertEqual(self.get("ragpkg-open1-x.tar.gz").status_code, 200)
+        self.assertFalse((self.exports / "ragpkg-open1-x.tar.gz").exists())
+        answer = self.client.get("/export/job/j677", headers=self.as_("eng"))
+        self.assertEqual(answer.status_code, 200, answer.text)
+        self.assertIsNone(answer.json()["expires_at"])
+
+    def test_a_finished_export_records_its_collection(self):
+        # #794: an encrypted package exported here follows this collection's access.
+        self.run_export()
+        self.assertEqual(package_retention.recorded_collections(), {"ragpkg-open1-x.tar.gz": "Open1"})
+        entry = json.loads((self.root / "uploads" / "exported_packages.json").read_text())["packages"]
+        self.assertEqual(entry["ragpkg-open1-x.tar.gz"]["collection"], "Open1")
+
+    def test_an_entry_written_before_794_is_read_and_rewritten_with_no_collection(self):
+        record = self.root / "uploads" / "exported_packages.json"
+        record.write_text(json.dumps({"packages": {"ragpkg-old.tar.gz": "2026-11-17T12:00:00Z"}}))
+        self.assertEqual(package_retention.expires_at("ragpkg-old.tar.gz"), "2026-11-18T12:00:00Z")
+        self.assertEqual(package_retention.recorded_collections(), {"ragpkg-old.tar.gz": None})
+        package_retention.record_export("ragpkg-new.tar.gz", NOW, "Open1")
+        self.assertEqual(json.loads(record.read_text())["packages"], {
+            "ragpkg-old.tar.gz": {"finished_at": "2026-11-17T12:00:00Z", "collection": None},
+            "ragpkg-new.tar.gz": {"finished_at": "2026-11-17T12:00:00Z", "collection": "Open1"}})
+
+    def test_an_entry_of_another_shape_moves_the_record_aside(self):
+        record = self.root / "uploads" / "exported_packages.json"
+        record.write_text(json.dumps({"packages": {"ragpkg-a.tar.gz": {"collection": "Open1"}}}))
+        with self.assertLogs("services.package_retention", "ERROR"):
+            self.assertEqual(package_retention.expiries(), {})
+        self.assertFalse(record.exists())
+
+    def test_a_recorded_name_outside_the_rule_is_ignored_and_never_deleted(self):
+        # #794 item 4: a tampered record can't name a file outside the exports folder.
+        outside = self.root / "outside.tar.gz"
+        outside.write_bytes(b"not a package")
+        old = self.write("ragpkg-old.tar.gz", recorded_hours_ago=25)
+        record = self.root / "uploads" / "exported_packages.json"
+        data = json.loads(record.read_text())
+        data["packages"]["../outside.tar.gz"] = "2026-01-01T00:00:00Z"
+        record.write_text(json.dumps(data))
+        with self.assertLogs("services.package_retention", "WARNING") as logs:
+            self.assertEqual(package_retention.sweep(), ["ragpkg-old.tar.gz"])
+        self.assertIn("'../outside.tar.gz'", "\n".join(logs.output))
+        self.assertTrue(outside.exists())
+        self.assertFalse(old.exists())
+        self.assertNotIn("../outside.tar.gz", package_retention.expiries())
+
     def test_an_export_whose_record_fails_still_completes_and_says_so(self):
         def broken(*_):
             raise OSError("disk full")
@@ -390,6 +442,201 @@ class InterruptedDownloadTests(DownloadTestCase):
         finally:
             audit._current.reset(token)
         self.assertIs(ctx["details"]["completed"], False)
+
+
+class EncryptedAccessTests(DownloadTestCase):
+    """#794 item 2 (RD-194 Q1, Q2): an encrypted package exported here follows
+    the collection recorded at its export, in the listing and the download."""
+
+    def setUp(self):
+        super().setUp()
+        status = self.client.put(f"/collections/{SECRET}/access", headers=self.as_("eng"),
+                                 json={"restricted": True, "users": ["dev"], "service_principals": []}).status_code
+        self.assertEqual(status, 200)
+
+    def write_encrypted(self, name, collection=SECRET, recorded=True):
+        path = self.exports / name
+        path.write_bytes(b"age-encryption.org/v1\n" + os.urandom(64))
+        if recorded:
+            package_retention.record_export(name, datetime.now(timezone.utc), collection)
+        return path
+
+    def listed(self, who):
+        answer = self.client.get("/packages", headers=self.as_(who))
+        self.assertEqual(answer.status_code, 200, answer.text)
+        return {p["filename"]: p for p in answer.json()["packages"]}
+
+    def test_a_restricted_collections_encrypted_package_is_hidden_from_a_developer_without_access(self):
+        path = self.write_encrypted("ragpkg-secret.tar.gz.age")
+        self.assertNotIn(path.name, self.listed("dev2"))
+        answer = self.get(path.name, who="dev2")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertEqual(answer.json()["error"]["message"],
+                         "No package named 'ragpkg-secret.tar.gz.age' in the exports directory.")
+        self.assertTrue(path.exists())
+        refused = [r for r in self.records("package.download") if r["actor"] == "dev2"][0]
+        self.assertEqual((refused["collection"], refused["details"]["reason"], refused["details"]["code"]),
+                         (SECRET, "collection_access", "PACKAGE_NOT_FOUND"))
+        for who in ("dev", "eng"):
+            entry = self.listed(who)[path.name]
+            self.assertIsNone(entry["collection"], "the recorded collection isn't revealed")
+            self.assertTrue(entry["encrypted"])
+        self.assertEqual(self.get(path.name, who="dev").status_code, 200)
+        self.assertFalse(path.exists())
+
+    def test_an_open_collections_encrypted_package_is_open(self):
+        path = self.write_encrypted("ragpkg-open.tar.gz.age", collection="Open1")
+        self.assertIn(path.name, self.listed("dev2"))
+        self.assertEqual(self.get(path.name, who="dev2").status_code, 200)
+
+    def test_one_recorded_without_a_collection_is_for_engineers_only(self):
+        path = self.write_encrypted("ragpkg-before.tar.gz.age", collection=None)
+        self.assertNotIn(path.name, self.listed("dev"))
+        answer = self.get(path.name, who="dev")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        refused = [r for r in self.records("package.download") if r["actor"] == "dev"][0]
+        self.assertEqual((refused["collection"], refused["details"]["reason"]), (None, "collection_access"))
+        self.assertTrue(path.exists())
+        self.assertIn(path.name, self.listed("eng"))
+        self.assertEqual(self.get(path.name, who="eng").status_code, 200)
+        self.assertFalse(path.exists())
+
+    def test_one_copied_in_is_open_to_any_developer(self):
+        path = self.write_encrypted("ragpkg-copied.tar.gz.age", recorded=False)
+        self.assertIn(path.name, self.listed("dev2"))
+        self.assertEqual(self.get(path.name, who="dev2").status_code, 200)
+        self.assertTrue(path.exists(), "a package not exported here is kept")
+
+
+class DeletionRecordTests(DownloadTestCase):
+    def test_a_deletion_is_audited_and_the_sweep_goes_on_when_the_record_cant_be_rewritten(self):
+        # #794 item 6: the file is gone, so its package.delete record is written whatever the record does.
+        first = self.write("ragpkg-a.tar.gz", recorded_hours_ago=25)
+        second = self.write("ragpkg-b.tar.gz", recorded_hours_ago=25)
+        with patch.object(package_retention, "_write", side_effect=OSError("disk full")), \
+                self.assertLogs("services.package_retention", "ERROR") as logs:
+            self.assertEqual(package_retention.sweep(), ["ragpkg-a.tar.gz", "ragpkg-b.tar.gz"])
+        self.assertFalse(first.exists())
+        self.assertFalse(second.exists())
+        self.assertEqual([r["details"]["file"] for r in self.records("package.delete")],
+                         ["ragpkg-a.tar.gz", "ragpkg-b.tar.gz"])
+        self.assertIn("ragpkg-a.tar.gz", "\n".join(logs.output))
+        self.assertEqual(package_retention.sweep(), [])          # the leftover entries are dropped
+        self.assertEqual(package_retention.recorded_collections(), {})
+
+
+class SameOriginTests(DownloadTestCase):
+    """#794 item 5 (RD-194 Q4): the deleting GET checks Sec-Fetch-Site."""
+
+    def fetch(self, site, who="dev", method="GET", headers=None):
+        headers = dict(headers or self.as_(who))
+        if site is not None:
+            headers["Sec-Fetch-Site"] = site
+        return self.client.request(method, "/packages/ragpkg-mine.tar.gz", headers=headers)
+
+    def test_a_download_from_another_origin_of_the_site_is_refused(self):
+        path = self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+        for site in ("same-site", "cross-site"):
+            with self.subTest(site=site):
+                answer = self.fetch(site)
+                self.assertEqual((answer.status_code, answer.json()["error"]["code"]),
+                                 (403, "CROSS_ORIGIN_REFUSED"))
+                self.assertTrue(path.exists())
+        refused = self.records("package.download")
+        self.assertEqual([(r["actor"], r["result"]) for r in refused], [("dev", "refused")] * 2)
+
+    def test_same_origin_a_typed_url_and_no_header_download(self):
+        for site in ("same-origin", "none", None):
+            with self.subTest(site=site):
+                path = self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+                self.assertEqual(self.fetch(site).status_code, 200)
+                self.assertFalse(path.exists())
+
+    def test_head_and_a_service_key_are_not_checked(self):
+        path = self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+        self.assertEqual(self.fetch("cross-site", method="HEAD").status_code, 200)
+        store.create_principal("svc", "developer")
+        key = store.issue_key("svc")[1]
+        self.assertEqual(self.fetch("cross-site", headers={"Authorization": "Bearer " + key}).status_code, 200)
+        self.assertFalse(path.exists())
+
+
+class HeadRecordTests(DownloadTestCase):
+    def test_head_is_audited_as_a_header_check(self):
+        # #794 item 7 (RD-194 Q5): head true, no completed.
+        self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+        self.assertEqual(self.get("ragpkg-mine.tar.gz", method="HEAD").status_code, 200)
+        details = self.records("package.download")[-1]["details"]
+        self.assertIs(details["head"], True)
+        self.assertNotIn("completed", details)
+        self.assertEqual(self.get("ragpkg-mine.tar.gz").status_code, 200)
+        details = self.records("package.download")[-1]["details"]
+        self.assertIs(details["completed"], True)
+        self.assertNotIn("head", details)
+
+
+class CancelledClaimTests(DownloadTestCase):
+    """#794 item 8: a claim whose request is cancelled while its thread runs is
+    released once the thread ends."""
+
+    def blocked(self, real):
+        import threading
+        entered, proceed, self.claimed = threading.Event(), threading.Event(), threading.Event()
+
+        def claim(*args):
+            entered.set()
+            proceed.wait(5)
+            try:
+                return real(*args)
+            finally:
+                self.claimed.set()
+        return claim, entered, proceed
+
+    def cancel_during_claim(self, start, entered, proceed, released):
+        def settled():
+            return self.claimed.is_set() and released()
+
+        async def scenario():
+            task = asyncio.ensure_future(start())
+            await asyncio.to_thread(entered.wait, 5)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            proceed.set()
+            for _ in range(500):
+                if settled():
+                    return True
+                await asyncio.sleep(0.01)
+            return False
+        return asyncio.run(scenario())
+
+    def test_a_cancelled_import_start_releases_its_package(self):
+        claim, entered, proceed = self.blocked(importer._claim_package)
+        with patch.object(importer, "_claim_package", claim):
+            settled = self.cancel_during_claim(
+                lambda: importer.start_import_job("ragpkg-x.tar.gz", "abort"), entered, proceed,
+                lambda: not importer._active and not package_retention._settling)
+        self.assertTrue(settled, "the import claim was never released")
+        self.assertFalse(importer.package_busy("ragpkg-x.tar.gz"))
+
+    def test_a_cancelled_download_releases_its_slot(self):
+        path = self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+        claim, entered, proceed = self.blocked(package_retention.claim)
+        response = transfer._PackageStream(path, path.name, head=False)
+
+        async def receive():
+            await asyncio.sleep(3600)
+
+        async def send(message):
+            pass
+        with patch.object(package_retention, "claim", claim):
+            settled = self.cancel_during_claim(
+                lambda: response({"type": "http", "method": "GET", "headers": []}, receive, send),
+                entered, proceed,
+                lambda: not package_retention._downloading and not package_retention._settling)
+        self.assertTrue(settled, "the download slot was never released")
+        self.assertFalse(package_retention.busy(path.name))
+        self.assertTrue(path.exists())
 
 
 class SweepTests(DownloadTestCase):
