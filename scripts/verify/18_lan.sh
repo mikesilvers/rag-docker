@@ -40,7 +40,7 @@ section "LAN units: setting, startup refusal, certificate step, nginx configurat
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_lan_mode.py)
 check "test_lan_mode.py registered regression checks" $?
 
-section "LAN refusal in the built API image, on the default verify project"
+section "LAN refusal in the built API image, on the running verify project (default or LAN configuration)"
 # One-off api containers (no dependencies, removed afterwards) with LAN mode
 # switched on by environment: the real image and its settings parsing refuse to
 # start, with one line and no traceback, in every run, not only with --lan.
