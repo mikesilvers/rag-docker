@@ -317,6 +317,11 @@ def _claim_package(key: str, filename: str) -> None:
         _active.add(key)
 
 
+def _release_package(key: str) -> None:
+    with _lock:
+        _active.discard(key)
+
+
 def package_busy(filename: str) -> bool:
     """Whether an import of this package is running (#677: a download is
     refused, and the expiry sweep waits, meanwhile)."""
@@ -1102,8 +1107,11 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
                               f"'{key}' is not encrypted, so it takes no passphrase. "
                               "Anyone with the file can read it.")
     job_id = str(uuid.uuid4())[:8]
-    # Off the event loop: the claim waits while a sweep holds the retention lock (#677).
-    await asyncio.to_thread(_claim_package, key, filename)
+    # Off the event loop: the claim waits while a sweep holds the retention lock
+    # (#677). A cancellation while it runs still releases it (#794).
+    from services import package_retention
+    await package_retention.run_claim(lambda: _claim_package(key, filename),
+                                      lambda _: _release_package(key))
 
     # The first write is durable, so it runs off the event loop (#309). A start
     # cancelled meanwhile releases its guard; the store removes the record.
@@ -1127,8 +1135,7 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
             "owner": owner,                     # who started it, for the job lists (#617)
         })
     except BaseException:
-        with _lock:
-            _active.discard(key)
+        _release_package(key)
         raise
     asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict,
                                           passphrase))

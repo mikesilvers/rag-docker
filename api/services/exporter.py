@@ -107,10 +107,11 @@ def _run(job_id: str, collection: str, include_models: bool,
     else:
         # Recorded before the status turns completed, so a client that sees the
         # export finish also sees when its package expires (#677). A failure
-        # leaves the package unrecorded, never expired: the job says so.
+        # leaves the package unrecorded, never expired: the job says so. The
+        # collection is recorded too: an encrypted package follows its access (#794).
         warnings = list(result["warnings"])
         try:
-            package_retention.record_export(result["filename"], datetime.now(timezone.utc))
+            package_retention.record_export(result["filename"], datetime.now(timezone.utc), collection)
         except Exception:                          # noqa: BLE001 - reported in the warnings
             _log.exception("Could not record the expiry of package %s", result["filename"])
             warnings.append("The package's expiry could not be recorded, so it won't be deleted "

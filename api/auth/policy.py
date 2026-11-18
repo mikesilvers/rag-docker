@@ -131,6 +131,13 @@ HUMAN_ONLY = frozenset(path for _, path in ACCESS
     "/auth/logout", "/auth/password", "/audit", "/audit.csv", "/collections/{name}/access"}
 
 
+# GET routes that change state (#794): a full download of a package exported
+# here deletes it. A cookie-authenticated GET of one sent from another origin
+# (`Sec-Fetch-Site` present and neither `same-origin` nor `none`) is refused
+# like a cross-origin change (middleware.py); HEAD changes nothing.
+STATE_CHANGING_GET = frozenset({"/packages/{filename}"})
+
+
 def required(method: str, path: str) -> str | None:
     """The access a route needs, or None when it has no entry (refused)."""
     return ACCESS.get(("GET" if method == "HEAD" else method, path))
