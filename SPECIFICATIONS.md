@@ -4548,9 +4548,13 @@ Two-step verification (#607). These are ticked once the tests reviewer's full `s
   the other import records, and job records leave hidden documents out; only Engineers' sessions read or change access; every
   change and refusal is audited.
   *Evidence: `scripts/tests/test_collection_access.py` (suite 17), which fails on the code before #606, and its
-  #788 cases on the code before #788; `auth_stack.py collection-access`, with its Prepare-area document check
-  (#788), and the matrix rows (suite 17); the Collections page's Access cases in
-  `scripts/verify/browser/ui_controls.js` (suite 06), including a late answer for an earlier opening (#788).*
+  #788 cases on the code before #788, with the #792 cases `NestedCopyTests`, the fail-closed import test
+  `test_a_failed_build_with_no_answer_on_existence_keeps_its_access` and
+  `test_package_source_asks_in_chain_order_and_never_about_the_original`; `auth_stack.py collection-access`, with
+  its Prepare-area document check (#788), which first shows a second Developer sees the document before the
+  import (#792), and the matrix rows (suite 17); the Collections page's Access cases in
+  `scripts/verify/browser/ui_controls.js` (suite 06), including a late answer for an earlier opening (#788), an
+  earlier opening's failed read and its late lists of people and service principals (#792).*
 
 ### 10.7 Audit log (#29)
 

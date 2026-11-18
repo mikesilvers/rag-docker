@@ -658,6 +658,20 @@ class NestedCopyTests(AccessTestCase):
         with patch.object(wc, "_collection_exists_sync", unanswered):
             self.assertEqual(importer.package_source(gone_copy), gone_copy)      # no answer counts as existing
 
+    def test_package_source_asks_in_chain_order_and_never_about_the_original(self):
+        asked = []
+
+        def none_exist(name):
+            asked.append(name)
+            return False
+        self.assertEqual(access.package_source(OPEN, none_exist), OPEN)
+        self.assertEqual(asked, [])
+        self.assertEqual(access.package_source(NESTED, none_exist), SECRET)
+        self.assertEqual(asked, [NESTED, STAGING])
+        asked.clear()
+        self.assertEqual(access.package_source(NESTED, lambda n: asked.append(n) or n == STAGING), STAGING)
+        self.assertEqual(asked, [NESTED, STAGING])
+
     def test_begin_on_a_copy_takes_the_narrowest_state_of_its_chain(self):
         from services import collection_recovery
 
