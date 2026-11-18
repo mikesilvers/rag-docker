@@ -1528,10 +1528,12 @@ function prepareCases() {
       });
     })(), async run(s) {
       await waitText(s.page, 'minutes.txt');
+      await waitSelected(s.page, 0);
       await fillNth(s.page, 'select', 0, B);
       await press(s.page, 'Import all prepared');
       await waitFor(s.page, () => [...document.querySelectorAll('[role=alert]')].some(a => a.textContent.includes('total 600.0 MB; one import can be at most 512 MB') && a.textContent.includes('Import them in smaller selections.')), 'the IMPORT_TOO_LARGE alert');
       assert.equal(callsTo(s, 'POST', '/api/prepare/import').length, 1);
+      assert.equal(callsTo(s, 'POST', '/api/prepare/import')[0].body.collection, B);
       const input = await s.page.$('#prepare-file-input');
       await input.uploadFile(...tempFiles(['a.txt', 'b.zip']));
       await waitText(s.page, 'b.zip');
