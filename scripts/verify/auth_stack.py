@@ -151,6 +151,41 @@ def code(method, path, body=None, token=None, headers=None, paced=True):
     return auth_setup.paced(path, send) if paced else send()
 
 
+def upload(token, filename, content):
+    """POST /prepare/upload of one file as a same-origin browser would.
+    Returns (status, parsed body or None)."""
+    boundary = "vfy" + secrets.token_hex(8)
+    data = ('--{}\r\nContent-Disposition: form-data; name="files"; filename="{}"\r\n'
+            'Content-Type: application/octet-stream\r\n\r\n'.format(boundary, filename).encode()
+            + content + "\r\n--{}--\r\n".format(boundary).encode())
+    headers = {"Origin": auth_setup.origin(), "Cookie": "rag_session=" + token,
+               "Content-Type": "multipart/form-data; boundary=" + boundary}
+    req = urllib.request.Request(auth_setup.api_base() + "/prepare/upload", data=data, method="POST",
+                                 headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            status, raw = response.status, response.read()
+    except urllib.error.HTTPError as error:
+        status, raw = error.code, error.read()
+    try:
+        return status, json.loads(raw)
+    except ValueError:
+        return status, None
+
+
+def wait_job(token, path, timeout=600):
+    """GET `path` every 2 s until the job ends; returns its record."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status, raw, _ = code("GET", path, token=token)
+        expect(status == 200, "{} answered {}".format(path, status))
+        job = json.loads(raw)
+        if job["status"] in ("completed", "failed", "partial", "cancelled"):
+            return job
+        time.sleep(2)
+    raise CheckFailed("{} didn't end within {}s".format(path, timeout))
+
+
 def error_code(raw):
     try:
         return json.loads(raw)["error"]["code"]
@@ -905,11 +940,14 @@ def check_collection_access(operator_ok):
     """Per-collection access (#606) on the stack: a collection the harness
     Engineer creates is restricted to it; a throwaway End User and Developer
     and a Developer key can't see or use it until granted, and the access routes
-    refuse a key. Changes and refusals are in the audit log."""
+    refuse a key. Changes and refusals are in the audit log. In the Prepare
+    area, a document the granted Developer imports into it is hidden from a
+    Developer without access (#788)."""
     expect(operator_ok, "creates accounts, a service principal and a collection, so it runs only on the verify project")
     admin = role_token("engineer")
     name = "VfyAccess" + secrets.token_hex(4)
     users, principal = [], None
+    document, document_owner = None, None
     try:
         status, raw, _ = code("POST", "/collections", {"name": name}, token=admin)
         expect(status == 201, "creating {} answered {} {}".format(name, status, error_code(raw)))
@@ -952,6 +990,33 @@ def check_collection_access(operator_ok):
             got = answer(who, "GET", "/ingest/config/" + name)
             expect(got[0] == 200, "{}: the granted collection's settings answered {}".format(who, got))
         expect(not listed("End User"), "the End User sees a collection not granted to it")
+
+        # The Prepare area (#606 Q18, #788): a .csv is labelled from its data,
+        # with no LLM call, so preparing it is quick.
+        status, body = upload(dev_token, "vfy-access-{}.csv".format(secrets.token_hex(3)), b"name,team\nAda,core\n")
+        expect(status == 201 and body and len(body["documents"]) == 1, "the upload answered {} {}".format(status, body))
+        document, document_owner = body["documents"][0]["id"], dev_token
+        status, raw, _ = code("POST", "/prepare/jobs", {"document_ids": [document]}, token=dev_token)
+        expect(status == 202, "starting the preparation answered {} {}".format(status, error_code(raw)))
+        job = wait_job(dev_token, "/prepare/job/" + json.loads(raw)["job_id"])
+        expect(job["status"] == "completed", "the preparation ended {}: {}".format(job["status"], job.get("errors")))
+        status, raw, _ = code("POST", "/prepare/import", {"collection": name, "document_ids": [document],
+                                                          "chunk_size": 500, "chunk_overlap": 50}, token=dev_token)
+        expect(status == 202, "the import into {} answered {} {}".format(name, status, error_code(raw)))
+        job = wait_job(dev_token, "/ingest/job/" + json.loads(raw)["job_id"])
+        expect(job["status"] == "completed", "the import ended {}: {}".format(job["status"], job.get("errors")))
+        other, _, other_token = throwaway("developer", operator_ok)
+        users.append(other)
+
+        def prepared(token):
+            status, raw, _ = code("GET", "/prepare/documents", token=token)
+            expect(status == 200, "GET /prepare/documents answered {}".format(status))
+            return document in [d["id"] for d in json.loads(raw)["documents"]]
+        expect(prepared(dev_token), "the granted Developer doesn't see the document it imported")
+        expect(not prepared(other_token), "a Developer without access sees a document imported only into {}".format(name))
+        status, raw, _ = code("GET", "/prepare/documents/" + document, token=other_token)
+        expect((status, error_code(raw)) == (404, "DOCUMENT_NOT_FOUND"),
+               "a Developer without access reading the document answered {} {}".format(status, error_code(raw)))
         got = answer("key", "PUT", "/collections/{}/access".format(name), {"restricted": False})
         expect(got == (403, "KEY_NOT_ALLOWED"), "a key changing access answered {}".format(got))
         got = answer("key", "GET", "/collections/{}/access".format(name))
@@ -972,6 +1037,8 @@ def check_collection_access(operator_ok):
         expect(audited("collection.access.refused", actor=principal),
                "no collection.access.refused record for the key's settings read")
     finally:
+        if document:
+            code("DELETE", "/prepare/documents/" + document, token=document_owner)
         code("DELETE", "/collections/{}?confirm=true".format(name), token=admin)
         for username in users:
             code("POST", "/auth/users/{}/disable".format(username), token=admin)
