@@ -38956,6 +38956,23 @@ class PackageTests(AccessTestCase):
         self.assertEqual(record["status"], "failed", record)
         self.assertEqual(store.collection_access("Applied"), store.CollectionAccess(True, ("dev2",), ()))
 
+    def test_a_failed_build_with_no_answer_on_existence_keeps_its_access(self):
+        # Weaviate can't say whether the partial collection is gone: fail closed (#788).
+        built = []
+
+        def build(target, *a):
+            built.append(target)
+            raise RuntimeError("timed out")
+
+        def unknown(name):
+            if built:
+                raise ConnectionError("no answer")
+            return name[:1].upper() + name[1:] in self.collections
+        with patch.object(wc, "_collection_exists_sync", unknown):
+            record = self.run_import("Unanswered", "rename", {"name": "dev2", "kind": "user"}, _build=build)
+        self.assertEqual((record["status"], built), ("failed", ["Unanswered"]), record)
+        self.assertEqual(store.collection_access("Unanswered"), store.CollectionAccess(True, ("dev2",), ()))
+
     def test_a_replace_keeps_the_target_access(self):
         def begin(*a):
             raise importer.PackageError("IMPORT_FAILED", "stopped before the replace")
