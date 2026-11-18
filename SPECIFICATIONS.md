@@ -1641,8 +1641,13 @@ The state is in `auth.db` (schema version 4, tables `restricted_collections` and
 stored collection name): a store from before #606 gains the empty tables on first open, so every existing
 collection stays open. A staging or recovery collection of a rebuild or import (`<target>__tuning_<token>`,
 `<target>__importing_<token>`) gets its target's access when its ownership is recorded, before it is created, under
-its own name, and keeps it whatever later happens to the target (a delete, a re-create, new grants); discarding or
-deleting the copy drops it. The rule is read on every request, so a change applies to
+its own name, and keeps that state as its own; discarding or deleting the copy drops it. While the target has a
+state too, anyone but an Engineer may use the copy (query it, see it listed, export it, import its package) only when
+they may use both the copy and the target (#788), so restricting or narrowing the target reaches its existing copies,
+including ones kept from before #606 with no state of their own. Deleting the target drops its state, so the copy is
+then governed by its own state alone; a re-created target's state narrows it again. A state kept for a name that
+doesn't exist (a create or import that failed while the collection might exist, below) narrows that name's copies
+too; it only ever narrows. The rule is read on every request, so a change applies to
 each session's and key's next request; no session ends and a running job finishes. Grants stay when an account is
 disabled or its role changes; an Engineer demoted to a lower role is then bound by them.
 
@@ -1650,9 +1655,13 @@ disabled or its role changes; an Engineer demoted to a lower role is then bound 
   included. The restriction is written before the collection is created: if that write fails nothing is created
   (`500 CREATE_FAILED`); if the create fails, the state it replaced is put back, but only while the state is still
   the one it wrote, so a create and an import of the same new name at once never leave it open or give one the
-  other's grants. An import does the same with the state it writes. An import that creates a collection under a new name (`rename`) copies its source collection's state
-  (open stays open; restricted copies the grants); one that creates its package's own name, which doesn't exist
-  here, restricts it to the job's owner. An import `replace` and tuning keep the target's state.
+  other's grants, and only when Weaviate answers that the collection doesn't exist: one it applied but answered with
+  an error, or whose existence it can't confirm, keeps the restriction (#788). An import does the same with the
+  state it writes, and also keeps it when its build's cleanup of the partial collection failed (`cleanup_pending`).
+  An import that creates a collection under a new name (`rename`) copies its source collection's state
+  (open stays open; restricted copies the grants), and for a package of an existing staging or recovery copy the
+  narrower of the copy's and its target's (restricted to the accounts granted both when both are restricted); one
+  that creates its package's own name, which doesn't exist here, restricts it to the job's owner. An import `replace` and tuning keep the target's state.
   `DELETE /collections/{name}` deletes the state, so a later collection of the same name starts afresh.
 - **Refusal.** A caller without access gets the answer given for something that doesn't exist, so the name isn't
   confirmed: `404 COLLECTION_NOT_FOUND` on `POST /query`, `GET`/`POST /retrieval/config`, `GET`/`POST
@@ -1671,7 +1680,8 @@ disabled or its role changes; an Engineer demoted to a lower role is then bound 
   collection (saved before #606, or placed by hand) is served to Engineers only.
 - **Packages.** A package's collection is the name in its manifest; for a staging or recovery copy that no longer
   exists here, its target. `GET /packages` hides an unencrypted package whose collection exists here and is
-  restricted, from a caller without access to it (Weaviate not answering counts as existing). An import job refuses a package of such
+  restricted, from a caller without access to it (Weaviate not answering counts as existing); for an existing copy,
+  access means access to the copy and its target. The listing and the import job use the same rule. An import job refuses a package of such
   a collection, for encrypted packages too once decrypted, before anything is created or replaced: the job fails
   with the answer a missing package gives (`PACKAGE_UNREADABLE`, "No package named '<file>' in the exports
   directory.") and names no collection.
@@ -4451,15 +4461,19 @@ Two-step verification (#607). These are ticked once the tests reviewer's full `s
   granted ones and Engineers; a new collection is restricted to its creator; a delete drops the state; existing
   collections stay open after the upgrade; the settings routes answer `404` for a missing collection; packages of
   restricted collections are hidden and their import fails as a missing package (encrypted ones once decrypted, and
-  a package of a discarded staging copy as its target's); an imported copy takes its source's access; a staging or
-  recovery copy keeps the access it was made with when its target is deleted or re-created; creation is fail-closed
-  and a failed create or import puts back only its own state; documents in the Prepare area imported only into
+  a package of a discarded staging copy as its target's); an imported copy takes its source's access (an existing
+  staging copy's package the narrower of the copy's and its target's); a staging or recovery copy is usable, while
+  its target has a state, only by those who may use both (#788), and by its own state alone once the target is
+  deleted; creation is fail-closed and a failed create or import puts back only its own state, and only when the
+  collection is known not to exist (a pending cleanup, an applied create or an unanswered check keeps the
+  restriction); documents in the Prepare area imported only into
   collections the caller can't use are hidden and refused, a document with a usable import stays visible without
   the other import records, and job records leave hidden documents out; only Engineers' sessions read or change access; every
   change and refusal is audited.
-  *Evidence: `scripts/tests/test_collection_access.py` (suite 17), which fails on the code before #606;
-  `auth_stack.py collection-access` and the matrix rows (suite 17); the Collections page's Access case in
-  `scripts/verify/browser/ui_controls.js` (suite 06).*
+  *Evidence: `scripts/tests/test_collection_access.py` (suite 17), which fails on the code before #606, and its
+  #788 cases on the code before #788; `auth_stack.py collection-access`, with its Prepare-area document check
+  (#788), and the matrix rows (suite 17); the Collections page's Access cases in
+  `scripts/verify/browser/ui_controls.js` (suite 06), including a late answer for an earlier opening (#788).*
 
 ### 10.7 Audit log (#29)
 

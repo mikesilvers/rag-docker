@@ -827,7 +827,7 @@ def _exists(name: str) -> bool:
     try:
         return wc._collection_exists_sync(name)
     except Exception:                                 # noqa: BLE001
-        _log.exception("Could not check whether %r exists for an import's access check", name)
+        _log.exception("Could not check whether %r exists for a package's access check", name)
         return True
 
 
@@ -840,22 +840,28 @@ def _source(original: str) -> str:
 
 def _refused(owner, source: str) -> bool:
     """True when the package's collection (`_source`) exists here, is
-    restricted, and the job's owner may not use it (#606)."""
-    if owner is None or not auth_store.collection_access(source).restricted:
+    restricted, and the job's owner may not use it (#606). For an existing
+    staging or recovery copy that means the copy or its target (access.scope,
+    #788)."""
+    names = access.scope(source)
+    if owner is None or not any(auth_store.collection_access(n).restricted for n in names):
         return False
-    return _exists(source) and not auth_store.owner_has_access(owner, source)
+    return _exists(source) and not all(auth_store.owner_has_access(owner, n) for n in names)
 
 
 def _start_access(owner, source: str, target: str):
     """A collection this import creates (#606): when the package's collection
-    (`_source`) exists here, the new one gets its state; otherwise it starts
+    (`_source`) exists here, the new one gets its state, and for a staging or
+    recovery copy the narrower of the copy's and its target's (#788), so an
+    import can't open what the copy's target restricts; otherwise it starts
     restricted to the job's owner. Written before any data; returns (the state
     replaced, the state written) for auth_store.put_back. A job with no owner
     (a direct call in tests) records nothing and returns None."""
     if owner is None:
         return None
     if source != target and _exists(source):
-        return auth_store.copy_collection_access(source, target)
+        scope = access.scope(source)
+        return auth_store.copy_collection_access(source, target, scope[1] if len(scope) > 1 else None)
     return auth_store.restrict_to(target, auth_store.user_id_for(owner))
 
 
@@ -1031,15 +1037,22 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
             except Exception:
                 _log.exception("Could not finish import marker for %r; startup will retry", marked)
         if new_access and not built and job.get("status") == "failed":
-            # This job made no collection (its build removes what it started),
-            # so the state it wrote goes back to what it replaced, unless a
-            # create of the same name wrote its own since (#606). A collection
-            # it did build keeps its state.
-            try:
-                auth_store.put_back(*new_access)
-            except Exception:                         # noqa: BLE001
-                _log.exception("Could not put back the access state of %r after a failed import",
-                               new_access[0])
+            # The state this job wrote goes back to what it replaced, unless a
+            # create of the same name wrote its own since (#606), but only once
+            # the collection is known to be gone: a build whose cleanup failed
+            # (cleanup_pending), or a create Weaviate applied but answered with
+            # an error, leaves a partial collection, which keeps the
+            # restriction (#788). A collection it did build keeps its state.
+            if ((job.get("error_detail") or {}).get("cleanup_pending")
+                    or _exists(new_access[0])):
+                _log.warning("Import into %r failed but the collection may still exist; "
+                             "its access state stays", new_access[0])
+            else:
+                try:
+                    auth_store.put_back(*new_access)
+                except Exception:                         # noqa: BLE001
+                    _log.exception("Could not put back the access state of %r after a failed import",
+                                   new_access[0])
         if ownership and ownership["state"] == "scratch":
             try:
                 collection_recovery.discard(ownership, wc.get_client())

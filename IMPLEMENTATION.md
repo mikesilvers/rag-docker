@@ -3472,7 +3472,8 @@ def begin(target: str, operation: str, client) -> dict:
     _write(record)  # Ownership is persisted before collection creation.
     # The copy will hold the target's data, so it gets the target's access as
     # it is now, under its own name, before it exists (#606). Later changes to
-    # the target (a delete, a re-create, new grants) never change it.
+    # the target never change this state, but while the target has a state a
+    # caller other than an Engineer needs both (access.scope, #788).
     auth_store.copy_collection_access(target, staging)
     return record
 
@@ -13806,7 +13807,7 @@ def _exists(name: str) -> bool:
     try:
         return wc._collection_exists_sync(name)
     except Exception:                                 # noqa: BLE001
-        _log.exception("Could not check whether %r exists for an import's access check", name)
+        _log.exception("Could not check whether %r exists for a package's access check", name)
         return True
 
 
@@ -13819,22 +13820,28 @@ def _source(original: str) -> str:
 
 def _refused(owner, source: str) -> bool:
     """True when the package's collection (`_source`) exists here, is
-    restricted, and the job's owner may not use it (#606)."""
-    if owner is None or not auth_store.collection_access(source).restricted:
+    restricted, and the job's owner may not use it (#606). For an existing
+    staging or recovery copy that means the copy or its target (access.scope,
+    #788)."""
+    names = access.scope(source)
+    if owner is None or not any(auth_store.collection_access(n).restricted for n in names):
         return False
-    return _exists(source) and not auth_store.owner_has_access(owner, source)
+    return _exists(source) and not all(auth_store.owner_has_access(owner, n) for n in names)
 
 
 def _start_access(owner, source: str, target: str):
     """A collection this import creates (#606): when the package's collection
-    (`_source`) exists here, the new one gets its state; otherwise it starts
+    (`_source`) exists here, the new one gets its state, and for a staging or
+    recovery copy the narrower of the copy's and its target's (#788), so an
+    import can't open what the copy's target restricts; otherwise it starts
     restricted to the job's owner. Written before any data; returns (the state
     replaced, the state written) for auth_store.put_back. A job with no owner
     (a direct call in tests) records nothing and returns None."""
     if owner is None:
         return None
     if source != target and _exists(source):
-        return auth_store.copy_collection_access(source, target)
+        scope = access.scope(source)
+        return auth_store.copy_collection_access(source, target, scope[1] if len(scope) > 1 else None)
     return auth_store.restrict_to(target, auth_store.user_id_for(owner))
 
 
@@ -14010,15 +14017,22 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
             except Exception:
                 _log.exception("Could not finish import marker for %r; startup will retry", marked)
         if new_access and not built and job.get("status") == "failed":
-            # This job made no collection (its build removes what it started),
-            # so the state it wrote goes back to what it replaced, unless a
-            # create of the same name wrote its own since (#606). A collection
-            # it did build keeps its state.
-            try:
-                auth_store.put_back(*new_access)
-            except Exception:                         # noqa: BLE001
-                _log.exception("Could not put back the access state of %r after a failed import",
-                               new_access[0])
+            # The state this job wrote goes back to what it replaced, unless a
+            # create of the same name wrote its own since (#606), but only once
+            # the collection is known to be gone: a build whose cleanup failed
+            # (cleanup_pending), or a create Weaviate applied but answered with
+            # an error, leaves a partial collection, which keeps the
+            # restriction (#788). A collection it did build keeps its state.
+            if ((job.get("error_detail") or {}).get("cleanup_pending")
+                    or _exists(new_access[0])):
+                _log.warning("Import into %r failed but the collection may still exist; "
+                             "its access state stays", new_access[0])
+            else:
+                try:
+                    auth_store.put_back(*new_access)
+                except Exception:                         # noqa: BLE001
+                    _log.exception("Could not put back the access state of %r after a failed import",
+                                   new_access[0])
         if ownership and ownership["state"] == "scratch":
             try:
                 collection_recovery.discard(ownership, wc.get_client())
@@ -15388,7 +15402,9 @@ async def create_collection(body: CreateCollectionRequest, request: Request = No
 
     # A new collection starts restricted to the account that created it (#606),
     # written before it exists, so it is never open: if this write fails nothing
-    # is created, and if the create fails the state goes back (put_back).
+    # is created, and if the create fails the state goes back (put_back), but
+    # only when the collection is known not to exist: a create Weaviate applied
+    # but answered with an error keeps the restriction (#788).
     principal = access.principal_of(request)
     states = None
     if principal is not None:
@@ -15410,9 +15426,17 @@ async def create_collection(body: CreateCollectionRequest, request: Request = No
         _log.exception("Could not create collection %r", body.name)
         if states is not None:
             try:
-                await asyncio.to_thread(store.put_back, body.name, states[1], states[0])
+                gone = not await wc.collection_exists(body.name)
             except Exception:                         # noqa: BLE001
-                _log.exception("Could not put back the access state of %r after a failed create", body.name)
+                _log.exception("Could not check whether %r exists after a failed create", body.name)
+                gone = False
+            if not gone:
+                _log.warning("Collection %r may exist after a failed create; its restriction stays", body.name)
+            else:
+                try:
+                    await asyncio.to_thread(store.put_back, body.name, states[1], states[0])
+                except Exception:                         # noqa: BLE001
+                    _log.exception("Could not put back the access state of %r after a failed create", body.name)
         return api_error(500, "CREATE_FAILED", "Failed to create collection.")
 
     async with _registry_lock:
@@ -16420,26 +16444,18 @@ def _list_packages_sync() -> list[dict]:
 
 async def _hidden(principal, packages: list[dict]) -> set[str]:
     """The packages a caller may not see (#606): unencrypted ones whose
-    collection exists here and is restricted to others. Weaviate failing to
-    answer counts as existing, so the listing fails closed."""
+    collection exists here and is restricted to others. Whose access a package
+    follows is the import's own rule (importer._source), so the listing and
+    POST /import agree (#788). Weaviate failing to answer counts as existing
+    (importer._exists), so the listing fails closed."""
     visible = await asyncio.to_thread(access.visible_filter, principal)
     hidden = set()
-
-    async def exists(name):
-        try:
-            return await wc.collection_exists(name)
-        except Exception:                             # noqa: BLE001
-            _log.exception("Could not check whether %r exists for the package listing", name)
-            return True
     for p in packages:
         name = p.get("collection")
         if p.get("encrypted") or not p.get("readable") or not isinstance(name, str) or not name:
             continue
-        # A package of a discarded staging or recovery copy follows its target.
-        source = access.canonical(name)
-        if access.target_of(source) != source and not await exists(source):
-            source = access.target_of(source)
-        if not visible(source) and await exists(source):
+        source = await asyncio.to_thread(importer._source, name)
+        if not visible(source) and await asyncio.to_thread(importer._exists, source):
             hidden.add(p["filename"])
     return hidden
 
@@ -19143,20 +19159,34 @@ def _no_store() -> bool:
     return str(db_path()) not in _ready and not db_path().exists()
 
 
-def copy_collection_access(source: str, target: str) -> tuple[CollectionAccess, CollectionAccess]:
+def _grant_set(conn, collection: str):
+    """None for an open collection; otherwise the ids of the accounts granted it."""
+    if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (collection,)).fetchone() is None:
+        return None
+    return [row["user_id"] for row in
+            conn.execute("SELECT user_id FROM collection_grants WHERE collection = ?", (collection,))]
+
+
+def copy_collection_access(source: str, target: str,
+                           narrowed_by: str | None = None) -> tuple[CollectionAccess, CollectionAccess]:
     """The target takes the source's state: open stays open, restricted copies
-    its grants. Returns (the target's state it replaced, the state written)."""
+    its grants. With `narrowed_by` (the target of a staging or recovery copy
+    `source`, #788), it takes the narrower of the two: restricted when either
+    is, to the accounts granted every restricted one. Returns (the target's
+    state it replaced, the state written)."""
     source, target = _canonical(source), _canonical(target)
     if _no_store():
         return CollectionAccess(False), CollectionAccess(False)
     with _connect(write=True) as conn:
         before = _access(conn, target)
-        if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (source,)).fetchone() is None:
+        sets = [_grant_set(conn, source)]
+        if narrowed_by is not None:
+            sets.append(_grant_set(conn, _canonical(narrowed_by)))
+        restricted = [ids for ids in sets if ids is not None]
+        if not restricted:
             _open(conn, target)
         else:
-            ids = [row["user_id"] for row in
-                   conn.execute("SELECT user_id FROM collection_grants WHERE collection = ?", (source,))]
-            _restrict(conn, target, ids)
+            _restrict(conn, target, [i for i in restricted[0] if all(i in ids for ids in restricted[1:])])
         return before, _access(conn, target)
 
 
@@ -19617,10 +19647,14 @@ refusal is audited (services/audit.py, `access_refused`).
 A staging or recovery collection of a rebuild or import
 (`<target>__tuning_<token>`, `<target>__importing_<token>`) holds its target's
 data, so it is given its target's access when it is made
-(collection_recovery.begin) and keeps that state under its own name, whatever
-later happens to the target. Every name is looked up as itself. `target_of`
-maps a copy's name to its target only for a package of a copy that no longer
-exists (services/importer.py, routers/transfer.py).
+(collection_recovery.begin) and keeps that state under its own name. While its
+target has a state too, a caller other than an Engineer may use the copy only
+when they may use both (`scope`, #788): restricting the target later reaches
+its existing copies, including ones kept from before #606 with no state of
+their own. A deleted target's state is dropped with it, so the copy is then
+governed by its own state alone; a re-created target's new state narrows it
+again. `target_of` also maps a package of a copy that no longer exists to its
+target (services/importer.py, routers/transfer.py).
 """
 from __future__ import annotations
 
@@ -19655,12 +19689,21 @@ def package_source(name: str, exists) -> str:
     return name
 
 
+def scope(name: str) -> tuple[str, ...]:
+    """The names whose state decides who may use collection `name`: the name
+    itself, and for a staging or recovery copy also its target (#788)."""
+    name = canonical(name)
+    target = target_of(name)
+    return (name,) if target == name else (name, target)
+
+
 def allowed(principal, name: str) -> bool:
-    """True when the principal may use the collection. No principal means a
-    handler called directly (tests), which is not checked, as job owners aren't."""
+    """True when the principal may use the collection (every name in `scope`).
+    No principal means a handler called directly (tests), which is not
+    checked, as job owners aren't."""
     if principal is None:
         return True
-    return store.has_access(principal.user_id, principal.role, canonical(name))
+    return all(store.has_access(principal.user_id, principal.role, n) for n in scope(name))
 
 
 def principal_of(request):
@@ -19686,8 +19729,11 @@ def visible_filter(principal):
     me = principal.user_id
 
     def visible(name: str) -> bool:
-        grants = restricted.get(canonical(name))
-        return grants is None or me in grants
+        for n in scope(name):
+            grants = restricted.get(n)
+            if grants is not None and me not in grants:
+                return False
+        return True
     return visible
 ```
 
@@ -24855,9 +24901,12 @@ export default function CollectionsPage() {
   const [accessError, setAccessError] = useState('')
   // The dialog's own read of the state: until it succeeds the choice is
   // unknown and Save stays disabled; once the Engineer changes something, a
-  // late answer doesn't overwrite the change.
+  // late answer doesn't overwrite the change. Each opening is numbered, and
+  // an answer to an earlier opening (another collection's, or one closed
+  // since) is ignored, so it can't become this dialog's draft (#788).
   const [accessLoaded, setAccessLoaded] = useState(false)
   const touched = useRef(false)
+  const accessRead = useRef(0)
 
   async function load() {
     api.getCollections().then(r => {
@@ -24872,15 +24921,20 @@ export default function CollectionsPage() {
   }
 
   function openAccess(name: string) {
+    const ticket = ++accessRead.current
     setAccessError('')
     setAccessTarget(name)
     setAccessLoaded(false)
     touched.current = false
     setDraft({ restricted: false, users: [], service_principals: [] })
     api.getCollectionAccess(name).then(a => {
+      if (ticket !== accessRead.current) return
       if (!touched.current) setDraft({ ...a })
       setAccessLoaded(true)
-    }).catch((e: unknown) => setAccessError(`Could not read who may use this collection: ${e instanceof Error ? e.message : String(e)}`))
+    }).catch((e: unknown) => {
+      if (ticket !== accessRead.current) return
+      setAccessError(`Could not read who may use this collection: ${e instanceof Error ? e.message : String(e)}`)
+    })
     api.listUsers().then(r => setPeople(r.users))
       .catch((e: unknown) => setAccessError(`Could not load the people: ${e instanceof Error ? e.message : String(e)}`))
     api.listPrincipals().then(r => setPrincipals(r.principals))
@@ -24888,6 +24942,7 @@ export default function CollectionsPage() {
   }
 
   function closeAccess() {
+    accessRead.current++
     setAccessTarget('')
     setAccessError('')
   }
@@ -29968,6 +30023,41 @@ def code(method, path, body=None, token=None, headers=None, paced=True):
     return auth_setup.paced(path, send) if paced else send()
 
 
+def upload(token, filename, content):
+    """POST /prepare/upload of one file as a same-origin browser would.
+    Returns (status, parsed body or None)."""
+    boundary = "vfy" + secrets.token_hex(8)
+    data = ('--{}\r\nContent-Disposition: form-data; name="files"; filename="{}"\r\n'
+            'Content-Type: application/octet-stream\r\n\r\n'.format(boundary, filename).encode()
+            + content + "\r\n--{}--\r\n".format(boundary).encode())
+    headers = {"Origin": auth_setup.origin(), "Cookie": "rag_session=" + token,
+               "Content-Type": "multipart/form-data; boundary=" + boundary}
+    req = urllib.request.Request(auth_setup.api_base() + "/prepare/upload", data=data, method="POST",
+                                 headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            status, raw = response.status, response.read()
+    except urllib.error.HTTPError as error:
+        status, raw = error.code, error.read()
+    try:
+        return status, json.loads(raw)
+    except ValueError:
+        return status, None
+
+
+def wait_job(token, path, timeout=600):
+    """GET `path` every 2 s until the job ends; returns its record."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status, raw, _ = code("GET", path, token=token)
+        expect(status == 200, "{} answered {}".format(path, status))
+        job = json.loads(raw)
+        if job["status"] in ("completed", "failed", "partial", "cancelled"):
+            return job
+        time.sleep(2)
+    raise CheckFailed("{} didn't end within {}s".format(path, timeout))
+
+
 def error_code(raw):
     try:
         return json.loads(raw)["error"]["code"]
@@ -30722,11 +30812,14 @@ def check_collection_access(operator_ok):
     """Per-collection access (#606) on the stack: a collection the harness
     Engineer creates is restricted to it; a throwaway End User and Developer
     and a Developer key can't see or use it until granted, and the access routes
-    refuse a key. Changes and refusals are in the audit log."""
+    refuse a key. Changes and refusals are in the audit log. In the Prepare
+    area, a document the granted Developer imports into it is hidden from a
+    Developer without access (#788)."""
     expect(operator_ok, "creates accounts, a service principal and a collection, so it runs only on the verify project")
     admin = role_token("engineer")
     name = "VfyAccess" + secrets.token_hex(4)
     users, principal = [], None
+    document, document_owner = None, None
     try:
         status, raw, _ = code("POST", "/collections", {"name": name}, token=admin)
         expect(status == 201, "creating {} answered {} {}".format(name, status, error_code(raw)))
@@ -30769,6 +30862,33 @@ def check_collection_access(operator_ok):
             got = answer(who, "GET", "/ingest/config/" + name)
             expect(got[0] == 200, "{}: the granted collection's settings answered {}".format(who, got))
         expect(not listed("End User"), "the End User sees a collection not granted to it")
+
+        # The Prepare area (#606 Q18, #788): a .csv is labelled from its data,
+        # with no LLM call, so preparing it is quick.
+        status, body = upload(dev_token, "vfy-access-{}.csv".format(secrets.token_hex(3)), b"name,team\nAda,core\n")
+        expect(status == 201 and body and len(body["documents"]) == 1, "the upload answered {} {}".format(status, body))
+        document, document_owner = body["documents"][0]["id"], dev_token
+        status, raw, _ = code("POST", "/prepare/jobs", {"document_ids": [document]}, token=dev_token)
+        expect(status == 202, "starting the preparation answered {} {}".format(status, error_code(raw)))
+        job = wait_job(dev_token, "/prepare/job/" + json.loads(raw)["job_id"])
+        expect(job["status"] == "completed", "the preparation ended {}: {}".format(job["status"], job.get("errors")))
+        status, raw, _ = code("POST", "/prepare/import", {"collection": name, "document_ids": [document],
+                                                          "chunk_size": 500, "chunk_overlap": 50}, token=dev_token)
+        expect(status == 202, "the import into {} answered {} {}".format(name, status, error_code(raw)))
+        job = wait_job(dev_token, "/ingest/job/" + json.loads(raw)["job_id"])
+        expect(job["status"] == "completed", "the import ended {}: {}".format(job["status"], job.get("errors")))
+        other, _, other_token = throwaway("developer", operator_ok)
+        users.append(other)
+
+        def prepared(token):
+            status, raw, _ = code("GET", "/prepare/documents", token=token)
+            expect(status == 200, "GET /prepare/documents answered {}".format(status))
+            return document in [d["id"] for d in json.loads(raw)["documents"]]
+        expect(prepared(dev_token), "the granted Developer doesn't see the document it imported")
+        expect(not prepared(other_token), "a Developer without access sees a document imported only into {}".format(name))
+        status, raw, _ = code("GET", "/prepare/documents/" + document, token=other_token)
+        expect((status, error_code(raw)) == (404, "DOCUMENT_NOT_FOUND"),
+               "a Developer without access reading the document answered {} {}".format(status, error_code(raw)))
         got = answer("key", "PUT", "/collections/{}/access".format(name), {"restricted": False})
         expect(got == (403, "KEY_NOT_ALLOWED"), "a key changing access answered {}".format(got))
         got = answer("key", "GET", "/collections/{}/access".format(name))
@@ -30789,6 +30909,8 @@ def check_collection_access(operator_ok):
         expect(audited("collection.access.refused", actor=principal),
                "no collection.access.refused record for the key's settings read")
     finally:
+        if document:
+            code("DELETE", "/prepare/documents/" + document, token=document_owner)
         code("DELETE", "/collections/{}?confirm=true".format(name), token=admin)
         for username in users:
             code("POST", "/auth/users/{}/disable".format(username), token=admin)
@@ -38510,7 +38632,7 @@ class ListingTests(AccessTestCase):
 
     def test_a_change_applies_to_the_next_request(self):
         self.assertEqual(self.put(SECRET, {"restricted": False}).status_code, 200)
-        # The copy keeps the access it was made with (CopyTests).
+        # The copy keeps its own state, which still restricts it (CopyTests, #788).
         self.assertEqual(self.names("user"), [OPEN, SECRET])
 
 
@@ -38578,7 +38700,7 @@ class AccessRouteTests(AccessTestCase):
 
     def test_an_empty_grant_set_leaves_engineers_only(self):
         self.put(SECRET, {"restricted": True})
-        self.assertEqual(self.names("dev"), [OPEN, STAGING])               # the copy keeps its own grants
+        self.assertEqual(self.names("dev"), [OPEN])                        # the copy follows its target (#788)
         self.assertEqual(self.names("eng"), [OPEN, SECRET, STAGING])
 
 
@@ -38795,6 +38917,24 @@ class PackageTests(AccessTestCase):
         self.assertEqual(seen, [store.CollectionAccess(True, ("dev2",), ())])
         self.assertFalse(store.collection_access("Brandnew").restricted)
 
+    def test_a_failed_cleanup_keeps_the_new_collection_access(self):
+        # The build's own delete of the partial collection failed (#788).
+        def build(target, *a):
+            raise importer.PackageError("IMPORT_FAILED", "the insert failed; partial target cleanup failed",
+                                        {"collection": target, "cleanup_pending": True})
+        record = self.run_import("Halfbuilt", "rename", {"name": "dev2", "kind": "user"}, _build=build)
+        self.assertEqual(record["status"], "failed", record)
+        self.assertEqual(store.collection_access("Halfbuilt"), store.CollectionAccess(True, ("dev2",), ()))
+
+    def test_a_failed_build_that_left_the_collection_keeps_its_access(self):
+        # The create was applied but answered with an error (#788).
+        def build(target, *a):
+            self.collections.add(target)
+            raise RuntimeError("timed out")
+        record = self.run_import("Applied", "rename", {"name": "dev2", "kind": "user"}, _build=build)
+        self.assertEqual(record["status"], "failed", record)
+        self.assertEqual(store.collection_access("Applied"), store.CollectionAccess(True, ("dev2",), ()))
+
     def test_a_replace_keeps_the_target_access(self):
         def begin(*a):
             raise importer.PackageError("IMPORT_FAILED", "stopped before the replace")
@@ -38805,10 +38945,21 @@ class PackageTests(AccessTestCase):
         self.assertEqual((record["status"], record["error"]), ("failed", "stopped before the replace"), record)
         self.assertEqual(store.collection_access(SECRET), before)
 
+    def test_a_failure_after_the_build_keeps_the_new_collection_access(self):
+        # The build finished, so the collection exists; a later failure must
+        # not put back (open) the state the import gave it.
+        def restore(*a):
+            raise importer.PackageError("IMPORT_FAILED", "the sidecars failed")
+        record = self.run_import("Builtnew", "rename", {"name": "dev2", "kind": "user"},
+                                 _build=lambda *a: 1, _restore_sidecars=restore)
+        self.assertEqual((record["status"], record["error"]), ("failed", "the sidecars failed"), record)
+        self.assertEqual(store.collection_access("Builtnew"), store.CollectionAccess(True, ("dev2",), ()))
 
 
 class CopyTests(AccessTestCase):
-    """A staging or recovery copy keeps the access it was made with (#606)."""
+    """A staging or recovery copy gets its target's access when it is made
+    (#606) and keeps it as its own state; while the target has a state, a
+    caller other than an Engineer needs both (#788)."""
 
     def test_begin_snapshots_and_discard_drops(self):
         from services import collection_recovery
@@ -38834,24 +38985,47 @@ class CopyTests(AccessTestCase):
         self.assertFalse(store.collection_access(last["staging"]).restricted)
         self.assertTrue(store.collection_access(copy).restricted)          # a copy not discarded keeps it
 
-    def test_deleting_or_recreating_the_target_leaves_the_copy_as_it_was(self):
+    def test_a_copy_follows_a_deleted_and_re_created_target(self):
         async def delete(name):
             self.collections.discard(name)
             return 1
 
         async def create(**kwargs):
             self.collections.add(kwargs["name"])
+        body = {"question": "What?", "collection": STAGING}
         with patch.object(wc, "delete_collection_when_idle", delete):
             self.assertEqual(self.client.delete(f"/collections/{SECRET}?confirm=true",
                                                 headers=self.as_("eng")).status_code, 200)
         self.assertNotIn(STAGING, self.names("user"))                     # not opened by the delete
+        self.assertIn(STAGING, self.names("dev"))                         # its own state alone now
         with patch.object(wc, "create_collection", create):
             self.assertEqual(self.client.post("/collections", json={"name": SECRET},
                                               headers=self.as_("dev2")).status_code, 201)
-        self.assertEqual(self.names("dev2"), [OPEN, SECRET])               # the new SECRET, not the old copy
-        self.assertIn(STAGING, self.names("dev"))
+        # The new SECRET is dev2's; the copy is dev's: each lacks one side.
+        self.assertEqual(self.names("dev2"), [OPEN, SECRET])
+        self.assertEqual(self.names("dev"), [OPEN])
+        for who in ("dev", "dev2"):
+            self.refused(self.client.post("/query", json=body, headers=self.as_(who)))
+        self.assertIn(STAGING, self.names("eng"))
+
+    def test_a_copy_with_no_state_follows_its_target(self):
+        # A copy kept from before #606 has no state of its own (#788).
+        store.drop_collection_access(STAGING)
+        for who, sees in (("dev", True), ("svc", True), ("eng", True), ("user", False), ("dev2", False)):
+            with self.subTest(who=who):
+                self.assertEqual(STAGING in self.names(who), sees)
         body = {"question": "What?", "collection": STAGING}
-        self.refused(self.client.post("/query", json=body, headers=self.as_("dev2")))
+        self.refused(self.client.post("/query", json=body, headers=self.as_("user")))
+
+    def test_narrowing_the_target_reaches_the_copy(self):
+        self.assertEqual(self.put(SECRET, {"restricted": True, "users": ["dev"]}).status_code, 200)
+        self.assertNotIn(STAGING, self.names("svc"))
+        self.assertIn(STAGING, self.names("dev"))
+
+    def test_opening_the_target_leaves_the_copy_its_own_state(self):
+        self.assertEqual(self.put(SECRET, {"restricted": False}).status_code, 200)
+        self.assertNotIn(STAGING, self.names("user"))
+        self.assertIn(STAGING, self.names("dev"))
 
 
 class CreateFailureTests(AccessTestCase):
@@ -38880,6 +39054,32 @@ class CreateFailureTests(AccessTestCase):
         self.assertEqual(seen, [store.CollectionAccess(True, ("dev2",), ())])
         self.assertFalse(store.collection_access("Fresh").restricted)
 
+    def test_a_failed_create_that_left_the_collection_keeps_the_restriction(self):
+        # Weaviate applied the create but the client got an error (#788).
+        async def create(**kwargs):
+            self.collections.add(kwargs["name"])
+            raise TimeoutError("read timed out")
+        with patch.object(wc, "create_collection", create):
+            answer = self.client.post("/collections", json={"name": "Fresh"}, headers=self.as_("dev2"))
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (500, "CREATE_FAILED"))
+        self.assertEqual(store.collection_access("Fresh"), store.CollectionAccess(True, ("dev2",), ()))
+
+    def test_a_failed_create_with_no_answer_on_existence_keeps_the_restriction(self):
+        async def create(**kwargs):
+            raise RuntimeError("weaviate refused")
+
+        asked = []
+
+        async def unknown(name):
+            asked.append(name)
+            if len(asked) > 1:                       # the check after the failed create
+                raise ConnectionError("no answer")
+            return False
+        with patch.object(wc, "create_collection", create), patch.object(wc, "collection_exists", unknown):
+            answer = self.client.post("/collections", json={"name": "Fresh"}, headers=self.as_("dev2"))
+        self.assertEqual((answer.status_code, asked), (500, ["Fresh", "Fresh"]))
+        self.assertEqual(store.collection_access("Fresh"), store.CollectionAccess(True, ("dev2",), ()))
+
     def test_put_back_only_restores_its_own_state(self):
         before, mine = store.restrict_to("Race", store.get_user("dev2").id)
         theirs = store.restrict_to("Race", store.get_user("dev").id)[1]     # another create wrote since
@@ -38901,6 +39101,32 @@ class CreateFailureTests(AccessTestCase):
 
 
 class PackageSourceTests(AccessTestCase):
+    def test_a_package_of_an_existing_copy_follows_the_copy_and_its_target(self):
+        # The copy's own state is open; SECRET still restricts it (#788).
+        self.assertEqual(self.put(STAGING, {"restricted": False}).status_code, 200)
+        dev2 = {"name": "dev2", "kind": "user"}
+        self.assertEqual(importer._source(STAGING), STAGING)
+        self.assertTrue(importer._refused(dev2, STAGING))
+        self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, STAGING))
+        from routers import transfer
+        listed = [{"filename": "ragpkg-copy.tar.gz", "size_bytes": 1, "collection": STAGING, "chunk_count": 1,
+                   "fidelity": "chunks-only", "created_at": None, "readable": True}]
+        with patch.object(transfer, "_list_packages_sync", lambda: [dict(p) for p in listed]):
+            self.assertEqual(self.client.get("/packages", headers=self.as_("dev2")).json()["packages"], [])
+            self.assertEqual(len(self.client.get("/packages", headers=self.as_("dev")).json()["packages"]), 1)
+
+    def test_an_import_from_a_copy_takes_the_narrower_state(self):
+        self.assertEqual(self.put(STAGING, {"restricted": True, "users": ["dev", "dev2"]}).status_code, 200)
+        self.assertEqual(self.put(SECRET, {"restricted": True, "users": ["dev"]}).status_code, 200)
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, STAGING, "Fromcopy")
+        self.assertEqual(written, store.CollectionAccess(True, ("dev",), ()))
+        self.assertEqual(self.put(STAGING, {"restricted": False}).status_code, 200)
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, STAGING, "Fromcopy2")
+        self.assertEqual(written, store.CollectionAccess(True, ("dev",), ()))      # the target's alone
+        self.assertEqual(self.put(SECRET, {"restricted": False}).status_code, 200)
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, STAGING, "Fromcopy3")
+        self.assertEqual(written, store.CollectionAccess(False))
+
     def test_a_package_of_a_discarded_copy_follows_its_target(self):
         gone = SECRET + "__importing_" + "1" * 32
         self.assertEqual(importer._source(gone), SECRET)                   # the copy no longer exists
@@ -39073,6 +39299,18 @@ class PrepareAreaTests(AccessTestCase):
             mine = self.client.get("/prepare/job/pj1", headers=self.as_("dev")).json()
             self.assertEqual(mine["document_ids"], job["document_ids"])
         self.assertFalse(self.records("collection.access.refused"))
+
+    def test_a_refused_selection_is_audited_as_an_access_refusal(self):
+        for path, body, action in (
+                ("/prepare/jobs", {"document_ids": [self.secret_doc, self.open_doc]}, "prepare.start"),
+                ("/prepare/import", {"collection": OPEN, "document_ids": [self.secret_doc]}, "prepare.import")):
+            with self.subTest(path=path):
+                answer = self.client.post(path, json=body, headers=self.as_("dev2"))
+                self.assertEqual((answer.status_code, answer.json()["error"]["detail"]),
+                                 (404, {"documents": [self.secret_doc]}))
+                item = [r for r in self.records(action) if r["actor"] == "dev2"][-1]
+                self.assertEqual((item["result"], item["collection"], item["details"].get("reason")),
+                                 ("refused", SECRET, "collection_access"), item)
 
 
 if __name__ == "__main__":
@@ -55041,6 +55279,37 @@ function collectionsCases() {
       assert.deepEqual(state, { save: true, checked: 0 });
       assert.equal(callsTo(s, 'PUT', '/api/collections/' + B + '/access').length, 0);
     } },
+    (() => {
+      // The page's own read of A answers at once; the dialog's read of A is held
+      // until B's dialog has read B (#788).
+      const late = hold();
+      let readsOfA = 0;
+      return { name: 'Access (#788): a late answer for an earlier opening does not fill another collection\'s dialog', open: open({
+        ['GET /api/collections/' + A + '/access']: () => (++readsOfA === 1 ? json(200, OPEN) : late),
+        ['GET /api/collections/' + B + '/access']: json(200, { restricted: true, users: ['vfy-developer'], service_principals: [] }),
+        'GET /api/auth/users': json(200, { users: [] }),
+        'GET /api/auth/service-principals': json(200, { principals: [] }),
+        'PUT /api/collections/*': call => json(200, call.body),
+      }), async run(s) {
+        await waitText(s.page, A);
+        await waitFor(s.page, () => [...document.querySelectorAll('tbody tr')].every(r => r.cells[5].textContent.trim() !== '\u2014'), 'the access column');
+        await (await s.page.$$('tbody button'))[0].click();   // row A: Access
+        await waitText(s.page, 'Access to ' + A);
+        await press(s.page, 'Cancel');
+        await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+        await (await s.page.$$('tbody button'))[2].click();   // row B: Access
+        await waitText(s.page, 'Access to ' + B);
+        await waitFor(s.page, () => [...document.querySelectorAll('.fixed button')].some(b => b.textContent.trim() === 'Save' && !b.disabled), 'Save to be enabled once B is read');
+        late.release(json(200, { restricted: true, users: ['vfy-a-only'], service_principals: [] }));
+        await new Promise(r => setTimeout(r, 300));
+        await press(s.page, 'Save');
+        await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+        const puts = s.calls.filter(call => call.method === 'PUT');
+        assert.equal(puts.length, 1);
+        assert.equal(puts[0].path, '/api/collections/' + B + '/access');
+        assert.deepEqual(puts[0].body, { restricted: true, users: ['vfy-developer'], service_principals: [] });
+      } };
+    })(),
     { name: 'New Collection modal starts with HNSW, Cosine and the three HNSW sliders at their defaults and bounds', open: open(), async run(s) {
       await waitText(s.page, A);
       await press(s.page, '+ New Collection');

@@ -12,10 +12,14 @@ refusal is audited (services/audit.py, `access_refused`).
 A staging or recovery collection of a rebuild or import
 (`<target>__tuning_<token>`, `<target>__importing_<token>`) holds its target's
 data, so it is given its target's access when it is made
-(collection_recovery.begin) and keeps that state under its own name, whatever
-later happens to the target. Every name is looked up as itself. `target_of`
-maps a copy's name to its target only for a package of a copy that no longer
-exists (services/importer.py, routers/transfer.py).
+(collection_recovery.begin) and keeps that state under its own name. While its
+target has a state too, a caller other than an Engineer may use the copy only
+when they may use both (`scope`, #788): restricting the target later reaches
+its existing copies, including ones kept from before #606 with no state of
+their own. A deleted target's state is dropped with it, so the copy is then
+governed by its own state alone; a re-created target's new state narrows it
+again. `target_of` also maps a package of a copy that no longer exists to its
+target (services/importer.py, routers/transfer.py).
 """
 from __future__ import annotations
 
@@ -50,12 +54,21 @@ def package_source(name: str, exists) -> str:
     return name
 
 
+def scope(name: str) -> tuple[str, ...]:
+    """The names whose state decides who may use collection `name`: the name
+    itself, and for a staging or recovery copy also its target (#788)."""
+    name = canonical(name)
+    target = target_of(name)
+    return (name,) if target == name else (name, target)
+
+
 def allowed(principal, name: str) -> bool:
-    """True when the principal may use the collection. No principal means a
-    handler called directly (tests), which is not checked, as job owners aren't."""
+    """True when the principal may use the collection (every name in `scope`).
+    No principal means a handler called directly (tests), which is not
+    checked, as job owners aren't."""
     if principal is None:
         return True
-    return store.has_access(principal.user_id, principal.role, canonical(name))
+    return all(store.has_access(principal.user_id, principal.role, n) for n in scope(name))
 
 
 def principal_of(request):
@@ -81,6 +94,9 @@ def visible_filter(principal):
     me = principal.user_id
 
     def visible(name: str) -> bool:
-        grants = restricted.get(canonical(name))
-        return grants is None or me in grants
+        for n in scope(name):
+            grants = restricted.get(n)
+            if grants is not None and me not in grants:
+                return False
+        return True
     return visible

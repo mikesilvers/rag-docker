@@ -67,7 +67,8 @@ def begin(target: str, operation: str, client) -> dict:
     _write(record)  # Ownership is persisted before collection creation.
     # The copy will hold the target's data, so it gets the target's access as
     # it is now, under its own name, before it exists (#606). Later changes to
-    # the target (a delete, a re-create, new grants) never change it.
+    # the target never change this state, but while the target has a state a
+    # caller other than an Engineer needs both (access.scope, #788).
     auth_store.copy_collection_access(target, staging)
     return record
 

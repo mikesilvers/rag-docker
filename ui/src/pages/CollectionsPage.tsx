@@ -35,9 +35,12 @@ export default function CollectionsPage() {
   const [accessError, setAccessError] = useState('')
   // The dialog's own read of the state: until it succeeds the choice is
   // unknown and Save stays disabled; once the Engineer changes something, a
-  // late answer doesn't overwrite the change.
+  // late answer doesn't overwrite the change. Each opening is numbered, and
+  // an answer to an earlier opening (another collection's, or one closed
+  // since) is ignored, so it can't become this dialog's draft (#788).
   const [accessLoaded, setAccessLoaded] = useState(false)
   const touched = useRef(false)
+  const accessRead = useRef(0)
 
   async function load() {
     api.getCollections().then(r => {
@@ -52,15 +55,20 @@ export default function CollectionsPage() {
   }
 
   function openAccess(name: string) {
+    const ticket = ++accessRead.current
     setAccessError('')
     setAccessTarget(name)
     setAccessLoaded(false)
     touched.current = false
     setDraft({ restricted: false, users: [], service_principals: [] })
     api.getCollectionAccess(name).then(a => {
+      if (ticket !== accessRead.current) return
       if (!touched.current) setDraft({ ...a })
       setAccessLoaded(true)
-    }).catch((e: unknown) => setAccessError(`Could not read who may use this collection: ${e instanceof Error ? e.message : String(e)}`))
+    }).catch((e: unknown) => {
+      if (ticket !== accessRead.current) return
+      setAccessError(`Could not read who may use this collection: ${e instanceof Error ? e.message : String(e)}`)
+    })
     api.listUsers().then(r => setPeople(r.users))
       .catch((e: unknown) => setAccessError(`Could not load the people: ${e instanceof Error ? e.message : String(e)}`))
     api.listPrincipals().then(r => setPrincipals(r.principals))
@@ -68,6 +76,7 @@ export default function CollectionsPage() {
   }
 
   function closeAccess() {
+    accessRead.current++
     setAccessTarget('')
     setAccessError('')
   }
