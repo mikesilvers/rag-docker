@@ -1357,6 +1357,8 @@ and rebuilding alone does not resolve changes because Docker installs the lock.
 
 **Node (`ui/`)** — `package-lock.json` is committed and `npm ci` installs from it exactly. Regenerate with `npm install --package-lock-only` after editing `package.json`.
 
+**Docker images** — Weaviate and Ollama are updated by hand: Dependabot ignores `semitechnologies/weaviate` and `ollama/ollama` (the reasons are in `.github/dependabot.yml`), so no automatic notice of their security releases arrives. At each release plan, check [Weaviate's releases](https://github.com/weaviate/weaviate/releases) for security fixes.
+
 ## MCP server (parked)
 
 An MCP server exposing the RAG lifecycle as tools is **built and tested but not

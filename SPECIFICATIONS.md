@@ -24,6 +24,14 @@ services:
   weaviate:
     # 1.27.0 is the minimum supported by weaviate-client 4.23.1 (pinned in
     # api/requirements.txt); 1.25.x fails at connect with WeaviateStartUpError.
+    # Use the plain X.Y.Z tag: it is the multi-arch image. The suffixed tags,
+    # such as 1.40.2-9858973.arm64, carry one platform only (#527, #530), so
+    # Dependabot ignores Weaviate (.github/dependabot.yml) and it is upgraded
+    # by hand. The main stack's images are pinned by tag, not digest (decided
+    # on #544): weaviate and ollama to exact versions, nginx to the 1.29-alpine
+    # tag, which moves with patch and Alpine rebuilds and which Dependabot
+    # updates. The opt-in telemetry collector (docker-compose.telemetry.yml) is
+    # the exception: it is pinned by digest.
     image: semitechnologies/weaviate:1.40.2
     environment:
       QUERY_DEFAULTS_LIMIT: 25
@@ -1686,7 +1694,9 @@ disabled or its role changes; an Engineer demoted to a lower role is then bound 
   exists here, the nearest collection in its chain that exists here, or the original when none does (#792). An
   encrypted package's manifest can't be read, so one exported here has the collection recorded at its export (#794);
   one recorded without a collection (before #794) is listed and served to Engineers only, and one copied in names no
-  collection. `GET /packages` hides a package whose collection exists here and is
+  collection. An encrypted package exported here that is missing from the record (its record write failed at
+  export, or an unreadable record was moved aside) is treated as copied in (#798). `GET /packages` hides a package
+  whose collection exists here and is
   restricted, from a caller without access to it (Weaviate not answering counts as existing); for an existing copy,
   access means access to every collection in its chain. The listing and the import job use the same rule. An import job refuses a package of such
   a collection, for encrypted packages too once decrypted, before anything is created or replaced: the job fails
@@ -4410,6 +4420,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *Evidence: `scripts/tests/test_export_encryption.py` (suite 05) through `packager.open_package`, `importer._run` and the API; suite 05 imports the encrypted export with a wrong passphrase against the existing collection (`replace`) and checks the collections, their counts, the package file and the import work directories are unchanged, checks both 400 refusals, then imports it with the right passphrase (`rename`) with every chunk.*
 - [x] A package this instance exported doesn't stay in `./exports` (#677): `GET /packages/{filename}` (Developer and above, the listing's access rule) streams it and deletes it after a complete download, while an interrupted download, `HEAD` and a package not exported here keep it; `409 PACKAGE_BUSY` while an import of it runs or another download is in progress; a sweep at start-up and every 15 minutes deletes recorded packages older than `EXPORT_RETENTION_HOURS` (1-720, default 24) and skips busy ones; `GET /packages` and the export job status carry `expires_at`; downloads and deletions are audited as `package.download` and `package.delete`; an unreadable record is moved aside, never overwritten.
       *Evidence: `scripts/tests/test_package_download.py` (suite 05): the route's bytes, headers and refusals, deletion only of a recorded package, an interrupted download driven directly, the record, the sweep and its 15-minute interval, a real API start-up sweeping an expired package, an invalid setting stopping the API, the import claim under the shared lock, and the audit records; suite 05's live checks through the proxy (a full download deletes, an interrupted one keeps, the sweep deletes a recorded package and keeps one copied in, an End User is refused); `browser/transfer_page.js` (suite 06): the Download links, "Expires" in local time and the page catching up after a download.*
+- [x] Packages exported here are tied to their collection and the deleting download is hardened (#794): each export records its collection in `exported_packages.json`, and an entry written before #794 (a bare finish time) is still read, with no collection; an encrypted package exported here follows its recorded collection's access rule in `GET /packages` and `GET /packages/{filename}` (Weaviate not answering counts as the collection existing), and one recorded with no collection is listed and served to Engineers only; `GET /packages/{filename}` is for the Developer role and above, people and service keys alike; a cookie-authenticated `GET /packages/{filename}` whose `Sec-Fetch-Site` is present and neither `same-origin` nor `none` is refused `403 CROSS_ORIGIN_REFUSED`, while `HEAD`, service keys and requests without the header aren't checked; `HEAD` writes `package.download` with `details.head: true` and no `completed`; recorded names outside the download rule are ignored, never deleted, and logged once per process (#798); a deletion is audited and the sweep goes on when the record can't be rewritten; an import claim or download slot is released when its request is cancelled during the claim.
+      *Evidence: `scripts/tests/test_package_download.py` (host and suite 05): `RecordTests` (the record's shape, entries before #794, wrongly typed entries, names outside the rule logged once), `EncryptedAccessTests` (restricted, open, no recorded collection, copied in, a collection gone, Weaviate failing, an End User), `DeletionRecordTests`, `SameOriginTests` (the `Sec-Fetch-Site` cases, `HEAD`, service keys, the listing), `HeadRecordTests` and `CancelledClaimTests`; suite 17's `matrix` and `key-matrix` checks (the `GET /packages/{filename}` row for every role and key) and `origin` check (the `Sec-Fetch-Site` cases through the proxy) in `scripts/verify/auth_stack.py`.*
 - [x] `GET /ingest/config` returns `is_default: true` for a collection with no saved config; `is_default: false` after saving one.
 - [x] `GET /retrieval/config/{collection}` answers 200 with the defaults and `is_default: true`, and logs a warning naming the collection, when the saved file can't be read, isn't JSON, holds JSON that isn't an object, has a field the response can't carry (a wrong type, a fractional or nested `top_k`, a `NaN` or infinite `alpha`) or holds the response-only key `is_default`; missing fields are filled from the defaults, and coercible and out-of-range values are still served as saved (#439, #477).
       *Evidence: `RetrievalConfigFileTests` in `scripts/tests/test_api_paths.py`, in the built API image with `--network none` (suite 01, through `16_api_paths.sh`), sends each saved file through the app; its non-object, wrong-type and fractional or nested checks fail on the code before #439, and its non-finite `alpha` and `is_default` checks fail on the code before #477.*

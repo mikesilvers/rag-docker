@@ -475,6 +475,26 @@ def check_origin(operator_ok):
                 name, status, error_code(raw)))
     status, _, _ = code("GET", "/collections", token=token, headers={"Origin": "http://evil.example"})
     expect(status == 200, "a cross-origin GET answered {} (reads aren't origin-checked)".format(status))
+    # #794: the deleting GET /packages/{filename} refuses a cookie request whose
+    # Sec-Fetch-Site is present and not same-origin or none, through nginx. The
+    # package doesn't exist, so an allowed request is a 404 and deletes nothing.
+    package = "/packages/ragpkg-vfy-no-such.tar.gz"
+    for method, site, want in (("GET", "cross-site", 403), ("GET", "same-site", 403),
+                               ("GET", "same-origin", 404), ("GET", "none", 404), ("GET", None, 404),
+                               ("HEAD", "cross-site", 404)):
+        headers = {"Origin": auth_setup.origin()}
+        if site is not None:
+            headers["Sec-Fetch-Site"] = site
+        status, raw, _ = code(method, package, token=token, headers=headers)
+        if want == 403:
+            expect(status == 403 and error_code(raw) == "CROSS_ORIGIN_REFUSED",
+                   "{} {} with Sec-Fetch-Site {}: answered {} {}".format(method, package, site, status,
+                                                                         error_code(raw)))
+        else:
+            expect(status == 404, "{} {} with Sec-Fetch-Site {}: answered {}, wanted the 404 of an "
+                   "allowed request".format(method, package, site, status))
+    status, _, _ = code("GET", "/packages", token=token, headers={"Sec-Fetch-Site": "cross-site"})
+    expect(status == 200, "the package listing with Sec-Fetch-Site cross-site answered {}".format(status))
     request("POST", "/auth/logout", token=token)
 
 

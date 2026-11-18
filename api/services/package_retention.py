@@ -74,6 +74,9 @@ _downloading: set[str] = set()
 _settling: set = set()
 # An unreadable record that couldn't be moved aside: writes refuse meanwhile.
 _stuck = False
+# Recorded names outside the download rule already logged by this process
+# (#798): each is logged once, not on every read. Changed under `_lock` only.
+_reported: set[str] = set()
 
 
 def lock():
@@ -126,8 +129,9 @@ def _entry(value) -> dict | None:
 def _read() -> dict[str, dict]:
     """Recorded filename -> `{"finished_at", "collection"}`. Missing is empty; an
     unreadable record is moved aside (`_set_aside`) and taken as empty. A name
-    outside the download rule is left out and logged (#794): nothing deletes,
-    expires or serves it as recorded."""
+    outside the download rule is left out and logged (#794), once per process
+    (#798): nothing deletes, expires or serves it as recorded, and reads never
+    rewrite the record, so the next export or deletion writes it out."""
     path = _path()
     with _lock:
         try:
@@ -143,8 +147,10 @@ def _read() -> dict[str, dict]:
             _set_aside(path)
             return {}
         for name in [k for k in entries if not valid_name(k)]:
-            _log.warning("The record of exported packages names %r, which isn't a package name; "
-                         "it is ignored", name)
+            if name not in _reported:
+                _reported.add(name)
+                _log.warning("The record of exported packages names %r, which isn't a package name; "
+                             "it is ignored", name)
             del entries[name]
         return entries
 
