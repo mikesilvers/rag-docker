@@ -82,8 +82,9 @@ Use `completed` for work that is done, and `"not planned"` for a duplicate or a 
 - **Relates** when only part of a ticket waits, for example its UI after a toolchain upgrade. `createJiraIssueLink` with `linkType: "Relates"`, plus a comment on the waiting ticket saying which part waits, and for what.
 - **No link** for a same-file conflict that only needs a rebase: whichever PR lands second rebases. It is listed in the epic's Lanes section.
 - **Verify note:** one machine runs one verify stack at a time (`rag-verify` on port 8081, behind a lock). Lanes can be developed and reviewed in parallel, but their verify runs and `rag-pr-review` evaluations queue.
-- **Limit on open PRs:** no new fix agent starts while 2 or more non-Markdown PRs from the release wait for or are in evaluation. Markdown-only PRs (every changed file is `*.md`) don't count: they take the fast path and don't use the verify stack. A fix agent's question round doesn't count as a PR.
-- **Evaluation queue order:** the next PR to evaluate is a security fix; then a PR on the critical path or one that unblocks other tickets (for example on the longest chain, or one whose merge clears a Blocks link); then the oldest. A PR that conflicts with `develop` goes back to its fix agent, and keeps its place once updated.
+- **Limit on open PRs:** no non-Markdown PR from the release opens while 2 or more non-Markdown PRs from the release wait for or are in evaluation. Markdown-only PRs (every changed file is `*.md`) don't count: they take the fast path and don't use the verify stack. A fix agent's question round doesn't count as a PR.
+- **Prepared branches:** while the limit is reached, a fix agent may still start and prepare its branch, with no PR yet; at most 2 prepared branches from the release at a time. It stays In Progress, with the checkpoint comment `Prepared: <branch> @ <sha>, waiting for an open-PR slot`, and opens its PR when a slot frees, after merging the current `develop`.
+- **Evaluation queue order:** the next PR to evaluate is a security fix; then a PR on the critical path or one that unblocks other tickets (for example on the longest chain, or one whose merge clears a Blocks link); then the oldest. A PR that conflicts with `develop` goes back to its fix agent, and keeps its place once updated. The same order picks the next ticket to prepare and the next prepared branch to open; a prepared branch's age counts from the time it was pushed ready.
 
 ## The epic's Lanes section
 
@@ -106,9 +107,9 @@ Same-file conflicts with no ordering need are not linked; whichever PR lands sec
 
 **Verification is the bottleneck.** One machine runs one verify stack at a time (`rag-verify` on port 8081, behind a lock), so verify runs and rag-pr-review evaluations queue across lanes.
 
-**Limit on open PRs.** No new fix agent starts while 2 or more non-Markdown PRs from the release wait for or are in evaluation. Markdown-only PRs (every changed file is `*.md`) don't count, since they don't use the verify stack, and neither does a fix agent's question round.
+**Limit on open PRs.** No non-Markdown PR from the release opens while 2 or more non-Markdown PRs from the release wait for or are in evaluation. Markdown-only PRs (every changed file is `*.md`) don't count, since they don't use the verify stack, and neither does a fix agent's question round. While the limit is reached, fix agents may still prepare their branches (dev-docs, code and host tests, pushed, no PR), at most 2 at a time. A prepared ticket stays In Progress, with the checkpoint comment `Prepared: <branch> @ <sha>, waiting for an open-PR slot`, and opens its PR when a slot frees.
 
-**Evaluation queue order.** Security fixes first; then PRs on the critical path or that unblock other tickets (for example on the longest chain, or whose merge clears a Blocks link); then the oldest. A PR that conflicts with `develop` goes back to its fix agent and keeps its place once updated.
+**Evaluation queue order.** Security fixes first; then PRs on the critical path or that unblock other tickets (for example on the longest chain, or whose merge clears a Blocks link); then the oldest. A PR that conflicts with `develop` goes back to its fix agent and keeps its place once updated. The same order picks the next ticket to prepare and the next prepared branch to open; a prepared branch's age counts from the time it was pushed ready.
 ```
 
 In the Order column, `→` means "then", `·` separates independent chains, and `+` joins items done together.
@@ -123,7 +124,7 @@ A Markdown file, `<EPIC>-release-plan.md`, in the session's scratchpad directory
 4. **Recommended moves, closes, folds and splits:** a table of item, recommendation and why. Name each overridden placement by the maintainer, with its date.
 5. **What stays:** grouped, with the count. The counts add up: children = moved + closed + folded + stay.
 6. **Dependencies:** a table of item, depends on, kind (hard, soft, or a scope note), and why, with the evidence.
-7. **Lanes:** the lane table (lane and label, order inside the lane, waits on other lanes), grouped by the files the tickets change, with tickets that share no file in separate lanes or marked independent; the start-now list, the longest chain, the rebase-only conflicts, the verify note, the limit on open PRs and the evaluation queue order.
+7. **Lanes:** the lane table (lane and label, order inside the lane, waits on other lanes), grouped by the files the tickets change, with tickets that share no file in separate lanes or marked independent; the start-now list, the longest chain, the rebase-only conflicts, the verify note, the limit on open PRs with prepared branches, and the evaluation queue order.
 8. **Decisions for the maintainer:** a numbered list, each a question that can be answered yes or no or by a choice.
 9. **Review log:** one line per review, saying what changed or "No changes".
 

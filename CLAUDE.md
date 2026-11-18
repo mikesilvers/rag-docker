@@ -20,14 +20,15 @@ Code from forks is built or run only after a clean security review and the maint
 - Every question to the maintainer, and the answer, goes on the ticket as a dated Q/A comment, including questions asked in chat. A decision that changes scope or acceptance is also posted on the GitHub issue as a "Decision (maintainer, date)" comment.
 - Moving a ticket to Done also closes its GitHub issue, if it is still open.
 - A new GitHub issue gets the current release's label only when it is an urgent bug. Otherwise leave it unlabelled and ask the maintainer which release. Never add `Triage` to an issue we open.
-- After a PR merges, its Medium and Low findings become a "Follow-ups from #N" issue.
+- A ready patch from the rag-pr-review tests reviewer (every test in it ran and passed) goes into the PR before it merges, on a PR by `mikesilvers` that isn't from a fork, READY or NOT READY, whatever the finding's severity: the coordinating session sends it to the PR's fix agent, and the new head gets its own evaluation, patch-only when it adds only the patch (`.claude/skills/rag-pr-review/reference.md`, "Reviewer patches before merge").
+- After a PR merges, its Medium and Low findings with no ready reviewer patch become a "Follow-ups from #N" issue.
 - The details are in the `rag-jira` skill.
 
 ## Planning a release
 
 Before a release's work starts, run the project's `rag-release-plan` skill on its Jira epic (`/rag-release-plan <epic key>`). Its first phase is read-only and ends with a review report that the maintainer approves. Nothing in Jira or GitHub changes before that approval. The procedure lives in `.claude/skills/rag-release-plan/`.
 
-During a release, no new fix agent starts while 2 or more non-Markdown PRs from the release wait for or are in evaluation, and the evaluation queue runs security fixes first, then the critical path or unblockers, then the oldest (details in `rag-release-plan`).
+During a release, no non-Markdown PR from the release opens while 2 or more non-Markdown PRs from the release wait for or are in evaluation. A fix agent may still start and prepare its branch (pushed, no PR), with at most 2 prepared branches at a time, and opens its PR when a slot frees. The evaluation queue runs security fixes first, then the critical path or unblockers, then the oldest, and the same order picks the next ticket to prepare and the next prepared branch to open (details in `rag-release-plan`).
 
 ## Developing a fix
 
@@ -38,12 +39,13 @@ Every fix starts in a fresh agent run with the `rag-fix` skill (`rag-fix RD-<n>`
 - After every step, the agent saves a checkpoint and pushes, and an interrupted ticket is resumed from its checkpoint. The steps, the layout and the resume procedure are in that repository's README.
 - Each dev-doc goes through a review loop. Every review is a real pass that re-reads the sources, and the log records exactly what changed. A document passes after two consecutive reviews with no changes, with at most 10 reviews; a failed loop stops and is reported. A maintainer-directed scope change restarts the loop.
 - The dev-docs may be written with a shell heredoc (maintainer approval, 2026-11-04).
+- Applying a ready reviewer patch, or opening a prepared branch's PR, needs no new dev-docs. The agent merges the current `develop` into its branch when it needs to, and never rebases or force-pushes.
 - When something is unclear, stop and ask the maintainer. Don't guess. An agent started by a session returns its question to that session, which asks the maintainer.
 
 ## Verification
 
 - Fix agents run only the host tests their change touches, and never run `stack.sh`.
-- The rag-pr-review tests reviewer runs the full `stack.sh run` (no `RAG_SKIP_SLOW`, no filter) on the PR merged with `develop`, and its recap summary is the PR's verify record. For a Markdown-only PR (every changed file is `*.md`, skills under `.claude/` included), it runs the host tests that read the changed files instead, and CI `verify` on the PR's head is the full-run record.
+- The rag-pr-review tests reviewer runs the full `stack.sh run` (no `RAG_SKIP_SLOW`, no filter) on the PR merged with `develop`, and its recap summary is the PR's verify record. For a Markdown-only PR (every changed file is `*.md`, skills under `.claude/` included), it runs the host tests that read the changed files instead, and CI `verify` on the PR's head is the full-run record. For a patch-only head (the previous reviewed head plus exactly its ready reviewer patch, with `develop` unchanged), it runs only the suites the patch touches, and the previous full run plus those runs are the verify record.
 - Verification runs only on the disposable verify project (`rag-verify`, port 8081), never on the live `rag-docker` stack. Never override the suites' refusal of the live stack with `RAG_VERIFY_LIVE=1`. See `scripts/verify/README.md`.
 
 ## Merging into `develop`
