@@ -30905,11 +30905,6 @@ def check_collection_access(operator_ok):
         expect(status == 202, "starting the preparation answered {} {}".format(status, error_code(raw)))
         job = wait_job(dev_token, "/prepare/job/" + json.loads(raw)["job_id"])
         expect(job["status"] == "completed", "the preparation ended {}: {}".format(job["status"], job.get("errors")))
-        status, raw, _ = code("POST", "/prepare/import", {"collection": name, "document_ids": [document],
-                                                          "chunk_size": 500, "chunk_overlap": 50}, token=dev_token)
-        expect(status == 202, "the import into {} answered {} {}".format(name, status, error_code(raw)))
-        job = wait_job(dev_token, "/ingest/job/" + json.loads(raw)["job_id"])
-        expect(job["status"] == "completed", "the import ended {}: {}".format(job["status"], job.get("errors")))
         other, _, other_token = throwaway("developer", operator_ok)
         users.append(other)
 
@@ -30917,6 +30912,13 @@ def check_collection_access(operator_ok):
             status, raw, _ = code("GET", "/prepare/documents", token=token)
             expect(status == 200, "GET /prepare/documents answered {}".format(status))
             return document in [d["id"] for d in json.loads(raw)["documents"]]
+        # A document with no imports is shared, so the hiding below comes from the import (#792).
+        expect(prepared(other_token), "a second Developer doesn't see a prepared document with no imports")
+        status, raw, _ = code("POST", "/prepare/import", {"collection": name, "document_ids": [document],
+                                                          "chunk_size": 500, "chunk_overlap": 50}, token=dev_token)
+        expect(status == 202, "the import into {} answered {} {}".format(name, status, error_code(raw)))
+        job = wait_job(dev_token, "/ingest/job/" + json.loads(raw)["job_id"])
+        expect(job["status"] == "completed", "the import ended {}: {}".format(job["status"], job.get("errors")))
         expect(prepared(dev_token), "the granted Developer doesn't see the document it imported")
         expect(not prepared(other_token), "a Developer without access sees a document imported only into {}".format(name))
         status, raw, _ = code("GET", "/prepare/documents/" + document, token=other_token)
