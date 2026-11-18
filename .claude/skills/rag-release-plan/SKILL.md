@@ -104,7 +104,7 @@ Also give:
 - the longest chain;
 - the same-file conflicts that only need a rebase (no ordering need);
 - the verify note: verify runs are serial on one machine (one `rag-verify` project behind a lock), so verify runs and `rag-pr-review` evaluations queue across lanes;
-- the limit on open PRs and the evaluation queue order ("Running the release").
+- the limit on open PRs, prepared branches and the evaluation queue order ("Running the release").
 
 See "Lanes and links" in `reference.md`.
 
@@ -175,13 +175,17 @@ Re-read the epic's children with JQL. Check the counts, the lane labels, the Fix
 
 These rules are for the session that runs the release: it starts the fix agents and picks the next PR to evaluate. You don't start fix agents or evaluate PRs. You write the rules into the report (step 8) and the epic's Lanes section (step 15).
 
-- **Limit on open PRs.** No new fix agent starts while 2 or more non-Markdown PRs from the release wait for or are in evaluation. Markdown-only PRs (every changed file is `*.md`) don't count: they take the fast path and don't use the verify stack. A fix agent's question round doesn't count as a PR.
+- **Limit on open PRs.** No non-Markdown PR from the release opens while 2 or more non-Markdown PRs from the release wait for or are in evaluation. Markdown-only PRs (every changed file is `*.md`) don't count: they take the fast path and don't use the verify stack. A fix agent's question round doesn't count as a PR.
+- **Prepared branches.** While the limit is reached, a fix agent may still start and prepare its branch: dev-docs, code and host tests, pushed, with no PR yet (`rag-fix`, step 5). At most 2 prepared branches from the release exist at a time, and the lane and blocker rules still apply. A prepared ticket stays In Progress under its assignee, with the checkpoint comment `Prepared: <branch> @ <sha>, waiting for an open-PR slot`. When a slot frees, tell the next prepared branch's agent to open its PR: it merges the current `develop`, re-runs its host tests and opens the PR.
 - **Evaluation queue order.** The next PR to evaluate is:
   1. a security fix;
   2. then a PR on the critical path or one that unblocks other tickets, for example on the longest chain, or one whose merge clears a Blocks link;
   3. then the oldest.
 
   A PR that conflicts with `develop` goes back to its fix agent. It keeps its place in the queue once updated.
+
+  The same order picks the next ticket a fix agent prepares and the next prepared branch that opens its PR. For a prepared branch, "the oldest" counts from the time it was pushed ready, and its PR keeps that time in the evaluation queue.
+- **Reviewer patches.** When an evaluation of a PR by `mikesilvers` that isn't from a fork ends with a ready reviewer patch, send the patch's path to the PR's fix agent before the merge: resume it, or start a fresh `rag-fix` run that resumes from its checkpoint ("Reviewer patches before merge" in `rag-pr-review` reference.md). Its new head is evaluated in the queue like any other PR, patch-only when it adds only the patch.
 
 ## After the release ships
 
@@ -213,7 +217,8 @@ Use this when the maintainer says the release has shipped, or asks to mark its v
 | Applying a change the report didn't propose | Stop and ask. Phase 2 applies only the approved decisions. |
 | Linking a rebase-only conflict | No link. List it in the epic's Lanes section. |
 | Grouping lanes by theme | Group tickets by the files they change. Tickets that share no file go in separate lanes, or are marked independent. |
-| Starting a fix agent while 2 or more non-Markdown PRs wait for or are in evaluation | Wait until fewer than 2 are open. Markdown-only PRs and question rounds don't count. |
+| Opening a non-Markdown PR while 2 or more non-Markdown PRs wait for or are in evaluation | Prepare the branch instead, and open it when a slot frees, in queue order. Markdown-only PRs and question rounds don't count. |
+| Starting a third prepared branch from the release | At most 2 prepared branches at a time. Wait until one opens its PR. |
 | Evaluating PRs out of queue order, or sending a conflicting PR to the back | Security fixes first, then the critical path or unblockers, then the oldest. A conflicting PR keeps its place once updated. |
 | Moving a ticket's epic without its Fix Version and labels | Change all four together: Fix Version, parent epic, Jira release label, GitHub `release:` label. |
 | Marking a version released without the go-ahead | Only on the maintainer's own yes in this session. |

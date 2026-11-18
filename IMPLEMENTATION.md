@@ -14250,7 +14250,7 @@ def _build(target: str, pkg: Path, manifest: dict, progress, instance: str | Non
         raise
 
 
-def _exists(name: str) -> bool:
+def exists_fail_closed(name: str) -> bool:
     """Whether a collection exists; Weaviate failing to answer counts as
     existing, so the access checks below fail closed."""
     try:
@@ -14260,37 +14260,37 @@ def _exists(name: str) -> bool:
         return True
 
 
-def _source(original: str) -> str:
+def package_source(original: str) -> str:
     """Whose access a package of `original` follows (#606): the collection
     itself, or for a staging or recovery copy that no longer exists here, the
     nearest collection it was made from that exists here, or the original
     (auth.access.package_source, #792)."""
-    return access.package_source(original, _exists)
+    return access.package_source(original, exists_fail_closed)
 
 
 def _refused(owner, source: str) -> bool:
-    """True when the package's collection (`_source`) exists here, is
+    """True when the package's collection (`package_source`) exists here, is
     restricted, and the job's owner may not use it (#606). For an existing
     staging or recovery copy that means the copy or any collection it was made
     from (access.scope, #788, #792)."""
     names = access.scope(source)
     if owner is None or not any(auth_store.collection_access(n).restricted for n in names):
         return False
-    return _exists(source) and not all(auth_store.owner_has_access(owner, n) for n in names)
+    return exists_fail_closed(source) and not all(auth_store.owner_has_access(owner, n) for n in names)
 
 
 def _start_access(owner, source: str, target: str):
     """A collection this import creates (#606): when the package's collection
-    (`_source`) exists here, the new one gets its state, and for a staging or
-    recovery copy the narrowest of the copy's and every collection's it was
-    made from (#788, #792), so an import can't open what any of them restricts;
-    otherwise it starts
-    restricted to the job's owner. Written before any data; returns (the state
-    replaced, the state written) for auth_store.put_back. A job with no owner
-    (a direct call in tests) records nothing and returns None."""
+    (`package_source`) exists here, the new one gets its state, and for a
+    staging or recovery copy the narrowest of the copy's and every
+    collection's it was made from (#788, #792), so an import can't open what
+    any of them restricts; otherwise it starts restricted to the job's owner.
+    Written before any data; returns (the state replaced, the state written)
+    for auth_store.put_back. A job with no owner (a direct call in tests)
+    records nothing and returns None."""
     if owner is None:
         return None
-    if source != target and _exists(source):
+    if source != target and exists_fail_closed(source):
         return auth_store.copy_collection_access(source, target, access.scope(source)[1:])
     return auth_store.restrict_to(target, auth_store.user_id_for(owner))
 
@@ -14329,7 +14329,7 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
         original = manifest["collection"]["name"]
         # A package of a collection its owner may not use is refused as if it
         # weren't there, before the job names the collection anywhere (#606).
-        source = _source(original) if isinstance(original, str) and original else None
+        source = package_source(original) if isinstance(original, str) and original else None
         if source and _refused(job.get("owner"), source):
             job["access_refused"] = True
             raise PackageError("PACKAGE_UNREADABLE",
@@ -14474,7 +14474,7 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
             # an error, leaves a partial collection, which keeps the
             # restriction (#788). A collection it did build keeps its state.
             if ((job.get("error_detail") or {}).get("cleanup_pending")
-                    or _exists(new_access[0])):
+                    or exists_fail_closed(new_access[0])):
                 _log.warning("Import into %r failed but the collection may still exist; "
                              "its access state stays", new_access[0])
             else:
@@ -16909,9 +16909,10 @@ async def _hidden(principal, packages: list[dict]) -> dict[str, str | None]:
     package exported here follows the collection recorded at its export (#794),
     and one recorded without a collection (before #794) is seen by Engineers
     only. An encrypted package copied in names no collection and is not hidden.
-    Whose access a package follows is the import's own rule (importer._source),
-    so the listing and POST /import agree (#788). Weaviate failing to answer
-    counts as existing (importer._exists), so the listing fails closed."""
+    Whose access a package follows is the import's own rule
+    (importer.package_source), so the listing and POST /import agree (#788).
+    Weaviate failing to answer counts as existing
+    (importer.exists_fail_closed), so the listing fails closed."""
     visible = await asyncio.to_thread(access.visible_filter, principal)
     recorded = None
     hidden: dict[str, str | None] = {}
@@ -16930,8 +16931,8 @@ async def _hidden(principal, packages: list[dict]) -> dict[str, str | None]:
             name = p.get("collection")
             if not p.get("readable") or not isinstance(name, str) or not name:
                 continue
-        source = await asyncio.to_thread(importer._source, name)
-        if not visible(source) and await asyncio.to_thread(importer._exists, source):
+        source = await asyncio.to_thread(importer.package_source, name)
+        if not visible(source) and await asyncio.to_thread(importer.exists_fail_closed, source):
             hidden[p["filename"]] = name
     return hidden
 
@@ -39906,7 +39907,7 @@ class NestedCopyTests(AccessTestCase):
 
     def test_package_checks_of_an_existing_copy_of_a_copy(self):
         self.open_copies()
-        self.assertEqual(importer._source(NESTED), NESTED)
+        self.assertEqual(importer.package_source(NESTED), NESTED)
         self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, NESTED))
         self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, NESTED))
         self.assertEqual(self.packages_seen(NESTED), {"dev2": 0, "dev": 1})
@@ -39922,12 +39923,12 @@ class NestedCopyTests(AccessTestCase):
     def test_a_package_of_a_discarded_copy_of_a_copy_follows_the_nearest_existing(self):
         gone_copy = STAGING + "__importing_" + "3" * 32          # STAGING is still here
         gone_both = SECRET + "__tuning_" + "4" * 32 + "__tuning_" + "5" * 32
-        self.assertEqual(importer._source(gone_copy), STAGING)
-        self.assertEqual(importer._source(gone_both), SECRET)
-        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, importer._source(gone_both)))
-        self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, importer._source(gone_both)))
+        self.assertEqual(importer.package_source(gone_copy), STAGING)
+        self.assertEqual(importer.package_source(gone_both), SECRET)
+        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, importer.package_source(gone_both)))
+        self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, importer.package_source(gone_both)))
         self.assertEqual(self.packages_seen(gone_both), {"dev2": 0, "dev": 1})
-        _, written = importer._start_access({"name": "dev", "kind": "user"}, importer._source(gone_both),
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, importer.package_source(gone_both),
                                             "Fromgone")
         self.assertEqual(written, store.collection_access(SECRET))
 
@@ -39936,7 +39937,7 @@ class NestedCopyTests(AccessTestCase):
                 raise ConnectionError("no answer")
             return name[:1].upper() + name[1:] in self.collections
         with patch.object(wc, "_collection_exists_sync", unanswered):
-            self.assertEqual(importer._source(gone_copy), gone_copy)      # no answer counts as existing
+            self.assertEqual(importer.package_source(gone_copy), gone_copy)      # no answer counts as existing
 
     def test_begin_on_a_copy_takes_the_narrowest_state_of_its_chain(self):
         from services import collection_recovery
@@ -40044,7 +40045,7 @@ class PackageSourceTests(AccessTestCase):
         # The copy's own state is open; SECRET still restricts it (#788).
         self.assertEqual(self.put(STAGING, {"restricted": False}).status_code, 200)
         dev2 = {"name": "dev2", "kind": "user"}
-        self.assertEqual(importer._source(STAGING), STAGING)
+        self.assertEqual(importer.package_source(STAGING), STAGING)
         self.assertTrue(importer._refused(dev2, STAGING))
         self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, STAGING))
         from routers import transfer
@@ -40068,11 +40069,11 @@ class PackageSourceTests(AccessTestCase):
 
     def test_a_package_of_a_discarded_copy_follows_its_target(self):
         gone = SECRET + "__importing_" + "1" * 32
-        self.assertEqual(importer._source(gone), SECRET)                   # the copy no longer exists
-        self.assertEqual(importer._source(STAGING), STAGING)               # an existing copy is itself
-        self.assertEqual(importer._source(OPEN), OPEN)
-        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, importer._source(gone)))
-        before, after = importer._start_access({"name": "dev", "kind": "user"}, importer._source(gone),
+        self.assertEqual(importer.package_source(gone), SECRET)                   # the copy no longer exists
+        self.assertEqual(importer.package_source(STAGING), STAGING)               # an existing copy is itself
+        self.assertEqual(importer.package_source(OPEN), OPEN)
+        self.assertTrue(importer._refused({"name": "dev2", "kind": "user"}, importer.package_source(gone)))
+        before, after = importer._start_access({"name": "dev", "kind": "user"}, importer.package_source(gone),
                                                gone + "_ab12cd34")
         self.assertEqual(after, store.collection_access(SECRET))
         from routers import transfer
