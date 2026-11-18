@@ -1,9 +1,9 @@
-"""Host-only check that the pinned dependencies are at or above their patched versions (#522, #562, #651, #749), that the Python locks stay fully pinned (#524)
+"""Host-only check that the pinned dependencies are at or above their patched versions (#522, #562, #633, #651, #749), that the Python locks stay fully pinned (#524)
 and that the MCP lock satisfies mcp/requirements.in (#524).
 
 Reads the Python locks, api/requirements.in, ui/package.json and
 ui/package-lock.json. The floors are the first patched versions of the
-Dependabot alerts #522, #562, #651 and #749 closed. filelock (3.x, no patched release that
+Dependabot alerts #522, #562, #633, #651 and #749 closed. filelock (3.x, no patched release that
 unstructured accepts) is left out on purpose; the #522 PR explains its alerts.
 postcss-selector-parser stays on 6.x: @tailwindcss/typography, its only user
 since Tailwind 4 (RD-157), pins 6.0.10 exactly, and a scoped npm override in
@@ -28,7 +28,7 @@ FLOORS = {
         'opentelemetry-api': '1.45.2', 'opentelemetry-sdk': '1.45.2', 'opentelemetry-proto': '1.45.2',
         'opentelemetry-exporter-otlp-proto-common': '1.45.2',
         'opentelemetry-exporter-otlp-proto-http': '1.45.2',
-        'authlib': '1.9.1',
+        'authlib': '1.9.1', 'joserfc': '1.7.6',
     },
     'mcp/requirements.txt': {
         'certifi': '2026.10.19', 'pyjwt': '2.15.0', 'opentelemetry-api': '1.45.2',
