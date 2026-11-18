@@ -32,7 +32,7 @@ Each one points at the section of `reference.md` that holds the details.
 ### Change a ticket's status
 
 1. Use `transitionJiraIssue` with `transitionId` ("Statuses").
-2. Move it to In Progress when the fix agent takes it, and to In Review when the fix agent opens its PR. Move it to Done when the PR merges, as "Finish a ticket" says.
+2. Move it to In Progress when the fix agent takes it, and to In Review when the fix agent opens its PR. Move it to Done when the PR merges, as "Finish a ticket" says. A ticket whose branch is prepared, waiting for an open-PR slot, stays In Progress until its PR opens; one whose PR takes a reviewer patch stays In Review.
 3. When the ticket waits on the maintainer, move it to Needs Mike and add a comment saying exactly what he has to decide.
 
 ### Record a question and its answer
