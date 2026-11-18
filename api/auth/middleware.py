@@ -8,7 +8,9 @@ before the route runs, and never reads the body of a request it refuses.
 The refusals, in the order they apply:
   503 SETUP_REQUIRED          no account exists yet (python -m auth bootstrap)
   401 AUTH_REQUIRED           no valid session cookie
-  403 CROSS_ORIGIN_REFUSED    a cookie-authenticated POST/PUT/PATCH/DELETE from another origin
+  403 CROSS_ORIGIN_REFUSED    a cookie-authenticated POST/PUT/PATCH/DELETE from another origin,
+                              or a GET of a state-changing route (policy.STATE_CHANGING_GET)
+                              whose Sec-Fetch-Site is present and not same-origin or none (#794)
   403 PASSWORD_CHANGE_REQUIRED the user must change a generated password first
   403 MFA_ENROLLMENT_REQUIRED two-step verification is required for everyone and
                               the user hasn't set it up (#607); only the session
@@ -143,6 +145,10 @@ class AuthMiddleware:
         if principal is None:
             return api_error(401, "AUTH_REQUIRED", "Log in to use this."), None
         if scope["method"] in UNSAFE and not same_origin(scope):
+            return api_error(403, "CROSS_ORIGIN_REFUSED",
+                             "This request came from another site and was refused."), principal
+        if (scope["method"] == "GET" and template in policy.STATE_CHANGING_GET
+                and _header(scope, b"sec-fetch-site") not in (None, "same-origin", "none")):
             return api_error(403, "CROSS_ORIGIN_REFUSED",
                              "This request came from another site and was refused."), principal
         if principal.must_change_password and access != policy.SESSION:

@@ -12899,10 +12899,11 @@ def _run(job_id: str, collection: str, include_models: bool,
     else:
         # Recorded before the status turns completed, so a client that sees the
         # export finish also sees when its package expires (#677). A failure
-        # leaves the package unrecorded, never expired: the job says so.
+        # leaves the package unrecorded, never expired: the job says so. The
+        # collection is recorded too: an encrypted package follows its access (#794).
         warnings = list(result["warnings"])
         try:
-            package_retention.record_export(result["filename"], datetime.now(timezone.utc))
+            package_retention.record_export(result["filename"], datetime.now(timezone.utc), collection)
         except Exception:                          # noqa: BLE001 - reported in the warnings
             _log.exception("Could not record the expiry of package %s", result["filename"])
             warnings.append("The package's expiry could not be recorded, so it won't be deleted "
@@ -13044,15 +13045,23 @@ yet; #676's key file will be one) and its record entry, and writes one
 `package.delete` audit record. `may_sweep` alone decides whether the sweep may
 delete a package, so a later "keep" flag changes only that function.
 
-**The record.** Replaced whole (a temporary file renamed into place) under a
-lock. One that can't be read is never overwritten: it is moved aside to
-`exported_packages.json.corrupt-<time>` and logged, the packages it named are
-no longer expired (delete them by hand), and a new record starts. If it can't be
-moved, writes refuse until it is dealt with.
+**The record.** Each entry is `{"finished_at": ..., "collection": ...}`: the
+collection is the one exported, so an encrypted package exported here follows
+that collection's access (routers/transfer.py `_hidden`, #794). An entry written
+before #794 is a bare finish time and is read with no collection. A recorded
+name outside the download rule (`valid_name`) is ignored and logged, so a
+tampered record can't name a file outside the exports folder. Replaced whole (a
+temporary file renamed into place) under a lock. One that can't be read is
+never overwritten: it is moved aside to `exported_packages.json.corrupt-<time>`
+and logged, the packages it named are no longer expired (delete them by hand),
+and a new record starts. If it can't be moved, writes refuse until it is dealt
+with.
 
 **Imports.** An import claims its package (importer.start_import_job) under
 this module's lock too, so a sweep or a post-download deletion can't remove a
-package between its busy check and the unlink while an import starts.
+package between its busy check and the unlink while an import starts. Both
+claims run in a worker thread through `run_claim`, which releases what a claim
+took when the request waiting for it is cancelled (#794).
 """
 from __future__ import annotations
 
@@ -13080,6 +13089,8 @@ _TIME = "%Y-%m-%dT%H:%M:%SZ"
 
 _lock = threading.RLock()
 _downloading: set[str] = set()
+# Releases of claims whose request was cancelled, kept until they finish.
+_settling: set = set()
 # An unreadable record that couldn't be moved aside: writes refuse meanwhile.
 _stuck = False
 
@@ -13119,9 +13130,23 @@ def _set_aside(path: Path) -> None:
                "named won't expire: delete them from ./exports by hand", path, aside)
 
 
-def _read() -> dict[str, str]:
-    """Recorded filename -> finish time. Missing is empty; an unreadable record
-    is moved aside (`_set_aside`) and taken as empty."""
+def _entry(value) -> dict | None:
+    """One entry as read: a bare finish time (before #794) or an object with
+    `finished_at` and `collection`. None when it is neither."""
+    if isinstance(value, str):
+        return {"finished_at": value, "collection": None}
+    if isinstance(value, dict) and isinstance(value.get("finished_at"), str):
+        collection = value.get("collection")
+        if collection is None or isinstance(collection, str):
+            return {"finished_at": value["finished_at"], "collection": collection or None}
+    return None
+
+
+def _read() -> dict[str, dict]:
+    """Recorded filename -> `{"finished_at", "collection"}`. Missing is empty; an
+    unreadable record is moved aside (`_set_aside`) and taken as empty. A name
+    outside the download rule is left out and logged (#794): nothing deletes,
+    expires or serves it as recorded."""
     path = _path()
     with _lock:
         try:
@@ -13132,14 +13157,18 @@ def _read() -> dict[str, str]:
             _set_aside(path)
             return {}
         packages = data.get("packages") if isinstance(data, dict) else None
-        if not isinstance(packages, dict) or not all(
-                isinstance(k, str) and isinstance(v, str) for k, v in packages.items()):
+        entries = {k: _entry(v) for k, v in packages.items()} if isinstance(packages, dict) else None
+        if entries is None or not all(isinstance(k, str) and v is not None for k, v in entries.items()):
             _set_aside(path)
             return {}
-        return dict(packages)
+        for name in [k for k in entries if not valid_name(k)]:
+            _log.warning("The record of exported packages names %r, which isn't a package name; "
+                         "it is ignored", name)
+            del entries[name]
+        return entries
 
 
-def _write(entries: dict[str, str]) -> None:
+def _write(entries: dict[str, dict]) -> None:
     path = _path()
     if _stuck and os.path.lexists(path):
         raise RuntimeError(f"{path} is unreadable and couldn't be moved aside; it isn't overwritten")
@@ -13159,11 +13188,13 @@ def _write(entries: dict[str, str]) -> None:
         raise
 
 
-def record_export(filename: str, finished: datetime) -> None:
-    """Record a package this instance exported. Raises when it can't be written."""
+def record_export(filename: str, finished: datetime, collection: str | None = None) -> None:
+    """Record a package this instance exported, with the collection it holds
+    (#794). Raises when it can't be written."""
     with _lock:
         entries = _read()
-        entries[filename] = finished.astimezone(timezone.utc).strftime(_TIME)
+        entries[filename] = {"finished_at": finished.astimezone(timezone.utc).strftime(_TIME),
+                             "collection": collection}
         _write(entries)
 
 
@@ -13171,6 +13202,17 @@ def _drop(filename: str) -> None:
     entries = _read()
     if entries.pop(filename, None) is not None:
         _write(entries)
+
+
+def _forget(filename: str) -> None:
+    """`_drop`, never raising: a deletion is audited and a sweep goes on even
+    when the record can't be rewritten (#794). The entry is left; once its file
+    is gone, a later sweep drops it."""
+    try:
+        _drop(filename)
+    except Exception:                                 # noqa: BLE001 - logged; the record is retried later
+        _log.exception("Could not remove %s from the record of exported packages; a later sweep "
+                       "drops it", filename)
 
 
 def _expiry(finished_at: str) -> datetime | None:
@@ -13187,17 +13229,23 @@ def _format(when: datetime | None) -> str | None:
 
 def expires_at(filename: str) -> str | None:
     """When a recorded package expires (UTC), or None for one not recorded."""
-    finished = _read().get(filename)
-    return _format(_expiry(finished)) if finished is not None else None
+    entry = _read().get(filename)
+    return _format(_expiry(entry["finished_at"])) if entry is not None else None
 
 
 def expiries() -> dict[str, str | None]:
     """Every recorded package's `expires_at`, from one read (the listing)."""
-    return {name: _format(_expiry(finished)) for name, finished in _read().items()}
+    return {name: _format(_expiry(entry["finished_at"])) for name, entry in _read().items()}
 
 
 def recorded(filename: str) -> bool:
     return filename in _read()
+
+
+def recorded_collections() -> dict[str, str | None]:
+    """Every recorded package's collection (None when not recorded with one),
+    from one read (routers/transfer.py `_hidden`, #794)."""
+    return {name: entry["collection"] for name, entry in _read().items()}
 
 
 def companions(filename: str) -> list[str]:
@@ -13226,6 +13274,25 @@ def claim(filename: str) -> bool:
 def release(filename: str) -> None:
     with _lock:
         _downloading.discard(filename)
+
+
+async def run_claim(claim, undo):
+    """Run `claim()` in a worker thread and return its result (#794). If the
+    awaiting task is cancelled meanwhile, the thread still finishes; `undo`
+    is then called, in a worker thread, with what it returned, so a claim never
+    outlives a cancelled request. An exception from `claim` propagates."""
+    task = asyncio.ensure_future(asyncio.to_thread(claim))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        def settle(done):
+            if done.cancelled() or done.exception() is not None:
+                return
+            follow = asyncio.ensure_future(asyncio.to_thread(undo, done.result()))
+            _settling.add(follow)
+            follow.add_done_callback(_settling.discard)
+        task.add_done_callback(settle)
+        raise
 
 
 def may_sweep(filename: str, finished_at: str, now: datetime) -> bool:
@@ -13264,12 +13331,12 @@ def delete(filename: str, reason: str, scope=None) -> bool:
             _log.exception("Could not delete package %s (%s); it is kept and tried again", filename, reason)
             return False
         if removed is None:
-            _drop(filename)
+            _forget(filename)
             return False
         if removed is False:
             _log.warning("%s in the exports folder is not a regular file; it is left as it is "
                          "and no longer expired", filename)
-            _drop(filename)
+            _forget(filename)
             return False
         for name in companions(filename):
             try:
@@ -13277,7 +13344,7 @@ def delete(filename: str, reason: str, scope=None) -> bool:
                     _log.warning("Companion %s of %s is not a regular file; left as it is", name, filename)
             except OSError:
                 _log.exception("Could not delete %s, a companion of %s", name, filename)
-        _drop(filename)
+        _forget(filename)
     audit.package_deleted(filename, reason, scope)
     return True
 
@@ -13298,12 +13365,13 @@ def sweep(now: datetime | None = None) -> list[str]:
     now = now or datetime.now(timezone.utc)
     deleted = []
     with _lock:
-        for filename, finished_at in sorted(_read().items()):
+        for filename, entry in sorted(_read().items()):
+            finished_at = entry["finished_at"]
             expiry = _expiry(finished_at)
             if expiry is None or expiry > now:
                 continue
             if not os.path.lexists(_exports() / filename):
-                _drop(filename)
+                _forget(filename)
                 continue
             if not may_sweep(filename, finished_at, now):
                 continue
@@ -13646,6 +13714,11 @@ def _claim_package(key: str, filename: str) -> None:
         if key in _active:
             raise ImportInProgressError(filename)
         _active.add(key)
+
+
+def _release_package(key: str) -> None:
+    with _lock:
+        _active.discard(key)
 
 
 def package_busy(filename: str) -> bool:
@@ -14434,8 +14507,11 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
                               f"'{key}' is not encrypted, so it takes no passphrase. "
                               "Anyone with the file can read it.")
     job_id = str(uuid.uuid4())[:8]
-    # Off the event loop: the claim waits while a sweep holds the retention lock (#677).
-    await asyncio.to_thread(_claim_package, key, filename)
+    # Off the event loop: the claim waits while a sweep holds the retention lock
+    # (#677). A cancellation while it runs still releases it (#794).
+    from services import package_retention
+    await package_retention.run_claim(lambda: _claim_package(key, filename),
+                                      lambda _: _release_package(key))
 
     # The first write is durable, so it runs off the event loop (#309). A start
     # cancelled meanwhile releases its guard; the store removes the record.
@@ -14459,8 +14535,7 @@ async def start_import_job(filename: str, on_conflict: str, passphrase: str | No
             "owner": owner,                     # who started it, for the job lists (#617)
         })
     except BaseException:
-        with _lock:
-            _active.discard(key)
+        _release_package(key)
         raise
     asyncio.create_task(asyncio.to_thread(telemetry.admitted(_run), job_id, filename, on_conflict,
                                           passphrase))
@@ -16821,21 +16896,37 @@ def _list_packages_sync() -> list[dict]:
             for p in sorted([*root.glob("ragpkg-*.tar.gz"), *root.glob("ragpkg-*" + age_stream.ENCRYPTED_SUFFIX)])]
 
 
-async def _hidden(principal, packages: list[dict]) -> set[str]:
-    """The packages a caller may not see (#606): unencrypted ones whose
-    collection exists here and is restricted to others. Whose access a package
-    follows is the import's own rule (importer._source), so the listing and
-    POST /import agree (#788). Weaviate failing to answer counts as existing
-    (importer._exists), so the listing fails closed."""
+async def _hidden(principal, packages: list[dict]) -> dict[str, str | None]:
+    """The packages a caller may not see (#606), each with the collection its
+    refusal names: those whose collection exists here and is restricted to
+    others. An unencrypted package's collection is its manifest's; an encrypted
+    package exported here follows the collection recorded at its export (#794),
+    and one recorded without a collection (before #794) is seen by Engineers
+    only. An encrypted package copied in names no collection and is not hidden.
+    Whose access a package follows is the import's own rule (importer._source),
+    so the listing and POST /import agree (#788). Weaviate failing to answer
+    counts as existing (importer._exists), so the listing fails closed."""
     visible = await asyncio.to_thread(access.visible_filter, principal)
-    hidden = set()
+    recorded = None
+    hidden: dict[str, str | None] = {}
     for p in packages:
-        name = p.get("collection")
-        if p.get("encrypted") or not p.get("readable") or not isinstance(name, str) or not name:
-            continue
+        if p.get("encrypted"):
+            if recorded is None:
+                recorded = await asyncio.to_thread(package_retention.recorded_collections)
+            if p["filename"] not in recorded:
+                continue
+            name = recorded[p["filename"]]
+            if name is None:
+                if principal is not None and principal.role != "engineer":
+                    hidden[p["filename"]] = None
+                continue
+        else:
+            name = p.get("collection")
+            if not p.get("readable") or not isinstance(name, str) or not name:
+                continue
         source = await asyncio.to_thread(importer._source, name)
         if not visible(source) and await asyncio.to_thread(importer._exists, source):
-            hidden.add(p["filename"])
+            hidden[p["filename"]] = name
     return hidden
 
 
@@ -16888,7 +16979,10 @@ class _PackageStream(Response):
         listener = None
         try:
             if not self.head:
-                claimed = await asyncio.to_thread(package_retention.claim, self.filename)
+                # A cancellation while the claim runs still releases it (#794).
+                claimed = await package_retention.run_claim(
+                    lambda: package_retention.claim(self.filename),
+                    lambda took: took and package_retention.release(self.filename))
                 if not claimed:
                     return await self._refuse(send, _package_busy(self.filename))
             try:
@@ -16936,7 +17030,8 @@ class _PackageStream(Response):
                 listener.cancel()
             if fd is not None:
                 os.close(fd)
-            audit.note(completed=completed)
+            if not self.head:
+                audit.note(completed=completed)
             try:
                 if completed and not self.head:
                     await asyncio.to_thread(package_retention.after_download, self.filename, scope)
@@ -16953,8 +17048,13 @@ class _PackageStream(Response):
 @router.get("/packages/{filename}")
 async def download_package(filename: str, request: Request = None):
     """One package from ./exports, streamed (#677). A full download deletes a
-    package this instance exported; any other package is served and kept."""
-    audit.note(completed=False)
+    package this instance exported; any other package is served and kept. A
+    HEAD is audited with `head: true` and no `completed` (#794)."""
+    head = request is not None and request.method == "HEAD"
+    if head:
+        audit.note(head=True)
+    else:
+        audit.note(completed=False)
     if not package_retention.valid_name(filename):
         return _package_not_found(filename)
     path = packager.exports_dir() / filename
@@ -16967,13 +17067,14 @@ async def download_package(filename: str, request: Request = None):
     # The listing's access rule (#606): a package hidden from the caller there
     # answers as one that doesn't exist, and the refusal is audited.
     summary = await asyncio.to_thread(_summary, path)
-    if filename in await _hidden(access.principal_of(request), [summary]):
-        await asyncio.to_thread(audit.access_refused, request, access.canonical(summary["collection"]),
-                                "PACKAGE_NOT_FOUND")
+    refused = await _hidden(access.principal_of(request), [summary])
+    if filename in refused:
+        collection = refused[filename]
+        await asyncio.to_thread(audit.access_refused, request,
+                                access.canonical(collection) if collection else None, "PACKAGE_NOT_FOUND")
         return _package_not_found(filename)
     if await asyncio.to_thread(package_retention.busy, filename):
         return _package_busy(filename)
-    head = request is not None and request.method == "HEAD"
     return _PackageStream(path, filename, head=head)
 ```
 
@@ -18667,6 +18768,13 @@ HUMAN_ONLY = frozenset(path for _, path in ACCESS
     "/auth/logout", "/auth/password", "/audit", "/audit.csv", "/collections/{name}/access"}
 
 
+# GET routes that change state (#794): a full download of a package exported
+# here deletes it. A cookie-authenticated GET of one sent from another origin
+# (`Sec-Fetch-Site` present and neither `same-origin` nor `none`) is refused
+# like a cross-origin change (middleware.py); HEAD changes nothing.
+STATE_CHANGING_GET = frozenset({"/packages/{filename}"})
+
+
 def required(method: str, path: str) -> str | None:
     """The access a route needs, or None when it has no entry (refused)."""
     return ACCESS.get(("GET" if method == "HEAD" else method, path))
@@ -19744,7 +19852,9 @@ before the route runs, and never reads the body of a request it refuses.
 The refusals, in the order they apply:
   503 SETUP_REQUIRED          no account exists yet (python -m auth bootstrap)
   401 AUTH_REQUIRED           no valid session cookie
-  403 CROSS_ORIGIN_REFUSED    a cookie-authenticated POST/PUT/PATCH/DELETE from another origin
+  403 CROSS_ORIGIN_REFUSED    a cookie-authenticated POST/PUT/PATCH/DELETE from another origin,
+                              or a GET of a state-changing route (policy.STATE_CHANGING_GET)
+                              whose Sec-Fetch-Site is present and not same-origin or none (#794)
   403 PASSWORD_CHANGE_REQUIRED the user must change a generated password first
   403 MFA_ENROLLMENT_REQUIRED two-step verification is required for everyone and
                               the user hasn't set it up (#607); only the session
@@ -19879,6 +19989,10 @@ class AuthMiddleware:
         if principal is None:
             return api_error(401, "AUTH_REQUIRED", "Log in to use this."), None
         if scope["method"] in UNSAFE and not same_origin(scope):
+            return api_error(403, "CROSS_ORIGIN_REFUSED",
+                             "This request came from another site and was refused."), principal
+        if (scope["method"] == "GET" and template in policy.STATE_CHANGING_GET
+                and _header(scope, b"sec-fetch-site") not in (None, "same-origin", "none")):
             return api_error(403, "CROSS_ORIGIN_REFUSED",
                              "This request came from another site and was refused."), principal
         if principal.must_change_password and access != policy.SESSION:
@@ -30605,6 +30719,8 @@ MATRIX = (
     ("GET", "/import/job/vfy-no-such-job", None, "developer"),
     ("GET", "/import/jobs", None, "developer"),
     ("GET", "/packages", None, "developer"),
+    # Downloading a package (#677): an allowed request finds no such package, 404.
+    ("GET", "/packages/ragpkg-vfy-no-such.tar.gz", None, "developer"),
     ("GET", "/help/transfer", None, "developer"),
     ("GET", "/tune/" + X, None, "developer"),
     ("GET", "/health/details", None, "developer"),       # the full health report (#750)
@@ -40318,6 +40434,58 @@ class RecordTests(DownloadTestCase):
         self.assertEqual(answer.status_code, 200, answer.text)
         self.assertEqual(answer.json()["expires_at"], package_retention.expires_at("ragpkg-open1-x.tar.gz"))
 
+    def test_the_export_status_drops_expires_at_once_the_package_is_downloaded(self):
+        # SPECIFICATIONS.md GET /packages: the job status carries expires_at only
+        # while its package is still recorded (#677).
+        self.run_export()
+        (self.exports / "ragpkg-open1-x.tar.gz").write_bytes(package_bytes("Open1"))
+        self.assertIsNotNone(self.client.get("/export/job/j677", headers=self.as_("eng")).json()["expires_at"])
+        self.assertEqual(self.get("ragpkg-open1-x.tar.gz").status_code, 200)
+        self.assertFalse((self.exports / "ragpkg-open1-x.tar.gz").exists())
+        answer = self.client.get("/export/job/j677", headers=self.as_("eng"))
+        self.assertEqual(answer.status_code, 200, answer.text)
+        self.assertIsNone(answer.json()["expires_at"])
+
+    def test_a_finished_export_records_its_collection(self):
+        # #794: an encrypted package exported here follows this collection's access.
+        self.run_export()
+        self.assertEqual(package_retention.recorded_collections(), {"ragpkg-open1-x.tar.gz": "Open1"})
+        entry = json.loads((self.root / "uploads" / "exported_packages.json").read_text())["packages"]
+        self.assertEqual(entry["ragpkg-open1-x.tar.gz"]["collection"], "Open1")
+
+    def test_an_entry_written_before_794_is_read_and_rewritten_with_no_collection(self):
+        record = self.root / "uploads" / "exported_packages.json"
+        record.write_text(json.dumps({"packages": {"ragpkg-old.tar.gz": "2026-11-17T12:00:00Z"}}))
+        self.assertEqual(package_retention.expires_at("ragpkg-old.tar.gz"), "2026-11-18T12:00:00Z")
+        self.assertEqual(package_retention.recorded_collections(), {"ragpkg-old.tar.gz": None})
+        package_retention.record_export("ragpkg-new.tar.gz", NOW, "Open1")
+        self.assertEqual(json.loads(record.read_text())["packages"], {
+            "ragpkg-old.tar.gz": {"finished_at": "2026-11-17T12:00:00Z", "collection": None},
+            "ragpkg-new.tar.gz": {"finished_at": "2026-11-17T12:00:00Z", "collection": "Open1"}})
+
+    def test_an_entry_of_another_shape_moves_the_record_aside(self):
+        record = self.root / "uploads" / "exported_packages.json"
+        record.write_text(json.dumps({"packages": {"ragpkg-a.tar.gz": {"collection": "Open1"}}}))
+        with self.assertLogs("services.package_retention", "ERROR"):
+            self.assertEqual(package_retention.expiries(), {})
+        self.assertFalse(record.exists())
+
+    def test_a_recorded_name_outside_the_rule_is_ignored_and_never_deleted(self):
+        # #794 item 4: a tampered record can't name a file outside the exports folder.
+        outside = self.root / "outside.tar.gz"
+        outside.write_bytes(b"not a package")
+        old = self.write("ragpkg-old.tar.gz", recorded_hours_ago=25)
+        record = self.root / "uploads" / "exported_packages.json"
+        data = json.loads(record.read_text())
+        data["packages"]["../outside.tar.gz"] = "2026-01-01T00:00:00Z"
+        record.write_text(json.dumps(data))
+        with self.assertLogs("services.package_retention", "WARNING") as logs:
+            self.assertEqual(package_retention.sweep(), ["ragpkg-old.tar.gz"])
+        self.assertIn("'../outside.tar.gz'", "\n".join(logs.output))
+        self.assertTrue(outside.exists())
+        self.assertFalse(old.exists())
+        self.assertNotIn("../outside.tar.gz", package_retention.expiries())
+
     def test_an_export_whose_record_fails_still_completes_and_says_so(self):
         def broken(*_):
             raise OSError("disk full")
@@ -40509,6 +40677,201 @@ class InterruptedDownloadTests(DownloadTestCase):
         finally:
             audit._current.reset(token)
         self.assertIs(ctx["details"]["completed"], False)
+
+
+class EncryptedAccessTests(DownloadTestCase):
+    """#794 item 2 (RD-194 Q1, Q2): an encrypted package exported here follows
+    the collection recorded at its export, in the listing and the download."""
+
+    def setUp(self):
+        super().setUp()
+        status = self.client.put(f"/collections/{SECRET}/access", headers=self.as_("eng"),
+                                 json={"restricted": True, "users": ["dev"], "service_principals": []}).status_code
+        self.assertEqual(status, 200)
+
+    def write_encrypted(self, name, collection=SECRET, recorded=True):
+        path = self.exports / name
+        path.write_bytes(b"age-encryption.org/v1\n" + os.urandom(64))
+        if recorded:
+            package_retention.record_export(name, datetime.now(timezone.utc), collection)
+        return path
+
+    def listed(self, who):
+        answer = self.client.get("/packages", headers=self.as_(who))
+        self.assertEqual(answer.status_code, 200, answer.text)
+        return {p["filename"]: p for p in answer.json()["packages"]}
+
+    def test_a_restricted_collections_encrypted_package_is_hidden_from_a_developer_without_access(self):
+        path = self.write_encrypted("ragpkg-secret.tar.gz.age")
+        self.assertNotIn(path.name, self.listed("dev2"))
+        answer = self.get(path.name, who="dev2")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        self.assertEqual(answer.json()["error"]["message"],
+                         "No package named 'ragpkg-secret.tar.gz.age' in the exports directory.")
+        self.assertTrue(path.exists())
+        refused = [r for r in self.records("package.download") if r["actor"] == "dev2"][0]
+        self.assertEqual((refused["collection"], refused["details"]["reason"], refused["details"]["code"]),
+                         (SECRET, "collection_access", "PACKAGE_NOT_FOUND"))
+        for who in ("dev", "eng"):
+            entry = self.listed(who)[path.name]
+            self.assertIsNone(entry["collection"], "the recorded collection isn't revealed")
+            self.assertTrue(entry["encrypted"])
+        self.assertEqual(self.get(path.name, who="dev").status_code, 200)
+        self.assertFalse(path.exists())
+
+    def test_an_open_collections_encrypted_package_is_open(self):
+        path = self.write_encrypted("ragpkg-open.tar.gz.age", collection="Open1")
+        self.assertIn(path.name, self.listed("dev2"))
+        self.assertEqual(self.get(path.name, who="dev2").status_code, 200)
+
+    def test_one_recorded_without_a_collection_is_for_engineers_only(self):
+        path = self.write_encrypted("ragpkg-before.tar.gz.age", collection=None)
+        self.assertNotIn(path.name, self.listed("dev"))
+        answer = self.get(path.name, who="dev")
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (404, "PACKAGE_NOT_FOUND"))
+        refused = [r for r in self.records("package.download") if r["actor"] == "dev"][0]
+        self.assertEqual((refused["collection"], refused["details"]["reason"]), (None, "collection_access"))
+        self.assertTrue(path.exists())
+        self.assertIn(path.name, self.listed("eng"))
+        self.assertEqual(self.get(path.name, who="eng").status_code, 200)
+        self.assertFalse(path.exists())
+
+    def test_one_copied_in_is_open_to_any_developer(self):
+        path = self.write_encrypted("ragpkg-copied.tar.gz.age", recorded=False)
+        self.assertIn(path.name, self.listed("dev2"))
+        self.assertEqual(self.get(path.name, who="dev2").status_code, 200)
+        self.assertTrue(path.exists(), "a package not exported here is kept")
+
+
+class DeletionRecordTests(DownloadTestCase):
+    def test_a_deletion_is_audited_and_the_sweep_goes_on_when_the_record_cant_be_rewritten(self):
+        # #794 item 6: the file is gone, so its package.delete record is written whatever the record does.
+        first = self.write("ragpkg-a.tar.gz", recorded_hours_ago=25)
+        second = self.write("ragpkg-b.tar.gz", recorded_hours_ago=25)
+        with patch.object(package_retention, "_write", side_effect=OSError("disk full")), \
+                self.assertLogs("services.package_retention", "ERROR") as logs:
+            self.assertEqual(package_retention.sweep(), ["ragpkg-a.tar.gz", "ragpkg-b.tar.gz"])
+        self.assertFalse(first.exists())
+        self.assertFalse(second.exists())
+        self.assertEqual([r["details"]["file"] for r in self.records("package.delete")],
+                         ["ragpkg-a.tar.gz", "ragpkg-b.tar.gz"])
+        self.assertIn("ragpkg-a.tar.gz", "\n".join(logs.output))
+        self.assertEqual(package_retention.sweep(), [])          # the leftover entries are dropped
+        self.assertEqual(package_retention.recorded_collections(), {})
+
+
+class SameOriginTests(DownloadTestCase):
+    """#794 item 5 (RD-194 Q4): the deleting GET checks Sec-Fetch-Site."""
+
+    def fetch(self, site, who="dev", method="GET", headers=None):
+        headers = dict(headers or self.as_(who))
+        if site is not None:
+            headers["Sec-Fetch-Site"] = site
+        return self.client.request(method, "/packages/ragpkg-mine.tar.gz", headers=headers)
+
+    def test_a_download_from_another_origin_of_the_site_is_refused(self):
+        path = self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+        for site in ("same-site", "cross-site"):
+            with self.subTest(site=site):
+                answer = self.fetch(site)
+                self.assertEqual((answer.status_code, answer.json()["error"]["code"]),
+                                 (403, "CROSS_ORIGIN_REFUSED"))
+                self.assertTrue(path.exists())
+        refused = self.records("package.download")
+        self.assertEqual([(r["actor"], r["result"]) for r in refused], [("dev", "refused")] * 2)
+
+    def test_same_origin_a_typed_url_and_no_header_download(self):
+        for site in ("same-origin", "none", None):
+            with self.subTest(site=site):
+                path = self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+                self.assertEqual(self.fetch(site).status_code, 200)
+                self.assertFalse(path.exists())
+
+    def test_head_and_a_service_key_are_not_checked(self):
+        path = self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+        self.assertEqual(self.fetch("cross-site", method="HEAD").status_code, 200)
+        store.create_principal("svc", "developer")
+        key = store.issue_key("svc")[1]
+        self.assertEqual(self.fetch("cross-site", headers={"Authorization": "Bearer " + key}).status_code, 200)
+        self.assertFalse(path.exists())
+
+
+class HeadRecordTests(DownloadTestCase):
+    def test_head_is_audited_as_a_header_check(self):
+        # #794 item 7 (RD-194 Q5): head true, no completed.
+        self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+        self.assertEqual(self.get("ragpkg-mine.tar.gz", method="HEAD").status_code, 200)
+        details = self.records("package.download")[-1]["details"]
+        self.assertIs(details["head"], True)
+        self.assertNotIn("completed", details)
+        self.assertEqual(self.get("ragpkg-mine.tar.gz").status_code, 200)
+        details = self.records("package.download")[-1]["details"]
+        self.assertIs(details["completed"], True)
+        self.assertNotIn("head", details)
+
+
+class CancelledClaimTests(DownloadTestCase):
+    """#794 item 8: a claim whose request is cancelled while its thread runs is
+    released once the thread ends."""
+
+    def blocked(self, real):
+        import threading
+        entered, proceed, self.claimed = threading.Event(), threading.Event(), threading.Event()
+
+        def claim(*args):
+            entered.set()
+            proceed.wait(5)
+            try:
+                return real(*args)
+            finally:
+                self.claimed.set()
+        return claim, entered, proceed
+
+    def cancel_during_claim(self, start, entered, proceed, released):
+        def settled():
+            return self.claimed.is_set() and released()
+
+        async def scenario():
+            task = asyncio.ensure_future(start())
+            await asyncio.to_thread(entered.wait, 5)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            proceed.set()
+            for _ in range(500):
+                if settled():
+                    return True
+                await asyncio.sleep(0.01)
+            return False
+        return asyncio.run(scenario())
+
+    def test_a_cancelled_import_start_releases_its_package(self):
+        claim, entered, proceed = self.blocked(importer._claim_package)
+        with patch.object(importer, "_claim_package", claim):
+            settled = self.cancel_during_claim(
+                lambda: importer.start_import_job("ragpkg-x.tar.gz", "abort"), entered, proceed,
+                lambda: not importer._active and not package_retention._settling)
+        self.assertTrue(settled, "the import claim was never released")
+        self.assertFalse(importer.package_busy("ragpkg-x.tar.gz"))
+
+    def test_a_cancelled_download_releases_its_slot(self):
+        path = self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
+        claim, entered, proceed = self.blocked(package_retention.claim)
+        response = transfer._PackageStream(path, path.name, head=False)
+
+        async def receive():
+            await asyncio.sleep(3600)
+
+        async def send(message):
+            pass
+        with patch.object(package_retention, "claim", claim):
+            settled = self.cancel_during_claim(
+                lambda: response({"type": "http", "method": "GET", "headers": []}, receive, send),
+                entered, proceed,
+                lambda: not package_retention._downloading and not package_retention._settling)
+        self.assertTrue(settled, "the download slot was never released")
+        self.assertFalse(package_retention.busy(path.name))
+        self.assertTrue(path.exists())
 
 
 class SweepTests(DownloadTestCase):

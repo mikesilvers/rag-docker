@@ -59,6 +59,8 @@ MATRIX = (
     ("GET", "/import/job/vfy-no-such-job", None, "developer"),
     ("GET", "/import/jobs", None, "developer"),
     ("GET", "/packages", None, "developer"),
+    # Downloading a package (#677): an allowed request finds no such package, 404.
+    ("GET", "/packages/ragpkg-vfy-no-such.tar.gz", None, "developer"),
     ("GET", "/help/transfer", None, "developer"),
     ("GET", "/tune/" + X, None, "developer"),
     ("GET", "/health/details", None, "developer"),       # the full health report (#750)
