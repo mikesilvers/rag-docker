@@ -188,6 +188,40 @@ function collectionsCases() {
         assert.equal(s.calls.filter(call => call.method === 'PUT').length, 0);
       } };
     })(),
+    (() => {
+      // A's opening's lists of people and service principals are held until B's
+      // dialog has its own: the late people list and the late principals error
+      // must not reach B's dialog (#792).
+      const lateUsers = hold(), latePrincipals = hold();
+      let usersReads = 0, principalsReads = 0;
+      const user = name => ({ username: name, role: 'developer', enabled: true, must_change_password: false, created_at: '2026-01-02T12:00:00Z' });
+      return { name: 'Access (#792): an earlier opening\'s late lists of people and service principals do not reach another collection\'s dialog', open: open({
+        ['GET /api/collections/' + B + '/access']: json(200, { restricted: true, users: ['vfy-developer'], service_principals: [] }),
+        'GET /api/auth/users': () => (++usersReads === 1 ? lateUsers : json(200, { users: [user('vfy-developer')] })),
+        'GET /api/auth/service-principals': () => (++principalsReads === 1 ? latePrincipals : json(200, { principals: [] })),
+        'PUT /api/collections/*': call => json(200, call.body),
+      }), async run(s) {
+        await waitText(s.page, A);
+        await (await s.page.$$('tbody button'))[0].click();   // row A: Access
+        await waitText(s.page, 'Access to ' + A);
+        await press(s.page, 'Cancel');
+        await waitFor(s.page, () => !document.querySelector('.fixed.inset-0'), 'the dialog to close');
+        await (await s.page.$$('tbody button'))[2].click();   // row B: Access
+        await waitText(s.page, 'Access to ' + B);
+        await waitText(s.page, 'vfy-developer');
+        lateUsers.release(json(200, { users: [user('vfy-stale')] }));
+        latePrincipals.release(apiError(500, 'INTERNAL_ERROR', 'Synthetic late principals failure.'));
+        await new Promise(r => setTimeout(r, 300));
+        const state = await s.page.evaluate(() => ({
+          error: document.body.textContent.includes('Synthetic late principals failure.'),
+          people: [...document.querySelectorAll('.fixed fieldset')][0].textContent.trim(),
+          save: [...document.querySelectorAll('.fixed button')].find(b => b.textContent.trim() === 'Save').disabled,
+        }));
+        assert.deepEqual(state, { error: false, people: 'Peoplevfy-developer', save: false });
+        assert.equal(usersReads, 2);
+        assert.equal(principalsReads, 2);
+      } };
+    })(),
     { name: 'New Collection modal starts with HNSW, Cosine and the three HNSW sliders at their defaults and bounds', open: open(), async run(s) {
       await waitText(s.page, A);
       await press(s.page, '+ New Collection');
