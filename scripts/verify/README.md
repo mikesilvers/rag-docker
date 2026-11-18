@@ -1341,7 +1341,9 @@ nothing reaches the backend or a model. 67 cases:
   (Ctrl+Enter, plain Enter, Ask disabled while empty or loading), the citations toggle, markdown,
   the latency and error lines and the End User view with `response_format`; the Retrieval page's
   saved and default texts, alpha slider and Save while loading; and the client's handling of
-  nginx's HTML 413, 502, 504 and 500 pages, a non-JSON 200 and a JSON message.
+  nginx's HTML 413, 502, 504 and 500 pages, a non-JSON 200 and a JSON message; and query-only
+  mode (#670): the "Query-only" tag, the nav and router without the pages that change data, the
+  Collections page without create and Delete, and the Transfer page without its import controls.
 - `ui_pages.js`: Gold Standard generate (selector, sample size, progress, confirm) and review
   (summary bar, approve, reject, regenerate, edit, failed action, export enabled); the Transfer
   export controls (collection selector, fidelity line, include-models payload, progress and
