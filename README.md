@@ -305,7 +305,10 @@ package (`package.download`, with `completed` true or false; a header check,
 deletion of one, after its download or when it expired (`package.delete`,
 with the reason; an expiry's actor is `system`); every change and
 refusal on the Users and Service keys pages; every `python -m auth` action
-but `list` (actor `operator`); reads of the audit log; and each API start.
+but `list` (actor `operator`); every `python -m loader` run past its arguments
+(`operator.load`, actor `operator`, with the package, the collection and the
+chunks loaded or the refusal's code; see [Query-only mode](#query-only-mode));
+reads of the audit log; and each API start.
 Each record names the actor (a username, a service principal with the key id,
 `operator` or `system`), their role at the time, the client address, the
 collection or account acted on, the result with the HTTP status, and the
@@ -543,6 +546,93 @@ volume is kept, unused until you switch again.
   [audit log](#audit-log) from another machine shows that one address; its
   actor names who acted.
 - **Engine 28.0.0 or newer** is still required, as for the default mode.
+
+## Query-only mode
+
+A query-only instance (#670) answers questions on collections built somewhere
+else and can't change them. You build and tune collections on a full instance,
+export them, copy the package to the query-only machine and load it there. The
+query-only side has no uploads, preparation, ingest, re-chunking or collection
+deletes, which keeps it small and stable and is the safer thing to put on your
+network. It can run on another machine with nothing connecting it to the build
+instance, and that machine can be offline.
+
+It is opt-in, with `docker-compose.query-only.yml` next to the base file:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.query-only.yml up -d
+# and to share it with your office, with LAN mode's file too (#26):
+docker compose -f docker-compose.yml -f docker-compose.lan.yml -f docker-compose.query-only.yml up -d
+```
+
+**What it refuses.** With `RAG_QUERY_ONLY=true` the API answers `403 QUERY_ONLY`
+to every route that creates, changes or deletes a collection or its data:
+creating and deleting collections, ingest, document preparation, saving the
+chunking and retrieval settings, gold standard generation, edits and saves,
+re-chunking, re-embedding and re-indexing, and importing a package through the
+API. Whoever may not use a route at all is still refused as before (`401`,
+`FORBIDDEN`). The UI shows a **Query-only** tag and hides the Import, Prepare,
+Chunking, Retrieval and Gold Standard pages, the Transfer page's import
+controls, and **+ New Collection** and **Delete** on the Collections page.
+
+**What keeps working.** Questions, accounts and two-step verification, service
+keys, who may use each collection (the Collections page's **Access**), the
+audit log, health, and export with the package list and download.
+
+### Two machines: export, copy, load, query
+
+1. **Export** on the build machine (the Transfer page). The package is written
+   to that machine's `./exports/`. Copy it off in time: a package exported
+   there is deleted `EXPORT_RETENTION_HOURS` after its export (24 hours by
+   default), or as soon as it has been fully downloaded through the API
+   ([Downloading a package](#downloading-a-package-and-when-packages-are-deleted)).
+   Downloading it on the Transfer page gives you the file and removes it from
+   the server.
+2. **Copy** the package into `./exports/` on the query-only machine (scp, a
+   shared folder or a USB drive). Nothing connects the two instances. There
+   the package wasn't exported, so it never expires and a download doesn't
+   delete it: delete it by hand once it is loaded.
+3. **Start** the query-only instance as above. On a new machine, create the
+   first AI Engineer first (`docker compose exec api python -m auth bootstrap
+   <username>`); in LAN mode, do that in the default mode, as
+   [Sharing with your office](#sharing-with-your-office) says. A machine with
+   no internet installs with the offline bundle (`package-offline.sh`, see
+   [Moving to another Mac](#moving-to-another-mac)).
+4. **Load** it on the host:
+
+   ```bash
+   docker compose exec api python -m loader <package> [--on-conflict abort|rename|replace]
+   ```
+
+   `<package>` is the file's name in `./exports/`. The loader runs the same
+   import code and checks as the Transfer page's import: the archive, its
+   digests and its sources, and the embedding model and dimensions, which must
+   be the build machine's (`EMBED_MODEL`), or the load is refused with
+   `EMBEDDING_MISMATCH`. `--on-conflict` is `abort` by default (refused when the
+   collection exists); `rename` loads it under a new name; `replace` loads a
+   newer build over the existing collection, and a question or export of that
+   collection can fail while the replace runs. For an encrypted package
+   (`.tar.gz.age`) the loader asks for the passphrase, or reads it as the first
+   line of standard input with `docker compose exec -T api python -m loader
+   <package> < passphrase-file`; it is never an argument. One load runs at a
+   time. Each step is a line starting `loader:`; the exit status is 0 loaded,
+   1 refused or failed, 2 a usage error; each run is an `operator.load` record
+   in the [audit log](#audit-log). The loader runs only on a query-only
+   instance: a full instance imports on the Transfer page. If a load is
+   stopped (Ctrl-C), the next load or the API's next start removes what it
+   left half-built.
+5. **Open it** to the people who should use it. A collection the loader
+   creates starts restricted with no grants, so only AI Engineers can use it
+   until one opens it or grants it to accounts and keys on the Collections page
+   (**Access**). A `replace` keeps the collection's access.
+6. **Query.** Users ask questions on the Q&A page or through the API, on this
+   machine or, in LAN mode, from the network.
+
+**Models.** The query-only instance needs the embedding model and the answer
+model. With the default settings that is one LLM. If the build machine uses a
+separate `BUILD_LLM_MODEL`, set the LLM settings on the query-only machine so
+the build model is the answer model (for example `BUILD_LLM_MODEL` equal to
+`ANSWER_LLM_MODEL`), so Ollama doesn't download a model nothing there uses.
 
 ## Workflow
 
@@ -987,6 +1077,7 @@ All API settings are environment variables in `docker-compose.yml`:
 | `MAX_PACKAGE_EXPANDED_BYTES` | `17179869184` (16 GiB) | The most an imported package's files may add up to when unpacked. Over it the import fails with `PACKAGE_TOO_LARGE` |
 | `MAX_PACKAGE_MEMBERS` | `100000` | The most entries an imported package may hold, folders included. Over it the import fails with `PACKAGE_TOO_MANY_MEMBERS` |
 | `AUTH_COOKIE_SECURE` | `false` | Marks the session cookie `Secure`. Exactly `true` or `false`; anything else stops the API. Leave it `false` for the loopback HTTP profile, where a Secure cookie would never be sent back. `docker-compose.lan.yml` sets it `true` for LAN mode's TLS (#26) |
+| `RAG_QUERY_ONLY` | `false` | Query-only mode (#670), set `true` by `docker-compose.query-only.yml`. Exactly `true` or `false`; anything else stops the API. When `true` the API refuses every route that creates, changes or deletes a collection or its data with `403 QUERY_ONLY`. See [Query-only mode](#query-only-mode) |
 | `RAG_LAN_MODE` | `false` | LAN mode (#26), set `true` only by `docker-compose.lan.yml`. Exactly `true` or `false`; anything else stops the API. When `true` the API refuses to start unless `AUTH_COOKIE_SECURE` is `true` and an enabled AI Engineer exists. See [Sharing with your office](#sharing-with-your-office) |
 | `AUTH_DIR` | `/app/auth_data` | Container path of the accounts store, the `auth_data` volume |
 | `EXPORT_RETENTION_HOURS` | `24` | How long a package this instance exported stays in `./exports/` when nobody downloads it, counted from the export's finish; whole hours, 1-720, anything else stops the API. A full download deletes it at once. Packages copied in to be imported are never expired. See [Downloading a package](#downloading-a-package-and-when-packages-are-deleted) |
@@ -1070,7 +1161,8 @@ rag-docker/
 │   └── certs/            # Your own LAN mode certificate, if any (ignored by git)
 ├── exports/              # Export packages land here (bind mount)
 ├── docker-compose.yml
-└── docker-compose.lan.yml # LAN mode, opt-in (#26)
+├── docker-compose.lan.yml # LAN mode, opt-in (#26)
+└── docker-compose.query-only.yml # Query-only mode, opt-in (#670)
 ```
 
 ## Exporting and importing a RAG
@@ -1148,7 +1240,7 @@ package list.
   give the time as `expires_at` (UTC); the Transfer page shows it in your local
   time.
 - **Copying it straight from the host folder** (for example to load it into a
-  query-only instance on another machine) is fine, but the server can't see that
+  [query-only instance](#query-only-mode) on another machine) is fine, but the server can't see that
   copy: the package is still deleted after `EXPORT_RETENTION_HOURS`, so copy it
   before then.
 - **Busy packages wait.** While a package is being imported or downloaded,

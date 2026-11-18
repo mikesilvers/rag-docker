@@ -9,6 +9,7 @@ bash scripts/verify/stack.sh run                    # everything, ~20 min plus s
 RAG_SKIP_SLOW=1 bash scripts/verify/stack.sh run    # skip LLM work, ~8 min, start-up included
 bash scripts/verify/stack.sh run 02 04              # only the named suites
 bash scripts/verify/stack.sh run --lan              # LAN mode, TLS on loopback only (#26)
+bash scripts/verify/stack.sh run --query-only       # query-only mode on a second instance (#670)
 ```
 
 Exits non-zero if any check fails.
@@ -139,6 +140,24 @@ chat reply. The checks: preparation and gold standard were answered only by `qwe
 only by the answer model. Preparation writes to a temporary folder and the pair isn't stored; the
 small model is deleted from Ollama and the collection dropped at the end.
 
+`24_query_only.sh` checks query-only mode (#670, SPECIFICATIONS.md §2.6 and §10.11). In every run:
+`query_only_config.py` resolves `docker-compose.yml` with and without `docker-compose.query-only.yml` through
+`docker compose config` (nothing started) and checks that only the api's `RAG_QUERY_ONLY` changes, from `"false"` to
+`"true"`; `../tests/test_query_only.py` runs in the API image with no network (the setting, the classification of
+every state-changing route, the `403 QUERY_ONLY` refusals and their order, the user answers' `query_only`, the
+loader and the access of a collection it creates); a one-off api container refuses `RAG_QUERY_ONLY=yes` with one
+line; and on the default instance `python -m loader` refuses with `NOT_QUERY_ONLY` (exit 1, an `operator.load`
+record) and a path is a usage error (exit 2). The rest needs `stack.sh run --query-only`, which runs this suite
+alone: it ingests the fixtures' `policies.txt` into `VfyQueryOnly` and exports it, then `stack.sh query-only-mode`
+starts the project again in query-only mode with empty volumes and only that package in its exports folder (the
+second machine). There, after the test accounts are made again, it checks `GET /auth/me`'s `query_only`, a load
+with `EMBED_MODEL` set to another model for that process (refused `EMBEDDING_MISMATCH`, no collection), the load
+(exit 0, the exported chunk count, an `operator.load` record), a second load (`COLLECTION_EXISTS`), that the End
+User doesn't see the loaded collection until the Engineer opens it (`PUT .../access`, kept), each of the 19 refused
+routes (`403 QUERY_ONLY`), a Developer's delete (`FORBIDDEN`) and no session (`401`), outside `RAG_SKIP_SLOW=1` an
+End User's question with an answer and citations, and an export and the package list. The project is removed when
+the run ends. Two stacks never run at once, so Docker's memory holds one answer model.
+
 ## Entry point and verify project
 
 `stack.sh` runs everything on compose project `rag-verify`, a disposable copy of
@@ -149,9 +168,10 @@ against" below).
 
 | Command | What it does |
 |---|---|
-| `stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] \| --lan] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
-| `stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] \| --lan]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT`, `RAG_VERIFY_OTEL_ENABLED` and `RAG_VERIFY_TELEMETRY_PIN`. `--telemetry-pin FILE` supplies a reviewed collector pin (see "Evaluating a collector pin change"). |
+| `stack.sh run [--checkout DIR] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only] [suite ...]` | `up`, then that checkout's `all.sh` (only the named suites, if given; `RAG_SKIP_SLOW` and `RAG_ALLOW_RESTART` pass through), then `down`, always, even on failure or Ctrl-C. Exits with `all.sh`'s status, or 2 if the project didn't come up. |
+| `stack.sh up [--checkout DIR] [--pull] [--telemetry [--telemetry-pin FILE] \| --lan \| --query-only]` | Brings the project up and leaves it running, then prints the `export` lines that point `docker compose` and the suites at it. `--pull` pulls newer base images for the build. `--telemetry` brings it up in the same telemetry configuration as `run --telemetry` (see "Optional Collector acceptance") and also prints `COMPOSE_PROFILES`, `RAG_VERIFY_HARNESS`, `RAG_VERIFY_CHECKOUT`, `RAG_VERIFY_OTEL_ENABLED` and `RAG_VERIFY_TELEMETRY_PIN`. `--telemetry-pin FILE` supplies a reviewed collector pin (see "Evaluating a collector pin change"). |
 | `stack.sh down` | Removes the project: its containers, network, volumes, images and exports folder. |
+| `stack.sh query-only-mode --package NAME [--checkout DIR]` | Only for `24_query_only.sh`, under the inherited lock of a `run --query-only` (#670): keeps package NAME aside, removes the project's containers, network and volumes (not its images or the model copy), puts the package back alone in an empty exports folder, and starts the project again from the checkout's `docker-compose.query-only.yml`, after the configuration check and without a build, as a second instance on another machine would be. |
 
 `--checkout` is the checkout to build and test; the default is the one holding
 `stack.sh`. The overlay `docker-compose.verify.yml` and `stack.sh` itself always
