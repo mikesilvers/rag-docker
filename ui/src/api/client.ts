@@ -217,6 +217,8 @@ export interface AuthUser {
   username: string; role: Role; must_change_password: boolean; kind?: 'user' | 'service'
   // Two-step verification (#607): enrolled, required for everyone, and a set-up due because of it.
   mfa_enrolled?: boolean; mfa_required?: boolean; mfa_enrollment_required?: boolean
+  // Query-only mode (#670): the pages that change data are hidden.
+  query_only?: boolean
 }
 export interface AdminUser {
   username: string; role: Role; enabled: boolean; must_change_password: boolean; created_at: string; mfa_enrolled?: boolean
