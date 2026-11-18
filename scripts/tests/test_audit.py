@@ -842,9 +842,10 @@ class ReviewerConcurrencyTests(AuditTestCase):
     ROUNDS = int(os.environ.get("RAG_AUDIT_ROUNDS", "3"))
     MAX, KEEP = 4096, 1000                            # rotate every ~20 records; delete nothing
 
-    def writers(self, records_per_thread=150, threads=4, child_records=150):
+    def writers(self, records_per_thread=150, threads=4, child_records=150, hold=None):
         """Start 4 threads and a second process appending padded, numbered
-        records; returns a function that waits for them all."""
+        records; returns a function that waits for them all. `hold`, when
+        given, is called by each thread once, after half its records (#790)."""
         script = ("import sys; sys.path.insert(0, sys.argv[1]);"
                   "from services import audit\n"
                   f"for n in range({child_records}): audit.record('query', result='success',"
@@ -855,6 +856,8 @@ class ReviewerConcurrencyTests(AuditTestCase):
 
         def write(t):
             for n in range(records_per_thread):
+                if hold and n == records_per_thread // 2:
+                    hold()
                 audit.record("query", result="success", details={"t": t, "n": n, "pad": "w" * 150})
 
         pool = [threading.Thread(target=write, args=(t,)) for t in range(threads)]
@@ -879,24 +882,47 @@ class ReviewerConcurrencyTests(AuditTestCase):
         # A read holds every record up to some point, each once, newest first:
         # exactly the oldest-first prefix of the final log, reversed.
         partial = 0                                   # reads made while the writers ran
+        THREADS = 4
         for round_ in range(self.ROUNDS):
             with self.subTest(round=round_), self.settings_patch():
                 for path in self.audit_dir.glob("audit.jsonl*"):
                     path.unlink()
                 self.seed()
                 reads, done = [], threading.Event()
+                arrived, count = threading.Lock(), [0]
+                all_held, released = threading.Event(), threading.Event()
+                held_read, stuck = [], []
+
+                def hold():
+                    # Each thread stops after half its records until the reader has finished a
+                    # read it started while all four were stopped (#790): that read can't hold
+                    # the threads' second halves, so every round has a partial read.
+                    with arrived:
+                        count[0] += 1
+                        if count[0] == THREADS:
+                            all_held.set()
+                    if not released.wait(timeout=60):
+                        stuck.append(True)
 
                 def reader():
                     while not done.is_set() or len(reads) < 3:
+                        held = all_held.is_set() and not released.is_set()
                         reads.append([item["id"] for item in audit.newest_first()])
+                        if held and not released.is_set():
+                            held_read.append(reads[-1])
+                            released.set()
 
                 watcher = threading.Thread(target=reader)
-                wait = self.writers()
+                wait = self.writers(threads=THREADS, hold=hold)
                 watcher.start()
                 wait()
                 done.set()
                 watcher.join()
                 final = [r["id"] for r in self.records()]                 # oldest first
+                self.assertFalse(stuck, "the reader didn't finish a read while the writer threads were held")
+                self.assertEqual(len(held_read), 1)
+                self.assertLess(len(held_read[0]), len(final),
+                                "the read made while the writer threads were held isn't partial")
                 self.assertEqual(len(final), 60 + 4 * 150 + 150)
                 self.assertEqual(len(set(final)), len(final))
                 self.assertGreater(len(list(self.audit_dir.glob("audit.jsonl.*"))), 20)   # it rotated a lot
