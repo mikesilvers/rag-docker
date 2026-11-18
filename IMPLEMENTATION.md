@@ -40804,7 +40804,7 @@ class EncryptedAccessTests(DownloadTestCase):
         self.assertTrue(path.exists(), "a package not exported here is kept")
 
     def test_a_restricted_collection_that_no_longer_exists_here_hides_nothing(self):
-        # Reviewer (#794): the import's own rule (importer._source, _exists); a
+        # Reviewer (#794): the import's own rule (importer.package_source, exists_fail_closed); a
         # restricted collection deleted here no longer guards its encrypted package.
         path = self.write_encrypted("ragpkg-gone.tar.gz.age")
         with patch.object(wc, "_collection_exists_sync", lambda name: False):
