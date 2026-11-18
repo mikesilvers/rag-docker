@@ -874,7 +874,7 @@ def _refused(owner, source: str) -> bool:
     return _exists(source) and not all(auth_store.owner_has_access(owner, n) for n in names)
 
 
-def _start_access(owner, source: str, target: str):
+def _start_access(owner, source: str, target: str, operator: bool = False):
     """A collection this import creates (#606): when the package's collection
     (`_source`) exists here, the new one gets its state, and for a staging or
     recovery copy the narrowest of the copy's and every collection's it was
@@ -882,12 +882,15 @@ def _start_access(owner, source: str, target: str):
     otherwise it starts
     restricted to the job's owner. Written before any data; returns (the state
     replaced, the state written) for auth_store.put_back. A job with no owner
-    (a direct call in tests) records nothing and returns None."""
-    if owner is None:
+    (a direct call in tests) records nothing and returns None. A load by the
+    operator (`python -m loader`, #670) has no owner either, but its new
+    collection starts restricted with no grants: Engineers only, until one
+    opens or grants it."""
+    if owner is None and not operator:
         return None
     if source != target and _exists(source):
         return auth_store.copy_collection_access(source, target, access.scope(source)[1:])
-    return auth_store.restrict_to(target, auth_store.user_id_for(owner))
+    return auth_store.restrict_to(target, auth_store.user_id_for(owner) if owner is not None else None)
 
 
 @telemetry.traced("rag.import")
@@ -981,7 +984,8 @@ def _run(job_id: str, filename: str, on_conflict: str, passphrase: str | None = 
             # A collection this import creates gets its access state before any
             # data is written; a replace keeps the target's (#606).
             if not exists or on_conflict != "replace":
-                states = _start_access(job.get("owner"), source or target, target)
+                states = _start_access(job.get("owner"), source or target, target,
+                                       operator=job.get("operator") is True)
                 if states is not None:
                     before, written = states
                     new_access = (target, written, before)       # put_back's (collection, expected, previous)
