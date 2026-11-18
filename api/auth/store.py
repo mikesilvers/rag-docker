@@ -966,20 +966,34 @@ def _no_store() -> bool:
     return str(db_path()) not in _ready and not db_path().exists()
 
 
-def copy_collection_access(source: str, target: str) -> tuple[CollectionAccess, CollectionAccess]:
+def _grant_set(conn, collection: str):
+    """None for an open collection; otherwise the ids of the accounts granted it."""
+    if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (collection,)).fetchone() is None:
+        return None
+    return [row["user_id"] for row in
+            conn.execute("SELECT user_id FROM collection_grants WHERE collection = ?", (collection,))]
+
+
+def copy_collection_access(source: str, target: str,
+                           narrowed_by: str | None = None) -> tuple[CollectionAccess, CollectionAccess]:
     """The target takes the source's state: open stays open, restricted copies
-    its grants. Returns (the target's state it replaced, the state written)."""
+    its grants. With `narrowed_by` (the target of a staging or recovery copy
+    `source`, #788), it takes the narrower of the two: restricted when either
+    is, to the accounts granted every restricted one. Returns (the target's
+    state it replaced, the state written)."""
     source, target = _canonical(source), _canonical(target)
     if _no_store():
         return CollectionAccess(False), CollectionAccess(False)
     with _connect(write=True) as conn:
         before = _access(conn, target)
-        if conn.execute("SELECT 1 FROM restricted_collections WHERE collection = ?", (source,)).fetchone() is None:
+        sets = [_grant_set(conn, source)]
+        if narrowed_by is not None:
+            sets.append(_grant_set(conn, _canonical(narrowed_by)))
+        restricted = [ids for ids in sets if ids is not None]
+        if not restricted:
             _open(conn, target)
         else:
-            ids = [row["user_id"] for row in
-                   conn.execute("SELECT user_id FROM collection_grants WHERE collection = ?", (source,))]
-            _restrict(conn, target, ids)
+            _restrict(conn, target, [i for i in restricted[0] if all(i in ids for ids in restricted[1:])])
         return before, _access(conn, target)
 
 

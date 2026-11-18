@@ -840,22 +840,28 @@ def _source(original: str) -> str:
 
 def _refused(owner, source: str) -> bool:
     """True when the package's collection (`_source`) exists here, is
-    restricted, and the job's owner may not use it (#606)."""
-    if owner is None or not auth_store.collection_access(source).restricted:
+    restricted, and the job's owner may not use it (#606). For an existing
+    staging or recovery copy that means the copy or its target (access.scope,
+    #788)."""
+    names = access.scope(source)
+    if owner is None or not any(auth_store.collection_access(n).restricted for n in names):
         return False
-    return _exists(source) and not auth_store.owner_has_access(owner, source)
+    return _exists(source) and not all(auth_store.owner_has_access(owner, n) for n in names)
 
 
 def _start_access(owner, source: str, target: str):
     """A collection this import creates (#606): when the package's collection
-    (`_source`) exists here, the new one gets its state; otherwise it starts
+    (`_source`) exists here, the new one gets its state, and for a staging or
+    recovery copy the narrower of the copy's and its target's (#788), so an
+    import can't open what the copy's target restricts; otherwise it starts
     restricted to the job's owner. Written before any data; returns (the state
     replaced, the state written) for auth_store.put_back. A job with no owner
     (a direct call in tests) records nothing and returns None."""
     if owner is None:
         return None
     if source != target and _exists(source):
-        return auth_store.copy_collection_access(source, target)
+        scope = access.scope(source)
+        return auth_store.copy_collection_access(source, target, scope[1] if len(scope) > 1 else None)
     return auth_store.restrict_to(target, auth_store.user_id_for(owner))
 
 
