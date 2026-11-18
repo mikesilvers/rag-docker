@@ -170,7 +170,7 @@ class ListingTests(AccessTestCase):
 
     def test_a_change_applies_to_the_next_request(self):
         self.assertEqual(self.put(SECRET, {"restricted": False}).status_code, 200)
-        # The copy keeps the access it was made with (CopyTests).
+        # The copy keeps its own state, which still restricts it (CopyTests, #788).
         self.assertEqual(self.names("user"), [OPEN, SECRET])
 
 
@@ -238,7 +238,7 @@ class AccessRouteTests(AccessTestCase):
 
     def test_an_empty_grant_set_leaves_engineers_only(self):
         self.put(SECRET, {"restricted": True})
-        self.assertEqual(self.names("dev"), [OPEN, STAGING])               # the copy keeps its own grants
+        self.assertEqual(self.names("dev"), [OPEN])                        # the copy follows its target (#788)
         self.assertEqual(self.names("eng"), [OPEN, SECRET, STAGING])
 
 
@@ -455,6 +455,24 @@ class PackageTests(AccessTestCase):
         self.assertEqual(seen, [store.CollectionAccess(True, ("dev2",), ())])
         self.assertFalse(store.collection_access("Brandnew").restricted)
 
+    def test_a_failed_cleanup_keeps_the_new_collection_access(self):
+        # The build's own delete of the partial collection failed (#788).
+        def build(target, *a):
+            raise importer.PackageError("IMPORT_FAILED", "the insert failed; partial target cleanup failed",
+                                        {"collection": target, "cleanup_pending": True})
+        record = self.run_import("Halfbuilt", "rename", {"name": "dev2", "kind": "user"}, _build=build)
+        self.assertEqual(record["status"], "failed", record)
+        self.assertEqual(store.collection_access("Halfbuilt"), store.CollectionAccess(True, ("dev2",), ()))
+
+    def test_a_failed_build_that_left_the_collection_keeps_its_access(self):
+        # The create was applied but answered with an error (#788).
+        def build(target, *a):
+            self.collections.add(target)
+            raise RuntimeError("timed out")
+        record = self.run_import("Applied", "rename", {"name": "dev2", "kind": "user"}, _build=build)
+        self.assertEqual(record["status"], "failed", record)
+        self.assertEqual(store.collection_access("Applied"), store.CollectionAccess(True, ("dev2",), ()))
+
     def test_a_replace_keeps_the_target_access(self):
         def begin(*a):
             raise importer.PackageError("IMPORT_FAILED", "stopped before the replace")
@@ -465,10 +483,21 @@ class PackageTests(AccessTestCase):
         self.assertEqual((record["status"], record["error"]), ("failed", "stopped before the replace"), record)
         self.assertEqual(store.collection_access(SECRET), before)
 
+    def test_a_failure_after_the_build_keeps_the_new_collection_access(self):
+        # The build finished, so the collection exists; a later failure must
+        # not put back (open) the state the import gave it.
+        def restore(*a):
+            raise importer.PackageError("IMPORT_FAILED", "the sidecars failed")
+        record = self.run_import("Builtnew", "rename", {"name": "dev2", "kind": "user"},
+                                 _build=lambda *a: 1, _restore_sidecars=restore)
+        self.assertEqual((record["status"], record["error"]), ("failed", "the sidecars failed"), record)
+        self.assertEqual(store.collection_access("Builtnew"), store.CollectionAccess(True, ("dev2",), ()))
 
 
 class CopyTests(AccessTestCase):
-    """A staging or recovery copy keeps the access it was made with (#606)."""
+    """A staging or recovery copy gets its target's access when it is made
+    (#606) and keeps it as its own state; while the target has a state, a
+    caller other than an Engineer needs both (#788)."""
 
     def test_begin_snapshots_and_discard_drops(self):
         from services import collection_recovery
@@ -494,24 +523,47 @@ class CopyTests(AccessTestCase):
         self.assertFalse(store.collection_access(last["staging"]).restricted)
         self.assertTrue(store.collection_access(copy).restricted)          # a copy not discarded keeps it
 
-    def test_deleting_or_recreating_the_target_leaves_the_copy_as_it_was(self):
+    def test_a_copy_follows_a_deleted_and_re_created_target(self):
         async def delete(name):
             self.collections.discard(name)
             return 1
 
         async def create(**kwargs):
             self.collections.add(kwargs["name"])
+        body = {"question": "What?", "collection": STAGING}
         with patch.object(wc, "delete_collection_when_idle", delete):
             self.assertEqual(self.client.delete(f"/collections/{SECRET}?confirm=true",
                                                 headers=self.as_("eng")).status_code, 200)
         self.assertNotIn(STAGING, self.names("user"))                     # not opened by the delete
+        self.assertIn(STAGING, self.names("dev"))                         # its own state alone now
         with patch.object(wc, "create_collection", create):
             self.assertEqual(self.client.post("/collections", json={"name": SECRET},
                                               headers=self.as_("dev2")).status_code, 201)
-        self.assertEqual(self.names("dev2"), [OPEN, SECRET])               # the new SECRET, not the old copy
-        self.assertIn(STAGING, self.names("dev"))
+        # The new SECRET is dev2's; the copy is dev's: each lacks one side.
+        self.assertEqual(self.names("dev2"), [OPEN, SECRET])
+        self.assertEqual(self.names("dev"), [OPEN])
+        for who in ("dev", "dev2"):
+            self.refused(self.client.post("/query", json=body, headers=self.as_(who)))
+        self.assertIn(STAGING, self.names("eng"))
+
+    def test_a_copy_with_no_state_follows_its_target(self):
+        # A copy kept from before #606 has no state of its own (#788).
+        store.drop_collection_access(STAGING)
+        for who, sees in (("dev", True), ("svc", True), ("eng", True), ("user", False), ("dev2", False)):
+            with self.subTest(who=who):
+                self.assertEqual(STAGING in self.names(who), sees)
         body = {"question": "What?", "collection": STAGING}
-        self.refused(self.client.post("/query", json=body, headers=self.as_("dev2")))
+        self.refused(self.client.post("/query", json=body, headers=self.as_("user")))
+
+    def test_narrowing_the_target_reaches_the_copy(self):
+        self.assertEqual(self.put(SECRET, {"restricted": True, "users": ["dev"]}).status_code, 200)
+        self.assertNotIn(STAGING, self.names("svc"))
+        self.assertIn(STAGING, self.names("dev"))
+
+    def test_opening_the_target_leaves_the_copy_its_own_state(self):
+        self.assertEqual(self.put(SECRET, {"restricted": False}).status_code, 200)
+        self.assertNotIn(STAGING, self.names("user"))
+        self.assertIn(STAGING, self.names("dev"))
 
 
 class CreateFailureTests(AccessTestCase):
@@ -540,6 +592,32 @@ class CreateFailureTests(AccessTestCase):
         self.assertEqual(seen, [store.CollectionAccess(True, ("dev2",), ())])
         self.assertFalse(store.collection_access("Fresh").restricted)
 
+    def test_a_failed_create_that_left_the_collection_keeps_the_restriction(self):
+        # Weaviate applied the create but the client got an error (#788).
+        async def create(**kwargs):
+            self.collections.add(kwargs["name"])
+            raise TimeoutError("read timed out")
+        with patch.object(wc, "create_collection", create):
+            answer = self.client.post("/collections", json={"name": "Fresh"}, headers=self.as_("dev2"))
+        self.assertEqual((answer.status_code, answer.json()["error"]["code"]), (500, "CREATE_FAILED"))
+        self.assertEqual(store.collection_access("Fresh"), store.CollectionAccess(True, ("dev2",), ()))
+
+    def test_a_failed_create_with_no_answer_on_existence_keeps_the_restriction(self):
+        async def create(**kwargs):
+            raise RuntimeError("weaviate refused")
+
+        asked = []
+
+        async def unknown(name):
+            asked.append(name)
+            if len(asked) > 1:                       # the check after the failed create
+                raise ConnectionError("no answer")
+            return False
+        with patch.object(wc, "create_collection", create), patch.object(wc, "collection_exists", unknown):
+            answer = self.client.post("/collections", json={"name": "Fresh"}, headers=self.as_("dev2"))
+        self.assertEqual((answer.status_code, asked), (500, ["Fresh", "Fresh"]))
+        self.assertEqual(store.collection_access("Fresh"), store.CollectionAccess(True, ("dev2",), ()))
+
     def test_put_back_only_restores_its_own_state(self):
         before, mine = store.restrict_to("Race", store.get_user("dev2").id)
         theirs = store.restrict_to("Race", store.get_user("dev").id)[1]     # another create wrote since
@@ -561,6 +639,32 @@ class CreateFailureTests(AccessTestCase):
 
 
 class PackageSourceTests(AccessTestCase):
+    def test_a_package_of_an_existing_copy_follows_the_copy_and_its_target(self):
+        # The copy's own state is open; SECRET still restricts it (#788).
+        self.assertEqual(self.put(STAGING, {"restricted": False}).status_code, 200)
+        dev2 = {"name": "dev2", "kind": "user"}
+        self.assertEqual(importer._source(STAGING), STAGING)
+        self.assertTrue(importer._refused(dev2, STAGING))
+        self.assertFalse(importer._refused({"name": "dev", "kind": "user"}, STAGING))
+        from routers import transfer
+        listed = [{"filename": "ragpkg-copy.tar.gz", "size_bytes": 1, "collection": STAGING, "chunk_count": 1,
+                   "fidelity": "chunks-only", "created_at": None, "readable": True}]
+        with patch.object(transfer, "_list_packages_sync", lambda: [dict(p) for p in listed]):
+            self.assertEqual(self.client.get("/packages", headers=self.as_("dev2")).json()["packages"], [])
+            self.assertEqual(len(self.client.get("/packages", headers=self.as_("dev")).json()["packages"]), 1)
+
+    def test_an_import_from_a_copy_takes_the_narrower_state(self):
+        self.assertEqual(self.put(STAGING, {"restricted": True, "users": ["dev", "dev2"]}).status_code, 200)
+        self.assertEqual(self.put(SECRET, {"restricted": True, "users": ["dev"]}).status_code, 200)
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, STAGING, "Fromcopy")
+        self.assertEqual(written, store.CollectionAccess(True, ("dev",), ()))
+        self.assertEqual(self.put(STAGING, {"restricted": False}).status_code, 200)
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, STAGING, "Fromcopy2")
+        self.assertEqual(written, store.CollectionAccess(True, ("dev",), ()))      # the target's alone
+        self.assertEqual(self.put(SECRET, {"restricted": False}).status_code, 200)
+        _, written = importer._start_access({"name": "dev", "kind": "user"}, STAGING, "Fromcopy3")
+        self.assertEqual(written, store.CollectionAccess(False))
+
     def test_a_package_of_a_discarded_copy_follows_its_target(self):
         gone = SECRET + "__importing_" + "1" * 32
         self.assertEqual(importer._source(gone), SECRET)                   # the copy no longer exists
@@ -733,6 +837,18 @@ class PrepareAreaTests(AccessTestCase):
             mine = self.client.get("/prepare/job/pj1", headers=self.as_("dev")).json()
             self.assertEqual(mine["document_ids"], job["document_ids"])
         self.assertFalse(self.records("collection.access.refused"))
+
+    def test_a_refused_selection_is_audited_as_an_access_refusal(self):
+        for path, body, action in (
+                ("/prepare/jobs", {"document_ids": [self.secret_doc, self.open_doc]}, "prepare.start"),
+                ("/prepare/import", {"collection": OPEN, "document_ids": [self.secret_doc]}, "prepare.import")):
+            with self.subTest(path=path):
+                answer = self.client.post(path, json=body, headers=self.as_("dev2"))
+                self.assertEqual((answer.status_code, answer.json()["error"]["detail"]),
+                                 (404, {"documents": [self.secret_doc]}))
+                item = [r for r in self.records(action) if r["actor"] == "dev2"][-1]
+                self.assertEqual((item["result"], item["collection"], item["details"].get("reason")),
+                                 ("refused", SECRET, "collection_access"), item)
 
 
 if __name__ == "__main__":
