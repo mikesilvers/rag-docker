@@ -34487,6 +34487,28 @@ section "LAN override, resolved without starting it"
 python3 ./lan_config.py "$REPO_ROOT"
 check "docker-compose.lan.yml publishes only the proxy on every interface at 443 (RAG_LAN_PORT changes it), in LAN mode with a Secure cookie, after tls-init" $?
 
+# #555 (reviewer): the fail-closed chain checks report a broken chain.
+python3 - "$REPO_ROOT" <<'ENDPY'
+import copy, sys
+sys.path.insert(0, ".")
+import lan_config
+checkout = sys.argv[1]
+config = lan_config.resolve(checkout)
+bad_ui = copy.deepcopy(config)
+bad_ui["services"]["ui"]["depends_on"]["api"]["condition"] = "service_started"
+bad_proxy = copy.deepcopy(config)
+del bad_proxy["services"]["proxy"]["depends_on"]["ui"]
+failed = False
+for label, cfg, expected in (("ui condition service_started", bad_ui, "the ui doesn't wait for a healthy api"),
+                             ("no ui in the proxy's depends_on", bad_proxy, "the proxy doesn't wait for the ui")):
+    found = lan_config.problems(cfg, checkout, "443")
+    if not any(expected in problem for problem in found):
+        failed = True
+        print("    {}: not reported; problems were {}".format(label, found), file=sys.stderr)
+sys.exit(1 if failed else 0)
+ENDPY
+check "lan_config reports a ui that doesn't wait for a healthy api, and a proxy that doesn't wait for the ui" $?
+
 section "LAN units: setting, startup refusal, certificate step, nginx configuration"
 (cd "$REPO_ROOT" && docker run --rm --network none -v "$REPO_ROOT:/repo:ro" -w /repo -e RAG_TEST_API_DIR=/repo/api "$(docker compose images -q api)" python scripts/tests/test_lan_mode.py)
 check "test_lan_mode.py registered regression checks" $?
@@ -34552,6 +34574,8 @@ lan cookie
 check "a login over HTTPS sets the session cookie Secure, HttpOnly and SameSite=Strict" $?
 lan origin
 check "a same-origin change over HTTPS is accepted, another origin's refused 403 CROSS_ORIGIN_REFUSED" $?
+lan server-tokens
+check "nginx sends no version: the Server header is plain nginx on an API answer and on its own 421 page (#555)" $?
 lan refusals
 check "the API refuses LAN mode with one line when AUTH_COOKIE_SECURE is false or no Engineer exists" $?
 lan rate-limit
@@ -34685,7 +34709,7 @@ if __name__ == "__main__":
 ```python
 """LAN mode on the verify project (#26). Host-side, standard library, Python 3.9+.
 
-    python3 lan_stack.py https|hosts|tls|bindings|cookie|origin|refusals|rate-limit|address
+    python3 lan_stack.py https|hosts|tls|bindings|cookie|origin|server-tokens|refusals|rate-limit|address
 
 Run by 18_lan.sh in a `stack.sh run --lan`, which brings the verify project up
 in LAN mode with TLS on 127.0.0.1:<verify port> only, copies the certificate
@@ -34706,6 +34730,9 @@ printing what failed:
             SameSite=Strict
   origin    a cookie-authenticated change from another origin is refused 403
             CROSS_ORIGIN_REFUSED, and from https://localhost:<port> accepted
+  server-tokens
+            the Server header is exactly "nginx" on an API answer and on
+            nginx's own 421 page, whose body names no version either (#555)
   refusals  a one-off api container of the LAN configuration (no ports, the
             running project untouched) refuses to start, with one line, when
             AUTH_COOKIE_SECURE is false and when its account store is empty
@@ -34825,6 +34852,21 @@ def check_hosts():
     for path in ("/api/health", "/"):
         status = status_for(host, path)
         assert status == 421, "Host {} got {} at {}, not 421".format(host, status, path)
+
+
+def check_server_tokens():
+    for host, path, expected in (("localhost", "/api/health", 200), ("rebind.invalid", "/", 421)):
+        conn = http.client.HTTPSConnection("localhost", port(), context=context(), timeout=60)
+        try:
+            conn.request("GET", path, headers={"Host": "{}:{}".format(host, port())})
+            response = conn.getresponse()
+            body = response.read().decode("utf-8", "replace")
+            server = response.getheader("Server")
+        finally:
+            conn.close()
+        assert response.status == expected, "Host {} got {} at {}, not {}".format(host, response.status, path, expected)
+        assert server == "nginx", "Host {} at {}: Server header {!r}, not 'nginx'".format(host, path, server)
+        assert not re.search(r"nginx/\d", body), "Host {} at {}: the page names nginx's version".format(host, path)
 
 
 def handshake(ctx, alpn=None):
@@ -34966,7 +35008,8 @@ def check_address():
 
 
 CHECKS = {"https": check_https, "hosts": check_hosts, "tls": check_tls, "bindings": check_bindings,
-          "cookie": check_cookie, "origin": check_origin, "refusals": check_refusals,
+          "cookie": check_cookie, "origin": check_origin, "server-tokens": check_server_tokens,
+          "refusals": check_refusals,
           "rate-limit": check_rate_limit, "address": check_address}
 
 
@@ -35435,6 +35478,24 @@ class MainImportTests(unittest.TestCase):
         self.assertEqual(sum(l.startswith("Settings refused: WEAVIATE_PORT: ") for l in lines), 1, lines)
         self.assertNotIn("Traceback", result.stderr)
         self.assertNotIn("not-a-port-7f3a", result.stdout + result.stderr)
+
+    def test_a_validators_own_message_is_used_as_is_through_main(self):
+        # #555 (reviewer): uvicorn's import of main, a validator's own message
+        # unprefixed and a pydantic type error prefixed with its setting, one
+        # line each, no traceback, neither value printed.
+        result = self.run_import(AUDIT_LOG_KEEP="0", MAX_PREPARATION_BYTES="12-vfy-secret-9c1d")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(sorted(result.stderr.splitlines()), [
+            "Settings refused: AUDIT_LOG_KEEP must be 1 to 1000",
+            "Settings refused: MAX_PREPARATION_BYTES: Input should be a valid integer, unable to parse string as an integer"])
+        self.assertNotIn("vfy-secret-9c1d", result.stderr)
+
+    def test_settings_itself_still_raises_validation_error(self):
+        import pydantic
+        import config
+        with self.assertRaises(pydantic.ValidationError):
+            config.Settings(rag_lan_mode="yes")
 
 
 # ── the certificate step ─────────────────────────────────────────────────────
