@@ -883,13 +883,17 @@ def _start_access(owner, source: str, target: str, operator: bool = False):
     Written before any data; returns (the state replaced, the state written)
     for auth_store.put_back. A job with no owner (a direct call in tests)
     records nothing and returns None. A load by the operator (`python -m
-    loader`, #670) has no owner either, but its new collection starts
-    restricted with no grants: Engineers only, until one opens or grants it."""
-    if owner is None and not operator:
+    loader`, #670) has no owner either: every collection it creates starts
+    restricted with no grants (Engineers only, until one opens or grants it),
+    and never copies an existing collection's state, a rename or a staging
+    copy's package included (maintainer, 2026-11-18)."""
+    if operator:
+        return auth_store.restrict_to(target, None)
+    if owner is None:
         return None
     if source != target and exists_fail_closed(source):
         return auth_store.copy_collection_access(source, target, access.scope(source)[1:])
-    return auth_store.restrict_to(target, auth_store.user_id_for(owner) if owner is not None else None)
+    return auth_store.restrict_to(target, auth_store.user_id_for(owner))
 
 
 @telemetry.traced("rag.import")

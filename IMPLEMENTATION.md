@@ -1475,13 +1475,15 @@ ingest settings and gold standard sessions come with it.
 
 --on-conflict says what to do when the collection already exists: abort (the
 default) refuses, rename loads it under a new name, replace loads it over the
-existing one (a query or export of that collection can fail while that runs).
+existing one. While any load runs, a question or export of its collection can
+meet it half-built or fail.
 
 It runs only on a query-only instance (RAG_QUERY_ONLY=true), where the API
 itself changes no collection; a full instance imports on the Transfer page. One
-load runs at a time. A collection it creates starts restricted with no grants,
-so only AI Engineers can use it until one opens it or grants it on the
-Collections page; a replace keeps the collection's access.
+load runs at a time. Every collection it creates, a rename included, starts
+restricted with no grants, so only AI Engineers can use it until one opens it
+or grants it on the Collections page; it never copies another collection's
+access. Only a replace keeps the collection's access.
 
 The passphrase of an encrypted package is asked for without echo when standard
 input is a terminal, and otherwise read as the first line of standard input
@@ -1490,12 +1492,20 @@ argument, never printed and never recorded.
 
 Each step is one line on standard error, prefixed "loader: ". Exit status: 0
 loaded, 1 refused or failed, 2 usage error. Every run past the arguments writes
-one audit record (#29), `operator.load`, with actor `operator`: the package, the
-collection, the conflict mode, whether it is encrypted, and the chunks loaded or
-the code of the refusal. A record that can't be written is one more line.
+one audit record (#29), `operator.load`, with actor `operator` and result
+`success`, `refused` (before the load), `failed` (the load failed) or
+`interrupted` (Ctrl-C): the package, the collection, the conflict mode, whether
+it is encrypted, and the chunks loaded or the code. A record that can't be
+written is one more line.
 
-Ctrl-C stops a load at once, as a kill would. The half-built collection it may
-leave is removed by the next load, or by the API's next start.
+Ctrl-C writes the `interrupted` record and then stops the load at once, as a
+kill would. What it leaves: a collection it was building, which the next load
+removes (it runs the import's clean-up of an interrupted import first); the
+load's work folder (import-* in UPLOAD_DIR) and a replace's scratch staging
+collection, which stay until the API's next start (docker compose restart api).
+A replace stopped after the old collection was deleted keeps the old data in
+the recovery collection the import made; load the package again with
+--on-conflict replace, or restore from that collection.
 """
 from __future__ import annotations
 
@@ -1523,17 +1533,43 @@ def _say(line: str) -> None:
     print("loader: " + line, file=sys.stderr, flush=True)
 
 
+# The run's state, for the Ctrl-C handler: the job once the load has started,
+# and whether a record is being written (the handler then writes none: the
+# audit log's locks are held, and that record is the run's own).
+_state: dict = {}
+
+
 def _audit(package: str, on_conflict: str, encrypted: bool, collection: str | None,
-           code: str | None = None, chunks: int | None = None) -> None:
+           result: str = "success", code: str | None = None, chunks: int | None = None) -> None:
     from services import audit
     details: dict = {"on_conflict": on_conflict, "encrypted": encrypted}
     if chunks is not None:
         details["chunks"] = chunks
     if code:
         details["code"] = code
-    if not audit.record("operator.load", result="refused" if code else "success", actor="operator",
-                        actor_kind="operator", target=package, collection=collection, details=details):
+    _state["auditing"] = True
+    try:
+        written = audit.record("operator.load", result=result, actor="operator", actor_kind="operator",
+                               target=package, collection=collection, details=details)
+    finally:
+        _state["auditing"] = False
+    if not written:
         _say("the audit record could not be written")
+
+
+def _interrupted(package: str, on_conflict: str, encrypted: bool):
+    """The SIGINT handler: record the load as interrupted, then die of the
+    signal as a kill would, so the import's `finally` never retires the marker
+    of a half-built collection."""
+    def handler(signum, frame):
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        if not _state.get("auditing"):
+            job = _state.get("job") or {}
+            _say("load interrupted: INTERRUPTED")
+            _audit(package, on_conflict, encrypted, job.get("collection"), result="interrupted",
+                   code="INTERRUPTED")
+        os.kill(os.getpid(), signal.SIGINT)
+    return handler
 
 
 def _passphrase() -> str:
@@ -1578,6 +1614,7 @@ def _load(package: str, on_conflict: str, passphrase: str | None) -> dict:
         "owner": None, "operator": True,        # access: restricted, no grants (#670)
     }
     job = importer._jobs[job_id]
+    _state["job"] = job
     done = threading.Event()
     ticker = threading.Thread(target=_progress, args=(job, done), daemon=True)
     ticker.start()
@@ -1602,14 +1639,15 @@ def main(argv=None) -> int:
         parser.error(f"not a package name: {args.package!r} (ragpkg-*.tar.gz or ragpkg-*.tar.gz.age, "
                      "a file in ./exports)")
 
-    # Ctrl-C acts as a kill: the import's clean-up would otherwise retire the
-    # marker of a half-built collection that the next load must remove.
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-
     from config import settings
     from services import importer, packager
     package, on_conflict = args.package, args.on_conflict
     encrypted = age_stream.is_encrypted_name(package)
+    # Ctrl-C is recorded, then acts as a kill: Python's KeyboardInterrupt would
+    # run the import's clean-up, which retires the marker of a half-built
+    # collection that the next load must remove.
+    _state.clear()
+    signal.signal(signal.SIGINT, _interrupted(package, on_conflict, encrypted))
     _say(f"loading {package} (on conflict: {on_conflict})")
     lock = None
     try:
@@ -1636,7 +1674,7 @@ def main(argv=None) -> int:
         job = _load(package, on_conflict, passphrase)
     except _Refused as refused:
         _say(f"load refused: {refused.code}: {refused}")
-        _audit(package, on_conflict, encrypted, None, code=refused.code)
+        _audit(package, on_conflict, encrypted, None, result="refused", code=refused.code)
         return 1
     finally:
         if lock is not None:
@@ -1652,7 +1690,7 @@ def main(argv=None) -> int:
         return 0
     code = job.get("error_code") or "IMPORT_FAILED"
     _say(f"load failed: {code}: {job.get('error')}")
-    _audit(package, on_conflict, encrypted, job.get("collection"), code=code)
+    _audit(package, on_conflict, encrypted, job.get("collection"), result="failed", code=code)
     return 1
 
 
@@ -14528,13 +14566,17 @@ def _start_access(owner, source: str, target: str, operator: bool = False):
     Written before any data; returns (the state replaced, the state written)
     for auth_store.put_back. A job with no owner (a direct call in tests)
     records nothing and returns None. A load by the operator (`python -m
-    loader`, #670) has no owner either, but its new collection starts
-    restricted with no grants: Engineers only, until one opens or grants it."""
-    if owner is None and not operator:
+    loader`, #670) has no owner either: every collection it creates starts
+    restricted with no grants (Engineers only, until one opens or grants it),
+    and never copies an existing collection's state, a rename or a staging
+    copy's package included (maintainer, 2026-11-18)."""
+    if operator:
+        return auth_store.restrict_to(target, None)
+    if owner is None:
         return None
     if source != target and exists_fail_closed(source):
         return auth_store.copy_collection_access(source, target, access.scope(source)[1:])
-    return auth_store.restrict_to(target, auth_store.user_id_for(owner) if owner is not None else None)
+    return auth_store.restrict_to(target, auth_store.user_id_for(owner))
 
 
 @telemetry.traced("rag.import")
@@ -28820,6 +28862,9 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `ui_ingest_check.py` | the checks of suite 22, one per subcommand, on the host, and its cleanup (#641) |
 | `23_llm_split.sh` | the build and answer models (#671), full runs only: with `BUILD_LLM_MODEL` set to a small model, preparation and gold standard use it and query uses the answer model |
 | `llm_split.py` | helper for suite 23, run in the API container: pulls the small model, runs the three tasks through the services' code and prints the models Ollama reports answering each (#671) |
+| `24_query_only.sh` | §2.6 and §10.11 — query-only mode (#670): the overlay resolved without starting it; registers `../tests/test_query_only.py`; the start-up refusal of a non-boolean `RAG_QUERY_ONLY`; the loader's refusal on a full instance; with `stack.sh run --query-only`, build and export, `stack.sh query-only-mode`, then the load, the refusals, access and Q&A on the query-only instance |
+| `query_only_config.py` | host-side, standard library: `docker-compose.yml` with and without `docker-compose.query-only.yml` as `docker compose config` resolves them; only the api's `RAG_QUERY_ONLY` may differ (#670) |
+| `../tests/test_query_only.py` | API image, no network (also on the host): `RAG_QUERY_ONLY` parsing, the refused and kept routes, the refusals through the app and their order, `query_only` in the user answers, the loader (usage, refusals, lock, passphrase, results `success`/`refused`/`failed`/`interrupted`, the Ctrl-C handler) and the access of a collection it creates (#670) |
 | `../tests/test_suite_registration.py` | host-only: the suites above run the files #386 registered and `check` their status, registered by infrastructure |
 | `../tests/test_ci_workflow.py` | host-only: the CI workflow's trigger, permissions, action pins, verify-project sequence, logs artifact and model cache, the README badge and the embedded copies (#24), registered by infrastructure |
 | `../tests/test_weaviate_pin.py` | host-only: the Weaviate image is a plain release tag, stated the same in the offline packaging list, README, SPECIFICATIONS.md and the embedded copies, and Dependabot ignores its updates (#530); the nginx tag in SPECIFICATIONS.md's compose copy and 11.3 image list matches docker-compose.yml (#665), registered by infrastructure |
@@ -36213,7 +36258,8 @@ class LoaderTests(Folders):
         self.assertEqual(code, 1)
         self.assertIn("load failed: EMBEDDING_MISMATCH: another model", err)
         record = self.records("operator.load")[-1]
-        self.assertEqual((record["result"], record["details"]["code"]), ("refused", "EMBEDDING_MISMATCH"))
+        # A load that ran and failed is `failed`, not `refused` (maintainer, 2026-11-18).
+        self.assertEqual((record["result"], record["details"]["code"]), ("failed", "EMBEDDING_MISMATCH"))
 
     def test_an_encrypted_package_reads_its_passphrase_from_stdin(self):
         name = self.package("ragpkg-vfy-2.tar.gz.age")
@@ -36246,11 +36292,39 @@ class LoaderTests(Folders):
         self.assertEqual(code, 0)
         self.assertIn("loader: chunks written: 7", err)
 
-    def test_ctrl_c_acts_as_a_kill(self):
+    def test_ctrl_c_is_recorded_then_acts_as_a_kill(self):
+        # The handler is installed once the arguments are read; on SIGINT it
+        # records the load as interrupted (with the job's collection), restores
+        # SIG_DFL and sends SIGINT again, so the import's `finally` never runs.
         name = self.package()
         with self.fake_run(collection="P", original_collection="P"):
             self.main([name])
-        loader.signal.signal.assert_called_with(loader.signal.SIGINT, loader.signal.SIG_DFL)
+        signum, handler = loader.signal.signal.call_args_list[0][0]
+        self.assertEqual(signum, loader.signal.SIGINT)
+        self.assertTrue(callable(handler))
+        loader._state.clear()
+        loader._state["job"] = {"collection": "Policies"}
+        loader.signal.signal.reset_mock()
+        err = io.StringIO()
+        with patch.object(loader.os, "kill") as kill, contextlib.redirect_stderr(err):
+            handler(loader.signal.SIGINT, None)
+        loader.signal.signal.assert_called_once_with(loader.signal.SIGINT, loader.signal.SIG_DFL)
+        kill.assert_called_once_with(os.getpid(), loader.signal.SIGINT)
+        self.assertIn("load interrupted: INTERRUPTED", err.getvalue())
+        record = self.records("operator.load")[-1]
+        self.assertEqual((record["result"], record["collection"], record["target"], record["details"]["code"]),
+                         ("interrupted", "Policies", name, "INTERRUPTED"))
+
+    def test_ctrl_c_while_a_record_is_written_writes_no_second_one(self):
+        handler = loader._interrupted("ragpkg-x.tar.gz", "abort", False)
+        loader._state.clear()
+        loader._state["auditing"] = True
+        before = len(self.records())
+        with patch.object(loader.os, "kill") as kill:
+            handler(loader.signal.SIGINT, None)
+        kill.assert_called_once()
+        self.assertEqual(len(self.records()), before)
+        loader._state.clear()
 
 
 # ── S5: access to a collection the loader creates ────────────────────────────
@@ -36271,10 +36345,27 @@ class AccessTests(Folders):
         self.assertIsNone(importer._start_access(None, "Policies", "Policies"))
         self.assertEqual(store.collection_access("Policies"), store.CollectionAccess(False))
 
-    def test_a_rename_takes_the_existing_collections_state(self):
+    def test_a_rename_starts_engineers_only_too(self):
+        # Maintainer, 2026-11-18 (#808): the loader never copies an existing
+        # collection's access, even an open one; only replace keeps access.
         store.set_collection_access("Policies", False)
         with patch.object(importer, "exists_fail_closed", return_value=True):
             importer._start_access(None, "Policies", "Policies_ab12cd34", operator=True)
+        self.assertEqual(store.collection_access("Policies_ab12cd34"), store.CollectionAccess(True, (), ()))
+        self.assertEqual(store.collection_access("Policies"), store.CollectionAccess(False))
+
+    def test_a_staging_copys_package_starts_engineers_only(self):
+        store.set_collection_access("Policies", False)
+        staging = "Policies__importing_" + "0" * 32
+        with patch.object(importer, "exists_fail_closed", return_value=True):
+            importer._start_access(None, "Policies", staging, operator=True)
+        self.assertEqual(store.collection_access(staging), store.CollectionAccess(True, (), ()))
+
+    def test_an_owners_import_still_copies_the_source_state(self):
+        # The API's import is unchanged (#606): a rename copies the source's state.
+        store.set_collection_access("Policies", False)
+        with patch.object(importer, "exists_fail_closed", return_value=True):
+            importer._start_access({"name": "eng", "kind": "user"}, "Policies", "Policies_ab12cd34")
         self.assertEqual(store.collection_access("Policies_ab12cd34"), store.CollectionAccess(False))
 
     def test_the_operator_is_never_refused_for_access(self):

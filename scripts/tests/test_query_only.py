@@ -409,7 +409,8 @@ class LoaderTests(Folders):
         self.assertEqual(code, 1)
         self.assertIn("load failed: EMBEDDING_MISMATCH: another model", err)
         record = self.records("operator.load")[-1]
-        self.assertEqual((record["result"], record["details"]["code"]), ("refused", "EMBEDDING_MISMATCH"))
+        # A load that ran and failed is `failed`, not `refused` (maintainer, 2026-11-18).
+        self.assertEqual((record["result"], record["details"]["code"]), ("failed", "EMBEDDING_MISMATCH"))
 
     def test_an_encrypted_package_reads_its_passphrase_from_stdin(self):
         name = self.package("ragpkg-vfy-2.tar.gz.age")
@@ -442,11 +443,39 @@ class LoaderTests(Folders):
         self.assertEqual(code, 0)
         self.assertIn("loader: chunks written: 7", err)
 
-    def test_ctrl_c_acts_as_a_kill(self):
+    def test_ctrl_c_is_recorded_then_acts_as_a_kill(self):
+        # The handler is installed once the arguments are read; on SIGINT it
+        # records the load as interrupted (with the job's collection), restores
+        # SIG_DFL and sends SIGINT again, so the import's `finally` never runs.
         name = self.package()
         with self.fake_run(collection="P", original_collection="P"):
             self.main([name])
-        loader.signal.signal.assert_called_with(loader.signal.SIGINT, loader.signal.SIG_DFL)
+        signum, handler = loader.signal.signal.call_args_list[0][0]
+        self.assertEqual(signum, loader.signal.SIGINT)
+        self.assertTrue(callable(handler))
+        loader._state.clear()
+        loader._state["job"] = {"collection": "Policies"}
+        loader.signal.signal.reset_mock()
+        err = io.StringIO()
+        with patch.object(loader.os, "kill") as kill, contextlib.redirect_stderr(err):
+            handler(loader.signal.SIGINT, None)
+        loader.signal.signal.assert_called_once_with(loader.signal.SIGINT, loader.signal.SIG_DFL)
+        kill.assert_called_once_with(os.getpid(), loader.signal.SIGINT)
+        self.assertIn("load interrupted: INTERRUPTED", err.getvalue())
+        record = self.records("operator.load")[-1]
+        self.assertEqual((record["result"], record["collection"], record["target"], record["details"]["code"]),
+                         ("interrupted", "Policies", name, "INTERRUPTED"))
+
+    def test_ctrl_c_while_a_record_is_written_writes_no_second_one(self):
+        handler = loader._interrupted("ragpkg-x.tar.gz", "abort", False)
+        loader._state.clear()
+        loader._state["auditing"] = True
+        before = len(self.records())
+        with patch.object(loader.os, "kill") as kill:
+            handler(loader.signal.SIGINT, None)
+        kill.assert_called_once()
+        self.assertEqual(len(self.records()), before)
+        loader._state.clear()
 
 
 # ── S5: access to a collection the loader creates ────────────────────────────
@@ -467,10 +496,27 @@ class AccessTests(Folders):
         self.assertIsNone(importer._start_access(None, "Policies", "Policies"))
         self.assertEqual(store.collection_access("Policies"), store.CollectionAccess(False))
 
-    def test_a_rename_takes_the_existing_collections_state(self):
+    def test_a_rename_starts_engineers_only_too(self):
+        # Maintainer, 2026-11-18 (#808): the loader never copies an existing
+        # collection's access, even an open one; only replace keeps access.
         store.set_collection_access("Policies", False)
         with patch.object(importer, "exists_fail_closed", return_value=True):
             importer._start_access(None, "Policies", "Policies_ab12cd34", operator=True)
+        self.assertEqual(store.collection_access("Policies_ab12cd34"), store.CollectionAccess(True, (), ()))
+        self.assertEqual(store.collection_access("Policies"), store.CollectionAccess(False))
+
+    def test_a_staging_copys_package_starts_engineers_only(self):
+        store.set_collection_access("Policies", False)
+        staging = "Policies__importing_" + "0" * 32
+        with patch.object(importer, "exists_fail_closed", return_value=True):
+            importer._start_access(None, "Policies", staging, operator=True)
+        self.assertEqual(store.collection_access(staging), store.CollectionAccess(True, (), ()))
+
+    def test_an_owners_import_still_copies_the_source_state(self):
+        # The API's import is unchanged (#606): a rename copies the source's state.
+        store.set_collection_access("Policies", False)
+        with patch.object(importer, "exists_fail_closed", return_value=True):
+            importer._start_access({"name": "eng", "kind": "user"}, "Policies", "Policies_ab12cd34")
         self.assertEqual(store.collection_access("Policies_ab12cd34"), store.CollectionAccess(False))
 
     def test_the_operator_is_never_refused_for_access(self):

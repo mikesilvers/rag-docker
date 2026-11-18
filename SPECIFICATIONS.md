@@ -394,16 +394,25 @@ controls, and keeps the Collections page's list and Access without "+ New Collec
   Under the lock and before the load it runs the import's sweep of an interrupted import, as the API does at start-up.
 - An encrypted package's passphrase is read from the terminal without echo, or as the first line of standard input
   when that isn't a terminal; never an argument, never printed or recorded.
-- A collection it creates starts restricted with no grants (Engineers only, until one opens or grants it); a rename
-  copies the state of the package's collection when that exists here; `replace` keeps the target's state; a failed
-  load puts back the state it wrote. It is never refused a package for collection access.
-- Ctrl-C ends it at once, as a kill: the half-built collection is removed by the next load or the API's next start.
+- Every collection it creates starts restricted with no grants (Engineers only, until one opens or grants it): a
+  `rename`, or a package of a staging or recovery copy whose base exists here, too. It never copies another
+  collection's state (maintainer, 2026-11-18). `replace` keeps the target's state; a failed load puts back the state
+  it wrote. It is never refused a package for collection access.
+- While any load runs, whatever its mode, a question or export of its collection can meet it half-built or fail: the
+  API's in-process guards don't see the loader's process.
+- Ctrl-C: a SIGINT handler writes the `operator.load` record with result `interrupted` (`details.code`
+  `INTERRUPTED`), restores SIG_DFL and sends SIGINT again, so the process ends as a kill would and the import's
+  `finally` never retires the marker of a half-built collection. The next load's sweep removes a half-built
+  collection a marker owns; the work folder (`import-*` in `UPLOAD_DIR`) and a `replace`'s scratch staging collection
+  stay until the API's next start. A `replace` stopped after deleting the old collection leaves the old data in the
+  retained recovery collection.
 - Output: one `loader: ` line per step on standard error (the package and mode, `chunks written: N` at most every 5
   seconds while it changes, then the collection, chunks, fidelity and notes, or `load refused: CODE: message` / `load
   failed: CODE: message`). Exit 0 loaded, 1 refused or failed, 2 usage error.
 - Audit: each run past the arguments writes `operator.load` (§3.1.9), actor `operator`, `target` the package,
-  `collection` the collection loaded into (or the package's, when a failure knows it), result `success` or
-  `refused`, `details` `on_conflict`, `encrypted`, and `chunks` or `code`.
+  `collection` the collection loaded into (or the package's, when a failure knows it), result `success`, `refused`
+  (a refusal before the load), `failed` (the import job failed) or `interrupted` (Ctrl-C), `details` `on_conflict`,
+  `encrypted`, and `chunks` or `code`.
 
 **Verify.** `scripts/verify/stack.sh run --query-only` (§10.11).
 
@@ -4801,7 +4810,8 @@ the tests reviewer's full `stack.sh run` and `stack.sh run --query-only` on the 
 - [ ] `python -m loader` loads a package from `./exports` on a query-only instance only, one at a time, with the
       import's checks (another embedding model is refused `EMBEDDING_MISMATCH` and creates nothing), exits 0, 1 or 2,
       reads an encrypted package's passphrase from the terminal or standard input only, and writes one `operator.load`
-      record per run past its arguments; a collection it creates is restricted with no grants.
+      record per run past its arguments (`success`, `refused`, `failed` or `interrupted`); every collection it
+      creates, a rename included, is restricted with no grants.
       *Evidence: `test_query_only.py` `LoaderTests` and `AccessTests`; in every run suite 24 checks the refusal on a
       full instance; in a `stack.sh run --query-only` it loads the package, checks the refused load, `COLLECTION_EXISTS`
       on a second load, and that the End User sees the collection only after the Engineer opens it.*

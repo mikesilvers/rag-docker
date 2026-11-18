@@ -13,13 +13,15 @@ ingest settings and gold standard sessions come with it.
 
 --on-conflict says what to do when the collection already exists: abort (the
 default) refuses, rename loads it under a new name, replace loads it over the
-existing one (a query or export of that collection can fail while that runs).
+existing one. While any load runs, a question or export of its collection can
+meet it half-built or fail.
 
 It runs only on a query-only instance (RAG_QUERY_ONLY=true), where the API
 itself changes no collection; a full instance imports on the Transfer page. One
-load runs at a time. A collection it creates starts restricted with no grants,
-so only AI Engineers can use it until one opens it or grants it on the
-Collections page; a replace keeps the collection's access.
+load runs at a time. Every collection it creates, a rename included, starts
+restricted with no grants, so only AI Engineers can use it until one opens it
+or grants it on the Collections page; it never copies another collection's
+access. Only a replace keeps the collection's access.
 
 The passphrase of an encrypted package is asked for without echo when standard
 input is a terminal, and otherwise read as the first line of standard input
@@ -28,12 +30,20 @@ argument, never printed and never recorded.
 
 Each step is one line on standard error, prefixed "loader: ". Exit status: 0
 loaded, 1 refused or failed, 2 usage error. Every run past the arguments writes
-one audit record (#29), `operator.load`, with actor `operator`: the package, the
-collection, the conflict mode, whether it is encrypted, and the chunks loaded or
-the code of the refusal. A record that can't be written is one more line.
+one audit record (#29), `operator.load`, with actor `operator` and result
+`success`, `refused` (before the load), `failed` (the load failed) or
+`interrupted` (Ctrl-C): the package, the collection, the conflict mode, whether
+it is encrypted, and the chunks loaded or the code. A record that can't be
+written is one more line.
 
-Ctrl-C stops a load at once, as a kill would. The half-built collection it may
-leave is removed by the next load, or by the API's next start.
+Ctrl-C writes the `interrupted` record and then stops the load at once, as a
+kill would. What it leaves: a collection it was building, which the next load
+removes (it runs the import's clean-up of an interrupted import first); the
+load's work folder (import-* in UPLOAD_DIR) and a replace's scratch staging
+collection, which stay until the API's next start (docker compose restart api).
+A replace stopped after the old collection was deleted keeps the old data in
+the recovery collection the import made; load the package again with
+--on-conflict replace, or restore from that collection.
 """
 from __future__ import annotations
 
@@ -61,17 +71,43 @@ def _say(line: str) -> None:
     print("loader: " + line, file=sys.stderr, flush=True)
 
 
+# The run's state, for the Ctrl-C handler: the job once the load has started,
+# and whether a record is being written (the handler then writes none: the
+# audit log's locks are held, and that record is the run's own).
+_state: dict = {}
+
+
 def _audit(package: str, on_conflict: str, encrypted: bool, collection: str | None,
-           code: str | None = None, chunks: int | None = None) -> None:
+           result: str = "success", code: str | None = None, chunks: int | None = None) -> None:
     from services import audit
     details: dict = {"on_conflict": on_conflict, "encrypted": encrypted}
     if chunks is not None:
         details["chunks"] = chunks
     if code:
         details["code"] = code
-    if not audit.record("operator.load", result="refused" if code else "success", actor="operator",
-                        actor_kind="operator", target=package, collection=collection, details=details):
+    _state["auditing"] = True
+    try:
+        written = audit.record("operator.load", result=result, actor="operator", actor_kind="operator",
+                               target=package, collection=collection, details=details)
+    finally:
+        _state["auditing"] = False
+    if not written:
         _say("the audit record could not be written")
+
+
+def _interrupted(package: str, on_conflict: str, encrypted: bool):
+    """The SIGINT handler: record the load as interrupted, then die of the
+    signal as a kill would, so the import's `finally` never retires the marker
+    of a half-built collection."""
+    def handler(signum, frame):
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        if not _state.get("auditing"):
+            job = _state.get("job") or {}
+            _say("load interrupted: INTERRUPTED")
+            _audit(package, on_conflict, encrypted, job.get("collection"), result="interrupted",
+                   code="INTERRUPTED")
+        os.kill(os.getpid(), signal.SIGINT)
+    return handler
 
 
 def _passphrase() -> str:
@@ -116,6 +152,7 @@ def _load(package: str, on_conflict: str, passphrase: str | None) -> dict:
         "owner": None, "operator": True,        # access: restricted, no grants (#670)
     }
     job = importer._jobs[job_id]
+    _state["job"] = job
     done = threading.Event()
     ticker = threading.Thread(target=_progress, args=(job, done), daemon=True)
     ticker.start()
@@ -140,14 +177,15 @@ def main(argv=None) -> int:
         parser.error(f"not a package name: {args.package!r} (ragpkg-*.tar.gz or ragpkg-*.tar.gz.age, "
                      "a file in ./exports)")
 
-    # Ctrl-C acts as a kill: the import's clean-up would otherwise retire the
-    # marker of a half-built collection that the next load must remove.
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-
     from config import settings
     from services import importer, packager
     package, on_conflict = args.package, args.on_conflict
     encrypted = age_stream.is_encrypted_name(package)
+    # Ctrl-C is recorded, then acts as a kill: Python's KeyboardInterrupt would
+    # run the import's clean-up, which retires the marker of a half-built
+    # collection that the next load must remove.
+    _state.clear()
+    signal.signal(signal.SIGINT, _interrupted(package, on_conflict, encrypted))
     _say(f"loading {package} (on conflict: {on_conflict})")
     lock = None
     try:
@@ -174,7 +212,7 @@ def main(argv=None) -> int:
         job = _load(package, on_conflict, passphrase)
     except _Refused as refused:
         _say(f"load refused: {refused.code}: {refused}")
-        _audit(package, on_conflict, encrypted, None, code=refused.code)
+        _audit(package, on_conflict, encrypted, None, result="refused", code=refused.code)
         return 1
     finally:
         if lock is not None:
@@ -190,7 +228,7 @@ def main(argv=None) -> int:
         return 0
     code = job.get("error_code") or "IMPORT_FAILED"
     _say(f"load failed: {code}: {job.get('error')}")
-    _audit(package, on_conflict, encrypted, job.get("collection"), code=code)
+    _audit(package, on_conflict, encrypted, job.get("collection"), result="failed", code=code)
     return 1
 
 

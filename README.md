@@ -306,8 +306,9 @@ deletion of one, after its download or when it expired (`package.delete`,
 with the reason; an expiry's actor is `system`); every change and
 refusal on the Users and Service keys pages; every `python -m auth` action
 but `list` (actor `operator`); every `python -m loader` run past its arguments
-(`operator.load`, actor `operator`, with the package, the collection and the
-chunks loaded or the refusal's code; see [Query-only mode](#query-only-mode));
+(`operator.load`, actor `operator`, result `success`, `refused`, `failed` or
+`interrupted`, with the package, the collection and the chunks loaded or the
+code; see [Query-only mode](#query-only-mode));
 reads of the audit log; and each API start.
 Each record names the actor (a username, a service principal with the key id,
 `operator` or `system`), their role at the time, the client address, the
@@ -610,21 +611,33 @@ audit log, health, and export with the package list and download.
    be the build machine's (`EMBED_MODEL`), or the load is refused with
    `EMBEDDING_MISMATCH`. `--on-conflict` is `abort` by default (refused when the
    collection exists); `rename` loads it under a new name; `replace` loads a
-   newer build over the existing collection, and a question or export of that
-   collection can fail while the replace runs. For an encrypted package
+   newer build over the existing collection. While any load runs, whatever
+   its mode, a question or export of its collection can meet it half-built or
+   fail: wait for the loader to finish. For an encrypted package
    (`.tar.gz.age`) the loader asks for the passphrase, or reads it as the first
    line of standard input with `docker compose exec -T api python -m loader
    <package> < passphrase-file`; it is never an argument. One load runs at a
    time. Each step is a line starting `loader:`; the exit status is 0 loaded,
    1 refused or failed, 2 a usage error; each run is an `operator.load` record
-   in the [audit log](#audit-log). The loader runs only on a query-only
-   instance: a full instance imports on the Transfer page. If a load is
-   stopped (Ctrl-C), the next load or the API's next start removes what it
-   left half-built.
-5. **Open it** to the people who should use it. A collection the loader
-   creates starts restricted with no grants, so only AI Engineers can use it
-   until one opens it or grants it to accounts and keys on the Collections page
-   (**Access**). A `replace` keeps the collection's access.
+   in the [audit log](#audit-log), with result `success`, `refused` (before the
+   load), `failed` or `interrupted`. The loader runs only on a query-only
+   instance: a full instance imports on the Transfer page.
+
+   **If a load is stopped** (Ctrl-C), it is recorded as `interrupted` and
+   then ends at once. A collection it was building is left half-built until
+   the next load, which removes it first. The load's work folder (`import-*`
+   in the upload volume, several GB for a package with models) and, for a
+   `replace`, its scratch staging collection stay until the API restarts:
+   run `docker compose restart api` to remove them. A `replace` stopped after
+   it had deleted the old collection leaves the old data in the recovery
+   collection the import keeps (`<Name>__importing_<token>`, listed on the
+   Collections page): load the package again with `--on-conflict replace`, or
+   export the recovery collection and load that package.
+5. **Open it** to the people who should use it. Every collection the loader
+   creates, a `rename` included, starts restricted with no grants, so only AI
+   Engineers can use it until one opens it or grants it to accounts and keys
+   on the Collections page (**Access**). The loader never copies another
+   collection's access; only a `replace` keeps the collection's access.
 6. **Query.** Users ask questions on the Q&A page or through the API, on this
    machine or, in LAN mode, from the network.
 
