@@ -129,7 +129,7 @@ services:
       SOURCES_DIR: /app/sources
       EXPORTS_DIR: /app/exports
       OLLAMA_MODELS_DIR: /ollama
-      # Shown by /health and compared against the memory Docker actually
+      # Shown by /health/details and compared against the memory Docker actually
       # provides. Raise this if you allocate more to Docker Desktop.
       RECOMMENDED_MEMORY_GB: 12
       # The most one upload's ZIPs may expand to in all, gzipped members'
@@ -4368,7 +4368,7 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *Three services — Weaviate, LLM and Embed, each with its model name and
       latency. Polling measured at 30s intervals.*
 - [x] Health dashboard shows a degraded 503 body with the failing services red, loads the latency metrics while health is degraded or can't be read, and shows a message, with no stale cards, when health can't be read.
-      *Evidence: `scripts/verify/browser/ui_criteria.js` (suite 06) stubs `/api/health` with a
+      *Evidence: `scripts/verify/browser/ui_criteria.js` (suite 06) stubs `/api/health/details` with a
       degraded 503, a proxy 502, a refused connection and a 503 without a health body; its checks
       fail on the code before #375. `scripts/tests/test_health.py` (suite 01) checks the 503 body
       for a missing model and an unreachable Ollama or Weaviate.
@@ -4865,7 +4865,7 @@ the tests reviewer's full `stack.sh run` and `stack.sh run --query-only` on the 
 
 Memory and swap are set in **Docker Desktop → Settings → Resources**, not in
 `docker-compose.yml`; a compose `mem_limit` caps a container and cannot raise the
-VM ceiling. `/health` reports the allocated figure against
+VM ceiling. `/health/details` reports the allocated figure against
 `RECOMMENDED_MEMORY_GB` (§3.1.1) so a misconfigured host is visible rather than
 presenting as mysterious timeouts.
 
