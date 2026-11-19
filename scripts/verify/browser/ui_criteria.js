@@ -1180,7 +1180,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
   }
 
   // ── degraded and unreachable health (#375) ─────────────────────────────────
-  // /health answers 503 with its per-service body when a dependency is down. The
+  // /health/details answers 503 with its per-service body when a dependency is down. The
   // page must show that body, red for the failing service, keep loading the
   // latency metrics, and say so when health can't be read at all. Each load is
   // driven by hand through the captured 30s refresh, with the answers stubbed.
