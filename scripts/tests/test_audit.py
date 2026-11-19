@@ -881,7 +881,7 @@ class ReviewerConcurrencyTests(AuditTestCase):
     def test_full_reads_while_writers_rotate_are_whole_prefixes(self):
         # A read holds every record up to some point, each once, newest first:
         # exactly the oldest-first prefix of the final log, reversed.
-        partial = 0                                   # reads made while the writers ran
+        partial = 0                                   # reads, other than the held one, made while the writers ran
         THREADS = 4
         for round_ in range(self.ROUNDS):
             with self.subTest(round=round_), self.settings_patch():
@@ -926,12 +926,13 @@ class ReviewerConcurrencyTests(AuditTestCase):
                 self.assertEqual(len(final), 60 + 4 * 150 + 150)
                 self.assertEqual(len(set(final)), len(final))
                 self.assertGreater(len(list(self.audit_dir.glob("audit.jsonl.*"))), 20)   # it rotated a lot
-                partial += sum(1 for ids in reads if len(ids) < len(final))
+                partial += sum(1 for ids in reads if len(ids) < len(final) and ids is not held_read[0])
                 for n, ids in enumerate(reads):
                     self.assertEqual(list(reversed(ids)), final[:len(ids)],
                                      f"read {n} of {len(reads)} ({len(ids)} records) isn't a whole prefix: "
                                      f"{len(ids) - len(set(ids))} duplicate(s)")
-        self.assertGreater(partial, 0, "no read overlapped the writers, so the race wasn't exercised")
+        self.assertGreater(partial, 0, "no read other than the held one overlapped the writers, "
+                                       "so the race wasn't exercised")
 
     def test_paging_with_the_cursor_while_writers_rotate(self):
         # Paging back from the first page with `before` while records are added
