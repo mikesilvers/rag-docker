@@ -4571,11 +4571,10 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   deletes an account; each change and refusal is one API log line with no password. A username breaking the rule is
   `422 INVALID_USERNAME` whatever its length, its refusal logged and audited cut to 256 characters.
   *Evidence: `test_auth.py` `AdminRouteTests`, `StoreTests.test_two_last_engineer_changes_at_once_leave_one_engineer`
-  (two last-engineer changes at the same time leave one engineer) and the policy checks (suite 17); `auth_stack.py
-  matrix` with the six
-  routes for every role and `auth_stack.py admin-accounts` on the running stack, with a throwaway `vfy-t-*`
-  account and the API log searched for the generated passwords (suite 17). These checks fail on the code before
-  PR 2 of #25, which has no such routes.*
+  (two last-engineer changes at the same time leave one engineer) and the policy checks (suite 17);
+  `auth_stack.py matrix` with the six routes for every role and `auth_stack.py admin-accounts` on the running stack,
+  with a throwaway `vfy-t-*` account and the API log searched for the generated passwords (suite 17). These checks
+  fail on the code before PR 2 of #25, which has no such routes.*
 - [x] The Users page: an engineer-only entry in the nav's Admin menu and route; the account list; create and reset show the generated
   password once until "Done"; no reset on the own row; role change, disable and enable; reset, disable and a role
   change ask first (the own row says what it does to the engineer), a cancel sends nothing, and enable doesn't ask;
