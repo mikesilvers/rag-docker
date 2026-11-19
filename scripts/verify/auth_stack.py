@@ -393,6 +393,12 @@ def check_service_keys(operator_ok):
 def check_public(operator_ok):
     status, raw, _ = code("GET", "/health", headers={})
     expect(status in (200, 503), "GET /health without a session answered {}".format(status))
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        body = None
+    expect(body in ({"status": "ok"}, {"status": "degraded"}),
+           "GET /health without a session answered {} {!r}, not a status-only body".format(status, raw[:200]))
     status, raw, _ = code("GET", "/auth/status", headers={})
     expect(status == 200 and json.loads(raw) == {"setup_required": False},
            "GET /auth/status answered {} {!r}".format(status, raw[:200]))

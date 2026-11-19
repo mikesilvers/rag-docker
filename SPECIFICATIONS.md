@@ -4799,8 +4799,8 @@ are ticked once the tests reviewer's full `stack.sh run` on the change passes.
       query's. Every other check runs on one model.
       *Evidence: `scripts/verify/23_llm_split.sh` (full runs only); `test_prepare.py` (suite 21),
       `test_goldstandard_api_paths.py` (suite 09, through 04) and `test_retrieval_controls.py` (suite 11).*
-- [ ] `/api/health` reports `llm` (the answer model), `build_llm` and `same_model`; a missing build or answer
-      model answers 503 `degraded`; `same_model` never affects the status. The Health page shows one LLM card
+- [ ] `/api/health/details` (a Developer or AI Engineer session) reports `llm` (the answer model), `build_llm` and `same_model`, and the public `/api/health` answers only `{"status": ...}`; a missing build or answer
+      model answers 503 `degraded` on both; `same_model` never affects the status. The Health page shows one LLM card
       ("builds and answers") when `same_model` is true, otherwise an Answer LLM card and a Build LLM card, and
       treats a body without `build_llm` as unreadable.
       *Evidence: `scripts/tests/test_health.py` `TwoModelsTests` (suite 01); suite 01's real-stack check that
