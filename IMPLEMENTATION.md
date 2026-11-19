@@ -27024,8 +27024,8 @@ import { useAuth } from '../context/AuthContext'
 
 const ROLES: Role[] = ['end_user', 'developer', 'engineer']
 const ROLE_LABELS: Record<Role, string> = { end_user: 'End User', developer: 'Developer', engineer: 'AI Engineer' }
-// Reset password, Disable and a role change ask first, on every row; Enable
-// doesn't (#551). The own row says what the change does to the Engineer.
+// Reset password, Reset two-step, Disable and a role change ask first, on every
+// row; Enable doesn't (#551, #779). The own row says what the change does to the Engineer.
 const ASK = {
   role: (name: string, own: boolean, next: Role) => own
     ? `Change your own role to ${ROLE_LABELS[next]}? You will lose access to the Users page.`
@@ -27034,6 +27034,7 @@ const ASK = {
     ? "Disable your own account? You will be logged out and can't log in again until another AI Engineer enables you."
     : `Disable ${name}? Their sessions end and they can't log in until enabled.`,
   reset: (name: string) => `Reset the password of ${name}? Their sessions end and they must change the new password at their next login.`,
+  reset2: (name: string) => `Reset the two-step verification of ${name}? Their sessions end and they must log in again with their password alone.`,
 }
 
 // Account administration for Engineers (#25). The API decides what is allowed:
@@ -27186,7 +27187,7 @@ export default function UsersPage() {
                     onClick={() => { if (!u.enabled || window.confirm(ASK.disable(u.username, own))) act(u.username, () => u.enabled ? api.disableUser(u.username) : api.enableUser(u.username)) }}
                     className="text-blue-600 hover:underline disabled:opacity-50">{u.enabled ? 'Disable' : 'Enable'}</button>
                   {u.mfa_enrolled && !own && (
-                    <button disabled={busy} onClick={() => act(u.username, () => api.resetUserMfa(u.username))}
+                    <button disabled={busy} onClick={() => { if (window.confirm(ASK.reset2(u.username))) act(u.username, () => api.resetUserMfa(u.username)) }}
                       className="text-blue-600 hover:underline disabled:opacity-50">Reset two-step</button>
                   )}
                 </td>
@@ -59467,6 +59468,10 @@ function mfaCases() {
   const on = { enrolled: true, enrolled_at: '2026-11-16T12:00:00Z', required: false, recovery_codes_remaining: 10 };
   const me = (role, over = {}) => ({ username: 'vfy-' + role.replace('_', '-'), role, must_change_password: false, ...over });
   const row = (username, role, over = {}) => ({ username, role, enabled: true, must_change_password: false, created_at: '2026-10-01T12:00:00Z', mfa_enrolled: false, ...over });
+  // Reset two-step asks first (#779): each Users case below keeps what was asked.
+  const RESET2_ASK = 'Reset the two-step verification of vfy-developer? Their sessions end and they must log in again with their password alone.';
+  const resetAccepted = { seen: [] }, resetCancelled = { seen: [] };
+  const dialogTo = (d, accept) => async dlg => { d.seen.push(dlg.message()); if (accept) await dlg.accept(); else await dlg.dismiss(); };
   return [
     { name: 'The account menu has Account, which opens the two-step set-up: a QR code, the key as text, and the codes once', open: { role: 'developer', path: '/qa', routes: base({
       'GET /api/auth/mfa': json(200, off),
@@ -59586,7 +59591,7 @@ function mfaCases() {
         'POST /api/auth/users/vfy-developer/reset-mfa': () => { list[0].mfa_enrolled = false; return json(200, { user: list[0] }); },
         'POST /api/auth/mfa/policy': apiError(409, 'MFA_ENROLL_FIRST', 'Set up two-step verification for your own account first, on the Account page.'),
       });
-    })() }, async run(s) {
+    })(), onDialog: dialogTo(resetAccepted, true) }, async run(s) {
       await waitText(s.page, 'vfy-off');
       const buttons = u => s.page.evaluate(n => [...document.querySelectorAll(`tr[data-username="${n}"] button`)].map(b => b.textContent.trim()), u);
       assert.deepEqual(await buttons('vfy-developer'), ['Reset password', 'Disable', 'Reset two-step']);
@@ -59595,10 +59600,22 @@ function mfaCases() {
       await s.page.evaluate(() => [...document.querySelectorAll('tr[data-username="vfy-developer"] button')].find(b => b.textContent.trim() === 'Reset two-step').click());
       await waitFor(s.page, () => document.querySelector('tr[data-username="vfy-developer"] td:nth-child(5)').textContent.trim() === 'Off', 'Off after the reset');
       assert.equal(callsTo(s, 'POST', '/api/auth/users/vfy-developer/reset-mfa').length, 1);
+      assert.deepEqual(resetAccepted.seen, [RESET2_ASK]);
       await s.page.click('#mfa-required');
       await waitText(s.page, 'for your own account first');
       assert.deepEqual(callsTo(s, 'POST', '/api/auth/mfa/policy').map(c => c.body), [{ required: true }]);
       assert.equal(await s.page.evaluate(() => document.querySelector('#mfa-required').checked), false);
+    } },
+    { name: 'A cancelled Reset two-step sends nothing', open: { role: 'engineer', path: '/users', routes: base({
+      'GET /api/auth/users': () => json(200, { users: [row('vfy-developer', 'developer', { mfa_enrolled: true }), row('vfy-engineer', 'engineer', { mfa_enrolled: true })] }),
+    }), onDialog: dialogTo(resetCancelled, false) }, async run(s) {
+      await waitText(s.page, 'vfy-developer');
+      await s.page.evaluate(() => [...document.querySelectorAll('tr[data-username="vfy-developer"] button')].find(b => b.textContent.trim() === 'Reset two-step').click());
+      // A dismissed confirmation is answered inside the click; the pause only gives a wrongly sent request time to be seen.
+      await new Promise(r => setTimeout(r, 300));
+      assert.deepEqual(resetCancelled.seen, [RESET2_ASK]);
+      assert.equal(s.calls.filter(c => c.method === 'POST' && c.path.startsWith('/api/auth/users/')).length, 0);
+      assert.equal(await s.page.evaluate(() => document.querySelector('tr[data-username="vfy-developer"] td:nth-child(5)').textContent.trim()), 'On');
     } },
   ];
 }
@@ -60156,10 +60173,12 @@ function prepareCases() {
       });
     })(), async run(s) {
       await waitText(s.page, 'minutes.txt');
+      await waitSelected(s.page, 0);
       await fillNth(s.page, 'select', 0, B);
       await press(s.page, 'Import all prepared');
       await waitFor(s.page, () => [...document.querySelectorAll('[role=alert]')].some(a => a.textContent.includes('total 600.0 MB; one import can be at most 512 MB') && a.textContent.includes('Import them in smaller selections.')), 'the IMPORT_TOO_LARGE alert');
       assert.equal(callsTo(s, 'POST', '/api/prepare/import').length, 1);
+      assert.equal(callsTo(s, 'POST', '/api/prepare/import')[0].body.collection, B);
       const input = await s.page.$('#prepare-file-input');
       await input.uploadFile(...tempFiles(['a.txt', 'b.zip']));
       await waitText(s.page, 'b.zip');

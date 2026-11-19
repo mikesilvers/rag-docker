@@ -4,8 +4,8 @@ import { useAuth } from '../context/AuthContext'
 
 const ROLES: Role[] = ['end_user', 'developer', 'engineer']
 const ROLE_LABELS: Record<Role, string> = { end_user: 'End User', developer: 'Developer', engineer: 'AI Engineer' }
-// Reset password, Disable and a role change ask first, on every row; Enable
-// doesn't (#551). The own row says what the change does to the Engineer.
+// Reset password, Reset two-step, Disable and a role change ask first, on every
+// row; Enable doesn't (#551, #779). The own row says what the change does to the Engineer.
 const ASK = {
   role: (name: string, own: boolean, next: Role) => own
     ? `Change your own role to ${ROLE_LABELS[next]}? You will lose access to the Users page.`
@@ -14,6 +14,7 @@ const ASK = {
     ? "Disable your own account? You will be logged out and can't log in again until another AI Engineer enables you."
     : `Disable ${name}? Their sessions end and they can't log in until enabled.`,
   reset: (name: string) => `Reset the password of ${name}? Their sessions end and they must change the new password at their next login.`,
+  reset2: (name: string) => `Reset the two-step verification of ${name}? Their sessions end and they must log in again with their password alone.`,
 }
 
 // Account administration for Engineers (#25). The API decides what is allowed:
@@ -166,7 +167,7 @@ export default function UsersPage() {
                     onClick={() => { if (!u.enabled || window.confirm(ASK.disable(u.username, own))) act(u.username, () => u.enabled ? api.disableUser(u.username) : api.enableUser(u.username)) }}
                     className="text-blue-600 hover:underline disabled:opacity-50">{u.enabled ? 'Disable' : 'Enable'}</button>
                   {u.mfa_enrolled && !own && (
-                    <button disabled={busy} onClick={() => act(u.username, () => api.resetUserMfa(u.username))}
+                    <button disabled={busy} onClick={() => { if (window.confirm(ASK.reset2(u.username))) act(u.username, () => api.resetUserMfa(u.username)) }}
                       className="text-blue-600 hover:underline disabled:opacity-50">Reset two-step</button>
                   )}
                 </td>
