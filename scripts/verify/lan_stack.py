@@ -1,6 +1,6 @@
 """LAN mode on the verify project (#26). Host-side, standard library, Python 3.9+.
 
-    python3 lan_stack.py https|hosts|tls|bindings|cookie|origin|refusals|rate-limit|address
+    python3 lan_stack.py https|hosts|tls|bindings|cookie|origin|server-tokens|refusals|rate-limit|address
 
 Run by 18_lan.sh in a `stack.sh run --lan`, which brings the verify project up
 in LAN mode with TLS on 127.0.0.1:<verify port> only, copies the certificate
@@ -21,6 +21,9 @@ printing what failed:
             SameSite=Strict
   origin    a cookie-authenticated change from another origin is refused 403
             CROSS_ORIGIN_REFUSED, and from https://localhost:<port> accepted
+  server-tokens
+            the Server header is exactly "nginx" on an API answer and on
+            nginx's own 421 page, whose body names no version either (#555)
   refusals  a one-off api container of the LAN configuration (no ports, the
             running project untouched) refuses to start, with one line, when
             AUTH_COOKIE_SECURE is false and when its account store is empty
@@ -140,6 +143,21 @@ def check_hosts():
     for path in ("/api/health", "/"):
         status = status_for(host, path)
         assert status == 421, "Host {} got {} at {}, not 421".format(host, status, path)
+
+
+def check_server_tokens():
+    for host, path, expected in (("localhost", "/api/health", 200), ("rebind.invalid", "/", 421)):
+        conn = http.client.HTTPSConnection("localhost", port(), context=context(), timeout=60)
+        try:
+            conn.request("GET", path, headers={"Host": "{}:{}".format(host, port())})
+            response = conn.getresponse()
+            body = response.read().decode("utf-8", "replace")
+            server = response.getheader("Server")
+        finally:
+            conn.close()
+        assert response.status == expected, "Host {} got {} at {}, not {}".format(host, response.status, path, expected)
+        assert server == "nginx", "Host {} at {}: Server header {!r}, not 'nginx'".format(host, path, server)
+        assert not re.search(r"nginx/\d", body), "Host {} at {}: the page names nginx's version".format(host, path)
 
 
 def handshake(ctx, alpn=None):
@@ -281,7 +299,8 @@ def check_address():
 
 
 CHECKS = {"https": check_https, "hosts": check_hosts, "tls": check_tls, "bindings": check_bindings,
-          "cookie": check_cookie, "origin": check_origin, "refusals": check_refusals,
+          "cookie": check_cookie, "origin": check_origin, "server-tokens": check_server_tokens,
+          "refusals": check_refusals,
           "rate-limit": check_rate_limit, "address": check_address}
 
 
