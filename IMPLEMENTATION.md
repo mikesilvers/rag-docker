@@ -51697,9 +51697,13 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     }
 
     // Transfer, stubbed: reopening the job a panel is polling, while its poll is
-    // in flight, keeps one poll chain (#629). Each lookup answers after 1 s, so
-    // one chain polls at most 3 times in 7 s (answer, then 2 s wait); a second
-    // chain for the same job would make it at least 4.
+    // in flight, keeps one poll chain (#629). The stub holds every lookup of the
+    // job until the test releases it, so "in flight when the row is clicked" is
+    // true by construction, not by a race with a timer. After the reopen the
+    // test releases the held lookups, the old chain's first and the new chain's,
+    // and counts the lookups that follow: one chain makes exactly one (after its
+    // 2 s wait), and an old chain that the reopen did not stop makes a second.
+    // No wall-clock window is counted, so a slow machine cannot change the result.
     {
       const s = await session(browser, BASE, 'developer');
       try {
@@ -51711,6 +51715,11 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
           collection: null, original_collection: null, chunks_written: 2, fidelity: null, renamed: false, notes: [],
           restored_sessions: [], error: null, error_code: null, error_detail: null };
         const lookups = { '/api/export/job/vfy629e': [], '/api/import/job/vfy629i': [] };
+        // Answers a held lookup. A request the page has already dropped is ignored.
+        const release = lookup => {
+          lookup.answered = true;
+          lookup.request.respond(json(lookup.path.includes('/export/') ? exportJob : importJob)).catch(() => {});
+        };
         await s.page.setRequestInterception(true);
         s.page.on('request', request => {
           const path = new URL(request.url()).pathname;
@@ -51719,35 +51728,41 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
           if (path === '/api/import/jobs') return request.respond(json({ jobs: [
             { ...importJob, owner: mine, created_at: at(30), finished_at: null }] }));
           if (path in lookups) {
-            const lookup = { start: Date.now(), answered: false };
-            lookups[path].push(lookup);
-            setTimeout(() => {
-              lookup.answered = true;
-              request.respond(json(path.includes('/export/') ? exportJob : importJob)).catch(() => {});
-            }, 1000);
+            lookups[path].push({ path, request, answered: false });
             return;
           }
           return request.continue();
         });
-        await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' });
-        // Waits for a new lookup of the job, then clicks the job's row while it
-        // is in flight: still unanswered once the click has happened.
-        const reopen = async (path, text) => {
-          const before = lookups[path].length;
-          for (let i = 0; i < 100 && lookups[path].length === before; i++) await sleep(50);
-          const inflight = lookups[path][lookups[path].length - 1];
-          const clickedAt = Date.now();
-          const clicked = await clickRow(s.page, text);
-          return { path, clickedAt, inFlight: !!inflight && lookups[path].length > before && clicked && !inflight.answered };
+        // Held lookups keep connections open, so the page is not waited on to go idle.
+        await s.page.goto(BASE + '/transfer', { waitUntil: 'domcontentloaded' });
+        // Waits for a condition, polling every 50 ms, for at most limit ms.
+        const until = async (condition, limit = 8000) => {
+          for (let waited = 0; waited < limit && !condition(); waited += 50) await sleep(50);
+          return condition();
         };
-        const exported = await reopen('/api/export/job/vfy629e', 'StubExport629');
-        const imported = await reopen('/api/import/job/vfy629i', 'ragpkg-stub629.tar.gz');
-        await sleep(imported.clickedAt + 7200 - Date.now());
-        for (const [kind, click] of [['export', exported], ['import', imported]]) {
-          const count = lookups[click.path].filter(l => l.start >= click.clickedAt && l.start <= click.clickedAt + 7000).length;
+        const check629 = async (kind, path, text) => {
+          // Each panel opens its running job on load and makes its first lookup, which is held.
+          const arrived = await until(() => lookups[path].length >= 1);
+          const before = lookups[path].length;
+          const first = lookups[path][0];
+          const clicked = arrived && await clickRow(s.page, text);
+          // The reopen starts a new chain with a lookup at once: exactly one more.
+          await until(() => lookups[path].length > before);
+          await sleep(300);
+          const started = lookups[path].length - before;
+          const inFlight = !!clicked && !!first && !first.answered && started === 1;
+          // Release the old chain's lookup, then the new chain's.
+          for (const lookup of lookups[path]) if (!lookup.answered) release(lookup);
+          const released = lookups[path].length;
+          await until(() => lookups[path].length > released);
+          // A second chain would make its lookup at the same moment; allow for it.
+          await sleep(1500);
+          const after = lookups[path].length - released;
           r.check(`Transfer: reopening the polled ${kind} while its poll is in flight keeps one poll chain (#629)`,
-            click.inFlight && count <= 3, `inFlight=${click.inFlight} lookups in 7 s=${count}`);
-        }
+            inFlight && after === 1, `inFlight=${inFlight} new lookups after release=${after}`);
+        };
+        await check629('export', '/api/export/job/vfy629e', 'StubExport629');
+        await check629('import', '/api/import/job/vfy629i', 'ragpkg-stub629.tar.gz');
       } finally { await s.ctx.close(); }
     }
 
