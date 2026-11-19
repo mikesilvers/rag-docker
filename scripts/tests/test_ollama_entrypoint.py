@@ -249,20 +249,25 @@ class ModelSettingsTests(EntrypointTestCase):
 
     def test_a_name_with_a_space_or_glob_character_is_refused(self):
         # The names are word-split, so they are checked as compose-models.sh checks them.
-        for bad in ("two words", "llama*", "x?y", "a;b"):
+        # And the loose names (#772): "..", a leading "/" and a leading "-".
+        for bad in ("two words", "llama*", "x?y", "a;b", "a..b", "../x", "x/../y", "/x", "-x"):
             with self.subTest(name=bad):
                 result, _ = self.run_script(MODELS_SH, BUILD_LLM_MODEL=bad)
                 self.assertEqual(result.returncode, 2)
                 self.assertIn(f"models.sh: not a model name: '{bad}'", result.stderr)
                 self.assertEqual(result.stdout, "")
-        result, _ = self.run_script(MODELS_SH, ANSWER_LLM_MODEL="someone/model:v1.2_x-y")
-        self.assertEqual(result.returncode, 0, result.stderr)
+        for good in ("someone/model:v1.2_x-y", "hf.co/user/model:Q4_K_M"):
+            with self.subTest(name=good):
+                result, _ = self.run_script(MODELS_SH, ANSWER_LLM_MODEL=good)
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_the_entrypoint_stops_on_a_bad_name_before_any_pull(self):
-        result, calls = self.run_entrypoint(ANSWER_LLM_MODEL="two words")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("models.sh: not a model name: 'two words'", result.stderr)
-        self.assertEqual(self.pulls(calls), [])
+        for bad in ("two words", "a..b", "-x"):
+            with self.subTest(name=bad):
+                result, calls = self.run_entrypoint(ANSWER_LLM_MODEL=bad)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"models.sh: not a model name: '{bad}'", result.stderr)
+                self.assertEqual(self.pulls(calls), [])
 
     def test_an_unknown_command_is_refused(self):
         result, _ = self.run_script(MODELS_SH, "pull")
