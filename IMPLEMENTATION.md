@@ -28824,7 +28824,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_health.py` | controlled `/health/details` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415); the public `/health`'s status-only body and who may read the details (#750), registered by suite 01 |
 | `../tests/test_installed_authlib.py` | the Authlib installed in the built API image is the version `api/requirements.txt` pins (#565), run in the image with no network; registered by suite 01 |
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
-| `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health` reports, so the status flips to `below_recommended` on any host (#536) |
+| `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health/details` reports, so the status flips to `below_recommended` on any host (#536) |
 | `../tests/test_memory_override.py` | host-side, standard library: the derived override makes `system_info.memory_info` report `below_recommended` with a note for allocations below and above the 12.35 GB a fixed 13 GB could flip, and no override without a usable allocation (#536); embedded copies; registered by suite 01 |
 | `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command, account administration, service API keys, two-step verification (#607), per-collection access (#606); registers `../tests/test_auth.py`, `../tests/test_collection_access.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
 | `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
@@ -31616,6 +31616,12 @@ def check_service_keys(operator_ok):
 def check_public(operator_ok):
     status, raw, _ = code("GET", "/health", headers={})
     expect(status in (200, 503), "GET /health without a session answered {}".format(status))
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        body = None
+    expect(body in ({"status": "ok"}, {"status": "degraded"}),
+           "GET /health without a session answered {} {!r}, not a status-only body".format(status, raw[:200]))
     status, raw, _ = code("GET", "/auth/status", headers={})
     expect(status == 200 and json.loads(raw) == {"setup_required": False},
            "GET /auth/status answered {} {!r}".format(status, raw[:200]))
@@ -44059,7 +44065,7 @@ check "health reports the build model, the same as the answer model by default, 
 check_eq "the recommended minimum defaults to 12.0 GB" \
   "$(jfield "['resources']['memory']['recommended_minimum_gb']" < "$RAG_INFRA_TMP/vfy_health.json")" "12.0"
 # Whether this machine meets it depends on its Docker allocation, so check the
-# status agrees with the allocation /health reports, not that it is 'ok'.
+# status agrees with the allocation /health/details reports, not that it is 'ok'.
 python3 -c "
 import json, os
 m = json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_health.json'))['resources']['memory']
@@ -44070,7 +44076,7 @@ check "the memory status agrees with the reported allocation" $?
 # Raise the recommendation past the actual allocation (in-process only --
 # neither the running server nor docker-compose.yml is touched) and confirm
 # the status flips and a note is attached. The override comes from the
-# allocation /health reported, never a constant: a fixed 13 GB stayed 'ok' on
+# allocation /health/details reported, never a constant: a fixed 13 GB stayed 'ok' on
 # any host giving Docker 12.35 GB or more (#536).
 python3 "$REPO_ROOT/scripts/tests/test_memory_override.py"
 check "the memory override always exceeds the reported allocation (#536)" $?
@@ -51245,7 +51251,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
   }
 
   // ── degraded and unreachable health (#375) ─────────────────────────────────
-  // /health answers 503 with its per-service body when a dependency is down. The
+  // /health/details answers 503 with its per-service body when a dependency is down. The
   // page must show that body, red for the failing service, keep loading the
   // latency metrics, and say so when health can't be read at all. Each load is
   // driven by hand through the captured 30s refresh, with the answers stubbed.

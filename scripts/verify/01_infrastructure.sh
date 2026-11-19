@@ -202,7 +202,7 @@ check "health reports the build model, the same as the answer model by default, 
 check_eq "the recommended minimum defaults to 12.0 GB" \
   "$(jfield "['resources']['memory']['recommended_minimum_gb']" < "$RAG_INFRA_TMP/vfy_health.json")" "12.0"
 # Whether this machine meets it depends on its Docker allocation, so check the
-# status agrees with the allocation /health reports, not that it is 'ok'.
+# status agrees with the allocation /health/details reports, not that it is 'ok'.
 python3 -c "
 import json, os
 m = json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_health.json'))['resources']['memory']
@@ -213,7 +213,7 @@ check "the memory status agrees with the reported allocation" $?
 # Raise the recommendation past the actual allocation (in-process only --
 # neither the running server nor docker-compose.yml is touched) and confirm
 # the status flips and a note is attached. The override comes from the
-# allocation /health reported, never a constant: a fixed 13 GB stayed 'ok' on
+# allocation /health/details reported, never a constant: a fixed 13 GB stayed 'ok' on
 # any host giving Docker 12.35 GB or more (#536).
 python3 "$REPO_ROOT/scripts/tests/test_memory_override.py"
 check "the memory override always exceeds the reported allocation (#536)" $?
