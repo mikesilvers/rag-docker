@@ -3794,7 +3794,7 @@ rag-docker/
 │   │   ├── importer.py          # Import job: validation order, conflicts, atomicity
 │   │   ├── model_bundle.py      # Ollama manifest + blob copy, both directions
 │   │   ├── tuning.py            # Re-chunk / re-embed / re-index, staged rebuilds
-│   │   ├── system_info.py       # VM memory reporting for /health
+│   │   ├── system_info.py       # VM memory reporting for /health/details
 │   │   └── goldstandard.py      # Generation, session management
 │   ├── models/
 │   │   └── schemas.py           # Pydantic request/response models
