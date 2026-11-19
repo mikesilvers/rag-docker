@@ -1078,7 +1078,7 @@ All use the existing envelope, `{"error": {"code", "message", "detail"}}`.
 | E5 | Export produces a file matching the §4.1 pattern in `./exports` |
 | E6 | Manifest digests match every file listed |
 | E7 | A collection with sources exports `fidelity: with-sources`; a pre-retention one exports `chunks-only` |
-| E8 | `python retrieve.py "question"` returns an answer with no third-party packages installed |
+| E8 | `python retrieve.py "question"` returns an answer with no third-party packages installed. The verify check proves retrieval rather than generated text: it checks exit 0 and the citation count (suite 15) |
 | E9 | `retrieve.py --top-k 10` overrides the baked default |
 | E10 | `retrieve.py` exits 3 with one sentence when the stack is down |
 | E11 | Import into a clean instance reproduces chunk count and answers equivalently |
