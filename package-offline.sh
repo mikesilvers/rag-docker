@@ -67,8 +67,10 @@ docker volume inspect "$MODELVOL" >/dev/null 2>&1 \
 # llama3.1:8b became the default holds only phi3.5). The names are the ones the
 # entrypoint resolves from the LLM settings compose gives the ollama service
 # (#671), read as the CI model cache reads them; a manifest without a tag is
-# under "latest". A library model is under library/<name>, a namespaced one
-# (`user/model`) under its own namespace.
+# under "latest". A library model is under registry.ollama.ai/library/<name>, a
+# namespaced one (`user/model`) under registry.ollama.ai/<user>/<model>, and one
+# whose first path segment is a host, with a dot (`hf.co/user/model`), under that
+# host's own manifest directory (#772).
 MODELS="$(bash ollama/compose-models.sh)" \
   || { echo "ERROR: could not read the model names (ollama/compose-models.sh)." >&2; exit 1; }
 MODELS="$(echo $MODELS)"   # one line, space-separated
@@ -79,8 +81,11 @@ MISSING="$(docker run --rm --network none --entrypoint sh \
   -c 'for m in "$@"; do
         n=${m%%:*}; t=latest
         case "$m" in *:*) t=${m#*:} ;; esac
-        case "$n" in */*) p=$n ;; *) p=library/$n ;; esac
-        [ -f "/models/models/manifests/registry.ollama.ai/$p/$t" ] || echo "$m"
+        case "$n" in
+          */*) case "${n%%/*}" in *.*) p=$n ;; *) p=registry.ollama.ai/$n ;; esac ;;
+          *) p=registry.ollama.ai/library/$n ;;
+        esac
+        [ -f "/models/models/manifests/$p/$t" ] || echo "$m"
       done' sh $MODELS)" \
   || { echo "ERROR: could not read the models in volume '$MODELVOL'." >&2; exit 1; }
 if [ -n "$MISSING" ]; then

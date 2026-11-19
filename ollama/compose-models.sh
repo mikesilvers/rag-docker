@@ -25,7 +25,9 @@ except (ValueError, KeyError, TypeError, AttributeError):
     sys.exit("compose-models.sh: the compose config has no ollama service.")
 for key in ("LLM_MODEL", "BUILD_LLM_MODEL", "ANSWER_LLM_MODEL"):
     value = env.get(key) or ""
-    if not re.fullmatch(r"[A-Za-z0-9._:/-]*", value):
+    # The rule ollama/models.sh applies: those characters only, and no "..", no
+    # leading "/" or "-" (#772). An empty value means not set.
+    if not re.fullmatch(r"[A-Za-z0-9._:/-]*", value) or ".." in value or value.startswith(("/", "-")):
         sys.exit("compose-models.sh: %s is not a model name: %r" % (key, value))
     print("v:" + value)
 ')" || exit 1

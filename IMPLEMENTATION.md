@@ -523,10 +523,11 @@ EMBED_MODEL_NAME=nomic-embed-text
 
 # A model name is letters, digits and . _ : / - only, as compose-models.sh
 # requires on the host: the names are word-split below, so a space or a glob
-# character must stop here, not be split or expanded.
+# character must stop here, not be split or expanded. A name with `..`, or one
+# starting with `/` or `-`, is refused too (#772).
 for _name in "${ANSWER_MODEL}" "${BUILD_MODEL}"; do
     case "${_name}" in
-        *[!A-Za-z0-9._:/-]*)
+        *[!A-Za-z0-9._:/-]*|*..*|/*|-*)
             echo "models.sh: not a model name: '${_name}'" >&2
             # Sourced, return to the caller; run, exit.
             return 2 2>/dev/null || exit 2 ;;
@@ -607,7 +608,9 @@ except (ValueError, KeyError, TypeError, AttributeError):
     sys.exit("compose-models.sh: the compose config has no ollama service.")
 for key in ("LLM_MODEL", "BUILD_LLM_MODEL", "ANSWER_LLM_MODEL"):
     value = env.get(key) or ""
-    if not re.fullmatch(r"[A-Za-z0-9._:/-]*", value):
+    # The rule ollama/models.sh applies: those characters only, and no "..", no
+    # leading "/" or "-" (#772). An empty value means not set.
+    if not re.fullmatch(r"[A-Za-z0-9._:/-]*", value) or ".." in value or value.startswith(("/", "-")):
         sys.exit("compose-models.sh: %s is not a model name: %r" % (key, value))
     print("v:" + value)
 ')" || exit 1
@@ -52517,8 +52520,10 @@ docker volume inspect "$MODELVOL" >/dev/null 2>&1 \
 # llama3.1:8b became the default holds only phi3.5). The names are the ones the
 # entrypoint resolves from the LLM settings compose gives the ollama service
 # (#671), read as the CI model cache reads them; a manifest without a tag is
-# under "latest". A library model is under library/<name>, a namespaced one
-# (`user/model`) under its own namespace.
+# under "latest". A library model is under registry.ollama.ai/library/<name>, a
+# namespaced one (`user/model`) under registry.ollama.ai/<user>/<model>, and one
+# whose first path segment is a host, with a dot (`hf.co/user/model`), under that
+# host's own manifest directory (#772).
 MODELS="$(bash ollama/compose-models.sh)" \
   || { echo "ERROR: could not read the model names (ollama/compose-models.sh)." >&2; exit 1; }
 MODELS="$(echo $MODELS)"   # one line, space-separated
@@ -52529,8 +52534,11 @@ MISSING="$(docker run --rm --network none --entrypoint sh \
   -c 'for m in "$@"; do
         n=${m%%:*}; t=latest
         case "$m" in *:*) t=${m#*:} ;; esac
-        case "$n" in */*) p=$n ;; *) p=library/$n ;; esac
-        [ -f "/models/models/manifests/registry.ollama.ai/$p/$t" ] || echo "$m"
+        case "$n" in
+          */*) case "${n%%/*}" in *.*) p=$n ;; *) p=registry.ollama.ai/$n ;; esac ;;
+          *) p=registry.ollama.ai/library/$n ;;
+        esac
+        [ -f "/models/models/manifests/$p/$t" ] || echo "$m"
       done' sh $MODELS)" \
   || { echo "ERROR: could not read the models in volume '$MODELVOL'." >&2; exit 1; }
 if [ -n "$MISSING" ]; then
@@ -66509,8 +66517,10 @@ docker volume inspect "$MODELVOL" >/dev/null 2>&1 \
 # llama3.1:8b became the default holds only phi3.5). The names are the ones the
 # entrypoint resolves from the LLM settings compose gives the ollama service
 # (#671), read as the CI model cache reads them; a manifest without a tag is
-# under "latest". A library model is under library/<name>, a namespaced one
-# (`user/model`) under its own namespace.
+# under "latest". A library model is under registry.ollama.ai/library/<name>, a
+# namespaced one (`user/model`) under registry.ollama.ai/<user>/<model>, and one
+# whose first path segment is a host, with a dot (`hf.co/user/model`), under that
+# host's own manifest directory (#772).
 MODELS="$(bash ollama/compose-models.sh)" \
   || { echo "ERROR: could not read the model names (ollama/compose-models.sh)." >&2; exit 1; }
 MODELS="$(echo $MODELS)"   # one line, space-separated
@@ -66521,8 +66531,11 @@ MISSING="$(docker run --rm --network none --entrypoint sh \
   -c 'for m in "$@"; do
         n=${m%%:*}; t=latest
         case "$m" in *:*) t=${m#*:} ;; esac
-        case "$n" in */*) p=$n ;; *) p=library/$n ;; esac
-        [ -f "/models/models/manifests/registry.ollama.ai/$p/$t" ] || echo "$m"
+        case "$n" in
+          */*) case "${n%%/*}" in *.*) p=$n ;; *) p=registry.ollama.ai/$n ;; esac ;;
+          *) p=registry.ollama.ai/library/$n ;;
+        esac
+        [ -f "/models/models/manifests/$p/$t" ] || echo "$m"
       done' sh $MODELS)" \
   || { echo "ERROR: could not read the models in volume '$MODELVOL'." >&2; exit 1; }
 if [ -n "$MISSING" ]; then
