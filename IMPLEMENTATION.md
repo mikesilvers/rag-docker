@@ -28900,7 +28900,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_upgrade_backup.py` | host-only: the README's 1.1.0 → 1.2.0 upgrade blocks, run as written under bash, `zsh -c` and interactive zsh with comments off, against stub `docker`, `git` and `curl`; the stub docker accepts only mounts inside its temp directory and only the README's two container commands: no block holds a `#` comment line; the backup skips a missing volume (a wrong prefix) and counts only existing volumes' archives, and writes each copy to a `.tmp` file that replaces the archive only once `gzip -t` passes, so a failed or corrupt copy prints `backup FAILED` and keeps an earlier archive; the rollback is gated on `git checkout v1.1.0` and checks every archive (`gzip -t`, `tar tzf`) and volume before it empties any, and a failed restore stops before `compose up`; alpine is pinned by version and digest; git ignores `backups/` (#679, #693), registered by infrastructure |
 | `../tests/test_version_agreement.py` | host-only: the first-party version strings agree with each other, not with a fixed version: `ui/package.json`, the root versions in `ui/package-lock.json`, `mcp/mcpapp.py`, the two `service.version` defaults in `api/services/telemetry.py` and `RAG_OTEL_SERVICE_VERSION` in `docker-compose.telemetry.yml` and `docker-compose.telemetry.verify.yml` (#605, #656), registered by infrastructure |
 | `../tests/test_ui_dependencies.py` | host-only: the copy of `ui/package.json` embedded in `IMPLEMENTATION.md` (`### ui/package.json`) is the file, exactly, so a UI dependency bump that misses the copy fails (#532), registered by infrastructure |
-| `../tests/test_tailwind_output.py` | host-only, standard library plus node and npm: the built UI CSS keeps what the Tailwind 4 migration relies on (RD-157, #773): the `prose` and `prose-sm` rules, `relative`, `hover` on every device with no `@media (hover: hover)`, and the `@source` globs with automatic detection off (a sentinel `.jsx` file under `ui/src/` is scanned, a sentinel `.md` file is not). It builds a scratch copy of `ui/` with `npm ci` from the lock file and `vite build`, so it needs the network unless the npm cache holds the packages, and is skipped only when node or npm is missing; a second class reads `ui/src/index.css` and `NavBar.tsx` directly. Registered by infrastructure |
+| `../tests/test_tailwind_output.py` | runs from the host, standard library plus the docker CLI: the built UI CSS keeps what the Tailwind 4 migration relies on (RD-157, #773): the `prose` and `prose-sm` rules, `relative`, `hover` on every device with no `@media (hover: hover)`, and the `@source` globs with automatic detection off (a sentinel `.jsx` file under `ui/src/` is scanned, a sentinel `.md` file is not). It builds a scratch copy of `ui/` with `npm ci --ignore-scripts` from the lock file and `vite build` in a throwaway container of the image `ui/Dockerfile` builds with (its `builder` stage), not on the host (#826), so it needs the network unless the image and the npm cache are present, and is skipped, with a message, only when the docker CLI is missing (a docker or build failure fails it); a second class reads `ui/src/index.css` and `NavBar.tsx` directly. Registered by infrastructure |
 | `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
 | `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
@@ -51697,9 +51697,13 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
     }
 
     // Transfer, stubbed: reopening the job a panel is polling, while its poll is
-    // in flight, keeps one poll chain (#629). Each lookup answers after 1 s, so
-    // one chain polls at most 3 times in 7 s (answer, then 2 s wait); a second
-    // chain for the same job would make it at least 4.
+    // in flight, keeps one poll chain (#629). The stub holds every lookup of the
+    // job until the test releases it, so "in flight when the row is clicked" is
+    // true by construction, not by a race with a timer. After the reopen the
+    // test releases the held lookups, the old chain's first and the new chain's,
+    // and counts the lookups that follow: one chain makes exactly one (after its
+    // 2 s wait), and an old chain that the reopen did not stop makes a second.
+    // No wall-clock window is counted, so a slow machine cannot change the result.
     {
       const s = await session(browser, BASE, 'developer');
       try {
@@ -51711,6 +51715,11 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
           collection: null, original_collection: null, chunks_written: 2, fidelity: null, renamed: false, notes: [],
           restored_sessions: [], error: null, error_code: null, error_detail: null };
         const lookups = { '/api/export/job/vfy629e': [], '/api/import/job/vfy629i': [] };
+        // Answers a held lookup. A request the page has already dropped is ignored.
+        const release = lookup => {
+          lookup.answered = true;
+          lookup.request.respond(json(lookup.path.includes('/export/') ? exportJob : importJob)).catch(() => {});
+        };
         await s.page.setRequestInterception(true);
         s.page.on('request', request => {
           const path = new URL(request.url()).pathname;
@@ -51719,35 +51728,41 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
           if (path === '/api/import/jobs') return request.respond(json({ jobs: [
             { ...importJob, owner: mine, created_at: at(30), finished_at: null }] }));
           if (path in lookups) {
-            const lookup = { start: Date.now(), answered: false };
-            lookups[path].push(lookup);
-            setTimeout(() => {
-              lookup.answered = true;
-              request.respond(json(path.includes('/export/') ? exportJob : importJob)).catch(() => {});
-            }, 1000);
+            lookups[path].push({ path, request, answered: false });
             return;
           }
           return request.continue();
         });
-        await s.page.goto(BASE + '/transfer', { waitUntil: 'networkidle2' });
-        // Waits for a new lookup of the job, then clicks the job's row while it
-        // is in flight: still unanswered once the click has happened.
-        const reopen = async (path, text) => {
-          const before = lookups[path].length;
-          for (let i = 0; i < 100 && lookups[path].length === before; i++) await sleep(50);
-          const inflight = lookups[path][lookups[path].length - 1];
-          const clickedAt = Date.now();
-          const clicked = await clickRow(s.page, text);
-          return { path, clickedAt, inFlight: !!inflight && lookups[path].length > before && clicked && !inflight.answered };
+        // Held lookups keep connections open, so the page is not waited on to go idle.
+        await s.page.goto(BASE + '/transfer', { waitUntil: 'domcontentloaded' });
+        // Waits for a condition, polling every 50 ms, for at most limit ms.
+        const until = async (condition, limit = 8000) => {
+          for (let waited = 0; waited < limit && !condition(); waited += 50) await sleep(50);
+          return condition();
         };
-        const exported = await reopen('/api/export/job/vfy629e', 'StubExport629');
-        const imported = await reopen('/api/import/job/vfy629i', 'ragpkg-stub629.tar.gz');
-        await sleep(imported.clickedAt + 7200 - Date.now());
-        for (const [kind, click] of [['export', exported], ['import', imported]]) {
-          const count = lookups[click.path].filter(l => l.start >= click.clickedAt && l.start <= click.clickedAt + 7000).length;
+        const check629 = async (kind, path, text) => {
+          // Each panel opens its running job on load and makes its first lookup, which is held.
+          const arrived = await until(() => lookups[path].length >= 1);
+          const before = lookups[path].length;
+          const first = lookups[path][0];
+          const clicked = arrived && await clickRow(s.page, text);
+          // The reopen starts a new chain with a lookup at once: exactly one more.
+          await until(() => lookups[path].length > before);
+          await sleep(300);
+          const started = lookups[path].length - before;
+          const inFlight = !!clicked && !!first && !first.answered && started === 1;
+          // Release the old chain's lookup, then the new chain's.
+          for (const lookup of lookups[path]) if (!lookup.answered) release(lookup);
+          const released = lookups[path].length;
+          await until(() => lookups[path].length > released);
+          // A second chain would make its lookup at the same moment; allow for it.
+          await sleep(1500);
+          const after = lookups[path].length - released;
           r.check(`Transfer: reopening the polled ${kind} while its poll is in flight keeps one poll chain (#629)`,
-            click.inFlight && count <= 3, `inFlight=${click.inFlight} lookups in 7 s=${count}`);
-        }
+            inFlight && after === 1, `inFlight=${inFlight} new lookups after release=${after}`);
+        };
+        await check629('export', '/api/export/job/vfy629e', 'StubExport629');
+        await check629('import', '/api/import/job/vfy629i', 'ragpkg-stub629.tar.gz');
       } finally { await s.ctx.close(); }
     }
 

@@ -12,16 +12,21 @@ drop one silently:
   * the `@source` globs, which are the files v3's `content` globs named, with
     automatic source detection off.
 
-BuiltCssTests copies ui/ into a scratch directory, installs what
-ui/package-lock.json pins (`npm ci`), runs `vite build` and reads the stylesheet.
-It needs node and npm (and the network unless the npm cache holds the packages);
-it is skipped, with a message, only when node or npm is missing. SourceTests read
-ui/src/index.css and NavBar.tsx and need nothing. Standard library only; no
-Docker or stack needed, and nothing under the checkout is changed.
+BuiltCssTests copies ui/ into a scratch directory and, in a throwaway container
+of the image ui/Dockerfile builds with (its `builder` stage), installs what
+ui/package-lock.json pins (`npm ci --ignore-scripts`), runs `vite build` and
+reads the stylesheet. Nothing of the UI toolchain runs on the host, so a lock
+file edited by a fork is installed only inside the container. It needs the
+docker CLI (and the network unless the image and the npm cache are present); it
+is skipped, with a message, only when the docker CLI is missing, and a docker or
+build failure fails it. SourceTests read ui/src/index.css, NavBar.tsx and
+ui/Dockerfile and need nothing. Standard library only; no stack needed, and
+nothing under the checkout is changed.
 
 Run: python3 scripts/tests/test_tailwind_output.py
 """
 from pathlib import Path
+import os
 import re
 import shutil
 import subprocess
@@ -35,7 +40,19 @@ UI = ROOT / 'ui'
 V3_SOURCES = ['../index.html', './**/*.{js,ts,jsx,tsx}']
 
 
+def builder_image():
+    """The image ui/Dockerfile builds in (`FROM <image> AS builder`), so the test follows it."""
+    found = re.search(r'^FROM\s+(\S+)\s+AS\s+builder\s*$', (UI / 'Dockerfile').read_text(), re.M | re.I)
+    if not found:
+        raise AssertionError('ui/Dockerfile has no `FROM <image> AS builder` line')
+    return found.group(1)
+
+
 class SourceTests(unittest.TestCase):
+    def test_builder_image_is_read_from_the_dockerfile(self):
+        image = builder_image()
+        self.assertRegex(image, r'^[^:\s]+:[^:\s]+$', 'the builder image should be a name with a tag')
+
     def test_index_css_configuration(self):
         css = (UI / 'src/index.css').read_text()
         for line, why in (
@@ -64,8 +81,9 @@ def run(command, cwd, timeout):
 class BuiltCssTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if not (shutil.which('node') and shutil.which('npm')):
-            raise unittest.SkipTest('node and npm are needed to build the UI CSS')
+        if not shutil.which('docker'):
+            raise unittest.SkipTest('the docker CLI is needed to build the UI CSS in a container')
+        image = builder_image()
         scratch = Path(tempfile.mkdtemp(prefix='rag-tailwind-'))
         cls.addClassCleanup(shutil.rmtree, scratch, ignore_errors=True)
         ui = scratch / 'ui'
@@ -73,8 +91,14 @@ class BuiltCssTests(unittest.TestCase):
         # One file the globs match and one they do not, each with a class nothing else uses.
         (ui / 'src/zz_sentinel_in.jsx').write_text("export const sentinel = 'bg-fuchsia-950'\n")
         (ui / 'src/zz_sentinel_out.md').write_text('bg-lime-950\n')
-        run(['npm', 'ci', '--ignore-scripts', '--no-audit', '--no-fund'], ui, 300)
-        run(['npx', '--no-install', 'vite', 'build'], ui, 180)
+        # The build runs in a container, as the image build does, not on the host. The invoking
+        # user owns what it writes (so the clean-up works), and npm gets a cache under /tmp.
+        container = ['docker', 'run', '--rm']
+        if hasattr(os, 'getuid'):
+            container += ['--user', '{}:{}'.format(os.getuid(), os.getgid())]
+        container += ['-e', 'HOME=/tmp', '-e', 'npm_config_cache=/tmp/.npm', '-v', '{}:/app'.format(ui), '-w', '/app', image]
+        run(container + ['npm', 'ci', '--ignore-scripts', '--no-audit', '--no-fund'], ui, 300)
+        run(container + ['npx', '--no-install', 'vite', 'build'], ui, 180)
         sheets = list((ui / 'dist/assets').glob('*.css'))
         assert len(sheets) == 1, 'expected one built stylesheet, found {}'.format(sheets)
         # Whitespace out, so the checks don't depend on the minifier's spacing.
