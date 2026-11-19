@@ -338,8 +338,8 @@ class OfflinePackageTests(Workspace):
         self.assertEqual(missing.stdout.split(), ["someone/other", "library-less:1"])
 
     def test_the_model_check_looks_under_a_models_own_host(self):
-        # A name whose first path segment has a dot is a registry host (#772): its manifest
-        # is under that host's directory, not under registry.ollama.ai.
+        # A name with three segments starts with a registry host (#772, #824): its manifest is
+        # under that host's directory, not under registry.ollama.ai.
         text = (ROOT / "package-offline.sh").read_text()
         script = re.search(r"-c '(for m in .*?done)' sh \$MODELS", text, re.S).group(1)
         store = self.temp / "store"
@@ -362,6 +362,30 @@ class OfflinePackageTests(Workspace):
         self.assertEqual(missing.stdout.split(), ["hf.co/other/model", "hf.co/user/absent",
                                                   "hf.co/user/model:nope", "someone/assistant:v2",
                                                   "llama3.1:9b"])
+
+    def test_the_model_check_follows_ollamas_name_parse(self):
+        # Ollama parses a name from the right (#824): the tag is after the last ":" of the last
+        # segment, so a port isn't a tag, and the first segment is a host only with three segments.
+        text = (ROOT / "package-offline.sh").read_text()
+        script = re.search(r"-c '(for m in .*?done)' sh \$MODELS", text, re.S).group(1)
+        def make(name, *paths):
+            manifests = self.temp / name / "models" / "manifests"
+            for path in paths:
+                (manifests / path).parent.mkdir(parents=True, exist_ok=True)
+                (manifests / path).write_text("{}")
+            return self.temp / name
+        run = lambda store, *models: subprocess.run(
+            ["sh", "-c", script.replace("/models/", f"{store}/"), "sh", *models],
+            capture_output=True, text=True, timeout=60)
+        store = make("store", "registry.ollama.ai/hf.co/model/latest",
+                     "reg.example:5000/u/m/tag", "reg.example:5000/u/m/latest")
+        found = run(store, "hf.co/model", "reg.example:5000/u/m:tag", "reg.example:5000/u/m")
+        self.assertEqual((found.returncode, found.stdout), (0, ""), found.stderr)
+        # Only the old, wrong places: hf.co as a host, and the port dropped.
+        wrong = make("store2", "hf.co/model/latest", "reg.example/u/m/tag")
+        names = ["hf.co/model", "reg.example:5000/u/m:tag", "reg.example:5000/u/m", "a/b/c/d"]
+        missing = run(wrong, *names)
+        self.assertEqual((missing.returncode, missing.stdout.split()), (0, names), missing.stderr)
 
     def test_a_host_model_name_reaches_the_check_unchanged(self):
         result, _out, _files = self.build({}, STUB_BUILD_LLM_MODEL="hf.co/user/model")
