@@ -452,6 +452,43 @@ class Export(Fixture):
             self.build(PASSPHRASE)
         self.assertEqual(list(self.exports.iterdir()), [])
 
+    def test_staging_is_in_upload_dir_and_removed_after_every_build(self):
+        """The unencrypted package files are staged under UPLOAD_DIR, never in
+        EXPORTS_DIR, and the staging is gone after a build that succeeds or
+        fails, plain or encrypted (#549)."""
+        real = packager._add_members
+        for passphrase in (None, PASSPHRASE):
+            for fail in (False, True):
+                seen = []
+
+                def add_members(tar, stage, stem):
+                    seen.append((stage.parent, stage.name,
+                                 sorted(p.name for p in self.exports.iterdir()),
+                                 (stage / "chunks.jsonl").exists()))
+                    if fail:
+                        raise OSError("disk full")
+                    return real(tar, stage, stem)
+                for p in self.exports.iterdir():
+                    p.unlink()
+                with self.subTest(encrypted=bool(passphrase), fail=fail), \
+                     patch.object(packager, "_add_members", add_members):
+                    if fail:
+                        with self.assertRaises(OSError):
+                            self.build(passphrase)
+                    else:
+                        result = self.build(passphrase)
+                    self.assertEqual(len(seen), 1)
+                    parent, name, exports_then, staged = seen[0]
+                    self.assertEqual(parent, self.uploads)
+                    self.assertTrue(name.startswith("export-"), name)
+                    self.assertTrue(staged, "chunks.jsonl not staged")
+                    self.assertFalse([n for n in exports_then if not n.endswith(".partial")],
+                                     f"EXPORTS_DIR held more than the partial archive: {exports_then}")
+                    self.assertEqual([p.name for p in self.uploads.iterdir() if p.name.startswith("export-")],
+                                     [], "staging left in UPLOAD_DIR")
+                    left = sorted(p.name for p in self.exports.iterdir())
+                    self.assertEqual(left, [] if fail else [result["filename"]])
+
     def test_the_startup_sweep_removes_encrypted_partials_only(self):
         for name in (".a.tar.gz.partial", ".b.tar.gz.age.partial", "c.tar.gz.age", "d.tar.gz"):
             (self.exports / name).write_bytes(b"x")
