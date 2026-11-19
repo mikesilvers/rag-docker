@@ -4557,8 +4557,8 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   *Evidence: `scripts/tests/test_auth_enforcement.py` in the API image (suite 17), which fails on the code before #25; `auth_stack.py matrix` for no session and each harness role on the running stack (suite 17), against the matrix written out in the check, not read from the API; `test_auth.py` checks that every app route has exactly one policy entry and every entry a route, and that a route without one is refused.*
 - [x] Before bootstrap every protected route and the login answer `503 SETUP_REQUIRED`; `bootstrap` works once and is then refused; `create-user` is refused before it; generated passwords are printed alone on standard output and must be changed at first login, when only the session routes answer; the last enabled engineer can't be disabled or demoted; usage errors exit 2.
   *Evidence: `test_auth.py` (store and `python -m auth` in a subprocess); suite 17 on the stack: `bootstrap` refused, forced change on created accounts.*
-- [x] Login, `GET /auth/me` and logout; the cookie's attributes; a session survives an API restart (with `RAG_ALLOW_RESTART=1`) and ends after 12 hours idle or 7 days; a password reset or disable ends the user's sessions at once, and a role change applies to an existing session's next request; the own password change needs the current password, follows the rules, and ends the user's other sessions.
-  *Evidence: `test_auth.py` (expiry with a patched clock); suite 17 on the stack, with throwaway `vfy-t-*` accounts and a session aged in the store.*
+- [x] Login, `GET /auth/me` and logout; the cookie's attributes; a session survives an API restart (with `RAG_ALLOW_RESTART=1`) and ends after 12 hours idle or 7 days; each login deletes every session that has ended by time, anyone's; a malformed earlier cookie doesn't hide the session; a password reset or disable ends the user's sessions at once, and a role change applies to an existing session's next request; the own password change needs the current password, follows the rules, and ends the user's other sessions.
+  *Evidence: `test_auth.py` (expiry with a patched clock; `test_a_new_session_sweeps_the_ended_ones`, `test_a_malformed_earlier_cookie_does_not_hide_the_session`); suite 17 on the stack, with throwaway `vfy-t-*` accounts and a session aged in the store.*
 - [x] A cookie-authenticated change from another origin, or with neither `Origin` nor `Sec-Fetch-Site: same-origin`, is refused `403 CROSS_ORIGIN_REFUSED`; the API sends no `Access-Control-*` headers; every login failure is the same `401 LOGIN_FAILED`; five failures for a username and address within 15 minutes throttle the pair for 15 minutes, for unknown usernames too, attempts are counted before they are checked, a wrong current password on `POST /auth/password` counts too, and the throttle survives a restart; a path with a control character (`%0A`) is refused `404` before its body is read; a password change to the current password is refused; the API log has one line per login and no password or session token.
   *Evidence: `test_auth.py`; suite 17 on the stack; suite 01's CORS check.*
 - [x] The verify harness gets its test credentials without committing, printing or passing them on a command line or in the environment: one account per role, generated passwords replaced at first login, kept in a 0600 file in a 0700 folder of the user's own outside the checkout, with the operator command run only on the verify project.
@@ -5145,7 +5145,9 @@ trace continuity. Full default and enabled runs and their actual limitations are
 required; a resolved Compose file alone is not runtime acceptance.
 
 Collector verification binds exact harness-owned assets across alternate checkouts
-and pins verification protocol/version/export budgets. Disabled-mode observation
+and pins verification protocol/version/export budgets. An evaluator-supplied
+`--telemetry-pin` (same repository, tag and digest only, outside the checkout) may
+set the expected Collector image. Disabled-mode observation
 requires termination of previous producer, Collector queues and capture handlers.
 Malformed decoded evidence is incomplete acceptance; malformed archive metadata
 and incomplete TAR framing are rejected before offline reconstruction.

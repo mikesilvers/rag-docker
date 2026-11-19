@@ -67,7 +67,8 @@
 # --telemetry-pin FILE (#532). The guard then expects that image, which may
 # change only the tag and digest of this checkout's pin, never the
 # repository. Nothing here contacts a registry, and no file in the checkout
-# is read as a pin.
+# is read as a pin: the file is checked by device and inode, for telemetry-mode's
+# inherited pin too.
 #
 # What this does not do: the suites, and anything else the checkout runs on the
 # host, still have full access to Docker. It keeps verification away from the
@@ -191,13 +192,41 @@ if [ "$CMD" != down ]; then
 fi
 
 # The reviewed collector pin (#532): the evaluator's file, never the checkout's.
-if [ "$PIN_SET" = 1 ]; then
-  [ -f "$PIN" ] || fail "--telemetry-pin must name an existing file: $PIN"
+# --telemetry-pin and the inherited pin of telemetry-mode (#764) get one check:
+# the file exists, and neither it nor a directory above it is the checkout,
+# compared by device and inode so letter case on a case-insensitive volume
+# doesn't matter, and it has no second hard link (one could be in the checkout).
+check_pin() {
+  [ -f "$PIN" ] || fail "$1 must name an existing file: $PIN"
   PIN="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$PIN")" \
-    || fail "could not resolve the --telemetry-pin path."
-  case "$PIN" in
-    "$CHECKOUT"/*) fail "--telemetry-pin must be outside the checkout under test: $PIN" ;;
-  esac
+    || fail "could not resolve the $1 path."
+  python3 - "$PIN" "$CHECKOUT" <<'PINPY' || fail "$1 must be outside the checkout under test: $PIN"
+import os, sys
+
+pin, checkout = sys.argv[1:3]
+try:
+    if os.stat(pin).st_nlink > 1:
+        sys.exit(1)
+    folder = os.path.dirname(pin)
+    while True:
+        if os.path.samefile(folder, checkout):
+            sys.exit(1)
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            break
+        folder = parent
+except OSError:
+    sys.exit(1)
+PINPY
+}
+if [ "$PIN_SET" = 1 ]; then
+  check_pin "--telemetry-pin"
+fi
+# telemetry-mode, run by a suite under the inherited lock, keeps the run's
+# reviewed pin, checked again here; up and run take it only from --telemetry-pin.
+if [ "$CMD" = telemetry-mode ] && [ -n "${RAG_VERIFY_TELEMETRY_PIN:-}" ]; then
+  PIN="$RAG_VERIFY_TELEMETRY_PIN"
+  check_pin "RAG_VERIFY_TELEMETRY_PIN"
 fi
 
 # The private folder, checked before any Docker command; up and run create it.
@@ -256,9 +285,6 @@ export RAG_VERIFY_TELEMETRY="$TELEMETRY"
 export RAG_VERIFY_OTEL_ENABLED="$OTEL_ENABLED"
 export RAG_VERIFY_HARNESS="$HARNESS"
 export RAG_VERIFY_CHECKOUT="$CHECKOUT"
-# telemetry-mode, run by a suite under the inherited lock, keeps the run's
-# reviewed pin; up and run take it only from --telemetry-pin.
-[ "$CMD" != telemetry-mode ] || PIN="${RAG_VERIFY_TELEMETRY_PIN:-}"
 export RAG_VERIFY_TELEMETRY_PIN="$PIN"
 if [ "$TELEMETRY" = 1 ]; then
   export COMPOSE_FILE="$CHECKOUT/docker-compose.yml:$CHECKOUT/docker-compose.telemetry.yml:$HARNESS/docker-compose.verify.yml:$HARNESS/docker-compose.telemetry.verify.yml"
