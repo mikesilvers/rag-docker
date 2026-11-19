@@ -175,6 +175,24 @@ class MainImportTests(unittest.TestCase):
         self.assertNotIn("Traceback", result.stderr)
         self.assertNotIn("not-a-port-7f3a", result.stdout + result.stderr)
 
+    def test_a_validators_own_message_is_used_as_is_through_main(self):
+        # #555 (reviewer): uvicorn's import of main, a validator's own message
+        # unprefixed and a pydantic type error prefixed with its setting, one
+        # line each, no traceback, neither value printed.
+        result = self.run_import(AUDIT_LOG_KEEP="0", MAX_PREPARATION_BYTES="12-vfy-secret-9c1d")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(sorted(result.stderr.splitlines()), [
+            "Settings refused: AUDIT_LOG_KEEP must be 1 to 1000",
+            "Settings refused: MAX_PREPARATION_BYTES: Input should be a valid integer, unable to parse string as an integer"])
+        self.assertNotIn("vfy-secret-9c1d", result.stderr)
+
+    def test_settings_itself_still_raises_validation_error(self):
+        import pydantic
+        import config
+        with self.assertRaises(pydantic.ValidationError):
+            config.Settings(rag_lan_mode="yes")
+
 
 # ── the certificate step ─────────────────────────────────────────────────────
 

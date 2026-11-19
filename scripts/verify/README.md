@@ -269,13 +269,15 @@ would fail by design). `--lan` can't be combined with `--telemetry`.
 `lan_config.py` (`docker compose config` of the base file plus
 `docker-compose.lan.yml`, under the project name `rag-lan-config`, with no
 `.env`; nothing is created) and runs `../tests/test_lan_mode.py` in the API
-image. It also checks, in one-off api containers of the default verify project
+image. It also checks, in one-off api containers of the running verify project
+(default or LAN configuration)
 (`docker compose run --rm --no-deps`), that the API refuses with one line and
 no traceback for a non-Secure cookie in LAN mode, an empty account store in LAN
 mode and a non-boolean `RAG_LAN_MODE`. Only in a `--lan` run does it check the running LAN project through
 `lan_stack.py`: HTTPS with the generated certificate, the hosts nginx answers
 for (localhost, 127.0.0.1 and the test names; another `Host` gets 421, #664),
 TLS versions and HTTP/2, the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
+a `Server` header with no nginx version (`server_tokens off`),
 the API's refusal in one-off containers (`docker compose run --rm
 --no-deps`, no ports) and nginx's login rate limit (logins sent without
 waiting until one is refused `429 LOGIN_RATE_LIMITED`, #577); it also prints
