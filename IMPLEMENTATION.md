@@ -20499,7 +20499,7 @@ def main(argv=None) -> int:
     p = commands.add_parser("set-role", help="change a user's role")
     p.add_argument("username")
     p.add_argument("role")
-    p = commands.add_parser("disable", help="disable an account and end its sessions")
+    p = commands.add_parser("disable", help="disable an account (a user's sessions end, a service account's keys stop working)")
     p.add_argument("username")
     p = commands.add_parser("enable", help="enable a disabled account")
     p.add_argument("username")
@@ -28154,8 +28154,7 @@ would fail by design). `--lan` can't be combined with `--telemetry`.
 `docker-compose.lan.yml`, under the project name `rag-lan-config`, with no
 `.env`; nothing is created) and runs `../tests/test_lan_mode.py` in the API
 image. It also checks, in one-off api containers of the running verify project
-(default or LAN configuration)
-(`docker compose run --rm --no-deps`), that the API refuses with one line and
+(default or LAN configuration; `docker compose run --rm --no-deps`), that the API refuses with one line and
 no traceback for a non-Secure cookie in LAN mode, an empty account store in LAN
 mode and a non-boolean `RAG_LAN_MODE`. Only in a `--lan` run does it check the running LAN project through
 `lan_stack.py`: HTTPS with the generated certificate, the hosts nginx answers
@@ -29491,13 +29490,17 @@ bash scripts/verify/stack.sh run --telemetry --telemetry-pin <bundle>/telemetry-
   can't be done, there is no telemetry run.
 - `FILE` must be an existing file outside the checkout under test (after
   resolving symlinks); otherwise `stack.sh` exits 2 before any Docker command.
+  The check compares by device and inode, so letter case on a case-insensitive
+  volume doesn't matter, and it refuses a file with a second hard link, since
+  that link could be a file in the checkout.
 - Its `image` must be `<repository>:<tag>@sha256:<digest>` with the harness
   pin's repository, so only the tag and digest can change. Anything else (an
   unreadable file, another form, another repository) is refused by the guard,
   and nothing is built.
 - The same pin applies to suite 15's `telemetry-mode` calls, which inherit it
   as `RAG_VERIFY_TELEMETRY_PIN`. `up` and `run` set that variable only from
-  the option; an ambient value is ignored.
+  the option; an ambient value is ignored. `telemetry-mode` checks the inherited
+  pin the same way as `--telemetry-pin`, before any Docker command.
 
 Without the option, the harness's own pin applies, as before.
 ````
@@ -29804,13 +29807,15 @@ check_pin() {
   [ -f "$PIN" ] || fail "$1 must name an existing file: $PIN"
   PIN="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$PIN")" \
     || fail "could not resolve the $1 path."
-  python3 - "$PIN" "$CHECKOUT" <<'PINPY' || fail "$1 must be outside the checkout under test: $PIN"
+  local rc=0
+  python3 - "$PIN" "$CHECKOUT" <<'PINPY' || rc=$?
 import os, sys
 
+# Exit 1: the pin is in the checkout. 3: it has a second hard link. 4: an OS error.
 pin, checkout = sys.argv[1:3]
 try:
     if os.stat(pin).st_nlink > 1:
-        sys.exit(1)
+        sys.exit(3)
     folder = os.path.dirname(pin)
     while True:
         if os.path.samefile(folder, checkout):
@@ -29820,8 +29825,14 @@ try:
             break
         folder = parent
 except OSError:
-    sys.exit(1)
+    sys.exit(4)
 PINPY
+  case "$rc" in
+    0) ;;
+    3) fail "$1 has a second hard link, which could be a file in the checkout under test: $PIN" ;;
+    4) fail "$1 could not be checked against the checkout under test: $PIN" ;;
+    *) fail "$1 must be outside the checkout under test: $PIN" ;;
+  esac
 }
 if [ "$PIN_SET" = 1 ]; then
   check_pin "--telemetry-pin"
@@ -31701,9 +31712,14 @@ def check_origin(operator_ok):
             expect(status == 403 and error_code(raw) == "CROSS_ORIGIN_REFUSED",
                    "{} {} with Sec-Fetch-Site {}: answered {} {}".format(method, package, site, status,
                                                                          error_code(raw)))
-        else:
+        elif method == "HEAD":
+            # A HEAD answer has no body, so only its status can be checked.
             expect(status == 404, "{} {} with Sec-Fetch-Site {}: answered {}, wanted the 404 of an "
                    "allowed request".format(method, package, site, status))
+        else:
+            expect(status == 404 and error_code(raw) == "PACKAGE_NOT_FOUND",
+                   "{} {} with Sec-Fetch-Site {}: answered {} {}, wanted the 404 PACKAGE_NOT_FOUND of an "
+                   "allowed request".format(method, package, site, status, error_code(raw)))
     status, _, _ = code("GET", "/packages", token=token, headers={"Sec-Fetch-Site": "cross-site"})
     expect(status == 200, "the package listing with Sec-Fetch-Site cross-site answered {}".format(status))
     request("POST", "/auth/logout", token=token)
@@ -35524,9 +35540,7 @@ class MainImportTests(unittest.TestCase):
         self.assertNotIn("vfy-secret-9c1d", result.stderr)
 
     def test_settings_itself_still_raises_validation_error(self):
-        import pydantic
-        import config
-        with self.assertRaises(pydantic.ValidationError):
+        with self.assertRaises(ValidationError):
             config.Settings(rag_lan_mode="yes")
 
 
@@ -42376,7 +42390,7 @@ class SameOriginTests(DownloadTestCase):
         self.assertEqual(self.fetch("cross-site", headers={"Authorization": "Bearer " + key}).status_code, 200)
         self.assertFalse(path.exists())
 
-    def test_the_listing_and_a_refused_package_are_not_origin_checked_by_sec_fetch_site(self):
+    def test_the_listing_is_not_origin_checked_but_a_missing_package_is_refused_before_the_route(self):
         # Reviewer (#794): only the deleting GET is checked; the listing changes nothing.
         self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
         headers = dict(self.as_("dev"), **{"Sec-Fetch-Site": "cross-site"})

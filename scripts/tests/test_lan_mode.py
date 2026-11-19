@@ -188,9 +188,7 @@ class MainImportTests(unittest.TestCase):
         self.assertNotIn("vfy-secret-9c1d", result.stderr)
 
     def test_settings_itself_still_raises_validation_error(self):
-        import pydantic
-        import config
-        with self.assertRaises(pydantic.ValidationError):
+        with self.assertRaises(ValidationError):
             config.Settings(rag_lan_mode="yes")
 
 
