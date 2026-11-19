@@ -20496,7 +20496,7 @@ def main(argv=None) -> int:
     p = commands.add_parser("set-role", help="change a user's role")
     p.add_argument("username")
     p.add_argument("role")
-    p = commands.add_parser("disable", help="disable an account and end its sessions")
+    p = commands.add_parser("disable", help="disable an account (a user's sessions end, a service account's keys stop working)")
     p.add_argument("username")
     p = commands.add_parser("enable", help="enable a disabled account")
     p.add_argument("username")
