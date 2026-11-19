@@ -29486,13 +29486,17 @@ bash scripts/verify/stack.sh run --telemetry --telemetry-pin <bundle>/telemetry-
   can't be done, there is no telemetry run.
 - `FILE` must be an existing file outside the checkout under test (after
   resolving symlinks); otherwise `stack.sh` exits 2 before any Docker command.
+  The check compares by device and inode, so letter case on a case-insensitive
+  volume doesn't matter, and it refuses a file with a second hard link, since
+  that link could be a file in the checkout.
 - Its `image` must be `<repository>:<tag>@sha256:<digest>` with the harness
   pin's repository, so only the tag and digest can change. Anything else (an
   unreadable file, another form, another repository) is refused by the guard,
   and nothing is built.
 - The same pin applies to suite 15's `telemetry-mode` calls, which inherit it
   as `RAG_VERIFY_TELEMETRY_PIN`. `up` and `run` set that variable only from
-  the option; an ambient value is ignored.
+  the option; an ambient value is ignored. `telemetry-mode` checks the inherited
+  pin the same way as `--telemetry-pin`, before any Docker command.
 
 Without the option, the harness's own pin applies, as before.
 ````
@@ -29799,13 +29803,15 @@ check_pin() {
   [ -f "$PIN" ] || fail "$1 must name an existing file: $PIN"
   PIN="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$PIN")" \
     || fail "could not resolve the $1 path."
-  python3 - "$PIN" "$CHECKOUT" <<'PINPY' || fail "$1 must be outside the checkout under test: $PIN"
+  local rc=0
+  python3 - "$PIN" "$CHECKOUT" <<'PINPY' || rc=$?
 import os, sys
 
+# Exit 1: the pin is in the checkout. 3: it has a second hard link. 4: an OS error.
 pin, checkout = sys.argv[1:3]
 try:
     if os.stat(pin).st_nlink > 1:
-        sys.exit(1)
+        sys.exit(3)
     folder = os.path.dirname(pin)
     while True:
         if os.path.samefile(folder, checkout):
@@ -29815,8 +29821,14 @@ try:
             break
         folder = parent
 except OSError:
-    sys.exit(1)
+    sys.exit(4)
 PINPY
+  case "$rc" in
+    0) ;;
+    3) fail "$1 has a second hard link, which could be a file in the checkout under test: $PIN" ;;
+    4) fail "$1 could not be checked against the checkout under test: $PIN" ;;
+    *) fail "$1 must be outside the checkout under test: $PIN" ;;
+  esac
 }
 if [ "$PIN_SET" = 1 ]; then
   check_pin "--telemetry-pin"

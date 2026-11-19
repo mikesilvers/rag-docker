@@ -928,28 +928,37 @@ class StackDockerCallTests(unittest.TestCase):
     def test_pin_in_the_checkout_by_another_spelling_is_refused(self):
         # #764: a different letter case on a case-insensitive volume (APFS), and a
         # hard link outside the checkout, are the checkout's file all the same.
+        # Each is refused with its own message (RD-206).
         real = ROOT / 'telemetry/image.json'
         variant = str(real).upper()
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         hard = Path(folder.name) / 'hard.json'
-        spellings = {}
+
+        def refused(pin, message):
+            box = Sandbox(self)
+            result = box.run(['bash', str(STACK), 'run', '--telemetry', '--telemetry-pin', pin])
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn(message, result.stderr)
+            self.assertEqual([c for c in box.calls() if c[0] == 'docker'], [])
+
+        tried = []
         if variant != str(real) and Path(variant).exists() and os.path.samefile(variant, real):
-            spellings['letter case'] = variant
+            tried.append('letter case')
+            with self.subTest(spelling='letter case'):
+                refused(variant, 'must be outside the checkout')
+        # The hard link is made last: once it exists, the checkout's file has a
+        # second link, and the letter-case spelling would be refused for that.
         try:
             os.link(real, hard)
-            spellings['hard link'] = str(hard)
         except OSError:
             pass
-        if not spellings:
+        else:
+            tried.append('hard link')
+            with self.subTest(spelling='hard link'):
+                refused(str(hard), 'has a second hard link')
+        if not tried:
             self.skipTest('the volume is case-sensitive and no hard link can be made')
-        for name, pin in spellings.items():
-            with self.subTest(spelling=name):
-                box = Sandbox(self)
-                result = box.run(['bash', str(STACK), 'run', '--telemetry', '--telemetry-pin', pin])
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn('must be outside the checkout', result.stderr)
-                self.assertEqual([c for c in box.calls() if c[0] == 'docker'], [])
 
     def test_up_lan_bootstraps_then_switches_to_lan_mode(self):
         # #26: default up, the first Engineer, the LAN guard, the LAN up without a

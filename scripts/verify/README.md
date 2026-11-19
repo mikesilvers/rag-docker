@@ -1605,12 +1605,16 @@ bash scripts/verify/stack.sh run --telemetry --telemetry-pin <bundle>/telemetry-
   can't be done, there is no telemetry run.
 - `FILE` must be an existing file outside the checkout under test (after
   resolving symlinks); otherwise `stack.sh` exits 2 before any Docker command.
+  The check compares by device and inode, so letter case on a case-insensitive
+  volume doesn't matter, and it refuses a file with a second hard link, since
+  that link could be a file in the checkout.
 - Its `image` must be `<repository>:<tag>@sha256:<digest>` with the harness
   pin's repository, so only the tag and digest can change. Anything else (an
   unreadable file, another form, another repository) is refused by the guard,
   and nothing is built.
 - The same pin applies to suite 15's `telemetry-mode` calls, which inherit it
   as `RAG_VERIFY_TELEMETRY_PIN`. `up` and `run` set that variable only from
-  the option; an ambient value is ignored.
+  the option; an ambient value is ignored. `telemetry-mode` checks the inherited
+  pin the same way as `--telemetry-pin`, before any Docker command.
 
 Without the option, the harness's own pin applies, as before.
