@@ -243,6 +243,8 @@ else
     name=${run%%:*}; want=${run#*:}
     args=(--api-url "$API" --json --citations)
     [ "$name" = top2 ] && args+=(--top-k 2)
+    # Retrieval, not the generated text, is what the check wants: generation
+    # varies (an empty answer), as for E11 below (#549).
     # As the End User test account (#25): the password goes in on stdin.
     _rag_require_lock_owner
     python3 ./auth_setup.py password end_user \
@@ -255,11 +257,11 @@ try:
     d = json.load(open("/tmp/vfy_p_r.json"))
 except ValueError:
     sys.exit(1)
-sys.exit(0 if d["answer"].strip() and len(d["citations"] or []) == int(sys.argv[1]) else 1)
+sys.exit(0 if isinstance(d, dict) and len(d.get("citations") or []) == int(sys.argv[1]) else 1)
 ENDPY
     answered=$?
     [ "$rc" = 0 ] && [ "$answered" = 0 ]
-    check "E8/E9: retrieve.py ($name) answers with $want citation(s)" $? \
+    check "E8/E9: retrieve.py ($name) retrieves $want citation(s)" $? \
       "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
   done
   # Retrieval, not the generated text, is what shows retrieve.py works against
@@ -267,6 +269,7 @@ ENDPY
   # load (a 504), so the check wants citations and allows 3 attempts (#549).
   e11=1
   for attempt in 1 2 3; do
+    _rag_require_lock_owner
     python3 ./auth_setup.py password end_user \
       | python3 -I -S "$RTMP/retrieve.py" --username vfy-end-user --password-stdin --api-url "$API" \
           --json --citations --collection "$IMP" "$QUESTION" > /tmp/vfy_p_r.json 2> /tmp/vfy_p_r.err

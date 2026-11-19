@@ -270,8 +270,7 @@ would fail by design). `--lan` can't be combined with `--telemetry`.
 `docker-compose.lan.yml`, under the project name `rag-lan-config`, with no
 `.env`; nothing is created) and runs `../tests/test_lan_mode.py` in the API
 image. It also checks, in one-off api containers of the running verify project
-(default or LAN configuration)
-(`docker compose run --rm --no-deps`), that the API refuses with one line and
+(default or LAN configuration; `docker compose run --rm --no-deps`), that the API refuses with one line and
 no traceback for a non-Secure cookie in LAN mode, an empty account store in LAN
 mode and a non-boolean `RAG_LAN_MODE`. Only in a `--lan` run does it check the running LAN project through
 `lan_stack.py`: HTTPS with the generated certificate, the hosts nginx answers
@@ -1607,12 +1606,16 @@ bash scripts/verify/stack.sh run --telemetry --telemetry-pin <bundle>/telemetry-
   can't be done, there is no telemetry run.
 - `FILE` must be an existing file outside the checkout under test (after
   resolving symlinks); otherwise `stack.sh` exits 2 before any Docker command.
+  The check compares by device and inode, so letter case on a case-insensitive
+  volume doesn't matter, and it refuses a file with a second hard link, since
+  that link could be a file in the checkout.
 - Its `image` must be `<repository>:<tag>@sha256:<digest>` with the harness
   pin's repository, so only the tag and digest can change. Anything else (an
   unreadable file, another form, another repository) is refused by the guard,
   and nothing is built.
 - The same pin applies to suite 15's `telemetry-mode` calls, which inherit it
   as `RAG_VERIFY_TELEMETRY_PIN`. `up` and `run` set that variable only from
-  the option; an ambient value is ignored.
+  the option; an ambient value is ignored. `telemetry-mode` checks the inherited
+  pin the same way as `--telemetry-pin`, before any Docker command.
 
 Without the option, the harness's own pin applies, as before.

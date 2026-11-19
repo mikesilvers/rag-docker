@@ -496,9 +496,14 @@ def check_origin(operator_ok):
             expect(status == 403 and error_code(raw) == "CROSS_ORIGIN_REFUSED",
                    "{} {} with Sec-Fetch-Site {}: answered {} {}".format(method, package, site, status,
                                                                          error_code(raw)))
-        else:
+        elif method == "HEAD":
+            # A HEAD answer has no body, so only its status can be checked.
             expect(status == 404, "{} {} with Sec-Fetch-Site {}: answered {}, wanted the 404 of an "
                    "allowed request".format(method, package, site, status))
+        else:
+            expect(status == 404 and error_code(raw) == "PACKAGE_NOT_FOUND",
+                   "{} {} with Sec-Fetch-Site {}: answered {} {}, wanted the 404 PACKAGE_NOT_FOUND of an "
+                   "allowed request".format(method, package, site, status, error_code(raw)))
     status, _, _ = code("GET", "/packages", token=token, headers={"Sec-Fetch-Site": "cross-site"})
     expect(status == 200, "the package listing with Sec-Fetch-Site cross-site answered {}".format(status))
     request("POST", "/auth/logout", token=token)

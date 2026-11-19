@@ -4558,7 +4558,7 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
 - [x] Before bootstrap every protected route and the login answer `503 SETUP_REQUIRED`; `bootstrap` works once and is then refused; `create-user` is refused before it; generated passwords are printed alone on standard output and must be changed at first login, when only the session routes answer; the last enabled engineer can't be disabled or demoted; usage errors exit 2.
   *Evidence: `test_auth.py` (store and `python -m auth` in a subprocess); suite 17 on the stack: `bootstrap` refused, forced change on created accounts.*
 - [x] Login, `GET /auth/me` and logout; the cookie's attributes; a session survives an API restart (with `RAG_ALLOW_RESTART=1`) and ends after 12 hours idle or 7 days; each login deletes every session that has ended by time, anyone's; a malformed earlier cookie doesn't hide the session; a password reset or disable ends the user's sessions at once, and a role change applies to an existing session's next request; the own password change needs the current password, follows the rules, and ends the user's other sessions.
-  *Evidence: `test_auth.py` (expiry with a patched clock; `test_a_new_session_sweeps_the_ended_ones`, `test_a_malformed_earlier_cookie_does_not_hide_the_session`); suite 17 on the stack, with throwaway `vfy-t-*` accounts and a session aged in the store.*
+  *Evidence: `test_auth.py` (expiry with a patched clock; `test_a_new_session_sweeps_the_ended_ones`, `test_a_malformed_earlier_cookie_does_not_hide_the_session`, `RouteTests.test_a_login_sweeps_other_users_ended_sessions` for the login route across users, `test_an_empty_or_unreadable_session_cookie_is_no_session`); suite 17 on the stack, with throwaway `vfy-t-*` accounts and a session aged in the store.*
 - [x] A cookie-authenticated change from another origin, or with neither `Origin` nor `Sec-Fetch-Site: same-origin`, is refused `403 CROSS_ORIGIN_REFUSED`; the API sends no `Access-Control-*` headers; every login failure is the same `401 LOGIN_FAILED`; five failures for a username and address within 15 minutes throttle the pair for 15 minutes, for unknown usernames too, attempts are counted before they are checked, a wrong current password on `POST /auth/password` counts too, and the throttle survives a restart; a path with a control character (`%0A`) is refused `404` before its body is read; a password change to the current password is refused; the API log has one line per login and no password or session token.
   *Evidence: `test_auth.py`; suite 17 on the stack; suite 01's CORS check.*
 - [x] The verify harness gets its test credentials without committing, printing or passing them on a command line or in the environment: one account per role, generated passwords replaced at first login, kept in a 0600 file in a 0700 folder of the user's own outside the checkout, with the operator command run only on the verify project.
@@ -4571,11 +4571,10 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
   deletes an account; each change and refusal is one API log line with no password. A username breaking the rule is
   `422 INVALID_USERNAME` whatever its length, its refusal logged and audited cut to 256 characters.
   *Evidence: `test_auth.py` `AdminRouteTests`, `StoreTests.test_two_last_engineer_changes_at_once_leave_one_engineer`
-  (two last-engineer changes at the same time leave one engineer) and the policy checks (suite 17); `auth_stack.py
-  matrix` with the six
-  routes for every role and `auth_stack.py admin-accounts` on the running stack, with a throwaway `vfy-t-*`
-  account and the API log searched for the generated passwords (suite 17). These checks fail on the code before
-  PR 2 of #25, which has no such routes.*
+  (two last-engineer changes at the same time leave one engineer) and the policy checks (suite 17);
+  `auth_stack.py matrix` with the six routes for every role and `auth_stack.py admin-accounts` on the running stack,
+  with a throwaway `vfy-t-*` account and the API log searched for the generated passwords (suite 17). These checks
+  fail on the code before PR 2 of #25, which has no such routes.*
 - [x] The Users page: an engineer-only entry in the nav's Admin menu and route; the account list; create and reset show the generated
   password once until "Done"; no reset on the own row; role change, disable and enable; reset, disable and a role
   change ask first (the own row says what it does to the engineer), a cancel sends nothing, and enable doesn't ask;
