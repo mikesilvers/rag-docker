@@ -623,7 +623,7 @@ class SameOriginTests(DownloadTestCase):
         self.assertEqual(self.fetch("cross-site", headers={"Authorization": "Bearer " + key}).status_code, 200)
         self.assertFalse(path.exists())
 
-    def test_the_listing_and_a_refused_package_are_not_origin_checked_by_sec_fetch_site(self):
+    def test_the_listing_is_not_origin_checked_but_a_missing_package_is_refused_before_the_route(self):
         # Reviewer (#794): only the deleting GET is checked; the listing changes nothing.
         self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
         headers = dict(self.as_("dev"), **{"Sec-Fetch-Site": "cross-site"})

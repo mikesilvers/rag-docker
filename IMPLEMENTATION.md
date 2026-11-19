@@ -31697,9 +31697,14 @@ def check_origin(operator_ok):
             expect(status == 403 and error_code(raw) == "CROSS_ORIGIN_REFUSED",
                    "{} {} with Sec-Fetch-Site {}: answered {} {}".format(method, package, site, status,
                                                                          error_code(raw)))
-        else:
+        elif method == "HEAD":
+            # A HEAD answer has no body, so only its status can be checked.
             expect(status == 404, "{} {} with Sec-Fetch-Site {}: answered {}, wanted the 404 of an "
                    "allowed request".format(method, package, site, status))
+        else:
+            expect(status == 404 and error_code(raw) == "PACKAGE_NOT_FOUND",
+                   "{} {} with Sec-Fetch-Site {}: answered {} {}, wanted the 404 PACKAGE_NOT_FOUND of an "
+                   "allowed request".format(method, package, site, status, error_code(raw)))
     status, _, _ = code("GET", "/packages", token=token, headers={"Sec-Fetch-Site": "cross-site"})
     expect(status == 200, "the package listing with Sec-Fetch-Site cross-site answered {}".format(status))
     request("POST", "/auth/logout", token=token)
@@ -42372,7 +42377,7 @@ class SameOriginTests(DownloadTestCase):
         self.assertEqual(self.fetch("cross-site", headers={"Authorization": "Bearer " + key}).status_code, 200)
         self.assertFalse(path.exists())
 
-    def test_the_listing_and_a_refused_package_are_not_origin_checked_by_sec_fetch_site(self):
+    def test_the_listing_is_not_origin_checked_but_a_missing_package_is_refused_before_the_route(self):
         # Reviewer (#794): only the deleting GET is checked; the listing changes nothing.
         self.write("ragpkg-mine.tar.gz", recorded_hours_ago=0)
         headers = dict(self.as_("dev"), **{"Sec-Fetch-Site": "cross-site"})
