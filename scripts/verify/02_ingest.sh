@@ -974,10 +974,12 @@ if [ -z "$(volume_removal_refusal_reason)" ]; then
 else
   skip "job lists on the stack: not the verify project"
 fi
-# A killed job's leftovers (#377): ingest staging in UPLOAD_DIR, and an export's
-# `.build-*` directory and `.*.tar.gz.partial` archive in EXPORTS_DIR.
+# A killed job's leftovers (#377): ingest staging and an export's `export-*`
+# staging directory in UPLOAD_DIR (#549), and an export's `.*.tar.gz.partial` or
+# `.*.tar.gz.age.partial` archive in EXPORTS_DIR. A `.build-*` directory left in
+# EXPORTS_DIR by an earlier version is still swept.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_startup_sweep.py)
-check "startup sweep: ingest staging and export build leftovers, exact names, links never followed" $?
+check "startup sweep: ingest staging, export staging and partial archives, exact names, links never followed" $?
 
 # With auto-schema off, an insert into a deleted collection fails and creates
 # nothing, instead of recreating it with inferred properties and no vectorizer.

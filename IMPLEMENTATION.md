@@ -45626,10 +45626,12 @@ if [ -z "$(volume_removal_refusal_reason)" ]; then
 else
   skip "job lists on the stack: not the verify project"
 fi
-# A killed job's leftovers (#377): ingest staging in UPLOAD_DIR, and an export's
-# `.build-*` directory and `.*.tar.gz.partial` archive in EXPORTS_DIR.
+# A killed job's leftovers (#377): ingest staging and an export's `export-*`
+# staging directory in UPLOAD_DIR (#549), and an export's `.*.tar.gz.partial` or
+# `.*.tar.gz.age.partial` archive in EXPORTS_DIR. A `.build-*` directory left in
+# EXPORTS_DIR by an earlier version is still swept.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_startup_sweep.py)
-check "startup sweep: ingest staging and export build leftovers, exact names, links never followed" $?
+check "startup sweep: ingest staging, export staging and partial archives, exact names, links never followed" $?
 
 # With auto-schema off, an insert into a deleted collection fails and creates
 # nothing, instead of recreating it with inferred properties and no vectorizer.
@@ -48687,6 +48689,8 @@ else
     name=${run%%:*}; want=${run#*:}
     args=(--api-url "$API" --json --citations)
     [ "$name" = top2 ] && args+=(--top-k 2)
+    # Retrieval, not the generated text, is what the check wants: generation
+    # varies (an empty answer), as for E11 below (#549).
     # As the End User test account (#25): the password goes in on stdin.
     _rag_require_lock_owner
     python3 ./auth_setup.py password end_user \
@@ -48699,11 +48703,11 @@ try:
     d = json.load(open("/tmp/vfy_p_r.json"))
 except ValueError:
     sys.exit(1)
-sys.exit(0 if d["answer"].strip() and len(d["citations"] or []) == int(sys.argv[1]) else 1)
+sys.exit(0 if isinstance(d, dict) and len(d.get("citations") or []) == int(sys.argv[1]) else 1)
 ENDPY
     answered=$?
     [ "$rc" = 0 ] && [ "$answered" = 0 ]
-    check "E8/E9: retrieve.py ($name) answers with $want citation(s)" $? \
+    check "E8/E9: retrieve.py ($name) retrieves $want citation(s)" $? \
       "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
   done
   # Retrieval, not the generated text, is what shows retrieve.py works against
@@ -48711,6 +48715,7 @@ ENDPY
   # load (a 504), so the check wants citations and allows 3 attempts (#549).
   e11=1
   for attempt in 1 2 3; do
+    _rag_require_lock_owner
     python3 ./auth_setup.py password end_user \
       | python3 -I -S "$RTMP/retrieve.py" --username vfy-end-user --password-stdin --api-url "$API" \
           --json --citations --collection "$IMP" "$QUESTION" > /tmp/vfy_p_r.json 2> /tmp/vfy_p_r.err
