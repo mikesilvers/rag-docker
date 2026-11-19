@@ -4468,6 +4468,15 @@ progress bar, always reaches the total), `pairs_completed` (pairs that exist) an
       *`scripts/verify/browser/ui_criteria.js` (suite 06), section "running and recent jobs (#617)",
       the checks marked (#629), for the export and the import panel.*
 
+- [x] The web UI supports Safari 16.4, Chrome 111 and Firefox 128 or newer, the floor Tailwind CSS 4
+      sets, and uses Tailwind 4's default colour palette, font stack and form-field styles (#773,
+      RD-157, §7). The built CSS keeps what the Tailwind 4 migration relies on: the `prose` and
+      `prose-sm` rules, `relative`, `hover` on every device (no `@media (hover: hover)`), and the
+      `@source` globs, which are v3's `content` globs with automatic detection off.
+      *`scripts/tests/test_tailwind_output.py` (suite 01) builds the CSS from `ui/package-lock.json`
+      and checks each of these. The browser floor itself is §7's statement: no suite runs an older
+      browser (the browser suites drive one Chromium).*
+
 ### 10.5 Infrastructure
 
 - [x] A restart restores a Raft snapshot and its later operations, preserving objects and deleted collections; the check reports elapsed restart seconds.

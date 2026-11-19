@@ -28901,6 +28901,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_upgrade_backup.py` | host-only: the README's 1.1.0 → 1.2.0 upgrade blocks, run as written under bash, `zsh -c` and interactive zsh with comments off, against stub `docker`, `git` and `curl`; the stub docker accepts only mounts inside its temp directory and only the README's two container commands: no block holds a `#` comment line; the backup skips a missing volume (a wrong prefix) and counts only existing volumes' archives, and writes each copy to a `.tmp` file that replaces the archive only once `gzip -t` passes, so a failed or corrupt copy prints `backup FAILED` and keeps an earlier archive; the rollback is gated on `git checkout v1.1.0` and checks every archive (`gzip -t`, `tar tzf`) and volume before it empties any, and a failed restore stops before `compose up`; alpine is pinned by version and digest; git ignores `backups/` (#679, #693), registered by infrastructure |
 | `../tests/test_version_agreement.py` | host-only: the first-party version strings agree with each other, not with a fixed version: `ui/package.json`, the root versions in `ui/package-lock.json`, `mcp/mcpapp.py`, the two `service.version` defaults in `api/services/telemetry.py` and `RAG_OTEL_SERVICE_VERSION` in `docker-compose.telemetry.yml` and `docker-compose.telemetry.verify.yml` (#605, #656), registered by infrastructure |
 | `../tests/test_ui_dependencies.py` | host-only: the copy of `ui/package.json` embedded in `IMPLEMENTATION.md` (`### ui/package.json`) is the file, exactly, so a UI dependency bump that misses the copy fails (#532), registered by infrastructure |
+| `../tests/test_tailwind_output.py` | host-only, standard library plus node and npm: the built UI CSS keeps what the Tailwind 4 migration relies on (RD-157, #773): the `prose` and `prose-sm` rules, `relative`, `hover` on every device with no `@media (hover: hover)`, and the `@source` globs with automatic detection off (a sentinel `.jsx` file under `ui/src/` is scanned, a sentinel `.md` file is not). It builds a scratch copy of `ui/` with `npm ci` from the lock file and `vite build`, so it needs the network unless the npm cache holds the packages, and is skipped only when node or npm is missing; a second class reads `ui/src/index.css` and `NavBar.tsx` directly. Registered by infrastructure |
 | `15_transfer_paths.sh` | transfer and tuning paths with no check before (#387): import refusals, `on_conflict`, unknown job ids, `/packages`, the package file unchanged, export without the model store, `retrieve.py` (E8-E10), E11 retrieval, a re-chunk with no chunks; run by `05_transfer.sh` |
 | `transfer_packages.py` | helper for suite 15; writes one damaged copy of a package per refusal kind |
 | `../tests/test_package_refusals.py` | controlled import checks 1 and 2, collection-name and `chunks.jsonl` record refusals, registered by suite 15 |
@@ -43880,6 +43881,8 @@ python3 "$REPO_ROOT/scripts/tests/test_dependency_floors.py"
 check "pinned dependencies are at or above their patched versions (#522)" $?
 python3 "$REPO_ROOT/scripts/tests/test_ui_dependencies.py"
 check "the embedded ui/package.json copy in IMPLEMENTATION.md matches the file (#532)" $?
+python3 "$REPO_ROOT/scripts/tests/test_tailwind_output.py"
+check "the built UI CSS keeps the Tailwind 4 rules the migration relies on (#773)" $?
 python3 "$REPO_ROOT/scripts/tests/test_weaviate_pin.py"
 check "the Weaviate pin is the same everywhere and Dependabot leaves it alone (#530)" $?
 python3 "$REPO_ROOT/scripts/tests/test_upgrade_backup.py"
@@ -45624,10 +45627,12 @@ if [ -z "$(volume_removal_refusal_reason)" ]; then
 else
   skip "job lists on the stack: not the verify project"
 fi
-# A killed job's leftovers (#377): ingest staging in UPLOAD_DIR, and an export's
-# `.build-*` directory and `.*.tar.gz.partial` archive in EXPORTS_DIR.
+# A killed job's leftovers (#377): ingest staging and an export's `export-*`
+# staging directory in UPLOAD_DIR (#549), and an export's `.*.tar.gz.partial` or
+# `.*.tar.gz.age.partial` archive in EXPORTS_DIR. A `.build-*` directory left in
+# EXPORTS_DIR by an earlier version is still swept.
 (cd "$REPO_ROOT" && docker compose exec -T -e RAG_TEST_API_DIR=/app api python - < scripts/tests/test_startup_sweep.py)
-check "startup sweep: ingest staging and export build leftovers, exact names, links never followed" $?
+check "startup sweep: ingest staging, export staging and partial archives, exact names, links never followed" $?
 
 # With auto-schema off, an insert into a deleted collection fails and creates
 # nothing, instead of recreating it with inferred properties and no vectorizer.
@@ -48685,6 +48690,8 @@ else
     name=${run%%:*}; want=${run#*:}
     args=(--api-url "$API" --json --citations)
     [ "$name" = top2 ] && args+=(--top-k 2)
+    # Retrieval, not the generated text, is what the check wants: generation
+    # varies (an empty answer), as for E11 below (#549).
     # As the End User test account (#25): the password goes in on stdin.
     _rag_require_lock_owner
     python3 ./auth_setup.py password end_user \
@@ -48697,11 +48704,11 @@ try:
     d = json.load(open("/tmp/vfy_p_r.json"))
 except ValueError:
     sys.exit(1)
-sys.exit(0 if d["answer"].strip() and len(d["citations"] or []) == int(sys.argv[1]) else 1)
+sys.exit(0 if isinstance(d, dict) and len(d.get("citations") or []) == int(sys.argv[1]) else 1)
 ENDPY
     answered=$?
     [ "$rc" = 0 ] && [ "$answered" = 0 ]
-    check "E8/E9: retrieve.py ($name) answers with $want citation(s)" $? \
+    check "E8/E9: retrieve.py ($name) retrieves $want citation(s)" $? \
       "exit $rc: $(head -c 200 /tmp/vfy_p_r.err)"
   done
   # Retrieval, not the generated text, is what shows retrieve.py works against
@@ -48709,6 +48716,7 @@ ENDPY
   # load (a 504), so the check wants citations and allows 3 attempts (#549).
   e11=1
   for attempt in 1 2 3; do
+    _rag_require_lock_owner
     python3 ./auth_setup.py password end_user \
       | python3 -I -S "$RTMP/retrieve.py" --username vfy-end-user --password-stdin --api-url "$API" \
           --json --citations --collection "$IMP" "$QUESTION" > /tmp/vfy_p_r.json 2> /tmp/vfy_p_r.err
