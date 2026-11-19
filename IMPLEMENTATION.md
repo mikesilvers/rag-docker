@@ -27024,8 +27024,8 @@ import { useAuth } from '../context/AuthContext'
 
 const ROLES: Role[] = ['end_user', 'developer', 'engineer']
 const ROLE_LABELS: Record<Role, string> = { end_user: 'End User', developer: 'Developer', engineer: 'AI Engineer' }
-// Reset password, Disable and a role change ask first, on every row; Enable
-// doesn't (#551). The own row says what the change does to the Engineer.
+// Reset password, Reset two-step, Disable and a role change ask first, on every
+// row; Enable doesn't (#551, #779). The own row says what the change does to the Engineer.
 const ASK = {
   role: (name: string, own: boolean, next: Role) => own
     ? `Change your own role to ${ROLE_LABELS[next]}? You will lose access to the Users page.`
@@ -27034,6 +27034,7 @@ const ASK = {
     ? "Disable your own account? You will be logged out and can't log in again until another AI Engineer enables you."
     : `Disable ${name}? Their sessions end and they can't log in until enabled.`,
   reset: (name: string) => `Reset the password of ${name}? Their sessions end and they must change the new password at their next login.`,
+  reset2: (name: string) => `Reset the two-step verification of ${name}? Their sessions end and they must log in again with their password alone.`,
 }
 
 // Account administration for Engineers (#25). The API decides what is allowed:
@@ -27186,7 +27187,7 @@ export default function UsersPage() {
                     onClick={() => { if (!u.enabled || window.confirm(ASK.disable(u.username, own))) act(u.username, () => u.enabled ? api.disableUser(u.username) : api.enableUser(u.username)) }}
                     className="text-blue-600 hover:underline disabled:opacity-50">{u.enabled ? 'Disable' : 'Enable'}</button>
                   {u.mfa_enrolled && !own && (
-                    <button disabled={busy} onClick={() => act(u.username, () => api.resetUserMfa(u.username))}
+                    <button disabled={busy} onClick={() => { if (window.confirm(ASK.reset2(u.username))) act(u.username, () => api.resetUserMfa(u.username)) }}
                       className="text-blue-600 hover:underline disabled:opacity-50">Reset two-step</button>
                   )}
                 </td>
@@ -28823,7 +28824,7 @@ live under `UPLOAD_DIR/collection_operations`, outside extraction workspaces.
 | `../tests/test_health.py` | controlled `/health/details` 503 body for a missing model and an unreachable Ollama or Weaviate, alone or together (#375, #415), and advisory memory (#415); the public `/health`'s status-only body and who may read the details (#750), registered by suite 01 |
 | `../tests/test_installed_authlib.py` | the Authlib installed in the built API image is the version `api/requirements.txt` pins (#565), run in the image with no network; registered by suite 01 |
 | `../tests/test_collection_registry.py` | controlled collection-registry regressions (#388, #445): atomic save, a failed save keeps the old file, an unreadable registry is kept and logged, the folder is fsynced after the replace, startup removes interrupted saves' temporary files; registered by suite 01 |
-| `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health` reports, so the status flips to `below_recommended` on any host (#536) |
+| `memory_override.py` | helper for suite 01, on the host: the in-process `RECOMMENDED_MEMORY_GB` its memory checks raise past the allocation, derived from the `allocated_gb` `/health/details` reports, so the status flips to `below_recommended` on any host (#536) |
 | `../tests/test_memory_override.py` | host-side, standard library: the derived override makes `system_info.memory_info` report `below_recommended` with a note for allocations below and above the 12.35 GB a fixed 13 GB could flip, and no override without a usable allocation (#536); embedded copies; registered by suite 01 |
 | `17_auth.sh` | §10.6 — authentication (#25): the endpoint/role matrix, sessions, origin rules, throttling, the operator command, account administration, service API keys, two-step verification (#607), per-collection access (#606); registers `../tests/test_auth.py`, `../tests/test_collection_access.py`, `../tests/test_auth_enforcement.py` and `../tests/test_verify_auth.py`; opt-in restart check |
 | `auth_setup.py` | the test accounts and their credentials file, and a role's login into a cookie jar; run by `lib.sh` (#25) |
@@ -31615,6 +31616,12 @@ def check_service_keys(operator_ok):
 def check_public(operator_ok):
     status, raw, _ = code("GET", "/health", headers={})
     expect(status in (200, 503), "GET /health without a session answered {}".format(status))
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        body = None
+    expect(body in ({"status": "ok"}, {"status": "degraded"}),
+           "GET /health without a session answered {} {!r}, not a status-only body".format(status, raw[:200]))
     status, raw, _ = code("GET", "/auth/status", headers={})
     expect(status == 200 and json.loads(raw) == {"setup_required": False},
            "GET /auth/status answered {} {!r}".format(status, raw[:200]))
@@ -44058,7 +44065,7 @@ check "health reports the build model, the same as the answer model by default, 
 check_eq "the recommended minimum defaults to 12.0 GB" \
   "$(jfield "['resources']['memory']['recommended_minimum_gb']" < "$RAG_INFRA_TMP/vfy_health.json")" "12.0"
 # Whether this machine meets it depends on its Docker allocation, so check the
-# status agrees with the allocation /health reports, not that it is 'ok'.
+# status agrees with the allocation /health/details reports, not that it is 'ok'.
 python3 -c "
 import json, os
 m = json.load(open(os.environ['RAG_INFRA_TMP'] + '/vfy_health.json'))['resources']['memory']
@@ -44069,7 +44076,7 @@ check "the memory status agrees with the reported allocation" $?
 # Raise the recommendation past the actual allocation (in-process only --
 # neither the running server nor docker-compose.yml is touched) and confirm
 # the status flips and a note is attached. The override comes from the
-# allocation /health reported, never a constant: a fixed 13 GB stayed 'ok' on
+# allocation /health/details reported, never a constant: a fixed 13 GB stayed 'ok' on
 # any host giving Docker 12.35 GB or more (#536).
 python3 "$REPO_ROOT/scripts/tests/test_memory_override.py"
 check "the memory override always exceeds the reported allocation (#536)" $?
@@ -51244,7 +51251,7 @@ const LOGIN_RATE_LIMITED = 'Too many login attempts. Wait a minute and try again
   }
 
   // ── degraded and unreachable health (#375) ─────────────────────────────────
-  // /health answers 503 with its per-service body when a dependency is down. The
+  // /health/details answers 503 with its per-service body when a dependency is down. The
   // page must show that body, red for the failing service, keep loading the
   // latency metrics, and say so when health can't be read at all. Each load is
   // driven by hand through the captured 30s refresh, with the answers stubbed.
@@ -59492,6 +59499,10 @@ function mfaCases() {
   const on = { enrolled: true, enrolled_at: '2026-11-16T12:00:00Z', required: false, recovery_codes_remaining: 10 };
   const me = (role, over = {}) => ({ username: 'vfy-' + role.replace('_', '-'), role, must_change_password: false, ...over });
   const row = (username, role, over = {}) => ({ username, role, enabled: true, must_change_password: false, created_at: '2026-10-01T12:00:00Z', mfa_enrolled: false, ...over });
+  // Reset two-step asks first (#779): each Users case below keeps what was asked.
+  const RESET2_ASK = 'Reset the two-step verification of vfy-developer? Their sessions end and they must log in again with their password alone.';
+  const resetAccepted = { seen: [] }, resetCancelled = { seen: [] };
+  const dialogTo = (d, accept) => async dlg => { d.seen.push(dlg.message()); if (accept) await dlg.accept(); else await dlg.dismiss(); };
   return [
     { name: 'The account menu has Account, which opens the two-step set-up: a QR code, the key as text, and the codes once', open: { role: 'developer', path: '/qa', routes: base({
       'GET /api/auth/mfa': json(200, off),
@@ -59611,7 +59622,7 @@ function mfaCases() {
         'POST /api/auth/users/vfy-developer/reset-mfa': () => { list[0].mfa_enrolled = false; return json(200, { user: list[0] }); },
         'POST /api/auth/mfa/policy': apiError(409, 'MFA_ENROLL_FIRST', 'Set up two-step verification for your own account first, on the Account page.'),
       });
-    })() }, async run(s) {
+    })(), onDialog: dialogTo(resetAccepted, true) }, async run(s) {
       await waitText(s.page, 'vfy-off');
       const buttons = u => s.page.evaluate(n => [...document.querySelectorAll(`tr[data-username="${n}"] button`)].map(b => b.textContent.trim()), u);
       assert.deepEqual(await buttons('vfy-developer'), ['Reset password', 'Disable', 'Reset two-step']);
@@ -59620,10 +59631,22 @@ function mfaCases() {
       await s.page.evaluate(() => [...document.querySelectorAll('tr[data-username="vfy-developer"] button')].find(b => b.textContent.trim() === 'Reset two-step').click());
       await waitFor(s.page, () => document.querySelector('tr[data-username="vfy-developer"] td:nth-child(5)').textContent.trim() === 'Off', 'Off after the reset');
       assert.equal(callsTo(s, 'POST', '/api/auth/users/vfy-developer/reset-mfa').length, 1);
+      assert.deepEqual(resetAccepted.seen, [RESET2_ASK]);
       await s.page.click('#mfa-required');
       await waitText(s.page, 'for your own account first');
       assert.deepEqual(callsTo(s, 'POST', '/api/auth/mfa/policy').map(c => c.body), [{ required: true }]);
       assert.equal(await s.page.evaluate(() => document.querySelector('#mfa-required').checked), false);
+    } },
+    { name: 'A cancelled Reset two-step sends nothing', open: { role: 'engineer', path: '/users', routes: base({
+      'GET /api/auth/users': () => json(200, { users: [row('vfy-developer', 'developer', { mfa_enrolled: true }), row('vfy-engineer', 'engineer', { mfa_enrolled: true })] }),
+    }), onDialog: dialogTo(resetCancelled, false) }, async run(s) {
+      await waitText(s.page, 'vfy-developer');
+      await s.page.evaluate(() => [...document.querySelectorAll('tr[data-username="vfy-developer"] button')].find(b => b.textContent.trim() === 'Reset two-step').click());
+      // A dismissed confirmation is answered inside the click; the pause only gives a wrongly sent request time to be seen.
+      await new Promise(r => setTimeout(r, 300));
+      assert.deepEqual(resetCancelled.seen, [RESET2_ASK]);
+      assert.equal(s.calls.filter(c => c.method === 'POST' && c.path.startsWith('/api/auth/users/')).length, 0);
+      assert.equal(await s.page.evaluate(() => document.querySelector('tr[data-username="vfy-developer"] td:nth-child(5)').textContent.trim()), 'On');
     } },
   ];
 }
@@ -60181,10 +60204,12 @@ function prepareCases() {
       });
     })(), async run(s) {
       await waitText(s.page, 'minutes.txt');
+      await waitSelected(s.page, 0);
       await fillNth(s.page, 'select', 0, B);
       await press(s.page, 'Import all prepared');
       await waitFor(s.page, () => [...document.querySelectorAll('[role=alert]')].some(a => a.textContent.includes('total 600.0 MB; one import can be at most 512 MB') && a.textContent.includes('Import them in smaller selections.')), 'the IMPORT_TOO_LARGE alert');
       assert.equal(callsTo(s, 'POST', '/api/prepare/import').length, 1);
+      assert.equal(callsTo(s, 'POST', '/api/prepare/import')[0].body.collection, B);
       const input = await s.page.$('#prepare-file-input');
       await input.uploadFile(...tempFiles(['a.txt', 'b.zip']));
       await waitText(s.page, 'b.zip');
