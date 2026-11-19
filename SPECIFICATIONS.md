@@ -4811,7 +4811,13 @@ are ticked once the tests reviewer's full `stack.sh run` on the change passes.
 - [ ] Ollama pulls each distinct model `ollama/models.sh` resolves, the answer model first, and its healthcheck
       passes only when every one is listed by exact name; `package-offline.sh` and the CI model cache key read
       the same names through `ollama/compose-models.sh`, so the default key is unchanged.
-      *Evidence: `test_ollama_entrypoint.py`, `test_distribution.py`, `test_ci_workflow.py` and
+      `package-offline.sh` finds each model's manifest by the name mapping of §11.3.
+      *Evidence: `test_ollama_entrypoint.py` (`test_a_name_with_a_space_or_glob_character_is_refused`,
+      `test_the_entrypoint_stops_on_a_bad_name_before_any_pull`), `test_distribution.py`
+      (`test_the_model_check_finds_library_and_namespaced_models`,
+      `test_the_model_check_looks_under_a_models_own_host`, `test_the_model_check_follows_ollamas_name_parse`,
+      `test_a_host_model_name_reaches_the_check_unchanged`,
+      `test_unreadable_model_settings_stop_before_anything_is_saved`), `test_ci_workflow.py` and
       `test_collector.py` (suites 01 and 05); the stack's own start-up waits on that healthcheck.*
 - [ ] Packages record `answer_llm` and `build_llm` and keep `llm` as the answer model, at `package_format` 1;
       `include_models` bundles the answer model, never the build model; import checks and installs only the
@@ -4911,6 +4917,23 @@ Before saving any image, `package-offline.sh` MUST check that the
 pulls, and stop naming the missing ones otherwise (#647): a bundle without one
 would make the offline target try to download it. It exports the whole volume,
 so a model left in it (phi3.5, after an upgrade to 1.2.1) goes in too.
+
+The check looks for each model's manifest at `models/manifests/<path>/<tag>` in
+the volume, and reads the model name from the right, as Ollama does (#772,
+#824): the tag is what follows the last `:` of the last path segment, else
+`latest`, so a port in a registry host is not a tag.
+
+| Shape | Example | `<path>` under `models/manifests/` |
+|---|---|---|
+| One segment | `llama3.1:8b` | `registry.ollama.ai/library/llama3.1` (tag `8b`) |
+| Two segments | `someone/assistant`, `hf.co/model` | `registry.ollama.ai/someone/assistant`; a dot in the first segment doesn't make it a host |
+| Three segments, a registry host first | `hf.co/user/model:Q4_K_M`, `reg.example:5000/u/m:tag` | `hf.co/user/model`, `reg.example:5000/u/m`: the host's own directory |
+| Four or more | `a/b/c/d` | the name as given, as for three; not an Ollama name, so it is reported missing unless stored there |
+
+A model name MUST have only letters, digits and `. _ : / -`, MUST NOT contain
+`..`, and MUST NOT start with `/` or `-`. `ollama/models.sh` and
+`ollama/compose-models.sh` refuse any other name for the answer and build model
+settings, and `package-offline.sh` then stops before saving anything (#772).
 
 The image list MUST match the images `docker compose config` resolves. It is
 `rag-docker-api:latest`, `rag-docker-ui:latest`,
