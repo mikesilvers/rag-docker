@@ -337,14 +337,51 @@ class OfflinePackageTests(Workspace):
         missing = run("someone/other", "library-less:1", "llama3.1:8b")
         self.assertEqual(missing.stdout.split(), ["someone/other", "library-less:1"])
 
+    def test_the_model_check_looks_under_a_models_own_host(self):
+        # A name whose first path segment has a dot is a registry host (#772): its manifest
+        # is under that host's directory, not under registry.ollama.ai.
+        text = (ROOT / "package-offline.sh").read_text()
+        script = re.search(r"-c '(for m in .*?done)' sh \$MODELS", text, re.S).group(1)
+        store = self.temp / "store"
+        manifests = store / "models" / "manifests"
+        for path in ("hf.co/user/model/latest", "hf.co/user/model/Q4_K_M",
+                     "registry.ollama.ai/library/llama3.1/8b",
+                     "registry.ollama.ai/someone/assistant/latest",
+                     "registry.ollama.ai/hf.co/other/model/latest"):
+            (manifests / path).parent.mkdir(parents=True, exist_ok=True)
+            (manifests / path).write_text("{}")
+        run = lambda *models: subprocess.run(
+            ["sh", "-c", script.replace("/models/", f"{store}/"), "sh", *models],
+            capture_output=True, text=True, timeout=60)
+        found = run("hf.co/user/model", "hf.co/user/model:Q4_K_M", "llama3.1:8b", "someone/assistant")
+        self.assertEqual((found.returncode, found.stdout), (0, ""), found.stderr)
+        # A host model that is only under registry.ollama.ai, or not stored, is missing; a
+        # library name with a dot (llama3.1:8b) is not a host.
+        missing = run("hf.co/other/model", "hf.co/user/absent", "hf.co/user/model:nope",
+                      "someone/assistant:v2", "llama3.1:9b")
+        self.assertEqual(missing.stdout.split(), ["hf.co/other/model", "hf.co/user/absent",
+                                                  "hf.co/user/model:nope", "someone/assistant:v2",
+                                                  "llama3.1:9b"])
+
+    def test_a_host_model_name_reaches_the_check_unchanged(self):
+        result, _out, _files = self.build({}, STUB_BUILD_LLM_MODEL="hf.co/user/model")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        check = [c for c in self.calls() if c[0] == "run"][0]
+        self.assertEqual(check[-4:], ["sh", "llama3.1:8b", "hf.co/user/model", "nomic-embed-text"])
+
     def test_unreadable_model_settings_stop_before_anything_is_saved(self):
-        result, out, _files = self.build({}, STUB_BUILD_LLM_MODEL="bad name")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("BUILD_LLM_MODEL is not a model name", result.stderr)
-        self.assertIn("ERROR: could not read the model names (ollama/compose-models.sh).",
-                      result.stderr)
-        self.assertFalse(out.exists())
-        self.assertEqual([c for c in self.calls() if c[0] in ("save", "run")], [])
+        # Spaces, and the loose names #772 refuses: "..", a leading "/" and a leading "-".
+        for bad in ("bad name", "a..b", "../x", "/x", "-x"):
+            with self.subTest(name=bad):
+                # source_tree makes "src" with mkdir(), so each case starts without it.
+                shutil.rmtree(self.temp / "src", ignore_errors=True)
+                result, out, _files = self.build({}, STUB_BUILD_LLM_MODEL=bad)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("BUILD_LLM_MODEL is not a model name", result.stderr)
+                self.assertIn("ERROR: could not read the model names (ollama/compose-models.sh).",
+                              result.stderr)
+                self.assertFalse(out.exists())
+                self.assertEqual([c for c in self.calls() if c[0] in ("save", "run")], [])
 
     def test_a_missing_model_stops_before_anything_is_saved(self):
         # An install from before #647 holds phi3.5, not llama3.1:8b.

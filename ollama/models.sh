@@ -27,10 +27,11 @@ EMBED_MODEL_NAME=nomic-embed-text
 
 # A model name is letters, digits and . _ : / - only, as compose-models.sh
 # requires on the host: the names are word-split below, so a space or a glob
-# character must stop here, not be split or expanded.
+# character must stop here, not be split or expanded. A name with `..`, or one
+# starting with `/` or `-`, is refused too (#772).
 for _name in "${ANSWER_MODEL}" "${BUILD_MODEL}"; do
     case "${_name}" in
-        *[!A-Za-z0-9._:/-]*)
+        *[!A-Za-z0-9._:/-]*|*..*|/*|-*)
             echo "models.sh: not a model name: '${_name}'" >&2
             # Sourced, return to the caller; run, exit.
             return 2 2>/dev/null || exit 2 ;;
