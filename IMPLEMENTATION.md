@@ -11735,7 +11735,7 @@ def build(
         # 8. archive under a temporary name, then rename, so a partial file is
         #    never mistaken for a package.
         tmp_archive = out_dir / f".{filename}.partial"
-        identity = age_stream.generate_identity() if key else None
+        identity = age_stream.generate_identity() if encryption == "key" else None
         _write_archive(stage, stem, tmp_archive, passphrase,
                        identity.public_bytes if identity is not None else None)
         key_filename = None
