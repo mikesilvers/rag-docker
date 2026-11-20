@@ -12046,18 +12046,32 @@ def iter_chunks_file(pkg: Path) -> Iterator[dict]:
 ### api/services/age_stream.py
 
 ```python
-"""Passphrase encryption of export packages in the age v1 format (#27).
+"""Encryption of export packages in the age v1 format (#27, #676).
 
-An encrypted package is an ordinary age file with one `scrypt` (passphrase)
-recipient, so `age -d` opens it as well as import does. The format is the C2SP
-age specification (https://c2sp.org/age); this module implements only the parts
-a passphrase file uses, on the `cryptography` package the API already locks:
+An encrypted package is an ordinary age file, so `age -d` opens it as well as
+import does. It has one recipient, of one of two kinds:
+
+- a new X25519 key per package (#676, the default): one `X25519` stanza. The
+  secret key is written once, to the package's key file, in age's own identity
+  file layout (`# created:`, `# public key: age1...`, `AGE-SECRET-KEY-1...`),
+  so `age -d -i <package>.key` opens it too;
+- a passphrase (#27): one `scrypt` stanza.
+
+The format is the C2SP age specification (https://c2sp.org/age); this module
+implements only the parts these files use, on the `cryptography` package the
+API already locks. Keys and recipients are Bech32 (BIP 173), as age writes them.
+age's post-quantum hybrid recipients (`mlkem768x25519`, `AGE-SECRET-KEY-PQ-1`)
+are not supported: export writes X25519 only, and import refuses a PQ key file.
+A passphrase file looks like this:
 
     age-encryption.org/v1
     -> scrypt <salt, base64> <work factor>
     <wrapped file key, base64>
     --- <header MAC, base64>
     <16-byte nonce><STREAM payload: 64 KiB chunks, ChaCha20-Poly1305>
+
+A key file's package has `-> X25519 <ephemeral share, base64>` and the wrapped
+file key in place of the scrypt stanza; everything after the stanza is the same.
 
 pyrage was not used: its passphrase API takes and returns whole byte strings,
 and a package can be several GB. Both directions here stream: the encryptor is a
@@ -12081,7 +12095,8 @@ from hashlib import sha256
 from typing import BinaryIO
 
 from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
@@ -12099,6 +12114,10 @@ _NONCE = 16
 WORK_FACTOR = 18
 MAX_WORK_FACTOR = 20
 _SCRYPT_LABEL = b"age-encryption.org/v1/scrypt"
+_X25519_LABEL = b"age-encryption.org/v1/X25519"
+# The longest key file import reads (POST /import and the loader): age's own is
+# about 190 characters.
+KEY_FILE_MAX = 4096
 # A passphrase file's header is about 150 bytes. Reading stops well before a
 # hostile file could make the parser hold a large one.
 HEADER_MAX = 64 * 1024
@@ -12119,8 +12138,11 @@ class AgeError(Exception):
 
     header      not a valid age header (or not an age file at all), a scrypt
                 work factor that is not a decimal without a sign or leading
-                zero included (#549)
+                zero included (#549); a malformed X25519 stanza, one whose
+                share gives an all-zero secret, or a scrypt stanza next to it
     recipient   a valid age header, but not for a passphrase
+    key         an X25519 key that unwraps none of the file's X25519 stanzas
+    identity    a key file that isn't one valid age X25519 secret key
     work_factor the scrypt work factor is above MAX_WORK_FACTOR, a decimal of
                 more than two digits included
     nonce       the file ends inside the 16-byte payload nonce
@@ -12297,18 +12319,214 @@ def verify_mac(header: Header, file_key: bytes) -> None:
         raise AgeError("hmac", "the age header MAC does not match")
 
 
-def check_header(fh: BinaryIO) -> bool:
-    """True when `fh` starts with a valid age passphrase header. No scrypt runs,
-    and the work factor is not held against the limit; for the listing.
+def header_kind(fh: BinaryIO) -> str | None:
+    """`"passphrase"` when `fh` starts with a valid age passphrase header, `"key"`
+    when it starts with a valid header with an `X25519` stanza and no `scrypt`
+    (#676), else None. No scrypt or X25519 operation runs, and the work factor
+    is not held against the limit: for the listing and for choosing which
+    secret an import needs.
 
-    Any failure reading or parsing the file is False, never an exception: one
+    Any failure reading or parsing the file is None, never an exception: one
     bad file must not break the listing of the others (#27 review).
     """
     try:
-        scrypt_stanza(read_header(fh))
+        header = read_header(fh)
+        types = [s.args[0] for s in header.stanzas]
+        if "scrypt" in types:
+            scrypt_stanza(header)
+            return "passphrase"
+        return "key" if "X25519" in types else None
     except Exception:                                 # noqa: BLE001 - see above
-        return False
-    return True
+        return None
+
+
+def check_header(fh: BinaryIO) -> bool:
+    """True when `fh` starts with a valid passphrase or key header (`header_kind`)."""
+    return header_kind(fh) is not None
+
+
+# ── X25519 keys (#676) ────────────────────────────────────────────────────────
+
+_BECH32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+_BECH32_REV = {c: i for i, c in enumerate(_BECH32)}
+
+
+def _polymod(values) -> int:
+    gen = (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)
+    chk = 1
+    for v in values:
+        top = chk >> 25
+        chk = (chk & 0x1FFFFFF) << 5 ^ v
+        for i in range(5):
+            chk ^= gen[i] if (top >> i) & 1 else 0
+    return chk
+
+
+def _hrp_expand(hrp: str) -> list[int]:
+    return [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
+
+
+def _convert(data, frombits: int, tobits: int, pad: bool) -> list[int]:
+    acc = bits = 0
+    out = []
+    maxv = (1 << tobits) - 1
+    for value in data:
+        acc = (acc << frombits) | value
+        bits += frombits
+        while bits >= tobits:
+            bits -= tobits
+            out.append((acc >> bits) & maxv)
+    if pad:
+        if bits:
+            out.append((acc << (tobits - bits)) & maxv)
+    elif bits >= frombits or (acc << (tobits - bits)) & maxv:
+        raise ValueError("invalid Bech32 padding")
+    return out
+
+
+def _bech32_encode(hrp: str, data: bytes) -> str:
+    """Bech32 (BIP 173), lowercase, with no length limit, as age writes keys."""
+    words = _convert(data, 8, 5, True)
+    values = _hrp_expand(hrp) + words
+    poly = _polymod(values + [0] * 6) ^ 1
+    checksum = [(poly >> 5 * (5 - i)) & 31 for i in range(6)]
+    return hrp + "1" + "".join(_BECH32[w] for w in words + checksum)
+
+
+def _bech32_decode(text: str) -> tuple[str, bytes]:
+    """The HRP (lowercase) and the data of a Bech32 string. Raises ValueError,
+    never naming the input, for mixed case, a bad character or checksum."""
+    if text.lower() != text and text.upper() != text:
+        raise ValueError("mixed-case Bech32")
+    text = text.lower()
+    pos = text.rfind("1")
+    if pos < 1 or pos + 7 > len(text) or any(ord(c) < 33 or ord(c) > 126 for c in text):
+        raise ValueError("malformed Bech32")
+    hrp, rest = text[:pos], text[pos + 1:]
+    try:
+        values = [_BECH32_REV[c] for c in rest]
+    except KeyError:
+        raise ValueError("invalid Bech32 character") from None
+    if _polymod(_hrp_expand(hrp) + values) != 1:
+        raise ValueError("invalid Bech32 checksum")
+    return hrp, bytes(_convert(values[:-6], 5, 8, False))
+
+
+_RAW = serialization.Encoding.Raw
+
+
+class Identity:
+    """An age X25519 secret key. Its repr never shows the key, and nothing
+    returns its text except `encode()`, which only the key file uses."""
+
+    __slots__ = ("_key",)
+
+    def __init__(self, key: X25519PrivateKey):
+        self._key = key
+
+    def __repr__(self) -> str:
+        return "Identity(<redacted>)"
+
+    @property
+    def public_bytes(self) -> bytes:
+        return self._key.public_key().public_bytes(_RAW, serialization.PublicFormat.Raw)
+
+    @property
+    def recipient(self) -> str:
+        """The `age1...` recipient: the public key, which is not secret."""
+        return _bech32_encode("age", self.public_bytes)
+
+    def encode(self) -> str:
+        """The `AGE-SECRET-KEY-1...` line of the key file."""
+        raw = self._key.private_bytes(_RAW, serialization.PrivateFormat.Raw,
+                                      serialization.NoEncryption())
+        return _bech32_encode("age-secret-key-", raw).upper()
+
+    def exchange(self, share: bytes) -> bytes:
+        return self._key.exchange(X25519PublicKey.from_public_bytes(share))
+
+
+def generate_identity() -> Identity:
+    """A new X25519 key pair: one per package (#676)."""
+    return Identity(X25519PrivateKey.generate())
+
+
+def parse_identity(text: str) -> Identity:
+    """The key in the contents of an age X25519 identity file (#676).
+
+    Blank lines and `#` comments are skipped, and CRLF line ends are accepted.
+    Exactly one other line must remain: one `AGE-SECRET-KEY-1...` key. Anything
+    else, a post-quantum `AGE-SECRET-KEY-PQ-1...` key included, raises
+    AgeError("identity"), whose message never contains the text.
+    """
+    bad = AgeError("identity", "the key file is not a valid age X25519 key")
+    if not isinstance(text, str) or len(text) > KEY_FILE_MAX:
+        raise bad
+    lines = [line[:-1] if line.endswith("\r") else line for line in text.split("\n")]
+    keys = [line for line in lines if line.strip() and not line.startswith("#")]
+    if len(keys) != 1 or not keys[0].startswith("AGE-SECRET-KEY-1"):
+        raise bad
+    try:
+        hrp, data = _bech32_decode(keys[0])
+    except ValueError:
+        raise bad from None
+    if hrp != "age-secret-key-" or len(data) != 32:
+        raise bad
+    return Identity(X25519PrivateKey.from_private_bytes(data))
+
+
+def identity_file(identity: Identity, created, package: str) -> str:
+    """The key file's text, in age's identity file layout, so `age -d -i` reads
+    it. `created` is a UTC datetime."""
+    return (f"# created: {created.strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+            f"# public key: {identity.recipient}\n"
+            f"# The key of {package}. Store it apart from the package: anyone with "
+            "both can read it.\n"
+            f"{identity.encode()}\n")
+
+
+def _x25519_stanza(file_key: bytes, recipient: bytes) -> bytes:
+    """The `X25519` stanza wrapping `file_key` to the raw public key `recipient`."""
+    ephemeral = X25519PrivateKey.generate()
+    share = ephemeral.public_key().public_bytes(_RAW, serialization.PublicFormat.Raw)
+    secret = ephemeral.exchange(X25519PublicKey.from_public_bytes(recipient))
+    if secret == bytes(32):
+        raise ValueError("the recipient is a low-order point")
+    wrap = _hkdf(secret, share + recipient, _X25519_LABEL)
+    body = ChaCha20Poly1305(wrap).encrypt(b"\x00" * 12, file_key, None)
+    return b"-> X25519 " + _b64encode(share) + b"\n" + _b64encode(body) + b"\n"
+
+
+def x25519_unwrap(header: Header, identity: Identity) -> bytes:
+    """The file key from the first `X25519` stanza `identity` opens.
+
+    Stanzas are taken in order, as age does: other stanza types are skipped, a
+    malformed X25519 stanza met first is a header failure, and one that doesn't
+    open is passed over. A scrypt stanza must be alone (`scrypt_stanza`).
+    """
+    if "scrypt" in [s.args[0] for s in header.stanzas]:
+        raise AgeError("header", "a scrypt stanza must be the only stanza")
+    ours = identity.public_bytes
+    for stanza in header.stanzas:
+        if stanza.args[0] != "X25519":
+            continue
+        if len(stanza.args) != 2:
+            raise AgeError("header", "malformed X25519 stanza")
+        share = _b64decode(stanza.args[1].encode("ascii"))
+        if len(share) != 32 or len(stanza.body) != _FILE_KEY + _TAG:
+            raise AgeError("header", "malformed X25519 stanza")
+        try:
+            secret = identity.exchange(share)
+        except ValueError:
+            secret = bytes(32)
+        if secret == bytes(32):
+            raise AgeError("header", "the X25519 share gives an all-zero secret")
+        try:
+            return ChaCha20Poly1305(_hkdf(secret, share + ours, _X25519_LABEL)).decrypt(
+                b"\x00" * 12, stanza.body, None)
+        except InvalidTag:
+            continue
+    raise AgeError("key", "the key does not decrypt this file")
 
 
 # ── Payload (STREAM) ──────────────────────────────────────────────────────────
@@ -12403,34 +12621,48 @@ class Decryptor(io.RawIOBase):
             raise self._error
 
 
-def open_decrypt(fh: BinaryIO, passphrase: str) -> Decryptor:
-    """Parse the header, unwrap the key, check the MAC; then stream the payload."""
+def open_decrypt(fh: BinaryIO, passphrase: str | None = None, *,
+                 identity: Identity | None = None) -> Decryptor:
+    """Parse the header, unwrap the key with the passphrase or the X25519
+    identity (exactly one), check the MAC; then stream the payload."""
+    if (passphrase is None) == (identity is None):
+        raise ValueError("open_decrypt takes a passphrase or an identity")
     header = read_header(fh)
-    file_key = unwrap_file_key(header, passphrase)
+    if identity is not None:
+        file_key = x25519_unwrap(header, identity)
+    else:
+        file_key = unwrap_file_key(header, passphrase)
     verify_mac(header, file_key)
     return Decryptor(fh, file_key)
 
 
 class Encryptor(io.RawIOBase):
-    """Writes an age passphrase file to `fh` from the plaintext written to it.
+    """Writes an age file to `fh` from the plaintext written to it, for a
+    passphrase or for an X25519 recipient (`recipient`, the raw 32-byte public
+    key; #676): exactly one of them.
 
     The last chunk carries the final flag, so a full chunk is held back until
     either more data or `close()` shows whether it is the last. `close()` writes
     it and leaves `fh` open: the caller owns that file.
     """
 
-    def __init__(self, fh: BinaryIO, passphrase: str, work_factor: int | None = None):
+    def __init__(self, fh: BinaryIO, passphrase: str | None = None, work_factor: int | None = None,
+                 *, recipient: bytes | None = None):
         super().__init__()
+        if (passphrase is None) == (recipient is None):
+            raise ValueError("Encryptor takes a passphrase or a recipient")
         self._fh = fh
-        work_factor = WORK_FACTOR if work_factor is None else work_factor
         file_key = os.urandom(_FILE_KEY)
-        salt = os.urandom(16)
-        key = _scrypt(passphrase.encode("utf-8"), salt, work_factor)
-        wrapped = ChaCha20Poly1305(key).encrypt(b"\x00" * 12, file_key, None)
-        mac_input = (VERSION_LINE + b"\n"
-                     + b"-> scrypt " + _b64encode(salt) + b" " + str(work_factor).encode() + b"\n"
-                     + _b64encode(wrapped) + b"\n"   # 43 characters: one short line
-                     + b"---")
+        if recipient is not None:
+            stanza = _x25519_stanza(file_key, recipient)
+        else:
+            work_factor = WORK_FACTOR if work_factor is None else work_factor
+            salt = os.urandom(16)
+            key = _scrypt(passphrase.encode("utf-8"), salt, work_factor)
+            wrapped = ChaCha20Poly1305(key).encrypt(b"\x00" * 12, file_key, None)
+            stanza = (b"-> scrypt " + _b64encode(salt) + b" " + str(work_factor).encode() + b"\n"
+                      + _b64encode(wrapped) + b"\n")   # 43 characters: one short line
+        mac_input = VERSION_LINE + b"\n" + stanza + b"---"
         nonce = os.urandom(_NONCE)
         fh.write(mac_input + b" " + _b64encode(_header_mac(file_key, mac_input)) + b"\n" + nonce)
         self._aead = ChaCha20Poly1305(_hkdf(file_key, nonce, b"payload"))

@@ -58,7 +58,8 @@ CHUNK = age_stream.CHUNK
 STEM = "ragpkg-corpus-20261027T000000Z-0123abcd"
 # The testkit's outcomes, and the AgeError kinds that mean each.
 OUTCOME = {"header": "header failure", "work_factor": "header failure",
-           "recipient": "no match", "passphrase": "no match", "nonce": "header failure",
+           "recipient": "no match", "passphrase": "no match", "key": "no match",
+           "identity": "no match", "nonce": "header failure",
            "hmac": "HMAC failure", "payload": "payload failure"}
 
 
@@ -351,6 +352,174 @@ def records(count=3, width=4):
     return [{"id": str(uuid.UUID(int=i + 1)), "vector": [0.1 * (i + 1)] * width,
              "properties": {"content": f"chunk {i}", "source_file": "doc.txt", "chunk_index": i},
              "source_sha256": None} for i in range(count)]
+
+
+_BECH32_TEST = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+
+def bech32_data(text):
+    """Bech32 (BIP 173) data bytes of `text`, written here from the BIP, with no
+    code from age_stream; the checksum is verified."""
+    text = text.lower()
+    hrp, rest = text[:text.rfind("1")], text[text.rfind("1") + 1:]
+    values = [_BECH32_TEST.index(c) for c in rest]
+    chk = 1
+    for v in [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp] + values:
+        top, chk = chk >> 25, (chk & 0x1FFFFFF) << 5 ^ v
+        for i, g in enumerate((0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)):
+            chk ^= g if (top >> i) & 1 else 0
+    assert chk == 1, "bad checksum"
+    bits = "".join(format(v, "05b") for v in values[:-6])
+    return hrp, bytes(int(bits[i:i + 8], 2) for i in range(0, len(bits) - len(bits) % 8, 8))
+
+
+def independent_x25519_decrypt(blob, key_line):
+    """The age v1 X25519 format, decrypted straight from the specification with
+    no code from age_stream (#676)."""
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+    from cryptography.hazmat.primitives import serialization
+    hrp, raw = bech32_data(key_line)
+    assert hrp == "age-secret-key-" and len(raw) == 32
+    private = X25519PrivateKey.from_private_bytes(raw)
+    ours = private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    header_end = blob.index(b"\n---") + 4
+    lines = blob[:header_end].split(b"\n")
+    assert lines[0] == b"age-encryption.org/v1", lines[0]
+    args = lines[1].split(b" ")
+    assert args[:2] == [b"->", b"X25519"] and len(args) == 3, args
+    share = base64.b64decode(args[2] + b"=")
+    body = base64.b64decode(lines[2] + b"=")
+    secret = private.exchange(X25519PublicKey.from_public_bytes(share))
+    wrap = HKDF(hashes.SHA256(), 32, share + ours, b"age-encryption.org/v1/X25519").derive(secret)
+    file_key = ChaCha20Poly1305(wrap).decrypt(bytes(12), body, None)
+    hmac_key = HKDF(hashes.SHA256(), 32, None, b"header").derive(file_key)
+    mac_end = blob.index(b"\n", header_end)
+    check = crypto_hmac.HMAC(hmac_key, hashes.SHA256())
+    check.update(blob[:header_end])
+    check.verify(base64.b64decode(blob[header_end + 1:mac_end] + b"="))
+    nonce = blob[mac_end + 1:mac_end + 17]
+    aead = ChaCha20Poly1305(HKDF(hashes.SHA256(), 32, nonce, b"payload").derive(file_key))
+    payload = blob[mac_end + 17:]
+    chunks = [payload[i:i + CHUNK + 16] for i in range(0, len(payload), CHUNK + 16)] or [b""]
+    return b"".join(aead.decrypt(n.to_bytes(11, "big") + (b"\x01" if n == len(chunks) - 1 else b"\x00"), c, None)
+                    for n, c in enumerate(chunks))
+
+
+def x25519_identities(path):
+    """The `identity:` lines of a vector that are X25519 keys (a vector can
+    list a post-quantum one too)."""
+    head = path.read_bytes().partition(b"\n\n")[0].decode()
+    return [line[len("identity: "):] for line in head.splitlines()
+            if line.startswith("identity: AGE-SECRET-KEY-1")]
+
+
+def key_encrypt(data, identity):
+    out = io.BytesIO()
+    enc = age_stream.Encryptor(out, recipient=identity.public_bytes)
+    enc.write(data)
+    enc.close()
+    return out.getvalue()
+
+
+class X25519Keys(unittest.TestCase):
+    """A new X25519 key per package (#676): the testkit, an independent
+    decryption, the key file and its parser."""
+
+    def test_x25519_vectors(self):
+        seen = 0
+        for name, meta, _p, body in vectors():
+            keys = x25519_identities(VECTORS / name)
+            if not keys:
+                continue
+            seen += 1
+            with self.subTest(vector=name):
+                released, outcome = bytearray(), "success"
+                try:
+                    read_all(age_stream.open_decrypt(io.BytesIO(body),
+                                                     identity=age_stream.parse_identity(keys[0])), released)
+                except age_stream.AgeError as exc:
+                    outcome = OUTCOME[exc.kind]
+                self.assertEqual(outcome, meta["expect"])
+                if "payload" in meta:
+                    self.assertEqual(hashlib.sha256(released).hexdigest(), meta["payload"])
+        self.assertEqual(seen, 68)
+
+    def test_round_trips_through_both_decryptions(self):
+        identity = age_stream.generate_identity()
+        line = identity.encode()
+        for size in RoundTrip.SIZES:
+            data = os.urandom(size)
+            with self.subTest(size=size):
+                blob = key_encrypt(data, identity)
+                self.assertEqual(age_stream.open_decrypt(io.BytesIO(blob), identity=identity).read(), data)
+                self.assertEqual(independent_x25519_decrypt(blob, line), data)
+
+    def test_each_identity_is_new_and_each_file_fresh(self):
+        keys = {age_stream.generate_identity().encode() for _ in range(20)}
+        self.assertEqual(len(keys), 20)
+        identity = age_stream.generate_identity()
+        self.assertNotEqual(key_encrypt(b"same", identity), key_encrypt(b"same", identity))
+
+    def test_a_wrong_key_is_kind_key_and_a_passphrase_is_refused(self):
+        blob = key_encrypt(b"data", age_stream.generate_identity())
+        with self.assertRaises(age_stream.AgeError) as caught:
+            age_stream.open_decrypt(io.BytesIO(blob), identity=age_stream.generate_identity())
+        self.assertEqual(caught.exception.kind, "key")
+        with self.assertRaises(age_stream.AgeError) as caught:
+            age_stream.open_decrypt(io.BytesIO(blob), PASSPHRASE)
+        self.assertEqual(caught.exception.kind, "recipient")
+        with self.assertRaises(age_stream.AgeError) as caught:
+            age_stream.open_decrypt(io.BytesIO(encrypt(b"data")), identity=age_stream.generate_identity())
+        self.assertEqual(caught.exception.kind, "header")
+
+    def test_header_kind(self):
+        self.assertEqual(age_stream.header_kind(io.BytesIO(encrypt(b"x"))), "passphrase")
+        self.assertEqual(age_stream.header_kind(io.BytesIO(key_encrypt(b"x", age_stream.generate_identity()))), "key")
+        for junk in (b"", b"not age\n", b"age-encryption.org/v1\n-> X25519 abc\n"):
+            self.assertIsNone(age_stream.header_kind(io.BytesIO(junk)))
+        self.assertTrue(age_stream.check_header(io.BytesIO(key_encrypt(b"x", age_stream.generate_identity()))))
+
+    def test_the_key_file_is_ages_layout_and_parses_back(self):
+        from datetime import datetime, timezone
+        identity = age_stream.generate_identity()
+        text = age_stream.identity_file(identity, datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc), STEM + ".tar.gz.age")
+        lines = text.splitlines()
+        self.assertEqual(lines[0], "# created: 2026-11-20T12:00:00Z")
+        self.assertEqual(lines[1], "# public key: " + identity.recipient)
+        self.assertIn(STEM + ".tar.gz.age", lines[2])
+        self.assertIn("Store it apart from the package", lines[2])
+        self.assertTrue(lines[3].startswith("AGE-SECRET-KEY-1") and lines[3] == lines[3].upper())
+        self.assertTrue(text.endswith("\n"))
+        self.assertEqual(bech32_data(identity.recipient)[0], "age")
+        self.assertEqual(age_stream.parse_identity(text).public_bytes, identity.public_bytes)
+        self.assertEqual(age_stream.parse_identity(text.replace("\n", "\r\n")).public_bytes, identity.public_bytes)
+        self.assertEqual(age_stream.parse_identity("\n\n" + lines[3]).public_bytes, identity.public_bytes)
+
+    def test_the_key_never_shows_in_a_repr_or_an_error(self):
+        identity = age_stream.generate_identity()
+        line = identity.encode()
+        self.assertNotIn(line, repr(identity))
+        self.assertNotIn(line.lower(), repr(identity).lower())
+        broken = line[:-1] + ("Q" if line[-1] != "Q" else "P")
+        other = age_stream.generate_identity().encode()
+        pq = "AGE-SECRET-KEY-PQ-1HZLGZUPT4ETPKDEV8HSGFDCYZ4E522W0A7PU2LHT8EH9W6YLNC3SW78XKG"
+        for text in ("", "# only a comment\n", broken, line + "\n" + other, line.lower()[:20] + line[20:],
+                     pq, "AGE-SECRET-KEY-1", "x" * (age_stream.KEY_FILE_MAX + 1), line + " ",
+                     identity.recipient):
+            with self.subTest(text=text[:24]), self.assertRaises(age_stream.AgeError) as caught:
+                age_stream.parse_identity(text)
+            self.assertEqual(caught.exception.kind, "identity")
+            self.assertNotIn(line, str(caught.exception))
+            self.assertNotIn(text.strip() or "\x00", str(caught.exception))
+
+    def test_the_encryptor_and_decryptor_take_exactly_one_secret(self):
+        identity = age_stream.generate_identity()
+        with self.assertRaises(ValueError):
+            age_stream.Encryptor(io.BytesIO())
+        with self.assertRaises(ValueError):
+            age_stream.Encryptor(io.BytesIO(), PASSPHRASE, LOW, recipient=identity.public_bytes)
+        with self.assertRaises(ValueError):
+            age_stream.open_decrypt(io.BytesIO(b""), PASSPHRASE, identity=identity)
 
 
 class Fixture(unittest.TestCase):
