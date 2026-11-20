@@ -28823,6 +28823,7 @@ for (localhost, 127.0.0.1 and the test names; another `Host` gets 421, #664),
 TLS versions and HTTP/2, the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
 a `Server` header with no nginx version (`server_tokens off`),
 `lan_mode` in the user answer and an unencrypted export refused `400 ENCRYPTION_REQUIRED` (#676),
+a default export completing as a key export whose key file and encrypted package download over HTTPS (#676),
 the API's refusal in one-off containers (`docker compose run --rm
 --no-deps`, no ports) and nginx's login rate limit (logins sent without
 waiting until one is refused `429 LOGIN_RATE_LIMITED`, #577); it also prints
@@ -35317,6 +35318,8 @@ lan server-tokens
 check "nginx sends no version: the Server header is plain nginx on an API answer and on its own 421 page (#555)" $?
 lan export
 check "LAN mode refuses an unencrypted export 400 ENCRYPTION_REQUIRED, and the user answer says lan_mode (#676)" $?
+lan export-key
+check "LAN mode: a default export is a key export, and its key file and encrypted package download over HTTPS (reviewer, #676)" $?
 lan refusals
 check "the API refuses LAN mode with one line when AUTH_COOKIE_SECURE is false or no Engineer exists" $?
 lan rate-limit
@@ -35450,7 +35453,7 @@ if __name__ == "__main__":
 ```python
 """LAN mode on the verify project (#26). Host-side, standard library, Python 3.9+.
 
-    python3 lan_stack.py https|hosts|tls|bindings|cookie|origin|server-tokens|export|refusals|rate-limit|address
+    python3 lan_stack.py https|hosts|tls|bindings|cookie|origin|server-tokens|export|export-key|refusals|rate-limit|address
 
 Run by 18_lan.sh in a `stack.sh run --lan`, which brings the verify project up
 in LAN mode with TLS on 127.0.0.1:<verify port> only, copies the certificate
@@ -35477,6 +35480,11 @@ printing what failed:
   export    LAN mode exports only encrypted packages (#676): the user answer
             says lan_mode, and POST /export with encryption "none" is refused
             400 ENCRYPTION_REQUIRED before anything else is checked
+  export-key
+            a default export (no encryption named) of a new, empty collection
+            completes as a key export in LAN mode; its key file and its
+            age-encrypted package each download over HTTPS, and the key's
+            download leaves the job saying key_on_server false (reviewer, #676)
   refusals  a one-off api container of the LAN configuration (no ports, the
             running project untouched) refuses to start, with one line, when
             AUTH_COOKIE_SECURE is false and when its account store is empty
@@ -35498,6 +35506,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import auth_setup  # noqa: E402
@@ -35713,6 +35722,60 @@ def check_export():
     assert (status, code) == (400, "ENCRYPTION_REQUIRED"), "an unencrypted export got {} {}".format(status, code)
 
 
+def download(path, cookie):
+    """(status, raw body) of GET /api<path> over verified TLS."""
+    conn = http.client.HTTPSConnection("localhost", port(), context=context(), timeout=120)
+    try:
+        conn.request("GET", "/api" + path, headers={"Cookie": cookie})
+        response = conn.getresponse()
+        return response.status, response.read()
+    finally:
+        conn.close()
+
+
+def check_export_key():
+    """Reviewer (#676): a key export completes in LAN mode, and its key and
+    package download over HTTPS. The downloads delete both files."""
+    token, _ = login()
+    cookie = "{}={}".format(auth_setup.COOKIE, token)
+    headers = {"Cookie": cookie, "Origin": origin()}
+    name = "VfyLanKey" + secrets.token_hex(3)
+    status, _, _ = request("POST", "/collections", {"name": name}, headers)
+    assert status == 201, "creating {} answered {}".format(name, status)
+    try:
+        status, body, _ = request("POST", "/export", {"collection": name}, headers)
+        assert status == 202, "the default export answered {} {}".format(status, body)
+        job = "/export/job/" + body["job_id"]
+        deadline = time.time() + 300
+        while True:
+            status, body, _ = request("GET", job, headers={"Cookie": cookie})
+            if status == 200 and body["status"] in ("completed", "failed"):
+                break
+            assert time.time() < deadline, "the export is still {} after 300 s".format((body or {}).get("status"))
+            time.sleep(1)
+        package, key = body["filename"], body["key_filename"]
+        assert (body["status"], body["encryption"], body["key_on_server"]) == ("completed", "key", True), \
+            "the export ended {} {} key_on_server {} ({})".format(body["status"], body["encryption"],
+                                                                 body["key_on_server"], body.get("error_code"))
+        assert package and package.endswith(".tar.gz.age") and key == package + ".key", \
+            "package {!r}, key file {!r}".format(package, key)
+        status, raw = download("/packages/" + key, cookie)
+        lines = raw.decode("ascii", "replace").splitlines()
+        secret = [line for line in lines if line.startswith("AGE-SECRET-KEY-1")]
+        assert status == 200 and len(secret) == 1, \
+            "the key file answered {} with {} secret key line(s)".format(status, len(secret))
+        status, body, _ = request("GET", job, headers={"Cookie": cookie})
+        assert status == 200 and body["key_on_server"] is False, \
+            "after the key's download the job says key_on_server {!r}".format((body or {}).get("key_on_server"))
+        status, raw = download("/packages/" + package, cookie)
+        assert status == 200 and raw.startswith(b"age-encryption.org/v1\n-> X25519 "), \
+            "the package answered {} starting {!r}".format(status, raw[:32])
+        assert b"scrypt" not in raw.split(b"\n---", 1)[0], "the package's header has an scrypt stanza"
+    finally:
+        request("DELETE", "/collections/{}?confirm=true".format(name), headers=headers)
+        request("POST", "/auth/logout", headers=headers)
+
+
 def one_off(*env):
     """A one-off api container of the LAN configuration: (exit status, its output lines)."""
     args = ["docker", "compose", "run", "--rm", "--no-deps", "-T"]
@@ -35765,7 +35828,7 @@ def check_address():
 
 CHECKS = {"https": check_https, "hosts": check_hosts, "tls": check_tls, "bindings": check_bindings,
           "cookie": check_cookie, "origin": check_origin, "server-tokens": check_server_tokens,
-          "export": check_export, "refusals": check_refusals,
+          "export": check_export, "export-key": check_export_key, "refusals": check_refusals,
           "rate-limit": check_rate_limit, "address": check_address}
 
 

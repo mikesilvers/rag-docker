@@ -278,6 +278,7 @@ for (localhost, 127.0.0.1 and the test names; another `Host` gets 421, #664),
 TLS versions and HTTP/2, the single loopback binding, the `Secure` cookie, the origin rule over HTTPS,
 a `Server` header with no nginx version (`server_tokens off`),
 `lan_mode` in the user answer and an unencrypted export refused `400 ENCRYPTION_REQUIRED` (#676),
+a default export completing as a key export whose key file and encrypted package download over HTTPS (#676),
 the API's refusal in one-off containers (`docker compose run --rm
 --no-deps`, no ports) and nginx's login rate limit (logins sent without
 waiting until one is refused `429 LOGIN_RATE_LIMITED`, #577); it also prints

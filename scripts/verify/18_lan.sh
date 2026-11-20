@@ -105,6 +105,8 @@ lan server-tokens
 check "nginx sends no version: the Server header is plain nginx on an API answer and on its own 421 page (#555)" $?
 lan export
 check "LAN mode refuses an unencrypted export 400 ENCRYPTION_REQUIRED, and the user answer says lan_mode (#676)" $?
+lan export-key
+check "LAN mode: a default export is a key export, and its key file and encrypted package download over HTTPS (reviewer, #676)" $?
 lan refusals
 check "the API refuses LAN mode with one line when AUTH_COOKIE_SECURE is false or no Engineer exists" $?
 lan rate-limit
